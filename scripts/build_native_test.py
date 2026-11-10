@@ -14,6 +14,14 @@ with `cargo test --lib --no-run`, under the same lock, clean and checks.  Its
 receipt kind is `rust-library-test`, it binds no `tests/*.rs` source digest, and
 it records exactly one Fresh=false test artifact for the rootyard library
 target.
+
+Lib mode also binds the external test-support sources that Rust pulls into the
+library through `#[path]` or `include_str!`, which `source_digest` does not
+cover because they live outside `src`.  `LIB_TEST_SUPPORT_DIRS` is the explicit,
+closed list of those directories; the receipt records
+`lib_test_support_inputs_sha256`, a digest over each regular file's
+repository-relative path and contents, recomputed before and after compilation
+so a mid-build change is rejected.
 """
 import argparse
 import hashlib
@@ -31,6 +39,20 @@ ROOT = Path(__file__).resolve().parents[1]
 NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]{0,127}$')
 FEATURES = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]*(,[A-Za-z_][A-Za-z0-9_-]*)*$')
 PROFILE_KEYS = ('opt_level', 'debuginfo', 'debug_assertions', 'overflow_checks', 'test')
+# Narrow, explicit closure of test-support sources the rootyard lib harness
+# reaches from under `tests/` (all are outside `source_digest`'s `src` tree):
+# - tests/blob_gateway_support: `#[path = "../../tests/blob_gateway_support/mod.rs"]`
+#   in src/blob_git_gateway/session_http_acceptance.rs.
+# - tests/serving_proof_support: `#[path = "../../../../../tests/serving_proof_support/contract.rs"]`
+#   in src/ref_store/core/pack_snapshot/materialize/serving_tests.rs.
+# - tests/serving_reads_support and tests/serving_support: `#[path]` includes
+#   from that contract.rs.
+# - tests/fixtures: `include_str!("../../tests/fixtures/rename_gate.c")` in
+#   src/workspaces/git.rs (and the sibling capture_read_gate.c).
+# Every regular file in these directories is included; missing directories
+# are treated as empty.
+LIB_TEST_SUPPORT_DIRS = ('tests/blob_gateway_support', 'tests/serving_proof_support',
+                         'tests/serving_reads_support', 'tests/serving_support', 'tests/fixtures')
 
 
 def sha256_file(path):
@@ -38,6 +60,20 @@ def sha256_file(path):
     with Path(path).open('rb') as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b''):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def lib_test_support_digest():
+    """Digest repo-relative path plus contents of every lib-mode test-support file."""
+    files = []
+    for directory in LIB_TEST_SUPPORT_DIRS:
+        path = ROOT / directory
+        if path.is_dir():
+            files.extend(item for item in path.rglob('*') if item.is_file())
+    digest = hashlib.sha256()
+    for path in sorted(files, key=lambda item: item.relative_to(ROOT).as_posix()):
+        digest.update(path.relative_to(ROOT).as_posix().encode() + b'\0')
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 
 
@@ -138,6 +174,7 @@ def run_build(args):
             output.unlink()
         before = source_digest()
         test_before = sha256_file(test_source) if test_source else None
+        support_before = lib_test_support_digest() if library else None
         lock_before = sha256_file(ROOT / 'Cargo.lock')
         head_before, status_before = git_state()
         # Clear only the rootyard package so its test artifact is honestly Fresh=false.
@@ -192,10 +229,13 @@ def run_build(args):
             raise BuildError(runner + ' failed with status ' + str(returncode))
         after = source_digest()
         test_after = sha256_file(test_source) if test_source else None
+        support_after = lib_test_support_digest() if library else None
         lock_after = sha256_file(ROOT / 'Cargo.lock')
         head_after, status_after = git_state()
         if (before, test_before, lock_before) != (after, test_after, lock_after):
             raise BuildError('Source inputs changed during build; rebuild before recording acceptance.')
+        if library and support_before != support_after:
+            raise BuildError('lib test-support inputs changed during build; rebuild before recording acceptance.')
         if (head_before, status_before) != (head_after, status_after):
             raise BuildError('HEAD or working-tree state changed during build; refusing the receipt')
         artifact = selected_library_artifact(events) if library else selected_artifact(events, args.test)
@@ -215,7 +255,9 @@ def run_build(args):
                   'workspace_commit': head_after, 'fresh': False,
                   'source_inputs_sha256': before,
                   'binary_sha256': sha256_file(output)}
-        if not library:
+        if library:
+            report['lib_test_support_inputs_sha256'] = support_after
+        else:
             report['integration_test_source_sha256'] = test_after
         report.update({
                   'cargo_lock_sha256': lock_after,
