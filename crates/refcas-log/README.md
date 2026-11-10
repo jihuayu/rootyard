@@ -38,9 +38,11 @@ encoded entry is limited to 1 MiB. Input collection and JSON encoding enforce
 these bounds before unbounded allocation. Full reads fail when a range exceeds
 the budget; limited reads return a bounded nonempty prefix when entries exist.
 Index zero is valid, empty ranges stay empty, and SQLite index overflow fails.
-Both reader methods reject gaps between returned entries, while a purged prefix
-or missing suffix remains a valid short read. This is not a full store scan and
-does not identify a missing entry at a requested range boundary.
+Complete reads reject missing entries throughout the requested range's
+intersection with the persisted live bounds. Limited reads validate only the
+returned prefix (the first live requested index and contiguous entries) and may
+stop at their count or byte budget; they do not inspect the remaining suffix, so
+a gap after the budget is not diagnosed by that call.
 
 Reads fail closed on a genuine hole. Append, truncate and purge each commit in
 one transaction and never leave a hole, so the stored log is exactly
