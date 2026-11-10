@@ -26,7 +26,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_stored_selector_is_bounded_sorted_unique_and_canonical() {
+    fn explicit_selector_intent_rejects_invalid_oids_and_canonicalizes_order() {
         let format = GitObjectFormat::Sha1;
         let refs = [("a".repeat(40)), ("b".repeat(40))]
             .iter()
@@ -45,10 +45,12 @@ mod tests {
             resolve_oids(&snapshot, format, &refs, Some(&head)).unwrap(),
             ["a".repeat(40), "b".repeat(40), head.clone()]
         );
-        // A stored explicit capture must be rejected for exactly what it holds: each case builds its own
-        // selector from the stored rows, so an empty selector can never stand in for the real one.
+        // `resolve_oids` parses the *caller's* explicit intent, so an unsorted list is not an error (it is
+        // canonicalized, see the positive case below). Only invalid hex, empty, duplicate and over-bound intents
+        // are rejected here; strict equality between stored order and the resolved set is enforced by the stored
+        // capture check, not by this resolver. Each case builds its own selector, so an empty selector can never
+        // stand in for the real one.
         for (stored, head) in [
-            (vec!["b".repeat(40), "a".repeat(40)], None),
             (vec!["a".repeat(40), "a".repeat(40)], None),
             (vec!["A".repeat(40)], None),
             (vec!["a".repeat(38)], None),
