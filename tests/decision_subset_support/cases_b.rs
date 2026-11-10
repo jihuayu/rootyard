@@ -214,10 +214,6 @@ async fn one_second_token_expiry_on_the_database_clock_refuses_commit_without_ba
     let outcome = async {
         let fmt = SHA1;
         let commit = world.verified.commit_oid.clone();
-        auth::expire_after_millis(&world.db.pool, world.actor.token_id, 2_000).await?;
-        let expiry = auth::token_expiry(&world.db.pool, world.actor.token_id)
-            .await?
-            .ok_or_else(|| anyhow!("token expiry was not stored"))?;
         let plan = world
             .plan_with_head(vec![fixture::update(fmt, "refs/heads/side", None, Some(&commit))?], 2, HeadUpdate::Keep)
             .await?;
@@ -226,6 +222,13 @@ async fn one_second_token_expiry_on_the_database_clock_refuses_commit_without_ba
         let before_refs = facts::refs(&world.db.pool, world.verified.repo).await?;
         let before_revision = facts::gate_revision(&world.db.pool, world.verified.repo).await?;
         let prepared = fixture::prepare(&world.adapter, &world.db.pool, plan).await?;
+        // Start the real DB-clock expiry only once planning/facts/prepare are done, so the
+        // 2s window is spent by select, not by setup: the decision must be selected while the
+        // token is valid and then become invalid before commit.
+        auth::expire_after_millis(&world.db.pool, world.actor.token_id, 2_000).await?;
+        let expiry = auth::token_expiry(&world.db.pool, world.actor.token_id)
+            .await?
+            .ok_or_else(|| anyhow!("token expiry was not stored"))?;
         let selection = fixture::select(&world.adapter, &world.db.pool, prepared, &world.actor).await?;
         let decision = facts::decision(&world.db.pool, world.verified.repo, identity.operation_id())
             .await?
