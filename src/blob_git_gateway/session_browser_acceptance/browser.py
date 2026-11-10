@@ -44,6 +44,9 @@ SHELL = "/blob"
 LOGIN = "/login"
 FAULT_MARKER = "FAULT-INJECTION-MARKER-7f3a"
 STEP_MS = 30_000
+# The cookie-only fetch aborts itself below the step bound, so an unanswered
+# request reports the route's fetch reason instead of a step timeout.
+FETCH_TIMEOUT_MS = 5_000
 
 # The page-side storage read returns only one of these fixed status words; a
 # Web Storage SecurityError is caught inside the page and never crosses the
@@ -559,19 +562,22 @@ class Client:
         The bounded `evaluate` turns an in-page fetch rejection or a step
         timeout into the route's fixed fetch reason; a resolved fetch whose
         status is not the required `401` is the route's fixed status failure.
+        The fetch carries an `AbortSignal` shorter than the step, so an
+        unanswered request fails here rather than at the step bound.
         Neither the path, the request headers, the cookies, the response body
         nor any exception text crosses this boundary: only the integer status
         of a `401` is returned.
         """
         status = await evaluate(
             page,
-            """async (path) => {
+            """async ([path, timeout]) => {
                 const response = await fetch(path, {credentials: 'same-origin',
-                    headers: {Accept: 'application/json'}});
+                    headers: {Accept: 'application/json'},
+                    signal: AbortSignal.timeout(timeout)});
                 return response.status;
             }""",
             f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED",
-            path,
+            [path, FETCH_TIMEOUT_MS],
         )
         if isinstance(status, bool) or not isinstance(status, int) or status != 401:
             raise Failure(f"{route.upper()}_COOKIE_ONLY_STATUS_INVALID")
