@@ -166,6 +166,9 @@ jobs:
         run: python3 tests/backup_ci_pins.py --binary target/debug/rootyard --report test-results/backup-ci-pins.json
       - name: Exercise durable push recovery
         run: python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
+      - name: Exercise direct collaborator Git transport and write-endpoint authorization (#4)
+        timeout-minutes: 15
+        run: python3 tests/collaborator_transport.py --binary target/debug/rootyard --report test-results/collaborator-transport.json
       - name: Recover native Git receipts after collaborator and organization withdrawal
         run: python3 tests/recorded_membership_recovery.py --binary target/debug/rootyard --report test-results/recorded-membership-recovery.json
       - name: Recover native Git receipts after token revocation
