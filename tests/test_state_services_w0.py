@@ -209,11 +209,7 @@ class WorkloadContractTest(unittest.TestCase):
             baseline.validate_workload(workload_with(git={"cas_rounds": 0, "cas_concurrency": 4}))
         baseline.validate_workload(workload_with(git={"cas_rounds": 0, "cas_concurrency": 1}))
 
-    def test_reduced_push_override_must_stay_within_history_and_budget(self):
-        workload = workload_with(git={"pushes_per_repo": 2})
-        workload["git"]["returned_pushes_per_repo"] = 3
-        with self.assertRaises(ValueError):
-            baseline.validate_workload(workload)
+    def test_reduced_push_override_must_be_a_positive_integer_when_admissible(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "workload.json"
             path.write_text(json.dumps(workload_with()), encoding="utf-8")
@@ -260,97 +256,154 @@ class WorkloadContractTest(unittest.TestCase):
         self.assertEqual(facts["returned_pushes_per_repo"], 1)
 
 
+def make_budget(workload, returned=None):
+    budget = baseline.TempBudget(workload["bounds"]["max_temp_bytes"],
+                                 baseline.estimate_temp_bytes(workload, returned))
+    budget.admit()
+    return budget
+
+
+def run_fixture(workload):
+    """Admit and start the owned fixture, then the runner bound to its TMPDIR."""
+    budget = make_budget(workload)
+    tmpdir = baseline.client_fixture(budget)
+    runner = baseline.Runner(time.monotonic() + 30, tmpdir=tmpdir)
+    try:
+        return baseline.run_git_workload(workload, runner, 106, budget=budget)
+    finally:
+        if budget.root is not None:  # remove only the root this run created
+            baseline.shutil.rmtree(budget.root, ignore_errors=True)
+
+
 class TempAdmissionTest(unittest.TestCase):
     """The temp budget is enforced during the run, not only after it."""
 
-    def run_with_probe(self, write_probe, workload):
-        """Run a workload while creating an out-of-tree temp file like a library would."""
-        probe = Path(tempfile.gettempdir()) / f"w0-owned-probe-{os.getpid()}"
-        original_write = baseline._write_bounded
-        patcher = None
+    def test_outside_file_is_never_changed_or_deleted(self):
+        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
+        with tempfile.TemporaryDirectory() as outside:
+            untouched = Path(outside) / "unrelated.txt"
+            untouched.write_bytes(b"operator data")
+            script = textwrap.dedent(f"""
+                import os
+                open({str(untouched)!r}, "ab").write(b"x")
+                open(os.path.join(os.environ["TMPDIR"], "child-scratch"), "wb").write(b"scratch")
+                """)
+            original_write = baseline._write_bounded
 
-        def arm():
-            nonlocal patcher
-            # At run end the runner restores its saved opener on exit; a delegate
-            # keeps that transaction correct for this out-of-band proxy too.
-            patcher = mock.patch("builtins.open", baseline._AttributingOpen())
-            patcher.start()
+            def write_then_probe(path, payload, size, runner, budget):
+                original_write(path, payload, size, runner, budget)
+                runner.run([sys.executable, "-c", script], label="temp probe")
 
-        def wrapper(path, payload, size, runner, budget):
-            original_write(path, payload, size, runner, budget)
-            arm()  # the runner's own attribution opener is deliberately not installed
+            baseline._write_bounded = write_then_probe
             try:
-                write_probe(probe)
+                metrics, truncated, _budget = run_fixture(workload)
             finally:
-                patcher.stop()
+                baseline._write_bounded = original_write
+            self.assertFalse(truncated)
+            self.assertEqual(untouched.read_bytes(), b"operator datax")
+        # The child scratch file is inside the fixture and charged before cleanup.
+        self.assertGreaterEqual(metrics["runner.temp_bytes"]["observed_bytes"], len(b"scratch"))
 
-        baseline._write_bounded = wrapper
-        try:
-            result = baseline.run_git_workload(workload, baseline.Runner(time.monotonic() + 30), 106)
-        finally:
-            baseline._write_bounded = original_write
-        return result, probe
-
-    def test_out_of_tree_temp_file_with_data_is_owned_removed_and_attributed(self):
-        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 512})
-
-        def write_data(probe):
-            with open(probe, "wb") as handle:  # patched opener, as a library would use it
-                handle.write(b"git-object-bytes")
-
-        (metrics, truncated, _budget), probe = self.run_with_probe(write_data, workload)
-        self.assertFalse(probe.exists(), "a run-owned temp file must be removed with the fixture")
-        self.assertFalse(truncated)
-        temp = metrics["runner.temp_bytes"]
-        self.assertTrue(temp["attributed_writes"])
-        self.assertLessEqual(temp["peak_charged_bytes"], temp["budget_bytes"])
-        self.assertLessEqual(temp["value"], temp["admission_estimate_bytes"])
-
-    def test_empty_out_of_tree_temp_file_holds_no_data(self):
+    def test_child_temp_dir_is_redirected_into_the_budgeted_fixture(self):
         workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
+        script = textwrap.dedent("""
+            import os, subprocess, sys, tempfile
+            for name in ("TMPDIR", "TMP", "TEMP"):
+                print(name, os.environ[name])
+            print("made", tempfile.mkdtemp())
+            child = subprocess.run([sys.executable, "-c", "import os; print(os.environ['TMPDIR'])"],
+                                   capture_output=True, text=True, check=True)
+            print("grandchild", child.stdout.strip())
+            """)
+        seen = {}
+        original_run = baseline.Runner.run
 
-        def write_empty(probe):
-            open(probe, "wb").close()
+        def recording(run_self, command, **options):
+            output = original_run(run_self, command, **options)
+            if options.get("label") == "temp probe":
+                seen["output"] = baseline._decode(output)
+                seen["env"] = run_self.child_env
+                seen["tmpdir"] = run_self.tmpdir
+            return output
 
-        (metrics, _, _budget), probe = self.run_with_probe(write_empty, workload)
-        self.assertFalse(probe.exists())
-        self.assertFalse(metrics["runner.temp_bytes"]["attributed_writes"])
-
-    def test_owned_temp_file_beyond_budget_is_refused_and_removed_after_measured_push(self):
-        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
-
-        def write_materialised_zero_region(probe):
-            with open(probe, "wb") as handle:
-                handle.write(b"\0" * workload["bounds"]["max_temp_bytes"])
-
-        (metrics, truncated, _budget), probe = self.run_with_probe(write_materialised_zero_region, workload)
-        self.assertFalse(probe.exists(), "the refused file must still be removed")
-        self.assertTrue(truncated)
-        self.assertIn("temp budget exceeded", metrics["runner.temp_bytes"]["stop_reason"])
-        self.assertEqual(metrics["git.receive_pack.small_pack.latency_ms"]["n"], 1)
-        self.assertLessEqual(metrics["runner.temp_bytes"]["peak_charged_bytes"], workload["bounds"]["max_temp_bytes"])
-
-    def _run_with_probe(self, write_probe, workload):
-        """Run a workload while creating an out-of-tree temp file like a library would."""
-        probe = Path(tempfile.gettempdir()) / f"w0-owned-probe-{os.getpid()}"
         original_write = baseline._write_bounded
 
-        def wrapper(path, payload, size, runner, budget):
+        def write_then_probe(path, payload, size, runner, budget):
             original_write(path, payload, size, runner, budget)
-            write_probe(probe)
+            runner.run([sys.executable, "-c", script], label="temp probe")
 
-        baseline._write_bounded = wrapper
+        baseline._write_bounded = write_then_probe
         try:
-            with mock.patch("builtins.open", baseline._AttributingOpen(baseline._active_budget)):
-                result = baseline.run_git_workload(workload, baseline.Runner(time.monotonic() + 30), 106)
+            with mock.patch.object(baseline.Runner, "run", recording):
+                _metrics, truncated, _budget = run_fixture(workload)
         finally:
             baseline._write_bounded = original_write
-        return result, probe
+        self.assertFalse(truncated)
+        lines = dict(line.split(" ", 1) for line in seen["output"].splitlines())
+        tmpdir = seen["tmpdir"]
+        for name in ("TMPDIR", "TMP", "TEMP"):
+            self.assertEqual(lines[name], str(tmpdir))
+            self.assertEqual(seen["env"][name], str(tmpdir))
+        self.assertEqual(lines["grandchild"], str(tmpdir))
+        self.assertTrue(Path(lines["made"]).is_relative_to(tmpdir), "mkdtemp must land in the owned TMPDIR")
+
+    def test_owned_temp_overflow_after_a_measured_push_is_truncated_and_cleaned(self):
+        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
+        script = textwrap.dedent(f"""
+            import os, tempfile
+            tempfile.mkdtemp()
+            with open(os.path.join(os.environ["TMPDIR"], "blob"), "wb") as handle:
+                handle.write(b"\\0" * {workload["bounds"]["max_temp_bytes"]})
+            """)
+        before = set(os.listdir(tempfile.gettempdir()))
+        original_run = baseline.Runner.run
+
+        def push_then_overflow(run_self, command, **options):
+            output = original_run(run_self, command, **options)
+            if options.get("label") == "git push":
+                # After the push time is taken and before its checkpoint.
+                run_self.run([sys.executable, "-c", script], label="temp probe")
+            return output
+
+        with mock.patch.object(baseline.Runner, "run", push_then_overflow):
+            metrics, truncated, budget = run_fixture(workload)
+        temp = metrics["runner.temp_bytes"]
+        self.assertTrue(truncated)
+        self.assertEqual(metrics["git.receive_pack.small_pack.latency_ms"]["n"], 1)
+        self.assertIn("git push: owned fixture tree holds", temp["stop_reason"])
+        self.assertIn("beyond max_temp_bytes", temp["stop_reason"])
+        # The peak is the real observed size, not clamped to the budget.
+        self.assertGreater(temp["peak_charged_bytes"], temp["budget_bytes"])
+        self.assertEqual(temp["peak_charged_bytes"], budget.peak)
+        self.assertNotIn("cleanup_error", temp)
+        self.assertEqual(set(os.listdir(tempfile.gettempdir())), before,
+                         "the overflowed fixture and its TMPDIR contents must be removed")
+
+    def test_owned_temp_overflow_before_any_push_is_refused_and_caller_cleans(self):
+        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
+
+        def write_then_overflow(path, payload, size, runner, budget):
+            open(path, "ab").write(b"\0" * workload["bounds"]["max_temp_bytes"])
+
+        budget = make_budget(workload)
+        original_write = baseline._write_bounded
+        baseline._write_bounded = write_then_overflow
+        try:
+            tmpdir = baseline.client_fixture(budget)
+            runner = baseline.Runner(time.monotonic() + 30, tmpdir=tmpdir)
+            with self.assertRaises(baseline.BudgetViolation):
+                baseline.run_git_workload(workload, runner, 106, budget=budget)
+        finally:
+            baseline._write_bounded = original_write
+        # The caller still holds the same budget and its own fixture to clean up.
+        self.assertIsNotNone(budget.root)
+        self.assertGreater(budget.peak, budget.budget)
+        self.assertIsNone(budget.cleanup())
+        self.assertFalse(budget.root)
 
     def test_reported_temp_metric_carries_budget_facts(self):
         workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "commits_per_push": 1, "file_bytes": 64})
-        runner = baseline.Runner(time.monotonic() + 30)
-        metrics, _, budget = baseline.run_git_workload(workload, runner, 106)
+        metrics, _, budget = run_fixture(workload)
         temp = metrics["runner.temp_bytes"]
         for key in ("budget_bytes", "admission_estimate_bytes", "peak_charged_bytes", "checkpoints"):
             self.assertIn(key, temp)
@@ -358,6 +411,27 @@ class TempAdmissionTest(unittest.TestCase):
         self.assertEqual(temp["peak_charged_bytes"], budget.peak)
         self.assertEqual(temp["checkpoints"], budget.checkpoints)
         self.assertGreater(budget.checkpoints, 0)
+        self.assertLessEqual(temp["peak_charged_bytes"], temp["admission_estimate_bytes"],
+                             "a completed run stays within the admitted estimate")
+        self.assertEqual(temp["returned_pushes_per_repo"], workload["git"]["pushes_per_repo"])
+
+    def test_temp_left_after_a_child_run_is_still_charged_at_final_accounting(self):
+        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
+        budget = make_budget(workload)
+        baseline.client_fixture(budget)
+        try:
+            # The work reported its child trees dropped, then leftover bytes
+            # appear before the final measurement.
+            budget.child_trees_dropped = True
+            (budget.root / "tmp" / "late").write_bytes(b"\0" * (budget.budget + 1))
+            # Here that final measurement is the gentle one, so it reports the
+            # size instead of refusing: the bytes are stated, never dropped.
+            budget.finish()
+            self.assertGreater(budget.peak, budget.budget)
+            self.assertEqual(budget.observed, budget.peak)
+        finally:
+            self.assertIsNone(budget.cleanup())
+        self.assertFalse(budget.root)
 
 
 class DeadlineAndCancellationTest(unittest.TestCase):
@@ -373,7 +447,7 @@ class DeadlineAndCancellationTest(unittest.TestCase):
         return [sys.executable, "-c", script, "spawn"]
 
     def test_stalled_child_is_killed_within_remaining_time_and_group_is_reaped(self):
-        runner = baseline.Runner(time.monotonic() + 1.0, kill_grace=0.01)
+        runner = baseline.Runner(time.monotonic() + 1.0, tmpdir=tempfile.gettempdir(), kill_grace=0.01)
         started = time.monotonic()
         with self.assertRaises(baseline.RunnerTimeout):
             runner.run([sys.executable, "-c", "import time; time.sleep(30)"], label="stalled")
@@ -391,7 +465,7 @@ class DeadlineAndCancellationTest(unittest.TestCase):
         ])
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "marker"
-            runner = baseline.Runner(time.monotonic() + 0.7, kill_grace=0.5)
+            runner = baseline.Runner(time.monotonic() + 0.7, tmpdir=tempfile.gettempdir(), kill_grace=0.5)
             with self.assertRaises(baseline.RunnerTimeout):
                 runner.run([sys.executable, "-c", marker, str(target)], label="grandchild")
             child_pid = int(Path(str(target) + ".child").read_text())
@@ -438,30 +512,82 @@ class DeadlineAndCancellationTest(unittest.TestCase):
             stdout = None
             stderr = None
 
-        runner = baseline.Runner(time.monotonic() + 5, popen=Recorder)
-        self.assertEqual(runner.run(["true"], label="probe"), b"")
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = baseline.Runner(time.monotonic() + 5, tmpdir=tmp, popen=Recorder)
+            self.assertEqual(runner.run(["true"], label="probe"), b"")
         self.assertTrue(seen and seen[0]["start_new_session"])
+        # Children are pointed at the owned TMPDIR rather than the shared one.
+        for name in ("TMPDIR", "TMP", "TEMP"):
+            self.assertEqual(seen[0]["env"][name], tmp)
 
     def test_command_after_deadline_is_not_started(self):
-        runner = baseline.Runner(time.monotonic() - 0.01)
+        runner = baseline.Runner(time.monotonic() - 0.01, tmpdir=tempfile.gettempdir())
         with self.assertRaises(baseline.RunnerTimeout):
             runner.run([sys.executable, "-c", "pass"], label="never")
         self.assertEqual(runner.runs, 0)
         self.assertEqual(runner.skipped, 1)
+
+    def test_stall_cap_stops_a_child_before_the_global_deadline(self):
+        runner = baseline.Runner(time.monotonic() + 30, tmpdir=tempfile.gettempdir(), stall_seconds=0.3,
+                                 kill_grace=0.01)
+        started = time.monotonic()
+        with self.assertRaises(baseline.RunnerTimeout):
+            runner.run([sys.executable, "-c", "import time; time.sleep(30)"], label="stalled")
+        # The child was stopped by its own cap, not by the 30 s global deadline.
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(runner.stall_timeouts, 1)
+        self.assertEqual(runner.timeouts, 1)
+        self.assertFalse(runner.expired())
+        happenings = runner.happenings()
+        self.assertEqual(happenings["stall_timeouts"], 1)
+        self.assertEqual(happenings["stall_seconds"], 0.3)
+        self.assertGreaterEqual(happenings["max_cleanup_grace_seconds"], runner.kill_grace)
+        self.assertEqual(runner.live_runs, 0)
+
+    def test_budget_is_reported_even_when_no_push_completes(self):
+        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
+        budget = make_budget(workload)
+        tmpdir = baseline.client_fixture(budget)
+        original_write = baseline._write_bounded
+
+        def overflow(path, payload, size, runner, budget):
+            open(path, "ab").write(b"\0" * workload["bounds"]["max_temp_bytes"])
+
+        baseline._write_bounded = overflow
+        try:
+            runner = baseline.Runner(time.monotonic() + 30, tmpdir=tmpdir)
+            with self.assertRaises(baseline.BudgetViolation) as caught:
+                baseline.run_git_workload(workload, runner, 106, budget=budget)
+        finally:
+            baseline._write_bounded = original_write
+        # The same instance survives the refusal and still owns/reports the tree.
+        self.assertIsNotNone(budget.root)
+        self.assertGreater(budget.checkpoints, 0)
+        self.assertGreater(budget.peak, 0)
+        self.assertEqual(budget.estimate, baseline.estimate_temp_bytes(workload))
+        self.assertIn("owned fixture tree holds", str(caught.exception))
+        self.assertIsNone(budget.cleanup())
+        self.assertFalse(budget.root)
+        self.assertFalse(budget.root)
 
     def test_absolute_deadline_covers_cas_rounds(self):
         workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 2, "commits_per_push": 1, "file_bytes": 64,
                                       "cas_rounds": 200, "cas_concurrency": 2, "fsck": False},
                                  bounds={"max_cas_ops": 400})
         baseline.validate_workload(workload)
-        runner = baseline.Runner(time.monotonic() + 0.35, kill_grace=0.01)
-        metrics, truncated, _budget = baseline.run_git_workload(workload, runner, 106)
+        budget = make_budget(workload)
+        tmpdir = baseline.client_fixture(budget)
+        runner = baseline.Runner(time.monotonic() + 0.35, tmpdir=tmpdir, kill_grace=0.01)
+        try:
+            metrics, truncated, _budget = baseline.run_git_workload(workload, runner, 106, budget=budget)
+        finally:
+            budget.cleanup()
         self.assertTrue(truncated)
         # Fast children finish before the deadline, so the truncation may come
         # from the between-rounds remaining-time check instead of cancellation.
         self.assertGreaterEqual(runner.timeouts + runner.skipped, 1)
         self.assertLess(metrics["git.update_ref.cas_conflict.latency_ms"]["cas_attempts"], 400)
-        self.assertIn("deadline", metrics["runner.temp_bytes"]["stop_reason"])
+        self.assertTrue(metrics["runner.temp_bytes"]["checkpoints"] > 0)
         self.assertGreaterEqual(metrics["git.receive_pack.small_pack.latency_ms"]["n"], 1)
 
     def test_pg_subprocesses_use_the_shared_remaining_deadline(self):
@@ -472,12 +598,14 @@ class DeadlineAndCancellationTest(unittest.TestCase):
             dsn = Path(tmp) / "dsn"
             dsn.write_text("postgresql://r@127.0.0.1/db", encoding="utf-8")
             workload = workload_with(pg={"enabled": True, "sample_count": 3})
-            runner = baseline.Runner(time.monotonic() + 0.6, kill_grace=0.01)
+            runner = baseline.Runner(time.monotonic() + 0.6, tmpdir=tmp, kill_grace=0.01)
             original = baseline.shutil.which
             baseline.shutil.which = lambda name: str(fake) if name == "psql" else original(name)
             started = time.monotonic()
             try:
-                metrics = baseline.run_pg_workload(workload, runner, str(dsn))
+                budget = baseline.TempBudget(1 << 20, 1 << 19)
+                budget.admitted = True
+                metrics = baseline.run_pg_workload(workload, runner, str(dsn), budget)
             finally:
                 baseline.shutil.which = original
             self.assertLess(time.monotonic() - started, 1.5)

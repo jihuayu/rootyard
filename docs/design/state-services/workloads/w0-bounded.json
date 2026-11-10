@@ -4,18 +4,18 @@
   "seed": 106,
   "description": "Bounded local Git-only W0 workload. It deliberately does not start the Rootyard binary, PostgreSQL, Redis, Raft or a Blob provider.",
   "bounds": {
-    "wall_clock_seconds": 60,
-    "max_git_push_ops": 30,
-    "max_cas_ops": 80,
+    "wall_clock_seconds": 900,
+    "max_git_push_ops": 8,
+    "max_cas_ops": 128,
     "max_temp_bytes": 67108864
   },
   "git": {
     "repo_count": 2,
-    "pushes_per_repo": 4,
-    "commits_per_push": 2,
-    "file_bytes": 2048,
-    "cas_rounds": 10,
-    "cas_concurrency": 4,
+    "pushes_per_repo": 1,
+    "commits_per_push": 1,
+    "file_bytes": 1024,
+    "cas_rounds": 32,
+    "cas_concurrency": 2,
     "fsck": true
   },
   "pg": {

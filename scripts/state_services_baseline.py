@@ -9,24 +9,33 @@ the Rootyard service and never fabricates a measurement.
 Resource contract:
 
 * One absolute runner deadline is armed before source identity is read and
-  covers every Git, PostgreSQL and cleanup subprocess. Each child is given the
-  remaining time (capped by a per-subprocess stall cap), cancelled with that
-  remaining time, sent SIGTERM/SIGKILL in its own process group, and reaped.
+  covers every Git and PostgreSQL subprocess. Each child's stop time is fixed
+  before it is spawned as ``min(global deadline, start + stall cap)``; on
+  either limit its whole process group is SIGTERMed, then SIGKILLed after a
+  bounded grace window and reaped. That grace is charged after the stop time
+  and reported, not claimed to end by the workload deadline.
 * ``validate_workload`` rejects the workload before any subprocess, directory
   or output file exists unless every factor is an integer within hard runner
   limits, every product is exactly computable and within declared bounds, and
   the conservative temp admission estimate fits ``bounds.max_temp_bytes``.
-* The temp budget is checked during the run: the full estimate is reserved
-  before the fixture directory is created, every expensive step is charged as
-  live observed bytes plus the not-yet-performed estimate, and a breach after
-  the first push truncates the run with a recorded reason.
+* Resource accounting and cleanup are confined to one private fixture root
+  created with ``mkdtemp`` before any child exists. Child processes and the
+  runner's own stdio get ``<root>/tmp`` as TMPDIR/TMP/TEMP, so temporary files
+  they create are inside the observed tree. Nothing outside that root is
+  attributed, changed or deleted; observing a write elsewhere would not grant
+  ownership of it.
+* ``TempBudget.admit`` is a separate pre-run feasibility check: the admission
+  estimate for the workload actually returned must fit ``max_temp_bytes``.
+  At runtime each checkpoint measures the owned tree and compares it directly
+  with ``max_temp_bytes``; nothing is clamped and no OS quota is claimed. The
+  peak is the largest observed size. A breach after the first push truncates
+  the run with a recorded reason; the same budget instance is reported either
+  way.
 """
 from __future__ import annotations
 
 import argparse
-import builtins
 import concurrent.futures
-import errno
 import hashlib
 import json
 import math
@@ -212,16 +221,12 @@ def validate_workload(workload, limits=None):
     _integer(bounds.get("max_temp_bytes"), "bounds.max_temp_bytes", 1, limits["max_temp_bytes"])
     _integer(bounds.get("max_git_push_ops"), "bounds.max_git_push_ops", 0)
     _integer(bounds.get("max_cas_ops"), "bounds.max_cas_ops", 0)
-    returned = git.get("returned_pushes_per_repo", git["pushes_per_repo"])
-    _integer(returned, "git.returned_pushes_per_repo", 1, git["pushes_per_repo"])
     if git["cas_rounds"] == 0 and git["cas_concurrency"] != 1:
         raise ValueError("git.cas_concurrency must be 1 when git.cas_rounds is 0")
     # Compare factored products. No huge intermediate count is ever formed:
     # outside factors are rejected exactly, not saturating into a passing value.
     if git["repo_count"] > bounds["max_git_push_ops"] // git["pushes_per_repo"]:
         raise ValueError(f"git workload exceeds max_git_push_ops {bounds['max_git_push_ops']}")
-    if returned > 1 and git["repo_count"] > bounds["max_git_push_ops"] // returned:
-        raise ValueError("reduced git workload exceeds max_git_push_ops")
     if git["cas_rounds"] > bounds["max_cas_ops"] // git["cas_concurrency"]:
         raise ValueError(f"CAS workload exceeds max_cas_ops {bounds['max_cas_ops']}")
     pg = _object(workload.get("pg"), "workload.pg")
@@ -280,11 +285,16 @@ ADMISSION_BOUND = (2**62) // RUNNER_LIMITS["max_git_repos"]
 
 
 def admission(workload, returned=None):
-    """Return admission facts or raise ValueError when the run cannot be admitted."""
+    """Feasibility check: does the returned workload's worst case fit the budget?
+
+    This is a separate admission decision made before any effect; at runtime
+    the monitored tree is compared directly against ``max_temp_bytes``.
+    """
     budget = workload["bounds"]["max_temp_bytes"]
     estimate = estimate_temp_bytes(workload, returned)
     if estimate <= budget:
-        return {"estimate_bytes": estimate, "budget_bytes": budget, "returned_pushes_per_repo": returned_pushes(workload, returned)}
+        return {"estimate_bytes": estimate, "budget_bytes": budget,
+                "returned_pushes_per_repo": returned_pushes(workload, returned)}
     reduced = estimate_temp_bytes(workload, 1)
     message = (f"workload temp admission estimate {estimate} exceeds max_temp_bytes {budget};"
                f" one push per repository estimates {reduced}")
@@ -300,33 +310,43 @@ def admission(workload, returned=None):
 class Runner:
     """Runs subprocesses against one absolute deadline with process-group cleanup.
 
-    Children get private file-backed stdio, are never given more than the
-    remaining deadline, are killed with SIGTERM/SIGKILL in their own process
-    group when that expires, and are reaped. ``popen``/``clock`` are seams for
-    deterministic tests; ``kill_grace`` bounds the SIGTERM window.
+    Each child's own stop time is ``min(global deadline, its start time +
+    stall_seconds)``, fixed before it is spawned. On either limit the child's
+    whole process group is SIGTERMed, then SIGKILLed after a bounded grace
+    window and reaped. That cleanup grace is charged after the stop time and
+    is reported (``max_cleanup_grace_seconds``) rather than being claimed to
+    end by the workload deadline.
+
+    Children get private file-backed stdio inside the run's owned ``tmpdir``
+    (also exported as TMPDIR/TMP/TEMP), so their temporary files stay in the
+    monitored tree. ``popen``/``clock`` are seams for tests.
     """
 
-    def __init__(self, deadline, *, stall_seconds=DEFAULT_STALL_SECONDS, kill_grace=KILL_GRACE_SECONDS,
+    def __init__(self, deadline, *, tmpdir, stall_seconds=DEFAULT_STALL_SECONDS, kill_grace=KILL_GRACE_SECONDS,
                  popen=None, clock=time.monotonic):
         if isinstance(stall_seconds, bool) or not isinstance(stall_seconds, (int, float)) \
                 or not math.isfinite(stall_seconds) or stall_seconds <= 0:
             raise ValueError("stall_seconds must be a finite positive number")
-        if not isinstance(kill_grace, (int, float)) or not math.isfinite(kill_grace) or kill_grace <= 0:
+        if isinstance(kill_grace, bool) or not isinstance(kill_grace, (int, float)) \
+                or not math.isfinite(kill_grace) or kill_grace <= 0:
             raise ValueError("kill_grace must be a finite positive number")
         self.deadline = deadline
+        self.tmpdir = Path(tmpdir)
+        self.child_env = {**os.environ, **{name: str(self.tmpdir) for name in ("TMPDIR", "TMP", "TEMP")}}
         self.stall_seconds = stall_seconds
         self.kill_grace = kill_grace
         self.popen = popen or subprocess.Popen
         self.clock = clock
         self.runs = 0
         self.timeouts = 0
+        self.stall_timeouts = 0
         self.failures = 0
         self.skipped = 0
         self.live_runs = 0
         self.max_live_runs = 0
         self.groups_killed = 0
-        self.cancel_window = 0.0
-        self.retained = []  # pgids cancelled earlier; re-signalled when a later child is cancelled
+        self.max_cleanup_grace_seconds = 0.0
+        self.retained = []  # pgids cancelled earlier, re-signalled when their cleanup grace ends
 
     def remaining(self):
         return max(0.0, self.deadline - self.clock())
@@ -340,15 +360,16 @@ class Runner:
             raise RunnerTimeout(label)
 
     def _spawn(self, command, cwd):
-        # Children get unique private file-backed streams. With pipes, an
-        # unrelated process inheriting the write end (the harness's own log
-        # pipe during a concurrent spawn, or a not-yet-reaped survivor of an
-        # earlier group kill) makes the drain wait on someone else: that was
-        # observed here as a 30 s `git status` measured against a 30 s
-        # wall-clock budget, corrupting wall-clock measurements.
-        out = tempfile.TemporaryFile()
-        err = tempfile.TemporaryFile()
-        options = {"stdin": subprocess.DEVNULL, "stdout": out, "stderr": err, "start_new_session": True}
+        # Children get unique private file-backed streams inside the owned
+        # tmpdir. With pipes, an unrelated process inheriting the write end (the
+        # harness's own log pipe during a concurrent spawn, or a not-yet-reaped
+        # survivor of an earlier group kill) makes the drain wait on someone
+        # else: that was observed here as a 30 s `git status` measured against a
+        # 30 s wall-clock budget, corrupting wall-clock measurements.
+        out = tempfile.TemporaryFile(dir=self.tmpdir)
+        err = tempfile.TemporaryFile(dir=self.tmpdir)
+        options = {"stdin": subprocess.DEVNULL, "stdout": out, "stderr": err, "start_new_session": True,
+                   "env": self.child_env}
         if cwd is not None:
             options["cwd"] = cwd
         try:
@@ -366,7 +387,10 @@ class Runner:
 
     def run(self, command, *, label, cwd=None, text=False, gentle=False):
         self.enforce_deadline(label)
-        limit = self.remaining()
+        # Start is read before spawning; the child may run for at most
+        # stall_seconds from it, and never past the one global deadline.
+        started = self.clock()
+        child_stop = min(self.deadline, started + self.stall_seconds)
         try:
             process = self._spawn(command, cwd)
         except OSError as error:
@@ -376,22 +400,22 @@ class Runner:
         self.live_runs += 1
         self.max_live_runs = max(self.max_live_runs, self.live_runs)
         try:
-            stop = self.clock() + limit
             while True:
-                left = stop - self.clock()
+                left = child_stop - self.clock()
                 if left <= 0:
                     timed_out = True
                     break
                 try:
-                    process.wait(timeout=min(left, self.stall_seconds))
+                    process.wait(timeout=left)
                     timed_out = False
                     break
                 except subprocess.TimeoutExpired:
                     continue
             if timed_out:
                 self.timeouts += 1
+                if child_stop < self.deadline:
+                    self.stall_timeouts += 1
                 self._kill_tree(process)
-                self.retained.append((process.pid, self.clock()))
                 raise RunnerTimeout(label)
             if gentle and process.returncode == GENTLE_FAILURE:
                 # Read-only opt-in probes (history lookup) report absence this way.
@@ -399,19 +423,17 @@ class Runner:
             if process.returncode != 0:
                 self.failures += 1
                 raise ChildFailed(label, command)
-            self.retained = [(pgid, when) for pgid, when in self.retained
-                             if self._group_alive(pgid) is not False]
             out, _ = process._baseline_outputs
             out.seek(0)
             data = out.read()
         finally:
             self.live_runs -= 1
             self._close_outputs(process)
-        return data.decode("utf-8", "replace") if text else data
+        return _decode(data) if text else data
 
-    def _signal_group(self, process, sig):
+    def _signal_group(self, pgid, sig):
         try:
-            os.killpg(process.pid, sig)
+            os.killpg(pgid, sig)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -439,54 +461,53 @@ class Runner:
                 return True
         return False
 
-    def _signal_retained(self, sig):
-        held = []
-        for pgid, cancelled_at in self.retained:
-            if self._group_alive(pgid) is False:
-                continue  # nothing left in this group
-            try:
-                os.killpg(pgid, sig)
-            except (ProcessLookupError, PermissionError):
-                continue
-            if self.clock() - cancelled_at <= 3 * self.kill_grace:
-                held.append((pgid, cancelled_at))
-        self.retained = held
-
-    def _watchdog(self, process, timeout):
-        if timeout < 0:
-            process.wait()
-        else:
-            process.wait(timeout=timeout)
-
     def _kill_tree(self, process):
-        """SIGTERM the child's process group, force SIGKILL, and reap it.
+        """SIGTERM the child's group, SIGKILL it after the grace window, and reap.
 
         SIGTERM is not trusted to end the child: after the grace window the
         whole group, including same-group descendants a child may have
         spawned (e.g. a stalled shell), receives SIGKILL, and the leader is
-        reaped so no zombie is left behind.
+        reaped so no zombie is left behind. Groups whose grace is still open are
+        retained and re-signalled by the next cancellation.
         """
         start = self.clock()
-        self._signal_retained(signal.SIGTERM)
-        self._signal_group(process, signal.SIGTERM)
+        for pgid, _ in self.retained:
+            self._signal_group(pgid, signal.SIGTERM)
+        self._signal_group(process.pid, signal.SIGTERM)
         try:
-            self._watchdog(process, self.kill_grace)
+            process.wait(timeout=self.kill_grace)
         except subprocess.TimeoutExpired:
             pass
-        self._signal_group(process, signal.SIGKILL)
-        self._signal_retained(signal.SIGKILL)
+        self._signal_group(process.pid, signal.SIGKILL)
+        held = []
+        for pgid, cancelled_at in [(process.pid, start)] + self.retained:
+            if pgid != process.pid:
+                if self._group_alive(pgid) is False:
+                    continue  # nothing left in this group
+                self._signal_group(pgid, signal.SIGKILL)
+            if self.clock() - cancelled_at <= 3 * self.kill_grace:
+                held.append((pgid, cancelled_at))
+        self.retained = held
         if process.returncode is None:
             try:
-                self._watchdog(process, self.kill_grace)
+                process.wait(timeout=self.kill_grace)
             except subprocess.TimeoutExpired:
                 raise LimitExceeded("child ignored SIGKILL; aborting runner") from None
         self.groups_killed += 1
-        self.cancel_window = max(self.cancel_window, self.clock() - start)
+        self.max_cleanup_grace_seconds = max(self.max_cleanup_grace_seconds,
+                                             self.clock() - start + self.kill_grace)
 
     def happenings(self):
         return {"subprocess_runs": self.runs, "max_live_subprocesses": self.max_live_runs,
-                "timeouts": self.timeouts, "failures": self.failures, "skipped_after_deadline": self.skipped,
-                "process_groups_killed": self.groups_killed, "kill_grace_seconds": self.kill_grace}
+                "timeouts": self.timeouts, "stall_timeouts": self.stall_timeouts,
+                "failures": self.failures, "skipped_after_deadline": self.skipped,
+                "process_groups_killed": self.groups_killed,
+                "stall_seconds": self.stall_seconds, "kill_grace_seconds": self.kill_grace,
+                "max_cleanup_grace_seconds": self.max_cleanup_grace_seconds}
+
+
+def _decode(data):
+    return data.decode("utf-8", "replace")
 
 
 def _command(*args):
@@ -512,13 +533,14 @@ def source_identity(runner, allow_dirty):
     }
 
 
-def binary_identity(path):
+def binary_identity(runner, path):
+    """Hash a supplied binary; the work is a subprocess under the shared deadline."""
     if not path:
         return {"provided": False, "sha256": None, "reason": "no --binary path supplied; the runner does not execute a service binary"}
-    candidate = Path(path)
-    if not candidate.is_file():
+    if not Path(path).is_file():
         return {"provided": True, "sha256": None, "reason": "binary path does not exist; not executed"}
-    return {"provided": True, "sha256": sha256_file(candidate), "executed": False, "path": str(candidate)}
+    digest = runner.run([shutil.which("sha256sum") or "sha256sum", path], label="binary sha256", text=True).strip()
+    return {"provided": True, "sha256": digest.split()[0], "executed": False, "path": str(path)}
 
 
 def _directory_bytes(path):
@@ -533,134 +555,86 @@ def _directory_bytes(path):
 
 
 class TempBudget:
-    """Live temp accounting against a conservative promised estimate.
+    """Runtime monitor for one run's own private, self-controlled fixture tree.
 
-    The runner creates its own top-level fixture root and one subdirectory per
-    repository with ``mkdtemp`` (exclusive creation, so each adopted name is
-    proven to be ours). Temporary files the standard library creates in the
-    shared temp directory are adopted by ``_AttributingOpen`` and removed with
-    the fixture, so a cancelled run cannot leave them unaccounted.
+    The runner creates one top-level root with ``mkdtemp`` (an exclusive name,
+    so ownership is proven, not inferred). Child processes and the run's own
+    stdio get ``<root>/tmp`` as TMPDIR, so temporary files they create are
+    inside the tree. Each ``check`` measures the whole tree; the peak is the
+    largest observed size and a value above ``budget`` is a violation. Nothing
+    outside this root is read as owned, changed or deleted, and no OS or
+    filesystem-wide quota is claimed.
 
-    ``reserve`` charges the full estimate before the fixture exists. After a
-    step, ``check`` charges live observed bytes plus the estimate for steps not
-    yet performed (``held``). Live files (the work index and reflogs) are
-    charged once per repository inside the estimate; once the first one exists
-    their per-repository share leaves ``held`` because the file is now
-    observed. At the start of a later repository that share is still in
-    ``held`` while an earlier repository's file is observed, so ``owed_live``
-    projects it back instead of double-booking.
+    ``admit`` is the separate feasibility decision: the admission estimate for
+    the workload actually returned (``estimate``) must fit ``budget``. Runtime
+    checks compare observed bytes with the budget directly; they never add
+    observed bytes to the admission estimate.
     """
 
-    def __init__(self, budget, estimate, returned_estimate=None, live_share=0):
+    def __init__(self, budget, estimate):
         self.budget = budget
         self.estimate = estimate
-        self.returned_estimate = estimate if returned_estimate is None else returned_estimate
-        self.live_share = live_share
         self.root = None
-        self.held = estimate
-        self.live_charged = False
-        self.owed_live = 0
         self.observed = 0
         self.peak = 0
         self.checkpoints = 0
-        self.owned_dirs = []
-        self.owned_files = []
-        self.open_files = []
-        self.attributed_writes = False
-        self.refused = None
+        self.admitted = False
+        self.child_trees_dropped = False
 
-    def reserve(self, label):
-        self._charge(self.held, label)
+    def admit(self):
+        """Record feasibility for the effective workload; raise if it cannot fit."""
+        if self.estimate > self.budget:
+            raise ValueError(f"admission estimate {self.estimate} exceeds max_temp_bytes {self.budget}")
+        self.admitted = True
 
     def open(self, label):
-        """Create the run's own private fixture root and adopt it."""
+        """Create the run's own private fixture root."""
         self.root = Path(tempfile.mkdtemp(prefix="rootyard-w0-git-"))
-        self.owned_dirs.append(self.root)
         self.check(label)
 
     def repository_dir(self, index, label):
         path = Path(tempfile.mkdtemp(prefix=f"repo-{index}-", dir=self.root))
-        self.owned_dirs.append(path)
         self.check(label)
         return path
 
-    def begin_repository(self, first):
-        self.owed_live = 0 if first else self.live_share
+    def finish(self):
+        """Final accounting after every child is gone; it bounds work, not write reports.
 
-    def own(self, path):
-        """Register a file the run created outside the fixture for removal."""
-        candidate = Path(path)
-        if candidate not in self.owned_files:
-            self.owned_files.append(candidate)
-
-    def attach_file(self, handle):
-        for stream in (handle, getattr(handle, "file", None)):
-            if stream is not None and hasattr(stream, "fileno"):
-                self.open_files.append(stream)
-                return
-
-    def finalize(self):
-        """Close run-owned handles and record whether they ever held data."""
-        for stream in self.open_files:
-            try:
-                stream.close()
-            except OSError:
-                pass
-        self.open_files = []
-        for path in self.owned_files:
-            try:
-                if path.stat().st_size > 0:
-                    self.attributed_writes = True
-                    break
-            except OSError:
-                continue
-        return self.peak
+        Only when that work reported the child trees as dropped does it measure
+        just the run's own observations, which writing the bounded report needs.
+        """
+        if self.root is not None:
+            self.check("temp budget final check", gentle=True)
 
     def cleanup(self):
-        """Remove every run-owned file and directory, deepest first.
-
-        Returns an error string when something could not be removed; the
-        report surfaces it instead of claiming a clean fixture.
-        """
-        errors = []
-        for path in sorted(set(self.owned_files), key=lambda item: len(str(item)), reverse=True):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                errors.append(f"{type(error).__name__} removing {path.name}")
-        for path in sorted(set(self.owned_dirs), key=lambda item: len(str(item)), reverse=True):
-            try:
-                shutil.rmtree(path)
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                errors.append(f"{type(error).__name__} removing {path.name}")
-        self.owned_files = []
-        self.owned_dirs = []
-        return "; ".join(sorted(set(errors))) or None
-
-    def _charge(self, value, label):
-        if value > self.budget:
-            raise BudgetViolation(f"{label}: temp charge {value} would exceed max_temp_bytes {self.budget}")
-        self.peak = max(self.peak, value)
-
-    def check(self, label):
-        """Observe the fixture root and charge live bytes plus pending estimate."""
+        """Remove only the run's own fixture root; return an error string on failure."""
+        self.child_trees_dropped = self.root is not None
         if self.root is None:
-            self._charge(self.held, label)
+            return None
+        try:
+            # Default symlinks=False: an entry linked elsewhere is unlinked, not followed.
+            shutil.rmtree(self.root)
+        except OSError as failure:
+            # Keep the root so the caller can report what remains.
+            self.child_trees_dropped = False
+            return f"{type(failure).__name__} removing the owned fixture root"
+        self.root = None
+        return None
+
+    def check(self, label, gentle=False):
+        """Measure the owned tree; a size beyond the declared budget is a breach.
+
+        The peak records every observation, including a breaching one; it is
+        never clamped to the budget to imply a quota the OS did not enforce.
+        """
+        if self.root is None:
             return
         self.observed = _directory_bytes(self.root)
-        if not self.live_charged and (self.root / "repo-0" / "work" / ".git" / "index").is_file():
-            self.held = max(0, self.held - self.live_share)
-            self.live_charged = True
-        projected = self.held + self.observed + self.owed_live
-        if projected > self.budget:
-            raise BudgetViolation(f"{label}: temp budget exceeded ({self.held} pending + "
-                                  f"{self.observed} observed + {self.owed_live} owed)")
-        self._charge(projected, label)
+        self.peak = max(self.peak, self.observed)
         self.checkpoints += 1
+        if self.observed > self.budget and not gentle:
+            raise BudgetViolation(f"{label}: owned fixture tree holds {self.observed} bytes, beyond "
+                                  f"max_temp_bytes {self.budget}")
 
 
 def _isolated_worktree_parent(root=None):
@@ -681,85 +655,27 @@ def _isolated_worktree_parent(root=None):
         probe = probe.parent
 
 
-_REAL_OPEN = open
-# The budget currently enforcing a run; ``_AttributingOpen`` instances created
-# around a run resolve to it instead of holding a private copy.
-_active_budget = None
+def client_fixture(budget):
+    """Create the run's private fixture root and its TMPDIR, or refuse.
 
-
-def _inside(path, root):
-    """Lexical containment: entries created in tempdir itself are run-owned."""
-    try:
-        Path(os.path.abspath(os.fsdecode(path))).relative_to(Path(os.path.abspath(str(root))))
-        return True
-    except (ValueError, OSError, TypeError):
-        return False
-
-
-class _AttributingOpen:
-    """Attribute temp files created outside the fixture to the run that made them.
-
-    The standard library creates its temporary files by name in the shared
-    temp directory (``tempfile._TemporaryFileWrapper`` opens the wrapped file
-    through an opener it captured at import time). Those files often outlive
-    the code that created them until a garbage collector notices, so they can
-    pile up unaccounted. While a run is active, the run's budget adopts every
-    such file: it is charged and refused when it would breach the budget, and
-    removed when the run ends. Everything else is delegated unchanged, so the
-    proxy is transparent to callers and to ``unittest.mock.patch``, whose own
-    context manager is delegated as well.
+    The root is a ``mkdtemp`` directory, created once before any child or
+    report exists. Child processes and the run's own stdio get ``<root>/tmp``
+    as TMPDIR; the budget then monitors that whole tree.
     """
-
-    def __init__(self, budget=None):
-        self._budget = budget
-
-    @property
-    def budget(self):
-        return _active_budget if _active_budget is not None else self._budget
-
-    @budget.setter
-    def budget(self, value):
-        self._budget = value
-
-    def __call__(self, file, mode="r", *args, **kwargs):
-        budget = self.budget
-        writing = isinstance(file, (str, bytes, os.PathLike)) and any(flag in mode for flag in "wax+")
-        if budget is None or not writing or budget.root is None or _inside(file, budget.root):
-            return _REAL_OPEN(file, mode, *args, **kwargs)
-        candidate = Path(os.fsdecode(file))
-        budget.own(candidate)
-        try:
-            handle = _REAL_OPEN(file, mode, *args, **kwargs)
-        except OSError as error:
-            budget.owned_files = [path for path in budget.owned_files if path != candidate]
-            if error.errno == errno.ENOSPC:
-                raise BudgetViolation(f"{error.filename}: temp directory full while creating a run-owned file") from error
-            raise
-        budget.attach_file(handle)
-        try:
-            budget.check("temp file")
-        except BudgetViolation:
-            # A refused write breaks the run even though nothing was charged;
-            # the report must say the run was budget-stopped.
-            budget.refused = "temp file creates bytes beyond the admitted budget"
-            raise
-        return handle
-
-    def __enter__(self):
-        return _REAL_OPEN.__enter__(self)
-
-    def __exit__(self, *exc):
-        return _REAL_OPEN.__exit__(self, *exc)
-
-    def __getattr__(self, name):
-        return getattr(_REAL_OPEN, name)
+    if _isolated_worktree_parent(tempfile.gettempdir()) is None:
+        # Refuse before any effect: a bounded private fixture is impossible here.
+        raise LimitExceeded("temp directory is inside a Git repository; fixture work trees would inherit it, "
+                            "so the workload cannot run (set TMPDIR outside any repository)")
+    budget.open("git fixture admission")
+    budget.root.joinpath("tmp").mkdir()
+    return budget.root / "tmp"
 
 
 def _write_bounded(path, payload, size, runner, budget):
     """Write a payload in cancellable chunks, checking the live temp budget."""
     budget.check("git payload")
     full = payload * (size // len(payload) + 1)
-    with _REAL_OPEN(path, "wb") as handle:
+    with open(path, "wb") as handle:
         written = 0
         while written < size:
             if runner.expired():
@@ -798,45 +714,42 @@ def _cas_targets(runner, bare):
     return head, parent, "losing_parent"
 
 
-def run_git_workload(workload, runner, seed, returned=None):
+def temp_metric(budget, extra=None):
+    """The temp metric and report fields for the single budget instance."""
+    metric = {"status": "measured", "value": budget.observed, "budget_bytes": budget.budget,
+              "admission_estimate_bytes": budget.estimate, "peak_charged_bytes": budget.peak,
+              "observed_bytes": budget.observed, "checkpoints": budget.checkpoints}
+    metric.update(extra or {})
+    return metric
+
+
+def run_git_workload(workload, runner, seed, returned=None, budget=None):
     """Run Git; the deadline and temp budget gate every expensive step.
 
-    Returns ``(metrics, truncated, budget)`` with the same ``TempBudget``
-    instance that enforced every checkpoint, and removes the fixture before
-    returning. A deadline or budget hit after the first push truncates the run;
-    workload rejection happens before any effect.
+    ``budget`` must be the same ``TempBudget`` a ``client_fixture`` created
+    before the runner was constructed, and must already be admitted for the
+    effective workload. Returns ``(metrics, truncated, budget)`` with that
+    instance and leaves the fixture in place; the caller removes it after its
+    own final accounting. A timeout or budget breach after the first push
+    truncates the run and keeps the measured samples.
     """
+    if budget is None or budget.root is None:
+        raise ValueError("run_git_workload requires the opened budget from client_fixture")
     spec = workload["git"]
     pushes = returned_pushes(workload, returned)
-    full_estimate = estimate_temp_bytes(workload)
-    returned_estimate = estimate_temp_bytes(workload, pushes)
-    live_share = (ADMISSION["work_index_bytes"] + 2 * ADMISSION["index_entry_bytes"]
-                  + ADMISSION["work_reflog_bytes"] + ADMISSION["ref_lock_bytes"])
-    budget = TempBudget(workload["bounds"]["max_temp_bytes"], full_estimate, returned_estimate,
-                        live_share=live_share)
     push_samples, cas_samples, fsck_samples = [], [], []
     cas_outcomes, cas_modes = {}, {}
     bare_repos = []
     progressed = truncated = False
     stop_reason = None
-    real_open = getattr(builtins, "open", _REAL_OPEN)
-    _active_budget = budget
-    builtins.open = _AttributingOpen(budget)
     try:
         runner.enforce_deadline("git fixture admission")
-        if _isolated_worktree_parent(tempfile.gettempdir()) is None:
-            # Fail before any effect: a bounded report is impossible here.
-            raise LimitExceeded("temp directory is inside a Git repository; fixture work trees would inherit it, "
-                                "so the workload cannot run (set TMPDIR outside any repository)")
-        budget.reserve("git fixture admission")
-        budget.open("git fixture admission")
-        root = budget.root
+        budget.check("git fixture admission")
         workers = max(1, min(RUNNER_LIMITS["max_cas_concurrency"], spec["cas_concurrency"]))
         # fsck is deferred until the CAS pool is closed so a pool exit can never
         # wait on a cancelled fsck child while the deadline has already passed.
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             for repo_index in range(spec["repo_count"]):
-                budget.begin_repository(repo_index == 0)
                 repo_dir = budget.repository_dir(repo_index, "git init")
                 bare = repo_dir / "bare.git"
                 work = repo_dir / "work"
@@ -891,58 +804,45 @@ def run_git_workload(workload, runner, seed, returned=None):
                 git_output(runner, ["--git-dir", str(bare_repos[repo_index]), "fsck", "--no-dangling"])
                 fsck_samples.append((time.perf_counter() - started_fsck) * 1000.0)
                 budget.check("git fsck")
-    except (RunnerTimeout, BudgetViolation) as error:
+    except (RunnerTimeout, BudgetViolation, LimitExceeded) as error:
         if not progressed:
             raise
         truncated = True
-        stop_reason = str(error) if budget.refused is None else f"{error} ({budget.refused})"
+        stop_reason = str(error)
         if isinstance(error, RunnerTimeout):
             cas_outcomes["timeout"] = max(1, cas_outcomes.get("timeout", 0))
-    finally:
-        _active_budget = None
-        vars(builtins)["open"] = real_open
-        temp_bytes = _directory_bytes(budget.root) if budget.root is not None else 0
-        peak = budget.finalize()
-        removal_error = budget.cleanup()
     metrics = {
         "git.receive_pack.small_pack.latency_ms": summarize(push_samples) if push_samples else unavailable("no pushes executed"),
         "git.update_ref.cas_conflict.latency_ms": summarize(cas_samples) if cas_samples else unavailable(
             "no CAS attempts executed"),
         "git.fsck.closure.duration_ms": summarize(fsck_samples) if fsck_samples else unavailable(
             "fsck disabled, or stopped by the remaining-time/temp budget"),
-        "runner.temp_bytes": summarize([temp_bytes]),
+        "runner.temp_bytes": temp_metric(budget, {"returned_pushes_per_repo": pushes}),
     }
     cas = metrics["git.update_ref.cas_conflict.latency_ms"]
     cas["cas_successes"] = cas_outcomes.get("won", 0)
     cas["cas_attempts"] = sum(count for name, count in cas_outcomes.items() if name != "timeout")
     cas["cas_outcomes"] = {name: cas_outcomes.get(name, 0) for name in ("won", "cas_conflict", "failed", "timeout")}
     cas["cas_targets"] = cas_modes
-    temp = metrics["runner.temp_bytes"]
-    temp.update({"budget_bytes": budget.budget, "admission_estimate_bytes": full_estimate,
-                 "returned_estimate_bytes": returned_estimate, "peak_charged_bytes": peak,
-                 "checkpoints": budget.checkpoints, "attributed_writes": budget.attributed_writes})
-    if removal_error:
-        temp["cleanup_error"] = removal_error
     if stop_reason and truncated:
-        temp["stop_reason"] = stop_reason
+        metrics["runner.temp_bytes"]["stop_reason"] = stop_reason
     return metrics, truncated, budget
 
 
-def run_pg_workload(workload, runner, dsn_file):
+def run_pg_workload(workload, runner, dsn_file, budget):
+    keys = ("pg.round_trip.latency_ms", "pg.advisory_lock.acquire_ms")
     if not dsn_file:
-        reason = "no --pg-dsn-file supplied; W0 has no permitted PostgreSQL service and does not read ambient credentials"
-        return {"pg.round_trip.latency_ms": unavailable(reason), "pg.advisory_lock.acquire_ms": unavailable(reason)}
+        return {key: unavailable("no --pg-dsn-file supplied; W0 has no permitted PostgreSQL service and does not "
+                                 "read ambient credentials") for key in keys}
     psql = shutil.which("psql")
     if not psql:
-        reason = "psql client unavailable; PostgreSQL not measured"
-        return {"pg.round_trip.latency_ms": unavailable(reason), "pg.advisory_lock.acquire_ms": unavailable(reason)}
+        return {key: unavailable("psql client unavailable; PostgreSQL not measured") for key in keys}
     try:
         dsn = Path(dsn_file).read_text(encoding="utf-8").strip()
         if not dsn:
             raise ValueError("empty DSN file")
     except (OSError, ValueError):
-        reason = "DSN file unreadable; PostgreSQL not measured"
-        return {"pg.round_trip.latency_ms": unavailable(reason), "pg.advisory_lock.acquire_ms": unavailable(reason)}
+        return {key: unavailable("DSN file unreadable; PostgreSQL not measured") for key in keys}
     samples, lock_samples = [], []
     pg = workload["pg"]
     count = pg["sample_count"] if pg["enabled"] else 3
@@ -959,8 +859,10 @@ def run_pg_workload(workload, runner, dsn_file):
     except RunnerTimeout:
         pass
     except ChildFailed:
-        return {"pg.round_trip.latency_ms": unavailable("psql query failed; details suppressed"),
-                "pg.advisory_lock.acquire_ms": unavailable("psql query failed; details suppressed")}
+        return {key: unavailable("psql query failed; details suppressed") for key in keys}
+    finally:
+        # psql writes its temporary files under the run's owned TMPDIR.
+        budget.finish()
     return {
         "pg.round_trip.latency_ms": summarize(samples) if samples else unavailable("no PostgreSQL samples completed"),
         "pg.advisory_lock.acquire_ms": summarize(lock_samples) if lock_samples else unavailable("no advisory-lock samples completed"),
@@ -1020,7 +922,7 @@ def scan_report_text(text, raw_dsn=None):
 
 
 def build_report(workload, workload_path, budgets, args, git_metrics, truncated, child_cpu, runner,
-                 deadline, source, admission_facts, *, pg_metrics=None, version=None, elapsed=None):
+                 deadline, source, admission_facts, git_version, pg_metrics=None, elapsed=None):
     unavailable_api = "no native HTTP service was executed in W0; API push-end-to-end is unmeasured"
     unavailable_blob = "no OpenDAL BlobStore exists at the baseline; S3/Local adapter is not a Blob authority and no provider credentials were used"
     metrics = {key: unavailable("not measured by this bounded runner") for key in METRIC_REGISTRY}
@@ -1028,7 +930,7 @@ def build_report(workload, workload_path, budgets, args, git_metrics, truncated,
     for key in ("blob.put.latency_ms", "blob.get.latency_ms"):
         metrics[key] = unavailable(unavailable_blob)
     metrics.update(git_metrics)
-    metrics.update(pg_metrics or run_pg_workload(workload, runner, args.pg_dsn_file))
+    metrics.update(pg_metrics)
     metrics["runner.child_cpu_seconds"] = summarize([child_cpu])
     metrics["runner.peak_rss_bytes"] = summarize([resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024])
     report = {
@@ -1040,13 +942,13 @@ def build_report(workload, workload_path, budgets, args, git_metrics, truncated,
                                  else time.monotonic() - (deadline - workload["bounds"]["wall_clock_seconds"]), 3),
         "identity": {
             "source": source,
-            "binary": binary_identity(args.binary),
+            "binary": binary_identity(runner, args.binary),
             "workload": {"id": workload["id"], "sha256": sha256_file(workload_path),
                          "bounds": {key: workload["bounds"].get(key) for key in
                                     ("wall_clock_seconds", "max_git_push_ops", "max_cas_ops", "max_temp_bytes")}},
             "budgets": {"sha256": sha256_file(args.budgets), "status": budgets.get("status")},
             "runner": {"sha256": sha256_file(Path(__file__)), "python": sys.version.split()[0],
-                       "git": version if version is not None else git_output(runner, ["--version"]),
+                       "git": git_version,
                        "platform": platform.platform()},
         },
         "limits": {"runner_limits": dict(RUNNER_LIMITS), "admission_params": dict(ADMISSION),
@@ -1061,10 +963,9 @@ def build_report(workload, workload_path, budgets, args, git_metrics, truncated,
             "no Rootyard binary or native service was executed",
             "CAS latency is local git update-ref contention, not RefStore commit latency",
             "this smoke runner does not satisfy issue #106 runtime baseline by itself",
-            "runner.temp_bytes is post-run stored bytes; admission_estimate_bytes is the conservative pre-run reservation and "
-            "peak_charged_bytes is the live high-water of observed plus pending bytes, which can exceed the estimate only when "
-            "a live file is charged both as an existing byte and as a not-yet-created one (for example the work index at the "
-            "start of a later repository); the budget still rejects any breach",
+            "runner.temp_bytes measures only the runner's own fixture tree (including the owned TMPDIR given to children); "
+            "admission_estimate_bytes is the separate pre-run feasibility estimate for the returned workload and "
+            "peak_charged_bytes is the largest measured size of the owned tree; this is not an OS or filesystem-wide quota",
             "PostgreSQL is only measured with an explicit --pg-dsn-file and a local psql; its DSN is never written to the report",
         ],
     }
@@ -1080,7 +981,7 @@ def main(argv=None):
     parser.add_argument("--pg-dsn-file")
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--stall-seconds", type=float, default=DEFAULT_STALL_SECONDS,
-                        help="per-subprocess cap, itself capped by the remaining absolute deadline")
+                        help="per-child cap from its own start, itself capped by the absolute runner deadline")
     parser.add_argument("--returned-pushes-per-repo", type=int,
                         help="reduce pushes per repo (at least 1) when the full run is not admitted")
     args = parser.parse_args(argv)
@@ -1094,17 +995,31 @@ def main(argv=None):
     except ValueError as error:
         raise SystemExit(f"workload rejected before any measurement: {error}")
     seed = int(workload["seed"])
-    child_start = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime + resource.getrusage(resource.RUSAGE_CHILDREN).ru_stime
+    # One budget instance for the whole run, created before any child, fixture
+    # or report directory, so its facts survive every outcome.
+    budget = TempBudget(workload["bounds"]["max_temp_bytes"],
+                        facts["estimate_bytes"] if returned is None else estimate_temp_bytes(workload, returned))
+    budget.admit()
     # One absolute deadline: it covers source identity, Git, PostgreSQL and
     # every version/cleanup subprocess that follows.
     deadline = time.monotonic() + workload["bounds"]["wall_clock_seconds"]
-    runner = Runner(deadline, stall_seconds=args.stall_seconds)
+    child_start = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime + resource.getrusage(resource.RUSAGE_CHILDREN).ru_stime
     truncated = False
-    budget = None
-    source = {"status": "unavailable", "reason": "source identity not collected before the run stopped"}
     try:
+        tmpdir = client_fixture(budget)
+    except LimitExceeded as error:
+        # Refused before any effect: no child, fixture or report directory exists.
+        raise SystemExit(f"run refused before measurement: {error}")
+    runner = Runner(deadline, tmpdir=tmpdir, stall_seconds=args.stall_seconds)
+    version = unavailable("git version not probed within the runner deadline")
+    source = {"status": "unavailable", "reason": "source identity not collected before the run stopped"}
+    git_metrics = {}
+    try:
+        if not runner.expired():
+            version = git_output(runner, ["--version"])
         source = source_identity(runner, args.allow_dirty)
-        git_metrics, truncated, budget = run_git_workload(workload, runner, seed, facts["returned_pushes_per_repo"])
+        git_metrics, truncated, budget = run_git_workload(workload, runner, seed, facts["returned_pushes_per_repo"],
+                                                          budget)
     except RunnerTimeout:
         truncated = True
         git_metrics = {key: unavailable("absolute runner deadline reached; remaining steps cancelled")
@@ -1112,33 +1027,39 @@ def main(argv=None):
     except BudgetViolation as error:
         git_metrics = {key: unavailable(f"temp budget stopped the run: {error}") for key in GIT_METRICS}
     except LimitExceeded as error:
-        # Pre-push refusal (for example a temp root inside a repository) or a
-        # child that survived SIGKILL: no bounded measurement is possible.
+        # A child that survived SIGKILL: no bounded measurement is possible.
         git_metrics = {key: unavailable(f"run refused before measurement: {error}") for key in GIT_METRICS}
-    child_cpu = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime + resource.getrusage(resource.RUSAGE_CHILDREN).ru_stime - child_start
     try:
-        pg_metrics = run_pg_workload(workload, runner, args.pg_dsn_file)
-        version = git_output(runner, ["--version"])
+        pg_metrics = run_pg_workload(workload, runner, args.pg_dsn_file, budget)
     except RunnerTimeout:
-        # PostgreSQL or the version probe consumed the remaining deadline:
-        # record that honestly instead of retrying beyond the budget.
+        # PostgreSQL consumed the remaining deadline: record that honestly
+        # instead of retrying beyond the budget.
         truncated = True
         pg_metrics = {key: unavailable("absolute runner deadline reached; PostgreSQL not measured")
                       for key in ("pg.round_trip.latency_ms", "pg.advisory_lock.acquire_ms")}
-        version = unavailable("git version not probed within the runner deadline")
+    child_cpu = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime + resource.getrusage(resource.RUSAGE_CHILDREN).ru_stime - child_start
+    # Final accounting and the only removal of the owned fixture root.
+    git_metrics.setdefault("runner.temp_bytes",
+                           temp_metric(budget, {"returned_pushes_per_repo": returned_pushes(workload, returned)}))
+    temp = git_metrics["runner.temp_bytes"]
+    try:
+        budget.finish()
+    except BudgetViolation as error:
+        raise SystemExit(f"refusing to write report: {error}")
+    temp.update(temp_metric(budget))
+    cleanup_error = budget.cleanup()
+    temp["cleaned"] = cleanup_error is None
+    if cleanup_error:
+        temp["cleanup_error"] = cleanup_error
     elapsed = time.monotonic() - (deadline - workload["bounds"]["wall_clock_seconds"])
     report = build_report(workload, Path(args.workload), budgets, args, git_metrics, truncated, child_cpu,
-                          runner, deadline, source, facts, pg_metrics=pg_metrics, version=version, elapsed=elapsed)
-    # Provenance for the budget that actually enforced the run (not a copy).
-    if budget is not None:
-        report["limits"]["temp_budget"] = {
-            "budget_bytes": budget.budget,
-            "estimate_bytes": budget.estimate,
-            "returned_estimate_bytes": budget.returned_estimate,
-            "peak_charged_bytes": budget.peak,
-            "checkpoints": budget.checkpoints,
-            "attributed_writes": budget.attributed_writes,
-        }
+                          runner, deadline, source, facts, version, pg_metrics=pg_metrics, elapsed=elapsed)
+    # Provenance for the budget instance that actually governed the run.
+    report["limits"]["temp_budget"] = dict(temp_metric(budget),
+                                           estimate_bytes=budget.estimate,
+                                           returned_pushes_per_repo=temp["returned_pushes_per_repo"])
+    if cleanup_error:
+        report["limits"]["temp_budget"]["cleanup_error"] = cleanup_error
     text = json.dumps(redact(report), indent=2, sort_keys=True)
     raw_dsn = None
     if args.pg_dsn_file and Path(args.pg_dsn_file).is_file():
