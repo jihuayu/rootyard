@@ -322,14 +322,52 @@ async fn read_bounded<R: AsyncRead + Unpin>(reader: &mut R, buffer: &mut [u8], i
     timeout(idle, reader.read(buffer)).await.map_err(|_| anyhow!("backend read timed out"))?.map_err(Into::into)
 }
 
+/// End-to-end headers of one backend response, minus the hop-by-hop ones and
+/// the framing the proxy recomputes: connection management, `Content-Length`
+/// (recomputed from the decoded body) and `Transfer-Encoding` (bodies are
+/// forwarded decoded and delimited by `Connection: close`). Retained headers
+/// keep their order and value verbatim, so `WWW-Authenticate`, `Content-Type`
+/// and `X-Rootyard-Operation` reach the Git client exactly as the service sent
+/// them.
+pub(super) fn response_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut hop_by_hop = vec![
+        "connection".to_owned(),
+        "proxy-connection".to_owned(),
+        "keep-alive".to_owned(),
+        "transfer-encoding".to_owned(),
+        "content-length".to_owned(),
+        "te".to_owned(),
+        "trailer".to_owned(),
+        "upgrade".to_owned(),
+    ];
+    // Headers listed by `Connection` are themselves hop-by-hop.
+    for (name, value) in headers {
+        if name == "connection" {
+            hop_by_hop.extend(value.split(',').map(|token| token.trim().to_ascii_lowercase()).filter(|token| !token.is_empty()));
+        }
+    }
+    headers
+        .iter()
+        .filter(|(name, _)| !hop_by_hop.iter().any(|hop| hop == name))
+        .cloned()
+        .collect()
+}
+
+/// Write one client response: the status line, the backend end-to-end headers,
+/// the recomputed `Content-Length` and `Connection: close`.
 pub(super) async fn write_reply<W: AsyncWrite + Unpin>(
     writer: &mut W,
     idle: Duration,
     status: u16,
     reason: &str,
+    headers: &[(String, String)],
     body: &[u8],
 ) -> Result<()> {
-    let head = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
+    for (name, value) in response_headers(headers) {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()));
     timeout(idle, async {
         writer.write_all(head.as_bytes()).await?;
         writer.write_all(body).await?;
@@ -440,6 +478,101 @@ mod tests {
             let error = read(raw).await.unwrap_err().to_string();
             assert_eq!(error, "backend header is malformed", "{raw:?}");
         }
+    }
+
+    /// One backend response (head followed by its body) as the proxy writes it
+    /// to a stock Git client: the codec round trip from the wire bytes to the
+    /// bytes on the client socket.
+    async fn reply(backend: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let mut reader = backend;
+        let (_, status, headers) = read_backend_head(&mut reader, Instant::now() + Duration::from_secs(5)).await.unwrap();
+        let (decoded, truncated) = read_backend(&mut reader, &headers, &Bounds { max_body: 1024, max_response: 1024, idle: &Duration::from_secs(5) }).await.unwrap();
+        assert!(!truncated);
+        let mut written = Vec::new();
+        write_reply(&mut written, Duration::from_secs(5), status, "OK", &headers, &decoded).await.unwrap();
+        let mut client = BufReader::new(written.as_slice());
+        let (_, status, reply_headers) = read_backend_head(&mut client, Instant::now() + Duration::from_secs(5)).await.unwrap();
+        let (reply_body, truncated) = read_backend(&mut client, &reply_headers, &Bounds { max_body: 1024, max_response: 1024, idle: &Duration::from_secs(5) }).await.unwrap();
+        assert!(!truncated);
+        (status, reply_headers, reply_body)
+    }
+
+    #[tokio::test]
+    async fn reply_preserves_401_challenge_content_type_and_operation() {
+        let backend: &[u8] = b"HTTP/1.1 401 Unauthorized\r\n\
+            WWW-Authenticate: Basic realm=\"rootyard\"\r\n\
+            Content-Type: application/x-git-receive-pack-result\r\n\
+            X-Rootyard-Operation: 7d8c1f0e-2b3a-4c5d-8e9f-0a1b2c3d4e5f\r\n\
+            Cache-Control: no-cache\r\n\
+            Content-Length: 12\r\n\
+            \r\n\
+            challenged!!";
+        let (status, headers, body) = reply(backend).await;
+        assert_eq!(status, 401);
+        assert_eq!(body, b"challenged!!");
+        assert_eq!(header(&headers, "www-authenticate"), Some("Basic realm=\"rootyard\""));
+        assert_eq!(header(&headers, "content-type"), Some("application/x-git-receive-pack-result"));
+        assert_eq!(header(&headers, "x-rootyard-operation"), Some("7d8c1f0e-2b3a-4c5d-8e9f-0a1b2c3d4e5f"));
+        assert_eq!(header(&headers, "cache-control"), Some("no-cache"));
+    }
+
+    #[tokio::test]
+    async fn reply_preserves_git_content_type_and_operation() {
+        let backend: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Type: application/x-git-receive-pack-advertisement\r\n\
+            X-Rootyard-Operation: 0d9e4c7a-1f2b-4a3c-9b8d-6e5f4a3b2c1d\r\n\
+            Content-Length: 4\r\n\
+            \r\n\
+            000d";
+        let (status, headers, body) = reply(backend).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"000d");
+        assert_eq!(header(&headers, "content-type"), Some("application/x-git-receive-pack-advertisement"));
+        assert_eq!(header(&headers, "x-rootyard-operation"), Some("0d9e4c7a-1f2b-4a3c-9b8d-6e5f4a3b2c1d"));
+        assert_eq!(header(&headers, "content-length"), Some("4"));
+    }
+
+    #[tokio::test]
+    async fn reply_recomputes_length_and_drops_hop_by_hop_headers() {
+        let backend = [
+            "HTTP/1.1 200 OK",
+            "Content-Type: application/x-git-receive-pack-result",
+            "Transfer-Encoding: chunked",
+            "Connection: keep-alive, X-Hop, close",
+            "X-Hop: stripped",
+            "Keep-Alive: timeout=5",
+            "",
+            // Two exact chunks (sizes in hex); no chunk boundary ends on a CR,
+            // because `read_backend` stops a chunk read at a CR.
+            "4",
+            "chun",
+            "6",
+            "ked-bo",
+            "2",
+            "dy",
+            "0",
+            "",
+            "",
+        ]
+        .join("\r\n")
+        .into_bytes();
+        let (status, headers, body) = reply(&backend).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"chunked-body");
+        assert_eq!(header(&headers, "content-length"), Some("12"));
+        assert_eq!(header(&headers, "connection"), Some("close"));
+        assert_eq!(header(&headers, "content-type"), Some("application/x-git-receive-pack-result"));
+        for hop in ["transfer-encoding", "x-hop", "keep-alive"] {
+            assert_eq!(header(&headers, hop), None, "{hop} must not reach the client");
+        }
+        assert_eq!(headers.iter().filter(|(name, _)| name == "content-length").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn synthetic_reply_has_no_backend_headers() {
+        let mut written = Vec::new();
+        write_reply(&mut written, Duration::from_secs(5), 502, "Bad Gateway", &[], b"").await.unwrap();
+        assert_eq!(written, b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     }
 
     #[tokio::test]

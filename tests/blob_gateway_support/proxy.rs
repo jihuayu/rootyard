@@ -123,6 +123,10 @@ pub struct Captured {
 struct Reply {
     status: u16,
     reason: &'static str,
+    /// The backend's end-to-end response headers, kept verbatim so a stock Git
+    /// client sees the real `WWW-Authenticate` challenge, `Content-Type` and
+    /// `X-Rootyard-Operation`. Empty when the answer is not a backend response.
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -370,31 +374,7 @@ impl Proxy {
     /// Forward every held request concurrently and answer each client with its
     /// own service response, unchanged by the proxy.
     pub async fn resolve_held(&self) -> Result<()> {
-        let arrived = {
-            let mut state = self.shared.state.lock().await;
-            let hold = state.hold.take().ok_or_else(|| anyhow!("no hold barrier is armed"))?;
-            ensure!(
-                hold.arrived.len() == hold.count,
-                "the barrier is not full: {} of {} requests arrived",
-                hold.arrived.len(),
-                hold.count
-            );
-            hold.arrived
-        };
-        let mut forwards = Vec::with_capacity(arrived.len());
-        for request in arrived {
-            let outcome = request.joint.clone();
-            forwards.push(tokio::spawn(async move {
-                let reply = forward(&request).await;
-                if let Some(outcome) = outcome {
-                    *outcome.lock().await = Some(reply);
-                }
-            }));
-        }
-        for forward in forwards {
-            forward.await.map_err(|error| anyhow!("a held forward task failed: {error}"))?;
-        }
-        Ok(())
+        resolve_held(&self.shared).await
     }
 
     pub async fn records(&self) -> Vec<Record> {
@@ -410,6 +390,35 @@ impl Proxy {
         let _ = timeout(Duration::from_secs(10), self.acceptor).await;
         Ok(())
     }
+}
+
+/// Open the armed barrier: forward every held request concurrently.
+async fn resolve_held(shared: &Shared) -> Result<()> {
+    let arrived = {
+        let mut state = shared.state.lock().await;
+        let hold = state.hold.take().ok_or_else(|| anyhow!("no hold barrier is armed"))?;
+        ensure!(
+            hold.arrived.len() == hold.count,
+            "the barrier is not full: {} of {} requests arrived",
+            hold.arrived.len(),
+            hold.count
+        );
+        hold.arrived
+    };
+    let mut forwards = Vec::with_capacity(arrived.len());
+    for request in arrived {
+        let outcome = request.joint.clone();
+        forwards.push(tokio::spawn(async move {
+            let reply = forward(&request).await;
+            if let Some(outcome) = outcome {
+                *outcome.lock().await = Some(reply);
+            }
+        }));
+    }
+    for forward in forwards {
+        forward.await.map_err(|error| anyhow!("a held forward task failed: {error}"))?;
+    }
+    Ok(())
 }
 
 async fn take_operation_rule(shared: &Shared, operation: &str) -> Option<Rule> {
@@ -514,11 +523,12 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                         .map(|operation| CreatedOperation { operation });
                 }
                 shared.state.lock().await.records.push(record);
-                Reply { status: traffic.status, reason: "OK", body: traffic.body }
+                Reply { status: traffic.status, reason: "OK", headers: traffic.headers, body: traffic.body }
             }
         };
         let closed = wire::connection_closed(&headers);
-        wire::write_reply(&mut write, shared.limits.idle, reply.status, reply.reason, &reply.body).await?;
+        wire::write_reply(&mut write, shared.limits.idle, reply.status, reply.reason, &reply.headers, &reply.body)
+            .await?;
         if closed {
             return Ok(());
         }
@@ -580,7 +590,7 @@ async fn forward(request: &DeferredRef) -> Outcome {
     else {
         return Err("forward failed".to_owned());
     };
-    Ok(Reply { status: traffic.status, reason: "OK", body: traffic.body })
+    Ok(Reply { status: traffic.status, reason: "OK", headers: traffic.headers, body: traffic.body })
 }
 
 /// Advertisement body after the `# service=git-receive-pack` pkt-line prefix.

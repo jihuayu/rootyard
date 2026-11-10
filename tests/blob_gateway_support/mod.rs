@@ -24,5 +24,7 @@ pub mod db;
 pub mod git;
 pub mod preflight;
 pub mod proxy;
+#[cfg(test)]
+mod proxy_reply;
 pub mod service;
 pub mod wire;
