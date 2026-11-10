@@ -148,9 +148,30 @@ class AuditRowsByIdTest(unittest.TestCase):
         self.assertIn("audit_rows_by_id(self.snapshot_rows, self.restored_rows)", body)
         self.assertIn("self.restored_tenants == [alice_tenant]", body)
         self.assertIn('self.restored_actors == ["alice"]', body)
+        # Writes after the restore add rows legally, so a full-set comparison
+        # would fail for the wrong reason: original ids are compared as exact
+        # rows and the added ids are returned to be bound to the walked window.
         for name in ("restored_http_audit_sequence_continues",
                      "restored_concurrent_audit_sequence_continues"):
-            self.assertIn("audit_rows_by_id(self.restored_rows, after)", method_source(name))
+            body = method_source(name)
+            self.assertIn("audit_subrows_by_id(", body)
+            self.assertNotIn("audit_rows_by_id(self.restored_rows, after)", body)
+
+
+class AuditSubrowsByIdTest(unittest.TestCase):
+    def test_added_rows_are_returned_and_originals_are_compared_in_full(self):
+        rows = [audit_row(), audit_row(id=8, target_name="carol")]
+        after = [dict(row) for row in rows] + [audit_row(id=9, action="collaborator.updated")]
+        self.assertEqual(drill.audit_subrows_by_id(rows, after), [9])
+        self.assertEqual(drill.audit_subrows_by_id(rows, rows), [])
+        # The original ids keep the full-row check even when new rows exist.
+        rewritten = [dict(rows[0], actor_name="bob"), rows[1], after[2]]
+        with self.assertRaisesRegex(AssertionError, "changed \\['actor_name'\\]"):
+            drill.audit_subrows_by_id(rows, rewritten)
+        with self.assertRaisesRegex(AssertionError, "disappeared"):
+            drill.audit_subrows_by_id(rows, [rows[0], after[2]])
+        with self.assertRaisesRegex(AssertionError, "duplicate audit id"):
+            drill.audit_subrows_by_id(rows, after + [dict(after[2])])
 
 
 class SettledOutcomesTest(unittest.TestCase):
@@ -218,12 +239,27 @@ class DrillWiringTest(unittest.TestCase):
         self.assertLess(handlers.index("if head_ref == base_ref {"),
                         handlers.index("auth::authorize_repo_with_role(&tx, &actor, &owner, &name,"
                                        " auth::Role::Write"))
-        # A triage issue is a real audit write that must be accounted for.
+        # Bob holds a triage grant on demo only: both writes use demo, never
+        # the planned "ahead" repository where Bob has no grant.
+        self.assertIn('self.document(self.repo_path("/issues"), 201, token=self.bob', helper)
+        self.assertIn('self.document(self.repo_path("/pulls"), 403, token=self.bob', helper)
+        self.assertNotIn('"ahead"', helper)
         self.assertIn("self.triage_negative(", source(self.source, "setup_repos"))
-        self.assertIn("issue.created", (ROOT / "src/web/handlers.rs").read_text())
+        # The REST create_issue handler records no audit row (only the web form
+        # handler does), so the drill never expects issue.created from REST.
+        forge = (ROOT / "src/forge/handlers.rs").read_text()
+        rest = forge[forge.index("pub async fn create_issue("):]
+        rest = rest[:rest.index("pub async fn list_issues(")]
+        self.assertNotIn("record_audit_event", rest)
+        self.assertIn("record_audit_event", (ROOT / "src/web/handlers.rs").read_text())
         restored = method_source("restored_http_audit_sequence_continues")
-        self.assertIn('["issue.created", "collaborator.updated"]', restored)
-        self.assertIn('["bob", "alice"]', restored)
+        self.assertIn('["collaborator.updated"]', restored)
+        self.assertIn('["alice"]', restored)
+        self.assertIn("rest_triage_issue_audited", restored)
+        source_case = method_source("setup_repos")
+        self.assertIn("before_triage = self.audit_rows(self.db)", source_case)
+        self.assertIn("self.pre_push_rows == before_triage", source_case)
+        self.assertIn('"collaborator.added"] * 3', source_case)
 
     def test_audit_walk_is_ascending_from_the_known_floor(self):
         body = method_source("audit_page")
@@ -250,17 +286,28 @@ class DrillWiringTest(unittest.TestCase):
         self.assertIn("len(set(branches))", body)
         self.assertNotIn('"refs/heads/main"', body)
         self.assertIn('"branch_ref": branch_ref', body)
-        # The saved prefix equals the source sequence plus the restored
-        # window's issue write, and the 32 raced rows are the walked window.
-        self.assertIn("known == self.source_sequence", body)
-        self.assertIn("self.prefix_sequence = known + window", body)
-        self.assertIn("known + window == self.prefix_sequence", body)
+        # The known prefix is the source collaborator rows plus the restored
+        # PUT (also collaborator.updated), not the source sequence alone, and
+        # it is re-read and compared byte-identically after the race.
+        self.assertIn("known == expected_prefix", body)
+        self.assertIn("self.source_sequence + self.after_http_rows[len(self.restored_rows):]", body)
+        self.assertNotIn("known == self.source_sequence", body)
+        self.assertIn("self.action_sequence(self.target_db, self.saved_actions) == "
+                      "self.prefix_sequence", body)
+        self.assertNotIn("known + window == self.prefix_sequence", body)
         self.assertIn("self.walk_audit(self.http_floor, limit=7)", body)
-        self.assertIn("audit_rows_by_id(self.restored_rows, after)", body)
+        self.assertIn("audit_subrows_by_id(before_rows, after)", body)
+        self.assertNotIn("audit_rows_by_id(self.restored_rows, after)", body)
+        # The cursor is per repository, so its window equals demo's SQL rows.
+        self.assertIn("walked == [value for value in demo_rows if value > self.http_floor]", body)
         self.assertIn("[row[\"id\"] for row in rows] == list(new)", body)
         self.assertIn(">= self.race_floor", body)
         # The saved prefix is captured on the source before any restore write.
         self.assertIn("self.source_sequence = self.action_sequence(self.db, self.saved_actions)",
+                      method_source("source_audit_writes_advance_sequence"))
+        # The restored PUT is a collaborator.updated too, so it must be part of
+        # the saved action set the race prefix is selected with.
+        self.assertIn('["collaborator.added", "collaborator.updated"]',
                       method_source("source_audit_writes_advance_sequence"))
         self.assertEqual(drill.new_audit_ids([1, 2], [1, 2, 4], [4], expected=1), [4])
         with self.assertRaisesRegex(AssertionError, "expected 1"):

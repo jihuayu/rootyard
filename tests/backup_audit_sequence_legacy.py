@@ -15,15 +15,19 @@ HTTP/Git against run-owned databases, a temporary volume and temporary clones:
    server itself and kept as the Git/receipt recovery check.  Real API
    collaborator writes then create ``repository_audit_log`` rows whose ids come
    from the migration-110 sequence (``record_audit_event``).  The drill proves
-   the pushes write ``audit_events`` (outbox claims) and *not*
-   ``repository_audit_log``.
+   the pushes write ``git_operations``/``audit_events`` and *not*
+   ``repository_audit_log``.  A REST ``POST .../issues`` is a real issue write
+   (it proves Bob's triage grant) but the REST handler records no audit row:
+   only the web form handler emits ``issue.created``, so the drill never counts
+   a REST issue as an audit write.
 2. ``backup --offline`` then ``restore --isolated`` into a brand-new database
    and data directory.
 3. On the restored service the next real API audit writes (one, then 32
    concurrent) must allocate ids strictly above every pre-backup id, found
    through the ascending ``?after=<floor>`` cursor -- never the oldest page --
    and every pre-backup row (all columns, ``created_at`` included) must survive
-   byte-identically.
+   byte-identically.  The cursor walks are cross-checked against the SQL id
+   sets, because each repository's cursor only sees its own rows.
 4. Negative control, in the restored run-owned database only: dropping the
    migration-110 sequence default (the schema shape a pre-110 source has) makes
    audit writes fail with no server-side ID allocation.  It is labelled as a
@@ -33,7 +37,7 @@ HTTP/Git against run-owned databases, a temporary volume and temporary clones:
    ``restore`` of the same archive, which re-imports it and re-applies
    migration 110.
 
-Missing dependencies (PostgreSQL 17 server, Git >= 2.43, CREATEDB, and a binary
+Missing dependencies (PostgreSQL 17 server with CREATEDB, Git >= 2.43, and a binary
 bound to this checkout's production source bytes) are hard failures, never
 skips.  A loopback functional drill only: no power-loss, RPO/RTO or HA claim.
 """
@@ -117,23 +121,14 @@ def new_audit_ids(before_ids, after_ids, api_ids, expected=None):
     return sorted(added)
 
 
-def audit_rows_by_id(before, after):
-    """Reject a restore that lost, added or changed any full audit row.
+def _keyed_audit_rows(rows):
+    keys = [row["id"] for row in rows]
+    assert len(keys) == len(set(keys)), "duplicate audit id in " + repr(keys[:10])
+    return {row["id"]: row for row in rows}
 
-    Every row is keyed by its id and compared as the complete persisted row
-    (tenant, repository, actor id/name, action, target, details, timestamps),
-    so a row copied under another actor or tenant, a rewritten detail or a
-    shifted ``created_at`` fails even when the id set is unchanged.
-    """
-    def keyed(rows):
-        keys = [row["id"] for row in rows]
-        assert len(keys) == len(set(keys)), "duplicate audit id in " + repr(keys[:10])
-        return {row["id"]: row for row in rows}
-    expected, actual = keyed(before), keyed(after)
-    lost = sorted(set(expected) - set(actual))
-    added = sorted(set(actual) - set(expected))
-    assert not lost, "audit rows disappeared: " + repr(lost[:10])
-    assert not added, "audit rows appeared: " + repr(added[:10])
+
+def _compare_audit_rows(expected, actual):
+    """Every expected id present and equal in ``actual``, as the full row."""
     changed = [key for key in sorted(expected) if expected[key] != actual[key]]
     if changed:
         key = changed[0]
@@ -141,7 +136,39 @@ def audit_rows_by_id(before, after):
                         if expected[key].get(name) != actual[key].get(name))
         raise AssertionError("audit row " + repr(key) + " changed " + repr(fields)
                              + ": " + repr(expected[key]) + " -> " + repr(actual[key]))
+
+
+def audit_rows_by_id(before, after):
+    """Reject a restore that lost, added or changed any full audit row.
+
+    Every row is keyed by its id and compared as the complete persisted row
+    (tenant, repository, actor id/name, action, target, details, timestamps),
+    so a row copied under another actor or tenant, a rewritten detail or a
+    shifted ``created_at`` fails even when the id set is unchanged.  Both sides
+    must be the same set: use this only where no write may have happened.
+    """
+    expected, actual = _keyed_audit_rows(before), _keyed_audit_rows(after)
+    lost = sorted(set(expected) - set(actual))
+    added = sorted(set(actual) - set(expected))
+    assert not lost, "audit rows disappeared: " + repr(lost[:10])
+    assert not added, "audit rows appeared: " + repr(added[:10])
+    _compare_audit_rows(expected, actual)
     return actual
+
+
+def audit_subrows_by_id(rows, after):
+    """Compare only rows whose id already exists in ``rows``; return added ids.
+
+    A legal post-restore write adds id-only rows, so a full-set comparison
+    would fail for the wrong reason.  This checks every original id is still
+    present, byte-identical in all persisted columns, and returns the added ids
+    so the caller can bind them to the exact walked window.
+    """
+    expected, actual = _keyed_audit_rows(rows), _keyed_audit_rows(after)
+    lost = sorted(set(expected) - set(actual))
+    assert not lost, "audit rows disappeared: " + repr(lost[:10])
+    _compare_audit_rows(expected, actual)
+    return sorted(set(actual) - set(expected))
 
 
 def settled_outcomes(rows):
@@ -163,7 +190,6 @@ class AuditSequenceLegacyHarness(BackupHarness):
         # bootstraps before Config), so a later rebuild must not be mistaken for
         # this run's binary: the runner digest is recorded for the report.
         self.hook_runner = None
-        self.audit_path = "/api/repos/alice/demo/audit"
         self.rules_path = "/api/repos/alice/demo/branch-rules"
         self.authors_path = "/api/repos/alice/demo/collaborators"
 
@@ -220,11 +246,15 @@ class AuditSequenceLegacyHarness(BackupHarness):
                              + "&limit=" + str(limit), token=self.alice)
         return [int(item["id"]) for item in page["items"]], page["next_after"]
 
-    def walk_audit(self, after, limit=100):
-        """Walk the ascending global cursor across the fixture repositories."""
+    def walk_audit(self, after, limit=100, repo="demo"):
+        """Walk the ascending cursor of one repository past ``after``.
+
+        The cursor is per repository (audit.rs also filters repository_id), so
+        the drill compares it with the same repository's SQL rows.
+        """
         ids, pages = [], 0
         while True:
-            more, page_next = self.audit_page(after, limit)
+            more, page_next = self.audit_page(after, limit, repo)
             pages += 1
             assert more == sorted(more) and all(value > after for value in more), (after, more)
             ids.extend(more)
@@ -240,12 +270,19 @@ class AuditSequenceLegacyHarness(BackupHarness):
         return None
 
     def triage_negative(self, label):
-        """A real triage write succeeds (issue.created) and a pull create is
-        refused by the role gate (403) with distinct branch names, so the
-        same-branch 400 cannot stand in for the role refusal."""
-        self.document(self.repo_path("/issues", "ahead"), 201, token=self.bob,
+        """Prove Bob's triage grant on the repository it was granted for.
+
+        Bob is a triage collaborator of ``alice/demo`` only, so both writes go
+        there: a real issue create (201, the REST handler's own permission) and
+        a pull create refused by the role gate (403).  Distinct valid branch
+        names keep the same-branch 400 from standing in for the role refusal;
+        both branches exist, so a role check ordered after the ref lookup
+        cannot answer 409 either.  The REST issue create writes no audit row,
+        so callers still expect their audit rows to be unchanged.
+        """
+        self.document(self.repo_path("/issues"), 201, token=self.bob,
                       method="POST", body={"title": label + " triage issue"})
-        self.document(self.repo_path("/pulls", "ahead"), 403, token=self.bob, method="POST",
+        self.document(self.repo_path("/pulls"), 403, token=self.bob, method="POST",
                       body={"title": label + " triage cannot open pulls",
                             "head_ref": "refs/heads/main", "base_ref": "refs/heads/triage-base"})
 
@@ -304,11 +341,16 @@ class AuditSequenceLegacyHarness(BackupHarness):
         # Bob's triage grant is observable through the real API before the
         # backup: a triage may file an issue and may not open a pull request.
         assert self.collaborator("bob")["role"] == "triage"
+        before_triage = self.audit_rows(self.db)
         self.triage_negative("source")
         self.pre_push_rows = self.audit_rows(self.db)
-        # Three real creates and Bob's one issue; nothing else was written.
+        # The REST issue create returned 201 but recorded no audit row: only
+        # the web form handler emits issue.created.  The refused pull create
+        # wrote nothing, and the only audit rows are the three real creates.
+        assert self.pre_push_rows == before_triage, \
+            "the REST triage issue/pull writes recorded repository_audit_log rows"
         assert [row["action"] for row in self.pre_push_rows] == [
-            "collaborator.added"] * 3 + ["issue.created"], self.pre_push_rows
+            "collaborator.added"] * 3, self.pre_push_rows
         planned = self.base + other["clone_path"]
         base = self.second
         for remote, commit in ((self.remote, "audit-then-push.txt"), (planned, "ahead-then-write.txt")):
@@ -329,8 +371,8 @@ class AuditSequenceLegacyHarness(BackupHarness):
         self.pre_push_ids = self.all_audit_ids(self.db)
         # The pushes are Git/receipt facts only: the audit rows are exactly the
         # pre-push snapshot (three collaborator creations, no push action).
-        assert self.audit_rows(self.db) == self.pre_push_rows, \
-            "a Git push wrote repository_audit_log"
+        # The failure message is the set comparison's own.
+        audit_rows_by_id(self.pre_push_rows, self.audit_rows(self.db))
         self.hook_runner = self.hook_runner_digest()
         assert self.hook_runner == self.runtime_binary_sha256, \
             "the managed hook runner is not the executed binary"
@@ -351,22 +393,26 @@ class AuditSequenceLegacyHarness(BackupHarness):
         # are Git/receipt facts (Git operations, not repository_audit_log).
         self.audit_events_before = int(self.query(self.db, "SELECT count(*) FROM audit_events"))
         before = self.audit_rows(self.db)
+        # Every row id allocated so far proves the write below advances past it.
+        self.ids_before_write = self.all_audit_ids(self.db)
         self.update_collaborator("carol", "maintain")
         after = self.audit_rows(self.db)
         rows = after[len(before):]
         assert [row["action"] for row in rows] == ["collaborator.updated"], rows
+        assert [row["actor_name"] for row in rows] == ["alice"], rows
+        assert rows[0]["id"] > max(self.ids_before_write), (rows, self.ids_before_write)
         walked, _ = self.walk_audit(max(row["id"] for row in before))
         assert walked == [row["id"] for row in rows]
         # The saved prefix is every collaborator write of the source; the
         # pushes above added none of these actions.
         self.saved_actions = ["collaborator.added", "collaborator.updated"]
         self.source_sequence = self.action_sequence(self.db, self.saved_actions)
-        assert self.source_sequence == [row for row in final
-                                        if row["action"] in self.saved_actions]
-        assert [row["id"] for row in rows] == [row["id"] for row in self.source_sequence[-1:]]
         self.cli("worker-once")  # outbox audit-log consumer claims the push events
         self.audit_events_after = int(self.query(self.db, "SELECT count(*) FROM audit_events"))
         final = self.audit_rows(self.db)
+        assert self.source_sequence == [row for row in final
+                                        if row["action"] in self.saved_actions]
+        assert [row["id"] for row in rows] == [row["id"] for row in self.source_sequence[-1:]]
         assert final == after, "a Git push or the audit-log consumer wrote repository_audit_log"
         assert self.audit_events_after > self.audit_events_before, \
             "the settled pushes produced no outbox audit_events claim"
@@ -415,8 +461,9 @@ class AuditSequenceLegacyHarness(BackupHarness):
         audit_rows_by_id(self.snapshot_rows, self.restored_rows)
         self.restored_tenants = sorted({str(row["tenant_id"]) for row in self.restored_rows})
         self.restored_actors = sorted({row["actor_name"] for row in self.restored_rows})
-        # Both repositories of alice's tenant; the pre-push rows have no issue
-        # yet, so their only actor is alice.
+        # Both repositories of alice's tenant; the audited source writes are
+        # alice's collaborator creates/updates only (Bob's REST issue is an
+        # issue row, not an audit row), so their only actor is alice.
         assert self.restored_tenants == [alice_tenant], self.restored_tenants
         assert self.restored_actors == ["alice"], self.restored_actors
         self.restored_floor = max(row["id"] for row in self.restored_rows)
@@ -432,23 +479,31 @@ class AuditSequenceLegacyHarness(BackupHarness):
         # their roles and versions, together with the real API-visible grants.
         assert self.collaborator("bob")["role"] == "triage", "bob's triage grant was not restored"
         assert self.collaborator("carol")["role"] == "maintain"
+        # Bob's triage writes are real 201/403 outcomes, but the REST issue
+        # handler records no audit row, so the audit window is the PUT alone.
         self.triage_negative("restored")
+        assert self.audit_rows(self.target_db) == self.restored_rows, \
+            "the restored REST triage issue/pull writes recorded audit rows"
         self.update_collaborator("bob", "maintain")
         after = self.audit_rows(self.target_db)
         assert self.collaborator("bob")["role"] == "maintain"
         rows = after[len(self.restored_rows):]
-        # Both real writes of this window are audited: Bob's issue, then the
-        # PUT. The refused pull create writes nothing.
-        assert [row["action"] for row in rows] == ["issue.created", "collaborator.updated"], rows
-        assert [row["actor_name"] for row in rows] == ["bob", "alice"], rows
+        # One real API audit write of this window: alice's PUT.  The refused
+        # pull create and Bob's REST issue write nothing here.
+        assert [row["action"] for row in rows] == ["collaborator.updated"], rows
+        assert [row["actor_name"] for row in rows] == ["alice"], rows
+        assert rows[0]["target_name"] == "bob", rows
         walked, pages = self.walk_audit(self.restored_floor, limit=100)
         assert walked == [row["id"] for row in rows], (walked, [row["id"] for row in rows])
         new = new_audit_ids([row["id"] for row in self.restored_rows],
-                            [row["id"] for row in after], walked)
-        audit_rows_by_id(self.restored_rows, after)
+                            [row["id"] for row in after], walked, expected=1)
+        added = audit_subrows_by_id(self.restored_rows, after)
+        assert added == new == [rows[0]["id"]], (added, new, rows)
         self.after_http_rows = after
         self.http_floor = new[-1]
         return {"status": 200, "actions": [row["action"] for row in rows],
+                "actors": [row["actor_name"] for row in rows],
+                "rest_triage_issue_audited": False,
                 "walked_audit_ids": walked, "pages": pages,
                 "pre_backup_max_id": self.restored_floor}
 
@@ -458,16 +513,15 @@ class AuditSequenceLegacyHarness(BackupHarness):
         count = 2 * CONCURRENT_WRITERS
         race_prefix = "refs/heads/audit-race-" + os.urandom(4).hex() + "-"
         branches = [race_prefix + "%02d" % index for index in range(count)]
+        # The prefix known before the race is every collaborator write of the
+        # source plus the restored window's PUT (also collaborator.updated):
+        # four source rows plus one restored row, in id order.
         known = self.action_sequence(self.target_db, self.saved_actions)
-        # The source prefix plus the restored window's own collaborator/issue
-        # writes: nothing may be added, lost or re-ordered after restore.
-        window = self.action_sequence(self.target_db, ["issue.created"])
-        assert known == self.source_sequence
-        assert window == [row for row in self.after_http_rows if row["action"] == "issue.created"]
-        assert [row["id"] for row in window] == [row["id"] for row in self.after_http_rows
-                                                 if row["action"] == "issue.created"]
-        self.prefix_sequence = known + window
-        before_max = max(row["id"] for row in self.after_http_rows)
+        expected_prefix = self.source_sequence + self.after_http_rows[len(self.restored_rows):]
+        assert known == expected_prefix, (known, expected_prefix)
+        assert known[:len(self.source_sequence)] == self.source_sequence
+        self.prefix_sequence = known
+        before_rows = self.after_http_rows
 
         def write(branch_ref):
             body = {"branch_ref": branch_ref, "required_approvals": 0,
@@ -486,25 +540,35 @@ class AuditSequenceLegacyHarness(BackupHarness):
         walked, pages = self.walk_audit(self.http_floor, limit=7)
         new = new_audit_ids([row["id"] for row in self.after_http_rows],
                             [row["id"] for row in after], walked, expected=count)
-        rows = [row for row in after if row["id"] in set(new)]
+        # The cursor is per repository (all these writes are demo's), so the
+        # SQL rows of the same repository must show the very same window.
+        demo_rows = [row["id"] for row in after if row["repository_id"] == self.repo["id"]]
+        assert walked == [value for value in demo_rows if value > self.http_floor], (walked, demo_rows)
+        rows = sorted((row for row in after if row["id"] in set(new)), key=lambda row: row["id"])
         # Exactly one branch-rule row per request, each naming its own branch.
+        # The same set is the one the cursor walk returned.
         assert [row["action"] for row in rows] == ["branch_rule.upserted"] * count, rows
         assert sorted(row["target_name"] for row in rows) == branches
         assert [row["id"] for row in rows] == list(new), (rows, new)
-        # Saved prefix unchanged; the window then extends the sequence with
-        # ids that were never used before (the burned sequence value of the
-        # walked window is allowed to skip, reuse is not).
-        assert known + window == self.prefix_sequence, "saved audit rows changed after restore"
-        window_ids = set(row["id"] for row in rows)
+        # The prefix saved after restore is re-read from SQL and must be
+        # byte-identical, in action and id order, to what was captured.
+        assert self.action_sequence(self.target_db, self.saved_actions) == self.prefix_sequence, \
+            "the saved audit prefix changed during the concurrent window"
+        assert [row["id"] for row in self.prefix_sequence] \
+            == [row["id"] for row in before_rows], "prefix ids changed"
+        # Every pre-existing row (all columns) is unchanged; the added rows are
+        # exactly the walked window.
+        added = audit_subrows_by_id(before_rows, after)
+        assert added == new, (added, new)
+        window_ids = [row["id"] for row in rows]
         self.race_floor = max(window_ids)
         sequence = self.query(self.target_db,
                               "SELECT last_value || '/' || is_called FROM repository_audit_log_id_seq")
         assert int(sequence.split("/")[0]) >= self.race_floor, sequence
-        audit_rows_by_id(self.restored_rows, after)
         self.after_race_rows = after
         return {"concurrent_writes": count, "statuses": sorted({result[0] for result in results}),
                 "unique_branch_refs": len(set(branches)), "audit_rows_for_window": len(rows),
-                "saved_prefix_len": len(known), "window_ids": list(new), "pages": pages,
+                "saved_prefix_len": len(known), "window_ids": window_ids, "pages": pages,
                 "first_new_audit_id": new[0], "last_new_audit_id": new[-1]}
 
     def restored_git_push_and_audit_events_recovery(self):
@@ -531,10 +595,10 @@ class AuditSequenceLegacyHarness(BackupHarness):
         self.cli("worker-once")
         logs_after = int(self.query(self.target_db, "SELECT count(*) FROM repository_audit_log"))
         events_after = int(self.query(self.target_db, "SELECT count(*) FROM audit_events"))
-        rows_after = self.audit_rows(self.target_db)
-        # Git/receipt recovery is the push; the audit id space is untouched by it.
+        # Git/receipt recovery is the push; the audit id space is untouched by
+        # it: the full-set row comparison is exact here (no write is allowed).
         assert logs_after == logs_before, "the restored Git push wrote repository_audit_log"
-        assert rows_after == self.after_race_rows, "the restored Git push changed audit rows"
+        audit_rows_by_id(self.after_race_rows, self.audit_rows(self.target_db))
         assert events_after > events_before, "the restored push produced no audit_events claim"
         return {"pushed_oid": oid, "git_operation_outcomes": outcomes,
                 "audit_events": {"before": events_before, "after": events_after},
@@ -557,11 +621,17 @@ class AuditSequenceLegacyHarness(BackupHarness):
         statuses = []
         try:
             assert self.audit_sequence_column()[0] == "", "control could not remove the sequence default"
+            control = "refs/heads/missing-default-control-" + os.urandom(4).hex() + "-"
             statuses = [self.http(self.rules_path, token=self.alice, method="POST",
-                                  body={"branch_ref": "refs/heads/missing-default-control-%d" % index})[0]
+                                  body={"branch_ref": control + "%d" % index})[0]
                         for index in range(3)]
             assert statuses and all(status >= 500 for status in statuses), (
                 "a missing ID default must fail the write, observed " + repr(statuses))
+            # The failed audit insert must roll the whole request back: no rule
+            # of the control's own run-owned prefix was committed.
+            assert self.query(self.target_db, "SELECT count(*) FROM forge_branch_rules "
+                              "WHERE branch_ref LIKE '" + control + "%'") == "0", \
+                "the refused control write committed a branch rule"
         finally:
             self.query(self.target_db, "CREATE SEQUENCE IF NOT EXISTS repository_audit_log_id_seq AS bigint")
             self.query(self.target_db, MIGRATION_110.read_text())
