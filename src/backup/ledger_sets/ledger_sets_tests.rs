@@ -615,10 +615,16 @@ fn every_tombstone_row_of_a_key_must_be_the_single_legal_release_fence() {
         ("generation-3", RootTombstone { generation: 3, ..tombstone() }),
         ("owner", RootTombstone { owner_id: Uuid::from_u128(0x1600), ..tombstone() }),
         ("purpose", RootTombstone { purpose: "other".into(), ..tombstone() }),
-        ("uppercase-release", RootTombstone { release_digest: sha(0x33).to_uppercase(), ..tombstone() }),
+        ("uppercase-release", RootTombstone { release_digest: "AB".repeat(32), ..tombstone() }),
         ("short-release", RootTombstone { release_digest: "ab".repeat(31), ..tombstone() }),
         ("non-hex-release", RootTombstone { release_digest: "zz".repeat(32), ..tombstone() }),
     ];
+    // `sha(0x33)` is all digits, so upper-casing it would change nothing; the
+    // uppercase row must really differ from the legal fence.
+    let uppercase = &broken[3].1.release_digest;
+    assert_eq!(uppercase.len(), 64);
+    assert_ne!(uppercase, &sha(0x33));
+    assert!(uppercase.bytes().any(|byte| byte.is_ascii_uppercase()));
     for (name, row) in broken {
         for captured in [true, false] {
             let mut sets = valid.clone();
