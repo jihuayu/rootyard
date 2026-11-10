@@ -245,7 +245,7 @@ impl PgPackSnapshotMaterializer {
             return Ok(None);
         }
         let deadline = effective_deadline(deadline)?;
-        let (snapshot, binding) = capture.registered_parts()?;
+        let (snapshot, binding, capture_incarnation) = capture.registered_parts()?;
         let registered = RegisteredServingRead { snapshot, binding };
         if registered.snapshot.complete_transient_pack_read().is_none() {
             return Err(RefStoreError::Unsupported(
@@ -281,7 +281,7 @@ impl PgPackSnapshotMaterializer {
         {
             return Err(RefStoreError::Unsupported("materialized view exceeds its workspace bound"));
         }
-        match self.revalidate_serving(pool, &registered, native, deadline).await? {
+        match self.revalidate_serving(pool, &registered, capture_incarnation, native, deadline).await? {
             Some(view) => Ok(Some(view)),
             None => Err(RefStoreError::Database("serving read transaction cleanup left no view".into())),
         }
@@ -293,10 +293,15 @@ impl PgPackSnapshotMaterializer {
     /// recheck, but the returned value keeps the verified native view and the
     /// sealed [`VerifiedReadViewProof`] alive together. The proof is built by
     /// [`VerifiedReadView::of_materialized`], which accepts nothing but the
-    /// T2-completed [`MaterializedPackRead`] itself. A checked empty capture
-    /// still returns `Ok(None)`: no bytes, no proof. This is an internal
-    /// materialization proof only; no gateway route consumes it yet (the
-    /// `serving_proof` module docs list what a consumer must still enforce).
+    /// T2-completed [`MaterializedPackRead`] itself and reads the proof's
+    /// cluster incarnation back from that view's private, T2-sealed anchor (the
+    /// value T2 re-read `FOR SHARE` and compared with the capture). A restore
+    /// rotation between capture and T2 makes T2 refuse, so no view and no proof
+    /// exist; no caller can pass an incarnation in. A checked empty capture still
+    /// returns `Ok(None)`: no bytes, no proof (its anchor is kept only in the
+    /// opaque capture). This is an internal materialization proof only; no
+    /// gateway route consumes it yet (the `serving_proof` module docs list what
+    /// a consumer must still enforce).
     pub(crate) async fn materialize_serving_read_sealed(
         &self,
         pool: &Pool,
@@ -318,6 +323,7 @@ impl PgPackSnapshotMaterializer {
         &self,
         pool: &Pool,
         registered: &RegisteredServingRead,
+        capture_incarnation: Uuid,
         native: NativeReadClosure,
         deadline: Instant,
     ) -> Result<Option<MaterializedPackRead>, RefStoreError> {
@@ -326,7 +332,13 @@ impl PgPackSnapshotMaterializer {
         let result = async {
             let fresh = pg::before_deadline(
                 deadline,
-                revalidate_serving_capture(&tx, registered, self.store_identity.as_hex(), deadline),
+                revalidate_serving_capture(
+                    &tx,
+                    registered,
+                    capture_incarnation,
+                    self.store_identity.as_hex(),
+                    deadline,
+                ),
             )
             .await?;
             if fresh != registered.snapshot || fresh.materialization_digest() != registered.binding {
@@ -348,7 +360,10 @@ impl PgPackSnapshotMaterializer {
             Ok(fresh)
         }
         .await;
-        let sealed = result.map(|fresh| Some(MaterializedPackRead::sealed(fresh, native)));
+        // The view — and only this transient serving T2 path — keeps the anchor
+        // T2 just re-read `FOR SHARE` and compared with the capture. The proof
+        // factory later reads it back from here; no call site supplies it.
+        let sealed = result.map(|fresh| Some(MaterializedPackRead::sealed(fresh, native, Some(capture_incarnation))));
         let cleanup = match tokio::time::timeout_at(deadline, tx.rollback()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(RefStoreError::Database("serving read transaction cleanup failed".into())),
@@ -428,7 +443,10 @@ impl PgPackSnapshotMaterializer {
                     "materialized native closure binding differs from the revalidated read",
                 ));
             }
-            Ok(MaterializedPackRead::sealed(fresh, native))
+            // Legacy/history materialization takes no cluster authority row
+            // lock, so it can never carry a serving anchor: its view is
+            // unanchored and can never become a serving proof.
+            Ok(MaterializedPackRead::sealed(fresh, native, None))
         });
         // Bounded cleanup under the SAME absolute deadline. The sealed value is
         // returned only when cleanup succeeded; a timeout or a failed rollback
@@ -448,9 +466,17 @@ impl PgPackSnapshotMaterializer {
 
 /// Opaque owned materialized read view. Not `Clone`, not `Serialize`, no public
 /// constructor and no write/publish/serving capability.
+///
+/// `serving_incarnation` is the view's provenance, not a caller input. Only the
+/// transient serving T2 path — after `revalidate_serving_capture` locked
+/// `cluster_authority` `FOR SHARE` and compared the live incarnation with the
+/// capture's anchor — builds a view with `Some(anchor)`. Legacy/history
+/// materialization leaves it `None`, and an unanchored view can never become a
+/// serving proof.
 pub struct MaterializedPackRead {
     snapshot: PackReadSnapshot,
     native: NativeReadClosure,
+    serving_incarnation: Option<Uuid>,
 }
 
 /// Pure binding step of the sealed builder: the capture must be the very
@@ -459,11 +485,19 @@ pub struct MaterializedPackRead {
 /// [`VerifiedReadView::of_materialized`] re-checks against the snapshot's
 /// recomputed A5b materialization digest. The capture's digest alone is never a
 /// proof input.
+///
+/// The cluster incarnation is likewise not chosen here: the view must carry the
+/// very anchor its T2 compared (and the capture must still carry the same one),
+/// and [`VerifiedReadView::of_materialized`] reads that value back from the view
+/// itself — never from an argument — before sealing it.
 fn serving_materialization(
     view: MaterializedPackRead,
     capture: &ServingReadCapture,
 ) -> Result<MaterializedServingRead, RefStoreError> {
-    let (captured, binding) = capture.registered_parts()?;
+    let (captured, binding, anchor) = capture.registered_parts()?;
+    if view.serving_incarnation() != Some(anchor) {
+        return Err(RefStoreError::MetadataScopeMismatch("cluster authority incarnation"));
+    }
     if *view.snapshot() != captured {
         return Err(RefStoreError::MetadataScopeMismatch("materialized serving read is not its capture"));
     }
@@ -497,12 +531,17 @@ impl MaterializedServingRead {
 }
 
 /// Test-only: build the production view shape over a fixture snapshot and a
-/// stand-in native closure, so offline unit cases can drive the same pure step
-/// the materializer runs. Never reachable outside this crate's test builds.
+/// stand-in native closure, with an explicit fixed serving anchor
+/// (`None` models the unanchored legacy/history view). Never reachable outside
+/// this crate's test builds, and never a production seal input.
 #[cfg(test)]
-pub(crate) fn test_materialized_view(snapshot: PackReadSnapshot, native: NativeReadClosure) -> MaterializedPackRead {
+pub(crate) fn test_materialized_view(
+    snapshot: PackReadSnapshot,
+    native: NativeReadClosure,
+    serving_incarnation: Option<Uuid>,
+) -> MaterializedPackRead {
     assert_eq!(native.read_digest(), snapshot.materialization_digest(), "a test view must bind its own snapshot");
-    MaterializedPackRead::sealed(snapshot, native)
+    MaterializedPackRead::sealed(snapshot, native, serving_incarnation)
 }
 
 impl MaterializedPackRead {
@@ -511,8 +550,19 @@ impl MaterializedPackRead {
     /// cleanup. The view keeps the single source of truth (`native`); the public
     /// [`Self::read_digest_hex`] is derived from it, never stored separately, so
     /// the A5b binding cannot drift from the bytes it describes.
-    fn sealed(snapshot: PackReadSnapshot, native: NativeReadClosure) -> Self {
-        Self { snapshot, native }
+    ///
+    /// `serving_incarnation` is set by the caller that holds the T2 anchor lock
+    /// itself ([`Self::materialize_serving_read`]'s T2) and is `None` everywhere
+    /// else.
+    fn sealed(snapshot: PackReadSnapshot, native: NativeReadClosure, serving_incarnation: Option<Uuid>) -> Self {
+        Self { snapshot, native, serving_incarnation }
+    }
+
+    /// The cluster authority incarnation T2 locked `FOR SHARE` and compared with
+    /// the capture anchor, or `None` for a legacy/history view that never took
+    /// that lock. This is the only source the proof factory may seal from.
+    pub(in crate::ref_store) fn serving_incarnation(&self) -> Option<Uuid> {
+        self.serving_incarnation
     }
 
     pub(super) fn snapshot(&self) -> &PackReadSnapshot {

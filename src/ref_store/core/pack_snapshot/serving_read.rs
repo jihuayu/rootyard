@@ -40,6 +40,19 @@
 //! the final T2 recheck ([`super::PgPackSnapshotMaterializer::materialize_serving_read`])
 //! reacquires PostgreSQL under one absolute deadline.
 //!
+//! # Cluster authority anchor (#174)
+//!
+//! Both the capture and T2 read the global restore incarnation
+//! (`public.cluster_authority.incarnation`, migration 085) under `FOR SHARE` as
+//! the **first** statement of their short transaction (see
+//! `serving_read_sql::lock_cluster_incarnation`). The capture keeps that exact
+//! UUID in its opaque [`ServingReadCapture`] (registered and checked-empty
+//! alike); T2 locks and re-reads the singleton and refuses with
+//! `RefStoreError::MetadataScopeMismatch("cluster authority incarnation")` when
+//! it is no longer the captured value. A restore rotation between capture and T2
+//! therefore never yields a materialized view or a proof, and the newly rotated
+//! UUID is never attached to the old capture.
+//!
 //! # What it does not claim
 //!
 //! A capture is metadata only. It is not a Git read snapshot, not a byte proof,
@@ -93,8 +106,15 @@ pub struct PgServingReads;
 /// ([`Self::is_empty`]) or a complete registered-pack capture whose
 /// [`Self::registered_snapshot`] carries the real
 /// [`PackReadSnapshot::source_kind`] = [`super::ReadSnapshotSourceKind::ServingTransient`].
+///
+/// Every capture also keeps [`Self::capture_incarnation`]: the global cluster
+/// authority incarnation its capture transaction locked `FOR SHARE`. It is only
+/// ever set by the DB capture path (test fixtures pass an explicit fixed one),
+/// travels with the capture into T2, and — after T2 re-proved it — into the
+/// sealed proof.
 pub struct ServingReadCapture {
     inner: CaptureInner,
+    cluster_incarnation: Uuid,
 }
 
 enum CaptureInner {
@@ -119,6 +139,7 @@ pub(super) struct RegisteredServingRead {
 
 impl ServingReadCapture {
     fn empty(
+        cluster_incarnation: Uuid,
         scope: MetadataSnapshotScope,
         gate_revision: i64,
         gate_digest: String,
@@ -133,20 +154,36 @@ impl ServingReadCapture {
                 head_ref,
                 capture_digest,
             }),
+            cluster_incarnation,
         }
     }
 
-    /// Test-only registered capture of an already-built test snapshot; the
-    /// binding must be that snapshot's own A5b digest.
+    /// Test-only registered capture of an already-built test snapshot and an
+    /// explicit fixed cluster incarnation; the binding must be that snapshot's
+    /// own A5b digest.
     #[cfg(test)]
-    pub(super) fn for_test(snapshot: PackReadSnapshot, binding: RequestDigest) -> Self {
+    pub(super) fn for_test(snapshot: PackReadSnapshot, binding: RequestDigest, cluster_incarnation: Uuid) -> Self {
         debug_assert_eq!(binding, snapshot.materialization_digest());
-        Self { inner: CaptureInner::Registered(Box::new(RegisteredServingRead { snapshot, binding })) }
+        debug_assert!(!cluster_incarnation.is_nil());
+        Self {
+            inner: CaptureInner::Registered(Box::new(RegisteredServingRead { snapshot, binding })),
+            cluster_incarnation,
+        }
     }
 
-    fn registered(snapshot: PackReadSnapshot) -> Self {
+    fn registered(snapshot: PackReadSnapshot, cluster_incarnation: Uuid) -> Self {
         let binding = snapshot.materialization_digest();
-        Self { inner: CaptureInner::Registered(Box::new(RegisteredServingRead { snapshot, binding })) }
+        Self {
+            inner: CaptureInner::Registered(Box::new(RegisteredServingRead { snapshot, binding })),
+            cluster_incarnation,
+        }
+    }
+
+    /// The cluster authority incarnation this capture transaction locked and
+    /// read `FOR SHARE`; T2 must re-read exactly this value before any sealed
+    /// materialization exists.
+    pub(crate) fn capture_incarnation(&self) -> Uuid {
+        self.cluster_incarnation
     }
 
     /// A checked empty repository has no packs and therefore no byte protection
@@ -238,12 +275,16 @@ impl ServingReadCapture {
         }
     }
 
-    /// The registered snapshot (cloned) plus its complete A5b binding digest.
-    /// Used by the materializer, which must keep the capture alive so the caller
-    /// can release it after the local view is built.
-    pub(super) fn registered_parts(&self) -> Result<(PackReadSnapshot, RequestDigest), RefStoreError> {
+    /// The registered snapshot (cloned), its complete A5b binding digest and the
+    /// capture's cluster incarnation anchor (the value T2 compared and the only
+    /// incarnation a sealed proof may carry). Used by the materializer, which
+    /// must keep the capture alive so the caller can release it after the local
+    /// view is built.
+    pub(super) fn registered_parts(&self) -> Result<(PackReadSnapshot, RequestDigest, Uuid), RefStoreError> {
         match &self.inner {
-            CaptureInner::Registered(registered) => Ok((registered.snapshot.clone(), registered.binding)),
+            CaptureInner::Registered(registered) => {
+                Ok((registered.snapshot.clone(), registered.binding, self.cluster_incarnation))
+            }
             CaptureInner::Empty(_) => Err(RefStoreError::Unsupported(
                 "an empty serving read capture has no registered pack bytes to materialize",
             )),
@@ -453,9 +494,19 @@ async fn capture_checked(
     deadline: Instant,
 ) -> Result<ServingReadCapture, RefStoreError> {
     pg::bound(tx, deadline).await?;
+    // (0) The global restore incarnation is read first, before the unlocked
+    // shape peek and before any repository/gate/usage lock, so restore's
+    // singleton `UPDATE` is this capture's only conflicting writer and the
+    // capture anchor is the incarnation every later read in this short
+    // transaction is ordered against.
+    let cluster_incarnation = serving_read_sql::lock_cluster_incarnation(tx).await?;
     match serving_read_sql::peek_pack_mode(tx, scope.repository_id()).await? {
-        PackMode::MetadataOnly => capture_empty(tx, scope, backend_identity_hex, deadline).await,
-        PackMode::PackVerified => capture_registered(tx, scope, backend_identity_hex, lease_seconds, deadline).await,
+        PackMode::MetadataOnly => {
+            capture_empty(tx, cluster_incarnation, scope, backend_identity_hex, deadline).await
+        }
+        PackMode::PackVerified => {
+            capture_registered(tx, cluster_incarnation, scope, backend_identity_hex, lease_seconds, deadline).await
+        }
     }
 }
 
@@ -465,6 +516,7 @@ async fn capture_checked(
 /// capture, never a fabricated [`PackReadSnapshot`].
 async fn capture_empty(
     tx: &Transaction<'_>,
+    cluster_incarnation: Uuid,
     scope: &MetadataSnapshotScope,
     backend_identity_hex: &str,
     deadline: Instant,
@@ -488,7 +540,14 @@ async fn capture_empty(
     let head_ref = gate.head_ref().as_str().to_owned();
     let capture_digest =
         serving_empty_capture_digest(scope, backend_identity_hex, gate.revision(), &gate.digest().as_hex(), &head_ref);
-    Ok(ServingReadCapture::empty(*scope, gate.revision(), gate.digest().as_hex(), head_ref, capture_digest))
+    Ok(ServingReadCapture::empty(
+        cluster_incarnation,
+        *scope,
+        gate.revision(),
+        gate.digest().as_hex(),
+        head_ref,
+        capture_digest,
+    ))
 }
 
 /// A `pack_verified` capture: bounded transient admission, then the same atomic
@@ -497,6 +556,7 @@ async fn capture_empty(
 /// descriptors a future GC enumerates.
 async fn capture_registered(
     tx: &Transaction<'_>,
+    cluster_incarnation: Uuid,
     scope: &MetadataSnapshotScope,
     backend_identity_hex: &str,
     lease_seconds: i64,
@@ -603,7 +663,7 @@ async fn capture_registered(
         logical_bytes,
         expires_at_unix_micros,
     })?;
-    Ok(ServingReadCapture::registered(snapshot))
+    Ok(ServingReadCapture::registered(snapshot, cluster_incarnation))
 }
 
 /// Source-kind-specific T2 for a registered serving read capture.
@@ -611,6 +671,9 @@ async fn capture_registered(
 /// It runs in the caller's (materializer-owned) short transaction, holds the
 /// transient pin row `FOR SHARE` and re-proves everything the capture proved:
 ///
+/// * the global cluster authority incarnation: the singleton is locked `FOR
+///   SHARE` first and must still be exactly the capture's anchor, otherwise a
+///   typed scope mismatch is returned before any other statement;
 /// * the current strict serving authority (repository lane, ready binding,
 ///   captured realm and the live Blob backend digest of the store the
 ///   materializer actually holds) — a history-incarnation/authority/group epoch
@@ -626,6 +689,7 @@ async fn capture_registered(
 pub(super) async fn revalidate_serving_capture(
     tx: &Transaction<'_>,
     registered: &RegisteredServingRead,
+    capture_incarnation: Uuid,
     backend_identity_hex: &str,
     deadline: Instant,
 ) -> Result<PackReadSnapshot, RefStoreError> {
@@ -635,6 +699,16 @@ pub(super) async fn revalidate_serving_capture(
     let pin_id = expected.pin_id();
     let generation = expected.pin_generation();
     let repository_id = scope.repository_id();
+
+    // (0) The restore incarnation is locked and compared first, before any
+    // repository/pin/gate lock, in the same global lock order as the capture.
+    // `pg::bound` above only sets this transaction's lock/statement budget; it
+    // locks no row, so this is still the first row lock taken. A rotation
+    // between capture and T2 refuses here; the rotated UUID is never read out
+    // and attached to the old capture.
+    if serving_read_sql::lock_cluster_incarnation(tx).await? != capture_incarnation {
+        return Err(RefStoreError::MetadataScopeMismatch("cluster authority incarnation"));
+    }
 
     // (1) Same live strict serving realm (gate `FOR SHARE`, no refs write can
     // interleave with this check) and the same live physical backend.

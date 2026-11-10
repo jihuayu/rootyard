@@ -53,18 +53,28 @@ impl super::VerifiedReadViewProof {
     pub(crate) fn contract_scope(&self) -> super::ProvenScope {
         self.scope
     }
+
+    /// The cluster authority incarnation the proof sealed.
+    pub(crate) fn contract_cluster_incarnation(&self) -> uuid::Uuid {
+        self.cluster_incarnation()
+    }
 }
 
 impl MaterializedServingRead {
     /// `(proof gate revision, proof realm, proof A5b binding)`.
     pub(crate) fn contract_parts(&self) -> (i64, super::ProvenScope, RequestDigest) {
-        (self.proof().gate_revision(), self.proof().contract_scope(), self.proof().contract_binding())
+        (
+            self.proof().gate_revision(),
+            self.proof().contract_scope(),
+            self.proof().contract_binding(),
+        )
     }
 
     /// The same factory the materializer's seal site uses, re-run over the
     /// sealed view: a contract case can therefore prove that the view and its
-    /// proof bind the identical A5b materialization digest, and that the
-    /// factory refuses again if the two could ever disagree.
+    /// proof bind the identical A5b materialization digest and the same
+    /// cluster incarnation, which the factory reads back from the view itself.
+    /// There is deliberately no way to re-run it with a chosen incarnation.
     pub(crate) fn contract_refactory(&self) -> Result<super::VerifiedReadView, RefStoreError> {
         super::VerifiedReadView::of_materialized(self.view())
     }

@@ -24,12 +24,13 @@
 //!   `verify_refs` before a proof may describe an encoded response, run the
 //!   final authorization and the cluster incarnation fence, restore the
 //!   incarnation and only then seal/issue.
-//! * [`ProvenScope`] has no cluster incarnation, so it cannot by itself pin a
-//!   token to one cluster authority: the issuer
+//! * The proof carries the cluster authority incarnation its capture locked
+//!   `FOR SHARE` (migration 085) and its T2 re-checked exactly, but an issuer
 //!   ([`crate::blob_git_gateway::repo_session`]) still needs a pre-capture
-//!   authorization bound to the incarnation and a post-response final fence in
-//!   the same incarnation (short ordered transactions, pool max 1). None of
-//!   that is implemented here.
+//!   authorization in that incarnation, the final authorization and the
+//!   post-response cluster-incarnation fence (short ordered transactions, pool
+//!   max 1) before a token may be issued. None of that is implemented here, and
+//!   a proof never makes an incarnation current again after a restore.
 //!
 //! # Construction
 //!
@@ -41,8 +42,13 @@
 //! turned into a proof, not even from a sibling module of this crate. The view
 //! keeps its own A5b binding and the proof is sealed on exactly that value, and
 //! only when it equals the snapshot's recomputed A5b materialization digest.
-//! Test code uses separate `cfg(test)` helpers; they never feed a production
-//! seal site.
+//! The cluster incarnation is likewise not a caller input: the factory takes no
+//! UUID at all and reads the anchor out of the view itself. Only the transient
+//! serving T2 path builds a view with that anchor, after it locked
+//! `cluster_authority` `FOR SHARE` and compared the live incarnation with the
+//! capture; a legacy/history view is unanchored and is refused. Test code uses
+//! separate `cfg(test)` helpers that supply a fixed anchor only in test builds;
+//! they never feed a production seal site.
 
 /// Crate-private read-only accessors for the `cfg(test)` contract suite that
 /// lives in the sibling `materialize::serving_tests` subtree; never compiled
@@ -66,6 +72,7 @@ pub(crate) struct VerifiedReadView {
     gate_revision: i64,
     scope: ProvenScope,
     binding: RequestDigest,
+    cluster_incarnation: Uuid,
 }
 
 impl VerifiedReadView {
@@ -76,8 +83,13 @@ impl VerifiedReadView {
     /// closure's digest T2 compared with its own recomputation, and that binding
     /// must equal the A5b materialization digest recomputed from the view's
     /// snapshot. Nothing else is accepted: there is no other factory, and the
-    /// view keeps its native closure and its snapshot together, so its binding
-    /// can neither be chosen by a caller nor drift from the snapshot.
+    /// view keeps its native closure, its snapshot and its provenance together,
+    /// so neither its binding nor its cluster incarnation can be chosen by a
+    /// caller or drift from the snapshot.
+    ///
+    /// The incarnation is read back from the view's private anchor, which only
+    /// the serving T2 path sets (the value it locked `FOR SHARE` and compared
+    /// with the capture). An unanchored view, or a nil anchor, is refused.
     pub(crate) fn of_materialized(view: &MaterializedPackRead) -> Result<Self, RefStoreError> {
         let snapshot = view.snapshot();
         if snapshot.complete_transient_pack_read().is_none() {
@@ -89,12 +101,27 @@ impl VerifiedReadView {
         if snapshot.materialization_digest() != binding {
             return Err(RefStoreError::MetadataScopeMismatch("serving proof binding"));
         }
-        Ok(Self { gate_revision: snapshot.gate_revision(), scope: ProvenScope::of(snapshot.scope()), binding })
+        let cluster_incarnation = match view.serving_incarnation() {
+            Some(cluster_incarnation) if !cluster_incarnation.is_nil() => cluster_incarnation,
+            Some(_) => return Err(RefStoreError::MetadataScopeMismatch("cluster authority incarnation")),
+            None => return Err(RefStoreError::Unsupported("serving proof requires a T2-anchored view")),
+        };
+        Ok(Self {
+            gate_revision: snapshot.gate_revision(),
+            scope: ProvenScope::of(snapshot.scope()),
+            binding,
+            cluster_incarnation,
+        })
     }
 
     /// Consume the view into the sealed proof. Only the materializer calls it.
     pub(super) fn seal(self) -> VerifiedReadViewProof {
-        VerifiedReadViewProof { gate_revision: self.gate_revision, scope: self.scope, binding: self.binding }
+        VerifiedReadViewProof {
+            gate_revision: self.gate_revision,
+            scope: self.scope,
+            binding: self.binding,
+            cluster_incarnation: self.cluster_incarnation,
+        }
     }
 }
 
@@ -109,10 +136,14 @@ pub struct VerifiedReadViewProof {
     scope: ProvenScope,
     /// The A5b materialization digest the native view was verified against.
     binding: RequestDigest,
+    /// The global cluster authority incarnation the capture locked `FOR SHARE`
+    /// and T2 re-read identically; never a freshly rotated value.
+    cluster_incarnation: Uuid,
 }
 
 /// The captured realm, copied out of the sealed snapshot. Deliberately has no
-/// cluster incarnation (see the module docs).
+/// cluster incarnation: the incarnation anchor is sealed next to the scope, not
+/// inside it, so it can only come from the T2-compared capture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProvenScope {
     repository_id: Uuid,
@@ -167,7 +198,15 @@ impl VerifiedReadViewProof {
         self.gate_revision
     }
 
-    /// Consume the proof into its verified gate revision and realm.
+    /// The cluster authority incarnation the capture locked and T2 re-proved.
+    /// Crate-private: only gateway code in this crate may compare it, and only
+    /// by equality with the live singleton.
+    pub(crate) fn cluster_incarnation(&self) -> Uuid {
+        self.cluster_incarnation
+    }
+
+    /// Consume the proof into its verified gate revision and realm. The cluster
+    /// incarnation stays behind [`Self::cluster_incarnation`].
     pub(crate) fn into_parts(self) -> (i64, ProvenScope) {
         (self.gate_revision, self.scope)
     }
@@ -178,7 +217,10 @@ impl MaterializedPackRead {
     /// transient serving read whose A5b binding is `binding`: never a retained
     /// A5a snapshot, a `metadata_only` shape, or a view the native closure did
     /// not cover. The binding is compared with the full A5b materialization
-    /// digest, not the narrower A5a read digest.
+    /// digest, not the narrower A5a read digest. The returned probe scope never
+    /// becomes a proof: the real seal site goes through
+    /// [`VerifiedReadView::of_materialized`], which additionally requires the
+    /// view's own T2-sealed incarnation anchor.
     #[cfg(test)]
     pub(crate) fn verified_read_scope(&self, binding: &RequestDigest) -> Option<ProvenScope> {
         self.snapshot()

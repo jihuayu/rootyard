@@ -25,7 +25,14 @@
 //!   while the verified native view (with its packs) stays alive next to it;
 //! * the sealed view re-proves through the same factory on that A5b binding;
 //! * a checked empty capture seals to `Ok(None)` through the sealed builder: no
-//!   bytes, no proof.
+//!   bytes, no proof, while still carrying the current non-nil cluster authority
+//!   incarnation as its anchor;
+//! * the sealed proof carries exactly the cluster authority incarnation the
+//!   capture locked and its T2 re-read identically (the view's own anchor, which
+//!   no caller can supply), and rotating `cluster_authority.incarnation` between
+//!   capture and T2 (the same `UPDATE` effect the restore rotation runs) makes
+//!   the sealed builder refuse with no view and no proof, after which the
+//!   transient pin is still released.
 //!
 //! What they do not prove: that any HTTP response was served. The proof is an
 //! internal materialization proof and no gateway route consumes it.
@@ -41,7 +48,6 @@ mod serving_support;
 
 use self::serving_reads_support::{ensure_migration_146, operation_deadline, provision_ready};
 use self::serving_support::{actor, Fixture};
-use super::super::ServingReadCapture;
 use super::PgPackSnapshotMaterializer;
 use crate::blob_store::config::BlobProfile;
 use crate::blob_store::opendal::BlobStore;
@@ -56,7 +62,7 @@ use crate::ref_store::core::pack_commit::{
     PackCommitScope, PackMembershipEntry, PackPendingToken, PackRegistrationRequest, PgAuthorizedCommit, PgPackCommit,
     PlannedArtifact, PlannedPack, PrepareOutcome, PreparedPublication, VerifiedAuthorizedPublication,
 };
-use crate::ref_store::core::pack_snapshot::{probe_a5a, PgServingReads};
+use crate::ref_store::core::pack_snapshot::{PgServingReads, probe_a5a};
 use crate::ref_store::core::{CommitMode, PgRefStoreCore};
 use crate::ref_store::{
     CoreGateVersion, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, OperationIdentity, RefName, RefPrecondition,
@@ -66,6 +72,7 @@ use anyhow::{anyhow, ensure, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use rootyard::ref_store::core::pack_snapshot::ServingReadCapture;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -397,115 +404,6 @@ async fn protected_pack_count(fixture: &Fixture, pin_id: Uuid) -> Result<i64> {
         .get(0))
 }
 
-/// The production builder, the sealed proof and the surviving native view.
-#[tokio::test]
-#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, the production Blob profile and native git"]
-async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    // `Option` because the failure sits inside an `async` block that must return
-    // one type; the early `?` below leaves it as `None`.
-    let (outcome, release) = async {
-        ensure_migration_146(&fixture).await?;
-        let owner = actor(&fixture.pool, false).await?;
-        let repo = provision_ready(&fixture, &owner.identity, "serving-proof-native").await?;
-        let store = open_store()?;
-        let format = repo.ready.object_format;
-        let git = git_binary()?;
-        let source = GitRepo::new(git.clone(), format).await?;
-        let commit_oid = source.build_commit("file.txt", b"serving proof fixture\n", "serving proof main").await?;
-        source.update_ref("refs/heads/main", &commit_oid).await?;
-        let files = source.pack_all("first").await?;
-        let gate = gate_version(&fixture.pool, repo.ready.repository_id, repo.ready.tenant_id).await?;
-        commit_first_pack(
-            &fixture,
-            &store,
-            repo.ready.tenant_id,
-            repo.ready.owner_id,
-            repo.ready.repository_id,
-            gate,
-            &git,
-            &owner.identity,
-            vec![main_update(format, &commit_oid)?],
-            &files,
-        )
-        .await?;
-        let mode: String = fixture
-            .pool
-            .get()
-            .await?
-            .query_one(
-                "SELECT pack_mode FROM ref_store_core_gates WHERE repository_id=$1",
-                &[&repo.ready.repository_id],
-            )
-            .await?
-            .get(0);
-        ensure!(mode == "pack_verified", "the authorized commit must advance the gate to pack_verified, got {mode}");
-
-        let scope = repo.ready.scope()?;
-        let reads = PgServingReads;
-        let capture = reads.capture(&fixture.pool, &scope, &repo.backend, LEASE_SECONDS, operation_deadline()).await?;
-        let prepared = (|| {
-            ensure!(!capture.is_empty(), "a pack_verified gate with one registered pack must not capture as empty");
-            let (snapshot, binding) = capture.registered_parts()?;
-            let a5a = probe_a5a(&snapshot);
-            Ok::<_, anyhow::Error>((binding, a5a))
-        })();
-        let outcome = async {
-            let (binding, a5a) = prepared?;
-            let materializer: PgPackSnapshotMaterializer = repo.materializer()?;
-            let sealed =
-                materializer.materialize_serving_read_sealed(&fixture.pool, &capture, operation_deadline()).await;
-            let sealed = match sealed {
-                Ok(Some(sealed)) => sealed,
-                Ok(None) => return Err(anyhow!("non-empty capture sealed to Ok(None)")),
-                Err(error) => return Err(anyhow!("the production sealed builder refused a real capture: {error}")),
-            };
-            let view = sealed.view();
-            let (proof_revision, proven, proof_binding) = sealed.contract_parts();
-            let capture_pin = capture
-                .pin_id()
-                .ok_or_else(|| anyhow!("the non-empty capture must carry a pin id"))?;
-            let expected_packs = protected_pack_count(&fixture, capture_pin).await?;
-            ensure!(expected_packs > 0, "the capture must register at least one pack");
-            ensure!(view.pack_count() == expected_packs, "the sealed view must expose every captured pack");
-            ensure!(view.verified_pairs() == 1, "the sealed view must cover one native-verified pair");
-            ensure!(
-                proof_revision == view.gate_revision() && proof_revision > repo.ready.gate_revision,
-                "the proof must state the captured (post commit) gate revision"
-            );
-            ensure!(proof_binding == binding, "the proof must carry the capture's A5b binding");
-            ensure!(view.read_digest_hex() == binding.as_hex(), "the view's A5b binding is its native digest");
-            ensure!(
-                a5a.as_hex() != proof_binding.as_hex(),
-                "the A5a read digest must never be mistaken for the A5b binding"
-            );
-            ensure!(
-                proven.contract_tenant_id() == repo.ready.tenant_id
-                    && proven.contract_repository_id() == repo.ready.repository_id
-                    && proven.contract_object_format() == format
-                    && proven.contract_history_incarnation() == repo.ready.history_incarnation
-                    && proven.contract_authority_epoch() == repo.ready.authority_epoch
-                    && proven.contract_group_epoch() == repo.ready.group_epoch,
-                "the proof realm must be the capture realm"
-            );
-            ensure!(view.verified_read_scope(&binding).is_some(), "the view must prove the same A5b binding");
-            ensure!(view.verified_read_scope(&a5a).is_none(), "the view must never prove the narrower A5a read digest");
-            sealed.contract_refactory()?;
-            Ok(())
-        }
-        .await;
-        Ok::<_, anyhow::Error>((outcome, Some((reads, capture))))
-    }
-    .await?;
-    if let Some((reads, capture)) = &release {
-        let released = reads.release(&fixture.pool, capture, operation_deadline()).await;
-        fixture.teardown().await?;
-        outcome?;
-        released.map_err(|error| anyhow!("serving read release failed: {error}"))?;
-    }
-    Ok(())
-}
-
 /// Names the production Blob profile's root prefix to this case alone. The guard
 /// restores the previous value on exit; the empty case downloads nothing.
 struct BlobRootIsolation(Option<std::ffi::OsString>);
@@ -533,34 +431,285 @@ impl Drop for BlobRootIsolation {
     }
 }
 
+/// The current global cluster authority incarnation (migration 085).
+async fn current_incarnation(fixture: &Fixture) -> Result<Uuid> {
+    Ok(fixture
+        .pool
+        .get()
+        .await?
+        .query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
+        .await?
+        .get(0))
+}
+
+/// Rotate the singleton exactly as the restore rotation
+/// (`src/backup/authority::fence`) does and return the freshly committed value.
+async fn rotate_incarnation(fixture: &Fixture) -> Result<Uuid> {
+    let rotated: Uuid = fixture
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "UPDATE public.cluster_authority SET incarnation=gen_random_uuid(),rotated_at=clock_timestamp()
+             WHERE singleton=true RETURNING incarnation",
+            &[],
+        )
+        .await?
+        .get(0);
+    ensure!(!rotated.is_nil(), "a rotation must never commit a nil incarnation");
+    Ok(rotated)
+}
+
+/// A real-PostgreSQL `metadata_only` repository with a real owner, for the
+/// captured-but-refused cases that still need a transient pin row.
+async fn provision_empty_repository(fixture: &Fixture, name: &str) -> Result<RepoFixture> {
+    ensure_migration_146(fixture).await?;
+    let owner = actor(&fixture.pool, false).await?;
+    provision_ready(fixture, &owner.identity, name).await
+}
+
+/// Make one registered pack + one ref through the real authorized pipeline, so
+/// a subsequent capture is a real non-empty `pack_verified` serving read.
+async fn provision_verified_pack(fixture: &Fixture, repo: &RepoFixture) -> Result<()> {
+    let store = open_store()?;
+    let format = repo.ready.object_format;
+    let git = git_binary()?;
+    let owner = actor(&fixture.pool, false).await?;
+    let source = GitRepo::new(git.clone(), format).await?;
+    let commit_oid = source.build_commit("file.txt", b"serving proof fixture\n", "serving proof main").await?;
+    source.update_ref("refs/heads/main", &commit_oid).await?;
+    let files = source.pack_all("first").await?;
+    let gate = gate_version(&fixture.pool, repo.ready.repository_id, repo.ready.tenant_id).await?;
+    commit_first_pack(
+        fixture,
+        &store,
+        repo.ready.tenant_id,
+        repo.ready.owner_id,
+        repo.ready.repository_id,
+        gate,
+        &git,
+        &owner.identity,
+        vec![main_update(format, &commit_oid)?],
+        &files,
+    )
+    .await?;
+    let mode: String = fixture
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT pack_mode FROM ref_store_core_gates WHERE repository_id=$1",
+            &[&repo.ready.repository_id],
+        )
+        .await?
+        .get(0);
+    ensure!(mode == "pack_verified", "the authorized commit must advance the gate to pack_verified, got {mode}");
+    Ok(())
+}
+
+/// Seal one real non-empty capture and run `check` inside the pin window, then
+/// release the transient pin on **every** exit path and tear the fixture down
+/// before returning the check's own outcome.
+async fn with_sealed_capture<F, Fut>(fixture: &Fixture, repo: &RepoFixture, check: F) -> Result<()>
+where
+    F: FnOnce(ServingReadCapture) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let scope = repo.ready.scope()?;
+    let reads = PgServingReads;
+    let capture = reads.capture(&fixture.pool, &scope, &repo.backend, LEASE_SECONDS, operation_deadline()).await?;
+    let result = check(capture).await;
+    let released = reads.release(&fixture.pool, &capture, operation_deadline()).await;
+    fixture.teardown().await?;
+    result?;
+    released.map_err(|error| anyhow!("serving read release failed: {error}"))
+}
+
+/// The production builder, the sealed proof and the surviving native view.
 #[tokio::test]
-#[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the production Blob profile"]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, the production Blob profile and native git"]
+async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let provisioned = async {
+        let repo = provision_empty_repository(&fixture, "serving-proof-native").await?;
+        provision_verified_pack(&fixture, &repo).await?;
+        Ok::<_, anyhow::Error>(repo)
+    }
+    .await;
+    let repo = match provisioned {
+        Ok(repo) => repo,
+        Err(error) => {
+            fixture.teardown().await?;
+            return Err(error);
+        }
+    };
+    with_sealed_capture(&fixture, &repo, |capture| async {
+        ensure!(!capture.is_empty(), "a pack_verified gate with one registered pack must not capture as empty");
+        let (snapshot, binding) = capture.registered_parts()?;
+        let a5a = probe_a5a(&snapshot);
+        let captured_incarnation = capture.capture_incarnation();
+        ensure!(!captured_incarnation.is_nil(), "the capture anchor must be a non-nil incarnation");
+        ensure!(
+            captured_incarnation == current_incarnation(&fixture).await?,
+            "the capture anchor must be the current cluster authority incarnation"
+        );
+        let materializer: PgPackSnapshotMaterializer = repo.materializer()?;
+        let sealed =
+            match materializer.materialize_serving_read_sealed(&fixture.pool, &capture, operation_deadline()).await {
+                Ok(Some(sealed)) => sealed,
+                Ok(None) => return Err(anyhow!("non-empty capture sealed to Ok(None)")),
+                Err(error) => return Err(anyhow!("the production sealed builder refused a real capture: {error}")),
+            };
+        let view = sealed.view();
+        ensure!(
+            view.serving_incarnation() == Some(captured_incarnation),
+            "the sealed view must carry exactly the T2-compared capture anchor"
+        );
+        let (proof_revision, proven, proof_binding) = sealed.contract_parts();
+        let capture_pin = capture.pin_id().ok_or_else(|| anyhow!("the non-empty capture must carry a pin id"))?;
+        let expected_packs = protected_pack_count(&fixture, capture_pin).await?;
+        ensure!(expected_packs > 0, "the capture must register at least one pack");
+        ensure!(view.pack_count() == expected_packs, "the sealed view must expose every captured pack");
+        ensure!(view.verified_pairs() == 1, "the sealed view must cover one native-verified pair");
+        ensure!(
+            proof_revision == view.gate_revision() && proof_revision > repo.ready.gate_revision,
+            "the proof must state the captured (post commit) gate revision"
+        );
+        ensure!(proof_binding == binding, "the proof must carry the capture's A5b binding");
+        ensure!(view.read_digest_hex() == binding.as_hex(), "the view's A5b binding is its native digest");
+        ensure!(
+            a5a.as_hex() != proof_binding.as_hex(),
+            "the A5a read digest must never be mistaken for the A5b binding"
+        );
+        ensure!(
+            proven.contract_tenant_id() == repo.ready.tenant_id
+                && proven.contract_repository_id() == repo.ready.repository_id
+                && proven.contract_object_format() == repo.ready.object_format
+                && proven.contract_history_incarnation() == repo.ready.history_incarnation
+                && proven.contract_authority_epoch() == repo.ready.authority_epoch
+                && proven.contract_group_epoch() == repo.ready.group_epoch,
+            "the proof realm must be the capture realm"
+        );
+        ensure!(
+            sealed.proof().contract_cluster_incarnation() == captured_incarnation,
+            "the proof must carry exactly the capture's cluster authority incarnation"
+        );
+        ensure!(view.verified_read_scope(&binding).is_some(), "the view must prove the same A5b binding");
+        ensure!(view.verified_read_scope(&a5a).is_none(), "the view must never prove the narrower A5a read digest");
+        // The factory reads the incarnation back from the view: re-running it
+        // over the sealed view reproduces exactly that T2-bound anchor.
+        let refactory = sealed.contract_refactory()?;
+        ensure!(
+            refactory.contract_cluster_incarnation() == captured_incarnation,
+            "the proof incarnation must be fixed to the view's T2-bound anchor"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// A restore rotation between capture and T2 must refuse before any view or
+/// proof exists, and the transient pin must still be released afterwards.
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, the production Blob profile and native git"]
+async fn a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materialization() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let provisioned = async {
+        let repo = provision_empty_repository(&fixture, "serving-proof-rotation").await?;
+        provision_verified_pack(&fixture, &repo).await?;
+        Ok::<_, anyhow::Error>(repo)
+    }
+    .await;
+    let repo = match provisioned {
+        Ok(repo) => repo,
+        Err(error) => {
+            fixture.teardown().await?;
+            return Err(error);
+        }
+    };
+    with_sealed_capture(&fixture, &repo, |capture| async {
+        ensure!(!capture.is_empty(), "the rotation case needs a real non-empty capture");
+        let captured_incarnation = capture.capture_incarnation();
+        let pin_id = capture.pin_id().ok_or_else(|| anyhow!("the non-empty capture must carry a pin id"))?;
+        // The restore rotation runs while Blob/native IO is in flight, i.e.
+        // between the capture and T2.
+        let rotated = rotate_incarnation(&fixture).await?;
+        ensure!(rotated != captured_incarnation, "the rotation must change the incarnation");
+        ensure!(
+            current_incarnation(&fixture).await? == rotated,
+            "the rotation must be committed before the sealed builder runs"
+        );
+        let materializer: PgPackSnapshotMaterializer = repo.materializer()?;
+        let refused = materializer.materialize_serving_read_sealed(&fixture.pool, &capture, operation_deadline()).await;
+        match refused {
+            Err(RefStoreError::MetadataScopeMismatch(field)) => {
+                ensure!(field == "cluster authority incarnation", "the refusal must name the incarnation, got {field}");
+            }
+            Err(error) => {
+                return Err(anyhow!("a rotated incarnation must be a typed incarnation refusal, got {error}"))
+            }
+            Ok(None) => return Err(anyhow!("a non-empty capture must never seal to Ok(None)")),
+            Ok(Some(_)) => return Err(anyhow!("a rotated incarnation must never produce a sealed view or proof")),
+        }
+        // The refused capture's pin is still exactly the one that must be
+        // released, and its anchor never becomes the rotated value.
+        ensure!(capture.pin_id() == Some(pin_id), "the refused capture must keep its own pin identity");
+        ensure!(capture.capture_incarnation() == captured_incarnation, "the capture anchor must not be rewritten");
+        Ok(())
+    })
+    .await
+}
+
+/// The checked-empty capture still carries the current non-nil incarnation as
+/// its anchor, seals to `Ok(None)` (no bytes, no proof) before and after a
+/// rotation, and releases without owning a row.
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, the production Blob profile and native git"]
 async fn sealed_materialization_returns_none_for_a_checked_empty_capture() -> Result<()> {
     let _blob_root = BlobRootIsolation::new();
     let fixture = Fixture::new().await?;
     let outcome = async {
-        ensure_migration_146(&fixture).await?;
-        let owner = actor(&fixture.pool, false).await?;
-        let repo = provision_ready(&fixture, &owner.identity, "serving-proof-empty").await?;
+        let repo = provision_empty_repository(&fixture, "serving-proof-empty").await?;
+        let current = current_incarnation(&fixture).await?;
+        ensure!(!current.is_nil(), "the cluster authority incarnation must never be nil");
         let scope = repo.ready.scope()?;
         let reads = PgServingReads;
         let capture = reads.capture(&fixture.pool, &scope, &repo.backend, LEASE_SECONDS, operation_deadline()).await?;
         ensure!(capture.is_empty(), "a metadata_only repository must capture as empty");
+        ensure!(capture.capture_incarnation() == current, "the empty capture anchor must be the current incarnation");
         let materializer: PgPackSnapshotMaterializer = repo.materializer()?;
-        let sealed = materializer.materialize_serving_read_sealed(&fixture.pool, &capture, operation_deadline()).await;
-        let result = match sealed {
+        let result =
+            match materializer.materialize_serving_read_sealed(&fixture.pool, &capture, operation_deadline()).await {
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => Err(anyhow!("an empty capture must never seal a proof")),
+                Err(RefStoreError::Unsupported(reason)) => {
+                    Err(anyhow!("an empty capture must seal to Ok(None), not a refusal: {reason}"))
+                }
+                Err(error) => Err(anyhow!("an empty capture must seal to Ok(None): {error}")),
+            };
+        // A restore rotation does not turn the (byte-less) empty observation
+        // into a proof either; the capture keeps its original anchor.
+        let rotated = rotate_incarnation(&fixture).await?;
+        ensure!(capture.capture_incarnation() == current, "the empty capture anchor must never be rewritten");
+        ensure!(rotated != current, "the rotation must change the incarnation");
+        let after_rotation =
+            materializer.materialize_serving_read_sealed(&fixture.pool, &capture, operation_deadline()).await;
+        let after = match after_rotation {
             Ok(None) => Ok(()),
-            Ok(Some(_)) => Err(anyhow!("an empty capture must never seal a proof")),
-            Err(RefStoreError::Unsupported(reason)) => {
-                Err(anyhow!("an empty capture must seal to Ok(None), not a refusal: {reason}"))
-            }
-            Err(error) => Err(anyhow!("an empty capture must seal to Ok(None): {error}")),
+            Ok(Some(_)) => Err(anyhow!("a rotated empty capture must never seal a proof")),
+            Err(error) => Err(anyhow!("a rotated empty capture must still seal to Ok(None): {error}")),
         };
         let released = reads.release(&fixture.pool, &capture, operation_deadline()).await;
+        // Teardown must run on every path (an empty capture owns no row, so the
+        // release below only has to be acknowledged).
+        fixture.teardown().await?;
         result?;
+        after?;
         released.map_err(|error| anyhow!("serving read release failed: {error}"))
     }
     .await;
-    fixture.teardown().await?;
+    if outcome.is_err() {
+        fixture.teardown().await?;
+    }
     outcome
 }

@@ -12,9 +12,12 @@
 //! response was served: a later task must, in the gateway, copy packs/index,
 //! check checksums and `verify_refs`, fully encode the body, run the final
 //! authorization and the cluster-incarnation fence, restore the incarnation
-//! and only then seal/issue. The proof's realm has no cluster incarnation, so
-//! "response and token share the same PG snapshot/final fence" is a consumer
-//! requirement that is still unimplemented here.
+//! and only then seal/issue. The proof carries the cluster authority
+//! incarnation its capture locked `FOR SHARE` (migration 085) and its T2
+//! re-read identically, but a restore rotation between capture and T2 refuses
+//! with no view and no proof; "response and token share the same PG
+//! snapshot/final fence" remains a consumer requirement that is unimplemented
+//! here.
 //!
 //! `snapshot::build_view` still materializes through the unsealed
 //! [`PgPackSnapshotMaterializer::materialize_serving_read`]; dead code remains
@@ -29,7 +32,9 @@
 //! repository A5a quota is unchanged. [`ServingReadCapture`] is opaque and
 //! either a checked empty-repository observation or a real [`PackReadSnapshot`]
 //! with [`ReadSnapshotSourceKind::ServingTransient`]; the materializer routes
-//! that source kind to the migration-146 T2 recheck.
+//! that source kind to the migration-146 T2 recheck. Both shapes also keep the
+//! cluster authority incarnation the capture locked first (see
+//! `serving_read`), and T2 refuses when it moved.
 //!
 //! A5a: atomic, durable, complete **registered pack membership** snapshot plus a
 //! durable pin and permanent historical receipts (#107 foundation).
