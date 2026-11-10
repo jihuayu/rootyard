@@ -259,8 +259,19 @@ def _reap_owned(child, window=5.0):
     """
     group = child.pid  # start_new_session made the leader's pid its PGID
     linux = _proc_available()
+    census_ok = False
     try:
-        if not linux or _group_members(group) or child.poll() is None:
+        if linux:
+            try:
+                members = _group_members(group)
+                census_ok = True
+            except Exception:
+                # Unreadable or malformed /proc entry: the census cannot prove
+                # an empty group, but the known run-owned group is still killed.
+                members = None
+        else:
+            members = None
+        if not linux or members is None or members or child.poll() is None:
             os.killpg(group, 9)
     except ProcessLookupError:
         pass
@@ -270,11 +281,16 @@ def _reap_owned(child, window=5.0):
         return False
     if not linux:
         return True
-    deadline = time.monotonic() + window
-    while _group_members(group):
-        if time.monotonic() > deadline:
-            return False
-        time.sleep(0.02)
+    if not census_ok:
+        return False
+    try:
+        deadline = time.monotonic() + window
+        while _group_members(group):
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.02)
+    except Exception:
+        return False
     return True
 
 
@@ -283,7 +299,12 @@ def _proc_available():
 
 
 def _group_members(group):
-    """Live (non-zombie) pids in exactly `group`; Linux /proc only."""
+    """Live (non-zombie) pids in exactly `group`; Linux /proc only.
+
+    Only a member demonstrably gone during the scan (FileNotFoundError or
+    ProcessLookupError) is skipped; any other I/O failure or a malformed stat
+    makes the census unknown and raises instead of proving an empty group.
+    """
     if not _proc_available():
         raise NotImplementedError("process-group proof requires Linux /proc")
     members = []
@@ -292,11 +313,13 @@ def _group_members(group):
             continue
         try:
             stat = (entry / "stat").read_text(errors="replace")
-            fields = stat[stat.rindex(")") + 2:].split()
-            if int(fields[2]) == group and fields[0] != "Z":
-                members.append(int(entry.name))
-        except (OSError, ValueError, IndexError):
+        except FileNotFoundError:
             continue
+        except ProcessLookupError:
+            continue
+        fields = stat[stat.rindex(")") + 2:].split()
+        if int(fields[2]) == group and fields[0] != "Z":
+            members.append(int(entry.name))
     return members
 
 

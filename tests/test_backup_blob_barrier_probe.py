@@ -468,6 +468,57 @@ class ProbeTest(unittest.TestCase):
         leftovers = [entry for entry in self.owned.iterdir() if entry.name.startswith("probe-")]
         self.assertEqual(leftovers, [])
 
+    @unittest.skipUnless(LINUX, "process census is Linux /proc only")
+    def test_an_unreadable_or_malformed_own_stat_makes_the_census_unknown(self):
+        # An own /proc stat read that raises or yields garbage must never be
+        # skipped: doing so could falsely prove this live process absent.
+        own_stat = "/proc/" + str(os.getpid()) + "/stat"
+        real_read_text = Path.read_text
+
+        def failing_read_text(self, *args, **kwargs):
+            if str(self) == own_stat:
+                raise PermissionError(13, "Permission denied", own_stat)
+            return real_read_text(self, *args, **kwargs)
+
+        def malformed_read_text(self, *args, **kwargs):
+            if str(self) == own_stat:
+                return "garbage without any closing parenthesis"
+            return real_read_text(self, *args, **kwargs)
+
+        try:
+            with mock.patch.object(Path, "read_text", failing_read_text):
+                with self.assertRaises(OSError):
+                    probe._group_members(os.getpgrp())
+            with mock.patch.object(Path, "read_text", malformed_read_text):
+                with self.assertRaises(ValueError):
+                    probe._group_members(os.getpgrp())
+        finally:
+            self.assertIs(Path.read_text, real_read_text)
+        # Unpatched, the real /proc proves this process a live group member.
+        self.assertIn(os.getpid(), probe._group_members(os.getpgrp()))
+
+    @unittest.skipUnless(LINUX, "process-group quiescence proof is Linux /proc only")
+    def test_a_failed_census_still_kills_the_owned_child_but_never_claims_quiescence(self):
+        def unknown_census(group):
+            raise PermissionError(13, "Permission denied", "/proc")
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                 start_new_session=True)
+        try:
+            with mock.patch.object(probe, "_group_members", unknown_census):
+                self.assertFalse(probe._reap_owned(child, window=5))
+        finally:
+            try:
+                os.killpg(child.pid, 9)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        self.assertIsNotNone(child.returncode)
+        self.assertEqual(probe._group_members(child.pid), [])
+
     def test_a_guarded_target_data_dir_is_never_used_by_the_child(self):
         # The watched target carries .rootyard-restore.guard; the child must see
         # a private guard-free data dir, the same DATABASE_URL, and no leak.
