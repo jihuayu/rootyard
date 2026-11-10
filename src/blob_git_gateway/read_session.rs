@@ -241,7 +241,7 @@ mod tests {
         assert_eq!(presented_for_test(&duplicate).err(), Some(SessionTokenError::Invalid));
         assert_eq!(answer(Some(id(4)), Some(&tokens), &duplicate, &live, 3), Err(malformed()));
         // A nil capture/lookup incarnation is never compared.
-        assert_eq!(live_realm(&serving(3, Uuid::nil()), id(4)), Err(malformed()));
+        assert_eq!(live_realm(&serving(3, id(4)), Uuid::nil()), Err(malformed()));
     }
 
     #[test]
