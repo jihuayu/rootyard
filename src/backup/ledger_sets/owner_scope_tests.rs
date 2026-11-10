@@ -199,13 +199,15 @@ fn the_publication_producer_is_each_artifact_owner() {
             vec![1]
         };
         let lines = check_declared(std::slice::from_ref(&declared));
-        let mut expected =
-            expected.into_iter().map(|index| format!("owner_scope_mismatch:{}", at(index))).collect::<Vec<_>>();
-        // `declared_violations` sorts its lines; compare on that same order.
-        expected.sort();
-        assert_eq!(declared.scope, expected, "{field}: {lines:?}");
-        assert!(!lines.iter().any(|line| line.contains("digest")), "{field}: {lines:?}");
-        assert!(canonical(&declared).is_ok() || *field == "publication_owner", "{field}: {lines:?}");
+        {
+            let mut expected =
+                expected.into_iter().map(|index| format!("owner_scope_mismatch:{}", at(index))).collect::<Vec<_>>();
+            // `declared_violations` sorts its lines; compare on that same order.
+            expected.sort();
+            assert_eq!(declared.scope, expected, "{field}: {lines:?}");
+            assert!(!lines.iter().any(|line| line.contains("digest")), "{field}: {lines:?}");
+            assert!(canonical(&declared).is_ok() || *field == "publication_owner", "{field}: {lines:?}");
+        }
     }
 }
 
