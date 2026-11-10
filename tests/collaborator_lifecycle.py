@@ -35,16 +35,17 @@ class lifecycle:
                 "repository": self.repo["id"], "owner": self.repo["owner"],
                 "name": self.repo["name"]}
 
-    def worker(self, user):
+    def worker(self, user, purpose):
         """A fresh clone for ``user`` so Git never reads or writes a peer's tree.
 
-        ``user`` names the fixture identity (as in ``self.users[user]``).
+        ``purpose`` names the case's own directory, so a user with several
+        workers (one per case) never clones over an earlier tree.
         """
-        name = user if isinstance(user, str) else user.name
-        work = self.root / ("owned-work-" + name)
-        self.git("clone", self.remote, str(work), token=self.users[name])
-        self.git("config", "user.name", name.title(), cwd=work)
-        self.git("config", "user.email", name + "@collaborator.invalid", cwd=work)
+        work = self.root / ("owned-work-" + user + "-" + purpose)
+        assert not work.exists(), ("worker already exists for this case", work.name)
+        self.git("clone", self.remote, str(work), token=self.users[user])
+        self.git("config", "user.name", user.title(), cwd=work)
+        self.git("config", "user.email", user + "@collaborator.invalid", cwd=work)
         return work
 
     def commit(self, work, filename, message):
@@ -140,7 +141,7 @@ class lifecycle:
                                                 token=self.alice))
             assert (permission["role"], permission["direct_role"], permission["is_owner"]) == (
                 role, role, False), permission
-            work = self.worker(user)
+            work = self.worker(user, "roles")
             assert (work / "README.md").read_text() == "collaborator matrix seed\n"
             self.git("fetch", "origin", cwd=work, token=token)
             assert self.git("rev-parse", "origin/main", cwd=work).stdout.decode().strip() == self.seed
@@ -184,7 +185,7 @@ class lifecycle:
         received = {}
         for user, role in (("carol", "read"), ("dave", "triage"), ("erin", "write"),
                            ("frank", "maintain"), ("grace", "admin")):
-            peer = self.worker(user)
+            peer = self.worker(user, "fetch")
             if role in ("read", "triage"):
                 denied = self.git("push", "origin", "HEAD:refs/heads/fetch-" + user, cwd=peer,
                                   token=self.users[user], check=False)
@@ -296,7 +297,7 @@ class lifecycle:
         assert self.rules() == []
         results = {}
         for user, role in (("erin", "write"), ("grace", "admin")):
-            work = self.worker(user)
+            work = self.worker(user, "non-ff")
             self.git("checkout", "-B", "ff-" + user, cwd=work)
             self.commit(work, "ff.txt", "first " + user)
             first = self.push_branch(work, self.users[user], "ff-" + user)
@@ -314,7 +315,7 @@ class lifecycle:
     def withdrawal(self):
         """API removal denies new requests without erasing the live-grant receipts."""
         self.grant("judy", "write")
-        work = self.worker("judy")
+        work = self.worker("judy", "withdrawal")
         oid = self.commit(work, "before.txt", "before withdrawal")
         assert self.push_branch(work, self.users["judy"], "judy-before") == oid
         operation = self.last_operation("recorded")
