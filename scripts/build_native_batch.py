@@ -394,7 +394,7 @@ def bin_specs_for(manifest, args):
     listed = {entry['name']: entry for entry in manifest['bins']}
     selected = []
     if args.all_bins:
-        selected = list(manifest['bins'])
+        selected = enabled_bins(manifest, args)
     else:
         for name in bins:
             if name not in listed:
@@ -493,7 +493,7 @@ def implicit_bins_for(manifest, args):
     """
     if not args.test:
         return []
-    requested = {entry['name'] for entry in manifest['bins']} \
+    requested = {entry['name'] for entry in enabled_bins(manifest, args)} \
         if args.all_bins else set(unique_identifiers(args.bin, '--bin'))
     return [entry for entry in enabled_bins(manifest, args) if entry['name'] not in requested]
 
@@ -554,7 +554,7 @@ def plan_batch(args, manifest):
     if manifest_out == target or target in manifest_out.parents:
         raise BuildError('--manifest-out must be outside CARGO_TARGET_DIR')
     implicit = implicit_bins_for(manifest, args)
-    requested_names = tuple(entry['name'] for entry in manifest['bins']) if args.all_bins else \
+    requested_names = tuple(entry['name'] for entry in bin_specs) if args.all_bins else \
         tuple(spec['name'] for spec in bin_specs)
     return Plan(Selection(args.features, args.no_default_features, args.package_debug, args.strip_debuginfo),
                 bin_specs, test_specs, outputs, manifest_out, implicit, requested_names)
@@ -616,7 +616,48 @@ def _profile(event):
                                                'overflow_checks', 'test')}
 
 
-def artifact_index(events, package, binaries=()):
+def _unbound_source(record, target):
+    """The source of an indexed artifact when no metadata target set was supplied.
+
+    ``target.src_path`` is still required (an event without one is refused),
+    but it is not compared with metadata: only the standalone index, which
+    has no metadata document, is allowed to index this way. The batch itself
+    always passes its metadata targets, so receipts never carry an unchecked
+    source.
+    """
+    source = target.get('src_path')
+    if not source:
+        raise BuildError('Cargo reported ' + record['kind'] + ' ' + record['target'] +
+                         ' without a target src_path')
+    try:
+        return str(Path(source).resolve())
+    except OSError as error:
+        raise BuildError('Cargo reported ' + record['kind'] + ' ' + record['target'] +
+                         ' with an unusable src_path ' + repr(source) + ': ' + str(error)) from error
+
+
+def _bind_source(record, target, targets):
+    """Require the event's ``target.src_path`` to be the metadata target's canonical source."""
+    name, kind = record['target'], record['kind']
+    spec = targets.get((kind, name))
+    if spec is None:
+        raise BuildError('Cargo reported ' + kind + ' ' + name + ' that cargo metadata does not list for the ' +
+                         PACKAGE + ' package')
+    source = target.get('src_path')
+    if not source:
+        raise BuildError('Cargo reported ' + kind + ' ' + name + ' without a target src_path')
+    try:
+        reported = Path(source).resolve()
+    except OSError as error:
+        raise BuildError('Cargo reported ' + kind + ' ' + name + ' with an unusable src_path ' + repr(source) +
+                         ': ' + str(error)) from error
+    if reported != Path(spec['source']):
+        raise BuildError('Cargo reported ' + kind + ' ' + name + ' from ' + str(reported) +
+                         ', but cargo metadata lists its source as ' + spec['source'])
+    record['source'] = spec['source']
+
+
+def artifact_index(events, package, targets=()):
     """Index the fresh=False lib/bin/test compiler artifacts of exactly one selected package.
 
     Cargo reports every unit it built or found fresh in this invocation, so a
@@ -630,10 +671,16 @@ def artifact_index(events, package, binaries=()):
     checks stay closed: any Fresh=true selected artifact, a lib other than
     the package-named one, a duplicate, a kind other than lib/bin/test, a
     bin/test without an executable, or a bin the event lists as ``test``
-    (which Cargo would run as a unit test) is rejected. When ``binaries``
-    (the metadata bins) is given, a bin artifact must be one of them and its
-    source path must be that bin's: Cargo cannot mean another program by a
-    known name.
+    (which Cargo would run as a unit test) is rejected. When ``targets``
+    (the metadata targets) is given, every lib, bin and test artifact must be
+    the metadata target of its kind and name, and its ``target.src_path`` must
+    be that target's canonical source path: Cargo cannot mean another library,
+    program or test source by a known name. A missing or foreign source path is
+    rejected. ``targets`` is optional only for a standalone index that has no
+    metadata document (as in :mod:`tests`); then every artifact's source is
+    still required from its own event, but it is not compared with metadata.
+    The batch path always passes its metadata targets (and
+    :func:`select_artifacts` refuses to run without them).
 
     ``target.kind`` (``["test"]``) is the classification of a target, not
     ``profile.test``: a ``harness = false`` integration test has kind
@@ -644,7 +691,7 @@ def artifact_index(events, package, binaries=()):
     lib = None
     bins, tests = {}, {}
     skipped = {}
-    binaries = {entry['name']: entry for entry in binaries}
+    targets = {(entry['kind'], entry['name']): entry for entry in targets}
     for event in events:
         if event.get('reason') != 'compiler-artifact':
             continue
@@ -662,7 +709,12 @@ def artifact_index(events, package, binaries=()):
                                  f'the {PACKAGE} lib to every receipt')
             if lib is not None:
                 raise BuildError(f'Cargo reported two {PACKAGE} lib artifacts for one build')
-            lib = {'target': name, 'kind': 'lib', 'fresh': False, 'package_id': event.get('package_id')}
+            record = {'target': name, 'kind': 'lib', 'fresh': False, 'package_id': event.get('package_id')}
+            if targets:
+                _bind_source(record, target, targets)
+            else:
+                record['source'] = _unbound_source(record, target)
+            lib = record
         elif kinds == ['bin']:
             executable = event.get('executable')
             if not executable:
@@ -674,14 +726,13 @@ def artifact_index(events, package, binaries=()):
             record = {'target': name, 'kind': 'bin', 'fresh': False,
                       'executable': str(Path(executable).resolve()),
                       'package_id': event.get('package_id'), 'profile': _profile(event)}
-            if binaries:
-                if name not in binaries:
-                    raise BuildError('Cargo reported binary ' + name + ' that cargo metadata does not list for '
-                                     'the ' + PACKAGE + ' package')
+            if targets:
+                _bind_source(record, target, targets)
                 if str(Path(executable).resolve().with_suffix('')) != str(canonical_target() / 'debug' / name):
                     raise BuildError('binary ' + name + ' was built at ' + str(executable) +
                                      ', not at its canonical location')
-                record['source'] = binaries[name]['source']
+            else:
+                record['source'] = _unbound_source(record, target)
             bins[name] = record
         elif kinds == ['test']:
             executable = event.get('executable')
@@ -690,9 +741,14 @@ def artifact_index(events, package, binaries=()):
             if not name or name in tests:
                 raise BuildError(f'Cargo reported duplicate {name!r} {PACKAGE} test artifacts; '
                                  'expected exactly one')
-            tests[name] = {'target': name, 'kind': 'test', 'fresh': False,
-                           'profile': _profile(event), 'executable': str(Path(executable).resolve()),
-                           'package_id': event.get('package_id')}
+            record = {'target': name, 'kind': 'test', 'fresh': False,
+                      'profile': _profile(event), 'executable': str(Path(executable).resolve()),
+                      'package_id': event.get('package_id')}
+            if targets:
+                _bind_source(record, target, targets)
+            else:
+                record['source'] = _unbound_source(record, target)
+            tests[name] = record
         else:
             raise BuildError(f'unexpected {PACKAGE} artifact {name!r} {kinds}; only lib, bin and test '
                              'artifacts belong in this batch')
@@ -707,7 +763,7 @@ def require_build_finished(events):
         raise BuildError('Cargo did not report exactly one successful build-finished event')
 
 
-def select_artifacts(events, package, plan, binaries=()):
+def select_artifacts(events, package, plan, targets=()):
     """Return ``(lib, [(bin artifact, implicit)], [test artifacts])`` for the real targets.
 
     Foreign-package artifacts (dependencies Cargo rebuilt alongside the
@@ -716,9 +772,15 @@ def select_artifacts(events, package, plan, binaries=()):
     implicit ones Cargo also built for a ``--test`` in metadata order; a bin
     that is in neither set is an unknown extra and fails the batch. Every
     selected bin is bound to its canonical ``<target>/debug/<name>`` path.
+
+    ``targets`` is mandatory here: the batch path refuses to select an
+    artifact whose metadata target (lib, bin or test) and source it cannot
+    check, so no receipt is ever built from an unverified event.
     """
+    if not targets:
+        raise BuildError('the batch must verify artifacts against cargo metadata targets')
     bin_specs, test_specs = plan.bins, plan.tests
-    lib, bins, tests, _ = artifact_index(events, package, binaries)
+    lib, bins, tests, _ = artifact_index(events, package, targets)
     require_build_finished(events)
     wanted_bins = [spec['name'] for spec in bin_specs]
     missing = [name for name in wanted_bins if name not in bins]
@@ -728,10 +790,14 @@ def select_artifacts(events, package, plan, binaries=()):
     if unknown:
         raise BuildError('Cargo reported binaries that were not selected: ' + ', '.join(unknown))
     selected = [(bins[name], False) for name in wanted_bins]
-    # An implicit bin is only accepted when Cargo built it here: after a clean
-    # every enabled bin unit is rebuilt, so a Fresh=false bin event is Cargo's
-    # own report of the implicit build, not an inspection this batch lacks.
-    selected += [(bins[spec['name']], True) for spec in plan.implicit_bins if spec['name'] in bins]
+    # An implicit bin is not optional: Cargo builds every enabled bin when a
+    # --test is selected, and the integration test links and runs through
+    # them, so a missing one means the event stream does not describe this
+    # build.
+    missing = [spec['name'] for spec in plan.implicit_bins if spec['name'] not in bins]
+    if missing:
+        raise BuildError('Cargo did not report every enabled implicit binary: ' + ', '.join(missing))
+    selected += [(bins[spec['name']], True) for spec in plan.implicit_bins]
     selected_bins = [artifact for artifact, _ in selected]
     for artifact in selected_bins:
         expected = str(canonical_target() / 'debug' / artifact['target'])
@@ -1323,8 +1389,7 @@ def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, comm
     after = source_snapshot(plan)
     require_unchanged(before, after)
     lib, bins, tests = select_artifacts(events, metadata_before['package_id'], plan,
-                                        [entry for entry in metadata_targets(metadata_before)
-                                         if entry['kind'] == 'bin'])
+                                        metadata_targets(metadata_before))
     metadata_after = cargo_metadata()
     # The target set is planned from the first document, so a target added or
     # removed while building is a mismatch like a redirected target directory.

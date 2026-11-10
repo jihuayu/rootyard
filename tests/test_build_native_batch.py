@@ -98,6 +98,19 @@ AUTO_BINS = ('rootyard-view-lab', 'rootyard-workspace-lab')
 #: auto-discovered src/bin labs sit between the [[bin]] tables' bins.
 ALL_BINS = ('rootyard', 'rootyard-pando-lab') + AUTO_BINS + ('rootyard-vfs-mount',)
 TESTS = ('ref_store_snapshot_backup_fixture', 'ref_store_holds_backup_fixture')
+
+
+def build_root():
+    """The fixture workspace: what build_native.ROOT is while one test runs."""
+    return Path(os.path.join(os.environ.get('ROOTYARD_BATCH_FIXTURE_ROOT', '/nonexistent'), 'ws')).resolve()
+
+
+#: The workspace ``artifact`` sources resolve against; setUp rebinds it.
+ROOT = build_root()
+#: Each target's metadata source, relative to the workspace root.
+SRC_PATHS = {'rootyard': 'src/main.rs',
+             **{name: 'src/bin/' + name + '.rs' for name in ALL_BINS if name != 'rootyard'},
+             **{name: 'tests/' + name + '.rs' for name in TESTS}}
 HELPER = 'tests/helper/mod.rs'
 UNTRACKED_HELPER = 'tests/helper/untracked.rs'
 CARGO_CONFIG = '.cargo/config.toml'
@@ -166,14 +179,23 @@ class _Lines:
         self.close()
 
 
-def artifact(kind, name, package=PACKAGE_ID, fresh=False, executable=None, test_profile=None):
+def artifact(kind, name, package=PACKAGE_ID, fresh=False, executable=None, test_profile=None,
+             src_path=SRC_PATHS, target=None, **extra):
+    """One Cargo compiler-artifact event.
+
+    ``target`` overrides the whole ``target`` object (a missing or foreign
+    ``src_path``); by default it carries the metadata source of the name.
+    """
+    if src_path is SRC_PATHS:
+        src_path = str(ROOT / ('src/lib.rs' if kind == 'lib' else SRC_PATHS.get(name, 'tests/' + name + '.rs')))
+    target = target if target is not None else {'name': name, 'kind': [kind], 'src_path': src_path}
     return {'reason': 'compiler-artifact', 'package_id': package,
-            'target': {'name': name, 'kind': [kind]},
+            'target': target,
             'profile': {'opt_level': '0', 'debuginfo': 2, 'debug_assertions': True,
                         'overflow_checks': True,
                         'test': kind == 'test' if test_profile is None else test_profile},
             'fresh': fresh,
-            **({'executable': executable} if executable is not None else {})}
+            **({'executable': executable} if executable is not None else {}), **extra}
 
 
 def finished(success=True):
@@ -185,6 +207,8 @@ class BatchTest(unittest.TestCase):
         self.tempdir = Path(tempfile.mkdtemp(prefix='rootyard-build-batch-'))
         self.addCleanup(shutil.rmtree, self.tempdir, True)
         self.root = Path(os.path.join(self.tempdir, 'ws')).resolve()
+        global ROOT
+        ROOT = self.root
         (self.root / 'src' / 'bin').mkdir(parents=True)
         (self.root / 'tests').mkdir()
         (self.root / 'Cargo.toml').write_text(CARGO_TOML)
@@ -327,13 +351,26 @@ class BatchTest(unittest.TestCase):
                        features='pando-lab', no_default_features=False):
         bins = BINS if bins is None else bins
         tests = TESTS if tests is None else tests
+        bins, tests = tuple(bins), tuple(tests)
         if implicit:
-            bins = tuple(bins) + self.implicit_bins(tuple(bins), tuple(tests), features,
+            bins = bins + self.implicit_bins(bins, tests, features,
                                                     no_default_features)
+        # A lib event of a foreign package never meets the metadata check:
+        # only the selected package's lib source is bound.
         events = [artifact('lib', 'rootyard', fresh=fresh)] if lib else []
         events += [artifact('bin', name, fresh=fresh, executable=self.binary(name)) for name in bins]
         events += [artifact('test', name, fresh=fresh, executable=self.compiled_test(name)) for name in tests]
         return events + [finished()]
+
+    def foreign_lib(self, foreign):
+        """The event of the lib `rootyard` links against, named by its dependency package."""
+        return [artifact('lib', 'depcrate', package=foreign)]
+
+    def without_test(self, name, bins=BINS, tests=TESTS):
+        """The default events without the test event of ``name`` (its bins stay)."""
+        return [event for event in self.default_events(bins=bins, tests=tests)
+                if not (event.get('target', {}).get('name') == name and
+                        list(event['target'].get('kind') or []) == ['test'])]
 
     def write_executables(self, events):
         for event in events:
@@ -377,8 +414,9 @@ class BatchTest(unittest.TestCase):
         finally:
             os.close(fd)
 
-    def args(self, bins=BINS, tests=TESTS, features='pando-lab', no_default_features=False,
+    def args(self, bins=None, tests=TESTS, features='pando-lab', no_default_features=False,
              package_debug=None, strip_debuginfo=True, outputs=None, all_bins=False, manifest_out=None):
+        bins = [] if all_bins else (BINS if bins is None else bins)
         outputs = outputs if outputs is not None else [
             str(os.path.join(self.outdir, name.replace('_', '-'))) for name in tests]
         return argparse.Namespace(features=features, no_default_features=no_default_features,
@@ -463,7 +501,8 @@ class BatchTest(unittest.TestCase):
                                            'duration_seconds': report['build']['duration_seconds'],
                                            'fresh_false_artifacts': [
                                                {'target': 'rootyard', 'kind': 'lib', 'fresh': False,
-                                                'package_id': PACKAGE_ID}] + [
+                                                'package_id': PACKAGE_ID,
+                                                'source': str((self.root / 'src/lib.rs').resolve())}] + [
                                                {'target': name, 'kind': 'bin', 'fresh': False,
                                                 'executable': self.binary(name), 'package_id': PACKAGE_ID,
                                                 'profile': {'opt_level': '0', 'debuginfo': 2,
@@ -770,7 +809,7 @@ class BatchTest(unittest.TestCase):
         self.assert_failure(self.default_events(fresh=True), 'Fresh rootyard artifact')
 
     def test_fresh_true_lib_alone_is_rejected(self):
-        events = [artifact('lib', 'rootyard', fresh=True)] + self.default_events()[1:]
+        events = [artifact('lib', 'rootyard', fresh=True)] + self.default_events()
         self.assert_failure(events, 'Fresh')
 
     def test_missing_lib_artifact_is_rejected(self):
@@ -787,8 +826,11 @@ class BatchTest(unittest.TestCase):
         duplicate = self.default_events() + [artifact('test', TESTS[0],
                                                       executable=self.compiled_test(TESTS[0]))]
         self.assert_failure(duplicate, 'duplicate')
-        extra = self.default_events() + self.default_events(tests=('some_other_test',))[-2:-1]
-        self.assert_failure(extra, 'tests that were not selected')
+        # A test event carries its metadata kind and name: a name metadata
+        # does not list is refused before it can pass as an extra test.
+        unlisted = self.default_events() + [artifact('test', 'some_other_test',
+                                                     executable=self.compiled_test('some_other_test'))]
+        self.assert_failure(unlisted, 'test some_other_test that cargo metadata does not list')
         two_libs = self.default_events() + [artifact('lib', 'rootyard')]
         self.assert_failure(two_libs, 'two rootyard lib artifacts')
 
@@ -804,10 +846,11 @@ class BatchTest(unittest.TestCase):
         # Real Cargo reports the dependency it rebuilt before the selected
         # package's units; only the selected package's events may reach a receipt.
         foreign = 'path+file:///ws#depcrate@0.1.0'
-        events = self.default_events()
-        events.insert(0, artifact('lib', 'depcrate', package=foreign))
+        # A foreign package's lib is named by that package, not this one.
+        events = self.foreign_lib(foreign) + self.default_events()
         # A foreign bin is skipped too, even though its kind/name are not selected.
-        events.insert(-1, artifact('bin', 'sneaky', package=foreign, executable=self.binary('sneaky')))
+        events.insert(-1, artifact('bin', 'sneaky', package=foreign, executable=self.binary('sneaky'),
+                                   src_path=str(Path('/ws/src/bin/sneaky.rs'))))
         report = self.build(events=events)
         recorded = report['build']['fresh_false_artifacts']
         self.assertEqual([(item['kind'], item['target']) for item in recorded],
@@ -825,18 +868,29 @@ class BatchTest(unittest.TestCase):
 
     def test_foreign_package_artifacts_are_named_in_index_and_never_in_receipts(self):
         foreign = 'path+file:///ws#depcrate@0.1.0'
+        # The selected package's lib is reported before its bins and tests.
+        own = self.default_events()
         events = [artifact('lib', 'depcrate', package=foreign),
                   artifact('bin', 'depcrate-tool', package=foreign,
-                           executable=self.binary('dependency-only-tool')),
+                           executable=self.binary('dependency-only-tool'),
+                           src_path=str(Path('/ws/src/bin/depcrate-tool.rs'))),
                   # A fresh (dirty-reused) dependency is Cargo's business; it is
                   # not one of the selected artifacts a receipt vouches for.
-                  artifact('lib', 'depcrate', package=foreign, fresh=True)] + self.default_events()
+                  artifact('lib', 'depcrate', package=foreign, fresh=True)] + own
+        # The standalone index (no metadata target set) stays available: each
+        # record keeps the source its own event reported, none is bound to
+        # metadata, and foreign packages never reach a record.
         lib, bins, tests, skipped = batch.artifact_index(events, PACKAGE_ID)
         self.assertEqual(lib, {'target': 'rootyard', 'kind': 'lib', 'fresh': False,
-                               'package_id': PACKAGE_ID})
+                               'package_id': PACKAGE_ID, 'source': str(self.root / 'src' / 'lib.rs')})
         self.assertEqual(sorted(bins), sorted(BINS + AUTO_BINS))
         self.assertEqual(sorted(tests), sorted(TESTS))
         self.assertEqual(skipped, {foreign: 3})
+        # Without a metadata target set, every record of this package keeps
+        # the source its own event reported (and foreign names never appear).
+        self.assertEqual({record['source'] for record in [*bins.values(), *tests.values()]},
+                         {str((self.root / self.bin_source(name)).resolve()) for name in BINS + AUTO_BINS} |
+                         {str((self.root / 'tests' / (name + '.rs')).resolve()) for name in TESTS})
         self.assertTrue(all(item['package_id'] == PACKAGE_ID
                             for item in [lib, *bins.values(), *tests.values()]))
         self.assertNotIn('depcrate-tool', bins)
@@ -883,14 +937,16 @@ class BatchTest(unittest.TestCase):
         # kind ["test"], an executable under
         # target/debug/build/<pkg>/<hash>/out, profile.test = true (recorded
         # as reported, not re-derived from harness or kind).
-        events = self.default_events(tests=())
+        # The event of the harness = false target arrives in place of the
+        # one for the default-discovered tests with that name.
+        arguments = [str(self.outdir / 'fixture')]
+        events = self.without_test(TESTS[0], bins=(), tests=(TESTS[0],))
         events.insert(-1, artifact('test', TESTS[0], executable=self.compiled_harness_false(TESTS[0])))
-        report = self.build(events=events, args=self.args(tests=TESTS[:1],
-                                                          outputs=[str(self.outdir / 'fixture')]))
+        report = self.build(events=events, args=self.args(bins=ALL_BINS, tests=(TESTS[0],), outputs=arguments))
         entry = report['artifacts'][-1]
         self.assertEqual((entry['kind'], entry['target'], entry['fresh']), ('test', TESTS[0], False))
         self.assertEqual(entry['original_artifact'], self.compiled_harness_false(TESTS[0]))
-        self.assertEqual(entry['artifact'], str((self.outdir / 'fixture').resolve()))
+        self.assertEqual(entry['artifact'], str(Path(arguments[0]).resolve()))
         self.assertEqual(entry['source'], str(self.root / 'tests' / (TESTS[0] + '.rs')))
         self.assertEqual(entry['source_sha256'], batch.sha256_file(self.root / 'tests' / (TESTS[0] + '.rs')))
         self.assertTrue(Path(entry['artifact']).is_file())
@@ -899,8 +955,9 @@ class BatchTest(unittest.TestCase):
         self.assertTrue(Path(self.compiled_harness_false(TESTS[0])).is_file())
         receipt = json.loads(Path(entry['receipt']).read_text())
         self.assertEqual(receipt['kind'], 'rust-integration-test')
-        self.assertEqual(len(receipt['fresh_false_artifacts']), 1)
-        harness = receipt['fresh_false_artifacts'][0]
+        harness = next(item for item in receipt['fresh_false_artifacts'] if item['kind'] == 'test')
+        # The test record carries its metadata source, which survives the copy.
+        self.assertEqual(harness['source'], str((self.root / 'tests' / (TESTS[0] + '.rs')).resolve()))
         self.assertEqual((harness['kind'], harness['target'], harness['fresh']), ('test', TESTS[0], False))
         self.assertEqual(harness['executable'], self.compiled_harness_false(TESTS[0]))
         self.assertIs(harness['profile']['test'], True)
@@ -912,21 +969,21 @@ class BatchTest(unittest.TestCase):
     def test_harness_false_test_stays_a_selected_test_for_fresh_and_kind(self):
         # A harness = false fixture is a selected test: Fresh=true is a stale
         # receipt, even though its executable lives under target/debug/build.
-        stale = self.default_events(tests=())
-        stale.insert(-1, artifact('test', TESTS[0], fresh=True,
+        stale = self.without_test(TESTS[0])
+        stale.insert(1, artifact('test', TESTS[0], fresh=True,
                                   executable=self.compiled_harness_false(TESTS[0])))
         self.assert_failure(stale, 'Fresh ' + TESTS[0] + ' artifact',
-                            args=self.args(tests=TESTS[:1], outputs=[str(self.outdir / 'stale')]))
+                            args=self.args(tests=(TESTS[0],), outputs=[str(self.outdir / 'stale')]))
         # profile.test = false on that same kind ["test"] artifact is rejected.
-        dev = self.default_events(tests=())
+        dev = self.without_test(TESTS[0], bins=(), tests=(TESTS[0],))
         dev.insert(-1, artifact('test', TESTS[0], test_profile=False,
-                                executable=self.compiled_harness_false(TESTS[0])))
-        self.assert_failure(dev, 'test profile', args=self.args(tests=TESTS[:1],
-                                                                outputs=[str(self.outdir / 'dev')]))
+                               executable=self.compiled_harness_false(TESTS[0])))
+        self.assert_failure(dev, 'test profile',
+                            args=self.args(bins=ALL_BINS, tests=(TESTS[0],), outputs=[str(self.outdir / 'dev')]))
         # The same artifact reported under another name is an extra test.
         extra = self.default_events() + [artifact('test', 'other_fixture',
                                                   executable=self.compiled_harness_false('other_fixture'))]
-        self.assert_failure(extra, 'tests that were not selected')
+        self.assert_failure(extra, 'test other_fixture that cargo metadata does not list')
 
     def test_missing_test_executable_on_disk_is_rejected(self):
         vanished = self.compiled_test(TESTS[0])
@@ -1010,6 +1067,10 @@ class BatchTest(unittest.TestCase):
 
     # -- selection validation (no Cargo at all) ----------------------------
     def planning_failure(self, args, message):
+        # Only this refusal's history counts: an earlier build in the same
+        # test legitimately cleaned once.
+        self.clean_commands = []
+        self.popen_calls = []
         with self.assertRaises(batch.BuildError) as caught:
             batch.run_batch(args)
         self.assertIn(message, str(caught.exception))
@@ -1211,6 +1272,64 @@ path = "src/bin/rootyard-view-lab.rs"
                                            'rootyard-view-lab')
         self.assert_failure(events, 'not at its canonical location', args=args)
 
+    def test_a_bin_must_arrive_with_its_metadata_source_path(self):
+        # The metadata name and kind, the canonical executable and a foreign
+        # target.src_path: the event is not the metadata bin, so the batch
+        # refuses before publishing anything. (The test above moves only the
+        # executable; this one moves only the source.)
+        args = self.args(tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')])
+        events = self.default_events(bins=('rootyard',), tests=TESTS[:1], implicit=False)
+        events += [artifact('bin', name, executable=self.binary(name)) for name in ALL_BINS[1:]]
+        index = next(index for index, event in enumerate(events)
+                     if event.get('target', {}).get('name') == 'rootyard-view-lab')
+        events[index]['target']['src_path'] = str(self.root / 'src' / 'bin' / 'other-lab.rs')
+        self.assertEqual(events[index]['target']['kind'], ['bin'])
+        self.assertEqual(events[index]['executable'], self.binary('rootyard-view-lab'))
+        self.assert_failure(events, 'Cargo reported bin rootyard-view-lab from ' +
+                            str((self.root / 'src' / 'bin' / 'other-lab.rs').resolve()), args=args)
+
+    def test_an_integration_test_must_arrive_with_its_metadata_source_path(self):
+        # Same for a selected test: metadata name/kind and the canonical
+        # compiled executable, but target.src_path names another test file.
+        args = self.args()
+        events = self.default_events()
+        index = next(index for index, event in enumerate(events)
+                     if event['target'].get('name') == TESTS[1] and event['target']['kind'] == ['test'])
+        self.assertEqual(events[index]['executable'], self.compiled_test(TESTS[1]))
+        events[index]['target']['src_path'] = str(self.root / 'tests' / 'other_fixture.rs')
+        self.assert_failure(events, 'Cargo reported test ' + TESTS[1] + ' from ' +
+                            str((self.root / 'tests' / 'other_fixture.rs').resolve()), args=args)
+
+    def test_artifacts_without_a_source_path_or_metadata_are_rejected(self):
+        # Only the batch path is reachable from here: the source binding is
+        # mandatory, so a missing src_path or metadata target is refused.
+        args = self.args(tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')])
+        no_source = self.default_events(bins=('rootyard',), tests=TESTS[:1], implicit=False)
+        (next(event for event in no_source if event.get('target', {}).get('kind') == ['bin'])
+         ['target']).pop('src_path')
+        (next(event for event in no_source if event.get('target', {}).get('kind') == ['test'])
+         ['target']).pop('src_path')
+        self.assert_failure(no_source, 'without a target src_path', args=args)
+        events = self.default_events(bins=('rootyard',), tests=TESTS[:1])
+        plan = batch.plan_batch(args, self.manifest())
+        targets = batch.metadata_targets(batch.metadata_record(
+            json.loads(self.metadata_json())))
+        self.write_executables(events)
+        batch.select_artifacts(events, PACKAGE_ID, plan, targets)
+        with self.assertRaises(batch.BuildError) as caught:
+            batch.select_artifacts(events, PACKAGE_ID, plan)
+        self.assertIn('verify artifacts against cargo metadata targets', str(caught.exception))
+        # The batch's own path always supplies the metadata targets.
+        with mock.patch.object(batch, 'select_artifacts',
+                               wraps=batch.select_artifacts) as selected, \
+                mock.patch.object(batch.subprocess, 'Popen', self.fake_popen(events)):
+            batch.run_batch(args)
+        self.assertTrue(selected.call_args.args[3])
+        # A missing source is refused even by the standalone index.
+        with self.assertRaises(batch.BuildError) as caught:
+            batch.artifact_index(no_source, PACKAGE_ID)
+        self.assertIn('without a target src_path', str(caught.exception))
+
     def test_missing_fresh_and_duplicate_implicit_bins_are_rejected(self):
         args = self.args(tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')])
         fresh = self.default_events(bins=('rootyard',), tests=TESTS[:1])
@@ -1230,14 +1349,15 @@ path = "src/bin/rootyard-view-lab.rs"
         as_unit_test[index] = artifact('bin', 'rootyard-workspace-lab', test_profile=True,
                                        executable=self.binary('rootyard-workspace-lab'))
         self.assert_failure(as_unit_test, 'built as a test unit', args=args)
-        # An always-enabled implicit bin simply missing from the stream is not
-        # refused by itself: Cargo may omit a bin unit, and nothing receipted
-        # it. The requested bins and tests stay required.
-        absent = [event for event in self.default_events(bins=('rootyard',), tests=TESTS[:1])
-                  if event.get('target', {}).get('name') != 'rootyard-workspace-lab']
-        report = self.build(args=args, events=absent)
-        self.assertEqual([entry['target'] for entry in report['artifacts'] if entry['kind'] == 'bin'],
-                         ['rootyard', 'rootyard-pando-lab', 'rootyard-vfs-mount', 'rootyard-view-lab'])
+        # An enabled implicit bin missing from the stream is refused: the
+        # integration test links and runs through every enabled bin Cargo
+        # builds for it, so its absence means the stream is not this build's.
+        # (Requested bins stay "did not report the requested binaries".)
+        for absent_name in AUTO_BINS:
+            absent = [event for event in self.default_events(bins=('rootyard',), tests=TESTS[:1])
+                      if not (event.get('target', {}).get('kind') == ['bin'] and
+                              event['target']['name'] == absent_name)]
+            self.assert_failure(absent, 'every enabled implicit binary: ' + absent_name, args=args)
 
     def test_implicit_bin_receipts_are_withdrawn_on_a_late_failure(self):
         # Receipts of an earlier batch (implicit ones beside the manifest
@@ -1261,15 +1381,42 @@ path = "src/bin/rootyard-view-lab.rs"
                    if target['name'] == 'rootyard-view-lab')
         lab['required-features'] = ['state-redis']
         self.metadata_document = document
-        with self.assertRaises(batch.BuildError) as caught:
-            batch.run_batch(self.args(all_bins=True, bins=()))
-        self.assertIn('bin rootyard-view-lab requires features state-redis', str(caught.exception))
-        self.assertEqual(self.popen_calls, [])
-        self.assertEqual(self.clean_calls(), [])
-        # Enabling it makes --all-bins select it, named explicitly.
-        report = self.build(args=self.args(all_bins=True, bins=(), features='pando-lab,state-redis'))
-        self.assertIn('rootyard-view-lab',
-                      [entry['target'] for entry in report['artifacts'] if entry['kind'] == 'bin'])
+        # --all-bins is every *enabled* metadata bin: a lab whose
+        # required-features this selection lacks is not selected, as the help
+        # says, and the command never names it. Cargo, asked for the enabled
+        # bins and the tests, reports exactly those: every named bin with
+        # Fresh=false and no event for the disabled lab.
+        args = self.args(all_bins=True, bins=())
+        enabled = tuple(name for name in ALL_BINS if name != 'rootyard-view-lab')
+        events = self.default_events(bins=enabled, tests=TESTS, implicit=False)
+        self.assertFalse([event for event in events
+                          if (event.get('target') or {}).get('name') == 'rootyard-view-lab'])
+        report = self.build(events=events, args=args)
+        # Every enabled bin was requested by name, so none is implicit, and the
+        # disabled lab is never built or reported.
+        self.assertEqual([entry['target'] for entry in report['artifacts'] if entry['kind'] == 'bin'],
+                         [name for name in ALL_BINS if name != 'rootyard-view-lab'])
+        self.assertEqual({entry['implicit'] for entry in report['artifacts'] if entry['kind'] == 'bin'},
+                         {False})
+        command = self.popen_calls[0][0]
+        self.assertEqual(command.count('--bin'), len(enabled))
+        self.assertNotIn('rootyard-view-lab', command)
+        self.assertNotIn('--all-bins', command)
+        self.assertNotIn('rootyard-view-lab',
+                         [item['target'] for item in report['build']['fresh_false_artifacts']])
+        self.assertFalse(list(self.outdir.rglob('*rootyard-view-lab*')))
+        # If Cargo reports the disabled lab anyway, it is not an enabled bin:
+        # refused before publication.
+        stray = self.default_events(bins=enabled, tests=TESTS, implicit=False)
+        stray.insert(-1, artifact('bin', 'rootyard-view-lab', executable=self.binary('rootyard-view-lab')))
+        self.assert_failure(stray, 'binaries that were not selected: rootyard-view-lab', args=args)
+        # An explicit --bin for it is still refused at planning, with or
+        # without a --test (a planning refusal runs no clean or build).
+        self.planning_failure(self.args(bins=('rootyard-view-lab',), tests=()),
+                              'bin rootyard-view-lab requires features state-redis')
+        self.planning_failure(self.args(bins=('rootyard-view-lab',), tests=TESTS[:1],
+                                        outputs=[str(self.outdir / 'fixture')]),
+                              'bin rootyard-view-lab requires features state-redis')
 
     # -- bound build inputs -------------------------------------------------
     def bound_record(self, with_blobs=False):
