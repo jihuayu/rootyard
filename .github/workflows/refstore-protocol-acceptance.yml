@@ -238,15 +238,17 @@ jobs:
             --log lfs-db-facts=test-results/refstore/lfs-db-facts.json \
             --log lfs-suite=test-results/refstore/lfs.log \
             --log-marker lfs-suite='"passed": true' \
-            --harness workflow=.github/workflows/refstore-protocol-acceptance.yml \
-            --harness lfs=tests/lfs.py \
-            --harness lfs_remote_contract=tests/lfs_remote_contract.py \
-            --harness e2e=tests/e2e.py \
-            --harness schema_baseline=tests/schema_baseline.py \
-            --harness native_evidence=tests/native_evidence.py \
-            --harness owned_fuse_cleanup=tests/owned_fuse_cleanup.py \
-            --harness build_native=scripts/build_native.py \
-            --harness native_report_manifest=scripts/native_report_manifest.py \
+            --harness .github/workflows/refstore-protocol-acceptance.yml \
+            --harness tests/lfs.py \
+            --harness tests/lfs_remote_contract.py \
+            --harness tests/e2e.py \
+            --harness tests/schema_baseline.py \
+            --harness tests/native_evidence.py \
+            --harness tests/owned_fuse_cleanup.py \
+            --harness scripts/owned_garage_fixture.sh \
+            --harness scripts/owned_object_store_env.py \
+            --harness scripts/build_native.py \
+            --harness scripts/native_report_manifest.py \
             --fixture postgres=postgres:17 \
             --fixture garage="Garage v2.1.0 sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78e93ee8da7cf6a"
       - name: Stop only the job-owned Garage fixture
