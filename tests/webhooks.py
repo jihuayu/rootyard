@@ -121,22 +121,27 @@ class WebhooksHarness(PullsHarness):
                 ]
             )
 
-    def json_response(self, path: str, expected: int, **kwargs):
-        """Send one request and return its status, parsed JSON body and headers.
+    def json_response(self, path: str, expected, **kwargs):
+        """Send one raw request and return its status and parsed JSON body.
 
-        A conflict is only meaningful together with its JSON envelope, so the
-        body is parsed instead of discarded before the caller judges the status.
+        ``expected`` is one status or a minimal tuple of statuses the caller
+        judges further from the parsed error vocabulary. Any other status, a
+        missing Cache-Control/Content-Type header or a non-object JSON body
+        fails here, so no caller can absorb a 401, 500 or opaque conflict.
         """
-        status, body, headers = self.http(path, token=kwargs.pop("token", None) or self.alice, **kwargs)
+        allowed = expected if isinstance(expected, tuple) else (expected,)
+        assert allowed, "at least one expected status is required"
+        status, body, headers = self.http(
+            path, token=kwargs.pop("token", None) or self.alice, **kwargs
+        )
         norm_headers = {k.lower(): v for k, v in headers.items()}
+        assert status in allowed, f"{path}: expected {expected}, got {status}: {body[:200]!r}"
+        assert norm_headers.get("cache-control") == "no-store", norm_headers
+        assert "application/json" in norm_headers.get("content-type", ""), norm_headers
         try:
             parsed = json.loads(body)
         except ValueError:
             parsed = None
-        if status != expected:
-            raise AssertionError(f"{path}: expected {expected}, got {status}: {body[:200]!r}")
-        assert norm_headers.get("cache-control") == "no-store", norm_headers
-        assert "application/json" in norm_headers.get("content-type", ""), norm_headers
         assert isinstance(parsed, dict), (status, body[:200])
         return status, parsed
 
@@ -475,17 +480,35 @@ class WebhooksHarness(PullsHarness):
         # the live row instead of assuming the pre-push version is still
         # current, and only PATCH against a version just read.
         pr_now = self.document(self.pr1_path)
-        if pr_now["head_oid"] != self.feat2_oid:
+        assert pr_now["base_oid"] == self.base_oid, pr_now
+        if pr_now["head_oid"] == self.feat2_oid:
+            # Already advanced: the returned row itself must be the feat2 bump.
+            assert pr_now["version"] > self.pr1_version_before_push, pr_now
+        else:
             # Not yet auto-advanced: the old head must still be stored, so the
             # manual PATCH is the one legitimate single use of a just-read version.
             assert pr_now["head_oid"] == self.pr1["head_oid"], pr_now
-            _, patched = self.json_response(
+            status, patched = self.json_response(
                 self.pr1_path,
-                200,
+                (200, 409),
                 method="PATCH",
                 body={"expected_version": pr_now["version"], "head_oid": self.feat2_oid},
             )
-            pr_now = patched
+            if status == 409:
+                # A 409 is only the legitimate background win when it is exactly
+                # the version conflict, i.e. a concurrent writer committed a
+                # version bump. Any other 409 (head_oid/base_oid mismatch,
+                # closed/merged PR, ...) fails here. The one bounded read-back
+                # must then prove the writer landed exactly feat2/base and a
+                # version past the pre-push one; a stale old-head row fails on
+                # the shared oracle below instead of being retried.
+                assert patched.get("error") == "pull request version conflict", patched
+                # Exactly one bounded read-back; it must show the feat2 bump.
+                pr_now = self.document(self.pr1_path)
+            else:
+                pr_now = patched
+        # 200 uses the real returned row; both paths must satisfy the same
+        # feat2/base/version oracle before the merge below can mean anything.
         assert pr_now["head_oid"] == self.feat2_oid, pr_now
         assert pr_now["base_oid"] == self.base_oid, pr_now
         assert pr_now["version"] > self.pr1_version_before_push, pr_now
