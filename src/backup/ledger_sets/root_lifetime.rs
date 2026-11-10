@@ -1,10 +1,10 @@
 //! Root lifetime: the head, its generation-1 capture and its release tombstone.
 //!
 //! Every decision is pure so a corrupted source is refused identically in
-//! production and in unit tests. [`super::ledger_sets::check_heads`] is the
-//! public entry point for this module.
+//! production and in unit tests. [`super::check_heads`] is the module entry
+//! point.
 
-use super::ledger_sets::{DeclaredPair, RootCapture, RootHead, RootTombstone};
+use super::{DeclaredPair, RootCapture, RootHead, RootTombstone};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 

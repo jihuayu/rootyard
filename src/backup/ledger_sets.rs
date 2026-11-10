@@ -24,8 +24,8 @@
 //! repository tenant: only the realm fields (`tenant_id`,
 //! `history_incarnation`, epochs and object format) bind a declared set to the
 //! registration. A producer owner distinct from the repository tenant is valid.
+use self::root_lifetime::check_heads;
 use super::ledger_canonical::{canonical, declared_agrees, retained_pair};
-use super::root_lifetime::check_heads;
 use crate::ref_store::core::pack_commit::{MembershipDigest, PackMembershipEntry, packs_digest, refs_digest};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
