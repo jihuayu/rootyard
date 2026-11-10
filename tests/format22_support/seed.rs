@@ -208,7 +208,9 @@ fn write_volume_identity(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir.join("repos"))?;
     let volume = dir.join(".volume-id");
     ensure!(!volume.exists(), "refusing to overwrite an existing volume identity");
-    std::fs::write(&volume, format!("{}\n", Uuid::new_v4()))?;
+    // `Storage::open_role` requires exactly 36 bytes and parses the UUID text,
+    // so write the canonical hyphenated form with no trailing newline.
+    std::fs::write(&volume, Uuid::new_v4().to_string())?;
     std::fs::set_permissions(&volume, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
