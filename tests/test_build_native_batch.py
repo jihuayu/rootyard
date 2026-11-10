@@ -9,8 +9,16 @@ temporary workspace and a fake Cargo JSON event stream, then prove:
 * every recorded artifact is Fresh=false, the selected test is reported as a
   ``test`` profile artifact copied (not moved, not mirrored) outside the target
   directory, and binary receipts keep the rootyard lib + exact bin binding;
+* a relocated test whose destination is on another filesystem is staged and
+  renamed inside that destination's directory and keeps the compiled
+  artifact's bytes and hashes; a copy mismatch or a failing copy on that side
+  publishes nothing and withdraws the bin receipts already staged in target/.
+  The device boundary is emulated (its ``st_dev`` view and ``EXDEV`` for
+  cross-device rename/hardlink, as a Docker named volume or foreign bind mount
+  behaves); no test writes to a physical second device;
 * receipts and the batch manifest are published only after all requirements
-  hold, are withdrawn on every failure path, and use the standalone field sets;
+  hold, are withdrawn on every failure path, use the standalone field sets, and
+  the manifest is renamed last as the commit marker after every receipt;
 * source changes, stale (Fresh=true) artifacts, duplicate, missing, extra or
   wrong-profile artifacts, bad selection, collisions and passthrough profile
   environment fail closed;
@@ -29,6 +37,7 @@ the implementation. The fake event stream uses the same
 ``compiler-artifact`` / ``build-finished`` records Cargo writes.
 """
 import argparse
+import contextlib
 import copy
 import fcntl
 import hashlib
@@ -353,7 +362,10 @@ class BatchTest(unittest.TestCase):
     def build(self, events=None, args=None, **kwargs):
         args = args or self.args()
         events = self.default_events(bins=args.bin, tests=args.test) if events is None else events
-        with mock.patch.object(batch.subprocess, 'Popen', self.fake_popen(events, **kwargs)):
+        # The batch's staged copies are named on disk before publication; no
+        # other test may silently hardlink or rename across devices for it.
+        with self.cross_device_is_explicit(), \
+                mock.patch.object(batch.subprocess, 'Popen', self.fake_popen(events, **kwargs)):
             return batch.run_batch(args)
 
     # -- shared assertions --------------------------------------------------
@@ -461,6 +473,11 @@ class BatchTest(unittest.TestCase):
             self.assertEqual(test['binary_sha256'], batch.sha256_file(output))
             self.assertEqual(test['original_artifact_sha256'], batch.sha256_file(entry['executable']))
 
+    def real_device(self, path):
+        """``(major, minor)`` of the real device holding ``path``."""
+        st = os.lstat(path)
+        return (os.major(st.st_dev), os.minor(st.st_dev))
+
     def test_test_executables_are_copied_outside_target_and_survive_a_clean(self):
         args = self.args()
         self.build(args=args)
@@ -468,6 +485,10 @@ class BatchTest(unittest.TestCase):
             self.assertTrue(Path(output).is_file())
             self.assertEqual(Path(output).stat().st_mode & 0o777, 0o700)
             self.assertNotIn(self.target, Path(output).resolve().parents)
+            # Same-device relocation is one real copy, not a hardlink to the artifact.
+            self.assertEqual(self.real_device(output), self.real_device(self.outdir))
+            self.assertEqual(self.real_device(output), self.real_device(self.root))
+            self.assertNotEqual(os.stat(output).st_ino, os.stat(self.compiled_test(name)).st_ino)
             compiled = Path(self.compiled_test(name))
             self.assertTrue(compiled.is_file(), 'the compiled test artifact must not be moved out of target')
             compiled.unlink()
@@ -502,6 +523,174 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(receipt['binary_sha256'], batch.sha256_file(self.binary('rootyard')))
         for output, name in zip(args.output, args.test):
             self.assertEqual(Path(output).read_bytes(), Path(self.compiled_test(name)).read_bytes())
+
+    # -- relocation across filesystem boundaries ---------------------------
+    def cross_device_is_explicit(self):
+        """Patch cross-device hardlink/rename to fail unless a test emulates a device.
+
+        ``emulated_device`` is the only place that says so (by setting
+        ``self.device_boundary``); every other fixture then really depends on a
+        same-device operation and fails closed here rather than elsewhere.
+        """
+        enabled = bool(getattr(self, 'device_boundary', False))
+
+        def checked(operation):
+            def run(source, destination):
+                if not enabled and os.stat(source).st_dev != os.stat(destination).st_dev:
+                    raise OSError(18, 'Invalid cross-device link', str(source))
+                return operation(source, destination)
+            return run
+
+        def patch(tool, name):
+            return mock.patch.object(tool, name, checked(getattr(tool, name)))
+
+        guarded = contextlib.ExitStack()
+        guarded.enter_context(patch(batch.os, 'link'))
+        guarded.enter_context(patch(batch.os, 'rename'))
+        guarded.enter_context(patch(batch.shutil.os, 'link'))
+        guarded.enter_context(patch(batch.shutil.os, 'rename'))
+        guarded.enter_context(patch(shutil.os, 'link'))
+        guarded.enter_context(patch(shutil.os, 'rename'))
+        return guarded
+
+    @contextlib.contextmanager
+    def emulated_device(self, path):
+        """Let the batch see ``path`` on another device; real syscalls still run locally.
+
+        Patch this around ``batch.run_batch`` only: the assertion helpers copy,
+        compare and remove files with their own real views. It mirrors a Docker
+        named volume mounted at the output directory, or a bind mount on another
+        device, next to an in-container ``CARGO_TARGET_DIR``; it is not a
+        physical second device.
+        """
+        real_stat = os.stat
+        marker = Path(path)
+
+        def fake_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            try:
+                inside = marker == Path(path) or marker in Path(path).parents
+            except TypeError:
+                inside = False
+            if not inside:
+                return result
+            fields = list(result)
+            fields[2] = os.makedev(os.major(result.st_dev) + 1000, os.minor(result.st_dev))
+            return type(result)(fields)
+
+        def no_cross(source, destination):
+            if fake_stat(source).st_dev != fake_stat(destination).st_dev:
+                raise OSError(18, 'Invalid cross-device link', str(source))
+
+        patches = [mock.patch.object(batch.os, 'stat', fake_stat),
+                   mock.patch.object(batch.os, 'link', no_cross),
+                   mock.patch.object(batch.os, 'rename', no_cross),
+                   mock.patch.object(batch.shutil.os, 'stat', fake_stat),
+                   mock.patch.object(batch.shutil.os, 'link', no_cross),
+                   mock.patch.object(batch.shutil.os, 'rename', no_cross)]
+        for patcher in patches:
+            patcher.start()
+        self.device_boundary = True
+        try:
+            yield
+        finally:
+            self.device_boundary = False
+            for patcher in reversed(patches):
+                patcher.stop()
+
+    def test_cross_filesystem_outputs_are_staged_and_renamed_in_their_own_directory(self):
+        args = self.args()
+        volume = self.outdir / 'volume'
+        outputs = [str(volume / name.replace('_', '-')) for name in args.test]
+        args = self.args(outputs=outputs)
+        volume.mkdir(parents=True)
+        seen = []
+        real_replace = os.replace
+
+        def record(source, destination, *arguments, **keywords):
+            staged, target = Path(source), Path(destination)
+            device = self.real_device(staged)
+            self.assertEqual(device, self.real_device(target.parent),
+                             'a payload must be renamed only inside its destination directory')
+            seen.append((target, device))
+            return real_replace(source, destination, *arguments, **keywords)
+
+        with self.cross_device_is_explicit(), self.emulated_device(volume), \
+                mock.patch.object(batch.os, 'replace', record):
+            report = self.build(args=args)
+        self.assertEqual(report['status'], 'passed')
+        self.assertEqual(self.real_device(outputs[0]), self.real_device(volume))
+        self.assertEqual({device for _, device in seen},
+                         {self.real_device(self.target), self.real_device(volume)})
+        for output, name in zip(outputs, args.test):
+            artifact = Path(self.compiled_test(name))
+            self.assertEqual(Path(output).read_bytes(), artifact.read_bytes())
+            self.assertEqual(batch.sha256_file(output), batch.sha256_file(artifact))
+            self.assertEqual(os.stat(output).st_mode & 0o777, 0o700)
+            entry = next(item for item in report['artifacts'] if item['target'] == name)
+            self.assertIs(entry['fresh'], False)
+            self.assertEqual(entry['artifact'], str(Path(output).resolve()))
+            self.assertEqual(entry['sha256'], batch.sha256_file(artifact))
+            self.assertEqual(entry['original_artifact_sha256'], batch.sha256_file(artifact))
+            self.assertEqual(entry['size'], artifact.stat().st_size)
+            receipt = json.loads(Path(output + '.build.json').read_text())
+            self.assertIs(receipt['fresh'], False)
+            self.assertEqual(receipt['binary_sha256'], batch.sha256_file(artifact))
+            self.assertEqual(receipt['original_artifact_sha256'], batch.sha256_file(artifact))
+            self.assertEqual(receipt['batch']['targets'][-1], name)
+        # The manifest is the last rename: the commit marker follows every
+        # receipt and relocated executable this transaction renamed.
+        self.assertEqual(seen[-1][0], Path(args.manifest_out).resolve())
+        earlier = {target for target, _ in seen[:-1]}
+        self.assertLessEqual({Path(output + '.build.json').resolve() for output in outputs} |
+                             {Path(output).resolve() for output in outputs} |
+                             {(self.target / 'debug' / (name + '.build.json')).resolve()
+                              for name in args.bin},
+                             earlier)
+        self.assertFalse([path for path in volume.iterdir()
+                          if path.name.startswith('.') or path.name.endswith('.batch-new')],
+                         'cross-filesystem staging must not leave hidden siblings behind')
+
+    def copy_staging_failure(self, copyfile):
+        """The error of a batch whose copy to the other device goes through ``copyfile``."""
+        volume = self.outdir / 'volume'
+        args = self.args(outputs=[str(volume / name.replace('_', '-')) for name in TESTS])
+        # Directories are created on this side too (prepare_destinations), so
+        # create them before the boundary exists. Each test gets its own.
+        volume.mkdir(parents=True, exist_ok=True)
+        self.seed_previous_batch(args)
+        fake_cargo = self.fake_popen(self.default_events())
+        with self.cross_device_is_explicit(), self.emulated_device(volume), \
+                mock.patch.object(batch.shutil, 'copyfile', copyfile), \
+                mock.patch.object(self, 'write_executables'), \
+                mock.patch.object(batch.subprocess, 'Popen', fake_cargo):
+            with self.assertRaises((batch.BuildError, OSError)) as caught:
+                batch.run_batch(args)
+        self.assert_nothing_published(args)
+        return caught.exception
+
+    def test_cross_filesystem_copy_mismatch_publishes_nothing(self):
+        # A copy onto the other device whose bytes do not match the artifact is
+        # caught by the SHA-256 check and never renamed over the destination.
+        real_copyfile = batch.shutil.copyfile
+
+        def wrong_copy(source, destination, *arguments, **keywords):
+            real_copyfile(source, destination, *arguments, **keywords)
+            with open(destination, 'ab') as handle:
+                handle.write(b'tampered')
+
+        error = self.copy_staging_failure(wrong_copy)
+        self.assertIn('does not match the artifact', str(error))
+
+    def test_cross_filesystem_copy_error_withdraws_staged_bin_receipts(self):
+        # A full volume on the other device fails the copy of the first test
+        # after the bin receipts were already staged in target/: run_batch's
+        # error path must withdraw those staged receipts too.
+        def no_space(source, destination, *arguments, **keywords):
+            raise OSError(28, 'No space left on device', str(destination))
+
+        error = self.copy_staging_failure(no_space)
+        self.assertIn('No space left on device', str(error))
 
     # -- fail-closed paths --------------------------------------------------
     def assert_failure(self, events, message, args=None, **kwargs):

@@ -47,16 +47,31 @@ property of those two transactions but pays for the clean once:
   source replacement or a directory) is refused rather than half-recorded;
 * it copies test executables outside ``CARGO_TARGET_DIR`` (mode 0700) so a
   later ``cargo clean --package rootyard`` cannot delete them, and it never
-  moves or rewrites a binary in ``CARGO_TARGET_DIR``;
+  moves or rewrites a binary in ``CARGO_TARGET_DIR``. The compiled artifact and
+  each destination may live on different filesystems (a target directory on one
+  device and a mounted output volume on another): the copy is staged as a
+  hidden ``.<name>.batch-new`` sibling *in the destination's own directory*,
+  its SHA-256 is verified against the artifact, and only then is it renamed over
+  the destination inside that filesystem. No step requires a rename across
+  directories or devices;
 * receipts use the field sets of the two standalone builders, so
   ``native_report_manifest.py``, ``NativeProfile`` (``blob_only_service.py``)
   and the RefStore backup drills accept them unchanged. ``command`` is the
   exact one cargo invocation and ``clean_command`` the single clean, so no
   receipt pretends each artifact was cleaned and built on its own;
 * receipts and the batch manifest are published only after *all* requirements
-  hold and the sources are still unchanged, by renamed directory swaps; a
-  failure removes every receipt/manifest and relocated executable this
-  transaction could have installed. There is no option that skips Cargo.
+  hold and the sources are still unchanged, each by one ``os.replace`` of its
+  own staged sibling onto its own destination; a failure removes every
+  receipt/manifest and relocated executable this transaction could have
+  installed. There is no option that skips Cargo.
+
+The set of payloads is *not* published atomically. Each file (a bin receipt in
+``CARGO_TARGET_DIR``, a relocated executable and its receipt, the batch
+manifest) appears complete or not at all, but they may live in different
+directories or filesystems and become visible one after another. The commit
+marker is the last-renamed batch manifest: a per-file receipt on its own is not
+an accepted batch, and a consumer must treat receipts as bound only once the
+manifest for that transaction exists.
 
 Cargo's own target-dir resolution is recorded rather than reimplemented: the
 build appends ``--config build.target-dir=<canonical target>`` (the real
@@ -588,33 +603,19 @@ def select_artifacts(events, package, bin_specs, test_specs):
     return lib, selected_bins, selected_tests
 
 
-def same_filesystem(paths):
-    """A copy keeps file identity (mode, xattrs) only inside one filesystem.
-
-    Missing paths are skipped here; the copy itself fails closed on them.
-    """
-    families = set()
-    for path in paths:
-        path = Path(path).resolve()
-        if not path.exists():
-            continue
-        st = path.stat()
-        families.add((os.major(st.st_dev), os.minor(st.st_dev)))
-    if len(families) > 1:
-        raise BuildError('selected artifacts and their destinations are on different filesystems; '
-                         'a copy there could not preserve file identity')
-
-
 class Publisher:
     """Stage every payload beside its destination and publish by ``os.replace``.
 
     A receipt is written to a hidden sibling; a relocated test executable is
     copied to a hidden sibling with the same copy+chmod+hash procedure
-    ``build_native_test.py`` uses, and the compiled artifact stays in place.
+    ``build_native_test.py`` uses (a byte copy, so the source may be on another
+    filesystem than the destination), and the compiled artifact stays in place.
     Nothing is published until Cargo, the event checks, the digests and every
-    staging check succeeded; each payload is then renamed over its destination,
-    so a reader sees the previous file or the complete new one, and a failure
-    removes every staging file and any already renamed receipt.
+    staging check succeeded; each payload is then renamed over its destination
+    within its own directory, so a reader sees the previous file or the complete
+    new one for that path, and a failure removes every staging file and any
+    already renamed payload. The payloads are not one cross-directory atomic
+    rename: callers publish the batch manifest last as the commit marker.
     """
 
     def __init__(self):
@@ -1071,116 +1072,145 @@ def run_batch(args):
         # A failed or interrupted batch never leaves a receipt, manifest or
         # relocated executable from an earlier or partial transaction behind.
         remove_paths(owned + [path.with_name('.' + path.name + '.batch-new') for path in owned])
-        before = source_snapshot(plan)
-        clean_started = time.monotonic()
-        subprocess.run(CLEAN_COMMAND, cwd=_root(), check=True)
-        clean_seconds = round(time.monotonic() - clean_started, 3)
-        build_started = time.monotonic()
-        events = run_json_build(command)
-        build_seconds = round(time.monotonic() - build_started, 3)
-        after = source_snapshot(plan)
-        require_unchanged(before, after)
-        lib, bins, tests = select_artifacts(events, metadata_before['package_id'], plan.bins, plan.tests)
-        metadata_after = cargo_metadata()
-        if metadata_after['target_directory'] != metadata_before['target_directory'] or \
-                metadata_after['package_id'] != metadata_before['package_id']:
-            raise BuildError('cargo metadata (package id or target directory) changed during build')
-        require_unchanged(before, after)
-        if tests:
-            same_filesystem([artifact['executable'] for artifact in tests] + plan.outputs)
-            for artifact, output in zip(tests, plan.outputs):
-                if Path(artifact['executable']).resolve() == output:
-                    raise BuildError('relocated output would overwrite the compiled artifact ' + str(output))
+        try:
+            return publish_transaction(plan, owned, lock_path, metadata_before, toolchain, command,
+                                       started)
+        except BaseException:
+            # Staging siblings of this transaction may sit in the target
+            # directory and in every output directory (each on its own
+            # filesystem); withdraw them wherever the failure happened.
+            remove_paths(owned + [path.with_name('.' + path.name + '.batch-new') for path in owned])
+            raise
 
-        digests = {'source_inputs': before['source_inputs'], 'cargo_lock': before['cargo_lock'],
-                   'commit': before['git']['commit'], 'git_head': before['git']['head'],
-                   'working_tree': {key: before['git'][key] for key in ('tree', 'status')},
-                   'test_sources': before['tests']}
-        timings = {'clean_seconds': clean_seconds, 'build_seconds': build_seconds}
-        # The one frozen bound-input record of this batch, re-measured now.
-        bound = bind_inputs(plan, before)
-        targets = [lib] + bins
-        publisher = Publisher()
-        artifacts = []
-        # Receipts describe the sources and artifacts after everything that can
-        # change them was measured; their digests are taken when they are staged.
-        for (spec, path), artifact in zip(bin_receipts, bins):
-            publisher.text(path, binary_receipt(path=artifact['executable'], digests=digests,
-                                                toolchain=toolchain, command=command, targets=targets,
-                                                lock_path=lock_path, timings=timings, bound=bound))
-            stat = os.stat(artifact['executable'])
-            artifacts.append({'kind': 'bin', 'target': spec['name'], 'artifact': artifact['executable'],
-                              'receipt': str(path), 'fresh': False,
-                              'sha256': sha256_file(artifact['executable']), 'size': stat.st_size,
-                              'mtime_ns': stat.st_mtime_ns, 'duration_seconds': build_seconds})
-        copy_receipts = []
-        for (spec, output, path), artifact in zip(test_receipts, tests):
-            original = artifact['executable']
-            copy_artifact = dict(artifact, source=str(spec['source']), output=str(output),
-                                 source_sha256=before['tests'][spec['name']],
-                                 original_artifact_sha256=sha256_file(original))
-            publisher.copy(original, output)
-            copy_receipts.append((path, copy_artifact))
-            artifacts.append({'kind': 'test', 'target': spec['name'], 'artifact': str(output),
-                              'original_artifact': original,
-                              'original_artifact_sha256': copy_artifact['original_artifact_sha256'],
-                              'receipt': str(path), 'fresh': False,
-                              'sha256': copy_artifact['original_artifact_sha256'],
-                              'source': str(spec['source']), 'source_sha256': copy_artifact['source_sha256'],
-                              'duration_seconds': build_seconds})
-        # A test receipt hashes the relocated executable, which only exists when
-        # the batch stages it; build the payload after staging the copies.
-        publisher.stage()
-        for path, artifact in copy_receipts:
-            staged = Path(artifact['output']).with_name('.' + Path(artifact['output']).name + '.batch-new')
-            publisher.text(path, test_receipt(path=staged, artifact=artifact, digests=digests,
-                                              toolchain=toolchain, command=command, targets=targets,
-                                              lock_path=lock_path, timings=timings, bound=bound))
-        manifest = {
-            'kind': KIND,
-            'manifest_version': RECEIPT_VERSION,
-            'status': 'passed',
-            'source_commit': digests['commit'],
-            'source_inputs_sha256': digests['source_inputs'],
-            'working_tree': digests['working_tree'],
-            'cargo_lock_sha256': digests['cargo_lock'],
-            'bound_inputs': bound['bound_inputs'],
-            'bound_input_inventory': bound['bound_input_inventory'],
-            'toolchain': toolchain,
-            'features': selection.as_record(),
-            'architecture': toolchain['architecture'],
-            'target_directory': str(target),
-            'lock_file': str(lock_path),
-            'cargo_metadata_target_directory': metadata_after['target_directory'],
-            'cargo_package_id': metadata_after['package_id'],
-            'clean': {'command': CLEAN_COMMAND, 'commands': 1, 'duration_seconds': clean_seconds},
-            'build': {'command': command, 'commands': 1, 'duration_seconds': build_seconds,
-                      'fresh_false_artifacts': targets},
-            'artifacts': artifacts,
-            'duration_seconds': round(time.monotonic() - started, 3),
-        }
-        # Stage every remaining payload, then re-check the sources at the moment
-        # the receipts are about to become visible; publish renames them in place.
-        publisher.stage()
-        for entry in artifacts:
-            if entry['kind'] != 'test':
-                continue
-            staged = Path(entry['artifact']).with_name('.' + Path(entry['artifact']).name + '.batch-new')
-            entry['sha256'] = sha256_file(staged)
-            entry['size'] = os.path.getsize(staged)
-            staged_receipt = (Path(entry['receipt']).parent /
-                              ('.' + Path(entry['receipt']).name + '.batch-new'))
-            receipt = json.loads(staged_receipt.read_text())
-            if receipt['binary_sha256'] != entry['sha256']:
-                raise BuildError('staged ' + entry['target'] + ' copy does not match its receipt')
-        require_unchanged(before, source_snapshot(plan))
-        if bound_inputs_for_receipts(before, source_snapshot(plan)) != \
-                bound['bound_input_inventory']:
-            raise BuildError('bound build inputs changed after their inventory was frozen')
-        # The batch manifest is the last renamed payload: its presence is the
-        # commit marker that every receipt of this transaction is in place.
-        publisher.text(plan.manifest_out, manifest)
-        publisher.publish()
+
+def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, command, started):
+    """Clean, build, verify and publish one batch; it runs under the canonical lock."""
+    selection = plan.selection
+    target = canonical_target()
+    # Bin receipts stay in CARGO_TARGET_DIR (the single clean was the only
+    # destructive step on it); test receipts sit beside their relocated output.
+    bin_receipts = [(spec, target / 'debug' / (spec['name'] + '.build.json')) for spec in plan.bins]
+    test_receipts = list(zip(plan.tests, plan.outputs, [Path(str(output) + '.build.json')
+                                                        for output in plan.outputs]))
+    # ``owned`` is every final path of this transaction, in the order run_batch
+    # names them: bin receipts, test receipts, the manifest, then the outputs.
+    assert bin_receipts == list(zip(plan.bins, owned[:len(plan.bins)]))
+    assert test_receipts == list(zip(plan.tests, plan.outputs,
+                                     owned[len(plan.bins):len(plan.bins) + len(plan.tests)]))
+    assert owned[len(plan.bins) + len(plan.tests)] == plan.manifest_out
+    assert owned[len(plan.bins) + len(plan.tests) + 1:] == list(plan.outputs)
+    before = source_snapshot(plan)
+    clean_started = time.monotonic()
+    subprocess.run(CLEAN_COMMAND, cwd=_root(), check=True)
+    clean_seconds = round(time.monotonic() - clean_started, 3)
+    build_started = time.monotonic()
+    events = run_json_build(command)
+    build_seconds = round(time.monotonic() - build_started, 3)
+    after = source_snapshot(plan)
+    require_unchanged(before, after)
+    lib, bins, tests = select_artifacts(events, metadata_before['package_id'], plan.bins, plan.tests)
+    metadata_after = cargo_metadata()
+    if metadata_after['target_directory'] != metadata_before['target_directory'] or \
+            metadata_after['package_id'] != metadata_before['package_id']:
+        raise BuildError('cargo metadata (package id or target directory) changed during build')
+    require_unchanged(before, after)
+    if tests:
+        for artifact, output in zip(tests, plan.outputs):
+            if Path(artifact['executable']).resolve() == output:
+                raise BuildError('relocated output would overwrite the compiled artifact ' + str(output))
+
+    digests = {'source_inputs': before['source_inputs'], 'cargo_lock': before['cargo_lock'],
+               'commit': before['git']['commit'], 'git_head': before['git']['head'],
+               'working_tree': {key: before['git'][key] for key in ('tree', 'status')},
+               'test_sources': before['tests']}
+    timings = {'clean_seconds': clean_seconds, 'build_seconds': build_seconds}
+    # The one frozen bound-input record of this batch, re-measured now.
+    bound = bind_inputs(plan, before)
+    targets = [lib] + bins
+    publisher = Publisher()
+    artifacts = []
+    # Receipts describe the sources and artifacts after everything that can
+    # change them was measured; their digests are taken when they are staged.
+    for (spec, path), artifact in zip(bin_receipts, bins):
+        publisher.text(path, binary_receipt(path=artifact['executable'], digests=digests,
+                                            toolchain=toolchain, command=command, targets=targets,
+                                            lock_path=lock_path, timings=timings, bound=bound))
+        stat = os.stat(artifact['executable'])
+        artifacts.append({'kind': 'bin', 'target': spec['name'], 'artifact': artifact['executable'],
+                          'receipt': str(path), 'fresh': False,
+                          'sha256': sha256_file(artifact['executable']), 'size': stat.st_size,
+                          'mtime_ns': stat.st_mtime_ns, 'duration_seconds': build_seconds})
+    copy_receipts = []
+    for (spec, output, path), artifact in zip(test_receipts, tests):
+        original = artifact['executable']
+        copy_artifact = dict(artifact, source=str(spec['source']), output=str(output),
+                             source_sha256=before['tests'][spec['name']],
+                             original_artifact_sha256=sha256_file(original))
+        publisher.copy(original, output)
+        copy_receipts.append((path, copy_artifact))
+        artifacts.append({'kind': 'test', 'target': spec['name'], 'artifact': str(output),
+                          'original_artifact': original,
+                          'original_artifact_sha256': copy_artifact['original_artifact_sha256'],
+                          'receipt': str(path), 'fresh': False,
+                          'sha256': copy_artifact['original_artifact_sha256'],
+                          'source': str(spec['source']), 'source_sha256': copy_artifact['source_sha256'],
+                          'duration_seconds': build_seconds})
+    # A test receipt hashes the relocated executable, which only exists when
+    # the batch stages it; build the payload after staging the copies.
+    publisher.stage()
+    for path, artifact in copy_receipts:
+        staged = Path(artifact['output']).with_name('.' + Path(artifact['output']).name + '.batch-new')
+        publisher.text(path, test_receipt(path=staged, artifact=artifact, digests=digests,
+                                          toolchain=toolchain, command=command, targets=targets,
+                                          lock_path=lock_path, timings=timings, bound=bound))
+    manifest = {
+        'kind': KIND,
+        'manifest_version': RECEIPT_VERSION,
+        'status': 'passed',
+        'source_commit': digests['commit'],
+        'source_inputs_sha256': digests['source_inputs'],
+        'working_tree': digests['working_tree'],
+        'cargo_lock_sha256': digests['cargo_lock'],
+        'bound_inputs': bound['bound_inputs'],
+        'bound_input_inventory': bound['bound_input_inventory'],
+        'toolchain': toolchain,
+        'features': selection.as_record(),
+        'architecture': toolchain['architecture'],
+        'target_directory': str(target),
+        'lock_file': str(lock_path),
+        'cargo_metadata_target_directory': metadata_after['target_directory'],
+        'cargo_package_id': metadata_after['package_id'],
+        'clean': {'command': CLEAN_COMMAND, 'commands': 1, 'duration_seconds': clean_seconds},
+        'build': {'command': command, 'commands': 1, 'duration_seconds': build_seconds,
+                  'fresh_false_artifacts': targets},
+        'artifacts': artifacts,
+        'duration_seconds': round(time.monotonic() - started, 3),
+    }
+    # Stage every remaining payload, then re-check the sources at the moment
+    # the receipts are about to become visible; publish renames each staged
+    # sibling onto its own destination in that destination's directory.
+    publisher.stage()
+    for entry in artifacts:
+        if entry['kind'] != 'test':
+            continue
+        staged = Path(entry['artifact']).with_name('.' + Path(entry['artifact']).name + '.batch-new')
+        entry['sha256'] = sha256_file(staged)
+        entry['size'] = os.path.getsize(staged)
+        staged_receipt = (Path(entry['receipt']).parent /
+                          ('.' + Path(entry['receipt']).name + '.batch-new'))
+        receipt = json.loads(staged_receipt.read_text())
+        if receipt['binary_sha256'] != entry['sha256']:
+            raise BuildError('staged ' + entry['target'] + ' copy does not match its receipt')
+    require_unchanged(before, source_snapshot(plan))
+    if bound_inputs_for_receipts(before, source_snapshot(plan)) != \
+            bound['bound_input_inventory']:
+        raise BuildError('bound build inputs changed after their inventory was frozen')
+    # The payloads are not renamed as one atomic set across directories or
+    # filesystems. The batch manifest is the last renamed payload: its
+    # presence is the commit marker that every receipt of this transaction
+    # has already been renamed into place.
+    publisher.text(plan.manifest_out, manifest)
+    publisher.publish()
     return manifest
 
 
