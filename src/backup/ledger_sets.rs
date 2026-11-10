@@ -556,9 +556,12 @@ fn verified_selector(root: &RootCapture, proof: &RootProof) -> bool {
 /// differ from the repository tenant; the capture itself must carry the same
 /// full scope as the head, and the tombstone must repeat it.
 ///
-/// A capture's presence is decided by its key alone: a present capture whose
-/// generation, scope, owner or register digest disagrees with the head is a
-/// violation and can never be read as a release-before-register root.
+/// A capture's presence is decided by its key alone. The verdicts are stable and
+/// distinct: `root_capture_missing:{at}:{state}` when the key has no capture,
+/// `root_capture_mismatch:{at}:{state}` when it has one that disagrees with the
+/// head (generation, scope, owner or register digest). A missing capture is the
+/// only shape a release tombstone may explain (release-before-register); a
+/// present but disagreeing capture is never accepted.
 pub(super) fn check_heads(
     heads: &[RootHead],
     tombstones: &[RootTombstone],
@@ -596,9 +599,12 @@ pub(super) fn check_heads(
         match (head.state.as_str(), head.last_generation) {
             // Registered and still active: `register` writes no tombstone.
             ("active", 1) => {
-                if !valid {
-                    let reason = if captured { "capture_mismatch" } else { "capture_missing" };
-                    lines.push(format!("root_capture_missing:{at}:active:{reason}"));
+                // A missing and a present-but-wrong capture are different facts
+                // with different verdicts; neither is ever accepted here.
+                if !captured {
+                    lines.push(format!("root_capture_missing:{at}:active"));
+                } else if !valid {
+                    lines.push(format!("root_capture_mismatch:{at}:active"));
                 } else if fence {
                     lines.push(format!("root_head_mismatch:{at}:tombstone_without_release"));
                 }

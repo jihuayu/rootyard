@@ -470,9 +470,12 @@ fn root_lifetime_covers_heads_captures_and_tombstones() {
     active.tombstones.clear();
     assert!(active.violations().is_empty(), "{:?}", active.violations());
     // Nothing registered: refused.
+    // A missing capture is exactly its own missing verdict, never a mismatch.
     let mut nothing = active.clone();
     nothing.roots.clear();
-    assert!(nothing.violations().contains(&format!("root_capture_missing:{REPO}:{ROOT}:active")));
+    let lines = nothing.violations();
+    assert!(lines.contains(&format!("root_capture_missing:{REPO}:{ROOT}:active")), "{lines:?}");
+    assert!(!lines.iter().any(|line| line.starts_with("root_capture_mismatch")), "{lines:?}");
     // A capture without its head is invisible and refused.
     let mut headless = valid.clone();
     headless.heads.clear();
@@ -507,10 +510,10 @@ fn root_lifetime_covers_heads_captures_and_tombstones() {
     // The capture must itself carry the head's register digest, owner and tenant.
     let mut digest = registered.clone();
     digest.roots[0].register_digest = sha(0x35);
-    assert_root_refused(&digest.violations(), "root_capture_missing", "released");
+    assert_root_refused(&digest.violations(), "root_capture_mismatch", "released");
     let mut producer = active.clone();
     producer.roots[0].owner_id = Uuid::from_u128(0x1600);
-    assert_root_refused(&producer.violations(), "root_capture_missing", "active");
+    assert_root_refused(&producer.violations(), "root_capture_mismatch", "active");
     // A release-before-register head that the capture proves was registered is
     // not a release-before-register root.
     let mut contradiction = valid_source();
