@@ -237,7 +237,18 @@ class BatchTest(unittest.TestCase):
         self.clean_commands = []
 
         self.addCleanup(mock.patch.stopall)
-        mock.patch.dict(os.environ, {'CARGO_TARGET_DIR': 'target'}).start()
+        self.cargo_home = self.tempdir / 'cargo-home'
+        self.home = self.tempdir / 'home'
+        self.cargo_home.mkdir()
+        self.home.mkdir()
+        mock.patch.dict(
+            os.environ,
+            {
+                'CARGO_TARGET_DIR': 'target',
+                'CARGO_HOME': str(self.cargo_home),
+                'HOME': str(self.home),
+            },
+        ).start()
         for name in batch.PASSTHROUGH_VARIABLES:
             os.environ.pop(name, None)
         for name in list(os.environ):
@@ -1618,6 +1629,83 @@ path = "src/bin/rootyard-view-lab.rs"
                          first['bound_inputs']['by_role']['integration_test_source'] - 1)
         self.assertEqual(second['bound_inputs']['total_bytes'],
                          first['bound_inputs']['total_bytes'] - len('pub fn helper() {}\n'))
+
+    def test_in_repository_config_rejects_compiler_and_profile_keys(self):
+        cases = [
+            ('[build]\ntarget = "SENTINEL"\n', 'build.target'),
+            ('[build]\nrustc = "SENTINEL"\n', 'build.rustc'),
+            ('[build]\nrustc-wrapper = "SENTINEL"\n', 'build.rustc-wrapper'),
+            (
+                '[build]\nrustc-workspace-wrapper = "SENTINEL"\n',
+                'build.rustc-workspace-wrapper',
+            ),
+            ('[profile.test]\nopt-level = "SENTINEL"\n', 'profile.test.opt-level'),
+            (
+                '[profile.test.package.rootyard]\ncodegen-units = "SENTINEL"\n',
+                'profile.test.package.rootyard.codegen-units',
+            ),
+        ]
+        for text, key in cases:
+            with self.subTest(key=key):
+                (self.root / CARGO_CONFIG).write_text(text)
+                self.metadata_calls = []
+                self.clean_commands = []
+                self.popen_calls = []
+                with self.assertRaises(batch.BuildError) as caught:
+                    batch.run_batch(self.args())
+                self.assertEqual(len(self.metadata_calls), 1)
+                self.assertEqual(self.clean_commands, [])
+                self.assertEqual(self.popen_calls, [])
+                self.assertIn(key, str(caught.exception))
+                self.assertNotIn('SENTINEL', str(caught.exception))
+        self.assertEqual(batch.config_path_keys(CARGO_CONFIG_TEXT.encode()), [])
+
+    def test_cargo_home_config_is_refused(self):
+        path = self.cargo_home / 'config.toml'
+        path.write_text('[build]\nrustc = "SENTINEL"\n')
+        self.metadata_calls = []
+        self.clean_commands = []
+        self.popen_calls = []
+        with self.assertRaises(batch.BuildError) as caught:
+            batch.run_batch(self.args())
+        self.assertIn(str(path), str(caught.exception))
+        self.assertNotIn('SENTINEL', str(caught.exception))
+        self.assertEqual(self.metadata_calls, [])
+        self.assertEqual(self.clean_commands, [])
+        self.assertEqual(self.popen_calls, [])
+
+    def test_ancestor_cargo_config_is_refused(self):
+        path = self.root.parent / '.cargo' / 'config'
+        path.parent.mkdir()
+        path.write_text('[build]\nrustc = "SENTINEL"\n')
+        self.metadata_calls = []
+        self.clean_commands = []
+        self.popen_calls = []
+        with self.assertRaises(batch.BuildError) as caught:
+            batch.run_batch(self.args())
+        self.assertIn(str(path), str(caught.exception))
+        self.assertNotIn('SENTINEL', str(caught.exception))
+        self.assertEqual(self.metadata_calls, [])
+        self.assertEqual(self.clean_commands, [])
+        self.assertEqual(self.popen_calls, [])
+
+    def test_home_cargo_config_is_refused_without_cargo_home(self):
+        config_path = self.home / '.cargo' / 'config.toml'
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text('[build]\nrustc = "SENTINEL"\n', encoding='utf-8')
+        self.metadata_calls = []
+        self.clean_commands = []
+        self.popen_calls = []
+        with mock.patch.dict(os.environ):
+            os.environ.pop('CARGO_HOME', None)
+            with self.assertRaises(batch.BuildError) as caught:
+                batch.run_batch(self.args())
+        message = str(caught.exception)
+        self.assertIn(os.path.abspath(str(config_path)), message)
+        self.assertNotIn('SENTINEL', message)
+        self.assertEqual(self.metadata_calls, [])
+        self.assertEqual(self.clean_commands, [])
+        self.assertEqual(self.popen_calls, [])
 
     def test_a_config_change_is_recorded_by_the_next_fresh_run(self):
         text = '[build]\njobs = 8\n'

@@ -1014,6 +1014,7 @@ CARGO_CONFIG_FILES = ('.cargo/config.toml', '.cargo/config')
 #: ``<triple>.<key>``. ``runner`` is not one: it only runs a built binary.
 PATH_KEYS = ('rustflags', 'linker', 'target-dir', 'directory', 'local-registry',
              'registry', 'CARGO_TARGET_DIR')
+BUILD_REDIRECT_KEYS = ('target', 'rustc', 'rustc-wrapper', 'rustc-workspace-wrapper')
 PATH_TABLES = ('build', 'target', 'source', 'env')
 TOML_KEY = re.compile(r'\s*(?:"([^"]*)"|([A-Za-z0-9_.\-]+))\s*=(.*)$')
 #: ``[target.<triple>]`` table names come from rustc's ``-vV`` output, which is
@@ -1026,30 +1027,39 @@ def _relative(path):
 
 
 def config_path_keys(raw):
-    """The keys of one Cargo config that redirect inputs (``[table]`` headers, then ``key =``)."""
-    table, keys = None, []
+    """The keys of one Cargo config that redirect inputs or override the compiler/profile."""
+    table, keys, seen = None, [], set()
     for line in raw.decode('utf-8', 'replace').splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith('#'):
             continue
         if stripped.startswith('[') and stripped.endswith(']'):
-            table = stripped.strip('[]<').strip().strip('"')
+            table = stripped.strip('[]<>').strip().strip('"')
             continue
         match = TOML_KEY.match(stripped)
         if not match:
             continue
-        key = match.group(1) if match.group(1) is not None else match.group(2).strip('"')
+        key = match.group(1) if match.group(1) is not None else match.group(2)
         names = [key] if table is None else table.split('.') + [key]
         candidates = {key, '.'.join(names[-2:]), '.'.join(names[-3:])}
         table_names = names[:-1]
         if len(table_names) >= 2 and table_names[0] in PATH_TABLES:
             candidates.add(table_names[0] + '.' + table_names[1] + '.' + key)
         folded = {candidate.lower() for candidate in candidates}
+        hit = None
         for pattern in PATH_KEYS:
             if pattern.lower() in folded:
-                keys.append(table + '.' + key if table is not None and key != 'CARGO_TARGET_DIR'
-                            else pattern)
+                hit = table + '.' + key if table is not None and key != 'CARGO_TARGET_DIR' else pattern
                 break
+        if hit is None and table is not None:
+            parts = table.split('.')
+            if table == 'build' and key in BUILD_REDIRECT_KEYS:
+                hit = 'build.' + key
+            elif parts[0] == 'profile':
+                hit = table + '.' + key
+        if hit is not None and hit not in seen:
+            seen.add(hit)
+            keys.append(hit)
     return keys
 
 
@@ -1058,8 +1068,36 @@ def require_in_repository_config(name, raw):
     keys = config_path_keys(raw)
     if keys:
         raise BuildError(name + ' sets ' + ', '.join(repr(key) for key in keys) +
-                         ', a value that redirects build inputs; this batch binds in-repository '
-                         'configuration only and refuses rather than record a partial input set')
+                         ', a value that redirects build inputs or overrides the compiler or '
+                         'build profile; this batch binds in-repository configuration only and '
+                         'refuses rather than record a partial input set')
+
+
+def reject_external_cargo_config():
+    """Refuse to run when a Cargo config outside the workspace could change the build."""
+    root = _root()
+    cargo_home = os.environ.get('CARGO_HOME')
+    if cargo_home:
+        home = Path(cargo_home)
+        if not home.is_absolute():
+            home = root / home
+        candidates = [home / 'config.toml', home / 'config']
+    else:
+        user_home = os.environ.get('HOME')
+        if user_home:
+            candidates = [Path(user_home) / '.cargo' / 'config.toml',
+                          Path(user_home) / '.cargo' / 'config']
+        else:
+            candidates = []
+    for ancestor in root.resolve().parents:
+        candidates.append(ancestor / '.cargo' / 'config.toml')
+        candidates.append(ancestor / '.cargo' / 'config')
+    for path in candidates:
+        if path.is_file():
+            raise BuildError('Cargo configuration outside the workspace at ' +
+                             os.path.abspath(str(path)) +
+                             ' could change this build; this batch binds in-repository '
+                             'configuration only and refuses to proceed')
 
 
 def bound_input_files():
@@ -1335,6 +1373,7 @@ def test_receipt(*, path, artifact, digests, toolchain, command, targets, lock_p
 def run_batch(args):
     """Run the whole transaction and return the published batch manifest."""
     reject_passthrough_environment()
+    reject_external_cargo_config()
     # The target set is Cargo's: the metadata document is read before the
     # request is planned, so --all-bins, a --bin name, a --test that is a
     # metadata test and the implicit bins all come from one target list.
