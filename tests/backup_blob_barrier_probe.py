@@ -251,47 +251,114 @@ def _listening(bind, timeout=0.2):
 def _reap_owned(child, window=5.0):
     """Kill the probe's own session and prove it quiescent; True only when proven.
 
-    SIGKILL goes to the leader's own PGID (made unique to its session) whenever
-    the leader or any member is alive, including a child left behind by a leader
-    that already exited. Proof reads only that PGID from Linux /proc; there it
-    is refused rather than approximated, and elsewhere the leader's group is
-    killed and reaped without the member proof.
+    Ownership is proven first, on Linux, by a successful non-reaping
+    waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT): None means our still
+    unreaped child is alive and a siginfo means it exited but is still
+    unreaped. Either way the unreaped leader pins the numeric PGID, so it is
+    still ours to signal. SIGKILL then goes to the leader's own PGID (made
+    unique to its session) unconditionally, including for children left
+    behind by a leader that already exited, and the group is censused from
+    Linux /proc until an empty census is read or the window runs out. The
+    leader stays unreaped until after all signals and the final census, then
+    it is reaped with Popen.wait. Proof is refused rather than approximated:
+    an unknown observer, a reaped child or a failed wait proves nothing, and
+    a census that cannot be read never yields True.
+
+    On platforms without /proc the group is not pinned by waitid, so the
+    leader's group is killed and reaped without the ownership proof or
+    member census.
     """
     group = child.pid  # start_new_session made the leader's pid its PGID
     linux = _proc_available()
-    census_ok = False
+    result = False
+
     try:
         if linux:
+            # Establish ownership BEFORE any signal or reap: only a successful
+            # non-reaping waitid can tell that this unreaped child still pins
+            # the numeric PGID. An already reaped leader or an unknown
+            # observer must never let a killpg reach a reused PGID.
             try:
-                members = _group_members(group)
-                census_ok = True
-            except Exception:
-                # Unreadable or malformed /proc entry: the census cannot prove
-                # an empty group, but the known run-owned group is still killed.
-                members = None
-        else:
-            members = None
-        if not linux or members is None or members or child.poll() is None:
-            os.killpg(group, 9)
-    except ProcessLookupError:
-        pass
-    try:
-        child.wait(timeout=window)
-    except subprocess.TimeoutExpired:
-        return False
-    if not linux:
-        return True
-    if not census_ok:
-        return False
-    try:
-        deadline = time.monotonic() + window
-        while _group_members(group):
-            if time.monotonic() > deadline:
+                _exit_state(child)
+            except OSError:
                 return False
-            time.sleep(0.02)
+            signal_ok = True
+            # The leader is still unreaped, so this numeric group belongs to
+            # our session: signal it unconditionally, even if it is a zombie.
+            try:
+                os.killpg(group, 9)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                signal_ok = False
+            census_ok = False
+            deadline = time.monotonic() + window
+            while True:
+                try:
+                    members = _group_members(group)
+                except Exception:
+                    break
+                if not members:
+                    census_ok = True
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            result = signal_ok and census_ok
+        else:
+            try:
+                os.killpg(group, 9)
+            except ProcessLookupError:
+                pass
+            result = True
     except Exception:
-        return False
-    return True
+        result = False
+    finally:
+        # The leader stays unreaped until after every signal and the final
+        # census; only a successful final reap preserves a proven True.
+        try:
+            child.wait(timeout=window)
+        except Exception:
+            result = False
+    return result
+
+
+def _exit_state(child):
+    """Non-reaping exit observation of this probe's own `child`.
+
+    Uses os.waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT) so the child is
+    observed without being reaped and therefore keeps pinning its numeric pid
+    (and session PGID). Returns None when the successful call reports no
+    exited child, i.e. our unreaped child is alive; returns the exit status
+    for CLD_EXITED and its negation for CLD_KILLED/CLD_DUMPED when it exited
+    but is still unreaped. Any other outcome -- unexpected pid or code, a
+    ChildProcessError, or an unavailable API -- means the true state is
+    unknown and raises OSError. Never assigns Popen.returncode.
+    """
+    try:
+        waitid = os.waitid
+        constants = (os.P_PID, os.WEXITED, os.WNOHANG, os.WNOWAIT, os.CLD_EXITED,
+                     os.CLD_KILLED, os.CLD_DUMPED)
+    except AttributeError as exc:
+        raise OSError("non-reaping waitid is unavailable") from exc
+    if not all(isinstance(value, int) for value in constants):
+        raise OSError("non-reaping waitid is unavailable")
+    pid_selector, exited, nohang, nowait, cld_exited, cld_killed, cld_dumped = constants
+    try:
+        info = waitid(pid_selector, child.pid, exited | nohang | nowait)
+    except ChildProcessError as exc:
+        raise OSError("child is already reaped; ownership unknown") from exc
+    except (OSError, AttributeError) as exc:
+        raise OSError("non-reaping waitid failed; ownership unknown") from exc
+    if info is None:
+        return None
+    if info.si_pid != child.pid:
+        raise OSError("waitid reported an unexpected pid")
+    if info.si_code == cld_exited:
+        return info.si_status
+    if info.si_code in (cld_killed, cld_dumped):
+        return -info.si_status
+    raise OSError("waitid reported an unexpected code")
 
 
 def _proc_available():
@@ -352,26 +419,38 @@ def serving_barrier_probe(binary, env, mode, root, secrets=(), window=OBSERVATIO
                                      start_new_session=True)
         deadline = started + window
         listening = False
+        exit_state = 0
+        alive = False
+        observed = False
         while time.monotonic() < deadline:
             if _listening(child_env["ROOTYARD_BIND"], timeout=min(0.2, max(0.01, (deadline - time.monotonic()) / 2))):
                 listening = True
                 break
-            if child.poll() is not None:
+            try:
+                state = _exit_state(child)
+            except OSError:
                 break
+            observed = True
+            if state is not None:
+                exit_state, alive = state, False
+                break
+            alive = True
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         diagnostics = own_lines(stdout_path, secrets) + own_lines(stderr_path, secrets)
         outcome["diagnostics"] = diagnostics
         if listening:
             outcome["status"] = "started"
             outcome["reason"] = "answered a loopback HTTP request"
-        elif child.poll() is None:
+        elif not observed:
+            outcome.update(status="unknown", reason="exit state could not be observed without reaping")
+        elif alive:
             outcome.update(status="unknown", alive=True, reason="still alive at the end of the observation window")
-        elif child.returncode == 0:
+        elif exit_state == 0:
             outcome.update(status="unknown", exit=0, reason="exit 0 without a barrier refusal")
         elif _exact_refusal(stdout_path, secrets, mode) or _exact_refusal(stderr_path, secrets, mode):
-            outcome.update(status="refused", exit=child.returncode, expected=BARRIER_REFUSALS[mode])
+            outcome.update(status="refused", exit=exit_state, expected=BARRIER_REFUSALS[mode])
         else:
-            outcome.update(status="unknown", exit=child.returncode, reason="exit without the exact barrier refusal")
+            outcome.update(status="unknown", exit=exit_state, reason="exit without the exact barrier refusal")
     finally:
         # The probe owns the child from Popen on: on any failure (and on every
         # return) kill and reap exactly that child's group before letting the

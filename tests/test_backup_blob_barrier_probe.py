@@ -519,6 +519,53 @@ class ProbeTest(unittest.TestCase):
         self.assertIsNotNone(child.returncode)
         self.assertEqual(probe._group_members(child.pid), [])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "non-reaping waitid observation is Linux-only")
+    def test_exit_state_observes_a_natural_exit_without_reaping(self):
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(17)"], start_new_session=True)
+        try:
+            first = second = None
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                first = probe._exit_state(child)
+                if first is not None:
+                    self.assertEqual(first, 17)
+                    second = probe._exit_state(child)
+                    break
+                time.sleep(0.01)
+            self.assertEqual(first, 17)
+            self.assertEqual(second, 17)
+            self.assertIsNone(child.returncode)
+            self.assertTrue(probe._reap_owned(child))
+            self.assertEqual(child.returncode, 17)
+            with self.assertRaises(ChildProcessError):
+                os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        finally:
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "non-reaping waitid ownership is Linux-only")
+    def test_reap_owned_refuses_a_reaped_leader_and_never_signals_its_pgid(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        try:
+            child.wait(timeout=10)
+            self.assertIsNotNone(child.returncode)
+            with mock.patch.object(probe, "_group_members", side_effect=OSError("unknown census")), \
+                    mock.patch.object(probe.os, "killpg") as killpg:
+                self.assertFalse(probe._reap_owned(child))
+            killpg.assert_not_called()
+        finally:
+            try:
+                if child.poll() is None:
+                    child.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
     def test_a_guarded_target_data_dir_is_never_used_by_the_child(self):
         # The watched target carries .rootyard-restore.guard; the child must see
         # a private guard-free data dir, the same DATABASE_URL, and no leak.
