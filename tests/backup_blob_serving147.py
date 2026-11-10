@@ -1031,7 +1031,8 @@ class Drill(BlobOnlyHarness):
         markers = self.format22_marker
         registrations = [row["registration_id"] for row in markers["registrations"]]
         detail = format22_manifest_checks(manifest, {
-            "format": 22, "schema_versions": manifest["schema_versions"], "registered_packs": registrations,
+            "format": 22, "schema_versions": SCHEMA_VERSIONS, "schema_baseline": SCHEMA_VERSIONS,
+            "registered_packs": registrations,
             "artifacts": len(registrations) * 2, "roots": markers["roots"], "repos": markers["repositories"],
             "producer": markers["producer_owner_id"], "serving_read": markers["serving_read"]})
         assert result["format"] == 22 and result["blob_artifacts"] == detail["closure_artifacts"], result

@@ -28,6 +28,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backup_blob_serving169_support as support  # noqa: E402
+import schema_baseline  # noqa: E402
 
 CANARY = "issue169-offline-canary"
 
@@ -825,11 +826,13 @@ def positive_inputs(producer=None):
     repos = [ready_repo(str(uuid.uuid4()), tenant), ready_repo(str(uuid.uuid4()), tenant)]
     roots = [{"root_id": str(uuid.uuid4()), "state": "active", "owner_id": producer},
              {"root_id": str(uuid.uuid4()), "state": "released", "owner_id": producer}]
-    expected = {"format": 22, "schema_versions": [147], "registered_packs": registrations,
+    versions = list(schema_baseline.SCHEMA_VERSIONS)
+    expected = {"format": 22, "schema_versions": versions, "schema_baseline": list(versions),
+                "registered_packs": registrations,
                 "artifacts": len(artifacts), "roots": roots, "repos": repos, "producer": producer,
                 "serving_read": serving_read_marker(repos[0]["id"], tenant)}
     carry = {table: {"rows": 2, "sha256": "00" * 32} for table in support._CARRY_TABLES}
-    manifest = {"format": 22, "schema_versions": [147],
+    manifest = {"format": 22, "schema_versions": list(versions),
                 "repositories": [{"id": repo["id"], "backend": "pg_refstore"} for repo in repos],
                 "blob_closure": {"artifacts": len(artifacts), "bytes": sum(row["content_length"] for row in artifacts),
                                  "provider": "s3", "backend_identity": "ab" * 32},
@@ -951,6 +954,47 @@ class Format22ManifestTest(unittest.TestCase):
         manifest["format"] = 21
         with self.assertRaisesRegex(AssertionError, "not format22"):
             support.format22_manifest_checks(manifest, expected)
+
+    def test_realistic_full_ordered_schema_vector_is_accepted(self):
+        # Format22 returns every applied migration, not just its maximum: the
+        # realistic archive carries the complete ascending baseline ending at 147.
+        versions = list(schema_baseline.SCHEMA_VERSIONS)
+        self.assertGreater(len(versions), 1)
+        self.assertEqual(versions, sorted(set(versions)))
+        self.assertEqual(versions[-1], 147)
+        self.assertEqual(support.expected_schema_versions(versions, schema_baseline.SCHEMA_VERSIONS, 147), versions)
+        manifest, expected = positive_inputs()
+        self.assertEqual(manifest["schema_versions"], versions)
+        support.format22_manifest_checks(manifest, expected)
+
+    def test_missing_reordered_or_extra_schema_versions_are_refused(self):
+        manifest, expected = positive_inputs()
+        versions = list(schema_baseline.SCHEMA_VERSIONS)
+        for bad in ([147],                 # only the maximum (the old wrong assumption)
+                    versions[:-1],         # drop the current version
+                    versions[1:],          # drop the first migration
+                    versions[0:1] + versions[2:],  # drop a middle migration
+                    versions[:-1] + [146, 147],    # duplicate an entry
+                    [versions[1], versions[0]] + versions[2:],  # first two swapped
+                    versions[:-1] + [versions[-1] + 1],  # an unknown extra max version
+                    versions + [versions[-1] + 1]):  # an extra appended version
+            with self.assertRaisesRegex(AssertionError, "unexpected schema versions", msg=str(bad)):
+                support.format22_manifest_checks(dict(manifest, schema_versions=bad), expected)
+        with self.assertRaisesRegex(AssertionError, "unexpected schema versions"):
+            support.format22_manifest_checks(dict(manifest, schema_versions=None), expected)
+
+    def test_expected_vector_cannot_be_derived_from_the_manifest_or_be_unbounded(self):
+        # The oracle must be an independent full vector ending at the supported
+        # current version, never a self-derived or malformed expectation.
+        baseline = list(schema_baseline.SCHEMA_VERSIONS)
+        for bad in ([147], [], [1, 2, 3], [147, 146], [146, 147, 148], [1, 1, 2, 147],
+                    baseline[:-1], baseline[1:], baseline + [148]):
+            with self.assertRaises(AssertionError, msg=str(bad)):
+                support.expected_schema_versions(bad, baseline, 147)
+        with self.assertRaises(AssertionError):
+            support.expected_schema_versions(baseline, baseline, 148)
+        with self.assertRaises(TypeError):
+            support.expected_schema_versions(None, baseline, 147)
 
 
 class Format22RestoredServingReadTest(unittest.TestCase):

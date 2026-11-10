@@ -181,11 +181,33 @@ _CARRY_TABLES = (
 )
 
 
+def expected_schema_versions(schema_versions, baseline, current):
+    """The independent ordered migration vector a format22 manifest must carry.
+
+    Format22 returns every migration the source applied (``crate::db::SCHEMA_VERSIONS``),
+    not only its maximum, so the oracle is the caller's baseline list (never the
+    manifest under test): a strictly ascending unique projection of the complete
+    migration baseline that ends at the supported current version.
+    """
+    versions = [int(version) for version in schema_versions]
+    complete = sorted({int(version) for version in baseline})
+    need(complete and complete[-1] == int(current),
+         "schema baseline does not end at the supported current version")
+    need(versions and versions == sorted(set(versions)), "schema baseline is not an ascending unique vector")
+    need(versions[-1] == int(current), "schema baseline does not end at the supported current version")
+    need(complete == versions,
+         "schema baseline is not the complete migration vector up to the supported current version")
+    return versions
+
+
 def format22_manifest_checks(manifest, expected):
     """Return a detail dict or raise AssertionError for a non-format22 archive.
 
     ``expected`` carries the API-created identities: ``format`` (22),
-    ``schema_versions``, ``registered_packs`` (registrations the source holds),
+    ``schema_versions`` (the complete independent full ordered migration vector,
+    e.g. ``schema_baseline.SCHEMA_VERSIONS``), ``schema_baseline`` (the same
+    baseline, used to prove ``schema_versions`` is complete, not truncated),
+    ``registered_packs`` (registrations the source holds),
     ``artifacts`` (pack + idx rows), ``roots`` (``[{root_id, state, owner_id}]``
     with at least one active and one released root), ``repos``
     (``[{id, owner_id, tenant_id}]``), ``producer`` (the owner of every root
@@ -194,7 +216,8 @@ def format22_manifest_checks(manifest, expected):
     manifest.
     """
     need(manifest.get("format") == 22 == expected["format"], "archive is not format22")
-    need(manifest.get("schema_versions") == list(expected["schema_versions"]) == [147], "unexpected schema versions")
+    schema_versions = expected_schema_versions(expected["schema_versions"], expected["schema_baseline"], 147)
+    need(manifest.get("schema_versions") == schema_versions, "unexpected schema versions")
     repos = manifest.get("repositories") or []
     need(len(repos) == len(expected["repos"]), "manifest repository count differs from the API-created set")
     need({str(repo["id"]) for repo in repos} == {str(repo["id"]) for repo in expected["repos"]},
