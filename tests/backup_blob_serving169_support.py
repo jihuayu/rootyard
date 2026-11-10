@@ -136,7 +136,8 @@ def text_array(values):
 _CARRY_TABLES = (
     "ref_store_core_pack_publications", "ref_store_core_pack_artifacts", "ref_store_core_pack_memberships",
     "ref_store_core_root_heads", "ref_store_core_roots", "ref_store_core_root_packs", "ref_store_core_root_refs",
-    "ref_store_core_root_receipts", "ref_store_core_snapshot_packs", "ref_store_core_pins",
+    "ref_store_core_root_receipts", "ref_store_core_root_oids", "ref_store_core_root_tombstones",
+    "ref_store_core_snapshot_packs", "ref_store_core_pins",
 )
 
 

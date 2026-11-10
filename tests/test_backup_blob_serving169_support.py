@@ -156,6 +156,18 @@ def positive_inputs(producer=None):
     return manifest, expected
 
 
+class CarryInventoryTest(unittest.TestCase):
+    # Migration 144 root OID/tombstone ledgers, pinned independently of the
+    # implementation tuple so a silent drop cannot derive its own expectation.
+    MIGRATION_144_ROOT_LEDGERS = frozenset({"ref_store_core_root_oids", "ref_store_core_root_tombstones"})
+
+    def test_migration_144_root_ledgers_are_in_the_carry_inventory(self):
+        carry = set(support._CARRY_TABLES)
+        self.assertEqual(len(support._CARRY_TABLES), len(carry), "carry inventory repeats a table")
+        self.assertLessEqual(self.MIGRATION_144_ROOT_LEDGERS, carry,
+                             "carry inventory must include the migration-144 root OIDs and tombstones")
+
+
 class Format22ManifestTest(unittest.TestCase):
     def test_positive_manifest_with_active_released_roots_and_distinct_producer(self):
         manifest, expected = positive_inputs()
