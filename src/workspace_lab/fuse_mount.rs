@@ -78,9 +78,9 @@ mod ownership;
 use fuse_dispatch::MountFs;
 use fuse_io::{Entry, safe_link_at, walk_dir};
 
-// Kept at the historical `fuse_mount::` path for existing callers and tests;
-// the implementation lives in `ownership`.
-pub(crate) use ownership::{mount_id_at_path, mount_id_in, mount_options, unmount_owned, owns_current_mount};
+// The owned teardown implementation lives in `ownership`; only this module
+// (and its tests, through `super`) uses it, so no wider re-export is needed.
+use ownership::unmount_owned;
 
 pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
 
@@ -401,7 +401,7 @@ impl Overlay {
 /// `AutoUnmount` is added only for the independent helper. The in-process
 /// service mount and the lab mount keep the legacy option list so an
 /// existing deployment is not switched onto the fusermount3 path by accident.
-fn mount_options(auto_unmount: bool) -> Vec<MountOption> {
+pub(crate) fn mount_options(auto_unmount: bool) -> Vec<MountOption> {
     let mut options = vec![MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions];
     if auto_unmount {
         options.push(MountOption::AutoUnmount);
@@ -419,7 +419,7 @@ fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Re
     // Capture the kernel mount identity before anyone else can observe the
     // mount point. An unverifiable mount is not published: a later path-based
     // unmount could otherwise hit a different mount stacked at the same path.
-    let mount_id = match mount_id_at_path(&mountpoint) {
+    let mount_id = match ownership::mount_id_at_path(&mountpoint) {
         Ok(Some(mount_id)) => mount_id,
         Ok(None) => {
             // The helper mount already succeeded, so dropping the background
@@ -498,13 +498,6 @@ pub fn mount(lower: PathBuf, upper: PathBuf, mountpoint: PathBuf) -> io::Result<
     let fs = MountFs::new(Overlay::new(lower, upper)?)?;
     fuser::mount2(fs, mountpoint, &mount_options(false))
 }
-
-// The mount identity/teardown tests live in a submodule so this file stays
-// below the workspace_lab anti-monolith bound; they load `super::*` of
-// `fuse_mount` and cover the `ownership` helpers `unmount_owned` calls.
-#[cfg(test)]
-#[path = "fuse_mount/mount_tests.rs"]
-mod mount_tests;
 
 #[cfg(test)]
 mod tests {

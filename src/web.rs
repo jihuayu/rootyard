@@ -29,24 +29,17 @@ use crate::AppState;
 use axum::Router;
 use std::sync::Arc;
 
-/// State the session middleware is attached with. It is independent of the
-/// route state so the session/account and repository page tables can be
-/// composed without `Arc<AppState>` until the final middleware step.
-#[derive(Clone)]
-pub(crate) struct SessionContext {
-    state: Arc<AppState>,
-}
-
 /// The Web UI router merged into the default application router.
 ///
 /// Every page is authorized by one `session::middleware` layer (cookie plus
 /// Origin/CSRF checks) that is applied over the complete, final router:
 /// shared pages, repository Web/UI pages and organization administration. The
-/// layer stays outermost of the merge, so no route can bypass it.
+/// layer stays outermost of the whole merge (navigation, repository pages and
+/// organization administration), exactly once, so no route can bypass it.
 pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
-    let router = Router::new()
+    Router::new()
         .merge(navigation::routes())
         .merge(repository_pages::router())
-        .merge(org_admin::routes());
-    router.layer(axum::middleware::from_fn_with_state(SessionContext { state }, session::middleware))
+        .merge(org_admin::routes())
+        .layer(axum::middleware::from_fn_with_state(state, session::middleware))
 }

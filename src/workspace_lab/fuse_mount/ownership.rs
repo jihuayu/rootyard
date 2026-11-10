@@ -3,12 +3,7 @@
 //! `/proc/self/mountinfo` is the only source consulted: an owned teardown must
 //! unmount exactly the mount this process created, never whichever mount now
 //! sits at the same path.
-use std::{
-    ffi::CString,
-    fs, io,
-    os::unix::ffi::OsStrExt,
-    path::Path,
-};
+use std::{ffi::CString, fs, io, os::unix::ffi::OsStrExt, path::Path};
 
 use super::MountId;
 
@@ -20,7 +15,7 @@ use super::MountId;
 /// and a `fusermount -u` fallback are deliberately not used: a lazy detach
 /// leaves the session thread parked on its descriptor, and a blind path unmount
 /// could remove a mount this handle does not own.
-pub(super) fn unmount_owned(mountpoint: &Path, mount_id: MountId) -> io::Result<()> {
+pub(crate) fn unmount_owned(mountpoint: &Path, mount_id: MountId) -> io::Result<()> {
     match mount_id_at_path(mountpoint)? {
         Some(current) if owns_current_mount(mount_id, Some(current)) => {
             let path = CString::new(mountpoint.as_os_str().as_bytes())
@@ -37,11 +32,11 @@ pub(super) fn unmount_owned(mountpoint: &Path, mount_id: MountId) -> io::Result<
 }
 
 /// True only for the exact mount this handle created.
-pub(super) fn owns_current_mount(captured: MountId, current: Option<MountId>) -> bool {
+pub(crate) fn owns_current_mount(captured: MountId, current: Option<MountId>) -> bool {
     current == Some(captured)
 }
 
-pub(super) fn mount_id_at_path(mountpoint: &Path) -> io::Result<Option<MountId>> {
+pub(crate) fn mount_id_at_path(mountpoint: &Path) -> io::Result<Option<MountId>> {
     mount_id_in(&fs::read_to_string("/proc/self/mountinfo")?, mountpoint)
 }
 

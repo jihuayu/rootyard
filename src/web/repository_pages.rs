@@ -7,7 +7,7 @@
 //! `web::handlers` views, which run the same token/session authorization as
 //! the rest of the Web UI.
 
-use crate::{AppState, application::MetadataState, web};
+use crate::{AppState, web};
 
 use axum::{
     Router,
@@ -15,15 +15,14 @@ use axum::{
 };
 use std::sync::Arc;
 
-/// State of the page router before the session/Origin/CSRF middleware is
-/// attached.
+/// The page router before the session/Origin/CSRF middleware is attached.
 ///
-/// The page router is built independently of the `Arc<AppState>` that the
-/// middleware needs; every handler extracts the same `MetadataState`
-/// (`FromRef<Arc<AppState>>`) once the router is turned into the service.
-pub(in crate::web) type PageRouter = Router<MetadataState>;
+/// The pages are editable over the same application state as the rest of the
+/// Web UI; `src/web.rs` merges them into its root and attaches the single
+/// session middleware there.
+pub(in crate::web) type PageRouter = Router<Arc<AppState>>;
 
-pub(super) fn router() -> PageRouter {
+pub(in crate::web) fn router() -> PageRouter {
     Router::new().merge(pages("/web")).merge(pages("/ui"))
 }
 
