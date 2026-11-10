@@ -1,6 +1,8 @@
 //! Stock Smart HTTP receive-pack against a disposable Pando session. Native
 //! output is buffered and released only after the authoritative PG ref/outbox
-//! transaction commits. A failed CAS discards the native success response.
+//! transaction commits. A typed pre-commit ref CAS refusal replaces that native
+//! success response with the negotiated receive-pack `ng` report; an ambiguous
+//! commit or any other failure stays a distinct HTTP error.
 use super::*;
 use crate::pando_gateway::{prepare, publish, snapshot};
 use axum::http::request::Parts;
@@ -28,8 +30,10 @@ pub(super) async fn execute(
         deadline,
     )
     .await?;
-    let requested = input.commands.as_ref().ok_or_else(Error::bad_request)?.changes.clone();
-    let refs = input.commands.as_ref().ok_or_else(Error::bad_request)?.refs.clone();
+    let commands = input.commands.as_ref().ok_or_else(Error::bad_request)?;
+    let requested = commands.changes.clone();
+    let refs = commands.refs.clone();
+    let capabilities = commands.capabilities;
     let ref_guard =
         storage::ref_publication::acquire(&state.pool, repo.id, repo.storage_generation, &refs, deadline).await?;
     let snapshot_lease = storage::read_leases::shared(&state.pool, repo.id, deadline).await?;
@@ -49,17 +53,46 @@ pub(super) async fn execute(
         return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "Pando native receive failed"));
     }
     let tenant_id = owner_id(&state, &repo).await?;
-    let prepared = Box::pin(prepare::stage(&state, &repo, tenant_id, &snapshot, &snapshot_lease, deadline))
-        .await?
-        .ok_or(Error(StatusCode::CONFLICT, "Pando receive did not change refs"))?;
-    Box::pin(publish::publish(
+    let prepared = Box::pin(prepare::stage(&state, &repo, tenant_id, &snapshot, &snapshot_lease, deadline)).await?;
+    let Some(prepared) = prepared else {
+        // Native receive-pack changed no ref in the disposable snapshot. If its
+        // own negotiated report already refused every requested ref, that report
+        // is the authoritative pre-commit answer: pass it through instead of
+        // turning a Git `ng` into an opaque HTTP 409. Otherwise nothing was
+        // accepted and the unchanged HTTP refusal remains.
+        if !protocol::reports_rejection(&reply, &refs, &capabilities) {
+            return Err(Error(StatusCode::CONFLICT, "Pando receive did not change refs"));
+        }
+        return receive_response(status, content_type, reply);
+    };
+    match Box::pin(publish::publish_typed(
         &state, &repo, &actor, tenant_id, &snapshot, &prepared, &requested, &ref_guard, deadline,
     ))
-    .await?;
+    .await
+    {
+        Ok(_) => {}
+        Err(publish::PublishError::RefRejected(rejection)) => {
+            // Proven before the PG transaction committed: no ref, operation,
+            // event or outbox row changed, so every requested ref gets `ng`.
+            // The buffered native `ok` lines are deliberately discarded.
+            debug_assert!(
+                !capabilities.atomic || rejection.refs == refs,
+                "atomic refusal must cover every requested ref"
+            );
+            let reply = protocol::rejected_refs_report(&capabilities, &rejection.refs, rejection.reason)?;
+            let content_type = HeaderValue::from_static("application/x-git-receive-pack-result");
+            return receive_response(StatusCode::OK, content_type, reply);
+        }
+        Err(publish::PublishError::Failed(error)) => return Err(error),
+    }
     ref_guard.ensure_active()?;
     snapshot_lease.ensure_active()?;
     transfer_authorized(&state, Some(&actor), None, None, &repo, true).await.map_err(Error::internal)?;
     state.transfer_metrics.record_success();
+    receive_response(status, content_type, reply)
+}
+
+fn receive_response(status: StatusCode, content_type: HeaderValue, reply: Vec<u8>) -> Result<Response<Body>, Error> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)

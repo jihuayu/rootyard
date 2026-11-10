@@ -1,0 +1,7 @@
+legacy_pando_setup: passed
+same_old_oid_two_stock_clients_one_winner: passed
+loser_negotiated_sideband_ng_reason: passed
+atomic_multiref_rejection_no_ref_changed: passed
+auth_failure_distinct_from_refusal: passed
+post_commit_response_lost_unknown_transport: passed
+source_binary_runner_stable: passed

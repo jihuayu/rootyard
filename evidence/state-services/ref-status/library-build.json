@@ -1,0 +1,44 @@
+{
+  "kind": "rust-library-test",
+  "relocated_artifact": true,
+  "original_artifact_sha256": "61d76226f262d54b3280ad398c81938ed6112103fe65b1807972db3f16bf14a8",
+  "workspace_commit": "fc8fe80d286a500ba4ba6fece6dcd984eb541e03",
+  "source_inputs_sha256": "7d109c35cc0b7990e4cb9becf5321ac2a8fe567c85cc06d63ba6eb272e1355a7",
+  "binary_sha256": "61d76226f262d54b3280ad398c81938ed6112103fe65b1807972db3f16bf14a8",
+  "cargo_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+  "command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--config",
+    "profile.test.package.rootyard.debug=0",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--config",
+    "profile.test.package.rootyard.strip=\"debuginfo\"",
+    "test",
+    "--locked",
+    "--lib",
+    "--features",
+    "pando-lab",
+    "--no-run",
+    "--message-format=json-render-diagnostics"
+  ],
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "package_rebuilt": true,
+  "fresh_false_artifacts": [
+    {
+      "target": "rootyard",
+      "kind": "lib",
+      "fresh": false,
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "executable": "/workspace/rootyard/target/debug/deps/rootyard-c0079f9c54fbe267"
+    }
+  ]
+}
