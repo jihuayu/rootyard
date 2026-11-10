@@ -329,21 +329,7 @@ pub async fn restore(
         ])
         .arg(source.join("metadata.dump"));
     checked(&mut restore).await?;
-    let mut expected_relations = catalog::relations(manifest.format, false)?;
-    if allow_legacy_schema007 {
-        // A genuine schema007 dump declares the sequences migrations 110/120
-        // later attach to repository_audit_log/organization_audit_log; at
-        // schema007 no column owns them, so pg_restore --clean emits no drop
-        // for them. Expect exactly those two relations, nothing derived from
-        // the running binary; every other object is still checked against the
-        // frozen schema007 catalog below.
-        expected_relations.extend(FORMAT4_RESTORE_SEQUENCES.iter().map(|name| (*name).to_owned()));
-        expected_relations.sort();
-    }
-    ensure!(
-        schema(&client, manifest.format, &expected_relations).await? == manifest.schema_versions,
-        "restored schema mismatch"
-    );
+    ensure!(schema(&client, manifest.format).await? == manifest.schema_versions, "restored schema mismatch");
     // The catalog projection ends with SET search_path=pg_catalog. Restore the
     // target's public application schema before applying the reviewed upgrade.
     client.batch_execute("SET search_path=public").await?;
@@ -364,9 +350,7 @@ pub async fn restore(
         let mut upgraded = client;
         crate::db::migrate_client(&mut upgraded).await?;
         ensure!(
-            schema(&upgraded, super::catalog::FORMAT, &super::catalog::relations(super::catalog::FORMAT, false)?)
-                .await?
-                == crate::db::SCHEMA_VERSIONS,
+            schema(&upgraded, super::catalog::FORMAT).await? == crate::db::SCHEMA_VERSIONS,
             "restored legacy schema did not upgrade to the current catalog"
         );
         client = upgraded;

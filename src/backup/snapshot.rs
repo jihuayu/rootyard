@@ -32,7 +32,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     // archive that would be mistaken for an independent byte backup.
     let served = ledger::serving_repositories(&tx).await?;
     let format = if served > 0 { FORMAT_PAIRED } else { FORMAT };
-    let versions = schema(&tx, format, &catalog::relations(format, false)?).await?;
+    let versions = schema(&tx, format).await?;
     tx.batch_execute("SET LOCAL search_path=public").await?;
     // A durable cutover/rollback fence means the backend authority is in
     // motion. Never capture a paired backup from a repository under transition.
