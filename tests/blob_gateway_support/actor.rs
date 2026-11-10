@@ -7,6 +7,7 @@ use deadpool_postgres::Pool;
 use rootyard::db;
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct Actor {
     pub identity: db::Identity,
     pub token: String,
