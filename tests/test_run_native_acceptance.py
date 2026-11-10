@@ -559,6 +559,36 @@ class RunnerContractTest(unittest.TestCase):
         self.assertIn("dbpass123", log.read_text())  # raw failure evidence stays outside the report
         self.assertIn("deliberate failure", log.read_text())
 
+    def test_inherited_sensitive_environment_is_redacted(self):
+        url_value = "postgresql://db.invalid/parent-db-secret-marker-6392"
+        token_value = "parent-env-token-secret-marker-8261"
+        public_marker = "public-build-marker-2026"
+        script = (
+            "import os, sys\n"
+            "for name in ('DATABASE_URL', 'PARENT_ACCESS_TOKEN', 'ROOTYARD_PUBLIC_MARKER'):\n"
+            "    sys.stdout.write(os.environ[name] + '\\n')\n"
+            "sys.exit(2)\n"
+        )
+        suite = self.fx.suite("smoke-inherited", {"loopback:free": "exclusive"})
+        suite["argv"] = [sys.executable, "-c", script]
+        plan = self.fx.plan([suite])
+        completed, report = self.fx.run(self.tracker, plan, extra_env={
+            "DATABASE_URL": url_value,
+            "PARENT_ACCESS_TOKEN": token_value,
+            "ROOTYARD_PUBLIC_MARKER": public_marker})
+        text = (self.fx.root / "run-run-test" / "report.json").read_text()
+        summary = by_id(report, "smoke-inherited")["summary"]
+        self.assertTrue(completed.returncode == 1)
+        self.assertFalse(url_value in completed.stderr)
+        self.assertFalse(token_value in completed.stderr)
+        self.assertEqual(report["selftest"]["status"], "passed")
+        self.assertFalse(url_value in text)
+        self.assertFalse(token_value in text)
+        self.assertFalse(url_value in summary)
+        self.assertFalse(token_value in summary)
+        self.assertIn("[REDACTED]", summary)
+        self.assertIn(public_marker, summary)
+
     def test_plan_rejects_credentials_without_echo(self):
         plan = self.fx.plan([self.fx.suite("a", {"loopback:free": "exclusive"})],
                             environment_from_plan={"ROOTYARD_TEST_DATABASE_URL":

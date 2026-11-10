@@ -284,6 +284,7 @@ def sensitive_values(plan, run_id, run_dir):
     paths), so listing it would fail the self-test on every run.
     """
     values = []
+    values.extend(value for name, value in os.environ.items() if SENSITIVE_ENV.search(name))
     for field in ("environment", "environment_from_plan"):
         values.extend(str(value) for value in plan.get(field, {}).values())
     for suite in plan["suites"]:
