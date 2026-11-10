@@ -151,6 +151,17 @@ class prerequisite:
             return True
         return {"sys.platform": sys.platform, "machine": os.uname().machine}
 
+    @staticmethod
+    def worktree_git_dir(root):
+        """Git dir of ``root`` from its ``.git`` file, or None when discovery suffices."""
+        marker = Path(root) / ".git"
+        if not marker.is_file():
+            return None
+        text = marker.read_text().strip()
+        if not text.startswith("gitdir:"):
+            return None
+        return str((Path(root) / text.split(":", 1)[1].strip()).resolve())
+
     def source_binding(self):
         """Bind the executed binary to the current production inputs via its build receipt."""
         root = Path(__file__).resolve().parents[1]
@@ -171,7 +182,7 @@ class prerequisite:
         # when this path is a linked worktree whose git dir lies outside the
         # mounted source, else the ordinary discovery from cwd.
         checkout_env = dict(self.env, GIT_OPTIONAL_LOCKS="0")
-        git_dir = os.environ.get("ROOTYARD_GIT_DIR")
+        git_dir = os.environ.get("ROOTYARD_GIT_DIR") or self.worktree_git_dir(root)
         if git_dir:
             resolved = self.git("rev-parse", "--absolute-git-dir", cwd=root, check=False)
             if resolved.returncode or resolved.stdout.decode().strip() != git_dir:
