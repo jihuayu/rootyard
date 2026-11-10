@@ -154,9 +154,9 @@ python3 scripts/run_native_acceptance.py --plan /outside/path/plan.json \
 ```
 
 `--exclude SUITE` (repeatable) drops an unreferenced suite after the original
-plan has been validated; if any included suite depends on an excluded suite, the
-runner rejects the invocation with a bounded preflight error before spawning
-suites or acquiring resource locks.
+plan has been validated; if any included suite depends on an excluded suite, or
+if exclusion would leave no suites, the runner rejects the invocation with a
+bounded preflight error before spawning suites or acquiring resource locks.
 `--verify-host` names the checkout root used to refuse in-checkout lock, run,
 log and report paths (default: the repository root).
 
