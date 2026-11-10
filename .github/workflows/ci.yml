@@ -293,11 +293,11 @@ jobs:
             --harness tests/fixtures/capture_read_gate.c \
             --fixture postgres=postgres:17 \
             --fixture workspace_mount_mode=direct \
-            --require-case workspace_capture=WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix \
-            --require-case workspace_capture=WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture \
-            --require-case workspace_capture=WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive \
-            --require-case workspace_capture=WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision \
-            --require-case workspace_capture=WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing \
             --fixture rust="$(rustc -V)" \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \

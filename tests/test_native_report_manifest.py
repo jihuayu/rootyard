@@ -24,11 +24,11 @@ def digest(path):
 
 
 WORKSPACE_CAPTURE_REQUIRED_CASES = (
-    "WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix",
-    "WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture",
-    "WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive",
-    "WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision",
-    "WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing",
+    "__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix",
+    "__main__.WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture",
+    "__main__.WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive",
+    "__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision",
+    "__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing",
 )
 
 
