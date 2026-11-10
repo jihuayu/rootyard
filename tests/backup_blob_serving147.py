@@ -725,7 +725,8 @@ class Drill(BlobOnlyHarness):
             # dumped `CREATE SCHEMA public` must own the exact grants/catalog,
             # so drop it only inside this freshly created run-owned clone.
             self.query(copy, "DROP SCHEMA IF EXISTS public CASCADE")
-            assert not self.query(copy, "SELECT count(*) FROM pg_namespace WHERE nspname = 'public'"), \
+            # `query` returns the count as text, and the valid "0" is truthy.
+            assert self.query(copy, "SELECT count(*) FROM pg_namespace WHERE nspname = 'public'") == "0", \
                 case.name + ": the clone's public schema survived its drop"
             restore = subprocess.Popen(["pg_restore", "--no-password", "--exit-on-error", "--no-owner",
                                         "--no-privileges", "--dbname", name, self.corruption_dump],
