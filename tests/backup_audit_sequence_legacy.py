@@ -73,7 +73,10 @@ REQUIRED_EXECUTABLES = ("git", "psql", "pg_dump", "pg_restore")
 # Exact migration-110 DDL, replayed only in the control's restored run-owned
 # database to return it to the reviewed schema after the negative control.
 MIGRATION_110 = Path(__file__).resolve().parents[1] / "migrations" / "110_audit_sequence.sql"
-AUDIT_COLUMNS = "id,actor_name,action,target_type,target_name,details,created_unix,created_at"
+# Every persisted repository_audit_log column (migrations/050_members_rbac.sql);
+# the restore comparison must see a changed tenant, repository or actor.
+AUDIT_COLUMNS = "id,tenant_id,repository_id,actor_id,actor_name,action,target_type,target_name,"
+AUDIT_COLUMNS += "details,created_unix,created_at"
 
 
 def numeric_version(text):
@@ -109,6 +112,33 @@ def new_audit_ids(before_ids, after_ids, api_ids):
         raise AssertionError("audit sequence rewound: new ID " + repr(low)
                              + " is not above pre-backup maximum " + repr(max(before)))
     return sorted(added)
+
+
+def audit_rows_by_id(before, after):
+    """Reject a restore that lost, added or changed any full audit row.
+
+    Every row is keyed by its id and compared as the complete persisted row
+    (tenant, repository, actor id/name, action, target, details, timestamps),
+    so a row copied under another actor or tenant, a rewritten detail or a
+    shifted ``created_at`` fails even when the id set is unchanged.
+    """
+    def keyed(rows):
+        keys = [row["id"] for row in rows]
+        assert len(keys) == len(set(keys)), "duplicate audit id in " + repr(keys[:10])
+        return {row["id"]: row for row in rows}
+    expected, actual = keyed(before), keyed(after)
+    lost = sorted(set(expected) - set(actual))
+    added = sorted(set(actual) - set(expected))
+    assert not lost, "audit rows disappeared: " + repr(lost[:10])
+    assert not added, "audit rows appeared: " + repr(added[:10])
+    changed = [key for key in sorted(expected) if expected[key] != actual[key]]
+    if changed:
+        key = changed[0]
+        fields = sorted(name for name in set(expected[key]) | set(actual[key])
+                        if expected[key].get(name) != actual[key].get(name))
+        raise AssertionError("audit row " + repr(key) + " changed " + repr(fields)
+                             + ": " + repr(expected[key]) + " -> " + repr(actual[key]))
+    return actual
 
 
 def settled_outcomes(rows):
@@ -363,10 +393,20 @@ class AuditSequenceLegacyHarness(BackupHarness):
         self.start()
         assert self.hook_runner_digest() == self.runtime_binary_sha256, \
             "the restored data directory does not expose the executed binary as its hook runner"
+        alice_tenant = self.query(self.target_db, "SELECT n.id FROM namespaces n WHERE n.slug='alice'")
         self.restored_rows = self.audit_rows(self.target_db)
-        assert self.restored_rows == self.snapshot_rows, "restored audit rows differ from the source"
+        # Full-row comparison keyed by id, so a row re-attributed to another
+        # tenant/repository/actor or with another created_at also fails.
+        audit_rows_by_id(self.snapshot_rows, self.restored_rows)
+        self.restored_tenants = sorted({str(row["tenant_id"]) for row in self.restored_rows})
+        self.restored_actors = sorted({row["actor_name"] for row in self.restored_rows})
+        # The captured identities are the fixture's own: both repositories of
+        # alice's tenant and only alice's API writes as the audit actor.
+        assert self.restored_tenants == [alice_tenant], self.restored_tenants
+        assert self.restored_actors == ["alice"], self.restored_actors
         self.restored_floor = max(row["id"] for row in self.restored_rows)
         return {"fresh_database": self.source_db != self.target_db,
+                "restored_tenants": self.restored_tenants, "restored_actors": self.restored_actors,
                 "restored_sequence_equals_source": True,
                 "restored_rows": len(self.restored_rows),
                 "restore_seconds": result["elapsed_seconds"]}
@@ -390,9 +430,9 @@ class AuditSequenceLegacyHarness(BackupHarness):
         assert walked == [row["id"] for row in rows], (walked, [row["id"] for row in rows])
         new = new_audit_ids([row["id"] for row in self.restored_rows],
                             [row["id"] for row in after], walked)
-        kept = {row["id"]: row for row in after}
-        assert [kept[row["id"]] for row in self.restored_rows] == self.restored_rows, \
-            "pre-backup audit rows changed after restore"
+        audit_rows_by_id(self.restored_rows, after)
+
+        assert sorted(kept) == [row["id"] for row in self.restored_rows]
         self.after_http_rows = after
         self.http_floor = new[-1]
         return {"status": 200, "action": "collaborator.updated", "walked_audit_ids": walked,
@@ -439,6 +479,7 @@ class AuditSequenceLegacyHarness(BackupHarness):
         # restored update and these 32 concurrent creates, all in id order.
         self.race_sequence = self.action_sequence(self.target_db, self.saved_actions)
         assert self.race_sequence == self.source_sequence, "saved audit rows changed after restore"
+        audit_rows_by_id(self.restored_rows, after)
         window_ids = [row["id"] for row in rows]
         assert window_ids == [row["id"] for row in self.race_sequence[-count:]], (
             window_ids, self.race_sequence[-count:])

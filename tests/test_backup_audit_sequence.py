@@ -95,6 +95,64 @@ class NewAuditIdsModelTest(unittest.TestCase):
             drill.new_audit_ids([1.0], [1.0, 2], [2])
 
 
+def audit_row(**overrides):
+    row = {"id": 7, "tenant_id": "t-1", "repository_id": "r-1", "actor_id": "u-1",
+           "actor_name": "alice", "action": "collaborator.added", "target_type": "collaborator",
+           "target_name": "bob", "details": {"role": "triage", "version": 1},
+           "created_unix": 1700000000, "created_at": "2026-11-10 06:00:00.123456+00"}
+    row.update(overrides)
+    return row
+
+
+class AuditRowsByIdTest(unittest.TestCase):
+    def test_identical_rows_pass_and_extra_rows_are_checked_too(self):
+        rows = [audit_row(), audit_row(id=8, target_name="carol")]
+        self.assertEqual(sorted(drill.audit_rows_by_id(rows, [dict(r) for r in rows])), [7, 8])
+        after = rows + [audit_row(id=9, action="collaborator.updated")]
+        # Added rows belong to new_audit_ids (the walked window): this
+        # comparison only proves the captured rows are still there unchanged.
+        with self.assertRaisesRegex(AssertionError, "appeared"):
+            drill.audit_rows_by_id(rows, after)
+        with self.assertRaisesRegex(AssertionError, "disappeared"):
+            drill.audit_rows_by_id(after, rows)
+
+    def test_re_attributed_or_rewritten_rows_fail(self):
+        rows = [audit_row()]
+        for field, value in (("tenant_id", "t-2"), ("repository_id", "r-2"), ("actor_id", "u-2"),
+                             ("actor_name", "bob"), ("created_at", "2026-11-10 06:00:00.123457+00"),
+                             ("details", {"role": "admin", "version": 1}), ("created_unix", 1)):
+            with self.assertRaisesRegex(AssertionError, "changed \\[\\'" + field + "'"):
+                drill.audit_rows_by_id(rows, [audit_row(**{field: value})])
+
+    def test_lost_or_duplicate_ids_fail(self):
+        rows = [audit_row(), audit_row(id=8)]
+        with self.assertRaisesRegex(AssertionError, "disappeared"):
+            drill.audit_rows_by_id(rows, [rows[0]])
+        with self.assertRaisesRegex(AssertionError, "duplicate audit id"):
+            drill.audit_rows_by_id(rows, [rows[0], dict(rows[0])])
+
+    def test_columns_cover_every_identity_field(self):
+        columns = drill.AUDIT_COLUMNS.split(",")
+        self.assertEqual(columns, ["id", "tenant_id", "repository_id", "actor_id", "actor_name",
+                                   "action", "target_type", "target_name", "details",
+                                   "created_unix", "created_at"])
+        # The model must be the table's own column list, not a subset.
+        ddl = (ROOT / "migrations/050_members_rbac.sql").read_text()
+        table = ddl[ddl.index("CREATE TABLE repository_audit_log ("):]
+        table = table[:table.index(");")]
+        declared = re.findall(r"^\s{4}(\w+)\s+(?:BIGINT|UUID|TEXT|JSONB|TIMESTAMPTZ)", table, re.M)
+        self.assertEqual(sorted(declared), sorted(columns))
+
+    def test_restore_uses_the_full_row_comparison(self):
+        body = method_source("offline_backup_and_fresh_database_restore")
+        self.assertIn("audit_rows_by_id(self.snapshot_rows, self.restored_rows)", body)
+        self.assertIn("self.restored_tenants == [alice_tenant]", body)
+        self.assertIn('self.restored_actors == ["alice"]', body)
+        for name in ("restored_http_audit_sequence_continues",
+                     "restored_concurrent_audit_sequence_continues"):
+            self.assertIn("audit_rows_by_id(self.restored_rows, after)", method_source(name))
+
+
 class SettledOutcomesTest(unittest.TestCase):
     def test_unsettled_or_ambiguous_journal_is_never_a_pass(self):
         self.assertIsNone(drill.settled_outcomes([]))
