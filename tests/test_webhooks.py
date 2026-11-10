@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import copy
+from dataclasses import dataclass, field
 import hashlib
 import hmac
 import ipaddress
@@ -14,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.parse
 import urllib.request
@@ -115,6 +118,253 @@ def _backoff_delay_seconds_py(attempt: int, base_seconds: int = 2, max_seconds: 
     cap = max(base, max_seconds)
     shift = min(30, max(0, attempt - 1))
     return min(cap, base * (1 << shift))
+
+
+class _FakeReceiver:
+    """Deterministic stand-in for LocalWebhookReceiver's lock/snapshot contract."""
+
+    def __init__(self, scripted):
+        self.lock = threading.Lock()
+        self.requests: list[dict] = []
+        self.scripted = scripted
+
+    def install(self, requests: list[dict]) -> None:
+        """Seed records that existed before the ping issued its own clear."""
+        self.pre_ping = list(requests)
+
+    def clear(self) -> None:
+        with self.lock:
+            self.requests = list(self.pre_ping)
+
+    def deliver(self, record: dict) -> None:
+        """Append one record under the receiver lock, as the HTTP handler does."""
+        with self.lock:
+            self.requests.append(record)
+
+    def compile_target_ping(self, record: dict) -> None:
+        """Queue the ping record; ``__call__`` delivers it when the API returns."""
+        self.scripted.arrivals.append(record)
+
+
+@dataclass
+class _ScriptedDocument:
+    """``self.document`` substitute returning the scripted ping API response.
+
+    The ping endpoint answers only after its own POST was delivered, so queued
+    ``arrivals`` land, and the receiver is snapshotted, just before
+    ``__call__`` returns. ``after_return`` lands once the API has answered.
+    """
+
+    response: dict
+    calls: list[tuple] = field(default_factory=list)
+    arrivals: list[dict] = field(default_factory=list)
+    snapshot_at_return: list[dict] | None = None
+    receiver: _FakeReceiver | None = None
+    after_return: list[dict] = field(default_factory=list)
+
+    def __call__(self, path, code=200, method="GET", body=None, **kwargs):
+        self.calls.append((path, code, method, body, kwargs))
+        if path.endswith("/ping"):
+            for record in self.arrivals:
+                self.receiver.deliver(copy.deepcopy(record))
+            self.snapshot_at_return = webhooks.receiver_request_snapshot(self.receiver)
+            for record in self.after_return:
+                self.receiver.deliver(copy.deepcopy(record))
+        return copy.deepcopy(self.response)
+
+
+PING_HOOK_ID = "3f1c4c0e-9a4e-4a51-8f0b-3c2f5d7e9a10"
+PING_REPOSITORY_ID = "8b6d2e71-5c34-4f0a-9d12-6e7a0b1c2d3e"
+PING_ZEN = "Rootyard HMAC verification test"
+PING_SECRET = "whsec_pure_unit_ping_secret_0123456789"
+
+
+def _ping_payload(zen: str = PING_ZEN) -> bytes:
+    return webhooks.serde_json_struct_bytes(
+        [
+            ("event", "ping"),
+            ("zen", zen),
+            ("hook_id", PING_HOOK_ID),
+            ("repository_id", PING_REPOSITORY_ID),
+        ]
+    )
+
+
+def _ping_delivery(delivery_id: str, *, signature: str | None = None, zen: str = PING_ZEN) -> dict:
+    """Ping API response as WebhookDelivery serializes it (struct field order)."""
+    body = _ping_payload(zen)
+    return {
+        "id": delivery_id,
+        "webhook_id": PING_HOOK_ID,
+        "repository_id": PING_REPOSITORY_ID,
+        "sequence": 7,
+        "event_id": "ping-fixed-1",
+        "event_type": "ping",
+        "payload": {"event": "ping", "zen": zen, "hook_id": PING_HOOK_ID,
+                    "repository_id": PING_REPOSITORY_ID},
+        "request_headers": _signed_record(delivery_id)["headers"],
+        "signature_256": signature
+        or webhooks.compute_hmac_sha256_header(PING_SECRET, body),
+        "state": "delivered",
+        "attempts": 1,
+        "max_attempts": 3,
+        "response_status": 200,
+        "last_error": None,
+        "next_attempt_unix": 0,
+        "delivered_at": "2026-11-10 00:00:00+00",
+        "created_at": "2026-11-10 00:00:00+00",
+        "updated_at": "2026-11-10 00:00:00+00",
+    }
+
+
+def _signed_record(
+    delivery_id: str,
+    *,
+    body: bytes | None = None,
+    secret: str = PING_SECRET,
+    signature: str | None = None,
+    event: str = "ping",
+    hook_id: str = PING_HOOK_ID,
+) -> dict:
+    """One receiver record shaped exactly like LocalWebhookReceiver appends."""
+    body = _ping_payload() if body is None else body
+    signature = (
+        webhooks.compute_hmac_sha256_header(secret, body) if signature is None else signature
+    )
+    return {
+        "path": "/webhook",
+        "headers": {
+            "host": "127.0.0.1:0",
+            "content-type": "application/json",
+            "x-rootyard-event": event,
+            "x-rootyard-delivery": delivery_id,
+            "x-rootyard-hook-id": hook_id,
+            "x-rootyard-signature-256": signature,
+            "x-rootyard-attempt": "1",
+        },
+        "raw_body": body,
+        "json": json.loads(body),
+        "signature": signature,
+        "signature_valid": hmac.compare_digest(
+            signature, webhooks.compute_hmac_sha256_header(PING_SECRET, body)
+        ),
+        "response_status": 200,
+    }
+
+
+class _PingOracleTest(unittest.TestCase):
+    """Drive WebhooksHarness.ping_and_hmac_sha256_signature_verification offline."""
+
+    def run_ping(self, response, background=(), target=None, after_return=()):
+        """Run the real harness method against a fake receiver and scripted API.
+
+        ``background`` records are already received when the ping is issued,
+        ``target`` records arrive while the ping API call returns, and
+        ``after_return`` records arrive once it has answered.
+        """
+        document = _ScriptedDocument(
+            response=response, after_return=list(after_return)
+        )
+        receiver = _FakeReceiver(document)
+        document.receiver = receiver
+        receiver.install(background)
+
+        harness = webhooks.WebhooksHarness.__new__(webhooks.WebhooksHarness)
+        harness.hook = {"id": PING_HOOK_ID}
+        harness.hook_path = f"/api/repos/alice/forge/webhooks/{PING_HOOK_ID}"
+        harness.webhook_secret = PING_SECRET
+        harness.receiver = receiver
+        harness.document = document
+        for record in target or ():
+            receiver.compile_target_ping(record)
+        harness.ping_and_hmac_sha256_signature_verification()
+        return document
+
+    def test_ping_receipt_is_correlated_by_delivery_id_despite_background_pushes(self):
+        target = "0c1c8f8e-2b5a-4a86-9f4e-7f3d2a1b6c55"
+        before = _signed_record(
+            "outbox:0d0b6c1e-6a2f-4e0b-8a51-1c0f6d3e2a41", body=b'{"event":"push"}', event="push"
+        )
+        between_a = _signed_record(
+            "outbox:1e1c7d2f-7b30-4f1c-9b62-2d1a7e4f3b52", body=b'{"event":"push"}', event="push"
+        )
+        # An unrelated ping-shaped event with another delivery id must not be
+        # mistaken for the target, even though it carries a valid signature.
+        between_b = _signed_record(
+            "outbox:2f2d8e30-8c41-4a2d-ac73-3e2b8f5a4c63", event="ping"
+        )
+
+        later_push = _signed_record(
+            "outbox:3a3e9f41-9d52-4b3e-bd84-4f3c9a6b5d74", body=b'{"event":"push"}', event="push"
+        )
+
+        # Snapshot order: before, between_a, the target, between_b. A further
+        # push may arrive after the API has answered and must change nothing.
+        document = self.run_ping(
+            _ping_delivery(target),
+            background=[before, between_a],
+            target=[_signed_record(target), between_b],
+            after_return=[later_push],
+        )
+        self.assertEqual(len(document.snapshot_at_return), 4)
+        self.assertEqual(
+            webhooks.requests_for_delivery(document.snapshot_at_return, target),
+            [document.snapshot_at_return[2]],
+        )
+        document.receiver.deliver(later_push)
+        # Live receiver: 2 background + target + between_b + later arrivals.
+        self.assertEqual(len(webhooks.receiver_request_snapshot(document.receiver)), 6)
+
+        self.assertEqual(len(document.calls), 1)
+        path, code, method, body, _ = document.calls[0]
+        self.assertEqual(
+            (path, code, method),
+            (f"/api/repos/alice/forge/webhooks/{PING_HOOK_ID}/ping", 200, "POST"),
+        )
+        self.assertEqual(body["event_id"], "ping-fixed-1")
+
+    def test_ping_receipt_fails_on_bad_hmac_or_duplicate_delivery_id(self):
+        target = "0c1c8f8e-2b5a-4a86-9f4e-7f3d2a1b6c55"
+        background = _signed_record(
+            "outbox:0d0b6c1e-6a2f-4e0b-8a51-1c0f6d3e2a41", body=b'{"event":"push"}', event="push"
+        )
+        good = _ping_delivery(target)
+        # Same request bytes as a valid delivery, but signed with another secret.
+        foreign_secret_record = _signed_record(target, secret="whsec_someone_elses_secret")
+        wrong_event = copy.deepcopy(good)
+        wrong_event["event_type"] = "push"
+        wrong_event["payload"] = {"event": "push"}
+
+        cases = {
+            # Two receiver records claim the exact target delivery id.
+            "exact-delivery-id duplicate": dict(
+                response=good,
+                target=[_signed_record(target)],
+                background=[background, _signed_record(target)],
+            ),
+            # The target record's request was not signed with this hook secret.
+            "bad HMAC in receiver record": dict(
+                response=good, target=[foreign_secret_record], background=[background]
+            ),
+            # The API advertises a signature that does not sign the payload.
+            "bad HMAC in API signature": dict(
+                response=_ping_delivery(target, signature="sha256=" + "0" * 64),
+                target=[_signed_record(target)],
+                background=[background],
+            ),
+            "a ping-shaped event that is not the ping": dict(
+                response=wrong_event, target=[_signed_record(target)], background=[background]
+            ),
+            "target delivery missing": dict(
+                response=good,
+                target=[_signed_record("0a0b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d")],
+                background=[background],
+            ),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(AssertionError):
+                    self.run_ping(**case)
 
 
 class WebhooksTrackAContractTest(unittest.TestCase):
