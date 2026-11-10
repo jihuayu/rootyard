@@ -328,16 +328,22 @@ class teams:
         self.git("checkout", "-B", base_ref, self.seed, cwd=work)
         base = self.commit(work, "base-" + user + ".txt", "role base " + role)
         self.git("push", "origin", "HEAD:refs/heads/" + base_ref, cwd=work, token=token)
+        # Capture this push's receipt before the next push moves the head, so
+        # each ref is bound to its own operation instead of the final one.
+        base_operation = self.team_assert_operation(self.last_operation("recorded"), user, "demo")
         self.git("checkout", "-B", head_ref, base, cwd=work)
         head = self.commit(work, "head-" + user + ".txt", "role head " + role)
         self.git("push", "origin", "HEAD:refs/heads/" + head_ref, cwd=work, token=token)
+        head_operation = self.team_assert_operation(self.last_operation("recorded"), user, "demo")
         pushed = [self.ref("refs/heads/" + base_ref), self.ref("refs/heads/" + head_ref)]
         assert pushed == [base, head] and base != head, pushed
         self.team_no_rule(base_ref, head_ref)
         assert len(self.operations()) == ops_before + 2, (user, len(self.operations()), ops_before)
         assert len(self.events()) == events_before + 2, (user, len(self.events()), events_before)
-        for ref, oid in (("refs/heads/" + base_ref, base), ("refs/heads/" + head_ref, head)):
-            operation = self.team_assert_operation(self.last_operation("recorded"), user, "demo")
+        assert base_operation["id"] != head_operation["id"], (base_operation, head_operation)
+        for ref, oid, operation in (
+                ("refs/heads/" + base_ref, base, base_operation),
+                ("refs/heads/" + head_ref, head, head_operation)):
             [event] = self.events_for(ref, operation["id"])
             assert event["new_oid"] == oid, event
         receipt = self.team_ref_transaction(user, head)
