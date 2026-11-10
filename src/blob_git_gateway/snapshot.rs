@@ -230,13 +230,14 @@ async fn build_into(
     let materializer =
         PgPackSnapshotMaterializer::new(state.store().clone(), state.git_binary().to_path_buf()).map_err(ref_error)?;
     let (read, sealed) = match mode {
-        Materializer::Unsealed => (
-            materializer.materialize_serving_read(state.pool(), handle, deadline).await.map_err(ref_error)?,
-            None,
-        ),
+        Materializer::Unsealed => {
+            (materializer.materialize_serving_read(state.pool(), handle, deadline).await.map_err(ref_error)?, None)
+        }
         Materializer::Sealed => {
-            let sealed =
-                materializer.materialize_serving_read_sealed(state.pool(), handle, deadline).await.map_err(ref_error)?;
+            let sealed = materializer
+                .materialize_serving_read_sealed(state.pool(), handle, deadline)
+                .await
+                .map_err(ref_error)?;
             (sealed.as_ref().map(MaterializedServingRead::view), sealed)
         }
     };

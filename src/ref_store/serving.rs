@@ -580,9 +580,8 @@ async fn read_cluster_incarnation_nowait(tx: &Transaction<'_>) -> Result<Cluster
             rows.len()
         )));
     };
-    let incarnation: Uuid = row
-        .try_get(0)
-        .map_err(|_| RefStoreError::Database("cluster authority row has no uuid incarnation".into()))?;
+    let incarnation: Uuid =
+        row.try_get(0).map_err(|_| RefStoreError::Database("cluster authority row has no uuid incarnation".into()))?;
     if incarnation.is_nil() {
         return Err(RefStoreError::Database("cluster authority incarnation is nil".into()));
     }

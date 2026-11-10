@@ -10,9 +10,9 @@ use zeroize::Zeroizing;
 
 use super::{
     BEHIND_MESSAGE, MAX_LIFETIME_SECONDS, MIN_LIFETIME_SECONDS, REVISION_HEADER, SESSION_HEADER, SessionRealm,
-    SessionTokenCodec, SessionTokenError, SessionTokens, TEST_MAX_TOKEN_LEN, VersionComparison, presented_for_test,
+    SessionTokenCodec, SessionTokenError, SessionTokens, TEST_MAX_TOKEN_LEN, VersionComparison,
     codec::{BODY_LEN, FORMAT_BYTE, PREFIX, Presented, TRAILER, now_seconds, presented},
-    compare,
+    compare, presented_for_test,
 };
 use crate::{blob_store::BlobBackendIdentity, ref_store::GitObjectFormat};
 

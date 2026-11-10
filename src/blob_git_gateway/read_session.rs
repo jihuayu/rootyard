@@ -381,9 +381,6 @@ mod tests {
             answer(Some(id(8)), Some(&tokens), &presented, &live, 5),
             Err(GatewayError::Unavailable(AUTHORITY_CHANGED))
         );
-        assert_eq!(
-            answer(Some(id(4)), Some(&tokens), &header("rs1.anything.anything"), &live, 5),
-            Err(malformed())
-        );
+        assert_eq!(answer(Some(id(4)), Some(&tokens), &header("rs1.anything.anything"), &live, 5), Err(malformed()));
     }
 }

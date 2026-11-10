@@ -28,8 +28,7 @@ use tokio::time::Instant;
 
 use super::{
     error::GatewayError,
-    native,
-    read_session,
+    native, read_session,
     repo_session::{IssuedSession, SessionRealm},
     serving::lookup,
     session::{ReadAuthorization, authenticate, authority_error, read_authorization},
@@ -40,10 +39,7 @@ use crate::{
     browse::models::{
         self, BlobByOidQuery, BlobQuery, BlobResponse, TreeByOidQuery, TreeEntry, TreeQuery, TreeResponse,
     },
-    ref_store::{
-        GitObjectFormat,
-        core::pack_snapshot::MaterializedServingRead,
-    },
+    ref_store::{GitObjectFormat, core::pack_snapshot::MaterializedServingRead},
 };
 
 const MAX_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
@@ -512,10 +508,7 @@ fn parse_tree(raw: &[u8], path: &str, after: Option<&str>, limit: usize) -> Resu
 ///    key, trusted clock) whose full realm matches this same fresh lookup, and
 ///    attached with [`IssuedSession::apply`]; a token-disabled gateway or a
 ///    checked empty read leaves the response token-free.
-pub(super) async fn finalize<T: Serialize>(
-    session: BrowseSession,
-    value: &T,
-) -> Result<Response, GatewayError> {
+pub(super) async fn finalize<T: Serialize>(session: BrowseSession, value: &T) -> Result<Response, GatewayError> {
     let state = &session.state;
     let limit = session.budget().min(state.limits().max_response_bytes);
     let bytes = encode_response(value, limit)?;

@@ -92,9 +92,7 @@ impl VerifiedReadView {
     pub(crate) fn of_materialized(view: &MaterializedPackRead) -> Result<Self, RefStoreError> {
         let snapshot = view.snapshot();
         if snapshot.complete_transient_pack_read().is_none() {
-            return Err(RefStoreError::Unsupported(
-                "serving proof requires a transient complete pack-verified read",
-            ));
+            return Err(RefStoreError::Unsupported("serving proof requires a transient complete pack-verified read"));
         }
         let binding = view.proven_binding();
         if snapshot.materialization_digest() != binding {

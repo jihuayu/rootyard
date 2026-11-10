@@ -501,9 +501,7 @@ async fn capture_checked(
     // transaction is ordered against.
     let cluster_incarnation = serving_read_sql::lock_cluster_incarnation(tx).await?;
     match serving_read_sql::peek_pack_mode(tx, scope.repository_id()).await? {
-        PackMode::MetadataOnly => {
-            capture_empty(tx, cluster_incarnation, scope, backend_identity_hex, deadline).await
-        }
+        PackMode::MetadataOnly => capture_empty(tx, cluster_incarnation, scope, backend_identity_hex, deadline).await,
         PackMode::PackVerified => {
             capture_registered(tx, cluster_incarnation, scope, backend_identity_hex, lease_seconds, deadline).await
         }

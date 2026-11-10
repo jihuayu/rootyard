@@ -134,9 +134,9 @@ pub(crate) use codec::SessionTokenCodec;
 /// Header-only extraction of a presented token; the gateway read session and
 /// the keyring rotation tests both present real header values.
 pub(crate) use codec::presented;
-pub(crate) use codec::{MAX_LIFETIME_SECONDS, MIN_LIFETIME_SECONDS};
 #[cfg(test)]
 pub(crate) use codec::presented as presented_for_test;
+pub(crate) use codec::{MAX_LIFETIME_SECONDS, MIN_LIFETIME_SECONDS};
 
 use codec::{Presented, now_seconds};
 

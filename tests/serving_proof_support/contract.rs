@@ -46,13 +46,13 @@ mod serving_reads_support;
 #[path = "../serving_support/mod.rs"]
 mod serving_support;
 
-use self::serving_reads_support::{ensure_migration_146, operation_deadline, provision_ready, RepoFixture};
-use self::serving_support::{actor, Actor, Fixture};
+use self::serving_reads_support::{RepoFixture, ensure_migration_146, operation_deadline, provision_ready};
+use self::serving_support::{Actor, Fixture, actor};
 use super::PgPackSnapshotMaterializer;
+use crate::blob_store::BlobProvider;
 use crate::blob_store::config::BlobProfile;
 use crate::blob_store::opendal::BlobStore;
 use crate::blob_store::protected::{ProtectedPublication, ProtectedUploader, UploadSource};
-use crate::blob_store::BlobProvider;
 use crate::ref_store::artifact_hold::{
     AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldPurpose, ArtifactSpec, HoldScope, PgArtifactHoldStore,
 };
@@ -68,11 +68,11 @@ use crate::ref_store::{
     CoreGateVersion, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, OperationIdentity, RefName, RefPrecondition,
     RefTarget, RefUpdate, VersionCheck,
 };
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
+use rootyard::ref_store::core::pack_snapshot::ServingReadCapture;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use rootyard::ref_store::core::pack_snapshot::ServingReadCapture;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -396,10 +396,7 @@ async fn protected_pack_count(fixture: &Fixture, pin_id: Uuid) -> Result<i64> {
         .pool
         .get()
         .await?
-        .query_one(
-            "SELECT count(*)::bigint FROM ref_store_core_serving_read_packs WHERE pin_id=$1",
-            &[&pin_id],
-        )
+        .query_one("SELECT count(*)::bigint FROM ref_store_core_serving_read_packs WHERE pin_id=$1", &[&pin_id])
         .await?
         .get(0))
 }
@@ -501,10 +498,7 @@ async fn provision_verified_pack(fixture: &Fixture, repo: &RepoFixture, owner: &
         .pool
         .get()
         .await?
-        .query_one(
-            "SELECT pack_mode FROM ref_store_core_gates WHERE repository_id=$1",
-            &[&repo.ready.repository_id],
-        )
+        .query_one("SELECT pack_mode FROM ref_store_core_gates WHERE repository_id=$1", &[&repo.ready.repository_id])
         .await?
         .get(0);
     ensure!(mode == "pack_verified", "the authorized commit must advance the gate to pack_verified, got {mode}");
@@ -559,7 +553,7 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
         let repo = repo_ref;
         let result = async {
             // A pack_verified gate with one registered pack never captures as empty.
-        ensure!(!capture.is_empty(), "a pack_verified gate with one registered pack must not capture as empty");
+            ensure!(!capture.is_empty(), "a pack_verified gate with one registered pack must not capture as empty");
             let (snapshot, binding, capture_anchor) = capture.registered_parts()?;
             let a5a = probe_a5a(&snapshot);
             let captured_incarnation = capture.capture_incarnation();
@@ -574,9 +568,7 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
             );
             let materializer: PgPackSnapshotMaterializer = repo.materializer()?;
             let sealed =
-                match materializer
-                    .materialize_serving_read_sealed(&fixture.pool, &capture, operation_deadline())
-                    .await
+                match materializer.materialize_serving_read_sealed(&fixture.pool, &capture, operation_deadline()).await
                 {
                     Ok(Some(sealed)) => sealed,
                     Ok(None) => return Err(anyhow!("non-empty capture sealed to Ok(None)")),
@@ -683,7 +675,7 @@ async fn a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materializ
                     );
                 }
                 Err(error) => {
-                    return Err(anyhow!("a rotated incarnation must be a typed incarnation refusal, got {error}"))
+                    return Err(anyhow!("a rotated incarnation must be a typed incarnation refusal, got {error}"));
                 }
                 Ok(None) => return Err(anyhow!("a non-empty capture must never seal to Ok(None)")),
                 Ok(Some(_)) => return Err(anyhow!("a rotated incarnation must never produce a sealed view or proof")),

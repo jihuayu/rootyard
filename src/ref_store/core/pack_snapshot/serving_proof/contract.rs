@@ -63,11 +63,7 @@ impl super::VerifiedReadViewProof {
 impl MaterializedServingRead {
     /// `(proof gate revision, proof realm, proof A5b binding)`.
     pub(crate) fn contract_parts(&self) -> (i64, super::ProvenScope, RequestDigest) {
-        (
-            self.proof().gate_revision(),
-            self.proof().contract_scope(),
-            self.proof().contract_binding(),
-        )
+        (self.proof().gate_revision(), self.proof().contract_scope(), self.proof().contract_binding())
     }
 
     /// The same factory the materializer's seal site uses, re-run over the
