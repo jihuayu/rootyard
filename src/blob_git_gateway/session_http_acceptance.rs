@@ -231,9 +231,10 @@ async fn case(db: &Db) -> Result<()> {
 
     // 7. A correctly MACed lower bound one past the live revision, minted for
     // the exact realm a fresh authorized lookup states, is the generic 503.
-    let live = lookup(&db.pool, &owner.identity, &owner.username, &name, true, state.store().backend_identity(), deadline())
-        .await
-        .map_err(|error| anyhow!("authorized serving lookup refused: {}", error.1))?;
+    let live =
+        lookup(&db.pool, &owner.identity, &owner.username, &name, true, state.store().backend_identity(), deadline())
+            .await
+            .map_err(|error| anyhow!("authorized serving lookup refused: {}", error.1))?;
     let gate = &live.gate;
     let realm = SessionRealm::new(
         gate.tenant_id(),
@@ -246,9 +247,8 @@ async fn case(db: &Db) -> Result<()> {
     )
     .map_err(|_| anyhow!("live session realm refused"))?;
     let future_revision = gate.revision().checked_add(1).context("live gate revision overflow")?;
-    let future = tokens
-        .issue_for_test(&realm, future_revision)
-        .map_err(|_| anyhow!("future-bound session issue refused"))?;
+    let future =
+        tokens.issue_for_test(&realm, future_revision).map_err(|_| anyhow!("future-bound session issue refused"))?;
     let ahead = raw_get(&client, &format!("{base}/refs"), &owner.token, Some(future.token())).await?;
     ensure!(ahead.status == 503, "future session bound was not refused with 503");
     ensure!(contains(&ahead.body, BEHIND_MESSAGE), "future session refusal did not carry BEHIND_MESSAGE");
