@@ -211,26 +211,67 @@ fn write_meta_vote(conn: &Connection, v: &Vote<u64>) -> Res<()> {
 ///
 /// `purge` is inclusive and deletes rows through the boundary. The only row it can leave at the
 /// boundary is its own, because a purge writes `meta` in the same transaction that deletes rows: a
-/// crash restores both, and a resume keeps a row only if nothing changed `meta`. So a boundary row
-/// must carry exactly the boundary's `LogId`; any other `LogId` at or below it is residue that
-/// cannot come from this store and fails closed.
+/// crash restores both, and a resume keeps a row only if nothing changed `meta`. An
+/// [`is_invalid_residue`] row at or below the boundary therefore cannot come from this store and fails
+/// closed, wherever it sits. That check is what [`read_last`] relies on, so a disallowed row hidden
+/// beneath a valid live tail is never reported as part of the log.
 fn read_last(conn: &Connection) -> Res<Option<LogId<u64>>> {
     let purged = purged_boundary(conn)?;
+    invalid_residue(conn, purged.as_ref())?;
     match stored_max(conn)? {
-        Some((_, lid)) => match &purged {
-            Some(p) if lid.index <= p.index && !same_boundary_row(&lid, p) => {
-                Err(E::Refused(format!("last stored {lid} is at or below purge boundary {p}")))
-            }
-            _ => Ok(Some(lid)),
-        },
+        Some((_, lid)) => Ok(Some(lid)),
         None => Ok(purged),
     }
 }
 
-/// True for a row that `purge` may legitimately leave behind: one at the boundary index with the
-/// boundary's own `LogId` (inclusive purge; see [`read_last`]).
+/// True for a row `purge` may legitimately leave behind: exactly the boundary row it addressed
+/// (same index, same full `LogId`). Every other row at or below the boundary is [`is_invalid_residue`].
 fn same_boundary_row(row: &LogId<u64>, purged: &LogId<u64>) -> bool {
     row == purged
+}
+
+/// The consistent fail-closed rule for rows the inclusive purge should have deleted: a row below
+/// the boundary is invalid, and a row at it is valid only with the boundary's own `LogId`.
+fn is_invalid_residue(row: &LogId<u64>, purged: &LogId<u64>) -> bool {
+    row.index < purged.index || (row.index == purged.index && !same_boundary_row(row, purged))
+}
+
+/// Fail closed if any stored row at or below the boundary is invalid residue. With no boundary no
+/// row exists, and without rows the index scan is empty.
+///
+/// Per level this is a jump to the greatest index `<= level` (the `INTEGER PRIMARY KEY` index, so
+/// bounded by rows and never false on a sparse index), then one row: an invalid row is reported,
+/// the boundary's own row lets the scan end, and any other row repeats one level lower. Only
+/// residue costs iterations, at most one per distinct level.
+fn residue_scan(conn: &Connection, boundary: LogId<u64>) -> Res<Option<(LogId<u64>, LogId<u64>)>> {
+    let mut level = boundary.index;
+    loop {
+        let key = idx_to_i64(level)?;
+        let Some(row) =
+            read_indexed_row(conn, "SELECT {cols} FROM log_entry WHERE idx <= ?1 ORDER BY idx DESC LIMIT 1", [key])?
+        else {
+            return Ok(None);
+        };
+        let row_id = *row.get_log_id();
+        if is_invalid_residue(&row_id, &boundary) {
+            return Ok(Some((row_id, boundary)));
+        }
+        match row_id.index.checked_sub(1) {
+            Some(next) => level = next,
+            None => return Ok(None),
+        }
+    }
+}
+
+/// [`residue_scan`] with its refusal; the message names the invalid row and the boundary.
+fn invalid_residue(conn: &Connection, purged: Option<&LogId<u64>>) -> Res<()> {
+    let Some(boundary) = purged else { return Ok(()) };
+    match residue_scan(conn, *boundary)? {
+        Some((row, boundary)) => {
+            Err(E::Refused(format!("stored {row} is invalid residue at or below purge boundary {boundary}")))
+        }
+        None => Ok(()),
+    }
 }
 
 /// Decode the persistent purge boundary exactly as written (absent = nothing purged).
@@ -265,9 +306,16 @@ fn decode_entry_row(row: &rusqlite::Row<'_>) -> Res<(LogId<u64>, EntryOf)> {
     Ok((lid, entry))
 }
 fn stored_max(conn: &Connection) -> Res<Option<(i64, LogId<u64>)>> {
-    let mut st = conn.prepare(&format!("SELECT {ENTRY_COLUMNS} FROM log_entry ORDER BY idx DESC LIMIT 1"))?;
-    let mut rows = st.query([])?;
-    rows.next()?.map(|row| decode_entry_row(row).map(|(lid, _)| (lid.index as i64, lid))).transpose()
+    Ok(read_indexed_row(conn, "SELECT {cols} FROM log_entry ORDER BY idx DESC LIMIT 1", [])?
+        .map(|entry| (entry.get_log_id().index as i64, *entry.get_log_id())))
+}
+
+/// First row (with full checksum/identity validation) of an `{cols}`-templated index query, or
+/// `None` when the query yields no row.
+fn read_indexed_row<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Res<Option<EntryOf>> {
+    let mut st = conn.prepare(&sql.replace("{cols}", ENTRY_COLUMNS))?;
+    let mut rows = st.query(params)?;
+    rows.next()?.map(decode_entry_row).transpose().map(|row| row.map(|(_, entry)| entry))
 }
 fn read_row(conn: &Connection, idx: i64) -> Res<Option<(LogId<u64>, EntryOf)>> {
     let mut st = conn.prepare(&format!("SELECT {ENTRY_COLUMNS} FROM log_entry WHERE idx=?1"))?;
@@ -337,6 +385,8 @@ fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res
         return Ok(Vec::new()); // empty range: never touches SQL
     }
     let purged = purged_boundary(conn)?;
+    // Same rule as `read_last`; the scan is empty without a boundary.
+    invalid_residue(conn, purged.as_ref())?;
     let first = purged.as_ref().map_or(lo, |p| lo.max(p.index.saturating_add(1)));
     let known = match stored_max(conn)? {
         Some((max, _)) => idx_from_i64(max)?.saturating_add(1),
@@ -347,13 +397,6 @@ fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res
         return Ok(Vec::new()); // nothing stored can be requested
     }
     let (rows, stop) = read_rows(conn, idx_to_i64(first)?, idx_to_i64(end)?, limited)?;
-    // A row `purge` may leave at the boundary (see `read_last`) is not live even if it is on disk.
-    // Such a row can only be the boundary itself, which lies below `first`; refuse if one appears.
-    if let Some((idx, e)) = rows.first()
-        && purged.as_ref().is_some_and(|p| *idx == p.index && same_boundary_row(&e.log_id, p))
-    {
-        return Err(E::Refused(format!("log entry {idx} is at or below the purge boundary but was read")));
-    }
     // The head is required for every result, budget stops included.
     if rows.first().is_none_or(|(idx, _)| *idx != first) {
         return Err(E::Refused(format!("log entry {first} is missing although it is stored")));
@@ -834,6 +877,18 @@ mod tests {
     }
 
     #[test]
+    fn residue_rule_is_consistent() {
+        // Below the boundary any row is invalid; at the boundary only its own full `LogId` is valid.
+        let b = LogId::new(CommittedLeaderId::new(3, 1), 5);
+        let at = |term: u64, node: u64| LogId::new(CommittedLeaderId::new(term, node), 5);
+        assert!(!is_invalid_residue(&at(3, 1), &b), "the boundary's own row");
+        assert!(is_invalid_residue(&at(2, 1), &b), "same index, older log id");
+        assert!(is_invalid_residue(&at(3, 9), &b), "same index, other node");
+        assert!(is_invalid_residue(&lid(3, 4), &b), "below the boundary, even the same leader");
+        assert!(!is_invalid_residue(&lid(3, 6), &b), "above the boundary is live");
+    }
+
+    #[test]
     fn restart_preserves_vote_committed_purge_and_logs() {
         let rt = rt();
         let dir = tempfile::tempdir().unwrap();
@@ -1216,6 +1271,18 @@ mod tests {
         assert!(rt.block_on(r.try_get_log_entries(5001..)).unwrap().is_empty());
     }
 
+    /// Pins the purge boundary with a matching meta checksum (upsert).
+    fn set_purged(dir: &Path, boundary: LogId<u64>) {
+        let value = je(&boundary).unwrap();
+        let hash = checksum(&[b"meta", K_PURGED.as_bytes(), value.as_bytes()]);
+        Connection::open(dir.join(DB_FILE))
+            .unwrap()
+            .execute(
+                "INSERT INTO meta(k, v, checksum) VALUES(?1, ?2, ?3) ON CONFLICT(k) DO UPDATE SET v=excluded.v, checksum=excluded.checksum",
+                (K_PURGED, &value, hash),
+            )
+            .unwrap();
+    }
     /// Replaces a row's whole `LogId` (leader id included) with valid, checksum-consistent data.
     fn rewrite_row(dir: &Path, idx: u64, new_id: LogId<u64>) {
         let entry: EntryOf = Entry { log_id: new_id, payload: EntryPayload::Blank };
@@ -1277,8 +1344,83 @@ mod tests {
             rt.block_on(PersistentLog::open(dir.path(), 7, false)).is_err(),
             "a leftover row with another LogId at the boundary must fail closed"
         );
-        let err = rt.block_on(PersistentLog::open(dir.path(), 7, false)).err().expect("residue");
+        let err = match rt.block_on(PersistentLog::open(dir.path(), 7, false)) {
+            Ok(_) => panic!("a leftover row with another LogId at the boundary must fail closed"),
+            Err(e) => e,
+        };
         assert!(format!("{err}").contains("at or below purge boundary"), "{err}");
+    }
+
+    #[test]
+    fn hidden_residue_beneath_valid_live_tail_fails_closed() {
+        let rt = rt();
+        // Disallowed leftovers hidden below a valid live tail: the max row is valid, so 8a8ceb9's
+        // max-only check accepted it. Each is caught by the bounded index scan on open, on state and
+        // on reads; the boundary's own row stays supported.
+        let rows: Vec<_> = (0..=4).map(|i| seeded_row(&rt, i)).collect();
+        let leftovers: [(u64, LogId<u64>, &str); 3] = [
+            (1, lid(2, 1), "below the boundary, same leader, older term"),
+            (2, LogId::new(CommittedLeaderId::new(9, 9), 2), "below the boundary, other node"),
+            (3, LogId::new(CommittedLeaderId::new(9, 9), 3), "at the boundary, another LogId"),
+        ];
+        for (idx, other, what) in leftovers {
+            let dir = tempfile::tempdir().unwrap();
+            let mut s = open(&rt, dir.path());
+            append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+            rt.block_on(s.purge(lid(1, 3))).unwrap();
+            rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+            drop(s);
+            insert_row(dir.path(), idx, &rows[idx as usize]);
+            rewrite_row(dir.path(), idx, other);
+            // Grading: 8a8ceb9 saw only the live tail (4) and accepted the residue beneath it, and
+            // its range read never looked below the boundary.
+            let prior = with_copy(dir.path(), prior_read_last);
+            assert_eq!(format!("{prior:?}"), format!("Ok(Some({:?}))", lid(1, 4)), "{what}: 8a8ceb9 input");
+            // This store refuses before it can report anything: open, state and every read path.
+            let err = match rt.block_on(PersistentLog::open(dir.path(), 7, true)) {
+                Ok(_) => panic!("{what}: residue accepted on open"),
+                Err(e) => e,
+            };
+            assert!(format!("{err}").contains("invalid residue at or below purge boundary"), "{what}: {err}");
+            // To observe state and reads on their own, a handle is opened with the rule's input
+            // momentarily absent (no boundary pinned), then the boundary is restored, as a purge
+            // would, through another connection; the handle's state and read paths must still refuse.
+            let probe_dir = tempfile::tempdir().unwrap();
+            std::fs::copy(dir.path().join(DB_FILE), probe_dir.path().join(DB_FILE)).unwrap();
+            Connection::open(probe_dir.path().join(DB_FILE))
+                .unwrap()
+                .execute("DELETE FROM meta WHERE k=?1", [K_PURGED])
+                .unwrap();
+            let mut s = open(&rt, probe_dir.path());
+            set_purged(probe_dir.path(), lid(1, 3));
+            let state_err = rt.block_on(s.get_log_state()).expect_err("residue on state");
+            assert!(format!("{state_err}").contains("invalid residue"), "{what}: {state_err}");
+            let mut r = rt.block_on(s.get_log_reader());
+            for err in [
+                rt.block_on(r.try_get_log_entries(4..5)).expect_err("full read"),
+                rt.block_on(r.try_get_log_entries(0..10)).expect_err("whole-log read"),
+                rt.block_on(r.limited_get_log_entries(0, 10)).expect_err("limited read"),
+            ] {
+                assert!(format!("{err}").contains("invalid residue"), "{what}: {err}");
+            }
+            drop(r);
+            drop(s);
+        }
+
+        // The matching boundary row (what `purge` may leave) stays supported, hidden or not.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 3))).unwrap();
+        drop(s);
+        insert_row(dir.path(), 3, &rows[3]);
+        let mut s = open(&rt, dir.path());
+        assert_eq!(state(&rt, &mut s).last_log_id, Some(lid(1, 4)), "live tail");
+        let mut r = rt.block_on(s.get_log_reader());
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(0..10)).unwrap()), vec![4], "boundary not live");
+        assert_eq!(indices(&rt.block_on(r.limited_get_log_entries(3, 10)).unwrap()), vec![4]);
+        drop(r);
+        drop(s);
     }
 
     #[test]
@@ -1327,7 +1469,10 @@ mod tests {
         insert_row(dir.path(), 2, &row);
         rewrite_row(dir.path(), 2, LogId::new(CommittedLeaderId::new(9, 9), 2));
         // This store refuses the leftover outright.
-        let err = rt.block_on(PersistentLog::open(dir.path(), 7, false)).err().expect("residue");
+        let err = match rt.block_on(PersistentLog::open(dir.path(), 7, false)) {
+            Ok(_) => panic!("a leftover row with another LogId at the boundary must fail closed"),
+            Err(e) => e,
+        };
         assert!(format!("{err}").contains("at or below purge boundary"), "{err}");
         // Grading: fcb's comparison rejects rows *below* the boundary, so a row one index *above* it
         // becomes the tail it reports (here `T9-N9-2` above `T1-N1-1`).
@@ -1379,6 +1524,20 @@ mod tests {
         std::fs::copy(dir.join(DB_FILE), copy.path().join("copy.sqlite3")).unwrap();
         let conn = Connection::open(copy.path().join("copy.sqlite3")).unwrap();
         f(&conn)
+    }
+    /// 8a8ceb9's `read_last`, kept only to grade the hidden-residue regression against it: it judged
+    /// only the highest row, so invalid residue beneath a valid live tail was accepted.
+    fn prior_read_last(conn: &Connection) -> Res<Option<LogId<u64>>> {
+        let purged = purged_boundary(conn)?;
+        match stored_max(conn)? {
+            Some((_, lid)) => match &purged {
+                Some(p) if lid.index <= p.index && !same_boundary_row(&lid, p) => {
+                    Err(E::Refused(format!("last stored {lid} is at or below purge boundary {p}")))
+                }
+                _ => Ok(Some(lid)),
+            },
+            None => Ok(purged),
+        }
     }
     /// fcb22c5's `read_last`, kept only to grade the purge-residue regression against it.
     fn fcb_read_last(conn: &Connection) -> Res<Option<LogId<u64>>> {

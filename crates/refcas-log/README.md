@@ -58,8 +58,11 @@ evidence of a hole remains, and the reduced log is reported, as openraft permits
 deletes rows, so the only row a purge can leave at the boundary index is one
 carrying the boundary's own `LogId` (an entry whose commit was lost). That row is
 never live: it is not reported as the tail and not returned by reads, which start
-at the boundary's successor. A row at or below the boundary with any other
-`LogId` cannot come from this store and makes `open` fail.
+at the boundary's successor. A row below the boundary, or a row at it with any
+other `LogId`, cannot come from this store. This rule covers the whole database,
+not only its highest row: open and every read path (state and ranges) run one
+bounded indexed lookup per purged level, so residue hidden beneath a valid live
+tail still makes them fail closed.
 
 Rename, truncate or purge commit before the crates.io 0.9.26 reader checks, so
 this crate allows those errors for a committed log at exactly
@@ -76,7 +79,7 @@ cargo clippy --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 cargo test --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 ```
 
-Eighteen unit tests cover restart, exact purge identity, replay, committed
+Twenty unit tests cover restart, exact purge identity, replay, committed
 rewrite refusal, holes, truncation, snapshot-style purge, bounds, identity/lock
 refusal, and malformed or valid-JSON corruption. They delete rows directly in
 SQLite (after a passing `quick_check`) and reopen: an internal row, index 0 with
@@ -88,11 +91,14 @@ called that valid prefix a hole); a full read over either budget still refuses.
 Boundary tests pin empty, totally purged, first-live, past-the-end and budget-cap
 reads. Purge-residue tests pin a boundary row carrying the boundary's own LogId
 (served from its successor) and rows at or below the boundary with another
-`LogId`, which fail `open` (fcb22c5 reported them as the tail). The four
-regressions for the defects above grade fcb22c5 through its own reader helpers
-and fail on it; the own-`LogId` leftover test passes there through the purge pin
-that shortens whole-range starts, and the grading probes inside it show that.
-Tests exercise the same durable helpers as the trait implementations.
+`LogId`, which fail `open` (fcb22c5 reported them as the tail). One regression
+hides invalid residue below the boundary and at it beneath a valid live tail:
+8a8ceb9's max-only check, graded through its own helper, accepts it, while open,
+state and reads here refuse it and the matching boundary row stays supported.
+The four regressions for the fcb22c5 defects grade fcb22c5 through its own reader
+helpers and fail on it; the own-`LogId` leftover test passes there through the
+purge pin that shortens whole-range starts, and the grading probes inside it show
+that. Tests exercise the same durable helpers as the trait implementations.
 
 One integration test calls the public vote
 trait in a child process, waits for a persisted-vote acknowledgement, sends
