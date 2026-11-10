@@ -1,58 +1,42 @@
 //! Streaming, content-addressed object storage shared by pack, LFS and workspace publishers.
-//! Keys are tenant-scoped and immutable; callers publish their database manifests only
-//! after `put_file` and a verifying read complete.
-use crate::baseline_metrics::{Outcome, Phase, Timer};
-use anyhow::{Context, Result, bail, ensure};
-use futures_util::StreamExt;
-use hmac::{Hmac, Mac};
-use reqwest::{Client, Method, StatusCode, Url, header};
-use sha2::{Digest, Sha256};
-use std::{
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime},
-};
-use tokio::{
-    fs::{self, File},
-    io::{AsyncReadExt, AsyncWriteExt},
-    time::Instant,
-};
-use tokio_util::io::ReaderStream;
+//!
+//! **Legacy compatibility layer.** This module keeps the pre-OpenDAL public API,
+//! legacy content-addressed paths and legacy semantics alive while delegating
+//! transport/signing/multipart/retry to Apache OpenDAL. New standalone
+//! deployments must use [`crate::blob_store`] instead: its versioned locators
+//! bind tenant, authority, generation and a unique publication attempt, its
+//! production profile refuses missing config/`fs`/`memory`, and its receipt is
+//! a SHA-256 read-back proof.
+//!
+//! `RemoteObjectStore::Local` is an explicitly legacy local fixture/development
+//! backend. It is selected only when `ROOTYARD_OBJECT_STORE_ENDPOINT` is absent
+//! and callers that require a remote authority (Workspace, production Pando)
+//! already reject it. Local LFS/checkpoint ACK durability is tracked separately
+//! (#109) and is not solved by this module.
+//!
+//! **Typed failure surface (preserved).** `RemoteOp` and `RemoteStoreError`
+//! stay exactly where the ref-store integration put them:
+//! `remote_errors` owns the bounded operation enumeration, the numeric HTTP
+//! status and the privacy-safe `Display`/`Debug`, and this module re-exports
+//! both so `lfs::hydration` and the worker diagnostics in `observability` keep
+//! downcasting to the same type across the OpenDAL adapter. The adapter must
+//! therefore translate provider failures into `RemoteStoreError`, never into a
+//! flattened string.
+//!
+//! **Module wiring.** The inherent read path (`head`, `get_to_file`,
+//! `get_range`) lives in [`super::remote_io`], publish/delete in
+//! [`super::remote_publish`]; both are `impl RemoteObjectStore` blocks split out
+//! only for reviewability. The pre-OpenDAL hand-written S3 implementation that
+//! also defined those methods is historical and no longer compiled:
+//! `src/storage/historical_s3.rs`.
+use anyhow::{Context, Result, ensure};
+use reqwest::Url;
+use std::path::PathBuf;
 use uuid::Uuid;
 
-const PART_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_RANGE_BYTES: u64 = 1024 * 1024;
-type HmacSha256 = Hmac<Sha256>;
+use crate::storage::remote_provider::LegacyS3Store;
 
-pub(crate) use super::remote_errors::{RemoteOp, RemoteStoreError};
-
-/// One remote body boundary read. Deadline exhaustion maps to a typed
-/// `RemoteStoreError::timeout(op)` and an explicit `reqwest` stream failure
-/// (connection reset or mid-body decode error) maps to
-/// `RemoteStoreError::transport(op, error)` with the source chain kept intact.
-/// Local file readers never pass through this helper, so local I/O faults are
-/// never misattributed to the remote store.
-async fn remote_chunk<S>(stream: &mut S, op: RemoteOp, deadline: Instant) -> Result<Option<bytes::Bytes>>
-where
-    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
-{
-    match tokio::time::timeout_at(deadline, stream.next()).await {
-        Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
-        Ok(Some(Err(error))) => Err(RemoteStoreError::transport(op, error).into()),
-        Ok(None) => Ok(None),
-        Err(_) => Err(RemoteStoreError::timeout(op).into()),
-    }
-}
-
-/// Read a small remote control-response body under the same deadline, mapping
-/// body-boundary timeout and transport failures onto the typed remote-store
-/// error for `op` instead of surfacing a raw `reqwest` error.
-async fn remote_text(response: reqwest::Response, op: RemoteOp, deadline: Instant) -> Result<String> {
-    match tokio::time::timeout_at(deadline, response.text()).await {
-        Ok(Ok(text)) => Ok(text),
-        Ok(Err(error)) => Err(RemoteStoreError::transport(op, error).into()),
-        Err(_) => Err(RemoteStoreError::timeout(op).into()),
-    }
-}
+pub use super::remote_errors::{RemoteOp, RemoteStoreError};
 
 #[derive(Clone, Debug)]
 pub struct ObjectKey {
@@ -81,7 +65,7 @@ impl ObjectKey {
     }
 
     /// Legacy tenant-only content-addressed key. Never registered as a
-    /// deletable Pando artifact.
+    /// deletable Pando artifact. Its physical path is frozen for old readers.
     pub fn new(tenant_id: Uuid, namespace: &str, sha256: &str) -> Result<Self> {
         Self::validate(tenant_id, namespace, sha256)?;
         Ok(Self { tenant_id, authority: None, namespace: namespace.into(), sha256: sha256.into() })
@@ -122,46 +106,17 @@ pub struct StoredObject {
     pub size: u64,
 }
 
+/// Legacy store selector. `Local` is explicitly node-local legacy behavior;
+/// `OpenDal` is a remote S3-compatible provider under the frozen legacy paths.
 pub enum RemoteObjectStore {
     Local(PathBuf),
-    S3(S3Store),
-}
-
-pub struct S3Store {
-    client: Client,
-    endpoint: Url,
-    bucket: String,
-    region: String,
-    access_key: String,
-    secret_key: String,
-    session_token: Option<String>,
-}
-
-enum Payload {
-    FileRange(PathBuf, u64, u64),
-    Bytes(Vec<u8>),
-}
-
-/// Removes a partially written object temp when the async future is dropped.
-struct TempObject {
-    path: PathBuf,
-}
-
-impl Drop for TempObject {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn valid_bucket(s: &str) -> bool {
-    (3..=63).contains(&s.len())
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
-        && !s.starts_with('.')
-        && !s.ends_with('.')
-        && !s.contains("..")
+    OpenDal(LegacyS3Store),
 }
 
 impl RemoteObjectStore {
+    /// Legacy selector. With no `ROOTYARD_OBJECT_STORE_ENDPOINT` it returns the
+    /// explicitly legacy local backend; that fallback is *not* available from
+    /// `crate::blob_store::BlobProfile`, which rejects missing configuration.
     pub fn from_env(local_root: PathBuf) -> Result<Self> {
         let Ok(endpoint) = std::env::var("ROOTYARD_OBJECT_STORE_ENDPOINT") else {
             return Ok(Self::Local(local_root));
@@ -190,480 +145,22 @@ impl RemoteObjectStore {
             std::env::var("ROOTYARD_OBJECT_STORE_SECRET_KEY").context("object store secret key missing")?;
         ensure!(!access_key.is_empty() && !secret_key.is_empty(), "object store credentials missing");
         let session_token = std::env::var("ROOTYARD_OBJECT_STORE_SESSION_TOKEN").ok();
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        Ok(Self::S3(S3Store { client, endpoint, bucket, region, access_key, secret_key, session_token }))
+        let store = LegacyS3Store::open(&endpoint, &bucket, &region, access_key, secret_key, session_token)?;
+        Ok(Self::OpenDal(store))
     }
 
-    pub async fn put_file(
-        &self,
-        key: &ObjectKey,
-        source: &Path,
-        expected_size: u64,
-        deadline: Instant,
-    ) -> Result<StoredObject> {
-        let actual = hash_file(source, deadline).await?;
-        ensure!(actual.size == expected_size && actual.sha256 == key.sha256, "object source digest or size mismatch");
-        // Only the S3-backed store has remote time and bytes to report: the local
-        // filesystem fallback must never appear as remote transport. Bytes are the
-        // known source length, counted only after the upload reports success.
-        match self {
-            Self::Local(root) => local_put(root, key, source, deadline).await?,
-            Self::S3(s3) => {
-                let upload = Timer::start(Phase::RemotePut);
-                match s3.put(key, source, expected_size, deadline).await {
-                    Ok(()) => upload.finish_with_bytes(Outcome::Ok, expected_size),
-                    Err(error) => {
-                        upload.finish(Outcome::Error);
-                        return Err(error);
-                    }
-                }
-            }
-        }
-        let head = self.head(key, deadline).await?.context("uploaded object is missing")?;
-        ensure!(head.size == expected_size, "uploaded object is truncated");
-        let verification = std::env::temp_dir().join(format!("rootyard-verify-{}", Uuid::new_v4()));
-        let verified =
-            self.fetch_to_file(Phase::RemoteVerifiedReadback, key, &verification, expected_size, deadline).await;
-        let _ = fs::remove_file(&verification).await;
-        verified?;
-        Ok(actual)
-    }
-
-    pub async fn head(&self, key: &ObjectKey, deadline: Instant) -> Result<Option<StoredObject>> {
-        match self {
-            Self::Local(root) => {
-                let path = root.join(key.path());
-                match fs::metadata(&path).await {
-                    Ok(meta) if meta.is_file() => {
-                        Ok(Some(StoredObject { sha256: key.sha256.clone(), size: meta.len() }))
-                    }
-                    Ok(_) => bail!("stored object is not a file"),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(e.into()),
-                }
-            }
-            Self::S3(s3) => s3.head(key, deadline).await,
-        }
-    }
-
-    pub async fn get_to_file(
-        &self,
-        key: &ObjectKey,
-        destination: &Path,
-        expected_size: u64,
-        deadline: Instant,
-    ) -> Result<()> {
-        self.fetch_to_file(Phase::RemoteGet, key, destination, expected_size, deadline).await
-    }
-
-    /// Shared download path. The caller picks the fixed phase, so a plain GET and
-    /// a post-upload verification read are never conflated and never both counted
-    /// for one transfer.
-    async fn fetch_to_file(
-        &self,
-        phase: Phase,
-        key: &ObjectKey,
-        destination: &Path,
-        expected_size: u64,
-        deadline: Instant,
-    ) -> Result<()> {
-        let parent = destination.parent().context("object destination parent missing")?;
-        fs::create_dir_all(parent).await?;
-        let temp = parent.join(format!(".rootyard-object-{}", Uuid::new_v4()));
-        let _temp_guard = TempObject { path: temp.clone() };
-        // Local filesystem reads carry no remote observation at all.
-        let transfer = match self {
-            Self::Local(_) => None,
-            Self::S3(_) => Some(Timer::start(phase)),
-        };
-        let result = async {
-            let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
-            let mut hash = Sha256::new();
-            let mut size = 0u64;
-            match self {
-                Self::Local(root) => {
-                    let mut input = File::open(root.join(key.path())).await?;
-                    let mut buf = [0u8; 64 * 1024];
-                    loop {
-                        let n = tokio::time::timeout_at(deadline, input.read(&mut buf)).await??;
-                        if n == 0 {
-                            break;
-                        }
-                        size += n as u64;
-                        ensure!(size <= expected_size, "stored object exceeds expected size");
-                        hash.update(&buf[..n]);
-                        out.write_all(&buf[..n]).await?;
-                    }
-                }
-                Self::S3(s3) => {
-                    let response = s3.send(RemoteOp::Get, key, "", None, None, deadline).await?;
-                    if response.status() != StatusCode::OK {
-                        return Err(RemoteStoreError::http(RemoteOp::Get, response.status().as_u16()).into());
-                    }
-                    let mut stream = response.bytes_stream();
-                    while let Some(chunk) = remote_chunk(&mut stream, RemoteOp::Get, deadline).await? {
-                        size += chunk.len() as u64;
-                        ensure!(size <= expected_size, "stored object exceeds expected size");
-                        hash.update(&chunk);
-                        out.write_all(&chunk).await?;
-                    }
-                }
-            }
-            ensure!(
-                size == expected_size && hex::encode(hash.finalize()) == key.sha256,
-                "stored object digest or size mismatch"
-            );
-            out.sync_all().await?;
-            fs::rename(&temp, destination).await?;
-            File::open(parent).await?.sync_all().await?;
-            Ok::<u64, anyhow::Error>(size)
-        }
-        .await;
-        match (&result, transfer) {
-            (Ok(bytes), Some(transfer)) => transfer.finish_with_bytes(Outcome::Ok, *bytes),
-            (Err(_), Some(transfer)) => transfer.finish(Outcome::Error),
-            _ => {}
-        }
-        if result.is_err() {
-            let _ = fs::remove_file(&temp).await;
-        }
-        result.map(|_| ())
-    }
-
-    pub async fn get_range(&self, key: &ObjectKey, start: u64, len: u64, deadline: Instant) -> Result<Vec<u8>> {
-        ensure!(len <= MAX_RANGE_BYTES && len > 0, "object range exceeds limit");
-        let end = start.checked_add(len - 1).context("object range overflow")?;
-        match self {
-            Self::Local(root) => {
-                use tokio::io::AsyncSeekExt;
-                let mut file = File::open(root.join(key.path())).await?;
-                file.seek(std::io::SeekFrom::Start(start)).await?;
-                let mut bytes = vec![0u8; len as usize];
-                tokio::time::timeout_at(deadline, file.read_exact(&mut bytes)).await??;
-                Ok(bytes)
-            }
-            Self::S3(s3) => {
-                let range = format!("bytes={start}-{end}");
-                let response = s3.send(RemoteOp::Get, key, "", None, Some((&header::RANGE, &range)), deadline).await?;
-                if response.status() != StatusCode::PARTIAL_CONTENT {
-                    return Err(RemoteStoreError::http(RemoteOp::Get, response.status().as_u16()).into());
-                }
-                let mut stream = response.bytes_stream();
-                let mut bytes = Vec::with_capacity(len as usize);
-                while let Some(chunk) = remote_chunk(&mut stream, RemoteOp::Get, deadline).await? {
-                    ensure!(chunk.len() <= len as usize - bytes.len(), "object range response exceeds limit");
-                    bytes.extend_from_slice(&chunk);
-                }
-                ensure!(bytes.len() == len as usize, "object range response truncated");
-                Ok(bytes)
-            }
-        }
-    }
-
-    pub async fn delete(&self, key: &ObjectKey, deadline: Instant) -> Result<()> {
-        match self {
-            Self::Local(root) => match fs::remove_file(root.join(key.path())).await {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
-            },
-            Self::S3(s3) => {
-                let response = s3.send(RemoteOp::Delete, key, "", None, None, deadline).await?;
-                if !response.status().is_success() {
-                    return Err(RemoteStoreError::http(RemoteOp::Delete, response.status().as_u16()).into());
-                }
-                Ok(())
-            }
-        }
+    /// Retained for callers that explicitly need the old path-only accessor.
+    pub fn is_legacy_local(&self) -> bool {
+        matches!(self, Self::Local(_))
     }
 }
 
-async fn hash_file(path: &Path, deadline: Instant) -> Result<StoredObject> {
-    let mut file = File::open(path).await?;
-    let mut hash = Sha256::new();
-    let mut size = 0u64;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = tokio::time::timeout_at(deadline, file.read(&mut buf)).await??;
-        if n == 0 {
-            break;
-        }
-        size = size.checked_add(n as u64).context("object size overflow")?;
-        hash.update(&buf[..n]);
-    }
-    Ok(StoredObject { sha256: hex::encode(hash.finalize()), size })
-}
-
-async fn local_put(root: &Path, key: &ObjectKey, source: &Path, deadline: Instant) -> Result<()> {
-    let target = root.join(key.path());
-    let parent = target.parent().context("object parent missing")?;
-    fs::create_dir_all(parent).await?;
-    let temp = parent.join(format!(".tmp-{}", Uuid::new_v4()));
-    let result = async {
-        let mut input = File::open(source).await?;
-        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
-        tokio::time::timeout_at(deadline, tokio::io::copy(&mut input, &mut output)).await??;
-        output.sync_all().await?;
-        match fs::hard_link(&temp, &target).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = hash_file(&target, deadline).await?;
-                ensure!(existing.sha256 == key.sha256, "immutable object key collision");
-            }
-            Err(e) => return Err(e.into()),
-        }
-        File::open(parent).await?.sync_all().await?;
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    let _ = fs::remove_file(&temp).await;
-    result
-}
-
-fn percent_encode(value: &str) -> String {
-    let mut out = String::new();
-    for b in value.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-fn amz_time() -> Result<(String, String)> {
-    let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::gmtime_r(&secs, &mut tm) }.is_null() {
-        bail!("UTC clock conversion failed");
-    }
-    let date = format!("{:04}{:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-    let timestamp = format!("{}T{:02}{:02}{:02}Z", date, tm.tm_hour, tm.tm_min, tm.tm_sec);
-    Ok((date, timestamp))
-}
-
-fn hmac(key: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid signing key"))?;
-    mac.update(bytes);
-    Ok(mac.finalize().into_bytes().to_vec())
-}
-
-impl S3Store {
-    fn url(&self, key: &ObjectKey, query: &str) -> Result<Url> {
-        let mut url = self.endpoint.clone();
-        url.set_path(&format!("/{}/{}", self.bucket, key.path()));
-        if !query.is_empty() {
-            url.set_query(Some(query));
-        }
-        Ok(url)
-    }
-
-    fn signed(
-        &self,
-        method: &Method,
-        key: &ObjectKey,
-        query: &str,
-        extra: Option<(&header::HeaderName, &str)>,
-    ) -> Result<reqwest::RequestBuilder> {
-        let url = self.url(key, query)?;
-        let (date, timestamp) = amz_time()?;
-        let mut host = url.host_str().context("object store host missing")?.to_owned();
-        if host.contains(':') {
-            host = format!("[{host}]");
-        }
-        if let Some(port) = url.port() {
-            host.push_str(&format!(":{port}"));
-        }
-        let mut headers = vec![
-            ("host".to_owned(), host),
-            ("x-amz-content-sha256".to_owned(), "UNSIGNED-PAYLOAD".to_owned()),
-            ("x-amz-date".to_owned(), timestamp.clone()),
-        ];
-        if let Some(token) = &self.session_token {
-            headers.push(("x-amz-security-token".into(), token.clone()));
-        }
-        if let Some((name, value)) = extra {
-            headers.push((name.as_str().to_owned(), value.to_owned()));
-        }
-        headers.sort_by(|a, b| a.0.cmp(&b.0));
-        let canonical_headers = headers.iter().map(|(k, v)| format!("{k}:{}\n", v.trim())).collect::<String>();
-        let signed_headers = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
-        let canonical = format!(
-            "{}\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
-            method.as_str(),
-            url.path(),
-            query,
-            canonical_headers,
-            signed_headers
-        );
-        let scope = format!("{date}/{}/s3/aws4_request", self.region);
-        let to_sign =
-            format!("AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{}", hex::encode(Sha256::digest(canonical.as_bytes())));
-        let k_date = hmac(format!("AWS4{}", self.secret_key).as_bytes(), date.as_bytes())?;
-        let k_region = hmac(&k_date, self.region.as_bytes())?;
-        let k_service = hmac(&k_region, b"s3")?;
-        let k_signing = hmac(&k_service, b"aws4_request")?;
-        let signature = hex::encode(hmac(&k_signing, to_sign.as_bytes())?);
-        let auth = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-            self.access_key
-        );
-        let mut request = self.client.request(method.clone(), url).header(header::AUTHORIZATION, auth);
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        Ok(request)
-    }
-
-    async fn send(
-        &self,
-        op: RemoteOp,
-        key: &ObjectKey,
-        query: &str,
-        payload: Option<Payload>,
-        extra: Option<(&header::HeaderName, &str)>,
-        deadline: Instant,
-    ) -> Result<reqwest::Response> {
-        let method = op.method();
-        // Retries keep only the last finite typed error; no URL, header, query
-        // or body text is copied between attempts.
-        let mut last: Option<RemoteStoreError> = None;
-        for attempt in 0..3 {
-            let mut request = self.signed(&method, key, query, extra)?;
-            if let Some(body) = &payload {
-                request = match body {
-                    Payload::FileRange(path, offset, len) => {
-                        use tokio::io::AsyncSeekExt;
-                        let mut file = File::open(path).await?;
-                        file.seek(std::io::SeekFrom::Start(*offset)).await?;
-                        request
-                            .header(header::CONTENT_LENGTH, *len)
-                            .body(reqwest::Body::wrap_stream(ReaderStream::new(file.take(*len))))
-                    }
-                    Payload::Bytes(bytes) => request.body(bytes.clone()),
-                };
-            }
-            match tokio::time::timeout_at(deadline, request.send()).await {
-                Ok(Ok(response)) if !response.status().is_server_error() => return Ok(response),
-                Ok(Ok(response)) => last = Some(RemoteStoreError::http(op, response.status().as_u16())),
-                Ok(Err(error)) => last = Some(RemoteStoreError::transport(op, error)),
-                // Deadline exhaustion is terminal, not retried, matching the
-                // previous retry policy.
-                Err(_) => return Err(RemoteStoreError::timeout(op).into()),
-            }
-            if attempt < 2 {
-                tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
-            }
-        }
-        match last {
-            Some(error) => Err(error.into()),
-            None => Err(RemoteStoreError::no_recorded_cause(op).into()),
-        }
-    }
-
-    async fn head(&self, key: &ObjectKey, deadline: Instant) -> Result<Option<StoredObject>> {
-        let response = self.send(RemoteOp::Head, key, "", None, None, deadline).await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !response.status().is_success() {
-            return Err(RemoteStoreError::http(RemoteOp::Head, response.status().as_u16()).into());
-        }
-        let size =
-            response.headers().get(header::CONTENT_LENGTH).context("object HEAD missing length")?.to_str()?.parse()?;
-        Ok(Some(StoredObject { sha256: key.sha256.clone(), size }))
-    }
-
-    async fn put(&self, key: &ObjectKey, source: &Path, size: u64, deadline: Instant) -> Result<()> {
-        if let Some(existing) = self.head(key, deadline).await? {
-            ensure!(existing.size == size, "immutable object key collision");
-            return Ok(());
-        }
-        if size <= PART_BYTES {
-            let response = self
-                .send(
-                    RemoteOp::Put,
-                    key,
-                    "",
-                    Some(Payload::FileRange(source.to_owned(), 0, size)),
-                    Some((&header::IF_NONE_MATCH, "*")),
-                    deadline,
-                )
-                .await?;
-            let status = response.status();
-            if !(status.is_success()
-                || status == StatusCode::PRECONDITION_FAILED && self.head(key, deadline).await?.is_some())
-            {
-                return Err(RemoteStoreError::http(RemoteOp::Put, status.as_u16()).into());
-            }
-            return Ok(());
-        }
-        let initiated = self.send(RemoteOp::MultipartInitiate, key, "uploads=", None, None, deadline).await?;
-        if !initiated.status().is_success() {
-            return Err(RemoteStoreError::http(RemoteOp::MultipartInitiate, initiated.status().as_u16()).into());
-        }
-        let xml = remote_text(initiated, RemoteOp::MultipartInitiate, deadline).await?;
-        let upload_id = xml
-            .split("<UploadId>")
-            .nth(1)
-            .and_then(|s| s.split("</UploadId>").next())
-            .context("multipart upload id missing")?
-            .to_owned();
-        ensure!(!upload_id.is_empty() && upload_id.len() <= 2048, "invalid multipart upload id");
-        let encoded = percent_encode(&upload_id);
-        let mut parts = Vec::new();
-        let result = async {
-            let mut offset = 0u64;
-            while offset < size {
-                let number = parts.len() + 1;
-                ensure!(number <= 10_000, "too many multipart parts");
-                let len = (size - offset).min(PART_BYTES);
-                let query = format!("partNumber={number}&uploadId={encoded}");
-                let response = self
-                    .send(
-                        RemoteOp::MultipartPart,
-                        key,
-                        &query,
-                        Some(Payload::FileRange(source.to_owned(), offset, len)),
-                        None,
-                        deadline,
-                    )
-                    .await?;
-                if !response.status().is_success() {
-                    return Err(RemoteStoreError::http(RemoteOp::MultipartPart, response.status().as_u16()).into());
-                }
-                let etag = response.headers().get(header::ETAG).context("multipart ETag missing")?.to_str()?.to_owned();
-                ensure!(etag.starts_with('"') && etag.ends_with('"') && etag.len() < 256, "invalid multipart ETag");
-                parts.push((number, etag));
-                offset += len;
-            }
-            let mut body = String::from("<CompleteMultipartUpload>");
-            for (number, etag) in &parts {
-                body.push_str(&format!("<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"));
-            }
-            body.push_str("</CompleteMultipartUpload>");
-            let query = format!("uploadId={encoded}");
-            let response = self
-                .send(RemoteOp::MultipartComplete, key, &query, Some(Payload::Bytes(body.into_bytes())), None, deadline)
-                .await?;
-            if !response.status().is_success() {
-                return Err(RemoteStoreError::http(RemoteOp::MultipartComplete, response.status().as_u16()).into());
-            }
-            let text = remote_text(response, RemoteOp::MultipartComplete, deadline).await?;
-            ensure!(!text.contains("<Error>"), "multipart completion reported an error");
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-        if result.is_err() {
-            let query = format!("uploadId={encoded}");
-            let _ = self.send(RemoteOp::MultipartAbort, key, &query, None, None, deadline).await;
-        }
-        result
-    }
+fn valid_bucket(s: &str) -> bool {
+    (3..=63).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && !s.contains("..")
 }
 
 #[cfg(test)]
