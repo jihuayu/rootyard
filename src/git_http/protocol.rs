@@ -624,12 +624,8 @@ mod tests {
         // Duplicates do not stand in for the missing ref.
         let duplicated = report(&[b"unpack ok\n", b"ng refs/heads/a x\n", b"ng refs/heads/a y\n"]);
         assert!(!reports_rejection(&duplicated, &refs, &v1));
-        let repeated = report(&[
-            b"unpack ok\n",
-            b"ng refs/heads/a x\n",
-            b"ng refs/heads/a x\n",
-            b"ng refs/heads/b y\n",
-        ]);
+        let repeated =
+            report(&[b"unpack ok\n", b"ng refs/heads/a x\n", b"ng refs/heads/a x\n", b"ng refs/heads/b y\n"]);
         assert!(!reports_rejection(&repeated, &refs, &v1));
         // An unknown ref is never substituted for a requested one.
         let extra = report(&[b"unpack ok\n", b"ng refs/heads/a x\n", b"ng refs/heads/b y\n", b"ng refs/heads/c z\n"]);
@@ -738,11 +734,8 @@ mod tests {
         let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
         // An `ok` hidden after an embedded LF inside an `ng` reason must never be
         // read as "ng b" plus a separately supplied "ng a".
-        let hidden_ok = report(&[
-            b"unpack ok\n",
-            b"ng refs/heads/b stale\nok refs/heads/a",
-            b"ng refs/heads/a stale\n",
-        ]);
+        let hidden_ok =
+            report(&[b"unpack ok\n", b"ng refs/heads/b stale\nok refs/heads/a", b"ng refs/heads/a stale\n"]);
         assert!(!reports_rejection(&hidden_ok, &refs, &v1));
         // A status line without its terminal LF is malformed, not a bare reason.
         let no_terminal_lf = report(&[b"unpack ok\n", b"ng refs/heads/a stale", b"ng refs/heads/b stale\n"]);

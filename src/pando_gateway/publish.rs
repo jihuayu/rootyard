@@ -138,12 +138,12 @@ pub async fn publish(
     guard: &PublicationGuard,
     deadline: Instant,
 ) -> Result<i64, Error> {
-    publish_typed(state, repo, actor, tenant_id, snapshot, prepared, requested, guard, deadline)
-        .await
-        .map_err(|error| match error {
+    publish_typed(state, repo, actor, tenant_id, snapshot, prepared, requested, guard, deadline).await.map_err(
+        |error| match error {
             PublishError::RefRejected(rejection) => Error(StatusCode::CONFLICT, rejection.reason),
             PublishError::Failed(error) => error,
-        })
+        },
+    )
 }
 
 /// Same publication as [`publish`], but preserves the typed pre-commit CAS

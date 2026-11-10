@@ -179,10 +179,7 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
         if result.is_err() {
             // Re-attribute the outer deadline to the same operation instead of
             // letting it fall through to a detached scope.
-            observability::worker::run(&operation, Phase::Dispatch, async {
-                observability::observe_timeout()
-            })
-            .await;
+            observability::worker::run(&operation, Phase::Dispatch, async { observability::observe_timeout() }).await;
         }
         let (count, failed) = result.unwrap_or((0, true));
         if count > 0 {
