@@ -1014,21 +1014,28 @@ def main(argv=None):
     version = unavailable("git version not probed within the runner deadline")
     source = {"status": "unavailable", "reason": "source identity not collected before the run stopped"}
     git_metrics = {}
+
+    def aborted(error):
+        """Work started and stopped abnormally: no false success, budget facts kept."""
+        nonlocal truncated
+        truncated = True
+        metrics = {key: unavailable(f"run stopped before this metric completed: {error}") for key in GIT_METRICS}
+        metrics["runner.temp_bytes"] = temp_metric(
+            budget, {"returned_pushes_per_repo": returned_pushes(workload, returned), "stop_reason": str(error)})
+        return metrics
+
     try:
         if not runner.expired():
             version = git_output(runner, ["--version"])
         source = source_identity(runner, args.allow_dirty)
         git_metrics, truncated, budget = run_git_workload(workload, runner, seed, facts["returned_pushes_per_repo"],
                                                           budget)
-    except RunnerTimeout:
-        truncated = True
-        git_metrics = {key: unavailable("absolute runner deadline reached; remaining steps cancelled")
-                       for key in GIT_METRICS}
-    except BudgetViolation as error:
-        git_metrics = {key: unavailable(f"temp budget stopped the run: {error}") for key in GIT_METRICS}
-    except LimitExceeded as error:
-        # A child that survived SIGKILL: no bounded measurement is possible.
-        git_metrics = {key: unavailable(f"run refused before measurement: {error}") for key in GIT_METRICS}
+    except RunnerTimeout as error:
+        git_metrics = aborted(error)
+    except (BudgetViolation, LimitExceeded) as error:
+        # A budget breach or a child that survived SIGKILL before the first
+        # push: the same budget instance is still reported and removed below.
+        git_metrics = aborted(error)
     try:
         pg_metrics = run_pg_workload(workload, runner, args.pg_dsn_file, budget)
     except RunnerTimeout:
@@ -1038,19 +1045,22 @@ def main(argv=None):
         pg_metrics = {key: unavailable("absolute runner deadline reached; PostgreSQL not measured")
                       for key in ("pg.round_trip.latency_ms", "pg.advisory_lock.acquire_ms")}
     child_cpu = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime + resource.getrusage(resource.RUSAGE_CHILDREN).ru_stime - child_start
-    # Final accounting and the only removal of the owned fixture root.
     git_metrics.setdefault("runner.temp_bytes",
                            temp_metric(budget, {"returned_pushes_per_repo": returned_pushes(workload, returned)}))
     temp = git_metrics["runner.temp_bytes"]
+    # Final accounting; the root is removed in the finally even when that
+    # accounting refuses, so no owned fixture survives an error.
     try:
         budget.finish()
     except BudgetViolation as error:
+        # No report claims success over a breach; cleanup still runs below.
         raise SystemExit(f"refusing to write report: {error}")
-    temp.update(temp_metric(budget))
-    cleanup_error = budget.cleanup()
-    temp["cleaned"] = cleanup_error is None
-    if cleanup_error:
-        temp["cleanup_error"] = cleanup_error
+    finally:
+        cleanup_error = budget.cleanup()
+        temp.update(temp_metric(budget))
+        temp["cleaned"] = cleanup_error is None
+        if cleanup_error:
+            temp["cleanup_error"] = cleanup_error
     elapsed = time.monotonic() - (deadline - workload["bounds"]["wall_clock_seconds"])
     report = build_report(workload, Path(args.workload), budgets, args, git_metrics, truncated, child_cpu,
                           runner, deadline, source, facts, version, pg_metrics=pg_metrics, elapsed=elapsed)

@@ -614,6 +614,41 @@ class DeadlineAndCancellationTest(unittest.TestCase):
         self.assertEqual(runner.live_runs, 0)
 
 
+class _AbortedRun:
+    """Run main in-process with a failure injected before the first push.
+
+    The owned fixture has just been created, so the failure occurs before the
+    push count can be read from the workload. The budget instance constructed
+    by main is kept to compare the report with the instance that governed the
+    run.
+    """
+
+    def __init__(self, failure):
+        self.failure = failure
+        self.budget = None
+
+    def __enter__(self):
+        original_init = baseline.TempBudget.__init__
+        original_run = baseline.run_git_workload
+        budget_holder = self
+
+        def recording_init(budget, *args, **kwargs):
+            original_init(budget, *args, **kwargs)
+            budget_holder.budget = budget
+
+        def aborting_run(workload, runner, seed, returned=None, budget=None):
+            raise budget_holder.failure
+
+        self._original = (original_init, original_run)
+        baseline.TempBudget.__init__ = recording_init
+        baseline.run_git_workload = aborting_run
+        return self
+
+    def __exit__(self, *exc):
+        baseline.TempBudget.__init__, baseline.run_git_workload = self._original
+        return False
+
+
 class ReportContractTest(unittest.TestCase):
     def run_report(self, workload, extra=()):
         with tempfile.TemporaryDirectory() as tmp:
@@ -680,6 +715,54 @@ class ReportContractTest(unittest.TestCase):
             text = out.read_text(encoding="utf-8")
         self.assertNotIn(secret, text)
         self.assertNotIn("127.0.0.1:5432", text)
+
+    def run_main_in_process(self, workload):
+        """Run baseline.main in this process; return its exit status or SystemExit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workload_path = Path(tmp) / "workload.json"
+            report_path = Path(tmp) / "report.json"
+            workload_path.write_text(json.dumps(workload), encoding="utf-8")
+            try:
+                status = baseline.main(["--workload", str(workload_path), "--out", str(report_path),
+                                        "--allow-dirty", "--returned-pushes-per-repo", "1"])
+            except SystemExit as exit:
+                status = exit
+            report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else None
+        return status, report
+
+    def assert_aborted_report(self, failure):
+        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 2, "file_bytes": 64})
+        before = set(os.listdir(tempfile.gettempdir()))
+        with _AbortedRun(failure) as aborted:
+            status, report = self.run_main_in_process(workload)
+        self.assertEqual(status, 0)
+        self.assertIsNotNone(report, "an aborted run that started work must still write a report")
+        self.assertTrue(report["truncated"])
+        self.assertFalse(report["metrics"]["pg.round_trip.latency_ms"]["status"] == "measured")
+        budget = aborted.budget
+        self.assertIsNotNone(budget)
+        self.assertFalse(budget.root, "the owned root must be removed")
+        self.assertEqual(set(os.listdir(tempfile.gettempdir())), before, "no residue from the aborted run")
+        temp = report["metrics"]["runner.temp_bytes"]
+        limits = report["limits"]["temp_budget"]
+        for facts in (temp, limits):
+            self.assertEqual(facts["budget_bytes"], budget.budget)
+            self.assertEqual(facts["peak_charged_bytes"], budget.peak)
+            self.assertEqual(facts["checkpoints"], budget.checkpoints)
+            self.assertEqual(facts["returned_pushes_per_repo"], 1,
+                             "the effective push count survives an aborted run")
+        self.assertEqual(temp["cleaned"], True)
+        self.assertIn(str(failure), temp["stop_reason"])
+        self.assertEqual(limits["estimate_bytes"], budget.estimate)
+        self.assertEqual(temp["admission_estimate_bytes"], budget.estimate)
+        self.assertEqual(report["limits"]["admission"]["returned_pushes_per_repo"], 1)
+        self.assertNotIn("cleanup_error", temp)
+
+    def test_pre_first_push_budget_violation_still_reports_truncation_and_budget(self):
+        self.assert_aborted_report(baseline.BudgetViolation("git commit: owned fixture tree holds 9 bytes"))
+
+    def test_generic_limit_exceeded_still_reports_truncation_and_budget(self):
+        self.assert_aborted_report(baseline.LimitExceeded("child ignored SIGKILL; aborting runner"))
 
     def test_redaction_and_scan_detect_secret_shapes(self):
         redacted = baseline.redact({"dsn": "a", "note": "see postgresql://u:pw@host/db", "nested": [{"password": "x"}]})
