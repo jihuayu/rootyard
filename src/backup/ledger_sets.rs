@@ -128,6 +128,8 @@ pub(super) struct RootCapture {
     pub tenant_id: Uuid,
     /// The capture's producer/requester; it may differ from the tenant.
     pub owner_id: Uuid,
+    pub purpose: String,
+    pub business_intent_digest: String,
     pub realm: Realm,
     pub ref_count: i32,
     pub oid_count: i32,
@@ -137,11 +139,40 @@ pub(super) struct RootCapture {
     /// The stored register digest, held by the head and, once released, by the
     /// tombstone; it must be this capture's own recomputed register digest.
     pub register_digest: String,
+    /// Stored `selector_kind` (`snapshot` or `oids`).
+    pub selector_kind: String,
+    /// Stored HEAD ref and (optionally) its object id.
+    pub head_ref: String,
+    pub head_oid: Option<String>,
+    /// Stored native binding digest (`core-root-binding-v1`).
+    pub native_binding_digest: String,
     /// `(ref_name, oid)` of `ref_store_core_root_refs`.
     pub refs: Vec<(String, String)>,
     /// `(ordinal, oid)` of `ref_store_core_root_oids`.
     pub oids: Vec<(i32, String)>,
+    /// The core's own verdict on this capture: `None` when the real
+    /// `retention_root` algorithm refused it, otherwise its re-proven metadata.
+    pub proof: Option<RootProof>,
     pub packs: Vec<RetainedPack>,
+}
+
+/// What the real `retention_root` capture validator proved about one capture.
+/// Every digest is recomputed by the core from the stored rows; none is trusted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct RootProof {
+    pub tenant_id: Uuid,
+    pub owner_id: Uuid,
+    pub purpose: String,
+    pub business_intent_digest: String,
+    pub register_digest: String,
+    pub head_ref: String,
+    pub head_oid: Option<String>,
+    pub selector_kind: String,
+    /// Exact selector object ids (`resolve_oids`), not the stored row order.
+    pub oids: Vec<String>,
+    pub refs_digest: String,
+    pub pack_set_digest: String,
+    pub native_binding_digest: String,
 }
 
 /// One `ref_store_core_root_heads` row (the root's current lifetime state).
@@ -444,7 +475,13 @@ pub(super) fn check_snapshots(snapshots: &[SnapshotSet], declared: &[DeclaredPai
 }
 
 /// Every retained root (active or released) must still retain the canonical A4
-/// set of its registrations, its complete refs and its selector OIDs.
+/// set of its registrations, its complete refs and its exact selector.
+///
+/// The selector, native binding and register digests are not re-implemented
+/// here: `proof` is the verdict of the core's own capture validator, so a
+/// tampered selector order/format, a whole-snapshot selector that is not the
+/// captured refs plus HEAD, or a binding digest outside the core domain is
+/// already refused there.
 pub(super) fn check_roots(roots: &[RootCapture], declared: &[DeclaredPair]) -> Vec<String> {
     let sets: BTreeMap<Uuid, &DeclaredPair> = declared.iter().map(|pair| (pair.registration_id, pair)).collect();
     let mut lines = Vec::new();
@@ -458,6 +495,10 @@ pub(super) fn check_roots(roots: &[RootCapture], declared: &[DeclaredPair]) -> V
                 Err(reason) => lines.push(format!("root_set_mismatch:{at}:{reason}")),
             }
         }
+        let Some(proof) = &root.proof else {
+            lines.push(format!("root_capture_invalid:{at}"));
+            continue;
+        };
         // A root prepares its native set from the source snapshot refs plus the
         // resolved selector OIDs, so only the captured refs are used to
         // recompute the stored `refs_digest`.
@@ -470,7 +511,7 @@ pub(super) fn check_roots(roots: &[RootCapture], declared: &[DeclaredPair]) -> V
         if !refs_ok {
             lines.push(format!("root_refs_mismatch:{at}"));
         }
-        if count(root.oids.len()) != root.oid_count {
+        if !verified_selector(root, proof) {
             lines.push(format!("root_selector_mismatch:{at}"));
         }
         rebuilt.sort_by_key(|pack| pack.pack_id());
@@ -484,6 +525,26 @@ pub(super) fn check_roots(roots: &[RootCapture], declared: &[DeclaredPair]) -> V
     lines
 }
 
+/// The stored capture columns must be exactly the ones the core re-derived.
+fn verified_selector(root: &RootCapture, proof: &RootProof) -> bool {
+    let mut stored = root.oids.clone();
+    stored.sort_by_key(|(ordinal, _)| *ordinal);
+    let ordinals = stored.iter().enumerate().all(|(index, (ordinal, _))| usize::try_from(*ordinal) == Ok(index));
+    ordinals
+        && stored.iter().map(|(_, oid)| oid.clone()).eq(proof.oids.iter().cloned())
+        && root.tenant_id == proof.tenant_id
+        && root.owner_id == proof.owner_id
+        && root.purpose == proof.purpose
+        && root.business_intent_digest == proof.business_intent_digest
+        && root.register_digest == proof.register_digest
+        && root.selector_kind == proof.selector_kind
+        && root.head_ref == proof.head_ref
+        && root.head_oid == proof.head_oid
+        && root.refs_digest == proof.refs_digest
+        && root.pack_set_digest == proof.pack_set_digest
+        && root.native_binding_digest == proof.native_binding_digest
+}
+
 /// The root lifetime must be observable in the exact shape `retention_root`
 /// writes: `register` inserts an `active`/1 head plus its generation-1 capture
 /// (no tombstone), `release` moves that head to `released`/2 and inserts one
@@ -494,6 +555,10 @@ pub(super) fn check_roots(roots: &[RootCapture], declared: &[DeclaredPair]) -> V
 /// The producer `owner_id` (head, tombstone, capture) is the requester and may
 /// differ from the repository tenant; the capture itself must carry the same
 /// full scope as the head, and the tombstone must repeat it.
+///
+/// A capture's presence is decided by its key alone: a present capture whose
+/// generation, scope, owner or register digest disagrees with the head is a
+/// violation and can never be read as a release-before-register root.
 pub(super) fn check_heads(
     heads: &[RootHead],
     tombstones: &[RootTombstone],
@@ -503,6 +568,7 @@ pub(super) fn check_heads(
     let captures: BTreeMap<(Uuid, Uuid), &RootCapture> =
         roots.iter().map(|root| ((root.repository_id, root.root_id), root)).collect();
     let mut lines = Vec::new();
+    let by_key = |tombstone: &RootTombstone| (tombstone.repository_id, tombstone.root_id);
     for head in heads {
         let key = (head.repository_id, head.root_id);
         let at = format!("{}:{}", key.0, key.1);
@@ -512,28 +578,44 @@ pub(super) fn check_heads(
                 && purpose == head.purpose
                 && intent == head.business_intent_digest
         };
-        let fence = tombstones.iter().find(|t| (t.repository_id, t.root_id) == key && release_fence(t, head, &scope));
-        let capture = captures.get(&key).copied().filter(|capture| {
+        let rows = tombstones.iter().filter(|t| by_key(t) == key).collect::<Vec<_>>();
+        let fence = rows.iter().any(|t| release_fence(t, head, &scope));
+        // Existence is decided by the key alone: a capture that is present but
+        // carries another scope, owner or register digest is a violation, never a
+        // release-before-register. Only a key with no capture row at all may be
+        // explained by a release tombstone. `register` only ever writes the
+        // generation-1 capture of the root.
+        let capture = captures.get(&key).copied();
+        let valid = capture.is_some_and(|capture| {
             capture.generation == 1
                 && scope(capture.tenant_id, capture.owner_id, &head.purpose, &head.business_intent_digest)
                 && capture.register_digest == head.register_digest
                 && source_owner(capture, declared).is_some()
         });
+        let captured = capture.is_some();
         match (head.state.as_str(), head.last_generation) {
             // Registered and still active: `register` writes no tombstone.
-            ("active", 1) => match capture {
-                Some(_) if fence.is_none() => {}
-                Some(_) => lines.push(format!("root_head_mismatch:{at}:tombstone_without_release")),
-                None => lines.push(format!("root_capture_missing:{at}:active")),
-            },
+            ("active", 1) => {
+                if !valid {
+                    let reason = if captured { "capture_mismatch" } else { "capture_missing" };
+                    lines.push(format!("root_capture_missing:{at}:active:{reason}"));
+                } else if fence {
+                    lines.push(format!("root_head_mismatch:{at}:tombstone_without_release"));
+                }
+            }
             // Registered, then released: the capture stays and one release tombstone fences it.
-            ("released", 2) => match capture {
-                Some(_) if fence.is_some() => {}
-                Some(_) => lines.push(format!("root_head_mismatch:{at}:unreleased")),
-                // Released before `register`: the tombstone alone fences the intent.
-                None if fence.is_some() => {}
-                None => lines.push(format!("root_capture_missing:{at}:released")),
-            },
+            ("released", 2) => {
+                if captured && !valid {
+                    lines.push(format!("root_capture_mismatch:{at}:released"));
+                } else if !captured {
+                    // Released before `register`: the tombstone alone fences the intent.
+                    if !fence {
+                        lines.push(format!("root_capture_missing:{at}:released"));
+                    }
+                } else if !fence {
+                    lines.push(format!("root_head_mismatch:{at}:unreleased"));
+                }
+            }
             _ => lines.push(format!("root_head_mismatch:{at}:state")),
         }
     }
@@ -542,13 +624,53 @@ pub(super) fn check_heads(
             lines.push(format!("root_head_missing:{}:{}", root.repository_id, root.root_id));
         }
     }
+    // Every stored tombstone row of a key is judged, never only the one row that
+    // happens to match: an active root has no tombstone, a registered-then-
+    // released root has exactly one generation-2 tombstone bound to its scope and
+    // regenerated register digest, and a release-before-register root has exactly
+    // one such tombstone whose expected register digest is the intent it fences.
+    // An extra, duplicate, generation-3, foreign-scope or malformed row is refused.
+    for head in heads {
+        let key = (head.repository_id, head.root_id);
+        let at = format!("{}:{}", key.0, key.1);
+        let scope = |tenant: Uuid, owner: Uuid, purpose: &str, intent: &str| {
+            tenant == head.tenant_id
+                && owner == head.owner_id
+                && purpose == head.purpose
+                && intent == head.business_intent_digest
+        };
+        let rows = tombstones.iter().filter(|t| by_key(t) == key).collect::<Vec<_>>();
+        let shape = |t: &RootTombstone| {
+            t.generation == 2
+                && scope(t.tenant_id, t.owner_id, &t.purpose, &t.business_intent_digest)
+                && canonical_digest(&t.release_digest)
+        };
+        let problem = match (head.state.as_str(), head.last_generation) {
+            ("active", 1) => (!rows.is_empty()).then_some("tombstone_without_release"),
+            ("released", 2) if rows.len() != 1 => Some("tombstone_mismatch"),
+            ("released", 2) if !shape(rows[0]) => Some("tombstone_mismatch"),
+            _ => None,
+        };
+        match problem {
+            Some(reason) => lines.push(format!("root_head_mismatch:{at}:{reason}")),
+            None if head.state == "released" && !release_fence(rows[0], head, &scope) => {
+                lines.push(format!("root_tombstone_mismatch:{at}:register_digest"));
+            }
+            None => {}
+        }
+    }
     for tombstone in tombstones {
-        let key = (tombstone.repository_id, tombstone.root_id);
+        let key = by_key(tombstone);
         if !heads.iter().any(|head| (head.repository_id, head.root_id) == key) {
             lines.push(format!("root_tombstone_without_head:{}:{}", key.0, key.1));
         }
     }
     lines
+}
+
+/// A release digest as `release` stores it: canonical lowercase SHA-256 hex.
+fn canonical_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// One generation-2 release tombstone that fences exactly this head's scope and
@@ -557,7 +679,7 @@ fn release_fence(tombstone: &RootTombstone, head: &RootHead, scope: &impl Fn(Uui
     tombstone.generation == 2
         && tombstone.expected_register_digest == head.register_digest
         && scope(tombstone.tenant_id, tombstone.owner_id, &tombstone.purpose, &tombstone.business_intent_digest)
-        && tombstone.release_digest.len() == 64
+        && canonical_digest(&tombstone.release_digest)
 }
 
 /// The declared registration a root capture was taken from, via one of its
