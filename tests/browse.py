@@ -426,17 +426,25 @@ class BrowseHarness(Harness):
                 + repr(round(slow_seconds, 3))
             )
 
-            events = self._deadline_git_events(log)
-            assert len(events) >= 3, events
-            assert len({int(event["pid"]) for event in events}) == len(events), events
-            recorded = len(events)
+            recorded_events = self._deadline_git_events(log)
+            recorded = len(recorded_events)
+            # Two distinct child starts in series already prove the per-command
+            # timeout (2s) cannot be the whole bound: each child is delayed
+            # only 0.7s, so a 504 returned after a second child began had to
+            # come from a deadline shared by the chain, not from any child's
+            # own timeout.  A slow CI may spend much of the 2s budget on
+            # auth/lease/snapshot work and start fewer than three children;
+            # the shared-budget proof must not require a third start.
+            assert recorded >= 2, recorded_events
+            assert len({int(event["pid"]) for event in recorded_events}) == recorded, recorded_events
+            assert len({int(event["pgid"]) for event in recorded_events}) == 1, recorded_events
             time.sleep(0.75)
             assert len(self._deadline_git_events(log)) == recorded, (
                 "a Git step started after the request deadline"
             )
 
             cleanup_started = time.monotonic()
-            self._wait_for_deadline_git_cleanup(events)
+            self._wait_for_deadline_git_cleanup(recorded_events)
             cleanup_seconds = time.monotonic() - cleanup_started
 
             marker.unlink()
@@ -453,8 +461,8 @@ class BrowseHarness(Harness):
                 "health_seconds": round(health_seconds, 3),
                 "cleanup_seconds": round(cleanup_seconds, 3),
                 "delayed_git_starts": recorded,
-                "delayed_git_pids": sorted({int(event["pid"]) for event in events}),
-                "delayed_git_pgids": sorted({int(event["pgid"]) for event in events}),
+                "delayed_git_pids": sorted({int(event["pid"]) for event in recorded_events}),
+                "delayed_git_pgids": sorted({int(event["pgid"]) for event in recorded_events}),
             }
 
     def list_commits_deadline(self):
