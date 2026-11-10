@@ -35,15 +35,16 @@ class lifecycle:
                 "repository": self.repo["id"], "owner": self.repo["owner"],
                 "name": self.repo["name"]}
 
-    def worker(self, user, purpose):
+    def worker(self, user, purpose, token=None):
         """A fresh clone for ``user`` so Git never reads or writes a peer's tree.
 
         ``purpose`` names the case's own directory, so a user with several
-        workers (one per case) never clones over an earlier tree.
+        workers (one per case) never clones over an earlier tree. ``token``
+        overrides the grant holder (e.g. a read-only token of that user).
         """
         work = self.root / ("owned-work-" + user + "-" + purpose)
         assert not work.exists(), ("worker already exists for this case", work.name)
-        self.git("clone", self.remote, str(work), token=self.users[user])
+        self.git("clone", self.remote, str(work), token=token or self.users[user])
         self.git("config", "user.name", user.title(), cwd=work)
         self.git("config", "user.email", user + "@collaborator.invalid", cwd=work)
         return work
@@ -234,8 +235,7 @@ class lifecycle:
     def read_only_token(self):
         """A read-only token of the write collaborator keeps 403 on every write path."""
         token = self.account("create-token", "erin", "--read-only")
-        work = self.root / "owned-work-erin_ro"
-        self.git("clone", self.remote, str(work), token=token)
+        work = self.worker("erin", "read-only", token)
         assert (work / "README.md").is_file()
         assert self.upload_status(token) == 200
         assert self.receive_refs_status(token) == 403
