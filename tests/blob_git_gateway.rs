@@ -944,6 +944,24 @@ async fn lost_ack_case(case: &Case, git: &'static Git) -> Result<Value> {
         .map_err(|_| anyhow!("the armed receive-pack POST never reached the proxy"))?
         .ok_or_else(|| anyhow!("the proxy lost the captured receive-pack POST"))?;
     ensure!(capture.status == Some(200), "the service answered the captured POST with {:?}", capture.status);
+    let records = case.proxy.records().await;
+    let pushes = records
+        .iter()
+        .filter(|record| record.method == "POST" && record.path.ends_with("/git-receive-pack"))
+        .collect::<Vec<_>>();
+    let matching = pushes.iter().filter(|record| record.request_sha256 == capture.request_sha256).collect::<Vec<_>>();
+    ensure!(
+        matching.len() == 1,
+        "expected exactly one receive-pack POST with the captured digest, saw {}",
+        matching.len()
+    );
+    let matched = matching[0];
+    ensure!(
+        matched.status == Some(200),
+        "the captured receive-pack POST did not reach the service: {:?}",
+        matched.status
+    );
+    ensure!(!matched.truncated, "the captured receive-pack POST record is truncated");
     let (unpack, results) = assert_git_report("captured", &capture.response)?;
     ensure!(unpack == "ok", "the captured report did not unpack: {unpack}");
     ensure!(results == vec![("refs/heads/main".to_owned(), None)], "the captured report was not one `ok`: {results:?}");
