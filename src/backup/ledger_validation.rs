@@ -598,3 +598,64 @@ fn decode_tombstones(rows: Vec<tokio_postgres::Row>) -> Vec<RootTombstone> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{process::Stdio, time::Duration};
+
+    const DIAG_DATABASE_URL: &str = "ROOTYARD_BACKUP169_DIAG_DATABASE_URL";
+    const DIAG_DEADLINE: Duration = Duration::from_secs(300);
+
+    /// Ignored native diagnostic: runs the real [`validate_source`] on a
+    /// read-only `REPEATABLE READ` transaction over a source restored from the
+    /// retained `metadata.dump`, and prints the full refusal chain (`{:#}`) so
+    /// the exact hidden validator violation becomes visible.
+    #[tokio::test]
+    #[ignore = "requires ROOTYARD_BACKUP169_DIAG_DATABASE_URL pointing at a restored diagnostic database"]
+    async fn backup169_native_source_validation_diagnostic() {
+        let Some(database_url) = std::env::var(DIAG_DATABASE_URL).ok().filter(|url| !url.is_empty()) else {
+            eprintln!("{DIAG_DATABASE_URL} is not set; skipped");
+            return;
+        };
+        // Only the DSN is injected, never the neighboring production settings.
+        let config = Config {
+            database_url,
+            data_dir: std::env::temp_dir(),
+            bind: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            git: std::path::PathBuf::from("git"),
+            max_request_bytes: 1,
+            max_output_bytes: 1,
+            max_concurrent_git: 1,
+            git_timeout: Duration::from_secs(1),
+            git_memory_bytes: 1,
+            max_repo_bytes: 1,
+            max_pending_deliveries: 1,
+            outbox_worker: false,
+            metrics_bind: None,
+        };
+        let deadline = tokio::time::Instant::now() + DIAG_DEADLINE;
+        // Read-only session: the diagnostic can never write, even by accident.
+        let mut client = super::super::postgres::pg(&config).await.expect("diagnostic database connection failed");
+        client
+            .batch_execute("SET default_transaction_read_only=on")
+            .await
+            .expect("read-only diagnostic session refused");
+        // The backup-path environment: a REPEATABLE READ transaction proving the
+        // imported snapshot, while PostgreSQL read-only mode blocks all DML.
+        let tx = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .expect("diagnostic repeatable-read transaction failed");
+        tx.batch_execute("SET LOCAL search_path=public").await.expect("diagnostic transaction setup failed");
+        let refusal = tokio::time::timeout_at(deadline, validate_source(&tx, deadline)).await;
+        match refusal {
+            Ok(Ok(())) => eprintln!("backup169 diagnostic: source artifact ledger is valid"),
+            Ok(Err(error)) => panic!("backup169 diagnostic: source validator refused the fixture: {error:#}"),
+            Err(_) => panic!("backup169 diagnostic: deadline exceeded ({DIAG_DEADLINE:?})"),
+        }
+    }
+}
