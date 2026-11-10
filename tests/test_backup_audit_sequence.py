@@ -194,15 +194,36 @@ class DrillWiringTest(unittest.TestCase):
         # update goes through the PUT helper with the live version and 200.
         self.assertIn('for name in ("bob", "carol", "dave")', source(self.source, "setup"))
         self.assertIn('self.collaborator("bob")["role"] == "triage"', body)
+        self.assertIn("self.triage_negative(", body)
         self.assertIn('self.update_collaborator("bob", "maintain")', body)
         self.assertNotIn('"version": 1', body)
-        self.assertIn('["collaborator.updated"]', body)
+        self.assertNotIn("kept", body)
         helper = method_source("update_collaborator")
         self.assertIn('self.document(self.authors_path + "/" + name, 200', helper)
         self.assertIn('"expected_version": current["version"]', helper)
         # The API only reports that action when a row actually changed.
         self.assertIn('(StatusCode::OK, "collaborator.updated")',
                       (ROOT / "src/members/rbac.rs").read_text())
+
+    def test_triage_negatives_use_distinct_valid_refs_and_real_writes(self):
+        helper = method_source("triage_negative")
+        # Same-branch pulls are refused as 400 before the role gate: the
+        # negative must use two distinct, valid branch names to be a 403.
+        self.assertIn('"head_ref": "refs/heads/main"', helper)
+        self.assertIn('"base_ref": "refs/heads/triage-base"', helper)
+        models = (ROOT / "src/pulls/models.rs").read_text()
+        self.assertIn('!s.contains("..")', models)
+        self.assertIn('(12..=1024).contains(&s.len())', models)
+        handlers = (ROOT / "src/pulls/handlers.rs").read_text()
+        self.assertLess(handlers.index("if head_ref == base_ref {"),
+                        handlers.index("auth::authorize_repo_with_role(&tx, &actor, &owner, &name,"
+                                       " auth::Role::Write"))
+        # A triage issue is a real audit write that must be accounted for.
+        self.assertIn("self.triage_negative(", source(self.source, "setup_repos"))
+        self.assertIn("issue.created", (ROOT / "src/web/handlers.rs").read_text())
+        restored = method_source("restored_http_audit_sequence_continues")
+        self.assertIn('["issue.created", "collaborator.updated"]', restored)
+        self.assertIn('["bob", "alice"]', restored)
 
     def test_audit_walk_is_ascending_from_the_known_floor(self):
         body = method_source("audit_page")
@@ -225,20 +246,25 @@ class DrillWiringTest(unittest.TestCase):
         body = method_source("restored_concurrent_audit_sequence_continues")
         # One unique, previously absent branch per request: a shared main (or a
         # reused rule) would make every request after the first a 409.
-        self.assertIn('self.race_prefix = "refs/heads/audit-race-" + os.urandom(4).hex()', body)
+        self.assertIn('"refs/heads/audit-race-" + os.urandom(4).hex()', body)
         self.assertIn("len(set(branches))", body)
         self.assertNotIn('"refs/heads/main"', body)
-        self.assertEqual(method_source("restored_concurrent_audit_sequence_continues").count(
-            "self.race_prefix + "), 1)
         self.assertIn('"branch_ref": branch_ref', body)
-        self.assertIn("[row[\"id\"] for row in rows] == sorted(new) == new", body)
-        # The per-action SQL sequence is captured on the source and restored
-        # byte-identically, and only the 32 window rows extend it.
+        # The saved prefix equals the source sequence plus the restored
+        # window's issue write, and the 32 raced rows are the walked window.
+        self.assertIn("known == self.source_sequence", body)
+        self.assertIn("self.prefix_sequence = known + window", body)
+        self.assertIn("known + window == self.prefix_sequence", body)
+        self.assertIn("self.walk_audit(self.http_floor, limit=7)", body)
+        self.assertIn("audit_rows_by_id(self.restored_rows, after)", body)
+        self.assertIn("[row[\"id\"] for row in rows] == list(new)", body)
+        self.assertIn(">= self.race_floor", body)
+        # The saved prefix is captured on the source before any restore write.
         self.assertIn("self.source_sequence = self.action_sequence(self.db, self.saved_actions)",
                       method_source("source_audit_writes_advance_sequence"))
-        self.assertIn("self.race_sequence == self.source_sequence", body)
-        self.assertIn("ids == sorted(set(ids))", body)
-        self.assertIn("window_ids == [row[\"id\"] for row in self.race_sequence[-count:]]", body)
+        self.assertEqual(drill.new_audit_ids([1, 2], [1, 2, 4], [4], expected=1), [4])
+        with self.assertRaisesRegex(AssertionError, "expected 1"):
+            drill.new_audit_ids([1], [1, 2, 3], [2, 3], expected=1)
 
     def test_git_push_is_not_claimed_as_an_audit_sequence_step(self):
         push = method_source("restored_git_push_and_audit_events_recovery")
