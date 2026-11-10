@@ -201,7 +201,7 @@ fn open_test_tokens(backend: &BlobBackendIdentity) -> Result<SessionTokens> {
     // The key lives only in this `Zeroizing` owner and is wiped with it.
     let key = Zeroizing::new(TEST_KEY_BYTES);
     let codec = SessionTokenCodec::new([(TEST_KEY_ID, key)], TEST_KEY_ID, backend, BOUNDED_LIFETIME)
-        .map_err(|error| anyhow!("test session codec was refused: {error}"))?;
+        .map_err(|_| anyhow!("test session codec was refused"))?;
     Ok(SessionTokens::new(codec))
 }
 
