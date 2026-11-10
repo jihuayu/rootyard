@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use super::{
     error::GatewayError,
-    repo_session::{SESSION_HEADER, SessionRealm, SessionTokens, presented},
+    repo_session::{BEHIND_MESSAGE, SESSION_HEADER, SessionRealm, SessionTokens, VersionComparison, presented},
     serving::ServingRepository,
     snapshot::{self, RefView},
     state::BlobGitState,
@@ -113,7 +113,12 @@ fn answer(
     let Some(tokens) = tokens else { return Ok(()) };
     let realm = live_realm(serving, captured)?;
     let header = presented(headers).map_err(|error| error.for_repo())?;
-    tokens.verify(&header, &realm, captured_revision).map(|_| ()).map_err(|error| error.for_repo())
+    match tokens.verify(&header, &realm, captured_revision).map_err(|error| error.for_repo())? {
+        None | Some(VersionComparison::Satisfied { .. }) => Ok(()),
+        // An authentic same-realm token bound above the captured revision must
+        // never be served from this older view; the bound is kept, never exposed.
+        Some(VersionComparison::Behind { .. }) => Err(GatewayError::Unavailable(BEHIND_MESSAGE)),
+    }
 }
 
 /// The full realm of an authorized serving lookup bound to the incarnation the
@@ -137,7 +142,7 @@ fn live_realm(serving: &ServingRepository, captured: Uuid) -> Result<SessionReal
 mod tests {
     use super::*;
     use crate::blob_git_gateway::repo_session::{
-        BEHIND_MESSAGE, SessionTokenCodec, SessionTokenError, TEST_MAX_TOKEN_LEN, presented_for_test,
+        SessionTokenCodec, SessionTokenError, TEST_MAX_TOKEN_LEN, presented_for_test,
     };
     use crate::ref_store::{GitObjectFormat, RefName};
     use axum::http::{HeaderName, HeaderValue};
@@ -222,14 +227,19 @@ mod tests {
 
     #[test]
     fn malformed_and_duplicate_headers_are_bad_requests() {
+        // `presented` is a pure extractor: an empty textual value is returned as
+        // `Presented::Token("")` and only the production `answer` path rejects it.
+        let tokens = tokens();
+        let live = serving(3, id(4));
         for value in ["", "rs1.", "rs2.abc.def", &"x".repeat(TEST_MAX_TOKEN_LEN + 1)] {
-            assert_eq!(presented(&header(value)).err(), Some(SessionTokenError::Invalid), "{value:?}");
-            assert_eq!(presented_for_test(&header(value)).err(), Some(SessionTokenError::Invalid));
+            assert!(presented(&header(value)).is_ok(), "{value:?}");
+            assert_eq!(answer(Some(id(4)), Some(&tokens), &header(value), &live, 3), Err(malformed()), "{value:?}");
         }
         let mut duplicate = header("rs1.a.b");
         duplicate.append(HeaderName::from_static(SESSION_HEADER), HeaderValue::from_static("rs1.a.b"));
         assert_eq!(presented(&duplicate).err(), Some(SessionTokenError::Invalid));
         assert_eq!(presented_for_test(&duplicate).err(), Some(SessionTokenError::Invalid));
+        assert_eq!(answer(Some(id(4)), Some(&tokens), &duplicate, &live, 3), Err(malformed()));
         // A nil capture/lookup incarnation is never compared.
         assert_eq!(live_realm(&serving(3, Uuid::nil()), id(4)), Err(malformed()));
     }
