@@ -303,12 +303,18 @@ class lifecycle:
             first = self.push_branch(work, self.users[user], "ff-" + user)
             self.commit(work, "ff.txt", "second " + user)
             second = self.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
+            # Publish the second commit, so the branch the server holds is at
+            # ``second``; the rewind below is then a real non-fast-forward.
+            assert self.push_branch(work, self.users[user], "ff-" + user) == second
             self.git("reset", "--hard", first, cwd=work)
             stale = self.commit(work, "stale.txt", "stale " + user)
             assert stale not in (first, second)
             denied = self.git("push", "--force", "origin", "HEAD:refs/heads/ff-" + user, cwd=work,
                               token=self.users[user], check=False)
-            assert denied.returncode != 0 and self.ref("refs/heads/ff-" + user) == first
+            assert denied.returncode != 0, (
+                "a rewind from " + second[:8] + " to " + stale[:8] + " was accepted")
+            assert self.ref("refs/heads/ff-" + user) == second, (
+                "rejected push moved the ref", self.ref("refs/heads/ff-" + user))
             results[role] = "rejected"
         return results
 
