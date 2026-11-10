@@ -430,59 +430,41 @@ INTEGRATED_SCHEMA = "rootyard.state-services.integrated-manifest/v1"
 SUPPORTED_RUST_VERSIONS = {"1.85", "1.88"}
 
 
-def _version_matches(request, version):
-    """True when `version` (a plain or `=x.y.z` requirement) equals `request`.
-
-    Both arguments may carry Cargo's exact `=` prefix; leading zeros ("0.9")
-    compare by integer value, so "=0.57.0" matches "=0.57.0".
-    """
-    if version is None:
-        return False
-    version = version.strip().lstrip("=").strip()
-    try:
-        have = tuple(int(part) for part in version.split("."))
-    except ValueError:
-        return False
-    request = request.strip()
-    if request.startswith("="):
-        try:
-            return have == tuple(int(part) for part in request[1:].strip().split("."))
-        except ValueError:
-            return False
-    if request.startswith("^"):
-        request = request[1:].strip()
-    try:
-        want = tuple(int(part) for part in request.split("."))
-    except ValueError:
-        return False
-    if not want:
-        return False
-    # Cargo caret/default semantics: same left-most non-zero component.
-    return have[: len(want) - 1] == want[:-1] and have[len(want) - 1] >= want[-1]
-
-
 def _dependency_ok(spec, expected):
-    """Check one declared dependency spec against its recorded integrated shape."""
+    """Check one declared dependency spec against its recorded integrated shape.
+
+    Feature lists, default-features and optionality must match the record
+    exactly; a reviewed extension must be recorded in `integrated_manifest`
+    first, so a crate cannot quietly gain providers/features here.
+    """
     if isinstance(spec, str):
-        return _version_matches(spec, expected.get("version"))
+        return (expected.get("features", []) == []
+                and expected.get("default_features", True) is True
+                and expected.get("optional", False) is False
+                and not str(expected.get("version", "")).startswith("=")
+                and str(spec).strip() == str(expected.get("version", "")).strip())
     if not isinstance(spec, dict):
         return False
-    if bool(spec.get("optional", False)) != bool(expected.get("optional", False)):
+    if spec.get("optional", False) is not expected.get("optional", False):
+        return False
+    if spec.get("default-features", spec.get("default_features", True)) is not expected.get("default_features", True):
         return False
     if expected.get("path"):
-        return "version" not in spec
-    if spec.get("path") is not None:
+        return "version" not in spec and "package" not in spec
+    if spec.get("path") is not None or spec.get("package") is not None:
         return False
-    if expected.get("version") is not None and not _version_matches(spec.get("version", ""), expected["version"]):
+    if "features" in expected and set(spec.get("features") or []) != set(expected["features"]):
         return False
-    if "default_features" in expected and spec.get("default-features", spec.get("default_features", True)) != expected["default_features"]:
-        return False
-    if "features" in expected:
-        have = set(spec.get("features") or [])
-        if not set(expected["features"]) <= have:
+    requirement = str(expected.get("version", ""))
+    declared = str(spec.get("version", ""))
+    if requirement.startswith("="):
+        # Exact pins must be declared exactly (never via a caret range).
+        if declared != requirement:
             return False
-        if expected.get("features_exact") and have != set(expected["features"]):
-            return False
+    elif declared.strip().lstrip("^").strip() != requirement:
+        # Any other range can drift a whole crate line (axum 0.8 -> 0.7,
+        # reqwest 0.12 -> 0.11); only the exact recorded text is reviewed.
+        return False
     return True
 
 
@@ -493,12 +475,13 @@ def _is_local_feature(item):
 
 # Tables a reviewed integrated dependency may come from. `path` appears only
 # for the in-repo vendor patch; a path in a dependency table would shadow the
-# crates.io release the freeze pins.
-REVIEWED_TABLES = ("dependencies", "dev-dependencies", "patch", "path")
+# crates.io release the freeze pins. Target-specific tables are never accepted.
+DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
+REVIEWED_TABLES = DEPENDENCY_TABLES + ("patch", "path")
 
 
 def _reviewed_spec(manifest, table, key, name):
-    """The manifest entry a reviewed dependency key refers to (dotted keys)."""
+    """The manifest entry a reviewed dependency key refers to."""
     if table == "patch":
         source, _, crate = key.partition(".")[2].partition(".")
         return ((manifest.get("patch") or {}).get(source) or {}).get(crate)
@@ -506,35 +489,48 @@ def _reviewed_spec(manifest, table, key, name):
         # Only the reviewed in-repo vendor patch may carry a path; a path in a
         # dependency table itself is never accepted.
         return ((manifest.get("patch") or {}).get("crates-io") or {}).get(key.partition(".")[2])
-    spec = (manifest.get(table) or {}).get(key)
-    if spec is None and name:
-        spec = (manifest.get(table) or {}).get(name)
-    return spec
+    return (manifest.get(table) or {}).get(name)
 
 
 def _dependency_entries(manifest):
-    """Every declared dependency, keyed by table and name, including patches."""
+    """Every declared dependency, keyed by table and name, including patches.
+
+    Target-specific `[target.*.*-dependencies]` entries are kept (with their
+    full target key) so the integrated contract rejects them explicitly
+    instead of silently ignoring them.
+    """
     entries = {}
-    for table in ("dependencies", "dev-dependencies", "build-dependencies"):
+    for table in DEPENDENCY_TABLES:
         for name, spec in (manifest.get(table) or {}).items():
             entries[f"{table}.{name}"] = spec
+    for target, tables in (manifest.get("target") or {}).items():
+        for table in DEPENDENCY_TABLES:
+            for name, spec in (tables.get(table) or {}).items():
+                entries[f"target.{target}.{table}.{name}"] = spec
     for source, patch in (manifest.get("patch") or {}).items():
         for name, spec in patch.items():
             entries[f"patch.{source}.{name}"] = spec
             if isinstance(spec, dict) and spec.get("path"):
-                # Vendored sources are reviewed against their exact path.
                 entries[f"path.{name}"] = spec
     return entries
 
 
+LOCK_ENTRY = re.compile(r"^\[\[package\]\]\n(.*?)(?=\n\[\[package\]\]|\Z)", re.M | re.S)
+
+
+def lock_package_identities(lock_text):
+    """(name, version, source, checksum) identity of every locked package."""
+    identities = set()
+    for block in LOCK_ENTRY.findall(lock_text.strip() + "\n"):
+        fields = dict(re.findall(r'^([a-z_]+) = "([^"]*)"$', block, re.M))
+        require("name" in fields and "version" in fields, "lockfile package without name/version")
+        identities.add((fields["name"], fields["version"], fields.get("source"), fields.get("checksum")))
+    return identities
+
+
 def lock_packages(lock_text):
     """(name, version) pairs of every package in a Cargo lockfile."""
-    return set(re.findall(r'^name = "([^"]+)"\nversion = "([^"]+)"', lock_text, re.M))
-
-
-def added_lock_packages(baseline_lock_text, lock_text):
-    """Packages present in `lock_text` but not in the baseline lock, by name."""
-    return sorted({name for name, _ in lock_packages(lock_text)} - {name for name, _ in lock_packages(baseline_lock_text)})
+    return {(name, version) for name, version, _, _ in lock_package_identities(lock_text)}
 
 
 def check_integrated_manifest(integrated, manifest_text, lock_text):
@@ -542,15 +538,25 @@ def check_integrated_manifest(integrated, manifest_text, lock_text):
 
     The integrated branch legitimately carries new features and dependencies
     that the frozen W0 parent never had. This contract makes them explicit:
+    the exact reviewed Cargo.toml/Cargo.lock bytes are pinned first; then
     every feature is exactly its recorded, non-empty value; a `dep:` entry must
     name a declared dependency and exactly the crate it enables; optional
     dependencies must be enabled by a feature; dependencies are limited to the
-    reviewed list with their recorded versions/features/optionality; the
-    recorded MSRV holds; and the lockfile keeps every frozen package and adds
-    only recorded package names. The historical fixtures are never rewritten
-    from this tree.
+    reviewed list with exact recorded versions/features/default-features/
+    optionality; target-specific dependency tables are rejected; the recorded
+    MSRV holds; and the lockfile keeps every frozen (name, version, source,
+    checksum) package and adds only explicitly recorded [name, version] pairs.
+    The historical fixtures are never rewritten from this tree.
     """
     require(integrated.get("schema") == INTEGRATED_SCHEMA, "integrated manifest schema drift")
+    # Primary approval: the exact reviewed current bytes. Any semantic finding
+    # below on different bytes is an unreviewed change, never auto-approved.
+    require(integrated.get("manifest_sha256"), "the integrated contract must record the reviewed Cargo.toml SHA-256")
+    require(hashlib.sha256(manifest_text.encode("utf-8")).hexdigest() == integrated["manifest_sha256"],
+            "current Cargo.toml differs from the reviewed integrated manifest")
+    require(integrated.get("lock_sha256"), "the integrated contract must record the reviewed Cargo.lock SHA-256")
+    require(hashlib.sha256(lock_text.encode("utf-8")).hexdigest() == integrated["lock_sha256"],
+            "current Cargo.lock differs from the reviewed integrated lockfile")
     manifest = parse_manifest(manifest_text)
     _check_msrv(manifest, integrated.get("declared_rust_version"), "current integrated manifest")
     if integrated.get("declared_rust_version") not in SUPPORTED_RUST_VERSIONS:
@@ -584,12 +590,12 @@ def check_integrated_manifest(integrated, manifest_text, lock_text):
                     f"optional dependency {name} has no enabling feature")
     actual = _dependency_entries(manifest)
     reviewed = set(integrated.get("dependencies") or {})
+    for key in actual:
+        require(not key.startswith("target."), f"unreviewed target-specific integrated dependency {key.split('.', 1)[1]}")
     for key, expected in (integrated.get("dependencies") or {}).items():
-        table, _, name = key.partition(".")
-        if table == "target":
-            raise ValueError("target-specific integrated dependencies are not declared")
+        table = key.partition(".")[0]
         require(table in REVIEWED_TABLES, f"integrated dependency {key} uses an unreviewed table")
-        spec = _reviewed_spec(manifest, table, key, name)
+        spec = _reviewed_spec(manifest, table, key, key.partition(".")[2])
         require(spec is not None, f"integrated dependency {key} is missing")
         require(_dependency_ok(spec, expected), f"integrated dependency {key} changed")
     for key in actual:
@@ -601,14 +607,19 @@ def check_integrated_manifest(integrated, manifest_text, lock_text):
             path = (actual[key] or {}).get("path")
             require(path == integrated["dependencies"][key].get("path"),
                     f"vendored source {key} must stay at {integrated['dependencies'][key].get('path')!r}")
+    # Package identities corroborate the exact bytes: frozen packages keep
+    # (name, version, source, checksum) and additions are explicit pairs.
     parent_lock = (ROOT / integrated["baseline_lock"]).read_text(encoding="utf-8")
-    previous = lock_packages(parent_lock)
-    present = lock_packages(lock_text)
-    require(previous <= present, f"lockfile lost frozen packages: {sorted(previous - present)}")
-    added = set(added_lock_packages(parent_lock, lock_text))
-    allowed = set(integrated.get("lock_additions") or [])
-    unreviewed = added - allowed
-    require(not unreviewed, f"lockfile contains unreviewed additions: {sorted(unreviewed)[:10]}")
+    previous = lock_package_identities(parent_lock)
+    present = lock_package_identities(lock_text)
+    lost = previous - present
+    require(not lost, f"lockfile lost frozen packages: {sorted(lost)[:10]}")
+    added = sorted((name, version) for name, version, _, _ in present - previous)
+    recorded = integrated.get("lock_additions") or []
+    require(all(isinstance(item, list) and len(item) == 2 for item in recorded),
+            "recorded lock additions must be explicit [name, version] pairs")
+    unreviewed = sorted(item for item in added if item not in {tuple(pair) for pair in recorded})
+    require(not unreviewed, f"lockfile contains unreviewed additions: {unreviewed[:10]}")
     return integrated
 
 

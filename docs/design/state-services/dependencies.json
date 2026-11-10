@@ -158,51 +158,100 @@
     },
     "dependencies": {
       "dependencies.anyhow": {
-        "version": "1"
+        "version": "1",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.async-compression": {
         "version": "0.4",
         "features": [
           "tokio",
           "gzip"
-        ]
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.async-stream": {
-        "version": "0.3"
+        "version": "0.3",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.axum": {
-        "version": "0.8"
+        "version": "0.8",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.base64": {
-        "version": "0.22"
+        "version": "0.22",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.bytes": {
-        "version": "1"
+        "version": "1",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.deadpool-postgres": {
-        "version": "0.14"
+        "version": "0.14",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.fs2": {
-        "version": "0.4"
+        "version": "0.4",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.fuser": {
         "version": "0.16",
         "default_features": false,
         "features": [
           "abi-7-31"
-        ]
+        ],
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.futures-util": {
-        "version": "0.3"
+        "version": "0.3",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.hex": {
-        "version": "0.4"
+        "version": "0.4",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.hmac": {
-        "version": "0.12"
+        "version": "0.12",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.libc": {
-        "version": "0.2"
+        "version": "0.2",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.opendal": {
         "version": "=0.57.0",
@@ -214,14 +263,23 @@
           "layers-concurrent-limit",
           "layers-retry",
           "layers-timeout"
-        ]
+        ],
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.opendal-service-s3": {
         "version": "=0.57.0",
-        "default_features": false
+        "default_features": false,
+        "features": [],
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.rand": {
-        "version": "0.9"
+        "version": "0.9",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.rdkafka": {
         "version": "0.39",
@@ -230,7 +288,8 @@
         "features": [
           "tokio",
           "ssl"
-        ]
+        ],
+        "features_exact": true
       },
       "dependencies.redis": {
         "version": "=0.32.7",
@@ -240,7 +299,8 @@
           "tokio-rustls-comp",
           "connection-manager",
           "acl"
-        ]
+        ],
+        "features_exact": true
       },
       "dependencies.reqwest": {
         "version": "0.12",
@@ -249,10 +309,16 @@
           "rustls-tls",
           "stream",
           "json"
-        ]
+        ],
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.ring": {
-        "version": "0.17"
+        "version": "0.17",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.rustls": {
         "version": "0.23",
@@ -260,67 +326,109 @@
         "features": [
           "ring",
           "std"
-        ]
+        ],
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.rustls-pemfile": {
-        "version": "2"
+        "version": "2",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.serde": {
         "version": "1",
         "features": [
           "derive"
-        ]
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.serde_json": {
-        "version": "1"
+        "version": "1",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.sha2": {
-        "version": "0.10"
+        "version": "0.10",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.tokio": {
         "version": "1",
         "features": [
           "full"
-        ]
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.tokio-postgres": {
         "version": "0.7",
         "features": [
           "with-uuid-1",
           "with-serde_json-1"
-        ]
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.tokio-postgres-rustls": {
         "version": "0.14",
         "features": [
           "ring"
-        ]
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.tokio-util": {
         "version": "0.7",
         "features": [
           "io"
-        ]
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.uuid": {
         "version": "1",
         "features": [
           "v4",
           "serde"
-        ]
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dependencies.zeroize": {
-        "version": "1.9"
+        "version": "1.9",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "dev-dependencies.opendal": {
         "version": "=0.57.0",
         "default_features": false,
         "features": [
           "services-memory"
-        ]
+        ],
+        "optional": false,
+        "features_exact": true
       },
       "dev-dependencies.tempfile": {
-        "version": "3"
+        "version": "3",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
       },
       "patch.crates-io.opendal-service-s3": {
         "path": "vendor/opendal-service-s3",
@@ -332,97 +440,373 @@
       }
     },
     "lock_additions": [
-      "aes",
-      "arc-swap",
-      "asyncband",
-      "autocfg",
-      "backon",
-      "block-padding",
-      "cbc",
-      "cipher",
-      "combine",
-      "const-random",
-      "const-random-macro",
-      "core-foundation",
-      "core-foundation-sys",
-      "crc32c",
-      "crunchy",
-      "dlv-list",
-      "futures",
-      "gloo-timers",
-      "hashbrown",
-      "inout",
-      "jiff",
-      "jiff-core",
-      "jiff-static",
-      "jiff-tzdb",
-      "jiff-tzdb-platform",
-      "jni",
-      "jni-macros",
-      "jni-sys",
-      "jni-sys-macros",
-      "lazy_static",
-      "libm",
-      "mea",
-      "num-bigint",
-      "num-bigint-dig",
-      "num-integer",
-      "num-iter",
-      "num-traits",
-      "opendal",
-      "opendal-core",
-      "opendal-layer-concurrent-limit",
-      "opendal-layer-retry",
-      "opendal-layer-timeout",
-      "opendal-service-azblob",
-      "opendal-service-azure-common",
-      "opendal-service-s3",
-      "openssl-probe",
-      "ordered-multimap",
-      "pbkdf2",
-      "pem",
-      "pem-rfc7468",
-      "pkcs1",
-      "pkcs5",
-      "pkcs8",
-      "portable-atomic",
-      "portable-atomic-util",
-      "quick-xml",
-      "rand",
-      "rand_chacha",
-      "rand_core",
-      "redis",
-      "reqsign-aws-core",
-      "reqsign-aws-v4",
-      "reqsign-azure-storage",
-      "reqsign-core",
-      "reqsign-file-read-tokio",
-      "reqwest",
-      "rsa",
-      "rust-ini",
-      "rustc_version",
-      "rustls-native-certs",
-      "rustls-platform-verifier",
-      "rustls-platform-verifier-android",
-      "salsa20",
-      "same-file",
-      "schannel",
-      "scrypt",
-      "security-framework",
-      "security-framework-sys",
-      "semver",
-      "sha1",
-      "signature",
-      "simd_cesu8",
-      "simdutf8",
-      "spin",
-      "tiny-keccak",
-      "walkdir",
-      "wasm-streams",
-      "webpki-root-certs",
-      "winapi-util"
+      [
+        "aes",
+        "0.8.4"
+      ],
+      [
+        "arc-swap",
+        "1.9.4"
+      ],
+      [
+        "asyncband",
+        "0.7.4"
+      ],
+      [
+        "autocfg",
+        "1.5.1"
+      ],
+      [
+        "backon",
+        "1.6.0"
+      ],
+      [
+        "block-padding",
+        "0.3.3"
+      ],
+      [
+        "cbc",
+        "0.1.2"
+      ],
+      [
+        "cipher",
+        "0.4.4"
+      ],
+      [
+        "combine",
+        "4.6.9"
+      ],
+      [
+        "const-random",
+        "0.1.18"
+      ],
+      [
+        "const-random-macro",
+        "0.1.16"
+      ],
+      [
+        "core-foundation",
+        "0.10.1"
+      ],
+      [
+        "core-foundation-sys",
+        "0.8.7"
+      ],
+      [
+        "crc32c",
+        "0.6.9"
+      ],
+      [
+        "crunchy",
+        "0.2.4"
+      ],
+      [
+        "dlv-list",
+        "0.5.2"
+      ],
+      [
+        "futures",
+        "0.3.34"
+      ],
+      [
+        "gloo-timers",
+        "0.3.0"
+      ],
+      [
+        "hashbrown",
+        "0.14.5"
+      ],
+      [
+        "inout",
+        "0.1.4"
+      ],
+      [
+        "jiff",
+        "0.2.40"
+      ],
+      [
+        "jiff-core",
+        "0.1.3"
+      ],
+      [
+        "jiff-static",
+        "0.2.40"
+      ],
+      [
+        "jiff-tzdb",
+        "0.1.9"
+      ],
+      [
+        "jiff-tzdb-platform",
+        "0.1.3"
+      ],
+      [
+        "jni",
+        "0.22.4"
+      ],
+      [
+        "jni-macros",
+        "0.22.4"
+      ],
+      [
+        "jni-sys",
+        "0.4.1"
+      ],
+      [
+        "jni-sys-macros",
+        "0.4.1"
+      ],
+      [
+        "lazy_static",
+        "1.5.1"
+      ],
+      [
+        "libm",
+        "0.2.16"
+      ],
+      [
+        "mea",
+        "0.6.7"
+      ],
+      [
+        "num-bigint",
+        "0.4.8"
+      ],
+      [
+        "num-bigint-dig",
+        "0.8.6"
+      ],
+      [
+        "num-integer",
+        "0.1.47"
+      ],
+      [
+        "num-iter",
+        "0.1.46"
+      ],
+      [
+        "num-traits",
+        "0.2.19"
+      ],
+      [
+        "opendal",
+        "0.57.0"
+      ],
+      [
+        "opendal-core",
+        "0.57.0"
+      ],
+      [
+        "opendal-layer-concurrent-limit",
+        "0.57.0"
+      ],
+      [
+        "opendal-layer-retry",
+        "0.57.0"
+      ],
+      [
+        "opendal-layer-timeout",
+        "0.57.0"
+      ],
+      [
+        "opendal-service-azblob",
+        "0.57.0"
+      ],
+      [
+        "opendal-service-azure-common",
+        "0.57.0"
+      ],
+      [
+        "opendal-service-s3",
+        "0.57.0"
+      ],
+      [
+        "openssl-probe",
+        "0.2.2"
+      ],
+      [
+        "ordered-multimap",
+        "0.7.3"
+      ],
+      [
+        "pbkdf2",
+        "0.12.2"
+      ],
+      [
+        "pem",
+        "4.0.0"
+      ],
+      [
+        "pem-rfc7468",
+        "0.7.0"
+      ],
+      [
+        "pkcs1",
+        "0.7.5"
+      ],
+      [
+        "pkcs5",
+        "0.7.1"
+      ],
+      [
+        "pkcs8",
+        "0.10.2"
+      ],
+      [
+        "portable-atomic",
+        "1.15.0"
+      ],
+      [
+        "portable-atomic-util",
+        "0.2.8"
+      ],
+      [
+        "quick-xml",
+        "0.39.4"
+      ],
+      [
+        "quick-xml",
+        "0.42.0"
+      ],
+      [
+        "rand",
+        "0.8.8"
+      ],
+      [
+        "rand_chacha",
+        "0.3.1"
+      ],
+      [
+        "rand_core",
+        "0.6.4"
+      ],
+      [
+        "redis",
+        "0.32.7"
+      ],
+      [
+        "reqsign-aws-core",
+        "3.2.0"
+      ],
+      [
+        "reqsign-aws-v4",
+        "3.3.1"
+      ],
+      [
+        "reqsign-azure-storage",
+        "3.3.0"
+      ],
+      [
+        "reqsign-core",
+        "3.3.2"
+      ],
+      [
+        "reqsign-file-read-tokio",
+        "3.0.7"
+      ],
+      [
+        "reqwest",
+        "0.13.5"
+      ],
+      [
+        "rsa",
+        "0.9.10"
+      ],
+      [
+        "rust-ini",
+        "0.21.3"
+      ],
+      [
+        "rustc_version",
+        "0.4.1"
+      ],
+      [
+        "rustls-native-certs",
+        "0.8.5"
+      ],
+      [
+        "rustls-platform-verifier",
+        "0.7.1"
+      ],
+      [
+        "rustls-platform-verifier-android",
+        "0.2.0"
+      ],
+      [
+        "salsa20",
+        "0.10.2"
+      ],
+      [
+        "same-file",
+        "1.0.6"
+      ],
+      [
+        "schannel",
+        "0.1.30"
+      ],
+      [
+        "scrypt",
+        "0.11.0"
+      ],
+      [
+        "security-framework",
+        "3.7.0"
+      ],
+      [
+        "security-framework-sys",
+        "2.17.0"
+      ],
+      [
+        "semver",
+        "1.0.28"
+      ],
+      [
+        "sha1",
+        "0.11.0"
+      ],
+      [
+        "signature",
+        "2.2.0"
+      ],
+      [
+        "simd_cesu8",
+        "1.2.0"
+      ],
+      [
+        "simdutf8",
+        "0.1.5"
+      ],
+      [
+        "spin",
+        "0.9.9"
+      ],
+      [
+        "tiny-keccak",
+        "2.0.2"
+      ],
+      [
+        "walkdir",
+        "2.5.0"
+      ],
+      [
+        "wasm-streams",
+        "0.5.0"
+      ],
+      [
+        "webpki-root-certs",
+        "1.0.11"
+      ],
+      [
+        "winapi-util",
+        "0.1.11"
+      ]
     ],
-    "lock_additions_note": "Sorted names. A name listed here that already exists in the frozen lock (e.g. `rand`, `hashbrown`, `reqwest`) means an additional locked version appears; names absent from the lock are a no-op."
+    "lock_additions_note": "Explicit [name, version] pairs added relative to the frozen W0 lock. Frozen packages are compared by (name, version, source, checksum); a same-name package at another version is an unreviewed addition.",
+    "lock_sha256": "fcd88cd99ce590cfa401180bc45bbafa4099193abe552c562a4cca81d84c4186",
+    "lock_sha256_note": "Exact reviewed SHA-256 of the committed integrated Cargo.lock (Root-owned). Pins the whole reviewed dependency graph; the frozen (name,version,source,checksum) identity comparison below remains as corroboration.",
+    "target_dependencies_policy": "No [target.*.dependencies/dev-dependencies/build-dependencies] entries are declared or accepted by the integrated contract; any target-specific dependency is rejected as unreviewed until one is explicitly recorded here.",
+    "manifest_sha256": "b330229dffa6bd4c74aacda2d869d206b321444f5d8101431ce21d6e28fcbc51",
+    "manifest_sha256_note": "Exact reviewed SHA-256 of the committed integrated Cargo.toml (Root-owned). The exact-bytes pin is the primary integrated approval: features, target tables, versions and dependency edges cannot change without the pin and this record changing together, which requires explicit PR review. The semantic checks below remain as readable corroboration."
   },
   "open_items_before_add": [
     "Compile OpenRaft 0.9.25 against the planned MSRV and prove its durable storage/network adapter contract.",

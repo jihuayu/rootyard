@@ -213,8 +213,57 @@ class IntegratedManifestTest(unittest.TestCase):
             self.lock_text if lock_text is None else lock_text,
         )
 
+    def assert_reviewed_inputs_reject(self, *, manifest_text=None, lock_text=None):
+        """Mutated bytes must fail on the exact pins, then alone on semantics.
+
+        The second call drops only the pin of the untouched input after
+        re-hashing the mutated input *inside the recorded contract* to prove
+        the semantic checks (not just the byte pin) still reject it.
+        """
+        text = self.manifest_text if manifest_text is None else manifest_text
+        lock = self.lock_text if lock_text is None else lock_text
+        with self.assertRaisesRegex(ValueError, "differs from the reviewed integrated (manifest|lockfile)"):
+            self.check(text, lock)
+        integrated = copy.deepcopy(self.integrated)
+        if manifest_text is not None:
+            integrated["manifest_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        else:
+            integrated["lock_sha256"] = hashlib.sha256(lock.encode("utf-8")).hexdigest()
+        with self.assertRaisesRegex(ValueError, r"^(?!current Cargo)"):
+            self.check(text, lock, integrated=integrated)
+
+    def test_exact_reviewed_bytes_are_the_primary_pin(self):
+        self.check()
+        self.assertEqual(hashlib.sha256(self.manifest_text.encode("utf-8")).hexdigest(),
+                         self.integrated["manifest_sha256"])
+        self.assertEqual(hashlib.sha256(self.lock_text.encode("utf-8")).hexdigest(),
+                         self.integrated["lock_sha256"])
+        # A review record pointing at other bytes than the reviewed tree fails.
+        for key, message in (("manifest_sha256", "reviewed integrated manifest"),
+                             ("lock_sha256", "reviewed integrated lockfile")):
+            integrated = copy.deepcopy(self.integrated)
+            integrated[key] = "0" * 64
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.check(integrated=integrated)
+            integrated = copy.deepcopy(self.integrated)
+            del integrated[key]
+            with self.subTest(key=key, missing=True):
+                with self.assertRaisesRegex(ValueError, "must record the reviewed Cargo.(toml|lock) SHA-256"):
+                    self.check(integrated=integrated)
+
     def mutated(self, old, new):
         return checks.manifest_mutation(self.manifest_text, old, new)
+
+    def rehashed(self, manifest_text):
+        """The recorded contract with only the pin moved to the mutated bytes.
+
+        Used to prove the semantic checks still reject; the default tests never
+        do this, so mutated Cargo inputs are rejected by the exact pin alone.
+        """
+        integrated = copy.deepcopy(self.integrated)
+        integrated["manifest_sha256"] = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
+        return integrated
 
     def test_current_integrated_manifest_matches_its_record(self):
         self.check()
@@ -229,18 +278,17 @@ class IntegratedManifestTest(unittest.TestCase):
         )
         for old, new, message in cases:
             with self.subTest(change=new):
-                with self.assertRaisesRegex(ValueError, message):
-                    self.check(self.mutated(old, new))
+                self.assert_reviewed_inputs_reject(manifest_text=self.mutated(old, new))
         extra_patch = self.mutated(
             'opendal-service-s3 = { path = "vendor/opendal-service-s3" }',
             'opendal-service-s3 = { path = "vendor/opendal-service-s3" }\nevil = { path = "vendor/evil" }')
         with self.assertRaisesRegex(ValueError, "unreviewed integrated dependency patch.crates-io.evil"):
-            self.check(extra_patch)
+            self.check(extra_patch, integrated=self.rehashed(extra_patch))
         repointed = self.mutated(
             "opendal-service-s3 = { path = \"vendor/opendal-service-s3\" }",
             "opendal-service-s3 = { path = \"vendor/evil\" }")
         with self.assertRaisesRegex(ValueError, "vendored source path.opendal-service-s3 must stay at"):
-            self.check(repointed)
+            self.check(repointed, integrated=self.rehashed(repointed))
 
     def test_default_enabled_or_nonempty_metrics_feature_fails(self):
         cases = (
@@ -253,8 +301,11 @@ class IntegratedManifestTest(unittest.TestCase):
         )
         for old, new, message in cases:
             with self.subTest(change=new):
+                mutated = self.mutated(old, new)
+                with self.assertRaisesRegex(ValueError, "differs from the reviewed integrated manifest"):
+                    self.check(mutated)
                 with self.assertRaisesRegex(ValueError, message):
-                    self.check(self.mutated(old, new))
+                    self.check(mutated, integrated=self.rehashed(mutated))
 
     def test_default_feature_list_is_pinned(self):
         integrated = copy.deepcopy(self.integrated)
@@ -262,27 +313,107 @@ class IntegratedManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "feature default must stay"):
             self.check(integrated=integrated)
 
-    def test_lockfile_must_keep_frozen_packages_and_only_recorded_additions(self):
+    def test_exact_feature_lists_allow_no_extra_providers_or_features(self):
+        cases = (
+            ('reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }',
+             'reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "cookies"] }',
+             "integrated dependency dependencies.reqwest changed"),
+            ('features = ["services-s3", "reqwest-rustls-no-provider-tls"',
+             'features = ["services-s3", "reqwest-rustls-no-provider-tls", "services-fs"',
+             "integrated dependency dependencies.opendal changed"),
+            ('fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }',
+             'fuser = { version = "0.16", default-features = true, features = ["abi-7-31"] }',
+             "integrated dependency dependencies.fuser changed"),
+        )
+        for old, new, message in cases:
+            with self.subTest(change=new):
+                self.assert_reviewed_inputs_reject(manifest_text=self.mutated(old, new))
+        # The reviewed request itself still passes unchanged.
+        self.check()
+
+    def test_dependency_line_changes_fail_the_exact_pin_and_the_record(self):
+        for old, new in (('axum = "0.8"', 'axum = "0.7"'),
+                         ('reqwest = { version = "0.12",', 'reqwest = { version = "0.11",')):
+            with self.subTest(change=new):
+                mutated = self.mutated(old, new)
+                with self.assertRaisesRegex(ValueError, "differs from the reviewed integrated manifest"):
+                    self.check(mutated)
+                # Even a re-hashed review record cannot relocate a crate line.
+                with self.assertRaisesRegex(ValueError, "integrated dependency dependencies.(axum|reqwest) changed"):
+                    self.check(mutated, integrated=self.rehashed(mutated))
+
+    def test_unreviewed_target_specific_dependency_tables_are_rejected(self):
+        for table in ("dependencies", "dev-dependencies", "build-dependencies"):
+            extra = (
+                "\n[target.'cfg(windows)'.%s]\nevil_crate = \"1\"\n" % table)
+            with self.subTest(table=table):
+                self.assert_reviewed_inputs_reject(manifest_text=self.manifest_text + extra)
+        # Even a recorded target key cannot be smuggled into the contract.
+        integrated = copy.deepcopy(self.integrated)
+        integrated["dependencies"][
+            "target.'cfg(windows)'.dependencies.evil_crate"] = {"version": "1", "features": [],
+                                                                "default_features": True, "optional": False}
+        target_text = self.manifest_text + "\n[target.'cfg(windows)'.dependencies]\nevil_crate = \"1\"\n"
+        integrated["manifest_sha256"] = hashlib.sha256(target_text.encode("utf-8")).hexdigest()
+        with self.assertRaisesRegex(ValueError, "unreviewed target-specific integrated dependency"):
+            self.check(target_text, integrated=integrated)
+        self.assertEqual(checks._dependency_entries(checks.parse_manifest(
+            self.manifest_text + "\n[target.'cfg(windows)'.dependencies]\nevil_crate = \"1\"\n")),
+            {**checks._dependency_entries(checks.parse_manifest(self.manifest_text)),
+             "target.cfg(windows).dependencies.evil_crate": "1"})
+
+    def test_lockfile_is_the_reviewed_file_and_checked_by_package_identity(self):
+        self.assertEqual(hashlib.sha256(self.lock_text.encode("utf-8")).hexdigest(),
+                         self.integrated["lock_sha256"])
+        # A same-name package at a new version, a checksum tamper and a source
+        # tamper all fail the exact pin, and still fail identity checks.
+        renamed = self.lock_text.replace('name = "anyhow"\nversion = "1.0.104"',
+                                         'name = "anyhow"\nversion = "99.0.0"', 1)
+        self.assertNotEqual(renamed, self.lock_text)
+        checksum = self.lock_text.replace(
+            'checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"',
+            'checksum = "%s"' % ("0" * 64), 1)
+        self.assertNotEqual(checksum, self.lock_text)
+        source = self.lock_text.replace('name = "axum"\nversion = "0.8.9"\n'
+                                        'source = "registry+https://github.com/rust-lang/crates.io-index"',
+                                        'name = "axum"\nversion = "0.8.9"\n'
+                                        'source = "git+https://github.com/evil/axum"', 1)
+        self.assertNotEqual(source, self.lock_text)
+        for mutated, message in ((renamed, "lockfile lost frozen packages"),
+                                 (checksum, "lockfile lost frozen packages"),
+                                 (source, "lockfile lost frozen packages")):
+            with self.subTest(case=message):
+                with self.assertRaisesRegex(ValueError, "reviewed integrated lockfile"):
+                    self.check(lock_text=mutated)
+                integrated = copy.deepcopy(self.integrated)
+                integrated["lock_sha256"] = hashlib.sha256(mutated.encode("utf-8")).hexdigest()
+                with self.assertRaisesRegex(ValueError, message):
+                    self.check(lock_text=mutated, integrated=integrated)
+        # Same name, new (non-frozen) version: rejected as an unreviewed pair.
+        relocated = self.lock_text.replace('name = "wasm-streams"\nversion = "0.5.0"',
+                                           'name = "wasm-streams"\nversion = "0.5.1"', 1)
+        self.assertNotEqual(relocated, self.lock_text)
+        integrated = copy.deepcopy(self.integrated)
+        integrated["lock_sha256"] = hashlib.sha256(relocated.encode("utf-8")).hexdigest()
+        with self.assertRaisesRegex(ValueError, "unreviewed additions"):
+            self.check(lock_text=relocated, integrated=integrated)
+
+    def test_recorded_lock_additions_are_explicit_name_version_pairs(self):
+        frozen = checks.lock_package_identities(
+            (ROOT / self.integrated["baseline_lock"]).read_text(encoding="utf-8"))
+        present = checks.lock_package_identities(self.lock_text)
+        added = sorted([name, version] for name, version, _, _ in present - frozen)
+        self.assertTrue(all(isinstance(pair, list) and len(pair) == 2 for pair in self.integrated["lock_additions"]))
+        self.assertEqual(added, self.integrated["lock_additions"])
+        self.assertEqual(len({tuple(pair) for pair in added}), len(added), "additions must be unique")
+        self.assertIn(["rand", "0.8.8"], added)
+        self.assertNotIn(["anyhow", "1.0.104"], added, "frozen packages are not additions")
         extra = self.lock_text + (
             '\n[[package]]\nname = "evil-crate"\nversion = "9.9.9"\n'
-            'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
-        with self.assertRaisesRegex(ValueError, "unreviewed additions"):
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            'checksum = "' + "0" * 64 + '"\n')
+        with self.assertRaisesRegex(ValueError, "reviewed integrated lockfile"):
             self.check(lock_text=extra)
-        dropped = self.lock_text.replace('name = "anyhow"\nversion = "1.0.104"',
-                                         'name = "anyhow"\nversion = "1.0.99"', 1)
-        self.assertNotEqual(dropped, self.lock_text)
-        with self.assertRaisesRegex(ValueError, "lockfile lost frozen packages"):
-            self.check(lock_text=dropped)
-        added = checks.added_lock_packages(
-            (ROOT / self.integrated["baseline_lock"]).read_text(encoding="utf-8"), self.lock_text)
-        self.assertTrue(set(added) <= set(self.integrated["lock_additions"]))
-        # Packages that already appear at another version stay listed so a new
-        # second version is reviewed explicitly.
-        self.assertNotIn("anyhow", added)
-        self.assertIn("hashbrown", set(self.integrated["lock_additions"]) - set(added),
-                      "overlapping names are recorded ahead of the lockfile they describe")
-        self.assertEqual(len(set(self.integrated["lock_additions"])), len(self.integrated["lock_additions"]),
-                         "recorded lock additions must be unique package names")
 
 
 if __name__ == "__main__":
