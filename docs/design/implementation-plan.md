@@ -54,7 +54,7 @@
 | [#157](https://github.com/jihuayu/rootyard/issues/157) | [State/D] 真实 3 主机故障矩阵、ACK 完整性、RPO/RTO 与容量成本 | [#155](https://github.com/jihuayu/rootyard/issues/155), [#156](https://github.com/jihuayu/rootyard/issues/156), [#153](https://github.com/jihuayu/rootyard/issues/153), [#42](https://github.com/jihuayu/rootyard/issues/42), [#151](https://github.com/jihuayu/rootyard/issues/151) |
 | [#123](https://github.com/jihuayu/rootyard/issues/123) | [State/Release] 汇总单机与分布式新架构资格及发布闸门 | [#154](https://github.com/jihuayu/rootyard/issues/154), [#157](https://github.com/jihuayu/rootyard/issues/157) |
 
-## 新增任务与修复 backlog（全部未实现）
+## 新增任务与修复 backlog（#166–#169 见下方集成说明，#162–#165 与 #174 未实现）
 
 下列 issue 是维护者另行发布的后续任务和缺陷修复单。此处登记的是 GitHub 上的确切标题、范围摘要与技术前置；**没有实现、没有验收结果**，不计入任何已完成阶段，也不表示分布式、HA、GC 等新能力已交付。标题与正文以 GitHub 为准，issue 正文更新后须同步本表和 [任务映射](issue-map.md)。
 
@@ -70,10 +70,11 @@
 | [#169](https://github.com/jihuayu/rootyard/issues/169) | [Backup/P2] 配对归档逐项验证注册 pack 的完整 artifact 集合与摘要（pack+idx 角色、slot/locator/proof/hold 绑定、artifact_set_digest；缺件/错摘要拒绝归档） | [#120](https://github.com/jihuayu/rootyard/issues/120)；PR #161 候选能力，不扩大已验收范围 |
 | [#170](https://github.com/jihuayu/rootyard/issues/170) | Integrate the pending Forge and Blob/RefStore PR stack with reviewed recovery fixes | 合并 #89–#161 的候选栈（PR，不是新能力） |
 | [#171](https://github.com/jihuayu/rootyard/issues/171) | [Integration] 分离历史 W0 冻结快照与当前架构，修复合并后的验证契约 | #170；合并契约修复，不宣称新架构任务全部交付 |
+| [#172](https://github.com/jihuayu/rootyard/pull/172) | Pando 一致性与会话读取契约（提案，未实现）；对应实施 backlog [#174](https://github.com/jihuayu/rootyard/issues/174) | 文档提案；令牌/会话协议实施另立任务 |
 
 #171 只修复集成门禁：恢复当前第 12 章契约、把 W0 冻结输入放到显式归档、让 feature-only overlay 针对其冻结 parent fixture、修复结构检查。它不新增分布式/HA/GC 能力，也不关闭上述任何任务。
 
-PR #160 的独立实验 crate 只对应 #149 的日志存储切片，不改变 #149 仍为 open，也不构成 #115 的前置完成；#167 只修复其日志读取完整性，不使该 crate 进入根构建。
+修复 #166–#168 已并入 [PR #170](https://github.com/jihuayu/rootyard/pull/170) 集成，其结果绑定各自提交，集成后 CI 以 PR #170 最终检查为准；#169 仍 OPEN。PR #160 的独立实验 crate 只对应 #149 的日志存储切片，不改变 #149 仍为 open，也不构成 #115 的前置完成；#167 只修复其日志读取完整性，不使该 crate 进入根构建。
 
 ## 必须守住的验收边界
 
