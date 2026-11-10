@@ -12,12 +12,20 @@ workspace, interrupted-restore, physical durability or HA qualification.
 Issue #169 (corruption hardening + positive format22 roots). The four
 dedicated corruption negatives (missing pack, missing idx, missing pack+idx,
 wrong artifact_set_digest) run against their own throw-away `pg_dump` clone of
-the API-produced source, inside one statement-timeout-bounded transaction; the
-clone is dropped with FORCE before the next case, so no corrupted source can be
-read later and the base source is never modified. Each failed backup is
-observed by the drill only as a nonzero exit, no published directory, no
-COMPLETE and no success manifest; the base archive then still restores its
-exact rows. The positive format22 case uses a second, API-produced source
+the API-produced source, while its original Blob objects still exist and before
+the restore case deletes them. Each clone is imported and corrupted inside one
+statement-timeout-bounded transaction whose only privileged act is a
+transaction-local `SET LOCAL session_replication_role = replica` on the
+admin-owned disposable database (migration 142 keeps the A4 rows and triggers
+immutable); the clone must prove that exactly the intended row/field changed,
+then the clone is dropped with FORCE, so no corrupted source can be read later
+and the API source, the clean archive and the production schema are never
+modified. A backup may refuse only with the case's exact source-ledger
+validator violation, before it creates any file (destination, COMPLETE,
+manifest); any other nonzero exit fails the harness. The captured ledger
+digests and closure are asserted unchanged after every case, then the untouched
+clean archive restores into a fresh target with those exact digests and
+locators. The positive format22 case uses a second, API-produced source
 (source-bound Rust fixture `ref_store_format22_backup_fixture`) with non-empty
 active and released API-created roots and a producer owner that is not the
 repository tenant, then verifies and restores it into a fresh database.
@@ -37,8 +45,9 @@ import uuid
 
 from backup import bounded_line
 from backup_blob_serving169_support import (
-    CORRUPTION_CASES as CORRUPTION_NAMES, NativeFixtureRequest, corruption_plan, format22_manifest_checks,
-    native_marker_checks,
+    CHANGED as CORRUPTION_CHANGED, CORRUPTION_CASES as CORRUPTION_NAMES, NativeFixtureRequest, corruption_findings,
+    corruption_plan, corruption_sql, format22_manifest_checks, format22_restore_sql, format22_serving_read_checks,
+    native_marker_checks, validator_refusal,
 )
 
 
@@ -53,18 +62,28 @@ from blob_only_service import (
 )
 from schema_baseline import CURRENT_BLOB_BACKUP_FORMAT as CURRENT_BACKUP_FORMAT, CURRENT_SCHEMA_VERSION, SCHEMA_VERSIONS, catalog_tables
 
+CORRUPTION_CALLBACKS = {
+    "missing_pack": "corrupt_source_missing_pack_refused_before_publication",
+    "missing_idx": "corrupt_source_missing_idx_refused_before_publication",
+    "missing_all_artifacts": "corrupt_source_missing_all_artifacts_refused_before_publication",
+    "wrong_artifact_set_digest": "corrupt_source_wrong_artifact_set_digest_refused_before_publication",
+}
+assert tuple(CORRUPTION_CALLBACKS) == CORRUPTION_NAMES
+# The corruption negatives run while the original store is complete: before the
+# post-backup acknowledged write and before the restore case deletes the
+# original Blob objects.
 CASES = (
     "real_http_sha1_sha256_source_without_persistent_bare",
     "offline_volume_and_postgres_snapshot_barriers",
     "incomplete_and_damaged_archives_rejected_before_sql",
     "existing_database_and_directory_targets_refused",
+    CORRUPTION_CALLBACKS["missing_pack"],
+    CORRUPTION_CALLBACKS["missing_idx"],
+    CORRUPTION_CALLBACKS["missing_all_artifacts"],
+    CORRUPTION_CALLBACKS["wrong_artifact_set_digest"],
     "post_backup_acknowledged_write_excluded",
     "fresh_database_restore_clone_refs_content_fsck",
     "restored_exact_receive_replay_without_second_effect",
-    "corrupt_source_missing_pack_refused_before_publication",
-    "corrupt_source_missing_idx_refused_before_publication",
-    "corrupt_source_missing_all_artifacts_refused_before_publication",
-    "corrupt_source_wrong_artifact_set_digest_refused_before_publication",
     "format22_active_released_roots_distinct_producer_roundtrip",
 )
 LIMITATIONS = [
@@ -73,8 +92,8 @@ LIMITATIONS = [
     "serve-blob holds the shared lifecycle advisory lock for its whole lifetime; offline backup/restore hold the exclusive one until publication. The legacy volume flock still only covers the native GitFS path.",
     "No interrupted restore, multi-host failure, physical power-loss, throughput, or production RPO/RTO qualification is claimed.",
     "No legacy format/schema upgrade is exercised. The current binary must restore its own format22/schema147 archive; format21/schema147 stays readable as a metadata-only historical archive.",
-    "The corruption negatives use privileged raw SQL on a run-owned `pg_dump` clone (the documented outside-the-guarantee case of #169); no application path can create those rows and the base source is never modified.",
-    "The negative cases assert the observable fail-closed contract (nonzero exit, no destination, no COMPLETE, no success manifest, exact rows still restorable); the refusal wording and the internal validator path are product-owned and not asserted.",
+    "The corruption negatives use one privileged, transaction-local `SET LOCAL session_replication_role = replica` statement on a run-owned admin-owned `pg_dump` clone (the documented outside-the-guarantee case of #169, needs a superuser admin); no application path can create those rows, migration-142 triggers are never disabled outside that transaction, and the API source, the clean archive and the production schema are never modified.",
+    "The negative cases require the failure to be the source-ledger validator reporting a bounded list that carries the target's canonical_pair_mismatch plus its cause-specific violation (incomplete_pair, missing_artifacts, or declared_set_digest_mismatch from a declared-set source), with no destination, no COMPLETE and no manifest; a backend mismatch, missing Blob bytes, another registration/repository or any unrelated refusal fails the harness instead of passing it.",
     "The positive format22 roots case needs the source-bound ref_store_format22_backup_fixture receipt from the same candidate; without it the case is an explicit red FIXTURE_UNAVAILABLE, never a skip.",
 ]
 
@@ -93,8 +112,14 @@ class Drill(BlobOnlyHarness):
         self.managed_suffixes = {self.base_suffix}
         self.corruption_states = {}
         self.corruption_plan_used = ()
+        # Issue #169: one dump of the API source and the already-proven clean
+        # archive, both fixed before the first negative.
         self.corruption_dump = None
         self.corruption_base = None
+        self.corruption_backend_identity = None
+        self.corruption_bindings = None
+        self.corruption_source_root = None
+        self.corruption_locators = ()
         self.format22 = None
         self.format22_env = None
         self.format22_available = False
@@ -680,34 +705,74 @@ class Drill(BlobOnlyHarness):
         return destination
 
     def dump_to(self, path):
-        dump = subprocess.Popen(["pg_dump", "--no-password", "--schema=public", "--no-owner", "--no-privileges",
-                                 "--file", str(path)], env=self.pg_env(self.source_db),
+        # Custom format: `quarantined_copy` imports exactly this file with
+        # `pg_restore`, which only reads the archive formats (never plain SQL).
+        dump = subprocess.Popen(["pg_dump", "--no-password", "--format=custom", "--schema=public", "--no-owner",
+                                 "--no-privileges", "--file", str(path)], env=self.pg_env(self.source_db),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         _, stderr = dump.communicate(timeout=300)
         assert dump.returncode == 0, "source dump failed: " + self.redact(stderr[-2000:])
 
-    def quarantined_copy(self, label, dump_path, statement):
-        """Throw-away database = exact clone of the API-produced source plus one
-        privileged corruption, imported as one bounded transaction."""
+    def quarantined_copy(self, case, destination):
+        """Disposable admin-owned clone = exact dump of the API source, its
+        backend binding checked, then one privileged clone-local corruption
+        whose exact effect is proven before the caller may run a backup."""
+        assert not destination.exists(), case.name + ": the refusal destination already exists"
         copy = self.new_database(self.admin)
         name = urllib.parse.unquote(urllib.parse.urlsplit(copy).path.lstrip("/"))
         try:
             restore = subprocess.Popen(["pg_restore", "--no-password", "--exit-on-error", "--no-owner",
-                                        "--no-privileges", "--dbname", name, str(dump_path)],
+                                        "--no-privileges", "--dbname", name, self.corruption_dump],
                                        env={k: v for k, v in self.pg_env(copy).items() if k != "PGDATABASE"},
                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             _, stderr = restore.communicate(timeout=300)
-            assert restore.returncode == 0, label + ": clone restore failed: " + self.redact(stderr[-2000:])
-            corrupted = subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-c",
-                                        "BEGIN; SET LOCAL statement_timeout='60s'; SET LOCAL lock_timeout='10s'; "
-                                        + statement + "; COMMIT"],
-                                       env=self.pg_env(copy), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       timeout=120)
-            assert corrupted.returncode == 0, label + ": corruption refused: " + self.redact(corrupted.stderr[-2000:])
+            assert restore.returncode == 0, case.name + ": clone restore failed: " + self.redact(stderr[-2000:])
+            binding = self.binding(copy)
+            assert binding == self.corruption_bindings, \
+                case.name + ": the clone's Blob binding is not the valid source root/backend: " + self.redact(binding)
+            corrupted = subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1",
+                                        "--set", "ON_ERROR_ROLLBACK=off", "--file", "-"],
+                                       input=corruption_sql(case).encode(), env=self.pg_env(copy),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            assert corrupted.returncode == 0, case.name + ": clone-local corruption refused: " + \
+                self.redact(corrupted.stderr[-2000:])
+            lines = corrupted.stdout.decode().strip().splitlines()
+            echo = CORRUPTION_CHANGED + " "
+            assert len(lines) == 2 and lines[0].startswith(echo) and re.fullmatch(r"[0-9]+", lines[0][len(echo):]), \
+                case.name + ": the corruption did not report its exact row count: " + self.redact(lines)
+            self.corruption_evidence[case.name] = corruption_findings(case, int(lines[0][len(echo):]), lines[1])
             return copy
         except BaseException:
             self.drop_copy(copy)
             raise
+
+    def binding(self, database):
+        """The deployed serving binding/backend identity of every API repository."""
+        raw = self.query(database,
+            "SELECT coalesce(string_agg(x, E'\\n' ORDER BY x), '') FROM ("
+            "SELECT r.id::text || '|' || r.storage_backend || '|' || coalesce(b.object_format, '') || '|' || "
+            "coalesce(b.backend_identity, '') AS x FROM public.repositories r "
+            "LEFT JOIN public.ref_store_serving_repositories b ON b.repository_id=r.id) rows")
+        return raw
+
+    def source_backend(self):
+        """The valid source Blob root/backend: the one saved with the clean
+        archive, whose COMPLETE only exists after the paired closure was
+        verified against it, so a clone can never use another root/backend."""
+        assert self.corruption_base is not None and self.corruption_base.joinpath("COMPLETE").is_file(), \
+            "the clean archive was not completed before the first corruption negative"
+        assert self.corruption_bindings, "the source Blob binding was not captured"
+        closure = json.loads(self.corruption_base.joinpath("manifest.json").read_text()).get("blob_closure") or {}
+        assert closure.get("backend_identity"), "the clean archive has no Blob closure backend identity"
+        # Compare the archived closure against the exact backend identity rows
+        # the API source really served from; never derive or synthesize one.
+        identities = {row.rsplit("|", 1)[-1] for row in self.corruption_bindings.splitlines()}
+        assert len(identities) == 1 and "" not in identities, \
+            "the API source does not have one serving Blob backend: " + self.redact(self.corruption_bindings)
+        source_backend = identities.pop()
+        assert closure["backend_identity"] == source_backend, \
+            "the clean archive closure backend does not match the source serving binding"
+        return source_backend
 
     def drop_copy(self, database):
         name = urllib.parse.unquote(urllib.parse.urlsplit(database).path.lstrip("/"))
@@ -717,58 +782,159 @@ class Drill(BlobOnlyHarness):
         assert name not in names, "the owned clone survived its drop"
 
     def use_source_database(self, database):
-        """Run the real CLI against `database` with the source volume."""
+        """Run the real CLI against `database` with the source volume and the
+        exact source Blob root."""
         self.db = database
         self.env.update(DATABASE_URL=database, ROOTYARD_DATA_DIR=str(self.source_volume),
-                        ROOTYARD_SCRATCH_DIR=str(self.source_scratch))
+                        ROOTYARD_SCRATCH_DIR=str(self.source_scratch),
+                        ROOTYARD_BLOB_ROOT=self.corruption_source_root)
 
     def corrupt(self, case):
         """One dedicated corruption in its own clone; then the clone is dropped."""
         destination = self.fresh_destination("corrupt-" + case.name)
-        copy = self.quarantined_copy(case.name, self.corruption_dump, case.statement)
+        copy = self.quarantined_copy(case, destination)
         try:
             self.use_source_database(copy)
-            self.use_blob_suffix(case.name)
             process = self.run([self.args.binary, "backup", str(destination), "--offline"], check=False)
-            state = self.assert_failed_closed(case.name, destination, process)
+            state = self.assert_refused_by_validator(case, destination, process)
         finally:
             self.use_source_database(self.source_db)
             self.drop_copy(copy)
         return state
 
-    def corrupt_source_negative(self, name, findings=None):
-        """One issue-#169 negative: fail closed, then the base archive still restores."""
-        assert findings is None or not findings, name + ": validator findings on a valid source: " + str(findings)
-        if name not in self.corruption_states:
-            registered = self.query(self.source_db,
-                "SELECT registration_id FROM public.ref_store_core_pack_publications ORDER BY registration_id"
-            ).splitlines()
-            retainable = self.query(self.source_db,
-                "SELECT DISTINCT registration_id FROM ("
-                "SELECT registration_id FROM public.ref_store_core_root_packs UNION "
-                "SELECT registration_id FROM public.ref_store_core_snapshot_packs UNION "
-                "SELECT registration_id FROM public.ref_store_core_serving_read_packs) declared "
-                "ORDER BY registration_id").splitlines()
-            plan = corruption_plan(registered, retainable)
-            assert [entry.name for entry in plan] == list(CORRUPTION_NAMES)
-            self.corruption_plan_used = plan
-            chosen = next(entry for entry in plan if entry.name == name)
-            self.corruption_states[name] = self.corrupt(chosen)
+    def assert_refused_by_validator(self, case, destination, process):
+        """The backup refused with this case's exact source-ledger violation and
+        wrote nothing, and no corrupted source leaked back into the API source."""
+        assert process.returncode != 0, case.name + ": backup exited 0 on a corrupted source"
+        self.assert_failed_closed(case.name, destination, process)
+        violation = validator_refusal(process.stderr, case)
+        assert self.binding(self.source_db) == self.corruption_bindings, \
+            case.name + ": the API source binding changed during the clone"
+        return violation
+
+    def corruption_source(self):
+        """Capture the API source dump, closure and binding exactly once, with
+        the already-completed clean archive, before the first negative."""
+        if self.corruption_dump is not None:
+            return
+        # snapshot() already created and backup-verified the clean archive from
+        # the API source and its exact original Blob root; use that archive.
+        self.corruption_base = self.backup
+        assert self.corruption_base.joinpath("COMPLETE").is_file() and \
+            self.corruption_base.joinpath("manifest.json").is_file(), "the clean archive is incomplete"
+        self.corruption_source_root = self.env["ROOTYARD_BLOB_ROOT"]
+        assert self.corruption_source_root and not self.corruption_source_root.endswith("/"), "no source Blob root"
+        self.corruption_dump = self.root / "source.pgdump"
+        self.dump_to(self.corruption_dump)
+        assert self.corruption_dump.is_file() and self.corruption_dump.stat().st_size > 0, "the source dump is empty"
+        self.corruption_bindings = self.binding(self.source_db)
+        assert self.corruption_bindings, "the API source has no repository binding"
+        self.corruption_backend_identity = self.source_backend()
+        # The throw-away clones run the real CLI against the source volume; its
+        # scratch directory is run-owned and must exist before the first backup.
+        Path(self.env["ROOTYARD_SCRATCH_DIR"]).mkdir(mode=0o700, exist_ok=True)
+
+    def corruption_plan_rows(self):
+        # The actual publication identity of every registration: the validator
+        # names these exact repository/pack/registration ids, so the plan must
+        # never invent them.
+        scopes, registered = {}, []
+        for row in self.query(self.source_db,
+                "SELECT registration_id::text || '|' || repository_id::text || '|' || pack_id::text "
+                "FROM public.ref_store_core_pack_publications ORDER BY registration_id").splitlines():
+            registration, repository, pack = row.split("|")
+            scopes[registration] = (repository, pack)
+            registered.append(registration)
+        assert len(scopes) == len(registered), "a registration is not unique in its publications"
+        # The real synthetic source has zero serving reads and guarantees only
+        # API-created publications with live memberships: a registered
+        # membership is itself the source declaration that still holds the
+        # registration, so the archived set cannot shrink after artifact loss.
+        retainable = self.query(self.source_db,
+            "SELECT DISTINCT registration_id FROM ("
+            "SELECT registration_id FROM public.ref_store_core_root_packs UNION "
+            "SELECT registration_id FROM public.ref_store_core_snapshot_packs UNION "
+            "SELECT registration_id FROM public.ref_store_core_serving_read_packs UNION "
+            "SELECT registration_id FROM public.ref_store_core_pack_memberships) declared "
+            "ORDER BY registration_id").splitlines()
+        pairs, digests = {}, {}
+        for row in self.query(self.source_db,
+                "SELECT registration_id::text || '|' || role FROM public.ref_store_core_pack_artifacts "
+                "ORDER BY registration_id, role").splitlines():
+            registration, role = row.split("|")
+            pairs.setdefault(registration, set()).add(role)
+        for row in self.query(self.source_db,
+                "SELECT registration_id::text || '|' || artifact_set_digest FROM public.ref_store_core_pack_publications "
+                "UNION ALL SELECT registration_id::text || '|' || artifact_set_digest "
+                "FROM public.ref_store_core_pack_memberships "
+                "UNION ALL SELECT registration_id::text || '|' || artifact_set_digest "
+                "FROM public.ref_store_core_root_packs "
+                "UNION ALL SELECT registration_id::text || '|' || artifact_set_digest "
+                "FROM public.ref_store_core_snapshot_packs "
+                "UNION ALL SELECT p.registration_id::text || '|' || p.artifact_set_digest "
+                "FROM public.ref_store_core_serving_read_packs p").splitlines():
+            registration, digest = row.split("|")
+            digests.setdefault(registration, set()).add(digest)
+        return corruption_plan(registered, retainable, scopes, pairs, digests)
+
+    def corrupt_source_negative(self, name):
+        """One issue-#169 negative: one exact validator refusal on a corrupted
+        clone while the original Blob objects still exist, then the API source,
+        the clean archive and its digest capture are proven unchanged."""
+        assert name in CORRUPTION_NAMES, name + " is not an issue #169 corruption case"
+        assert name not in self.corruption_states, name + ": corruption case ran twice"
+        self.corruption_source()
+        assert self.corruption_dump is not None and self.corruption_base is not None, \
+            name + ": the source dump and clean archive must exist before any clone"
+        if not self.corruption_plan_used:
+            assert self.corruption_base.joinpath("COMPLETE").is_file(), "the clean archive is incomplete"
+            self.corruption_plan_used = tuple(self.corruption_plan_rows())
+            assert [entry.name for entry in self.corruption_plan_used] == list(CORRUPTION_NAMES)
         case = next(entry for entry in self.corruption_plan_used if entry.name == name)
-        assert self.corruption_base is not None and self.corruption_base.joinpath("COMPLETE").is_file()
-        detail = {"case": case.name, "statement_kind": "delete" if case.statement.startswith("DELETE") else "update",
-                  "breaks": list(case.broken_rows), "clone_dropped": True, "failed_closed": True}
+        assert case.name not in self.corruption_states, name + ": corruption case ran twice"
+        # Every original Blob object must still exist: a missing byte would be a
+        # different (unrelated) refusal than the ledger validator.
+        client = self.s3_client()
+        for locator in self.originals:
+            self.verify_original(client, locator)
+        violation = self.corrupt(case)
+        self.corruption_states[name] = violation
+        assert self.binding(self.source_db) == self.corruption_bindings and \
+            self.originals == self.original_locators(), name + ": the API source changed during the clone"
+        assert self.ledger_digests(self.source_db) == self.source_rows, name + ": the API source ledgers changed"
+        assert self.corruption_base.joinpath("COMPLETE").is_file(), name + ": the clean archive changed"
+        detail = {"case": case.name, "finding": case.finding, "statement_changed": case.targets_digest,
+                  "breaks": list(case.broken_rows),
+                  "clone_dropped": True, "failed_closed": True,
+                  "validator_refusal": violation.split("|", 1)[0],
+                  "expected_violation": case.refusal.violation(case.registration),
+                  "expected_cause_violation": case.refusal.cause_violation(case.registration),
+                  "original_blob_objects_intact": True, "api_source_unchanged": True,
+                  "corruption_evidence": self.corruption_evidence[case.name]}
         if len(self.corruption_states) == len(CORRUPTION_NAMES):
-            # After every dedicated negative the untouched archive must still
-            # restore its exact cut into a fresh target and database.
-            self.reset_target()
-            restored = self.restore_command(source=self.corruption_base, check=False)
-            assert restored.returncode == 0, "the uncorrupted archive does not restore after the negatives"
-            assert self.ledger_digests(self.target_db) == self.source_rows, \
-                "the restore target changed during the corruption negatives"
-            detail["all_negatives_failed_closed"] = True
-            detail["untouched_target_restored"] = True
+            detail.update(self.restore_clean_base())
         return detail
+
+    def restore_clean_base(self):
+        """After every negative: the untouched archive restores into a fresh,
+        separate run-owned target with the captured ledger digests and
+        locators, leaving the primary target unused for the later restore."""
+        assert set(self.corruption_states) == set(CORRUPTION_NAMES), "the negatives did not all run"
+        database = self.new_database(self.restore_admin)
+        target = self.fresh_destination("corruption-clean-restore")
+        tables = int(self.query(database, "SELECT count(*) FROM pg_tables WHERE schemaname='public'"))
+        assert tables == 0, "the dedicated corruption restore database is not empty"
+        restored = self.restore_command(source=self.corruption_base, target=target,
+                                        database=database, check=False)
+        assert restored.returncode == 0, "the uncorrupted archive does not restore after the negatives: " + \
+            self.redact(restored.stderr[-2000:])
+        digests = self.ledger_digests(database)
+        assert digests == self.source_rows, "the restore target changed during the corruption negatives"
+        assert self.artifact_rows(database) == self.closure_rows, "the clean archive lost its locators"
+        assert self.original_locators(database) == self.originals, "the restore target changed its locators"
+        shutil.rmtree(target)
+        return {"all_negatives_refused_by_validator": True, "untouched_target_restored": True,
+                "restored_ledger_tables": len(digests), "restored_closure_artifacts": self.closure_rows["count"]}
 
     def corrupt_source_missing_pack_refused_before_publication(self):
         return self.corrupt_source_negative("missing_pack")
@@ -815,7 +981,7 @@ class Drill(BlobOnlyHarness):
                                  stderr=subprocess.PIPE, timeout=900)
         assert fixture.returncode == 0, "format22 fixture refused: " + self.redact(fixture.stderr[-4000:])
         self.format22_marker = json.loads(seed.read_text())
-        native_marker_checks(self.format22_marker)
+        markers = native_marker_checks(self.format22_marker)
         self.format22_available = True
         return self.format22_env
 
@@ -832,7 +998,7 @@ class Drill(BlobOnlyHarness):
         detail = format22_manifest_checks(manifest, {
             "format": 22, "schema_versions": manifest["schema_versions"], "registered_packs": registrations,
             "artifacts": len(registrations) * 2, "roots": markers["roots"], "repos": markers["repositories"],
-            "producer": markers["producer_owner_id"]})
+            "producer": markers["producer_owner_id"], "serving_read": markers["serving_read"]})
         assert result["format"] == 22 and result["blob_artifacts"] == detail["closure_artifacts"], result
         self.format22 = {"directory": self.root / "format22-forward", "manifest": manifest, "detail": detail}
         return detail
@@ -865,8 +1031,14 @@ class Drill(BlobOnlyHarness):
         assert artifacts == self.format22["detail"]["closure_artifacts"], "restored artifacts differ"
         assert active >= 1 and released >= 1, "restored roots lost an active or released capture"
         assert foreign_owner >= 1, "restored roots lost the non-tenant producer owner"
+        # The one positive serving read must survive as exactly the marker's
+        # read in the fresh restored database (issue #169).
+        serving_read = self.format22["detail"]["serving_read"]
+        observed = self.query(self.format22_target, format22_restore_sql(serving_read))
+        serving_read_detail = format22_serving_read_checks(observed, serving_read)
         return {"restored": True, "verify": True, "artifacts": artifacts, "active_roots": active,
-                "released_roots": released, "producer_distinct_from_tenant": foreign_owner >= 1}
+                "released_roots": released, "producer_distinct_from_tenant": foreign_owner >= 1,
+                "serving_read": serving_read_detail}
 
     def format22_active_released_roots_distinct_producer_roundtrip(self):
         if not self.args.format22_fixture:
@@ -933,11 +1105,12 @@ def main(argv=None):
                  "the format22 fixture source inputs differ from the executed binary")
             need(fixture_receipt.get("integration_test_source_sha256"), "the format22 fixture receipt is incomplete")
         methods = (harness.synthetic_source, harness.snapshot, harness.invalid_archives, harness.existing_targets,
-                   harness.write_after_backup, harness.restore_and_clone, harness.restored_replay,
                    harness.corrupt_source_missing_pack_refused_before_publication,
                    harness.corrupt_source_missing_idx_refused_before_publication,
                    harness.corrupt_source_missing_all_artifacts_refused_before_publication,
                    harness.corrupt_source_wrong_artifact_set_digest_refused_before_publication,
+                   harness.write_after_backup,
+                   harness.restore_and_clone, harness.restored_replay,
                    harness.format22_active_released_roots_distinct_producer_roundtrip)
         for name, method in zip(CASES, methods, strict=True):
             harness.case(name, method)
