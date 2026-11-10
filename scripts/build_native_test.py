@@ -8,6 +8,12 @@ test artifact must be Fresh=false and is relocated outside CARGO_TARGET_DIR,
 where a later `build_native.py` `cargo clean --package rootyard` cannot delete
 it.  The receipt next to the relocated executable records the source, test,
 Cargo.lock and binary digests plus the unchanged HEAD/working-tree state.
+
+With the explicit ``--lib`` mode, the lib unit-test harness is compiled instead
+with `cargo test --lib --no-run`, under the same lock, clean and checks.  Its
+receipt kind is `rust-library-test`, it binds no `tests/*.rs` source digest, and
+it records exactly one Fresh=false test artifact for the rootyard library
+target.
 """
 import argparse
 import hashlib
@@ -66,6 +72,35 @@ def selected_artifact(events, name):
     return found[0]
 
 
+def selected_library_artifact(events):
+    """Return the sole Fresh=false rootyard lib test artifact."""
+    found = []
+    for event in events:
+        if event.get('reason') != 'compiler-artifact':
+            continue
+        target = event.get('target') or {}
+        if target.get('name') != 'rootyard' or 'lib' not in (target.get('kind') or []):
+            continue
+        profile = event.get('profile') or {}
+        # Only lib-test harness artifacts qualify; ordinary lib compiler artifacts are skipped.
+        if profile.get('test') is not True:
+            continue
+        if 'test' in target and target['test'] is not True:
+            continue
+        if not event.get('executable'):
+            continue
+        if event.get('fresh') is not False:
+            raise BuildError('Cargo reported a Fresh rootyard lib test artifact; refusing a stale receipt')
+        executable = event['executable']
+        found.append({'target': 'rootyard', 'kind': 'lib-test', 'fresh': False,
+                      'profile': {key: profile.get(key) for key in PROFILE_KEYS},
+                      'executable': str(Path(executable).resolve())})
+    if len(found) != 1:
+        raise BuildError('Cargo reported ' + str(len(found)) +
+                         ' rootyard lib test artifacts; expected exactly one')
+    return found[0]
+
+
 def require_build_finished(events):
     finished = [event for event in events if event.get('reason') == 'build-finished']
     if len(finished) != 1 or finished[0].get('success') is not True:
@@ -73,13 +108,21 @@ def require_build_finished(events):
 
 
 def run_build(args):
-    if not NAME.match(args.test):
-        raise BuildError('--test must be a plain Rust target identifier: ' + repr(args.test))
+    library = bool(getattr(args, 'lib', False))
+    if library and args.test is not None:
+        raise BuildError('--lib and --test are mutually exclusive')
+    if library:
+        test_source = None
+    else:
+        if args.test is None:
+            raise BuildError('one of --test or --lib is required')
+        if not NAME.match(args.test):
+            raise BuildError('--test must be a plain Rust target identifier: ' + repr(args.test))
+        test_source = ROOT / 'tests' / (args.test + '.rs')
+        if not test_source.is_file():
+            raise BuildError('integration-test source is missing: ' + str(test_source))
     if args.features and not FEATURES.match(args.features):
         raise BuildError('--features must be comma-separated Rust feature identifiers')
-    test_source = ROOT / 'tests' / (args.test + '.rs')
-    if not test_source.is_file():
-        raise BuildError('integration-test source is missing: ' + str(test_source))
     target = canonical_target()
     output = Path(args.output).expanduser()
     output = (ROOT / output if not output.is_absolute() else output).resolve()
@@ -94,7 +137,7 @@ def run_build(args):
         if output.exists():
             output.unlink()
         before = source_digest()
-        test_before = sha256_file(test_source)
+        test_before = sha256_file(test_source) if test_source else None
         lock_before = sha256_file(ROOT / 'Cargo.lock')
         head_before, status_before = git_state()
         # Clear only the rootyard package so its test artifact is honestly Fresh=false.
@@ -107,11 +150,22 @@ def run_build(args):
         if args.strip_debuginfo:
             command += ['--config', 'profile.dev.package.rootyard.strip="debuginfo"',
                         '--config', 'profile.test.package.rootyard.strip="debuginfo"']
-        command += ['rustc', '--locked', '--profile', 'test', '--test', args.test]
-        if args.features:
-            command += ['--features', args.features]
-        if getattr(args, 'no_default_features', False):
-            command += ['--no-default-features']
+        if library:
+            command += ['test', '--locked']
+        else:
+            command += ['rustc', '--locked', '--profile', 'test', '--test', args.test]
+        if library:
+            # Only an explicit user --no-default-features drops defaults; --features keeps them.
+            if args.no_default_features:
+                command += ['--no-default-features']
+            if args.features:
+                command += ['--features', args.features]
+            command += ['--lib', '--no-run']
+        else:
+            if args.features:
+                command += ['--features', args.features]
+            if getattr(args, 'no_default_features', False):
+                command += ['--no-default-features']
         command += ['--message-format=json-render-diagnostics']
         events = []
         process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=None,
@@ -134,16 +188,17 @@ def run_build(args):
             process.wait()
             raise
         if returncode != 0:
-            raise BuildError('cargo rustc failed with status ' + str(returncode))
+            runner = 'cargo test' if library else 'cargo rustc'
+            raise BuildError(runner + ' failed with status ' + str(returncode))
         after = source_digest()
-        test_after = sha256_file(test_source)
+        test_after = sha256_file(test_source) if test_source else None
         lock_after = sha256_file(ROOT / 'Cargo.lock')
         head_after, status_after = git_state()
         if (before, test_before, lock_before) != (after, test_after, lock_after):
             raise BuildError('Source inputs changed during build; rebuild before recording acceptance.')
         if (head_before, status_before) != (head_after, status_after):
             raise BuildError('HEAD or working-tree state changed during build; refusing the receipt')
-        artifact = selected_artifact(events, args.test)
+        artifact = selected_library_artifact(events) if library else selected_artifact(events, args.test)
         require_build_finished(events)
         original = Path(artifact['executable'])
         if not original.is_file():
@@ -154,17 +209,20 @@ def run_build(args):
         shutil.copyfile(original, temporary)
         os.chmod(temporary, 0o700)
         os.replace(temporary, output)
-        report = {'kind': 'rust-integration-test', 'relocated_artifact': True,
+        report = {'kind': 'rust-library-test' if library else 'rust-integration-test',
+                  'relocated_artifact': True,
                   'original_artifact_sha256': original_sha,
                   'workspace_commit': head_after, 'fresh': False,
                   'source_inputs_sha256': before,
-                  'binary_sha256': sha256_file(output),
-                  'integration_test_source_sha256': test_after,
+                  'binary_sha256': sha256_file(output)}
+        if not library:
+            report['integration_test_source_sha256'] = test_after
+        report.update({
                   'cargo_lock_sha256': lock_after,
                   'command': command,
                   'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
                   'package_rebuilt': True,
-                  'fresh_false_artifacts': [artifact]}
+                  'fresh_false_artifacts': [artifact]})
         receipt_tmp = receipt.with_suffix('.tmp')
         receipt_tmp.write_text(json.dumps(report, indent=2) + '\n')
         os.replace(receipt_tmp, receipt)
@@ -173,8 +231,11 @@ def run_build(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description='Build one selected Rust integration test and record its source binding.')
-    parser.add_argument('--test', required=True, help='Rust integration-test target name')
+        description='Build one selected Rust test executable and record its source binding.')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--test', help='Rust integration-test target name')
+    mode.add_argument('--lib', action='store_true',
+                      help='build the rootyard library unit-test harness (cargo test --lib --no-run)')
     parser.add_argument('--features')
     parser.add_argument('--no-default-features', action='store_true')
     parser.add_argument('--package-debug', choices=('0', '1', '2'), help='rootyard dev/test debug level')
