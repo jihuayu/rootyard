@@ -274,6 +274,7 @@ jobs:
             --build-receipt target/debug/rootyard.build.json \
             --binary target/debug/rootyard \
             --report web_sessions=test-results/web-sessions.json \
+            --report metrics=test-results/metrics.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
             --report webhook_fairness=test-results/webhook-fairness.json \
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
@@ -283,6 +284,7 @@ jobs:
             --log-marker "webhook_regressions=verified TLS and plaintext rejection: passed" \
             --log-marker "webhook_regressions=untrusted certificate rejected:" \
             --harness tests/web_sessions.py \
+            --harness tests/metrics.py \
             --harness tests/webhook_worker_recovery.py \
             --harness tests/webhook_fairness.py \
             --harness tests/webhooks.py \

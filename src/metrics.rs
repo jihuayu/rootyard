@@ -95,6 +95,8 @@ pub fn router(
 // expired included; the two oldest-expiry subqueries only consider rows whose
 // expiry is already past, so an unexpired session is never the "oldest expired"
 // sample, an empty set reports zero and the database clock is authoritative.
+// The webhook age likewise joins deliveries to their hook and measures only an
+// active hook's pending, retry-delayed failed and live leased rows.
 const SNAPSHOT_SQL: &str = r#"
 SELECT
  (SELECT count(*) FROM repositories WHERE state='provisioning'),
@@ -106,6 +108,9 @@ SELECT
  (SELECT count(*) FROM event_deliveries WHERE state='leased'),
  (SELECT COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(e.created_at))),0),0)::double precision
     FROM event_deliveries d JOIN outbox_events e ON e.event_id=d.event_id WHERE d.state<>'delivered'),
+ (SELECT COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(d.created_at))),0),0)::double precision
+    FROM forge_webhook_deliveries d JOIN forge_webhooks h ON h.id=d.webhook_id
+    WHERE h.active AND d.state IN ('pending','failed','leased')),
  (SELECT count(*) FROM repositories WHERE state='provisioning' AND next_retry_at<=statement_timestamp()),
  (SELECT COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(created_at))),0),0)::double precision
     FROM repositories WHERE state='provisioning'),
@@ -125,6 +130,7 @@ struct Snapshot {
     pending: i64,
     leased: i64,
     delivery_age: f64,
+    webhook_delivery_age: f64,
     provisioning_due: i64,
     provisioning_age: f64,
     browser_sessions: i64,
@@ -153,12 +159,13 @@ async fn snapshot(
         pending: row.try_get(4)?,
         leased: row.try_get(5)?,
         delivery_age: row.try_get(6)?,
-        provisioning_due: row.try_get(7)?,
-        provisioning_age: row.try_get(8)?,
-        browser_sessions: row.try_get(9)?,
-        browser_tokens: row.try_get(10)?,
-        expired_session_age: row.try_get(11)?,
-        expired_token_age: row.try_get(12)?,
+        webhook_delivery_age: row.try_get(7)?,
+        provisioning_due: row.try_get(8)?,
+        provisioning_age: row.try_get(9)?,
+        browser_sessions: row.try_get(10)?,
+        browser_tokens: row.try_get(11)?,
+        expired_session_age: row.try_get(12)?,
+        expired_token_age: row.try_get(13)?,
     };
     let workers = metrics_workers::query(&transaction, config).await?;
     transaction.commit().await?;
@@ -311,6 +318,12 @@ fn render(
         );
         gauge(
             &mut output,
+            "rootyard_webhook_delivery_oldest_age_seconds",
+            "Database-clock age since creation of the oldest outstanding webhook delivery on an active hook in pending, failed or leased state, retry delays and live leases included; delivered, dead_letter and inactive hooks are excluded and an empty set reports 0.",
+            s.webhook_delivery_age,
+        );
+        gauge(
+            &mut output,
             "rootyard_provisioning_backlog",
             "All repositories awaiting provisioning including retry delays.",
             s.repositories[0],
@@ -396,6 +409,7 @@ mod tests {
         assert!(!text.contains("rootyard_operations_unresolved"));
         assert!(!text.contains("rootyard_browser_"));
         assert!(!text.contains("rootyard_expired_browser_"));
+        assert!(!text.contains("rootyard_webhook_"));
         assert!(!text.contains("rootyard_workspace_"));
         assert!(!text.contains("rootyard_storage_maintenance"));
         // Process-local GC counters survive the failed snapshot unchanged.
@@ -420,6 +434,7 @@ mod tests {
         assert!(text.contains("rootyard_git_transfer_bytes_total{direction=\"sent\"} 17\n"));
         assert!(text.contains("rootyard_git_transfers_total{outcome=\"success\"} 1\n"));
         assert!(text.contains("rootyard_git_transfers_total{outcome=\"failure\"} 1\n"));
+        assert!(text.contains("rootyard_webhook_delivery_oldest_age_seconds 0\n"));
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (name, value) = line.split_once(' ').unwrap();
             assert!(name.starts_with("rootyard_"));
@@ -462,7 +477,7 @@ mod tests {
         crate::baseline_metrics::render(&mut baseline);
         assert_eq!(
             text.lines().filter(|l| !l.starts_with('#')).count(),
-            91 + baseline.lines().filter(|l| !l.starts_with('#')).count()
+            92 + baseline.lines().filter(|l| !l.starts_with('#')).count()
         );
     }
 

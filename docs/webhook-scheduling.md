@@ -126,6 +126,19 @@ work the scheduler can start in one scan.
 The manual endpoint intentionally remains a foreground, repository-authorized
 operation; it does not become the background scheduler.
 
+## Outstanding-age metric
+
+`rootyard_webhook_delivery_oldest_age_seconds` on the private metrics listener
+is exactly one label-free series. Each scrape evaluates, with the database clock
+(`statement_timestamp()`), the age of the oldest `forge_webhook_deliveries`
+row joined to `forge_webhooks` whose hook is active and whose state is
+`pending`, `failed` or `leased`. Retry-delayed `failed` rows and live `leased`
+rows are part of the scheduler's outstanding work and therefore count;
+`delivered`, `dead_letter` and inactive hooks are excluded. The value is clamped
+at zero and is zero for an empty set. It never reads `event_deliveries` or
+`outbox_events` and carries no hook, repository or tenant label. A failed SQL
+snapshot omits it like every other database-derived gauge.
+
 ## Native tests
 
 `tests/webhook_fairness.py` launches the Rust binary with its worker enabled and
