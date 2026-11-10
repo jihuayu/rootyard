@@ -3,7 +3,7 @@
 Two layers cover the native acceptance suites. Neither layer replaces the
 specialised cgroup VM gate in `.github/workflows/native-kernel-acceptance.yml`.
 
-## Layer 1 — every push and pull request (`.github/workflows/ci.yml`)
+## Layer 1 — every pull request and every push to `main` (`.github/workflows/ci.yml`)
 
 The verify job runs on a plain `ubuntu-22.04` host, not in the former
 `rust:1-trixie` container. That is the same host profile on which the manual
@@ -59,6 +59,25 @@ digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
 `git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
 the native tool provenance file. Injecting any of those defects turns the pull
 request red instead of leaving the regression to manual re-verification.
+
+## 专项与完整 candidate 分层 (specialised suites vs. the complete gate)
+
+The existing workflows already carry the layering; no new orchestrator, suite input or
+externally-triggered dependency is added. Choosing a layer:
+
+| Situation | What runs |
+| --- | --- |
+| Opening or updating any pull request | `CI` → `verify`, `container`; Pando → `isolated-lab`; Redis → `redis-contract`; plus `native` / `log-storage` automatically when their `pull_request.paths` match. This is the **full required gate** and is never skipped by default. |
+| Working on one affected area before the PR is ready | Dispatch the affected specialised workflow on the branch: `refstore-protocol-acceptance.yml`, `refcas-log.yml`, `native-kernel-acceptance.yml` (cgroup VM profile), `candidate-release-acceptance.yml` (Chromium + Garage candidate), or `pando-lab.yml` / `redis-contract.yml` (now also dispatachable). Dispatch is additive; it does not change the PR's required result. |
+| Merging to `main` | The `push` on `main` re-runs every full-gate workflow on the merged commit (the PR head is a different commit), so the complete gate is re-verified after merge. |
+
+Trigger policy: full-gate workflows (`ci.yml`, `pando-lab.yml`, `redis-contract.yml`) run
+`pull_request` on every PR head and `push` only for `main`. An unfiltered `push` duplicated the
+whole gate for each feature-branch head (before/after evidence and the limits of what has been
+observed are in `docs/acceptance/ci-trigger-dedup-20261110.md`). Do not add `paths:` filters to
+those workflows: a required check that is filtered out stays "expected" forever on a PR. The
+path-filtered suites above intentionally have none of their jobs as `main` required checks;
+their `workflow_dispatch` makes them available at any time.
 
 ## Layer 2 — candidate release gate (`.github/workflows/candidate-release-acceptance.yml`)
 
