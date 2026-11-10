@@ -470,7 +470,7 @@ pub async fn run(options: &Options) -> Result<Value> {
     let empty = provision_with(&db.pool, &empty_owner, "empty", &store).await?;
     let unrelated = provision_with(&db.pool, &owner, "unrelated", &store).await?;
 
-    let badges = repo::registration_badges(&db, &last_plan, &registrations).await?;
+    let badges = repo::registration_badges(&db, repo_id, tenant, &verified.gate, &registrations).await?;
     let mut retainable = Vec::new();
     for badge in &badges {
         let counts = marker::retainable_counts(&db.pool, badge.registration_id).await?;

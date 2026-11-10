@@ -15,8 +15,10 @@
 //!   request owner (storage tenant/RAM prefix stay derived from the same store);
 //! * `producer_snapshot` -- the A5 pack snapshot created by that owner, which is
 //!   the owner the root `prepare` proves the pin against;
-//! * `registration_badges` -- the stored `artifact_set_digest` read back from
-//!   the real publication row and re-derived from the typed A4 registration.
+//! * `registration_badges` -- the current typed A4 active membership, captured
+//!   read-only at the verified gate (`PgPackCommit::capture_baseline`, never a
+//!   stale pre-commit plan closure), and the stored `artifact_set_digest` read
+//!   back from the real publication row.
 //!
 //! An HTTP-provisioned `pg_refstore` repository carries the irreversible
 //! migration-144 decision-required fence from the moment it is ready (serving
@@ -32,8 +34,8 @@
 use anyhow::{Result, anyhow, ensure};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::core::pack_commit::{
-    AuthorizedCommitMode, PackArtifactRole, PackCommitPlan, PackPendingToken, PgAuthorizedCommit, PrepareOutcome,
-    RegisteredPack,
+    AuthorizedCommitMode, PackArtifactRole, PackCommitPlan, PackPendingToken, PgAuthorizedCommit, PgPackCommit,
+    PrepareOutcome, RegisteredArtifact, RegisteredPack,
 };
 use rootyard::ref_store::core::{
     CreatePackSnapshotRequest, MetadataPinOutcome, MetadataSnapshotScope, PackReadSnapshot, PackSnapshotExpectation,
@@ -316,26 +318,77 @@ pub struct RegistrationBadge {
     pub idx_sha256: String,
 }
 
-/// Read every fixture registration back through the production typed record
-/// (`capture_context` -> `RegisteredPack`) and require its stored
-/// `artifact_set_digest` to equal `RegisteredPack::artifact_set_digest()`.
+/// Require one artifact of a captured membership to be the exact stored
+/// artifact of the committed registration: role, slot, hold, locator identity
+/// (storage tenant, authority, generation, attempt, namespace, content digest,
+/// length), provider, backend identity and verified content.
+fn same_artifact(stored: &RegisteredArtifact, committed: &RegisteredArtifact) -> bool {
+    stored.role() == committed.role()
+        && stored.slot() == committed.slot()
+        && stored.hold_id() == committed.hold_id()
+        && stored.locator() == committed.locator()
+        && stored.locator().tenant_id() == committed.locator().tenant_id()
+        && stored.provider() == committed.provider()
+        && stored.backend_identity() == committed.backend_identity()
+        && stored.verified_sha256().as_str() == committed.verified_sha256().as_str()
+        && stored.verified_length() == committed.verified_length()
+}
+
+/// Read every fixture registration back from the *current* production typed A4
+/// active membership and require its stored `artifact_set_digest` to equal
+/// `RegisteredPack::artifact_set_digest()`.
+///
+/// This is a fresh read-only `PgPackCommit::capture_baseline` at the verified
+/// gate, not the closure of the last plan: after a successful decided commit
+/// that plan's expected revision is its pre-commit one, so its closure is
+/// correctly fenced off by `check_gate` (`RevisionMismatch`). The baseline's
+/// `old_packs()` is the same production complete active-membership reader a
+/// commit uses, including each stored producer's full ACK/artifact/A3
+/// validation; the stored publisher owner is resolved independently and is
+/// never compared with the tenant.
 pub async fn registration_badges(
     db: &Db,
-    plan: &PackCommitPlan,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    gate: &CoreGateVersion,
     packs: &[RegisteredPack],
 ) -> Result<Vec<RegistrationBadge>> {
-    let context = pack::closure(db, plan).await?;
-    let typed = context.old_packs().iter().chain(context.new_packs()).collect::<Vec<_>>();
+    let stage =
+        |error: anyhow::Error| anyhow!("stage=registration_badges expected_revision={}: {error:#}", gate.revision());
+    let mut client = db.pool.get().await.map_err(|error| stage(error.into()))?;
+    let baseline = PgPackCommit::new()
+        .capture_baseline(&mut client, repository_id, tenant_id, deadline())
+        .await
+        .map_err(|error| stage(anyhow!("capture_baseline refused: {error:?}")))?;
+    // The capture is a complete snapshot; the pooled client is not needed by
+    // the per-registration publication read-back below, so return it first.
+    drop(client);
+    ensure!(
+        baseline.gate().revision() == gate.revision() && baseline.gate().digest() == gate.digest(),
+        "the captured baseline gate is not the verified gate"
+    );
+    let typed = baseline.old_packs();
+    ensure!(
+        typed.len() == packs.len(),
+        "the active A4 membership holds {} packs, expected {}",
+        typed.len(),
+        packs.len()
+    );
     let mut out = Vec::with_capacity(packs.len());
     for pack in packs {
         let stored = typed
             .iter()
             .find(|candidate| candidate.pack_id() == pack.pack_id())
-            .ok_or_else(|| anyhow!("the registration is not in the captured A4 set"))?;
+            .ok_or_else(|| anyhow!("the registration is not in the current A4 membership"))?;
         ensure!(stored.registration_id() == pack.registration_id(), "registration identity differs");
         ensure!(
             stored.artifact_set_digest() == pack.artifact_set_digest(),
             "typed A4 set digest differs from the committed registration"
+        );
+        ensure!(
+            same_artifact(stored.artifact(PackArtifactRole::Pack), pack.artifact(PackArtifactRole::Pack))
+                && same_artifact(stored.artifact(PackArtifactRole::Idx), pack.artifact(PackArtifactRole::Idx)),
+            "the captured A4 artifacts differ from the committed pack/idx artifacts"
         );
         let row = db
             .pool
@@ -351,15 +404,13 @@ pub async fn registration_badges(
             stored_column == pack.artifact_set_digest().as_hex(),
             "the stored publication digest differs from the typed registration"
         );
-        let digest = |role: rootyard::ref_store::core::pack_commit::PackArtifactRole| {
-            pack.artifact(role).verified_sha256().as_str().to_owned()
-        };
+        let digest = |role: PackArtifactRole| stored.artifact(role).verified_sha256().as_str().to_owned();
         out.push(RegistrationBadge {
-            registration_id: pack.registration_id(),
-            pack_id: pack.pack_id(),
+            registration_id: stored.registration_id(),
+            pack_id: stored.pack_id(),
             artifact_set_digest: stored_column,
-            pack_sha256: digest(rootyard::ref_store::core::pack_commit::PackArtifactRole::Pack),
-            idx_sha256: digest(rootyard::ref_store::core::pack_commit::PackArtifactRole::Idx),
+            pack_sha256: digest(PackArtifactRole::Pack),
+            idx_sha256: digest(PackArtifactRole::Idx),
         });
     }
     Ok(out)
