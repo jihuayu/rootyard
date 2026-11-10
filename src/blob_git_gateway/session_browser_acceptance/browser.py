@@ -45,6 +45,30 @@ LOGIN = "/login"
 FAULT_MARKER = "FAULT-INJECTION-MARKER-7f3a"
 STEP_MS = 30_000
 
+# The page-side storage read returns only one of these fixed status words; a
+# Web Storage SecurityError is caught inside the page and never crosses the
+# protocol boundary as an exception, so no engine message, origin or value
+# can be reconstructed from the transport error.
+STORAGE_STATUS_OK = "ok"
+STORAGE_STATUS_DENIED = "denied"
+STORAGE_READ_SCRIPT = f"""() => {{
+    const read = (storage) => {{
+        const entries = [];
+        for (let index = 0; index < storage.length; index += 1) {{
+            const key = storage.key(index);
+            entries.push([key, storage.getItem(key)]);
+        }}
+        return entries;
+    }};
+    try {{
+        const pairs = [read(localStorage), read(sessionStorage)];
+        return {{status: '{STORAGE_STATUS_OK}', data: JSON.stringify(pairs)}};
+    }} catch (error) {{
+        const denied = error && error.name === 'SecurityError';
+        return {{status: denied ? '{STORAGE_STATUS_DENIED}' : 'error'}};
+    }}
+}}"""
+
 REASONS = frozenset(
     (
         "NO_ARGUMENTS",
@@ -66,7 +90,10 @@ REASONS = frozenset(
         "CREDENTIAL_IN_URL",
         "CREDENTIAL_IN_DOM",
         "CREDENTIAL_IN_STORAGE",
+        "DOM_READ_FAILED",
         "STORAGE_READ_FAILED",
+        "STORAGE_EVALUATION_FAILED",
+        "STORAGE_ACCESS_DENIED",
         "SHELL_NOT_SERVED",
         "SHELL_CSP_MISSING",
         "SHELL_SCRIPT_INVALID",
@@ -255,22 +282,37 @@ class Client:
         """No credential in the URL, the rendered DOM or the web storage.
 
         `CREDENTIAL_IN_STORAGE` alone means a secret was actually found in the
-        serialized storage; an exception while reading or serializing
-        localStorage/sessionStorage is the distinct `STORAGE_READ_FAILED`, so a
-        failed diagnostic is never mistaken for a discovered leak. Neither
-        reason carries the exception, the stored text or a traceback.
+        serialized storage. Every diagnostic that could not read is a fixed,
+        distinct reason and never a discovered leak: `DOM_READ_FAILED` for the
+        rendered content, `STORAGE_EVALUATION_FAILED` for the transport of the
+        storage evaluation, `STORAGE_ACCESS_DENIED` when the page caught a Web
+        Storage SecurityError, and `STORAGE_READ_FAILED` for any other
+        malformed or unreadable storage answer. Each stays a failure, so
+        unreadable storage never passes. No reason carries exception text or
+        class names, the stored text, a URL, an origin or a traceback.
         """
+        if any(secret in page.url for secret in self.secrets()):
+            raise Failure("CREDENTIAL_IN_URL")
         try:
-            if any(secret in page.url for secret in self.secrets()):
-                raise Failure("CREDENTIAL_IN_URL")
-            if any(secret in (await page.content()) for secret in self.secrets()):
-                raise Failure("CREDENTIAL_IN_DOM")
-            stored = await page.evaluate(
-                "() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)])")
-        except Failure:
-            raise
+            content = await page.content()
         except Exception:
-            raise Failure("STORAGE_READ_FAILED") from None
+            raise Failure("DOM_READ_FAILED") from None
+        if not isinstance(content, str):
+            raise Failure("DOM_READ_FAILED")
+        if any(secret in content for secret in self.secrets()):
+            raise Failure("CREDENTIAL_IN_DOM")
+        try:
+            answer = await page.evaluate(STORAGE_READ_SCRIPT)
+        except Exception:
+            raise Failure("STORAGE_EVALUATION_FAILED") from None
+        if not isinstance(answer, dict):
+            raise Failure("STORAGE_READ_FAILED")
+        status = answer.get("status")
+        if status == STORAGE_STATUS_DENIED:
+            raise Failure("STORAGE_ACCESS_DENIED")
+        if status != STORAGE_STATUS_OK:
+            raise Failure("STORAGE_READ_FAILED")
+        stored = answer.get("data")
         if not isinstance(stored, str):
             raise Failure("STORAGE_READ_FAILED")
         if any(secret in stored for secret in self.secrets()):
