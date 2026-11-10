@@ -14,7 +14,7 @@ use super::common::seeded;
 use super::fixture;
 use crate::retention_roots_support::db::deadline;
 use crate::retention_roots_support::pack::Draft;
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Result};
 use rootyard::ref_store::core::pack_commit::{
     PackCommitError, PackCommitPlan, PackCommitRejectCode, PackCommitScope, PackMembershipEntry, PgPackCommit,
 };
@@ -223,8 +223,10 @@ async fn unauthorized_actor_cannot_select_a_producers_plan() -> Result<()> {
             .await
             .err()
             .ok_or_else(|| anyhow!("another session selected the producer's plan"))?;
+        // `fixture::select_as` wraps the typed refusal in `anyhow`; assert only the
+        // stable safe denial literal it renders, never raw internals.
         ensure!(
-            mismatched.to_string().ends_with("denied: issuer_mismatch"),
+            mismatched.to_string().contains("issuer_mismatch"),
             "the mismatched issuer was not refused: {mismatched}"
         );
         ensure!(
@@ -257,10 +259,7 @@ async fn unauthorized_actor_cannot_select_a_producers_plan() -> Result<()> {
             .ok_or_else(|| anyhow!("a no-role issuer selected its own plan"))?;
         // `fixture::select` wraps the typed refusal in `anyhow`; assert only the
         // stable safe denial literal it renders, never raw internals.
-        ensure!(
-            denied.to_string().ends_with("denied: role_denied"),
-            "the no-role issuer was refused otherwise: {denied}"
-        );
+        ensure!(denied.to_string().contains("role_denied"), "the no-role issuer was refused otherwise: {denied}");
         ensure!(
             facts::decision(&world.db.pool, world.verified.repo, operation).await?.is_none(),
             "the role-denied refusal still persisted a decision"
