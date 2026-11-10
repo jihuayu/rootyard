@@ -35,6 +35,13 @@ required-features = ["pando-lab"]
 name = "rootyard-vfs-mount"
 path = "src/bin/rootyard-vfs-mount.rs"
 
+# Issue #169 source fixture: a program (argv, exit status), not a libtest case,
+# so the test harness must not consume its arguments.
+[[test]]
+name = "ref_store_format22_backup_fixture"
+path = "tests/ref_store_format22_backup_fixture.rs"
+harness = false
+
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"
