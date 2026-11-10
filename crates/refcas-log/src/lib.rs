@@ -281,8 +281,9 @@ fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res
     let mut rows = st.query([lo, hi])?;
     let mut out: Vec<EntryOf> = Vec::new();
     let mut bytes = 0usize;
+    let mut previous_index: Option<u64> = None;
     while let Some(r) = rows.next()? {
-        let (_, entry) = decode_entry_row(r)?;
+        let (log_id, entry) = decode_entry_row(r)?;
         let sid: String = r.get(1)?;
         let sdata: String = r.get(2)?;
         let next_bytes = bytes.saturating_add(sid.len() + sdata.len());
@@ -292,6 +293,12 @@ fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res
             }
             return Err(E::Refused("requested log range exceeds its read budget".into()));
         }
+        if let Some(previous) = previous_index
+            && previous.checked_add(1) != Some(log_id.index)
+        {
+            return Err(E::Refused(format!("log range has a gap after index {previous}, next is {}", log_id.index)));
+        }
+        previous_index = Some(log_id.index);
         bytes = next_bytes;
         out.push(entry);
     }
@@ -871,6 +878,29 @@ mod tests {
         let mut r = rt.block_on(s.get_log_reader());
         assert_eq!(rt.block_on(r.limited_get_log_entries(0, 3)).unwrap().len(), 3);
         assert!(rt.block_on(r.limited_get_log_entries(4, 4)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn range_read_rejects_internal_gap_without_rejecting_purged_prefix_or_tail() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..6).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        assert_eq!(logs(&rt, &mut s, 0..8), (2..6).map(|i| blank(1, i)).collect::<Vec<_>>());
+        assert!(logs(&rt, &mut s, 6..9).is_empty());
+        rt.block_on(s.truncate(lid(1, 5))).unwrap();
+        assert_eq!(logs(&rt, &mut s, 2..9), (2..5).map(|i| blank(1, i)).collect::<Vec<_>>());
+        drop(s);
+        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        assert_eq!(conn.execute("DELETE FROM log_entry WHERE idx=3", []).unwrap(), 1);
+        drop(conn);
+        let mut s = open(&rt, dir.path());
+        assert!(rt.block_on(s.try_get_log_entries(2..5)).is_err(), "full reader accepted an internal gap");
+        let mut reader = rt.block_on(s.get_log_reader());
+        assert!(rt.block_on(reader.limited_get_log_entries(2, 5)).is_err(), "limited reader accepted an internal gap");
+        assert_eq!(logs(&rt, &mut s, 4..5), vec![blank(1, 4)]);
+        assert!(logs(&rt, &mut s, 2..2).is_empty());
     }
 
     #[test]
