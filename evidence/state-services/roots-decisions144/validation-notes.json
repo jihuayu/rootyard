@@ -1,0 +1,43 @@
+{
+  "production_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+  "production_commit": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+  "later_changes": "Only backup fixtures, assertions, documentation and evidence; production inputs unchanged.",
+  "workflow": "Actual DeepSeek CLI primary implementation/test agents; Luna Max source-only review; Root alone builds, real services, native Git and qualification.",
+  "native_tests": {
+    "roots": 11,
+    "decisions_subset": 20,
+    "a4": 8,
+    "a5b": 12,
+    "failed": 0,
+    "ignored": 0
+  },
+  "library": {
+    "passed": 410,
+    "failed": 0,
+    "ignored": 9
+  },
+  "backup": {
+    "format20_cases": 7,
+    "genuine_format19_upgrade_cases": 7,
+    "skipped": 0
+  },
+  "failed_attempts": [
+    "Roots first 5/8: source pin generation and bare Git fixture target fixed, original assertions retained.",
+    "Decision first 11/20: actual SQL parameter25 persisted facts as authz; repaired without weakening final recheck. Other failures were JSONB/text fixture types and stale code/prefix assertions.",
+    "Backup v1: PG INT4 octet_length incorrectly decoded as i64; fixed to an explicit i32->i64 conversion.",
+    "Backup v2/v3: ordinary release also retains a tombstone; duplicate JSON cancellation count key and stale protocol marker corrected.",
+    "Backup v4: exact retained-ledger hashes matched, but fixture reconstruction lost a refused registration request ID with no receipt; preserve intent metadata independently of receipts.",
+    "Backup v5: restored ledgers and full-schema read-only checks passed; a negative quota mutation was correctly refused but its expected trigger-error wording was stale. Corrected the assertion, not the trigger.",
+    "Final reviewer follow-ups tighten exact root rows/released shape/Push action and broaden CI input paths; the initial added capture-revision assertion guessed all four mutations, corrected to the two registrations after reading the actual protocol. Release fences are head generations.",
+    "Unfiltered Python discovery requires unrelated native executables/kernel fixtures absent from this worktree; its failures are retained. The selected source-only run explicitly excludes those modules and reports 286 tests, 6 skips."
+  ],
+  "boundaries": [
+    "Unserved library increment. No Merge producer, distributed Raft bridge, service cutover, GC or encryption qualification.",
+    "LFS pointer refs fail closed without immutable remote byte attestation; local file availability is insufficient.",
+    "Backup archives PG metadata, not external Blob bytes. Restored retained roots are verified against surviving external S3 originals.",
+    "All RefStore ledgers are compared exactly across restore; all schema tables are checked unchanged around read-only replay. Unrelated cluster authority intentionally rotates during restore.",
+    "Loopback PG17/Garage S3 and native Git 2.47.3; Azure is a compilation check, not provider runtime acceptance.",
+    "Native admission/view/workspace bounds are process-local. No hard kernel cleanup return, physical orphan-disk bound, power-loss or restart-durable cleanup claim.",
+    "Issues stay open until the relevant PR is merged and acceptance is complete."
+  ]
+}

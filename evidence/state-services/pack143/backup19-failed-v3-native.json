@@ -1,0 +1,54 @@
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "synthetic_source_with_typed_native_pack_snapshot_ledger",
+      "status": "failed",
+      "seconds": 8.9916,
+      "error": "Command failed (1): ERROR:  column t.tenant_id does not exist\nLINE 1: ...FROM public.ref_store_core_snapshot_packs t WHERE t.tenant_i...\n                                                             ^\n"
+    }
+  ],
+  "skips": 0,
+  "binary": "/workspace/scratch/state-pack143-app-v1/rootyard",
+  "binary_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+  "backup_format": 19,
+  "schema_version": 143,
+  "pack_snapshot_fixture_helper": {
+    "binary": "/workspace/scratch/state-pack143-backup-helper-build-v4/ref_store_pack_snapshots_backup_fixture",
+    "binary_sha256": "1334f4bcc175e8facbbe999a6bfaed12d730e39f254a1cec6c6569e8f5e046d7",
+    "build_receipt": "/workspace/scratch/state-pack143-backup-helper-build-v4/ref_store_pack_snapshots_backup_fixture.build.json",
+    "build_receipt_sha256": "ba45ce82c2d553c07a9132d2bd664a81450615e6a9543772592a7d5ccf867260",
+    "build_kind": "rust-integration-test",
+    "package_rebuilt": true,
+    "fresh": false,
+    "fresh_false_artifact": {
+      "target": "ref_store_pack_snapshots_backup_fixture",
+      "kind": "test",
+      "fresh": false
+    },
+    "test_profile": true,
+    "integration_test_source_sha256": "0e3e44be8eef4f6f4b0ea4ceb4825bcb2c7382c06b241eb9ac129a33d432f911",
+    "integration_test_source_matches_source_file": true,
+    "source_inputs_sha256": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "candidate_application_receipt": "/workspace/scratch/state-pack143-app-v1/rootyard.build.json",
+    "candidate_application_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "candidate_application_package_rebuilt": true,
+    "source_inputs_match_candidate_application": true,
+    "retained_binding_stages": [
+      "seed"
+    ],
+    "helper_binary_sha256_after_run": "1334f4bcc175e8facbbe999a6bfaed12d730e39f254a1cec6c6569e8f5e046d7",
+    "candidate_application_sha256_after_run": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "binaries_unchanged_after_run": true
+  },
+  "limitations": [
+    "The typed A5/A4/A3 ledger is seeded by the real adapter and native PackVerifier; no SQL ACK, proof, receipt or registration is fabricated.",
+    "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+    "The random pack repository stays provisioning/gitfs/unserved for the whole drill.",
+    "The DB-clock-expired scenario uses a 1s lease and a bounded clock_timestamp() poll, created last; it is not a TTL unit test.",
+    "complete_git_read_snapshot() is false everywhere: this drill claims registered pack membership metadata only, never verified Blob bytes or native Git object closure.",
+    "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+    "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+  ]
+}

@@ -384,7 +384,7 @@ pub async fn list_repo_benchmarks(State(state): State<Arc<AppState>>, Path((owne
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoRead).await?;
     require_operator(&tx, &actor).await?;
     let latest = read_repo_benchmark_receipt_at(&state.storage.repo_path(access.repo_id))?;
     let rows = tx.query("SELECT details FROM repository_audit_log WHERE tenant_id = $1 AND repository_id = $2 AND action = 'shard.benchmark' ORDER BY id DESC LIMIT 50", &[&access.owner_id, &access.repo_id]).await.map_err(Error::internal)?;
@@ -402,7 +402,7 @@ pub async fn run_repo_benchmark(State(state): State<Arc<AppState>>, Path((owner,
     auth::writable(&actor)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     let _guard = state.storage.write_lock(access.repo_id).await;
     let repo_dir = state.storage.verify_path(access.repo_id).map_err(|_| conflict("bare Git repository volume verification failed"))?;
     let _route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;

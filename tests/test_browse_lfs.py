@@ -27,12 +27,26 @@ class BrowseAndLfsContractTest(unittest.TestCase):
         self.assertLessEqual(
             len(lfs_lines), 100, "src/lfs.rs must remain a thin router (<100 lines)"
         )
-        self.assertIn("pub fn routes() -> Router<Arc<AppState>>", browse_rs.read_text())
+        # src/browse.rs is mounted behind session auth and the sharding transport middleware, so
+        # its router factory takes the shared AppState. Accept exactly that single optional param.
+        self.assertRegex(
+            browse_rs.read_text(),
+            r"pub fn routes\((?:state: Arc<AppState>)?\) -> Router<Arc<AppState>> \{",
+            "src/browse.rs must expose routes(state: Arc<AppState>) -> Router<Arc<AppState>>",
+        )
+        library_rs = (ROOT / "src/lib.rs").read_text()
+        self.assertIn(
+            "browse::routes(state.clone())",
+            library_rs,
+            "src/lib.rs must mount the browse router with the shared AppState",
+        )
         self.assertIn("pub fn routes() -> Router<Arc<AppState>>", lfs_rs.read_text())
 
         expected_submodules = (
             ROOT / "src/browse/models.rs",
             ROOT / "src/browse/git_read.rs",
+            ROOT / "src/browse/git_read/command.rs",
+            ROOT / "src/browse/git_read/paging.rs",
             ROOT / "src/browse/handlers.rs",
             ROOT / "src/browse/object_format.rs",
             ROOT / "src/browse/transactions.rs",
@@ -103,8 +117,13 @@ class BrowseAndLfsContractTest(unittest.TestCase):
             "core.hooksPath=/dev/null",
             "--no-replace-objects",
             "ci_pins::reserved",
-            "write_lock",
-            "reliability::before_push",
+            # Authoritative storage fences: repository git slot, read lease, ref publication
+            # window and durable write admission replaced the old process-local write_lock.
+            "state.git_slots.clone().try_acquire_owned()",
+            "crate::storage::read_leases::shared",
+            "storage::ref_publication::acquire(",
+            "storage::admission::acquire(",
+            "reliability::before_gitfs_push",
             "update-ref",
             "--stdin",
             "--no-deref",
@@ -126,21 +145,43 @@ class BrowseAndLfsContractTest(unittest.TestCase):
     def test_lfs_routes_and_streaming_storage_contracts(self):
         lfs_rs = (ROOT / "src/lfs.rs").read_text()
         lfs_handlers_rs = (ROOT / "src/lfs/handlers.rs").read_text()
-        self.assertNotIn(
-            "{owner}/{repo}",
+        lfs_routes_rs = (ROOT / "src/lfs/routes.rs").read_text()
+        self.assertIn("mod routes;", lfs_rs, "src/lfs.rs must declare its routes submodule")
+        self.assertIn(
+            "routes::routes()",
             lfs_rs,
-            "src/lfs.rs must use {owner}/{name} to avoid matchit 0.8.4 route parameter conflict",
+            "src/lfs.rs must delegate route construction to routes::routes()",
         )
+        for lfs_route_text in (lfs_rs, lfs_routes_rs):
+            self.assertNotIn(
+                "{owner}/{repo}",
+                lfs_route_text,
+                "LFS routes must use {owner}/{name} to avoid matchit 0.8.4 route parameter conflict",
+            )
         for route in (
             '"/api/repos/{owner}/{name}/lfs/objects/batch"',
             '"/git/{owner}/{name}/info/lfs/objects/batch"',
             '"/{owner}/{name}/info/lfs/objects/batch"',
         ):
-            self.assertIn(route, lfs_rs)
+            self.assertIn(route, lfs_routes_rs, f"src/lfs/routes.rs must register {route}")
         self.assertIn(
-            "tokio::spawn",
+            "DefaultBodyLimit::disable()",
+            lfs_routes_rs,
+            "src/lfs/routes.rs must disable the body limit for streamed LFS uploads",
+        )
+        # Streaming upload/hydration moved out of handlers.rs: the disconnect-safe spawn that
+        # wraps upload_inner now lives in the upload module declared by src/lfs.rs.
+        self.assertIn("mod upload;", lfs_rs, "src/lfs.rs must declare its upload submodule")
+        lfs_upload_rs = (ROOT / "src/lfs/upload.rs").read_text()
+        self.assertIn(
+            "tokio::spawn(async move { upload_inner(",
+            lfs_upload_rs,
+            "src/lfs/upload.rs must wrap upload_inner in tokio::spawn for disconnect safety",
+        )
+        self.assertIn(
+            "sanitize_headers(&headers)",
             lfs_handlers_rs,
-            "src/lfs/handlers.rs must wrap upload_inner in tokio::spawn for disconnect safety",
+            "src/lfs/handlers.rs must sanitize inbound Authorization headers",
         )
 
         lfs_all = "\n".join(

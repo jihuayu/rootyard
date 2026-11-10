@@ -1,0 +1,39 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "scheduled_repack_and_staging",
+      "status": "passed",
+      "seconds": 10.5783,
+      "detail": {
+        "repack_succeeded": true,
+        "commit_graph_hydrated": true,
+        "stale_stage_reclaimed": true,
+        "retained_commit": "615cc8c0134e040edb032d275925520c537855c6",
+        "ci_pin_root": "1989a72b3f2b11a72fbcf50945de7735ad1d96c5",
+        "unreachable_oid_tombstoned_without_delete": "cb8d1e99f13260bd46215e96e84e5811c0c38fd0"
+      }
+    },
+    {
+      "name": "expired_claim_reclaim",
+      "status": "passed",
+      "seconds": 1.602,
+      "detail": {
+        "expired_attempt_reclaimed": 2,
+        "late_owner_fenced": true,
+        "duplicate_active_kind_rejected": true
+      }
+    },
+    {
+      "name": "killed_worker_volume_barrier",
+      "status": "passed",
+      "seconds": 10.4868,
+      "detail": {
+        "server_sigkill_recovered": true,
+        "descendant_volume_lock_held": true,
+        "claimed_attempt_after_restart": 2
+      }
+    }
+  ],
+  "binary_sha256": "85c66397f755768fa139cf4952fca6a21ca12747bd6d18b042f80c2a62f0eb3d"
+}

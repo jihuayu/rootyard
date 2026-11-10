@@ -1,0 +1,18 @@
+
+running 1 test
+test cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read ... FAILED
+
+failures:
+
+---- cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read stdout ----
+
+thread 'cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read' (461981) panicked at src/cache_wake/redis.rs:890:61:
+called `Result::unwrap()` on an `Err` value: Redis cache connection unavailable
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 287 filtered out; finished in 0.01s
+

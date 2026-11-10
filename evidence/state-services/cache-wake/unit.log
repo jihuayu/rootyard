@@ -1,0 +1,32 @@
+
+running 27 tests
+test cache_wake::memory::tests::entry_and_byte_budgets_are_enforced ... ok
+test cache_wake::memory::tests::metadata_is_bounded_under_replace_delete_and_expiry ... ok
+test cache_wake::memory::tests::round_trip_and_typed_validation ... ok
+test cache_wake::memory::tests::ttl_expiry_is_a_miss ... ok
+test cache_wake::origin::tests::aborted_leader_removes_its_entry_and_wakes_follower ... ok
+test cache_wake::origin::tests::breaker_opens_after_consecutive_origin_failures ... ok
+test cache_wake::origin::tests::origin_permits_bound_concurrency_without_spawning ... ok
+test cache_wake::origin::tests::origin_work_has_absolute_deadline_and_releases_permit ... ok
+test cache_wake::origin::tests::singleflight_coalesces_and_releases_leader ... ok
+test cache_wake::redis::cancel_tests::real_redis_cancelled_inflight_connections_are_closed ... ignored, requires a dedicated loopback real Redis via ROOTYARD_TEST_REDIS_URL
+test cache_wake::redis::tests::bounded_deadline_covers_permit_wait_and_contract_is_required ... ok
+test cache_wake::redis::tests::bounded_read_mismatch_is_a_miss_and_oversize_is_rejected_before_encode ... ok
+test cache_wake::redis::tests::closed_loopback_port_outage_is_bounded_without_process_signals ... ok
+test cache_wake::redis::tests::debug_never_prints_redis_credentials ... ok
+test cache_wake::redis::tests::eviction_policy_is_an_allowlist_with_no_noeviction ... ok
+test cache_wake::redis::tests::real_redis_bad_acl_credentials_are_rejected_bounded_and_redacted ... ignored, requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL
+test cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read ... ignored, requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL
+test cache_wake::redis::tests::real_redis_flushall_is_authoritative_cache_miss ... ignored, requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL
+test cache_wake::redis::tests::real_redis_noeviction_policy_fails_connect_closed_and_restores ... ignored, requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL
+test cache_wake::redis::tests::real_redis_wake_publishes_only_a_hint ... ignored, requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL
+test cache_wake::redis::tests::redis_url_rejects_tls_weakening_and_accepts_supported_sdk_syntax ... ok
+test cache_wake::redis::tests::url_policy_rejects_plaintext_remote_and_bad_channels ... ok
+test cache_wake::tests::debug_never_prints_encoded_keys_scopes_or_value_bytes ... ok
+test cache_wake::tests::keys_are_typed_versioned_and_do_not_embed_raw_discriminators ... ok
+test cache_wake::tests::limits_and_channels_are_bounded ... ok
+test cache_wake::tests::no_authorization_or_secret_kinds_exist ... ok
+test cache_wake::tests::value_kind_and_version_must_match_key ... ok
+
+test result: ok. 21 passed; 0 failed; 6 ignored; 0 measured; 261 filtered out; finished in 1.21s
+

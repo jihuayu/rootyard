@@ -1,0 +1,265 @@
+{
+  "version": 1,
+  "issue": "126",
+  "supporting": [
+    "prioritized105"
+  ],
+  "profile": "legacy-pando-ref-status-native",
+  "status": "passed",
+  "started_at": "2026-11-08T10:58:40.178100+00:00",
+  "runner_path": "/workspace/scratch/state-pando-ref-status-native.py",
+  "runner_sha256_before": "16c3890ed487df0e6b2acbe11fc5f0034fb864da6b85a549abc5f28374d11675",
+  "binary_path": "/workspace/scratch/state-pando-ref-status-app-v1/rootyard",
+  "source_root": "/workspace/scratch/state-pando-ref-status",
+  "case_inventory": [
+    "legacy_pando_setup",
+    "same_old_oid_two_stock_clients_one_winner",
+    "loser_negotiated_sideband_ng_reason",
+    "atomic_multiref_rejection_no_ref_changed",
+    "auth_failure_distinct_from_refusal",
+    "post_commit_response_lost_unknown_transport",
+    "source_binary_runner_stable"
+  ],
+  "cases": [
+    {
+      "name": "legacy_pando_setup",
+      "status": "passed",
+      "detail": {
+        "repository_id": "e0994427-b93a-460f-913c-93964921e8cd",
+        "clone_path": "/git/alice/retstatus-cas.git",
+        "seed_oid": "93d3d8997e8133a847096a51c683882a5076d30d",
+        "contender_oids": [
+          "e31930acd184cea13468ff7f83401dd77e19cf06",
+          "5b0efaeab8f989932419d2b186b14167b198dc89"
+        ],
+        "mode": "GitFS seed, offline Pando cutover, stock Git clones"
+      },
+      "seconds": 8.7167
+    },
+    {
+      "name": "same_old_oid_two_stock_clients_one_winner",
+      "status": "passed",
+      "detail": {
+        "winner_client": "b",
+        "winner_commit": "5b0efaeab8f989932419d2b186b14167b198dc89",
+        "loser_client": "a",
+        "loser_commit": "e31930acd184cea13468ff7f83401dd77e19cf06",
+        "advertised_old_oid_both": "93d3d8997e8133a847096a51c683882a5076d30d",
+        "both_advertisements_authenticated_200": true,
+        "readback_equals_winner": true,
+        "winner_http_status": 200,
+        "winner_report_accepted_main": true,
+        "loser_http_status": 200,
+        "loser_ng_ref": "refs/heads/main",
+        "loser_ng_reason": "incorrect old value provided",
+        "loser_stock_git_remote_rejected": true,
+        "http_409_is_not_refusal_proof": true,
+        "mode": "two real stock Git push processes; each authenticated 200 advertisement response was held by an owned loopback proxy until both arrived, so both commands carried the same advertised old OID; not an unsynchronized parallel push",
+        "gate": {
+          "expected": 2,
+          "arrived": 2,
+          "overflow": 0,
+          "released": true,
+          "timed_out": false,
+          "labels": [
+            "client-a",
+            "client-b"
+          ],
+          "scope": "only successful authenticated receive-pack advertisement GETs are gated"
+        }
+      },
+      "seconds": 5.7355
+    },
+    {
+      "name": "loser_negotiated_sideband_ng_reason",
+      "status": "passed",
+      "detail": {
+        "capabilities": {
+          "report_status": false,
+          "report_status_v2": true,
+          "sideband_64k": true,
+          "atomic": false
+        },
+        "sideband_negotiated": true,
+        "bands": [
+          1
+        ],
+        "progress_packets": 0,
+        "http_status": 200,
+        "ng_ref": "refs/heads/main",
+        "ng_reason": "incorrect old value provided",
+        "stock_git_parsed_ng": true
+      },
+      "seconds": 0.0
+    },
+    {
+      "name": "atomic_multiref_rejection_no_ref_changed",
+      "status": "passed",
+      "detail": {
+        "attempted_refs": [
+          "refs/heads/atomic-created",
+          "refs/heads/atomic-created-2",
+          "refs/heads/main"
+        ],
+        "atomic_negotiated": true,
+        "client_returncode": 1,
+        "refs_unchanged": true,
+        "refs_before": {
+          "HEAD": "5b0efaeab8f989932419d2b186b14167b198dc89",
+          "refs/heads/main": "5b0efaeab8f989932419d2b186b14167b198dc89"
+        },
+        "refs_after": {
+          "HEAD": "5b0efaeab8f989932419d2b186b14167b198dc89",
+          "refs/heads/main": "5b0efaeab8f989932419d2b186b14167b198dc89"
+        },
+        "refusal_http_status": 200,
+        "refusal_form": "http_200_all_requested_ng",
+        "ng_all_requested_refs": true,
+        "guard_reason_exact": false,
+        "not_cas_or_ng_proof": false,
+        "scope": "HTTP 200 negotiated ng report covers every requested ref",
+        "stock_git_stderr_tail": "remote: error: By default, deleting the current branch is denied, because the next        \nremote: 'git clone' won't result in any file checked out, causing confusion.        \nremote: \nremote: You can set 'receive.denyDeleteCurrent' configuration variable to        \nremote: 'warn' or 'ignore' in the remote repository to allow deleting the        \nremote: current branch, with or without a warning message.        \nremote: \nremote: To squelch this message, you can set it to 'refuse'.        \nremote: error: refusing to delete the current branch: refs/heads/main        \nTo http://127.0.0.1:34215/git/alice/retstatus-cas.git\n ! [remote rejected] main (deletion of the current branch prohibited)\n ! [remote rejected] HEAD -> atomic-created (atomic push failure)\n ! [remote rejected] HEAD -> atomic-created-2 (atomic push failure)\nerror: failed to push some refs to 'http://127.0.0.1:34215/git/alice/retstatus-cas.git'\n"
+      },
+      "seconds": 5.0554
+    },
+    {
+      "name": "auth_failure_distinct_from_refusal",
+      "status": "passed",
+      "detail": {
+        "http_statuses": [
+          401,
+          403
+        ],
+        "unauthenticated_returncode": 128,
+        "read_only_returncode": 128,
+        "posts": 0,
+        "ng_seen": false,
+        "refs_unchanged": true,
+        "classification": "authentication_or_authorization_failure_before_receive",
+        "not_a_ref_refusal": true
+      },
+      "seconds": 4.1187
+    },
+    {
+      "name": "post_commit_response_lost_unknown_transport",
+      "status": "passed",
+      "detail": {
+        "classification": "unknown_transport_after_commit",
+        "never_rejected_or_aborted": true,
+        "client_returncode": 1,
+        "client_stderr_tail": "error: RPC failed; curl 52 Empty reply from server\nsend-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly\nEverything up-to-date\n",
+        "upstream_http_status_before_drop": 200,
+        "proxy_dropped_response": true,
+        "upstream_success_report_before_drop": true,
+        "committed_winner_readback": true,
+        "winner_commit": "76f01615d12f020134c88c4137258146ca9c533c",
+        "fresh_clone_readback": true,
+        "fresh_clone_fsck": true
+      },
+      "seconds": 7.9272
+    },
+    {
+      "name": "source_binary_runner_stable",
+      "status": "passed",
+      "detail": {
+        "binary_sha256_before_and_after": "7d1cea075bf3f36c5079120ab6d0a7b5c9deca589fa0d754a6b7b5ab69c8b5bb",
+        "source_inputs_sha256_before_and_after": "7d109c35cc0b7990e4cb9becf5321ac2a8fe567c85cc06d63ba6eb272e1355a7",
+        "runner_sha256_before_and_after": "16c3890ed487df0e6b2acbe11fc5f0034fb864da6b85a549abc5f28374d11675",
+        "build_receipt_bound": true
+      },
+      "seconds": 0.1969
+    }
+  ],
+  "environment": {
+    "ROOTYARD_TEST_DATABASE_URL_present": true,
+    "ROOTYARD_OBJECT_STORE_ENDPOINT_present": true,
+    "credentials_or_headers_recorded": false,
+    "note": "Only presence booleans are recorded; values, argv and HTTP header values are never written."
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "memory_total": "18440100 kB",
+    "scope": "host-visible resources; not a reserved allocation"
+  },
+  "provider_versions": {
+    "garage": null,
+    "vault": null,
+    "reason": "service executables are not inspected by this harness"
+  },
+  "limits": [
+    "One physical host and loopback services; no HA, durability, power-loss or throughput qualification.",
+    "The two stock clients are synchronized only at authenticated advertisement GETs; server CAS ordering after the barrier is not forced.",
+    "The response-drop case is an owned proxy closing after the complete upstream response; it is not a general network partition.",
+    "Full client operation query/retry idempotency (#112/#117) is not exercised; no issue126-complete claim follows from this report.",
+    "No FUSE, mount, kernel control or old FUSE directory is used or traversed."
+  ],
+  "unmeasured": {
+    "server_cas_order": null,
+    "network_partition": null,
+    "client_retry_idempotency": null,
+    "throughput": null
+  },
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "7d1cea075bf3f36c5079120ab6d0a7b5c9deca589fa0d754a6b7b5ab69c8b5bb",
+    "source_inputs_sha256": "7d109c35cc0b7990e4cb9becf5321ac2a8fe567c85cc06d63ba6eb272e1355a7",
+    "workspace_commit": "fc8fe80d286a500ba4ba6fece6dcd984eb541e03",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-pando-ref-status#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-pando-ref-status#rootyard@0.1.0"
+      }
+    ]
+  },
+  "receipt_path": "/workspace/scratch/state-pando-ref-status-app-v1/rootyard.build.json",
+  "binary_bytes": 87413176,
+  "binary_sha256_before": "7d1cea075bf3f36c5079120ab6d0a7b5c9deca589fa0d754a6b7b5ab69c8b5bb",
+  "source_inputs_sha256_before": "7d109c35cc0b7990e4cb9becf5321ac2a8fe567c85cc06d63ba6eb272e1355a7",
+  "cargo_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+  "git_client_version": "git version 2.52.0",
+  "finished_at": "2026-11-08T10:59:12.431459+00:00",
+  "seconds": 32.2534,
+  "runner_sha256_after": "16c3890ed487df0e6b2acbe11fc5f0034fb864da6b85a549abc5f28374d11675",
+  "binary_sha256_after": "7d1cea075bf3f36c5079120ab6d0a7b5c9deca589fa0d754a6b7b5ab69c8b5bb",
+  "source_inputs_sha256_after": "7d109c35cc0b7990e4cb9becf5321ac2a8fe567c85cc06d63ba6eb272e1355a7",
+  "binary_still_matches": true,
+  "source_still_matches": true,
+  "runner_still_matches": true,
+  "fixture_root": "/tmp/rootyard-e2e-abfv6uxx",
+  "fixture_retained": false
+}

@@ -1,0 +1,94 @@
+{
+  "issues": [
+    69,
+    72
+  ],
+  "binary": "/workspace/scratch/round5-implementation/priority-v2/rootyard",
+  "binary_sha256": "bf49434c09791eea29cd442da3b5cc7e458fa7ef017340f6249c13a75f0ea726",
+  "source_head": "3cf4ca50a0025c9489f44e317328b572b6589efe",
+  "manual_dispatch_calls": 0,
+  "cases": [
+    {
+      "name": "no_active_hook_open_pull_updates_on_head_and_base_push",
+      "status": "passed",
+      "seconds": 6.582,
+      "detail": {
+        "repository_id": "1091432a-5afe-4195-9356-98c03b5cbccd",
+        "pull_number": 1,
+        "initial_job_id": "ceec8eda-fb25-457d-9fa1-1b6ffa393525",
+        "head_job_id": "5b3ce41e-ee14-4c27-a622-cfe9683df89d",
+        "head_oid": "30f9b3ccc879315c7bf73e2d22c489f0432c925b",
+        "base_oid": "0d186ada61333eb9238befc830406a4ca7cf341f",
+        "version_after_head": 2,
+        "version_after_base": 3,
+        "pin_oid_after_base": "30f9b3ccc879315c7bf73e2d22c489f0432c925b",
+        "queued_check_contexts": [
+          "ci/test"
+        ],
+        "active_hooks": 0,
+        "receiver_requests": 0,
+        "delivery_rows": 0
+      }
+    },
+    {
+      "name": "fair_pull_cursor_beyond_first_page",
+      "status": "passed",
+      "seconds": 5.155,
+      "detail": {
+        "pull_count": 17,
+        "first_page_updated": 16,
+        "seventeenth_number": 17,
+        "seventeenth_job_id": "4b71c46f-00ad-428b-9db4-437283a448e8",
+        "seventeenth_version": 2,
+        "historical_old_oid": "d547722e3fd94b27d52695e810d0c5b9a00ddef0",
+        "current_oid": "a81b93713a38ed826e03233ecf372db0443622ac"
+      }
+    },
+    {
+      "name": "paused_hook_does_not_block_pr_sync",
+      "status": "passed",
+      "seconds": 6.982,
+      "detail": {
+        "repository_id": "c1f0e60f-58c0-4b2a-a346-9c00231d4524",
+        "pull_number": 1,
+        "initial_job_id": "0f4dc85a-ae2f-4616-b8df-25a073a5b4c8",
+        "head_job_id": "2bf813dc-1216-4c95-afbe-3f28bd5ea19f",
+        "head_oid": "0db0a31e84b1f9dc939c3dac4373f14d8ec2d57b",
+        "base_oid": "e58e000fa8d36b227aab7cf3d35b42c235a1b682",
+        "version_after_head": 2,
+        "version_after_base": 3,
+        "pin_oid_after_base": "0db0a31e84b1f9dc939c3dac4373f14d8ec2d57b",
+        "queued_check_contexts": [
+          "ci/test"
+        ],
+        "hook_active": false,
+        "hook_version": 2,
+        "hook_deliveries": 0,
+        "receiver_requests": 0
+      }
+    },
+    {
+      "name": "deleted_hook_does_not_block_pr_sync",
+      "status": "passed",
+      "seconds": 6.069,
+      "detail": {
+        "repository_id": "2d057d95-c2d8-4828-a8e8-825875e76d39",
+        "pull_number": 1,
+        "initial_job_id": "47539eda-56be-4497-8573-09e3c673ce0f",
+        "head_job_id": "36d7a52c-a881-4bdc-8dac-eb52bf41d391",
+        "head_oid": "c9633235158db61a3bd63b005dcca1eeebbe48eb",
+        "base_oid": "39cec8381046a7f48d7c4d694ea39dc20f84565c",
+        "version_after_head": 2,
+        "version_after_base": 3,
+        "pin_oid_after_base": "c9633235158db61a3bd63b005dcca1eeebbe48eb",
+        "queued_check_contexts": [
+          "ci/test"
+        ],
+        "hook_deleted": true,
+        "hook_deliveries": 0,
+        "receiver_requests": 0
+      }
+    }
+  ],
+  "passed": true
+}

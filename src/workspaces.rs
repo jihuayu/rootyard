@@ -7,6 +7,8 @@ mod checkpoints;
 mod events;
 #[path = "workspaces/files.rs"]
 mod files;
+#[path = "workspaces/git.rs"]
+mod git;
 #[path = "workspaces/lazy.rs"]
 pub(crate) mod lazy;
 #[path = "workspaces/models.rs"]
@@ -17,8 +19,15 @@ pub mod mounts;
 mod remote;
 #[path = "workspaces/remote_gc.rs"]
 mod remote_gc;
+#[path = "workspaces/scan.rs"]
+mod scan;
 #[path = "workspaces/service.rs"]
 pub(crate) mod service;
+#[path = "workspaces/snapshot.rs"]
+pub(crate) mod snapshot;
+#[cfg(test)]
+#[path = "workspaces/snapshot_tests.rs"]
+mod snapshot_tests;
 
 use crate::AppState;
 use axum::{
@@ -26,6 +35,13 @@ use axum::{
     routing::{get, post},
 };
 pub use service::fence_restored;
+
+/// Graceful-shutdown hook: wait for owned workspace Git mutations to reach
+/// their bounded finish before the runtime exits. A SIGKILLed server cannot
+/// provide this guarantee; retry an unknown mutation with the same key.
+pub async fn drain_git_jobs(grace: std::time::Duration) {
+    git::drain(grace).await;
+}
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AppState>> {

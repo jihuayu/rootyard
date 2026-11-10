@@ -122,7 +122,7 @@ async fn permitted_repo(state:&AppState,principal:Principal<'_>,owner:&str,name:
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
     let repo_id=match principal {
-        Principal::User(actor)=>auth::authorize_repo_with_role(&tx,actor,owner,name,Role::Read).await?.repo_id,
+        Principal::User(actor)=>auth::authorize_repo_with_role(&tx,actor,owner,name,Role::Read,crate::token_scopes::RepoAction::ContentsRead).await?.repo_id,
         Principal::Integration(hook_id)=>tx.query_opt(
             "SELECT r.id FROM repositories r JOIN namespaces u ON u.id=r.owner_id \
              JOIN ci_integration_source_grants g ON g.repository_id=r.id \

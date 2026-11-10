@@ -48,9 +48,26 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         self.assertIn("cargo build --locked", ci_text)
         self.assertRegex(
             ci_text,
-            r"cargo\s+build\s+--locked\s+(?:--bins\s+--features\s+pando-lab|--features\s+pando-lab(?:\s+--bins)?)\b",
-            "ci.yml must build rootyard-pando-lab with --features pando-lab",
+            r"python3\s+scripts/build_native\.py\s+--features\s+pando-lab\s+--bins\b",
+            "ci.yml must invoke the attested native build for all pando-lab binaries",
         )
+        build_script = (ROOT / "scripts/build_native.py").read_text(encoding="utf-8")
+        for required in (
+            "command = ['cargo', 'build', '--locked']",
+            "['--bins'] if args.bins",
+            "command += ['--features', args.features]",
+            "with build_lock(target)",
+            "['cargo', 'clean', '--package', DEFAULT_BIN]",
+            "artifacts = fresh_artifacts(events, binary)",
+            "'package_rebuilt': True",
+            "before = source_digest()",
+            "after = source_digest()",
+            "if before != after:",
+            "'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest()",
+            "'source_inputs_sha256': before",
+            "temporary.replace(receipt)",
+        ):
+            self.assertIn(required, build_script, f"native build wrapper lost {required}")
         self.assertRegex(
             ci_text,
             r"cargo\s+clippy\s+--locked\s+--all-targets\s+--features\s+pando-lab\b",
@@ -83,13 +100,17 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         for cmd in expected_commands:
             self.assertIn(cmd, ci_text, f"Missing CI step command in .github/workflows/ci.yml: {cmd}")
 
-        # Pando lab harness must be wired with rootyard-pando-lab and non-root execution (initdb refuses root)
+        # initdb requires non-root. Container jobs switch user; the qualified
+        # plain-host profile executes as runner and verifies its uid at runtime.
         self.assertIn("tests/pando_lab.py", ci_text)
         self.assertIn("rootyard-pando-lab", ci_text)
-        self.assertTrue(
-            "runuser -u postgres" in ci_text or "su -s /bin/bash postgres" in ci_text or "su postgres" in ci_text,
-            "tests/pando_lab.py in ci.yml must run as non-root (postgres) user so initdb/pg_ctl succeed in container",
-        )
+        verify = ci_text.split("\n  container:\n", 1)[0]
+        switches_user = any(command in verify for command in (
+            "runuser -u postgres", "su -s /bin/bash postgres", "su postgres"))
+        host_runner = ("runs-on: ubuntu-22.04" in verify and "container:" not in verify
+                       and 'test "$(id -u)" -ne 0\n          python3 tests/pando_lab.py' in verify)
+        self.assertTrue(switches_user or host_runner,
+                        "Pando initdb must execute with a verified non-root user")
         self.assertIn("/usr/lib/postgresql/17/bin", ci_text)
 
     def test_ci_workflow_wires_design_docs_gate_unit_discovery_and_e2e_tiers(self) -> None:
@@ -130,7 +151,7 @@ class TestPhase1ImplementationStatusAndDocsSync(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, f"check_design_docs.py failed:\n{proc.stderr}")
         self.assertIn(
-            "PASS: 823 source blocks, 11 chapters, 7 synchronized diagrams",
+            f"PASS: 823 source blocks, 11 chapters, {len(list((ROOT / 'docs/design/diagrams').glob('*.mmd')))} synchronized diagrams",
             proc.stdout,
         )
         self.assertIn(expected_sha256, proc.stdout)

@@ -1,0 +1,78 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-pg-snapshot)
+error: this `if` statement can be collapsed
+   --> src/ref_store/core/pin.rs:334:5
+    |
+334 | /     if let MetadataReceipt::Snapshot(snapshot) = receipt {
+335 | |         if snapshot.gate_revision() != header.gate_revision
+336 | |             || snapshot.gate_digest_hex() != header.gate_digest.as_str()
+337 | |             || snapshot.head_ref() != header.head_ref.as_str()
+...   |
+345 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+    = note: `-D clippy::collapsible-if` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+    |
+334 ~     if let MetadataReceipt::Snapshot(snapshot) = receipt
+335 ~         && (snapshot.gate_revision() != header.gate_revision
+336 |             || snapshot.gate_digest_hex() != header.gate_digest.as_str()
+...
+340 |             || snapshot.refs_digest_hex() != header.refs_digest.as_str()
+341 ~             || snapshot.logical_bytes() != header.logical_bytes)
+342 |         {
+343 |             return Err(RefStoreError::MetadataScopeMismatch("stored receipt snapshot summary"));
+344 ~         }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/ref_store/core/snapshot_request.rs:132:9
+    |
+132 | /         if let Some(cursor) = &self.cursor {
+133 | |             if !cursor.binds(&self.scope, self.snapshot_id, self.pin_id, self.pin_generation, self.prefix.as_ref()) {
+134 | |                 return Err(RefStoreError::MetadataCursorScopeMismatch);
+135 | |             }
+136 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+132 ~         if let Some(cursor) = &self.cursor
+133 ~             && !cursor.binds(&self.scope, self.snapshot_id, self.pin_id, self.pin_generation, self.prefix.as_ref()) {
+134 |                 return Err(RefStoreError::MetadataCursorScopeMismatch);
+135 ~             }
+    |
+
+error: manual `!RangeInclusive::contains` implementation
+   --> src/ref_store/core/snapshot_contract.rs:147:12
+    |
+147 |         if bytes < 6 || bytes > 1024 || !value.starts_with("refs/") || value.chars().any(char::is_control) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `!(6..=1024).contains(&bytes)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_range_contains
+    = note: `-D clippy::manual-range-contains` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_range_contains)]`
+
+error: large size difference between variants
+   --> src/ref_store/core/snapshot_receipt.rs:454:1
+    |
+454 | / pub enum MetadataReceiptLookup {
+455 | |     Found(MetadataReceipt),
+    | |     ---------------------- the largest variant contains at least 272 bytes
+456 | |     Unknown,
+    | |     ------- the second-largest variant carries no data at all
+457 | | }
+    | |_^ the entire enum is at least 272 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+    = note: `-D clippy::large-enum-variant` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::large_enum_variant)]`
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+455 -     Found(MetadataReceipt),
+455 +     Found(Box<MetadataReceipt>),
+    |
+
+error: could not compile `rootyard` (lib) due to 4 previous errors

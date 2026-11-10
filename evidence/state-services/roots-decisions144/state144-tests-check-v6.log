@@ -1,0 +1,459 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+warning: multiple fields are never read
+  --> src/ref_store/core/publication_decision/auth_deps.rs:43:9
+   |
+38 | pub(super) struct LiveAuthority {
+   |                   ------------- fields in this struct
+...
+43 |     pub object_format: GitObjectFormat,
+   |         ^^^^^^^^^^^^^
+44 |     pub history_incarnation: Uuid,
+   |         ^^^^^^^^^^^^^^^^^^^
+45 |     pub authority_epoch: i64,
+   |         ^^^^^^^^^^^^^^^
+46 |     pub group_epoch: i64,
+   |         ^^^^^^^^^^^
+47 |     pub base_revision: i64,
+   |         ^^^^^^^^^^^^^
+48 |     pub head_ref: String,
+   |         ^^^^^^^^
+49 |     pub decision_required: bool,
+   |         ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `actor_id`, `token_id`, and `created_db_millis` are never read
+  --> src/ref_store/core/publication_decision/capability.rs:23:5
+   |
+18 | pub(crate) struct DecisionCapability {
+   |                   ------------------ fields in this struct
+...
+23 |     actor_id: Uuid,
+   |     ^^^^^^^^
+24 |     token_id: Uuid,
+   |     ^^^^^^^^
+...
+31 |     created_db_millis: i64,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: multiple methods are never used
+   --> src/ref_store/core/publication_decision/capability.rs:74:19
+    |
+ 35 | impl DecisionCapability {
+    | ----------------------- methods in this implementation
+...
+ 74 |     pub(crate) fn repository_id(&self) -> Uuid {
+    |                   ^^^^^^^^^^^^^
+...
+ 77 |     pub(crate) fn tenant_id(&self) -> Uuid {
+    |                   ^^^^^^^^^
+...
+ 80 |     pub(crate) fn owner_id(&self) -> Uuid {
+    |                   ^^^^^^^^
+...
+ 83 |     pub(crate) fn actor_id(&self) -> Uuid {
+    |                   ^^^^^^^^
+...
+ 86 |     pub(crate) fn token_id(&self) -> Uuid {
+    |                   ^^^^^^^^
+...
+ 98 |     pub(crate) fn object_format(&self) -> GitObjectFormat {
+    |                   ^^^^^^^^^^^^^
+...
+101 |     pub(crate) fn base_revision(&self) -> i64 {
+    |                   ^^^^^^^^^^^^^
+...
+104 |     pub(crate) fn not_after_millis(&self) -> i64 {
+    |                   ^^^^^^^^^^^^^^^^
+...
+107 |     pub(crate) fn created_db_millis(&self) -> i64 {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+110 |     pub(super) fn digests(&self) -> &DecisionDigests {
+    |                   ^^^^^^^
+
+warning: methods `public_code` and `subset_reason` are never used
+  --> src/ref_store/core/publication_decision/codes.rs:73:25
+   |
+31 | impl DecisionRejectCode {
+   | ----------------------- methods in this implementation
+...
+73 |     pub(crate) const fn public_code(self) -> &'static str {
+   |                         ^^^^^^^^^^^
+...
+90 |     pub(crate) const fn subset_reason(self) -> &'static str {
+   |                         ^^^^^^^^^^^^^
+
+warning: variants `ModeMismatch`, `DecisionRequired`, `ConsumeConflict`, and `QuotaExceeded` are never constructed
+   --> src/ref_store/core/publication_decision/codes.rs:123:5
+    |
+106 | pub(crate) enum DenialCode {
+    |                 ---------- variants in this enum
+...
+123 |     ModeMismatch,
+    |     ^^^^^^^^^^^^
+124 |     ProtocolStateMissing,
+125 |     DecisionRequired,
+    |     ^^^^^^^^^^^^^^^^
+...
+136 |     ConsumeConflict,
+    |     ^^^^^^^^^^^^^^^
+137 |     ScopeClosing,
+138 |     QuotaExceeded,
+    |     ^^^^^^^^^^^^^
+    |
+    = note: `DenialCode` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `reject_decision` is never used
+   --> src/ref_store/core/publication_decision/consume.rs:200:21
+    |
+200 | pub(crate) async fn reject_decision(
+    |                     ^^^^^^^^^^^^^^^
+
+warning: function `proof_refs_digest` is never used
+   --> src/ref_store/core/publication_decision/consume.rs:298:15
+    |
+298 | pub(crate) fn proof_refs_digest(selected: &SelectedDecision) -> RequestDigest {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_LOCK_ATTEMPTS` is never used
+  --> src/ref_store/core/publication_decision/contract.rs:34:18
+   |
+34 | pub(crate) const MAX_LOCK_ATTEMPTS: usize = 3;
+   |                  ^^^^^^^^^^^^^^^^^
+
+warning: associated functions `push` and `merge` are never used
+   --> src/ref_store/core/publication_decision/contract.rs:119:19
+    |
+118 | impl PublicationAction {
+    | ---------------------- associated functions in this implementation
+119 |     pub(crate) fn push() -> Self {
+    |                   ^^^^
+...
+123 |     pub(crate) fn merge(binding: MergeBinding) -> Self {
+    |                   ^^^^^
+
+warning: method `is_terminal` is never used
+   --> src/ref_store/core/publication_decision/contract.rs:174:25
+    |
+154 | impl DecisionState {
+    | ------------------ method in this implementation
+...
+174 |     pub(crate) const fn is_terminal(self) -> bool {
+    |                         ^^^^^^^^^^^
+
+warning: field `decision_id` is never read
+   --> src/ref_store/core/publication_decision/contract.rs:240:9
+    |
+238 |     Cancelled {
+    |     --------- field in this variant
+239 |         operation_id: Uuid,
+240 |         decision_id: Option<Uuid>,
+    |         ^^^^^^^^^^^
+    |
+    = note: `DecisionError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: methods `is_consumed`, `decision_id`, and `denial` are never used
+   --> src/ref_store/core/publication_decision/contract.rs:316:25
+    |
+315 | impl ConsumptionRecord {
+    | ---------------------- methods in this implementation
+316 |     pub(crate) const fn is_consumed(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+319 |     pub(crate) const fn decision_id(&self) -> Uuid {
+    |                         ^^^^^^^^^^^
+...
+324 |     pub(crate) const fn denial(&self) -> Option<DenialCode> {
+    |                         ^^^^^^
+
+warning: methods `operation_id` and `is_cancelled` are never used
+   --> src/ref_store/core/publication_decision/contract.rs:342:25
+    |
+341 | impl CancelOutcome {
+    | ------------------ methods in this implementation
+342 |     pub(crate) const fn operation_id(&self) -> Uuid {
+    |                         ^^^^^^^^^^^^
+...
+350 |     pub(crate) const fn is_cancelled(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+
+warning: methods `projection`, `verdict_rows`, `repository_id`, `tenant_id`, and `not_after_millis` are never used
+   --> src/ref_store/core/publication_decision/contract.rs:382:19
+    |
+369 | impl SelectedDecision {
+    | --------------------- methods in this implementation
+...
+382 |     pub(crate) fn projection(&self) -> &SelectedPackPlan {
+    |                   ^^^^^^^^^^
+...
+387 |     pub(crate) fn verdict_rows(&self) -> &[(String, String)] {
+    |                   ^^^^^^^^^^^^
+...
+407 |     pub(crate) fn repository_id(&self) -> Uuid {
+    |                   ^^^^^^^^^^^^^
+...
+410 |     pub(crate) fn tenant_id(&self) -> Uuid {
+    |                   ^^^^^^^^^
+...
+419 |     pub(crate) fn not_after_millis(&self) -> i64 {
+    |                   ^^^^^^^^^^^^^^^^
+
+warning: methods `operation_id`, `repository_id`, and `tenant_id` are never used
+  --> src/ref_store/core/publication_decision/metadata.rs:53:19
+   |
+49 | impl MetadataSelectedDecision {
+   | ----------------------------- methods in this implementation
+...
+53 |     pub(crate) fn operation_id(&self) -> Uuid {
+   |                   ^^^^^^^^^^^^
+...
+56 |     pub(crate) fn repository_id(&self) -> Uuid {
+   |                   ^^^^^^^^^^^^^
+...
+59 |     pub(crate) fn tenant_id(&self) -> Uuid {
+   |                   ^^^^^^^^^
+
+warning: field `role` is never read
+   --> src/ref_store/core/publication_decision/metadata.rs:102:16
+    |
+ 93 | pub(super) struct MetadataAuthority {
+    |                   ----------------- field in this struct
+...
+102 |     pub(super) role: Role,
+    |                ^^^^
+
+warning: field `head` is never read
+  --> src/ref_store/core/publication_decision/select.rs:25:9
+   |
+21 | pub(super) struct SelectionInput<'a> {
+   |                   -------------- field in this struct
+...
+25 |     pub head: &'a HeadUpdate,
+   |         ^^^^
+
+warning: fields `object_format` and `proof_facts_digest` are never read
+   --> src/ref_store/core/publication_decision/sql_locks.rs:268:9
+    |
+258 | pub(super) struct DecisionRow {
+    |                   ----------- fields in this struct
+...
+268 |     pub object_format: String,
+    |         ^^^^^^^^^^^^^
+...
+286 |     pub proof_facts_digest: Option<RequestDigest>,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: `rootyard` (lib) generated 18 warnings
+error[E0425]: cannot find function `repo_usage` in this scope
+   --> tests/ref_store_retention_roots.rs:320:27
+    |
+320 |         let repo_before = repo_usage(&db.pool, verified.repo).await?;
+    |                           ^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+ 20 + use crate::retention_roots_support::db::repo_usage;
+    |
+
+error[E0425]: cannot find function `tenant_usage` in this scope
+   --> tests/ref_store_retention_roots.rs:321:29
+    |
+321 |         let tenant_before = tenant_usage(&db.pool, verified.tenant).await?;
+    |                             ^^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+ 20 + use crate::retention_roots_support::db::tenant_usage;
+    |
+
+error[E0425]: cannot find function `repo_usage` in this scope
+   --> tests/ref_store_retention_roots.rs:341:13
+    |
+341 |             repo_usage(&db.pool, verified.repo).await? == repo_before
+    |             ^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+ 20 + use crate::retention_roots_support::db::repo_usage;
+    |
+
+error[E0425]: cannot find function `tenant_usage` in this scope
+   --> tests/ref_store_retention_roots.rs:342:20
+    |
+342 |                 && tenant_usage(&db.pool, verified.tenant).await? == tenant_before,
+    |                    ^^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+ 20 + use crate::retention_roots_support::db::tenant_usage;
+    |
+
+error[E0425]: cannot find function `repo_usage` in this scope
+   --> tests/ref_store_retention_roots.rs:382:26
+    |
+382 |         let repo_after = repo_usage(&db.pool, verified.repo).await?;
+    |                          ^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+ 20 + use crate::retention_roots_support::db::repo_usage;
+    |
+
+error[E0425]: cannot find function `tenant_usage` in this scope
+   --> tests/ref_store_retention_roots.rs:383:28
+    |
+383 |         let tenant_after = tenant_usage(&db.pool, verified.tenant).await?;
+    |                            ^^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+ 20 + use crate::retention_roots_support::db::tenant_usage;
+    |
+
+error[E0425]: cannot find function `repo_usage` in this scope
+   --> tests/ref_store_retention_roots.rs:401:13
+    |
+401 |             repo_usage(&db.pool, verified.repo).await? == repo_after
+    |             ^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+ 20 + use crate::retention_roots_support::db::repo_usage;
+    |
+
+error[E0425]: cannot find function `tenant_usage` in this scope
+   --> tests/ref_store_retention_roots.rs:402:20
+    |
+402 |                 && tenant_usage(&db.pool, verified.tenant).await? == tenant_after,
+    |                    ^^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+ 20 + use crate::retention_roots_support::db::tenant_usage;
+    |
+
+warning: unused import: `World`
+ --> tests/decision_subset_support/cases_a.rs:5:28
+  |
+5 | use super::fixture::{self, World};
+  |                            ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::retention_roots_support::db::deadline`
+ --> tests/decision_subset_support/cases_a.rs:7:5
+  |
+7 | use crate::retention_roots_support::db::deadline;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::retention_roots_support::pack::verify_advance`
+ --> tests/decision_subset_support/cases_a.rs:8:5
+  |
+8 | use crate::retention_roots_support::pack::verify_advance;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CommitRefsRequest` and `PgRefStoreCore`
+  --> tests/decision_subset_support/cases_a.rs:11:45
+   |
+11 | use rootyard::ref_store::core::{CommitMode, CommitRefsRequest, PgRefStoreCore};
+   |                                             ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^
+
+warning: unused import: `IssuerLane`
+  --> tests/decision_subset_support/cases_a.rs:12:56
+   |
+12 | use rootyard::ref_store::{GitObjectFormat, HeadUpdate, IssuerLane};
+   |                                                        ^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+  --> tests/decision_subset_support/cases_a.rs:13:5
+   |
+13 | use uuid::Uuid;
+   |     ^^^^^^^^^^
+
+warning: unused imports: `accepted` and `code`
+ --> tests/decision_subset_support/cases_b.rs:4:21
+  |
+4 | use super::common::{accepted, code, seeded};
+  |                     ^^^^^^^^  ^^^^
+
+warning: unused import: `World`
+ --> tests/decision_subset_support/cases_b.rs:5:28
+  |
+5 | use super::fixture::{self, World};
+  |                            ^^^^^
+
+warning: unused import: `crate::retention_roots_support::db::deadline`
+ --> tests/decision_subset_support/cases_b.rs:7:5
+  |
+7 | use crate::retention_roots_support::db::deadline;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::retention_roots_support::pack::verify_advance`
+ --> tests/decision_subset_support/cases_b.rs:8:5
+  |
+8 | use crate::retention_roots_support::pack::verify_advance;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `rootyard::ref_store::core::pack_commit::PgAuthorizedCommit`
+  --> tests/decision_subset_support/cases_b.rs:10:5
+   |
+10 | use rootyard::ref_store::core::pack_commit::PgAuthorizedCommit;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CommitMode`, `CommitRefsRequest`, and `PgRefStoreCore`
+  --> tests/decision_subset_support/cases_b.rs:11:33
+   |
+11 | use rootyard::ref_store::core::{CommitMode, CommitRefsRequest, PgRefStoreCore};
+   |                                 ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^
+
+warning: unused import: `IssuerLane`
+  --> tests/decision_subset_support/cases_b.rs:12:56
+   |
+12 | use rootyard::ref_store::{GitObjectFormat, HeadUpdate, IssuerLane};
+   |                                                        ^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+  --> tests/decision_subset_support/cases_b.rs:13:5
+   |
+13 | use uuid::Uuid;
+   |     ^^^^^^^^^^
+
+warning: unused imports: `accepted` and `code`
+ --> tests/decision_subset_support/cases_c.rs:4:21
+  |
+4 | use super::common::{accepted, code, seeded};
+  |                     ^^^^^^^^  ^^^^
+
+warning: unused import: `World`
+ --> tests/decision_subset_support/cases_c.rs:5:28
+  |
+5 | use super::fixture::{self, World};
+  |                            ^^^^^
+
+warning: unused import: `super::policy`
+ --> tests/decision_subset_support/cases_c.rs:7:5
+  |
+7 | use super::policy;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `rootyard::ref_store::core::pack_commit::PgAuthorizedCommit`
+  --> tests/decision_subset_support/cases_c.rs:11:5
+   |
+11 | use rootyard::ref_store::core::pack_commit::PgAuthorizedCommit;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `rootyard` (test "ref_store_retention_roots") due to 8 previous errors
+warning: build failed, waiting for other jobs to finish...
+error[E0308]: mismatched types
+   --> tests/decision_subset_support/cases_d.rs:133:34
+    |
+133 |             matches!(result, Err(rootyard::ref_store::core::pack_commit::AuthorizedCommitError::QuotaExceeded)),
+    |                      ------      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Error`, found `AuthorizedCommitError`
+    |                      |
+    |                      this expression has type `Result<CommitRefsReceipt, anyhow::Error>`
+
+For more information about this error, try `rustc --explain E0308`.
+warning: `rootyard` (test "ref_store_decision_subset") generated 18 warnings
+error: could not compile `rootyard` (test "ref_store_decision_subset") due to 1 previous error; 18 warnings emitted

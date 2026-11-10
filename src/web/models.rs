@@ -53,11 +53,10 @@ impl WebTreeQuery {
             (Some(p), _) => Some(p),
             (None, q) => q,
         };
-        if let Some(s) = spec {
-            if !valid_revision_spec(s) {
+        if let Some(s) = spec
+            && !valid_revision_spec(s) {
                 return Err(Error::bad_request());
             }
-        }
         let rel_path = normalize_rel_path(self.path.as_deref())?;
         let after = validate_tree_after(self.after.as_deref())?;
         let limit = validate_limit(self.limit)?;
@@ -95,11 +94,10 @@ impl WebBlobQuery {
             (Some(p), _) => Some(p),
             (None, q) => q,
         };
-        if let Some(s) = spec {
-            if !valid_revision_spec(s) {
+        if let Some(s) = spec
+            && !valid_revision_spec(s) {
                 return Err(Error::bad_request());
             }
-        }
         Ok(spec)
     }
 }

@@ -1,14 +1,22 @@
 //! Advisory wake transports. Only PostgreSQL owns delivery state and effects.
 use anyhow::{Context, Result, bail, ensure};
 use deadpool_postgres::Pool;
-use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+#[cfg(not(feature = "state-redis"))]
+use std::net::SocketAddr;
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use tokio::sync::Notify;
+#[cfg(not(feature = "state-redis"))]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
-    sync::Notify,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+use crate::observability::{
+    self,
+    worker::{OperationContext, Phase, WorkerKind},
+};
 
 type Task<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Implementations carry only a hint to rescan PG. They cannot supply a Claim,
@@ -38,6 +46,18 @@ pub struct Settings {
     pub transport: Option<Arc<dyn WakeTransport>>,
 }
 impl Settings {
+    /// Minimal serving never inspects or constructs external wake transports.
+    /// Notify coalesces hints; periodic PostgreSQL scanning owns reliability.
+    pub fn standalone() -> Self {
+        Self {
+            poll: Duration::from_secs(1),
+            batch: 64,
+            lease_seconds: 60,
+            consumers: crate::events::CONSUMERS.iter().map(|name| (*name).to_owned()).collect(),
+            transport: None,
+        }
+    }
+
     pub fn from_env() -> Result<Self> {
         fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
             let value = match std::env::var(name) {
@@ -58,22 +78,33 @@ impl Settings {
         );
         ensure!(consumers.len() == 1 || consumers[0] != consumers[1], "duplicate worker consumer");
         let transport: Option<Arc<dyn WakeTransport>> = match std::env::var("ROOTYARD_WAKE_TRANSPORT").as_deref() {
-            Err(_) | Ok("poll") => None,
+            Err(_) | Ok("poll") | Ok("memory") => None,
             Ok("redis") => {
-                let address = std::env::var("ROOTYARD_REDIS_ADDRESS")
-                    .context("ROOTYARD_REDIS_ADDRESS is required")?
-                    .parse()
-                    .context("Redis address must be a loopback socket address")?;
-                let channel = std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
-                Some(Arc::new(RedisWake::new(address, channel)?))
+                #[cfg(feature = "state-redis")]
+                {
+                    Some(Arc::new(crate::cache_wake::RedisWake::from_env()?))
+                }
+                #[cfg(not(feature = "state-redis"))]
+                {
+                    let address: std::net::SocketAddr = std::env::var("ROOTYARD_REDIS_ADDRESS")
+                        .context("ROOTYARD_REDIS_ADDRESS is required")?
+                        .parse()
+                        .context("Redis address must be a loopback socket address")?;
+                    let channel =
+                        std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
+                    Some(Arc::new(RedisWake::new(address, channel)?))
+                }
             }
+            #[cfg(feature = "kafka-wake")]
             Ok("kafka") => Some(Arc::new(crate::kafka_wake::KafkaWake::new(
                 std::env::var("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS")
                     .context("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS is required")?,
                 std::env::var("ROOTYARD_KAFKA_TOPIC").context("ROOTYARD_KAFKA_TOPIC is required")?,
                 std::env::var("ROOTYARD_KAFKA_GROUP").context("ROOTYARD_KAFKA_GROUP is required")?,
             )?)),
-            _ => bail!("wake transport must be poll, redis or kafka"),
+            #[cfg(not(feature = "kafka-wake"))]
+            Ok("kafka") => bail!("Kafka wake support was not compiled; enable kafka-wake explicitly"),
+            _ => bail!("wake transport must be poll, memory, redis or kafka"),
         };
         Ok(Self {
             poll: Duration::from_millis(number("ROOTYARD_WORKER_POLL_MS", 5000, 50, 60_000)?),
@@ -87,10 +118,11 @@ impl Settings {
 /// Runs independently of native Git, volume locks, and journal reconciliation.
 /// A fixed interval remains active even when no transport exists or it fails.
 pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: CancellationToken) {
+    let listener_operation = OperationContext::new(WorkerKind::DurableDispatch);
     let listener = settings.transport.clone().map(|transport| {
         let signal = signal.clone();
         let stop = stop.clone();
-        tokio::spawn(async move {
+        observability::worker::spawn(&listener_operation, Phase::Subscribe, async move {
             tokio::select! {biased;
                 _=stop.cancelled()=>{},
                 _=transport.subscribe(signal,stop.clone())=>{},
@@ -107,6 +139,7 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
             _=ticks.tick()=>{},
             _=signal.notified()=>{},
         }
+        let operation = OperationContext::new(WorkerKind::DurableDispatch);
         let scan = async {
             // A poisoned consumer cannot suppress another consumer's scan.
             let results = futures_util::future::join_all(settings.consumers.iter().map(|consumer| {
@@ -127,15 +160,27 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
             for result in results {
                 match result {
                     Ok(Ok(done)) => count += done,
-                    _ => failed = true,
+                    Ok(Err(error)) => {
+                        observability::observe_internal(&error);
+                        failed = true;
+                    }
+                    Err(_) => {
+                        observability::observe_timeout();
+                        failed = true;
+                    }
                 }
             }
             (count, failed)
         };
         let result = tokio::select! {biased;
             _=stop.cancelled()=>break,
-            result=tokio::time::timeout(Duration::from_secs(30),scan)=>result,
+            result=tokio::time::timeout(Duration::from_secs(30), observability::worker::run(&operation, Phase::Dispatch, scan))=>result,
         };
+        if result.is_err() {
+            // Re-attribute the outer deadline to the same operation instead of
+            // letting it fall through to a detached scope.
+            observability::worker::run(&operation, Phase::Dispatch, async { observability::observe_timeout() }).await;
+        }
         let (count, failed) = result.unwrap_or((0, true));
         if count > 0 {
             signal.notify_one();
@@ -177,12 +222,14 @@ pub async fn publisher(transport: Option<Arc<dyn WakeTransport>>, signal: Arc<No
     }
 }
 
+#[cfg(not(feature = "state-redis"))]
 /// Plain RESP2 over loopback only. Use a local authenticated TLS tunnel/proxy
 /// for a remote Redis deployment. No URL credentials or event data are accepted.
 pub struct RedisWake {
     address: SocketAddr,
     channel: String,
 }
+#[cfg(not(feature = "state-redis"))]
 impl RedisWake {
     pub fn new(address: SocketAddr, channel: String) -> Result<Self> {
         ensure!(
@@ -249,6 +296,7 @@ impl RedisWake {
         }
     }
 }
+#[cfg(not(feature = "state-redis"))]
 impl WakeTransport for RedisWake {
     fn publish(&self) -> Task<'_, Result<()>> {
         Box::pin(async move {
@@ -267,6 +315,7 @@ impl WakeTransport for RedisWake {
         Box::pin(self.listen(signal, stop))
     }
 }
+#[cfg(not(feature = "state-redis"))]
 fn encode(parts: &[&[u8]]) -> Vec<u8> {
     let mut output = format!("*{}\r\n", parts.len()).into_bytes();
     for part in parts {
@@ -276,12 +325,14 @@ fn encode(parts: &[&[u8]]) -> Vec<u8> {
     }
     output
 }
+#[cfg(not(feature = "state-redis"))]
 #[derive(Debug, PartialEq, Eq)]
 enum Frame {
     Bulk(Vec<u8>),
     Integer(i64),
     Array(Vec<Frame>),
 }
+#[cfg(not(feature = "state-redis"))]
 async fn line<R: tokio::io::AsyncBufRead + Unpin>(stream: &mut R, budget: &mut usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     loop {
@@ -296,6 +347,7 @@ async fn line<R: tokio::io::AsyncBufRead + Unpin>(stream: &mut R, budget: &mut u
         }
     }
 }
+#[cfg(not(feature = "state-redis"))]
 fn frame<'a, R: tokio::io::AsyncBufRead + Unpin + Send>(
     stream: &'a mut R,
     budget: &'a mut usize,
@@ -331,6 +383,7 @@ fn frame<'a, R: tokio::io::AsyncBufRead + Unpin + Send>(
         }
     })
 }
+#[cfg(not(feature = "state-redis"))]
 async fn read_frame<R: tokio::io::AsyncBufRead + Unpin + Send>(stream: &mut R) -> Result<Frame> {
     frame(stream, &mut 1024, 0).await
 }
@@ -338,6 +391,7 @@ async fn read_frame<R: tokio::io::AsyncBufRead + Unpin + Send>(stream: &mut R) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "state-redis"))]
     #[test]
     fn endpoint_and_channel_bounds() {
         assert!(RedisWake::new("0.0.0.0:6379".parse().unwrap(), "valid".into()).is_err());
@@ -346,6 +400,7 @@ mod tests {
         }
         assert!(RedisWake::new("[::1]:6379".parse().unwrap(), "rootyard:test_1-v1".into()).is_ok());
     }
+    #[cfg(not(feature = "state-redis"))]
     #[tokio::test]
     async fn bounded_resp() {
         let mut good = &b"*3\r\n$7\r\nmessage\r\n$1\r\nx\r\n$2\r\nv1\r\n"[..];

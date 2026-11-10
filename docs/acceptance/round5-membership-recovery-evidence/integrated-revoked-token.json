@@ -1,0 +1,55 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "fresh_migration_accounts",
+      "status": "passed",
+      "seconds": 2.0627,
+      "detail": null
+    },
+    {
+      "name": "native_repository_fixture",
+      "status": "passed",
+      "seconds": 1.7035,
+      "detail": {
+        "fixture_repo": "6c280d6a-1a22-4cd5-996b-a70d1cce4531",
+        "second_oid": "e3f5808c2a006987a594427fd3d0ff30e40bf578"
+      }
+    },
+    {
+      "name": "recorded_receipt_sets_revoked_token_operation",
+      "status": "passed",
+      "seconds": 3.3919,
+      "detail": {
+        "actual_native_push": true,
+        "required_matching_receipt": true,
+        "receipt_sha256": "38d5c219e17bd2237ee61d191280bef43df367e305a635376accbe0dd778139c",
+        "journal_evidence_digest": "0271428ddead57cb593fe8876868804ceebf74baf86c8f2c7cc53b61a4414f1c",
+        "admitted_refs": [
+          "refs/heads/recorded-recovery"
+        ],
+        "receipt_refs": [
+          "refs/heads/recorded-recovery"
+        ],
+        "token_revoked_before_restart": true,
+        "admission_state": "COMMITTED",
+        "operation_outcome": "recorded",
+        "repository_ready": true,
+        "restart_idempotent": true
+      }
+    }
+  ],
+  "limitations": [
+    "This harness kills the service process; it does not emulate kernel or power loss.",
+    "The SQL fault is an injected BEFORE trigger on git_operations, not a real disk failure.",
+    "It proves SQL settlement from the real native post-receive receipt; it does not repeat the failed write.",
+    "No external consumer exactly-once delivery is claimed."
+  ],
+  "runtime": {
+    "git_client": "git version 2.52.0",
+    "git_server": "git version 2.52.0",
+    "binary_sha256": "b9446ed9f2de4ec4a99fef6ba1676048b6f4d592bb3c25d8b91cb25280767e1d",
+    "native_executed_by_implementer": false
+  },
+  "retained_directory": "/tmp/rootyard-e2e-0dfmdw_5"
+}

@@ -30,8 +30,8 @@ pub(crate) mod publication;
 mod receive;
 use process::Process;
 pub(crate) use process::{
-    collect_git_output, collect_git_output_input, finish_group_child, group_quiescent, kill_group_child,
-    stop_group_child,
+    GitCommandFailed, StreamLimits, collect_git_output, collect_git_output_input, finish_group_child, group_quiescent,
+    kill_group_child, stop_group_child, stream_git_lines,
 };
 use protocol::{job_response_prefix, read_headers, route, validate_headers};
 
@@ -56,9 +56,19 @@ async fn transfer_authorized(
         }
     } else {
         let user = identity.ok_or_else(|| io::Error::other("missing Git actor"))?;
-        auth::verify_active(&state.pool, user, repo.id, write)
-            .await
-            .map_err(|_| io::Error::other("Git authority revoked"))
+        auth::verify_active(
+            &state.pool,
+            user,
+            repo.id,
+            if write {
+                crate::token_scopes::RepoAction::ContentsWrite
+            } else {
+                crate::token_scopes::RepoAction::ContentsRead
+            },
+            if write { auth::Role::Write } else { auth::Role::Read },
+        )
+        .await
+        .map_err(|_| io::Error::other("Git authority revoked"))
     }
 }
 
@@ -142,7 +152,20 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let repo = Repository::from_row(&row);
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        auth::authorize_repo(&tx, &identity, owner, name, write).await.map_err(|error| {
+        auth::authorize_repo_with_role(
+            &tx,
+            &identity,
+            owner,
+            name,
+            if write { auth::Role::Write } else { auth::Role::Read },
+            if write {
+                crate::token_scopes::RepoAction::ContentsWrite
+            } else {
+                crate::token_scopes::RepoAction::ContentsRead
+            },
+        )
+        .await
+        .map_err(|error| {
             if error.0 == StatusCode::CONFLICT && error.1 == "repository is not ready" {
                 Error(StatusCode::SERVICE_UNAVAILABLE, "repository not ready; recovery may be required")
             } else {
@@ -155,6 +178,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         }
         (Some(identity), repo, None, None)
     };
+    if !matches!(repo.storage_backend.as_str(), "gitfs" | "pando") {
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "repository backend is not served by this gateway"));
+    }
     if repo.storage_backend == "pando" && pin_oid.is_some() {
         return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "Pando pinned checkout is not ready"));
     }

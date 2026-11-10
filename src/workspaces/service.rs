@@ -8,8 +8,10 @@ use axum::{
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path as FsPath, PathBuf},
-    process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use uuid::Uuid;
 
@@ -40,34 +42,26 @@ pub(crate) async fn creation_lock(
     Ok(())
 }
 
-pub fn git(repo: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
-    let output = Command::new("git")
-        .arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(Error::internal)?;
-    if !output.status.success() {
-        return Err(conflict());
-    }
-    Ok(output.stdout)
+/// Bounded native Git command. Output and lifetime are capped by the shared
+/// GitFS collector; the process group is cleaned up on timeout or cancellation.
+pub async fn git(state: &AppState, repo: &FsPath, args: &[&str], limit: usize) -> Result<Vec<u8>, Error> {
+    super::git::run(state, repo, args, limit).await
 }
 
-pub async fn authorized(state: &AppState, headers: &HeaderMap, id: Uuid, role: Role) -> Result<Workspace, Error> {
+pub async fn authorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: Uuid,
+    role: Role,
+    action: crate::token_scopes::RepoAction,
+) -> Result<Workspace, Error> {
     let actor = auth::authenticate(&state.pool, headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let sql = format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1");
     let row = tx.query_opt(&sql, &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let ws = Workspace::from_row(&row);
-    let access = auth::authorize_repo_with_role(&tx, &actor, &ws.owner, &ws.repository, role).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &ws.owner, &ws.repository, role, action).await?;
     if access.repo_id != ws.repository_id {
         return Err(Error::not_found());
     }
@@ -86,8 +80,9 @@ pub async fn locked(
     actor: &crate::db::Identity,
     id: Uuid,
     role: Role,
+    action: crate::token_scopes::RepoAction,
 ) -> Result<Workspace, Error> {
-    locked_inner(tx, actor, id, role, true).await
+    locked_inner(tx, actor, id, role, action, true).await
 }
 
 async fn locked_inner(
@@ -95,12 +90,13 @@ async fn locked_inner(
     actor: &crate::db::Identity,
     id: Uuid,
     role: Role,
+    action: crate::token_scopes::RepoAction,
     require_mount: bool,
 ) -> Result<Workspace, Error> {
     let sql = format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1");
     let row = tx.query_opt(&sql, &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let initial = Workspace::from_row(&row);
-    let access = auth::authorize_repo_with_role(tx, actor, &initial.owner, &initial.repository, role).await?;
+    let access = auth::authorize_repo_with_role(tx, actor, &initial.owner, &initial.repository, role, action).await?;
     if access.repo_id != initial.repository_id {
         return Err(Error::not_found());
     }
@@ -129,7 +125,7 @@ pub async fn get(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Workspace>, Error> {
-    Ok(Json(authorized(&state, &headers, id, Role::Read).await?))
+    Ok(Json(authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?))
 }
 
 pub async fn lease(
@@ -141,7 +137,8 @@ pub async fn lease(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = locked_inner(&tx, &actor, id, Role::Write, false).await?;
+    let ws =
+        locked_inner(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite, false).await?;
     if ws.lease_epoch != input.expected_lease_epoch {
         return Err(conflict());
     }
@@ -181,6 +178,7 @@ pub async fn lease(
         return Err(conflict());
     }
     let same_host = ws.host_id == state.storage.volume_id;
+    let commit_started = Arc::new(AtomicBool::new(false));
     let commit = async {
         let active: bool = tx
             .query_one(
@@ -206,12 +204,21 @@ pub async fn lease(
             .await
             .map_err(Error::internal)?
             .get(0);
+        commit_started.store(true, Ordering::Release);
         tx.commit().await.map_err(Error::internal)?;
         Ok((Workspace::from_row(&row), deadline))
     };
-    let (saved, deadline) =
-        if same_host { super::mounts::with_frozen_async(id, commit).await? } else { commit.await? };
-    super::mounts::ensure(&state, id, deadline)?;
+    // On this host the commit runs inside one freeze that fences the superseded
+    // epoch before it is released, so that epoch cannot admit writes between the
+    // commit and the authorization below. Only an error proven to precede COMMIT
+    // thaws the old epoch; success, a COMMIT transport error or cancellation
+    // leaves the gate fenced until a later committed epoch is authorized here.
+    let (saved, deadline) = if same_host {
+        super::mounts::with_frozen_async(id, commit_started.clone(), commit).await?
+    } else {
+        commit.await?
+    };
+    super::mounts::ensure(&state, id, saved.lease_epoch, deadline)?;
     Ok(Json(saved))
 }
 
@@ -270,7 +277,15 @@ pub async fn create(
     ));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write).await?;
+    let repo = auth::authorize_repo_with_role(
+        &tx,
+        &actor,
+        &input.owner,
+        &input.repository,
+        Role::Write,
+        crate::token_scopes::RepoAction::WorkspacesWrite,
+    )
+    .await?;
     creation_lock(&tx, actor.id, &key).await?;
     if let Some(row) = tx.query_opt("SELECT request_sha256,workspace_id FROM workspace_creations WHERE actor_id=$1 AND idempotency_key=$2 FOR UPDATE", &[&actor.id,&key]).await.map_err(Error::internal)? {
         let existing: String = row.get(0);
@@ -289,7 +304,15 @@ pub async fn create(
         .await
         .map_err(|_| Error::timeout())?;
     source_lease.ensure_active()?;
-    let refreshed = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write).await?;
+    let refreshed = auth::authorize_repo_with_role(
+        &tx,
+        &actor,
+        &input.owner,
+        &input.repository,
+        Role::Write,
+        crate::token_scopes::RepoAction::WorkspacesWrite,
+    )
+    .await?;
     if refreshed.repo_id != repo.repo_id {
         return Err(Error::not_found());
     }
@@ -310,7 +333,7 @@ pub async fn create(
     source_lease.ensure_active()?;
     drop(_local);
     drop(source_lease);
-    let head = String::from_utf8(git(&dest, &["rev-parse", "HEAD"]).unwrap_or_default())
+    let head = String::from_utf8(git(&state, &dest, &["rev-parse", "HEAD"], 4096).await.unwrap_or_default())
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| crate::browse::models::valid_non_zero_oid(value));

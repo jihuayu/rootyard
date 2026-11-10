@@ -1,7 +1,7 @@
 //! HTTP handlers for Branch Protection Rules and merge policy evaluation.
 use crate::{
     AppState, Error,
-    auth::{self, authorize_repo as authorize, finish_tx as finish, idempotency_key},
+    auth::{self, finish_tx as finish, idempotency_key},
     members::{audit, models::Role, rbac},
     pulls::models::{
         BranchRule, BranchRuleInput, Page, RULE_FIELDS, context_valid, creation_replay, json,
@@ -94,11 +94,10 @@ pub async fn put_branch_rule_by_path(
     Json(input): Json<BranchRuleInput>,
 ) -> Result<Response, Error> {
     let branch_ref = normalize_branch_ref(&branch)?;
-    if let Some(ref body_branch) = input.branch_ref {
-        if normalize_branch_ref(body_branch)? != branch_ref {
+    if let Some(ref body_branch) = input.branch_ref
+        && normalize_branch_ref(body_branch)? != branch_ref {
             return Err(Error::bad_request());
         }
-    }
     upsert_branch_rule_inner(state, owner, name, branch_ref, headers, input).await
 }
 
@@ -134,7 +133,7 @@ async fn upsert_branch_rule_inner(
         tokio::time::Instant::now()+state.config.git_timeout).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain, crate::token_scopes::RepoAction::PullsWrite).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
 
     if let Some(key) = key {
@@ -259,7 +258,7 @@ pub async fn list_branch_rules(
     let (after, limit) = page.bounds()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::PullsRead).await?.repo_id;
     let tenant_id = repo_tenant_id(&tx, repo).await?;
     let fields = if has_self_approval_col(&tx).await? {
         format!("{RULE_FIELDS},prevent_self_approval")
@@ -295,7 +294,7 @@ pub async fn get_branch_rule(
     let branch_ref = normalize_branch_ref(&branch)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::PullsRead).await?.repo_id;
     let tenant_id = repo_tenant_id(&tx, repo).await?;
     let fields = if has_self_approval_col(&tx).await? {
         format!("{RULE_FIELDS},prevent_self_approval")
@@ -327,7 +326,7 @@ pub async fn delete_branch_rule(
         tokio::time::Instant::now()+state.config.git_timeout).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain, crate::token_scopes::RepoAction::PullsWrite).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     let deleted = tx
         .execute(
@@ -444,11 +443,9 @@ pub async fn evaluate_branch_policy(
             if let Some(role) =
                 rbac::resolve_effective_role_by_id(tx, repository_id, tenant_id, reviewer_id)
                     .await?
-            {
-                if role >= Role::Write {
+                && role >= Role::Write {
                     distinct_approvers.insert(reviewer_id);
                 }
-            }
         }
         distinct_approvers.len() as i64
     } else {

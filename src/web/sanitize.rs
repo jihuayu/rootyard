@@ -80,13 +80,12 @@ fn decode_html_entities_once(input: &str) -> String {
 fn decode_percent_once(input: &str) -> String {
     let (bytes, mut raw, mut i) = (input.as_bytes(), Vec::with_capacity(input.len()), 0);
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h1), Some(h2)) = ((bytes[i + 1] as char).to_digit(16), (bytes[i + 2] as char).to_digit(16)) {
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let (Some(h1), Some(h2)) = ((bytes[i + 1] as char).to_digit(16), (bytes[i + 2] as char).to_digit(16)) {
                 raw.push(((h1 << 4) | h2) as u8);
                 i += 3;
                 continue;
             }
-        }
         raw.push(bytes[i]);
         i += 1;
     }
@@ -159,12 +158,11 @@ fn strip_paired_dangerous_blocks(input: &str) -> String {
             let line_end = lower[after_open..].find('\n').map_or(bytes.len(), |r| after_open + r);
             if let Some(close_rel) = lower[after_open..].find(&close_pat) {
                 let close_start = after_open + close_rel;
-                if lower[after_open..close_start].find(&open_pat).is_none() {
-                    if let Some(gt_rel) = lower[close_start..].find('>') {
+                if lower[after_open..close_start].find(&open_pat).is_none()
+                    && let Some(gt_rel) = lower[close_start..].find('>') {
                         cursor = close_start + gt_rel + 1;
                         continue;
                     }
-                }
             }
             cursor = line_end;
         }
@@ -284,15 +282,14 @@ fn render_inline_markdown(text: &str) -> String {
     let pre = strip_dangerous_html(text);
     let (mut out, mut rest) = (String::with_capacity(pre.len() + 32), pre.as_str());
     while !rest.is_empty() {
-        if let Some(after_tick) = rest.strip_prefix('`') {
-            if let Some(end_tick) = after_tick.find('`') {
+        if let Some(after_tick) = rest.strip_prefix('`')
+            && let Some(end_tick) = after_tick.find('`') {
                 out.push_str(&format!("<code>{}</code>", escape_html(&after_tick[..end_tick])));
                 rest = &after_tick[end_tick + 1..];
                 continue;
             }
-        }
-        if let Some(after_bang) = rest.strip_prefix("![") {
-            if let Some(close_br) = after_bang.find("](") {
+        if let Some(after_bang) = rest.strip_prefix("![")
+            && let Some(close_br) = after_bang.find("](") {
                 let (alt, url_part) = (&after_bang[..close_br], &after_bang[close_br + 2..]);
                 if let Some(cp) = find_closing_paren(url_part) {
                     if let Some(u) = sanitize_url(&url_part[..cp]).filter(|u| !u.to_ascii_lowercase().starts_with("mailto:")) {
@@ -304,9 +301,8 @@ fn render_inline_markdown(text: &str) -> String {
                     continue;
                 }
             }
-        }
-        if let Some(after_br) = rest.strip_prefix('[') {
-            if let Some(close_br) = after_br.find("](") {
+        if let Some(after_br) = rest.strip_prefix('[')
+            && let Some(close_br) = after_br.find("](") {
                 let (label, url_part) = (strip_dangerous_html(&after_br[..close_br]), &after_br[close_br + 2..]);
                 if let Some(cp) = find_closing_paren(url_part) {
                     if let Some(u) = sanitize_url(&url_part[..cp]) {
@@ -318,14 +314,12 @@ fn render_inline_markdown(text: &str) -> String {
                     continue;
                 }
             }
-        }
-        if let Some(after_bold) = rest.strip_prefix("**") {
-            if let Some(end_bold) = after_bold.find("**") {
+        if let Some(after_bold) = rest.strip_prefix("**")
+            && let Some(end_bold) = after_bold.find("**") {
                 out.push_str(&format!("<strong>{}</strong>", strip_dangerous_html(&after_bold[..end_bold])));
                 rest = &after_bold[end_bold + 2..];
                 continue;
             }
-        }
         let step = rest.chars().next().map_or(1, char::len_utf8);
         let next_special = rest[step..].find(['`', '!', '[', '*']).map_or(rest.len(), |p| p + step);
         out.push_str(&rest[..next_special]);

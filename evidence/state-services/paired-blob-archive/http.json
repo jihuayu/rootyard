@@ -1,0 +1,215 @@
+{
+  "binary_sha256": "bc0abc3ed0ac2c5690581480456532eca17ffbbcb5a2667d10e0a1366845c03b",
+  "blob_profile": {
+    "delete_policy": "disabled",
+    "driver": "opendal",
+    "endpoint_loopback": true,
+    "endpoint_scheme": "http",
+    "root_configured": true,
+    "service": "s3"
+  },
+  "case_count": 11,
+  "cases": [
+    {
+      "detail": {
+        "basic_replay": true,
+        "db_binding": [
+          "pg_refstore",
+          "1",
+          "sha1"
+        ],
+        "repository_id": "6008153d-99c3-40db-aeba-3cd3d0f9e82e"
+      },
+      "name": "fresh_create_replay_pg_refstore_binding_no_persistent_bare",
+      "seconds": 1.1564,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "fsck": true,
+        "object_format": "sha1",
+        "oid": "5c9a2f98550a81f79910df160e80bca34da411b1"
+      },
+      "name": "sha1_empty_clone_commit_push_second_clone_fsck_exact",
+      "seconds": 5.6485,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "fsck": true,
+        "object_format": "sha256",
+        "oid": "340375743d79ccd49cd36221ea3c1400ca3453359aa8ddc8f10daa79b14aa908"
+      },
+      "name": "sha256_empty_clone_commit_push_second_clone_fsck_exact",
+      "seconds": 5.2653,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "ack_oid": "7a0e384b79b87fba29729b1574a71c0f24d2822e",
+        "killed_pid": 162118,
+        "restarted_pid": 162624
+      },
+      "name": "sigkill_after_ack_remove_scratch_restart_clone_exact",
+      "seconds": 6.8025,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "foreign_scope_denied": true,
+        "invalid_denied": true,
+        "own_scope_write": true,
+        "read_only_denied": true
+      },
+      "name": "wrong_read_only_scoped_foreign_writes_never_mutate",
+      "seconds": 7.5618,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "false_ok": false,
+        "loser_rejected": true,
+        "protocol_race_states": [
+          "rejected",
+          "committed"
+        ],
+        "protocol_race_statuses": [
+          200,
+          200
+        ],
+        "protocol_terminals_replayed": true,
+        "winner": 0,
+        "winner_oid": "33ea9ea6befc45fde2f4d1107481052a780fff34"
+      },
+      "name": "concurrent_same_ref_one_winner_parseable_no_false_ok",
+      "seconds": 20.6039,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "accepted_subset_exact": true,
+        "atomic_all_or_nothing": true,
+        "positive_atomic": true
+      },
+      "name": "multi_ref_atomic_vs_accepted_subset_actual_git_push",
+      "seconds": 19.0347,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "ack_oid": "0680573e822db2273de4ed6f6ba77ac7cb947568",
+        "missing_bytes_clone_rejected": true,
+        "unavailable_push_rejected": true
+      },
+      "name": "blob_unavailable_missing_bytes_never_acked_or_served",
+      "seconds": 7.3763,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "ack_oid": "b73f9c3f70bddfdf175ad2dca0b162939ff7fc9a",
+        "ls_remote_cycles": 130,
+        "registrations": 2,
+        "retained_rows": {
+          "ref_store_core_pack_snapshot_history": 0,
+          "ref_store_core_pins": 0,
+          "ref_store_core_serving_reads": 0,
+          "ref_store_core_snapshots": 0
+        },
+        "second_ref_oid": "1bdbebdf25f3505517250b6aaae2612bdb138dfc"
+      },
+      "name": "registered_read_cycles_do_not_exhaust_retained_snapshot_quota",
+      "seconds": 180.734,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "ack_oid": "3d236aeed1feec69cfc441ef92c6f1ac2fc68630",
+        "changed_body_status": 409,
+        "concurrent_post_statuses": [
+          503,
+          200
+        ],
+        "exact_replay_identical": true,
+        "gzip_replay_identical": true,
+        "gzip_replay_status": 200,
+        "ledger": {
+          "gate": "2|pack_verified",
+          "gate_rows": "1",
+          "operations": "1",
+          "registrations": "1"
+        },
+        "operation": "28be3fcd-e645-4b26-a2c9-1b81bdab03ff",
+        "report_bytes": 41
+      },
+      "name": "exact_receive_post_replays_before_native_without_second_effect",
+      "seconds": 8.4287,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "ack_oid": "47c81b5dbbb00c0246be3276057880bb0a078fcc",
+        "head_ref": "refs/heads/topic",
+        "repository_id": "7b84049f-90a1-40ba-8b41-46d625b6b2bc"
+      },
+      "name": "create_retry_preserves_the_first_pushed_default_branch",
+      "seconds": 4.1375,
+      "status": "passed"
+    }
+  ],
+  "expected_cases": [
+    "fresh_create_replay_pg_refstore_binding_no_persistent_bare",
+    "sha1_empty_clone_commit_push_second_clone_fsck_exact",
+    "sha256_empty_clone_commit_push_second_clone_fsck_exact",
+    "sigkill_after_ack_remove_scratch_restart_clone_exact",
+    "wrong_read_only_scoped_foreign_writes_never_mutate",
+    "concurrent_same_ref_one_winner_parseable_no_false_ok",
+    "multi_ref_atomic_vs_accepted_subset_actual_git_push",
+    "blob_unavailable_missing_bytes_never_acked_or_served",
+    "registered_read_cycles_do_not_exhaust_retained_snapshot_quota",
+    "exact_receive_post_replays_before_native_without_second_effect",
+    "create_retry_preserves_the_first_pushed_default_branch"
+  ],
+  "expected_count": 11,
+  "git_sha256": "92c38403054b6d6fef394391bd84beb54ebfaef2f096c1e93b56f5626733c649",
+  "harness_sha256": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+  "inputs_unchanged": true,
+  "kind": "rootyard/blob-only-native-acceptance",
+  "limitations": [
+    "serve-blob is an increment, not the default server; full equivalence is not claimed.",
+    "LFS, web UI and pull/merge endpoints are outside this harness and remain unqualified.",
+    "SHA-256 requires the Root-supplied trusted Git; missing support fails the case.",
+    "The crash case is SIGKILL of this harness's process group after an ACK, not kernel/power-loss behavior.",
+    "Blob corruption is not injected into the shared S3 fixture; unavailability uses a harmless wrong loopback endpoint and missing bytes use an isolated root prefix without stopping or mutating the shared provider.",
+    "Blob deletion is disabled; failed-upload orphan objects under the fixture root are not reclaimed by this harness.",
+    "Loopback HTTP and stock Git only; no SSH, HA, multi-host or provider failover is claimed.",
+    "No SQL row creates a ready repository or an ACK; SQL only verifies the actual repository binding."
+  ],
+  "measurement_kind": "native_execution",
+  "native_profile": {
+    "attested": true,
+    "binary_sha256": "bc0abc3ed0ac2c5690581480456532eca17ffbbcb5a2667d10e0a1366845c03b",
+    "build_receipt_sha256": "565d43a2483956407ccdfbccecced324a75e6293a5c1060985fc7083e7fab42d",
+    "git_sha256": "92c38403054b6d6fef394391bd84beb54ebfaef2f096c1e93b56f5626733c649",
+    "harness_sha256": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "source_inputs_sha256": "941eccc8b92e792b723b1c65c02bcf396d12a49b64545140f72f99cf348a7053",
+    "workspace_commit": "4c4abe182f159bad4c6647c4c79e3f721c069bc4"
+  },
+  "passed": true,
+  "pending_cases": [],
+  "qualification_kind": "clean-candidate",
+  "runtime": {
+    "git_version": "git version 2.52.0",
+    "tool_versions": {
+      "git": "git version 2.52.0",
+      "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+      "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)",
+      "python": "3.12.14"
+    }
+  },
+  "simulated_fields": false,
+  "skips": 0,
+  "source_head": "4c4abe182f159bad4c6647c4c79e3f721c069bc4",
+  "source_inputs_sha256": "941eccc8b92e792b723b1c65c02bcf396d12a49b64545140f72f99cf348a7053"
+}

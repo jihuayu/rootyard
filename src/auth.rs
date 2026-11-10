@@ -46,17 +46,11 @@ fn credentials(headers: &HeaderMap) -> Result<(Option<String>, String), Error> {
     credentials_for(headers, "ryt_")
 }
 
-pub(crate) fn credentials_for(
-    headers: &HeaderMap,
-    prefix: &str,
-) -> Result<(Option<String>, String), Error> {
+pub(crate) fn credentials_for(headers: &HeaderMap, prefix: &str) -> Result<(Option<String>, String), Error> {
     if headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
         return Err(Error::unauthorized());
     }
-    let raw = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(Error::unauthorized)?;
+    let raw = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or_else(Error::unauthorized)?;
     if raw.len() > 512 {
         return Err(Error::unauthorized());
     }
@@ -64,30 +58,21 @@ pub(crate) fn credentials_for(
     let (user, token) = if scheme.eq_ignore_ascii_case("bearer") {
         (None, value.to_owned())
     } else if scheme.eq_ignore_ascii_case("basic") {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(value)
-            .map_err(|_| Error::unauthorized())?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(value).map_err(|_| Error::unauthorized())?;
         let pair = String::from_utf8(bytes).map_err(|_| Error::unauthorized())?;
         let (user, token) = pair.split_once(':').ok_or_else(Error::unauthorized)?;
         (Some(user.to_owned()), token.to_owned())
     } else {
         return Err(Error::unauthorized());
     };
-    if token.len() != 68
-        || !token.starts_with(prefix)
-        || !token[4..].bytes().all(|b| b.is_ascii_hexdigit())
-    {
+    if token.len() != 68 || !token.starts_with(prefix) || !token[4..].bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::unauthorized());
     }
     Ok((user, token))
 }
 
 pub fn writable(identity: &Identity) -> Result<(), Error> {
-    if identity.read_only {
-        Err(Error(StatusCode::FORBIDDEN, "write permission required"))
-    } else {
-        Ok(())
-    }
+    if identity.read_only { Err(Error(StatusCode::FORBIDDEN, "write permission required")) } else { Ok(()) }
 }
 
 // Keys are opaque client operation identifiers, never authentication credentials.
@@ -102,9 +87,7 @@ pub fn idempotency_key(headers: &HeaderMap) -> Result<Option<&str>, Error> {
     }
     let key = value.to_str().map_err(|_| Error::bad_request())?;
     if !(1..=128).contains(&key.len())
-        || !key
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b':' | b'-'))
+        || !key.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b':' | b'-'))
     {
         return Err(Error::bad_request());
     }
@@ -117,6 +100,7 @@ pub async fn authorize_repo_with_role(
     owner: &str,
     name: &str,
     min_role: Role,
+    action: crate::token_scopes::RepoAction,
 ) -> Result<RepoAccess, Error> {
     if !db::valid_name(owner) || !db::valid_name(name) {
         return Err(Error::not_found());
@@ -130,7 +114,9 @@ pub async fn authorize_repo_with_role(
     .await
     .map_err(Error::internal)?
     .ok_or_else(Error::unauthorized)?;
-    verify_token(tx, actor, false).await?;
+    // read_only follows the resolved action, never the route's minimum role:
+    // an admin may legitimately perform a read with a read-only token.
+    verify_token(tx, actor, action.is_mutating()).await?;
 
     let row = tx
         .query_opt(
@@ -150,51 +136,113 @@ pub async fn authorize_repo_with_role(
         return Err(Error::not_found());
     };
 
-    if min_role >= Role::Triage {
-        writable(actor)?;
-        verify_token(tx, actor, true).await?;
-    }
     if effective_role < min_role {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
     if state != "ready" {
         return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
     }
-    Ok(RepoAccess {
+    // Scopes only narrow the RBAC result above and are read in the same
+    // transaction, so a token narrowing cannot race this authorisation.
+    crate::token_scopes::authorize_repository_for_request(
+        tx,
+        actor.token_id,
+        actor.id,
         repo_id,
-        owner_id,
-        role: effective_role,
-    })
+        action,
+        browser_credentials_allowed(),
+    )
+    .await
+    .map_err(scope_error)?;
+    Ok(RepoAccess { repo_id, owner_id, role: effective_role })
 }
 
-pub async fn authorize_repo_role(
-    tx: &Transaction<'_>,
-    actor: &Identity,
-    owner: &str,
-    name: &str,
-    min_role: Role,
-) -> Result<RepoAccess, Error> {
-    authorize_repo_with_role(tx, actor, owner, name, min_role).await
+fn scope_error(denial: crate::token_scopes::ScopeDenial) -> Error {
+    match denial {
+        crate::token_scopes::ScopeDenial::InvalidToken => Error::unauthorized(),
+        crate::token_scopes::ScopeDenial::Forbidden => {
+            Error(StatusCode::FORBIDDEN, "token scope does not permit this action")
+        }
+        crate::token_scopes::ScopeDenial::Unavailable => Error::internal("token scope store unavailable"),
+    }
 }
 
-pub async fn authorize_repo(
+/// Apply the token scope gate to an already-resolved repository.
+///
+/// Used by the personal-owner metadata fast path in `repositories::get_repo`,
+/// which bypasses the member-role lookup but must not bypass a restricted
+/// token's exact repository grants.
+pub async fn authorize_repo_action_by_id(
     tx: &Transaction<'_>,
     actor: &Identity,
-    owner: &str,
-    name: &str,
-    write: bool,
-) -> Result<Uuid, Error> {
-    let min_role = if write { Role::Write } else { Role::Read };
-    authorize_repo_with_role(tx, actor, owner, name, min_role)
-        .await
-        .map(|access| access.repo_id)
-}
-
-pub async fn verify_token(
-    tx: &Transaction<'_>,
-    actor: &Identity,
-    write: bool,
+    repo_id: Uuid,
+    action: crate::token_scopes::RepoAction,
 ) -> Result<(), Error> {
+    verify_token(tx, actor, action.is_mutating()).await?;
+    crate::token_scopes::authorize_repository_for_request(
+        tx,
+        actor.token_id,
+        actor.id,
+        repo_id,
+        action,
+        browser_credentials_allowed(),
+    )
+    .await
+    .map_err(scope_error)
+}
+
+/// Enforce one organisation namespace action. The organisation role check stays
+/// with the caller: scopes can only narrow membership, never replace it.
+pub async fn authorize_namespace_action(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    organization_id: Uuid,
+    action: crate::token_scopes::NamespaceAction,
+) -> Result<(), Error> {
+    verify_token(tx, actor, action.is_mutating()).await?;
+    crate::token_scopes::authorize_namespace_for_request(
+        tx,
+        actor.token_id,
+        actor.id,
+        organization_id,
+        action,
+        browser_credentials_allowed(),
+    )
+    .await
+    .map_err(scope_error)
+}
+
+/// Refuse repository/organisation creation for restricted tokens until an
+/// explicit create scope exists. Legacy unrestricted tokens keep their
+/// historical behaviour; no other repository grant is treated as create.
+pub async fn reject_restricted_create(tx: &Transaction<'_>, actor: &Identity) -> Result<(), Error> {
+    let restricted = token_is_restricted(tx, actor).await?;
+    if restricted {
+        return Err(Error(
+            StatusCode::FORBIDDEN,
+            "restricted token has no scope for repository or organisation creation",
+        ));
+    }
+    Ok(())
+}
+
+/// True when the acting token carries an explicit restricted grant set.
+pub async fn token_is_restricted(tx: &Transaction<'_>, actor: &Identity) -> Result<bool, Error> {
+    let row = tx
+        .query_opt(
+            "SELECT t.is_restricted FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 \
+             AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
+             AND (t.kind='api' OR ($4 AND t.kind='browser' AND t.is_restricted = false AND EXISTS \
+                 (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked AND s.expires_at>clock_timestamp()))) FOR SHARE OF t",
+            &[&actor.token_id, &actor.id, &actor.token_digest, &browser_credentials_allowed()],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::unauthorized)?;
+    Ok(row.get(0))
+}
+
+pub async fn verify_token(tx: &Transaction<'_>, actor: &Identity, write: bool) -> Result<(), Error> {
     // A separate statement observes the real database clock *after* lock waits.
     let row = tx.query_opt(
         "SELECT t.read_only FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) AND (t.kind='api' OR ($4 AND t.kind='browser' AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked AND s.expires_at>clock_timestamp())))",
@@ -213,16 +261,14 @@ pub async fn verify_active(
     pool: &Pool,
     actor: &Identity,
     repo_id: Uuid,
-    write: bool,
+    action: crate::token_scopes::RepoAction,
+    min_role: Role,
 ) -> Result<(), Error> {
     let mut client = pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    verify_token(&tx, actor, write).await?;
+    verify_token(&tx, actor, action.is_mutating()).await?;
     let row = tx
-        .query_opt(
-            "SELECT owner_id, state FROM repositories WHERE id=$1",
-            &[&repo_id],
-        )
+        .query_opt("SELECT owner_id, state FROM repositories WHERE id=$1", &[&repo_id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
@@ -231,15 +277,23 @@ pub async fn verify_active(
     if state != "ready" {
         return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
     }
-    let min_role = if write { Role::Write } else { Role::Read };
-    let Some((eff, _, _)) =
-        crate::members::rbac::resolve_effective_role(&*tx, repo_id, owner_id, actor.id).await?
+    let Some((eff, _, _)) = crate::members::rbac::resolve_effective_role(&*tx, repo_id, owner_id, actor.id).await?
     else {
         return Err(Error::not_found());
     };
     if eff < min_role {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
+    crate::token_scopes::authorize_repository_for_request(
+        &tx,
+        actor.token_id,
+        actor.id,
+        repo_id,
+        action,
+        browser_credentials_allowed(),
+    )
+    .await
+    .map_err(scope_error)?;
     Ok(())
 }
 
@@ -248,7 +302,6 @@ pub async fn finish_tx(tx: Transaction<'_>, actor: &Identity, write: bool) -> Re
     verify_token(&tx, actor, write).await?;
     tx.commit().await.map_err(Error::internal)
 }
-
 
 /// Re-verify the exact token, repository generation/state and effective write
 /// role for an already authenticated identity. Native receive hooks and the
@@ -260,6 +313,7 @@ pub async fn verify_repo_write_access<C: GenericClient + Sync>(
     token_id: Uuid,
     repo_id: Uuid,
     browser: bool,
+    action: crate::token_scopes::RepoAction,
 ) -> Result<(), Error> {
     let token = client
         .query_opt(
@@ -267,20 +321,17 @@ pub async fn verify_repo_write_access<C: GenericClient + Sync>(
              AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
              AND (t.kind='api' OR ($3 AND t.kind='browser' AND EXISTS \
                  (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked \
-                  AND s.expires_at>clock_timestamp()))) FOR SHARE OF t",
+                  AND s.expires_at>clock_timestamp())))",
             &[&token_id, &actor_id, &browser],
         )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::unauthorized)?;
-    if token.get::<_, bool>(0) {
+    if action.is_mutating() && token.get::<_, bool>(0) {
         return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
     }
     let repo = client
-        .query_opt(
-            "SELECT owner_id,state FROM repositories WHERE id=$1",
-            &[&repo_id],
-        )
+        .query_opt("SELECT owner_id,state FROM repositories WHERE id=$1", &[&repo_id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
@@ -296,6 +347,106 @@ pub async fn verify_repo_write_access<C: GenericClient + Sync>(
     if effective < Role::Write {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
+    // Late, non-locking scope check. A bare `GenericClient` cannot keep the
+    // token row `FOR SHARE` until publication, so this only closes the window
+    // at the moment of this statement; the fixed publication lock is tracked
+    // as remaining Git work and is not claimed here.
+    crate::token_scopes::authorize_repository_late(client, token_id, actor_id, repo_id, action, browser)
+        .await
+        .map_err(scope_error)?;
+    Ok(())
+}
+
+/// Late Git publication authorization on the publication owner's own
+/// PostgreSQL transaction.
+///
+/// The coordinator derives `actor` from the request it already authenticated
+/// and from the admitted operation; a native hook can never supply an identity,
+/// action or digest here.
+///
+/// Lock order is exact ref -> repository advisory -> local writer -> token
+/// `FOR SHARE` -> native CAS. When this authorisation takes the `FOR SHARE`
+/// lock before a revocation/narrowing writer arrives, that `FOR UPDATE` writer
+/// waits until the native CAS, journal settlement and guard drop finish. When
+/// the revoker commits first, the second statement below re-reads the live row
+/// with the real database clock after the lock wait and denies the
+/// authorisation, so no grant marker is written and the push is refused.
+/// Repository, role and live-grant checks run after that lock under the same
+/// real-clock re-read.
+pub async fn authorize_publication_window(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    repository_id: Uuid,
+    storage_generation: i64,
+) -> Result<(), Error> {
+    let browser = browser_credentials_allowed();
+    // Step 1: take the token row lock. The digest is the parent's verified
+    // immutable token identity, never a hook-reported value.
+    tx.query_opt(
+        "SELECT true FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 \
+         AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
+         AND (t.kind='api' OR ($4 AND t.kind='browser' AND t.is_restricted = false AND EXISTS \
+             (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked \
+              AND s.expires_at>clock_timestamp()))) FOR SHARE OF t",
+        &[&actor.token_id, &actor.id, &actor.token_digest, &browser],
+    )
+    .await
+    .map_err(Error::internal)?
+    .ok_or_else(Error::unauthorized)?;
+    // Step 2: an independent statement re-reads the live row after the lock
+    // wait, so expiry, read-only flips and browser-session loss are observed
+    // with the real database clock.
+    let live = tx
+        .query_opt(
+            "SELECT t.read_only, (t.expires_at IS NULL OR t.expires_at > clock_timestamp()), \
+                    (t.kind='api' OR ($4 AND t.kind='browser' AND t.is_restricted = false AND EXISTS \
+                     (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked \
+                      AND s.expires_at>clock_timestamp()))) \
+               FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 AND NOT t.revoked",
+            &[&actor.token_id, &actor.id, &actor.token_digest, &browser],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::unauthorized)?;
+    if !live.get::<_, bool>(1) || !live.get::<_, bool>(2) {
+        return Err(Error::unauthorized());
+    }
+    if live.get::<_, bool>(0) {
+        return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
+    }
+    // Step 3: current repository generation/state and effective write role,
+    // read under the same transaction that now owns the token lock.
+    let repo = tx
+        .query_opt("SELECT owner_id,state,storage_generation FROM repositories WHERE id=$1", &[&repository_id])
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    if repo.get::<_, i64>(2) != storage_generation {
+        return Err(Error(StatusCode::CONFLICT, "repository generation changed before ref publication"));
+    }
+    if repo.get::<_, String>(1) != "ready" {
+        return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
+    }
+    let owner_id: Uuid = repo.get(0);
+    let Some((effective, _, _)) =
+        crate::members::rbac::resolve_effective_role(&**tx, repository_id, owner_id, actor.id).await?
+    else {
+        return Err(Error::not_found());
+    };
+    if effective < Role::Write {
+        return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
+    }
+    // Step 4: the fixed action is ContentsWrite; the token can only narrow.
+    crate::token_scopes::authorize_repository_late(
+        &**tx,
+        actor.token_id,
+        actor.id,
+        repository_id,
+        crate::token_scopes::RepoAction::ContentsWrite,
+        browser,
+    )
+    .await
+    .map_err(scope_error)?;
     Ok(())
 }
 

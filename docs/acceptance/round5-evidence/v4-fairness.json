@@ -1,0 +1,192 @@
+{
+  "issue": 72,
+  "binary": "/workspace/scratch/round5-implementation/priority-v4/rootyard",
+  "binary_sha256": "7fce5b30de48f66fe676d3c60bf2da0c33e9d3b11d9c30bcc0ecbcc5974306db",
+  "source_head": "5c0f3d71a872b0bd87f657bd2c4d52a27b2c7981",
+  "manual_dispatch_calls": 0,
+  "cases": [
+    {
+      "name": "two_sorted_repositories_early_slow_does_not_starve_later",
+      "status": "passed",
+      "seconds": 2.974,
+      "detail": {
+        "sorted_order": [
+          "other",
+          "forge"
+        ],
+        "early_receiver_was_held": true,
+        "later_fast_delivery_seconds_while_held": 0.0,
+        "later_state_while_early_held": "delivered",
+        "early_state_while_held": "leased",
+        "early_final_attempts": 1,
+        "later_final_attempts": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "small_backfill_next_page_drains_over_rounds",
+      "status": "passed",
+      "seconds": 33.694,
+      "detail": {
+        "outbox_events": 17,
+        "active_hooks": 8,
+        "missing_pairs": 136,
+        "bounded_backfill_page_rows": 128,
+        "rows_after_next_page": 136,
+        "delivered_after_next_page": 16,
+        "delivered_in_later_round": 24,
+        "delivered_total": 136
+      }
+    },
+    {
+      "name": "large_outbox_hook_fanout_keeps_later_repo_live",
+      "status": "passed",
+      "seconds": 4.197,
+      "detail": {
+        "fanout_repositories": 4,
+        "hooks_per_fanout_repository": 512,
+        "outbox_events_per_fanout_repository": 200,
+        "hook_event_pairs_available": 409600,
+        "push_delivery_rows_while_healthy_delivered": 512,
+        "healthy_delivery_seconds_while_fanout_held": 0.015,
+        "healthy_attempts": 1,
+        "held_delivery_attempts": 1,
+        "held_delivery_id": "1c9f5852-21fa-43b0-b84a-788934fa10d2"
+      }
+    },
+    {
+      "name": "large_backlog_failure_and_hard_restart",
+      "status": "passed",
+      "seconds": 11.652,
+      "detail": {
+        "backlog_size": 20,
+        "attempts_while_first_send_held": 1,
+        "durable_state_before_hard_restart": "leased,1",
+        "failure_isolated_dead_letter_attempts": 1,
+        "delivered_after_restart": 20,
+        "attempts_per_marker": {
+          "backlog-0": [
+            1,
+            2
+          ],
+          "backlog-1": [
+            1
+          ],
+          "backlog-2": [
+            1
+          ],
+          "backlog-3": [
+            1
+          ],
+          "backlog-4": [
+            1
+          ],
+          "backlog-5": [
+            1
+          ],
+          "backlog-6": [
+            1
+          ],
+          "backlog-7": [
+            1
+          ],
+          "backlog-8": [
+            1
+          ],
+          "backlog-9": [
+            1
+          ],
+          "backlog-10": [
+            1
+          ],
+          "backlog-11": [
+            1
+          ],
+          "backlog-12": [
+            1
+          ],
+          "backlog-13": [
+            1
+          ],
+          "backlog-14": [
+            1
+          ],
+          "backlog-15": [
+            1
+          ],
+          "backlog-16": [
+            1
+          ],
+          "backlog-17": [
+            1
+          ],
+          "backlog-18": [
+            1
+          ],
+          "backlog-19": [
+            1
+          ]
+        }
+      }
+    },
+    {
+      "name": "graceful_cancel_leaves_durable_claim",
+      "status": "passed",
+      "seconds": 13.358,
+      "detail": {
+        "graceful_stop_seconds": 0.018,
+        "durable_state_after_cancel": "leased,1",
+        "attempts_after_restart": 2,
+        "receiver_attempts": [
+          1,
+          2
+        ],
+        "same_delivery_id": "061032b9-2d5d-4172-811a-76a93aa2843f"
+      }
+    },
+    {
+      "name": "valid_12s_receiver_respects_hook_timeout",
+      "status": "passed",
+      "seconds": 13.893,
+      "detail": {
+        "receiver_delay_seconds": 12.0,
+        "hook_timeout_ms": 20000,
+        "observed_seconds": 12.446,
+        "attempts": 1,
+        "state": "delivered"
+      }
+    },
+    {
+      "name": "cumulative_batch_over_10s",
+      "status": "passed",
+      "seconds": 13.715,
+      "detail": {
+        "per_send_delay_seconds": 6.0,
+        "observed_batch_seconds": 11.318,
+        "attempts": [
+          1,
+          1
+        ],
+        "states": [
+          "delivered",
+          "delivered"
+        ]
+      }
+    },
+    {
+      "name": "due_retry_keeps_sequence_order",
+      "status": "passed",
+      "seconds": 2.48,
+      "detail": {
+        "old_failed_sequence": 1,
+        "pending_sequence": 2,
+        "receiver_order": [
+          "sequence-1",
+          "sequence-2"
+        ]
+      }
+    }
+  ],
+  "passed": true
+}

@@ -1,0 +1,96 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "legacy_schema133_dirty_seed",
+      "status": "passed",
+      "seconds": 3.0803,
+      "detail": {
+        "source_schema_version": 133,
+        "owners": {
+          "a": "c1ed0095-7dd3-4775-aa1c-ce5a79525803",
+          "b": "823f4d67-9a1b-4587-b979-f4f6a8afb2fb"
+        },
+        "repositories": {
+          "a": "17359e2b-a025-4067-a178-ff25fa2f5c2a",
+          "b": "5d5a1dab-001d-44e0-9ee0-744ee584eb86"
+        },
+        "heads": {
+          "a": "f8e489cbcdc3fe71efb53e4783d08a9e140d6618",
+          "b": "0664c930275c00c191fad43191f2de1a2e00a376"
+        },
+        "seeded_dirty_class": "storage_maintenance_jobs.tenant_id != repositories.owner_id",
+        "bad_row_id": "0290699e-d9b2-4b61-8b1e-a8470f51a265",
+        "legal_control_row_id": "2c791848-5737-484b-b4ad-75746d9bb51d"
+      }
+    },
+    {
+      "name": "candidate_refuses_dirty_upgrade",
+      "status": "passed",
+      "seconds": 0.1554,
+      "detail": {
+        "candidate_exit_status": 1,
+        "diagnostic": "schema134 refuses to upgrade: 0 manifest link row(s), 0 repository state row(s), 1 maintenance job(s) and 0 tombstone(s) disagree with their repository identity; no row was modified",
+        "row_identifiers_absent": true,
+        "ledger_version": 133,
+        "constraints_absent": [
+          "pando_manifest_artifacts_manifest_identity_fkey",
+          "storage_maintenance_repo_state_repository_owner_fkey",
+          "storage_maintenance_jobs_repository_owner_fkey",
+          "storage_maintenance_tombstones_repository_owner_fkey",
+          "pando_pack_manifests_id_repository_tenant_key"
+        ],
+        "old_single_column_fk_preserved": true,
+        "bad_row_preserved": true,
+        "legal_control_row_preserved": true
+      }
+    },
+    {
+      "name": "explicit_repair_then_upgrade",
+      "status": "passed",
+      "seconds": 3.4166,
+      "detail": {
+        "schema_version": 134,
+        "composite_fks": [
+          "pando_manifest_artifacts_manifest_identity_fkey",
+          "storage_maintenance_jobs_repository_owner_fkey",
+          "storage_maintenance_repo_state_repository_owner_fkey",
+          "storage_maintenance_tombstones_repository_owner_fkey"
+        ],
+        "unique_constraint": "pando_pack_manifests_id_repository_tenant_key",
+        "single_column_manifest_fk_removed": true,
+        "observed": {
+          "pando_manifest_artifacts_manifest_identity_fkey": "validated composite cascade",
+          "storage_maintenance_repo_state_repository_owner_fkey": "validated composite cascade",
+          "storage_maintenance_jobs_repository_owner_fkey": "validated composite cascade",
+          "storage_maintenance_tombstones_repository_owner_fkey": "validated composite cascade"
+        },
+        "upgrade_after_explicit_delete": true,
+        "bad_row_removed_by_test": true,
+        "legal_control_row_preserved": true,
+        "clones_fetched_and_fsck": {
+          "a": "f8e489cbcdc3fe71efb53e4783d08a9e140d6618",
+          "b": "0664c930275c00c191fad43191f2de1a2e00a376"
+        }
+      }
+    }
+  ],
+  "candidate_binary_sha256": "85c66397f755768fa139cf4952fca6a21ca12747bd6d18b042f80c2a62f0eb3d",
+  "legacy_binary_sha256": "35d0886f032b1f9c8b05ccfd57cb6938d8b202e15e23e354ec9e3b6ccc09d896",
+  "required_environment": [
+    "ROOTYARD_TEST_DATABASE_URL"
+  ],
+  "not_tested": [
+    "Real Pando publication is not exercised by this dirty-maintenance upgrade entry point; tests/storage_identity_fks.py owns that proof.",
+    "Backup format/catalog gates and legacy schema133 restore are coordinator-owned follow-ups; no backup gate claim is made here.",
+    "GC/retention worker behaviour after upgrade is outside this script."
+  ],
+  "limitations": [
+    "Loopback functional timings are not a scalability benchmark.",
+    "Crash tests kill the service process, not the kernel or PostgreSQL; no power-loss guarantee is inferred.",
+    "Interrupted upload uses a truncated HTTP body; exhaustive transport fault injection is not covered.",
+    "The source schema is created by the real legacy binary, not by an edited manifest, dump or hand-written migration subset.",
+    "This entry point proves the dirty storage_maintenance_jobs refusal and the clean rerun only; it does not perform a real Pando cutover or publication. tests/storage_identity_fks.py proves that separately.",
+    "Backup format/catalog gates and legacy schema133 restore are coordinator-owned follow-ups; no backup gate claim is made here."
+  ]
+}

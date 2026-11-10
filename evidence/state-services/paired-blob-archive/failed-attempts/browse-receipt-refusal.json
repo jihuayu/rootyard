@@ -1,0 +1,24 @@
+{
+  "cases": [],
+  "error": "executed binary receipt does not match current candidate commit",
+  "expected_cases": [
+    "sha1_tree_and_blob_match_native_git",
+    "sha256_tree_and_blob_match_native_git",
+    "empty_nested_binary_and_utf8_paths_preserve_bytes",
+    "tree_pagination_and_direct_object_endpoints",
+    "annotated_tags_peel_to_the_pushed_commit",
+    "ref_advance_keeps_reachable_history_readable",
+    "restart_without_scratch_rebuilds_browse_and_clone"
+  ],
+  "kind": "rootyard/blob-browse-native-acceptance",
+  "limitations": [
+    "Loopback HTTP, one PostgreSQL server and one configured S3 provider; no HA or physical durability claim.",
+    "The restart kills only the harness-owned service process group after an acknowledged push.",
+    "This verifies tree/blob JSON, not full web UI, commits/compare, LFS or ref transaction equivalence.",
+    "Blob deletion stays disabled; uploaded fixture objects are not reclaimed by this harness.",
+    "Ordinary functional/recovery cases, not security or resource-exhaustion qualification."
+  ],
+  "passed": false,
+  "preflight_failed": true,
+  "skips": 0
+}

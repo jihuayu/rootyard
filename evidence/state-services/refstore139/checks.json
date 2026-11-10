@@ -1,0 +1,61 @@
+{
+  "qualified_source_commit": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+  "app_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+  "core_test_compiled_commit": "58c22eae733dd31ed0788c4d1cbe4bc013a6ebd3",
+  "core_test_input_equivalence": "Compiled inputs and explicit integration-test SHA match receipt before/after run at0bb2b6c; two later changed files are Python-only. Build receipt is not relabelled.",
+  "core_pg": {
+    "passed": 12,
+    "failed": 0,
+    "ignored": 0
+  },
+  "library": {
+    "passed": 281,
+    "failed": 0,
+    "ignored": 8
+  },
+  "source_python": {
+    "run": 286,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 6
+  },
+  "schema": {
+    "version": 139,
+    "tables": 93,
+    "functions": 16,
+    "triggers": 36,
+    "binary_migrator": true
+  },
+  "backup15_native_cases": 7,
+  "legacy14_native_cases": 7,
+  "cargo_fmt_check": {
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0
+  },
+  "git_diff_check": {
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "exit_code": 0
+  },
+  "clippy_all_targets_pando_lab": {
+    "exit_code": 0,
+    "log": "clippy.log"
+  },
+  "review": "Luna Max static reviews: core own-TX/budget/fencing/deadline and backup139/legacy138 changes; no confirmed blockers. URL query/encoded-credential fixture portability is inherited/unqualified.",
+  "limits": [
+    "Unserved provisioning GitFS metadata core only: no HTTP activation/cutover, Blob memberships, pins, roots, holds, decision bridge, Raft, GC integration. #107/#105 remain open.",
+    "Direct-SQL backup metadata fixture is not adapter/protocol ACK evidence; twelve PostgreSQL cases separately test adapter semantics.",
+    "One physical host/loopback services; no power-loss, HA, production latency or RPO/RTO guarantee.",
+    "No new MSRV1.88, Azure or production KeyProvider qualification.",
+    "Full dependency-stack remoteCI blocked by independent Sharding test-fixture issue134; no merged/released/deployed claim."
+  ]
+}

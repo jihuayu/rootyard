@@ -6,12 +6,17 @@ permissions:
   contents: read
 jobs:
   verify:
-    runs-on: ubuntu-24.04
-    container:
-      image: rust:1-trixie
-      # Match compose.yaml: orphaned Git grandchildren need an init reaper.
-      options: --init
-    timeout-minutes: 45
+    # Plain Ubuntu 22.04 host profile, matching the target on which the manual
+    # native-kernel-acceptance workflow passed its 17 assertions. There is no
+    # container init process: PID 1 is the runner host's init, which adopts and
+    # reaps orphaned Git grandchildren. Do not introduce a global child
+    # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
+    runs-on: ubuntu-22.04
+    # Job cap with bounded headroom for the three populated RefStore/artifact-hold
+    # backup drills below: their step caps grow from 5 to 10 minutes each, so the
+    # worst case added here is 3 x 5 = 15 minutes. Keep this bounded; raising it
+    # further must not be used to hide a regression inside one individual step.
+    timeout-minutes: 75
     services:
       postgres:
         image: postgres:17
@@ -19,22 +24,42 @@ jobs:
           POSTGRES_USER: rootyard
           POSTGRES_PASSWORD: rootyard-ci-only
           POSTGRES_DB: rootyard_test
+        # Publish the service on the host at a fixed loopback port. The
+        # container service itself is ephemeral and uses a CI-only password.
+        ports:
+          - 127.0.0.1:55432:5432
         options: >-
           --health-cmd "pg_isready -U rootyard -d rootyard_test"
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
-      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard:rootyard-ci-only@postgres:5432/rootyard_test
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard:rootyard-ci-only@127.0.0.1:55432/rootyard_test
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable Rust tools
+        with:
+          persist-credentials: false
+      - name: Use the project Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install native CI toolchain (postgresql-17 postgresql-client-17, Git 2.43, bubblewrap --size, FUSE, LFS)
+        timeout-minutes: 20
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
-      - name: Install matching PostgreSQL client and test tools
+          scripts/install_ci_native_tools.sh install \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/ci-native-tools/provenance.json
+      - name: Verify native CI tool profile
+        timeout-minutes: 5
         run: |
-          apt-get update && apt-get install -y --no-install-recommends git python3 python3-venv postgresql-17 postgresql-client-17 redis-server gcc g++ make pkg-config openjdk-21-jre-headless curl ca-certificates
           echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
           echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
+          scripts/install_ci_native_tools.sh preflight \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/ci-native-tools/provenance.json
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
       - name: Test bounded Kafka download helper
         run: python3 -m unittest discover -s tests -p 'test_download_ci_kafka.py'
       - name: Prepare verified isolated Kafka distribution
@@ -47,6 +72,10 @@ jobs:
           rustc --version
           cargo --version
           git --version
+          git lfs version
+          bwrap --version
+          unshare --version
+          fusermount3 --version
           python3 --version
           psql --version
           pg_dump --version
@@ -58,8 +87,17 @@ jobs:
       - run: cargo clippy --locked --all-targets --features pando-lab -- -D warnings
       - run: cargo test --locked --all-targets --features pando-lab
       - name: Verify durable PostgreSQL workers
-        run: cargo test --locked --test outbox --test resolution_fences -- --ignored
-      - run: python3 scripts/build_native.py --features pando-lab --bins
+        run: cargo test --locked --features pando-lab --test outbox --test resolution_fences -- --ignored
+      - name: Verify PostgreSQL RefStore registry and metadata-core contracts
+        timeout-minutes: 5
+        run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds -- --ignored --test-threads=1
+      - name: Build selected source-bound populated snapshot fixture integration test
+        timeout-minutes: 10
+        run: python3 scripts/build_native_test.py --test ref_store_snapshot_backup_fixture --features pando-lab --output test-results/refstore-snapshot-fixture --strip-debuginfo
+      - name: Build selected source-bound populated artifact-hold fixture integration test
+        timeout-minutes: 10
+        run: python3 scripts/build_native_test.py --test ref_store_holds_backup_fixture --features pando-lab --output test-results/refstore-holds-fixture --strip-debuginfo
+      - run: python3 scripts/build_native.py --features pando-lab --bins --strip-debuginfo
       - run: cargo build --locked --bin rootyard-view-lab
       - name: Verify design documentation integrity
         run: python3 scripts/check_design_docs.py
@@ -120,8 +158,21 @@ jobs:
         run: python3 tests/backup_ci_pins.py --binary target/debug/rootyard --report test-results/backup-ci-pins.json
       - name: Exercise durable push recovery
         run: python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
+      - name: Recover native Git receipts after collaborator and organization withdrawal
+        run: python3 tests/recorded_membership_recovery.py --binary target/debug/rootyard --report test-results/recorded-membership-recovery.json
+      - name: Recover native Git receipts after token revocation
+        run: python3 tests/recorded_recovery.py --binary target/debug/rootyard --report test-results/recorded-recovery.json
       - name: Exercise offline backup and fresh database restore
         run: python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
+      - name: Restore populated PostgreSQL RefStore core metadata from the current backup format
+        timeout-minutes: 10
+        run: python3 tests/backup_refstore_core139.py --binary target/debug/rootyard --report test-results/backup-refstore-core.json
+      - name: Restore populated PostgreSQL RefStore snapshot metadata from the current backup format
+        timeout-minutes: 10
+        run: python3 tests/backup_refstore_snapshot140.py --binary target/debug/rootyard --snapshot-fixture-binary test-results/refstore-snapshot-fixture --report test-results/backup-refstore-snapshot.json
+      - name: Restore populated permanent artifact-hold metadata from the current backup format
+        timeout-minutes: 10
+        run: python3 tests/backup_refstore_holds141.py --binary target/debug/rootyard --holds-fixture-binary test-results/refstore-holds-fixture --report test-results/backup-refstore-holds.json
       - name: Exercise restored schema-003 recovery protections
         run: python3 tests/backup_recovery.py --binary target/debug/rootyard --report test-results/backup-recovery.json
       - name: Exercise independent workers after fresh restore
@@ -160,30 +211,76 @@ jobs:
         run: python3 tests/git_views.py --binary target/debug/rootyard-view-lab --report test-results/git-views.json
       - name: Exercise Pando object store delta resolution, graph traversal, and differential export
         run: |
-          chmod -R a+rX "$GITHUB_WORKSPACE" && runuser -u postgres -- env PATH="/usr/lib/postgresql/17/bin:$PATH" PG_SHARE="/usr/share/postgresql/17" python3 tests/pando_lab.py --binary target/debug/rootyard-pando-lab
+          test "$(id -u)" -ne 0
+          python3 tests/pando_lab.py --binary target/debug/rootyard-pando-lab
           mkdir -p test-results
           latest_pando=$(ls -td /tmp/rootyard-pando-lab-* 2>/dev/null | head -1 || true)
-          if [ -n "$latest_pando" ] && [ -f "$latest_pando/results.json" ]; then
-            cp "$latest_pando/results.json" test-results/pando-lab.json
-          fi
+          test -n "$latest_pando"
+          test -f "$latest_pando/results.json"
+          cp "$latest_pando/results.json" test-results/pando-lab.json
       - name: Exercise external CI webhooks, HMAC-SHA256 delivery, and auto PR CI pins
         run: python3 tests/webhooks.py --binary target/debug/rootyard --report test-results/webhooks.json
+      - name: Exercise webhook batching, lease and TLS regressions
+        timeout-minutes: 10
+        env:
+          ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          python3 tests/ci_webhook_regressions.py --binary target/debug/rootyard 2>&1 | tee test-results/ci-webhook-regressions.log
+      - name: Exercise durable webhook worker recovery against real PostgreSQL
+        timeout-minutes: 15
+        env:
+          ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
+        run: python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
       - name: Exercise repository collaborators, teams, 5-role RBAC, and audit log
         run: python3 tests/members.py --binary target/debug/rootyard --report test-results/members.json
       - name: Exercise server-side HTML Web UI views, XSS sanitization, and PR/Issue workflows
         run: python3 tests/web.py --binary target/debug/rootyard --report test-results/web.json
-      - name: Exercise multi-node repository sharding, epoch write fencing, and automated failover
+      - name: Exercise real browser sessions, CSRF, expiry and revocation
+        timeout-minutes: 10
+        env:
+          ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
+        run: python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
+      - name: Exercise sharded control-plane placement, lease/epoch fencing, and explicit refusal of unmeasured failover, rebalance and DR
         run: python3 tests/sharding.py --binary target/debug/rootyard --report test-results/sharding.json
-      - name: Exercise multi-node 1/2/4-node concurrency and P95/P99 sharding benchmark suite
+      - name: Exercise labelled simulation-only 1/2/4-node sharding benchmark metadata receipts
         run: python3 tests/benchmark_tiers.py --binary target/debug/rootyard --report test-results/benchmark-tiers.json
       - name: Exercise explicitly labeled 4-tier reference models
         run: ROOTYARD_E2E_REQUIRE_M5=1 ROOTYARD_E2E_REQUIRE_P2=1 ROOTYARD_E2E_REQUIRE_P3=1 python3 tests/e2e_tiers.py --reference-only --tier all --report test-results/reference-tiers.json
+      - name: Bind native regressions to the built binary and source inputs
+        run: |
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/native-pr-gate.json \
+            --build-receipt target/debug/rootyard.build.json \
+            --binary target/debug/rootyard \
+            --report web_sessions=test-results/web-sessions.json \
+            --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
+            --log webhook_regressions=test-results/ci-webhook-regressions.log \
+            --log-marker "webhook_regressions=201 event batches: passed" \
+            --log-marker "webhook_regressions=concurrent claim fence: passed" \
+            --log-marker "webhook_regressions=verified TLS and plaintext rejection: passed" \
+            --log-marker "webhook_regressions=untrusted certificate rejected:" \
+            --harness tests/web_sessions.py \
+            --harness tests/webhook_worker_recovery.py \
+            --harness tests/ci_webhook_regressions.py \
+            --fixture postgres=postgres:17 \
+            --fixture rust="$(rustc -V)" \
+            --fixture git="$(git --version)" \
+            --fixture git_lfs="$(git lfs version)" \
+            --fixture bubblewrap="$(bwrap --version)" \
+            --fixture fuse_device="$(stat -Lc '%F mode=%a' /dev/fuse)" \
+            --fixture ci_native_tools_provenance_sha256="$(sha256sum test-results/ci-native-tools/provenance.json | awk '{print $1}')"
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-report
-          path: test-results/*.json
+          path: |
+            test-results/*.json
+            test-results/ci-webhook-regressions.log
+            test-results/evidence/*.jsonl
+            test-results/ci-native-tools/provenance.json
           if-no-files-found: ignore
 
   container:

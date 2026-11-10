@@ -31,7 +31,7 @@ pub async fn heartbeat(
     let actor = auth::authenticate(&state.pool,&headers).await?;
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
-    let access=auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain).await?;
+    let access=auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain,crate::token_scopes::RepoAction::CiDispatch).await?;
     let repo_row = tx.query_one(
         "SELECT storage_generation,object_format FROM repositories WHERE id=$1",&[&access.repo_id],
     ).await.map_err(Error::internal)?;

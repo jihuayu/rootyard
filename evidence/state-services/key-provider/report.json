@@ -1,0 +1,33 @@
+{
+  "status": "passed",
+  "case_count": 9,
+  "passed": 9,
+  "failed": 0,
+  "ignored": 0,
+  "cases": [
+    "debug_and_serialization_redact_all_key_material",
+    "length_delimited_aad_prevents_adjacent_field_collisions",
+    "rejects_unsafe_keyring_directory_and_manifest_shapes",
+    "rejects_malformed_key_files_modes_symlinks_and_fifos",
+    "roundtrip_uses_current_key_and_fresh_nonces",
+    "rotation_keeps_old_reads_rewraps_to_current_and_preserves_the_dek",
+    "tampered_ciphertext_nonce_aad_and_version_fail_closed",
+    "wrapped_metadata_validation_rejects_bad_lengths_ids_and_oversize",
+    "wrong_key_and_missing_key_file_fail_closed_without_generation"
+  ],
+  "test_command": [
+    "/workspace/scratch/state-key-provider-contract-v4/key_provider_contract",
+    "--test-threads=2"
+  ],
+  "build_receipt": "build.json",
+  "binary_sha256": "123de79ea662947a1855665e5a28d60bf0a987db36a1ad2781410c92af31f819",
+  "integration_test_source_sha256": "3934bdc91fc7ce319450bb578eb2bf34c494f0249d74eb9095ce86d458f59521",
+  "source_inputs_sha256": "ecc7399d5e1b4d027e97745fa94c591f433e50a78b3c43d7504e48f98ef7cfe7",
+  "workspace_commit": "d02a24e0f7c1fa47e27d4429802560840627caf7",
+  "scope": "Independent local KeyProvider component; no serving, Vault migration, Blob encryption pipeline, provider service, backup or persistent rewrap validation.",
+  "limits": [
+    "One Linux host; effective uid1000. Wrong-owner rejection was inspected, not exercised with a foreign-owned live key fixture.",
+    "Compile toolchain1.99.1; no new MSRV1.88 qualification.",
+    "Keyring manifest is operator-controlled configuration consistency, not an external immutable key identity anchor."
+  ]
+}

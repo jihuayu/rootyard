@@ -8,6 +8,16 @@ fn main() -> Result<()> {
         println!("rootyard-hook-v1");
         return Ok(());
     }
+    if args.len() == 2 && args[1] == rootyard::workspace_lab::fuse_helper::HELPER_ARG {
+        // The independent workspace FUSE helper branches before Config, the DB
+        // pool, `Store` and the volume lock exist: the child must never open
+        // PostgreSQL, the API router or the service storage lock. It receives
+        // only the two inherited sockets and a scrubbed environment.
+        if !cfg!(target_os = "linux") {
+            bail!("workspace FUSE helper requires Linux");
+        }
+        return rootyard::workspace_lab::fuse_helper::run_child().context("workspace FUSE helper stopped");
+    }
     let name = std::path::Path::new(&args[0]).file_name().and_then(|v| v.to_str()).unwrap_or("");
     match name {
         "reference-transaction" => {
@@ -24,6 +34,9 @@ async fn run() -> Result<()> {
         bail!("Rootyard phase one currently supports Linux only");
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 1 && args[0] == "serve-blob" {
+        return rootyard::standalone::run_from_env().await;
+    }
     if args.first().is_some_and(|s| s == "backup-verify") && args.len() == 2 {
         return rootyard::backup::check(std::path::Path::new(&args[1]))
             .map_err(|_| anyhow::anyhow!("backup verification failed; incomplete, unsafe or mismatched files"));
@@ -50,6 +63,9 @@ async fn run() -> Result<()> {
             println!("{count}");
         } else {
             let stop = tokio_util::sync::CancellationToken::new();
+            // Browser-session GC needs only PostgreSQL, so the control-plane
+            // worker runs the same bounded loop as the serving process.
+            let session_gc_task = tokio::spawn(rootyard::web::session_gc::run(pool.clone(), stop.child_token()));
             let mut task = tokio::spawn(rootyard::dispatch::worker(
                 pool,
                 settings,
@@ -58,7 +74,7 @@ async fn run() -> Result<()> {
             ));
             eprintln!("rootyard: PostgreSQL delivery worker started (no Git storage access)");
             tokio::select! {
-                _=shutdown()=>{ stop.cancel(); task.await?; },
+                _=shutdown()=>{ stop.cancel(); task.await?; let _ = session_gc_task.await; },
                 result=&mut task=>{ result?; bail!("delivery worker stopped unexpectedly"); },
             }
         }
@@ -76,7 +92,21 @@ async fn run() -> Result<()> {
                 || (args.len() == 5
                     && matches!(
                         args[4].as_str(),
-                        "--allow-legacy-schema007" | "--allow-legacy-schema130" | "--allow-legacy-schema131"
+                        "--allow-legacy-schema007"
+                            | "--allow-legacy-schema130"
+                            | "--allow-legacy-schema131"
+                            | "--allow-legacy-schema132"
+                            | "--allow-legacy-schema133"
+                            | "--allow-legacy-schema134"
+                            | "--allow-legacy-schema135"
+                            | "--allow-legacy-schema136"
+                            | "--allow-legacy-schema137"
+                            | "--allow-legacy-schema138"
+                            | "--allow-legacy-schema139"
+                            | "--allow-legacy-schema140"
+                            | "--allow-legacy-schema141"
+                            | "--allow-legacy-schema142"
+                            | "--allow-legacy-schema143"
                     )))
                 && args[2] == "--isolated"
                 && args[3] == "--trust-backup" =>
@@ -88,6 +118,18 @@ async fn run() -> Result<()> {
                 legacy == Some("--allow-legacy-schema007"),
                 legacy == Some("--allow-legacy-schema130"),
                 legacy == Some("--allow-legacy-schema131"),
+                legacy == Some("--allow-legacy-schema132"),
+                legacy == Some("--allow-legacy-schema133"),
+                legacy == Some("--allow-legacy-schema134"),
+                legacy == Some("--allow-legacy-schema135"),
+                legacy == Some("--allow-legacy-schema136"),
+                legacy == Some("--allow-legacy-schema137"),
+                legacy == Some("--allow-legacy-schema138"),
+                legacy == Some("--allow-legacy-schema139"),
+                legacy == Some("--allow-legacy-schema140"),
+                legacy == Some("--allow-legacy-schema141"),
+                legacy == Some("--allow-legacy-schema142"),
+                legacy == Some("--allow-legacy-schema143"),
             )
             .await
             .map_err(|_| anyhow::anyhow!("restore failed; keep target isolated and inspect or discard the fresh targets; database commit may have completed; never retry over existing state"))?;
@@ -148,9 +190,7 @@ async fn run() -> Result<()> {
             };
             rootyard::reliability::recover_startup(&state).await?;
             rootyard::sharding::transitions::reconcile_pending(&state).await.map_err(|e| anyhow::anyhow!(e.1))?;
-            rootyard::sharding::sidecar::reconcile_startup(&state)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.1))?;
+            rootyard::sharding::sidecar::reconcile_startup(&state).await.map_err(|e| anyhow::anyhow!(e.1))?;
             println!("offline reconciliation finished; inspect repository states for unresolved incidents");
         }
         "serve-mirror" if args.len() == 1 => {
@@ -160,6 +200,7 @@ async fn run() -> Result<()> {
             axum::serve(listener, rootyard::mirror::router(state)).with_graceful_shutdown(shutdown()).await?;
         }
         "serve" if args.len() <= 1 => {
+            rootyard::config::init_workspace_remote_delete_policy()?;
             let dispatch_settings = rootyard::dispatch::Settings::from_env()?;
             let maintenance_policy = rootyard::storage_lifecycle::models::Policy::from_env()?;
             std::fs::read_to_string("/proc/self/stat")
@@ -194,6 +235,9 @@ async fn run() -> Result<()> {
                 dispatch: rootyard::dispatch::Signals::default(),
                 git_slots: slots,
             });
+            // Fail startup on invalid admission settings before the listener
+            // accepts authentication traffic.
+            rootyard::auth_admission::init_for_state(&state)?;
             let configured_node = std::env::var("ROOTYARD_NODE_ID").ok();
             let local_fence = if std::env::var_os("ROOTYARD_LOCAL_FENCE_DIR").is_some() {
                 let node_id = configured_node.as_deref().context("local process fence requires ROOTYARD_NODE_ID")?;
@@ -209,9 +253,7 @@ async fn run() -> Result<()> {
             };
             rootyard::reliability::recover_startup(&state).await?;
             rootyard::sharding::transitions::reconcile_pending(&state).await.map_err(|e| anyhow::anyhow!(e.1))?;
-            rootyard::sharding::sidecar::reconcile_startup(&state)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.1))?;
+            rootyard::sharding::sidecar::reconcile_startup(&state).await.map_err(|e| anyhow::anyhow!(e.1))?;
             rootyard::recover(&state).await?;
             rootyard::sandbox::reconcile_startup(&state)
                 .await
@@ -235,6 +277,10 @@ async fn run() -> Result<()> {
                     state.git_slots.clone(),
                     state.config.max_concurrent_git,
                     state.transfer_metrics.clone(),
+                    rootyard::metrics_workers::Config {
+                        volume_id: state.storage.volume_id,
+                        scan_period_seconds: maintenance_policy.scan_period_seconds,
+                    },
                 );
                 Some(tokio::spawn(async move {
                     if axum::serve(listener, router).await.is_err() {
@@ -288,9 +334,31 @@ async fn run() -> Result<()> {
             let maintenance_task = maintenance_policy
                 .enabled
                 .then(|| tokio::spawn(rootyard::storage_lifecycle::run(state.clone(), maintenance_stop.clone())));
-            axum::serve(listener, rootyard::router(state)).with_graceful_shutdown(shutdown()).await?;
+            let session_gc_stop = tokio_util::sync::CancellationToken::new();
+            let session_gc_task =
+                tokio::spawn(rootyard::web::session_gc::run(state.pool.clone(), session_gc_stop.clone()));
+            // A disconnected client must not cancel a started workspace Git
+            // mutation: owned jobs finish under the normal Git deadline
+            // before the runtime exits. \`router\` consumes the state Arc, so
+            // the drain grace is computed before serving.
+            let git_shutdown_grace = state.config.git_timeout + std::time::Duration::from_secs(30);
+            axum::serve(
+                listener,
+                rootyard::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await?;
+            rootyard::workspaces::drain_git_jobs(git_shutdown_grace).await;
+            // The helper is a real child process: normal shutdown fences and
+            // unmounts inside it, then reaps it within a bounded grace. A helper
+            // that does not exit is reported as a failed shutdown.
+            rootyard::workspaces::mounts::shutdown_helper()
+                .await
+                .map_err(|_| anyhow::anyhow!("workspace FUSE helper shutdown failed"))?;
             worker.abort();
             maintenance_stop.cancel();
+            session_gc_stop.cancel();
+            let _ = session_gc_task.await;
             workspace_capture_stop.cancel();
             let _ = workspace_capture_task.await;
             if let Some(task) = controller_task {
@@ -312,7 +380,7 @@ async fn run() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130]]"
+            "usage: rootyard [serve | serve-blob | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132 | --allow-legacy-schema133 | --allow-legacy-schema134 | --allow-legacy-schema135 | --allow-legacy-schema136 | --allow-legacy-schema137 | --allow-legacy-schema138 | --allow-legacy-schema139 | --allow-legacy-schema140 | --allow-legacy-schema141 | --allow-legacy-schema142 | --allow-legacy-schema143]]"
         ),
     }
     Ok(())

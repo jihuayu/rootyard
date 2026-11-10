@@ -1,0 +1,124 @@
+{
+  "binary_sha256": "bc0abc3ed0ac2c5690581480456532eca17ffbbcb5a2667d10e0a1366845c03b",
+  "blob_only_service_sha256": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+  "cases": [
+    {
+      "detail": {
+        "archive_volume_initialized_by_real_reconcile_cli": true,
+        "closure_artifacts": 8,
+        "formats": [
+          "sha1",
+          "sha256"
+        ],
+        "no_persistent_bare": true,
+        "owned_databases": 2,
+        "real_git_push_clone_fsck": true,
+        "shared_barrier_loss_stops_service": true
+      },
+      "name": "real_http_sha1_sha256_source_without_persistent_bare",
+      "seconds": 13.5108,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "blob_bytes_in_archive": true,
+        "closure_artifacts": 8,
+        "closure_bytes": 6605,
+        "exclusive_pg_barrier_held_during_snapshot": true,
+        "format": 22,
+        "legacy_volume_lock_refused": true,
+        "schema": 147,
+        "serve_blob_refused_during_barrier": true,
+        "snapshot_waited_for_metadata_commit": true,
+        "source_ledgers_unchanged": true
+      },
+      "name": "offline_volume_and_postgres_snapshot_barriers",
+      "seconds": 21.7954,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "damaged_archives_rejected": 6,
+        "target_sql_untouched": true
+      },
+      "name": "incomplete_and_damaged_archives_rejected_before_sql",
+      "seconds": 125.8225,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "existing_directory_preserved": true,
+        "nested_backup_refused": true,
+        "populated_database_preserved": true
+      },
+      "name": "existing_database_and_directory_targets_refused",
+      "seconds": 8.2799,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "post_boundary_oid": "3c0e060aeffb4bfda60038b93bff767be9574cd8",
+        "real_post_boundary_ack": true
+      },
+      "name": "post_backup_acknowledged_write_excluded",
+      "seconds": 3.9186,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "exact_refs_content_fsck": true,
+        "formats": [
+          "sha1",
+          "sha256"
+        ],
+        "fresh_database": true,
+        "independent_blob_closure_restore": true,
+        "original_blob_objects_deleted_before_restore": true,
+        "post_boundary_commit_excluded": true,
+        "read_only_and_revoked_token_state_preserved": true,
+        "same_backend_identity": true,
+        "source_scratch_deleted": true
+      },
+      "name": "fresh_database_restore_clone_refs_content_fsck",
+      "seconds": 20.8553,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "exact_original_report": true,
+        "immutable_rows_unchanged": true,
+        "ledger_counters_unchanged": true
+      },
+      "name": "restored_exact_receive_replay_without_second_effect",
+      "seconds": 1.5225,
+      "status": "passed"
+    }
+  ],
+  "ci_release_gate": false,
+  "expected_cases": [
+    "real_http_sha1_sha256_source_without_persistent_bare",
+    "offline_volume_and_postgres_snapshot_barriers",
+    "incomplete_and_damaged_archives_rejected_before_sql",
+    "existing_database_and_directory_targets_refused",
+    "post_backup_acknowledged_write_excluded",
+    "fresh_database_restore_clone_refs_content_fsck",
+    "restored_exact_receive_replay_without_second_effect"
+  ],
+  "git_sha256": "92c38403054b6d6fef394391bd84beb54ebfaef2f096c1e93b56f5626733c649",
+  "harness_sha256": "20762bfde50bc2477474624f28b636f1a957a2d4736f2939d3f58aae0e3b4fcf",
+  "independent_blob_closure_backup_claimed": true,
+  "kind": "rootyard/paired-blob-backup-restore-acceptance",
+  "limitations": [
+    "Restore requires the same physical Blob backend identity (provider, endpoint, bucket, root, region, account) as the archive; a different backend is refused, not remapped.",
+    "Original Blob objects are deleted only in this run-owned fixture to prove the archive closure; product GC stays disabled and is untouched.",
+    "serve-blob holds the shared lifecycle advisory lock for its whole lifetime; offline backup/restore hold the exclusive one until publication. The legacy volume flock still only covers the native GitFS path.",
+    "No interrupted restore, multi-host failure, physical power-loss, throughput, or production RPO/RTO qualification is claimed.",
+    "No legacy format/schema upgrade is exercised. The current binary must restore its own format22/schema147 archive; format21/schema147 stays readable as a metadata-only historical archive."
+  ],
+  "passed": true,
+  "qualification_kind": "clean-candidate",
+  "retained_directory": "/tmp/rootyard-e2e-9r_xwpas",
+  "skips": 0,
+  "source_head": "4c4abe182f159bad4c6647c4c79e3f721c069bc4",
+  "source_inputs_sha256": "941eccc8b92e792b723b1c65c02bcf396d12a49b64545140f72f99cf348a7053"
+}

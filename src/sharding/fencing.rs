@@ -251,7 +251,7 @@ pub async fn get_fence_status(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read, crate::token_scopes::RepoAction::RepoRead).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let repo_gen: i64 = tx
         .query_one("SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id])
@@ -287,7 +287,7 @@ pub async fn apply_or_verify_fence(
     if matches!(action, "verify" | "check_write") {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read).await?;
+        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read, crate::token_scopes::RepoAction::RepoRead).await?;
         let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
         let repo_gen: i64 = tx
             .query_one("SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id])
@@ -308,7 +308,7 @@ pub async fn apply_or_verify_fence(
     auth::writable(&actor)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     let mutation = super::locks::exclusive(&state, access.repo_id).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let repo_gen: i64 = tx

@@ -1,0 +1,10 @@
+{
+  "remote_run": 42521472178,
+  "job": 128855697258,
+  "failure": "GitHub step5min cap; firstthree casespassed by21:23:57; cap21:24:07",
+  "local": "same seven-case core139 harness onsource-bound schema142app:7/7PASS115.290sec",
+  "change": "3populated backup stepcaps10min andbounded job75min; stripdebuginfo app/selectedfixtures toreduceartifactsize; allassertions/internaldeadlinesunchanged",
+  "builder": "optional flagdefaultsFalse; exactCargo config recorded inreceipt;12PythonunitsPASS;14F20referencechecksPASS",
+  "actual_flag_build": "PASS: repository run_build(strip=True), actual Cargo/Fresh=false, recorded low-disk package.debug=0 override; ELF debug_info/debug_line absent; schema142 binary smoke allchecksPASS10.022s",
+  "strip_binary_sha256": "e7951416a89d7dd15213b3c7ff9e89b4dc0adcf23d6c2d784c86a27acefd5a24"
+}

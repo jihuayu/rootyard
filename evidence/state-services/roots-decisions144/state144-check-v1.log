@@ -1,0 +1,154 @@
+    Checking opendal-service-s3 v0.57.0 (/workspace/scratch/state-services-roots-decisions/vendor/opendal-service-s3)
+    Checking opendal v0.57.0
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error[E0432]: unresolved import `crate::ref_store::core::publication_decision`
+  --> src/ref_store/core/pack_commit/authorized/cancel.rs:14:29
+   |
+14 | use crate::ref_store::core::publication_decision::{self, CancelOutcome};
+   |                             ^^^^^^^^^^^^^^^^^^^^ could not find `publication_decision` in `core`
+
+error[E0432]: unresolved import `crate::ref_store::core::publication_decision`
+  --> src/ref_store/core/pack_commit/authorized/select.rs:17:29
+   |
+17 | use crate::ref_store::core::publication_decision::{DecisionKind, SelectedDecision, select_and_install};
+   |                             ^^^^^^^^^^^^^^^^^^^^ could not find `publication_decision` in `core`
+
+error[E0432]: unresolved import `crate::ref_store::core::publication_decision`
+   --> src/ref_store/core/pack_commit/authorized/mod.rs:239:33
+    |
+239 |     use crate::ref_store::core::publication_decision::DecisionError as Decision;
+    |                                 ^^^^^^^^^^^^^^^^^^^^ could not find `publication_decision` in `core`
+
+error[E0432]: unresolved imports `super::pg::before_deadline`, `super::pg::bound_tx`, `super::pg::rollback_reads`
+  --> src/ref_store/core/retention_root/pg_register.rs:13:17
+   |
+13 | use super::pg::{before_deadline, bound_tx, db_now_micros, effective_deadline, pooled_client, rollback_reads, PgRetentionRoots};
+   |                 ^^^^^^^^^^^^^^^  ^^^^^^^^                                                    ^^^^^^^^^^^^^^ no `rollback_reads` in `ref_store::core::retention_root::pg`
+   |                 |                |
+   |                 |                no `bound_tx` in `ref_store::core::retention_root::pg`
+   |                 no `before_deadline` in `ref_store::core::retention_root::pg`
+
+error[E0432]: unresolved imports `super::pg::before_deadline`, `super::pg::bound_tx`, `super::pg::rollback_reads`
+  --> src/ref_store/core/retention_root/pg_release.rs:11:17
+   |
+11 | use super::pg::{before_deadline, bound_tx, effective_deadline, pooled_client, rollback_reads};
+   |                 ^^^^^^^^^^^^^^^  ^^^^^^^^                                     ^^^^^^^^^^^^^^ no `rollback_reads` in `ref_store::core::retention_root::pg`
+   |                 |                |
+   |                 |                no `bound_tx` in `ref_store::core::retention_root::pg`
+   |                 no `before_deadline` in `ref_store::core::retention_root::pg`
+
+error[E0432]: unresolved import `super::pg::rollback_reads`
+  --> src/ref_store/core/retention_root/read.rs:18:52
+   |
+18 | use super::pg::{effective_deadline, pooled_client, rollback_reads};
+   |                                                    ^^^^^^^^^^^^^^ no `rollback_reads` in `ref_store::core::retention_root::pg`
+
+error[E0432]: unresolved import `crate::ref_store::contract::CommitMode`
+  --> src/ref_store/core/pack_commit/closure.rs:26:34
+   |
+26 | use crate::ref_store::contract::{CommitMode, RequestDigest};
+   |                                  ^^^^^^^^^^ no `CommitMode` in `ref_store::contract`
+   |
+   = help: consider importing this enum through its public re-export instead:
+           crate::ref_store::CommitMode
+
+error[E0432]: unresolved import `crate::ref_store::contract::CommitMode`
+  --> src/ref_store/core/pack_commit/plan.rs:16:34
+   |
+16 | use crate::ref_store::contract::{CommitMode, OperationIdentity, RequestDigest};
+   |                                  ^^^^^^^^^^ no `CommitMode` in `ref_store::contract`
+   |
+   = help: consider importing this enum through its public re-export instead:
+           crate::ref_store::CommitMode
+
+error[E0432]: unresolved import `crate::ref_store::contract::CommitMode`
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:29:34
+   |
+29 | use crate::ref_store::contract::{CommitMode, OperationIdentity, RequestDigest};
+   |                                  ^^^^^^^^^^ no `CommitMode` in `ref_store::contract`
+   |
+   = help: consider importing this enum through its public re-export instead:
+           crate::ref_store::CommitMode
+
+error[E0432]: unresolved import `super::AuthorizedError`
+  --> src/ref_store/core/pack_commit/authorized/select.rs:13:13
+   |
+13 | use super::{AuthorizedError, PgAuthorizedCommit, PreparedPublication, effective_deadline, pooled_client};
+   |             ^^^^^^^^^^^^^^^ no `AuthorizedError` in `ref_store::core::pack_commit::authorized`
+
+error[E0433]: cannot find `publication_decision` in `core`
+   --> src/ref_store/core/pack_commit/authorized/mod.rs:238:61
+    |
+238 | pub(super) fn decision_error(error: crate::ref_store::core::publication_decision::DecisionError) -> AuthorizedCommitError {
+    |                                                             ^^^^^^^^^^^^^^^^^^^^ could not find `publication_decision` in `core`
+
+error[E0603]: module `witness` is private
+  --> src/ref_store/core/pack_commit/verifier/pointer.rs:22:49
+   |
+22 | use crate::ref_store::core::pack_commit::facts::witness::verify_local_bytes;
+   |                                                 ^^^^^^^  ------------------ function `verify_local_bytes` is not publicly re-exported
+   |                                                 |
+   |                                                 private module
+   |
+note: the module `witness` is defined here
+  --> src/ref_store/core/pack_commit/facts/mod.rs:14:1
+   |
+14 | mod witness;
+   | ^^^^^^^^^^^^
+
+error[E0603]: module `witness` is private
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:39:49
+   |
+39 | use crate::ref_store::core::pack_commit::facts::witness::{LfsByteWitness};
+   |                                                 ^^^^^^^ private module
+   |
+help: consider importing this trait through its public re-export instead:
+      crate::ref_store::core::pack_commit::LfsByteWitness
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:39:59
+   |
+39 | use crate::ref_store::core::pack_commit::facts::witness::{LfsByteWitness};
+   |                                                           ^^^^^^^^^^^^^^
+note: the module `witness` is defined here
+  --> src/ref_store/core/pack_commit/facts/mod.rs:14:1
+   |
+14 | mod witness;
+   | ^^^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+  --> src/ref_store/core/pack_commit/authorized/mod.rs:55:5
+   |
+55 | use uuid::Uuid;
+   |     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `AuthorizedCancelOutcome` and `AuthorizedCancelReceipt`
+  --> src/ref_store/core/pack_commit/authorized/mod.rs:57:18
+   |
+57 | pub use cancel::{AuthorizedCancelOutcome, AuthorizedCancelReceipt};
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `select::AuthorizedSelection`
+  --> src/ref_store/core/pack_commit/authorized/mod.rs:59:9
+   |
+59 | pub use select::AuthorizedSelection;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `GitObjectKind`, `LFS_MAX_OBJECT_BYTES`, `LfsByteLocation`, `LfsByteWitness`, `LfsPointerFact`, `NoDurableLfsBytes`, `PublicationFactsEngine`, `RefFacts`, `VerifiedPackIdentity`, and `VerifiedPublicationFacts`
+  --> src/ref_store/core/pack_commit/mod.rs:60:5
+   |
+60 |     GitObjectKind, LFS_MAX_OBJECT_BYTES, LfsByteLocation, LfsByteWitness, LfsPointerFact, NoDurableLfsBytes,
+   |     ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+61 |     PublicationFactsEngine, RefFacts, VerifiedPackIdentity, VerifiedPublicationFacts,
+   |     ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ref_store::core::types::GitObjectFormat`
+  --> src/ref_store/core/retention_root/candidate.rs:17:5
+   |
+17 | use crate::ref_store::core::types::GitObjectFormat;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some errors have detailed explanations: E0432, E0433, E0603.
+For more information about an error, try `rustc --explain E0432`.
+warning: `rootyard` (lib) generated 5 warnings
+error: could not compile `rootyard` (lib) due to 13 previous errors; 5 warnings emitted

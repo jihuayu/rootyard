@@ -1,0 +1,50 @@
+Command failed (101): Error: A2/A5 row cardinalities differ from the drill shape (one old A2 receipt plus six A5 receipts)
+
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "synthetic_source_with_typed_native_pack_snapshot_ledger",
+      "status": "failed",
+      "seconds": 7.8219,
+      "error": "Command failed (101): Error: A2/A5 row cardinalities differ from the drill shape (one old A2 receipt plus six A5 receipts)\n"
+    }
+  ],
+  "skips": 0,
+  "binary": "/workspace/scratch/state-pack143-app-v1/rootyard",
+  "binary_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+  "backup_format": 19,
+  "schema_version": 143,
+  "pack_snapshot_fixture_helper": {
+    "binary": "/workspace/scratch/state-pack143-backup-helper-build-v1/ref_store_pack_snapshots_backup_fixture",
+    "binary_sha256": "7ce5dd67257a6a7b392156046d26b64f326c97bd4ba2ead2d63f32b538df4c7c",
+    "build_receipt": "/workspace/scratch/state-pack143-backup-helper-build-v1/ref_store_pack_snapshots_backup_fixture.build.json",
+    "build_receipt_sha256": "8898f543a3d718494dda4a21f162c9216a40631cddc4e993706c78c1a3d9b0a5",
+    "build_kind": "rust-integration-test",
+    "package_rebuilt": true,
+    "fresh": false,
+    "fresh_false_artifact": {
+      "target": "ref_store_pack_snapshots_backup_fixture",
+      "kind": "test",
+      "fresh": false
+    },
+    "test_profile": true,
+    "integration_test_source_sha256": "583ad02898e4c48b587dd849f4ac55e231748fc5ac448236052e792f94b0ff61",
+    "integration_test_source_matches_source_file": true,
+    "source_inputs_sha256": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "candidate_application_receipt": "/workspace/scratch/state-pack143-app-v1/rootyard.build.json",
+    "candidate_application_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "candidate_application_package_rebuilt": true,
+    "source_inputs_match_candidate_application": true
+  },
+  "limitations": [
+    "The typed A5/A4/A3 ledger is seeded by the real adapter and native PackVerifier; no SQL ACK, proof, receipt or registration is fabricated.",
+    "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+    "The random pack repository stays provisioning/gitfs/unserved for the whole drill.",
+    "The DB-clock-expired scenario uses a 1s lease and a bounded clock_timestamp() poll, created last; it is not a TTL unit test.",
+    "complete_git_read_snapshot() is false everywhere: this drill claims registered pack membership metadata only, never verified Blob bytes or native Git object closure.",
+    "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+    "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+  ]
+}

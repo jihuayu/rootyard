@@ -1,0 +1,274 @@
+{
+  "suite": "local-workspace-prototype",
+  "binary": "/workspace/scratch/round5-implementation/security134-v1/rootyard-workspace-lab",
+  "binary_sha256": "ec7924496827a3b7fd7cde2a76ac8cdf4861c815c98517da2f09b0cab06b4205",
+  "git_version": "git version 2.52.0",
+  "checks": [
+    {
+      "name": "isolation_and_fixed_base",
+      "ok": true,
+      "detail": {
+        "independent_regular_files": 135,
+        "forks": 2,
+        "fixed_base_after_commit": true
+      },
+      "seconds": 0.813
+    },
+    {
+      "name": "partial_staging_and_intent",
+      "ok": true,
+      "detail": {
+        "head_index_worktree_distinct": true,
+        "raw_index_equal": true,
+        "intent_to_add": true
+      },
+      "seconds": 0.482
+    },
+    {
+      "name": "hardlinks_and_detached_head",
+      "ok": true,
+      "detail": {
+        "source_hardlinks_broken_into_independent_files": true,
+        "detached_head_preserved": true
+      },
+      "seconds": 0.466
+    },
+    {
+      "name": "merge_conflict",
+      "ok": true,
+      "detail": {
+        "stages": [
+          1,
+          2,
+          3
+        ],
+        "merge_head": true,
+        "restored_merge_committed": true
+      },
+      "seconds": 0.787
+    },
+    {
+      "name": "ignore_and_head_union",
+      "ok": true,
+      "detail": {
+        "ignored_untracked_excluded": 4,
+        "nested_negation": true,
+        "tracked_ignored_and_force_added": true,
+        "head_union_rm_cached": true,
+        "init_excludes_ignored_source_data_without_deleting_it": true
+      },
+      "seconds": 0.629
+    },
+    {
+      "name": "deletion_and_rename",
+      "ok": true,
+      "detail": {
+        "staged_and_unstaged_deletions": true,
+        "staged_and_unstaged_renames": true
+      },
+      "seconds": 0.46
+    },
+    {
+      "name": "modes_links_and_byte_names",
+      "ok": true,
+      "detail": {
+        "strange_tracked_names": 7,
+        "non_utf8_tracked_and_untracked": true,
+        "internal_relative_symlinks": true,
+        "executable_bits": true
+      },
+      "seconds": 0.521
+    },
+    {
+      "name": "fail_closed_corruption",
+      "ok": true,
+      "detail": {
+        "corruption_variants": [
+          "content",
+          "missing-index",
+          "manifest",
+          "manifest-digest",
+          "extra-file",
+          "execute-bit",
+          "manifest-traversal-rehashed",
+          "manifest-absolute-rehashed",
+          "manifest-duplicate-rehashed"
+        ],
+        "no_destination_published": true
+      },
+      "seconds": 1.323
+    },
+    {
+      "name": "unsupported_sources",
+      "ok": true,
+      "detail": {
+        "rejected_sources": [
+          "git-file",
+          "git-symlink",
+          "alternates",
+          "index-lock",
+          "ref-lock",
+          "unsupported-config",
+          "filter-config",
+          "info-filter-attributes",
+          "replacement-refs",
+          "split-index",
+          "sparse-config",
+          "fsmonitor-config",
+          "absolute-symlink",
+          "escaping-symlink",
+          "git-target-symlink",
+          "indirect-escape-symlink",
+          "indirect-git-symlink",
+          "wrong-base",
+          "bare-repository",
+          "sha256-repository"
+        ]
+      },
+      "seconds": 0.881
+    },
+    {
+      "name": "checkpoint_rejections_and_quiescence",
+      "ok": true,
+      "detail": {
+        "explicit_quiescence_required": true,
+        "active_lock_rejected": true,
+        "unsupported_mutated_config_rejected": true,
+        "unsafe_mutated_symlink_rejected": true
+      },
+      "seconds": 0.493
+    },
+    {
+      "name": "overlapping_store_leaves_source_untouched",
+      "ok": true,
+      "detail": {
+        "nested_store_rejected_before_any_source_mutation": true
+      },
+      "seconds": 0.026
+    },
+    {
+      "name": "unsupported_native_indexes",
+      "ok": true,
+      "detail": {
+        "native_git_generated_indexes_rejected": [
+          "sparse-index",
+          "fsmonitor-index"
+        ],
+        "unsupported_config_removed_before_validation": true
+      },
+      "seconds": 0.128
+    },
+    {
+      "name": "preflight_rejections_before_store",
+      "ok": true,
+      "detail": {
+        "preflight_rejections": [
+          "linked-worktree-git-file",
+          "worktree-shared-admin",
+          "submodule-git-modules",
+          "index-gitlink-without-gitmodules",
+          "head-gitlink-without-gitmodules",
+          "tracked-gitattributes-filter-lfs",
+          "sparse-checkout-ordinary-mode",
+          "split-index",
+          "external-alternates",
+          "sha256-repository",
+          "absolute-symlink",
+          "escaping-symlink",
+          "git-target-symlink",
+          "invalid-agent-before-store",
+          "invalid-oid-before-store",
+          "rootyardignore-ignored-attributes-accepted",
+          "ordinary-attributes-accepted",
+          "git-ignored-escaping-symlink-accepted"
+        ],
+        "fresh_store_paths_absent": true,
+        "source_bytes_refs_index_preserved": true,
+        "unmanaged_attributes_and_symlinks_not_rejected": true
+      },
+      "seconds": 1.465
+    },
+    {
+      "name": "recorded_git_version_mismatch",
+      "ok": true,
+      "detail": {
+        "exact_version_recorded": "git version 2.52.0",
+        "synthetic_version_mismatch_rejected_without_publication": true,
+        "matching_version_still_restores": true
+      },
+      "seconds": 0.397
+    },
+    {
+      "name": "publication_failpoints",
+      "ok": true,
+      "detail": {
+        "before_publish_exit": 86,
+        "after_publish_exit": 87,
+        "earlier_checkpoint_restorable": true,
+        "later_checkpoint_operation_succeeds": true
+      },
+      "seconds": 0.974
+    },
+    {
+      "name": "external_git_config_isolation",
+      "ok": true,
+      "detail": {
+        "system_global_and_command_config_ignored": true,
+        "external_git_paths_ignored": true
+      },
+      "seconds": 0.368
+    },
+    {
+      "name": "safe_config_and_raw_eol",
+      "ok": true,
+      "detail": {
+        "safe_local_config_accepted": true,
+        "raw_worktree_eol_preserved": true
+      },
+      "seconds": 0.45
+    },
+    {
+      "name": "status_and_rootyardignore",
+      "ok": true,
+      "detail": {
+        "dirty_entries": 2,
+        "ignored_entries": 3
+      },
+      "seconds": 0.297
+    },
+    {
+      "name": "changeset_and_three_way_apply",
+      "ok": true,
+      "detail": {
+        "changeset_applied": true,
+        "conflict_rejected": true
+      },
+      "seconds": 0.722
+    },
+    {
+      "name": "sync_dirty_incremental",
+      "ok": true,
+      "detail": {
+        "synced_entries": 2,
+        "excluded_ignored": 1
+      },
+      "seconds": 0.7
+    },
+    {
+      "name": "verify_readonly_view",
+      "ok": true,
+      "detail": {
+        "readonly_verified": true,
+        "writable_tamper_rejected": true
+      },
+      "seconds": 0.358
+    }
+  ],
+  "ok": true,
+  "limits": [
+    "Disposable local SHA-1 Git repositories on this operating system only.",
+    "Quiescence is a caller promise; no enforced write barrier is tested or claimed.",
+    "Process-exit publication failpoints do not emulate kernel or power loss.",
+    "No hostile multitenant isolation, remote persistence, cross-Git-version compatibility, or throughput claim."
+  ]
+}

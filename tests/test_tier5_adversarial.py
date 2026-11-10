@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import e2e_tiers  # noqa: E402
+from e2e_tiers import SchemaBoundaryIntegrationFixture  # noqa: E402
 import schema_baseline  # noqa: E402
 from workspace import WorkspaceHarness  # noqa: E402
 
@@ -75,6 +76,42 @@ def _extract_route_registrations(rs_path: Path) -> list[tuple[str, list[str]]]:
     return results
 
 
+def _expand_page_table(rs_path: str, prefixes: tuple[str, ...]) -> list[tuple[str, list[str]]]:
+    """Expands a shared page table that is mounted under several prefixes.
+
+    `src/web/repository_pages.rs` mounts one literal page table under
+    ``/web/repos/{owner}/{name}`` and the legacy ``/ui/repos/{owner}/{name}``
+    alias; an empty prefix list means the file's table is already absolute
+    (``org_admin``). The table's root page ``""`` is the repository overview,
+    so it is read from the same `.route(&page(""), …)` table.
+    """
+    text = (ROOT / rs_path).read_text(encoding="utf-8")
+    if not prefixes:
+        if 'format!("{prefix}' in text or re.search(r"pages\(\"/", text):
+            raise AssertionError(f"{rs_path} uses page prefixes but none were declared")
+        return _extract_route_registrations(ROOT / rs_path)
+    mounted = [prefix.strip('"') for prefix in re.findall(r"pages\((\"/[A-Za-z-]+\")\)", text)]
+    if sorted(mounted) != sorted(prefixes):
+        raise AssertionError(f"{rs_path} mounts page prefixes {mounted}, expected {list(prefixes)}")
+    if re.search(r'format!\("\{prefix\}/repos/\{\{owner\}\}/\{\{name\}\}\{tail\}"\)', text) is None:
+        raise AssertionError(f"{rs_path} does not build its pages from one shared format! table")
+    registrations = _extract_route_registrations(ROOT / rs_path)
+    root = re.findall("page\(\"\"\)\s*,(\s*get\([\w:]+\))", text)
+    if len(root) != 1:
+        raise AssertionError(f"{rs_path}: expected exactly one repository root page, found {len(root)}")
+    methods = [m.upper() for m in re.findall(r"\b(get|post|put|patch|delete)\s*\(", root[0])]
+    registrations.insert(0, ("", methods))
+    expanded: list[tuple[str, list[str]]] = []
+    for tail, page_methods in registrations:
+        # Tails: "" (repository overview), "/…", or the extractor's own
+        # leading parameter "/{oid}"; nothing may consume owner or name.
+        if tail and (not tail.startswith("/") or tail.split("/")[1] in ("{owner}", "{name}")):
+            raise AssertionError(f"{rs_path}: page '{tail}' is not a repository page tail")
+        for prefix in prefixes:
+            expanded.append((prefix + "/repos/{owner}/{name}" + tail, list(page_methods)))
+    return expanded
+
+
 def _normalize_route_pattern(route_path: str) -> str:
     """Replaces {param} with {} and {*wildcard} with {*} for collision detection."""
     segments = []
@@ -99,15 +136,23 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         "src/reliability.rs",
         "src/forge.rs",
         "src/pulls.rs",
-        "src/lfs.rs",
+        "src/lfs/routes.rs",
         "src/members.rs",
         "src/web.rs",
-        "src/sharding.rs",
+        "src/sharding/routes.rs",
     )
     ALL_PRIMARY_ROUTER_FILES = (
         *PRIMARY_ROUTER_FILES,
         "src/webhooks.rs",
     )
+    # Roots that only declare `mod routes;` and delegate must not hide an empty
+    # route table: the connected delegated file is checked instead of the root.
+    DELEGATED_ROUTE_FILES = {
+        "lfs": "src/lfs/routes.rs",
+        "sharding": "src/sharding/routes.rs",
+    }
+    # The single optional `state: Arc<AppState>` parameter is allowed here only.
+    STATE_ROUTE_DOMAINS = ("browse", "web")
 
     def test_all_seven_domain_routers_and_lib_rs_have_zero_method_path_collisions(self) -> None:
         lib_text = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
@@ -124,12 +169,74 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
             "web",
             "sharding",
         ):
-            self.assertIn(f".merge({domain}::routes())", lib_text)
+            root_rs = ROOT / "src" / f"{domain}.rs"
+            self.assertTrue(root_rs.is_file(), f"Missing domain root src/{domain}.rs")
+            root_src = root_rs.read_text(encoding="utf-8")
+            if domain in self.STATE_ROUTE_DOMAINS:
+                self.assertIn(
+                    "pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>>",
+                    root_src,
+                    f"src/{domain}.rs must take exactly the optional state parameter",
+                )
+                self.assertNotIn(
+                    "pub fn routes() -> Router<Arc<AppState>>",
+                    root_src,
+                    f"src/{domain}.rs must not keep a zero-argument routes() that the mount cannot call",
+                )
+                mount = f".merge({domain}::routes(state.clone()))"
+            else:
+                self.assertIn(
+                    "pub fn routes() -> Router<Arc<AppState>>",
+                    root_src,
+                    f"src/{domain}.rs missing pub fn routes() -> Router<Arc<AppState>>",
+                )
+                mount = f".merge({domain}::routes())"
+            self.assertIn(mount, lib_text, f"src/lib.rs does not mount {domain} routes via {mount}")
+            delegated = self.DELEGATED_ROUTE_FILES.get(domain)
+            if delegated is None:
+                self.assertNotIn(
+                    "routes::routes()",
+                    root_src,
+                    f"src/{domain}.rs has no declared delegation; keep its route table inline",
+                )
+            else:
+                self.assertIn("mod routes;", root_src, f"src/{domain}.rs must declare `mod routes;`")
+                self.assertTrue(
+                    e2e_tiers.SchemaBoundaryIntegrationFixture.directly_delegates_routes(root_src),
+                    f"src/{domain}.rs must delegate to routes::routes()",
+                )
+                empty_root = root_src.replace("routes::routes()", "Router::new()", 1)
+                empty_root += "\nfn unused() { let _ = routes::routes(); }\n"
+                self.assertFalse(
+                    e2e_tiers.SchemaBoundaryIntegrationFixture.directly_delegates_routes(empty_root),
+                    "an unused call must not disguise an empty exported router",
+                )
+                delegated_src = (ROOT / delegated).read_text(encoding="utf-8")
+                self.assertIn(
+                    "fn routes() -> Router<Arc<AppState>>",
+                    delegated_src,
+                    f"{delegated} must own the connected route table",
+                )
+                self.assertGreater(
+                    len(_extract_route_registrations(ROOT / delegated)),
+                    0,
+                    f"Delegated route file {delegated} registers no routes",
+                )
 
         seen_bindings: dict[tuple[str, str], tuple[str, str]] = {}
         total_bindings = 0
         for rel in self.ALL_PRIMARY_ROUTER_FILES:
-            regs = _extract_route_registrations(ROOT / rel)
+            if rel == "src/web.rs":
+                # Web UI is composed from page tables; `test_web` cross-checks
+                # their exact contents, here they join the shared collision map.
+                self.assertEqual(_extract_route_registrations(ROOT / rel), [], "src/web.rs must stay declarative")
+                regs = [
+                    *_extract_route_registrations(ROOT / "src/web/navigation.rs"),
+                    *_expand_page_table("src/web/repository_pages.rs", ("/web", "/ui")),
+                    *_expand_page_table("src/web/org_admin.rs", ()),
+                ]
+            else:
+                regs = _extract_route_registrations(ROOT / rel)
             self.assertGreater(len(regs), 0, f"No routes found in {rel}")
             for raw_path, methods in regs:
                 self.assertGreater(len(methods), 0, f"No HTTP methods extracted for {raw_path} in {rel}")
@@ -187,6 +294,38 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         self.assertEqual(param_by_prefix[("api", "repos", "{}", "{}", "teams", "{}", "members")][0], "{username}")
         self.assertEqual(param_by_prefix[("api", "repos", "{}", "{}", "permissions")][0], "{username}")
 
+    def test_route_audit_separates_services_and_rejects_same_scope_duplicates(self) -> None:
+        fixture = SchemaBoundaryIntegrationFixture
+        self.assertEqual(["legacy", "serve_blob"], fixture.audit_route_table()["scopes"])
+        with self.assertRaisesRegex(AssertionError, "router scope legacy"):
+            fixture.audit_route_table(extra_routes=[("duplicate", "/api/repos/{owner}/{name}/refs", "GET")])
+        with tempfile.TemporaryDirectory(prefix="rootyard-route-scope-") as tmp:
+            tree = Path(tmp)
+            route = '    .route("/api/repos/{owner}/{name}/refs", get(refs))\n'
+
+            def write(relative_path, count=1):
+                path = tree / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("pub fn routes() -> Router { Router::new()\n" + route * count + "}\n")
+                return path
+
+            write("src/browse.rs")
+            write("src/blob_git_gateway/mod.rs")
+            self.assertEqual(["legacy", "serve_blob"], fixture.audit_route_table(source_root=tree)["scopes"])
+            # Identical duplicate registrations within one file also collide.
+            write("src/blob_git_gateway/mod.rs", count=2)
+            with self.assertRaisesRegex(AssertionError, "router scope serve_blob"):
+                fixture.audit_route_table(source_root=tree)
+            write("src/blob_git_gateway/mod.rs")
+            duplicate = write("src/blob_git_gateway/duplicate.rs")
+            with self.assertRaisesRegex(AssertionError, "router scope serve_blob"):
+                fixture.audit_route_table(source_root=tree)
+            duplicate.unlink()
+            # An unrecognized service path is never silently exempted.
+            write("src/new_service/mod.rs")
+            with self.assertRaisesRegex(AssertionError, "router scope legacy"):
+                fixture.audit_route_table(source_root=tree)
+
     def test_no_legacy_axum_07_colon_or_star_route_syntax_and_valid_wildcard_placement(self) -> None:
         wildcard_routes: list[tuple[str, str]] = []
         for rs_file in sorted((ROOT / "src").rglob("*.rs")):
@@ -205,10 +344,24 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
                         )
                         wildcard_routes.append((rel, raw_path))
 
-        self.assertEqual(wildcard_routes, [("src/pulls.rs", "/api/repos/{owner}/{name}/branch-rules/{*branch}")])
+        # Both catch-alls are final-segment wildcards. src/pulls.rs owns the
+        # branch-rules catch-all of the PR router (branch names contain '/');
+        # src/blob_git_gateway/mod.rs is the separate Blob Git gateway ("serve-blob")
+        # router, where `any(api::unsupported_lfs)` explicitly refuses every LFS
+        # request instead of pretending to serve it.
+        self.assertEqual(
+            wildcard_routes,
+            [
+                ("src/blob_git_gateway/mod.rs", "/git/{owner}/{name}/info/lfs/{*rest}"),
+                ("src/pulls.rs", "/api/repos/{owner}/{name}/branch-rules/{*branch}"),
+            ],
+        )
 
     def test_lfs_upload_routes_disable_default_body_limit_while_api_router_caps_at_16kib(self) -> None:
-        lfs_src = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
+        lfs_root = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
+        self.assertIn("mod routes;", lfs_root, "src/lfs.rs must declare `mod routes;`")
+        self.assertIn("routes::routes()", lfs_root, "src/lfs.rs must delegate to routes::routes()")
+        lfs_src = (ROOT / "src/lfs/routes.rs").read_text(encoding="utf-8")
         lib_src = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
         mirror_src = (ROOT / "src/mirror.rs").read_text(encoding="utf-8")
 
@@ -219,8 +372,17 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
 
         # Ensure only PUT object routes are inside upload_routes before .layer(DefaultBodyLimit::disable())
         upload_block = lfs_src.split("DefaultBodyLimit::disable()", 1)[0]
-        self.assertEqual(upload_block.count("put(handlers::upload_object"), 8)
+        self.assertEqual(upload_block.count("put(upload::upload_object"), 8)
+        self.assertEqual(upload_block.count("put(upload::upload_object)"), 4)
+        self.assertEqual(upload_block.count("put(upload::upload_object_with_size)"), 4)
         self.assertNotIn("post(handlers::batch)", upload_block)
+        for other_method in ("get(", "post(", "patch(", "delete("):
+            self.assertNotIn(
+                other_method,
+                upload_block,
+                f"Only PUT LFS object uploads may bypass DefaultBodyLimit ({other_method})",
+            )
+        self.assertEqual(upload_block.count("objects/{oid}"), 8)
 
     def test_mirror_router_isolation_and_route_table_completeness(self) -> None:
         mirror_regs = _extract_route_registrations(ROOT / "src/mirror.rs")
@@ -244,13 +406,47 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
     """Class 2: Schema baseline 060, FK topological DAG, backup lock ordering, and relational CHECK constraints."""
 
     def test_migrations_001_to_030_exact_version_sequence_and_staged_sql_byte_parity(self) -> None:
-        self.assertEqual(schema_baseline.SCHEMA_VERSIONS, [1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60])
-        self.assertEqual(schema_baseline.LATEST_VERSION, 60)
-        self.assertEqual(schema_baseline.LATEST_PREFIX, "060")
-        self.assertEqual(schema_baseline.TABLE_COUNT, 34)
+        # Historical (pre-060) versions are frozen: newer migrations may only
+        # append versions after 060, never rewrite the earlier prefix.
+        frozen_versions = [1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60]
+        versions = schema_baseline.SCHEMA_VERSIONS
+        self.assertEqual([v for v in versions if v <= 60], frozen_versions)
+        self.assertEqual(versions, sorted(versions))
+        self.assertEqual(len(set(versions)), len(versions))
+        self.assertEqual(versions[0], 1)
 
+        # The frozen 060 fixture must describe exactly the 34 ordinary tables
+        # created by the historical migrations.
+        frozen_catalog = json.loads((ROOT / "schema/060_catalog.json").read_text(encoding="utf-8"))
+        frozen_tables = sorted(t["name"] for t in frozen_catalog["tables"] if t["kind"] == "r")
+        self.assertEqual(len(frozen_tables), 34)
+        historical_tables: list[str] = []
+        for mig_path in sorted((ROOT / "migrations").glob("*.sql")):
+            if int(mig_path.name.split("_", 1)[0]) > 60:
+                continue
+            body = "\n".join(
+                line.split("--", 1)[0] for line in mig_path.read_text(encoding="utf-8").splitlines()
+            )
+            historical_tables.extend(
+                m.group(1)
+                for m in re.finditer(
+                    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z0-9_]+)\s*\(",
+                    body,
+                    re.IGNORECASE,
+                )
+            )
+        self.assertEqual(sorted(historical_tables), frozen_tables)
+
+        # The live Rust registry must match every migration on disk exactly.
         info = e2e_tiers.SchemaBoundaryIntegrationFixture.verify_db_rs_and_migrations()
-        self.assertEqual(info["versions"], schema_baseline.SCHEMA_VERSIONS)
+        self.assertEqual(info["versions"], versions)
+        self.assertEqual(
+            info["files"], sorted(p.name for p in (ROOT / "migrations").glob("*.sql"))
+        )
+        latest = versions[-1]
+        self.assertEqual(schema_baseline.LATEST_VERSION, latest)
+        self.assertEqual(schema_baseline.LATEST_PREFIX, f"{latest:03d}")
+        self.assertGreaterEqual(latest, 60)
 
         staged_pairs = [
             ("migrations/009_forge_pulls.sql", "src/pulls/009_forge_pulls.sql", 9),
@@ -350,7 +546,10 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         self.assertEqual(len(created_order), schema_baseline.TABLE_COUNT)
         self.assertEqual(set(created_order), schema_baseline.EXPECTED_TABLES)
         expected_composite = {
+            "ci_checkout_delegations",
             "ci_checkout_jobs",
+            "ci_integration_checkout_jobs",
+            "ci_runs",
             "forge_branch_rules",
             "forge_check_runs",
             "forge_creation_requests",
@@ -358,11 +557,20 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             "forge_issues",
             "forge_pull_counters",
             "forge_pulls",
+            "forge_trusted_check_contexts",
             "forge_webhook_callbacks",
             "forge_webhook_deliveries",
             "forge_webhooks",
             "git_operations",
+            "lfs_locks",
             "lfs_objects",
+            "pando_pack_manifests",
+            "pando_repository_states",
+            "ref_store_core_gates",
+            "ref_store_core_pins",
+            "ref_store_core_serving_reads",
+            "ref_store_core_snapshots",
+            "ref_store_serving_repositories",
             "repository_audit_log",
             "repository_collaborators",
             "repository_shard_routes",
@@ -370,35 +578,83 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             "shard_failover_operations",
         }
         self.assertEqual(composite_tenant_tables, expected_composite)
+        # CREATE declarations include the historical actor/owner FK on
+        # git_operations. Later RBAC migrations separate its actor from the
+        # repository owner so collaborators can publish. Validate the current
+        # tenant FKs too, including constraints introduced through ALTER TABLE.
+        live = json.loads(schema_baseline.CATALOG_JSON_PATH.read_text())
+        current_composite = set()
+        for constraint in live["constraints"]:
+            definition = constraint["definition"].replace("public.", "").replace('"', "")
+            if re.search(
+                r"FOREIGN KEY \(repository_id, (?:tenant_id|owner_id)\) "
+                r"REFERENCES repositories\(id, owner_id\)", definition,
+            ):
+                current_composite.add(constraint["table"])
+        self.assertEqual(current_composite, (expected_composite - {"git_operations"}) | {
+            "storage_maintenance_repo_state", "storage_maintenance_jobs", "storage_maintenance_tombstones",
+        })
+        manifest_constraints = {
+            entry["name"]: entry["definition"].replace("public.", "").replace('"', "")
+            for entry in live["constraints"] if entry["table"] == "pando_manifest_artifacts"
+        }
+        self.assertEqual(
+            manifest_constraints["pando_manifest_artifacts_manifest_identity_fkey"],
+            "FOREIGN KEY (manifest_id, repository_id, tenant_id) "
+            "REFERENCES pando_pack_manifests(id, repository_id, tenant_id) ON DELETE CASCADE",
+        )
+        self.assertNotIn("pando_manifest_artifacts_manifest_id_fkey", manifest_constraints)
+        # Comments/reviews inherit tenant+repository identity through their
+        # composite issue/PR parent rather than a second direct repository FK.
+        for table, parent, number in (
+            ("forge_issue_comments", "forge_issues", "issue_number"),
+            ("forge_pull_reviews", "forge_pulls", "pull_number"),
+        ):
+            expected = (f"FOREIGN KEY (tenant_id, repository_id, {number}) "
+                        f"REFERENCES public.{parent}(tenant_id, repository_id, number)")
+            self.assertTrue(any(c["table"] == table and c["definition"] == expected
+                                for c in live["constraints"]), f"{table} lost its tenant-scoped parent FK")
 
     def test_backup_tables_lexicographical_lock_ordering_and_advisory_lock_barrier(self) -> None:
         info = e2e_tiers.SchemaBoundaryIntegrationFixture.verify_backup_tables_parity()
         self.assertEqual(info["count"], schema_baseline.TABLE_COUNT)
         self.assertEqual(info["tables"], sorted(schema_baseline.EXPECTED_TABLES))
+        self.assertEqual(info["catalog"], f"schema/{schema_baseline.LATEST_PREFIX}_catalog.json")
+        self.assertIsInstance(info["format"], int)
+        # The full catalog includes non-table relations. The snapshot's LOCK
+        # TABLE list uses only the ordinary-table subset, not those views.
+        self.assertTrue(set(info["tables"]) < set(info["relations"]))
+        self.assertEqual(info["relations"], sorted(info["relations"]))
 
+        # The root module must delegate to the frozen catalog instead of
+        # carrying its own copy of the relation list.
         backup_src = (ROOT / "src/backup.rs").read_text(encoding="utf-8")
-        adv_pos = backup_src.find("pg_advisory_lock(738390103)")
-        lock_pos = backup_src.find("LOCK TABLE {list} IN SHARE MODE")
-        self.assertGreater(adv_pos, 0)
-        self.assertGreater(lock_pos, adv_pos, "pg_advisory_lock must precede LOCK TABLE in src/backup.rs")
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_catalog.sql")', backup_src)
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_catalog.json")', backup_src)
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_restored_catalog.json")', backup_src)
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_upgraded_catalog.json")', backup_src)
-        for tbl in (
-            "forge_webhook_callbacks",
-            "forge_webhook_deliveries",
-            "forge_webhooks",
-            "repository_audit_log",
-            "repository_collaborators",
-            "repository_shard_routes",
-            "repository_team_members",
-            "repository_teams",
-            "shard_failover_operations",
-            "shard_nodes",
-            "shard_virtual_buckets",
-        ):
-            self.assertIn(f'"{tbl}"', backup_src)
+        self.assertNotIn("const TABLES", backup_src)
+        self.assertIn("use catalog::{", backup_src)
+        self.assertIn("FORMAT", backup_src)
+
+        catalog_src = (ROOT / "src/backup/catalog.rs").read_text(encoding="utf-8")
+        for suffix in ("catalog.json", "restored_catalog.json", "upgraded_catalog.json"):
+            self.assertIn(
+                f'include_str!("../../schema/{schema_baseline.LATEST_PREFIX}_{suffix}")',
+                catalog_src,
+            )
+        self.assertIn('entry["kind"] == "r"', catalog_src)
+        self.assertIn("names.sort();", catalog_src)
+
+        snapshot_src = (ROOT / "src/backup/snapshot.rs").read_text(encoding="utf-8")
+        adv_pos = snapshot_src.find("BackupMutex::acquire(&client)")
+        rel_pos = snapshot_src.find("catalog::relations(FORMAT, true)")
+        lock_pos = snapshot_src.find("LOCK TABLE {list} IN SHARE MODE")
+        self.assertGreater(adv_pos, 0, "advisory lock must be taken in src/backup/snapshot.rs")
+        transaction_pos = snapshot_src.find("client.build_transaction()")
+        self.assertGreater(transaction_pos, adv_pos, "backup must take the barrier before opening its snapshot transaction")
+        self.assertGreater(rel_pos, adv_pos, "catalog relations must be read after the advisory lock")
+        self.assertGreater(lock_pos, rel_pos, "pg_advisory_lock and the catalog relation list must precede LOCK TABLE")
+
+        postgres_src = (ROOT / "src/backup/postgres.rs").read_text(encoding="utf-8")
+        self.assertIn("catalog::relations(format, false)", postgres_src)
+        self.assertIn("backup supports only the exact Rootyard public schema", postgres_src)
 
     def test_schema_030_catalog_json_structural_invariants_and_contract_digest(self) -> None:
         self.assertEqual(
@@ -414,7 +670,17 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             )
         ]
         for cat in catalogs:
-            self.assertEqual(len(cat["tables"]), schema_baseline.TABLE_COUNT)
+            # The catalog lists every relation; TABLE_COUNT covers ordinary
+            # tables only (kind == "r"), views are validated separately below.
+            ordinary = [t for t in cat["tables"] if t["kind"] == "r"]
+            self.assertEqual(len(ordinary), schema_baseline.TABLE_COUNT)
+            # Non-table relations are sequences and must stay explicit.
+            non_tables = [t for t in cat["tables"] if t["kind"] != "r"]
+            self.assertEqual(
+                sorted(t["kind"] for t in non_tables),
+                ["S"] * len(non_tables),
+            )
+            self.assertEqual(len(ordinary) + len(non_tables), len(cat["tables"]))
             self.assertGreaterEqual(len(cat["columns"]), 314)
             self.assertGreaterEqual(len(cat["constraints"]), 254)
             self.assertGreaterEqual(len(cat["indexes"]), 70)
@@ -453,7 +719,15 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         c2 = [c for c in catalogs[2]["constraints"] if c["table"] in new_tables]
         self.assertEqual(c0, c1)
         self.assertEqual(c1, c2)
-        self.assertEqual(len(c0), 158)
+        # Anchor on the frozen 060 fixture; the live catalog may only grow
+        # because later migrations add constraints to these tables.
+        frozen = json.loads((ROOT / "schema/060_catalog.json").read_text(encoding="utf-8"))
+        frozen_new = [c for c in frozen["constraints"] if c["table"] in new_tables]
+        self.assertEqual(len(frozen_new), 158)
+        self.assertGreaterEqual(len(c0), len(frozen_new))
+        live_keys = {(c["table"], c["name"]) for c in c0}
+        for con in frozen_new:
+            self.assertIn((con["table"], con["name"]), live_keys)
 
     def test_sqlite_relational_constraint_adversarial_rejection_on_009_020_030_tables(self) -> None:
         with tempfile.TemporaryDirectory(prefix="rootyard-tier5-sql-") as tmp:
@@ -580,7 +854,18 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
     def test_all_track_submodules_exist_and_satisfy_single_responsibility_line_bounds(self) -> None:
         expected_submodules = {
             "pulls": (["models.rs", "handlers.rs", "checks.rs", "rules.rs", "merge.rs"], 600),
-            "browse": (["models.rs", "git_read.rs", "handlers.rs", "transactions.rs", "object_format.rs"], 550),
+            "browse": (
+                [
+                    "models.rs",
+                    "git_read.rs",
+                    "git_read/command.rs",
+                    "git_read/paging.rs",
+                    "handlers.rs",
+                    "transactions.rs",
+                    "object_format.rs",
+                ],
+                550,
+            ),
             "lfs": (["models.rs", "storage.rs", "handlers.rs"], 550),
             "webhooks": (["models.rs", "signing.rs", "delivery.rs", "handlers.rs"], 550),
             "members": (["models.rs", "rbac.rs", "audit.rs"], 550),
@@ -646,6 +931,80 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
                 self.assertNotIn(sql_kw, src, f"Router entry {entry_rel} must not embed inline SQL ({sql_kw})")
             self.assertNotIn("Command::new", src, f"Router entry {entry_rel} must not spawn subprocesses directly")
 
+    RUST_MODULE_RE = re.compile(r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_][a-z0-9_]*)\s*;')
+
+    def _rust_module_closure(self, rel: str) -> set[str]:
+        """Files reachable from `rel` through `mod x;` declarations.
+
+        Rust-only: the root and every in-repo (or `#[path]`-redirected) child
+        module. Used to prove that a refactored composition still compiles all
+        the modules it used to.
+        """
+        pending, seen = [rel], set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            path = ROOT / current
+            self.assertTrue(path.is_file(), f"{rel} declares a missing module file: {current}")
+            text = path.read_text(encoding="utf-8")
+            parent = path.parent
+            for match in re.finditer(r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_][a-z0-9_]*)\s*;', text):
+                prefix = text[max(0, match.start() - 200) : match.start()]
+                attr = re.search(r'#\[path\s*=\s*"([^"]+)"\]\s*$', prefix)
+                if attr is not None:
+                    pending.append((parent / attr.group(1)).relative_to(ROOT).as_posix())
+                    continue
+                name = match.group(1)
+                owned = path.with_suffix("")
+                candidates = (
+                    parent / f"{name}.rs",
+                    parent / name / "mod.rs",
+                    parent / f"{name}.rs",
+                    owned / f"{name}.rs",
+                    owned / name / "mod.rs",
+                )
+                for candidate in candidates:
+                    if candidate.is_file():
+                        pending.append(candidate.relative_to(ROOT).as_posix())
+                        break
+                else:
+                    # `#[cfg(...)]`-only, generated or external modules are not
+                    # composition files; anything else must resolve.
+                    cfg_only = re.search(r'#\[cfg\([^\]]*\)\]\s*$', prefix) is not None
+                    self.assertTrue(cfg_only, f"{current}: mod {name}; has no module file")
+        return seen
+
+    def test_web_composition_builds_every_web_module(self) -> None:
+        # The Web UI root is a thin composition file; every page module it used
+        # to declare in one piece must remain part of its Rust module closure,
+        # and each composition table must be reachable from it.
+        expected = {
+            "src/web.rs",
+            "src/web/detail_pagination.rs",
+            "src/web/handlers.rs",
+            "src/web/models.rs",
+            "src/web/native_reads.rs",
+            # Organization pages are owned by the files the admin UI imports.
+            "src/web/org_admin.rs",
+            "src/web/org_admin_actions.rs",
+            "src/web/org_admin_views.rs",
+            "src/web/repository_listing.rs",
+            "src/web/sanitize.rs",
+            "src/web/session.rs",
+            "src/web/session_gc.rs",
+            "src/web/templates.rs",
+            "src/web/tokens.rs",
+            "src/web/navigation.rs",
+            "src/web/repository_pages.rs",
+        }
+        closure = self._rust_module_closure("src/web.rs")
+        self.assertEqual(closure & expected, expected, "src/web.rs lost a Web UI module")
+        root = (ROOT / "src/web.rs").read_text(encoding="utf-8")
+        for table in ("navigation", "repository_pages", "org_admin"):
+            self.assertIn(f"pub mod {table};", root, f"src/web.rs must declare {table}")
+
     def test_serde_deny_unknown_fields_and_shared_auth_fencing_across_tracks(self) -> None:
         model_files = (
             "src/pulls/models.rs",
@@ -677,7 +1036,9 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
         # Verify shared auth::authenticate, authorize_repo, finish_tx, and tokio::spawn disconnect safety
         merge_src = (ROOT / "src/pulls/merge.rs").read_text(encoding="utf-8")
         tx_src = (ROOT / "src/browse/transactions.rs").read_text(encoding="utf-8")
-        lfs_src = (ROOT / "src/lfs/handlers.rs").read_text(encoding="utf-8")
+        lfs_root = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
+        self.assertIn("mod upload;", lfs_root, "src/lfs.rs must declare the upload submodule")
+        lfs_src = (ROOT / "src/lfs/upload.rs").read_text(encoding="utf-8")
         wh_src = (ROOT / "src/webhooks/handlers.rs").read_text(encoding="utf-8")
         self.assertIn("tokio::spawn", merge_src)
         self.assertIn("finish_tx", merge_src)
@@ -685,6 +1046,15 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
         self.assertIn("finish_tx", tx_src)
         self.assertIn("tokio::spawn", lfs_src)
         self.assertIn("auth::authenticate", lfs_src)
+        self.assertIn("sanitize_headers", lfs_src)
+        self.assertEqual(lfs_src.count("tokio::spawn(async move { upload_inner("), 2)
+        upload_inner = lfs_src.split("async fn upload_inner(", 1)[1]
+        self.assertLess(
+            upload_inner.index("sanitize_headers(&headers)"),
+            upload_inner.index("auth::authenticate"),
+            "LFS upload must strip conflicting auth headers before authenticating",
+        )
+        self.assertIn("auth::writable(&actor)", upload_inner)
         self.assertIn("tokio::spawn", wh_src)
 
 

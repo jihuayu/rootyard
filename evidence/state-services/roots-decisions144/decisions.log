@@ -1,0 +1,25 @@
+
+running 20 tests
+test decision_subset_support::cases_a::atomic_multi_update_bad_cas_is_durably_rejected_without_ref_or_revision_change ... ok
+test decision_subset_support::cases_a::branch_pointing_at_tree_or_blob_is_rejected_per_ref_and_valid_sibling_commits ... ok
+test decision_subset_support::cases_a::missing_new_target_is_per_ref_and_valid_sibling_still_commits ... ok
+test decision_subset_support::cases_a::missing_shared_pack_bytes_fail_the_whole_operation_without_refs ... ok
+test decision_subset_support::cases_a::mixed_batch_bad_cas_and_valid_new_ref_commits_only_the_good_ref_and_replays_exactly ... ok
+test decision_subset_support::cases_a::protected_branch_approval_rule_rejects_main_and_accepts_unprotected_sibling ... ok
+test decision_subset_support::cases_b::collaborator_rbac_revoke_between_select_and_commit_durably_rejects_decision ... ok
+test decision_subset_support::cases_b::one_second_token_expiry_on_the_database_clock_refuses_commit_without_backdating ... ok
+test decision_subset_support::cases_b::phantom_branch_rule_inserted_after_select_refuses_commit_and_keeps_refs ... ok
+test decision_subset_support::cases_b::restricted_pat_scope_narrowing_is_denied_at_select_without_a_decision ... ok
+test decision_subset_support::cases_b::revoked_api_token_between_select_and_commit_durably_rejects_decision ... ok
+test decision_subset_support::cases_b::trusted_check_withdrawal_after_select_refuses_commit ... ok
+test decision_subset_support::cases_c::all_rejected_prefix_and_head_dependency_refusals_leave_no_ref_revision ... ok
+test decision_subset_support::cases_c::cancel_before_install_persists_both_tombstones_and_blocks_late_select ... ok
+test decision_subset_support::cases_c::cancel_commit_race_has_exactly_one_terminal_and_unauthorized_cancel_is_denied ... ok
+test decision_subset_support::cases_c::decision_fence_refuses_legacy_metadata_and_a4_fresh_writes_but_replays_the_old_terminal ... ok
+test decision_subset_support::cases_c::metadata_commit_refs_request_uses_authorized_facade_not_legacy_plan ... ok
+test decision_subset_support::cases_d::metadata_accepted_subset_applies_only_valid_ref_sets_fence_and_replays_exactly ... ok
+test decision_subset_support::cases_d::metadata_reserved_terminal_finishes_at_quota_and_fresh_install_refuses_atomically ... ok
+test decision_subset_support::cases_d::metadata_revoked_token_final_commit_durably_rejects_without_ref_or_revision_effect ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 77.11s
+

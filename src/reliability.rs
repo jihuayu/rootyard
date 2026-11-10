@@ -148,6 +148,9 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
         let finished = journal::is_finished(&operation)?;
         let interrupted = journal::is_interrupted(&operation)?;
         let evidence = (journal::events(&operation), journal::receipts(&operation), journal::requests(&operation));
+        // Only the reconciliation below may mint the no-grant witness, and only
+        // from this operation's own journal evidence.
+        let mut no_grant = None;
         let (outcome, changes, evidence) = if operation.ci_pin.is_some() {
             match (
                 finished && operation.storage_generation == generation,
@@ -230,6 +233,12 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
                         })
                         .unwrap_or_default();
                     let evidence = serde_json::json!({"version":1,"finished":finished,"interrupted":interrupted,"reference_events":raw,"requested":requested,"post_receive":receipt,"storage_generation_matches":operation.storage_generation==generation,"repeated_receipt_refs":repeated,"ungranted_without_hooks":ungranted_without_hooks});
+                    if ungranted_without_hooks && outcome == "no_ref_changes" {
+                        // Re-derives every condition from the same journal; any
+                        // material difference yields no proof and keeps the
+                        // authority check in admission settlement.
+                        no_grant = crate::storage::no_grant_proof::NoGrantAbort::from_journal(&operation, outcome);
+                    }
                     (outcome, changes, evidence)
                 }
                 _ => {
@@ -237,26 +246,39 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
                 }
             }
         };
-        events::publish(
-            &state.pool,
-            &events::OperationRecord {
-                id: operation.id,
-                repository_id: repo,
-                actor_id: operation.actor_id,
-                token_id: operation.token_id,
-                service_principal_id: operation.service_principal_id,
-                actor_name: operation.actor_name.clone(),
-                sequence: operation.sequence,
-                storage_generation: operation.storage_generation,
-                outcome: outcome.into(),
-                evidence,
-                admission: operation
-                    .requires_parent_publication
-                    .then_some(events::AdmissionRecord { writer_id: operation.id, shard_epoch: operation.shard_epoch }),
-            },
-            &changes,
-        )
-        .await?;
+        let record = events::OperationRecord {
+            id: operation.id,
+            repository_id: repo,
+            actor_id: operation.actor_id,
+            token_id: operation.token_id,
+            service_principal_id: operation.service_principal_id,
+            actor_name: operation.actor_name.clone(),
+            sequence: operation.sequence,
+            storage_generation: operation.storage_generation,
+            outcome: outcome.into(),
+            evidence,
+            admission: operation
+                .requires_parent_publication
+                .then_some(events::AdmissionRecord { writer_id: operation.id, shard_epoch: operation.shard_epoch }),
+        };
+        // Only this reconciliation, and only for a journal-derived `recorded`
+        // outcome, may mint the historical settlement capability. It re-reads
+        // the same journal and must describe exactly this record and event
+        // payload; any mismatch falls back to ordinary current-authority
+        // publication, which still requires a live ready write.
+        let recorded = if outcome == "recorded" {
+            crate::storage::recorded_receipt_proof::RecordedReceiptProof::from_journal(&operation, outcome, generation)
+                .filter(|proof| proof.matches_record(&record, &changes))
+        } else {
+            None
+        };
+        match (no_grant, recorded) {
+            (Some(proof), _) => events::publish_with_no_grant(&state.pool, &record, &changes, &proof).await?,
+            (None, Some(proof)) => {
+                events::publish_with_recorded_receipt(&state.pool, &record, &changes, &proof).await?
+            }
+            (None, None) => events::publish(&state.pool, &record, &changes).await?,
+        }
         // PG publication committed. Wake hints can be lost and never affect correctness.
         state.dispatch.committed();
         if outcome == "unknown" {

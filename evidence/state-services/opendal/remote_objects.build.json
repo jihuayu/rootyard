@@ -1,0 +1,63 @@
+{
+  "kind": "test",
+  "workspace_commit": "b8e6fc67337acb4c0109ea082ae99bafb488d746",
+  "source_inputs_sha256": "7d8fda90ba516390ff4a612b707fee9c3540fba26d9b8f8505d83448ff4833cb",
+  "binary_sha256": "89e6f147dc82358f270724b4dd724596f40ebdb463d9cdc96f66504a8b486d44",
+  "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+  "command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--config",
+    "profile.test.package.rootyard.debug=0",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--config",
+    "profile.test.package.rootyard.strip=\"debuginfo\"",
+    "test",
+    "--locked",
+    "--lib",
+    "--test",
+    "legacy_s3_stack",
+    "--test",
+    "remote_objects",
+    "--test",
+    "blob_provider_contract",
+    "--features",
+    "blob-azblob",
+    "--no-run",
+    "--message-format=json-render-diagnostics"
+  ],
+  "package_rebuilt": true,
+  "relocated_artifact": true,
+  "original_artifact_sha256": "89e6f147dc82358f270724b4dd724596f40ebdb463d9cdc96f66504a8b486d44",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "fresh_false_artifacts": [
+    {
+      "target": "rootyard",
+      "kind": "lib",
+      "fresh": false,
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": false
+      }
+    },
+    {
+      "target": "remote_objects",
+      "kind": "test",
+      "fresh": false,
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "executable": "/workspace/rootyard/target/debug/deps/remote_objects-4daff0b6a6ad305a"
+    }
+  ],
+  "test_source_sha256": "4535d96f21a8ddd75fe1283c7006ec1f12356dfd5daa976a17757ad290ab4ecc"
+}

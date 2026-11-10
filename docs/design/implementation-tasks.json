@@ -1,0 +1,534 @@
+{
+  "architecture": "blob-only-v2",
+  "baseline": "49f09c233a88143ce092af556760149aa9571575",
+  "tasks": [
+    {
+      "key": "105",
+      "number": 105,
+      "title": "[Roadmap] Blob-only 单机与 Raft Ref-CAS 分布式状态服务",
+      "dependencies": []
+    },
+    {
+      "key": "106",
+      "number": 106,
+      "title": "[State/W0] 冻结全新安装 Blob-only 双部署契约与基线",
+      "dependencies": []
+    },
+    {
+      "key": "107",
+      "number": 107,
+      "title": "[State/W1] 完成 PG RefStore 服务权威与未决语义",
+      "dependencies": [
+        106
+      ]
+    },
+    {
+      "key": "108",
+      "number": 108,
+      "title": "[State/W1-B] 完成 OpenDAL Blob 生产 provider 契约",
+      "dependencies": [
+        106
+      ]
+    },
+    {
+      "key": "109",
+      "number": 109,
+      "title": "[State/W1-C] 全内容 Blob、可丢 Git 视图与 KeyProvider",
+      "dependencies": [
+        107,
+        108
+      ]
+    },
+    {
+      "key": "110",
+      "number": 110,
+      "title": "[State/W1-L] 交付单进程 PG+Blob 轻量单机",
+      "dependencies": [
+        107,
+        108,
+        109,
+        143,
+        144,
+        148
+      ]
+    },
+    {
+      "key": "111",
+      "number": 111,
+      "title": "[State/W2] Memory/Redis 缓存唤醒且 Redis 仅可丢",
+      "dependencies": [
+        106
+      ]
+    },
+    {
+      "key": "112",
+      "number": 112,
+      "title": "[State/S3] PG 发布决策服务接入、真实权限 writer 与撤销屏障",
+      "dependencies": [
+        107,
+        106
+      ]
+    },
+    {
+      "key": "113",
+      "number": 113,
+      "title": "[State/W4-A] 全局 Blob artifact hold、配额与防 ABA",
+      "dependencies": [
+        107,
+        108
+      ]
+    },
+    {
+      "key": "114",
+      "number": 114,
+      "title": "[State/S2] 补齐 RefStore snapshot/pin/root 核心契约与同权威保留语义",
+      "dependencies": [
+        107,
+        113
+      ]
+    },
+    {
+      "key": "115",
+      "number": 115,
+      "title": "[State/W5-A] 交付真实持久 Raft Ref-CAS 运行时",
+      "dependencies": [
+        106,
+        107,
+        149
+      ]
+    },
+    {
+      "key": "116",
+      "number": 116,
+      "title": "[State/W5-B] 确定性 Ref-CAS 状态机与幂等 CAS",
+      "dependencies": [
+        107,
+        112,
+        113,
+        114,
+        115
+      ]
+    },
+    {
+      "key": "117",
+      "number": 117,
+      "title": "[State/D4] Ref-CAS Git 事件重放、PG 投影与可靠任务桥",
+      "dependencies": [
+        116
+      ]
+    },
+    {
+      "key": "118",
+      "number": 118,
+      "title": "[State/W7-A] PG PR 合并与可恢复 finalizer 先行",
+      "dependencies": [
+        107,
+        109,
+        112,
+        114,
+        144
+      ]
+    },
+    {
+      "key": "119",
+      "number": 119,
+      "title": "[State/W7-B] CI/Namespace/Workspace/LFS producer 先行接入",
+      "dependencies": [
+        107,
+        109,
+        112,
+        114,
+        145,
+        146,
+        147
+      ]
+    },
+    {
+      "key": "120",
+      "number": 120,
+      "title": "[State/W8-A] 当前格式 PG+Blob 配对全新恢复",
+      "dependencies": [
+        107,
+        109,
+        113,
+        114,
+        118,
+        119
+      ]
+    },
+    {
+      "key": "122",
+      "number": 122,
+      "title": "[State/W9-A] Blob 压实与默认关闭的安全 GC",
+      "dependencies": [
+        113,
+        114,
+        118,
+        119,
+        120,
+        151,
+        153
+      ]
+    },
+    {
+      "key": "123",
+      "number": 123,
+      "title": "[State/Release] 汇总单机与分布式新架构资格及发布闸门",
+      "dependencies": [
+        154,
+        157
+      ]
+    },
+    {
+      "key": "42",
+      "number": 42,
+      "title": "[Perf] 独立 ref 并发写入不引入整仓传输锁",
+      "dependencies": [
+        107
+      ]
+    },
+    {
+      "key": "FRESH_AUTHORITY",
+      "number": 143,
+      "title": "[State/S1] 全新安装初始化、正常仓库创建与唯一 authority 的幂等 provisioning",
+      "dependencies": [
+        107,
+        106
+      ]
+    },
+    {
+      "key": "GATEWAY",
+      "number": 144,
+      "title": "[State/S2] 公网 Git/Browse/ref 事务 API 统一走 RefStore 与 Blob 临时视图",
+      "dependencies": [
+        107,
+        108,
+        109,
+        112,
+        114,
+        143
+      ]
+    },
+    {
+      "key": "LFS_BLOB",
+      "number": 145,
+      "title": "[State/S4] LFS Batch、传输与发布证明统一走 Blob 并用官方客户端验收",
+      "dependencies": [
+        108,
+        109,
+        112,
+        113,
+        114,
+        144
+      ]
+    },
+    {
+      "key": "WORKSPACE_BLOB",
+      "number": 146,
+      "title": "[State/S4] workspace/checkpoint 字节单 barrier 入 Blob、不可变 manifest 与远端恢复",
+      "dependencies": [
+        108,
+        109,
+        113,
+        114
+      ]
+    },
+    {
+      "key": "CI_NAMESPACE",
+      "number": 147,
+      "title": "[State/S4] CI checkout pin/revocation 与 Namespace GitView 的生产者与原子 retention",
+      "dependencies": [
+        107,
+        109,
+        112,
+        113,
+        114,
+        144
+      ]
+    },
+    {
+      "key": "RAFT_STORAGE",
+      "number": 149,
+      "title": "[State/D] 成熟 Raft 存储适配：WAL/vote/hardstate、原子 apply 与真实故障注入",
+      "dependencies": [
+        106,
+        107
+      ]
+    },
+    {
+      "key": "RAFT_RPC",
+      "number": 150,
+      "title": "[State/D] 租户作用域 mTLS Raft RPC、ReadIndex 与有界流式协议",
+      "dependencies": [
+        115,
+        116,
+        143
+      ]
+    },
+    {
+      "key": "REMOTE_AUTHZ",
+      "number": 152,
+      "title": "[State/D] PG OPEN→CLOSING 投影、signed decision 与吊销前 drain/terminal 屏障",
+      "dependencies": [
+        112,
+        115,
+        116,
+        150
+      ]
+    },
+    {
+      "key": "DISTRIBUTED_DEPLOY",
+      "number": 155,
+      "title": "[State/D] 真实 3 选票独立主机分布式部署 profile 与 PG/ingress HA 策略",
+      "dependencies": [
+        115,
+        116,
+        117,
+        111,
+        152,
+        150,
+        151
+      ]
+    },
+    {
+      "key": "SINGLE_QUALIFY",
+      "number": 154,
+      "title": "[State/S6] 单进程 app+PG+Blob 安装、SIGKILL 全恢复与资源成本实测",
+      "dependencies": [
+        110,
+        118,
+        119,
+        120,
+        145,
+        146,
+        147,
+        148
+      ]
+    },
+    {
+      "key": "DISTRIBUTED_QUALIFY",
+      "number": 157,
+      "title": "[State/D] 真实 3 主机故障矩阵、ACK 完整性、RPO/RTO 与容量成本",
+      "dependencies": [
+        155,
+        156,
+        153,
+        42,
+        151
+      ]
+    },
+    {
+      "key": "REMOVE_OLD",
+      "number": 148,
+      "title": "[State/S5] 移除 GitFS legacy Pando 运行时与本地 durable 回退，保留产品安全行为与证据",
+      "dependencies": [
+        144,
+        145,
+        146,
+        147,
+        118,
+        120
+      ]
+    },
+    {
+      "key": "REMOTE_MERGE",
+      "number": 156,
+      "title": "[State/D] PR 合并经 remote authz 的 Ref-CAS receipt 投影与可恢复 finalizer",
+      "dependencies": [
+        118,
+        117,
+        152
+      ]
+    },
+    {
+      "key": "REMOTE_BACKUP",
+      "number": 153,
+      "title": "[State/D] PG 切点+Raft index+Blob closure 配对备份与全新 incarnation 恢复",
+      "dependencies": [
+        120,
+        116,
+        117,
+        152
+      ]
+    },
+    {
+      "key": "RETENTION_BRIDGE",
+      "number": 151,
+      "title": "[State/D] 全局 PG artifact hold 与 Ref-CAS pin/root 的可恢复保留桥",
+      "dependencies": [
+        113,
+        114,
+        116,
+        117,
+        150
+      ]
+    }
+  ],
+  "deleted_issues": [
+    {
+      "number": 20,
+      "disposition": "superseded",
+      "replacements": [
+        108
+      ]
+    },
+    {
+      "number": 22,
+      "disposition": "superseded",
+      "replacements": [
+        109,
+        110,
+        144,
+        148
+      ]
+    },
+    {
+      "number": 24,
+      "disposition": "superseded",
+      "replacements": [
+        150,
+        143,
+        144
+      ]
+    },
+    {
+      "number": 26,
+      "disposition": "superseded",
+      "replacements": [
+        115,
+        116,
+        152,
+        155,
+        157
+      ]
+    },
+    {
+      "number": 43,
+      "disposition": "superseded",
+      "replacements": [
+        155,
+        157,
+        153
+      ]
+    },
+    {
+      "number": 44,
+      "disposition": "superseded",
+      "replacements": [
+        157,
+        154
+      ]
+    },
+    {
+      "number": 48,
+      "disposition": "superseded",
+      "replacements": [
+        105,
+        123
+      ]
+    },
+    {
+      "number": 121,
+      "disposition": "dropped_no_replacement",
+      "replacements": []
+    }
+  ],
+  "preserved_issues": [
+    139,
+    134,
+    130,
+    126,
+    98,
+    96,
+    95,
+    91,
+    90,
+    88,
+    87,
+    86,
+    85,
+    84,
+    83,
+    82,
+    81,
+    80,
+    79,
+    78,
+    77,
+    76,
+    75,
+    74,
+    73,
+    72,
+    71,
+    70,
+    69,
+    68,
+    67,
+    66,
+    47,
+    46,
+    45,
+    41,
+    40,
+    39,
+    38,
+    37,
+    36,
+    35,
+    34,
+    33,
+    32,
+    31,
+    30,
+    29,
+    28,
+    27,
+    25,
+    23,
+    21,
+    19,
+    18,
+    17,
+    16,
+    15,
+    14,
+    13,
+    12,
+    11,
+    10,
+    9,
+    8,
+    7,
+    6,
+    5,
+    4,
+    3,
+    2
+  ],
+  "retired_roadmap": {
+    "path": "../acceptance/retired-roadmap48.md",
+    "body_sha256": "68bcc1855633b91e8501e7c7b7a5aa80e8decd60d636bd195c10dfc5d8638cde"
+  },
+  "standalone_entry_keys": [
+    "110",
+    "118",
+    "119",
+    "120",
+    "SINGLE_QUALIFY"
+  ],
+  "distributed_keys": [
+    "111",
+    "115",
+    "116",
+    "117",
+    "RAFT_STORAGE",
+    "RAFT_RPC",
+    "REMOTE_AUTHZ",
+    "RETENTION_BRIDGE",
+    "REMOTE_MERGE",
+    "REMOTE_BACKUP",
+    "DISTRIBUTED_DEPLOY",
+    "DISTRIBUTED_QUALIFY"
+  ]
+}

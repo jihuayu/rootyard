@@ -18,10 +18,28 @@ use uuid::Uuid;
 
 pub mod admission;
 pub mod encrypted_objects;
+pub mod no_grant_proof;
 pub mod read_leases;
+pub mod recorded_receipt_proof;
 pub mod ref_admission;
 pub mod ref_publication;
+pub mod remote_errors;
+pub mod remote_io;
+pub mod remote_local;
+// The module order below is part of the `RemoteObjectStore::OpenDal` type: all
+// three `impl RemoteObjectStore` blocks belong to the same provider, never to
+// enum variants.
+//   remote_objects        - ObjectKey/StoredObject and the Local|OpenDal selector
+//   remote_io             - read path: head, verified get_to_file, bounded get_range
+//   remote_publish        - publish path: put + read-back proof, exact-key delete
+// src/storage/historical_s3.rs holds the superseded pre-OpenDAL hand-written S3
+// implementation (its own `RemoteObjectStore::{Local, S3}` with the same method
+// names) and is deliberately not compiled.
 pub mod remote_objects;
+pub mod remote_provider;
+pub(crate) mod remote_provider_errors;
+pub mod remote_provider_put;
+pub mod remote_publish;
 
 pub struct Storage {
     pub root: PathBuf,

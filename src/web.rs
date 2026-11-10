@@ -3,63 +3,43 @@
 //! commit history, commit diffs, branch comparison, Issues, Pull Requests, Reviews,
 //! Check Run status panels, atomic Pull Request merge, and RBAC audit logs under
 //! `/web/repos/{owner}/{name}...` and `/ui/repos/{owner}/{name}...`.
+//!
+//! Composition: [`navigation`] owns the login/app/logout, repository listing
+//! and the `/web/settings/...` token/session pages, [`repository_pages`] owns the
+//! repository pages for both the `/web` and legacy `/ui` prefixes, and
+//! [`org_admin`] owns organization administration. [`routes`] merges them and
+//! applies one session/Origin/CSRF middleware layer over the final router.
+pub mod detail_pagination;
 pub mod handlers;
 pub mod models;
 pub mod native_reads;
+pub mod navigation;
+pub mod org_admin;
+pub mod org_admin_actions;
+pub mod org_admin_views;
+pub mod repository_listing;
+pub mod repository_pages;
 pub mod sanitize;
 pub mod session;
+pub mod session_gc;
 pub mod templates;
+pub mod tokens;
 
 use crate::AppState;
-use axum::{
-    Router,
-    routing::{get, post},
-};
+use axum::Router;
 use std::sync::Arc;
 
+/// The Web UI router merged into the default application router.
+///
+/// Every page is authorized by one `session::middleware` layer (cookie plus
+/// Origin/CSRF checks) that is applied over the complete, final router:
+/// shared pages, repository Web/UI pages and organization administration. The
+/// layer stays outermost of the whole merge (navigation, repository pages and
+/// organization administration), exactly once, so no route can bypass it.
 pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
-        .route("/web/login", get(session::login_page).post(session::login))
-        .route("/web/app.js", get(session::app_js))
-        .route("/web/logout", post(session::logout))
-        .route("/web/repos", get(session::discover))
-        .route("/web/repos/{owner}/{name}", get(handlers::repo_overview))
-        .route("/web/repos/{owner}/{name}/tree", get(handlers::tree_view))
-        .route("/web/repos/{owner}/{name}/tree/{oid}", get(handlers::tree_by_oid_view))
-        .route("/web/repos/{owner}/{name}/blob", get(handlers::blob_view))
-        .route("/web/repos/{owner}/{name}/blob/{oid}", get(handlers::blob_by_oid_view))
-        .route("/web/repos/{owner}/{name}/commits", get(handlers::commits_view))
-        .route("/web/repos/{owner}/{name}/commits/{oid}", get(handlers::commit_detail_view))
-        .route("/web/repos/{owner}/{name}/commits/{oid}/checks", get(handlers::commit_checks_view))
-        .route("/web/repos/{owner}/{name}/compare", get(handlers::compare_view))
-        .route("/web/repos/{owner}/{name}/issues", get(handlers::issues_list_view).post(handlers::create_issue_web))
-        .route("/web/repos/{owner}/{name}/issues/{number}", get(handlers::issue_detail_view).post(handlers::update_issue_web).patch(handlers::update_issue_web))
-        .route("/web/repos/{owner}/{name}/issues/{number}/comments", post(handlers::create_issue_comment_web))
-        .route("/web/repos/{owner}/{name}/pulls", get(handlers::pulls_list_view).post(handlers::create_pull_web))
-        .route("/web/repos/{owner}/{name}/pulls/{number}", get(handlers::pull_detail_view).post(handlers::update_pull_web).patch(handlers::update_pull_web))
-        .route("/web/repos/{owner}/{name}/pulls/{number}/diff", get(handlers::pull_diff_view))
-        .route("/web/repos/{owner}/{name}/pulls/{number}/reviews", get(handlers::pull_reviews_view).post(handlers::create_review_web))
-        .route("/web/repos/{owner}/{name}/pulls/{number}/checks", get(handlers::pull_checks_view))
-        .route("/web/repos/{owner}/{name}/pulls/{number}/merge", post(handlers::merge_pull_web))
-        .route("/web/repos/{owner}/{name}/audit", get(handlers::audit_view))
-        .route("/ui/repos/{owner}/{name}", get(handlers::repo_overview))
-        .route("/ui/repos/{owner}/{name}/tree", get(handlers::tree_view))
-        .route("/ui/repos/{owner}/{name}/tree/{oid}", get(handlers::tree_by_oid_view))
-        .route("/ui/repos/{owner}/{name}/blob", get(handlers::blob_view))
-        .route("/ui/repos/{owner}/{name}/blob/{oid}", get(handlers::blob_by_oid_view))
-        .route("/ui/repos/{owner}/{name}/commits", get(handlers::commits_view))
-        .route("/ui/repos/{owner}/{name}/commits/{oid}", get(handlers::commit_detail_view))
-        .route("/ui/repos/{owner}/{name}/commits/{oid}/checks", get(handlers::commit_checks_view))
-        .route("/ui/repos/{owner}/{name}/compare", get(handlers::compare_view))
-        .route("/ui/repos/{owner}/{name}/issues", get(handlers::issues_list_view).post(handlers::create_issue_web))
-        .route("/ui/repos/{owner}/{name}/issues/{number}", get(handlers::issue_detail_view).post(handlers::update_issue_web).patch(handlers::update_issue_web))
-        .route("/ui/repos/{owner}/{name}/issues/{number}/comments", post(handlers::create_issue_comment_web))
-        .route("/ui/repos/{owner}/{name}/pulls", get(handlers::pulls_list_view).post(handlers::create_pull_web))
-        .route("/ui/repos/{owner}/{name}/pulls/{number}", get(handlers::pull_detail_view).post(handlers::update_pull_web).patch(handlers::update_pull_web))
-        .route("/ui/repos/{owner}/{name}/pulls/{number}/diff", get(handlers::pull_diff_view))
-        .route("/ui/repos/{owner}/{name}/pulls/{number}/reviews", get(handlers::pull_reviews_view).post(handlers::create_review_web))
-        .route("/ui/repos/{owner}/{name}/pulls/{number}/checks", get(handlers::pull_checks_view))
-        .route("/ui/repos/{owner}/{name}/pulls/{number}/merge", post(handlers::merge_pull_web))
-        .route("/ui/repos/{owner}/{name}/audit", get(handlers::audit_view))
+        .merge(navigation::routes())
+        .merge(repository_pages::router())
+        .merge(org_admin::routes())
         .layer(axum::middleware::from_fn_with_state(state, session::middleware))
 }

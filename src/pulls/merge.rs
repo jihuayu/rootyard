@@ -2,7 +2,7 @@
 //! per-repository storage write locks, native Git CAS `update-ref --no-deref`, and outbox events.
 use crate::{
     AppState, Error,
-    auth::{self, authorize_repo as authorize, finish_tx as finish, idempotency_key},
+    auth::{self, finish_tx as finish, idempotency_key},
     db, events, git_http, journal,
     pulls::{
         models::{
@@ -65,7 +65,7 @@ async fn merge_pull_inner(
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
         let access =
-            auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+            auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::PullsWrite).await?;
         finish(tx, &actor, true).await?;
         (access.repo_id, access.owner_id)
     };
@@ -82,14 +82,13 @@ async fn merge_pull_inner(
     if repo.state != "ready" {
         return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
     }
-    if let Some(expected_gen) = input.storage_generation {
-        if repo.storage_generation != expected_gen {
+    if let Some(expected_gen) = input.storage_generation
+        && repo.storage_generation != expected_gen {
             return Err(Error(
                 StatusCode::CONFLICT,
                 "repository storage generation mismatch",
             ));
         }
-    }
     if !valid_oid_for_format(&input.expected_head_oid, &repo.object_format)
         || !valid_oid_for_format(&input.expected_base_oid, &repo.object_format)
     {
@@ -145,7 +144,7 @@ async fn merge_pull_inner(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = authorize(&tx, &actor, &owner, &name, true).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::PullsWrite).await?.repo_id;
 
     let current_gen: i64 = tx
         .query_one(

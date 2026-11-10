@@ -1,0 +1,49 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/dsh-backup147)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 48.32s
+     Removed 533 files, 2.0GiB total
+   Compiling rootyard v0.1.0 (/workspace/scratch/dsh-backup147)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 16s
+{
+  "version": 1,
+  "binary_sha256": "bc0abc3ed0ac2c5690581480456532eca17ffbbcb5a2667d10e0a1366845c03b",
+  "source_inputs_sha256": "941eccc8b92e792b723b1c65c02bcf396d12a49b64545140f72f99cf348a7053",
+  "workspace_commit": "1d1ce6276b806b0aa0fbf4fd5ae02050a6211bf0",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--no-default-features",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--bin",
+    "rootyard",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--message-format=json-render-diagnostics"
+  ],
+  "package_rebuilt": true,
+  "clean_command": [
+    "cargo",
+    "clean",
+    "--package",
+    "rootyard"
+  ],
+  "target_dir": "/workspace/scratch/backup-native-target",
+  "lock_file": "/workspace/scratch/backup-native-target/.rootyard-native-build.lock",
+  "fresh_false_artifacts": [
+    {
+      "target": "rootyard",
+      "kind": "lib",
+      "fresh": false,
+      "package_id": "path+file:///workspace/scratch/dsh-backup147#rootyard@0.1.0"
+    },
+    {
+      "target": "rootyard",
+      "kind": "bin",
+      "fresh": false,
+      "executable": "/workspace/scratch/backup-native-target/debug/rootyard",
+      "package_id": "path+file:///workspace/scratch/dsh-backup147#rootyard@0.1.0"
+    }
+  ]
+}

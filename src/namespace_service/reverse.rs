@@ -199,7 +199,15 @@ pub async fn create(
     if mount.base_oid != view.source_oid {
         return Err(Error::not_found());
     }
-    let access = auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Write).await?;
+    let access = auth::authorize_repo_with_role(
+        &tx,
+        &actor,
+        &mount.owner,
+        &mount.repository,
+        Role::Write,
+        crate::token_scopes::RepoAction::ContentsWrite,
+    )
+    .await?;
     if access.repo_id != view.repository_id {
         return Err(Error::not_found());
     }
@@ -217,7 +225,14 @@ pub async fn create(
         .await
         .map_err(|_| Error::timeout())?;
     source_lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, access.repo_id, true).await?;
+    auth::verify_active(
+        &state.pool,
+        &actor,
+        access.repo_id,
+        crate::token_scopes::RepoAction::ContentsWrite,
+        Role::Write,
+    )
+    .await?;
     let _slot = state
         .git_slots
         .clone()

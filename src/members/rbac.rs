@@ -253,7 +253,7 @@ pub async fn list_collaborators(
     let (actor, mut client) = open_client(&s, &h).await?;
     let (after, limit) = p.bounds()?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read, crate::token_scopes::RepoAction::MembersRead).await?;
     let q = format!(
         "SELECT {COLLABORATOR_FIELDS} FROM repository_collaborators c JOIN users u ON u.id = c.user_id WHERE c.tenant_id=$1 AND c.repository_id=$2 ORDER BY u.username ASC OFFSET $3 LIMIT $4"
     );
@@ -311,7 +311,7 @@ async fn upsert_collaborator_inner(
     let key = idempotency_key(&h)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     serialize_member_mutation(&tx, &actor, &o, &n).await?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin, crate::token_scopes::RepoAction::MembersAdmin).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
     if uid == acc.owner_id {
         return Err(Error(
@@ -381,7 +381,7 @@ pub async fn get_collaborator(State(s): App, Path((o, n, u)): SubPath, h: Header
         return Err(Error::bad_request());
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read, crate::token_scopes::RepoAction::MembersRead).await?;
     let q = format!(
         "SELECT {COLLABORATOR_FIELDS} FROM repository_collaborators c JOIN users u ON u.id = c.user_id WHERE c.repository_id=$1 AND u.username=$2"
     );
@@ -402,7 +402,7 @@ pub async fn remove_collaborator(State(s): App, Path((o, n, u)): SubPath, h: Hea
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
     serialize_member_mutation(&tx, &actor, &o, &n).await?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin, crate::token_scopes::RepoAction::MembersAdmin).await?;
     if u == o {
         return Err(Error(
             StatusCode::CONFLICT,
@@ -449,7 +449,7 @@ pub async fn get_effective_permission(
 ) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read, crate::token_scopes::RepoAction::MembersRead).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
     let resolved = resolve_effective_role(&*tx, acc.repo_id, acc.owner_id, uid).await?;
     let (role, direct_role, team_role) = match resolved {

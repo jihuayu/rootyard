@@ -30,6 +30,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import native_evidence
+import owned_fuse_cleanup
 
 
 class Harness:
@@ -49,6 +50,11 @@ class Harness:
         self.env.update(DATABASE_URL=self.db, ROOTYARD_DATA_DIR=str(self.root / "data"),
                         GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
                         GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C")
+        # Production admission is deliberately conservative. Functional suites
+        # perform many loopback sign-ins from one peer; widen only this
+        # disposable process budget. tests/auth_admission.py overrides it with a
+        # small threshold to exercise the production rejection path.
+        self.env["ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE"] = "1000"
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]
@@ -127,7 +133,8 @@ class Harness:
 
     def start(self):
         self.log = open(self.root / "server.log", "ab")
-        self.proc = subprocess.Popen([self.args.binary, "serve"], env=self.env, stdout=self.log, stderr=self.log,
+        command = [*getattr(self, "server_prefix", ()), self.args.binary, "serve"]
+        self.proc = subprocess.Popen(command, env=self.env, stdout=self.log, stderr=self.log,
                                      start_new_session=True)
         until = time.monotonic() + 30
         while time.monotonic() < until:
@@ -150,8 +157,20 @@ class Harness:
                 try:
                     self.proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                    self.proc.wait()
+                    if not hard:
+                        os.killpg(self.proc.pid, signal.SIGKILL)
+                    # SIGKILL is already delivered. A FUSE daemon that is also
+                    # its own blocked client never releases the mount, so the
+                    # kernel waiter must be aborted with a forced unmount of
+                    # this fixture's own namespaced mounts before waiting again.
+                    owned_fuse_cleanup.release_owned_fuse_mounts(self)
+                    try:
+                        self.proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired as error:
+                        raise RuntimeError(
+                            "Owned test service did not exit after SIGKILL; "
+                            "kernel I/O may remain blocked. Preserve the fixture for diagnosis."
+                        ) from error
             self.proc = None
         if self.log:
             self.log.close()
@@ -171,6 +190,41 @@ class Harness:
         status, body, headers = self.http(path, **kwargs)
         assert status in (code if isinstance(code, tuple) else (code,)), f"{path}: expected {code}, got {status}: {body[:300]!r}"
         return body
+
+    def create_repository(self, payload, token=None):
+        """Create a real repository and wait for the API's ready view.
+
+        202 is an accepted pending provisioning request, never a ready fixture.
+        """
+        status, body, _ = self.http("/api/repos", token=token, method="POST", body=payload)
+        assert status in (201, 202), f"POST /api/repos: expected 201/202, got {status}: {body[:300]!r}"
+        created = json.loads(body)
+        identity = {}
+        for field in ("id", "owner", "name"):
+            value = created.get(field)
+            assert isinstance(value, str) and value, f"POST /api/repos: missing stable {field}: {created!r}"
+            identity[field] = value
+        path = "/api/repos/" + urllib.parse.quote(identity["owner"], safe="") + "/" + urllib.parse.quote(identity["name"], safe="")
+        deadline = time.monotonic() + 20
+        attempts = 0
+        last = {"status": status, "state": created.get("state"), **identity}
+        while True:
+            attempts += 1
+            code, raw, _ = self.http(path, token=token)
+            if code != 200:
+                raise AssertionError(self.redact(f"GET {path}: repository unavailable while provisioning; status={code} {last!r}"))
+            current = json.loads(raw)
+            observed = {field: current.get(field) for field in identity}
+            if observed != identity:
+                raise AssertionError(self.redact(f"GET {path}: repository identity changed; expected {identity!r}, got {observed!r}"))
+            last = {"status": code, "state": current.get("state"), **identity}
+            if current.get("state") == "ready":
+                return current
+            if current.get("state") != "provisioning":
+                raise AssertionError(self.redact(f"GET {path}: unexpected terminal repository state; {last!r}"))
+            if time.monotonic() >= deadline:
+                raise AssertionError(self.redact(f"POST /api/repos: {identity!r} not ready after {attempts} poll(s) in 20s; last={last!r}"))
+            time.sleep(.1)
 
     def setup(self):
         self.sql('CREATE SCHEMA "' + self.schema + '"', isolated=False)
@@ -201,7 +255,7 @@ class Harness:
         self.expect("/api/repos", 401)
         self.expect("/api/repos", 401, token={"token": "invalid"})
         self.expect("/api/repos", 403, method="POST", token=self.reader, body={"name": "forbidden"})
-        repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice, body={"name": "demo"}))
+        repo = self.create_repository({"name": "demo"}, token=self.alice)
         self.repo = repo
         assert repo["state"] == "ready"
         assert repo["clone_path"] == "/git/alice/demo.git"
@@ -306,7 +360,7 @@ class Harness:
         # remove pack transfer as a confounder and exercise receive-pack's ref lock.
         # An ambiguous rejected RPC can intentionally block its repository in
         # phase two. Isolate the race so later independent scenarios remain valid.
-        race_repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice, body={"name": "cas-race"}))
+        race_repo = self.create_repository({"name": "cas-race"}, token=self.alice)
         race_remote = self.base + race_repo["clone_path"]
         self.git("push", race_remote, self.first + ":refs/heads/race", self.second + ":refs/heads/main", cwd=self.work, token=self.alice)
         barrier = threading.Barrier(2)
@@ -349,8 +403,7 @@ class Harness:
         self.git("fsck", "--full", cwd=self.root / "after-crash")
 
     def provisioning_recovery(self):
-        existing = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice,
-                                          body={"name": "recover-existing"}))
+        existing = self.create_repository({"name": "recover-existing"}, token=self.alice)
         self.stop(hard=True)
         owner = str(uuid.UUID(self.alice["user_id"]))
         pending = [(str(uuid.uuid4()), "recover-missing"), (str(uuid.uuid4()), "recover-staging")]
@@ -455,7 +508,7 @@ class Harness:
                     queue.append(child)
         return found
 
-    def assert_reaped(self, children, operation):
+    def assert_no_live_descendants(self, children, operation):
         until = time.monotonic() + 2
         while True:
             remaining = []
@@ -520,7 +573,7 @@ class Harness:
                 sock.sendall(wire("git-upload-pack", body))
                 children = self.wait_for_git_children(sock, sent_at, "blocked streaming")
                 time.sleep(max(0, sent_at + 4 - time.monotonic()))
-                self.assert_reaped(children, "blocked streaming")
+                self.assert_no_live_descendants(children, "blocked streaming")
                 self.expect(path + "/info/refs?service=git-upload-pack", 200, token=self.alice)
             command = self.pkt(("0" * 40 + " " + "f" * 40 + " refs/heads/stalled").encode() + b"\0report-status\n") + b"0000"
             with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
@@ -528,7 +581,7 @@ class Harness:
                 sock.sendall(wire("git-receive-pack", command + b"PACK", 100000))
                 children = self.wait_for_git_children(sock, sent_at, "incomplete upload")
                 time.sleep(max(0, sent_at + 4 - time.monotonic()))
-                self.assert_reaped(children, "incomplete upload")
+                self.assert_no_live_descendants(children, "incomplete upload")
                 self.expect(path + "/info/refs?service=git-upload-pack", 200, token=self.alice)
             self.git("push", "origin", "HEAD:after-stalled", cwd=self.work, token=self.alice)
             assert not self.git("ls-remote", self.remote, "stalled", token=self.alice).stdout

@@ -1,0 +1,12 @@
+{
+  "backend": "reference_model",
+  "production_acceptance": false,
+  "tier": "all",
+  "feature": null,
+  "total": 591,
+  "passed": 591,
+  "failed": 0,
+  "errors": 0,
+  "skipped": 0,
+  "success": true
+}

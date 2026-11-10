@@ -1,0 +1,172 @@
+    Checking opendal-service-s3 v0.57.0 (/workspace/scratch/state-services-roots-decisions/vendor/opendal-service-s3)
+    Checking opendal v0.57.0
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error: redundant field names in struct initialization
+   --> src/ref_store/core/pack_commit/authorized/prepare.rs:161:9
+    |
+161 |         plan: plan,
+    |         ^^^^^^^^^^ help: replace it with: `plan`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#redundant_field_names
+    = note: `-D clippy::redundant-field-names` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::redundant_field_names)]`
+
+error: large size difference between variants
+  --> src/ref_store/core/authorized_metadata.rs:20:1
+   |
+20 | / pub enum MetadataDecisionPreparation {
+21 | |     Prepared(PreparedMetadataPublication),
+   | |     ------------------------------------- the largest variant contains at least 1040 bytes
+22 | |     Replayed(CommitRefsReceipt),
+   | |     --------------------------- the second-largest variant contains at least 320 bytes
+23 | | }
+   | |_^ the entire enum is at least 1040 bytes
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+   = note: `-D clippy::large-enum-variant` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::large_enum_variant)]`
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+   |
+21 -     Prepared(PreparedMetadataPublication),
+21 +     Prepared(Box<PreparedMetadataPublication>),
+   |
+
+error: unnecessary closure used to substitute value for `Option::None`
+   --> src/ref_store/core/decision_commit.rs:429:24
+    |
+429 |           let gate_row = tx
+    |  ________________________^
+430 | |             .query_opt(
+431 | |                 "SELECT tenant_id,object_format,history_incarnation,authority_epoch,group_epoch,head_ref,revision
+432 | |                  FROM ref_store_core_gates WHERE repository_id=$1 FOR UPDATE",
+...   |
+436 | |             .map_err(pg::db_error)?
+437 | |             .ok_or_else(|| RefStoreError::Unsupported("protocol provisioning requires an existing core gate"))?;
+    | |______________________________________________________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_lazy_evaluations
+    = note: `-D clippy::unnecessary-lazy-evaluations` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_lazy_evaluations)]`
+help: use `ok_or` instead
+    |
+437 -             .ok_or_else(|| RefStoreError::Unsupported("protocol provisioning requires an existing core gate"))?;
+437 +             .ok_or(RefStoreError::Unsupported("protocol provisioning requires an existing core gate"))?;
+    |
+
+error: large size difference between variants
+  --> src/ref_store/core/pack_commit/authorized/prepare.rs:24:1
+   |
+24 | / pub enum PrepareOutcome {
+25 | |     /// Complete sealed capture of a still-pending operation.
+26 | |     Prepared(PreparedPublication),
+   | |     ----------------------------- the largest variant contains at least 736 bytes
+27 | |     /// The operation already has a durable 138 terminal. Returned byte-for-byte
+28 | |     /// as historical data: no re-authorization, no fence check, no refund.
+29 | |     Replayed(PackCommitReceipt),
+   | |     --------------------------- the second-largest variant contains at least 336 bytes
+30 | | }
+   | |_^ the entire enum is at least 736 bytes
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+   |
+26 -     Prepared(PreparedPublication),
+26 +     Prepared(Box<PreparedPublication>),
+   |
+
+error: needlessly taken reference of both operands
+  --> src/ref_store/core/publication_decision/consume.rs:93:12
+   |
+93 |         || &row.action != &action
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#op_ref
+   = note: `-D clippy::op-ref` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::op_ref)]`
+help: use the values directly
+   |
+93 -         || &row.action != &action
+93 +         || row.action != action
+   |
+
+error: this `if` statement can be collapsed
+   --> src/ref_store/core/retention_root/candidate.rs:153:9
+    |
+153 | /         if let Some(head_oid) = snapshot.head_oid_hex() {
+154 | |             if !captured_refs
+155 | |                 .iter()
+156 | |                 .any(|reference| reference.name() == snapshot.head_ref() && reference.oid_hex() == head_oid)
+...   |
+160 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+    = note: `-D clippy::collapsible-if` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+    |
+153 ~         if let Some(head_oid) = snapshot.head_oid_hex()
+154 ~             && !captured_refs
+155 |                 .iter()
+...
+158 |                 return Err(RootError::RootSourceChanged("captured HEAD is not one of the captured refs"));
+159 ~             }
+    |
+
+error: this `if` statement can be collapsed
+  --> src/ref_store/core/retention_root/pg_release.rs:89:9
+   |
+89 | /         if let Some(gate) = super::sql::gate_realm(tx, repository_id, true).await? {
+90 | |             if gate.tenant_id != scope.tenant_id() {
+91 | |                 return Err(RootError::RootRealmMismatch("release gate tenant"));
+92 | |             }
+93 | |         }
+   | |_________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+   |
+89 ~         if let Some(gate) = super::sql::gate_realm(tx, repository_id, true).await?
+90 ~             && gate.tenant_id != scope.tenant_id() {
+91 |                 return Err(RootError::RootRealmMismatch("release gate tenant"));
+92 ~             }
+   |
+
+error: this `if` statement can be collapsed
+  --> src/ref_store/core/retention_root/request.rs:63:9
+   |
+63 | /         if let RootSelector::ObjectIds(values) = &self.selector {
+64 | |             if values.is_empty() {
+65 | |                 return Err(RootError::RootSelectorInvalid("a root needs at least one object id".into()));
+66 | |             }
+67 | |         }
+   | |_________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+   |
+63 ~         if let RootSelector::ObjectIds(values) = &self.selector
+64 ~             && values.is_empty() {
+65 |                 return Err(RootError::RootSelectorInvalid("a root needs at least one object id".into()));
+66 ~             }
+   |
+
+error: unnecessary closure used to substitute value for `Option::None`
+   --> src/ref_store/core/retention_root/sql_insert.rs:128:31
+    |
+128 |           let joined_revision = pack
+    |  _______________________________^
+129 | |             .joined_revision()
+130 | |             .ok_or_else(|| RootError::RootSourceChanged("a captured pack has no joined membership revision"))?;
+    | |_____________________________________________________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_lazy_evaluations
+help: use `ok_or` instead
+    |
+130 -             .ok_or_else(|| RootError::RootSourceChanged("a captured pack has no joined membership revision"))?;
+130 +             .ok_or(RootError::RootSourceChanged("a captured pack has no joined membership revision"))?;
+    |
+
+error: could not compile `rootyard` (lib test) due to 9 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `rootyard` (lib) due to 9 previous errors

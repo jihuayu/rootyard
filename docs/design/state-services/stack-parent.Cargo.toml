@@ -1,0 +1,60 @@
+[package]
+name = "rootyard"
+default-run = "rootyard"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Single-node Git hosting with PostgreSQL metadata and native Git storage"
+# Lowest Rust that can build this crate: edition 2024 let-chains are already
+# used in storage/sharding/workspace code, and dependencies declare at most
+# 1.85. The accepted gate toolchain is 1.99.1 (rust-toolchain.toml); see
+# docs/development.md for both versions and the reason they differ.
+rust-version = "1.88"
+
+[features]
+pando-lab = []
+
+[[bin]]
+name = "rootyard-pando-lab"
+path = "src/bin/rootyard-pando-lab.rs"
+required-features = ["pando-lab"]
+
+[[bin]]
+name = "rootyard-vfs-mount"
+path = "src/bin/rootyard-vfs-mount.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+deadpool-postgres = "0.14"
+fs2 = "0.4"
+fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+libc = "0.2"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "ssl"] }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-1"] }
+tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

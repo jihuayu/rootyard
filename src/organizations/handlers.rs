@@ -1,6 +1,7 @@
 use crate::{
     AppState, Error, auth, db,
     members::models::{Role, json},
+    token_scopes::NamespaceAction,
 };
 use axum::{
     Json,
@@ -15,6 +16,13 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 type Res = Result<Response, Error>;
+
+// The two paginated list handlers live in a sibling file to keep this module
+// focused on lifecycle and membership mutations. The re-export preserves the
+// historical `organizations::handlers::{list_members,list_teams}` paths.
+#[path = "listing.rs"]
+mod listing;
+pub use listing::{list_members, list_teams};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,12 +63,13 @@ pub async fn transfer_ownership(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin)
+        .await?;
     auth::finish_tx(tx, &actor, true).await?;
     Err(Error(StatusCode::CONFLICT, "repository ownership transfer is unsupported"))
 }
 
-async fn org_id(tx: &Transaction<'_>, slug: &str) -> Result<Uuid, Error> {
+pub(crate) async fn org_id(tx: &Transaction<'_>, slug: &str) -> Result<Uuid, Error> {
     if !db::valid_name(slug) {
         return Err(Error::not_found());
     }
@@ -70,13 +79,20 @@ async fn org_id(tx: &Transaction<'_>, slug: &str) -> Result<Uuid, Error> {
         .ok_or_else(Error::not_found)
         .map(|r| r.get(0))
 }
-async fn require_member(tx: &Transaction<'_>, org: Uuid, actor: Uuid, min: Role) -> Result<(), Error> {
+/// Direct membership role, or `404` when the caller is not a member. Shared by
+/// the JSON API and the `/web/organizations` pages so both resolve authority
+/// from the same row.
+pub(crate) async fn member_role(tx: &Transaction<'_>, org: Uuid, actor: Uuid) -> Result<Role, Error> {
     let row = tx
         .query_opt("SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", &[&org, &actor])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
-    if Role::parse(row.get::<_, &str>(0))? < min {
+    Role::parse(row.get::<_, &str>(0))
+}
+
+async fn require_member(tx: &Transaction<'_>, org: Uuid, actor: Uuid, min: Role) -> Result<(), Error> {
+    if member_role(tx, org, actor).await? < min {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient organization role"));
     }
     Ok(())
@@ -144,6 +160,7 @@ pub async fn create_organization(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, true).await?;
+    auth::reject_restricted_create(&tx, &actor).await?;
     let org = Uuid::new_v4();
     if let Some(key) = key {
         let inserted = tx.query_opt("INSERT INTO organization_creation_keys(actor_id,key,slug,organization_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING organization_id",
@@ -188,6 +205,7 @@ pub async fn get_organization(State(state): State<Arc<AppState>>, Path(slug): Pa
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgRead).await?;
     require_member(&tx, org, actor.id, Role::Read).await?;
     let row = tx
         .query_one("SELECT version,created_by,created_at::text FROM organizations WHERE id=$1", &[&org])
@@ -200,27 +218,28 @@ pub async fn get_organization(State(state): State<Arc<AppState>>, Path(slug): Pa
     ))
 }
 
-pub async fn list_members(State(state): State<Arc<AppState>>, Path(slug): Path<String>, headers: HeaderMap) -> Res {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let org = org_id(&tx, &slug).await?;
-    require_member(&tx, org, actor.id, Role::Read).await?;
-    let rows = tx.query("SELECT u.username,m.role,m.version FROM organization_memberships m JOIN users u ON u.id=m.user_id WHERE m.organization_id=$1 ORDER BY u.username LIMIT 101", &[&org]).await.map_err(Error::internal)?;
-    let items: Vec<_> = rows
-        .iter()
-        .take(100)
-        .map(|r| sjson!({"username":r.get::<_,&str>(0),"role":r.get::<_,&str>(1),"version":r.get::<_,i64>(2)}))
-        .collect();
-    auth::finish_tx(tx, &actor, false).await?;
-    Ok(json(StatusCode::OK, sjson!({"items":items,"truncated":rows.len()>100})))
-}
-
 pub async fn put_member(
     State(state): State<Arc<AppState>>,
     Path((slug, username)): Path<(String, String)>,
     headers: HeaderMap,
     Json(input): Json<MembershipInput>,
+) -> Res {
+    put_member_atomic(state, slug, username, headers, input, false).await
+}
+
+/// Shared member upsert used by the JSON API and the `/web/organizations` add
+/// form. `create_only` is evaluated inside the same authorized,
+/// organization-locked transaction as the write, *after* the organization
+/// admin role check. A non-admin caller therefore cannot distinguish an
+/// existing from a missing membership, and a stale form cannot recreate a
+/// removed membership.
+pub(crate) async fn put_member_atomic(
+    state: Arc<AppState>,
+    slug: String,
+    username: String,
+    headers: HeaderMap,
+    input: MembershipInput,
+    create_only: bool,
 ) -> Res {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     if !db::valid_name(&username) || input.expected_version.is_some_and(|v| v <= 0) {
@@ -229,6 +248,7 @@ pub async fn put_member(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgMembersWrite).await?;
     lock_org_for_admin(&tx, org, actor.id).await?;
     let user: Uuid = tx
         .query_opt("SELECT id FROM users WHERE username=$1", &[&username])
@@ -244,6 +264,12 @@ pub async fn put_member(
         .await
         .map_err(Error::internal)?;
     let (code, version) = if let Some(row) = existing {
+        if create_only {
+            // The web add form is create-only. Refusing here, after the admin
+            // and lock checks, keeps an unauthorized caller from learning
+            // whether the membership exists.
+            return Err(Error(StatusCode::CONFLICT, "membership already exists"));
+        }
         let version: i64 = row.get(0);
         if input.expected_version.is_some_and(|v| v != version) {
             return Err(Error(StatusCode::CONFLICT, "membership version conflict"));
@@ -285,6 +311,7 @@ pub async fn delete_member(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgMembersWrite).await?;
     lock_org_for_admin(&tx, org, actor.id).await?;
     let target = tx.query_opt("SELECT m.user_id,m.role FROM organization_memberships m JOIN users u ON u.id=m.user_id WHERE m.organization_id=$1 AND u.username=$2 FOR UPDATE OF m", &[&org,&username]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     protect_last_admin(&tx, org, target.get("user_id"), Role::parse(target.get::<_, &str>("role"))?, None).await?;
@@ -303,24 +330,6 @@ pub async fn delete_member(
     Ok(json(StatusCode::OK, sjson!({"removed":true,"username":username})))
 }
 
-pub async fn list_teams(State(state): State<Arc<AppState>>, Path(slug): Path<String>, headers: HeaderMap) -> Res {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let org = org_id(&tx, &slug).await?;
-    require_member(&tx, org, actor.id, Role::Read).await?;
-    let rows = tx
-        .query(
-            "SELECT id,slug,name,role,version FROM organization_teams WHERE organization_id=$1 ORDER BY slug LIMIT 101",
-            &[&org],
-        )
-        .await
-        .map_err(Error::internal)?;
-    let items: Vec<_> = rows.iter().take(100).map(|r| sjson!({"id":r.get::<_,Uuid>(0),"slug":r.get::<_,&str>(1),"name":r.get::<_,&str>(2),"role":r.get::<_,&str>(3),"version":r.get::<_,i64>(4)})).collect();
-    auth::finish_tx(tx, &actor, false).await?;
-    Ok(json(StatusCode::OK, sjson!({"items":items,"truncated":rows.len()>100})))
-}
-
 pub async fn create_team(
     State(state): State<Arc<AppState>>,
     Path(slug): Path<String>,
@@ -334,6 +343,7 @@ pub async fn create_team(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgTeamsWrite).await?;
     lock_org_for_admin(&tx, org, actor.id).await?;
     let id = Uuid::new_v4();
     let inserted = tx.execute("INSERT INTO organization_teams(id,organization_id,slug,name,role) VALUES($1,$2,$3,$4,$5) ON CONFLICT(organization_id,slug) DO NOTHING",
@@ -358,6 +368,7 @@ async fn change_team_member(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgTeamsWrite).await?;
     lock_org_for_admin(&tx, org, actor.id).await?;
     let team: Uuid = tx
         .query_opt("SELECT id FROM organization_teams WHERE organization_id=$1 AND slug=$2", &[&org, &team_slug])
@@ -371,6 +382,15 @@ async fn change_team_member(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?
         .get(0);
+    // The composite team/membership foreign key would otherwise surface a
+    // non-member as an internal error. Check the precondition here, after the
+    // admin and team checks, so an unauthorized caller still learns nothing.
+    if add {
+        tx.query_opt("SELECT 1 FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", &[&org, &user])
+            .await
+            .map_err(Error::internal)?
+            .ok_or(Error(StatusCode::CONFLICT, "user is not an organization member"))?;
+    }
     let changed = if add {
         tx.execute("INSERT INTO organization_team_members(team_id,organization_id,user_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", &[&team,&org,&user]).await.map_err(Error::internal)?
     } else {
@@ -381,15 +401,19 @@ async fn change_team_member(
     if !add && changed == 0 {
         return Err(Error::not_found());
     }
-    audit(
-        &tx,
-        org,
-        actor.id,
-        if add { "organization.team.member.added" } else { "organization.team.member.removed" },
-        &username,
-        sjson!({"team":team_slug}),
-    )
-    .await?;
+    // A repeated add is an idempotent NO-OP: keep the historic 200 response
+    // but do not append a second audit event for a state that did not change.
+    if changed != 0 {
+        audit(
+            &tx,
+            org,
+            actor.id,
+            if add { "organization.team.member.added" } else { "organization.team.member.removed" },
+            &username,
+            sjson!({"team":team_slug}),
+        )
+        .await?;
+    }
     auth::finish_tx(tx, &actor, true).await?;
     Ok(json(StatusCode::OK, sjson!({"team":team_slug,"username":username,"member":add})))
 }

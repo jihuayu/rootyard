@@ -1,0 +1,85 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "synthetic_source",
+      "status": "passed",
+      "seconds": 4.7195,
+      "detail": {
+        "fresh_databases": 2,
+        "live_server_backup_rejected": true,
+        "unknown_and_unfinished_journal": true
+      }
+    },
+    {
+      "name": "offline_barriers_and_snapshot",
+      "status": "passed",
+      "seconds": 41.7097,
+      "detail": {
+        "snapshot_includes_commit_after_barrier_wait": true,
+        "inherited_volume_lock_rejected": true,
+        "backup_seconds": 34.082865646
+      }
+    },
+    {
+      "name": "unsafe_or_corrupt_inputs",
+      "status": "passed",
+      "seconds": 160.8835,
+      "detail": {
+        "corrupt_missing_extra_traversal_symlink_rejected_before_sql": true,
+        "existing_targets_and_overlap_refused": true,
+        "external_object_dependencies_refused": true
+      }
+    },
+    {
+      "name": "backup_barrier_failures",
+      "status": "passed",
+      "seconds": 19.4744,
+      "detail": {
+        "exporter_connection_loss_no_publication": true,
+        "queued_ddl_bounded_safe_failure": true
+      }
+    },
+    {
+      "name": "interrupted_restore_guard",
+      "status": "passed",
+      "seconds": 23.6607,
+      "detail": {
+        "killed_parent_while_native_pg_restore_blocked": true,
+        "no_orphan_import_or_partial_sql": true,
+        "persistent_guard_blocks_startup": true
+      }
+    },
+    {
+      "name": "post_backup_write_not_in_snapshot",
+      "status": "passed",
+      "seconds": 3.6712,
+      "detail": {
+        "post_backup_acknowledged_commit": true,
+        "seconds_after_backup_boundary": 249.353
+      }
+    },
+    {
+      "name": "new_environment_restore_clone_fsck",
+      "status": "passed",
+      "seconds": 27.8297,
+      "detail": {
+        "fresh_database_and_directory": true,
+        "separate_pg_server": false,
+        "standard_authenticated_clone_fsck_refs_content": true,
+        "revoked_and_read_only_auth_preserved": true,
+        "unknown_stays_blocked": true,
+        "restore_seconds": 24.756673449,
+        "backup_boundary_commits_missing": 0,
+        "post_backup_acknowledged_commits_not_recovered": 1,
+        "observed_backup_age_at_last_ack_seconds": 249.353,
+        "production_rpo_rto_guarantee": false
+      }
+    }
+  ],
+  "binary_sha256": "85c66397f755768fa139cf4952fca6a21ca12747bd6d18b042f80c2a62f0eb3d",
+  "limitations": [
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.",
+    "Unknown evidence preserved, not automatically resolved."
+  ]
+}

@@ -41,7 +41,7 @@ pub async fn prepare(
         let actor=auth::authenticate(&state.pool,&headers).await?;
         let mut client=state.pool.get().await.map_err(Error::internal)?;
         let tx=client.transaction().await.map_err(Error::internal)?;
-        let access=auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Read).await?;
+        let access=auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Read,crate::token_scopes::RepoAction::ContentsRead).await?;
         let row=tx.query_opt("SELECT plan FROM ci_checkout_jobs WHERE repository_id=$1 AND job_id=$2 \
             AND issuer_token_id=$3 AND NOT cancelled AND NOT revoked \
             AND expires_unix>extract(epoch FROM clock_timestamp())",
@@ -49,7 +49,7 @@ pub async fn prepare(
             .await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
         let plan:Plan=serde_json::from_value(row.get(0)).map_err(Error::internal)?;
         for sub in &plan.dependencies.submodules {
-            auth::authorize_repo_with_role(&tx,&actor,&sub.owner,&sub.name,Role::Read).await?;
+            auth::authorize_repo_with_role(&tx,&actor,&sub.owner,&sub.name,Role::Read,crate::token_scopes::RepoAction::ContentsRead).await?;
         }
         tx.commit().await.map_err(Error::internal)?;
         (plan,headers.clone(),None)
@@ -125,11 +125,10 @@ async fn fetch_lfs(state:&AppState,primary:&str,headers:&HeaderMap,repo:&db::Rep
     }.await;
     drop(file);
     if let Err(error)=result {let _=std::fs::remove_file(&stage);return Err(error);}
-    if let Some(scope)=scope {
-        if let Err(error)=scope.validate_source(state,repo.id).await {
+    if let Some(scope)=scope
+        && let Err(error)=scope.validate_source(state,repo.id).await {
             let _=std::fs::remove_file(&stage);return Err(error);
         }
-    }
     std::fs::rename(&stage,&target).map_err(Error::internal)?;
     std::fs::File::open(&dir).and_then(|f|f.sync_all()).map_err(Error::internal)?;
     Ok(())

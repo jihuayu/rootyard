@@ -1,0 +1,104 @@
+
+running 17 tests
+test capture_serializes_with_commit_refs_and_commits_one_revision ... FAILED
+test corrupt_ledger_bodies_and_direct_pin_rewrites_are_typed_denials ... FAILED
+test direct_sql_scope_fks_and_delete_guards_are_durable ... FAILED
+test exact_create_replay_returns_old_receipt_and_never_double_charges ... FAILED
+test expired_and_released_replays_never_extend_or_revive ... FAILED
+test expired_pin_denies_pages_and_renew_but_release_is_exact ... FAILED
+test failure_after_inserts_rolls_back_every_metadata_row ... FAILED
+test non_ascii_refs_page_with_literal_prefix_and_cursor ... FAILED
+test oversize_capture_is_typed_and_writes_no_metadata_or_quota ... FAILED
+test renew_after_live_check_observes_expiry_without_charge ... FAILED
+test renew_release_generation_aba_and_exact_replay ... FAILED
+test retained_quota_is_exact_without_refund_and_racing_creates ... FAILED
+test scope_and_cursor_fences ... FAILED
+test stale_gate_is_rejected_and_pages_stay_immutable_while_refs_change ... FAILED
+test transition_blocks_pages_and_renew_but_allows_exact_release ... FAILED
+test unknown_commit_resolves_by_same_request_id ... FAILED
+test unknown_lookups_and_metadata_capabilities ... FAILED
+
+failures:
+
+---- capture_serializes_with_commit_refs_and_commits_one_revision stdout ----
+Error: backend never blocked on the fixture advisory barrier
+
+Caused by:
+    deadline has elapsed
+
+---- corrupt_ledger_bodies_and_direct_pin_rewrites_are_typed_denials stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- direct_sql_scope_fks_and_delete_guards_are_durable stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- exact_create_replay_returns_old_receipt_and_never_double_charges stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- expired_and_released_replays_never_extend_or_revive stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- expired_pin_denies_pages_and_renew_but_release_is_exact stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- failure_after_inserts_rolls_back_every_metadata_row stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- non_ascii_refs_page_with_literal_prefix_and_cursor stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- oversize_capture_is_typed_and_writes_no_metadata_or_quota stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- renew_after_live_check_observes_expiry_without_charge stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- renew_release_generation_aba_and_exact_replay stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- retained_quota_is_exact_without_refund_and_racing_creates stdout ----
+
+thread 'retained_quota_is_exact_without_refund_and_racing_creates' (32700) panicked at tests/ref_store_core_snapshot.rs:1348:31:
+unexpected racing create error: ref-store database error: error serializing parameter 13
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- scope_and_cursor_fences stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- stale_gate_is_rejected_and_pages_stay_immutable_while_refs_change stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- transition_blocks_pages_and_renew_but_allows_exact_release stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+---- unknown_commit_resolves_by_same_request_id stdout ----
+Error: backend never blocked on the fixture advisory barrier
+
+Caused by:
+    deadline has elapsed
+
+---- unknown_lookups_and_metadata_capabilities stdout ----
+Error: ref-store database error: error serializing parameter 13
+
+
+failures:
+    capture_serializes_with_commit_refs_and_commits_one_revision
+    corrupt_ledger_bodies_and_direct_pin_rewrites_are_typed_denials
+    direct_sql_scope_fks_and_delete_guards_are_durable
+    exact_create_replay_returns_old_receipt_and_never_double_charges
+    expired_and_released_replays_never_extend_or_revive
+    expired_pin_denies_pages_and_renew_but_release_is_exact
+    failure_after_inserts_rolls_back_every_metadata_row
+    non_ascii_refs_page_with_literal_prefix_and_cursor
+    oversize_capture_is_typed_and_writes_no_metadata_or_quota
+    renew_after_live_check_observes_expiry_without_charge
+    renew_release_generation_aba_and_exact_replay
+    retained_quota_is_exact_without_refund_and_racing_creates
+    scope_and_cursor_fences
+    stale_gate_is_rejected_and_pages_stay_immutable_while_refs_change
+    transition_blocks_pages_and_renew_but_allows_exact_release
+    unknown_commit_resolves_by_same_request_id
+    unknown_lookups_and_metadata_capabilities
+
+test result: FAILED. 0 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 34.57s
+

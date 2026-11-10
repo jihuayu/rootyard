@@ -1,0 +1,220 @@
+synthetic_source_with_typed_native_pack_commit: passed
+offline_barriers_and_snapshot: passed
+unsafe_or_corrupt_inputs: passed
+backup_barrier_failures: passed
+interrupted_restore_guard: passed
+post_backup_write_not_in_snapshot: passed
+new_environment_restore_schema142_pack_ledger_clone_fsck: passed
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "synthetic_source_with_typed_native_pack_commit",
+      "status": "passed",
+      "seconds": 5.3003,
+      "detail": {
+        "fresh_databases": 2,
+        "live_server_backup_rejected": true,
+        "unknown_and_unfinished_journal": true,
+        "direct_sql_core_fixture_repository": "946b1a1a-4f05-4abd-b3bd-cab0a75272db",
+        "core_fixture_is_adapter_or_protocol_acknowledgement": false,
+        "populated_fixture_rows_by_table": {
+          "ref_store_issuer_lanes": 1,
+          "ref_store_operations": 2,
+          "ref_store_cancellations": 1,
+          "ref_store_core_gates": 1,
+          "ref_store_core_refs": 1,
+          "ref_store_core_events": 1
+        },
+        "adapter_seeded_schema142_pack_tables": {
+          "ref_store_core_pack_artifacts": 2,
+          "ref_store_core_pack_history": 2,
+          "ref_store_core_pack_memberships": 1,
+          "ref_store_core_pack_publications": 1,
+          "ref_store_core_pack_repo_usage": 1,
+          "ref_store_core_pack_tenant_usage": 1
+        },
+        "adapter_seeded_complete_schema141_hold_tables": {
+          "artifact_hold_requests": 1,
+          "artifact_holds": 2,
+          "artifact_hold_consume_receipts": 2,
+          "artifact_hold_shards": 64,
+          "artifact_hold_repo_usage": 1,
+          "artifact_hold_tenant_usage": 1
+        },
+        "typed_native_pack_commit_registered_and_verified": true,
+        "native_pack_verifier_proof_minted_by_real_verifier": true,
+        "sql_faked_ack_or_registration": false,
+        "inherited_plain_sql_139_gate_reused_for_native_proof": false,
+        "pack_repository_tenant_equals_inherited_fixture_tenant": false,
+        "pack_gate_pack_mode": "pack_verified",
+        "pack_gate_revision": 2,
+        "pack_verified_gate_activated_by_the_commit": true,
+        "restored_blob_bytes_backed_up": false,
+        "held_remote_objects_deleted": false
+      }
+    },
+    {
+      "name": "offline_barriers_and_snapshot",
+      "status": "passed",
+      "seconds": 14.8933,
+      "detail": {
+        "snapshot_includes_commit_after_barrier_wait": true,
+        "inherited_volume_lock_rejected": true,
+        "backup_seconds": 11.317210188,
+        "backup_format": 18,
+        "archive_contains_schema_versions": [
+          138,
+          139
+        ],
+        "schema142_is_current": true,
+        "schema142_pack_ledger_tables": [
+          "ref_store_core_pack_artifacts",
+          "ref_store_core_pack_history",
+          "ref_store_core_pack_memberships",
+          "ref_store_core_pack_publications",
+          "ref_store_core_pack_repo_usage",
+          "ref_store_core_pack_tenant_usage"
+        ],
+        "schema142_pack_ledger_nonempty": true,
+        "schema141_hold_ledger_complete": {
+          "artifact_hold_requests": 1,
+          "artifact_holds": 2,
+          "artifact_hold_consume_receipts": 2,
+          "artifact_hold_shards": 64,
+          "artifact_hold_repo_usage": 1,
+          "artifact_hold_tenant_usage": 1
+        },
+        "parent_snapshot_inspected_dynamic_schema142_tables": [
+          "ref_store_core_pack_artifacts",
+          "ref_store_core_pack_history",
+          "ref_store_core_pack_memberships",
+          "ref_store_core_pack_publications",
+          "ref_store_core_pack_repo_usage",
+          "ref_store_core_pack_tenant_usage"
+        ],
+        "gate_pack_mode_pack_verified": true
+      }
+    },
+    {
+      "name": "unsafe_or_corrupt_inputs",
+      "status": "passed",
+      "seconds": 61.3903,
+      "detail": {
+        "corrupt_missing_extra_traversal_symlink_rejected_before_sql": true,
+        "existing_targets_and_overlap_refused": true,
+        "external_object_dependencies_refused": true
+      }
+    },
+    {
+      "name": "backup_barrier_failures",
+      "status": "passed",
+      "seconds": 10.9596,
+      "detail": {
+        "exporter_connection_loss_no_publication": true,
+        "queued_ddl_bounded_safe_failure": true
+      }
+    },
+    {
+      "name": "interrupted_restore_guard",
+      "status": "passed",
+      "seconds": 8.9234,
+      "detail": {
+        "killed_parent_while_native_pg_restore_blocked": true,
+        "no_orphan_import_or_partial_sql": true,
+        "persistent_guard_blocks_startup": true,
+        "restore_guard_preflight_seconds": 5.185,
+        "native_pg_restore_blocked_seconds": 2.641
+      }
+    },
+    {
+      "name": "post_backup_write_not_in_snapshot",
+      "status": "passed",
+      "seconds": 0.8983,
+      "detail": {
+        "post_backup_acknowledged_commit": true,
+        "seconds_after_backup_boundary": 97.272
+      }
+    },
+    {
+      "name": "new_environment_restore_schema142_pack_ledger_clone_fsck",
+      "status": "passed",
+      "seconds": 12.2087,
+      "detail": {
+        "fresh_database_and_directory": true,
+        "separate_pg_server": false,
+        "standard_authenticated_clone_fsck_refs_content": true,
+        "revoked_and_read_only_auth_preserved": true,
+        "unknown_stays_blocked": true,
+        "restore_seconds": 9.110950601,
+        "backup_boundary_commits_missing": 0,
+        "post_backup_acknowledged_commits_not_recovered": 1,
+        "observed_backup_age_at_last_ack_seconds": 97.272,
+        "production_rpo_rto_guarantee": false,
+        "populated_core_rows_restored_exactly": true,
+        "gates_refs_events_operations_cancellations_issuer_lanes_nonempty": true,
+        "terminal_event_cancellation_updates_refused_without_row_changes": true,
+        "core_repository_stays_provisioning_gitfs_unserved": true,
+        "core_fixture_direct_sql_not_adapter_acknowledgement": true,
+        "all_six_schema142_tables_restored_exactly": true,
+        "pack_publications_artifacts_memberships_history_usage_nonempty_after_restore": true,
+        "complete_schema141_hold_ledger_restored_exactly": true,
+        "schema142_pack_mode_pack_verified_retained": true,
+        "typed_replay_verify_helper_ran_on_restored_database": true,
+        "immutable_registration_replayed_without_proof_or_grant": true,
+        "restored_pack_counters_not_charged_by_replay": true,
+        "physical_locators_and_backend_identity_compared": true,
+        "known_refs_head_mode_revision_history_event_compared": true,
+        "direct_updates_deletes_truncate_refused_with_rows_unchanged": true,
+        "pack_mode_downgrade_refused": true,
+        "triggers_enabled_not_disabled_by_the_drill": true,
+        "s3_original_bytes_external_and_unchanged_after_restore": true,
+        "restored_blob_bytes_backed_up": false,
+        "byte_backup_or_physical_protection_closure_claimed": false,
+        "held_remote_objects_deleted": false
+      }
+    }
+  ],
+  "skips": 0,
+  "binary": "/workspace/scratch/state-pack142-app-v1/rootyard",
+  "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+  "backup_format": 18,
+  "schema_version": 142,
+  "pack_fixture_helper": {
+    "binary": "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture",
+    "binary_sha256": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "build_receipt": "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture.build.json",
+    "build_receipt_sha256": "212b9b4fe71eba7f4c283db90c6926aefdcd29735d50ad6536c89053ca719beb",
+    "build_kind": "rust-integration-test",
+    "package_rebuilt": true,
+    "fresh": false,
+    "fresh_false_artifact": {
+      "target": "ref_store_packs_backup_fixture",
+      "kind": "test",
+      "fresh": false
+    },
+    "test_profile": true,
+    "integration_test_source_sha256": "b451f874975d94183643d6d000aa57a88409568c34bac852e5a2b540b1ae445f",
+    "integration_test_source_matches_source_file": true,
+    "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "candidate_application_receipt": "/workspace/scratch/state-pack142-app-v1/rootyard.build.json",
+    "candidate_application_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "candidate_application_package_rebuilt": true,
+    "source_inputs_match_candidate_application": true,
+    "retained_binding_stages": [
+      "seed",
+      "verify"
+    ],
+    "helper_binary_sha256_after_run": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "candidate_application_sha256_after_run": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "binaries_unchanged_after_run": true
+  },
+  "limitations": [
+    "The typed pack ledger is seeded by the real A3/A4 pipeline and native PackVerifier; no SQL ACK, proof or registration is fabricated.",
+    "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+    "The random pack repository stays provisioning/gitfs/unserved for the whole drill.",
+    "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+    "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+  ]
+}

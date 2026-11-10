@@ -1,0 +1,20 @@
+{
+  "diagnostic_only": true,
+  "returncode": 101,
+  "summary": "test result: FAILED. 11 passed; 8 failed; 0 ignored;",
+  "seconds": 22.89,
+  "before": {
+    "source": "2ecf1ceded43decf0e769f95f1a46e03a0fceaf790fb5c297f132cdc84105820",
+    "test": "291a8f5cd10b00af2f4358d1b2c971130a2503d7439ec0ab183a6a718e3dd98c",
+    "binary": "43b4642d6b586f960d781c8c43f2101a8ec54b794501e7d29223f11990b8fe33"
+  },
+  "after": {
+    "source": "2ecf1ceded43decf0e769f95f1a46e03a0fceaf790fb5c297f132cdc84105820",
+    "test": "291a8f5cd10b00af2f4358d1b2c971130a2503d7439ec0ab183a6a718e3dd98c",
+    "binary": "43b4642d6b586f960d781c8c43f2101a8ec54b794501e7d29223f11990b8fe33"
+  },
+  "compiled_inputs_and_test_unchanged_during_run": true,
+  "limits": [
+    "Uncommitted development checkout diagnostic; not final clean-source qualification. Other independent new test files may be written during execution; compiled production inputs and this test are hashed."
+  ]
+}

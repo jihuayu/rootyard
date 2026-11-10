@@ -1,0 +1,21 @@
+sequenceDiagram
+  participant O as 备份恢复控制者
+  participant A as 应用与独立worker
+  participant P as 业务PostgreSQL
+  participant R as RefStore权威
+  participant B as Blob与维护删除器
+  participant N as 隔离的全新同版本目标
+  O->>A: 停止新写及独立worker
+  O->>R: 冻结新apply，排空或闭合unknown
+  O->>B: 冻结维护删除，建立备份hold
+  O->>P: 捕获PG cut与决策、hold、cursor
+  O->>R: 捕获权威快照、roots和终态
+  Note over P,R: 单机权威在同一PG内，分布式另绑定Raft index
+  O->>B: 校验完整对象闭包并写不可变配对manifest
+  O->>N: 核验manifest，恢复PG、权威与Blob
+  N->>N: 新history incarnation，拒绝旧decision与worker/deleter grant
+  N->>P: 重放投影与finalizer，对账权限和保留
+  N->>B: 空计算目录重建视图并验证clone/fsck与业务流
+  N-->>O: 验收通过后开放
+  Note over P,B: 不是跨存储原子事务，任一点不匹配拒绝开放
+  Note over O,N: 无旧版本升级或GitFS导入；旧副本不得获删除权

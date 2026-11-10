@@ -1,6 +1,13 @@
 //! Durable orphan cleanup for tenant-scoped remote checkpoint objects.
 use super::{remote, service};
-use crate::{AppState, Error, members::models::Role};
+use crate::{
+    AppState, Error, config,
+    members::models::Role,
+    observability::{
+        self,
+        worker::{OperationContext, Phase, WorkerKind},
+    },
+};
 use axum::{
     Json,
     extract::{Path, State},
@@ -21,6 +28,17 @@ pub(super) async fn lock_key(tx: &deadpool_postgres::Transaction<'_>, tenant: Uu
     Ok(())
 }
 
+async fn cleanup_pending_objects(client: &deadpool_postgres::Client, checkpoint: Uuid) -> Result<i64, Error> {
+    client
+        .query_one(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT tenant_id,digest FROM workspace_remote_staging_objects WHERE checkpoint_id=$1) pending",
+            &[&checkpoint],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(Error::internal)
+}
+
 pub async fn abandon(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -35,7 +53,8 @@ pub async fn abandon(
         .ok_or_else(Error::not_found)?;
     let workspace_id: Uuid = row.get(0);
     let status: String = row.get(1);
-    service::authorized(&state, &headers, workspace_id, Role::Write).await?;
+    service::authorized(&state, &headers, workspace_id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite)
+        .await?;
     if status == "committed" {
         return Err(Error(StatusCode::CONFLICT, "committed checkpoint is a retention root"));
     }
@@ -60,10 +79,28 @@ pub async fn abandon(
     tx.commit().await.map_err(Error::internal)?;
     // A transport failure leaves the staging rows as the retryable tombstone.
     let removed = collect_once(&state).await.unwrap_or(0);
-    Ok((StatusCode::OK, Json(json!({"checkpoint_id":cp,"state":"failed","objects_collected":removed}))))
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let pending = cleanup_pending_objects(&client, cp).await?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "checkpoint_id":cp,
+            "state":"failed",
+            "objects_collected":removed,
+            "cleanup_pending": pending > 0,
+            "cleanup_pending_objects": pending
+        })),
+    ))
 }
 
 pub async fn collect_once(state: &AppState) -> Result<usize, Error> {
+    // Fail closed. The tenant/workspace/SHA-256 key has no external delete
+    // authority or epoch yet, so the default program must not remove bytes or
+    // discard the failed checkpoint's retryable SQL references. Only an
+    // explicit unsafe operator opt-in may enter the legacy collector below.
+    if !config::workspace_unsafe_remote_delete() {
+        return Ok(0);
+    }
     let store = remote::remote_store(state)?;
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows = client
@@ -101,6 +138,9 @@ pub async fn collect_once(state: &AppState) -> Result<usize, Error> {
             tx.commit().await.map_err(Error::internal)?;
             continue;
         }
+        // The key is derived from this staging row's tenant and the workspace
+        // namespace only. Never borrow a tenant, source or authority from a
+        // request or from another checkpoint.
         let key = remote::key(tenant, &digest)?;
         store.delete(&key, tokio::time::Instant::now() + Duration::from_secs(30)).await.map_err(Error::internal)?;
         tx.execute(
@@ -116,9 +156,16 @@ pub async fn collect_once(state: &AppState) -> Result<usize, Error> {
 }
 
 pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
+    if !config::workspace_unsafe_remote_delete() {
+        eprintln!(
+            "rootyard: workspace remote delete disabled (safe default); failed staging references retained for an external delete broker"
+        );
+        return;
+    }
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
         tokio::select! { _=stop.cancelled()=>break, _=interval.tick()=>{} }
-        let _ = collect_once(&state).await;
+        let operation = OperationContext::new(WorkerKind::WorkspaceRemoteGc);
+        let _ = observability::worker::run(&operation, Phase::Collect, collect_once(&state)).await;
     }
 }

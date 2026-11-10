@@ -1,0 +1,128 @@
+{
+  "passed": true,
+  "target": "ref_store_decision_subset",
+  "expected": 20,
+  "returncode": 0,
+  "seconds": 77.351,
+  "summary": "test result: ok. 20 passed; 0 failed; 0 ignored;",
+  "command": [
+    "/workspace/scratch/state144-matrix-build-v2/ref_store_decision_subset",
+    "--ignored",
+    "--test-threads=1"
+  ],
+  "before": {
+    "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "test": "d9eb531a71735c880e5b82f0609dbdb7545585765aa11a3a897bb3a7ea37c6fe",
+    "test_inputs": {
+      "tests/ref_store_decision_subset.rs": "d9eb531a71735c880e5b82f0609dbdb7545585765aa11a3a897bb3a7ea37c6fe",
+      "tests/decision_subset_support/assert.rs": "1b6b4454900f81fb60d12adbd3b8ece727adb0dd5a2796743a61e0378d9c7955",
+      "tests/decision_subset_support/auth.rs": "aa731dd2f2631d69a87085e7171403246f804d1cfd436536dba266cda09bcac1",
+      "tests/decision_subset_support/cases_a.rs": "2fa574fa8b93d632f48cf198c1763bfba941867183df70bda60c3b89569ac208",
+      "tests/decision_subset_support/cases_b.rs": "db392c0ca9c4a4a7ae484abc5b7cc9bf8388a35e162c9d26eb46d39328c852df",
+      "tests/decision_subset_support/cases_c.rs": "497a2968c3d45e3c877812c483b4cb0577770a85355aa921fa258bf28ead9a98",
+      "tests/decision_subset_support/cases_d.rs": "dad8b4f07a5775a96dfebe57b56b5db7be8d8a107eca4e4fce635fa66b40b3ac",
+      "tests/decision_subset_support/common.rs": "d9fa3524d70cd5c103c7f5ef0d8bc9dbf4a24473e3203f1130fdd0e4862504bf",
+      "tests/decision_subset_support/fixture.rs": "026e9afaec244236e2baee258fd3054372593d8f46560472ccaf663fe3c0ffa8",
+      "tests/decision_subset_support/metadata.rs": "bc5647fd85d28b5b853ab86725b4b11c699d1166ad9fde44f6cee1678a05c1b2",
+      "tests/decision_subset_support/mod.rs": "a56cb62a92dc07d975d86ad9b6255068d21f52dc44e9c431a494dd762e24833f",
+      "tests/decision_subset_support/policy.rs": "248226fabd9a41e2aaeda9d176bdf793740cabc14d4aa37df52207b71429dc16",
+      "tests/retention_roots_support/cases_extra.rs": "3aeea235b98071cbe78d778378f1c0302095c3854432cfa7ccc9f50750dfff72",
+      "tests/retention_roots_support/cases_tail.rs": "4c6c07f30d82e39760deb324fb1dea8a61d5fbd3dbe2177e85dd1469bf1675ab",
+      "tests/retention_roots_support/common.rs": "daaa493af1e6dff15f153ec4d1e99c1353693d87349b313e5d827114c5723a3c",
+      "tests/retention_roots_support/db.rs": "85ed5644f64d86fd469b0c20b781ec1ebe6ea63179e5457a2975226f124abe06",
+      "tests/retention_roots_support/git.rs": "1e9d5de62ebabda8348c5c6ef78a641d4aa47ad9bfa4079eb5f9ff1aed68df2c",
+      "tests/retention_roots_support/mod.rs": "9703d9efa566e17cec0bfe6159dc4c020e1a0063619285ead08749c704cf3066",
+      "tests/retention_roots_support/pack.rs": "01a610be32ae33b551e70cb6aecc5ff2516d2435a81d057298c21a4e04d817b7",
+      "tests/retention_roots_support/roots.rs": "689bc65076d55305c3fcf97447eacec63fb8ddf4eeb4ee8a1ecbc16e2e7dda2f"
+    },
+    "binary": "dc2917beb1c0f2f026d0e3823476d3cfd629e5a4fdc8bbb48965c414d79a0a3d",
+    "head": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+    "clean": true
+  },
+  "after": {
+    "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "test": "d9eb531a71735c880e5b82f0609dbdb7545585765aa11a3a897bb3a7ea37c6fe",
+    "test_inputs": {
+      "tests/ref_store_decision_subset.rs": "d9eb531a71735c880e5b82f0609dbdb7545585765aa11a3a897bb3a7ea37c6fe",
+      "tests/decision_subset_support/assert.rs": "1b6b4454900f81fb60d12adbd3b8ece727adb0dd5a2796743a61e0378d9c7955",
+      "tests/decision_subset_support/auth.rs": "aa731dd2f2631d69a87085e7171403246f804d1cfd436536dba266cda09bcac1",
+      "tests/decision_subset_support/cases_a.rs": "2fa574fa8b93d632f48cf198c1763bfba941867183df70bda60c3b89569ac208",
+      "tests/decision_subset_support/cases_b.rs": "db392c0ca9c4a4a7ae484abc5b7cc9bf8388a35e162c9d26eb46d39328c852df",
+      "tests/decision_subset_support/cases_c.rs": "497a2968c3d45e3c877812c483b4cb0577770a85355aa921fa258bf28ead9a98",
+      "tests/decision_subset_support/cases_d.rs": "dad8b4f07a5775a96dfebe57b56b5db7be8d8a107eca4e4fce635fa66b40b3ac",
+      "tests/decision_subset_support/common.rs": "d9fa3524d70cd5c103c7f5ef0d8bc9dbf4a24473e3203f1130fdd0e4862504bf",
+      "tests/decision_subset_support/fixture.rs": "026e9afaec244236e2baee258fd3054372593d8f46560472ccaf663fe3c0ffa8",
+      "tests/decision_subset_support/metadata.rs": "bc5647fd85d28b5b853ab86725b4b11c699d1166ad9fde44f6cee1678a05c1b2",
+      "tests/decision_subset_support/mod.rs": "a56cb62a92dc07d975d86ad9b6255068d21f52dc44e9c431a494dd762e24833f",
+      "tests/decision_subset_support/policy.rs": "248226fabd9a41e2aaeda9d176bdf793740cabc14d4aa37df52207b71429dc16",
+      "tests/retention_roots_support/cases_extra.rs": "3aeea235b98071cbe78d778378f1c0302095c3854432cfa7ccc9f50750dfff72",
+      "tests/retention_roots_support/cases_tail.rs": "4c6c07f30d82e39760deb324fb1dea8a61d5fbd3dbe2177e85dd1469bf1675ab",
+      "tests/retention_roots_support/common.rs": "daaa493af1e6dff15f153ec4d1e99c1353693d87349b313e5d827114c5723a3c",
+      "tests/retention_roots_support/db.rs": "85ed5644f64d86fd469b0c20b781ec1ebe6ea63179e5457a2975226f124abe06",
+      "tests/retention_roots_support/git.rs": "1e9d5de62ebabda8348c5c6ef78a641d4aa47ad9bfa4079eb5f9ff1aed68df2c",
+      "tests/retention_roots_support/mod.rs": "9703d9efa566e17cec0bfe6159dc4c020e1a0063619285ead08749c704cf3066",
+      "tests/retention_roots_support/pack.rs": "01a610be32ae33b551e70cb6aecc5ff2516d2435a81d057298c21a4e04d817b7",
+      "tests/retention_roots_support/roots.rs": "689bc65076d55305c3fcf97447eacec63fb8ddf4eeb4ee8a1ecbc16e2e7dda2f"
+    },
+    "binary": "dc2917beb1c0f2f026d0e3823476d3cfd629e5a4fdc8bbb48965c414d79a0a3d",
+    "head": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+    "clean": true
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "370a2900286e2526e00fe4192d97200e5d618469707a0d19bccd6e969240c0f2",
+  "build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "dc2917beb1c0f2f026d0e3823476d3cfd629e5a4fdc8bbb48965c414d79a0a3d",
+    "workspace_commit": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+    "fresh": false,
+    "source_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "binary_sha256": "dc2917beb1c0f2f026d0e3823476d3cfd629e5a4fdc8bbb48965c414d79a0a3d",
+    "integration_test_source_sha256": "d9eb531a71735c880e5b82f0609dbdb7545585765aa11a3a897bb3a7ea37c6fe",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_decision_subset",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_decision_subset",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_decision_subset-13d640d708c8325b"
+      }
+    ],
+    "matrix_clean_once": true,
+    "matrix_first_rootyard_library_rebuilt": true
+  },
+  "qualification_kind": "clean-candidate",
+  "limits": [
+    "Loopback PG17 and Garage S3, native Git; no serving cutover or distributed Raft barrier.",
+    "Metadata backup does not archive original external Blob bytes."
+  ]
+}

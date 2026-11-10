@@ -1,0 +1,76 @@
+{
+  "binary_sha256": "6200812d69e819a7b9b2ede9c3e64b7f2702533852e8457998876eab9806ccd9",
+  "source_head": "063ce8829ff8a8fdf0ec0313da40ac8920e433fd",
+  "passed": true,
+  "cases": [
+    {
+      "name": "fixture",
+      "status": "passed",
+      "seconds": 2.6955,
+      "detail": {
+        "visible": 1001,
+        "pages_at_limit_1000": 2,
+        "repository_set_sha256": "900d6aafc78f54572c865019fd5b2d23c75793c492cd3b532def414275a99350"
+      }
+    },
+    {
+      "name": "default_boundary",
+      "status": "passed",
+      "seconds": 0.0687,
+      "detail": {
+        "first_page": 1000,
+        "second_page": 1,
+        "unique": 1001
+      }
+    },
+    {
+      "name": "bounded_traversal",
+      "status": "passed",
+      "seconds": 0.1203,
+      "detail": {
+        "pages": 11,
+        "unique": 1001,
+        "page_size": 97
+      }
+    },
+    {
+      "name": "cursor_contract",
+      "status": "passed",
+      "seconds": 0.0654,
+      "detail": {
+        "malformed_rejected": 9,
+        "limits_rejected": 5,
+        "query_rejected": 2
+      }
+    },
+    {
+      "name": "actor_scope",
+      "status": "passed",
+      "seconds": 0.0358,
+      "detail": {
+        "alice_cursor_on_bob": 400,
+        "bob_cursor_on_alice": 400,
+        "bob_visible": 2,
+        "read_only_scope_shared": true
+      }
+    },
+    {
+      "name": "concurrent_changes",
+      "status": "passed",
+      "seconds": 0.2111,
+      "detail": {
+        "pages_after_cursor": 27,
+        "unique_after_mutation": 1001,
+        "deleted_absent": true,
+        "early_insert_not_replayed": true,
+        "late_insert_visible": true
+      }
+    }
+  ],
+  "limitations": [
+    "One loopback process and one disposable PostgreSQL schema; not a scalability benchmark.",
+    "The cursor is a bounded scope-bound ordering position, not a signed capability or snapshot.",
+    "A catalog rewind/restore can move a cursor outside current rows; clients restart at page one.",
+    "Mutation coverage proves keyset semantics for inserts/deletes between pages, not serializable reads."
+  ]
+}

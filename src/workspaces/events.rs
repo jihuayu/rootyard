@@ -25,7 +25,8 @@ pub async fn list(
     Path(id): Path<Uuid>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<Value>, Error> {
-    let ws = service::authorized(&state, &headers, id, Role::Read).await?;
+    let ws =
+        service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
     let after = query.after_revision.unwrap_or(0);
     if after < 0 || after > ws.revision {
         return Err(Error::bad_request());
@@ -45,22 +46,22 @@ pub async fn stream(
     Path(id): Path<Uuid>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, Error> {
-    let ws = service::authorized(&state, &headers, id, Role::Read).await?;
+    let ws =
+        service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
     let mut after = query.after_revision.unwrap_or(0);
     if after < 0 || after > ws.revision {
         return Err(Error::bad_request());
     }
     let output = async_stream::stream! {
         loop {
-            if service::authorized(&state,&headers,id,Role::Read).await.is_err() { break; }
+            if service::authorized(&state,&headers,id,Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await.is_err() { break; }
             match batch(&state,id,after).await {
                 Ok(events) => {
-                    if let Some(first) = events.first().and_then(|v|v["revision"].as_i64()) {
-                        if first>after+1 {
+                    if let Some(first) = events.first().and_then(|v|v["revision"].as_i64())
+                        && first>after+1 {
                             yield Ok(Event::default().event("RESYNC_REQUIRED").data(json!({"snapshot_revision":first}).to_string()));
                             break;
                         }
-                    }
                     for item in events {
                         if let Some(rev)=item["revision"].as_i64() { after=rev; }
                         yield Ok(Event::default().id(after.to_string()).event("workspace").data(item.to_string()));

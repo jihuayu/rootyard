@@ -1,7 +1,7 @@
 //! A receive hook requests the parent-owned publication window. The hook exits
 //! before Git commits refs, so the parent retains both gates until Git stops.
 use crate::{
-    AppState, auth,
+    AppState,
     db::Identity,
     journal, reliability,
     storage::{self, ref_publication::PublicationGuard},
@@ -81,28 +81,30 @@ impl Coordinator {
                     {
                         continue;
                     }
+                    ensure!(
+                        guard.repository_id() == self.op.repository_id
+                            && guard.storage_generation() == self.op.storage_generation,
+                        "publication guard differs from admitted operation"
+                    );
                     let window =
                         guard.enter_window(&state.storage, deadline).await.map_err(|e| anyhow::anyhow!(e.1))?;
-                    auth::verify_active(&state.pool, &self.actor, self.op.repository_id, true)
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e.1))?;
                     let repo_path = state.storage.verify_path(self.op.repository_id)?;
                     let quota = state.config.max_repo_bytes;
                     let bytes = tokio::task::spawn_blocking(move || storage::disk_bytes(&repo_path, quota)).await??;
                     ensure!(bytes < quota, "repository quota reached before ref publication");
-                    let row = state
-                        .pool
-                        .get()
-                        .await?
-                        .query_one(
-                            "SELECT storage_generation,state FROM repositories WHERE id=$1",
-                            &[&self.op.repository_id],
+                    // Late authorization now runs on the owner's own transaction,
+                    // which already holds the exact-ref and repository advisory
+                    // locks; it takes the token `FOR SHARE` row lock and re-checks
+                    // the live grant, current role and repository state there.
+                    window
+                        .authorize_git_write(
+                            self.actor.clone(),
+                            self.op.repository_id,
+                            self.op.storage_generation,
+                            deadline,
                         )
-                        .await?;
-                    ensure!(
-                        row.get::<_, i64>(0) == self.op.storage_generation && row.get::<_, String>(1) == "ready",
-                        "repository changed before ref publication"
-                    );
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.1))?;
                     window.ensure_active().map_err(|e| anyhow::anyhow!(e.1))?;
                     journal::atomic(&self.op.path.join("publication.grant"), &self.nonce, false)?;
                     peer.write_all(b"1").await?;
@@ -176,10 +178,8 @@ pub(super) async fn settle(
     };
     let granted = coordinator.as_ref().is_some_and(Handle::granted);
     let mut coordinator = coordinator;
-    if !granted {
-        if let Some(handle) = coordinator.take() {
-            handle.abort().await;
-        }
+    if !granted && let Some(handle) = coordinator.take() {
+        handle.abort().await;
     }
     let _fallback = if granted {
         None

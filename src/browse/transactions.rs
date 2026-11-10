@@ -194,7 +194,7 @@ async fn execute_ref_transaction_inner(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, true).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?.repo_id;
     let current_generation: i64 = tx
         .query_one(
             "SELECT storage_generation FROM repositories WHERE id=$1 FOR SHARE",
@@ -210,8 +210,8 @@ async fn execute_ref_transaction_inner(
         "atomic": input.atomic,
         "updates": normalized_updates,
     });
-    if let Some(ref key) = idem_key {
-        if let Some(saved_response) =
+    if let Some(ref key) = idem_key
+        && let Some(saved_response) =
             creation_replay(&tx, actor.id, repo_id, key, &request_json).await?
         {
             auth::finish_tx(tx, &actor, true).await?;
@@ -222,13 +222,11 @@ async fn execute_ref_transaction_inner(
             )
                 .into_response());
         }
-    }
 
-    if let Some(expected_gen) = input.storage_generation {
-        if expected_gen != current_generation {
+    if let Some(expected_gen) = input.storage_generation
+        && expected_gen != current_generation {
             return Err(Error(StatusCode::CONFLICT, "storage generation mismatch"));
         }
-    }
     repo.storage_generation = current_generation;
     reliability::before_gitfs_push(&state, &repo).await?;
 
@@ -351,8 +349,13 @@ async fn execute_ref_transaction_inner(
         let mut all_old = true;
         let mut all_new = true;
         for change in &requested {
-            let observed = match git_read::run_git(&state, repo_id,
-                &["show-ref", "--verify", "--hash", &change.ref_name], 128).await {
+            // `show-ref --verify` reports a missing ref as the generic fatal
+            // 128, which can also mean a damaged repository. The quiet
+            // `rev-parse --verify` probe answers exactly 1 for "this ref does
+            // not exist", which is the observation a create needs: a missing
+            // old ref is the zero id, not a broken read.
+            let observed = match git_read::run_git(&state, repo_id, git_read::GitStep::RefVerify,
+                &["rev-parse", "--verify", "--quiet", &change.ref_name], 128).await {
                 Ok(raw) => Some(String::from_utf8_lossy(&raw).trim().to_owned()),
                 Err(e) if e.0 == StatusCode::NOT_FOUND => Some(zero_oid.to_owned()),
                 Err(_) => None,
@@ -448,7 +451,7 @@ async fn execute_ref_transaction_inner(
     // caller's token and effective role inside this same transaction so a
     // revocation during the transfer cannot publish refs or outbox events.
     auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repo_id,
-        auth::web_scope_enabled()).await?;
+        auth::web_scope_enabled(), crate::token_scopes::RepoAction::ContentsWrite).await?;
     tx.commit().await.map_err(Error::internal)?;
 
     Ok((

@@ -1,10 +1,17 @@
 //! Transparent Linux FUSE overlay over an immutable snapshot and private CoW layer.
-use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
-};
+//!
+//! Dispatch is bounded and per-mount: the kernel-facing shim in `fuse_ops` copies
+//! each request into an owned operation, and exactly one actor thread in
+//! `fuse_dispatch` owns this [`Overlay`] and the [`MutationGate`]. The actor is
+//! the only caller of `MutationGate::mutation`, so a mutation is admitted once
+//! and no thread-local `MutationGuard` is moved to another thread. Freeze,
+//! thaw-drain, fence and queue limits are documented in `fuse_dispatch`.
+//! Each queued mutation is stamped with the lease epoch observed at enqueue and
+//! is rejected if the actor admits it under a different epoch, so a lease
+//! handoff cannot replay an old write on the new authority.
+use fuser::{FileAttr, FileType, MountOption};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, File},
     io,
@@ -16,10 +23,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    sync::{
-        Arc, Condvar, Mutex, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicI64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -36,94 +40,6 @@ pub trait LazySource: Send + Sync {
     fn file(&self, relative: &Path) -> io::Result<Option<File>>;
 }
 
-const READ_WORKERS: usize = 4;
-const READ_QUEUE_BYTES: usize = 256;
-type ReadJob = Box<dyn FnOnce() + Send + 'static>;
-
-/// FUSE request dispatch is a single session thread. Hydration and pread for
-/// lazy lower files run on this bounded pool so one unreachable blob cannot
-/// block every other operation, and so distinct blobs hydrate concurrently.
-struct ReadPool {
-    queue: Mutex<VecDeque<ReadJob>>,
-    ready: Condvar,
-    capacity: usize,
-    closed: AtomicBool,
-}
-
-impl ReadPool {
-    fn new(workers: usize, capacity: usize) -> io::Result<Arc<Self>> {
-        let pool = Arc::new(Self {
-            queue: Mutex::new(VecDeque::new()),
-            ready: Condvar::new(),
-            capacity,
-            closed: AtomicBool::new(false),
-        });
-        for index in 0..workers {
-            let worker = pool.clone();
-            let result =
-                std::thread::Builder::new().name(format!("rootyard-fuse-read-{index}")).spawn(move || worker.run());
-            if let Err(error) = result {
-                pool.close();
-                return Err(error);
-            }
-        }
-        Ok(pool)
-    }
-
-    fn execute(&self, job: ReadJob) -> Result<(), ReadJob> {
-        let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.closed.load(Ordering::Acquire) || queue.len() >= self.capacity {
-            return Err(job);
-        }
-        queue.push_back(job);
-        drop(queue);
-        self.ready.notify_one();
-        Ok(())
-    }
-
-    fn run(&self) {
-        loop {
-            let job = {
-                let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                while queue.is_empty() && !self.closed.load(Ordering::Acquire) {
-                    queue = self.ready.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner);
-                }
-                queue.pop_front()
-            };
-            match job {
-                Some(job) => job(),
-                None => return,
-            }
-        }
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.ready.notify_all();
-    }
-}
-
-fn read_pool() -> io::Result<&'static ReadPool> {
-    static POOL: OnceLock<Result<Arc<ReadPool>, String>> = OnceLock::new();
-    POOL.get_or_init(|| ReadPool::new(READ_WORKERS, READ_QUEUE_BYTES).map_err(|e| e.to_string()))
-        .as_ref()
-        .map(|pool| pool.as_ref())
-        .map_err(|error| io::Error::other(error.clone()))
-}
-
-fn submit_read(job: ReadJob) {
-    match read_pool() {
-        Ok(pool) => {
-            if let Err(job) = pool.execute(job) {
-                // The bounded queue is saturated: preserve correctness by
-                // doing this one bounded read on the FUSE thread.
-                job();
-            }
-        }
-        Err(_) => job(),
-    }
-}
-
 fn open_lower(lazy: Option<&dyn LazySource>, relative: &Path, source: &Entry) -> io::Result<File> {
     if let Some(lazy) = lazy {
         match lazy.file(relative)? {
@@ -135,34 +51,109 @@ fn open_lower(lazy: Option<&dyn LazySource>, relative: &Path, source: &Entry) ->
     source.open(libc::O_RDONLY, 0)
 }
 
-pub struct MutationGate {
-    lock: RwLock<()>,
-    writable_until: AtomicI64,
-}
-impl MutationGate {
-    pub fn new(writable_until: i64) -> Arc<Self> {
-        Arc::new(Self { lock: RwLock::new(()), writable_until: AtomicI64::new(writable_until) })
-    }
-    pub fn update(&self, until: i64) {
-        self.writable_until.store(until, Ordering::Release);
-    }
-    pub fn freeze<T>(&self, work: impl FnOnce() -> T) -> T {
-        let _guard = self.lock.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        work()
-    }
-    fn mutation(&self) -> io::Result<std::sync::RwLockReadGuard<'_, ()>> {
-        let guard = self.lock.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(io::Error::other)?.as_secs() as i64;
-        if now >= self.writable_until.load(Ordering::Acquire) {
-            return Err(io::Error::from_raw_os_error(libc::EROFS));
-        }
-        Ok(guard)
-    }
-}
+// The gate now lives in its own module; keep the historical path stable for
+// `crate::workspace_lab::fuse_mount::MutationGate` callers.
+pub use super::mutation_gate::{FreezeDecision, GatePhase, LeaseObservation, MutationGate, MutationGuard};
 
+/// Identity of an owned mount, captured from `/proc/self/mountinfo`.
+///
+/// Mount IDs are unique in the kernel's mount-ID allocator, so comparing the
+/// captured ID proves that a path still carries the mount this handle created
+/// and not a newer mount stacked on top of it.
+pub(crate) type MountId = u64;
+
+#[path = "fuse_dispatch.rs"]
+mod fuse_dispatch;
 #[path = "fuse_io.rs"]
 mod fuse_io;
+#[path = "fuse_ops.rs"]
+mod fuse_ops;
+#[path = "inner_ops.rs"]
+mod inner_ops;
+#[path = "owned_ops.rs"]
+mod owned_ops;
+#[path = "fuse_mount/ownership.rs"]
+mod ownership;
+
+use fuse_dispatch::MountFs;
 use fuse_io::{Entry, safe_link_at, walk_dir};
+
+// The owned teardown implementation lives in `ownership`; only this module
+// (and its tests, through `super`) uses it, so no wider re-export is needed.
+use ownership::unmount_owned;
+
+pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
+
+/// Live kernel mount. Dropping the session unmounts and drops the shim, which
+/// stops the actor and drains every queued reply.
+///
+/// The handle also remembers the canonical mount point and the kernel mount ID
+/// captured when it mounted, so its owned teardown can unmount exactly this
+/// mount instead of whichever mount happens to sit at that path by then.
+pub struct MountHandle {
+    session: fuser::BackgroundSession,
+    dispatcher: Arc<fuse_dispatch::Dispatcher>,
+    /// Canonical mount point the kernel published for this handle.
+    mountpoint: PathBuf,
+    /// Kernel mount ID captured for this handle when it mounted.
+    mount_id: MountId,
+}
+
+impl MountHandle {
+    pub fn queue_usage(&self) -> DispatchQueueUsage {
+        self.dispatcher.usage()
+    }
+
+    /// Stop the per-mount actor before the session is unmounted. Every reply
+    /// still sitting in a queue slot fails with `EIO`; an operation already
+    /// admitted to the gate may still finish. Reads executing in the global
+    /// read pool re-check the shutdown flag after I/O and reply `EIO`.
+    ///
+    /// This is the non-consuming half: it neither unmounts nor waits for the
+    /// kernel session thread. Callers that own the handle and are about to
+    /// exit (the helper teardown, unmount, cancel and publish-failure paths)
+    /// must use [`MountHandle::shutdown_and_join`] instead.
+    pub fn shutdown(&self) {
+        self.dispatcher.shutdown();
+    }
+
+    /// Consuming teardown with a completion barrier.
+    ///
+    /// Stops the dispatcher, then consumes the `fuser::BackgroundSession` and
+    /// calls its public `join()`: `join` drops the mount and blocks until
+    /// the kernel session thread has actually ended. That is the difference
+    /// from `shutdown()` + drop, where the background session detaches its join
+    /// handle and a process exiting right afterwards can terminate before the
+    /// unmount completed and leave an owned mount behind.
+    ///
+    /// The unmount itself is done here and is not delegated to `join`: on the
+    /// pure-Rust `AutoUnmount` path, dropping `fuser`'s `Mount` only closes the
+    /// fusermount monitor socket, while the session thread still owns its own
+    /// `/dev/fuse` clone and sits in `read`. Closing the monitor alone cannot
+    /// wake that read, so a join-first teardown would wait for a process exit
+    /// that is itself waiting for the join. Unmounting this handle's exact
+    /// mount with a normal (non-lazy) `umount2` while the session descriptor is
+    /// still open makes the kernel fail the parked read with `ENODEV`; `join`
+    /// is then a bounded completion barrier. `AutoUnmount` remains the crash
+    /// path (SIGKILL closes the last descriptor and the monitor socket).
+    ///
+    /// A refused unmount is never papered over: the session is still joined in
+    /// and the independent shutdown watchdog bounds and fails that exit with a
+    /// non-zero code instead of claiming a graceful teardown.
+    ///
+    /// Returns only after every owned session teardown has completed, so an
+    /// owner may exit successfully after this call. A session thread that
+    /// panicked propagates here (fail closed) instead of being ignored.
+    pub fn shutdown_and_join(self) {
+        let Self { session, dispatcher, mountpoint, mount_id } = self;
+        dispatcher.shutdown();
+        // A refused unmount must fail this process, never be reported as a
+        // graceful teardown: helper-only callers panic and exit non-zero, and
+        // `AutoUnmount` still closes the descriptor on unwind.
+        unmount_owned(&mountpoint, mount_id).expect("owned FUSE unmount failed");
+        session.join();
+    }
+}
 
 pub struct Overlay {
     lower: PathBuf,
@@ -176,7 +167,7 @@ pub struct Overlay {
 }
 impl Overlay {
     pub fn new(lower: PathBuf, upper: PathBuf) -> io::Result<Self> {
-        Self::new_with_gate(lower, upper, MutationGate::new(i64::MAX))
+        Self::new_with_gate(lower, upper, MutationGate::new_with_lease(1, i64::MAX)?)
     }
     pub fn new_with_gate(lower: PathBuf, upper: PathBuf, gate: Arc<MutationGate>) -> io::Result<Self> {
         Self::new_with_gate_and_lazy(lower, upper, gate, None)
@@ -312,27 +303,27 @@ impl Overlay {
     }
     fn prepare(&mut self, p: &Path) -> io::Result<Entry> {
         let to = Entry::new(&self.upper, p, true)?;
-        if to.lstat().is_err() {
-            if let Ok(from) = self.selected(p) {
-                let source = self.host_entry(&from, false)?;
-                let m = source.lstat()?;
-                if m.is_file() {
-                    let mut input = if from.starts_with(&self.lower) {
-                        open_lower(self.lazy.as_deref(), p, &source)?
-                    } else {
-                        source.open(libc::O_RDONLY, 0)?
-                    };
-                    let mut output =
-                        to.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, m.permissions().mode() & 0o777)?;
-                    io::copy(&mut input, &mut output)?;
-                    output.sync_all()?;
-                } else if m.file_type().is_symlink() {
-                    let target = source.read_link()?;
-                    safe_link_at(&target, p)?;
-                    to.symlink(&target)?;
-                } else if m.is_dir() {
-                    to.mkdir(m.permissions().mode() & 0o777)?;
-                }
+        if to.lstat().is_err()
+            && let Ok(from) = self.selected(p)
+        {
+            let source = self.host_entry(&from, false)?;
+            let m = source.lstat()?;
+            if m.is_file() {
+                let mut input = if from.starts_with(&self.lower) {
+                    open_lower(self.lazy.as_deref(), p, &source)?
+                } else {
+                    source.open(libc::O_RDONLY, 0)?
+                };
+                let mut output =
+                    to.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, m.permissions().mode() & 0o777)?;
+                io::copy(&mut input, &mut output)?;
+                output.sync_all()?;
+            } else if m.file_type().is_symlink() {
+                let target = source.read_link()?;
+                safe_link_at(&target, p)?;
+                to.symlink(&target)?;
+            } else if m.is_dir() {
+                to.mkdir(m.permissions().mode() & 0o777)?;
             }
         }
         Ok(to)
@@ -405,62 +396,109 @@ impl Overlay {
     }
 }
 
-#[path = "fuse_ops.rs"]
-mod fuse_ops;
+/// Mount options shared by every mount.
+///
+/// `AutoUnmount` is added only for the independent helper. The in-process
+/// service mount and the lab mount keep the legacy option list so an
+/// existing deployment is not switched onto the fusermount3 path by accident.
+pub(crate) fn mount_options(auto_unmount: bool) -> Vec<MountOption> {
+    let mut options = vec![MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions];
+    if auto_unmount {
+        options.push(MountOption::AutoUnmount);
+    }
+    options
+}
+
+fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Result<MountHandle> {
+    // Canonicalize before mounting: `/proc/self/mountinfo` publishes the
+    // canonical path, and the teardown identity check compares it exactly.
+    let mountpoint = mountpoint.canonicalize()?;
+    let fs = MountFs::new(overlay)?;
+    let dispatcher = fs.dispatcher().clone();
+    let session = fuser::spawn_mount2(fs, &mountpoint, &mount_options(auto_unmount))?;
+    // Capture the kernel mount identity before anyone else can observe the
+    // mount point. An unverifiable mount is not published: a later path-based
+    // unmount could otherwise hit a different mount stacked at the same path.
+    let mount_id = match ownership::mount_id_at_path(&mountpoint) {
+        Ok(Some(mount_id)) => mount_id,
+        Ok(None) => {
+            // The helper mount already succeeded, so dropping the background
+            // session would leave an untracked FUSE thread and a mount nobody
+            // can prove ownership of. `AutoUnmount` removes the mount when the
+            // last helper descriptor dies, so exit immediately and lock-free:
+            // no IO, no unmount guess, no destructor that joins the session.
+            if auto_unmount {
+                // SAFETY: `_exit` is async-signal-safe and does not touch
+                // Rust state or any lock; process death closes the owned FUSE
+                // descriptor and lets `AutoUnmount` clean the mountpoint.
+                unsafe { libc::_exit(1) }
+            }
+            drop(session);
+            return Err(io::Error::other("owned FUSE mount is missing from /proc/self/mountinfo"));
+        }
+        Err(error) => {
+            // Same fail-closed rule when the mount table cannot be read at
+            // all. The legacy (non-`AutoUnmount`) caller keeps its previous
+            // error propagation because it has no helper death cleanup.
+            if auto_unmount {
+                // SAFETY: as above; this path must not run any Rust teardown.
+                unsafe { libc::_exit(1) }
+            }
+            drop(session);
+            return Err(error);
+        }
+    };
+    Ok(MountHandle { session, dispatcher, mountpoint, mount_id })
+}
+
+/// Spawn the bounded per-mount dispatcher and mount `overlay` in the background.
+///
+/// Every mount owns its own queue and actor, so a slow read on one mount cannot
+/// stall another mount. Queue limits are shared per helper and per process.
+///
+/// This is the historical option list (no `AutoUnmount`): used by the in-process
+/// service mount, whose unmount is driven by the owning API process.
+pub fn spawn(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
+    spawn_with(overlay, mountpoint, false)
+}
+
+/// Spawn a mount owned by one independent FUSE helper process with
+/// [`MountOption::AutoUnmount`].
+///
+/// The helper is the only owner of its `/dev/fuse` descriptors: the API parent
+/// never receives them and nothing outside the helper unmounts on its behalf.
+/// `AutoUnmount` therefore makes the helper's death the ownership boundary.
+/// `fuser` takes the pure-Rust `fusermount3` path, keeps the fusermount monitor
+/// socket inside its `Mount`, and passes `auto_unmount` to `fusermount3`. When
+/// the helper is SIGKILLed the kernel closes its last FUSE fd and that socket
+/// together, so `fusermount3` unmounts exactly the mount it created at that
+/// path; no explicit `umount` from the harness or the API is involved.
+///
+/// Owner ACL is deliberately unchanged: `AutoUnmount` is the only option added
+/// here. `fuser` injects `allow_other` on the *fusermount command line* when it
+/// is needed for `auto_unmount`, but it derives `SessionACL` from the original
+/// option list, so the session stays `SessionACL::Owner`. Do not add
+/// `AllowOther`/`AllowRoot` here: that would widen the session ACL, and
+/// `DefaultPermissions` keeps the kernel/userspace permission checks in place.
+///
+/// Qualification is the deployment's job, not this function's: the helper needs
+/// a host policy where `fusermount3` exists and the caller may use
+/// `auto_unmount`/`allow_other`. Where the host is conventionally non-root the
+/// supported shape is a private user/mount namespace entered as namespace root
+/// (`unshare -Urm`), which the lifecycle harness and CI already use; a
+/// conventional non-root host without that wrapper may need `user_allow_other`
+/// in the host `fuse.conf` and is *not* qualified by this change. This service
+/// never edits a global `fuse.conf` or any LSM policy, and makes no implicit
+/// rootless guarantee.
+pub fn spawn_helper(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
+    spawn_with(overlay, mountpoint, true)
+}
 
 pub fn mount(lower: PathBuf, upper: PathBuf, mountpoint: PathBuf) -> io::Result<()> {
-    let fs = Overlay::new(lower, upper)?;
-    fuser::mount2(fs, mountpoint, &[MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions])
+    let fs = MountFs::new(Overlay::new(lower, upper)?)?;
+    fuser::mount2(fs, mountpoint, &mount_options(false))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct NotManaged;
-
-    impl LazySource for NotManaged {
-        fn file(&self, _: &Path) -> io::Result<Option<File>> {
-            Ok(None)
-        }
-    }
-
-    #[test]
-    fn unknown_lazy_path_fails_closed_but_git_is_eager() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("worktree.txt"), b"remote placeholder").unwrap();
-        let entry = Entry::new(root.path(), Path::new("worktree.txt"), false).unwrap();
-        let error = open_lower(Some(&NotManaged), Path::new("worktree.txt"), &entry).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EIO));
-
-        fs::create_dir(root.path().join(".git")).unwrap();
-        fs::write(root.path().join(".git/config"), b"[core]").unwrap();
-        let entry = Entry::new(root.path(), Path::new(".git/config"), false).unwrap();
-        let file = open_lower(Some(&NotManaged), Path::new(".git/config"), &entry).unwrap();
-        assert_eq!(file.metadata().unwrap().len(), 6);
-    }
-
-    #[test]
-    fn read_pool_executes_distinct_jobs_concurrently() {
-        let pool = ReadPool::new(2, 8).unwrap();
-        let state = Arc::new((Mutex::new(0usize), Condvar::new()));
-        let (sender, receiver) = std::sync::mpsc::channel();
-        for _ in 0..2 {
-            let state = state.clone();
-            let sender = sender.clone();
-            pool.execute(Box::new(move || {
-                let (lock, ready) = &*state;
-                let mut count = lock.lock().unwrap();
-                *count += 1;
-                ready.notify_all();
-                let (count, timed_out) =
-                    ready.wait_timeout_while(count, Duration::from_millis(500), |count| *count < 2).unwrap();
-                sender.send(*count == 2 && !timed_out.timed_out()).unwrap();
-            }))
-            .ok()
-            .expect("read pool rejected a test job");
-        }
-        let results: Vec<bool> = (0..2).map(|_| receiver.recv_timeout(Duration::from_secs(2)).unwrap()).collect();
-        assert!(results.iter().all(|result| *result), "read pool serialized independent jobs");
-    }
-}
+#[path = "fuse_mount/tests.rs"]
+mod tests;

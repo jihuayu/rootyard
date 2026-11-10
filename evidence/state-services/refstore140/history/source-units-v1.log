@@ -1,0 +1,21 @@
+....................................................................................................s........................owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-f_jv68z_/workspace-service/mounts/ad397aa0-3cb2-447f-bebc-0dd87c39a2bc'
+owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-f_jv68z_/workspace-service/mounts/nope'
+.owned-fuse-cleanup: [Errno 20] Not a directory: 'bbf0a62f-7ccc-41fd-a12a-a7d2c20ade38'
+.owned-fuse-cleanup: FD for '/tmp/rootyard-cleanup-id-qqgqgtvx/workspace-service/mounts/e01aab33-14b4-4186-a1f1-33e50c3d596f' has mnt_id 52, expected 53
+..owned-fuse-cleanup: [Errno 20] Not a directory: 'workspace-service'
+......................................................................................ss..............................F...................................sss
+======================================================================
+FAIL: test_foreign_key_topological_dag_and_composite_tenant_isolation_across_all_23_tables (test_tier5_adversarial.TestTier5Schema030AndBackupCatalogAdversarial.test_foreign_key_topological_dag_and_composite_tenant_isolation_across_all_23_tables)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-pg-snapshot/tests/test_tier5_adversarial.py", line 486, in test_foreign_key_topological_dag_and_composite_tenant_isolation_across_all_23_tables
+    self.assertEqual(composite_tenant_tables, expected_composite)
+AssertionError: Items in the first set but not the second:
+'ref_store_core_snapshots'
+'ref_store_core_pins'
+
+----------------------------------------------------------------------
+Ran 286 tests in 24.420s
+
+FAILED (failures=1, skipped=6)
+{"status": "failed", "run": 286, "failures": 1, "errors": 0, "skipped": 6, "exclusion_reason": "Requires dedicated native executables/services/kernel fixture; not qualified by this source/unit-only run. Full CI native suites remain required."}

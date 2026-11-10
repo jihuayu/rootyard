@@ -1,6 +1,10 @@
 //! Data models, SSRF-safe webhook URL validation, event/context validators,
 //! and idempotent runtime schema initialization for Track A (`webhooks`).
-use crate::{Error, pulls::models::context_valid, webhooks::signing::sha256_hex};
+use crate::{
+    Error,
+    pulls::models::context_valid,
+    webhooks::{policy, signing::sha256_hex},
+};
 use axum::{
     Json,
     http::{StatusCode, Uri, header},
@@ -9,7 +13,7 @@ use axum::{
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -37,10 +41,8 @@ pub struct Webhook {
 
 impl Webhook {
     pub fn row(row: &Row) -> Result<Self, Error> {
-        let events: Vec<String> =
-            serde_json::from_value(row.get("events")).map_err(Error::internal)?;
-        let ci_contexts: Vec<String> =
-            serde_json::from_value(row.get("ci_contexts")).map_err(Error::internal)?;
+        let events: Vec<String> = serde_json::from_value(row.get("events")).map_err(Error::internal)?;
+        let ci_contexts: Vec<String> = serde_json::from_value(row.get("ci_contexts")).map_err(Error::internal)?;
         Ok(Self {
             id: row.get("id"),
             repository_id: row.get("repository_id"),
@@ -221,6 +223,8 @@ pub struct DeliveriesQuery {
     #[serde(default)]
     pub after: Option<i64>,
     #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]
     pub state: Option<String>,
@@ -228,25 +232,82 @@ pub struct DeliveriesQuery {
     pub event_type: Option<String>,
 }
 
+/// Opaque, hook-bound `(sequence, id)` cursor. Version and field count are
+/// strict: unknown versions, extra fields, non-positive sequences and malformed
+/// UUIDs are rejected. The legacy numeric `after` path remains accepted but is
+/// lossy for historic duplicate sequence values; clients wanting every tied ID
+/// exactly once should follow `next_cursor` instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveryCursor {
+    pub hook_id: Uuid,
+    pub sequence: i64,
+    pub id: Uuid,
+}
+
+impl DeliveryCursor {
+    const VERSION: &'static str = "v1";
+    const MAX_BYTES: usize = 160;
+
+    pub fn encode(self) -> String {
+        format!("{}.{}.{}.{}", Self::VERSION, self.hook_id, self.sequence, self.id)
+    }
+
+    pub fn parse(raw: &str, hook_id: Uuid) -> Result<Self, Error> {
+        if raw.is_empty() || raw.len() > Self::MAX_BYTES || raw.bytes().any(|b| b <= 32 || b == 127) {
+            return Err(Error::bad_request());
+        }
+        let mut parts = raw.split('.');
+        if parts.next() != Some(Self::VERSION) {
+            return Err(Error::bad_request());
+        }
+        let (Some(hook), Some(sequence), Some(id), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(Error::bad_request());
+        };
+        let parsed_hook = Uuid::parse_str(hook).map_err(|_| Error::bad_request())?;
+        if parsed_hook != hook_id || parsed_hook.is_nil() {
+            return Err(Error::bad_request());
+        }
+        if sequence.is_empty() || !sequence.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::bad_request());
+        }
+        let sequence: i64 = sequence.parse().map_err(|_| Error::bad_request())?;
+        if sequence <= 0 {
+            return Err(Error::bad_request());
+        }
+        let id = Uuid::parse_str(id).map_err(|_| Error::bad_request())?;
+        if id.is_nil() {
+            return Err(Error::bad_request());
+        }
+        Ok(Self { hook_id, sequence, id })
+    }
+}
+
 impl DeliveriesQuery {
+    /// `after` and `cursor` describe the same position and cannot be combined.
+    pub fn cursor(&self, hook_id: Uuid) -> Result<Option<DeliveryCursor>, Error> {
+        match (&self.cursor, &self.after) {
+            (Some(_), Some(_)) => Err(Error::bad_request()),
+            (Some(raw), None) => DeliveryCursor::parse(raw, hook_id).map(Some),
+            (None, _) => Ok(None),
+        }
+    }
+
     pub fn bounds(&self) -> Result<(i64, i64), Error> {
         let after = self.after.unwrap_or(0);
         let limit = self.limit.unwrap_or(50);
         if after < 0 || !(1..=100).contains(&limit) {
             return Err(Error::bad_request());
         }
-        if let Some(ref st) = self.state {
-            if !matches!(
-                st.as_str(),
-                "pending" | "leased" | "delivered" | "failed" | "dead_letter"
-            ) {
-                return Err(Error::bad_request());
-            }
+        if let Some(ref st) = self.state
+            && !matches!(st.as_str(), "pending" | "leased" | "delivered" | "failed" | "dead_letter")
+        {
+            return Err(Error::bad_request());
         }
-        if let Some(ref et) = self.event_type {
-            if !SUPPORTED_EVENTS.contains(&et.as_str()) {
-                return Err(Error::bad_request());
-            }
+        if let Some(ref et) = self.event_type
+            && !SUPPORTED_EVENTS.contains(&et.as_str())
+        {
+            return Err(Error::bad_request());
         }
         Ok((after, limit))
     }
@@ -288,53 +349,15 @@ pub fn json(status: StatusCode, value: impl Serialize) -> Response {
     (status, [(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
 }
 
-fn ipv4_is_blocked_non_loopback(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    ip.is_unspecified()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_multicast()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || octets[0] == 0
-        || octets[0] == 127
-        || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
-        || (octets[0] == 169 && octets[1] == 254)
-        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
-        || octets[0] >= 240
-}
-
-fn ipv6_is_blocked_non_loopback(ip: Ipv6Addr) -> bool {
-    let segs = ip.segments();
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return ipv4_is_blocked_non_loopback(mapped);
-    }
-    ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || (segs[0] & 0xfe00) == 0xfc00
-        || (segs[0] & 0xffc0) == 0xfe80
-        || (segs[0] == 0x2001 && segs[1] == 0x0db8)
-}
-
-/// DNS answers are validated at connection time, then pinned into the HTTP client's
-/// resolver so a second lookup cannot substitute a private address.
-pub fn permitted_peer(host_is_loopback: bool, ip: IpAddr) -> bool {
-    if host_is_loopback {
-        return ip.is_loopback();
-    }
-    match ip {
-        IpAddr::V4(v4) => !ipv4_is_blocked_non_loopback(v4),
-        IpAddr::V6(v6) => !ipv6_is_blocked_non_loopback(v6),
-    }
-}
-
-/// Validates a webhook target URL against SSRF rules.
+/// Validates a webhook target URL against SSRF rules under the current operator policy.
 pub fn validate_webhook_url(raw: &str) -> Result<ParsedWebhookTarget, Error> {
-    if !(8..=1024).contains(&raw.len())
-        || raw.contains('#')
-        || raw.bytes().any(|b| b <= 32 || b == 127)
-    {
+    validate_webhook_url_with_policy(raw, policy::loopback_targets_allowed())
+}
+
+/// Validates a webhook target URL against the SSRF rules. `loopback_allowed` is the
+/// explicit operator opt-in; loopback targets are rejected when it is false.
+pub fn validate_webhook_url_with_policy(raw: &str, loopback_allowed: bool) -> Result<ParsedWebhookTarget, Error> {
+    if !(8..=1024).contains(&raw.len()) || raw.contains('#') || raw.bytes().any(|b| b <= 32 || b == 127) {
         return Err(Error::bad_request());
     }
     let uri: Uri = raw.parse().map_err(|_| Error::bad_request())?;
@@ -350,28 +373,36 @@ pub fn validate_webhook_url(raw: &str) -> Result<ParsedWebhookTarget, Error> {
     if raw_host.is_empty() {
         return Err(Error::bad_request());
     }
-    let unbracketed = raw_host
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(raw_host)
-        .to_ascii_lowercase();
+    let unbracketed =
+        raw_host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(raw_host).to_ascii_lowercase();
 
     let port = match authority.port_u16() {
         Some(0) => return Err(Error::bad_request()),
         Some(p) => p,
-        None => if scheme == "https" { 443 } else { 80 },
+        None => {
+            if scheme == "https" {
+                443
+            } else {
+                80
+            }
+        }
     };
 
-    let is_loopback = matches!(unbracketed.as_str(), "127.0.0.1" | "::1" | "localhost");
+    let is_loopback = policy::host_is_loopback(&unbracketed);
     if scheme == "http" && !is_loopback {
+        return Err(Error::bad_request());
+    }
+    // Loopback egress is denied unless the operator opted in. The decision never
+    // comes from the request body, and it is re-evaluated for every delivery.
+    if is_loopback && !loopback_allowed {
         return Err(Error::bad_request());
     }
 
     if !is_loopback {
         if let Ok(ip) = unbracketed.parse::<IpAddr>() {
             let blocked = match ip {
-                IpAddr::V4(v4) => ipv4_is_blocked_non_loopback(v4),
-                IpAddr::V6(v6) => ipv6_is_blocked_non_loopback(v6),
+                IpAddr::V4(v4) => policy::ipv4_is_blocked_non_loopback(v4),
+                IpAddr::V6(v6) => policy::ipv6_is_blocked_non_loopback(v6),
             };
             if blocked {
                 return Err(Error::bad_request());
@@ -388,15 +419,8 @@ pub fn validate_webhook_url(raw: &str) -> Result<ParsedWebhookTarget, Error> {
         }
     }
 
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_owned())
-        .unwrap_or_else(|| "/".to_owned());
-    let host_for_header = if unbracketed.contains(':') {
-        format!("[{unbracketed}]")
-    } else {
-        unbracketed.clone()
-    };
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str().to_owned()).unwrap_or_else(|| "/".to_owned());
+    let host_for_header = if unbracketed.contains(':') { format!("[{unbracketed}]") } else { unbracketed.clone() };
     let host_header = if (scheme == "http" && port == 80) || (scheme == "https" && port == 443) {
         host_for_header
     } else {
@@ -414,10 +438,7 @@ pub fn validate_webhook_url(raw: &str) -> Result<ParsedWebhookTarget, Error> {
 }
 
 pub fn validate_secret(secret: &str) -> Result<String, Error> {
-    if !(8..=256).contains(&secret.len())
-        || secret.trim().is_empty()
-        || secret.chars().any(char::is_control)
-    {
+    if !(8..=256).contains(&secret.len()) || secret.trim().is_empty() || secret.chars().any(char::is_control) {
         return Err(Error::bad_request());
     }
     Ok(sha256_hex(secret.as_bytes()))
@@ -491,9 +512,7 @@ pub async fn ensure_schema(pool: &Pool) -> Result<(), Error> {
     }
 
     let tx = client.transaction().await.map_err(Error::internal)?;
-    tx.execute("SELECT pg_advisory_xact_lock(400402026)", &[])
-        .await
-        .map_err(Error::internal)?;
+    tx.execute("SELECT pg_advisory_xact_lock(400402026)", &[]).await.map_err(Error::internal)?;
     let ddl = crate::webhooks::MIGRATION_040_SQL
         .split("INSERT INTO schema_migrations")
         .next()
@@ -504,53 +523,5 @@ pub async fn ensure_schema(pool: &Pool) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ssrf_webhook_url_validation_matrix() {
-        for valid in [
-            "https://ci.example.com/webhooks/rootyard",
-            "https://hooks.example.org:8443/v1/events?env=prod",
-            "http://127.0.0.1:9000/hook",
-            "http://[::1]:9001/callback",
-            "http://localhost:8080/ci",
-        ] {
-            assert!(validate_webhook_url(valid).is_ok(), "expected valid URL: {valid}");
-        }
-        for invalid in [
-            "http://ci.example.com/webhooks",
-            "https://127.0.0.2/hook",
-            "https://0.0.0.0/hook",
-            "https://10.0.0.1/hook",
-            "https://172.16.0.1/hook",
-            "https://192.168.1.1/hook",
-            "https://169.254.169.254/latest/meta-data/",
-            "https://[fe80::1]/hook",
-            "https://[fc00::1]/hook",
-            "https://user:pass@ci.example.com/hook",
-            "https://ci.example.com/hook#frag",
-            "https://metadata.google.internal/computeMetadata/v1/",
-        ] {
-            assert!(validate_webhook_url(invalid).is_err(), "expected SSRF rejection: {invalid}");
-        }
-    }
-
-    #[test]
-    fn event_context_and_secret_validators() {
-        assert_eq!(validate_secret("whsec_valid_secret_12345").unwrap().len(), 64);
-        assert!(validate_secret("short").is_err());
-        assert_eq!(
-            validate_events(&["push".into(), "pull_request".into(), "push".into()]).unwrap(),
-            vec!["push".to_string(), "pull_request".to_string()]
-        );
-        assert_eq!(
-            validate_events(&["*".into()]).unwrap(),
-            vec!["push", "pull_request", "check_run"]
-        );
-        assert_eq!(
-            validate_ci_contexts(&["ci/build".into(), "ci/test".into(), "ci/build".into()]).unwrap(),
-            vec!["ci/build".to_string(), "ci/test".to_string()]
-        );
-    }
-}
+#[path = "models_tests.rs"]
+mod tests;

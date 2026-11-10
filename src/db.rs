@@ -151,12 +151,27 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (130, include_str!("../migrations/130_pando_transition_fence.sql")),
     (131, include_str!("../migrations/131_ci_checkout_plan_shape.sql")),
     (132, include_str!("../migrations/132_pando_remote_retention.sql")),
+    (133, include_str!("../migrations/133_browser_session_gc_indexes.sql")),
+    (134, include_str!("../migrations/134_storage_identity_fks.sql")),
+    (135, include_str!("../migrations/135_storage_maintenance_metrics.sql")),
+    (136, include_str!("../migrations/136_token_scopes.sql")),
+    (137, include_str!("../migrations/137_historical_admission_projection.sql")),
+    (138, include_str!("../migrations/138_ref_store_operation_identity.sql")),
+    (139, include_str!("../migrations/139_ref_store_core.sql")),
+    (140, include_str!("../migrations/140_ref_store_core_snapshots.sql")),
+    (141, include_str!("../migrations/141_ref_store_artifact_holds.sql")),
+    (142, include_str!("../migrations/142_ref_store_core_packs.sql")),
+    (143, include_str!("../migrations/143_ref_store_core_pack_snapshots.sql")),
+    (144, include_str!("../migrations/144_ref_store_core_roots_decisions.sql")),
+    (145, include_str!("../migrations/145_ref_store_serving.sql")),
+    (146, include_str!("../migrations/146_ref_store_serving_reads.sql")),
+    (147, include_str!("../migrations/147_ref_store_serving_operations.sql")),
 ];
 
 pub const SCHEMA_VERSIONS: &[i32] = &[
     1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95,
     96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 121, 125, 126, 127, 128, 129, 130,
-    131, 132,
+    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147,
 ];
 
 /// Runtime roles use a read-only schema check. Migration/backup ownership is

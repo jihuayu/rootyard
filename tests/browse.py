@@ -3,30 +3,238 @@
 import argparse
 import base64
 import concurrent.futures
+from contextlib import contextmanager
 import hashlib
 import json
 import os
+import shlex
+import shutil
 from pathlib import Path
 import sys
 import uuid
+import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness  # noqa: E402
 
 ZERO_OID = "0" * 40
 
+# The reconciler only auto-clears its own durable push ambiguity marker.  A
+# manual fence must use an unrelated reason so a concurrent worker cannot turn
+# the expected 409 into a 200 and hide the read/transaction gate.
+MANUAL_RECOVERY_REASON = "manual_test_browse_recovery_fence"
+
+CASE_NAMES = (
+    "setup_repos",
+    "refs_and_pagination",
+    "commits_and_pagination",
+    "tree_and_blob",
+    "compare_revisions",
+    "ref_transactions_atomic_cas",
+    "idempotency_and_concurrency",
+    "access_and_fences",
+    "object_format_and_negotiation",
+    "bounded_ref_and_commit_pages",
+    "selective_ref_prefix",
+    "protected_writes_and_ref_ack_failure",
+)
+
 
 class BrowseHarness(Harness):
-    def document(self, path, code=200, token=None, **kwargs):
-        status, body, headers = self.http(path, token=token or self.alice, **kwargs)
-        norm_headers = {k.lower(): v for k, v in headers.items()}
-        if isinstance(code, tuple):
-            assert status in code, f"{path}: expected {code}, got {status}: {body[:300]!r}"
+    def __init__(self, args):
+        super().__init__(args)
+        self.actor_labels = {}
+        self.native_git = os.environ.get("ROOTYARD_GIT") or shutil.which("git") or "git"
+
+    def account(self, *args):
+        account = super().account(*args)
+        self.register_token(account)
+        if account.get("token_id"):
+            if args and args[0] == "create-user":
+                self.actor_labels[account["token_id"]] = (
+                    "owner" if args[1] == "alice" else "non-member"
+                )
+            elif "--read-only" in args:
+                self.actor_labels[account["token_id"]] = "read-only"
+            else:
+                self.actor_labels[account["token_id"]] = "token"
+        return account
+
+    def register_token(self, account):
+        """Keep raw and Git Basic credential forms out of every diagnostic."""
+        token = account.get("token")
+        if not isinstance(token, str) or not token:
+            return
+        forms = [token]
+        username = account.get("username")
+        if isinstance(username, str) and username:
+            forms.append(base64.b64encode((username + ":" + token).encode()).decode())
+        for form in forms:
+            if form not in self.secrets:
+                self.secrets.append(form)
+
+    def actor_label(self, token):
+        """Return a stable role label, never a token id or credential."""
+        if not token:
+            return "anonymous"
+        label = self.actor_labels.get(token.get("token_id"))
+        if label:
+            return label
+        if token.get("read_only"):
+            return "read-only"
+        return "unknown"
+
+    @staticmethod
+    def _sql_literal(value):
+        return str(value).replace("'", "''")
+
+    def repository_diagnostics(self):
+        """Current schema and repository row facts for an unexpected response."""
+        repo = getattr(self, "repo", {}) or {}
+        repo_id = repo.get("id") if isinstance(repo, dict) else None
+        details = {
+            "schema": getattr(self, "schema", "unknown"),
+            "repository_id": repo_id or "unknown",
+            "role_effective_identity": "unavailable",
+            "row_effective_identity": "unavailable",
+            "current_state": "unavailable",
+            "recovery_reason": None,
+        }
+        if not repo_id:
+            return details
+        query = (
+            "SELECT json_build_object("
+            "'schema',current_schema(),"
+            "'repository_id',r.id::text,"
+            "'owner_id',r.owner_id::text,"
+            "'owner',ns.slug,"
+            "'name',r.name,"
+            "'state',r.state,"
+            "'recovery_reason',r.recovery_reason,"
+            "'storage_generation',r.storage_generation,"
+            "'storage_backend',r.storage_backend,"
+            "'row_effective_identity',json_build_object("
+            "'id',r.id::text,'owner_id',r.owner_id::text,"
+            "'owner',ns.slug,'name',r.name)) "
+            "FROM repositories r LEFT JOIN namespaces ns ON ns.id=r.owner_id "
+            "WHERE r.id='" + self._sql_literal(repo_id) + "'"
+        )
+        try:
+            raw = self.sql(query)
+            if not raw:
+                details["current_state"] = "missing"
+                details["row_effective_identity"] = "missing"
+                return details
+            row = json.loads(raw)
+        except Exception as error:  # noqa: BLE001 - diagnostic collection must not mask
+            details["current_state"] = "query_failed"
+            details["row_effective_identity"] = "query_failed"
+            details["diagnostic_error"] = type(error).__name__
+            return details
+        details.update({
+            "schema": row.get("schema") or details["schema"],
+            "repository_id": row.get("repository_id") or details["repository_id"],
+            "current_state": row.get("state") or "unknown",
+            "recovery_reason": row.get("recovery_reason"),
+            "storage_generation": row.get("storage_generation"),
+            "storage_backend": row.get("storage_backend"),
+            "row_effective_identity": row.get("row_effective_identity"),
+        })
+        return details
+
+    def _server_log_tail(self, limit=4000):
+        log = self.root / "server.log"
+        try:
+            return log.read_text(errors="replace")[-limit:]
+        except FileNotFoundError:
+            return ""
+        except Exception as error:  # noqa: BLE001 - type only, never str(error)
+            return "unavailable:" + type(error).__name__
+
+    def http_failure_detail(
+        self, path, expected, status, body, headers, token, note=None, error_type=None
+    ):
+        """Redacted facts for an unexpected HTTP result; never renders argv or creds."""
+        if isinstance(body, bytes):
+            body_text = body.decode(errors="replace")
+        elif body is None:
+            body_text = ""
         else:
-            assert status == code, f"{path}: expected {code}, got {status}: {body[:300]!r}"
-        assert norm_headers.get("cache-control") == "no-store", norm_headers
-        assert "application/json" in norm_headers.get("content-type", ""), norm_headers
-        return json.loads(body)
+            body_text = str(body)
+        details = {
+            "request_path": path,
+            "actor": self.actor_label(token),
+            "expected_status": expected,
+            "observed_status": status,
+            "response_content_type": headers.get("content-type")
+            or headers.get("Content-Type"),
+            "response_body": body_text[:1000],
+            "server_log_tail": self._server_log_tail(),
+        }
+        details.update(self.repository_diagnostics())
+        if note:
+            details["note"] = note
+        if error_type:
+            details["http_error"] = error_type
+        summary = f"{path}: expected {expected}, got {status}"
+        if body_text:
+            summary += f": {body_text[:300]!r}"
+        return self.redact(summary + "\n" + json.dumps(details, sort_keys=True))
+
+    def document(self, path, code=200, token=None, **kwargs):
+        actor = token or self.alice
+        try:
+            status, body, headers = self.http(path, token=actor, **kwargs)
+        except Exception as error:  # noqa: BLE001 - retain type only, not str(error)
+            raise AssertionError(
+                self.http_failure_detail(
+                    path, code, "exception", b"", {}, actor,
+                    error_type=type(error).__name__,
+                )
+            ) from None
+        norm_headers = {k.lower(): v for k, v in headers.items()}
+        expected = code if isinstance(code, tuple) else (code,)
+        if status not in expected:
+            raise AssertionError(
+                self.http_failure_detail(path, code, status, body, headers, actor)
+            )
+        notes = []
+        if norm_headers.get("cache-control") != "no-store":
+            notes.append(f"cache-control={norm_headers.get('cache-control')!r}")
+        if "application/json" not in norm_headers.get("content-type", ""):
+            notes.append(f"content-type={norm_headers.get('content-type')!r}")
+        if notes:
+            raise AssertionError(
+                self.http_failure_detail(
+                    path, code, status, body, headers, actor, note="; ".join(notes)
+                )
+            )
+        try:
+            return json.loads(body)
+        except Exception as error:  # noqa: BLE001 - retain type only
+            raise AssertionError(
+                self.http_failure_detail(
+                    path, code, status, body, headers, actor,
+                    note="invalid JSON response: " + type(error).__name__,
+                )
+            ) from None
+
+    @contextmanager
+    def recovery_fence(self):
+        """Set an operator/manual fence and always restore the ready row."""
+        repo_id = self._sql_literal(self.repo["id"])
+        self.sql(
+            "UPDATE repositories SET state='recovering', recovery_reason='"
+            + MANUAL_RECOVERY_REASON
+            + "' WHERE id='" + repo_id + "'"
+        )
+        try:
+            yield
+        finally:
+            self.sql(
+                "UPDATE repositories SET state='ready', recovery_reason=NULL WHERE id='"
+                + repo_id + "'"
+            )
 
     def repo_api(self, suffix="", repo="demo", owner="alice"):
         return f"/api/repos/{owner}/{repo}{suffix}"
@@ -146,7 +354,7 @@ class BrowseHarness(Harness):
         self.git("push", "origin", "HEAD:refs/heads/batch-page", cwd=self.work, token=self.alice)
         count_path = self.root / "cat-file-count"
         wrapper = self.root / "git-count-wrapper"
-        wrapper.write_text("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then echo x >> '" + str(count_path) + "'; fi\ndone\nexec /usr/bin/git \"$@\"\n")
+        wrapper.write_text("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then echo x >> '" + str(count_path) + "'; fi\ndone\nexec " + shlex.quote(self.native_git) + " \"$@\"\n")
         wrapper.chmod(0o700)
         self.stop()
         self.env["ROOTYARD_GIT"] = str(wrapper)
@@ -158,6 +366,85 @@ class BrowseHarness(Harness):
             after = len(count_path.read_text().splitlines())
             assert after - before == 2, (size, after - before)
         packed.write_text("# pack-refs with: peeled fully-peeled sorted\n" + "\n".join(existing) + "\n")
+
+    def selective_ref_prefix(self):
+        # A literal prefix narrower than a whole namespace must count the page
+        # after the filter.  a1/a2 sort in front of the only z-matches, so
+        # asking Git for the first page of heads and filtering that page
+        # afterwards would have answered an empty page for refs/heads/z.
+        def refs(prefix, limit=20, after=None):
+            query = "limit=" + str(limit) + "&prefix=" + urllib.parse.quote(prefix, safe="")
+            if after is not None:
+                query += "&after=" + urllib.parse.quote(after, safe="")
+            page = self.document(self.repo_api("/refs?" + query))
+            return [item["name"] for item in page["items"]], page["next_after"]
+
+        def walk(limit=1):
+            collected, cursor = [], None
+            while len(collected) <= 4096:
+                query = "/refs?limit=" + str(limit)
+                if cursor is not None:
+                    query += "&after=" + urllib.parse.quote(cursor, safe="")
+                page = self.document(self.repo_api(query))
+                collected.extend(item["name"] for item in page["items"])
+                cursor = page["next_after"]
+                if cursor is None:
+                    return collected, None
+            return collected, cursor
+
+        def write(ref_name, old_oid, new_oid):
+            self.document(self.repo_api("/ref-transactions"), 200, method="POST", body={
+                "updates": [{"ref_name": ref_name, "old_oid": old_oid, "new_oid": new_oid}]})
+
+        def local(*args):
+            return self.git("--git-dir=" + str(self.bare), *args)
+
+        created = ("refs/heads/a1", "refs/heads/a2", "refs/heads/z1", "refs/heads/z2")
+        # Refs Git returns but Browse must never show: reserve-managed proposal
+        # refs inside the public heads namespace, plus a valid Git name past the
+        # 1024-byte public limit.  They sort between a1 and z1, so a page that
+        # counts raw Git records instead of public refs is truncated here.
+        hidden = ("refs/heads/rootyard-proposals/one", "refs/heads/rootyard-proposals/two",
+                  "refs/heads/long/" + "/".join(["x" * 200] * 6))
+        try:
+            for name in created:
+                write(name, ZERO_OID, self.third)
+            for name in hidden:
+                local("update-ref", name, self.third)
+            # A limit-1 walk of the namespace-wide listing must deliver every
+            # public ref exactly once and hide the non-public ones.
+            expected = sorted(
+                name for name in local("for-each-ref", "--format=%(refname)").stdout.decode().splitlines()
+                if name.startswith(("refs/heads/", "refs/tags/"))
+                and len(name) <= 1024
+                and not name.startswith(("refs/heads/rootyard-proposals/", "refs/rootyard-ci/")))
+            collected, cursor = walk()
+            assert cursor is None, collected
+            assert collected == expected, (collected, expected)
+            assert len(set(collected)) == len(collected), collected
+            assert not [name for name in collected if name in hidden], collected
+            names, cursor = refs("refs/heads/z", limit=1)
+            assert names == ["refs/heads/z1"], names
+            assert cursor == "refs/heads/z1", cursor
+            # The cursor page continues inside the same literal prefix.
+            names, cursor = refs("refs/heads/z", limit=1, after=cursor)
+            assert names == ["refs/heads/z2"], names
+            assert cursor is None, cursor
+            # The full exact ref name is still a one-item page.
+            assert refs("refs/heads/z2")[0] == ["refs/heads/z2"]
+            # A narrow tag prefix keeps the existing tag and nothing else.
+            assert refs("refs/tags/v1")[0] == ["refs/tags/v1.0"]
+            assert refs("refs/heads/zzz")[0] == []
+            # `*` is a literal byte here, never a Git pattern: as a pattern it
+            # would match every branch, as a literal it matches none.
+            assert refs("refs/heads/*")[0] == []
+        finally:
+            for name in hidden:
+                local("update-ref", "-d", name)
+            for name in created:
+                write(name, self.third, ZERO_OID)
+        # The fixture is back to the refs the other cases assert.
+        assert refs("refs/heads/z")[0] == [] and refs("refs/heads/a")[0] == []
 
     def protected_writes_and_ref_ack_failure(self):
         self.git("push", "origin", self.third + ":refs/heads/release", cwd=self.work, token=self.alice)
@@ -185,7 +472,7 @@ class BrowseHarness(Harness):
         wrapper = self.root / "git-fault-wrapper"
         wrapper.write_text("#!/bin/sh\nupdate=0\nfor a in \"$@\"; do [ \"$a\" = update-ref ] && update=1; done\n"
                            + "if [ \"$update\" = 1 ] && [ -f '" + str(before_marker) + "' ]; then exit 42; fi\n"
-                           + "/usr/bin/git \"$@\"\nrc=$?\n"
+                           + shlex.quote(self.native_git) + " \"$@\"\nrc=$?\n"
                            + "if [ \"$update\" = 1 ] && [ \"$rc\" = 0 ] && [ -f '" + str(after_marker) + "' ]; then exit 42; fi\n"
                            + "exit \"$rc\"\n")
         wrapper.chmod(0o700)
@@ -632,18 +919,13 @@ class BrowseHarness(Harness):
             body=tx_body,
         )
 
-        # Repository recovering fence
-        self.sql(
-            f"UPDATE repositories SET state='recovering', recovery_reason='push_outcome_unknown' WHERE id='{self.repo['id']}'"
-        )
-        try:
+        # Repository recovering fence.  Use a manual reason, never the
+        # reconciler-owned push ambiguity marker, because a concurrent worker
+        # would legitimately auto-heal that marker and return 200 here.
+        with self.recovery_fence():
             for path in read_paths:
                 self.document(path, 409)
             self.document(self.repo_api("/ref-transactions"), 409, method="POST", body=tx_body)
-        finally:
-            self.sql(
-                f"UPDATE repositories SET state='ready', recovery_reason=NULL WHERE id='{self.repo['id']}'"
-            )
 
     def object_format_and_negotiation(self):
         status_doc = self.document(self.repo_api("/object-format"), token=self.reader)
@@ -730,20 +1012,16 @@ def main():
     harness = BrowseHarness(args)
     success = False
     try:
-        for name in (
-            "setup_repos",
-            "refs_and_pagination",
-            "commits_and_pagination",
-            "tree_and_blob",
-            "compare_revisions",
-            "ref_transactions_atomic_cas",
-            "idempotency_and_concurrency",
-            "access_and_fences",
-            "object_format_and_negotiation",
-            "bounded_ref_and_commit_pages",
-            "protected_writes_and_ref_ack_failure",
-        ):
+        for name in CASE_NAMES:
             harness.case(name, getattr(harness, name))
+        executed = [item["name"] for item in harness.results]
+        if executed != list(CASE_NAMES):
+            raise AssertionError(
+                "native case inventory mismatch: expected "
+                + repr(list(CASE_NAMES))
+                + ", executed "
+                + repr(executed)
+            )
         success = True
     except Exception as error:
         print(harness.redact(error), file=sys.stderr)
@@ -763,6 +1041,10 @@ def main():
         )
         report = dict(
             passed=success,
+            case_count=len(CASE_NAMES),
+            cases_run=len(harness.results),
+            cases_passed=sum(1 for item in harness.results if item["status"] == "passed"),
+            cases_failed=sum(1 for item in harness.results if item["status"] == "failed"),
             cases=harness.results,
             binary_sha256=binary_sha,
             limitations=[

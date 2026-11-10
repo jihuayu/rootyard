@@ -54,29 +54,42 @@ pub struct ObjectFormatReceipt {
 }
 
 pub fn detect_git_dir_object_format(repo_path: &StdPath) -> Option<ObjectFormat> {
-    if let Ok(raw) = std::fs::read(repo_path.join("rootyard-object-format.json")) {
-        if let Ok(r) = serde_json::from_slice::<ObjectFormatReceipt>(&raw) { return Some(r.object_format); }
-    }
+    if let Ok(raw) = std::fs::read(repo_path.join("rootyard-object-format.json"))
+        && let Ok(r) = serde_json::from_slice::<ObjectFormatReceipt>(&raw) { return Some(r.object_format); }
     if let Ok(raw) = std::fs::read_to_string(repo_path.join("config")) {
         for line in raw.lines() {
             let trimmed = line.split(['#', ';']).next().unwrap_or("").trim();
-            if let Some((k, v)) = trimmed.split_once('=') {
-                if k.trim().eq_ignore_ascii_case("objectformat") {
-                    if let Some(fmt) = ObjectFormat::from_str_name(v) { return Some(fmt); }
-                }
-            }
+            if let Some((k, v)) = trimmed.split_once('=')
+                && k.trim().eq_ignore_ascii_case("objectformat")
+                    && let Some(fmt) = ObjectFormat::from_str_name(v) { return Some(fmt); }
         }
     }
     None
 }
 
+/// Parse `rev-parse --show-object-format`; a successful probe always prints one
+/// supported format, so anything else is a broken read, never a SHA-1 guess.
+fn parse_object_format_probe(raw: &[u8]) -> Result<ObjectFormat, Error> {
+    ObjectFormat::from_str_name(&String::from_utf8_lossy(raw))
+        .ok_or_else(|| git_read::invalid_output(git_read::GitStep::ObjectFormat))
+}
+
 pub async fn detect_repo_object_format(state: &AppState, repo_id: Uuid) -> Result<ObjectFormat, Error> {
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     if let Some(fmt) = detect_git_dir_object_format(&repo_path) { return Ok(fmt); }
-    if let Ok(out) = git_read::run_git(state, repo_id, &["rev-parse", "--show-object-format"], 64).await {
-        if let Some(fmt) = ObjectFormat::from_str_name(&String::from_utf8_lossy(&out)) { return Ok(fmt); }
-    }
-    Ok(ObjectFormat::Sha1)
+    // The explicit receipt/config read above is the fast path; otherwise the
+    // probe is authoritative, because the project-minimum Git 2.43 implements
+    // `--show-object-format`. A failed or unparseable probe is a broken read:
+    // internal, never a SHA-1 guess on a damaged SHA-256 repository.
+    let out = git_read::run_git(
+        state,
+        repo_id,
+        git_read::GitStep::ObjectFormat,
+        &["rev-parse", "--show-object-format"],
+        64,
+    )
+    .await?;
+    parse_object_format_probe(&out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,17 +208,17 @@ pub async fn get_object_format(
 ) -> Result<Response, Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::RepoRead).await?.repo_id;
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = handlers::acquire_git_slot(&state)?;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::RepoRead, auth::Role::Read).await?;
     let object_format = _lease.guard(detect_repo_object_format(&state, repo_id)).await??;
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::RepoRead, auth::Role::Read).await?;
     Ok(handlers::json_ok(ObjectFormatStatusResponse {
         repository_id: repo_id, object_format, oid_hex_len: object_format.hex_len(),
         raw_oid_bytes: object_format.raw_len(), zero_oid: object_format.zero_oid().to_owned(),
@@ -229,17 +242,28 @@ pub async fn negotiate_object_format(
     if is_write { auth::writable(&actor)?; }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, is_write).await?;
+    let repo_id = auth::authorize_repo_with_role(
+        &tx, &actor, &owner, &name, auth::Role::Write,
+        if is_write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead },
+    ).await?.repo_id;
     auth::finish_tx(tx, &actor, is_write).await?;
     drop(client);
     let _permit = handlers::acquire_git_slot(&state)?;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, is_write).await?;
+    auth::verify_active(
+        &state.pool, &actor, repo_id,
+        if is_write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead },
+        auth::Role::Write,
+    ).await?;
     let repo_fmt = _lease.guard(detect_repo_object_format(&state, repo_id)).await??;
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, is_write).await?;
+    auth::verify_active(
+        &state.pool, &actor, repo_id,
+        if is_write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead },
+        auth::Role::Write,
+    ).await?;
 
     let proto_ver = if req.protocol_version == 0 { 1 } else { req.protocol_version };
     let server_caps = server_capabilities_for(repo_fmt, &req.operation, proto_ver);
@@ -365,14 +389,14 @@ pub async fn run_object_format_drill(
     };
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, true).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::RepoAdmin).await?.repo_id;
     auth::finish_tx(tx, &actor, true).await?;
     drop(client);
     let _permit = handlers::acquire_git_slot(&state)?;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, true).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::RepoAdmin, auth::Role::Write).await?;
 
     let journal_root = state.storage.root.join("journal");
     journal::mkdir(&journal_root).map_err(Error::internal)?;
@@ -395,7 +419,7 @@ pub async fn run_object_format_drill(
 
     if let Some(fmt) = target_fmt {
         _lease.ensure_active()?;
-        auth::verify_active(&state.pool, &actor, repo_id, true).await?;
+        auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::RepoAdmin, auth::Role::Write).await?;
         let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
         let receipt = ObjectFormatReceipt { object_format: fmt, updated_by: Some(actor.id) };
         let bytes = serde_json::to_vec(&receipt).map_err(Error::internal)?;
@@ -403,7 +427,7 @@ pub async fn run_object_format_drill(
     }
     let repo_fmt = _lease.guard(detect_repo_object_format(&state, repo_id)).await??;
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, true).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::RepoAdmin, auth::Role::Write).await?;
 
     let lfs_both = sha1_drill.lfs_verified && sha256_drill.lfs_verified && sha1_drill.lfs_content_sha256_oid == sha256_drill.lfs_content_sha256_oid;
     let passed = sha1_drill.browse_verified && sha256_drill.browse_verified && cross_format_ref_tx_rejected && cross_format_negotiation_rejected && lfs_both;
@@ -432,5 +456,16 @@ mod tests {
             updates: vec![RefUpdateInput { ref_name: "refs/heads/main".to_owned(), old_oid: Some(sha1), new_oid: Some(sha256) }],
         };
         assert!(mixed.normalize().is_err());
+    }
+
+    #[test]
+    fn object_format_probe_never_falls_back_to_sha1() {
+        assert_eq!(parse_object_format_probe(b"sha1\n").ok(), Some(ObjectFormat::Sha1));
+        assert_eq!(parse_object_format_probe(b"sha256\n").ok(), Some(ObjectFormat::Sha256));
+        for damaged in [b"".as_slice(), b"sha512\n".as_slice(), b"\xff".as_slice()] {
+            let err = parse_object_format_probe(damaged).expect_err("damaged probe output");
+            assert!(err.0.is_server_error(), "damaged probe must be internal, got {}", err.0);
+            assert_ne!(err.0, StatusCode::NOT_FOUND, "a broken probe is never a SHA-1 guess");
+        }
     }
 }

@@ -1,0 +1,6 @@
+
+running 1 test
+test blob_store::provider_contract_tests::real_provider_publish_verify_range_delete_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 356 filtered out; finished in 53.81s
+

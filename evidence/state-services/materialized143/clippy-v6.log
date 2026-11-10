@@ -1,0 +1,14 @@
+    Checking opendal-service-s3 v0.57.0 (/workspace/scratch/state-services-read-materialize/vendor/opendal-service-s3)
+    Checking opendal v0.57.0
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-read-materialize)
+error[E0432]: unresolved imports `super::clear_transfer_completion`, `super::install_transfer_completion`
+  --> src/blob_store/readback/retained_tests.rs:9:48
+   |
+ 9 |     clear_cleanup_stall, clear_readback_stall, clear_transfer_completion, install_cleanup_stall,
+   |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^ no `clear_transfer_completion` in `blob_store::readback`
+10 |     install_readback_stall, install_transfer_completion,
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `install_transfer_completion` in `blob_store::readback`
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `rootyard` (lib test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

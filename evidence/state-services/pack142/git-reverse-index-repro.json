@@ -1,0 +1,11 @@
+{
+  "default": [
+    ".idx",
+    ".pack",
+    ".rev"
+  ],
+  "disabled": [
+    ".idx",
+    ".pack"
+  ]
+}

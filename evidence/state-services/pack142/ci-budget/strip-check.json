@@ -1,0 +1,22 @@
+{
+  "actual_optional_strip_path": true,
+  "no_debug_info_or_line_sections": true,
+  "binary_sha256": "e7951416a89d7dd15213b3c7ff9e89b4dc0adcf23d6c2d784c86a27acefd5a24",
+  "bytes": 108542400,
+  "recorded_exact_command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "build",
+    "--locked",
+    "--bin",
+    "rootyard",
+    "--features",
+    "pando-lab",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--message-format=json-render-diagnostics"
+  ],
+  "low_disk_override_recorded": true,
+  "original_genuine18_producer_unchanged": true
+}

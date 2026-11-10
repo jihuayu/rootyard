@@ -72,10 +72,10 @@ fn command(repo: &FsPath, args: &[&str]) -> Command {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if let Some(fd) = volume_lock_fd {
-                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
+            if let Some(fd) = volume_lock_fd
+                && libc::fcntl(fd, libc::F_SETFD, 0) == -1
+            {
+                return Err(std::io::Error::last_os_error());
             }
             if libc::getppid() != parent_pid {
                 return Err(std::io::Error::other("Git parent exited before exec"));

@@ -1,0 +1,48 @@
+{
+  "kind": "rust-integration-test",
+  "relocated_artifact": true,
+  "original_artifact_sha256": "c90299a25d7487f47d7b6a324897a21689448624c8c5c71e9ace16a3de3f1644",
+  "workspace_commit": "b32081880aed8def9faf0a13b74f5861f5199268",
+  "fresh": false,
+  "source_inputs_sha256": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+  "binary_sha256": "c90299a25d7487f47d7b6a324897a21689448624c8c5c71e9ace16a3de3f1644",
+  "integration_test_source_sha256": "5ae30da02d4b1c66d1597d1add7ea9b50bf56a46380856e72f7da7e7fcec18f2",
+  "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+  "command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--config",
+    "profile.test.package.rootyard.debug=0",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--config",
+    "profile.test.package.rootyard.strip=\"debuginfo\"",
+    "rustc",
+    "--locked",
+    "--profile",
+    "test",
+    "--test",
+    "ref_store_pack_snapshots_backup_fixture",
+    "--features",
+    "pando-lab",
+    "--message-format=json-render-diagnostics"
+  ],
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "package_rebuilt": true,
+  "fresh_false_artifacts": [
+    {
+      "target": "ref_store_pack_snapshots_backup_fixture",
+      "kind": "test",
+      "fresh": false,
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "executable": "/workspace/rootyard/target/debug/deps/ref_store_pack_snapshots_backup_fixture-8e37c0b5d3c13c38"
+    }
+  ]
+}

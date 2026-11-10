@@ -1,0 +1,50 @@
+{
+  "kind": "rust-integration-test",
+  "relocated_artifact": true,
+  "original_artifact_sha256": "becff1a2108917f39503c504966eda71612227b8fe44f09d64e4bff7cce34d71",
+  "workspace_commit": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+  "fresh": false,
+  "source_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+  "binary_sha256": "becff1a2108917f39503c504966eda71612227b8fe44f09d64e4bff7cce34d71",
+  "integration_test_source_sha256": "7d917f3d9e1e997cf9d2a52fd10d25826abed6285557cbfe6b0536973bd40d62",
+  "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+  "command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--config",
+    "profile.test.package.rootyard.debug=0",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--config",
+    "profile.test.package.rootyard.strip=\"debuginfo\"",
+    "rustc",
+    "--locked",
+    "--profile",
+    "test",
+    "--test",
+    "ref_store_retention_roots",
+    "--features",
+    "pando-lab",
+    "--message-format=json-render-diagnostics"
+  ],
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "package_rebuilt": true,
+  "fresh_false_artifacts": [
+    {
+      "target": "ref_store_retention_roots",
+      "kind": "test",
+      "fresh": false,
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "executable": "/workspace/rootyard/target/debug/deps/ref_store_retention_roots-c42e7024cc57876b"
+    }
+  ],
+  "matrix_clean_once": true,
+  "matrix_first_rootyard_library_rebuilt": true
+}

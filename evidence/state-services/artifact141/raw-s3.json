@@ -1,0 +1,73 @@
+{
+  "runner_sha256": "b7d642f49865f961efc6c41038f64d9ad760e0e15fd8dc46a411aabff622e3c1",
+  "passed": true,
+  "returncode": 0,
+  "seconds": 53.927,
+  "summary": "test result: ok. 1 passed; 0 failed; 0 ignored;",
+  "command": [
+    "/workspace/scratch/state-artifact141-lib-v1/rootyard-lib-contract",
+    "--ignored",
+    "--test-threads=1",
+    "--exact",
+    "blob_store::provider_contract_tests::real_provider_publish_verify_range_delete_contract"
+  ],
+  "before": {
+    "source": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary": "fbc7b451c261798ba25cfe731e3a437be8bc88c05f77d23df52d4deb446fe4f4",
+    "head": "4c039d142bd7b9615fd57152e00db3c25eac13a4"
+  },
+  "after": {
+    "source": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary": "fbc7b451c261798ba25cfe731e3a437be8bc88c05f77d23df52d4deb446fe4f4",
+    "head": "4c039d142bd7b9615fd57152e00db3c25eac13a4"
+  },
+  "source_binary_harness_head_unchanged": true,
+  "binary_sha256": "fbc7b451c261798ba25cfe731e3a437be8bc88c05f77d23df52d4deb446fe4f4",
+  "build_receipt": {
+    "kind": "rust-library-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "fbc7b451c261798ba25cfe731e3a437be8bc88c05f77d23df52d4deb446fe4f4",
+    "workspace_commit": "4c039d142bd7b9615fd57152e00db3c25eac13a4",
+    "source_inputs_sha256": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary_sha256": "fbc7b451c261798ba25cfe731e3a437be8bc88c05f77d23df52d4deb446fe4f4",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "test",
+      "--locked",
+      "--lib",
+      "--features",
+      "pando-lab",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/rootyard-483657d8a2be41b7"
+      }
+    ]
+  },
+  "limits": [
+    "One loopback PostgreSQL17/Garage S3 fixture; no Azure, encryption, retirement, GC, serving or physical backup closure qualification."
+  ]
+}

@@ -1,0 +1,36 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-pg-snapshot)
+error[E0432]: unresolved imports `super::super::contract::MetadataQuotaResource`, `super::super::contract::MetadataQuotaScope`
+   --> src/ref_store/core/snapshot_usage.rs:181:34
+    |
+181 |     use super::super::contract::{MetadataQuotaResource, MetadataQuotaScope};
+    |                                  ^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^ no `MetadataQuotaScope` in `ref_store::core::contract`
+    |                                  |
+    |                                  no `MetadataQuotaResource` in `ref_store::core::contract`
+    |
+    = help: consider importing this enum through its public re-export instead:
+            crate::ref_store::MetadataQuotaResource
+    = help: consider importing this enum through its public re-export instead:
+            crate::ref_store::MetadataQuotaScope
+
+error[E0425]: cannot find function `advisory_request_lock` in module `snapshot_usage`
+  --> src/ref_store/core/snapshot_pg.rs:71:21
+   |
+71 |     snapshot_usage::advisory_request_lock(tx, request_id).await?;
+   |                     ^^^^^^^^^^^^^^^^^^^^^ not found in `snapshot_usage`
+   |
+help: consider importing this function
+   |
+23 + use crate::ref_store::core::snapshot_sql::advisory_request_lock;
+   |
+help: if you import `advisory_request_lock`, refer to it directly
+   |
+71 -     snapshot_usage::advisory_request_lock(tx, request_id).await?;
+71 +     advisory_request_lock(tx, request_id).await?;
+   |
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `rootyard` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+Some errors have detailed explanations: E0425, E0432.
+For more information about an error, try `rustc --explain E0425`.
+error: could not compile `rootyard` (lib test) due to 2 previous errors

@@ -1,0 +1,87 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "synthetic_source",
+      "status": "passed",
+      "seconds": 2.7132,
+      "detail": {
+        "fresh_databases": 2,
+        "live_server_backup_rejected": true,
+        "unknown_and_unfinished_journal": true
+      }
+    },
+    {
+      "name": "offline_barriers_and_snapshot",
+      "status": "passed",
+      "seconds": 21.196,
+      "detail": {
+        "snapshot_includes_commit_after_barrier_wait": true,
+        "inherited_volume_lock_rejected": true,
+        "backup_seconds": 17.002466972
+      }
+    },
+    {
+      "name": "unsafe_or_corrupt_inputs",
+      "status": "passed",
+      "seconds": 98.5162,
+      "detail": {
+        "corrupt_missing_extra_traversal_symlink_rejected_before_sql": true,
+        "existing_targets_and_overlap_refused": true,
+        "external_object_dependencies_refused": true
+      }
+    },
+    {
+      "name": "backup_barrier_failures",
+      "status": "passed",
+      "seconds": 13.991,
+      "detail": {
+        "exporter_connection_loss_no_publication": true,
+        "queued_ddl_bounded_safe_failure": true
+      }
+    },
+    {
+      "name": "interrupted_restore_guard",
+      "status": "passed",
+      "seconds": 13.5511,
+      "detail": {
+        "killed_parent_while_native_pg_restore_blocked": true,
+        "no_orphan_import_or_partial_sql": true,
+        "persistent_guard_blocks_startup": true,
+        "restore_guard_preflight_seconds": 8.178,
+        "native_pg_restore_blocked_seconds": 4.33
+      }
+    },
+    {
+      "name": "post_backup_write_not_in_snapshot",
+      "status": "passed",
+      "seconds": 0.7649,
+      "detail": {
+        "post_backup_acknowledged_commit": true,
+        "seconds_after_backup_boundary": 148.338
+      }
+    },
+    {
+      "name": "new_environment_restore_clone_fsck",
+      "status": "passed",
+      "seconds": 14.1267,
+      "detail": {
+        "fresh_database_and_directory": true,
+        "separate_pg_server": false,
+        "standard_authenticated_clone_fsck_refs_content": true,
+        "revoked_and_read_only_auth_preserved": true,
+        "unknown_stays_blocked": true,
+        "restore_seconds": 13.19936777,
+        "backup_boundary_commits_missing": 0,
+        "post_backup_acknowledged_commits_not_recovered": 1,
+        "observed_backup_age_at_last_ack_seconds": 148.338,
+        "production_rpo_rto_guarantee": false
+      }
+    }
+  ],
+  "binary_sha256": "bc0abc3ed0ac2c5690581480456532eca17ffbbcb5a2667d10e0a1366845c03b",
+  "limitations": [
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.",
+    "Unknown evidence preserved, not automatically resolved."
+  ]
+}

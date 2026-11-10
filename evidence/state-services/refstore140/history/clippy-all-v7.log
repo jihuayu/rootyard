@@ -1,0 +1,11 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-pg-snapshot)
+error: no rules expected `.`
+   --> tests/ref_store_snapshot_backup_fixture.rs:301:13
+    |
+301 |             .iter()
+    |             ^ no rules expected this token in macro call
+    |
+    = note: while trying to match end of macro
+
+error: could not compile `rootyard` (test "ref_store_snapshot_backup_fixture") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

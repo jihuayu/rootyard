@@ -1,0 +1,85 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "isolated_metrics_setup",
+      "status": "passed",
+      "seconds": 2.3755,
+      "detail": null
+    },
+    {
+      "name": "fixed_private_format",
+      "status": "passed",
+      "seconds": 0.0094,
+      "detail": {
+        "rootyard_error_log_dropped_total": "0",
+        "rootyard_postgres_up": "1",
+        "rootyard_git_capacity": "8",
+        "rootyard_git_in_flight": "0",
+        "rootyard_db_pool_max_size": "16",
+        "rootyard_db_pool_size": "2",
+        "rootyard_db_pool_available": "2",
+        "rootyard_db_pool_busy": "0",
+        "rootyard_db_pool_waiting": "0",
+        "rootyard_git_transfers_total{outcome=\"success\"}": "0",
+        "rootyard_git_transfers_total{outcome=\"failure\"}": "0",
+        "rootyard_git_transfer_bytes_total{direction=\"received\"}": "0",
+        "rootyard_git_transfer_bytes_total{direction=\"sent\"}": "0",
+        "rootyard_session_gc_cycles_total": "0",
+        "rootyard_session_gc_session_rows_deleted_total": "0",
+        "rootyard_session_gc_tokens_deleted_total": "0",
+        "rootyard_session_gc_failures_total": "0",
+        "rootyard_repositories{state=\"provisioning\"}": "0",
+        "rootyard_repositories{state=\"ready\"}": "0",
+        "rootyard_repositories{state=\"recovering\"}": "0",
+        "rootyard_operations_unresolved": "0",
+        "rootyard_event_deliveries{state=\"pending\"}": "0",
+        "rootyard_event_deliveries{state=\"leased\"}": "0",
+        "rootyard_event_delivery_oldest_age_seconds": "0",
+        "rootyard_provisioning_backlog": "0",
+        "rootyard_provisioning_due": "0",
+        "rootyard_provisioning_oldest_age_seconds": "0",
+        "rootyard_browser_web_sessions": "0",
+        "rootyard_browser_tokens": "0",
+        "rootyard_expired_browser_session_oldest_age_seconds": "0",
+        "rootyard_expired_browser_token_oldest_age_seconds": "0"
+      }
+    },
+    {
+      "name": "authoritative_aggregates",
+      "status": "passed",
+      "seconds": 0.1926,
+      "detail": null
+    },
+    {
+      "name": "browser_session_metrics",
+      "status": "passed",
+      "seconds": 0.2063,
+      "detail": {
+        "browser_web_sessions": 5,
+        "browser_tokens": 5,
+        "expired_session_oldest_age_seconds": 691200.093131,
+        "expired_token_oldest_age_seconds": 691200.110283,
+        "gc_disabled_counters": "0",
+        "deletion_growth_and_failed_cycle_counters": "separate native drill tests/session_gc_metrics.py; not executed by this harness"
+      }
+    },
+    {
+      "name": "database_failure_is_503",
+      "status": "passed",
+      "seconds": 0.028,
+      "detail": null
+    },
+    {
+      "name": "non_loopback_rejected",
+      "status": "passed",
+      "seconds": 0.013,
+      "detail": null
+    }
+  ],
+  "binary_sha256": "85c66397f755768fa139cf4952fca6a21ca12747bd6d18b042f80c2a62f0eb3d",
+  "limitations": [
+    "Synthetic SQL aggregates and a missing-table fault do not simulate a PostgreSQL outage or production load.",
+    "Browser-session rows beyond the real HTTP login/logout are SQL seeds with GC disabled; counter growth after real deletions and counter retention on a failed snapshot are covered by the separate native drill tests/session_gc_metrics.py, which this harness does not execute."
+  ]
+}

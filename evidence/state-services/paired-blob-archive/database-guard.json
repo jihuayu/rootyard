@@ -1,0 +1,5 @@
+{
+  "blocked_by_database_marker": true,
+  "no_migration_before_refusal": true,
+  "auto_migration_after_marker_reset_ready": true
+}

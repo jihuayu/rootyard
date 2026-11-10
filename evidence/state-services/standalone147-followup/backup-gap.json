@@ -1,0 +1,58 @@
+{
+  "binary_sha256": "23c2979aa492abb790ff7b6e7eb2efb8e5f1353d02498b16a6267f87029a1f9f",
+  "binding_error": "case inventory mismatch: ['real_http_sha1_sha256_source_without_persistent_bare', 'offline_volume_and_postgres_snapshot_barriers']",
+  "blob_only_service_sha256": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+  "cases": [
+    {
+      "detail": {
+        "archive_volume_initialized_by_real_reconcile_cli": true,
+        "formats": [
+          "sha1",
+          "sha256"
+        ],
+        "no_persistent_bare": true,
+        "owned_databases": 2,
+        "real_git_push_clone_fsck": true
+      },
+      "name": "real_http_sha1_sha256_source_without_persistent_bare",
+      "seconds": 10.3812,
+      "status": "passed"
+    },
+    {
+      "error": "positive nonempty pg_refstore backup failed (exit 1). Current production git_inventory requires persistent bare storage; this drill will not synthesize a bare repository or skip the positive restore contract.",
+      "name": "offline_volume_and_postgres_snapshot_barriers",
+      "seconds": 4.3647,
+      "status": "failed"
+    }
+  ],
+  "ci_release_gate": false,
+  "error": "positive nonempty pg_refstore backup failed (exit 1). Current production git_inventory requires persistent bare storage; this drill will not synthesize a bare repository or skip the positive restore contract.",
+  "expected_cases": [
+    "real_http_sha1_sha256_source_without_persistent_bare",
+    "offline_volume_and_postgres_snapshot_barriers",
+    "incomplete_and_damaged_archives_rejected_before_sql",
+    "existing_database_and_directory_targets_refused",
+    "post_backup_acknowledged_write_excluded",
+    "fresh_database_restore_clone_refs_content_fsck",
+    "restored_exact_receive_replay_without_second_effect"
+  ],
+  "git_sha256": "92c38403054b6d6fef394391bd84beb54ebfaef2f096c1e93b56f5626733c649",
+  "harness_sha256": "861b8dda0de40a0b230fd7cf671c192298e2d30d900013b4cf8206331dd2ef41",
+  "independent_blob_closure_backup_claimed": false,
+  "kind": "rootyard/blob-serving147-backup-gap-drill",
+  "limitations": [
+    "Known production gap: nonempty pg_refstore backup currently requires a missing persistent bare repository; the positive snapshot must fail.",
+    "External Blob originals remain in the same provider/root; no Blob bytes are exported or imported by this drill.",
+    "The archive is not qualified as an independent PG+Blob closure backup or as #120 completion.",
+    "The operator stops serve-blob before backup; serve-blob currently does not hold the legacy volume flock or check its restore guard.",
+    "No interrupted restore, multi-host failure, physical power-loss, throughput, or production RPO/RTO qualification is claimed.",
+    "No legacy format/schema upgrade is exercised. The current binary must restore its own format21/schema147 archive.",
+    "Remote Blob deletion is disabled; objects under this run's private prefix are retained."
+  ],
+  "passed": false,
+  "qualification_kind": "clean-candidate",
+  "retained_directory": "/tmp/rootyard-e2e-4wget_sf",
+  "skips": 0,
+  "source_head": "f1889aac45911e8a58b991c63373376f55af8939",
+  "source_inputs_sha256": "65c9da2bb9d0234cf3b7ac8ba119886ec4ba4235fcff44bc1298d42de6266511"
+}

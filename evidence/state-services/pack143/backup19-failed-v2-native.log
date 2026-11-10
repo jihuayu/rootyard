@@ -1,0 +1,50 @@
+Command failed (101): Error: fixture metadata field "ref_store_core_cancellations" is missing
+
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "synthetic_source_with_typed_native_pack_snapshot_ledger",
+      "status": "failed",
+      "seconds": 6.8468,
+      "error": "Command failed (101): Error: fixture metadata field \"ref_store_core_cancellations\" is missing\n"
+    }
+  ],
+  "skips": 0,
+  "binary": "/workspace/scratch/state-pack143-app-v1/rootyard",
+  "binary_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+  "backup_format": 19,
+  "schema_version": 143,
+  "pack_snapshot_fixture_helper": {
+    "binary": "/workspace/scratch/state-pack143-backup-helper-build-v2/ref_store_pack_snapshots_backup_fixture",
+    "binary_sha256": "359ab46fc5b178885d684abac37b30af70e0a1e6bc789057006a295ce3fa51f3",
+    "build_receipt": "/workspace/scratch/state-pack143-backup-helper-build-v2/ref_store_pack_snapshots_backup_fixture.build.json",
+    "build_receipt_sha256": "bd7602741630f20d9c9747b0950d7ae3854d15cf6913d45a0afad20d3181ebfb",
+    "build_kind": "rust-integration-test",
+    "package_rebuilt": true,
+    "fresh": false,
+    "fresh_false_artifact": {
+      "target": "ref_store_pack_snapshots_backup_fixture",
+      "kind": "test",
+      "fresh": false
+    },
+    "test_profile": true,
+    "integration_test_source_sha256": "4725e60c3f9571a7c761ae502bf7f99703cce66a2f1dc24d45767680f25e9555",
+    "integration_test_source_matches_source_file": true,
+    "source_inputs_sha256": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "candidate_application_receipt": "/workspace/scratch/state-pack143-app-v1/rootyard.build.json",
+    "candidate_application_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "candidate_application_package_rebuilt": true,
+    "source_inputs_match_candidate_application": true
+  },
+  "limitations": [
+    "The typed A5/A4/A3 ledger is seeded by the real adapter and native PackVerifier; no SQL ACK, proof, receipt or registration is fabricated.",
+    "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+    "The random pack repository stays provisioning/gitfs/unserved for the whole drill.",
+    "The DB-clock-expired scenario uses a 1s lease and a bounded clock_timestamp() poll, created last; it is not a TTL unit test.",
+    "complete_git_read_snapshot() is false everywhere: this drill claims registered pack membership metadata only, never verified Blob bytes or native Git object closure.",
+    "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+    "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+  ]
+}

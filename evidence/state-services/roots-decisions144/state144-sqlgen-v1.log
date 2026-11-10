@@ -1,0 +1,15 @@
+Traceback (most recent call last):
+  File "/workspace/scratch/generate-state144-sql-catalogs-v1.py", line 36, in <module>
+    runpy.run_path(str(root / 'tests/schema_contract.py'), run_name='__main__')
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 180, in <module>
+    main()
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 80, in main
+    migrate(fresh)
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 65, in migrate
+    run(command, db)
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 43, in run
+    raise RuntimeError('Synthetic schema contract command failed; private diagnostics suppressed')
+RuntimeError: Synthetic schema contract command failed; private diagnostics suppressed

@@ -1,0 +1,18 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-artifact-holds)
+error[E0603]: module `test_support` is private
+   --> src/ref_store/core/artifact_hold/request.rs:263:28
+    |
+263 |         crate::blob_store::test_support::store(limits).0.backend_identity().clone()
+    |                            ^^^^^^^^^^^^  ----- function `store` is not publicly re-exported
+    |                            |
+    |                            private module
+    |
+note: the module `test_support` is defined here
+   --> src/blob_store/mod.rs:81:1
+    |
+ 81 | mod test_support;
+    | ^^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0603`.
+error: could not compile `rootyard` (lib test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

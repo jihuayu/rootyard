@@ -1,0 +1,9 @@
+{
+  "git": "git version 2.47.3",
+  "git_binary_sha256": "356db14e102d68a1a37d8a1ac577dfd678d45d46e92f468bef8b7154e7bfdc60",
+  "git_mode": "0o755",
+  "git_owner_uid": 0,
+  "effective_uid": 1000,
+  "machine": "x86_64",
+  "limits": "Synthetic Linux loopback; no unprivileged-service/runtime cross-host or production capacity qualification."
+}

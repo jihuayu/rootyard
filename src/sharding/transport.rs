@@ -130,7 +130,7 @@ async fn route_browse_request(state: &Arc<AppState>, actor: &Identity,
         if count > 1 { return Err(conflict("cluster browse ingress requires a local node identity")); }
     }
     let access = auth::authorize_repo_with_role(&tx, actor, parsed.owner, parsed.name,
-        if parsed.role_write { Role::Write } else { Role::Read }).await?;
+        if parsed.role_write { Role::Write } else { Role::Read }, if parsed.role_write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead }).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let generation: i64 = tx.query_one("SELECT storage_generation FROM repositories WHERE id=$1",
         &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
@@ -226,7 +226,7 @@ pub fn route_git_request<'a>(state: &'a Arc<AppState>, request: &Request<Body>)
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, owner, name, if write { Role::Write } else { Role::Read }).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, owner, name, if write { Role::Write } else { Role::Read }, if write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead }).await?;
     let authority_incarnation: Uuid = tx.query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
         .await.map_err(Error::internal)?.get(0);
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
@@ -367,7 +367,7 @@ pub async fn authenticate_delegation(state: &Arc<AppState>, headers: &HeaderMap,
     ).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
     let actor = Identity { id: env.actor_id, token_id: env.token_id, username: row.get(0), read_only: row.get(1), token_digest: row.get(2) };
     let access = auth::authorize_repo_with_role(&tx, &actor, owner, name,
-        if role_write { Role::Write } else { Role::Read }).await?;
+        if role_write { Role::Write } else { Role::Read }, if role_write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead }).await?;
     if access.repo_id != env.repository_id { return Err(Error::unauthorized()); }
     // A backend recovery/resolve can advance the repository generation without
     // changing placement or the route epoch. Ingress may have signed this

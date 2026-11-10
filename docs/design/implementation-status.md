@@ -1,5 +1,96 @@
 # Rootyard 实现状态
 
+本页区分当前目标、候选代码与已验收范围。规范见 [架构](../architecture.md)、[最新实施计划](implementation-plan.md) 和 [任务映射](issue-map.md)。项目尚未发布，不安排旧版本升级或 GitFS 导入。
+
+## 当前基线与剩余工作
+
+本页状态以 [PR #170](https://github.com/jihuayu/rootyard/pull/170)（`codex/rubicon-all-pr-merge` → `main`）作为当前集成的权威记录；其最终合并状态、CI 结论与产出以该 PR 的最终检查和 artifacts 为准，本页不预先断言。该 PR 集成 32 个组件 PR（原 30 个及后来加入的 #172、#173），各组件 PR 的目标分支已统一为 `main`，实际合并状态以 PR #170 和原始 PR 记录为准；集成过程中的修复与合并结果见下节“集成状态”。集成状态不改变运行时边界：默认入口仍是既有 `serve`（legacy GitFS/Pando），Blob 单机仍是显式 `serve-blob` 候选，Raft 运行时未启用；分项组件验收不表示默认服务已替换，也不表示任何实施任务 epic 已全部完成。历史基线 PR #142 / `49f09c2` 的四组原生 8+11+12+20=51 场景（零失败、零忽略）及其证据见 [roots/decisions 证据](../../evidence/state-services/roots-decisions144/README.md)，保持原范围（其中的 CI 通过结论限于当时提交，不延伸到本分支）。
+
+| 能力 | 当前状态 | 后续范围 |
+| --- | --- | --- |
+| OpenDAL Blob、KeyProvider、cache/wake | 有独立组件与限定验收；`state-redis` 为默认关闭的可选 feature，Redis 只作可丢缓存/唤醒 | 全内容/加密路径接入、provider 与部署边界验收 |
+| PgRefStore 操作身份、CAS、pack 发布、快照和物化 | 库实现；显式 `serve-blob` 候选入口已使用 | 默认入口替换、全部业务 producer 与权限上下文等价 |
+| artifact holds / durable roots | 有持久账本和真实 PG/Blob/native Git 验收 | PR/CI/Workspace/LFS producers、GC 与完整恢复闭包 |
+| PG decisions / accepted-subset | PR #142 库增量验收通过 | HTTP/业务入口、浏览器与 Merge producer、远程 Raft 决策桥 |
+| Blob-only standalone（显式 `serve-blob`） | 候选：clone/push、tree/blob 与 refs/历史/compare 浏览、format22 配对备份/恢复有真实验收 | 默认部署替换、LFS/PR/Workspace/CI 接入、默认服务验收 |
+| Raft Ref-CAS distributed | 未交付；仅 PR #160 的独立实验 crate（见下） | 开源库选型、持久运行时、状态机、RPC、权限桥与 PG 投影 |
+| 全新环境恢复与生产资格 | format22 同后端配对恢复有证据；组件恢复有旧证据 | 新架构 PG/Raft/Blob 一致恢复、独立故障域和容量成本验收 |
+| 默认服务与对外 Git 传输 | 默认 `serve` 仍是既有 GitFS/Pando 实现；对外 Git 只承诺 Smart HTTP（HTTPS 由入口代理终止），不实现 SSH | 默认入口切换后补齐其特征接入 |
+
+## Blob 单机服务候选：`serve-blob`
+
+`rootyard serve-blob` 是显式的候选入口（`src/standalone.rs`），默认 `serve` 不受影响。它基于 schema147 的正常仓库创建、PG RefStore、OpenDAL Blob 和可丢弃 Git 计算视图运行；启动时检查未完成恢复标记、持有数据库级共享生命周期屏障，屏障丢失即关闭准入。
+
+服务能力与验收（同机、真实 PostgreSQL/S3/原生 Git、当前源码绑定二进制）：
+
+- HTTP/Git：`tests/blob_only_service.py` 11 项；tree/blob 浏览 `tests/blob_gateway_browse.py` 7 项（`f1889aa` 通过）；refs、提交列表/详情和 compare 历史 API 7 项（`7690758` 通过）。浏览复用捕获的 RefStore 快照、Blob 物化和真实 token/session 权限，支持 SHA-1/SHA-256、带注解标签、当前 refs 可达的历史对象、分页及二进制文件；消息、遍历、子进程输出和 JSON 编码都有明确上限。
+- 并发提交收尾只在原 pending token、请求绑定与同一 realm 持久 gate 前进均核对后写入拒绝终态；真正结果未知的提交保持 UNKNOWN。A3 两个指定竞争窗口只有错误分类单元回归，HTTP 竞争验收不保证调度恰落在这两个窗口。
+- 备份：format22/schema147 配对归档（见下节）7 项、旧 format21 备份/恢复 7 项，均在 `1d1ce62` 通过。
+- 本地结构检查（非新增执行记录）：`src/standalone.rs` 只构造 Smart HTTP 路由，不提供 SSH 入口；`state-redis` 默认不在 feature 中，`serve-blob` 目前不使用 Redis；独立实验 crate 不在根依赖中。
+
+Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上 Rust 库测试 464 通过、9 项服务依赖测试显式忽略，最小依赖 all-targets Clippy 通过（候选 PR #159/#161 的 GitHub 主 CI `verify` 任务当时为失败，记录未追溯根因；独立的 CI 恢复与问题修复在其他分支进行，本页不重复）；`backup_blob_serving147.py` 记录 Python 336 项中 331 通过、5 跳过，外加 3 项 live S3 工作区用例通过。上述结果绑定各自源码提交；集成后的全量门禁（all-targets Clippy、Rust 测试与 native/remote 用例）以 PR #170 最终检查与 artifacts 为准，本页不另作汇总通过声明。
+
+## 集成状态（PR #170）
+
+- **范围与 ancestry**：集成 32 个组件 PR；每个组件 PR 的 head 保留在集成 history 中（经真实 merge 提交而非 squash/rebase）；各组件 PR 的目标分支已统一为 `main`，实际合并状态以 PR #170 和原始 PR 记录为准。集成后仅新增集成门禁修复（issue #171）及后并入的 #172、#173。
+- **验收依据**：集成后的最终 CI 与 native/remote 结果见 PR #170 的最终检查和 artifacts；最终通过与否以该处为准，本页不在验证前给出全量通过结论。
+- **缺陷修复组件**（结果绑定各自提交的证据；当时集成后的 CI 仍待完成，未把分项结果推广为整体通过）：
+  - [issue #166](https://github.com/jihuayu/rootyard/issues/166)（本地集成修复提交 `bc0cff1`，LunaMax 已审）：备份 9 项；源码绑定二进制以当前 format21 恢复，并以真实的旧 format4 归档完成恢复与升级；此前失败的原始归档用例（Root 原样校验）恢复运行，完成约 6.3 秒。
+  - [issue #167](https://github.com/jihuayu/rootyard/issues/167)（本地集成修复提交 `a323f87`）并入 [PR #173](https://github.com/jihuayu/rootyard/pull/173)（head `18e4884`）：集成后保留 #167 的日志读取实现，`crates/refcas-log` 21 项单元测试加 1 项真实 SIGKILL/新进程用例通过；仍是隔离实验 crate，不是运行时。
+  - [issue #168](https://github.com/jihuayu/rootyard/issues/168)（本地集成修复提交 `a72cd4e`，LunaMax 已审）：41 项 W0 测试及真实 Git 的默认小规模运行通过。
+  - [issue #171](https://github.com/jihuayu/rootyard/issues/171)（本地集成修复提交 `9f161c9`，LunaMax 已审）：21 项 overlay 负向检查及实际 `cargo check --locked --lib --tests`（0 错误、0 警告）通过；Root 在私有 `TMPDIR` 下重跑组合 overlay/W0 62 项通过。
+  - [PR #172](https://github.com/jihuayu/rootyard/pull/172)（`fbe27cd`）：仅新增一致性/会话契约草案文档，未交付代码。
+- **未包含**：issue #169（配对归档 corrupt-ledger 加固）仍 OPEN，其未批准本地补丁未合并；#162–#165 及新的 #174（按 [PR #172](https://github.com/jihuayu/rootyard/pull/172) 提案实现会话读取，尚未实现）仍是 backlog（见[实施计划](implementation-plan.md)）。
+
+## issue #169 边界
+
+配对归档当前仅在受支持的 API 产生的静止配对流程上有资格，且只验证 API 验证过的 pack；不能据此声称已实现完整 canonical 注册 pack 校验或 root 发布等价性。PR #161 未实现完整的 ledger corruption guard，#169 的加固仍待完成。LunaMax 独立审查确认：由 API 创建并在静止状态固定的 root pack 能原子地从已登记的永久 artifact 派生。手工或特权直接改 DB 造成的损坏（root 到 A4 的等价性）未被 PR #161 语义验证。关闭 #169 前须有证据：正例为带非空、由 API 创建的活动与已释放 retention roots 的 format22 配对归档恢复；负例为损坏的 root/A4 artifact identity、摘要或缺失 idx 时必须在发布前被拒绝。不另称新的专项报告版本。
+
+#171 的修复随 PR #170 整合，最终 CI 状态以 PR 为准；它只处理合并后的契约缺陷，未新增或声称任何分布式、HA、GC 或容量能力：
+
+- 合并 PR #124 曾用旧 W0 正文覆盖 [第 12 章](12-state-services.md)，覆盖了 PR142 之后加入的 HTTP-only 段落，并带回旧 GitFS/Pando 导入与在线 transition。当前章节已从 canonical 分支 `codex/state-services-architecture-v2`（`23334bd`）逐字节恢复，W0 原始字节（SHA-256 `0187d9c0…`，80072 bytes）移到[显式历史归档](state-services/historical-w0/README.md)，`snapshot.json` 同时记录两者哈希。
+- W0/phase-metrics 的 feature-only overlay 检查改为只针对其冻结的 parent fixture（`bcd3918` manifest/lock）；当前集成 manifest 单独做显式契约验证。历史 v1/v5/v6 原始测量报告未修改。
+- `src/web.rs` 路由合成整理到原有 100 行结构上限内，全部 48 条路由与 session/Origin/CSRF 中间件保持不变；`src/token_management/mod.rs` 的过时发布声明注释已更正（父 token 发布锁已包含在当前代码）。
+
+本页不以缺失前提条件代替回归证据；集成后的二进制/PG 原生门禁以 PR #170 最终检查为准。缺陷修复 #166–#168 已有绑定各自提交的结果（见“集成状态”），集成后是否闭合以 PR #170 最终证据为准；[#169](https://github.com/jihuayu/rootyard/issues/169) 仍 OPEN，#162–#165 与 #174 仍是 backlog（见[实施计划](implementation-plan.md)）。详细构建、源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md) 与 [standalone147 证据](../../evidence/state-services/standalone147-followup/README.md)。
+
+## format22 配对备份与恢复的真实边界
+
+`format22/schema147` 是当前二进制自己的归档格式：归档既包含冻结 catalog 的 PostgreSQL 快照，也包含该快照引用的 **新鲜 PG RefStore pack/idx 闭包**（以校验和与流式行摘要绑定），并记录源物理 Blob 后端身份。备份与恢复使用与 `serve-blob` 相同的数据库级排他/共享生命周期屏障：备份固定单一 PG 快照并拒绝非终态写入切点，恢复在写入完成、发布与 fsync 前保持服务封锁，持久恢复标记同时阻止另一数据路径绕过。
+
+已验收（`1d1ce62`，[证据](../../evidence/state-services/paired-blob-archive/README.md)）：删除原始 pack/idx 对象后，在全新数据库、原 Blob 后端同一坐标上重建字节并通过 clone/content/refs/fsck 与精确重放；屏障丢失、离线/快照屏障违规、损坏归档、已有目标、非终态切点均被拒绝；备份后 ACK 的写入被排除。损坏归档包含六种被拒绝的损伤样本，不是穷举的完整性证明。
+
+明确限制：
+
+- 仅覆盖新鲜 PG RefStore 仓库的 pack 闭包，**不是全内容闭包**；LFS、workspace/checkpoint、事件归档等字节尚未进入 format22。
+- 只支持恢复到**同一物理 Blob 后端身份**；不支持改写到其他后端。
+- 混合旧格式/PG 仓库被拒绝；不作旧 format/schema 升级。
+- 中断的 format22 恢复没有专门恢复流程或演练（旧 format21 中断演练不覆盖 format22）；没有物理掉电、HA、多主机或生产 RPO/RTO 资格。
+- 产品物理 GC 仍默认关闭。
+- 本节取代此前“非空 Blob 仓库无法备份”“`backup::git_inventory` 仍要求持久 bare Git”的旧阻塞描述：该阻塞对 `pg_refstore` 仓库已由 format22 解除（旧描述保留在下方历史记录中，仅表示当时状态）。
+
+## 独立实验：Ref-CAS 日志存储（PR #160）
+
+PR #160 新增 `crates/refcas-log`：openraft 0.9.26 `RaftLogStorage`/`RaftLogReader` 的 SQLite 实现，带精确 purge 身份、校验和、有界 append/read、SQLite 提交后才确认日志 flush，以及 1 项真实 SIGKILL/新进程 vote 恢复测试；由独立 workflow 运行。它**只是隔离的实验 crate**：不在 `Cargo.toml` 根依赖、不参与根构建、不激活任何 Raft 运行时，状态机存储、快照、RPC/TLS/ReadIndex、完整 openraft 套件、Ref-CAS 集成和多主机资格均未实现。证据：[refcas-log 证据](../../evidence/state-services/refcas-log-slice/README.md)。
+
+## 仍待完成
+
+LFS、PR/Merge、Workspace、CI/Namespace 的新服务接入、默认入口替换；Raft 运行时、远程决策桥；GC 与容量成本；以及 format22 之外的全内容恢复与独立故障域验收。实施 issue 只有在相关实现合并并完成对应真实验收后关闭。
+
+## 历史实现与验收索引
+
+以下保留已发生的验收和原提交记录；其中旧“当前”指记录日期，不定义新的架构和 backlog。历史成功不因新设计而被抹除，也不作为新模式的验收结果。
+
+# 历史实现记录
+
+## 当前：状态服务 W0（提案，不是已实现能力）
+
+issue #105/#106 W0 已提交[原始第 12 章设计快照](state-services/historical-w0/README.md)（后来被彻底取代，当前章节以其后 canonical 分支为准）、[可执行生产者清单](state-services/producers.json)、[部署契约/配置 schema](state-services/deployment-contract.json)、[provisional 预算](state-services/budgets.json)、[依赖冻结证据](state-services/dependencies.json)与[有限基线工具](state-services/README.md)。设计仍为**提案**：RefStore、BlobStore/OpenDAL、Scope CLOSING/CancelDecision、W1–W9 均未实现；现有 GitFS/PG 与 Pando remote+Vault 路径仍是 legacy/既有边界，不是 target 新部署。
+
+历史 `d689bf8` 的 legacy Pando 基线回执记录于 [native-baseline](../../evidence/state-services/native-baseline.md)：可重跑脚本、原生二进制/源码/锁文件绑定、stock Git、真实 PG/Garage/Vault、冷暖 clone、竞争写入与 atomic 成功路径。该回执是**历史 pre-evolution 基线**，不回算到本次 rebase 的 security/token/membership parent，也不代表新后端或多主机资格。内部阶段等待、Blob bytes、精确 old-OID CAS 竞态、完整 producer coverage 与冻结预算仍待验收，**#106 保持 OPEN**。
+
+历史 round-4 以下内容保持原样（保留原文与其标注的日期边界）。
+
 ## 当前：round-4 浏览器与 LFS（above 为历史快照）
 
 集成源 `4c5bcfe56516434ea5b42985e9af90a8c1efe51f`（基线 main `a91c93f`，不可变二进制 `c0049c3a…`，生产输入 `8f399a06…`/331）通过全部 11 个 native coordinator job，独立终审 `APPROVED`（0 P1）：真实 Chromium 登录/发现/Issue+PR/合并/登出并拒绝旧 cookie；可撤销浏览器会话（CSRF/Origin/过期/父令牌撤销准入检查）；真实 stock `git-lfs` + 真实 Garage，删除源 `DATA_DIR` 后由第二进程/新 `DATA_DIR` 经共享 PostgreSQL 取回精确字节；pointer 规范化覆盖官方客户端 LF/CRLF、前导 Unicode 空白/NBSP 与两个 legacy 头，12 类坏 pointer 在 4 条发布路径上共 48 组合全部在 ref 移动前拒绝，18 个官方客户端探针全部匹配；4000 个真实 staging 清理在 native 数据 `ShareLock` 释放前无法删除；离线 format-8/schema-132 恢复撤销旧浏览器会话并在无目标 endpoint 下提供 LFS 字节。生产改动 4 个文件（浏览器与 LFS），**无 DDL**，schema 仍为 132。计数不混用：145 个 Rust 单元测试与 9 份 JSON 报告中的 25 个 case。水化 `0600` 属于加固——旧 `157748a` 适配器本已原子并通过 8 MiB 并发用例，本轮**不是**截断修复；旧二进制真实失败是 CRLF pointer 绕过（保留为标注的旧证据）。单物理主机、loopback 服务与一次性 PostgreSQL/Garage/Chromium，无生产 HA、厂商、云或跨主机声明；#26/#43/#44 与 umbrella #48 保持 OPEN。证据：[round-4 验收](../acceptance/round4-browser-lfs.md)、[evidence bundle](../../evidence/round4/browser-lfs-4c5bcfe/README.md)。

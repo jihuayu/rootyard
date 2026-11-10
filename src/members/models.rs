@@ -264,16 +264,14 @@ impl AuditQuery {
         if after < 0 || !(1..=100).contains(&limit) {
             return Err(Error::bad_request());
         }
-        if let Some(ref actor) = self.actor {
-            if !db::valid_name(actor) {
+        if let Some(ref actor) = self.actor
+            && !db::valid_name(actor) {
                 return Err(Error::bad_request());
             }
-        }
-        if let Some(ref action) = self.action {
-            if !valid_audit_token(action) {
+        if let Some(ref action) = self.action
+            && !valid_audit_token(action) {
                 return Err(Error::bad_request());
             }
-        }
         if let (Some(since), Some(until)) = (self.since, self.until) {
             if since > until || since < 0 || until < 0 {
                 return Err(Error::bad_request());

@@ -1,0 +1,36 @@
+   Compiling rootyard v0.1.0 (/workspace/scratch/round5-implementation/worker-diagnostics)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 58.22s
+     Running unittests src/lib.rs (/workspace/rootyard/target/debug/deps/rootyard-c512e8eeea7428b7)
+
+running 27 tests
+test workspaces::capture::tests::api_write_baseline_is_never_replayed_as_an_external_capture ... ok
+test workspaces::capture::tests::fingerprint_is_stable_across_unordered_filesystem_events ... ok
+test workspaces::capture::tests::reconcile_scan_failure_is_observed_in_the_reconcile_worker_scope ... {"event":"rootyard_error","event_id":"dd32f3f3-f813-43d9-a93f-8c8a714fd5a0","kind":"io","operation_id":"6868bf3a-c907-4a0f-b5ef-6d7ad962bb4e","phase":"reconcile","scope":"worker","status":503,"worker":"workspace_capture"}
+ok
+test workspaces::capture::tests::stale_scans_are_discarded_for_revision_and_lease_epoch_changes ... ok
+test workspaces::git::tests::cancellation_drops_the_process_group ... ok
+test workspaces::git::tests::capacity_exhaustion_is_a_retryable_503 ... ok
+test workspaces::git::tests::deadline_cancels_the_whole_process_group ... ok
+test workspaces::git::tests::disconnect_with_a_live_real_index_lock_keeps_the_owned_add ... ok
+test workspaces::git::tests::drain_warns_past_grace_but_joins_the_owned_job ... ok
+test workspaces::git::tests::foreign_index_lock_is_preserved_and_the_mutation_fails_cleanly ... ok
+test workspaces::git::tests::huge_stderr_is_drained_without_deadlock ... ok
+test workspaces::git::tests::huge_stdout_is_rejected_without_waiting_for_eof ... ok
+test workspaces::git::tests::native_git_success_is_returned_with_bounded_output ... ok
+test workspaces::git::tests::timed_out_owned_job_releases_capacity_after_clean_cleanup ... ok
+test workspaces::lazy::tests::failed_verification_never_publishes_final_path ... ok
+test workspaces::lazy::tests::follower_wait_is_bounded_when_leader_stalls ... ok
+test workspaces::lazy::tests::independent_blobs_hydrate_in_parallel ... ok
+test workspaces::lazy::tests::offline_fetch_times_out_with_eio_and_releases_flight ... ok
+test workspaces::lazy::tests::reader_rejects_corrupt_remote_blob_then_recovers ... ok
+test workspaces::lazy::tests::reader_rejects_truncated_remote_blob ... ok
+test workspaces::lazy::tests::remote_fetcher_publishes_verified_blob_and_cleans_staging ... ok
+test workspaces::lazy::tests::singleflight_shares_one_remote_fetch ... ok
+test workspaces::lazy::tests::staging_stays_private_until_verified_and_published ... ok
+test workspaces::lazy::tests::timed_out_fetch_cannot_resurrect_staging_file ... ok
+test workspaces::scan::tests::one_workspace_is_never_scanned_by_two_workers_at_once ... ok
+test workspaces::scan::tests::the_scan_thread_runs_with_the_caller_worker_scope_only ... ok
+test workspaces::scan::tests::timeout_keeps_capacity_and_inflight_until_work_returns ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 193 filtered out; finished in 5.53s
+

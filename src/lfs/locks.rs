@@ -129,16 +129,15 @@ pub async fn create_lock(
     let key = auth::idempotency_key(&headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Write).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
     let request = json!({"operation":"lfs_lock","path":input.path});
-    if let Some(key) = key {
-        if let Some(saved) =
+    if let Some(key) = key
+        && let Some(saved) =
             creation_replay(&tx, access.owner_id, access.repo_id, key, &request).await?
         {
             auth::finish_tx(tx, &actor, true).await?;
             return Ok(response(StatusCode::CREATED, saved));
         }
-    }
     let id = Uuid::new_v4();
     let inserted = tx.query_opt("INSERT INTO lfs_locks(id,tenant_id,repository_id,path,owner_user_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT(repository_id,path) DO NOTHING RETURNING id, path, to_char(locked_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS locked_at",
         &[&id,&access.owner_id,&access.repo_id,&input.path,&actor.id]).await.map_err(Error::internal)?;
@@ -195,7 +194,7 @@ pub async fn list_locks(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
     let rows = tx.query("SELECT l.id,l.path,to_char(l.locked_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS locked_at,u.username FROM lfs_locks l JOIN users u ON u.id=l.owner_user_id WHERE l.tenant_id=$1 AND l.repository_id=$2 AND ($3::text IS NULL OR l.path=$3) AND ($4::uuid IS NULL OR l.id=$4) AND ($5::uuid IS NULL OR l.id>$5) ORDER BY l.id LIMIT $6",
         &[&access.owner_id,&access.repo_id,&query.path,&query.id,&query.cursor,&(limit+1)]).await.map_err(Error::internal)?;
     let locks: Vec<_> = rows.iter().take(limit as usize).map(lock_view).collect();
@@ -238,7 +237,7 @@ pub async fn verify_locks(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Write).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
     let rows = tx.query("SELECT l.id,l.path,to_char(l.locked_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS locked_at,u.username,l.owner_user_id FROM lfs_locks l JOIN users u ON u.id=l.owner_user_id WHERE l.tenant_id=$1 AND l.repository_id=$2 AND ($3::uuid IS NULL OR l.id>$3) ORDER BY l.id LIMIT $4",
         &[&access.owner_id,&access.repo_id,&cursor,&(limit+1)]).await.map_err(Error::internal)?;
     let mut ours = Vec::new();
@@ -277,7 +276,7 @@ pub async fn unlock(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Write).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
     let (view, owner_id) = load_lock(&tx, access.repo_id, id).await?;
     if actor.id != owner_id && !(input.force && access.role >= Role::Admin) {
         return Err(Error(

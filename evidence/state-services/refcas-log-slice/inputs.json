@@ -1,0 +1,17 @@
+{
+  "source_commit": "7422754481715cca8bbcf28db08078b5e6460b22",
+  "files_sha256": {
+    ".github/workflows/refcas-log.yml": "3007ad1593192815f5fac3b941ba8cf90ea0ebeefb72c9f4ff1910e3a1bd0414",
+    "crates/refcas-log/Cargo.lock": "99e6986e5c5b3b8112546424f50d064fe86a97fb0aa8cd3201b5b206dac4380a",
+    "crates/refcas-log/Cargo.toml": "f458f48202269995020c79019e5424d19d3dcd92d29ec4eb98f38d3150795346",
+    "crates/refcas-log/README.md": "2c7a4f63113123c0f2b06e6c13739d22b47a0a90274117ca28e64d491e9dd31d",
+    "crates/refcas-log/src/bin/vote-probe.rs": "d9126aae26bd8c23a37f0893adc717d663f29966dbb1dbb43d717f1bdf7b4e52",
+    "crates/refcas-log/src/lib.rs": "d6c20e2ccba1df4137b970e8c9a0b700e7d511504444de61efa3b7959b48f3b3",
+    "crates/refcas-log/tests/vote_crash.rs": "55c8a47c253822bfebf9aab62960defd4ee6ba630ab9c86308db3b160c6216fc"
+  },
+  "unit_tests_passed": 9,
+  "vote_process_crash_tests_passed": 1,
+  "ignored": 0,
+  "strict_clippy": true,
+  "scope": "isolated log storage only; no service/RPC/STM/Git/quorum/power-loss qualification"
+}

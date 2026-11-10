@@ -1,0 +1,79 @@
+{
+  "passed": false,
+  "returncode": 101,
+  "seconds": 29.917,
+  "summary": "test result: FAILED. 7 passed; 3 failed; 0 ignored;",
+  "command": [
+    "/workspace/scratch/state-materialized-provider-build-v1/ref_store_materialized_reads",
+    "--ignored",
+    "--test-threads=1"
+  ],
+  "before": {
+    "source": "f7d308c01899835c09dbee529676cd8f903a865ba3fd9aa3e17178588282ebca",
+    "test": "c10098aadc34bf958d76937aea463a8d76a281e504bb9285c3f2eb0f27ce0a1c",
+    "binary": "3096a2103cd060f39a1c881562835757059ca274f28461025c24cdfc67ec7b52",
+    "head": "066309e88541ff30c2e442cfa5d49bc53767ee30",
+    "clean": true
+  },
+  "after": {
+    "source": "f7d308c01899835c09dbee529676cd8f903a865ba3fd9aa3e17178588282ebca",
+    "test": "c10098aadc34bf958d76937aea463a8d76a281e504bb9285c3f2eb0f27ce0a1c",
+    "binary": "3096a2103cd060f39a1c881562835757059ca274f28461025c24cdfc67ec7b52",
+    "head": "066309e88541ff30c2e442cfa5d49bc53767ee30",
+    "clean": true
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "b075c867e26c35516f037643304a2ccb73cd262b1c61074e0fe844b10ca4372d",
+  "build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "3096a2103cd060f39a1c881562835757059ca274f28461025c24cdfc67ec7b52",
+    "workspace_commit": "066309e88541ff30c2e442cfa5d49bc53767ee30",
+    "fresh": false,
+    "source_inputs_sha256": "f7d308c01899835c09dbee529676cd8f903a865ba3fd9aa3e17178588282ebca",
+    "binary_sha256": "3096a2103cd060f39a1c881562835757059ca274f28461025c24cdfc67ec7b52",
+    "integration_test_source_sha256": "c10098aadc34bf958d76937aea463a8d76a281e504bb9285c3f2eb0f27ce0a1c",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_materialized_reads",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_materialized_reads",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_materialized_reads-e4475da8c15f5108"
+      }
+    ]
+  },
+  "limits": [
+    "Loopback PG17, Garage S3, actual native Git; Materialized pinned local pack/index data and actual native Git closure; no serving, restart, HA, encryption, GC, roots or physical Blob backup qualification."
+  ],
+  "qualification_kind": "clean-candidate"
+}

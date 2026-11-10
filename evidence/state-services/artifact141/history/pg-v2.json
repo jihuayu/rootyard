@@ -1,0 +1,156 @@
+{
+  "passed": false,
+  "elapsed_seconds": 23.777,
+  "command": [
+    "/workspace/scratch/state-artifact141-pg-v2/ref_store_artifact_holds",
+    "--ignored",
+    "--test-threads=1"
+  ],
+  "returncode": 101,
+  "summary": "test result: FAILED. 18 passed; 1 failed; 0 ignored;",
+  "cases": [
+    {
+      "name": "acquire_vs_cancel_two_client_barrier_keeps_hold_and_tombstone",
+      "passed": true
+    },
+    {
+      "name": "cancel_before_register_blocks_acquire_without_rows_or_grant",
+      "passed": true
+    },
+    {
+      "name": "consume_vs_cancel_barrier_then_cancelled_parent_blocks_second_grant",
+      "passed": true
+    },
+    {
+      "name": "direct_update_delete_and_expiry_attempts_are_refused",
+      "passed": true
+    },
+    {
+      "name": "foreign_backend_grants_are_refused_before_consume_pool_and_provider_io",
+      "passed": true
+    },
+    {
+      "name": "fresh_batch_acquire_is_all_or_none_and_replay_returns_ack_without_grant_or_quota",
+      "passed": true
+    },
+    {
+      "name": "full_scope_fences_and_unrepresentable_purpose_are_typed_refusals",
+      "passed": true
+    },
+    {
+      "name": "global_request_identity_conflicts_across_repos_after_business_deletion",
+      "passed": true
+    },
+    {
+      "name": "grant_consumes_once_and_receipt_queries_never_regrant",
+      "passed": true
+    },
+    {
+      "name": "no_refunds_or_ledger_release_after_cancel_and_owner_tenant_deletion",
+      "passed": false
+    },
+    {
+      "name": "pool_lease_and_consume_ack_are_visible_while_a_provider_write_is_parked",
+      "passed": true
+    },
+    {
+      "name": "quota_boundaries_refuse_atomically_without_rows_or_refunds",
+      "passed": true
+    },
+    {
+      "name": "quota_race_with_distinct_connections_has_exactly_one_winner",
+      "passed": true
+    },
+    {
+      "name": "registered_operation_and_scope_fences_are_exact",
+      "passed": true
+    },
+    {
+      "name": "stable_consume_id_recovery_and_corrupt_ledger_fixtures_are_typed",
+      "passed": true
+    },
+    {
+      "name": "table_share_cut_parks_admission_and_exposes_only_acked_holds",
+      "passed": true
+    },
+    {
+      "name": "truncate_of_every_new_ledger_table_is_denied_and_rows_survive",
+      "passed": true
+    },
+    {
+      "name": "unknown_acquire_commit_returns_no_grant_and_replay_returns_old_ack",
+      "passed": true
+    },
+    {
+      "name": "unknown_consume_commit_returns_no_token_and_receipt_lookup_is_readonly",
+      "passed": true
+    }
+  ],
+  "source_binary_test_head_unchanged": true,
+  "before": {
+    "source": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary": "e94599c0843912197c9d04703a5a9dd6d6ad874dba3e45b90aed73f358549ce0",
+    "test": "d67b97972f8e669a893b1e9f795342e4e19fbd025333702df976c97f1ff51ec2",
+    "head": "e3e2d26d27f33087488f1470e5ca520e1d26140e"
+  },
+  "after": {
+    "source": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary": "e94599c0843912197c9d04703a5a9dd6d6ad874dba3e45b90aed73f358549ce0",
+    "test": "d67b97972f8e669a893b1e9f795342e4e19fbd025333702df976c97f1ff51ec2",
+    "head": "e3e2d26d27f33087488f1470e5ca520e1d26140e"
+  },
+  "build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "e94599c0843912197c9d04703a5a9dd6d6ad874dba3e45b90aed73f358549ce0",
+    "workspace_commit": "e3e2d26d27f33087488f1470e5ca520e1d26140e",
+    "fresh": false,
+    "source_inputs_sha256": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary_sha256": "e94599c0843912197c9d04703a5a9dd6d6ad874dba3e45b90aed73f358549ce0",
+    "integration_test_source_sha256": "d67b97972f8e669a893b1e9f795342e4e19fbd025333702df976c97f1ff51ec2",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_artifact_holds",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_artifact_holds",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_artifact_holds-563f71a503d3769e"
+      }
+    ]
+  },
+  "compiled_commit": "e3e2d26d27f33087488f1470e5ca520e1d26140e",
+  "tested_checkout_commit": "e3e2d26d27f33087488f1470e5ca520e1d26140e",
+  "compiled_inputs_and_integration_test_match_receipt": true,
+  "limits": [
+    "Real PostgreSQL on one loopback host; permanent hold metadata and ordering, local provider fault harness only. No successful S3 bytes, retirement, physical GC, serving/cutover, multi-host or power-loss qualification."
+  ]
+}

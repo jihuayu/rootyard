@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "status": "failed",
+  "profile": "legacy-pando-s3-vault",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "9f0e1d461d9acd64b202483a819fca0af1e845e9c49059e0830dd8b175cb77fa",
+    "source_inputs_sha256": "743d6938c501c27747f42916265ef2af6e90ff1e247e0fef9e82b487d1e6f683",
+    "workspace_commit": "3257358bac1649b606d4c03296d5d7fb2d080eeb",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "blob-azblob",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-blob-intents#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-blob-intents#rootyard@0.1.0"
+      }
+    ]
+  },
+  "binary_bytes": 100100416,
+  "runner_sha256": "3272ab6ed466b5fb862c222600fffb43e70382d2aadc3b5f2f3100899d574ea5",
+  "cases": [
+    {
+      "name": "schema_accounts_server_ready",
+      "seconds": 1.1552137230028166,
+      "status": "passed"
+    },
+    {
+      "name": "gitfs_seed_push_0",
+      "seconds": 0.4283889789949171,
+      "status": "passed"
+    },
+    {
+      "name": "gitfs_seed_push_1",
+      "seconds": 0.3988168990035774,
+      "status": "passed"
+    },
+    {
+      "name": "offline_pando_cutover_state-baseline-0",
+      "seconds": 1.5479552619945025,
+      "status": "passed"
+    },
+    {
+      "name": "offline_pando_cutover_state-baseline-1",
+      "seconds": 1.5664204909990076,
+      "status": "passed"
+    },
+    {
+      "name": "pando_server_ready",
+      "seconds": 0.5743865969998296,
+      "status": "passed"
+    }
+  ],
+  "harness_sha256": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+  "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "memory_total": "18440100 kB",
+    "scope": "host-visible resources; not a reserved hardware allocation"
+  },
+  "provider_versions": {
+    "garage": null,
+    "vault": null,
+    "reason": "service executable inspection unavailable to test uid"
+  },
+  "limits": [
+    "One physical host, loopback PostgreSQL/Garage/Vault; no throughput or HA qualification.",
+    "Small fixed workload; no production latency objective inferred.",
+    "PG sampling every 250ms can miss short waits; observed peak is a lower bound.",
+    "Git materialization, internal lock wait, and Blob costs are not separately instrumented."
+  ],
+  "unmeasured": {
+    "git_materialization_ms": null,
+    "blob_io_bytes": null,
+    "exact_lock_wait_ms": null,
+    "artifact_authority_contention_ms": null,
+    "native_git_cpu_seconds": null,
+    "peak_temp_disk_bytes": null
+  },
+  "idle_after_setup": {
+    "VmHWM": 32560,
+    "VmRSS": 32560,
+    "Threads": 5,
+    "units": {
+      "VmRSS": "KiB",
+      "VmHWM": "KiB",
+      "Threads": "count"
+    }
+  },
+  "pg_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "git_version": "git version 2.52.0",
+  "idle_pando": {
+    "VmHWM": 32768,
+    "VmRSS": 32768,
+    "Threads": 5,
+    "units": {
+      "VmRSS": "KiB",
+      "VmHWM": "KiB",
+      "Threads": "count"
+    }
+  },
+  "error": "Command failed (1): error: RPC failed; curl 7 Failed to connect to 127.0.0.1 port 38727 after 0 ms: Could not connect to server\nsend-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly\nEverything up-to-date\n",
+  "pg_samples": {
+    "count": 15,
+    "peak_connections": 7,
+    "peak_lock_waiters": 0,
+    "peak_active": 1,
+    "errors": []
+  },
+  "fixture_root": "/tmp/rootyard-e2e-3z1ndlqo",
+  "binary_still_matches": true,
+  "source_still_matches": true
+}

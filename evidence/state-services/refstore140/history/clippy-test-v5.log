@@ -1,0 +1,28 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-pg-snapshot)
+error[E0382]: borrow of moved value: `before`
+   --> tests/ref_store_core_snapshot.rs:557:53
+    |
+500 |         let before = gate_version(&pool, repo, tenant).await?;
+    |             ------ move occurs because `before` has type `rootyard::ref_store::CoreGateVersion`, which does not implement the `Copy` trait
+...
+527 |         let commit = tokio::spawn(async move {
+    |                                   ---------- value moved here
+...
+538 |                         before.revision(),
+    |                         ------ variable moved due to use in coroutine
+...
+557 |         assert_eq!(created.receipt.gate_revision(), before.revision());
+    |                                                     ^^^^^^ value borrowed here after move
+    |
+help: consider cloning the value before moving it into the closure
+    |
+527 ~         let value = before.clone();
+528 ~         let commit = tokio::spawn(async move {
+529 |             let _ = commit_started_tx.send(());
+...
+538 |                         history,
+539 ~                         value.revision(),
+    |
+
+For more information about this error, try `rustc --explain E0382`.
+error: could not compile `rootyard` (test "ref_store_core_snapshot") due to 1 previous error

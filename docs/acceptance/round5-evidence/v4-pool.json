@@ -1,0 +1,104 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "fresh_schema_actual_service",
+      "status": "passed",
+      "seconds": 2.5958,
+      "detail": {
+        "repository": "ready",
+        "metrics_listener": "owned loopback port"
+      }
+    },
+    {
+      "name": "actual_pool_saturation_gauges",
+      "status": "passed",
+      "seconds": 5.3446,
+      "detail": {
+        "http_status": 503,
+        "database_lock_waiters": 16,
+        "raw_values": {
+          "rootyard_db_pool_max_size": "16",
+          "rootyard_db_pool_size": "16",
+          "rootyard_db_pool_available": "0",
+          "rootyard_db_pool_busy": "16",
+          "rootyard_db_pool_waiting": "16",
+          "rootyard_postgres_up": "0"
+        },
+        "api_responses": {
+          "200": 16,
+          "503": 16,
+          "other": []
+        }
+      }
+    },
+    {
+      "name": "capacity_returns_after_unlock",
+      "status": "passed",
+      "seconds": 0.016,
+      "detail": {
+        "http_status": 200,
+        "raw_values": {
+          "rootyard_db_pool_max_size": "16",
+          "rootyard_db_pool_size": "16",
+          "rootyard_db_pool_available": "16",
+          "rootyard_db_pool_busy": "0",
+          "rootyard_db_pool_waiting": "0",
+          "rootyard_postgres_up": "1"
+        },
+        "api_responses": {
+          "200": 16,
+          "503": 16,
+          "other": []
+        }
+      }
+    }
+  ],
+  "binary_sha256": "7fce5b30de48f66fe676d3c60bf2da0c33e9d3b11d9c30bcc0ecbcc5974306db",
+  "actual_pool_metrics": {
+    "baseline": {
+      "http_status": 200,
+      "raw_values": {
+        "rootyard_db_pool_max_size": "16",
+        "rootyard_db_pool_size": "3",
+        "rootyard_db_pool_available": "3",
+        "rootyard_db_pool_busy": "0",
+        "rootyard_db_pool_waiting": "0",
+        "rootyard_postgres_up": "1"
+      }
+    },
+    "saturated": {
+      "http_status": 503,
+      "database_lock_waiters": 16,
+      "raw_values": {
+        "rootyard_db_pool_max_size": "16",
+        "rootyard_db_pool_size": "16",
+        "rootyard_db_pool_available": "0",
+        "rootyard_db_pool_busy": "16",
+        "rootyard_db_pool_waiting": "16",
+        "rootyard_postgres_up": "0"
+      }
+    },
+    "api_responses": {
+      "200": 16,
+      "503": 16,
+      "other": []
+    },
+    "recovered": {
+      "http_status": 200,
+      "raw_values": {
+        "rootyard_db_pool_max_size": "16",
+        "rootyard_db_pool_size": "16",
+        "rootyard_db_pool_available": "16",
+        "rootyard_db_pool_busy": "0",
+        "rootyard_db_pool_waiting": "0",
+        "rootyard_postgres_up": "1"
+      }
+    }
+  },
+  "limitations": [
+    "Loopback actual-service test with a synthetic held row lock; it is not a PostgreSQL outage, production load or monitoring-system integration test.",
+    "A saturated-pool scrape may itself return 503 because all 16 pooled sessions are blocked; process-local pool gauges are still exported while database-derived gauges are omitted.",
+    "Run only against a binary built from this implementation; an older binary without the pool gauges cannot pass."
+  ]
+}

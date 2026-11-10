@@ -1,0 +1,36 @@
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "synthetic_source",
+      "status": "passed",
+      "seconds": 3.9226,
+      "detail": {
+        "fresh_databases": 2,
+        "live_server_backup_rejected": true,
+        "unknown_and_unfinished_journal": true
+      }
+    },
+    {
+      "name": "offline_barriers_and_snapshot",
+      "status": "passed",
+      "seconds": 18.7549,
+      "detail": {
+        "snapshot_includes_commit_after_barrier_wait": true,
+        "inherited_volume_lock_rejected": true,
+        "backup_seconds": 15.094153088
+      }
+    },
+    {
+      "name": "unsafe_or_corrupt_inputs",
+      "status": "failed",
+      "seconds": 0.0848,
+      "error": "[('/tmp/rootyard-e2e-pssiun0k/backup/pando', '/tmp/rootyard-e2e-pssiun0k/tampered/pando', \"[Errno 28] No space left on device: '/tmp/rootyard-e2e-pssiun0k/tampered/pando'\")]"
+    }
+  ],
+  "binary_sha256": "a060369d0c55ddf543d25f9bcda0cb9a0bde8e9bbca35339a4b06d063b8a434d",
+  "limitations": [
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.",
+    "Unknown evidence preserved, not automatically resolved."
+  ]
+}

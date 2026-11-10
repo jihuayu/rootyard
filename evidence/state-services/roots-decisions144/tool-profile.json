@@ -1,0 +1,8 @@
+{
+  "rustc_from_actual_build_receipt": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "git": "git version 2.47.3",
+  "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)",
+  "app_hook_self_check": "rootyard-hook-v1",
+  "provider": "Actual loopback Garage S3 via OpenDAL; credentials and DSNs excluded",
+  "hardware_or_latency_sla_claimed": false
+}

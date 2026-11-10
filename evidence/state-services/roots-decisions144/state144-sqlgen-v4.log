@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/workspace/scratch/trace-state144-sqlgen.py", line 24, in <module>
+    runpy.run_path(sys.argv[1], run_name='__main__')
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/scratch/generate-state144-sql-catalogs-v4.py", line 38, in <module>
+    exec(compile(source, str(root / 'tests/schema_contract.py'), 'exec'), {'__name__': '__main__', '__file__': str(root / 'tests/schema_contract.py'), 'output': output})
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 183, in <module>
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 106, in main
+    for path in sorted(Path('migrations').glob('*.sql')):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Restored006 upgrade differs from full restore contract

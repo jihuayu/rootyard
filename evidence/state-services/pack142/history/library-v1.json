@@ -1,0 +1,69 @@
+{
+  "passed": false,
+  "returncode": 101,
+  "command": [
+    "/workspace/scratch/state-pack142-lib-build-v1/rootyard-lib-contract",
+    "--test-threads=2"
+  ],
+  "summary": "test result: FAILED. 373 passed; 1 failed; 9 ignored;",
+  "declared_tests": 383,
+  "seconds": 15.114,
+  "before": {
+    "source": "95e678b3e0b0ae479c06f22c035c149adb13945cbb7d98b5377f07dfa786c0ea",
+    "binary": "2bc83d06a8bdb997ba11336062c2f8b8b89e8d3885a0d3c8ca0c608ea20c1a38",
+    "head": "6b8cf4ae3e9aea17a79799fe21e529fc64a60f3a"
+  },
+  "after": {
+    "source": "95e678b3e0b0ae479c06f22c035c149adb13945cbb7d98b5377f07dfa786c0ea",
+    "binary": "2bc83d06a8bdb997ba11336062c2f8b8b89e8d3885a0d3c8ca0c608ea20c1a38",
+    "head": "6b8cf4ae3e9aea17a79799fe21e529fc64a60f3a"
+  },
+  "source_binary_head_unchanged": true,
+  "build_receipt": {
+    "kind": "rust-library-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "2bc83d06a8bdb997ba11336062c2f8b8b89e8d3885a0d3c8ca0c608ea20c1a38",
+    "workspace_commit": "6b8cf4ae3e9aea17a79799fe21e529fc64a60f3a",
+    "source_inputs_sha256": "95e678b3e0b0ae479c06f22c035c149adb13945cbb7d98b5377f07dfa786c0ea",
+    "binary_sha256": "2bc83d06a8bdb997ba11336062c2f8b8b89e8d3885a0d3c8ca0c608ea20c1a38",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "test",
+      "--locked",
+      "--lib",
+      "--features",
+      "pando-lab",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/rootyard-483657d8a2be41b7"
+      }
+    ]
+  },
+  "limits": [
+    "Eight existing ignored tests and the newly ignored mandatory-config real-provider test are not exercised by this library run. Dedicated PostgreSQL and real-provider runs are recorded separately."
+  ]
+}

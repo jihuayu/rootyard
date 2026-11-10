@@ -1,0 +1,360 @@
+{
+  "passed": true,
+  "kind": "backup18",
+  "returncode": 0,
+  "command": [
+    "python3",
+    "/workspace/scratch/trace-state142-backup.py",
+    "/workspace/scratch/state-services-pack-commit/tests/backup_refstore_packs142.py",
+    "--binary",
+    "/workspace/scratch/state-pack142-app-v1/rootyard",
+    "--report",
+    "/workspace/scratch/state-pack142-populated-backup18-v3/native.json",
+    "--pack-fixture-binary",
+    "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture"
+  ],
+  "seconds": 116.07,
+  "before": {
+    "source": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "head": "71410c9a633190789b9b2933276301f297380d88",
+    "harness": {
+      "tests/backup_refstore_packs142.py": "2ebd5759901bdfbd5c1e7ff52694b39e51caf7aaf0cb1350fd056506dfb567f2",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "887cfaf14554329a0334aea87b1e4ccf183d22deac642bd2a80aa492a40d2efc",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/ref_store_packs_backup_fixture.rs": "b451f874975d94183643d6d000aa57a88409568c34bac852e5a2b540b1ae445f"
+    },
+    "fixture_binary": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "diagnostic_launcher": "35d8fb4fdb820d0ee6b76542eb4684d836664c21c3ec1ffb4232352bf2d906d6"
+  },
+  "after": {
+    "source": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "head": "71410c9a633190789b9b2933276301f297380d88",
+    "harness": {
+      "tests/backup_refstore_packs142.py": "2ebd5759901bdfbd5c1e7ff52694b39e51caf7aaf0cb1350fd056506dfb567f2",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "887cfaf14554329a0334aea87b1e4ccf183d22deac642bd2a80aa492a40d2efc",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/ref_store_packs_backup_fixture.rs": "b451f874975d94183643d6d000aa57a88409568c34bac852e5a2b540b1ae445f"
+    },
+    "fixture_binary": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "diagnostic_launcher": "35d8fb4fdb820d0ee6b76542eb4684d836664c21c3ec1ffb4232352bf2d906d6"
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "fbab34b06d161daed1cf9e1dd0d6181921669b93b6fc4c83b2cfec51b744f804",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "workspace_commit": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-pack-commit#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-pack-commit#rootyard@0.1.0"
+      }
+    ]
+  },
+  "helper_build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "workspace_commit": "2fdc74fe1f92c8f7653aef24c8370bf1d805f3f0",
+    "fresh": false,
+    "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary_sha256": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "integration_test_source_sha256": "b451f874975d94183643d6d000aa57a88409568c34bac852e5a2b540b1ae445f",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_packs_backup_fixture",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_packs_backup_fixture",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_packs_backup_fixture-4e92ee35cb1342ad"
+      }
+    ]
+  },
+  "native": {
+    "passed": true,
+    "cases": [
+      {
+        "name": "synthetic_source_with_typed_native_pack_commit",
+        "status": "passed",
+        "seconds": 5.3003,
+        "detail": {
+          "fresh_databases": 2,
+          "live_server_backup_rejected": true,
+          "unknown_and_unfinished_journal": true,
+          "direct_sql_core_fixture_repository": "946b1a1a-4f05-4abd-b3bd-cab0a75272db",
+          "core_fixture_is_adapter_or_protocol_acknowledgement": false,
+          "populated_fixture_rows_by_table": {
+            "ref_store_issuer_lanes": 1,
+            "ref_store_operations": 2,
+            "ref_store_cancellations": 1,
+            "ref_store_core_gates": 1,
+            "ref_store_core_refs": 1,
+            "ref_store_core_events": 1
+          },
+          "adapter_seeded_schema142_pack_tables": {
+            "ref_store_core_pack_artifacts": 2,
+            "ref_store_core_pack_history": 2,
+            "ref_store_core_pack_memberships": 1,
+            "ref_store_core_pack_publications": 1,
+            "ref_store_core_pack_repo_usage": 1,
+            "ref_store_core_pack_tenant_usage": 1
+          },
+          "adapter_seeded_complete_schema141_hold_tables": {
+            "artifact_hold_requests": 1,
+            "artifact_holds": 2,
+            "artifact_hold_consume_receipts": 2,
+            "artifact_hold_shards": 64,
+            "artifact_hold_repo_usage": 1,
+            "artifact_hold_tenant_usage": 1
+          },
+          "typed_native_pack_commit_registered_and_verified": true,
+          "native_pack_verifier_proof_minted_by_real_verifier": true,
+          "sql_faked_ack_or_registration": false,
+          "inherited_plain_sql_139_gate_reused_for_native_proof": false,
+          "pack_repository_tenant_equals_inherited_fixture_tenant": false,
+          "pack_gate_pack_mode": "pack_verified",
+          "pack_gate_revision": 2,
+          "pack_verified_gate_activated_by_the_commit": true,
+          "restored_blob_bytes_backed_up": false,
+          "held_remote_objects_deleted": false
+        }
+      },
+      {
+        "name": "offline_barriers_and_snapshot",
+        "status": "passed",
+        "seconds": 14.8933,
+        "detail": {
+          "snapshot_includes_commit_after_barrier_wait": true,
+          "inherited_volume_lock_rejected": true,
+          "backup_seconds": 11.317210188,
+          "backup_format": 18,
+          "archive_contains_schema_versions": [
+            138,
+            139
+          ],
+          "schema142_is_current": true,
+          "schema142_pack_ledger_tables": [
+            "ref_store_core_pack_artifacts",
+            "ref_store_core_pack_history",
+            "ref_store_core_pack_memberships",
+            "ref_store_core_pack_publications",
+            "ref_store_core_pack_repo_usage",
+            "ref_store_core_pack_tenant_usage"
+          ],
+          "schema142_pack_ledger_nonempty": true,
+          "schema141_hold_ledger_complete": {
+            "artifact_hold_requests": 1,
+            "artifact_holds": 2,
+            "artifact_hold_consume_receipts": 2,
+            "artifact_hold_shards": 64,
+            "artifact_hold_repo_usage": 1,
+            "artifact_hold_tenant_usage": 1
+          },
+          "parent_snapshot_inspected_dynamic_schema142_tables": [
+            "ref_store_core_pack_artifacts",
+            "ref_store_core_pack_history",
+            "ref_store_core_pack_memberships",
+            "ref_store_core_pack_publications",
+            "ref_store_core_pack_repo_usage",
+            "ref_store_core_pack_tenant_usage"
+          ],
+          "gate_pack_mode_pack_verified": true
+        }
+      },
+      {
+        "name": "unsafe_or_corrupt_inputs",
+        "status": "passed",
+        "seconds": 61.3903,
+        "detail": {
+          "corrupt_missing_extra_traversal_symlink_rejected_before_sql": true,
+          "existing_targets_and_overlap_refused": true,
+          "external_object_dependencies_refused": true
+        }
+      },
+      {
+        "name": "backup_barrier_failures",
+        "status": "passed",
+        "seconds": 10.9596,
+        "detail": {
+          "exporter_connection_loss_no_publication": true,
+          "queued_ddl_bounded_safe_failure": true
+        }
+      },
+      {
+        "name": "interrupted_restore_guard",
+        "status": "passed",
+        "seconds": 8.9234,
+        "detail": {
+          "killed_parent_while_native_pg_restore_blocked": true,
+          "no_orphan_import_or_partial_sql": true,
+          "persistent_guard_blocks_startup": true,
+          "restore_guard_preflight_seconds": 5.185,
+          "native_pg_restore_blocked_seconds": 2.641
+        }
+      },
+      {
+        "name": "post_backup_write_not_in_snapshot",
+        "status": "passed",
+        "seconds": 0.8983,
+        "detail": {
+          "post_backup_acknowledged_commit": true,
+          "seconds_after_backup_boundary": 97.272
+        }
+      },
+      {
+        "name": "new_environment_restore_schema142_pack_ledger_clone_fsck",
+        "status": "passed",
+        "seconds": 12.2087,
+        "detail": {
+          "fresh_database_and_directory": true,
+          "separate_pg_server": false,
+          "standard_authenticated_clone_fsck_refs_content": true,
+          "revoked_and_read_only_auth_preserved": true,
+          "unknown_stays_blocked": true,
+          "restore_seconds": 9.110950601,
+          "backup_boundary_commits_missing": 0,
+          "post_backup_acknowledged_commits_not_recovered": 1,
+          "observed_backup_age_at_last_ack_seconds": 97.272,
+          "production_rpo_rto_guarantee": false,
+          "populated_core_rows_restored_exactly": true,
+          "gates_refs_events_operations_cancellations_issuer_lanes_nonempty": true,
+          "terminal_event_cancellation_updates_refused_without_row_changes": true,
+          "core_repository_stays_provisioning_gitfs_unserved": true,
+          "core_fixture_direct_sql_not_adapter_acknowledgement": true,
+          "all_six_schema142_tables_restored_exactly": true,
+          "pack_publications_artifacts_memberships_history_usage_nonempty_after_restore": true,
+          "complete_schema141_hold_ledger_restored_exactly": true,
+          "schema142_pack_mode_pack_verified_retained": true,
+          "typed_replay_verify_helper_ran_on_restored_database": true,
+          "immutable_registration_replayed_without_proof_or_grant": true,
+          "restored_pack_counters_not_charged_by_replay": true,
+          "physical_locators_and_backend_identity_compared": true,
+          "known_refs_head_mode_revision_history_event_compared": true,
+          "direct_updates_deletes_truncate_refused_with_rows_unchanged": true,
+          "pack_mode_downgrade_refused": true,
+          "triggers_enabled_not_disabled_by_the_drill": true,
+          "s3_original_bytes_external_and_unchanged_after_restore": true,
+          "restored_blob_bytes_backed_up": false,
+          "byte_backup_or_physical_protection_closure_claimed": false,
+          "held_remote_objects_deleted": false
+        }
+      }
+    ],
+    "skips": 0,
+    "binary": "/workspace/scratch/state-pack142-app-v1/rootyard",
+    "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "backup_format": 18,
+    "schema_version": 142,
+    "pack_fixture_helper": {
+      "binary": "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture",
+      "binary_sha256": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+      "build_receipt": "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture.build.json",
+      "build_receipt_sha256": "212b9b4fe71eba7f4c283db90c6926aefdcd29735d50ad6536c89053ca719beb",
+      "build_kind": "rust-integration-test",
+      "package_rebuilt": true,
+      "fresh": false,
+      "fresh_false_artifact": {
+        "target": "ref_store_packs_backup_fixture",
+        "kind": "test",
+        "fresh": false
+      },
+      "test_profile": true,
+      "integration_test_source_sha256": "b451f874975d94183643d6d000aa57a88409568c34bac852e5a2b540b1ae445f",
+      "integration_test_source_matches_source_file": true,
+      "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+      "candidate_application_receipt": "/workspace/scratch/state-pack142-app-v1/rootyard.build.json",
+      "candidate_application_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+      "candidate_application_package_rebuilt": true,
+      "source_inputs_match_candidate_application": true,
+      "retained_binding_stages": [
+        "seed",
+        "verify"
+      ],
+      "helper_binary_sha256_after_run": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+      "candidate_application_sha256_after_run": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+      "binaries_unchanged_after_run": true
+    },
+    "limitations": [
+      "The typed pack ledger is seeded by the real A3/A4 pipeline and native PackVerifier; no SQL ACK, proof or registration is fabricated.",
+      "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+      "The random pack repository stays provisioning/gitfs/unserved for the whole drill.",
+      "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+      "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+      "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+    ]
+  },
+  "limits": [
+    "One loopback PostgreSQL/Garage fixture; no HA/powerloss/production RPO/RTO/serving/GC qualification.",
+    "Current18 pack ledger seeded by real protectedS3/nativeGit/typed verified commit; external original Blob bytes remain outside the metadata archive.",
+    "Genuine17 is produced by retained schema141 app C300; upgraded142 pack tables must be empty, no fabricated registration."
+  ]
+}

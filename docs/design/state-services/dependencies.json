@@ -1,0 +1,874 @@
+{
+  "schema": "rootyard.state-services.dependencies/v1",
+  "baseline_commit": "d689bf8062a73cfadbc0a72abf3f1546d992e09c",
+  "baseline": {
+    "declared_rust_version": "1.85",
+    "edition": "2024",
+    "declared_license": "Apache-2.0",
+    "files": {
+      "Cargo.toml": "c867ebfd10a3e19f16c729706bfefd9ab20d20ce25a7e7ece3dff775f5d7324e",
+      "Cargo.lock": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+      "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "verified_locked_versions": {
+      "axum": "0.8.9",
+      "deadpool-postgres": "0.14.2",
+      "fuser": "0.16.0",
+      "rdkafka": "0.39.0",
+      "reqwest": "0.12.28",
+      "ring": "0.17.14",
+      "rustls": "0.23.46",
+      "serde": "1.0.229",
+      "sha2": "0.10.9",
+      "tokio": "1.54.1",
+      "tokio-postgres": "0.7.18",
+      "uuid": "1.26.1"
+    },
+    "planned_rust_version": "1.88",
+    "planned_rust_version_reason": "A pending security PR #92 raises the MSRV to 1.88 because of the existing lock. This is a planned target, not the W0 baseline; no Cargo change was made here.",
+    "scope": "historical pre-evolution d689 measurement/documentation point; not the rebased stack parent",
+    "files_note": "Historical hashes recorded from d689; current files are verified separately under current_stack_parent.",
+    "archived": {
+      "Cargo.toml": "docs/design/state-services/historical-d689/Cargo.toml",
+      "Cargo.lock": "docs/design/state-services/historical-d689/Cargo.lock"
+    },
+    "archived_note": "Historical d689 inputs. Already part of the archived native receipt and its evidence."
+  },
+  "selection_policy": {
+    "no_large_dependency_added_in_w0": true,
+    "verified_means": "Crates.io metadata checked by the root agent on 2026-11-08 for version, license and declared rust-version.",
+    "candidate_means": "Selected direction only; build cost, transitive license set, feature set and runtime behavior remain unverified until a later Cargo-enabled work package.",
+    "must_not_be_reinterpreted_as": "A compiled dependency, a compatibility qualification, or a build-cost measurement.",
+    "w0_does_not_modify_cargo": true,
+    "current_parent_cargo_changed_by_security_pr102": true
+  },
+  "candidates": [
+    {
+      "role": "blob",
+      "crate": "opendal",
+      "version": "0.57.0",
+      "license": "Apache-2.0",
+      "rust_version": "1.85",
+      "latest_observed": "0.59.5",
+      "latest_observed_rust_version": "1.91",
+      "verification": "verified_crates_io_metadata",
+      "selection": "primary_verified_compatible",
+      "added_to_cargo_in_w0": false,
+      "notes": "0.57.0 is the latest observed release compatible with the historical/current 1.85/1.88 border; 0.57.0 remains compatible with current 1.88; 0.59.5 is not. Provider/layer behavior and transitive licenses still require later qualification."
+    },
+    {
+      "role": "raft",
+      "crate": "openraft",
+      "version": "0.9.25",
+      "license": "MIT OR Apache-2.0",
+      "rust_version": null,
+      "verification": "verified_crates_io_metadata",
+      "selection": "primary_candidate_no_declared_msrv",
+      "added_to_cargo_in_w0": false,
+      "notes": "Stable 0.9.25. No declared rust-version; compile/MSRV qualification is mandatory before W5 dependency closure."
+    },
+    {
+      "role": "redis_client",
+      "crate": "redis",
+      "version": "1.8.1",
+      "license": "BSD-3-Clause",
+      "rust_version": "1.88",
+      "verification": "verified_crates_io_metadata",
+      "selection": "candidate_compatible_with_current_msrv",
+      "added_to_cargo_in_w0": false,
+      "notes": "Requires Rust 1.88; current parent declares 1.88, while historical d689 declared 1.85. Still not added by W0."
+    },
+    {
+      "role": "memory_cache",
+      "crate": "moka",
+      "version": "0.12.16",
+      "license": "MIT OR Apache-2.0",
+      "rust_version": "1.71.1",
+      "verification": "verified_crates_io_metadata",
+      "selection": "candidate",
+      "added_to_cargo_in_w0": false,
+      "notes": "Compatible with the declared baseline MSRV; bounded-cache semantics still need review."
+    },
+    {
+      "role": "raft_embedded_store",
+      "crate": "redb",
+      "version": "2.6.4",
+      "license": "MIT OR Apache-2.0",
+      "rust_version": "1.85",
+      "verification": "verified_crates_io_metadata",
+      "selection": "candidate",
+      "added_to_cargo_in_w0": false,
+      "notes": "Candidate durable embedded store compatible with the baseline MSRV; fsync/recovery semantics and Raft adapter fit remain unverified."
+    },
+    {
+      "role": "raft_embedded_store",
+      "crate": "rocksdb",
+      "version": null,
+      "license": null,
+      "rust_version": null,
+      "verification": "candidate_unverified",
+      "selection": "comparison_only",
+      "added_to_cargo_in_w0": false,
+      "notes": "No version/license/build-cost verification performed in W0; do not claim qualification."
+    }
+  ],
+  "integrated_manifest": {
+    "schema": "rootyard.state-services.integrated-manifest/v1",
+    "note": "Explicit contract for the integrated candidate manifest (issue #170). The integrated branch legitimately carries features and dependencies the frozen W0 parent never had; the frozen-parent overlay checks never read today's Cargo.toml/Cargo.lock. Verifying this block is a standard-library parse, not a Cargo build.",
+    "declared_rust_version": "1.88",
+    "baseline_lock": "docs/design/state-services/stack-parent.Cargo.lock",
+    "features": {
+      "default": {
+        "value": [
+          "kafka-wake"
+        ],
+        "note": "Transitional full profile; `--no-default-features` omits the Kafka wake dependency."
+      },
+      "kafka-wake": {
+        "value": [
+          "dep:rdkafka"
+        ],
+        "activates": [
+          "rdkafka"
+        ]
+      },
+      "pando-lab": {
+        "value": []
+      },
+      "blob-azblob": {
+        "value": [
+          "opendal/services-azblob"
+        ],
+        "activates": [
+          "opendal"
+        ],
+        "note": "Enables the reviewed `services-azblob` cargo feature on the pinned OpenDAL crate; it does not make OpenDAL optional and is default-OFF."
+      },
+      "state-baseline-metrics": {
+        "value": []
+      },
+      "state-redis": {
+        "value": [
+          "dep:redis"
+        ],
+        "activates": [
+          "redis"
+        ]
+      }
+    },
+    "dependencies": {
+      "dependencies.anyhow": {
+        "version": "1",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.async-compression": {
+        "version": "0.4",
+        "features": [
+          "tokio",
+          "gzip"
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.async-stream": {
+        "version": "0.3",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.axum": {
+        "version": "0.8",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.base64": {
+        "version": "0.22",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.bytes": {
+        "version": "1",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.deadpool-postgres": {
+        "version": "0.14",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.fs2": {
+        "version": "0.4",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.fuser": {
+        "version": "0.16",
+        "default_features": false,
+        "features": [
+          "abi-7-31"
+        ],
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.futures-util": {
+        "version": "0.3",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.hex": {
+        "version": "0.4",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.hmac": {
+        "version": "0.12",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.libc": {
+        "version": "0.2",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.opendal": {
+        "version": "=0.57.0",
+        "default_features": false,
+        "features": [
+          "services-s3",
+          "reqwest-rustls-no-provider-tls",
+          "executors-tokio",
+          "layers-concurrent-limit",
+          "layers-retry",
+          "layers-timeout"
+        ],
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.opendal-service-s3": {
+        "version": "=0.57.0",
+        "default_features": false,
+        "features": [],
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.rand": {
+        "version": "0.9",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.rdkafka": {
+        "version": "0.39",
+        "optional": true,
+        "default_features": false,
+        "features": [
+          "tokio",
+          "ssl"
+        ],
+        "features_exact": true
+      },
+      "dependencies.redis": {
+        "version": "=0.32.7",
+        "optional": true,
+        "default_features": false,
+        "features": [
+          "tokio-rustls-comp",
+          "connection-manager",
+          "acl"
+        ],
+        "features_exact": true
+      },
+      "dependencies.reqwest": {
+        "version": "0.12",
+        "default_features": false,
+        "features": [
+          "rustls-tls",
+          "stream",
+          "json"
+        ],
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.ring": {
+        "version": "0.17",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.rustls": {
+        "version": "0.23",
+        "default_features": false,
+        "features": [
+          "ring",
+          "std"
+        ],
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.rustls-pemfile": {
+        "version": "2",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.serde": {
+        "version": "1",
+        "features": [
+          "derive"
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.serde_json": {
+        "version": "1",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.sha2": {
+        "version": "0.10",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.tokio": {
+        "version": "1",
+        "features": [
+          "full"
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.tokio-postgres": {
+        "version": "0.7",
+        "features": [
+          "with-uuid-1",
+          "with-serde_json-1"
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.tokio-postgres-rustls": {
+        "version": "0.14",
+        "features": [
+          "ring"
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.tokio-util": {
+        "version": "0.7",
+        "features": [
+          "io"
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.uuid": {
+        "version": "1",
+        "features": [
+          "v4",
+          "serde"
+        ],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dependencies.zeroize": {
+        "version": "1.9",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "dev-dependencies.opendal": {
+        "version": "=0.57.0",
+        "default_features": false,
+        "features": [
+          "services-memory"
+        ],
+        "optional": false,
+        "features_exact": true
+      },
+      "dev-dependencies.tempfile": {
+        "version": "3",
+        "features": [],
+        "default_features": true,
+        "optional": false,
+        "features_exact": true
+      },
+      "patch.crates-io.opendal-service-s3": {
+        "path": "vendor/opendal-service-s3",
+        "note": "Root-authorized bounded vendor of opendal-service-s3 0.57.0 with one documented public shim; provenance in vendor/opendal-service-s3/README.vendor.md."
+      },
+      "path.opendal-service-s3": {
+        "path": "vendor/opendal-service-s3",
+        "note": "Root-authorized bounded vendor of crates.io opendal-service-s3 0.57.0 with one documented public shim; it must target only this in-repo path, never an external manifest, and leaves patch.crates-io as the only patch table."
+      }
+    },
+    "lock_additions": [
+      [
+        "aes",
+        "0.8.4"
+      ],
+      [
+        "arc-swap",
+        "1.9.4"
+      ],
+      [
+        "asyncband",
+        "0.7.4"
+      ],
+      [
+        "autocfg",
+        "1.5.1"
+      ],
+      [
+        "backon",
+        "1.6.0"
+      ],
+      [
+        "block-padding",
+        "0.3.3"
+      ],
+      [
+        "cbc",
+        "0.1.2"
+      ],
+      [
+        "cipher",
+        "0.4.4"
+      ],
+      [
+        "combine",
+        "4.6.9"
+      ],
+      [
+        "const-random",
+        "0.1.18"
+      ],
+      [
+        "const-random-macro",
+        "0.1.16"
+      ],
+      [
+        "core-foundation",
+        "0.10.1"
+      ],
+      [
+        "core-foundation-sys",
+        "0.8.7"
+      ],
+      [
+        "crc32c",
+        "0.6.9"
+      ],
+      [
+        "crunchy",
+        "0.2.4"
+      ],
+      [
+        "dlv-list",
+        "0.5.2"
+      ],
+      [
+        "futures",
+        "0.3.34"
+      ],
+      [
+        "gloo-timers",
+        "0.3.0"
+      ],
+      [
+        "hashbrown",
+        "0.14.5"
+      ],
+      [
+        "inout",
+        "0.1.4"
+      ],
+      [
+        "jiff",
+        "0.2.40"
+      ],
+      [
+        "jiff-core",
+        "0.1.3"
+      ],
+      [
+        "jiff-static",
+        "0.2.40"
+      ],
+      [
+        "jiff-tzdb",
+        "0.1.9"
+      ],
+      [
+        "jiff-tzdb-platform",
+        "0.1.3"
+      ],
+      [
+        "jni",
+        "0.22.4"
+      ],
+      [
+        "jni-macros",
+        "0.22.4"
+      ],
+      [
+        "jni-sys",
+        "0.4.1"
+      ],
+      [
+        "jni-sys-macros",
+        "0.4.1"
+      ],
+      [
+        "lazy_static",
+        "1.5.1"
+      ],
+      [
+        "libm",
+        "0.2.16"
+      ],
+      [
+        "mea",
+        "0.6.7"
+      ],
+      [
+        "num-bigint",
+        "0.4.8"
+      ],
+      [
+        "num-bigint-dig",
+        "0.8.6"
+      ],
+      [
+        "num-integer",
+        "0.1.47"
+      ],
+      [
+        "num-iter",
+        "0.1.46"
+      ],
+      [
+        "num-traits",
+        "0.2.19"
+      ],
+      [
+        "opendal",
+        "0.57.0"
+      ],
+      [
+        "opendal-core",
+        "0.57.0"
+      ],
+      [
+        "opendal-layer-concurrent-limit",
+        "0.57.0"
+      ],
+      [
+        "opendal-layer-retry",
+        "0.57.0"
+      ],
+      [
+        "opendal-layer-timeout",
+        "0.57.0"
+      ],
+      [
+        "opendal-service-azblob",
+        "0.57.0"
+      ],
+      [
+        "opendal-service-azure-common",
+        "0.57.0"
+      ],
+      [
+        "opendal-service-s3",
+        "0.57.0"
+      ],
+      [
+        "openssl-probe",
+        "0.2.2"
+      ],
+      [
+        "ordered-multimap",
+        "0.7.3"
+      ],
+      [
+        "pbkdf2",
+        "0.12.2"
+      ],
+      [
+        "pem",
+        "4.0.0"
+      ],
+      [
+        "pem-rfc7468",
+        "0.7.0"
+      ],
+      [
+        "pkcs1",
+        "0.7.5"
+      ],
+      [
+        "pkcs5",
+        "0.7.1"
+      ],
+      [
+        "pkcs8",
+        "0.10.2"
+      ],
+      [
+        "portable-atomic",
+        "1.15.0"
+      ],
+      [
+        "portable-atomic-util",
+        "0.2.8"
+      ],
+      [
+        "quick-xml",
+        "0.39.4"
+      ],
+      [
+        "quick-xml",
+        "0.42.0"
+      ],
+      [
+        "rand",
+        "0.8.8"
+      ],
+      [
+        "rand_chacha",
+        "0.3.1"
+      ],
+      [
+        "rand_core",
+        "0.6.4"
+      ],
+      [
+        "redis",
+        "0.32.7"
+      ],
+      [
+        "reqsign-aws-core",
+        "3.2.0"
+      ],
+      [
+        "reqsign-aws-v4",
+        "3.3.1"
+      ],
+      [
+        "reqsign-azure-storage",
+        "3.3.0"
+      ],
+      [
+        "reqsign-core",
+        "3.3.2"
+      ],
+      [
+        "reqsign-file-read-tokio",
+        "3.0.7"
+      ],
+      [
+        "reqwest",
+        "0.13.5"
+      ],
+      [
+        "rsa",
+        "0.9.10"
+      ],
+      [
+        "rust-ini",
+        "0.21.3"
+      ],
+      [
+        "rustc_version",
+        "0.4.1"
+      ],
+      [
+        "rustls-native-certs",
+        "0.8.5"
+      ],
+      [
+        "rustls-platform-verifier",
+        "0.7.1"
+      ],
+      [
+        "rustls-platform-verifier-android",
+        "0.2.0"
+      ],
+      [
+        "salsa20",
+        "0.10.2"
+      ],
+      [
+        "same-file",
+        "1.0.6"
+      ],
+      [
+        "schannel",
+        "0.1.30"
+      ],
+      [
+        "scrypt",
+        "0.11.0"
+      ],
+      [
+        "security-framework",
+        "3.7.0"
+      ],
+      [
+        "security-framework-sys",
+        "2.17.0"
+      ],
+      [
+        "semver",
+        "1.0.28"
+      ],
+      [
+        "sha1",
+        "0.11.0"
+      ],
+      [
+        "signature",
+        "2.2.0"
+      ],
+      [
+        "simd_cesu8",
+        "1.2.0"
+      ],
+      [
+        "simdutf8",
+        "0.1.5"
+      ],
+      [
+        "spin",
+        "0.9.9"
+      ],
+      [
+        "tiny-keccak",
+        "2.0.2"
+      ],
+      [
+        "walkdir",
+        "2.5.0"
+      ],
+      [
+        "wasm-streams",
+        "0.5.0"
+      ],
+      [
+        "webpki-root-certs",
+        "1.0.11"
+      ],
+      [
+        "winapi-util",
+        "0.1.11"
+      ]
+    ],
+    "lock_additions_note": "Explicit [name, version] pairs added relative to the frozen W0 lock. Frozen packages are compared by (name, version, source, checksum); a same-name package at another version is an unreviewed addition.",
+    "lock_sha256": "fcd88cd99ce590cfa401180bc45bbafa4099193abe552c562a4cca81d84c4186",
+    "lock_sha256_note": "Exact reviewed SHA-256 of the committed integrated Cargo.lock (Root-owned). Pins the whole reviewed dependency graph; the frozen (name,version,source,checksum) identity comparison below remains as corroboration.",
+    "target_dependencies_policy": "No [target.*.dependencies/dev-dependencies/build-dependencies] entries are declared or accepted by the integrated contract; any target-specific dependency is rejected as unreviewed until one is explicitly recorded here.",
+    "manifest_sha256": "b330229dffa6bd4c74aacda2d869d206b321444f5d8101431ce21d6e28fcbc51",
+    "manifest_sha256_note": "Exact reviewed SHA-256 of the committed integrated Cargo.toml (Root-owned). The exact-bytes pin is the primary integrated approval: features, target tables, versions and dependency edges cannot change without the pin and this record changing together, which requires explicit PR review. The semantic checks below remain as readable corroboration."
+  },
+  "open_items_before_add": [
+    "Compile OpenRaft 0.9.25 against the planned MSRV and prove its durable storage/network adapter contract.",
+    "Record historical 1.85 versus current-parent 1.88 explicitly (security PR #102); never silently bump Cargo in a W0 feature commit.",
+    "Check complete transitive license sets and NOTICE obligations for OpenDAL/OpenRaft/redb and chosen providers.",
+    "Measure build time, binary size and idle memory before calling any dependency lightweight."
+  ],
+  "current_stack_parent": {
+    "commit": "bcd391809c8b0d2a16409b6a28fe1147d7ed5c66",
+    "role": "security/token/membership recovery parent used for this rebase",
+    "declared_rust_version": "1.88",
+    "declared_rust_version_reason": "Security PR #102 raised MSRV to 1.88; W0 did not modify Cargo.",
+    "files": {
+      "Cargo.toml": "f11958990599c8803322f3c51b88c167025e6ce786ae26c9fc2060d23612be72",
+      "Cargo.lock": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+      "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "measurement_note": "The historical d689 native receipt was not rerun against this parent and does not qualify it.",
+    "archived": {
+      "Cargo.toml": "docs/design/state-services/stack-parent.Cargo.toml",
+      "Cargo.lock": "docs/design/state-services/stack-parent.Cargo.lock",
+      "LICENSE": "LICENSE"
+    },
+    "archived_note": "Frozen W0/phase-metrics parent inputs. Verified against these archives and the hashes above, never against today's Cargo.toml/Cargo.lock.",
+    "files_note": "Frozen W0/phase-metrics parent. Cargo.toml/Cargo.lock are archived under `archived` and pinned to these hashes; Cargo.lock stays the d689-evidenced lock, LICENSE is unchanged."
+  },
+  "implementation_overlay": {
+    "schema": "rootyard.state-services.implementation-overlay/v1",
+    "stack_base": "bcd391809c8b0d2a16409b6a28fe1147d7ed5c66",
+    "branch": "codex/state-services-baseline-metrics",
+    "recorded_manifest_commit": "7c9f424",
+    "recorded_note": "Informational provenance only; the file hashes below are authoritative.",
+    "feature": {
+      "name": "state-baseline-metrics",
+      "included": [],
+      "default_enabled": false,
+      "purpose": "Default-OFF phase instrumentation; adds no dependency, sub-feature or profile change."
+    },
+    "files": {
+      "Cargo.lock": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034"
+    },
+    "parent_manifest_sha256": "f11958990599c8803322f3c51b88c167025e6ce786ae26c9fc2060d23612be72",
+    "parent_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+    "parent_manifest_semantic_sha256": "d5d3f84b15150bfb4ae0f51f8a83490a14c005b9545d711c20a088281cd36aa5",
+    "scope": "Historical feature-only overlay of the frozen W0/phase-metrics parent (archived bytes only). Today's integrated manifest/lockfile are validated separately by `integrated_manifest`; neither contract rewrites the other.",
+    "rejected": [
+      "any dependency, dev-dependency, profile or patch change",
+      "any second feature or a non-empty overlay feature",
+      "any MSRV change or relaxation",
+      "any Cargo.lock change",
+      "relabelling the frozen parent hash with the child manifest hash"
+    ],
+    "child_manifest_sha256": null,
+    "child_manifest_semantic_sha256": "d51bd478a4c020becb3d77b8d57ffe5b66540390d12d553434b41fc3a50c8df2",
+    "child_manifest_note": "The overlay-applied child manifest bytes were not kept in this tree (only the frozen parent archive is); the record therefore pins the child's semantic digest = archived parent plus exactly the empty, default-OFF `state-baseline-metrics` feature. A fixture that reaches a supported child only by bumping `combine`, an undeclared transitive crate, contradicts the recorded no-dependency overlay and is not used."
+  },
+  "historical_manifest": {
+    "schema": "rootyard.state-services.historical-manifest/v1",
+    "baseline_commit": "d689bf8062a73cfadbc0a72abf3f1546d992e09c",
+    "Cargo.toml": "c867ebfd10a3e19f16c729706bfefd9ab20d20ce25a7e7ece3dff775f5d7324e",
+    "Cargo.lock": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "note": "d689 is the historical W0 measurement/documentation point. Its manifest, lockfile and LICENSE are frozen in `docs/design/state-services/historical-d689/` and its own evidence; the checker never compares them with today's Cargo, and today's integrated Cargo is never written back into them."
+  }
+}

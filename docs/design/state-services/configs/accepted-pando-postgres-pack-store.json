@@ -1,0 +1,33 @@
+{
+  "schema": "rootyard.deployment/v1",
+  "profile": "pando-postgres-pack-store",
+  "refs_authority": "pando-postgres",
+  "content_store": "pando-remote-encrypted-pack-store",
+  "metadata_wal_store": "postgres",
+  "remote_delete_enabled": false,
+  "database_url_env": "DATABASE_URL",
+  "data_dir": "/srv/rootyard/data",
+  "bind": "127.0.0.1:8080",
+  "git": "/usr/bin/git",
+  "object_store": {
+    "provider": "s3-compatible",
+    "endpoint_env": "ROOTYARD_OBJECT_STORE_ENDPOINT",
+    "bucket_env": "ROOTYARD_OBJECT_STORE_BUCKET",
+    "region_env": "ROOTYARD_OBJECT_STORE_REGION",
+    "access_key_env": "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+    "secret_key_env": "ROOTYARD_OBJECT_STORE_SECRET_KEY"
+  },
+  "kms": {
+    "provider": "vault-transit",
+    "url_env": "ROOTYARD_KMS_VAULT_URL",
+    "token_env": "ROOTYARD_KMS_VAULT_TOKEN",
+    "key_env": "ROOTYARD_KMS_VAULT_KEY"
+  },
+  "limits": {
+    "max_request_bytes": 134217728,
+    "max_output_bytes": 536870912,
+    "max_concurrent_git": 8,
+    "max_repo_bytes": 1073741824,
+    "max_pending_deliveries": 100000
+  }
+}

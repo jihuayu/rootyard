@@ -1,0 +1,69 @@
+{
+  "passed": true,
+  "returncode": 0,
+  "command": [
+    "/workspace/scratch/state144-lib-build-v1/rootyard-lib-contract",
+    "--test-threads=2"
+  ],
+  "summary": "test result: ok. 410 passed; 0 failed; 9 ignored;",
+  "declared_tests": 419,
+  "seconds": 15.348,
+  "before": {
+    "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "binary": "232ff5cd94f5cf51ded6c2eabeeea4b0cd7e2eed1afa192f4c6edb337197d68d",
+    "head": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25"
+  },
+  "after": {
+    "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "binary": "232ff5cd94f5cf51ded6c2eabeeea4b0cd7e2eed1afa192f4c6edb337197d68d",
+    "head": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25"
+  },
+  "source_binary_head_unchanged": true,
+  "build_receipt": {
+    "kind": "rust-library-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "232ff5cd94f5cf51ded6c2eabeeea4b0cd7e2eed1afa192f4c6edb337197d68d",
+    "workspace_commit": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+    "source_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "binary_sha256": "232ff5cd94f5cf51ded6c2eabeeea4b0cd7e2eed1afa192f4c6edb337197d68d",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "test",
+      "--locked",
+      "--lib",
+      "--features",
+      "pando-lab",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/rootyard-483657d8a2be41b7"
+      }
+    ]
+  },
+  "limits": [
+    "Eight existing ignored tests and the newly ignored mandatory-config real-provider test are not exercised by this library run. Dedicated PostgreSQL and real-provider runs are recorded separately."
+  ]
+}

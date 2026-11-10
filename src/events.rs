@@ -69,9 +69,45 @@ fn valid_oid(oid: &str) -> bool {
 /// Replay verifies immutable metadata and events. Unknown evidence may grow;
 /// terminal publication must contain the complete, identical transaction set.
 pub async fn publish(pool: &Pool, operation: &OperationRecord, changes: &[RefEventInput]) -> Result<()> {
+    publish_guarded(pool, operation, changes, None, None).await
+}
+
+/// Publish a reconciliation result carrying journal-derived proof that no
+/// parent publication (and therefore no native ref CAS) could have happened.
+/// Only this witness can relax the settlement authority recheck, and only for
+/// `no_ref_changes`.
+pub async fn publish_with_no_grant(
+    pool: &Pool,
+    operation: &OperationRecord,
+    changes: &[RefEventInput],
+    proof: &crate::storage::no_grant_proof::NoGrantAbort,
+) -> Result<()> {
+    publish_guarded(pool, operation, changes, Some(proof), None).await
+}
+
+/// Publish a reconciliation result carrying journal-derived proof that native
+/// Git already committed exactly these refs. Only this capability can skip the
+/// *current* token/RBAC recheck in admission settlement, and only to project a
+/// past committed transaction; route/epoch/fence/identity checks still apply.
+pub async fn publish_with_recorded_receipt(
+    pool: &Pool,
+    operation: &OperationRecord,
+    changes: &[RefEventInput],
+    proof: &crate::storage::recorded_receipt_proof::RecordedReceiptProof,
+) -> Result<()> {
+    publish_guarded(pool, operation, changes, None, Some(proof)).await
+}
+
+async fn publish_guarded(
+    pool: &Pool,
+    operation: &OperationRecord,
+    changes: &[RefEventInput],
+    no_grant: Option<&crate::storage::no_grant_proof::NoGrantAbort>,
+    recorded: Option<&crate::storage::recorded_receipt_proof::RecordedReceiptProof>,
+) -> Result<()> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    publish_in_tx(&tx, operation, changes).await?;
+    publish_in_tx_guarded(&tx, operation, changes, no_grant, recorded).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -80,6 +116,16 @@ pub async fn publish(pool: &Pool, operation: &OperationRecord, changes: &[RefEve
 /// transaction. Pando uses this with the authoritative ref/pack CAS so neither
 /// side can commit independently.
 pub async fn publish_in_tx(tx: &Transaction<'_>, operation: &OperationRecord, changes: &[RefEventInput]) -> Result<()> {
+    publish_in_tx_guarded(tx, operation, changes, None, None).await
+}
+
+async fn publish_in_tx_guarded(
+    tx: &Transaction<'_>,
+    operation: &OperationRecord,
+    changes: &[RefEventInput],
+    no_grant: Option<&crate::storage::no_grant_proof::NoGrantAbort>,
+    recorded: Option<&crate::storage::recorded_receipt_proof::RecordedReceiptProof>,
+) -> Result<()> {
     ensure!(matches!(operation.outcome.as_str(), "unknown" | "recorded" | "no_ref_changes"), "invalid outcome");
     ensure!(operation.sequence > 0 && operation.storage_generation > 0, "invalid operation sequence");
     ensure!(crate::db::valid_name(&operation.actor_name), "invalid actor name");
@@ -123,14 +169,36 @@ pub async fn publish_in_tx(tx: &Transaction<'_>, operation: &OperationRecord, ch
             .is_none(),
         "resolved operation is immutable"
     );
+    if let Some(proof) = no_grant {
+        // The witness must describe exactly this record and admission; a proof
+        // minted for another writer, generation or epoch is a hard error.
+        ensure!(proof.matches_operation(operation), "no-grant proof differs from its operation");
+    }
+    if let Some(proof) = recorded {
+        // The capability must describe exactly this record, admission and
+        // event payload; a proof minted for another operation, changes, actor,
+        // token, generation or epoch is a hard error.
+        ensure!(
+            operation.outcome == "recorded" && proof.matches_record(operation, changes),
+            "recorded receipt proof differs from its operation"
+        );
+    }
     if let Some(admission) = &operation.admission {
+        // The operation identity is immutable. Replaying a terminal admission
+        // or settling a new one may only use the writer that was admitted; a
+        // different operation cannot borrow another row's writer id.
+        ensure!(admission.writer_id == operation.id, "ref admission writer differs from operation");
         crate::storage::ref_admission::settle_in_tx(
             tx,
             operation.repository_id,
+            operation.storage_generation,
             admission,
             operation.actor_id,
             operation.token_id,
             &operation.outcome,
+            changes,
+            no_grant,
+            recorded,
         )
         .await?;
     }

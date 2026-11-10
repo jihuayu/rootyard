@@ -3,6 +3,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ make pk
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 COPY src ./src
 COPY migrations ./migrations
 COPY schema ./schema

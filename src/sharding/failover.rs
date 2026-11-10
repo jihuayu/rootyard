@@ -83,7 +83,7 @@ pub async fn list_failovers(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read, crate::token_scopes::RepoAction::RepoRead).await?;
     let sql = format!(
         "SELECT {FAILOVER_OP_FIELDS} FROM shard_failover_operations \
          WHERE tenant_id = $1 AND repository_id = $2 ORDER BY created_at DESC, id DESC LIMIT 100"
@@ -104,7 +104,7 @@ pub async fn execute_failover(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     require_operator(&tx, &actor).await?;
     finish(tx, &actor, false).await?;
     Err(conflict("automatic takeover requires verified target data and physical source fencing"))
@@ -128,7 +128,7 @@ pub async fn degrade_or_recover_repo(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     let mutation = super::locks::exclusive(&state, access.repo_id).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let repo_gen: i64 = tx

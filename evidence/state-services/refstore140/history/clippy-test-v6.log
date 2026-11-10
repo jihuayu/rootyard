@@ -1,0 +1,13 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-pg-snapshot)
+error: useless conversion to the same type: `i64`
+    --> tests/ref_store_core_snapshot.rs:1309:22
+     |
+1309 |         let seeded = i64::try_from(REPO_MAX_SNAPSHOTS - 1).unwrap();
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: consider removing `i64::try_from()`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_conversion
+     = note: `-D clippy::useless-conversion` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::useless_conversion)]`
+
+error: could not compile `rootyard` (test "ref_store_core_snapshot") due to 1 previous error

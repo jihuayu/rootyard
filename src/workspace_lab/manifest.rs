@@ -231,10 +231,8 @@ fn intent_to_add_paths(repo: &Path) -> Result<BTreeSet<PathBuf>> {
         let Some(nul) = bytes[cursor..end].iter().position(|b| *b == 0) else {
             break;
         };
-        if is_ita {
-            if let Ok(p) = relative_path(&bytes[cursor..cursor + nul]) {
-                out.insert(p);
-            }
+        if is_ita && let Ok(p) = relative_path(&bytes[cursor..cursor + nul]) {
+            out.insert(p);
         }
         cursor += nul + 1;
         cursor = start + (cursor - start).div_ceil(8) * 8;

@@ -1,0 +1,208 @@
+create_real_schema141_pando_source: passed
+legacy_binary_writes_format17_schema141_archive: passed
+candidate_cli_usage_and_mixed_legacy_flags: passed
+candidate_rejects_without_schema141_opt_in: passed
+candidate_restores_schema142_one_new_authority: passed
+restored_service_git_and_session_boundaries: passed
+source_authority_and_remote_objects_remain_available: passed
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "create_real_schema141_pando_source",
+      "status": "passed",
+      "seconds": 4.1628,
+      "detail": {
+        "source_heads": {
+          "alpha": "995fc5442c64ef293186f692d2a3e8a4b45ac1f9",
+          "beta": "3b9797763b150b6dffb1150452ddf8a9bac8f1c3"
+        },
+        "source_refs": {
+          "alpha": {
+            "refs/heads/main": "995fc5442c64ef293186f692d2a3e8a4b45ac1f9"
+          },
+          "beta": {
+            "refs/heads/main": "3b9797763b150b6dffb1150452ddf8a9bac8f1c3"
+          }
+        },
+        "source_authority_id": "c081e2d6-cfe9-4ead-9466-62335919caef",
+        "source_remote_paths_count": 8,
+        "source_remote_paths_sha256": "e2c4c4006f702304e639fbb5d3cfb85cadd378930f57d870ddf7b23a71ee70ef",
+        "cutovers": {
+          "alpha": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          },
+          "beta": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          }
+        },
+        "web_session_created": true,
+        "browser_token_created": true
+      }
+    },
+    {
+      "name": "legacy_binary_writes_format17_schema141_archive",
+      "status": "passed",
+      "seconds": 14.0937,
+      "detail": {
+        "format": 17,
+        "schema_last": 141,
+        "schema_contains_next": false,
+        "repository_count": 2,
+        "legacy_binary_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+        "backup_verified": true
+      }
+    },
+    {
+      "name": "candidate_cli_usage_and_mixed_legacy_flags",
+      "status": "passed",
+      "seconds": 0.034,
+      "detail": {
+        "missing_arguments_usage": true,
+        "missing_flags_usage": true,
+        "mixed_legacy_flags_usage": true,
+        "documented_opt_in": "--allow-legacy-schema141",
+        "documented_neighbour_opt_in": "--allow-legacy-schema140"
+      }
+    },
+    {
+      "name": "candidate_rejects_without_schema141_opt_in",
+      "status": "passed",
+      "seconds": 8.1901,
+      "detail": {
+        "explicit_schema_opt_in_required": true,
+        "mismatched_legacy_opt_in_rejected": true,
+        "target_data_published": false,
+        "target_database_empty": true
+      }
+    },
+    {
+      "name": "candidate_restores_schema142_one_new_authority",
+      "status": "passed",
+      "seconds": 9.6695,
+      "detail": {
+        "schema139_core_tables": 3,
+        "schema139_core_refs_key": "repository_id,ref_name",
+        "schema139_core_event_operation_fkey": true,
+        "schema139_core_event_immutable_trigger": true,
+        "schema142_core_gate_pack_mode_fence": true,
+        "schema142_core_gate_pack_mode_fence_enabled": true,
+        "schema139_core_rows": "0/0/0",
+        "genuine_legacy_source_had_core_rows": false,
+        "schema141_new_tables": [
+          "artifact_hold_consume_receipts",
+          "artifact_hold_repo_usage",
+          "artifact_hold_requests",
+          "artifact_hold_shards",
+          "artifact_hold_tenant_usage",
+          "artifact_holds"
+        ],
+        "schema141_hold_request_tables": [
+          "artifact_hold_requests"
+        ],
+        "schema141_hold_tables": [
+          "artifact_holds"
+        ],
+        "schema141_consumption_tables": [
+          "artifact_hold_consume_receipts"
+        ],
+        "schema141_seeded_rows": {
+          "artifact_hold_shards": 64
+        },
+        "schema141_new_tables_empty_except_migration_seed": true,
+        "schema141_hold_rows_fabricated": false,
+        "schema142_new_tables": [
+          "ref_store_core_pack_artifacts",
+          "ref_store_core_pack_history",
+          "ref_store_core_pack_memberships",
+          "ref_store_core_pack_publications",
+          "ref_store_core_pack_repo_usage",
+          "ref_store_core_pack_tenant_usage"
+        ],
+        "schema142_registration_tables": [
+          "ref_store_core_pack_artifacts",
+          "ref_store_core_pack_publications"
+        ],
+        "schema142_membership_tables": [
+          "ref_store_core_pack_memberships"
+        ],
+        "schema142_history_tables": [
+          "ref_store_core_pack_history"
+        ],
+        "schema142_usage_tables": [
+          "ref_store_core_pack_repo_usage",
+          "ref_store_core_pack_tenant_usage"
+        ],
+        "schema142_new_tables_empty_except_migration_seed": true,
+        "schema142_gate_pack_mode_default": "metadata_only",
+        "schema142_active_pack_membership_fabricated": false,
+        "schema141_shard_seed_unchanged": true,
+        "schema_version": 142,
+        "target_format": 18,
+        "indexes": 10,
+        "schema134_identity_constraints": true,
+        "schema135_metrics_index": true,
+        "schema136_token_scope_schema": true,
+        "schema138_operation_registry": true,
+        "legacy_tokens_default_unrestricted": true,
+        "target_authority_id": "1f25a2be-d7df-44c2-ae74-d7f186ed87af",
+        "target_authority_differs_from_source": true,
+        "target_manifest_artifacts": 8,
+        "target_authority_singleton_unique": true,
+        "target_remote_paths_count": 8,
+        "source_and_target_remote_paths_disjoint": true,
+        "browser_session_revoked": true,
+        "browser_token_revoked": true
+      }
+    },
+    {
+      "name": "restored_service_git_and_session_boundaries",
+      "status": "passed",
+      "seconds": 3.176,
+      "detail": {
+        "api_token_readable": true,
+        "old_browser_cookie_rejected": true,
+        "old_browser_bearer_rejected": true,
+        "git_clones": 2,
+        "clone_heads_exact": true,
+        "clone_contents_exact": true,
+        "fsck_clean": true,
+        "first_repo_refetch_after_second_ok": true,
+        "sole_target_authority_unchanged": true
+      }
+    },
+    {
+      "name": "source_authority_and_remote_objects_remain_available",
+      "status": "passed",
+      "seconds": 2.613,
+      "detail": {
+        "source_authority_unchanged": true,
+        "source_remote_paths_unchanged": true,
+        "source_remote_paths_count": 8,
+        "source_remote_paths_sha256": "e2c4c4006f702304e639fbb5d3cfb85cadd378930f57d870ddf7b23a71ee70ef",
+        "source_clone_heads_exact": true,
+        "source_clone_contents_exact": true,
+        "source_git_fsck_clean": true
+      }
+    }
+  ],
+  "reviewed_target_schema": 142,
+  "reviewed_target_format": 18,
+  "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+  "legacy_binary_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+  "harness_git_head": "71410c9a633190789b9b2933276301f297380d88",
+  "limitations": [
+    "Loopback functional drill; no production RPO/RTO or power-loss claim.",
+    "The legacy archive is produced by the trusted format17 binary and is never edited.",
+    "source_head values are repository heads, not binary build provenance.",
+    "Genuine format17/schema141 sources carry no ref-store core rows; the migrated schema139 core tables are verified present, constrained and empty, not round-tripped.",
+    "No schema140 snapshot/pin table or row assertion is made; that populated current-format qualification follows the primary migration-140 SQL.",
+    "The schema141 ledger tables are derived from the generated current-vs-140 catalogs and are verified present with only the exact fixed rows seeded by the settled migration141 SQL; this fixture inserts no hold, request or consumption row.",
+    "The schema142 pack-registration/membership/history/usage tables are derived from the generated 142-vs-141 catalogs and must stay empty on a genuine pre-142 source; this fixture inserts no pack row and claims no pack-verified gate.",
+    "A format16 drill requires root to supply the genuine retained old schema140 producer and its archive; a format17 drill requires the genuine retained schema141 producer; this harness never fabricates or relabels one."
+  ]
+}

@@ -1,0 +1,29 @@
+sequenceDiagram
+  participant C as Git客户端
+  participant A as 应用协调器
+  participant B as OpenDAL Blob
+  participant P as PG权限与决策
+  participant R as RefStore权威
+  C->>A: 真实鉴权的push与原operation身份
+  A->>P: 当前权限与配额准入
+  A->>B: 唯一attempt上传并独立回读校验
+  A->>R: 原子capture refs和pin
+  A->>A: 验证真实字节闭包及sealed selection
+  A->>P: OPEN scope安装绑定proof与epoch的decision
+  alt standalone
+    P->>P: 同事务重检授权并写refs、终态、事件
+  else distributed
+    A->>R: 认证grant安装及Apply
+    R->>R: 检查自有floor、CAS与保留绑定
+    R-->>A: 同日志裁决commit或cancel的不可变终态
+    A->>P: 幂等投影与业务finalizer
+  end
+  A-->>C: 确认结果，丢ACK则按原身份查询unknown
+  opt 权限撤销
+    P->>P: OPEN到CLOSING，停止新decision
+    P->>R: 各相关group的幂等CloseScope
+    R->>R: 单调floor，拒绝晚到旧grant，结算在途操作
+    R-->>P: 关闭与终态回执
+    P->>P: 对账投影及finalizer后才ACK撤销完成
+  end
+  Note over P,R: 无跨系统原子事务，无quorum时撤销保持pending

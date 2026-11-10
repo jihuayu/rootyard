@@ -1,0 +1,16 @@
+
+running 11 tests
+test actual_clock_pin_expiry_keeps_active_root_readable_but_refuses_delayed_register ... ok
+test cases_extra::concurrent_identical_register_and_release_share_one_charge_and_stored_receipt ... ok
+test cases_extra::long_published_ref_bytes_are_charged_and_logical_quota_refuses_atomically ... ok
+test cases_extra::selected_tree_oid_from_registered_pack_is_a_native_non_branch_root ... ok
+test cases_tail::independent_roots_share_packs_without_affecting_holds_and_over_quota_is_atomic ... ok
+test cases_tail::release_while_native_is_paused_grants_no_read_and_shared_max_pool_has_no_pg_over_native ... ok
+test durable_root_survives_source_pin_release_and_bytes_match_stock_git ... ok
+test exact_register_and_release_replay_is_free_and_changed_digest_conflicts ... ok
+test explicit_old_non_ref_oid_is_accepted_from_registered_pack_and_missing_oid_is_refused ... ok
+test release_before_register_binds_exact_digest_and_root_id_is_never_reused ... ok
+test whole_repository_delete_retains_root_metadata_locators_receipts_and_refuses_new_bytes ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 67.20s
+

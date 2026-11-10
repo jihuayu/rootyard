@@ -1,0 +1,10 @@
+{
+  "architecture": "blob-only-v2",
+  "diagrams": {
+    "standalone": "fresh-standalone.mmd",
+    "distributed": "fresh-distributed.mmd",
+    "publication": "publication-decision.mmd",
+    "retention": "retention-gc.mmd",
+    "restore": "fresh-restore.mmd"
+  }
+}

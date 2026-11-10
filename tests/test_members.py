@@ -132,14 +132,31 @@ class MembersTrackBContractTest(unittest.TestCase):
         for sig in (
             "pub fn idempotency_key(",
             "pub async fn authorize_repo_with_role(",
-            "pub async fn authorize_repo(",
+            "pub async fn authorize_repo_action_by_id(",
             "pub async fn verify_token(",
             "pub async fn finish_tx(",
         ):
             self.assertIn(sig, auth_src)
 
-        self.assertIn("Role::Triage", forge_src)
-        self.assertIn("Role::Read", forge_src)
+        # Repository authorization must name the explicit PAT action. The old
+        # untyped wrapper is gone, so neither name may reappear.
+        self.assertNotIn("pub async fn authorize_repo(", auth_src)
+        self.assertRegex(
+            auth_src,
+            r"pub async fn authorize_repo_with_role\([^)]*action: crate::token_scopes::RepoAction",
+        )
+        self.assertRegex(
+            auth_src,
+            r"pub async fn authorize_repo_action_by_id\([^)]*action: crate::token_scopes::RepoAction",
+        )
+
+        for module in ("handlers", "comments"):
+            self.assertIn(f'#[path = "forge/{module}.rs"]', forge_src)
+            self.assertIn(f"mod {module};", forge_src)
+            self.assertIn(f"{module}::", forge_src)
+            implementation = (ROOT / f"src/forge/{module}.rs").read_text(encoding="utf-8")
+            self.assertIn("Role::Triage", implementation)
+            self.assertIn("Role::Read", implementation)
         self.assertIn("resolve_effective_role", rbac_src)
         self.assertIn("check_review_permission", rbac_src)
         self.assertIn("is_self_approval_disallowed", pulls_rules)

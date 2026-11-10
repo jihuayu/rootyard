@@ -1,0 +1,108 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-holds-trust-check)
+error[E0624]: associated function `new` is private
+   --> src/blob_store/mod.rs:411:55
+    |
+411 |       fn sealed_receipt() { let _ = super::BlobReceipt::new; }
+    |                                                         ^^^ private associated function
+    |
+   ::: src/blob_store/transfer/receipt.rs:49:5
+    |
+ 49 | /     pub(super) fn new(
+ 50 | |         locator: BlobLocator,
+ 51 | |         provider: BlobProvider,
+ 52 | |         backend_identity: BlobBackendIdentity,
+ 53 | |         verified_sha256: String,
+ 54 | |         verified_length: u64,
+ 55 | |     ) -> Self {
+    | |_____________- private associated function defined here
+
+error[E0624]: associated function `new` is private
+   --> src/lib.rs:100:49
+    |
+100 |           let _ = crate::blob_store::BlobReceipt::new;
+    |                                                   ^^^ private associated function
+    |
+   ::: src/blob_store/transfer/receipt.rs:49:5
+    |
+ 49 | /     pub(super) fn new(
+ 50 | |         locator: BlobLocator,
+ 51 | |         provider: BlobProvider,
+ 52 | |         backend_identity: BlobBackendIdentity,
+ 53 | |         verified_sha256: String,
+ 54 | |         verified_length: u64,
+ 55 | |     ) -> Self {
+    | |_____________- private associated function defined here
+
+error[E0624]: method `put_file` is private
+   --> src/lib.rs:101:56
+    |
+101 |           let _ = crate::blob_store::opendal::BlobStore::put_file;
+    |                                                          ^^^^^^^^ private method
+    |
+   ::: src/blob_store/transfer.rs:151:5
+    |
+151 | /     pub(super) async fn put_file(
+152 | |         &self,
+153 | |         intent: UploadIntent,
+154 | |         source: &Path,
+155 | |         deadline: Instant,
+156 | |     ) -> Result<BlobReceipt, BlobError> {
+    | |_______________________________________- private method defined here
+
+error[E0624]: method `operator` is private
+   --> src/lib.rs:102:56
+    |
+102 |         let _ = crate::blob_store::opendal::BlobStore::operator;
+    |                                                        ^^^^^^^^ private method
+    |
+   ::: src/blob_store/opendal.rs:157:5
+    |
+157 |     pub(super) fn operator(&self) -> &Operator {
+    |     ------------------------------------------ private method defined here
+
+error[E0624]: method `object_path` is private
+   --> src/lib.rs:103:56
+    |
+103 |         let _ = crate::blob_store::opendal::BlobStore::object_path;
+    |                                                        ^^^^^^^^^^^ private method
+    |
+   ::: src/blob_store/opendal.rs:162:5
+    |
+162 |     pub(super) fn object_path(&self, locator: &BlobLocator) -> String {
+    |     ----------------------------------------------------------------- private method defined here
+
+error[E0624]: method `profile` is private
+   --> src/lib.rs:104:56
+    |
+104 |         let _ = crate::blob_store::opendal::BlobStore::profile;
+    |                                                        ^^^^^^^ private method
+    |
+   ::: src/blob_store/opendal.rs:140:5
+    |
+140 |     pub(super) fn profile(&self) -> &BlobProfile {
+    |     -------------------------------------------- private method defined here
+
+error[E0624]: method `credentials` is private
+   --> src/lib.rs:105:57
+    |
+105 |         let _ = crate::blob_store::config::BlobProfile::credentials;
+    |                                                         ^^^^^^^^^^^ private method
+    |
+   ::: src/blob_store/config.rs:253:5
+    |
+253 |     pub(super) fn credentials(&self) -> &BlobCredentials {
+    |     ---------------------------------------------------- private method defined here
+
+error[E0624]: method `object_path` is private
+   --> src/lib.rs:106:57
+    |
+106 |         let _ = crate::blob_store::config::BlobProfile::object_path;
+    |                                                         ^^^^^^^^^^^ private method
+    |
+   ::: src/blob_store/config.rs:318:5
+    |
+318 |     pub(super) fn object_path(&self, locator: &super::BlobLocator) -> String {
+    |     ------------------------------------------------------------------------ private method defined here
+
+For more information about this error, try `rustc --explain E0624`.
+error: could not compile `rootyard` (lib) due to 8 previous errors

@@ -1,0 +1,231 @@
+{
+  "binary_sha256": "23c2979aa492abb790ff7b6e7eb2efb8e5f1353d02498b16a6267f87029a1f9f",
+  "blob_profile": {
+    "delete_policy": "disabled",
+    "driver": "opendal",
+    "endpoint_loopback": true,
+    "endpoint_scheme": "http",
+    "root_configured": true,
+    "service": "s3"
+  },
+  "build_receipt_sha256": "234236257ef6065cb96ca654ed8a3c6570f006c4dac8bc0a570d01ace6f3fdb0",
+  "case_count": 7,
+  "cases": [
+    {
+      "detail": {
+        "blob": {
+          "bytes": 28,
+          "oid": "ad60b151934ab3ba69428c6d26cb62fbbecc9f70",
+          "sha256": "afb27df3bfe57da25952203e24f256b65c877e80b48904864712cdebe7e12376"
+        },
+        "commit_oid": "dd1dc2b2940fb871dce936763adde08e4e75fa67",
+        "format": "sha1",
+        "fresh_clone_fsck": true
+      },
+      "name": "sha1_tree_and_blob_match_native_git",
+      "seconds": 3.8524,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "blob": {
+          "bytes": 28,
+          "oid": "92d19664f32ce8b11a5d2cc5b72fdb4599b593a6e0e6189e9e214c86d2840af4",
+          "sha256": "afb27df3bfe57da25952203e24f256b65c877e80b48904864712cdebe7e12376"
+        },
+        "commit_oid": "2fd5afae21816b13a9287d5e3fcc2ca22ac4b138ad5152bc8551b52948843683",
+        "format": "sha256",
+        "fresh_clone_fsck": true
+      },
+      "name": "sha256_tree_and_blob_match_native_git",
+      "seconds": 3.597,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "formats": [
+          {
+            "files": {
+              "empty.txt": {
+                "bytes": 0,
+                "oid": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              },
+              "nested/deep/value.txt": {
+                "bytes": 19,
+                "oid": "54a11eb44e305ac92005ae4221211ae6bf24fcf0",
+                "sha256": "fc21723cf885ddf9aa9823df6cd8b07b0c5b7a405a92d1d079b0a3288ed2df8a"
+              },
+              "nested/space name.txt": {
+                "bytes": 23,
+                "oid": "db11e4e0c86144de3812c3b480ee5017ddff2b0f",
+                "sha256": "59b076ef2b5e35d9f35148c34dc1662063e9131a9412a4064b2dbb7bea245120"
+              },
+              "nested/unicode-\u4e2d\u6587.txt": {
+                "bytes": 14,
+                "oid": "83435115172ad26ec90b69187e95abb73a12d949",
+                "sha256": "1ab5625d3943783d4b548863b4fab35b91f9dc6440c370083c7dd54a283f2a68"
+              },
+              "payload.bin": {
+                "bytes": 8192,
+                "oid": "01173aaa0620b1754be138c456e7dbfa3a1d58ef",
+                "sha256": "dc404a613fedaeb54034514bc6505f56b933caa5250299ba7d094377a51caa46"
+              }
+            },
+            "format": "sha1"
+          },
+          {
+            "files": {
+              "empty.txt": {
+                "bytes": 0,
+                "oid": "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              },
+              "nested/deep/value.txt": {
+                "bytes": 19,
+                "oid": "c4203da848caeef05d2f21f36e5d7d83cd93980268963534218b06b504f8943e",
+                "sha256": "fc21723cf885ddf9aa9823df6cd8b07b0c5b7a405a92d1d079b0a3288ed2df8a"
+              },
+              "nested/space name.txt": {
+                "bytes": 23,
+                "oid": "ff1736945c618ff1b559c9fa2b212ea461ee73949d4d91a771fa4d6dc344b346",
+                "sha256": "59b076ef2b5e35d9f35148c34dc1662063e9131a9412a4064b2dbb7bea245120"
+              },
+              "nested/unicode-\u4e2d\u6587.txt": {
+                "bytes": 14,
+                "oid": "b8c849ba568b95e48797929b9c4fe6887e54a3e37a2730a2ca6cd02da3bd2cff",
+                "sha256": "1ab5625d3943783d4b548863b4fab35b91f9dc6440c370083c7dd54a283f2a68"
+              },
+              "payload.bin": {
+                "bytes": 8192,
+                "oid": "de7179dbd95c6e43650acda66115f39d309a6c19ec1bd76781fdc4cd2ded2790",
+                "sha256": "dc404a613fedaeb54034514bc6505f56b933caa5250299ba7d094377a51caa46"
+              }
+            },
+            "format": "sha256"
+          }
+        ]
+      },
+      "name": "empty_nested_binary_and_utf8_paths_preserve_bytes",
+      "seconds": 4.871,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "blob": {
+          "bytes": 19,
+          "oid": "54a11eb44e305ac92005ae4221211ae6bf24fcf0",
+          "sha256": "fc21723cf885ddf9aa9823df6cd8b07b0c5b7a405a92d1d079b0a3288ed2df8a"
+        },
+        "entries": 7,
+        "pages": 7,
+        "tab_and_newline_cursor_roundtrip": true,
+        "tree_oid": "7489bf9f403f1bf58b4d861fa8dbdb44b7cc0b36"
+      },
+      "name": "tree_pagination_and_direct_object_endpoints",
+      "seconds": 3.0045,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "tags": [
+          {
+            "blob": {
+              "bytes": 28,
+              "oid": "ad60b151934ab3ba69428c6d26cb62fbbecc9f70",
+              "sha256": "afb27df3bfe57da25952203e24f256b65c877e80b48904864712cdebe7e12376"
+            },
+            "format": "sha1",
+            "peeled_commit_oid": "dd1dc2b2940fb871dce936763adde08e4e75fa67",
+            "tag_oid": "5d4a92e2e2e3436beed91be91fd9c97d277809a0"
+          },
+          {
+            "blob": {
+              "bytes": 28,
+              "oid": "92d19664f32ce8b11a5d2cc5b72fdb4599b593a6e0e6189e9e214c86d2840af4",
+              "sha256": "afb27df3bfe57da25952203e24f256b65c877e80b48904864712cdebe7e12376"
+            },
+            "format": "sha256",
+            "peeled_commit_oid": "2fd5afae21816b13a9287d5e3fcc2ca22ac4b138ad5152bc8551b52948843683",
+            "tag_oid": "e8dccda10e313f2e9bddd78702ec3582a17ce0325027c84b0b8d462f00e24a74"
+          }
+        ]
+      },
+      "name": "annotated_tags_peel_to_the_pushed_commit",
+      "seconds": 6.0031,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "historical_blob": {
+          "bytes": 28,
+          "oid": "ad60b151934ab3ba69428c6d26cb62fbbecc9f70",
+          "sha256": "afb27df3bfe57da25952203e24f256b65c877e80b48904864712cdebe7e12376"
+        },
+        "new_commit_oid": "bb803c2212bfe2b06a5404223f1d762bc03e61c7",
+        "old_commit_oid": "dd1dc2b2940fb871dce936763adde08e4e75fa67"
+      },
+      "name": "ref_advance_keeps_reachable_history_readable",
+      "seconds": 4.5188,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "blob": {
+          "bytes": 8192,
+          "oid": "01173aaa0620b1754be138c456e7dbfa3a1d58ef",
+          "sha256": "dc404a613fedaeb54034514bc6505f56b933caa5250299ba7d094377a51caa46"
+        },
+        "commit_oid": "bb803c2212bfe2b06a5404223f1d762bc03e61c7",
+        "fresh_clone_fsck": true,
+        "old_pid": 16567,
+        "restarted_pid": 20420
+      },
+      "name": "restart_without_scratch_rebuilds_browse_and_clone",
+      "seconds": 3.9294,
+      "status": "passed"
+    }
+  ],
+  "expected_cases": [
+    "sha1_tree_and_blob_match_native_git",
+    "sha256_tree_and_blob_match_native_git",
+    "empty_nested_binary_and_utf8_paths_preserve_bytes",
+    "tree_pagination_and_direct_object_endpoints",
+    "annotated_tags_peel_to_the_pushed_commit",
+    "ref_advance_keeps_reachable_history_readable",
+    "restart_without_scratch_rebuilds_browse_and_clone"
+  ],
+  "expected_count": 7,
+  "git_sha256": "92c38403054b6d6fef394391bd84beb54ebfaef2f096c1e93b56f5626733c649",
+  "harness_inputs_sha256": {
+    "blob_gateway_browse.py": "b441b041a3858aa08873d32c3fafc8e49d7313f96ffa85e54c76cb6a7fdc0c5e",
+    "blob_only_service.py": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+    "e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+    "native_evidence.py": "a4cdec21201c94ce7c21ebb1852d6ec91c7f57b5a5af528af05cc3c61f1cfe2e",
+    "ops_provenance.py": "f9b3ec80d853b2cf949743be1a0cb95ae19e029e50c3a188e04ae8111a218b37",
+    "owned_fuse_cleanup.py": "1df7299f4ff20199cd338e812fd2d58af8626e024e0130249b864c7a4f0c91de"
+  },
+  "harness_sha256": "b441b041a3858aa08873d32c3fafc8e49d7313f96ffa85e54c76cb6a7fdc0c5e",
+  "inputs_unchanged": true,
+  "kind": "rootyard/blob-browse-native-acceptance",
+  "limitations": [
+    "Loopback HTTP, one PostgreSQL server and one configured S3 provider; no HA or physical durability claim.",
+    "The restart kills only the harness-owned service process group after an acknowledged push.",
+    "This verifies tree/blob JSON, not full web UI, commits/compare, LFS or ref transaction equivalence.",
+    "Blob deletion stays disabled; uploaded fixture objects are not reclaimed by this harness.",
+    "Ordinary functional/recovery cases, not security or resource-exhaustion qualification."
+  ],
+  "measurement_kind": "native_execution",
+  "passed": true,
+  "qualification_kind": "clean-candidate",
+  "simulated_fields": false,
+  "skips": 0,
+  "source_head": "f1889aac45911e8a58b991c63373376f55af8939",
+  "source_inputs_sha256": "65c9da2bb9d0234cf3b7ac8ba119886ec4ba4235fcff44bc1298d42de6266511",
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)",
+    "python": "3.12.14"
+  }
+}

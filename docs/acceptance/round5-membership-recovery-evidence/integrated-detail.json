@@ -1,0 +1,196 @@
+{
+  "test": "web_detail_pagination",
+  "binary": "/workspace/scratch/round5-implementation/integrated137-v1/rootyard",
+  "binary_sha256": "b9446ed9f2de4ec4a99fef6ba1676048b6f4d592bb3c25d8b91cb25280767e1d",
+  "source_head": "9e2bccfccbfdce1c8789ed8fb8a6f582eddd107e",
+  "schema_versions": "1,2,3,6,7,8,9,20,30,40,50,60,70,72,73,74,75,80,81,82,83,84,85,86,90,91,92,93,94,95,96,97,98,105,106,107,108,109,110,111,112,113,114,115,116,120,121,125,126,127,128,129,130,131,132,133,134,135,136,137",
+  "fixtures": {
+    "issue_comments_sql_seeded": 105,
+    "pull_reviews_sql_seeded": 105,
+    "comment_via_http": 1,
+    "review_via_http": 1,
+    "boundary_comments": {
+      "100": 100,
+      "101": 101
+    },
+    "empty_parent_comments": 0,
+    "issue_numbers": {
+      "comments": 1,
+      "empty": 4,
+      "boundary": [
+        2,
+        3
+      ]
+    },
+    "pull_number": 1,
+    "seed_note": "bulk history is operator SQL, counted via RETURNING; the 106th comment/review is written through the API"
+  },
+  "cases": [
+    {
+      "name": "fixture",
+      "status": "passed",
+      "seconds": 8.8025,
+      "detail": {
+        "fixtures": {
+          "issue_comments_sql_seeded": 105,
+          "pull_reviews_sql_seeded": 105,
+          "comment_via_http": 1,
+          "review_via_http": 1,
+          "boundary_comments": {
+            "100": 100,
+            "101": 101
+          },
+          "empty_parent_comments": 0,
+          "issue_numbers": {
+            "comments": 1,
+            "empty": 4,
+            "boundary": [
+              2,
+              3
+            ]
+          },
+          "pull_number": 1,
+          "seed_note": "bulk history is operator SQL, counted via RETURNING; the 106th comment/review is written through the API"
+        },
+        "schema_versions": "1,2,3,6,7,8,9,20,30,40,50,60,70,72,73,74,75,80,81,82,83,84,85,86,90,91,92,93,94,95,96,97,98,105,106,107,108,109,110,111,112,113,114,115,116,120,121,125,126,127,128,129,130,131,132,133,134,135,136,137"
+      }
+    },
+    {
+      "name": "comment_traversal",
+      "status": "passed",
+      "seconds": 0.0835,
+      "detail": {
+        "pages": [
+          100,
+          6
+        ],
+        "markers": 106,
+        "page_size": 100
+      }
+    },
+    {
+      "name": "comment_boundaries",
+      "status": "passed",
+      "seconds": 0.2586,
+      "detail": {
+        "exact_page": 100,
+        "probe_next": 101,
+        "empty_parent": 0
+      }
+    },
+    {
+      "name": "cursor_rejected",
+      "status": "passed",
+      "seconds": 0.2221,
+      "detail": {
+        "wrong_parent": 400,
+        "malformed": 400,
+        "oversized": 400,
+        "echoed_query": 400
+      }
+    },
+    {
+      "name": "review_traversal",
+      "status": "passed",
+      "seconds": 0.8526,
+      "detail": {
+        "pages": [
+          100,
+          6
+        ],
+        "markers": 106,
+        "wrong_kind": 400
+      }
+    },
+    {
+      "name": "anonymous_401",
+      "status": "passed",
+      "seconds": 0.0136,
+      "detail": {
+        "plain": 401,
+        "navigation": 303
+      }
+    },
+    {
+      "name": "web_mutations_render_first_page",
+      "status": "passed",
+      "seconds": 0.435,
+      "detail": {
+        "comment_mutation": {
+          "status": 201,
+          "numbers": 100,
+          "next_link": true
+        },
+        "review_mutation": {
+          "status": 201,
+          "numbers": 100,
+          "next_link": true
+        }
+      }
+    },
+    {
+      "name": "authenticated_actor_and_revocation",
+      "status": "passed",
+      "seconds": 0.4175,
+      "detail": {
+        "before_membership": 404,
+        "collaborator": 200,
+        "foreign_cursor": 400,
+        "after_membership": 404,
+        "revoked_token": 401
+      }
+    }
+  ],
+  "build": {
+    "attested": true,
+    "version": 1,
+    "binary_sha256": "b9446ed9f2de4ec4a99fef6ba1676048b6f4d592bb3c25d8b91cb25280767e1d",
+    "source_inputs_sha256": "a4b83299839799fcbbdc03fdc950f4a339020c4af3a5d3ff204d5edcd2852236",
+    "workspace_commit": "9e2bccfccbfdce1c8789ed8fb8a6f582eddd107e",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/round5-implementation/recorded-membership-recovery#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/round5-implementation/recorded-membership-recovery#rootyard@0.1.0"
+      }
+    ]
+  },
+  "candidate_source_match": true,
+  "passed": true,
+  "failure_traceback": null,
+  "todos": [],
+  "limitations": [
+    "One loopback process and one disposable PostgreSQL schema; not a scalability benchmark.",
+    "Bulk history is operator SQL (counted by RETURNING) because 105 rows per list are not produced through HTTP; the 106th row and both parents are created by real HTTP/Git.",
+    "The cursor is a scope-bound ordering position, not a signed capability or a snapshot; inserts after the cursor appear later and deletes simply vanish.",
+    "Review pagination is exercised on `/web/.../pulls/{number}`; `/web/.../pulls/{number}/reviews` shares the same renderer but is not separately paged here.",
+    "Actor binding is covered with a real read collaborator: a cursor minted for Alice is rejected (400) for Bob, whose pre-membership and post-revocation detail reads are 404 and whose revoked token is 401.",
+    "Mutation re-render checks status 201, page-one rows, next-page links, and the new 107th row remaining beyond page one."
+  ]
+}

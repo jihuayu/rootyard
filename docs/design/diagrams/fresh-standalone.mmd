@@ -1,0 +1,17 @@
+flowchart TB
+  C["Git / API / Web / Agent 客户端"] --> A["Rootyard standalone<br/>单 Rust 应用进程"]
+  A --> H["Smart HTTP / API / 鉴权"]
+  A --> P["发布协调器<br/>prepare / select / verify / commit"]
+  A --> R["PgRefStore<br/>PG 内权威 refs / CAS / 操作终态"]
+  A --> M["有界 MemoryCache / MemoryWake<br/>可删除，仅延迟优化"]
+  A --> W["内置可靠 worker<br/>PG 任务 / outbox / 周期扫描"]
+  H --> L["本地裸 Git 计算视图<br/>quarantine / upload-pack / receive-pack<br/>可删除并重建"]
+  P --> L
+  R --> PG[("业务 PostgreSQL<br/>身份 / 仓库 / 权限 / 策略<br/>refs / 决策 / roots / 配额 / 投影 / outbox")]
+  P --> PG
+  W --> PG
+  P --> B[("Apache OpenDAL 远程 Blob<br/>pack / idx / manifest / LFS<br/>workspace / checkpoint / backup 不可变字节")]
+  L --> B
+  M -. "丢失只影响延迟" .-> W
+  D["持久设备要求<br/>PG data/WAL 需正常持久盘<br/>Blob API 不是 WAL"] -.-> PG
+  X["非必需：Redis / Raft / Kafka / Vault / FUSE / controller"] -.-> A

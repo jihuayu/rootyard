@@ -57,21 +57,32 @@ class GitChildObservationTests(unittest.TestCase):
     def test_disappearing_proc_entry_is_reaped(self):
         harness = object.__new__(Harness)
         with patch("e2e.Path.read_text", side_effect=ProcessLookupError):
-            harness.assert_reaped({123: "100"}, "test upload")
+            harness.assert_no_live_descendants({123: "100"}, "test upload")
 
     def test_reused_pid_is_not_reported_as_surviving(self):
         harness = object.__new__(Harness)
         stat = "123 (git) " + " ".join(["S", "1", "123"] + ["0"] * 16 + ["101"])
         with patch("e2e.Path.read_text", return_value=stat):
-            harness.assert_reaped({123: "100"}, "test upload")
+            harness.assert_no_live_descendants({123: "100"}, "test upload")
 
-    def test_zombie_is_not_reported_as_reaped(self):
+    def test_adopted_zombie_and_dead_states_are_quiescent(self):
+        # process::group_quiescent deliberately treats Z/X as no live descendant:
+        # the server cannot reap PID1-adopted grandchildren, so they must not be
+        # reported as surviving children (no OS-reaping claim is made here).
         harness = object.__new__(Harness)
-        stat = "123 (git) " + " ".join(["Z", "1", "123"] + ["0"] * 16 + ["100"])
-        with patch("e2e.Path.read_text", return_value=stat), \
-                patch("e2e.time.monotonic", side_effect=[0, 3]):
-            with self.assertRaisesRegex(AssertionError, "'state': 'Z'"):
-                harness.assert_reaped({123: "100"}, "test upload")
+        for state in ("Z", "X"):
+            stat = "123 (git) " + " ".join([state, "1", "123"] + ["0"] * 16 + ["100"])
+            with patch("e2e.Path.read_text", return_value=stat):
+                harness.assert_no_live_descendants({123: "100"}, "test upload")
+
+    def test_live_child_with_matching_pid_and_starttime_survives(self):
+        harness = object.__new__(Harness)
+        for state in ("S", "R", "D"):
+            stat = "123 (git) " + " ".join([state, "1", "123"] + ["0"] * 16 + ["100"])
+            with patch("e2e.Path.read_text", return_value=stat), \
+                    patch("e2e.time.monotonic", side_effect=[0, 3]):
+                with self.assertRaisesRegex(AssertionError, "survived"):
+                    harness.assert_no_live_descendants({123: "100"}, "test upload")
 
 
 if __name__ == "__main__":

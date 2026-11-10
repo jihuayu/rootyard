@@ -1,0 +1,100 @@
+{
+  "passed": true,
+  "kind": "schema",
+  "returncode": 0,
+  "command": [
+    "python3",
+    "/workspace/scratch/state-services-pack-commit/tests/schema_contract.py",
+    "--binary",
+    "/workspace/scratch/state-pack142-app-v1/rootyard"
+  ],
+  "seconds": 11.194,
+  "before": {
+    "source": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "head": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+    "harness": {
+      "tests/schema_contract.py": "2d60de37e2fac8258a202396113c5452975f474c71b64811c80873faad054252",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "887cfaf14554329a0334aea87b1e4ccf183d22deac642bd2a80aa492a40d2efc"
+    }
+  },
+  "after": {
+    "source": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "head": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+    "harness": {
+      "tests/schema_contract.py": "2d60de37e2fac8258a202396113c5452975f474c71b64811c80873faad054252",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "887cfaf14554329a0334aea87b1e4ccf183d22deac642bd2a80aa492a40d2efc"
+    }
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "107ac382697789a604691e13f020150122f38eb46b81c937462c76711ca5055b",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "workspace_commit": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-pack-commit#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-pack-commit#rootyard@0.1.0"
+      }
+    ]
+  },
+  "helper_build_receipt": null,
+  "native": {
+    "schema_version": "142",
+    "migration_mode": "binary",
+    "canonical": true,
+    "roundtrip": true,
+    "restored003_upgrade": true,
+    "restored006_upgrade": true,
+    "restored007_upgrade": true,
+    "upgraded_roundtrip": true,
+    "custom_search_path_bootstrap": true,
+    "custom_migrate_idempotent": true,
+    "tables": 111,
+    "functions": 36,
+    "triggers": 84
+  },
+  "limits": [
+    "One loopback PostgreSQL/Garage fixture; no HA/powerloss/production RPO/RTO/serving/GC qualification.",
+    "Current18 pack ledger seeded by real protectedS3/nativeGit/typed verified commit; external original Blob bytes remain outside the metadata archive.",
+    "Genuine17 is produced by retained schema141 app C300; upgraded142 pack tables must be empty, no fabricated registration."
+  ]
+}

@@ -1,0 +1,253 @@
+{
+  "passed": false,
+  "kind": "backup20",
+  "returncode": 1,
+  "command": [
+    "python3",
+    "/workspace/scratch/trace-state142-backup.py",
+    "/workspace/scratch/state-services-roots-decisions/tests/backup_refstore_roots_decisions144.py",
+    "--binary",
+    "/workspace/scratch/state144-app-v2/rootyard",
+    "--report",
+    "/workspace/scratch/state144-backup20-native-v7/native.json",
+    "--roots-decisions-fixture-binary",
+    "/workspace/scratch/state144-backup-helper-build-v5/ref_store_roots_decisions_backup_fixture"
+  ],
+  "seconds": 16.051,
+  "before": {
+    "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "binary": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
+    "head": "f61d466af61abda19e04b1c16b29c3df6b0cb360",
+    "harness": {
+      "tests/backup_refstore_roots_decisions144.py": "5141df9faa41b092c504df1c8eb3005f2cbc61550482668a50cf11294169087c",
+      "tests/schema_baseline.py": "ee8f6b07e314105f3afd660bc0cdffc85b8f7d87f931acf71374d3348c51c729",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/backup_refstore_pack_snapshots143.py": "c74c21fb15f550382f208533d79e2004d7355c57378224d2dcaf214a22241d01",
+      "tests/ref_store_roots_decisions_backup_fixture.rs": "10f5ab2a91b22a2dbc507841ed292b6963f8ff624f30b0278919c0782a037e41",
+      "tests/roots_decisions_backup_support/db.rs": "48df53643027790aaf96b5b17712d54d6231e1529e7d53a7640139657c595663",
+      "tests/roots_decisions_backup_support/decisions.rs": "78fc6e144b91908d4a36d35c96821679bd1265ea5d06c3a921c48d87b7e89a00",
+      "tests/roots_decisions_backup_support/marker.rs": "5dfc6065aac30738599f3a11cc336fbe23478f94e0ed53e7516d078df328bd87",
+      "tests/roots_decisions_backup_support/mod.rs": "775486defa46a6ca5e26755ef80155541fe83b9bae3a73e47acd00aed1f2c295",
+      "tests/roots_decisions_backup_support/rows.rs": "9296d1acfdf9a16933868c02a3861438cdde09c8cc91d004415cadf5481d9b7a",
+      "tests/roots_decisions_backup_support/seed.rs": "14a735d6e8b57015ddfdb3f4931316815b4e942b4d3b67999485d2c998aded09",
+      "tests/roots_decisions_backup_support/verify.rs": "835eee73a1812831e6e3d3cabbc0739ff427405b2c961e872a069b3731e3a618",
+      "tests/retention_roots_support/cases_extra.rs": "3aeea235b98071cbe78d778378f1c0302095c3854432cfa7ccc9f50750dfff72",
+      "tests/retention_roots_support/cases_tail.rs": "4c6c07f30d82e39760deb324fb1dea8a61d5fbd3dbe2177e85dd1469bf1675ab",
+      "tests/retention_roots_support/common.rs": "daaa493af1e6dff15f153ec4d1e99c1353693d87349b313e5d827114c5723a3c",
+      "tests/retention_roots_support/db.rs": "85ed5644f64d86fd469b0c20b781ec1ebe6ea63179e5457a2975226f124abe06",
+      "tests/retention_roots_support/git.rs": "1e9d5de62ebabda8348c5c6ef78a641d4aa47ad9bfa4079eb5f9ff1aed68df2c",
+      "tests/retention_roots_support/mod.rs": "9703d9efa566e17cec0bfe6159dc4c020e1a0063619285ead08749c704cf3066",
+      "tests/retention_roots_support/pack.rs": "01a610be32ae33b551e70cb6aecc5ff2516d2435a81d057298c21a4e04d817b7",
+      "tests/retention_roots_support/roots.rs": "689bc65076d55305c3fcf97447eacec63fb8ddf4eeb4ee8a1ecbc16e2e7dda2f"
+    },
+    "fixture_binary": "935be82ff85693e266eec79a5d6bccb05b25f08572cfce3ba7a7c8da60e4827b",
+    "diagnostic_launcher": "35d8fb4fdb820d0ee6b76542eb4684d836664c21c3ec1ffb4232352bf2d906d6"
+  },
+  "after": {
+    "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "binary": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
+    "head": "f61d466af61abda19e04b1c16b29c3df6b0cb360",
+    "harness": {
+      "tests/backup_refstore_roots_decisions144.py": "5141df9faa41b092c504df1c8eb3005f2cbc61550482668a50cf11294169087c",
+      "tests/schema_baseline.py": "ee8f6b07e314105f3afd660bc0cdffc85b8f7d87f931acf71374d3348c51c729",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/backup_refstore_pack_snapshots143.py": "c74c21fb15f550382f208533d79e2004d7355c57378224d2dcaf214a22241d01",
+      "tests/ref_store_roots_decisions_backup_fixture.rs": "10f5ab2a91b22a2dbc507841ed292b6963f8ff624f30b0278919c0782a037e41",
+      "tests/roots_decisions_backup_support/db.rs": "48df53643027790aaf96b5b17712d54d6231e1529e7d53a7640139657c595663",
+      "tests/roots_decisions_backup_support/decisions.rs": "78fc6e144b91908d4a36d35c96821679bd1265ea5d06c3a921c48d87b7e89a00",
+      "tests/roots_decisions_backup_support/marker.rs": "5dfc6065aac30738599f3a11cc336fbe23478f94e0ed53e7516d078df328bd87",
+      "tests/roots_decisions_backup_support/mod.rs": "775486defa46a6ca5e26755ef80155541fe83b9bae3a73e47acd00aed1f2c295",
+      "tests/roots_decisions_backup_support/rows.rs": "9296d1acfdf9a16933868c02a3861438cdde09c8cc91d004415cadf5481d9b7a",
+      "tests/roots_decisions_backup_support/seed.rs": "14a735d6e8b57015ddfdb3f4931316815b4e942b4d3b67999485d2c998aded09",
+      "tests/roots_decisions_backup_support/verify.rs": "835eee73a1812831e6e3d3cabbc0739ff427405b2c961e872a069b3731e3a618",
+      "tests/retention_roots_support/cases_extra.rs": "3aeea235b98071cbe78d778378f1c0302095c3854432cfa7ccc9f50750dfff72",
+      "tests/retention_roots_support/cases_tail.rs": "4c6c07f30d82e39760deb324fb1dea8a61d5fbd3dbe2177e85dd1469bf1675ab",
+      "tests/retention_roots_support/common.rs": "daaa493af1e6dff15f153ec4d1e99c1353693d87349b313e5d827114c5723a3c",
+      "tests/retention_roots_support/db.rs": "85ed5644f64d86fd469b0c20b781ec1ebe6ea63179e5457a2975226f124abe06",
+      "tests/retention_roots_support/git.rs": "1e9d5de62ebabda8348c5c6ef78a641d4aa47ad9bfa4079eb5f9ff1aed68df2c",
+      "tests/retention_roots_support/mod.rs": "9703d9efa566e17cec0bfe6159dc4c020e1a0063619285ead08749c704cf3066",
+      "tests/retention_roots_support/pack.rs": "01a610be32ae33b551e70cb6aecc5ff2516d2435a81d057298c21a4e04d817b7",
+      "tests/retention_roots_support/roots.rs": "689bc65076d55305c3fcf97447eacec63fb8ddf4eeb4ee8a1ecbc16e2e7dda2f"
+    },
+    "fixture_binary": "935be82ff85693e266eec79a5d6bccb05b25f08572cfce3ba7a7c8da60e4827b",
+    "diagnostic_launcher": "35d8fb4fdb820d0ee6b76542eb4684d836664c21c3ec1ffb4232352bf2d906d6"
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "f7929340365ed6aaf2b30d1bf0935ba1dffcb9343c67046d4df708508890db6b",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
+    "source_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "workspace_commit": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-roots-decisions#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-roots-decisions#rootyard@0.1.0"
+      }
+    ]
+  },
+  "helper_build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "935be82ff85693e266eec79a5d6bccb05b25f08572cfce3ba7a7c8da60e4827b",
+    "workspace_commit": "a50ba480a7f92d1fd1a060c9bb380cd827d33e7c",
+    "fresh": false,
+    "source_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "binary_sha256": "935be82ff85693e266eec79a5d6bccb05b25f08572cfce3ba7a7c8da60e4827b",
+    "integration_test_source_sha256": "10f5ab2a91b22a2dbc507841ed292b6963f8ff624f30b0278919c0782a037e41",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_roots_decisions_backup_fixture",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_roots_decisions_backup_fixture",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_roots_decisions_backup_fixture-94ecf6ed9727c128"
+      }
+    ],
+    "matrix_clean_once": false,
+    "matrix_first_rootyard_library_rebuilt": false,
+    "matching_dependency_reuse": true
+  },
+  "native": {
+    "passed": false,
+    "cases": [
+      {
+        "name": "synthetic_source_with_typed_roots_and_decision_ledger",
+        "status": "failed",
+        "seconds": 14.9485,
+        "error": ""
+      }
+    ],
+    "skips": 0,
+    "binary": "/workspace/scratch/state144-app-v2/rootyard",
+    "binary_sha256": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
+    "backup_format": 20,
+    "schema_version": 144,
+    "roots_decisions_fixture_helper": {
+      "binary": "/workspace/scratch/state144-backup-helper-build-v5/ref_store_roots_decisions_backup_fixture",
+      "binary_sha256": "935be82ff85693e266eec79a5d6bccb05b25f08572cfce3ba7a7c8da60e4827b",
+      "build_receipt": "/workspace/scratch/state144-backup-helper-build-v5/ref_store_roots_decisions_backup_fixture.build.json",
+      "build_receipt_sha256": "2a0120c391346ca2a255700f1a5f26412bbd5b11e34e03158f16e47ca56daedb",
+      "build_kind": "rust-integration-test",
+      "package_rebuilt": true,
+      "fresh": false,
+      "fresh_false_artifact": {
+        "target": "ref_store_roots_decisions_backup_fixture",
+        "kind": "test",
+        "fresh": false
+      },
+      "test_profile": true,
+      "integration_test_source_sha256": "10f5ab2a91b22a2dbc507841ed292b6963f8ff624f30b0278919c0782a037e41",
+      "integration_test_source_matches_source_file": true,
+      "source_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+      "candidate_application_receipt": "/workspace/scratch/state144-app-v2/rootyard.build.json",
+      "candidate_application_sha256": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
+      "candidate_application_package_rebuilt": true,
+      "source_inputs_match_candidate_application": true,
+      "retained_binding_stages": [
+        "seed"
+      ],
+      "binaries_unchanged_after_run": true
+    },
+    "schema144_tables": [
+      "ref_store_core_protocol_repos",
+      "ref_store_core_root_heads",
+      "ref_store_core_root_oids",
+      "ref_store_core_root_packs",
+      "ref_store_core_root_receipts",
+      "ref_store_core_root_refs",
+      "ref_store_core_root_repo_usage",
+      "ref_store_core_root_tenant_usage",
+      "ref_store_core_root_tombstones",
+      "ref_store_core_roots",
+      "ref_store_decision_cancellations",
+      "ref_store_decision_dependencies",
+      "ref_store_decision_refs",
+      "ref_store_decision_repo_usage",
+      "ref_store_decision_scopes",
+      "ref_store_decision_tenant_usage",
+      "ref_store_publication_decisions"
+    ],
+    "limitations": [
+      "The typed A3/A4/A5, root and decision ledger is seeded by the real adapters and the real staged authorized pipeline; no SQL ACK, proof, receipt, registration or decision row is fabricated.",
+      "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+      "The random roots repository stays provisioning/gitfs/unserved for the whole drill.",
+      "Only the AcceptedSubset decision consumes refs; the Atomic decision is cancelled before commit and the third operation is cancelled before install.",
+      "complete_git_read_snapshot() is false everywhere: this drill claims registered pack membership metadata only, never verified Blob bytes or native Git object closure.",
+      "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+      "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+      "Decision rows are represented in the marker/report only by canonical per-table digests, counts and non-secret verdict codes; no credential or token_digest is written anywhere.",
+      "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+    ]
+  },
+  "limits": [
+    "Loopback PostgreSQL17/Garage/native Git; metadata backup only, external Blob bytes not archived.",
+    "Genuine format19 uses retained schema143 producer and old typed A5 helper, never relabeled."
+  ]
+}

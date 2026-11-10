@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "binary_sha256": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
+  "source_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+  "workspace_commit": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "build",
+    "--locked",
+    "--bin",
+    "rootyard",
+    "--features",
+    "pando-lab",
+    "--message-format=json-render-diagnostics"
+  ],
+  "package_rebuilt": true,
+  "clean_command": [
+    "cargo",
+    "clean",
+    "--package",
+    "rootyard"
+  ],
+  "target_dir": "/workspace/rootyard/target",
+  "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+  "fresh_false_artifacts": [
+    {
+      "target": "rootyard",
+      "kind": "lib",
+      "fresh": false,
+      "package_id": "path+file:///workspace/scratch/state-services-roots-decisions#rootyard@0.1.0"
+    },
+    {
+      "target": "rootyard",
+      "kind": "bin",
+      "fresh": false,
+      "executable": "/workspace/rootyard/target/debug/rootyard",
+      "package_id": "path+file:///workspace/scratch/state-services-roots-decisions#rootyard@0.1.0"
+    }
+  ]
+}

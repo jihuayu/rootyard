@@ -1,0 +1,442 @@
+.......................................E..........EEE.......................................EE............s........................owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-771adr38/workspace-service/mounts/408d063f-1324-4701-a9c1-59416151b056'
+owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-771adr38/workspace-service/mounts/nope'
+.owned-fuse-cleanup: [Errno 20] Not a directory: 'f1e76962-90ca-4c1a-a128-bd988c533859'
+.owned-fuse-cleanup: FD for '/tmp/rootyard-cleanup-id-6oeg7yav/workspace-service/mounts/3cb16c12-a620-44e5-88eb-66da1199040f' has mnt_id 52, expected 53
+..owned-fuse-cleanup: [Errno 20] Not a directory: 'workspace-service'
+......................................................................................ssEEE.....................................................[main (root-commit) 879d047] c1
+ 2 files changed, 1502 insertions(+)
+ create mode 100644 large.txt
+ create mode 100755 script.sh
+[main 38df507] c2
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+ create mode 100644 added.txt
+.F..E................FFF.FFFsssFFF..FFFE.FFFFFEE
+======================================================================
+ERROR: test_crash_after_first_ref_and_recover (test_changeset_service.ChangeSetServiceTest.test_crash_after_first_ref_and_recover)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_changeset_service.py", line 11, in test_crash_after_first_ref_and_recover
+    h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_claimed_origin_checkout_build_and_cancel (test_ci_sandbox.CiSandboxTest.test_claimed_origin_checkout_build_and_cancel)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_ci_sandbox.py", line 19, in test_claimed_origin_checkout_build_and_cancel
+    h=WebhooksHarness(argparse.Namespace(binary=str(binary),
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_fenced_retry_requires_new_attempt (test_ci_sandbox.CiSandboxTest.test_fenced_retry_requires_new_attempt)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_ci_sandbox.py", line 277, in test_fenced_retry_requires_new_attempt
+    h = WebhooksHarness(argparse.Namespace(binary=str(binary), keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_two_concurrent_claims_isolated_build_and_export (test_ci_sandbox.CiSandboxTest.test_two_concurrent_claims_isolated_build_and_export)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_ci_sandbox.py", line 191, in test_two_concurrent_claims_isolated_build_and_export
+    h = WebhooksHarness(argparse.Namespace(binary=str(binary), keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_pinned_subdir_view_and_git_bundle (test_namespace_service.NamespaceServiceTest.test_pinned_subdir_view_and_git_bundle)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_namespace_service.py", line 47, in test_pinned_subdir_view_and_git_bundle
+    h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_view_keeps_pinned_commit_after_source_branch_deleted (test_namespace_service.NamespaceServiceTest.test_view_keeps_pinned_commit_after_source_branch_deleted)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_namespace_service.py", line 18, in test_view_keeps_pinned_commit_after_source_branch_deleted
+    h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_artifact_pool_is_bounded_and_validated (test_sandbox_service.SandboxServiceTest.test_artifact_pool_is_bounded_and_validated)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_sandbox_service.py", line 342, in test_artifact_pool_is_bounded_and_validated
+    h = harness(
+        ^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_sandbox_service.py", line 16, in harness
+    h = Harness(argparse.Namespace(binary=BINARY, keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_isolated_jobs_logs_artifacts_cancel_and_timeout (test_sandbox_service.SandboxServiceTest.test_isolated_jobs_logs_artifacts_cancel_and_timeout)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_sandbox_service.py", line 83, in test_isolated_jobs_logs_artifacts_cancel_and_timeout
+    h = harness()
+        ^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_sandbox_service.py", line 16, in harness
+    h = Harness(argparse.Namespace(binary=BINARY, keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_quota_cancel_crash_cleanup_and_retention (test_sandbox_service.SandboxServiceTest.test_quota_cancel_crash_cleanup_and_retention)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_sandbox_service.py", line 243, in test_quota_cancel_crash_cleanup_and_retention
+    h = harness(
+        ^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_sandbox_service.py", line 16, in harness
+    h = Harness(argparse.Namespace(binary=BINARY, keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: setUpClass (test_view_lab.ViewLabDecompositionAndSemanticsTest)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_view_lab.py", line 23, in setUpClass
+    subprocess.run(
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: 'cargo'
+
+======================================================================
+ERROR: test_clone_and_namespace_git_children_stop_before_retry (test_workspace_source_lease.SourceLeaseTest.test_clone_and_namespace_git_children_stop_before_retry)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_source_lease.py", line 17, in test_clone_and_namespace_git_children_stop_before_retry
+    h=Harness(argparse.Namespace(binary="target/debug/rootyard",
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_conflicted_native_index_round_trips_through_checkpoint (test_workspaces_service.WorkspaceServiceTest.test_conflicted_native_index_round_trips_through_checkpoint)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspaces_service.py", line 13, in test_conflicted_native_index_round_trips_through_checkpoint
+    h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+ERROR: test_create_edit_checkpoint_fork_restore_restart (test_workspaces_service.WorkspaceServiceTest.test_create_edit_checkpoint_fork_restore_restart)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspaces_service.py", line 61, in test_create_edit_checkpoint_fork_restore_restart
+    h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/e2e.py", line 42, in __init__
+    self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
+                   ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 714, in __getitem__
+KeyError: 'ROOTYARD_TEST_DATABASE_URL'
+
+======================================================================
+FAIL: test_workspace_harness_all_checks_pass (test_track4_labs.WorkspaceEndToEndExecutionTests.test_workspace_harness_all_checks_pass)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_track4_labs.py", line 416, in test_workspace_harness_all_checks_pass
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_f50_overlay_cow_sandbox_rename_whiteout_chmod_and_git_add_f (test_workspace_crash_recovery.WorkspaceCrashRecoveryTestSuite.test_f50_overlay_cow_sandbox_rename_whiteout_chmod_and_git_add_f)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_crash_recovery.py", line 123, in test_f50_overlay_cow_sandbox_rename_whiteout_chmod_and_git_add_f
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_f51_power_loss_crash_drills_and_wal_recovery_windows (test_workspace_crash_recovery.WorkspaceCrashRecoveryTestSuite.test_f51_power_loss_crash_drills_and_wal_recovery_windows)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_crash_recovery.py", line 264, in test_f51_power_loss_crash_drills_and_wal_recovery_windows
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_overlay_write_rejects_parent_symlinks_in_native_cli (test_workspace_crash_recovery.WorkspaceCrashRecoveryTestSuite.test_overlay_write_rejects_parent_symlinks_in_native_cli)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_crash_recovery.py", line 17, in test_overlay_write_rejects_parent_symlinks_in_native_cli
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_kernel_fuse_transparent_cow (test_workspace_fuse.FuseMountTest.test_kernel_fuse_transparent_cow)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_fuse.py", line 77, in test_kernel_fuse_transparent_cow
+    self.assertEqual(child.returncode,0,child.stdout+child.stderr)
+AssertionError: 1 != 0 : F
+======================================================================
+FAIL: test_kernel_fuse_transparent_cow (tests.test_workspace_fuse.FuseMountTest.test_kernel_fuse_transparent_cow)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_fuse.py", line 80, in test_kernel_fuse_transparent_cow
+    self.assertTrue(binary.is_file())
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (failures=1)
+
+
+======================================================================
+FAIL: test_moved_symlink_cannot_escape_mount (test_workspace_fuse.FuseMountTest.test_moved_symlink_cannot_escape_mount)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_fuse.py", line 21, in test_moved_symlink_cannot_escape_mount
+    self.assertEqual(child.returncode,0,child.stdout+child.stderr)
+AssertionError: 1 != 0 : F
+======================================================================
+FAIL: test_moved_symlink_cannot_escape_mount (tests.test_workspace_fuse.FuseMountTest.test_moved_symlink_cannot_escape_mount)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_fuse.py", line 24, in test_moved_symlink_cannot_escape_mount
+    self.assertTrue(binary.is_file())
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (failures=1)
+
+
+======================================================================
+FAIL: test_live_editor_capture_checkpoint_and_remount (test_workspace_fuse_service.WorkspaceFuseServiceTest.test_live_editor_capture_checkpoint_and_remount)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_fuse_service.py", line 18, in test_live_editor_capture_checkpoint_and_remount
+    self.assertTrue(binary.is_file())
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_namespace_mount_verify_tamper_and_deterministic_git_view (test_workspace_remote_namespace.WorkspaceNamespaceViewTests.test_namespace_mount_verify_tamper_and_deterministic_git_view)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_remote_namespace.py", line 325, in test_namespace_mount_verify_tamper_and_deterministic_git_view
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_remote_cas_deduplication_and_cross_node_fidelity (test_workspace_remote_namespace.WorkspaceRemoteCasTests.test_remote_cas_deduplication_and_cross_node_fidelity)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_remote_namespace.py", line 154, in test_remote_cas_deduplication_and_cross_node_fidelity
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_remote_cas_merge_conflict_stages_and_corruption_rejection (test_workspace_remote_namespace.WorkspaceRemoteCasTests.test_remote_cas_merge_conflict_stages_and_corruption_rejection)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_remote_namespace.py", line 254, in test_remote_cas_merge_conflict_stages_and_corruption_rejection
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_atomic_two_phase_cross_repo_commit_back_and_base_drift_rollback (test_workspace_remote_namespace.WorkspaceWritableNamespaceAndLeaseTests.test_atomic_two_phase_cross_repo_commit_back_and_base_drift_rollback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_remote_namespace.py", line 756, in test_atomic_two_phase_cross_repo_commit_back_and_base_drift_rollback
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_deterministic_reverse_path_mapping_and_unmapped_or_traversal_rejection (test_workspace_remote_namespace.WorkspaceWritableNamespaceAndLeaseTests.test_deterministic_reverse_path_mapping_and_unmapped_or_traversal_rejection)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_remote_namespace.py", line 478, in test_deterministic_reverse_path_mapping_and_unmapped_or_traversal_rejection
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_multi_agent_overlapping_prefix_lease_conflict_and_expired_takeover (test_workspace_remote_namespace.WorkspaceWritableNamespaceAndLeaseTests.test_multi_agent_overlapping_prefix_lease_conflict_and_expired_takeover)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_remote_namespace.py", line 588, in test_multi_agent_overlapping_prefix_lease_conflict_and_expired_takeover
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_vfs_cow_write_and_dirty_state_classification (test_workspace_vfs.WorkspaceVfsTestSuite.test_vfs_cow_write_and_dirty_state_classification)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_vfs.py", line 229, in test_vfs_cow_write_and_dirty_state_classification
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_vfs_evict_reclaims_clean_and_protects_dirty_cow (test_workspace_vfs.WorkspaceVfsTestSuite.test_vfs_evict_reclaims_clean_and_protects_dirty_cow)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_vfs.py", line 303, in test_vfs_evict_reclaims_clean_and_protects_dirty_cow
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_vfs_manifest_tamper_detection (test_workspace_vfs.WorkspaceVfsTestSuite.test_vfs_manifest_tamper_detection)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_vfs.py", line 365, in test_vfs_manifest_tamper_detection
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_vfs_mount_lazy_catalog_and_inline_threshold (test_workspace_vfs.WorkspaceVfsTestSuite.test_vfs_mount_lazy_catalog_and_inline_threshold)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_vfs.py", line 102, in test_vfs_mount_lazy_catalog_and_inline_threshold
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+======================================================================
+FAIL: test_vfs_on_demand_hydrate_prewarm_and_cas_verification (test_workspace_vfs.WorkspaceVfsTestSuite.test_vfs_on_demand_hydrate_prewarm_and_cas_verification)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-roots-decisions/tests/test_workspace_vfs.py", line 163, in test_vfs_on_demand_hydrate_prewarm_and_cas_verification
+    harness = WorkspaceHarness()
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 3433, in __init__
+    require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+  File "/workspace/scratch/state-services-roots-decisions/tests/workspace.py", line 25, in require
+    raise AssertionError(message)
+AssertionError: native Rust workspace binary missing or not executable: /workspace/scratch/state-services-roots-decisions/target/debug/rootyard-workspace-lab
+
+----------------------------------------------------------------------
+Ran 326 tests in 28.228s
+
+FAILED (failures=18, errors=13, skipped=6)

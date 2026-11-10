@@ -431,7 +431,15 @@ class ShardingBenchmarkReferenceRunner:
 
 
 class ShardingBenchmarkHarness(ShardingHarness):
-    """Live PostgreSQL + Rootyard HTTP server E2E harness for Track 3 (F48 & F49)."""
+    """Live PostgreSQL + Rootyard HTTP server E2E harness for Track 3 (F48 & F49).
+
+    The native Rust benchmark endpoints record a labelled metadata/simulation drill:
+    every receipt is status="simulation_only" with pinned_roots_verified=False and
+    failover_verified=False, and its markdown starts with "# Simulation only".
+    These cases assert that honesty contract, the real node-tier shape, and the
+    explicit refusal boundaries; they never claim measured capacity, pinned-root
+    reachability, failover or multi-node HA validation.
+    """
 
     def setup(self) -> None:
         super().setup()
@@ -443,6 +451,7 @@ class ShardingBenchmarkHarness(ShardingHarness):
         res = self.document(
             self.clusterbenchpath,
             code=200,
+            token=self.operator,
             method="POST",
             json_body={
                 "node_counts": self.node_counts,
@@ -451,8 +460,12 @@ class ShardingBenchmarkHarness(ShardingHarness):
                 "pinned_roots": DEFAULT_PINNED_REFS,
             },
         )
-        assert res["pinned_roots_verified"] is True
+        # A 200 here is a labelled simulation receipt, not measured reachability or failover.
+        assert res["status"] == "simulation_only"
+        assert res["pinned_roots_verified"] is False
+        assert res["failover_verified"] is False
         assert [t["node_count"] for t in res["node_tiers"]] == self.node_counts
+        assert res["markdown_report"].startswith("# Simulation only")
         self.suite_receipt = res
 
     def pinned_root_reachability_under_gc_eviction_and_failover(self) -> None:
@@ -469,26 +482,41 @@ class ShardingBenchmarkHarness(ShardingHarness):
                 "inject_concurrent_gc": True,
             },
         )
-        assert res["pinned_roots_verified"] is True and res["failover_verified"] is True
+        # Injected failure/eviction/GC are simulated inputs; nothing is verified or measured.
+        assert res["status"] == "simulation_only"
+        assert res["pinned_roots_verified"] is False
+        assert res["failover_verified"] is False
+        assert [t["node_count"] for t in res["node_tiers"]] == self.node_counts
+        assert res["markdown_report"].startswith("# Simulation only")
         self.suite_receipt = res
 
     def cluster_and_repo_benchmark_endpoints_and_reports(self) -> None:
-        c_list = self.document(self.clusterbenchpath, code=200)
+        c_list = self.document(self.clusterbenchpath, code=200, token=self.operator)
         assert len(c_list["items"]) >= 1
-        r_list = self.document(self.repobenchpath, code=200)
+        assert c_list["latest"]["status"] == "simulation_only"
+        # Listing repo receipts needs the operator capability on top of repo Admin, so the
+        # ordinary owner token is refused; use alice's explicitly granted operator token.
+        r_list = self.document(self.repobenchpath, code=200, token=self.alice_operator)
         assert len(r_list["items"]) >= 1
+        assert r_list["latest"]["status"] == "simulation_only"
 
     def benchmark_access_and_validation_boundaries(self) -> None:
-        self.document(self.repobenchpath, code=404, token=self.outsider)
-        self.document(
+        self.refusal(self.repobenchpath, 404, "not found", token=self.outsider)
+        # The cluster endpoint checks the operator grant before request validation, so the
+        # request-shape guard must carry that grant and still get an exact 400.
+        self.refusal(
             self.clusterbenchpath,
-            code=400,
+            400,
+            "invalid request",
+            token=self.operator,
             method="POST",
             json_body={"node_counts": [3]},
         )
-        self.document(
+        # A missing pinned object is an explicit 409 refusal, never a fabricated receipt.
+        self.refusal(
             self.repobenchpath,
-            code=409,
+            409,
+            "pinned root reachability check failed",
             method="POST",
             json_body={"simulate_missing_pinned_objects": 1},
         )
@@ -589,6 +617,9 @@ def main() -> int:
             "passed": success,
             "mode": mode,
             "production_validation": False,
+            "multi_node_ha_validation": False,
+            "data_plane_success_claimed": False,
+            "benchmark_receipts": "reference_model" if args.reference_only else "simulation_only",
             "reference_only": args.reference_only,
             "data_plane_validation": "run cluster_workload_native.py and cluster_migration_native.py",
             "node_counts": parse_node_counts(args.node_counts),

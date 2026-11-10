@@ -1,0 +1,36 @@
+{
+  "scope": "documentation-and-task-design-only",
+  "runtime_changed": false,
+  "baseline": "49f09c233a88143ce092af556760149aa9571575",
+  "diagram_parser": "Mermaid 11.12.1 with jsdom 26.1.0; 5/5 passed",
+  "design_check": "823 source blocks,11 archived chapters,5 synchronized diagrams,34 published task DAG; no distributed dependencies on standalone path",
+  "documentation_tests": {
+    "passed": 8,
+    "failed": 0
+  },
+  "reference_only": {
+    "passed": 591,
+    "failed": 0,
+    "skipped": 0
+  },
+  "product_native_tests_rerun": false,
+  "review": "Luna Max final: no blocking coverage, dependency or deletion-map gaps; read-only",
+  "issue_actions": {
+    "rewrite": 19,
+    "create": 15,
+    "preserved": 71,
+    "deleted": [
+      20,
+      22,
+      24,
+      26,
+      43,
+      44,
+      48,
+      121
+    ]
+  },
+  "release_policy": "No merge; completion issues only close after merged and accepted. Old architecture issues are deliberately retired, not completed.",
+  "public_roadmap_archive": "https://github.com/jihuayu/rootyard/blob/5ef72e3/docs/acceptance/retired-roadmap48.md",
+  "documentation_pr": "https://github.com/jihuayu/rootyard/pull/158"
+}

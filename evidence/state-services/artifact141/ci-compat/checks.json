@@ -1,0 +1,27 @@
+{
+  "return_to_helpers_exactly_unchanged": [
+    "hex_value",
+    "percent_decode_ascii",
+    "header_safe_ascii",
+    "is_safe_return_to",
+    "safe_return_to",
+    "encode_query_value",
+    "login_target"
+  ],
+  "source_files_sha256": {
+    "src/web/session.rs": "043649001c49a512683501500f4c03ad3e4e0c97eb25b07acb721c0d0cf3ceff",
+    "src/web/session/return_to.rs": "b2c0cfd6e573a8c8ad386556b2549d64ff7047b1c2e544074926dd6a2e179b6d",
+    "src/sharding/replication.rs": "da170daca15888609b3621bc86b7c90b1c83dcd491eeb6cf5d7bab0623aa1329",
+    "src/sharding/replication/framing.rs": "3201536f595b255d66257551357e5fdbd4f8be74c34563e3d840301da7909020",
+    "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+    "tests/e2e_tiers.py": "cf39011441aef96d1e0157465e90b6f75812554d278fd273f577ca675f90b618"
+  },
+  "retained_backup_app_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+  "limits": [
+    "591 tests are explicitly reference models, not production acceptance.",
+    "Source/unit run excludes native/service/kernel suites and retains six existing skips.",
+    "Backup guard seven-case drill used retained schema141/format17 app c3003c7c; qualifies the changed harness with unchanged backup production code, not a newly built extracted-source app.",
+    "Original A3 source-bound PG19/S3/library/schema/backup evidence remains tied to its recorded source candidate; not relabeled.",
+    "Current remote full CI is not green; a new push must rerun it."
+  ]
+}

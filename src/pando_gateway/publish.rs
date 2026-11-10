@@ -1,13 +1,21 @@
 //! Commit Pando refs, pack-set membership and event outbox in one PG CAS.
 //! Remote encrypted pack publication precedes this transaction; an orphaned
 //! ready pack is harmless, while a PG ref must never point at an absent pack.
+//! The operation-registry binding is server-preallocated before ref mutation but
+//! is not HTTP client-retry idempotency: the caller protocol does not yet carry a
+//! stable operation id across retries. A lost reply remains unknown.
 use super::{prepare::PreparedPush, snapshot::Snapshot};
 use crate::{
     AppState, Error, auth,
+    baseline_metrics::{Phase, timed_result},
     browse::policy,
     db::{Identity, Repository},
     events::{self, OperationRecord, RefEventInput},
     journal::RefChange,
+    ref_store::{
+        IssuerLane, OperationIdentity, OperationState, PgRefStore, RefStoreError, RequestDigest, TerminalOutcome,
+        TerminalResult,
+    },
     storage::ref_publication::PublicationGuard,
 };
 use axum::http::StatusCode;
@@ -16,12 +24,104 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 const MAX_PACKS: usize = 256;
-fn conflict() -> Error {
-    Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs")
+/// A refusal proven before the publication transaction committed: every listed
+/// ref still has its pre-push authoritative value and no ref, operation, event
+/// or outbox row from this request is visible. Only this typed proof may be
+/// translated into a Git receive-pack `ng`; an ambiguous commit, an authority
+/// failure or an internal error must keep its distinct HTTP error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefRejection {
+    pub refs: Vec<String>,
+    pub reason: &'static str,
+}
+
+/// Reason reported to a stock client that lost a same-ref race. It must stay
+/// protocol-safe: no NUL, newline or control byte.
+pub(crate) const REF_CHANGED: &str = "ref changed; retry from current refs";
+
+impl RefRejection {
+    fn cas(requested: &[RefChange]) -> Self {
+        Self { refs: requested.iter().map(|change| change.ref_name.clone()).collect(), reason: REF_CHANGED }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum PublishError {
+    /// Exact advertised-old ref CAS refusal. Returned before `finish_tx`, so the
+    /// transaction is dropped and no part of the push commits.
+    RefRejected(RefRejection),
+    Failed(Error),
+}
+
+impl From<Error> for PublishError {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+fn conflict() -> PublishError {
+    PublishError::Failed(Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs"))
+}
+
+fn push_digest(
+    repo: &Repository,
+    tenant_id: Uuid,
+    snapshot: &Snapshot,
+    prepared: &PreparedPush,
+    actor: &Identity,
+) -> RequestDigest {
+    let mut fields: Vec<Vec<u8>> = vec![
+        repo.id.as_bytes().to_vec(),
+        tenant_id.as_bytes().to_vec(),
+        repo.storage_generation.to_be_bytes().to_vec(),
+        repo.object_format.as_bytes().to_vec(),
+        snapshot.ref_generation.to_be_bytes().to_vec(),
+        actor.id.as_bytes().to_vec(),
+    ];
+    if let Some(pack) = &prepared.pack {
+        fields.push(b"pack".to_vec());
+        fields.push(pack.id.as_bytes().to_vec());
+    }
+    for change in &prepared.changes {
+        fields.push(change.ref_name.as_bytes().to_vec());
+        fields.push(change.old_oid.as_bytes().to_vec());
+        fields.push(change.new_oid.as_bytes().to_vec());
+    }
+    let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    RequestDigest::of("pando-pg-ref-cas-v1", &fields)
+}
+
+fn ref_store_error(error: RefStoreError) -> Error {
+    if matches!(&error, RefStoreError::Timeout) {
+        Error::timeout()
+    } else if matches!(&error, RefStoreError::Cancelled { .. } | RefStoreError::UnknownOperation { .. })
+        || error.is_conflict()
+    {
+        // A generic ref-store conflict is not a proven advertised-old CAS
+        // refusal: it stays an ordinary Error and is never reported as `ng`.
+        Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs")
+    } else {
+        Error::internal(error)
+    }
 }
 
 fn deletes_head(head_ref: &str, changes: &[RefChange]) -> bool {
     changes.iter().any(|change| change.ref_name == head_ref && change.new_oid.bytes().all(|byte| byte == b'0'))
+}
+
+/// Classify an observed advertised-old mismatch. Only an absolute deadline that
+/// has not passed and a publication guard that is still live (ref locks,
+/// maintenance lease and admission) prove the refusal happened before any
+/// commit; a concurrent timeout or lease failure during the `FOR UPDATE` queries
+/// wins and stays a generic [`PublishError::Failed`], never a typed `ng`.
+fn classify_ref_mismatch(deadline: Instant, liveness: Result<(), Error>, requested: &[RefChange]) -> PublishError {
+    if Instant::now() >= deadline {
+        Error::timeout().into()
+    } else if let Err(error) = liveness {
+        error.into()
+    } else {
+        PublishError::RefRejected(RefRejection::cas(requested))
+    }
 }
 
 /// Caller has completed native receive-pack in a disposable Snapshot and
@@ -38,6 +138,28 @@ pub async fn publish(
     guard: &PublicationGuard,
     deadline: Instant,
 ) -> Result<i64, Error> {
+    publish_typed(state, repo, actor, tenant_id, snapshot, prepared, requested, guard, deadline).await.map_err(
+        |error| match error {
+            PublishError::RefRejected(rejection) => Error(StatusCode::CONFLICT, rejection.reason),
+            PublishError::Failed(error) => error,
+        },
+    )
+}
+
+/// Same publication as [`publish`], but preserves the typed pre-commit CAS
+/// refusal for the in-crate Git gateway. The proof must never be served as a
+/// receive-pack report by a caller that cannot prove its pre-commit nature.
+pub(crate) async fn publish_typed(
+    state: &Arc<AppState>,
+    repo: &Repository,
+    actor: &Identity,
+    tenant_id: Uuid,
+    snapshot: &Snapshot,
+    prepared: &PreparedPush,
+    requested: &[RefChange],
+    guard: &PublicationGuard,
+    deadline: Instant,
+) -> Result<i64, PublishError> {
     if repo.storage_backend != "pando"
         || snapshot.storage_generation != repo.storage_generation
         || guard.repository_id() != repo.id
@@ -59,36 +181,55 @@ pub async fn publish(
     {
         return Err(conflict());
     }
-    if let Some(pack) = &prepared.pack {
-        if pack.repository_id != repo.id
+    if let Some(pack) = &prepared.pack
+        && (pack.repository_id != repo.id
             || pack.tenant_id != tenant_id
             || pack.storage_generation != repo.storage_generation
-            || pack.object_format != repo.object_format
-        {
-            return Err(conflict());
-        }
+            || pack.object_format != repo.object_format)
+    {
+        return Err(conflict());
     }
     guard.ensure_active()?;
     crate::sharding::fencing::check_before_push(state, repo).await?;
     let window = guard.enter_window(&state.storage, deadline).await?;
     window.ensure_active()?;
     crate::sharding::fencing::check_before_push(state, repo).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let mut client = timed_result(Phase::PoolCheckout, state.pool.get()).await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, actor, &repo.owner, &repo.name, auth::Role::Write).await?;
+    let access = auth::authorize_repo_with_role(
+        &tx,
+        actor,
+        &repo.owner,
+        &repo.name,
+        auth::Role::Write,
+        crate::token_scopes::RepoAction::ContentsWrite,
+    )
+    .await?;
     if access.repo_id != repo.id || access.owner_id != tenant_id {
         return Err(conflict());
     }
-    let current = tx
-        .query_one(
+    // Spans the whole client round trip of this statement: submission, PostgreSQL
+    // execution plus the `FOR UPDATE OF s` row-lock wait, and the row coming back.
+    // It is not a pure server-side lock wait and not the later work in this tx.
+    let current = timed_result(
+        Phase::StateRow,
+        tx.query_one(
             "SELECT r.storage_generation,r.storage_backend,r.object_format,r.transition_state,
         s.state,s.storage_generation AS pando_generation,s.ref_generation,s.operation_sequence,
         s.object_format AS pando_format,s.pack_ids,s.head_ref FROM repositories r JOIN pando_repository_states s
         ON s.repository_id=r.id WHERE r.id=$1 AND s.tenant_id=$2 FOR UPDATE OF s",
             &[&repo.id, &tenant_id],
-        )
-        .await
-        .map_err(Error::internal)?;
+        ),
+    )
+    .await
+    .map_err(Error::internal)?;
+    // The row lock may have waited until the absolute deadline passed, or have
+    // outlived the ref guard. Neither is a proven advertised-old refusal, so
+    // validate both before any later branch could classify one.
+    if Instant::now() >= deadline {
+        return Err(Error::timeout().into());
+    }
+    guard.ensure_active()?;
     if current.get::<_, i64>("storage_generation") != repo.storage_generation
         || current.get::<_, i64>("pando_generation") != repo.storage_generation
         || current.get::<_, &str>("storage_backend") != "pando"
@@ -106,11 +247,25 @@ pub async fn publish(
         return Err(conflict());
     }
     if deletes_head(&head_ref, &prepared.changes) {
-        return Err(Error(StatusCode::CONFLICT, "cannot delete the advertised HEAD ref; retarget HEAD first"));
+        return Err(Error(StatusCode::CONFLICT, "cannot delete the advertised HEAD ref; retarget HEAD first").into());
     }
     let mut pack_ids: Vec<Uuid> = current.get("pack_ids");
     let next_ref = ref_generation.checked_add(1).ok_or_else(conflict)?;
     let next_operation = operation_sequence.checked_add(1).ok_or_else(conflict)?;
+    // The server preallocates a stable identity before any ref mutation and
+    // persists its pending/terminal rows in this same PG transaction. Existing
+    // callers do not yet carry an operation id across retries, so this is NOT
+    // client-request idempotency: a retried client push is a new operation.
+    let operation_id = Uuid::new_v4();
+    let identity = OperationIdentity::new(
+        repo.id,
+        actor.id,
+        IssuerLane::new("pando-publish").map_err(Error::internal)?,
+        next_operation,
+        operation_id,
+        push_digest(repo, tenant_id, snapshot, prepared, actor),
+    )
+    .map_err(Error::internal)?;
     for change in &prepared.changes {
         let old = tx
             .query_opt(
@@ -122,12 +277,16 @@ pub async fn publish(
         let zero = "0".repeat(change.old_oid.len());
         let actual = old.as_ref().map(|row| row.get::<_, String>(0)).unwrap_or(zero);
         if actual != change.old_oid {
-            return Err(conflict());
+            // The exact advertised old OID is gone. Nothing in this transaction
+            // has been committed yet, so the caller may report a negotiated
+            // `ng` for every requested ref instead of an HTTP 409 -- but only
+            // while this request still owns a live deadline and guard.
+            return Err(classify_ref_mismatch(deadline, guard.ensure_active(), requested));
         }
     }
     let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
     if timeout.is_zero() {
-        return Err(Error::timeout());
+        return Err(Error::timeout().into());
     }
     guard
         .guard(Box::pin(policy::validate(
@@ -188,6 +347,11 @@ pub async fn publish(
             .await
             .map_err(Error::internal)?;
     }
+    let ref_store = PgRefStore;
+    let begun = ref_store.begin(&tx, &identity, deadline).await.map_err(ref_store_error)?;
+    if begun.record.state() != OperationState::Pending {
+        return Err(conflict());
+    }
     for change in &prepared.changes {
         if change.new_oid.bytes().all(|byte| byte == b'0') {
             tx.execute("DELETE FROM pando_refs WHERE repository_id=$1 AND ref_name=$2", &[&repo.id, &change.ref_name])
@@ -212,7 +376,7 @@ pub async fn publish(
     .await
     .map_err(Error::internal)?;
     let record = OperationRecord {
-        id: Uuid::new_v4(),
+        id: operation_id,
         repository_id: repo.id,
         actor_id: actor.id,
         token_id: actor.token_id,
@@ -239,7 +403,25 @@ pub async fn publish(
         })
         .collect();
     events::publish_in_tx(&tx, &record, &events).await.map_err(Error::internal)?;
+    let terminal = TerminalResult::json(serde_json::json!({
+        "state": "committed",
+        "ref_generation": next_ref,
+        "operation_sequence": next_operation,
+        "pack_id": prepared.pack.as_ref().map(|pack| pack.id),
+        "change_count": prepared.changes.len(),
+    }))
+    .map_err(Error::internal)?;
+    ref_store
+        .record_terminal(&tx, &identity, TerminalOutcome::Committed, &terminal, deadline)
+        .await
+        .map_err(ref_store_error)?;
     window.ensure_active()?;
+    // The registry/deadline error propagates above and drops the transaction.
+    // This absolute check prevents a late token scan/commit after the caller's
+    // publication deadline. A lost reply after PG commit remains unknown.
+    if Instant::now() >= deadline {
+        return Err(Error::timeout().into());
+    }
     auth::finish_tx(tx, actor, true).await?;
     state.dispatch.committed();
     window.ensure_active()?;
@@ -252,6 +434,36 @@ mod tests {
 
     fn change(name: &str, oid: char) -> RefChange {
         RefChange { old_oid: "a".repeat(40), new_oid: oid.to_string().repeat(40), ref_name: name.into() }
+    }
+
+    #[test]
+    fn only_an_explicit_ref_rejection_is_typed_known() {
+        let failed: PublishError = Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs").into();
+        assert!(matches!(failed, PublishError::Failed(_)));
+        let rejection = RefRejection::cas(&[change("refs/heads/main", 'b')]);
+        assert_eq!(rejection.refs, ["refs/heads/main"]);
+        assert_eq!(rejection.reason, REF_CHANGED);
+        let typed = PublishError::RefRejected(rejection);
+        assert!(matches!(typed, PublishError::RefRejected(proof) if proof.reason == REF_CHANGED));
+    }
+
+    #[test]
+    fn concurrent_timeout_or_lost_lease_keeps_the_error_generic() {
+        let requested = [change("refs/heads/main", 'b')];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Only a live admission can turn the mismatch into typed proof.
+        let live = classify_ref_mismatch(deadline, Ok(()), &requested);
+        assert!(matches!(live, PublishError::RefRejected(proof) if proof.refs == ["refs/heads/main"]));
+        // An expired deadline is a timeout, never a negotiated `ng`.
+        let expired = classify_ref_mismatch(Instant::now(), Ok(()), &requested);
+        assert!(matches!(expired, PublishError::Failed(error) if error.0 == StatusCode::GATEWAY_TIMEOUT));
+        // A guard/lease lost during the `FOR UPDATE` wait stays generic too.
+        let lost = classify_ref_mismatch(
+            deadline,
+            Err(Error(StatusCode::SERVICE_UNAVAILABLE, "ref publication guard unavailable")),
+            &requested,
+        );
+        assert!(matches!(lost, PublishError::Failed(error) if error.0 == StatusCode::SERVICE_UNAVAILABLE));
     }
 
     #[test]

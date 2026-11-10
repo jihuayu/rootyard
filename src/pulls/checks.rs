@@ -1,7 +1,7 @@
 //! HTTP handlers for commit-bound Check Runs with monotonic `(attempt, sequence)` enforcement.
 use crate::{
     AppState, Error, db, git_http,
-    auth::{self, authorize_repo as authorize, finish_tx as finish, idempotency_key},
+    auth::{self, finish_tx as finish, idempotency_key},
     pulls::models::{
         CHECK_FIELDS, CheckRun, CheckRunInput, Page, body_valid, context_valid, creation_replay,
         json, positive, record_creation, valid_check_status_and_conclusion, valid_format,
@@ -20,7 +20,10 @@ async fn authorized_read_lease(state:&AppState,actor:&db::Identity,owner:&str,na
     write:bool)->Result<(uuid::Uuid,crate::storage::read_leases::Lease),Error>{
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
-    let repo=authorize(&tx,actor,owner,name,write).await?;
+    let repo=auth::authorize_repo_with_role(
+        &tx, actor, owner, name, if write { auth::Role::Write } else { auth::Role::Read },
+        if write { crate::token_scopes::RepoAction::ChecksWrite } else { crate::token_scopes::RepoAction::ChecksRead },
+    ).await?.repo_id;
     finish(tx,actor,false).await?;
     drop(client);
     let lease=crate::storage::read_leases::shared(&state.pool,repo,
@@ -101,7 +104,7 @@ async fn upsert_check_inner(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     crate::webhooks::trust::lock_policy_tx(&tx,expected_repo).await?;
-    let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::ChecksWrite).await?.repo_id;
     same_repository(expected_repo,repo)?;
     lease.guard(require_repo_oid_format(&state,repo,&commit_oid)).await??;
     lease.ensure_active()?;
@@ -242,7 +245,7 @@ pub async fn list_commit_checks(
     let (expected_repo,lease)=authorized_read_lease(&state,&actor,&owner,&name,false).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ChecksRead).await?.repo_id;
     same_repository(expected_repo,repo)?;
     lease.guard(require_repo_oid_format(&state,repo,&oid)).await??;
     lease.ensure_active()?;
@@ -285,7 +288,7 @@ pub async fn list_pull_checks(
     let (expected_repo,lease)=authorized_read_lease(&state,&actor,&owner,&name,false).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ChecksRead).await?.repo_id;
     same_repository(expected_repo,repo)?;
     let head_oid: String = tx
         .query_opt(

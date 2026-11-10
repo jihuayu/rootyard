@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "compiled_commit": "3c0ad400de1b43825c45a5e5938f47860aaec3c2",
+  "native_backup_tested_commit": "73d66f5ab8ae4a6055bed8f311519beca1db3446",
+  "compiled_inputs_sha256": "e7d68a840b82d600f1b9fc294944c46cb3c97b70df57a52b8bfa36d89b6b069e",
+  "application_sha256": "c11acf141750ab40e87ddbe65aa8c8cdecc5d8c069332450905dbc058bb5ad76",
+  "pg": "17 passed; 0 failed; 0 ignored",
+  "library": "295 passed; 0 failed; 8 existing ignored",
+  "source_python": "286 run; 0 failures; 0 errors; 6 existing skips; 13 native/service/kernel modules excluded",
+  "schema": {
+    "version": 140,
+    "tables": 99,
+    "functions": 27,
+    "triggers": 48,
+    "migration_mode": "binary"
+  },
+  "populated_backup16": "7/7; all six new tables nonempty; typed API seed and restored replay",
+  "genuine_legacy15": "7/7; real schema139/format15 producer, explicit opt-in, upgrade to schema140",
+  "all_targets_clippy": true,
+  "fmt": true,
+  "complete_git_snapshot": false,
+  "physical_gc_protection": false,
+  "serving_cutover": false,
+  "full_remote_ci_pass": false,
+  "credential_scan_passed": true
+}

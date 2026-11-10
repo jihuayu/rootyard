@@ -1,0 +1,9 @@
+{
+  "binary_sha256": "00704a2890929624f73634a48cf978070d566583e4b031e72a1bd294e383f71f",
+  "real_capture_read_held": true,
+  "tokio_worker_threads": 1,
+  "health_responded_while_capture_read_held": true,
+  "health_probe_seconds": 0.0016,
+  "workspace_row_lock_obtainable_while_capture_read_held": true,
+  "scope": "Actual Rust capture scanner and PG row lock; an LD_PRELOAD shim holds only the fixture capture-gated.bin read for an explicit release, simulating a slow local read. Not a physical disk/production latency claim."
+}

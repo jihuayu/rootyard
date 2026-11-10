@@ -1,0 +1,28 @@
+{
+  "archive_contains_blob_closure": false,
+  "backup_executed": 2,
+  "backup_qualified": false,
+  "backup_remaining_unexecuted": 5,
+  "binary_sha256": "23c2979aa492abb790ff7b6e7eb2efb8e5f1353d02498b16a6267f87029a1f9f",
+  "browse_passed": 7,
+  "default_service_replaced": false,
+  "file_sha256": {
+    "backup-gap.json": "53227edf9a09b36883f1651044e2e178dd7ca7c75e2faa50fee99b1fc746fc9e",
+    "browse.json": "48cbd08c2b6cb2b4f8a2a1c72a1776bed59b944e9634f48020ea7151dc5e37e1",
+    "build.json": "234236257ef6065cb96ca654ed8a3c6570f006c4dac8bc0a570d01ace6f3fdb0",
+    "clippy.log": "3e77b2c0e5758d3f5c797e30df62514b12b64e88b871d52169e6285d4ff7b87e",
+    "history/browse-newline-failure.json": "497d9430011b46f309319b4aff06769099f402e8917cded34c7300ac2a92ca3e",
+    "history/smart-http-before-pointer-fix.json": "c03fd4ea7b9c518be92aa2b4ab83c86cdeff30269c394f4183cb454fed95440b",
+    "library-tests.log": "12edc950d0346c20b83e371ea81cdeb07f4ad9326bb1a2fc32bf66708661dbe0",
+    "smart-http.json": "eb12249f3ad042e4ccef030fedf4df489f01b7aace8ee9c2e0d5b90af3d7b7ee"
+  },
+  "fixture": "local PostgreSQL 17.11, Garage 2.1.0, stock Git 2.52.0",
+  "fixture_private_values_scan_passed": true,
+  "raft_qualified": false,
+  "rust_library_ignored": 9,
+  "rust_library_passed": 456,
+  "smart_http_passed": 11,
+  "source_head": "f1889aac45911e8a58b991c63373376f55af8939",
+  "source_inputs_sha256": "65c9da2bb9d0234cf3b7ac8ba119886ec4ba4235fcff44bc1298d42de6266511",
+  "strict_clippy_passed": true
+}

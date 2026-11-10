@@ -29,10 +29,9 @@ async fn local_streaming_and_digest_gate() {
 }
 
 #[tokio::test]
+#[ignore = "requires a dedicated real S3 fixture and explicit publish/recover phase"]
 async fn s3_streaming_cycle() {
-    if std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_none() {
-        return;
-    }
+    std::env::var("ROOTYARD_OBJECT_STORE_ENDPOINT").expect("dedicated S3 fixture endpoint required");
     let store = RemoteObjectStore::from_env(PathBuf::from("unused")).unwrap();
     let fixture = PathBuf::from(std::env::var("ROOTYARD_S3_TEST_FIXTURE").unwrap());
     let phase = std::env::var("ROOTYARD_S3_TEST_PHASE").unwrap();

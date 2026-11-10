@@ -1,0 +1,12 @@
+{
+  "status": "passed",
+  "candidate": "6ca9e7538c1c52c20ff41199e4d6b2c563b2ee44",
+  "seconds": 76,
+  "kind": "all-target Clippy",
+  "features": [
+    "pando-lab",
+    "blob-azblob"
+  ],
+  "warnings": "denied",
+  "limits": "Azure adapter compile coverage only, not real Azure provider qualification. Later backup-helper changes are fixture-only owner/table-name corrections, not production source changes."
+}

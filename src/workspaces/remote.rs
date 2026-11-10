@@ -52,8 +52,15 @@ pub(super) struct RemoteManifest {
 }
 
 pub(super) fn remote_store(state: &AppState) -> Result<RemoteObjectStore, Error> {
-    let store = RemoteObjectStore::from_env(state.storage.root.join("workspace-service/local-object-cache"))
-        .map_err(Error::internal)?;
+    store_at(&state.storage.root)
+}
+
+/// Object store built from the process environment and a storage root only.
+/// The independent FUSE helper uses this instead of an `AppState`, so the child
+/// never needs PostgreSQL or the service configuration.
+pub(super) fn store_at(root: &std::path::Path) -> Result<RemoteObjectStore, Error> {
+    let store =
+        RemoteObjectStore::from_env(root.join("workspace-service/local-object-cache")).map_err(Error::internal)?;
     if matches!(store, RemoteObjectStore::Local(_)) {
         return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "remote object store is not configured"));
     }
@@ -142,7 +149,9 @@ pub async fn publish(
     let digest: Option<String> = row.get(5);
     let size: Option<i64> = row.get(6);
     let tenant: Uuid = row.get(7);
-    let ws = service::authorized(&state, &headers, ws_id, Role::Write).await?;
+    let ws =
+        service::authorized(&state, &headers, ws_id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite)
+            .await?;
     if ws.repository_id != repo_id {
         return Err(Error::not_found());
     }

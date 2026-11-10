@@ -12,6 +12,7 @@ import threading
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from forge import ForgeHarness  # noqa: E402
 from pulls import PullsHarness  # noqa: E402
 from schema_baseline import SCHEMA_VERSION_CSV, SCHEMA_VERSIONS  # noqa: E402
 
@@ -149,6 +150,11 @@ class WebhooksHarness(PullsHarness):
         return json.loads(body)
 
     def setup(self):
+        # Every receiver in this harness is a test-owned loopback listener. The
+        # service default denies loopback webhook targets, so the harness opts in
+        # explicitly; ``webhook_loopback_default_deny_and_operator_opt_in`` starts
+        # a second, opted-out server to prove the default and the send-time check.
+        self.env["ROOTYARD_WEBHOOK_ALLOW_LOOPBACK"] = "true"
         super().setup()
         self.ensure_migration_040()
         self.webhookspath = "/api/repos/alice/forge/webhooks"
@@ -515,6 +521,265 @@ class WebhooksHarness(PullsHarness):
         assert retried["state"] == "delivered"
         assert retried["response_status"] == 200
 
+    def webhook_loopback_default_deny_and_operator_opt_in(self):
+        # A separate service process without ROOTYARD_WEBHOOK_ALLOW_LOOPBACK keeps
+        # the secure default. The opt-in is never taken from a request body.
+        deny = ForgeHarness(self.args)
+        deny.env.pop("ROOTYARD_WEBHOOK_ALLOW_LOOPBACK", None)
+        receiver = LocalWebhookReceiver("whsec_deny_loopback_secret_0123456789")
+        try:
+            deny.setup()
+            deny.document("/api/repos", 201, method="POST", body={"name": "deny"})
+            hooks_path = "/api/repos/alice/deny/webhooks"
+            for bad_url in (
+                receiver.url,
+                "http://localhost:%d/owned-internal" % receiver.port,
+                "http://[::1]:%d/owned-internal" % receiver.port,
+                "https://127.0.0.1/owned-internal",
+                "https://localhost/owned-internal",
+                "https://10.0.0.1/hook",
+                "https://192.168.1.10/hook",
+                "https://169.254.169.254/latest/meta-data/",
+                "https://[fe80::1]/hook",
+                "https://[fc00::1]/hook",
+            ):
+                deny.document(
+                    hooks_path,
+                    400,
+                    method="POST",
+                    body={"url": bad_url, "secret": "whsec_deny_loopback_secret_0123456789"},
+                )
+            # Non-loopback HTTPS targets stay accepted, and switching an existing
+            # hook to loopback is rejected by the update path as well.
+            https_hook = deny.document(
+                hooks_path,
+                201,
+                method="POST",
+                body={
+                    "url": "https://ci.example.com/hook",
+                    "secret": "whsec_deny_loopback_secret_0123456789",
+                },
+            )
+            deny.document(
+                hooks_path + "/" + https_hook["id"],
+                400,
+                method="PATCH",
+                body={"expected_version": https_hook["version"], "url": receiver.url},
+            )
+
+            # A row persisted while loopback was allowed must not deliver once the
+            # policy is the default: the send path re-validates the target.
+            legacy_id = deny.sql(
+                "WITH inserted AS (INSERT INTO forge_webhooks (id,tenant_id,repository_id,url,secret,secret_sha256) "
+                "SELECT gen_random_uuid(), r.owner_id, r.id, '"
+                + receiver.url
+                + "', 'whsec_deny_loopback_secret_0123456789', "
+                "'" + hashlib.sha256(b"whsec_deny_loopback_secret_0123456789").hexdigest() + "' "
+                "FROM repositories r JOIN namespaces n ON n.id=r.owner_id "
+                "WHERE n.slug='alice' AND r.name='deny' RETURNING id) SELECT id FROM inserted"
+            )
+            denial = deny.document(
+                hooks_path + "/" + legacy_id + "/ping",
+                200,
+                method="POST",
+                body={"event_id": "deny-ping-1", "deliver_now": True},
+            )
+            assert denial["state"] in ("failed", "dead_letter"), denial
+            assert "blocked" in (denial.get("last_error") or ""), denial
+            assert receiver.requests == [], receiver.requests
+        finally:
+            receiver.close()
+            deny.cleanup()
+
+        # The opted-in harness process still accepts and delivers to loopback.
+        assert self.hook["url"].startswith("http://127.0.0.1:")
+        self.receiver.clear()
+        ping = self.document(
+            self.hook_path + "/ping",
+            200,
+            method="POST",
+            body={"event_id": "opt-in-ping-1", "deliver_now": True},
+        )
+        assert ping["state"] == "delivered"
+        assert len(self.receiver.requests) == 1
+
+    def collaborator_team_and_organization_tenant_scope(self):
+        # The tenant column is the repository owner. A direct collaborator, a
+        # repository team member, an organization administrator and an
+        # organization team member all act on the owner's rows, while an
+        # unrelated tenant still receives 404.
+        owner_rows = self.document(self.webhookspath)["items"]
+        assert [h["id"] for h in owner_rows] == [self.hook["id"]]
+
+        carol = self.issue_token("carol", create_user=True)
+        self.document(
+            "/api/repos/alice/forge/collaborators/" + carol["username"],
+            (200, 201),
+            method="PUT",
+            body={"role": "admin"},
+        )
+        collab_rows = self.document(self.webhookspath, token=carol)["items"]
+        assert [h["id"] for h in collab_rows] == [self.hook["id"]], collab_rows
+        fetched = self.document(self.hook_path, token=carol)
+        assert fetched["id"] == self.hook["id"]
+        patched = self.document(
+            self.hook_path,
+            200,
+            token=carol,
+            method="PATCH",
+            body={"expected_version": fetched["version"], "max_attempts": 4},
+        )
+        assert patched["max_attempts"] == 4
+
+        # ping/retry/dispatch/deliveries under the collaborator identity.
+        self.receiver.clear()
+        ping = self.document(
+            self.hook_path + "/ping",
+            200,
+            token=carol,
+            method="POST",
+            body={"event_id": "collab-ping-1", "deliver_now": True},
+        )
+        assert ping["event_id"] == "collab-ping-1" and ping["state"] == "delivered"
+        deliveries = self.document(self.hook_path + "/deliveries", token=carol)["items"]
+        assert any(d["event_id"] == "collab-ping-1" for d in deliveries), deliveries
+        retried = self.document(
+            self.hook_path + "/deliveries/" + ping["id"] + "/retry",
+            200,
+            token=carol,
+            method="POST",
+            body={"deliver_now": False},
+        )
+        assert retried["state"] == "pending"
+        summary = self.document(
+            self.dispatchpath,
+            200,
+            token=carol,
+            method="POST",
+            body={"limit": 5, "sync_outbox": False, "sync_pulls": False},
+        )
+        assert summary["delivered_count"] >= 1, summary
+
+        # Creation and idempotent replay are scoped to the owner tenant as well.
+        collab_body = {
+            "url": self.receiver.url,
+            "secret": "whsec_carol_collaborator_secret_0123456789",
+        }
+        collab_hook = self.document(
+            self.webhookspath,
+            201,
+            token=carol,
+            method="POST",
+            body=collab_body,
+            extra_headers={"Idempotency-Key": "collab-create-1"},
+        )
+        replay = self.document(
+            self.webhookspath,
+            200,
+            token=carol,
+            method="POST",
+            body=collab_body,
+            extra_headers={"Idempotency-Key": "collab-create-1"},
+        )
+        assert replay["id"] == collab_hook["id"]
+        bound = self.sql(
+            "SELECT count(*) FROM forge_webhooks w JOIN repositories r "
+            "ON r.id=w.repository_id AND r.owner_id=w.tenant_id "
+            "WHERE w.id='%s'" % collab_hook["id"]
+        )
+        assert bound == "1", bound
+        self.document(
+            self.webhookspath + "/" + collab_hook["id"], 200, token=carol, method="DELETE"
+        )
+
+        # Repository team membership (write role) is enough to manage hooks.
+        dave = self.issue_token("dave", create_user=True)
+        self.document(
+            "/api/repos/alice/forge/teams",
+            201,
+            method="POST",
+            body={"slug": "ci", "name": "CI", "role": "write"},
+        )
+        self.document(
+            "/api/repos/alice/forge/teams/ci/members/" + dave["username"],
+            (200, 201),
+            method="PUT",
+        )
+        team_hook = self.document(
+            self.webhookspath,
+            201,
+            token=dave,
+            method="POST",
+            body={"url": self.receiver.url, "secret": "whsec_dave_team_secret_0123456789"},
+        )
+        team_rows = self.document(self.webhookspath, token=dave)["items"]
+        assert team_hook["id"] in [h["id"] for h in team_rows]
+        self.document(
+            self.webhookspath + "/" + team_hook["id"], 200, token=dave, method="DELETE"
+        )
+
+        # Organization administrator (alice created the organization) and an
+        # organization team member (bob holds write on the org team).
+        self.document(
+            "/api/orgs", 201, method="POST", body={"slug": "webhookorg"}
+        )
+        self.document(
+            "/api/repos",
+            201,
+            method="POST",
+            body={"name": "orgdemo", "owner": "webhookorg"},
+        )
+        org_hooks = "/api/repos/webhookorg/orgdemo/webhooks"
+        org_hook = self.document(
+            org_hooks,
+            201,
+            method="POST",
+            body={
+                "url": self.receiver.url,
+                "secret": "whsec_org_admin_secret_0123456789",
+                "events": ["ping"],
+            },
+        )
+        assert self.document(org_hooks)["items"][0]["id"] == org_hook["id"]
+        org_bound = self.sql(
+            "SELECT count(*) FROM forge_webhooks w JOIN repositories r "
+            "ON r.id=w.repository_id AND r.owner_id=w.tenant_id "
+            "WHERE w.id='%s'" % org_hook["id"]
+        )
+        assert org_bound == "1", org_bound
+        org_ping = self.document(
+            org_hooks + "/" + org_hook["id"] + "/ping",
+            200,
+            method="POST",
+            body={"event_id": "org-ping-1", "deliver_now": True},
+        )
+        assert org_ping["state"] == "delivered"
+
+        self.document(
+            "/api/orgs/webhookorg/members/bob", (200, 201), method="PUT",
+            body={"role": "read"},
+        )
+        self.document(
+            "/api/orgs/webhookorg/teams",
+            201,
+            method="POST",
+            body={"slug": "ci", "name": "CI", "role": "write"},
+        )
+        self.document("/api/orgs/webhookorg/teams/ci/members/bob", (200, 201), method="PUT")
+        bob_hook = self.document(
+            org_hooks,
+            201,
+            token=self.bob,
+            method="POST",
+            body={"url": self.receiver.url, "secret": "whsec_org_team_secret_0123456789"},
+        )
+        assert bob_hook["id"] in [h["id"] for h in self.document(org_hooks, token=self.bob)["items"]]
+        self.document(org_hooks + "/" + bob_hook["id"], 200, token=self.bob, method="DELETE")
+
+        # Different tenant: no role on alice/other or the organization repository.
+        self.document("/api/repos/alice/other/webhooks", 404, token=carol)
+        self.document(org_hooks, 404, token=carol)
+
     def access_and_boundaries(self):
         # Non-owner (bob) receives 404 Not Found; read-only token receives 403 Forbidden on mutations.
         self.document(self.webhookspath, 404, token=self.bob)
@@ -552,6 +817,8 @@ def main():
             "idempotent_ci_callbacks_and_monotonic_check_runs",
             "outbox_push_and_pull_request_event_dispatch",
             "exponential_backoff_retry_and_dead_letter",
+            "webhook_loopback_default_deny_and_operator_opt_in",
+            "collaborator_team_and_organization_tenant_scope",
             "access_and_boundaries",
         ):
             harness.case(name, getattr(harness, name))

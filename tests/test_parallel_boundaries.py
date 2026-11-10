@@ -42,6 +42,37 @@ class ParallelBoundariesTest(unittest.TestCase):
             sql_files,
         )
 
+    def test_current_backup_format_tracks_frozen_catalog(self):
+        # backup_ci_checkouts/backup_ci_pins/backup_forge must assert the frozen
+        # format, never the manifest the binary under test produced. A format
+        # bump that forgets this mirror turns those suites into bare asserts.
+        catalog_rs = (ROOT / 'src/backup/catalog.rs').read_text()
+        match = re.search(r'pub\(super\) const FORMAT:\s*u32\s*=\s*(\d+);', catalog_rs)
+        self.assertIsNotNone(match, 'backup FORMAT constant missing in src/backup/catalog.rs')
+        current = int(match.group(1))
+        self.assertEqual(
+            schema_baseline.CURRENT_BACKUP_FORMAT, current,
+            'tests/schema_baseline.py CURRENT_BACKUP_FORMAT must track src/backup/catalog.rs FORMAT')
+        arm = re.search(schema_baseline.backup_format_arm(current) + r' \[(.*?)\n\s*\],', catalog_rs, re.S)
+        self.assertIsNotNone(arm, f'catalog arm for current format {current} missing')
+        fixtures = set(re.findall(r'schema/([A-Za-z0-9_]+\.json)', arm.group(1)))
+        self.assertEqual(
+            fixtures,
+            {f'{schema_baseline.LATEST_PREFIX}_{name}.json'
+             for name in ('catalog', 'restored_catalog', 'upgraded_catalog')},
+            'current format must freeze the newest schema catalog fixtures')
+        self.assertRegex(
+            catalog_rs, schema_baseline.backup_format_arm(current) + r' Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)',
+            'current format must consume exactly the migrations embedded in this binary')
+        restore_rs = (ROOT / 'src/backup/restore.rs').read_text()
+        legacy_formats = {
+            int(format)
+            for format in re.findall(r'allow_legacy_schema\w* \|\| manifest\.format == (\d+)', restore_rs)
+        }
+        self.assertNotIn(
+            current, legacy_formats,
+            'the current format must stay rejected without a legacy schema opt-in')
+
     def test_backup_tables_match_schema_baseline(self):
         # The backup now consumes the frozen catalog directly. Native schema
         # and backup suites check it against PostgreSQL; this is a wiring guard.
@@ -97,11 +128,16 @@ class ParallelBoundariesTest(unittest.TestCase):
         for signature in (
             "pub fn idempotency_key(",
             "pub async fn authorize_repo_with_role(",
-            "pub async fn authorize_repo(",
+            "pub async fn authorize_repo_action_by_id(",
             "pub async fn verify_token(",
             "pub async fn finish_tx(",
         ):
             self.assertIn(signature, auth_rs)
+
+        # Repository authorization must carry the explicit PAT action; the
+        # former untyped convenience wrapper was removed by scope hardening.
+        self.assertNotIn("pub async fn authorize_repo(", auth_rs)
+        self.assertRegex(auth_rs, r"pub async fn authorize_repo_with_role\([^)]*action: crate::token_scopes::RepoAction")
 
         events_rs = (ROOT / "src/events.rs").read_text()
         dispatch_rs = (ROOT / "src/dispatch.rs").read_text()

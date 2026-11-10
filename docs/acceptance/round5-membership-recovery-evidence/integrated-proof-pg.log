@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (/workspace/rootyard/target/debug/deps/rootyard-c512e8eeea7428b7)
+
+running 4 tests
+test storage::recorded_receipt_proof::tests::recorded_proof_rejects_admitted_ref_or_epoch_drift ... ok
+test storage::recorded_receipt_proof::tests::recorded_proof_settles_recovering_revoked_token ... ok
+test storage::recorded_receipt_proof::tests::recorded_proof_rejects_operator_recovery_reason ... ok
+test storage::recorded_receipt_proof::tests::read_only_current_writer_still_needs_live_authority ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 1.38s
+

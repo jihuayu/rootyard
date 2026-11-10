@@ -1,0 +1,192 @@
+{
+  "passed": false,
+  "kind": "backup19",
+  "returncode": 1,
+  "command": [
+    "python3",
+    "/workspace/scratch/state-services-pack-snapshot/tests/backup_refstore_pack_snapshots143.py",
+    "--binary",
+    "/workspace/scratch/state-pack143-app-v1/rootyard",
+    "--report",
+    "/workspace/scratch/state-pack143-populated-backup19-v1/native.json",
+    "--pack-snapshot-fixture-binary",
+    "/workspace/scratch/state-pack143-backup-helper-build-v1/ref_store_pack_snapshots_backup_fixture"
+  ],
+  "seconds": 15.846,
+  "before": {
+    "source": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "binary": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "head": "e1d6c57bac8ac243b8b94927d6e765ab3db0a2d5",
+    "harness": {
+      "tests/backup_refstore_pack_snapshots143.py": "6cb1d5c63f3d543da64b377985ef392b1f604324d55f40c865f9187a91228a28",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "a61c4c63993365602741335f7173cda663a2eed2d54e7e46145f83167aa16661",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/ref_store_pack_snapshots_backup_fixture.rs": "583ad02898e4c48b587dd849f4ac55e231748fc5ac448236052e792f94b0ff61"
+    },
+    "fixture_binary": "7ce5dd67257a6a7b392156046d26b64f326c97bd4ba2ead2d63f32b538df4c7c"
+  },
+  "after": {
+    "source": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "binary": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "head": "e1d6c57bac8ac243b8b94927d6e765ab3db0a2d5",
+    "harness": {
+      "tests/backup_refstore_pack_snapshots143.py": "6cb1d5c63f3d543da64b377985ef392b1f604324d55f40c865f9187a91228a28",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "a61c4c63993365602741335f7173cda663a2eed2d54e7e46145f83167aa16661",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/ref_store_pack_snapshots_backup_fixture.rs": "583ad02898e4c48b587dd849f4ac55e231748fc5ac448236052e792f94b0ff61"
+    },
+    "fixture_binary": "7ce5dd67257a6a7b392156046d26b64f326c97bd4ba2ead2d63f32b538df4c7c"
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "8842c251b3d1f04f581288d14142fd1fe0b1d250a6e7c643f5a3481b95c8bdb0",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "source_inputs_sha256": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "workspace_commit": "e1d6c57bac8ac243b8b94927d6e765ab3db0a2d5",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-pack-snapshot#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-pack-snapshot#rootyard@0.1.0"
+      }
+    ]
+  },
+  "helper_build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "7ce5dd67257a6a7b392156046d26b64f326c97bd4ba2ead2d63f32b538df4c7c",
+    "workspace_commit": "f7898cb1742ee81b7dc73aa206454b11122ddfd6",
+    "fresh": false,
+    "source_inputs_sha256": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "binary_sha256": "7ce5dd67257a6a7b392156046d26b64f326c97bd4ba2ead2d63f32b538df4c7c",
+    "integration_test_source_sha256": "583ad02898e4c48b587dd849f4ac55e231748fc5ac448236052e792f94b0ff61",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_pack_snapshots_backup_fixture",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_pack_snapshots_backup_fixture",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_pack_snapshots_backup_fixture-8e37c0b5d3c13c38"
+      }
+    ]
+  },
+  "native": {
+    "passed": false,
+    "cases": [
+      {
+        "name": "synthetic_source_with_typed_native_pack_snapshot_ledger",
+        "status": "failed",
+        "seconds": 7.8219,
+        "error": "Command failed (101): Error: A2/A5 row cardinalities differ from the drill shape (one old A2 receipt plus six A5 receipts)\n"
+      }
+    ],
+    "skips": 0,
+    "binary": "/workspace/scratch/state-pack143-app-v1/rootyard",
+    "binary_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "backup_format": 19,
+    "schema_version": 143,
+    "pack_snapshot_fixture_helper": {
+      "binary": "/workspace/scratch/state-pack143-backup-helper-build-v1/ref_store_pack_snapshots_backup_fixture",
+      "binary_sha256": "7ce5dd67257a6a7b392156046d26b64f326c97bd4ba2ead2d63f32b538df4c7c",
+      "build_receipt": "/workspace/scratch/state-pack143-backup-helper-build-v1/ref_store_pack_snapshots_backup_fixture.build.json",
+      "build_receipt_sha256": "8898f543a3d718494dda4a21f162c9216a40631cddc4e993706c78c1a3d9b0a5",
+      "build_kind": "rust-integration-test",
+      "package_rebuilt": true,
+      "fresh": false,
+      "fresh_false_artifact": {
+        "target": "ref_store_pack_snapshots_backup_fixture",
+        "kind": "test",
+        "fresh": false
+      },
+      "test_profile": true,
+      "integration_test_source_sha256": "583ad02898e4c48b587dd849f4ac55e231748fc5ac448236052e792f94b0ff61",
+      "integration_test_source_matches_source_file": true,
+      "source_inputs_sha256": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+      "candidate_application_receipt": "/workspace/scratch/state-pack143-app-v1/rootyard.build.json",
+      "candidate_application_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+      "candidate_application_package_rebuilt": true,
+      "source_inputs_match_candidate_application": true
+    },
+    "limitations": [
+      "The typed A5/A4/A3 ledger is seeded by the real adapter and native PackVerifier; no SQL ACK, proof, receipt or registration is fabricated.",
+      "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+      "The random pack repository stays provisioning/gitfs/unserved for the whole drill.",
+      "The DB-clock-expired scenario uses a 1s lease and a bounded clock_timestamp() poll, created last; it is not a TTL unit test.",
+      "complete_git_read_snapshot() is false everywhere: this drill claims registered pack membership metadata only, never verified Blob bytes or native Git object closure.",
+      "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+      "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+      "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+    ]
+  },
+  "limits": [
+    "Loopback PostgreSQL/Garage/nativeGit metadata backup only; external original Blob bytes are not archived.",
+    "A5a complete registered-membership metadata/pins; no materialized Git ReadSnapshot or serving qualification.",
+    "Genuine format18 uses retained schema142 producer and old typed A4 helper seed-only, never seeds against143."
+  ]
+}

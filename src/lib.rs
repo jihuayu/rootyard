@@ -1,11 +1,18 @@
+#![recursion_limit = "256"]
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod blob_git_gateway;
+pub mod standalone;
 #[rustfmt::skip]
 pub mod auth;
+pub mod auth_admission;
 pub mod backup;
+pub mod baseline_metrics;
+pub mod blob_store;
 #[rustfmt::skip]
 pub mod browse;
+pub mod cache_wake;
 #[rustfmt::skip]
 pub mod ci_checkouts;
 #[rustfmt::skip]
@@ -18,16 +25,21 @@ pub mod events;
 pub mod forge;
 pub mod git_http;
 pub mod journal;
+#[cfg(feature = "kafka-wake")]
 pub mod kafka_wake;
 pub mod pando_gateway;
+pub mod ref_store;
 #[rustfmt::skip]
 pub mod lfs;
 pub mod maintenance;
 #[rustfmt::skip]
 pub mod members;
 pub mod metrics;
+pub mod metrics_workers;
 pub mod namespace_service;
+pub mod observability;
 pub mod organizations;
+pub mod pagination;
 #[rustfmt::skip]
 pub mod mirror;
 #[rustfmt::skip]
@@ -38,6 +50,9 @@ pub mod sandbox;
 pub mod sharding;
 pub mod storage;
 pub mod storage_lifecycle;
+pub mod token_management;
+#[rustfmt::skip]
+pub mod token_scopes;
 pub mod view_lab;
 pub mod workspace_lab;
 pub mod workspaces;
@@ -73,6 +88,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(webhooks::routes())
         .merge(members::routes())
         .merge(organizations::routes())
+        .merge(token_management::routes())
+        .merge(auth_admission::routes())
         .merge(web::routes(state.clone()))
         .merge(sharding::routes())
         .merge(workspaces::routes())
@@ -80,5 +97,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(namespace_service::routes())
         .fallback(|State(state): State<Arc<AppState>>, request| async move { git_http::handle(state, request).await })
         .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(axum::middleware::from_fn(observability::middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_admission::login_middleware))
         .with_state(state)
 }

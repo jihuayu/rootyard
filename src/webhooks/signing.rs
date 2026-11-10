@@ -4,13 +4,17 @@ use crate::{
     Error,
     auth::idempotency_key,
     pulls::models::{CHECK_FIELDS, CheckRun},
-    webhooks::models::{CiCallbackInput, permitted_peer, validate_webhook_url},
+    webhooks::{
+        models::{CiCallbackInput, validate_webhook_url_with_policy},
+        policy,
+    },
 };
 use axum::http::{HeaderMap, StatusCode};
 use deadpool_postgres::Transaction;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 pub const SIGNATURE_PREFIX: &str = "sha256=";
@@ -93,11 +97,7 @@ pub fn verify_signature_header(secret: &str, payload: &[u8], header_value: &str)
     };
 
     let mut candidate_mac = [0u8; 32];
-    let hex_ok = if hex_part.len() == 64
-        && hex_part
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    let hex_ok = if hex_part.len() == 64 && hex_part.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         hex::decode_to_slice(hex_part, &mut candidate_mac).is_ok()
     } else {
         false
@@ -135,10 +135,7 @@ pub fn resolve_callback_identity(
     output: &str,
 ) -> Result<(String, String), Error> {
     let header_key = idempotency_key(headers)?.map(str::to_owned);
-    let delivery_hdr = headers
-        .get(HEADER_DELIVERY)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    let delivery_hdr = headers.get(HEADER_DELIVERY).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let event_id = header_key
         .or_else(|| input.event_id.clone())
         .or(delivery_hdr)
@@ -173,6 +170,10 @@ pub fn resolve_callback_identity(
     Ok((event_id, req_sha256))
 }
 
+/// Resolver result future used by the transport. Tests inject an owned,
+/// deliberately delayed resolver; production always uses `lookup_host`.
+type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+
 /// Dispatches over a verified TLS-capable HTTP transport. DNS is resolved and checked
 /// before use, then pinned to prevent a second lookup from bypassing SSRF policy.
 pub async fn send_http11_webhook(
@@ -185,38 +186,110 @@ pub async fn send_http11_webhook(
     signature_256: &str,
     body_bytes: &[u8],
 ) -> Result<u16, String> {
-    let target =
-        validate_webhook_url(url).map_err(|_| "invalid or SSRF-blocked target URL".to_owned())?;
+    send_http11_webhook_with_resolver(
+        url,
+        timeout_ms,
+        event_type,
+        delivery_id,
+        hook_id,
+        attempt,
+        signature_256,
+        body_bytes,
+        // Egress policy is re-evaluated for every attempt, so a hook persisted
+        // while the loopback opt-in was active stops delivering as soon as it
+        // is withdrawn.
+        policy::loopback_targets_allowed(),
+        |host, port| {
+            Box::pin(async move {
+                let resolved = tokio::net::lookup_host((host.as_str(), port)).await?;
+                Ok(resolved.collect())
+            })
+        },
+    )
+    .await
+}
+
+/// Transport with an explicit loopback decision and resolver seam. Both are
+/// private to the crate: no request data can relax SSRF policy, and the public
+/// path always combines the operator policy with the system resolver.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_http11_webhook_with_resolver<F>(
+    url: &str,
+    timeout_ms: i64,
+    event_type: &str,
+    delivery_id: Uuid,
+    hook_id: Uuid,
+    attempt: i64,
+    signature_256: &str,
+    body_bytes: &[u8],
+    loopback_allowed: bool,
+    resolve: F,
+) -> Result<u16, String>
+where
+    F: FnOnce(String, u16) -> ResolveFuture,
+{
+    let target = validate_webhook_url_with_policy(url, loopback_allowed)
+        .map_err(|_| "invalid or SSRF-blocked target URL".to_owned())?;
     let timeout_dur = Duration::from_millis(timeout_ms.clamp(100, 30_000) as u64);
-    let addresses: Vec<SocketAddr> = tokio::time::timeout(timeout_dur,
-        tokio::net::lookup_host((target.host.as_str(), target.port)))
-        .await.map_err(|_| "webhook DNS timed out".to_owned())?
-        .map_err(|e| format!("webhook DNS error: {e}"))?.collect();
-    if addresses.is_empty() || addresses.iter().any(|a| !permitted_peer(target.is_loopback, a.ip())) {
+    // ONE absolute deadline for DNS, connect, TLS and the response. Giving the
+    // resolver and then the HTTP client separate full timeouts would let a hook
+    // with a 30 s timeout occupy about 60 s and break both the scan reserve and
+    // the claim-lease assumption.
+    let deadline = Instant::now() + timeout_dur;
+    let addresses: Vec<SocketAddr> = tokio::time::timeout_at(deadline, resolve(target.host.clone(), target.port))
+        .await
+        .map_err(|_| "webhook DNS timed out".to_owned())?
+        .map_err(|e| format!("webhook DNS error: {e}"))?;
+    // Every answer of a non-loopback name must be publicly routable; a mixed
+    // answer fails closed before any connection is attempted.
+    if addresses.is_empty()
+        || addresses.iter().any(|a| !policy::permitted_peer(target.is_loopback, a.ip(), loopback_allowed))
+    {
         return Err("webhook DNS resolved to a blocked address".to_owned());
     }
+    let remaining = remaining_transport_budget(deadline)?;
     let mut builder = reqwest::Client::builder()
-        .timeout(timeout_dur).connect_timeout(timeout_dur)
-        .redirect(reqwest::redirect::Policy::none()).no_proxy()
+        .timeout(remaining)
+        .connect_timeout(remaining)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .resolve(&target.host, addresses[0]);
     if let Ok(pem_path) = std::env::var("ROOTYARD_WEBHOOK_CA_FILE") {
         let pem = std::fs::read(pem_path).map_err(|_| "webhook CA file unreadable".to_owned())?;
-        let cert = reqwest::Certificate::from_pem(&pem)
-            .map_err(|_| "invalid webhook CA certificate".to_owned())?;
+        let cert = reqwest::Certificate::from_pem(&pem).map_err(|_| "invalid webhook CA certificate".to_owned())?;
         builder = builder.add_root_certificate(cert);
     }
     let client = builder.build().map_err(|e| format!("webhook client error: {e}"))?;
-    let response = client.post(url)
-        .header("User-Agent", "Rootyard-Hookshot/1.0")
-        .header("Content-Type", "application/json")
-        .header("X-Rootyard-Event", event_type)
-        .header("X-Rootyard-Delivery", delivery_id.to_string())
-        .header("X-Rootyard-Hook-Id", hook_id.to_string())
-        .header("X-Rootyard-Signature-256", signature_256)
-        .header("X-Rootyard-Attempt", attempt.to_string())
-        .body(body_bytes.to_vec()).send().await
-        .map_err(|e| format!("webhook transport error: {e:?}"))?;
+    let remaining = remaining_transport_budget(deadline)?;
+    let response = tokio::time::timeout_at(
+        deadline,
+        client
+            .post(url)
+            .header("User-Agent", "Rootyard-Hookshot/1.0")
+            .header("Content-Type", "application/json")
+            .header("X-Rootyard-Event", event_type)
+            .header("X-Rootyard-Delivery", delivery_id.to_string())
+            .header("X-Rootyard-Hook-Id", hook_id.to_string())
+            .header("X-Rootyard-Signature-256", signature_256)
+            .header("X-Rootyard-Attempt", attempt.to_string())
+            .timeout(remaining)
+            .body(body_bytes.to_vec())
+            .send(),
+    )
+    .await
+    .map_err(|_| "webhook transport timed out".to_owned())?
+    .map_err(|e| format!("webhook transport error: {e:?}"))?;
     Ok(response.status().as_u16())
+}
+
+/// Time left before the one end-to-end transport deadline. Exhaustion is a
+/// failed attempt, never a fresh full timeout per stage.
+fn remaining_transport_budget(deadline: Instant) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("webhook transport timed out".to_owned());
+    }
+    Ok(remaining)
 }
 
 /// Upserts a commit-bound `CheckRun` from a verified webhook callback with monotonic
@@ -272,13 +345,7 @@ pub async fn upsert_callback_check_run(
             let att = attempt_opt.unwrap_or(1);
             let seq = match sequence_opt {
                 Some(explicit_seq) => explicit_seq,
-                None if att == cur.attempt
-                    && cur.sequence == 1
-                    && cur.status == "queued"
-                    && status != "queued" =>
-                {
-                    2
-                }
+                None if att == cur.attempt && cur.sequence == 1 && cur.status == "queued" && status != "queued" => 2,
                 None if att == cur.attempt
                     && cur.status == status
                     && cur.conclusion.as_ref() == conclusion
@@ -310,86 +377,18 @@ pub async fn upsert_callback_check_run(
                     .map_err(Error::internal)?;
                 Ok(CheckRun::row(&updated))
             } else if (att, seq) == (cur.attempt, cur.sequence) {
-                if cur.status == status
-                    && cur.conclusion.as_ref() == conclusion
-                    && cur.output == output
-                {
+                if cur.status == status && cur.conclusion.as_ref() == conclusion && cur.output == output {
                     Ok(cur)
                 } else {
-                    Err(Error(
-                        StatusCode::CONFLICT,
-                        "conflicting check run state for same attempt and sequence",
-                    ))
+                    Err(Error(StatusCode::CONFLICT, "conflicting check run state for same attempt and sequence"))
                 }
             } else {
-                Err(Error(
-                    StatusCode::CONFLICT,
-                    "stale check run attempt or sequence",
-                ))
+                Err(Error(StatusCode::CONFLICT, "stale check run attempt or sequence"))
             }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rfc4231_hmac_sha256_test_vectors() {
-        let key1 = [0x0bu8; 20];
-        assert_eq!(
-            hex::encode(hmac_sha256_bytes(&key1, b"Hi There")),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
-        );
-        assert_eq!(
-            hmac_sha256_hex("Jefe", b"what do ya want for nothing?"),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-        let key3 = [0xaau8; 20];
-        let data3 = [0xddu8; 50];
-        assert_eq!(
-            hex::encode(hmac_sha256_bytes(&key3, &data3)),
-            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
-        );
-        let key6 = [0xaau8; 131];
-        let data6 = b"Test Using Larger Than Block-Size Key - Hash Key First";
-        assert_eq!(
-            hex::encode(hmac_sha256_bytes(&key6, data6)),
-            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
-        );
-        let data7 = b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.";
-        assert_eq!(
-            hex::encode(hmac_sha256_bytes(&key6, data7)),
-            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"
-        );
-    }
-
-    #[test]
-    fn signature_header_and_constant_time_verification() {
-        let secret = "whsec_rootyard_super_secret_key";
-        let payload = br#"{"event":"pull_request","action":"opened","pull_number":1}"#;
-        let sig = signature_header(secret, payload);
-        assert!(sig.starts_with("sha256="));
-        assert_eq!(sig.len(), 71);
-        assert!(verify_signature_header(secret, payload, &sig));
-        assert!(!verify_signature_header(secret, b"{}", &sig));
-        assert!(!verify_signature_header("wrong_secret_value", payload, &sig));
-        assert!(!verify_signature_header(secret, payload, &sig.to_uppercase()));
-        assert!(!verify_signature_header(secret, payload, &sig[7..]));
-        assert!(!verify_signature_header(secret, payload, "sha256=deadbeef"));
-    }
-
-    #[test]
-    fn delivery_headers_include_required_metadata() {
-        let d_id = Uuid::new_v4();
-        let h_id = Uuid::new_v4();
-        let sig = "sha256=b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
-        let hdrs = build_delivery_headers("push", d_id, h_id, 2, sig);
-        assert_eq!(hdrs["X-Rootyard-Event"], "push");
-        assert_eq!(hdrs["X-Rootyard-Delivery"], d_id.to_string());
-        assert_eq!(hdrs["X-Rootyard-Hook-Id"], h_id.to_string());
-        assert_eq!(hdrs["X-Rootyard-Signature-256"], sig);
-        assert_eq!(hdrs["X-Rootyard-Attempt"], "2");
-    }
-}
+#[path = "signing_tests.rs"]
+mod tests;

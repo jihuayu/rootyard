@@ -1,0 +1,69 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-artifact-holds)
+error: this function has too many arguments (8/7)
+   --> tests/ref_store_holds_backup_fixture.rs:328:1
+    |
+328 | / fn acquire_request(
+329 | |     scope: HoldScope,
+330 | |     operation: OperationIdentity,
+331 | |     request_id: Uuid,
+...   |
+336 | |     artifacts: Vec<ArtifactSpec>,
+337 | | ) -> Result<AcquireArtifactHoldsRequest> {
+    | |________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#too_many_arguments
+    = note: `-D clippy::too-many-arguments` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`
+
+error: this function has too many arguments (8/7)
+   --> tests/ref_store_holds_backup_fixture.rs:794:1
+    |
+794 | / fn request_from_manifest(
+795 | |     scope: &HoldScope,
+796 | |     fixture: &Fixture,
+797 | |     parent: &ParentFixture,
+...   |
+802 | |     entry: &Value,
+803 | | ) -> Result<AcquireArtifactHoldsRequest> {
+    | |________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#too_many_arguments
+
+error: useless use of `vec!`
+   --> tests/ref_store_holds_backup_fixture.rs:497:20
+    |
+497 |       let acquires = vec![
+    |  ____________________^
+498 | |         SeededAcquire {
+499 | |             label: "consumed",
+500 | |             request: first_request,
+...   |
+513 | |         },
+514 | |     ];
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_vec
+    = note: `-D clippy::useless-vec` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::useless_vec)]`
+help: you can use an array directly
+    |
+497 ~     let acquires = [SeededAcquire {
+498 +             label: "consumed",
+499 +             request: first_request,
+500 +             ack: first_ack,
+501 +             consumed: Some(first_receipts),
+502 +             grant_dropped: false,
+503 +             replay_after_drop: false,
+504 +         },
+505 +         SeededAcquire {
+506 +             label: "dropped-grant",
+507 +             request: second_request,
+508 +             ack: second_ack,
+509 +             consumed: None,
+510 +             grant_dropped: true,
+511 +             replay_after_drop: true,
+512 ~         }];
+    |
+
+error: could not compile `rootyard` (test "ref_store_holds_backup_fixture") due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...

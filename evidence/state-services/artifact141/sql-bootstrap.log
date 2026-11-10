@@ -1,0 +1,2 @@
+{"schema_version": "141", "migration_mode": "sql", "canonical": true, "roundtrip": true, "restored003_upgrade": true, "restored006_upgrade": true, "restored007_upgrade": true, "upgraded_roundtrip": true, "custom_search_path_bootstrap": true, "custom_migrate_idempotent": true, "tables": 105, "functions": 33, "triggers": 69}
+Actual SQL141 catalogs generated; Rust migrator qualification remains pending

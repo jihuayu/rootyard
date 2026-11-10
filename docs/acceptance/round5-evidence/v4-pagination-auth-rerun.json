@@ -1,0 +1,82 @@
+{
+  "issue": 70,
+  "binary": "/workspace/scratch/round5-implementation/priority-v4/rootyard",
+  "binary_sha256": "7fce5b30de48f66fe676d3c60bf2da0c33e9d3b11d9c30bcc0ecbcc5974306db",
+  "source_head": "ecc3b7c0b23cce2fe6c3d257f9fc991c499b1f47",
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 4.8347,
+      "detail": null
+    },
+    {
+      "name": "allocator_concurrency",
+      "status": "passed",
+      "seconds": 0.3748,
+      "detail": {
+        "deliveries": 60,
+        "page1": 50,
+        "page2": 10
+      }
+    },
+    {
+      "name": "cursor_pagination",
+      "status": "passed",
+      "seconds": 0.1648,
+      "detail": {
+        "tied_rows": 7,
+        "legacy_skipped_ties": true
+      }
+    },
+    {
+      "name": "barrier_commit",
+      "status": "passed",
+      "seconds": 0.0653,
+      "detail": {
+        "holder_sequence": 1,
+        "waiter_sequence": 2,
+        "other_sequence": 1
+      }
+    },
+    {
+      "name": "barrier_rollback",
+      "status": "passed",
+      "seconds": 0.0558,
+      "detail": {
+        "sequence_after_rollback": 1
+      }
+    },
+    {
+      "name": "idempotent_duplicate",
+      "status": "passed",
+      "seconds": 0.0778,
+      "detail": {
+        "same_id": "e62bd718-1588-4355-80f6-7fdb2021fca8",
+        "next_sequence": 2
+      }
+    },
+    {
+      "name": "delete_race",
+      "status": "passed",
+      "seconds": 0.0571,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "name": "explain_index",
+      "status": "passed",
+      "seconds": 0.0178,
+      "detail": {
+        "plan_mentions": "forge_webhook_deliveries_hook_seq_idx"
+      }
+    }
+  ],
+  "passed": true,
+  "limitations": [
+    "One host, one disposable PostgreSQL 17 and owned loopback receivers.",
+    "Sequence monotonicity covers retained per-hook history only; operator SQL prune or PITR rollback can reset cursors.",
+    "Concurrency uses bounded threads and real row locks; it is not a throughput benchmark."
+  ]
+}

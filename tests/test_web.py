@@ -19,6 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class WebTrack1ContractTest(unittest.TestCase):
+    def _composition_sources(self) -> dict[str, str]:
+        """Every Web-UI Rust file that takes part in composition."""
+        sources = {"src/web.rs": (ROOT / "src/web.rs").read_text(encoding="utf-8")}
+        for name in ("navigation", "repository_pages"):
+            path = ROOT / "src/web" / f"{name}.rs"
+            self.assertTrue(path.is_file(), f"missing Web UI composition module {path}")
+            sources[f"src/web/{name}.rs"] = path.read_text(encoding="utf-8")
+        return sources
+
     def test_web_module_layout_and_anti_monolith_bounds(self) -> None:
         web_rs = ROOT / "src/web.rs"
         self.assertTrue(web_rs.is_file(), "src/web.rs must be a regular file")
@@ -26,23 +35,60 @@ class WebTrack1ContractTest(unittest.TestCase):
             (ROOT / "src/web/mod.rs").exists(),
             "src/web/mod.rs must never exist (Rust 2024 module layout)",
         )
-        web_src = web_rs.read_text(encoding="utf-8")
+        composition = self._composition_sources()
+        web_src = composition["src/web.rs"]
         web_lines = web_src.splitlines()
         self.assertLess(
             len(web_lines),
             100,
             f"src/web.rs must remain < 100 lines, got {len(web_lines)}",
         )
-        self.assertIn("pub fn routes() -> Router<Arc<AppState>>", web_src)
+        # The root keeps the only state-carrying `routes` signature, and every
+        # composed page table is merged into it. The session middleware has to
+        # be attached in the root over the completed router, so no table can
+        # escape the cookie/Origin/CSRF layer.
+        self.assertIn("pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>>", web_src)
+        # The state-carrying signature is root-only: tables are editable over
+        # the same state and are merged by the root, but may not publish a
+        # second `routes(state)` entry point of their own.
+        for rel, text in composition.items():
+            if rel != "src/web.rs":
+                self.assertNotIn("pub fn routes(", text, f"{rel} must not publish its own router entry")
+        for table in ("navigation::routes()", "repository_pages::router()", "org_admin::routes()"):
+            self.assertIn(f".merge({table})", web_src, f"src/web.rs must merge {table}")
+        routes_body = re.search(
+            r"\bfn routes\(state: Arc<AppState>\) -> Router<Arc<AppState>> \{(.*?)\n\}",
+            web_src,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(routes_body, "src/web.rs must keep fn routes(state: Arc<AppState>)")
+        body_lines = [line.strip() for line in routes_body.group(1).splitlines() if line.strip()]
+        self.assertEqual(
+            body_lines[-1],
+            ".layer(axum::middleware::from_fn_with_state(state, session::middleware))",
+            "the session/Origin/CSRF middleware must be the last layer over the merged router",
+        )
+        merged = [table for table in ("navigation::routes()", "repository_pages::router()", "org_admin::routes()")
+                  if f".layer(" in "".join(body_lines)]
+        self.assertEqual(len(merged), 3, "src/web.rs must merge the page tables before the middleware layer")
+        self.assertEqual(
+            web_src.count("session::middleware)"), 1, "the session middleware is attached exactly once"
+        )
+        self.assertIn(".merge(web::routes(state.clone()))", (ROOT / "src/lib.rs").read_text())
 
-        for sql_kw in ("SELECT ", "INSERT ", "UPDATE ", "DELETE "):
-            self.assertNotIn(
-                sql_kw, web_src, f"src/web.rs must not embed inline SQL ({sql_kw})"
-            )
-        self.assertNotIn("Command::new", web_src)
-        self.assertNotIn("/:", web_src)
-        self.assertNotIn("/*", web_src)
-        self.assertNotIn("{*", web_src)
+        for rel, text in composition.items():
+            for sql_kw in ("SELECT ", "INSERT ", "UPDATE ", "DELETE "):
+                self.assertNotIn(sql_kw, text, f"{rel} must not embed inline SQL ({sql_kw})")
+            self.assertNotIn("Command::new", text, f"{rel} must not spawn subprocesses")
+            self.assertNotIn("/:", text, f"{rel} must not use Axum 0.7 route syntax")
+            self.assertFalse(re.search(r"(?<![\w:])\{/\*", text), f"{rel} must not register path wildcards")
+            self.assertNotIn("{*", text, f"{rel} must not register wildcard routes")
+            if rel != "src/web.rs":
+                self.assertNotIn(
+                    "from_fn_with_state",
+                    text,
+                    f"{rel} must not attach its own middleware; src/web.rs owns the single session layer",
+                )
 
         for sub in ("models", "sanitize", "templates", "handlers"):
             self.assertIn(f"pub mod {sub};", web_src)
@@ -63,24 +109,110 @@ class WebTrack1ContractTest(unittest.TestCase):
             self.assertNotIn(
                 ".route(",
                 sub_text,
-                f"src/web/{sub}.rs must not contain '.route(' (only src/web.rs registers routes)",
+                f"src/web/{sub}.rs must not contain '.route(' (only the Web composition modules register routes)",
             )
+        for sub in (
+            "session",
+            "org_admin",
+            "org_admin_actions",
+            "org_admin_views",
+            "tokens",
+            "repository_listing",
+            "navigation",
+            "repository_pages",
+        ):
+            self.assertIn(f"pub mod {sub};", web_src, f"src/web.rs must declare the {sub} module")
 
     def test_web_routes_have_zero_wildcards_zero_collisions_and_consistent_matchit_params(
         self,
     ) -> None:
-        web_rs = ROOT / "src/web.rs"
-        web_src = web_rs.read_text(encoding="utf-8")
-        regs = t5._extract_route_registrations(web_rs)
-        self.assertEqual(len(regs), 38, f"Expected 38 route registrations (19 /web + 19 /ui), got {len(regs)}")
-
-        # Verify e2e_tiers route_block_re matches every route in src/web.rs
-        route_block_re = re.compile(
-            r'\.route\(\s*"([^"]+)"\s*,([^;]+?)\)\s*(?=\.route\(|\.layer\(|\.with_state\(|;|\n\})',
-            re.DOTALL,
+        composition = self._composition_sources()
+        self.assertEqual(
+            t5._extract_route_registrations(ROOT / "src/web.rs"), [],
+            "src/web.rs must stay a pure composition root",
         )
-        block_matches = route_block_re.findall(web_src)
-        self.assertEqual(len(block_matches), len(regs))
+        navigation = t5._extract_route_registrations(ROOT / "src/web/navigation.rs")
+        repository_pages = t5._expand_page_table(
+            "src/web/repository_pages.rs", ("/web", "/ui"),
+        )
+        organization = t5._expand_page_table("src/web/org_admin.rs", ())
+        regs = [*navigation, *repository_pages, *organization]
+        # Route audits read the literal `.route(&page("…"), …)` rows, so the
+        # 19 rows must stay literal and be mounted under both prefixes.
+        route_row_re = re.compile(r'\.route\(\s*&page\("([^"]*)"\)', re.DOTALL)
+        page_rows = route_row_re.findall(composition["src/web/repository_pages.rs"])
+        self.assertEqual(len(page_rows), 19, f"repository page rows changed: {page_rows}")
+        self.assertEqual(len(set(page_rows)), 19, "repository page tails must be unique")
+        self.assertEqual(len(navigation), len(t5._extract_route_registrations(ROOT / "src/web/navigation.rs")))
+        self.assertEqual(len(repository_pages), 2 * len(page_rows), "19 pages per /web and /ui prefix")
+        self.assertEqual(len(regs), 2 * 19 + 9 + 9, f"Web UI route count changed: got {len(regs)}")
+        repository_paths = {path for path, _ in [*repository_pages]}
+        organization_paths = {path for path, _ in organization}
+        session_routes = {
+            path: set(methods)
+            for path, methods in regs
+            if path not in repository_paths and path not in organization_paths
+        }
+        self.assertEqual(session_routes, {
+            "/web/login": {"GET", "POST"},
+            "/web/app.js": {"GET"},
+            "/web/logout": {"POST"},
+            "/web/repos": {"GET"},
+            # PAT token/session management UI added after the first 42 routes.
+            "/web/settings/tokens": {"GET", "POST"},
+            "/web/settings/tokens/{id}/rotate": {"POST"},
+            "/web/settings/tokens/{id}/revoke": {"POST"},
+            "/web/settings/tokens/{id}/scope": {"POST"},
+            "/web/settings/sessions": {"GET"},
+            "/web/settings/sessions/{id}/revoke": {"POST"},
+        })
+        repository_pairs = []
+        for prefix in ("/web", "/ui"):
+            mount = prefix + "/repos/{owner}/{name}"
+            routes = {path.removeprefix(mount): set(methods) for path, methods in regs
+                      if path.startswith(mount + "/") or path == mount}
+            self.assertEqual(len(routes), 19, f"{prefix} repository pages changed: {sorted(routes)}")
+            repository_pairs.append(routes)
+        self.assertEqual(*repository_pairs, "Web/UI repository routes and methods must agree")
+        base = ""  # page tails; the /web and /ui prefixes were compared above
+        expected_repository_routes = {
+            base: {"GET"},
+            base + "/tree": {"GET"}, base + "/tree/{oid}": {"GET"},
+            base + "/blob": {"GET"}, base + "/blob/{oid}": {"GET"},
+            base + "/commits": {"GET"}, base + "/commits/{oid}": {"GET"},
+            base + "/commits/{oid}/checks": {"GET"}, base + "/compare": {"GET"},
+            base + "/issues": {"GET", "POST"},
+            base + "/issues/{number}": {"GET", "POST", "PATCH"},
+            base + "/issues/{number}/comments": {"POST"},
+            base + "/pulls": {"GET", "POST"},
+            base + "/pulls/{number}": {"GET", "POST", "PATCH"},
+            base + "/pulls/{number}/diff": {"GET"},
+            base + "/pulls/{number}/reviews": {"GET", "POST"},
+            base + "/pulls/{number}/checks": {"GET"},
+            base + "/pulls/{number}/merge": {"POST"}, base + "/audit": {"GET"},
+        }
+        self.assertEqual(repository_pairs[0], expected_repository_routes)
+
+        # The two prefixes are produced by one shared page table, not two
+        # hand-maintained lists that can drift.
+        pages_src = composition["src/web/repository_pages.rs"]
+        self.assertIn('pages("/web")', pages_src)
+        self.assertIn('pages("/ui")', pages_src)
+        self.assertEqual(pages_src.count('format!("{prefix}/repos/'), 1, "repository pages must use one prefix table")
+
+        # The organization administration pages stay owned by org_admin and are
+        # merged into the same layer-protected router.
+        self.assertEqual(len(organization), 8, f"organization pages changed: {sorted(organization_paths)}")
+        self.assertTrue(all(path.startswith("/web/organizations") for path in organization_paths))
+        self.assertIn(".merge(org_admin::routes())", composition["src/web.rs"])
+        # Match precedence: the shared page tables must be merged before
+        # org_admin so no literal page path (e.g. /web/repos) is captured by an
+        # organization parameter route.
+        self.assertLess(
+            composition["src/web.rs"].index(".merge(repository_pages::router())"),
+            composition["src/web.rs"].index(".merge(org_admin::routes())"),
+        )
+        self.assertIn("pub fn routes() -> Router<Arc<AppState>>", composition["src/web.rs"] + (ROOT / "src/web/org_admin.rs").read_text())
 
         # Check non-collision against all existing primary routers
         seen_bindings: dict[tuple[str, str], tuple[str, str]] = {}
@@ -88,39 +220,19 @@ class WebTrack1ContractTest(unittest.TestCase):
         param_by_prefix: dict[tuple[str, ...], tuple[str, str, str]] = {}
 
         for rel in all_router_files:
-            for raw_path, methods in t5._extract_route_registrations(ROOT / rel):
-                self.assertTrue(raw_path.startswith("/"))
-                self.assertNotIn("/:", raw_path)
-                self.assertNotIn("/*", raw_path)
-                if rel == "src/web.rs":
-                    self.assertNotIn("{*", raw_path)
-                norm = t5._normalize_route_pattern(raw_path)
-                for method in methods:
-                    key = (norm, method)
-                    self.assertNotIn(
-                        key,
-                        seen_bindings,
-                        f"Route collision on {key}: {rel} ({raw_path}) vs {seen_bindings.get(key)}",
+            if rel == "src/web.rs":
+                files = (
+                    ("src/web/navigation.rs", t5._extract_route_registrations(ROOT / "src/web/navigation.rs")),
+                    ("src/web/repository_pages.rs", t5._expand_page_table("src/web/repository_pages.rs", ("/web", "/ui"))),
+                    ("src/web/org_admin.rs", t5._expand_page_table("src/web/org_admin.rs", ())),
+                )
+            else:
+                files = ((rel, t5._extract_route_registrations(ROOT / rel)),)
+            for rel_name, registrations in files:
+                for raw_path, methods in registrations:
+                    self._check_route_collision(
+                        rel_name, raw_path, methods, seen_bindings, param_by_prefix
                     )
-                    seen_bindings[key] = (rel, raw_path)
-
-                segments = [s for s in raw_path.strip("/").split("/") if s]
-                norm_prefix: list[str] = []
-                for seg in segments:
-                    if seg.startswith("{") and seg.endswith("}"):
-                        pkey = tuple(norm_prefix)
-                        if pkey in param_by_prefix:
-                            prev_seg, prev_file, prev_path = param_by_prefix[pkey]
-                            self.assertEqual(
-                                seg,
-                                prev_seg,
-                                f"Matchit param conflict at /{ '/'.join(norm_prefix) }: {seg} in {rel} vs {prev_seg} in {prev_file} ({prev_path})",
-                            )
-                        else:
-                            param_by_prefix[pkey] = (seg, rel, raw_path)
-                        norm_prefix.append("{*}" if seg.startswith("{*") else "{}")
-                    else:
-                        norm_prefix.append(seg)
 
         for prefix_root in ("web", "ui"):
             self.assertEqual(param_by_prefix[(prefix_root, "repos")][0], "{owner}")
@@ -130,6 +242,56 @@ class WebTrack1ContractTest(unittest.TestCase):
             self.assertEqual(param_by_prefix[(prefix_root, "repos", "{}", "{}", "commits")][0], "{oid}")
             self.assertEqual(param_by_prefix[(prefix_root, "repos", "{}", "{}", "issues")][0], "{number}")
             self.assertEqual(param_by_prefix[(prefix_root, "repos", "{}", "{}", "pulls")][0], "{number}")
+        self.assertEqual(param_by_prefix[("web", "settings", "tokens")][0], "{id}")
+        self.assertNotIn(("ui", "organizations"), param_by_prefix, "/ui must not expose organization administration")
+
+    def _check_route_collision(self, rel, raw_path, methods, seen_bindings, param_by_prefix) -> None:
+        self.assertTrue(raw_path.startswith("/"))
+        self.assertNotIn("/:", raw_path)
+        self.assertNotIn("/*", raw_path)
+        if rel.startswith("src/web/"):
+            self.assertNotIn("{*", raw_path)
+        norm = t5._normalize_route_pattern(raw_path)
+        for method in methods:
+            key = (norm, method)
+            self.assertNotIn(
+                key,
+                seen_bindings,
+                f"Route collision on {key}: {rel} ({raw_path}) vs {seen_bindings.get(key)}",
+            )
+            seen_bindings[key] = (rel, raw_path)
+
+        segments = [s for s in raw_path.strip("/").split("/") if s]
+        norm_prefix: list[str] = []
+        for seg in segments:
+            if seg.startswith("{") and seg.endswith("}"):
+                pkey = tuple(norm_prefix)
+                if pkey in param_by_prefix:
+                    prev_seg, prev_file, prev_path = param_by_prefix[pkey]
+                    self.assertEqual(
+                        seg,
+                        prev_seg,
+                        f"Matchit param conflict at /{ '/'.join(norm_prefix) }: {seg} in {rel} vs {prev_seg} in {prev_file} ({prev_path})",
+                    )
+                else:
+                    param_by_prefix[pkey] = (seg, rel, raw_path)
+                norm_prefix.append("{*}" if seg.startswith("{*") else "{}")
+            else:
+                norm_prefix.append(seg)
+
+    def test_token_publication_lock_comment_matches_integrated_code(self) -> None:
+        # The module must not describe the parent-token publication lock as
+        # living on another branch: it is part of this tree.
+        root_doc = (ROOT / "src/token_management/mod.rs").read_text(encoding="utf-8")
+        module_doc = "\n".join(
+            line for line in root_doc.splitlines() if line.startswith("//!")
+        )
+        for stale in ("separate branch", "private implementation branch", "another branch", "other branch"):
+            self.assertNotIn(stale, module_doc, f"stale token_management release claim: {stale}")
+        self.assertIn("parent-token publication lock", module_doc)
+        self.assertIn("storage::ref_publication", module_doc)
+        publication = (ROOT / "src/storage/ref_publication.rs").read_text(encoding="utf-8")
+        self.assertIn("FOR SHARE", publication, "the parent-token publication lock must stay in the tree")
 
     def test_rust_source_invariants_serde_auth_rbac_and_security_headers(self) -> None:
         models_src = (ROOT / "src/web/models.rs").read_text(encoding="utf-8")
@@ -155,6 +317,21 @@ class WebTrack1ContractTest(unittest.TestCase):
             '"no-store"',
         ):
             self.assertIn(tok, templates_src, f"Missing {tok} in src/web/templates.rs")
+
+        session_src = (ROOT / "src/web/session.rs").read_text(encoding="utf-8")
+        # Cookie/header normalisation and browser authentication live in the
+        # session domain; handlers must keep the compatibility re-export for
+        # every caller that imports them from `web::handlers`.
+        self.assertIn(
+            "pub fn normalize_web_headers(headers: &HeaderMap) -> HeaderMap",
+            session_src,
+        )
+        self.assertIn("pub async fn authenticate_web(", session_src)
+        self.assertIn("auth::authenticate(pool, &normalize_web_headers(headers))", session_src)
+        self.assertIn(
+            "pub use super::session::{authenticate_web, normalize_web_headers};",
+            handlers_src,
+        )
 
         for h_tok in (
             "auth::authenticate",

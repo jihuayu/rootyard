@@ -1,0 +1,108 @@
+//! Isolated PostgreSQL metadata core for prioritized #107 work.
+//!
+//! This component owns one explicit gate and the current refs of a repository
+//! that has no live legacy Pando authority and is still explicitly unserved.
+//! It is deliberately internal and currently unwired: no HTTP route, runtime
+//! profile, serving cutover, pack or blob IO, root, hold, decision or GC
+//! consumer is added here. Legacy Pando/GitFS call sites and long read
+//! leases are unchanged. A repository with a core gate is **not** serve-ready;
+//! activation needs a later, explicit cutover API.
+//!
+//! A2 adds a **metadata-only** snapshot/pin contract: immutable refs/HEAD rows
+//! captured with the exact gate revision/digest, a durable metadata pin,
+//! bounded keyset pages, generation-CAS renewal/release and a bounded
+//! successful-mutation receipt ledger with retained repo/tenant admission
+//! usage. It is not a Git `ReadSnapshot`: pack membership is typed
+//! `Unavailable`, and a metadata pin is not protective of Git objects.
+//!
+//! [`serving_scope`] is the single strict repository-authority predicate shared
+//! by every fresh core mutation, read/pin, root/decision and pack-proof path. It
+//! admits exactly two lanes: the existing isolated unserved
+//! `provisioning`/`gitfs` fixture repository, and the durable migration-145
+//! `pg_refstore` serving authority (ready repository + ready serving binding
+//! whose realm equals the locked gate realm and whose Blob backend digest equals
+//! the live store). A plain ready `gitfs`/Pando repository is always refused.
+//!
+//! Layout: [`contract`] owns the gate/version proof, [`command`] the exact CAS
+//! command and its canonical digest, [`types`] the ref vocabulary,
+//! [`terminal`] the immutable terminal shapes and [`sql`]/[`pg`] the owned
+//! short-transaction adapter over the migration-138 registry. A2 adds
+//! [`snapshot_contract`]/[`snapshot_receipt`] (pure contract),
+//! `snapshot_request` (bounded requests and digests), `pin` (pin/snapshot state
+//! machine and receipt codec), `snapshot_sql`/`snapshot_usage` (SQL-only
+//! helpers) and `snapshot_pg`/`pin_pg` (owned short transactions over migration
+//! 140).
+pub mod artifact_hold;
+pub mod authorized_metadata;
+pub use authorized_metadata::{MetadataDecisionPreparation, PgAuthorizedMetadata, PreparedMetadataPublication};
+pub mod command;
+pub mod contract;
+/// Migration-144 per-repository protocol realm + irreversible
+/// decision-required fence (common integration state).
+pub mod decision_commit;
+mod metadata_subset;
+/// A4a durable pack registration + verified commit foundation (unserved).
+pub mod pack_commit;
+/// A5a complete registered-pack-membership snapshot + durable pin (unserved).
+pub mod pack_snapshot;
+pub mod pg;
+/// Publication decisions: live PG authorization/policy, single-use decision
+/// capabilities and the cancel-before-install tombstone (crate-private surface).
+pub(crate) mod publication_decision;
+/// Durable, non-expiring retention **roots** over one existing pack-verified
+/// snapshot (library only, unserved).
+pub mod retention_root;
+/// Migration-145 `pg_refstore` serving scope: the one strict, shared
+/// repository-authority predicate used by every core path.
+pub(crate) mod serving_scope;
+pub mod sql;
+/// Verified accepted-subset selection vocabulary and the private derived
+/// projection of an original whole-batch plan.
+pub mod subset;
+pub mod terminal;
+pub mod types;
+
+mod pin;
+mod pin_pg;
+mod snapshot_pg;
+mod snapshot_request;
+mod snapshot_sql;
+mod snapshot_usage;
+
+pub mod snapshot_contract;
+pub mod snapshot_receipt;
+
+pub use command::CommitRefsRequest;
+pub use contract::{CommitMode, CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
+pub use decision_commit::{DecisionFence, PgDecisionProtocol, ProtocolRepoRealm, RealmExpectation};
+pub use pack_snapshot::{
+    CreatePackSnapshotRequest, MaterializedPackRead, PackPinReceipt, PackReadSnapshot, PackSnapshotExpectation,
+    PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceipt, PackSnapshotReceiptQuery, PackSnapshotRef,
+    PgPackSnapshot, PgPackSnapshotMaterializer,
+};
+pub use pg::PgRefStoreCore;
+pub use retention_root::{
+    PgRetentionRoots, PrepareRootRequest, RegisterRootRequest, ReleaseRootRequest, RootCandidate, RootError,
+    RootPurpose, RootReadAuthority, RootReadRequest, RootReadView, RootReceipt, RootReceiptQuery, RootRecord, RootRef,
+    RootSelector, RootSelectorKind, RootsScope,
+};
+pub use snapshot_contract::{
+    MAX_PIN_LEASE_SECONDS, MAX_RECEIPT_BODY_BYTES, MAX_SNAPSHOT_LOGICAL_BYTES, MAX_SNAPSHOT_PACKS, MAX_SNAPSHOT_PAGE,
+    MAX_SNAPSHOT_REFS, MetadataSnapshotCursor, MetadataSnapshotScope, PackMembershipDescriptor, REPO_MAX_LOGICAL_BYTES,
+    REPO_MAX_RECEIPTS, REPO_MAX_SNAPSHOT_REFS, REPO_MAX_SNAPSHOTS, RefPrefix, TENANT_MAX_LOGICAL_BYTES,
+    TENANT_MAX_RECEIPTS, TENANT_MAX_SNAPSHOT_REFS, TENANT_MAX_SNAPSHOTS,
+};
+pub use snapshot_receipt::{
+    CreateMetadataSnapshotOutcome, MetadataPinOutcome, MetadataPinReceipt, MetadataReceipt, MetadataReceiptLookup,
+    MetadataSnapshotPage, MetadataSnapshotReceipt, MetadataSnapshotRef,
+};
+pub use snapshot_request::{
+    CreateMetadataSnapshotRequest, PinReleaseReason, ReadMetadataSnapshotPageRequest, ReleaseMetadataPinRequest,
+    RenewMetadataPinRequest,
+};
+pub use terminal::{
+    CommitRefsReceipt, CommitRejectCode, CommitRejection, CommitTerminal, RefCommitResult, TerminalKind,
+};
+pub use types::{
+    GitObjectFormat, GitOid, HeadUpdate, MAX_REFS_PER_COMMIT, RefName, RefPrecondition, RefTarget, RefUpdate,
+};

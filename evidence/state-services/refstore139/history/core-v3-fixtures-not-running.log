@@ -1,0 +1,118 @@
+
+running 12 tests
+test atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked ... FAILED
+test bootstrap_requires_unserved_provisioning_repository ... FAILED
+test cancel_before_register_prevents_ref_changes ... FAILED
+test check_version_is_unknown_before_initialization ... FAILED
+test commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once ... FAILED
+test commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate ... FAILED
+test core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish_them ... FAILED
+test head_retarget_and_deletion_policy_is_atomic ... FAILED
+test oversized_aggregate_terminal_is_rejected_before_any_write ... FAILED
+test queued_begin_deadline_leaves_no_open_transaction_or_partial_gate ... FAILED
+test repository_authority_change_rejects_new_mutations_but_replays_old_terminal ... FAILED
+test two_connections_same_old_oid_have_one_committer_and_one_terminal_rejection ... FAILED
+
+failures:
+
+---- atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- bootstrap_requires_unserved_provisioning_repository stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- cancel_before_register_prevents_ref_changes stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- check_version_is_unknown_before_initialization stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish_them stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- head_retarget_and_deletion_policy_is_atomic stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- oversized_aggregate_terminal_is_rejected_before_any_write stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- queued_begin_deadline_leaves_no_open_transaction_or_partial_gate stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- repository_authority_change_rejects_new_mutations_but_replays_old_terminal stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+---- two_connections_same_old_oid_have_one_committer_and_one_terminal_rejection stdout ----
+Error: Error occurred while creating a new object: error connecting to server
+
+Caused by:
+    0: error connecting to server
+    1: Connection refused (os error 111)
+
+
+failures:
+    atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked
+    bootstrap_requires_unserved_provisioning_repository
+    cancel_before_register_prevents_ref_changes
+    check_version_is_unknown_before_initialization
+    commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once
+    commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate
+    core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish_them
+    head_retarget_and_deletion_policy_is_atomic
+    oversized_aggregate_terminal_is_rejected_before_any_write
+    queued_begin_deadline_leaves_no_open_transaction_or_partial_gate
+    repository_authority_change_rejects_new_mutations_but_replays_old_terminal
+    two_connections_same_old_oid_have_one_committer_and_one_terminal_rejection
+
+test result: FAILED. 0 passed; 12 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

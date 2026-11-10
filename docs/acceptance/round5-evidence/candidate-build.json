@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "binary_sha256": "9fb0ebea0f06d5e6de890acb2f5c2484b6f33324325a7e4fadb64c5859deb335",
+  "source_inputs_sha256": "6accb83872f66157f06a376add8128f4a261a931a1bf5b4607585780e7e69c05",
+  "workspace_commit": "8054fea1c77465fc466eaaf6866fcf58e803283f",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--bin",
+    "rootyard",
+    "--features",
+    "pando-lab"
+  ]
+}

@@ -1,0 +1,1 @@
+{"schema_version": "144", "migration_mode": "binary", "canonical": true, "roundtrip": true, "restored003_upgrade": true, "restored006_upgrade": true, "restored007_upgrade": true, "upgraded_roundtrip": true, "custom_search_path_bootstrap": true, "custom_migrate_idempotent": true, "tables": 132, "functions": 50, "triggers": 119}
