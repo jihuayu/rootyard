@@ -36,7 +36,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
 use reqwest::StatusCode;
 use rootyard::members::models::Role;
 use rootyard::{AppState, config, dispatch, metrics, router, storage};
@@ -218,11 +217,11 @@ fn transport(error: &reqwest::Error) -> anyhow::Error {
     }
 }
 
-/// `Basic` credentials carrying only the `ryt_` token as password, the form the
-/// production `auth::credentials` accepts.
+/// `Bearer` credentials carrying only the `ryt_` token, the form production
+/// `auth::credentials_for` parses to `(None, token)`; `auth::authenticate` then
+/// resolves the token's own user, so no Basic username is compared.
 fn authorization(token: &str) -> Result<reqwest::header::HeaderValue> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(format!(":{token}"));
-    reqwest::header::HeaderValue::from_str(&format!("Basic {encoded}"))
+    reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|_| anyhow!("the token header was refused"))
 }
 
