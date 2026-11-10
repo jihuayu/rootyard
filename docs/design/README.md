@@ -7,6 +7,7 @@
 - [架构决策与状态归属](../architecture.md)
 - [单机、分布式与发布/恢复协议图](architecture-diagrams.md)
 - [状态服务契约](12-state-services.md)
+- [Pando 一致性与会话读取契约（提案）](pando-consistency.md)
 - [实施计划、依赖和验收](implementation-plan.md)
 - [实现状态](implementation-status.md)
 - [旧任务删除与新任务覆盖](issue-map.md)
