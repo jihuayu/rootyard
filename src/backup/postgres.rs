@@ -156,14 +156,33 @@ pub(super) async fn schema(client: &(impl GenericClient + Sync), format: u32) ->
     ensure!(!incomplete, "incomplete Forge creation request in committed snapshot");
     Ok(versions)
 }
-pub(super) async fn repositories(client: &(impl GenericClient + Sync)) -> Result<Vec<Repository>> {
+/// Existing repositories with their unknown-operation count.
+///
+/// `has_ref_store_registry` is true exactly when this database carries the
+/// schema138 RefStore operation registry. That holds for every source snapshot
+/// and for every archive after the reviewed migrations (current formats).
+/// Only a genuine format4 archive still at its verified schema007 predates
+/// schema138 and so has no registry rows to count; it must not query a
+/// relation that does not exist. The choice comes from the verified format,
+/// never from swallowing a missing-relation error.
+pub(super) async fn repositories(
+    client: &(impl GenericClient + Sync),
+    has_ref_store_registry: bool,
+) -> Result<Vec<Repository>> {
+    let ref_store_operations = if has_ref_store_registry {
+        "(SELECT count(*) FROM public.ref_store_operations o WHERE o.repository_id=r.id \
+           AND o.state NOT IN ('committed','rejected','cancelled'))"
+    } else {
+        "0"
+    };
     Ok(client
         .query(
-            "SELECT r.id,r.storage_generation,r.state,r.recovery_reason,r.incident_revision,r.storage_backend,
-                    (SELECT count(*) FROM public.git_operations o WHERE o.repository_id=r.id AND o.outcome='unknown')
-                  + (SELECT count(*) FROM public.ref_store_operations o
-                      WHERE o.repository_id=r.id AND o.state NOT IN ('committed','rejected','cancelled'))
-               FROM public.repositories r ORDER BY r.id",
+            &format!(
+                "SELECT r.id,r.storage_generation,r.state,r.recovery_reason,r.incident_revision,r.storage_backend,
+                        (SELECT count(*) FROM public.git_operations o WHERE o.repository_id=r.id AND o.outcome='unknown')
+                      + {ref_store_operations}
+                   FROM public.repositories r ORDER BY r.id"
+            ),
             &[],
         )
         .await?
@@ -174,7 +193,7 @@ pub(super) async fn repositories(client: &(impl GenericClient + Sync)) -> Result
             state: r.get(2),
             recovery_reason: r.get(3),
             incident_revision: r.get(4),
-            backend: r.get(5),
+            backend: Some(r.get(5)),
             unknown_operations: r.get(6),
             refs: None,
             head: None,
@@ -189,7 +208,11 @@ pub(super) async fn git_inventory(config: &Config, root: &Path, repos: &mut [Rep
         // OpenDAL pack bytes, so no persistent bare repository may exist (and
         // one would be a second write authority). Any other backend is the
         // legacy native volume and must still have its bare repository.
-        if repo.backend == "pg_refstore" {
+        // This stage only validates native files; it never rewrites `backend`.
+        // A historical manifest (format 4..=19) has no backend field, so its
+        // label stays `None` ("unknown") until restore compares it with the
+        // restored database's own legacy backend.
+        if repo.backend.as_deref() == Some("pg_refstore") {
             ensure!(
                 fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
                 "pg_refstore repository must not have a persistent bare repository"
@@ -202,7 +225,6 @@ pub(super) async fn git_inventory(config: &Config, root: &Path, repos: &mut [Rep
             ensure!(repo.state == "provisioning", "ready or recovering repository missing");
             continue;
         }
-        repo.backend = "gitfs".into();
         for name in
             ["objects/info/alternates", "objects/info/http-alternates", "shallow", "commondir", "gitdir", "worktrees"]
         {

@@ -1,6 +1,37 @@
 //! Verified isolated restore and capability fencing.
 use super::*;
 
+/// Archives before format20 never recorded a storage backend. For those the
+/// restored database's own `storage_backend` is the only authority: it must be
+/// a legacy native backend (`gitfs` or `pando`, which own a bare repository;
+/// never `pg_refstore`, which has none), and only the comparison copy drops the
+/// new field so the repository compares exactly with the fields the archive
+/// had. Current formats must record the backend (a current archive decoded
+/// without it has `None` here) and match it exactly.
+/// Everything else (identity, generation, state, reason, incident, unknown
+/// operations, refs and HEAD) is compared unchanged for every format.
+pub(super) fn restore_metadata_repositories(
+    archived: &[Repository],
+    mut restored: Vec<Repository>,
+    has_backend: bool,
+) -> Result<()> {
+    for repo in &mut restored {
+        if !has_backend {
+            ensure!(
+                matches!(repo.backend.as_deref(), Some("gitfs" | "pando")),
+                "historical archive restored a repository on a non-native backend"
+            );
+            repo.backend = None;
+        }
+        if let Some(old) = archived.iter().find(|old| old.id == repo.id) {
+            repo.refs.clone_from(&old.refs);
+            repo.head.clone_from(&old.head);
+        }
+    }
+    ensure!(restored == archived, "restored metadata mismatch");
+    Ok(())
+}
+
 pub(super) fn verify(source: &Path) -> Result<Manifest> {
     let manifest_meta = fs::symlink_metadata(source.join("manifest.json"))?;
     ensure!(
@@ -367,14 +398,13 @@ pub async fn restore(
             "restored LFS metadata differs from backup closure"
         );
     }
-    let mut metadata_repos = repositories(&client).await?;
-    for repo in &mut metadata_repos {
-        if let Some(old) = manifest.repositories.iter().find(|old| old.id == repo.id) {
-            repo.refs.clone_from(&old.refs);
-            repo.head.clone_from(&old.head);
-        }
-    }
-    ensure!(metadata_repos == manifest.repositories, "restored metadata mismatch");
+    // Only a genuine format4 archive still at its verified schema007 predates
+    // the schema138 RefStore operation registry, so it has no rows to count.
+    // Every other archive was produced or migrated with that registry.
+    let has_ref_store_registry = manifest.format != 4;
+    let metadata_repos = repositories(&client, has_ref_store_registry).await?;
+    let has_backend = manifest.format >= 20;
+    restore_metadata_repositories(&manifest.repositories, metadata_repos, has_backend)?;
     // A backup can predate cancellation. Never resurrect any previously issued
     // checkout bearer after restoring old authority; plan and native pins remain
     // evidence, not permission to mint a credential for the same job again.
@@ -431,7 +461,7 @@ pub async fn restore(
     if manifest.format == FORMAT_PAIRED {
         let closure = manifest.blob_closure.as_ref().context("paired archive carries no Blob closure")?;
         ensure!(
-            manifest.repositories.iter().all(|r| r.backend == "pg_refstore"),
+            manifest.repositories.iter().all(|r| r.backend.as_deref() == Some("pg_refstore")),
             "mixed legacy/Blob restore is unsupported"
         );
         ensure!(
