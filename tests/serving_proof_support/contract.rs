@@ -39,10 +39,8 @@ mod serving_reads_support;
 #[path = "../serving_support/mod.rs"]
 mod serving_support;
 
-use self::serving_reads_support::{
-    ensure_migration_146, force_gate_pack_verified, operation_deadline, provision_ready,
-};
-use self::serving_support::{Fixture, actor};
+use self::serving_reads_support::{ensure_migration_146, operation_deadline, provision_ready};
+use self::serving_support::{actor, Fixture};
 use super::PgPackSnapshotMaterializer;
 use crate::blob_store::config::BlobProfile;
 use crate::blob_store::opendal::BlobStore;
@@ -52,18 +50,18 @@ use crate::ref_store::artifact_hold::{
     AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldPurpose, ArtifactSpec, HoldScope, PgArtifactHoldStore,
 };
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
-use crate::ref_store::core::PgRefStoreCore;
 use crate::ref_store::core::pack_commit::{
-    ContentDigest, PackArtifactRole, PackClosureContext, PackClosureProof, PackCommitExpectation, PackCommitPlan,
-    PackCommitReceipt, PackCommitScope, PackMembershipEntry, PackPendingToken, PackRegistrationRequest, PackVerifier,
-    PgPackCommit, PlannedArtifact, PlannedPack,
+    AuthorizedCommitMode, AuthorizedSelection, ContentDigest, PackArtifactRole, PackCommitExpectation, PackCommitPlan,
+    PackCommitScope, PackMembershipEntry, PackPendingToken, PackRegistrationRequest, PgAuthorizedCommit, PgPackCommit,
+    PlannedArtifact, PlannedPack, PrepareOutcome, PreparedPublication, VerifiedAuthorizedPublication,
 };
-use crate::ref_store::core::pack_snapshot::{PgServingReads, probe_a5a};
+use crate::ref_store::core::pack_snapshot::{probe_a5a, PgServingReads};
+use crate::ref_store::core::{CommitMode, PgRefStoreCore};
 use crate::ref_store::{
     CoreGateVersion, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, OperationIdentity, RefName, RefPrecondition,
     RefTarget, RefUpdate, VersionCheck,
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -235,18 +233,26 @@ async fn gate_version(pool: &deadpool_postgres::Pool, repo: Uuid, tenant: Uuid) 
     }
 }
 
-/// One real A4 verified commit of one real pack with one real ref.
+/// One real publish of one real pack with one real ref through the staged
+/// authorized pipeline: A3 hold → protected upload → registration →
+/// `begin_pending` stages the durable pending operation first; then
+/// `PgAuthorizedCommit::{prepare, select, verify, commit}` take the real
+/// decision-gated path (and enable the irreversible `decision_required` fence).
+/// The committed gate must be `pack_verified`.
 async fn commit_first_pack(
     fixture: &Fixture,
     store: &BlobStore,
     tenant: Uuid,
+    owner: Uuid,
     repo: Uuid,
     gate: CoreGateVersion,
-    format: GitObjectFormat,
     git: &Path,
+    actor: &crate::db::Identity,
     refs: Vec<RefUpdate>,
     files: &PairFiles,
 ) -> Result<()> {
+    let adapter = PgAuthorizedCommit::new(store.clone(), git.to_path_buf())
+        .map_err(|error| anyhow!("authorized adapter constructor refused: {error:?}"))?;
     let mut client = fixture.pool.get().await?;
     let baseline = PgPackCommit.capture_baseline(&mut client, repo, tenant, operation_deadline()).await?;
     ensure!(
@@ -265,7 +271,7 @@ async fn commit_first_pack(
     let scope = PackCommitScope::new(
         repo,
         tenant,
-        tenant,
+        owner,
         gate.object_format(),
         gate.history_incarnation(),
         gate.authority_epoch(),
@@ -273,7 +279,7 @@ async fn commit_first_pack(
     )?;
     let identity = OperationIdentity::new(
         repo,
-        tenant,
+        actor.id,
         IssuerLane::new("pack")?,
         1,
         Uuid::new_v4(),
@@ -289,7 +295,8 @@ async fn commit_first_pack(
         old_entries,
         planned,
     )?;
-    let token: PackPendingToken = PgPackCommit.begin_pending(&mut client, &plan, operation_deadline()).await?;
+    // Stage 0: the durable pending operation precedes every authorized stage.
+    let _token: PackPendingToken = PgPackCommit.begin_pending(&mut client, &plan, operation_deadline()).await?;
     drop(client);
 
     let hold_scope = HoldScope::new(
@@ -329,18 +336,42 @@ async fn commit_first_pack(
         .map_err(|_| anyhow!("protected upload refused"))?;
     ensure!(publication.receipts().len() == 2, "publication is not exactly one pair");
     register(fixture, &plan, &publication).await?;
-    let context: PackClosureContext = {
-        let mut client = fixture.pool.get().await?;
-        PgPackCommit.capture_context(&mut client, &plan, operation_deadline()).await?
+    // The first publication of a repository is atomic: all-or-nothing.
+    ensure!(plan.commit_mode() == CommitMode::Atomic, "the first pack plan is not an atomic publication");
+    let mode = match plan.commit_mode() {
+        CommitMode::Atomic => AuthorizedCommitMode::Atomic,
+        CommitMode::AcceptedSubset => AuthorizedCommitMode::AcceptedSubset,
     };
-    ensure!(context.new_packs().len() == 1 && context.old_packs().is_empty(), "first closure is not one new pack");
-    let proof: PackClosureProof =
-        PackVerifier::new(store.clone(), git.to_path_buf())?.verify(&plan, &context, std_deadline()).await?;
-    let mut client = fixture.pool.get().await?;
-    let receipt: PackCommitReceipt =
-        PgPackCommit.commit_verified_pending(&mut client, &plan, &token, &proof, operation_deadline()).await?;
-    drop(client);
-    ensure!(receipt.is_committed() && !receipt.replayed, "fresh verified commit did not commit");
+    // Stage 1: capture the durable pending operation (read-only).
+    let prepared: PreparedPublication = match adapter
+        .prepare(&fixture.pool, plan.clone(), operation_deadline())
+        .await
+        .map_err(|error| anyhow!("authorized prepare refused: {error:?}"))?
+    {
+        PrepareOutcome::Prepared(prepared) => *prepared,
+        PrepareOutcome::Replayed(_) => return Err(anyhow!("prepare replayed instead of staging the fresh pending")),
+    };
+    // Stage 2: the real decision select, as the owner identity.
+    let selection: AuthorizedSelection = adapter
+        .select(&fixture.pool, prepared, actor, mode, operation_deadline())
+        .await
+        .map_err(|error| anyhow!("authorized select refused: {error:?}"))?;
+    // Stage 3: the native closure proof over the selected plan (no PG client held).
+    let verified: VerifiedAuthorizedPublication = adapter
+        .verify(selection, operation_deadline())
+        .await
+        .map_err(|error| anyhow!("authorized verify refused: {error:?}"))?;
+    // Stage 4: the decision-gated terminal, enabling the `decision_required` fence.
+    let receipt = adapter
+        .commit(&fixture.pool, &verified, operation_deadline())
+        .await
+        .map_err(|error| anyhow!("authorized commit refused: {error:?}"))?;
+    ensure!(receipt.is_committed() && !receipt.replayed, "fresh authorized commit did not commit");
+    ensure!(
+        gate_version(&fixture.pool, repo, tenant).await?.revision() > gate.revision(),
+        "the authorized commit must advance the gate revision past {}",
+        gate.revision()
+    );
     Ok(())
 }
 
@@ -388,15 +419,26 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
             &fixture,
             &store,
             repo.ready.tenant_id,
+            repo.ready.owner_id,
             repo.ready.repository_id,
             gate,
-            format,
             &git,
+            &owner.identity,
             vec![main_update(format, &commit_oid)?],
             &files,
         )
         .await?;
-        force_gate_pack_verified(&fixture, repo.ready.repository_id).await?;
+        let mode: String = fixture
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT pack_mode FROM ref_store_core_gates WHERE repository_id=$1",
+                &[&repo.ready.repository_id],
+            )
+            .await?
+            .get(0);
+        ensure!(mode == "pack_verified", "the authorized commit must advance the gate to pack_verified, got {mode}");
 
         let scope = repo.ready.scope()?;
         let reads = PgServingReads;
@@ -425,7 +467,7 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
             ensure!(view.verified_pairs() == 1, "the sealed view must cover one native-verified pair");
             ensure!(
                 proof_revision == view.gate_revision() && proof_revision > repo.ready.gate_revision,
-                "the proof must state the captured (post force) gate revision"
+                "the proof must state the captured (post commit) gate revision"
             );
             ensure!(proof_binding == binding, "the proof must carry the capture's A5b binding");
             ensure!(view.read_digest_hex() == binding.as_hex(), "the view's A5b binding is its native digest");
