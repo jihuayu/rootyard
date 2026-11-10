@@ -200,11 +200,26 @@ class AuditSequenceLegacyHarness(BackupHarness):
             assert page_next == more[-1], "cursor did not advance to the last item id"
             after = page_next
 
-    def collaborator(self, name):
-        for item in self.document(self.authors_path + "?limit=100")["items"]:
+    def collaborator(self, name, path=None):
+        for item in self.document((path or self.authors_path) + "?limit=100")["items"]:
             if item["username"] == name:
                 return item
         return None
+
+    def update_collaborator(self, name, role):
+        """Real collaborator mutation: PUT the live version, expect 200 updated.
+
+        The path carries the username and the body must not repeat it; the
+        version is the row's current one, so the call fails loudly instead of
+        silently creating, if the source and the restored rows disagree.
+        """
+        current = self.collaborator(name)
+        assert current is not None, "collaborator " + name + " is missing"
+        updated = self.document(self.authors_path + "/" + name, 200, method="PUT",
+                                body={"role": role, "expected_version": current["version"]})
+        assert updated["username"] == name and updated["role"] == role, updated
+        assert updated["version"] == current["version"] + 1, (current, updated)
+        return current, updated
 
     def wait_settled(self, db, label):
         """Wait until the stock server settled every push journal by itself.
@@ -230,11 +245,12 @@ class AuditSequenceLegacyHarness(BackupHarness):
         assert self.query(self.db, "SELECT 1 FROM schema_migrations WHERE version=110") == "1"
         # Real create semantics: no expected_version means "create" (201,
         # collaborator.added); the API rejects expected_version for a new row.
-        for name in ("carol", "dave"):
+        # bob, carol and dave all start as triage collaborators of alice/demo.
+        for name in ("bob", "carol", "dave"):
             created = self.document(self.authors_path, 201, method="POST",
                                     body={"username": name, "role": "triage"})
             assert created["role"] == "triage" and created["version"] == 1, created
-        return {"audit_sequence": self.sequence}
+        return {"audit_sequence": self.sequence, "triage_collaborators": ["bob", "carol", "dave"]}
 
     def setup_repos(self):
         # Every real Git push happens here, before the single post-push snapshot,
@@ -242,6 +258,15 @@ class AuditSequenceLegacyHarness(BackupHarness):
         other = self.create_repository({"name": "ahead"}, token=self.alice)
         self.other = other
         assert other["state"] == "ready" and other["id"] != self.repo["id"], other
+        # Bob's triage grant is observable through the real API before the
+        # backup: a triage may file an issue and may not open a pull request.
+        assert self.collaborator("bob")["role"] == "triage"
+        self.document(self.repo_path("/issues", "ahead"), 201, token=self.bob,
+                      method="POST", body={"title": "source-side triage before the backup"})
+        self.document(self.repo_path("/pulls", "ahead"), 403, token=self.bob, method="POST",
+                      body={"title": "triage cannot open pulls", "head_ref": "main", "base_ref": "main"})
+        self.pre_push_rows = self.audit_rows(self.db)
+        assert [row["action"] for row in self.pre_push_rows].count("collaborator.added") == 3
         planned = self.base + other["clone_path"]
         base = self.second
         for remote, commit in ((self.remote, "audit-then-push.txt"), (planned, "ahead-then-write.txt")):
@@ -260,8 +285,10 @@ class AuditSequenceLegacyHarness(BackupHarness):
             assert self.git("ls-remote", remote, "main", token=self.alice).stdout.decode().strip() \
                 == self.git("rev-parse", "HEAD", cwd=target).stdout.decode().strip() + "\trefs/heads/main"
         self.pre_push_ids = self.all_audit_ids(self.db)
-        self.pre_push_rows = self.audit_rows(self.db)
-        assert [row["action"] for row in self.pre_push_rows].count("collaborator.added") == 2
+        # The pushes are Git/receipt facts only: the audit rows are exactly the
+        # pre-push snapshot (three collaborator creations, no push action).
+        assert self.audit_rows(self.db) == self.pre_push_rows, \
+            "a Git push wrote repository_audit_log"
         self.hook_runner = self.hook_runner_digest()
         assert self.hook_runner == self.runtime_binary_sha256, \
             "the managed hook runner is not the executed binary"
@@ -274,9 +301,7 @@ class AuditSequenceLegacyHarness(BackupHarness):
         # are Git/receipt facts (Git operations, not repository_audit_log).
         self.audit_events_before = int(self.query(self.db, "SELECT count(*) FROM audit_events"))
         before = self.audit_rows(self.db)
-        carol = self.document(self.authors_path, 200, method="POST",
-                              body={"username": "carol", "role": "maintain", "expected_version": 1})
-        assert carol["role"] == "maintain" and carol["version"] == 2, carol
+        self.update_collaborator("carol", "maintain")
         after = self.audit_rows(self.db)
         rows = after[len(before):]
         assert [row["action"] for row in rows] == ["collaborator.updated"], rows
@@ -334,15 +359,18 @@ class AuditSequenceLegacyHarness(BackupHarness):
                 "restore_seconds": result["elapsed_seconds"]}
 
     def restored_http_audit_sequence_continues(self):
-        # Bob already has a collaborator row (inherited migration), so update it
-        # with its real version (200, collaborator.updated).
-        bob = self.collaborator("bob")
-        assert bob is not None and bob["role"] == "triage", bob
-        updated = self.document(self.authors_path, 200, method="POST",
-                                body={"username": "bob", "role": "maintain",
-                                      "expected_version": bob["version"]})
-        assert updated["role"] == "maintain" and updated["version"] == bob["version"] + 1, updated
+        # The collaborators restored through the archive must be the ones the
+        # source created: bob (and carol's source-side update) survive with
+        # their roles and versions, together with the real API-visible grants.
+        assert self.collaborator("bob")["role"] == "triage", "bob's triage grant was not restored"
+        assert self.collaborator("carol")["role"] == "maintain"
+        self.document(self.repo_path("/issues", "ahead"), 201, token=self.bob,
+                      method="POST", body={"title": "restored triage authority"})
+        self.document(self.repo_path("/pulls", "ahead"), 403, token=self.bob, method="POST",
+                      body={"title": "triage cannot open pulls", "head_ref": "main", "base_ref": "main"})
+        self.update_collaborator("bob", "maintain")
         after = self.audit_rows(self.target_db)
+        assert self.collaborator("bob")["role"] == "maintain"
         rows = after[len(self.restored_rows):]
         assert [row["action"] for row in rows] == ["collaborator.updated"], rows
         walked, pages = self.walk_audit(self.restored_floor, limit=100)

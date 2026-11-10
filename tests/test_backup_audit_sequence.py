@@ -42,6 +42,14 @@ def method_source(name):
     return ast.get_source_segment(DRILL.read_text(), drill_method(name))
 
 
+def source(text, name):
+    tree = ast.parse(text)
+    klass = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                 and n.name == "AuditSequenceLegacyHarness")
+    node = next(n for n in klass.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(text, node)
+
+
 def executable(name):
     """The method without its docstring: only executable nodes remain."""
     method = drill_method(name)
@@ -124,12 +132,16 @@ class DrillWiringTest(unittest.TestCase):
 
     def test_http_audit_write_uses_real_update_semantics(self):
         body = method_source("restored_http_audit_sequence_continues")
-        # Bob exists (inherited collaborator); the update must send its version
-        # and expect 200 collaborator.updated, never a create with version 1.
+        # Bob's triage grant is a real source POST; restore must see it, and the
+        # update goes through the PUT helper with the live version and 200.
+        self.assertIn('for name in ("bob", "carol", "dave")', source(self.source, "setup"))
+        self.assertIn('self.collaborator("bob")["role"] == "triage"', body)
+        self.assertIn('self.update_collaborator("bob", "maintain")', body)
         self.assertNotIn('"version": 1', body)
-        self.assertIn('bob["version"]', body)
-        self.assertIn("self.document(self.authors_path, 200", body)
         self.assertIn('["collaborator.updated"]', body)
+        helper = method_source("update_collaborator")
+        self.assertIn('self.document(self.authors_path + "/" + name, 200', helper)
+        self.assertIn('"expected_version": current["version"]', helper)
         # The API only reports that action when a row actually changed.
         self.assertIn('(StatusCode::OK, "collaborator.updated")',
                       (ROOT / "src/members/rbac.rs").read_text())
