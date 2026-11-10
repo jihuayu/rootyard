@@ -7,6 +7,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -31,6 +32,25 @@ def migration_040_path() -> Path:
 def compute_hmac_sha256_header(secret: str, payload_bytes: bytes) -> str:
     digest = hmac.new(secret.encode("utf-8"), payload_bytes, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
+
+
+def receiver_request_snapshot(receiver) -> list[dict]:
+    """Copy the receiver's received requests while holding its lock.
+
+    Background deliveries append to the shared list at any time, so callers must
+    read one consistent snapshot instead of indexing the live list.
+    """
+    with receiver.lock:
+        return list(receiver.requests)
+
+
+def requests_for_delivery(requests: list[dict], delivery_id: str) -> list[dict]:
+    """Records whose lower-case x-rootyard-delivery header is exactly ``delivery_id``."""
+    return [
+        req
+        for req in requests
+        if req.get("headers", {}).get("x-rootyard-delivery") == delivery_id
+    ]
 
 
 class LocalWebhookReceiver:
@@ -341,6 +361,10 @@ class WebhooksHarness(PullsHarness):
         assert updated["version"] == 2 and updated["timeout_ms"] == 4000
 
     def ping_and_hmac_sha256_signature_verification(self):
+        # The receiver is shared with the background workers: outbox push
+        # deliveries can legitimately land before, between or after this ping.
+        # Receipt is therefore correlated by the delivery id the service
+        # advertises as X-Rootyard-Delivery, never by a global request count.
         self.receiver.clear()
         ping_delivery = self.document(
             f"{self.hook_path}/ping",
@@ -348,14 +372,42 @@ class WebhooksHarness(PullsHarness):
             method="POST",
             body={"zen": "Rootyard HMAC verification test", "event_id": "ping-fixed-1"},
         )
-        assert ping_delivery["state"] == "delivered"
-        assert ping_delivery["response_status"] == 200
-        assert ping_delivery["signature_256"].startswith("sha256=")
-        assert len(self.receiver.requests) == 1
-        req = self.receiver.requests[0]
-        assert req["signature_valid"] is True
-        assert req["headers"]["x-rootyard-event"] == "ping"
-        assert req["headers"]["x-rootyard-hook-id"] == self.hook["id"]
+        assert ping_delivery["event_id"] == "ping-fixed-1", ping_delivery
+        assert ping_delivery["event_type"] == "ping", ping_delivery
+        assert ping_delivery["webhook_id"] == self.hook["id"], ping_delivery
+        assert ping_delivery["state"] == "delivered", ping_delivery
+        assert ping_delivery["response_status"] == 200, ping_delivery
+        assert ping_delivery["payload"] == {
+            "event": "ping",
+            "zen": "Rootyard HMAC verification test",
+            "hook_id": self.hook["id"],
+            "repository_id": ping_delivery["repository_id"],
+        }, ping_delivery["payload"]
+        signature = ping_delivery["signature_256"]
+        assert re.fullmatch(r"sha256=[0-9a-f]{64}", signature), signature
+
+        # One consistent snapshot under the receiver lock; only this delivery's
+        # records are scored, so other delivery ids present at any point are fine.
+        delivery_id = ping_delivery["id"]
+        snapshot = receiver_request_snapshot(self.receiver)
+        matches = requests_for_delivery(snapshot, delivery_id)
+        assert len(matches) == 1, (delivery_id, [r.get("headers") for r in snapshot])
+        req = matches[0]
+        headers = req["headers"]
+        assert req["signature_valid"] is True, headers
+        assert req["signature"] == signature, headers
+        assert headers.get("x-rootyard-event") == "ping", headers
+        assert headers.get("x-rootyard-delivery") == delivery_id, headers
+        assert headers.get("x-rootyard-hook-id") == self.hook["id"], headers
+
+        # The signed body must be this ping-fixed-1 payload, so an unrelated ping
+        # cannot satisfy the oracle. The receiver already verified the HMAC over
+        # the exact raw bytes it received, so recomputing it here never depends
+        # on how the JSON object's keys happen to be ordered.
+        assert req["json"] == ping_delivery["payload"], req["json"]
+        assert req["signature"] == compute_hmac_sha256_header(
+            self.webhook_secret, req["raw_body"]
+        ), headers
 
     def auto_pr_ci_pin_and_queued_check_orchestration(self):
         # Configure branch protection requiring ci/test and ci/lint on refs/heads/main.
