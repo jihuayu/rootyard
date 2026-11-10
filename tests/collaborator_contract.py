@@ -184,13 +184,18 @@ class prerequisite:
         checkout_env = dict(self.env, GIT_OPTIONAL_LOCKS="0")
         git_dir = os.environ.get("ROOTYARD_GIT_DIR") or self.worktree_git_dir(root)
         if git_dir:
+            # A worktree's git dir lives under <common>/worktrees/<name>; the
+            # mounted shared dir is <common>, which is what Git needs to read
+            # HEAD, refs and the status from this source tree.
+            common = Path(git_dir).parent.parent
+            assert common.name == ".git", f"unexpected worktree git dir {git_dir}"
             resolved = self.git("rev-parse", "--absolute-git-dir", cwd=root, check=False)
-            if resolved.returncode or resolved.stdout.decode().strip() != git_dir:
-                checkout_env["GIT_DIR"] = git_dir
+            if resolved.returncode or resolved.stdout.decode().strip() != str(Path(git_dir).resolve()):
+                checkout_env["GIT_DIR"] = str(common)
         head_proc = self.git("rev-parse", "HEAD", cwd=root, check=False, env=checkout_env)
         assert head_proc.returncode == 0, (
-            "required dependency missing: checkout Git metadata unreachable (set "
-            "ROOTYARD_GIT_DIR to this worktree's git dir): " +
+            "required dependency missing: checkout Git metadata unreachable (mount the "
+            "shared .git dir or set ROOTYARD_GIT_DIR): " +
             self.redact(head_proc.stderr.decode(errors="replace")[-300:]))
         head = head_proc.stdout.decode().strip()
         tracked = self.git("status", "--porcelain", "--untracked-files=no", cwd=root,
