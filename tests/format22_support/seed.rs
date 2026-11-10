@@ -11,7 +11,12 @@
 //!   the retained roots are the only protection;
 //! * one active and one released retention root prepared and registered by the
 //!   same producer owner from that producer-owned snapshot (the feature under
-//!   test: a root owner that is not the repository tenant).
+//!   test: a root owner that is not the repository tenant);
+//! * one nonempty transient serving read captured by `PgServingReads::capture`
+//!   for a third real user (the *reader*, distinct from the tenant and the
+//!   producer) over the same verified gate. Its row is deliberately left
+//!   unreleased: the immediate format22 backup must archive a live serving-read
+//!   pack declaration through the actual SQL loader/decoder, not an empty ledger.
 //!
 //! Ordering matters: the bound repository is provisioned *first*, the owner
 //! grants the producer `write` over the production collaborator route, and only
@@ -22,7 +27,7 @@
 //! `repository_collaborators` row the owner's own request created.
 //!
 //! No SQL row here creates a repository, artifact, publication, collaborator,
-//! membership, snapshot, pin or root, and no repository row is edited
+//! membership, snapshot, pin, serving read or root, and no repository row is edited
 //! afterwards. The only direct writes are the token rows of the production
 //! `db::issue_token` and the fixture-local offline `data/.volume-id`.
 use anyhow::{Result, anyhow, ensure};
@@ -32,10 +37,12 @@ use rootyard::blob_store::config::BlobProfile;
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::db;
 use rootyard::members::models::Role;
+use rootyard::ref_store::core::MetadataSnapshotScope;
 use rootyard::ref_store::core::pack_commit::{PackCommitPlan, RegisteredPack};
+use rootyard::ref_store::core::pack_snapshot::PgServingReads;
 use rootyard::ref_store::core::retention_root::PgRetentionRoots;
 use rootyard::ref_store::serving::{ProvisionRequest, provision};
-use rootyard::ref_store::{CoreGateVersion, GitObjectFormat, PgRefStoreCore, VersionCheck};
+use rootyard::ref_store::{CoreGateVersion, GitObjectFormat, MetadataPinPurpose, PgRefStoreCore, VersionCheck};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -49,6 +56,8 @@ use super::{http, pack_plan, repo, roots};
 const SHA1: GitObjectFormat = GitObjectFormat::Sha1;
 const PACKS: i64 = 3;
 const ROOT_SLOTS: i64 = 2_000;
+/// Bounded transient serving-read lease; the immediate backup runs well inside it.
+const SERVING_READ_LEASE_SECONDS: u32 = 300;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -255,6 +264,62 @@ async fn packs(
     Ok((registrations, last_plan.ok_or_else(|| anyhow!("no pack was planned"))?, head))
 }
 
+/// One secret-free view of the transient serving read.
+struct ServingRead {
+    pin_id: Uuid,
+    pack_count: i64,
+}
+
+/// Capture one nonempty transient serving read for `reader` through the real
+/// `PgServingReads::capture` (strict serving authority, the live Blob backend
+/// identity of `store`, the verified gate realm and a bounded 300s lease).
+///
+/// Nothing here writes SQL: the header, refs and every pack/artifact descriptor
+/// are produced by the production capture, so the later backup loads and decodes
+/// exactly those rows. The capture is deliberately left unreleased (see `run`).
+async fn serving_read_capture(
+    db: &Db,
+    store: &BlobStore,
+    verified: &pack::Verified,
+    reader: &db::Identity,
+) -> Result<ServingRead> {
+    let scope = MetadataSnapshotScope::new(
+        verified.repo,
+        verified.tenant,
+        reader.id,
+        MetadataPinPurpose::Verification,
+        verified.gate.object_format(),
+        verified.gate.history_incarnation(),
+        verified.gate.authority_epoch(),
+        verified.gate.group_epoch(),
+    )
+    .map_err(|error| anyhow!("serving read scope rejected: {error:?}"))?;
+    ensure!(scope.owner_id() == reader.id, "the serving read is not owned by the reader");
+    let capture = PgServingReads
+        .capture(&db.pool, &scope, store.backend_identity(), SERVING_READ_LEASE_SECONDS, deadline())
+        .await
+        .map_err(|error| anyhow!("real serving read capture refused: {error:?}"))?;
+    ensure!(!capture.is_empty(), "the serving read capture is a checked empty repository");
+    let captured = capture.registered_snapshot().ok_or_else(|| anyhow!("serving read has no registered snapshot"))?;
+    let pin_id = capture.pin_id().ok_or_else(|| anyhow!("serving read capture minted no pin"))?;
+    ensure!(pin_id == captured.pin_id(), "serving read pin differs from its snapshot");
+    let scope = captured.scope();
+    ensure!(
+        scope.repository_id() == verified.repo
+            && scope.tenant_id() == verified.tenant
+            && scope.owner_id() == reader.id
+            && scope.purpose() == MetadataPinPurpose::Verification,
+        "the captured serving read scope differs from the requested repo/tenant/reader"
+    );
+    let pack_count = captured.pack_count();
+    ensure!(pack_count == PACKS, "the serving read captured {pack_count} pack descriptors, expected {PACKS}");
+    ensure!(
+        captured.snapshot_digest_hex().len() == 64 && captured.membership_digest_hex().len() == 64,
+        "the serving read digest is malformed"
+    );
+    Ok(ServingRead { pin_id, pack_count })
+}
+
 pub async fn run(options: &Options) -> Result<Value> {
     ensure!(options.git.is_absolute() && options.git.is_file(), "--git must be an absolute existing Git binary");
     ensure!(
@@ -264,17 +329,26 @@ pub async fn run(options: &Options) -> Result<Value> {
     let profile = BlobProfile::from_env().map_err(|_| anyhow!("a supported Blob profile is required"))?;
     let store = BlobStore::open(profile).map_err(|_| anyhow!("the Blob backend could not be opened"))?;
     write_volume_identity(&options.data_dir)?;
-    let db = Db::setup().await?;
+    // The paired harness already migrated this fresh run-owned database in
+    // `public`; the product backup source validator reads explicit `public.*`
+    // tables, so the seed must live there too (never in a random schema).
+    let db = Db::setup_public().await?;
     let http = http::Http::open(&db, &options.git, &options.data_dir).await?;
 
     // 1. The bound repository through the real create path. Every user row
     //    exists before its token: a refusal never orphans a credential.
     let owner_user = issued_user(&db.pool, "fmt22owner").await?;
     let producer_user = issued_user(&db.pool, "fmt22producer").await?;
+    let reader_user = issued_user(&db.pool, "fmt22reader").await?;
     let owner = authenticate(&db.pool, &owner_user).await?;
     let producer_identity = authenticate(&db.pool, &producer_user).await?;
+    let reader = authenticate(&db.pool, &reader_user).await?;
     let producer = producer_user.user_id;
     ensure!(producer != owner.id, "the producer must be a different real user than the repository owner");
+    ensure!(
+        reader.id != owner.id && reader.id != producer,
+        "the serving-read requester must be a third real user, distinct from the tenant and the producer"
+    );
     let repo_id = provision_with(&db.pool, &owner, "bound", &store).await?;
     let tenant = owner.id;
     // The producer is a collaborator with `write`, through the owner's real HTTP
@@ -350,9 +424,20 @@ pub async fn run(options: &Options) -> Result<Value> {
             "register_digest": register_digest,
         }));
     }
-    // The source pin is released: the retained roots are now the only
-    // protection of the registered packs (no snapshot/read declaration).
+    // The source pin is released, but the pin is not what retains the packs:
+    // the immutable snapshot descriptor survives (migration 143 keeps
+    // `snapshot_packs` with the snapshot), so both roots and that retained
+    // snapshot still declare every registration; the transient serving read
+    // below adds the third declaring set.
     repo::release_snapshot_pin(&db, &snapshot).await?;
+
+    // 3b. One nonempty transient serving read by the third real user, over the
+    //     same verified gate, captured only by the production
+    //     `PgServingReads::capture` (its SQL loader/decoder writes every row).
+    //     The capture is intentionally NOT released: the immediate format22
+    //     backup must archive a live serving-read pack declaration, so the row
+    //     survives until the drill's own lease (bounded, reclaimed afterwards).
+    let serving_read = serving_read_capture(&db, &store, &verified, &reader).await?;
 
     // 4. Empty and unrelated repositories last: created through the same API and
     //    never written, so they stay genuinely empty.
@@ -364,11 +449,24 @@ pub async fn run(options: &Options) -> Result<Value> {
     let mut retainable = Vec::new();
     for badge in &badges {
         let counts = marker::retainable_counts(&db.pool, badge.registration_id).await?;
-        let declared = counts["root_packs"].as_i64().unwrap_or(0)
-            + counts["snapshot_packs"].as_i64().unwrap_or(0)
-            + counts["serving_read_packs"].as_i64().unwrap_or(0);
+        // Two root captures (one active, one released), one retained snapshot
+        // descriptor (migration 143, kept after the pin release) and one live
+        // transient serving read descriptor (the unreleased capture above).
+        let root_packs = counts["root_packs"].as_i64().unwrap_or(0);
+        let snapshot_packs = counts["snapshot_packs"].as_i64().unwrap_or(0);
+        let serving_read_packs = counts["serving_read_packs"].as_i64().unwrap_or(0);
+        let declared = root_packs + snapshot_packs + serving_read_packs;
         ensure!(declared > 0, "a fixture registration is not retained by any root/snapshot/read declaration");
-        ensure!(declared < 2, "a fixture registration is declared by more than one pack set");
+        ensure!(root_packs == 2, "a fixture registration is declared by {root_packs} root_packs rows, expected 2");
+        ensure!(
+            snapshot_packs == 1,
+            "a fixture registration is declared by {snapshot_packs} snapshot_packs rows, expected 1"
+        );
+        ensure!(
+            serving_read_packs == 1,
+            "a fixture registration is declared by {serving_read_packs} serving_read_packs rows, expected 1"
+        );
+        ensure!(declared == 4, "a fixture registration has {declared} declared rows, expected 4");
         retainable.push(json!({"registration_id": badge.registration_id.to_string(), "declared": counts}));
     }
     let registration_json = badges
@@ -409,6 +507,15 @@ pub async fn run(options: &Options) -> Result<Value> {
         "gate_revision": verified.gate.revision(),
         "source_snapshot_id": snapshot.snapshot_id.to_string(),
         "source_pin_id": snapshot.pin_id.to_string(),
+        // Secret-free identity of the transient serving read: no credential,
+        // DSN, Blob root, endpoint or expiry is recorded here.
+        "serving_read": {
+            "pin_id": serving_read.pin_id.to_string(),
+            "repository_id": repo_id.to_string(),
+            "tenant_id": tenant.to_string(),
+            "owner_id": reader.id.to_string(),
+            "pack_count": serving_read.pack_count,
+        },
         "registrations": registration_json,
         "retainable": retainable,
         "packs": PACKS,
