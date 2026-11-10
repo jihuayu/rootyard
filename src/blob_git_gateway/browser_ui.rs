@@ -496,11 +496,13 @@ mod tests {
             let refused = run(with_body(token, revision), Some(presented(&presented_token)));
             assert_eq!(refused.err(), Some(bound_refusal()), "{what} was admitted");
         }
-        // An answer that would move the browser backwards is refused the same
-        // way, with its body dropped, and the rendering carries no marker.
-        let regressing = framed_token(4);
-        assert_eq!(super::super::repo_session::presented_bound(&regressing), Some(4));
-        let refused = run(with_body(Some(&regressing), Some("4")), Some(presented(&presented_token)));
+        // An answer below its newer presented bound is refused the same way,
+        // with its body dropped, and the rendering carries no marker: the
+        // browser presents revision 4 while the answer completes revision 3,
+        // an internally consistent pair that still moves the browser backwards.
+        let newer_bound = framed_token(4);
+        assert_eq!(super::super::repo_session::presented_bound(&newer_bound), Some(4));
+        let refused = run(with_body(Some(&presented_token), Some("3")), Some(presented(&newer_bound)));
         let rendered = match refused {
             Err(error) => {
                 assert_eq!(error, bound_refusal());
@@ -519,9 +521,9 @@ mod tests {
         assert!(!rendered.contains(MARKER), "the refused answer retained its repository body");
         assert!(!rendered.contains(r#""items""#), "the refused answer retained its repository shape");
         // A complete, non-regressing pair is admitted for the script to adopt,
-        // and the same complete pair is refused against a newer bound.
+        // and the same complete pair is refused against its newer presented bound.
         assert_eq!(status(answer(200, Some("rs1.next"), Some("3")), Some(presented(&presented_token))).unwrap(), 200);
-        assert_eq!(status(answer(200, Some("rs1.next"), Some("3")), Some(presented(&regressing))).unwrap(), 503);
+        assert_eq!(status(answer(200, Some("rs1.next"), Some("3")), Some(presented(&newer_bound))).unwrap(), 503);
     }
 
     #[test]
