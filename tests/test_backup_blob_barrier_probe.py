@@ -344,17 +344,28 @@ class ProbeTest(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pidfile.read_text()), 0)
 
-    def test_without_proc_the_group_is_reaped_but_never_claimed_quiescent(self):
-        original = probe._proc_available
-        probe._proc_available = lambda: False
-        try:
-            with self.assertRaises(NotImplementedError):
+    def test_non_linux_legacy_fallback_kills_and_reaps_without_waitid_or_census(self):
+        with self.assertRaises(NotImplementedError):
+            with mock.patch.object(probe, "_proc_available", return_value=False):
                 probe._group_members(os.getpid())
-            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-            self.assertTrue(probe._reap_owned(child, window=5))
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            with mock.patch.object(probe.sys, "platform", "darwin"), \
+                    mock.patch.object(probe, "_proc_available", return_value=False), \
+                    mock.patch.object(probe, "_exit_state", side_effect=AssertionError("waitid on non-Linux")), \
+                    mock.patch.object(probe, "_group_members", side_effect=AssertionError("census on non-Linux")):
+                self.assertTrue(probe._reap_owned(child, window=5))
             self.assertIsNotNone(child.returncode)
         finally:
-            probe._proc_available = original
+            try:
+                if child.poll() is None:
+                    child.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
 
     def test_a_ready_listener_is_a_violation_and_is_reaped(self):
         bind, holder = probe.reserve_loopback()
@@ -555,6 +566,50 @@ class ProbeTest(unittest.TestCase):
                     mock.patch.object(probe.os, "killpg") as killpg:
                 self.assertFalse(probe._reap_owned(child))
             killpg.assert_not_called()
+        finally:
+            try:
+                if child.poll() is None:
+                    child.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @unittest.skipUnless(LINUX, "Linux waitid/proc anchor is Linux-only")
+    def test_reap_owned_on_linux_without_proc_refuses_a_reaped_leader_without_signalling(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        try:
+            child.wait(timeout=10)
+            self.assertIsNotNone(child.returncode)
+            with mock.patch.object(probe, "_proc_available", return_value=False), \
+                    mock.patch.object(probe, "_group_members", side_effect=OSError("unknown census")) as census, \
+                    mock.patch.object(probe.os, "killpg") as killpg:
+                self.assertFalse(probe._reap_owned(child))
+            killpg.assert_not_called()
+            census.assert_not_called()
+        finally:
+            try:
+                if child.poll() is None:
+                    child.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @unittest.skipUnless(LINUX, "Linux waitid/proc anchor is Linux-only")
+    def test_reap_owned_on_linux_without_proc_refuses_an_unknown_observer_and_still_reaps(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        try:
+            with mock.patch.object(probe, "_proc_available", return_value=False), \
+                    mock.patch.object(probe, "_exit_state", side_effect=OSError("unknown observer")), \
+                    mock.patch.object(probe.os, "killpg") as killpg:
+                self.assertFalse(probe._reap_owned(child))
+            killpg.assert_not_called()
+            self.assertIsNotNone(child.wait(timeout=10))
         finally:
             try:
                 if child.poll() is None:

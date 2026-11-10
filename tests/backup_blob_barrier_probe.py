@@ -264,12 +264,14 @@ def _reap_owned(child, window=5.0):
     an unknown observer, a reaped child or a failed wait proves nothing, and
     a census that cannot be read never yields True.
 
-    On platforms without /proc the group is not pinned by waitid, so the
-    leader's group is killed and reaped without the ownership proof or
-    member census.
+    Linux without /proc is still Linux: waitid anchoring remains mandatory
+    (there is no legacy fallback), but the /proc census cannot be read, so
+    quiescence can never be proven and the result is False. Only non-Linux
+    platforms skip waitid and the census, killing and reaping the leader's
+    group with the legacy fallback.
     """
     group = child.pid  # start_new_session made the leader's pid its PGID
-    linux = _proc_available()
+    linux = sys.platform.startswith("linux")
     result = False
 
     try:
