@@ -532,7 +532,7 @@ class ProbeTest(unittest.TestCase):
             'stat -c %a "$ROOTYARD_DATA_DIR" > ' + quote(str(record)) + '.mode 2>/dev/null'
             ' || stat -f %Lp "$ROOTYARD_DATA_DIR" > ' + quote(str(record)) + '.mode\n'
             + refusal_body(FAILURE, EXTERNAL, 1, ""))
-        env = dict(PROBE_ENV, ROOTYARD_DATA_DIR=str(self.root / "real-data"))
+        env = dict(PROBE_ENV, ROOTYARD_DATA_DIR=str(target))
         previous = os.environ.get("ROOTYARD_DATA_DIR")
         os.environ["ROOTYARD_DATA_DIR"] = str(target)
         try:
