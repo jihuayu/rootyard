@@ -270,6 +270,19 @@ fn render(
         counters.received.load(Ordering::Relaxed),
         counters.sent.load(Ordering::Relaxed)
     );
+    let remote_metrics = crate::lfs::remote_metrics::counters().snapshot();
+    counter(
+        &mut output,
+        "rootyard_lfs_remote_failures_total",
+        "Typed LFS remote-store operation failures.",
+        remote_metrics.remote_failures_total,
+    );
+    gauge(
+        &mut output,
+        "rootyard_lfs_remote_repair_backlog",
+        "Admitted LFS repair jobs holding a bounded repair permit; not a durable queue.",
+        remote_metrics.repair_backlog,
+    );
     // The GC counters describe this process's own bounded loop. They stay
     // exported on a failed SQL snapshot because they never assert database
     // health, and they are read from the GC module's single counter set.
@@ -477,8 +490,10 @@ mod tests {
         crate::baseline_metrics::render(&mut baseline);
         assert_eq!(
             text.lines().filter(|l| !l.starts_with('#')).count(),
-            92 + baseline.lines().filter(|l| !l.starts_with('#')).count()
+            94 + baseline.lines().filter(|l| !l.starts_with('#')).count()
         );
+        assert!(text.contains("rootyard_lfs_remote_failures_total "));
+        assert!(text.contains("rootyard_lfs_remote_repair_backlog "));
     }
 
     #[test]

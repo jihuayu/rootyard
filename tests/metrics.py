@@ -80,7 +80,7 @@ class MetricsHarness(BrowserHarness):
         assert headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
         assert headers["cache-control"] == "no-store"
         values = dict(line.split(" ", 1) for line in text.splitlines() if not line.startswith("#"))
-        assert len(values) == 92, values
+        assert len(values) == 94, values
         for name in ("max_size", "size", "available", "busy", "waiting"):
             assert "rootyard_db_pool_" + name in values
         assert "rootyard_error_log_dropped_total" in values
