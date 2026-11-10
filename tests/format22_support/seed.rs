@@ -245,6 +245,10 @@ async fn packs(
         // Pack after the fixture ref reaches this sequence's target, so the
         // registered pack contains the commit the plan names.
         let files = fixture.pack_all(&format!("format22-{sequence}")).await?;
+        // Diagnostic only: the sequence, a fixed stage label and the gate
+        // revisions (no ids, refs or request contents) precede the unchanged
+        // typed error, so a bare rejection names the stage it escaped from.
+        let expected_revision = gate.revision();
         let draft = pack_plan::draft(
             db,
             target.repo,
@@ -255,13 +259,18 @@ async fn packs(
             refs,
             std::slice::from_ref(&files),
         )
-        .await?;
+        .await
+        .map_err(|error| anyhow!("sequence {sequence} stage=draft expected_revision={expected_revision}: {error:#}"))?;
         // The provisioned repository is already under the irreversible
         // decision-required fence, so its packs commit through the same
         // decision-gated pipeline the serving first push uses.
-        let new = repo::decided_pair(db, store, git, &draft, &files, producer).await?;
+        let new = repo::decided_pair(db, store, git, &draft, &files, producer).await.map_err(|error| {
+            anyhow!("sequence {sequence} stage=decided_pair expected_revision={expected_revision}: {error:#}")
+        })?;
         registrations.extend(new);
-        gate = current_gate(&db.pool, target.repo, target.tenant).await?;
+        gate = current_gate(&db.pool, target.repo, target.tenant).await.map_err(|error| {
+            anyhow!("sequence {sequence} stage=current_gate expected_revision={expected_revision}: {error:#}")
+        })?;
         last_plan = Some(draft.plan);
     }
     ensure!(head == fixture.rev_parse("refs/heads/main").await?, "fixture HEAD changed during packing");

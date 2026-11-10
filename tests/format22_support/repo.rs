@@ -142,7 +142,12 @@ pub async fn decided_pair(
     let pack_id = draft.plan.packs().first().ok_or_else(|| anyhow!("plan has no pack"))?.pack_id();
     let publication = pack_plan::publish(db, store, &draft.plan, files).await?;
     pack_plan::register(db, &draft.plan, pack_id, &publication).await?;
-    let context = pack::closure(db, &draft.plan).await?;
+    // Diagnostic only: `pack::closure` (via `capture_context`) returns an
+    // untagged bare rejection, so name it with the plan's expected revision to
+    // tell a closure failure apart from the authorized stages below.
+    let context = pack::closure(db, &draft.plan).await.map_err(|error| {
+        anyhow!("closure stage=closure expected_revision={}: {error:#}", draft.plan.expected().revision())
+    })?;
     ensure!(
         context.new_packs().len() == 1 && context.old_packs().len() == draft.plan.old_memberships().len(),
         "the planned closure is not one new pack on the planned membership"
