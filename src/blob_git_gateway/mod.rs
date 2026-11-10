@@ -43,6 +43,11 @@ mod snapshot;
 mod state;
 
 #[cfg(test)]
+#[path = "../../tests/blob_gateway_support/mod.rs"]
+mod session_acceptance_support;
+#[cfg(test)]
+mod session_browser_acceptance;
+#[cfg(test)]
 mod session_http_acceptance;
 
 use std::sync::Arc;

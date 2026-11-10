@@ -1,0 +1,667 @@
+"""Real headless Chromium acceptance of the push-bound Blob browser (#174).
+
+Started by the Rust case (`session_browser_acceptance.rs`) with two path-only
+arguments: this script and one mode-0600 JSON config. The interpreter is the
+Playwright virtualenv of the browser image (default
+`/opt/session174-playwright/bin/python3`).
+
+The client prints exactly one sanitized JSON line on stdout and never writes
+stderr: a failure is a fixed uppercase reason code in that line, never an
+exception message, a traceback, a URL, a cookie or a token.
+
+What it drives on a brand-new persistent profile in the private run root:
+
+1. no cookie exists at first, and every request is confined to the configured
+   loopback origin (anything else is aborted and fails the run);
+2. anonymous `/web/blob` is the origin's own `303` to
+   `/web/login?return_to=%2Fweb%2Fblob`, never a public shell;
+3. the real sign-in form receives the owner's API token; the session cookie is
+   HttpOnly and `SameSite=Strict`, the CSRF cookie is readable, and no
+   credential reaches a URL, the DOM or storage;
+4. the signed-in `/web/blob` is a direct `200` under its CSP; the page's own
+   script lists the repository and the real repository DOM link is clicked,
+   which must render `References`, `Files at HEAD`, `Commits` and the pushed
+   commit, with the page's own refs/tree/commits requests chained;
+5. cookie-only fetches of `/api` and `/git` are denied;
+6. one labelled client-side fault, only after the real chain passed: a
+   re-entered repository page is answered by the page itself with a synthetic
+   `200` tree carrying the real refs token and the immediately lower
+   revision; the UI must show its generic refusal, must not render the marker,
+   the tree or the commits, and no commits request may begin.
+"""
+
+import asyncio
+import json
+import re
+import sys
+from pathlib import Path
+
+TOKEN = "x-rootyard-session"
+REVISION = "x-rootyard-session-revision"
+SESSION_COOKIE = "rootyard_session"
+CSRF_COOKIE = "rootyard_csrf"
+SHELL = "/blob"
+LOGIN = "/login"
+FAULT_MARKER = "FAULT-INJECTION-MARKER-7f3a"
+STEP_MS = 30_000
+
+REASONS = frozenset(
+    (
+        "NO_ARGUMENTS",
+        "CONFIG_UNREADABLE",
+        "CONFIG_INVALID",
+        "CONFIG_PATH_UNSAFE",
+        "BROWSER_PLAYWRIGHT_UNAVAILABLE",
+        "BROWSER_LAUNCH_FAILED",
+        "BROWSER_SESSION_FAILED",
+        "NAVIGATION_EXCEEDED",
+        "ORIGIN_ESCAPE",
+        "COOKIES_BEFORE_SIGN_IN",
+        "ANONYMOUS_NOT_REDIRECTED",
+        "ANONYMOUS_SHELL_SERVED",
+        "LOGIN_PAGE_INVALID",
+        "SIGN_IN_FAILED",
+        "SESSION_COOKIE_INVALID",
+        "CSRF_COOKIE_INVALID",
+        "CREDENTIAL_IN_URL",
+        "CREDENTIAL_IN_DOM",
+        "CREDENTIAL_IN_STORAGE",
+        "SHELL_NOT_SERVED",
+        "SHELL_CSP_MISSING",
+        "SHELL_SCRIPT_INVALID",
+        "LIST_NOT_RENDERED",
+        "REPO_LINK_MISSING",
+        "REPO_LINK_INVALID",
+        "REPO_PAGE_INCOMPLETE",
+        "REPO_PAGE_STATUS_INVALID",
+        "READ_CHAIN_INVALID",
+        "COOKIE_ONLY_DENIAL_MISSING",
+        "API_READ_BOUND_INVALID",
+        "FAULT_BOUND_INVALID",
+        "FAULT_NOT_APPLIED",
+        "FAULT_REFUSAL_MISSING",
+        "FAULT_MARKER_RENDERED",
+        "FAULT_COMMITS_RENDERED",
+        "FAULT_COMMITS_REQUESTED",
+        "CLIENT_FAILED",
+    )
+)
+
+
+class Failure(Exception):
+    """A fixed reason code; its text is never printed or chained."""
+
+    def __init__(self, reason):
+        reason = reason if reason in REASONS else "CLIENT_FAILED"
+        super().__init__(reason)
+        self.reason = reason
+
+
+def summary(config, reason, extra):
+    payload = {
+        "result": "FAIL" if reason else "PASS",
+        "reason": reason or "PASS",
+        "mode": "client_fault_injection",
+        "browser": extra.get("browser", ""),
+    }
+    payload.update({key: value for key, value in extra.items() if key != "browser"})
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def load_config(path):
+    config_path = Path(path)
+    if not config_path.is_absolute() or config_path.is_symlink():
+        raise Failure("CONFIG_PATH_UNSAFE")
+    if config_path.stat().st_mode & 0o077:
+        raise Failure("CONFIG_PATH_UNSAFE")
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except OSError:
+        raise Failure("CONFIG_UNREADABLE") from None
+    except ValueError:
+        raise Failure("CONFIG_INVALID") from None
+    strings = ("origin", "username", "token", "repo", "oid", "file", "second_file", "chromium", "profile")
+    if not isinstance(config, dict) or any(not isinstance(config.get(key), str) for key in strings):
+        raise Failure("CONFIG_INVALID")
+    revision = config.get("expected_revision")
+    origin = config["origin"]
+    if not re.fullmatch(r"http://127\.0\.0\.1:[0-9]{1,5}", origin) or not isinstance(revision, int) or revision < 2:
+        raise Failure("CONFIG_INVALID")
+    if not Path(config["profile"]).is_absolute():
+        raise Failure("CONFIG_INVALID")
+    return config
+
+
+class Client:
+    """One run against the configured origin, keeping only throw-away state."""
+
+    def __init__(self, config):
+        self.config = config
+        self.origin = config["origin"]
+        self.owner = config["username"]
+        self.repo = config["repo"]
+        self.web = f"{self.origin}/web"
+        self.scope = f"/web/blob/repos/{self.owner}/{self.repo}"
+        self.alias = f"/web/blob/api/repos/{self.owner}/{self.repo}"
+        self.tokens = {config["token"]}
+        self.cookies = set()
+        self.escaped = False
+        self.commits_requests = 0
+        self.route_statuses = {}
+        self.read_pairs = {}
+
+    # -- confinement and capture ----------------------------------------
+
+    def confined(self, url):
+        return url.startswith(self.origin + "/")
+
+    def routes(self, context, page):
+        """Bound every request to the origin, recording only throw-away data.
+
+        Token strings seen on the wire are retained in memory to recognise a
+        credential in a page, URL or storage; they never leave this process.
+        Response statuses and session pairs are kept per exact route so the
+        caller can attest the page's own read chain.
+        """
+        self.listen(page)
+
+        async def confine(route, request):
+            if not self.confined(request.url):
+                self.escaped = True
+                await route.abort()
+                return
+            await route.continue_()
+
+        context.route("**/*", confine)
+        # Every later page (a tab or popup opened by the run) is watched too.
+        context.on("page", self.listen)
+
+    def listen(self, page):
+        """Register the response/request capture on one page."""
+
+        def route_name(path):
+            # Paths are path-only (the origin is already stripped); query
+            # strings only ever bound a read and are never classified.
+            if path == self.alias + "/refs":
+                return "web_refs"
+            if path == self.alias + "/tree":
+                return "web_tree"
+            if path == self.alias + "/commits":
+                return "web_commits"
+            if path == "/web" + SHELL:
+                return "web_blob"
+            if path == "/web/blob/api/repos":
+                return "web_list"
+            return None
+
+        def observe_response(response):
+            # Nothing is read from a response that left the origin.
+            if not self.confined(response.url):
+                self.escaped = True
+                return
+            headers = response.headers
+            session = headers.get(TOKEN)
+            if session:
+                self.tokens.add(session)
+            path = response.url[len(self.origin):].split("?", 1)[0]
+            status = int(response.status)
+            # The anonymous `/web/blob` answer is its own 303 sign-in redirect;
+            # the later signed-in 200 shell is the distinct `web_blob` route.
+            if path == "/web" + SHELL and status == 303:
+                self.route_statuses.setdefault("web_signin_redirect", status)
+            elif path == "/web" + LOGIN:
+                # The GET 200 form must not hide the post's own 303 sign-in.
+                if status == 303 or "web_login" not in self.route_statuses:
+                    self.route_statuses["web_login"] = status
+            else:
+                name = route_name(path)
+                if name is not None:
+                    self.route_statuses[name] = status
+            tail = path[len(self.alias) + 1:] if path.startswith(self.alias + "/") else None
+            if tail in ("refs", "tree", "commits"):
+                revision = headers.get(REVISION, "")
+                self.read_pairs.setdefault(id(page), {}).setdefault(tail, []).append(
+                    {"token": session, "revision": int(revision) if revision.isdecimal() else None}
+                )
+
+        def observe_request(request):
+            # The one place a commit read is counted; a request that left the
+            # origin is never counted, and its query is never classified.
+            if self.confined(request.url):
+                path = request.url[len(self.origin):].split("?", 1)[0]
+                if path == self.alias + "/commits":
+                    self.commits_requests += 1
+
+        page.on("response", observe_response)
+        page.on("request", observe_request)
+
+    def check_origin(self):
+        if self.escaped:
+            raise Failure("ORIGIN_ESCAPE")
+
+    def remember_cookies(self, context):
+        for cookie in context.cookies(self.origin):
+            name, value = cookie.get("name", ""), cookie.get("value", "")
+            if name == SESSION_COOKIE and value:
+                self.tokens.add(value)
+            if len(value) >= 8:
+                self.cookies.add(value)
+
+    def secrets(self):
+        return [value for value in self.cookies | self.tokens if len(value) >= 8]
+
+    async def no_credentials(self, page):
+        """No credential in the URL, the rendered DOM or the web storage."""
+        try:
+            if any(secret in page.url for secret in self.secrets()):
+                raise Failure("CREDENTIAL_IN_URL")
+            if any(secret in (await page.content()) for secret in self.secrets()):
+                raise Failure("CREDENTIAL_IN_DOM")
+            stored = await page.evaluate(
+                "() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)])")
+        except Failure:
+            raise
+        except Exception:
+            raise Failure("CREDENTIAL_IN_STORAGE") from None
+        if any(secret in stored for secret in self.secrets()):
+            raise Failure("CREDENTIAL_IN_STORAGE")
+
+    async def status_has(self, page, fragment, reason):
+        """Wait for the shell's own status line to name `fragment`."""
+        try:
+            await page.wait_for_function(
+                "([fragment]) => { const node = document.querySelector('#status');"
+                " return !!node && node.textContent.includes(fragment); }",
+                arg=[fragment],
+                timeout=STEP_MS,
+            )
+            return (await page.locator("#status").text_content()) or ""
+        except Exception:
+            raise Failure(reason) from None
+
+    # -- the run --------------------------------------------------------
+
+    async def run(self):
+        try:
+            from playwright.async_api import async_playwright
+        except Exception:
+            raise Failure("BROWSER_PLAYWRIGHT_UNAVAILABLE") from None
+        try:
+            async with async_playwright() as playwright:
+                context = await playwright.chromium.launch_persistent_context(
+                    self.config["profile"],
+                    executable_path=self.config["chromium"],
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--no-first-run",
+                        "--disable-background-networking",
+                        "--disable-component-update",
+                        "--disable-sync",
+                        "--disable-default-apps",
+                        "--disable-search-engine-choice-screen",
+                    ],
+                    service_workers="block",
+                )
+                try:
+                    browser = context.browser
+                    extra = {"browser": browser.version if browser else ""}
+                    page = context.pages[0] if context.pages else await context.new_page()
+                    self.routes(context, page)
+                    extra.update(await self.flow(context, page))
+                    self.check_origin()
+                    return summary(self.config, None, extra)
+                finally:
+                    await context.close()
+        except Failure:
+            raise
+        except Exception:
+            raise Failure("BROWSER_SESSION_FAILED") from None
+
+    async def goto(self, page, url, reason):
+        try:
+            await page.goto(url, wait_until="commit", timeout=STEP_MS)
+        except Exception:
+            raise Failure(reason) from None
+        self.check_origin()
+        return page
+
+    async def flow(self, context, page):
+        extra = {}
+
+        # 1. A brand-new profile holds no cookie.
+        if context.cookies(self.origin):
+            raise Failure("COOKIES_BEFORE_SIGN_IN")
+
+        # 2. Anonymous navigation is the origin's own sign-in redirect. The
+        # redirect target is the shared sign-in route (a navigation without a
+        # cookie is redirected by the same shared middleware from `/web/login`
+        # itself), so the first hop alone is inspected.
+        await self.goto(page, self.web + SHELL, "NAVIGATION_EXCEEDED")
+        request = await page.evaluate("() => ({path: location.pathname, search: location.search})")
+        if request["path"] != "/web" + LOGIN or request["search"] != "?return_to=%2Fweb%2Fblob":
+            raise Failure("ANONYMOUS_NOT_REDIRECTED")
+        await page.wait_for_load_state("load", timeout=STEP_MS)
+        await self.no_shell(page, "ANONYMOUS_SHELL_SERVED")
+        if await page.title() != "Rootyard sign in":
+            raise Failure("LOGIN_PAGE_INVALID")
+
+        # 3. The real form with the owner's API token.
+        await page.locator('input[name="username"]').fill(self.owner)
+        await page.locator('input[name="token"]').fill(self.config["token"])
+        async with page.expect_navigation(wait_until="commit", timeout=STEP_MS):
+            await page.get_by_role("button", name="Sign in").click()
+        self.check_origin()
+        if await page.evaluate("() => location.pathname") != "/web" + SHELL:
+            raise Failure("SIGN_IN_FAILED")
+        self.remember_cookies(context)
+        jars = {cookie["name"]: cookie for cookie in context.cookies(self.origin)}
+        session, csrf = jars.get(SESSION_COOKIE, {}), jars.get(CSRF_COOKIE, {})
+        if not session.get("value") or session.get("httpOnly") is not True or session.get("sameSite") != "Strict":
+            raise Failure("SESSION_COOKIE_INVALID")
+        if not csrf.get("value") or csrf.get("httpOnly") is not False or csrf.get("sameSite") != "Strict":
+            raise Failure("CSRF_COOKIE_INVALID")
+        await page.wait_for_load_state("load", timeout=STEP_MS)
+        await self.no_credentials(page)
+        extra["cookies"] = {"session_http_only": True, "session_same_site": "Strict", "csrf_readable": True}
+
+        # 4. The signed-in shell is a direct 200 under its CSP and loads only
+        # its own script; the script lists the repository by name.
+        await self.goto(page, self.web + SHELL, "SHELL_NOT_SERVED")
+        served = await page.evaluate(
+            """async () => {
+                const response = await fetch(location.pathname, {credentials: 'same-origin'});
+                return {status: response.status,
+                        csp: response.headers.get('content-security-policy') || '',
+                        type: response.headers.get('content-type') || ''};
+            }"""
+        )
+        if served["status"] != 200 or "text/html" not in served["type"]:
+            raise Failure("SHELL_NOT_SERVED")
+        if "script-src 'self'" not in served["csp"]:
+            raise Failure("SHELL_CSP_MISSING")
+        if await page.evaluate("() => Array.from(document.scripts).map((node) => node.src)") != [self.web + "/app.js"]:
+            raise Failure("SHELL_SCRIPT_INVALID")
+        await self.rendered(page, "LIST_NOT_RENDERED")
+        link = page.get_by_role("link", name=f"{self.owner}/{self.repo}", exact=True)
+        try:
+            await link.wait_for(state="visible", timeout=STEP_MS)
+        except Exception:
+            raise Failure("REPO_LINK_MISSING") from None
+        if await link.get_attribute("href") != self.scope:
+            raise Failure("REPO_LINK_INVALID")
+        # The visible, correctly linked repository entry is the index's client
+        # acceptance: only the status is recorded, the adapter proves identity.
+        extra["list"] = {
+            "status": self.route_statuses.get("web_list"),
+            "items_shape": True,
+            "accepted": True,
+            "repository_link_clicked": True,
+        }
+        await link.click()
+        await page.wait_for_url(self.origin + self.scope, timeout=STEP_MS)
+        await page.wait_for_load_state("load", timeout=STEP_MS)
+        self.check_origin()
+
+        # Real read chain: refs (unbound), tree, commits, each presenting the
+        # previous pair; the page's own status and content must prove it.
+        status = await self.status_has(page, "Read complete.", "READ_CHAIN_INVALID")
+        content = (await page.locator("#content").text_content()) or ""
+        for heading in ("References", "Files at HEAD", "Commits"):
+            if heading not in content:
+                raise Failure("REPO_PAGE_INCOMPLETE")
+        if self.config["oid"][:7] not in content or self.config["file"] not in content:
+            raise Failure("REPO_PAGE_INCOMPLETE")
+        if "This server did not provide a bounded session." in status:
+            raise Failure("READ_CHAIN_INVALID")
+        reads = await self.page_reads(page)
+        if reads["complete"] is not True:
+            raise Failure("READ_CHAIN_INVALID")
+        extra["reads"] = {tail: {"revision": reads[tail]["revision"]} for tail in ("refs", "tree", "commits")}
+
+        # 5. Cookie-only denial of the unchanged bearer-only routes.
+        extra["denials"] = {
+            "api": await self.cookie_only(page, "/api/repos"),
+            "git": await self.cookie_only(page, f"/git/{self.owner}/{self.repo}.git/info/refs?service=git-upload-pack"),
+        }
+        if extra["denials"] != {"api": 401, "git": 401}:
+            raise Failure("COOKIE_ONLY_DENIAL_MISSING")
+
+        # 6. The labelled client-side fault on its own page, only now that the
+        # real UI chain passed; the fixed route names and statuses then close
+        # the run.
+        extra["fault"] = await self.inject(context)
+        extra["routes"] = dict(self.route_statuses)
+        return extra
+
+    # -- reads ----------------------------------------------------------
+
+    async def rendered(self, page, reason):
+        """Wait until the page's own script rendered a list, so its first read
+        has happened and a later page fetch presents the same bound."""
+        await self.status_has(page, "", reason)
+
+    async def page_reads(self, page):
+        """The revisions of the page's own refs/tree/commits responses and
+        whether the page's chain completed.
+
+        Responses are not read back from requests: the protocol sends no
+        revision on a request, so the page's ordered response pairs recorded by
+        `listen` are the only source. The pairs belong to this page's own
+        navigation; the fault page has its own and is never consulted. Response
+        tokens stay in memory and are never returned or formatted."""
+        tail_names = ("refs", "tree", "commits")
+        try:
+            await page.get_by_role("heading", name="Commits").wait_for(timeout=STEP_MS)
+        except Exception:
+            raise Failure("READ_CHAIN_INVALID") from None
+        pairs = self.read_pairs.get(id(page)) or {}
+        revisions = {}
+        for tail in tail_names:
+            responses = pairs.get(tail) or []
+            if len(responses) != 1:
+                raise Failure("READ_CHAIN_INVALID")
+            response = responses[0]
+            token = response.get("token") if isinstance(response, dict) else None
+            revision = response.get("revision") if isinstance(response, dict) else None
+            if not isinstance(token, str) or not token:
+                raise Failure("READ_CHAIN_INVALID")
+            if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
+                raise Failure("READ_CHAIN_INVALID")
+            revisions[tail] = revision
+        seen = [revisions[tail] for tail in tail_names]
+        return {
+            "refs": {"revision": revisions["refs"]},
+            "tree": {"revision": revisions["tree"]},
+            "commits": {"revision": revisions["commits"]},
+            "complete": all(later >= earlier for earlier, later in zip(seen, seen[1:])),
+        }
+
+    async def cookie_only(self, page, path):
+        try:
+            return await page.evaluate(
+                """async (path) => {
+                    const response = await fetch(path, {credentials: 'same-origin',
+                        headers: {Accept: 'application/json'}});
+                    return response.status;
+                }""",
+                path,
+            )
+        except Failure:
+            raise
+        except Exception:
+            raise Failure("COOKIE_ONLY_DENIAL_MISSING") from None
+
+    async def no_shell(self, page, reason):
+        try:
+            scripts = await page.evaluate("() => Array.from(document.scripts).map((node) => node.src)")
+        except Exception:
+            raise Failure(reason) from None
+        if any(script.endswith("/web/app.js") for script in scripts):
+            raise Failure(reason)
+
+    async def inject(self, context):
+        """A fresh fault page whose one tree answer is synthetic.
+
+        The SPA issues its token-free refs read before any tree request, so by
+        the interception this page's own first refs response pair already
+        exists; the synthetic tree carries exactly that token and the revision
+        one below it. The page is a labelled client fault and the answer is
+        never presented as an upstream one. Only page-local facts and
+        booleans leave this method: no token, URL or identity.
+        """
+        origin = self.origin
+        target = origin + self.alias + "/tree?oid=HEAD"
+        synthetic = {
+            "oid": self.config["oid"],
+            "tree_oid": self.config["oid"],
+            "path": "",
+            "items": [
+                {
+                    "name": FAULT_MARKER,
+                    "path": FAULT_MARKER,
+                    "mode": "100644",
+                    "kind": "blob",
+                    "oid": self.config["oid"],
+                    "size": 1,
+                }
+            ],
+            "next_after": None,
+        }
+        # ``routes`` registered ``context.on("page", self.listen)``, so creating
+        # the page already attached its response/request capture exactly once;
+        # a second ``self.listen(page)`` would duplicate both.
+        page = await context.new_page()
+        facts = {"intercepted": 0, "commits": 0, "failed": False}
+
+        def observe_request(request):
+            # Commits requests of this page only; the global count also holds
+            # the successful UI chain and never speaks for the fault page.
+            if self.confined(request.url):
+                path = request.url[len(origin):].split("?", 1)[0]
+                if path == self.alias + "/commits":
+                    facts["commits"] += 1
+
+        page.on("request", observe_request)
+
+        async def fault(route, request):
+            # This handler confines on its own: a request that left the origin
+            # is aborted and fails the run, whatever other confinement exists.
+            if not self.confined(request.url):
+                self.escaped = True
+                facts["failed"] = True
+                await route.abort()
+                return
+            if request.url != target:
+                await route.continue_()
+                return
+            pairs = (self.read_pairs.get(id(page)) or {}).get("refs") or []
+            refs = pairs[0] if pairs else {}
+            token = refs.get("token") if isinstance(refs, dict) else None
+            revision = refs.get("revision") if isinstance(refs, dict) else None
+            presented = request.headers.get(TOKEN)
+            if (
+                facts["intercepted"]
+                or not isinstance(token, str)
+                or not token
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision <= 1
+                or not isinstance(presented, str)
+                or presented != token
+                or request.headers.get(REVISION) is not None
+            ):
+                # A malformed injection request is never answered with a pass.
+                facts["failed"] = True
+                await route.abort()
+                return
+            facts["intercepted"] += 1
+            facts["uses_token"] = True
+            facts["no_revision"] = True
+            fault_revision = revision
+            await route.fulfill(
+                status=200,
+                headers={
+                    "content-type": "application/json",
+                    "cache-control": "no-store",
+                    "x-rootyard-client-fault": "1",
+                    TOKEN: token,
+                    REVISION: str(revision - 1),
+                },
+                body=json.dumps(synthetic),
+            )
+
+        await page.route("**/*", fault)
+        await self.goto(page, self.web + self.scope, "FAULT_NOT_APPLIED")
+        # The tree request alone produces the generic refusal; refs may already
+        # have rendered before it.
+        await self.fault_status(page)
+        status = (await page.locator("#status").text_content()) or ""
+        content = (await page.locator("#content").text_content()) or ""
+        self.check_origin()
+        if facts["failed"]:
+            raise Failure("FAULT_BOUND_INVALID")
+        if facts["intercepted"] != 1:
+            raise Failure("FAULT_NOT_APPLIED")
+        if facts["commits"] != 0:
+            raise Failure("FAULT_COMMITS_REQUESTED")
+        refusal_shown = "Read complete." not in status and "refused" in status
+        marker_absent = FAULT_MARKER not in content
+        tree_absent = "Files at HEAD" not in content and self.config["file"] not in content
+        commits_absent = "Commits" not in content
+        await self.no_credentials(page)
+        return {
+            "mode": "client_fault_injection",
+            "refs_revision": fault_revision,
+            "synthetic_revision": fault_revision - 1,
+            "started": facts["intercepted"] == 1,
+            "fault_uses_refs_token": facts.get("uses_token") is True,
+            "fault_request_revision_absent": facts.get("no_revision") is True,
+            "refusal_shown": refusal_shown,
+            "marker_absent": marker_absent,
+            "tree_absent": tree_absent,
+            "commits_absent": commits_absent,
+            "commits_not_requested": facts["commits"] == 0,
+        }
+
+    async def fault_status(self, page):
+        try:
+            await page.wait_for_function(
+                "() => { const node = document.querySelector('#status');"
+                " return !!node && node.getAttribute('data-kind') === 'error'; }",
+                timeout=STEP_MS,
+            )
+            return (await page.locator("#status").text_content()) or ""
+        except Exception:
+            raise Failure("FAULT_REFUSAL_MISSING") from None
+
+
+async def main(argv):
+    if len(argv) != 2:
+        print(summary({}, "NO_ARGUMENTS", {}), flush=True)
+        return
+    try:
+        config = load_config(argv[1])
+    except Failure as failure:
+        print(summary({}, failure.reason, {}), flush=True)
+        return
+    except Exception:
+        print(summary({}, "CONFIG_INVALID", {}), flush=True)
+        return
+    client = Client(config)
+    try:
+        line = await client.run()
+    except Failure as failure:
+        line = summary(config, failure.reason, {})
+    except BaseException:
+        line = summary(config, "CLIENT_FAILED", {})
+    print(line, flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main(sys.argv[1:]))
+    except BaseException:
+        # Nothing but the one summary line ever reaches an output stream.
+        print(summary({}, "CLIENT_FAILED", {}), flush=True)

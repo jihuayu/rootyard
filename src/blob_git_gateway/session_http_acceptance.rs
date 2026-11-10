@@ -66,9 +66,6 @@
 //! URL, Git stderr, a token, the key, the database URL nor Blob secrets are
 //! ever printed.
 
-#[path = "../../tests/blob_gateway_support/mod.rs"]
-mod support;
-
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex, PoisonError},
@@ -92,6 +89,7 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::session_acceptance_support as support;
 use super::{
     BlobGitConfig, BlobGitState,
     repo_session::{BEHIND_MESSAGE, SessionRealm, SessionTokenCodec, SessionTokens},

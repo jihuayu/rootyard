@@ -38,7 +38,9 @@ use axum::{
 };
 use serde_json::Value;
 
-use super::{REVISION_HEADER, SESSION_HEADER, http_client};
+use crate::blob_git_gateway::repo_session::{REVISION_HEADER, SESSION_HEADER};
+
+use super::http_client;
 
 /// Upper bound on one proxied request body (the page sends only reads and its
 /// bounded form; a receive pack never travels through it).
@@ -85,18 +87,11 @@ impl Route {
             Self::Other => "other",
         }
     }
-
-    /// The repository-page reads the chain is built from.
-    pub(super) fn is_read(self) -> bool {
-        matches!(self, Self::WebRefs | Self::WebTree | Self::WebCommits)
-    }
 }
 
 /// One page request, redacted to what the assertions need.
 pub(super) struct Recorded {
     pub route: Route,
-    /// The request did not stay on the configured origin.
-    pub foreign: bool,
     pub status: u16,
     pub has_cookie: bool,
     pub has_authorization: bool,
@@ -195,12 +190,7 @@ async fn forward(State(adapter): State<Arc<Adapter>>, request: Request) -> Respo
     }
 }
 
-async fn relay(
-    adapter: &Adapter,
-    parts: axum::http::request::Parts,
-    body: Body,
-    route: Route,
-) -> Result<Response, ()> {
+async fn relay(adapter: &Adapter, parts: axum::http::request::Parts, body: Body, route: Route) -> Result<Response, ()> {
     let body = to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| ())?;
     let upstream_origin = adapter.fixture.upstream.as_str();
     let target = format!("{upstream_origin}{}", parts.uri.path_and_query().map_or("/", |target| target.as_str()));
@@ -248,7 +238,6 @@ fn record(
     let headers = &request.headers;
     Recorded {
         route,
-        foreign: false,
         status,
         has_cookie: headers.contains_key(header::COOKIE),
         has_authorization: headers.contains_key(header::AUTHORIZATION),
@@ -293,7 +282,8 @@ fn marker(fixture: &Fixture, bytes: &[u8], route: Route, record: &mut Recorded) 
                 return;
             };
             let named = |row: &Value| {
-                row["owner"].as_str() == Some(fixture.owner.as_str()) && row["name"].as_str() == Some(fixture.name.as_str())
+                row["owner"].as_str() == Some(fixture.owner.as_str())
+                    && row["name"].as_str() == Some(fixture.name.as_str())
             };
             record.list_names_repository = rows.iter().filter(|row| named(row)).count() == 1
                 && rows.iter().filter(|row| row["name"].as_str() == Some(fixture.name.as_str())).count() == 1;
@@ -344,7 +334,9 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 /// are this fixture's own `/{owner}/{name}/{refs|tree|commits}`; any other
 /// repository API read is `web_api_other`, never mistaken for the list.
 pub(super) fn route_of(fixture_prefix: &str, path: &str) -> Route {
-    for (exact, route) in [("/web/blob/api/repos", Route::WebList), ("/web/app.js", Route::WebAppJs), (FAVICON, Route::Favicon)] {
+    for (exact, route) in
+        [("/web/blob/api/repos", Route::WebList), ("/web/app.js", Route::WebAppJs), (FAVICON, Route::Favicon)]
+    {
         if path == exact {
             return route;
         }
@@ -421,4 +413,3 @@ mod tests {
         }
     }
 }
-
