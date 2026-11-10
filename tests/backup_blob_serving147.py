@@ -110,6 +110,7 @@ class Drill(BlobOnlyHarness):
         self.prefix = self.env["ROOTYARD_BLOB_ROOT"]
         self.base_suffix = "format22-169-" + uuid.uuid4().hex
         self.managed_suffixes = {self.base_suffix}
+        self.corruption_evidence = {}
         self.corruption_states = {}
         self.corruption_plan_used = ()
         # Issue #169: one dump of the API source and the already-proven clean
