@@ -190,7 +190,12 @@ fn a_view_from_another_capture_never_seals() {
     let (capture, binding) = registered_capture();
     let mut other = parts();
     other.snapshot_id = Uuid::from_bytes([9; 16]);
-    let (view, _, _) = view_bound_to(transient(other), binding, Some(FIXTURE_INCARNATION));
+    // The other view is a valid materialization of a different snapshot: it
+    // binds its own A5b digest, so only the cross-capture mismatch can refuse it.
+    let other_snapshot = transient(other);
+    let other_binding = other_snapshot.materialization_digest();
+    assert_ne!(other_binding, binding);
+    let (view, _, _) = view_bound_to(other_snapshot, other_binding, Some(FIXTURE_INCARNATION));
     assert!(serving_materialization(view, &capture).is_err());
 }
 
