@@ -210,7 +210,7 @@ async fn case(db: &Db) -> Result<()> {
     let malformed = raw_get(&client, &format!("{base}/refs"), &owner.token, Some(MALFORMED_SESSION)).await?;
     ensure!(malformed.status == 400, "malformed session header was not refused with 400");
     ensure!(!malformed.body.is_empty(), "malformed session refusal carried no body");
-    ensure_no_disclosure(&malformed.body, &secrets, "malformed session refusal");
+    ensure_no_disclosure(&malformed.body, &secrets, "malformed session refusal")?;
 
     // 6. The live foreign actor is refused identically with a malformed and no
     // session header: actor/repository authorization precedes token errors.
@@ -222,8 +222,12 @@ async fn case(db: &Db) -> Result<()> {
         ensure!(is_denial(answer.status), "foreign actor denial was not an authorization refusal");
         ensure!(!answer.body.is_empty(), "foreign actor denial carried no body");
         ensure!(!looks_like_refs(&answer.body), "foreign actor denial looked like a successful refs answer");
-        ensure_no_disclosure(&answer.body, &secrets, "foreign actor denial");
-        ensure_no_disclosure(&answer.body, &[&stranger.username, &owner.username], "foreign actor denial");
+        ensure_no_disclosure(&answer.body, &secrets, "foreign actor denial")?;
+        ensure_no_disclosure(
+            &answer.body,
+            &[stranger.username.as_str(), owner.username.as_str()],
+            "foreign actor denial",
+        )?;
         denied.push(answer);
     }
     ensure!(denied[0].status == denied[1].status, "foreign actor denial status depended on the session header");
@@ -253,7 +257,7 @@ async fn case(db: &Db) -> Result<()> {
     ensure!(ahead.status == 503, "future session bound was not refused with 503");
     ensure!(contains(&ahead.body, BEHIND_MESSAGE), "future session refusal did not carry BEHIND_MESSAGE");
     ensure!(!looks_like_refs(&ahead.body), "future session refusal looked like a successful refs answer");
-    ensure_no_disclosure(&ahead.body, &secrets, "future session refusal");
+    ensure_no_disclosure(&ahead.body, &secrets, "future session refusal")?;
 
     drop(server);
     Ok(())
@@ -272,10 +276,11 @@ fn looks_like_refs(body: &str) -> bool {
     body.contains("refs/") || body.contains("\"refs\"")
 }
 
-fn ensure_no_disclosure(body: &str, needles: &[&str], what: &str) {
+fn ensure_no_disclosure(body: &str, needles: &[&str], what: &str) -> Result<()> {
     for needle in needles {
         ensure!(!needle.is_empty() && !contains(body, needle), "{what} disclosed a repository or actor detail");
     }
+    Ok(())
 }
 
 fn open_store() -> Result<BlobStore> {
