@@ -99,5 +99,15 @@ opens a PR and the actual event counts are read from `actions/runs`.
 See "专项与完整 candidate 分层" in `docs/ci-acceptance.md`: during development the affected
 specialised workflows are dispatched manually on the branch, and the complete gate is the full
 `pull_request` run plus the post-merge `main` push run. No new suite input or orchestrator was
-added; `workflow_dispatch` is available on every workflow, including the two that gained it
-here.
+added; `workflow_dispatch` is available on every workflow except `ci.yml`, which never offered
+it, and it was added to the two suites that gained it here.
+
+## Enforcement and limits
+
+`tests/test_ci_workflow_triggers.py` pins the trigger contract (PR event plus `main`-only push,
+no `paths`/`paths-ignore` on either event, dispatch preserved, unchanged job ids). It uses the
+standard library only, because the repository declares no PyYAML dependency and the CI Python
+environment installs none; it reads the block-style `on:`/`jobs:` keys by indentation. It is
+not a YAML parser and does not validate the whole file: full YAML validity comes from GitHub
+parsing the pushed workflow, and the event counts above stay *expected* until a real push and
+PR are observed by Root.
