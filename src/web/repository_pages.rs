@@ -29,7 +29,7 @@ pub(in crate::web) fn router() -> PageRouter {
 /// One page table, mounted verbatim under `prefix` (`/web` or `/ui`).
 fn pages(prefix: &str) -> PageRouter {
     let page = |tail: &str| format!("{prefix}/repos/{{owner}}/{{name}}{tail}");
-    let all = Router::new()
+    Router::new()
         .route(&page(""), get(web::handlers::repo_overview))
         .route(&page("/tree"), get(web::handlers::tree_view))
         .route(&page("/tree/{oid}"), get(web::handlers::tree_by_oid_view))
