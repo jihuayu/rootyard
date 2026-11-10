@@ -180,6 +180,10 @@ class prerequisite:
             assert not proc.stderr.strip(), (
                 f"{label} resolved HEAD {proc.stdout.decode().strip()} with a warning: " +
                 proc.stderr.decode(errors="replace").strip()[-300:])
+            # When GIT_DIR is set Git stops searching for the work tree and
+            # rev-parse runs in a bare-style repository; pin it to this source.
+            if extra:
+                extra = {**extra, "GIT_WORK_TREE": str(root)}
             return proc.stdout.decode().strip(), {**env, **extra}, label
         raise AssertionError("required dependency missing: checkout HEAD unreachable (" +
                              "; ".join(tried) + ")")
