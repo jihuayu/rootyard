@@ -63,15 +63,13 @@
 //!
 //! 1. authenticate the actor (unchanged shared authentication);
 //! 2. authorize the repository through the live shared read lookup;
-//! 3. *only then* validate a presented header token (duplicates, malformed
-//!    values) and score it against the actually captured realm and revision;
-//! 4. after the bounded response encoding finishes, re-run authentication,
-//!    authorization, the realm and the cluster authority incarnation fence,
-//!    and only then issue and attach a fresh token.
+//! 3. read the live gate state, the binding and the cluster authority
+//!    incarnation *now*;
+//! 4. only then verify the token and score the version.
 //!
-//! A token error is therefore never answered before the caller has been
-//! authorized for the named repository, so it cannot become a version or
-//! existence oracle for another repository. A token that authenticates but does not bind the identical live
+//! Steps 3–4 therefore run after authorization: an unauthenticated or
+//! unauthorized caller cannot use a token error as a version or existence
+//! oracle. A token that authenticates but does not bind the identical live
 //! realm is refused as [`SessionTokenError::Realm`] — a retired or foreign key
 //! is [`SessionTokenError::Invalid`] — and the refusal names neither the other
 //! realm nor the current revision.
@@ -93,10 +91,12 @@
 //!
 //! ## Layout
 //!
-//! This file holds the exported pieces ([`SessionTokens`], [`SessionRealm`],
-//! [`RepoSession`], [`VersionComparison`], [`SessionTokenError`]). The signed
-//! frame lives in the private `codec` submodule; unit tests live in the private
-//! `tests` submodule.
+//! This file holds the pieces the gateway shares and exports ([`SessionTokens`],
+//! [`SessionRealm`], [`RepoSession`], [`VersionComparison`], [`SessionTokenError`]).
+//! The signed frame lives in the private `codec` submodule; unit tests live in
+//! the private `tests` submodule. The gateway JSON read routes reach the scoring
+//! boundary only through `super::read_session`; no token is issued yet (the
+//! low-level mint is test-only).
 use std::{fmt, sync::Arc};
 
 use axum::{
@@ -113,10 +113,15 @@ mod codec;
 #[cfg(test)]
 mod tests;
 
+/// The opened key set, built only by the private keyring loader. Tests open
+/// tokens through the very same type.
 pub(crate) use codec::SessionTokenCodec;
+/// Header-only extraction of a presented token; the gateway read session and
+/// the keyring rotation tests both present real header values.
+pub(crate) use codec::presented;
+pub(crate) use codec::{MAX_LIFETIME_SECONDS, MIN_LIFETIME_SECONDS};
 #[cfg(test)]
 pub(crate) use codec::presented as presented_for_test;
-pub(crate) use codec::{MAX_LIFETIME_SECONDS, MIN_LIFETIME_SECONDS};
 
 use codec::{Presented, now_seconds};
 
@@ -129,7 +134,6 @@ pub(crate) const REVISION_HEADER: &str = "x-rootyard-session-revision";
 /// Upper bound on encoded token length; see `codec::MAX_TOKEN_LEN`.
 #[cfg(test)]
 pub(crate) use codec::MAX_TOKEN_LEN as TEST_MAX_TOKEN_LEN;
-
 /// The exact realm a token is bound to, as read from PostgreSQL during this
 /// request. Nothing here comes from process start-up state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,18 +206,19 @@ impl RepoSession {
 /// authorized and found identical to the token's realm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VersionComparison {
-    /// The captured gate revision is at or beyond the token's lower bound.
+    /// The live gate revision is at or beyond the token's lower bound.
     Satisfied { bound: i64 },
-    /// Same realm, but the captured gate revision is behind the lower bound.
-    /// The caller must answer with an explicit distinguishable refusal; it must
+    /// Same realm, but the live gate revision is behind the lower bound. The
+    /// caller must answer with an explicit distinguishable refusal; it must
     /// never return this (older) view as satisfying and must never fall back to
     /// an unbounded answer.
     Behind { live_revision: i64 },
 }
 
 /// The only place a lower bound is scored. `live_revision` is the RefStore
-/// core gate revision the request actually captured from the authoritative
-/// store; it is never a storage generation, a layout counter or a cache cursor.
+/// core gate revision the request actually read from the authoritative store;
+/// it is never a storage generation, a layout counter or a cache cursor, and
+/// it is the only number compared with the bound.
 pub(crate) fn compare(
     session: &RepoSession,
     live: &SessionRealm,
@@ -231,15 +236,27 @@ pub(crate) fn compare(
 
 /// A token handed back with the actual served revision.
 ///
-/// A verifier trusts only the signed frame it re-parses; this value exists to
-/// attach that frame, its revision and the no-store policy to a finished
-/// response.
+/// Its fields are what [`IssuedSession::descriptor`] and
+/// [`IssuedSession::apply`] are built from; a verifier trusts only the signed
+/// frame it re-parses.
 pub(crate) struct IssuedSession {
     token: String,
     revision: i64,
+    lifetime_seconds: u32,
+    realm: SessionRealm,
 }
 
 impl IssuedSession {
+    /// Test-only: round-trip and rotation fixtures present the real header.
+    #[cfg(test)]
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub(crate) fn revision(&self) -> i64 {
+        self.revision
+    }
+
     /// Attach the bearer-equivalent token, the served revision and the
     /// no-store policy. The token is never placed in a URL.
     pub(crate) fn apply(&self, response: &mut Response) {
@@ -252,13 +269,41 @@ impl IssuedSession {
         }
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         headers.insert(header::VARY, HeaderValue::from_static("authorization, x-rootyard-session"));
+        debug_assert!(!self.realm.repository_id.is_nil());
     }
 }
 
 impl fmt::Debug for IssuedSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The encoded token is bearer-equivalent: never print it.
-        formatter.debug_struct("IssuedSession").field("revision", &self.revision).finish_non_exhaustive()
+        formatter
+            .debug_struct("IssuedSession")
+            .field("repository_id", &self.realm.repository_id)
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+/// Non-secret session metadata, the body of the issuance reply. It omits the
+/// token, both incarnations and the tenant id, and says nothing about any
+/// other repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SessionDescriptor {
+    pub(crate) revision: i64,
+    pub(crate) lifetime_seconds: u32,
+    pub(crate) repository_id: Uuid,
+}
+
+impl IssuedSession {
+    /// Non-secret facts for a JSON body. The token itself is never serialized.
+    /// Every issuance reply is built from this pair, so a token is never sent
+    /// without the revision and lifetime it is bound to.
+    pub(crate) fn descriptor(&self) -> SessionDescriptor {
+        SessionDescriptor {
+            revision: self.revision,
+            lifetime_seconds: self.lifetime_seconds,
+            repository_id: self.realm.repository_id,
+        }
     }
 }
 
@@ -275,7 +320,7 @@ pub(crate) enum SessionTokenError {
     /// repository, object format, history, authority/group epoch or cluster
     /// authority incarnation).
     Realm,
-    /// Authentic, same realm, but the captured gate is behind the bound.
+    /// Authentic, same realm, but the live gate is behind the bound.
     Behind,
 }
 
@@ -289,10 +334,10 @@ impl SessionTokenError {
         match self {
             Self::Invalid => GatewayError::BadRequest("invalid repository session token"),
             // A fresh token is only ever issued at a revision this server
-            // really served; the client asks the same authority for it and
-            // never resets its own lower bound.
+            // really committed or served; the client asks the same authority
+            // for it and never resets its own lower bound.
             Self::Expired => GatewayError::Unavailable(
-                "repository session has expired; resume read-your-writes and monotonic reads against the authoritative store and retry from a freshly served revision",
+                "repository session has expired; resume read-your-writes and monotonic reads against the authoritative store and retry from a freshly committed or served revision",
             ),
             Self::Realm => GatewayError::Conflict(
                 "repository session belongs to another repository, history or authority generation; re-read the authoritative store and obtain a fresh session there",
@@ -324,9 +369,11 @@ impl SessionTokens {
         self.codec.lifetime_seconds()
     }
 
-    /// Verify a presented header token against the authorized live realm and
-    /// the actually captured gate revision. `Presented::None` is the
-    /// unchanged, token-free path.
+    /// Verify a header value against the authorized live realm and the live
+    /// gate revision read in this request; `None` is the unchanged token-free
+    /// path. Only callers that already parsed the header (see `presented`) use
+    /// this; it validates the frame and delegates to the same `compare` scoring
+    /// as everything else, so there is no second, revision-blind comparison.
     pub(crate) fn verify(
         &self,
         presented: &Presented<'_>,
@@ -337,5 +384,24 @@ impl SessionTokens {
             Presented::None => Ok(None),
             Presented::Token(token) => self.codec.verify(token, now_seconds(), live, live_revision).map(Some),
         }
+    }
+
+    /// Issue a token for the revision this request really committed or served.
+    /// The bound may equal the live revision but never exceeds it: a bound
+    /// above the authoritative gate would make the very next read `Behind`.
+    ///
+    /// This is a test-only low-level mint, not the serving API. A bare `i64` is
+    /// not a proof of what this server committed or served, so production code
+    /// cannot reach it; the issuance route is added only in a later task, and it
+    /// must take an opaque proof from a real
+    /// [`ServingReadCapture`](crate::ref_store::core::pack_snapshot::ServingReadCapture) /
+    /// committed receipt. It never accepts a client-supplied revision.
+    #[cfg(test)]
+    pub(crate) fn issue_for_test(
+        &self,
+        live: &SessionRealm,
+        served_revision: i64,
+    ) -> Result<IssuedSession, SessionTokenError> {
+        self.codec.issue(live, served_revision, now_seconds())
     }
 }

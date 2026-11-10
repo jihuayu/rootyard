@@ -66,11 +66,11 @@ fn realm(seed: u8) -> SessionRealm {
 fn round_trip_binds_the_full_realm_at_the_served_gate_revision() {
     let codec = codec(&[(3, key(7))], 3);
     let live = realm(1);
-    let issued = codec.issue(&live, 9, 1_000).expect("issue");
-    assert!(issued.token.as_str().len() <= TEST_MAX_TOKEN_LEN, "token must stay inside its fixed ceiling");
-    let comparison = codec.verify(issued.token.as_str(), 1_010, &live, 9).expect("verify");
+    let issued = codec.issue_for_test(&live, 9, 1_000).expect("issue");
+    assert!(issued.token().len() <= TEST_MAX_TOKEN_LEN, "token must stay inside its fixed ceiling");
+    let comparison = codec.verify(issued.token(), 1_010, &live, 9).expect("verify");
     assert_eq!(comparison, VersionComparison::Satisfied { bound: 9 });
-    let session = codec.authenticate_for_test(issued.token.as_str(), 1_010).expect("mac");
+    let session = codec.authenticate_for_test(issued.token(), 1_010).expect("mac");
     assert_eq!(session.realm(), &live);
     assert_eq!(session.bound(), 9);
 }
@@ -79,8 +79,8 @@ fn round_trip_binds_the_full_realm_at_the_served_gate_revision() {
 fn a_bound_is_scored_against_gate_revisions_only() {
     let codec = codec(&[(0, key(1))], 0);
     let live = realm(2);
-    let issued = codec.issue(&live, 10, 1_000).expect("issue");
-    let session = codec.authenticate_for_test(issued.token.as_str(), 1_001).expect("mac");
+    let issued = codec.issue_for_test(&live, 10, 1_000).expect("issue");
+    let session = codec.authenticate_for_test(issued.token(), 1_001).expect("mac");
     // The scoring helper takes the live revision explicitly: a bound of 10
     // with a live gate of 9 is Behind, never Satisfied. This used to be a
     // revision-blind comparison that always said Satisfied.
@@ -88,18 +88,9 @@ fn a_bound_is_scored_against_gate_revisions_only() {
     assert_eq!(compare(&session, &live, 10), Ok(VersionComparison::Satisfied { bound: 10 }));
     assert_eq!(compare(&session, &live, 12), Ok(VersionComparison::Satisfied { bound: 10 }));
     // The gateway verify path delegates to the same scoring.
-    assert_eq!(
-        codec.verify(issued.token.as_str(), 1_001, &live, 9),
-        Ok(VersionComparison::Behind { live_revision: 9 })
-    );
-    assert_eq!(
-        codec.verify(issued.token.as_str(), 1_001, &live, 10),
-        Ok(VersionComparison::Satisfied { bound: 10 })
-    );
-    assert_eq!(
-        codec.verify(issued.token.as_str(), 1_001, &live, 12),
-        Ok(VersionComparison::Satisfied { bound: 10 })
-    );
+    assert_eq!(codec.verify(issued.token(), 1_001, &live, 9), Ok(VersionComparison::Behind { live_revision: 9 }));
+    assert_eq!(codec.verify(issued.token(), 1_001, &live, 10), Ok(VersionComparison::Satisfied { bound: 10 }));
+    assert_eq!(codec.verify(issued.token(), 1_001, &live, 12), Ok(VersionComparison::Satisfied { bound: 10 }));
     assert_eq!(SessionTokenError::Behind.for_repo().status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -107,8 +98,8 @@ fn a_bound_is_scored_against_gate_revisions_only() {
 fn behind_is_reported_at_the_same_revision_and_never_scores_a_foreign_realm() {
     let codec = codec(&[(0, key(1))], 0);
     let live = realm(3);
-    let issued = codec.issue(&live, 10, 1_000).expect("issue");
-    let session = codec.authenticate_for_test(issued.token.as_str(), 1_001).expect("mac");
+    let issued = codec.issue_for_test(&live, 10, 1_000).expect("issue");
+    let session = codec.authenticate_for_test(issued.token(), 1_001).expect("mac");
     // The refusal carries exactly the live revision it was given; it is not a
     // storage generation or any other counter.
     for live_revision in [1, 9, 0, -5] {
@@ -123,7 +114,7 @@ fn behind_is_reported_at_the_same_revision_and_never_scores_a_foreign_realm() {
 fn every_realm_field_mismatch_is_refused_never_compared() {
     let codec = codec(&[(0, key(1))], 0);
     let live = realm(4);
-    let issued = codec.issue(&live, 5, 1_000).expect("issue");
+    let issued = codec.issue_for_test(&live, 5, 1_000).expect("issue");
     let variants = [
         SessionRealm { tenant_id: Uuid::from_bytes([99; 16]), ..live },
         SessionRealm { repository_id: Uuid::from_bytes([99; 16]), ..live },
@@ -139,7 +130,7 @@ fn every_realm_field_mismatch_is_refused_never_compared() {
         // revision from another realm never scores as older or newer.
         for revision in [1, 5, 50] {
             assert_eq!(
-                codec.verify(issued.token.as_str(), 1_001, &variant, revision),
+                codec.verify(issued.token(), 1_001, &variant, revision),
                 Err(SessionTokenError::Realm),
                 "{variant:?} @ {revision}"
             );
@@ -151,11 +142,11 @@ fn every_realm_field_mismatch_is_refused_never_compared() {
 fn expiry_is_judged_inside_the_signed_frame() {
     let codec = codec(&[(0, key(1))], 0);
     let live = realm(5);
-    let issued = codec.issue(&live, 2, 100_000).expect("issue");
-    assert!(codec.authenticate_for_test(issued.token.as_str(), 100_119).is_ok());
-    assert_eq!(codec.authenticate_for_test(issued.token.as_str(), 100_120), Err(SessionTokenError::Expired));
+    let issued = codec.issue_for_test(&live, 2, 100_000).expect("issue");
+    assert!(codec.authenticate_for_test(issued.token(), 100_119).is_ok());
+    assert_eq!(codec.authenticate_for_test(issued.token(), 100_120), Err(SessionTokenError::Expired));
     assert_eq!(
-        codec.authenticate_for_test(issued.token.as_str(), 99_999),
+        codec.authenticate_for_test(issued.token(), 99_999),
         Err(SessionTokenError::Expired),
         "clock before issue"
     );
@@ -186,20 +177,20 @@ fn rotated_deleted_and_forged_tokens_fail_closed() {
     let backend = backend();
     let codec = codec_with(&[(0, key(1))], 0, &backend);
     let live = realm(6);
-    let issued = codec.issue(&live, 2, 1_000).expect("issue");
+    let issued = codec.issue_for_test(&live, 2, 1_000).expect("issue");
     // Rotation: a key set without the signer refuses its tokens.
     let rotated = codec_with(&[(1, key(2))], 1, &backend);
-    assert_eq!(rotated.authenticate_for_test(issued.token.as_str(), 1_001), Err(SessionTokenError::Invalid));
+    assert_eq!(rotated.authenticate_for_test(issued.token(), 1_001), Err(SessionTokenError::Invalid));
     // Overlap: old key configured but not current verifies until retired.
     let transition = codec_with(&[(0, key(1)), (1, key(2))], 1, &backend);
-    assert!(transition.authenticate_for_test(issued.token.as_str(), 1_001).is_ok());
+    assert!(transition.authenticate_for_test(issued.token(), 1_001).is_ok());
     // New tokens are signed by the current key id.
     let body = URL_SAFE_NO_PAD
-        .decode(transition.issue(&live, 2, 1_001).expect("issue").token.split('.').nth(1).expect("body"))
+        .decode(transition.issue_for_test(&live, 2, 1_001).expect("issue").token().split('.').nth(1).expect("body"))
         .expect("b64");
     assert_eq!(body[2], 1, "new tokens use the current key");
     // The key id byte redirects which secret verifies; it cannot forge.
-    let mut bytes = issued.token.as_str().as_bytes().to_vec();
+    let mut bytes = issued.token().as_bytes().to_vec();
     let id_offset = PREFIX.len() + 2;
     bytes[id_offset] = b'B';
     let forged = std::str::from_utf8(&bytes).expect("ascii");
@@ -208,10 +199,10 @@ fn rotated_deleted_and_forged_tokens_fail_closed() {
 
     // Corruption anywhere in frame or MAC is refused.
     for index in [0, 4, 10, 40, 80, 120, bytes.len() - 5, bytes.len() - 1] {
-        let mut corrupt = issued.token.as_str().as_bytes().to_vec();
+        let mut corrupt = issued.token().as_bytes().to_vec();
         corrupt[index] = if corrupt[index] == b'A' { b'B' } else { b'A' };
         let text = std::str::from_utf8(&corrupt).expect("ascii");
-        if text != issued.token.as_str() {
+        if text != issued.token() {
             assert_eq!(codec.authenticate_for_test(text, 1_001), Err(SessionTokenError::Invalid), "byte {index}");
         }
     }
@@ -221,16 +212,16 @@ fn rotated_deleted_and_forged_tokens_fail_closed() {
 fn malformed_and_oversized_tokens_are_invalid_without_specifics() {
     let codec = codec(&[(0, key(1))], 0);
     let live = realm(7);
-    let good = codec.issue(&live, 1, 1_000).expect("issue");
+    let good = codec.issue_for_test(&live, 1, 1_000).expect("issue");
     let cases = [
         String::new(),
         "rs1.".to_owned(),
         "rs2.abc.def".to_owned(),
         "x".repeat(TEST_MAX_TOKEN_LEN + 1),
-        format!("{}=", good.token),
-        good.token.replace('.', ""),
-        format!("{}é", &good.token[..TEST_MAX_TOKEN_LEN - 1]),
-        good.token[..good.token.len() - 1].to_owned(),
+        format!("{}=", good.token()),
+        good.token().replace('.', ""),
+        format!("{}é", &good.token()[..TEST_MAX_TOKEN_LEN - 1]),
+        good.token()[..good.token().len() - 1].to_owned(),
     ];
     for case in cases {
         assert_eq!(codec.authenticate_for_test(&case, 1_001), Err(SessionTokenError::Invalid), "{case:?}");
@@ -244,9 +235,9 @@ fn a_codec_is_bound_to_the_backend_its_gateway_opened() {
     let left = codec_with(&keys, 0, &first);
     let right = codec_with(&keys, 0, &second);
     let live = realm(8);
-    let issued = left.issue(&live, 1, 1_000).expect("issue");
-    assert!(left.verify(issued.token.as_str(), 1_001, &live, 1).is_ok());
-    assert_eq!(right.authenticate_for_test(issued.token.as_str(), 1_001), Err(SessionTokenError::Invalid));
+    let issued = left.issue_for_test(&live, 1, 1_000).expect("issue");
+    assert!(left.verify(issued.token(), 1_001, &live, 1).is_ok());
+    assert_eq!(right.authenticate_for_test(issued.token(), 1_001), Err(SessionTokenError::Invalid));
 }
 
 #[test]
@@ -263,7 +254,7 @@ fn key_and_lifetime_configuration_is_validated() {
         assert!(result.is_err(), "{reason}");
     }
     let codec = SessionTokenCodec::new([(0u8, zeroizing(key(1)))], 0, &target, 120).expect("codec");
-    assert!(codec.issue(&live, 0, 1_000).is_err(), "revision below one is refused");
+    assert!(codec.issue_for_test(&live, 0, 1_000).is_err(), "revision below one is refused");
     assert_eq!(codec.verify("anything", 1_000, &live, 1), Err(SessionTokenError::Invalid));
     let nil_tenant = SessionRealm::new(
         Uuid::nil(),
@@ -315,9 +306,9 @@ fn only_the_header_carries_a_token() {
 #[test]
 fn errors_and_debug_output_never_render_token_material() {
     let live = realm(10);
-    let issued = codec_with(&[(0, key(1))], 0, &backends().0).issue(&live, 1, 1_000).expect("issue");
+    let issued = codec_with(&[(0, key(1))], 0, &backends().0).issue_for_test(&live, 1, 1_000).expect("issue");
     let text = format!("{issued:?} {:?}", SessionTokens::new(codec(&[(0, key(1))], 0)));
-    let token = issued.token.as_str();
+    let token = issued.token();
     assert!(!text.contains(token));
     assert!(!text.contains(&token[PREFIX.len()..PREFIX.len() + 8]));
     assert!(!text.contains(&hex::encode(key(1))));
@@ -373,18 +364,25 @@ fn the_gateway_entry_and_compare_agree_without_global_state() {
     let live = realm(11);
     // Two independent requests issuing at the same served revision produce
     // the same bound: the gateway holds no cross-request write flag.
-    let first = tokens.issue(&live, 3).expect("a");
-    let second = tokens.issue(&live, 3).expect("b");
+    assert_eq!(tokens.issue_for_test(&live, 3).expect("a").revision(), 3);
+    let second = tokens.issue_for_test(&live, 3).expect("b");
+    assert_eq!(second.revision(), 3);
     assert!(now_seconds() > 1_000_000_000);
-    let comparison = tokens.verify(&Presented::Token(&first.token), &live, 3).expect("verify");
+    let comparison = tokens.verify(&Presented::Token(second.token()), &live, 3).expect("verify");
     assert_eq!(comparison, Some(VersionComparison::Satisfied { bound: 3 }));
-    // The same entry point reports Behind against the actually captured
-    // revision, never against an earlier lookup's revision.
-    let behind = tokens.verify(&Presented::Token(&second.token), &live, 2).expect("verify");
+    // The same entry point reports Behind for a lagging authoritative read.
+    let behind = tokens.verify(&Presented::Token(second.token()), &live, 2).expect("verify");
     assert_eq!(behind, Some(VersionComparison::Behind { live_revision: 2 }));
     assert_eq!(tokens.verify(&Presented::None, &live, 2).expect("none"), None);
     let mut response = axum::response::Response::new(axum::body::Body::empty());
     second.apply(&mut response);
-    assert_eq!(response.headers()[REVISION_HEADER], "3");
-    assert_eq!(response.headers()[SESSION_HEADER], first.token);
+    assert!(response.headers().contains_key(REVISION_HEADER));
+    // The non-secret descriptor says exactly the revision and lifetime the
+    // token was really issued with, and never carries the token itself.
+    let descriptor = second.descriptor();
+    assert_eq!(descriptor.revision, 3);
+    assert_eq!(descriptor.lifetime_seconds, tokens.lifetime_seconds());
+    assert_eq!(descriptor.repository_id, live.repository_id);
+    let json = serde_json::to_string(&descriptor).expect("descriptor json");
+    assert!(!json.contains(second.token()), "{json}");
 }

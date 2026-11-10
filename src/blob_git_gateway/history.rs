@@ -5,7 +5,9 @@
 //! ([`browse::BrowseSession`]): authenticate the current token, take the gateway
 //! slot and byte lease, resolve the repository through the shared serving
 //! authority (live token, RBAC, contents read scope, ready exact binding and the
-//! actually opened Blob backend), capture the RefStore ref view, and build its
+//! actually opened Blob backend), then score a presented repository session
+//! lower bound against that authorized realm and gate revision, capture the
+//! RefStore ref view under the same cluster authority incarnation, and build its
 //! computed view. `snapshot::build_view` downloads, verifies and materializes the
 //! sealed pack closure and fsck-checks it, so that private bare view holds the
 //! complete current-refs reachable history. This module only runs fixed,

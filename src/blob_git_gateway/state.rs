@@ -84,6 +84,12 @@ impl BlobGitState {
         &self.pool
     }
 
+    /// The configured repository session key set, if any. `None` means a
+    /// presented session header is an explicit `501`, never a guessed key.
+    pub(super) fn sessions(&self) -> Option<&SessionTokens> {
+        self.sessions.as_ref()
+    }
+
     pub fn store(&self) -> &BlobStore {
         &self.store
     }

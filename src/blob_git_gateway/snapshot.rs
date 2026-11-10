@@ -116,6 +116,12 @@ pub(super) async fn load_ref_view(
     })
 }
 
+/// The cluster authority incarnation the capture locked `FOR SHARE`; a JSON
+/// read refuses to materialize unless it is the authorized lookup's own value.
+pub(super) fn capture_incarnation(view: &RefView) -> Option<Uuid> {
+    view.handle.as_ref().map(ServingReadCapture::capture_incarnation)
+}
+
 /// Compose one private bare Git view from the verified snapshot bytes. The
 /// transient read pin is released on every outcome (success or typed failure).
 pub(super) async fn build_view(

@@ -98,6 +98,10 @@ impl std::fmt::Debug for ProvisionReceipt {
 pub struct ServingRepository {
     pub repository: Repository,
     pub gate: CoreGate,
+    /// The non-nil `public.cluster_authority.incarnation` this lookup read in
+    /// its own bounded transaction after authorization. A later serving read
+    /// capture must prove the identical value before it may materialize.
+    pub cluster_incarnation: Uuid,
 }
 
 impl std::fmt::Debug for ServingRepository {
@@ -106,6 +110,7 @@ impl std::fmt::Debug for ServingRepository {
             .debug_struct("ServingRepository")
             .field("repository_id", &self.repository.id)
             .field("revision", &self.gate.revision())
+            .field("cluster_incarnation", &self.cluster_incarnation)
             .finish()
     }
 }
@@ -470,6 +475,12 @@ async fn provision_in_tx(
 /// repository `ready`); only then is the durable binding, the live gate and the
 /// concrete Blob backend identity checked, so an unauthorized caller cannot
 /// probe serving state.
+///
+/// After authorization and before any repository/scope/gate read, the same
+/// bounded transaction also reads the cluster authority incarnation. The
+/// lookup rolls back and returns no client or transaction. A later serving read
+/// capture must prove the identical incarnation before it may materialize
+/// (#174).
 pub async fn lookup(
     pool: &Pool,
     actor: &Identity,
@@ -505,6 +516,11 @@ pub(crate) async fn lookup_in_tx(
     let (min_role, action) =
         if writable { (Role::Write, RepoAction::ContentsWrite) } else { (Role::Read, RepoAction::ContentsRead) };
     let access = auth::authorize_repo_with_role(tx, actor, owner, name, min_role, action).await?;
+    // Only an authorized caller reads the restore incarnation. It is read in
+    // this same narrow read-only transaction before any repository/scope/gate
+    // row, stays inside it, and is nil-free. (`LockedScope::lock` takes its own
+    // short read-only transaction, exactly as the capture does.)
+    let cluster_incarnation = read_cluster_incarnation(tx).await.map_err(map_refstore)?;
     // The tenant identity is the owner namespace resolved by that
     // authorization, never the actor id.
     let scope =
@@ -525,7 +541,25 @@ pub(crate) async fn lookup_in_tx(
         return Err(Error::internal("durable gate/binding realm mismatch"));
     }
     let repository = read_repository_in_tx(tx, access.repo_id).await?;
-    Ok(ServingRepository { repository, gate })
+    Ok(ServingRepository { repository, gate, cluster_incarnation })
+}
+
+/// Read the global restore incarnation (migration 085) in the caller's
+/// already-authorized transaction. Exactly one non-nil singleton row is
+/// required; anything else is a typed store failure, never an empty anchor.
+async fn read_cluster_incarnation(tx: &Transaction<'_>) -> Result<Uuid, RefStoreError> {
+    let row = tx
+        .query_opt("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
+        .await
+        .map_err(crate::ref_store::pg::db_error)?
+        .ok_or_else(|| RefStoreError::Database("cluster authority singleton row is missing".into()))?;
+    let incarnation: Uuid = row
+        .try_get(0)
+        .map_err(|_| RefStoreError::Database("cluster authority row has no uuid incarnation".into()))?;
+    if incarnation.is_nil() {
+        return Err(RefStoreError::Database("cluster authority incarnation is nil".into()));
+    }
+    Ok(incarnation)
 }
 
 async fn read_repository(pool: &Pool, repository_id: Uuid, deadline: Instant) -> Result<Repository, Error> {

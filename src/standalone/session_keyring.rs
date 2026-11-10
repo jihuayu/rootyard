@@ -265,7 +265,7 @@ mod tests {
     /// A token issued by the codec itself: its body is canonical base64url,
     /// unlike a `rs1.<arbitrary>.mac` header probe.
     fn issue(tokens: &SessionTokens, live: &SessionRealm, revision: i64) -> String {
-        tokens.issue(live, revision).expect("issue").token().to_owned()
+        tokens.issue_for_test(live, revision).expect("issue").token().to_owned()
     }
 
     /// The gateway entry point: header in, `Option<VersionComparison>` out.

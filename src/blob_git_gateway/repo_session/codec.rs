@@ -198,6 +198,8 @@ impl SessionTokenCodec {
         Ok(IssuedSession {
             token: format!("{PREFIX}{}.{}", URL_SAFE_NO_PAD.encode(body), URL_SAFE_NO_PAD.encode(mac.as_ref())),
             revision: served_revision,
+            lifetime_seconds: self.lifetime_seconds,
+            realm: *live,
         })
     }
 }
@@ -257,7 +259,11 @@ pub(crate) enum Presented<'a> {
 }
 
 /// Extract the explicitly presented token from the request header only.
-/// Duplicates are refused, and only a bounded ASCII value is considered.
+///
+/// This is pure header admission: a duplicate or non-text value is refused. It
+/// never authenticates a frame and says nothing about a repository, so a caller
+/// may run it before or after the live lookup; `authenticate` (inside the only
+/// `verify`/scoring path) re-checks the length and ASCII ceiling.
 pub(crate) fn presented<'a>(headers: &'a HeaderMap) -> Result<Presented<'a>, SessionTokenError> {
     let name = HeaderName::from_static(SESSION_HEADER);
     let mut values = headers.get_all(&name).iter();
