@@ -198,8 +198,6 @@ impl SessionTokenCodec {
         Ok(IssuedSession {
             token: format!("{PREFIX}{}.{}", URL_SAFE_NO_PAD.encode(body), URL_SAFE_NO_PAD.encode(mac.as_ref())),
             revision: served_revision,
-            lifetime_seconds: self.lifetime_seconds,
-            realm: *live,
         })
     }
 }
