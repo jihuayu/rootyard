@@ -11,10 +11,17 @@ use super::*;
 fn membership_only(declared: &[DeclaredPair]) -> SourceSets {
     let declared = declared
         .iter()
-        .map(|pair| DeclaredPair {
-            declared_by: Vec::new(),
-            declared_sets: pair.declared_sets.iter().filter(|(source, _, _)| source == "membership").cloned().collect(),
-            ..pair.clone()
+        .map(|pair| {
+            let publication = pair.publication.as_ref().expect("a membership-only pair is published");
+            DeclaredPair {
+                declared_by: vec!["membership".to_owned()],
+                declared_sets: vec![(
+                    "membership".to_owned(),
+                    publication.digest.clone(),
+                    publication.gate_revision.saturating_add(1),
+                )],
+                ..pair.clone()
+            }
         })
         .collect::<Vec<_>>();
     SourceSets { declared, ..Default::default() }
