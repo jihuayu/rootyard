@@ -171,12 +171,7 @@ fn commit_unknown_error() -> Error {
 
 fn map_refstore(error: RefStoreError) -> Error {
     match error {
-        // A timed-out or `NOWAIT`-contended lock wrote nothing: the generic
-        // retryable service error (never SQLSTATE).
-        RefStoreError::Timeout => Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ref-store authority is busy or the deadline expired; retry the same request",
-        ),
+        RefStoreError::Timeout => deadline_error(),
         RefStoreError::CommitUnknown { .. } | RefStoreError::MetadataCommitUnknown { .. } => commit_unknown_error(),
         RefStoreError::GateConflict
         | RefStoreError::DigestConflict
@@ -527,10 +522,10 @@ pub(crate) async fn lookup_in_tx(
     // another transaction). `NOWAIT` is required: auth already holds
     // tokens/users/repository `FOR SHARE` and `backup::authority::fence` updates
     // the cluster row before its token rows, so a *blocking* cluster
-    // `FOR SHARE` here could deadlock (token->cluster vs cluster->token). A
-    // contended lock is the generic retryable service error, never an
-    // incarnation or SQLSTATE.
-    let cluster_incarnation = read_cluster_incarnation_nowait(tx).await.map_err(map_refstore)?;
+    // `FOR SHARE` here could deadlock (token->cluster vs cluster->token). Only
+    // this one read maps a contended lock locally; every other failure (and
+    // every other DB read) keeps the shared deadline policy.
+    let cluster_incarnation = map_cluster_incarnation(read_cluster_incarnation_nowait(tx).await)?;
     // The tenant identity is the owner namespace resolved by that
     // authorization, never the actor id.
     let scope =
@@ -554,15 +549,31 @@ pub(crate) async fn lookup_in_tx(
     Ok(ServingRepository { repository, gate, cluster_incarnation })
 }
 
+/// The generic, retryable refusal for a cluster-anchor lock that `NOWAIT`
+/// could not take. It names no SQLSTATE, detail or incarnation.
+const NOWAIT_CONTENDED: &str = "ref-store authority is busy; retry the same request";
+
+/// Outcome of the cluster anchor `FOR SHARE NOWAIT`: either the incarnation was
+/// read, or the lock was held by another transaction. Any other failure is
+/// returned unchanged (and therefore mapped by the caller's shared mapper).
+enum ClusterIncarnation {
+    Read(Uuid),
+    LockNotAvailable,
+}
+
 /// Lock and read the global restore incarnation (migration 085) `FOR SHARE NOWAIT`
 /// in the caller's already-authorized transaction. Exactly one non-nil
 /// singleton row is required; anything else is a typed store failure, never an
 /// empty anchor.
-async fn read_cluster_incarnation_nowait(tx: &Transaction<'_>) -> Result<Uuid, RefStoreError> {
-    let rows = tx
+async fn read_cluster_incarnation_nowait(tx: &Transaction<'_>) -> Result<ClusterIncarnation, RefStoreError> {
+    let rows = match tx
         .query("SELECT incarnation FROM public.cluster_authority WHERE singleton=true FOR SHARE NOWAIT", &[])
         .await
-        .map_err(crate::ref_store::pg::db_error)?;
+    {
+        Ok(rows) => rows,
+        Err(error) if nowait_contended(&error) => return Ok(ClusterIncarnation::LockNotAvailable),
+        Err(error) => return Err(crate::ref_store::pg::db_error(error)),
+    };
     let [row] = rows.as_slice() else {
         return Err(RefStoreError::Database(format!(
             "cluster authority has {} singleton incarnation rows, expected exactly one",
@@ -575,7 +586,23 @@ async fn read_cluster_incarnation_nowait(tx: &Transaction<'_>) -> Result<Uuid, R
     if incarnation.is_nil() {
         return Err(RefStoreError::Database("cluster authority incarnation is nil".into()));
     }
-    Ok(incarnation)
+    Ok(ClusterIncarnation::Read(incarnation))
+}
+
+/// `SQLSTATE 55P03` (`lock_not_available`): the `NOWAIT` share lock was not
+/// taken, nothing was written, and retrying the same statement is the remedy.
+fn nowait_contended(error: &tokio_postgres::Error) -> bool {
+    error.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+}
+
+/// Map the cluster anchor outcome: only this lookup's contended `NOWAIT` becomes
+/// the generic retryable service error; everything else keeps the shared mapper.
+fn map_cluster_incarnation(outcome: Result<ClusterIncarnation, RefStoreError>) -> Result<Uuid, Error> {
+    match outcome {
+        Ok(ClusterIncarnation::Read(incarnation)) => Ok(incarnation),
+        Ok(ClusterIncarnation::LockNotAvailable) => Err(Error(StatusCode::SERVICE_UNAVAILABLE, NOWAIT_CONTENDED)),
+        Err(error) => Err(map_refstore(error)),
+    }
 }
 
 async fn read_repository(pool: &Pool, repository_id: Uuid, deadline: Instant) -> Result<Repository, Error> {
@@ -638,13 +665,31 @@ mod tests {
 
     #[test]
     fn refstore_errors_map_to_retryable_or_terminal_statuses() {
-        // Timeout also covers a `FOR SHARE NOWAIT` contention: both retry.
-        assert_eq!(map_refstore(RefStoreError::Timeout).0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(map_refstore(RefStoreError::Timeout).0, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
             map_refstore(RefStoreError::CommitUnknown { repository_id: Uuid::new_v4(), operation_id: None }).0,
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(map_refstore(RefStoreError::GateConflict).0, StatusCode::CONFLICT);
         assert_eq!(map_refstore(RefStoreError::RepositoryNotFound).0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn only_the_cluster_nowait_contention_is_a_generic_retryable_503() {
+        let incarnation = Uuid::new_v4();
+        assert_eq!(map_cluster_incarnation(Ok(ClusterIncarnation::Read(incarnation))).expect("read"), incarnation);
+        let contended = map_cluster_incarnation(Ok(ClusterIncarnation::LockNotAvailable)).expect_err("503");
+        assert_eq!(contended.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(contended.1, NOWAIT_CONTENDED);
+        // Every other failure keeps the shared mapper: a deadline is still the
+        // provisioning GATEWAY_TIMEOUT and an internal store failure is never
+        // disclosed.
+        let timed_out = map_cluster_incarnation(Err(RefStoreError::Timeout)).expect_err("deadline");
+        assert_eq!(timed_out.0, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(timed_out.1, deadline_error().1);
+        let missing = RefStoreError::Database("cluster authority incarnation is nil".into());
+        let internal = map_cluster_incarnation(Err(missing)).expect_err("internal");
+        assert_eq!(internal.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(internal.1, "service temporarily unavailable");
     }
 }

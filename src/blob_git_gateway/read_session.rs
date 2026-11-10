@@ -14,11 +14,15 @@
 //! 2. inspect the header (duplicate/non-text refused; without a key set, only
 //!    the presence of any occurrence is inspected, and it is a `501`);
 //! 3. capture the ref view; its cluster authority incarnation must be the
-//!    authorized lookup's own value or the refusal is a generic `503`;
-//! 4. *immediately* after that capture and before any Blob/native
-//!    materialization, score the header against the authorized realm (with
-//!    the capture's incarnation) and the revision the capture actually locked
-//!    through the single `SessionTokens::verify`/`compare` boundary.
+//!    authorized lookup's own value or the refusal is a generic `503`. This
+//!    anchor check is unconditional: it applies whether or not a key set is
+//!    configured and whether or not the request presented a header, because it
+//!    gates materialization, not the token verdict;
+//! 4. only after that anchor check, and before any Blob/native materialization,
+//!    score a presented header against the authorized realm (with the capture's
+//!    incarnation) and the revision the capture actually locked through the
+//!    single `SessionTokens::verify`/`compare` boundary. Without a key set there
+//!    is nothing to verify and step 4 is skipped.
 //!
 //! Every refusal after capture releases the transient capture through the
 //! bounded `snapshot::release_view` path before it is returned. A refusal never
@@ -44,13 +48,6 @@ pub(super) const SESSIONS_DISABLED: &str = "repository session tokens are not co
 pub(super) const AUTHORITY_CHANGED: &str =
     "repository authority changed after the read view was authorized; retry the same request";
 
-/// What the pre-capture header inspection decided; it never names a revision.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct ReadSession {
-    /// No session key set is configured and the request presented no header.
-    pub(super) keyring_absent: bool,
-}
-
 /// Inspect the presented header after the authorized lookup and before any
 /// capture or materialization. With a key set, duplicates/non-text values are
 /// refused (the frame is scored later, against the captured revision); without
@@ -61,15 +58,15 @@ pub(super) fn admit(
     tokens: Option<&SessionTokens>,
     headers: &HeaderMap,
     serving: &ServingRepository,
-) -> Result<ReadSession, GatewayError> {
+) -> Result<(), GatewayError> {
     let Some(_) = tokens else {
         if headers.get_all(SESSION_HEADER).iter().next().is_some() {
             return Err(GatewayError::NotImplemented(SESSIONS_DISABLED));
         }
-        return Ok(ReadSession { keyring_absent: true });
+        return Ok(());
     };
     presented(headers).map_err(|error| error.for_repo())?;
-    live_realm(serving, serving.cluster_incarnation).map(|_| ReadSession { keyring_absent: false })
+    live_realm(serving, serving.cluster_incarnation).map(|_| ())
 }
 
 /// Capture the ref view and require it to belong to the cluster authority
@@ -83,26 +80,36 @@ pub(super) async fn capture(
     deadline: tokio::time::Instant,
 ) -> Result<RefView, GatewayError> {
     let view = snapshot::load_ref_view(state, serving, deadline).await?;
-    let refused = match (state.sessions(), snapshot::capture_incarnation(&view)) {
-        (None, _) => None,
-        (Some(tokens), Some(captured)) if captured == serving.cluster_incarnation => {
-            // The only scoring entry: the authorized realm carries the
-            // *capture's* locked incarnation, the revision is the captured one.
-            let realm = live_realm(serving, captured);
-            presented(headers).map_err(|error| error.for_repo()).and_then(|header| {
-                tokens.verify(&header, &realm?, view.gate_revision()).map(|_| ()).map_err(|error| error.for_repo())
-            })
-            .err()
-        }
-        _ => Some(GatewayError::Unavailable(AUTHORITY_CHANGED)),
-    };
-    match refused {
-        None => Ok(view),
-        Some(error) => {
-            snapshot::release_view(state, &view, deadline).await;
-            Err(error)
-        }
+    if let Err(error) =
+        answer(snapshot::capture_incarnation(&view), state.sessions(), headers, serving, view.gate_revision())
+    {
+        snapshot::release_view(state, &view, deadline).await;
+        return Err(error);
     }
+    Ok(view)
+}
+
+/// The pure verdict for one loaded capture. The capture's own cluster anchor is
+/// checked first and unconditionally: a missing, nil or rotated anchor refuses
+/// with [`AUTHORITY_CHANGED`] before the key set or the header is considered, so
+/// a token-disabled or token-free read can never materialize a view captured in
+/// another incarnation. Only after that anchor matches is a presented header
+/// scored (when a key set exists) against the authorized realm bound to the
+/// *captured* incarnation and the revision the capture actually locked.
+fn answer(
+    captured_incarnation: Option<Uuid>,
+    tokens: Option<&SessionTokens>,
+    headers: &HeaderMap,
+    serving: &ServingRepository,
+    captured_revision: i64,
+) -> Result<(), GatewayError> {
+    let captured = captured_incarnation
+        .filter(|captured| !captured.is_nil() && *captured == serving.cluster_incarnation)
+        .ok_or(GatewayError::Unavailable(AUTHORITY_CHANGED))?;
+    let Some(tokens) = tokens else { return Ok(()) };
+    let realm = live_realm(serving, captured)?;
+    let header = presented(headers).map_err(|error| error.for_repo())?;
+    tokens.verify(&header, &realm, captured_revision).map(|_| ()).map_err(|error| error.for_repo())
 }
 
 /// The full realm of an authorized serving lookup bound to the incarnation the
@@ -186,24 +193,13 @@ mod tests {
         GatewayError::BadRequest("invalid repository session token")
     }
 
-    /// The scoring step `capture` runs after the capture: the lookup `serving`
-    /// may see an older revision than the one `captured`.
-    fn score(
-        serving: &ServingRepository,
-        captured: Uuid,
-        header: &Presented<'_>,
-        revision: i64,
-    ) -> Result<(), GatewayError> {
-        let live = live_realm(serving, captured)?;
-        tokens().verify(header, &live, revision).map(|_| ()).map_err(|error| error.for_repo())
-    }
-
     #[test]
     fn absent_header_is_unchanged_with_and_without_a_keyring() {
         let live = serving(3, id(4));
-        assert_eq!(score(&live, id(4), &Presented::None, 3), Ok(()));
-        assert_eq!(admit(None, &HeaderMap::new(), &live).map(|admitted| admitted.keyring_absent), Ok(true));
-        assert_eq!(admit(Some(&tokens()), &HeaderMap::new(), &live).map(|admitted| admitted.keyring_absent), Ok(false));
+        assert_eq!(answer(Some(id(4)), None, &HeaderMap::new(), &live, 3), Ok(()));
+        assert_eq!(answer(Some(id(4)), Some(&tokens()), &HeaderMap::new(), &live, 3), Ok(()));
+        assert_eq!(admit(None, &HeaderMap::new(), &live), Ok(()));
+        assert_eq!(admit(Some(&tokens()), &HeaderMap::new(), &live), Ok(()));
     }
 
     #[test]
@@ -232,14 +228,19 @@ mod tests {
 
     #[test]
     fn the_bound_is_scored_against_the_captured_revision() {
+        let tokens = tokens();
         let live = serving(9, id(4));
-        let issued = tokens().issue_for_test(&live_realm(&live, id(4)).expect("realm"), 10).expect("issue");
+        let issued = tokens.issue_for_test(&live_realm(&live, id(4)).expect("realm"), 10).expect("issue");
+        let presented = header(&issued.token());
         // The lookup saw gate 9 while the capture locked the committed 10.
-        let token = Presented::Token(issued.token());
-        assert_eq!(score(&live, id(4), &token, 10), Ok(()));
+        assert_eq!(answer(Some(id(4)), Some(&tokens), &presented, &live, 10), Ok(()));
         // The same bound-10 token against a capture at 9 is the existing Behind.
-        assert_eq!(score(&live, id(4), &token, 9), Err(GatewayError::Unavailable(BEHIND_MESSAGE)));
-        assert_eq!(score(&live, id(4), &Presented::None, 10), Ok(()));
+        assert_eq!(
+            answer(Some(id(4)), Some(&tokens), &presented, &live, 9),
+            Err(GatewayError::Unavailable(BEHIND_MESSAGE))
+        );
+        // No header remains token-free with a key set.
+        assert_eq!(answer(Some(id(4)), Some(&tokens), &HeaderMap::new(), &live, 10), Ok(()));
     }
 
     #[test]
@@ -256,5 +257,63 @@ mod tests {
             ))
         );
         assert_eq!(GatewayError::Unavailable(AUTHORITY_CHANGED).status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The capture anchor is checked before the key set and before the header:
+    /// a missing, nil or rotated anchor is refused with the generic retryable
+    /// `AUTHORITY_CHANGED`, whether session tokens are disabled or enabled and
+    /// whether or not a header was presented.
+    #[test]
+    fn the_capture_anchor_is_checked_before_the_key_set_or_the_header() {
+        let live = serving(5, id(4));
+        let rotated = GatewayError::Unavailable(AUTHORITY_CHANGED);
+        let tokens = tokens();
+        for captured in [None, Some(id(8)), Some(Uuid::nil())] {
+            // Tokens disabled and no header: the anchor still gates materialization.
+            assert_eq!(answer(captured, None, &HeaderMap::new(), &live, 5), Err(rotated.clone()), "{captured:?}");
+            // Tokens enabled and no header: the same refusal, not a token verdict.
+            assert_eq!(
+                answer(captured, Some(&tokens), &HeaderMap::new(), &live, 5),
+                Err(rotated.clone()),
+                "{captured:?}"
+            );
+        }
+        // A matching anchor is admitted token-free, with or without a key set.
+        assert_eq!(answer(Some(id(4)), None, &HeaderMap::new(), &live, 5), Ok(()));
+        assert_eq!(answer(Some(id(4)), Some(&tokens), &HeaderMap::new(), &live, 5), Ok(()));
+    }
+
+    /// A keyring-present realm rotation still fails after the anchor matched:
+    /// the presented token belongs to another authority generation.
+    #[test]
+    fn a_keyring_present_realm_rotation_is_refused() {
+        let rotated = serving(5, id(4));
+        let foreign = live_realm(&serving(5, id(8)), id(8)).expect("realm");
+        let issued = tokens().issue_for_test(&foreign, 5).expect("issue");
+        assert_eq!(
+            answer(Some(id(4)), Some(&tokens()), &header(&issued.token()), &rotated, 5),
+            Err(GatewayError::Conflict(
+                "repository session belongs to another repository, history or authority generation; re-read the authoritative store and obtain a fresh session there"
+            ))
+        );
+    }
+
+    /// The header is scored only after the anchor matched, against the captured
+    /// revision and never the lookup's; a malformed frame is a `400`.
+    #[test]
+    fn an_unrotated_capture_is_scored_after_its_anchor() {
+        let tokens = tokens();
+        let live = serving(9, id(4));
+        let issued = tokens.issue_for_test(&live_realm(&live, id(4)).expect("realm"), 5).expect("issue");
+        let presented = header(&issued.token());
+        assert_eq!(answer(Some(id(4)), Some(&tokens), &presented, &live, 5), Ok(()));
+        assert_eq!(
+            answer(Some(id(8)), Some(&tokens), &presented, &live, 5),
+            Err(GatewayError::Unavailable(AUTHORITY_CHANGED))
+        );
+        assert_eq!(
+            answer(Some(id(4)), Some(&tokens), &header("rs1.anything.anything"), &live, 5),
+            Err(malformed())
+        );
     }
 }
