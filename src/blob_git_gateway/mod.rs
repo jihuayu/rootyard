@@ -32,7 +32,7 @@ mod process_guard;
 mod protocol;
 mod publish;
 mod receive;
-mod repo_session;
+pub(crate) mod repo_session;
 mod resource;
 mod serving;
 mod session;
@@ -49,6 +49,7 @@ use axum::{
 
 pub use config::{BlobGitConfig, BlobGitConfigError, BlobGitLimits, BlobGitNativeLimits};
 pub use error::GatewayError;
+pub use repo_session::SessionTokens;
 pub use state::BlobGitState;
 
 /// Mount the Blob Git gateway. The caller owns the listener and the real Blob

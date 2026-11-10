@@ -532,7 +532,7 @@ fn read<const N: usize>(slice: &[u8]) -> [u8; N] {
 /// One gateway's immutable key set. Every verify/issue call reads the trusted
 /// wall clock itself; no cross-request state is kept here.
 #[derive(Clone)]
-pub(crate) struct SessionTokens {
+pub struct SessionTokens {
     codec: Arc<SessionTokenCodec>,
 }
 

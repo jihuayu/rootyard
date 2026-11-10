@@ -7,6 +7,7 @@ use std::{future::IntoFuture, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 mod config;
+mod session_keyring;
 
 /// Explicit integration entry while business endpoint equivalence is completed.
 pub async fn run_from_env() -> Result<()> {
@@ -36,9 +37,12 @@ pub async fn run_from_env() -> Result<()> {
         crate::blob_store::config::BlobProfile::from_env().map_err(|_| anyhow!("invalid Blob profile"))?,
     )
     .map_err(|_| anyhow!("could not construct remote Blob provider"))?;
-    let (bind, gateway) = config::gateway_config(pool.clone(), store)?;
-    let state = crate::blob_git_gateway::BlobGitState::new(gateway)
+    let (bind, gateway, sessions) = config::gateway_config(pool.clone(), store)?;
+    let mut state = crate::blob_git_gateway::BlobGitState::new(gateway)
         .map_err(|_| anyhow!("invalid Blob Git gateway configuration"))?;
+    if let Some(sessions) = sessions {
+        state = state.with_sessions(sessions);
+    }
     let router = crate::blob_git_gateway::router(Arc::new(state));
     let check = async {
         loop {
