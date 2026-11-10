@@ -436,6 +436,7 @@ class WebhooksHarness(PullsHarness):
         )
 
         # Now update feature branch and PR #1 head_oid to feat2_oid: old CI on feat1_oid must NOT allow merge!
+        self.pr1_version_before_push = self.pr1["version"]
         self.git(
             "push",
             "origin",
@@ -443,16 +444,36 @@ class WebhooksHarness(PullsHarness):
             cwd=self.work,
             token=self.alice,
         )
-        self.pr1 = self.document(
-            self.pr1_path,
-            200,
-            method="PATCH",
-            body={
-                "expected_version": self.pr1["version"],
-                "head_oid": self.feat2_oid,
-            },
-        )
+        # Background reconciliation may already have advanced PR #1 from the
+        # authoritative `feature` ref (head_oid=feat2_oid, version bumped). Read
+        # the live row instead of assuming the manual PATCH's pre-push version is
+        # still current, and only PATCH against a version just read; a 409 means
+        # a further writer won, so re-read and verify the row is exactly feat2.
+        pr_now = self.document(self.pr1_path)
+        if pr_now["head_oid"] == self.feat2_oid and pr_now["version"] > self.pr1["version"]:
+            self.pr1 = pr_now
+        else:
+            # Not yet auto-advanced: the old head must still be stored, so the
+            # manual PATCH is the one legitimate single use of a just-read version.
+            assert pr_now["head_oid"] == self.pr1["head_oid"], pr_now
+            try:
+                self.pr1 = self.document(
+                    self.pr1_path,
+                    200,
+                    method="PATCH",
+                    body={"expected_version": pr_now["version"], "head_oid": self.feat2_oid},
+                )
+            except AssertionError:
+                # At most one bounded re-read: accept the 409 only if a writer
+                # genuinely landed exactly feat2, never any arbitrary head.
+                self.pr1 = self.document(self.pr1_path)
+        assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
+        assert self.pr1["version"] > self.pr1_version_before_push, self.pr1
         self.document(self.dispatchpath, 200, method="POST", body={})
+        # Orchestration runs concurrently with the background worker; re-read the
+        # actual version so a later PATCH 409 cannot mask the queued-check result.
+        self.pr1 = self.document(self.pr1_path)
+        assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
 
         # Merge at feat2_oid must fail with 409 because feat2_oid's check runs are still 'queued'.
         self.document(
