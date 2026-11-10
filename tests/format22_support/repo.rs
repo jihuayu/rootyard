@@ -18,11 +18,22 @@
 //! * `registration_badges` -- the stored `artifact_set_digest` read back from
 //!   the real publication row and re-derived from the typed A4 registration.
 //!
-//! Nothing here writes SQL for positive state, creates a fake repository or
-//! fabricates a digest.
+//! An HTTP-provisioned `pg_refstore` repository carries the irreversible
+//! migration-144 decision-required fence from the moment it is ready (serving
+//! enables it before readiness, including the first push). The production
+//! serving pipeline therefore commits received packs through the decision-gated
+//! facade, not the legacy A4 path. `decided_pair` reproduces that tail with the
+//! real `PgAuthorizedCommit::{prepare,select,verify,commit}` calls after the
+//! same `pack_plan::publish`/`register`; the producer token is the operation
+//! issuer, exactly as the serving request owner is.
+//!
+//! Nothing here writes SQL for positive state, creates a fake repository,
+//! disables a fence or fabricates a digest.
 use anyhow::{Result, anyhow, ensure};
 use rootyard::blob_store::opendal::BlobStore;
-use rootyard::ref_store::core::pack_commit::{PackCommitPlan, PackPendingToken, RegisteredPack};
+use rootyard::ref_store::core::pack_commit::{
+    AuthorizedCommitMode, PackCommitPlan, PackPendingToken, PgAuthorizedCommit, PrepareOutcome, RegisteredPack,
+};
 use rootyard::ref_store::core::{
     CreatePackSnapshotRequest, MetadataPinOutcome, MetadataSnapshotScope, PackReadSnapshot, PackSnapshotExpectation,
 };
@@ -30,7 +41,7 @@ use rootyard::ref_store::{CoreGateVersion, MetadataPinPurpose};
 use std::path::Path;
 use uuid::Uuid;
 
-use super::db::Db;
+use super::db::{Db, deadline};
 use super::git::{GitRepo, PairFiles};
 use super::pack::{self, Verified};
 use super::pack_plan;
@@ -100,6 +111,72 @@ pub async fn advance_pair(
     ensure!(receipt.is_committed() && !receipt.replayed, "advance verified commit did not commit");
     let gate = super::db::gate_version(&db.pool, draft.plan.repository_id(), draft.plan.tenant_id()).await?;
     ensure!(gate.revision() == receipt.terminal.revision, "advanced gate revision differs");
+    Ok(context.new_packs().to_vec())
+}
+
+/// `finish_pair`/`advance_pair`'s upload tail through the decision-gated
+/// pipeline production serving uses on a fenced repository: A3 acquire +
+/// protected upload + A4 register (same shared `publish`/`register`), then
+/// `prepare` -> `select` -> `verify` -> `commit` on the same original plan.
+///
+/// The plan's closure context (`pack::closure` -> `capture_context`) is
+/// captured **before** `prepare`, at the planned gate revision: `prepare` seals
+/// it at `expected_revision`, and `select` then installs the decision in the
+/// same transaction as the gate advance, so a context requested afterwards can
+/// only be reached with `expected_v1`. The registrations it reads are the durable
+/// A4 rows of this plan (same ids, digests, locators); nothing is synthesized.
+pub async fn decided_pair(
+    db: &Db,
+    store: &BlobStore,
+    git: &Path,
+    draft: &pack_plan::Draft,
+    files: &PairFiles,
+    actor: &rootyard::db::Identity,
+) -> Result<Vec<RegisteredPack>> {
+    let mode = match draft.plan.commit_mode().as_str() {
+        "accepted_subset" => AuthorizedCommitMode::AcceptedSubset,
+        "atomic" => AuthorizedCommitMode::Atomic,
+        other => return Err(anyhow!("unknown planned commit mode {other}")),
+    };
+    ensure!(draft.plan.identity().issuer_id() == actor.id, "the producer token is not the operation issuer");
+    let pack_id = draft.plan.packs().first().ok_or_else(|| anyhow!("plan has no pack"))?.pack_id();
+    let publication = pack_plan::publish(db, store, &draft.plan, files).await?;
+    pack_plan::register(db, &draft.plan, pack_id, &publication).await?;
+    let context = pack::closure(db, &draft.plan).await?;
+    ensure!(
+        context.new_packs().len() == 1 && context.old_packs().len() == draft.plan.old_memberships().len(),
+        "the planned closure is not one new pack on the planned membership"
+    );
+    ensure!(
+        context.new_packs()[0].registration_id() == draft.plan.packs()[0].registration_id(),
+        "the captured closure is not this plan's registration"
+    );
+    let authorized = PgAuthorizedCommit::new(store.clone(), git.to_path_buf())
+        .map_err(|error| anyhow!("authorized pipeline rejected the Blob/Git configuration: {error:?}"))?;
+    let prepared = match authorized.prepare(&db.pool, draft.plan.clone(), deadline()).await {
+        Ok(PrepareOutcome::Prepared(publication)) => publication,
+        Ok(PrepareOutcome::Replayed(_)) => return Err(anyhow!("authorized prepare replayed a fresh operation")),
+        Err(error) => return Err(anyhow!("authorized prepare refused ({}): {error:?}", error.code())),
+    };
+    let selection = authorized
+        .select(&db.pool, *prepared, actor, mode, deadline())
+        .await
+        .map_err(|error| anyhow!("authorized select refused ({}): {error:?}", error.code()))?;
+    ensure!(
+        selection.accepted_refs() == draft.plan.refs().len() && !selection.is_all_rejected(),
+        "the decision did not accept every planned ref"
+    );
+    let verified = authorized
+        .verify(selection, deadline())
+        .await
+        .map_err(|error| anyhow!("authorized verify refused ({}): {error:?}", error.code()))?;
+    let receipt = authorized
+        .commit(&db.pool, &verified, deadline())
+        .await
+        .map_err(|error| anyhow!("authorized commit refused ({}): {error:?}", error.code()))?;
+    ensure!(receipt.is_committed() && !receipt.replayed, "decided verified commit did not commit");
+    let gate = super::db::gate_version(&db.pool, draft.plan.repository_id(), draft.plan.tenant_id()).await?;
+    ensure!(gate.revision() == receipt.terminal.revision, "gate after the decided commit differs");
     Ok(context.new_packs().to_vec())
 }
 

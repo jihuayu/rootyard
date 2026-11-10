@@ -49,6 +49,19 @@ pub struct Db {
 }
 
 impl Db {
+    /// The actual connection URL this fixture opened (never a credential of the
+    /// process: it is the caller-supplied `ROOTYARD_TEST_DATABASE_URL`).
+    pub fn database_url(&self) -> String {
+        self.url.clone()
+    }
+
+    /// The random schema every pool of this fixture is bound to.
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+}
+
+impl Db {
     pub async fn setup() -> Result<Self> {
         let url = database_url();
         let admin = db::pool(&url)?;

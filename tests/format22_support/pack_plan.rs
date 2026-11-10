@@ -32,6 +32,11 @@ pub struct Draft {
 }
 
 /// The shared `draft` with `owner_id` = the pack producer instead of the tenant.
+///
+/// The producer is also the operation issuer (the shared helper issues as the
+/// tenant). That is the same relationship a real serving receive request has:
+/// `db::Identity.id` is both the request owner and the issuer lane actor, and
+/// the decision-gated commit refuses any other issuer (`issuer_mismatch`).
 pub async fn draft(
     db: &Db,
     repo: Uuid,
@@ -71,7 +76,7 @@ pub async fn draft(
     )?;
     let identity = OperationIdentity::new(
         repo,
-        tenant,
+        owner,
         IssuerLane::new("pack")?,
         sequence,
         Uuid::new_v4(),

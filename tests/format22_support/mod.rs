@@ -5,11 +5,15 @@
 //! unchanged with `#[path]`; `pack_plan` only re-declares the three helpers of
 //! `pack.rs` that hard-code `owner_id == tenant_id`, because issue #169 needs
 //! registered packs whose producer owner is a different real user; `roots` only
-//! re-declares the scope so a root capture can name that producer.
+//! re-declares the scope so a root capture can name that producer. `http`
+//! serves the production router in process so the owner grants the producer its
+//! collaborator role over the real `POST /api/repos/{owner}/{name}/collaborators`
+//! route instead of a SQL grant.
 #![allow(clippy::too_many_arguments)]
 #![allow(dead_code)]
 
 pub mod digest_vectors;
+pub mod http;
 pub mod marker;
 pub mod pack_plan;
 pub mod repo;

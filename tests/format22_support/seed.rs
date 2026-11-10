@@ -13,20 +13,25 @@
 //!   same producer owner from that producer-owned snapshot (the feature under
 //!   test: a root owner that is not the repository tenant).
 //!
-//! Ordering matters: the bound repository is provisioned *first* and gets its
-//! packs, and the empty/unrelated repositories are provisioned *after*, so they
-//! stay genuinely empty. The producer never creates a repository of its own.
+//! Ordering matters: the bound repository is provisioned *first*, the owner
+//! grants the producer `write` over the production collaborator route, and only
+//! then do its packs commit; the empty/unrelated repositories are provisioned
+//! *after*, so they stay genuinely empty. The producer never creates a
+//! repository of its own and is never rewritten into the tenant: the
+//! decision-gated `select` resolves the producer's effective role from the live
+//! `repository_collaborators` row the owner's own request created.
 //!
-//! No SQL row here creates a repository, artifact, publication, membership,
-//! snapshot, pin or root, and no repository row is edited afterwards. The only
-//! direct writes are the token rows of the production `db::issue_token` and the
-//! fixture-local offline `data/.volume-id`.
+//! No SQL row here creates a repository, artifact, publication, collaborator,
+//! membership, snapshot, pin or root, and no repository row is edited
+//! afterwards. The only direct writes are the token rows of the production
+//! `db::issue_token` and the fixture-local offline `data/.volume-id`.
 use anyhow::{Result, anyhow, ensure};
 use base64::Engine as _;
 use deadpool_postgres::Pool;
 use rootyard::blob_store::config::BlobProfile;
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::db;
+use rootyard::members::models::Role;
 use rootyard::ref_store::core::pack_commit::{PackCommitPlan, RegisteredPack};
 use rootyard::ref_store::core::retention_root::PgRetentionRoots;
 use rootyard::ref_store::serving::{ProvisionRequest, provision};
@@ -39,7 +44,7 @@ use uuid::Uuid;
 use super::db::{Db, deadline};
 use super::marker;
 use super::pack;
-use super::{pack_plan, repo, roots};
+use super::{http, pack_plan, repo, roots};
 
 const SHA1: GitObjectFormat = GitObjectFormat::Sha1;
 const PACKS: i64 = 3;
@@ -93,8 +98,10 @@ async fn current_gate(pool: &Pool, repo: Uuid, tenant: Uuid) -> Result<CoreGateV
 }
 
 /// Result of the production token issuance, before any identity is derived.
+/// The secret stays inside this module and the HTTP helpers' arguments.
 struct IssuedUser {
     user_id: Uuid,
+    username: String,
     token: String,
 }
 
@@ -109,7 +116,8 @@ async fn issued_user(pool: &Pool, prefix: &str) -> Result<IssuedUser> {
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or_else(|| anyhow!("token response has no user id"))?;
     let token = issued["token"].as_str().ok_or_else(|| anyhow!("token response has no secret"))?.to_owned();
-    Ok(IssuedUser { user_id, token })
+    let username = issued["username"].as_str().ok_or_else(|| anyhow!("token response has no username"))?.to_owned();
+    Ok(IssuedUser { user_id, username, token })
 }
 
 /// Authenticate an issued token through the production `auth::authenticate`.
@@ -126,6 +134,7 @@ async fn authenticate(pool: &Pool, user: &IssuedUser) -> Result<db::Identity> {
         .await
         .map_err(|error| anyhow!("real token authentication failed: {}", error.1))?;
     ensure!(!identity.read_only && identity.id == user.user_id, "issued token identity differs");
+    ensure!(identity.username == user.username, "issued token belongs to another user");
     Ok(identity)
 }
 
@@ -147,6 +156,42 @@ async fn provision_with(pool: &Pool, actor: &db::Identity, name: &str, store: &B
     Ok(receipt.repository.id)
 }
 
+/// Grant the producer `write` on the owner's bound repository through the real
+/// owner route (`POST /api/repos/{owner}/bound/collaborators`), then read the
+/// stored grant back through the producer's own token. The owner's admin role is
+/// resolved by the production `auth::authorize_repo_with_role`; the insertion is
+/// the production `members::rbac::upsert_collaborator`, never SQL here.
+async fn grant_producer(
+    http: &http::Http,
+    owner_token: &str,
+    owner_username: &str,
+    producer: &IssuedUser,
+) -> Result<Value> {
+    let (owner_id, whoami_owner) = http.whoami(owner_token).await?;
+    ensure!(whoami_owner == owner_username, "the owner token authenticates another user");
+    let (status, body) =
+        http.post_collaborator(owner_token, owner_username, "bound", &producer.username, Role::Write).await?;
+    ensure!(status == axum::http::StatusCode::CREATED, "the owner collaborator grant answered {status}");
+    http::ensure_created(&body, &producer.username, Role::Write)?;
+    let stored_user: Uuid = body["user_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| anyhow!("the collaborator response has no user id"))?;
+    ensure!(stored_user == producer.user_id, "the collaborator grant names another user");
+    // The producer's own token must now read that exact grant.
+    let (status, stored) = http.get_collaborator(&producer.token, owner_username, "bound", &producer.username).await?;
+    ensure!(status == axum::http::StatusCode::OK, "the producer collaborator read answered {status}");
+    http::ensure_read_back(&stored, producer.user_id, &producer.username, Role::Write)?;
+    Ok(json!({
+        "repository_owner_id": owner_id.to_string(),
+        "user_id": producer.user_id.to_string(),
+        "username": producer.username,
+        "role": Role::Write.as_str(),
+        "route": format!("/api/repos/{owner_username}/bound/collaborators"),
+        "status": status.as_u16(),
+    }))
+}
+
 /// Fixture-local offline data directory: the operator-initialized volume
 /// identity the real `backup --offline` CLI requires (no server runs).
 fn write_volume_identity(dir: &Path) -> Result<()> {
@@ -166,7 +211,7 @@ async fn packs(
     target: &repo::Existing,
     git: &std::path::Path,
     fixture: &super::git::GitRepo,
-    producer: Uuid,
+    producer: &db::Identity,
 ) -> Result<(Vec<RegisteredPack>, PackCommitPlan, String)> {
     let mut gate = target.gate.clone();
     let first = fixture.build_commit("file.txt", b"root fixture\n", "format22 main").await?;
@@ -191,18 +236,17 @@ async fn packs(
             db,
             target.repo,
             target.tenant,
-            producer,
+            producer.id,
             sequence,
             &gate,
             refs,
             std::slice::from_ref(&files),
         )
         .await?;
-        let new = if sequence == 1 {
-            repo::finish_pair(db, store, git, &draft, &files).await?
-        } else {
-            repo::advance_pair(db, store, git, &draft, &files).await?
-        };
+        // The provisioned repository is already under the irreversible
+        // decision-required fence, so its packs commit through the same
+        // decision-gated pipeline the serving first push uses.
+        let new = repo::decided_pair(db, store, git, &draft, &files, producer).await?;
         registrations.extend(new);
         gate = current_gate(&db.pool, target.repo, target.tenant).await?;
         last_plan = Some(draft.plan);
@@ -221,22 +265,29 @@ pub async fn run(options: &Options) -> Result<Value> {
     let store = BlobStore::open(profile).map_err(|_| anyhow!("the Blob backend could not be opened"))?;
     write_volume_identity(&options.data_dir)?;
     let db = Db::setup().await?;
+    let http = http::Http::open(&db, &options.git, &options.data_dir).await?;
 
     // 1. The bound repository through the real create path. Every user row
     //    exists before its token: a refusal never orphans a credential.
     let owner_user = issued_user(&db.pool, "fmt22owner").await?;
     let producer_user = issued_user(&db.pool, "fmt22producer").await?;
     let owner = authenticate(&db.pool, &owner_user).await?;
-    authenticate(&db.pool, &producer_user).await?;
+    let producer_identity = authenticate(&db.pool, &producer_user).await?;
+    let producer = producer_user.user_id;
+    ensure!(producer != owner.id, "the producer must be a different real user than the repository owner");
     let repo_id = provision_with(&db.pool, &owner, "bound", &store).await?;
     let tenant = owner.id;
-    let producer = producer_user.user_id;
+    // The producer is a collaborator with `write`, through the owner's real HTTP
+    // route, before any of its packs commits: the decision-gated `select`
+    // resolves exactly this live role and refuses anything lower.
+    let collaborator = grant_producer(&http, &owner_user.token, &owner.username, &producer_user).await?;
     let (target, fixture) = repo::open(&db, repo_id, tenant, &options.git).await?;
     // The pack producer (durable hold/publication/acquirer owner) is the real
     // token user, while the storage tenant/RAM-prefix identity of every blob
     // locator stays the repository tenant's; both are read from the real rows
     // by the drill and never assumed equal.
-    let (registrations, last_plan, head) = packs(&db, &store, &target, &options.git, &fixture, producer).await?;
+    let (registrations, last_plan, head) =
+        packs(&db, &store, &target, &options.git, &fixture, &producer_identity).await?;
     ensure!(registrations.len() as i64 == PACKS, "not every planned pack registered");
 
     // 2. A5 snapshot + pin of the multi-pack membership, owned by the producer.
@@ -351,6 +402,7 @@ pub async fn run(options: &Options) -> Result<Value> {
         ],
         "tenant_id": tenant.to_string(),
         "producer_owner_id": producer.to_string(),
+        "producer_collaborator": collaborator,
         "pack_owner_id": producer.to_string(),
         "storage_tenant_id": tenant.to_string(),
         "root_owner_id": producer.to_string(),
