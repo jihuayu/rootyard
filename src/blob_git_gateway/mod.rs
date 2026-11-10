@@ -66,7 +66,7 @@ pub use state::BlobGitState;
 /// bearer-only behaviour unchanged. Cookie authentication is added only for the
 /// GET-only `/web/blob/api/...` reads, where the validated session cookie is
 /// translated into the `Authorization` header the gateway handlers read.
-fn web_router(state: Arc<BlobGitState>) -> Router {
+fn web_router(state: Arc<BlobGitState>) -> Router<Arc<BlobGitState>> {
     Router::new()
         .nest("/web", browser_ui::router())
         .layer(axum::middleware::from_fn_with_state(state, crate::web::session::middleware))

@@ -83,7 +83,7 @@ async fn serve(
     let worker_stop = CancellationToken::new();
     let server_stop = CancellationToken::new();
     let mut worker = tokio::spawn(crate::dispatch::worker(
-        pool,
+        pool.clone(),
         crate::dispatch::Settings::standalone(),
         Arc::new(Notify::new()),
         worker_stop.clone(),
