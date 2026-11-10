@@ -314,6 +314,7 @@ def serving_barrier_probe(binary, env, mode, root, secrets=(), window=OBSERVATIO
     outcome = {"mode": mode, "window_seconds": window, "data_dir": str(directory / "data")}
     stdout_path, stderr_path = directory / "stdout.log", directory / "stderr.log"
     child = None
+    quiescent = False
     started = time.monotonic()
     try:
         # The child reads ROOTYARD_DATA_DIR before the PostgreSQL barrier. A
@@ -348,14 +349,23 @@ def serving_barrier_probe(binary, env, mode, root, secrets=(), window=OBSERVATIO
             outcome.update(status="refused", exit=child.returncode, expected=BARRIER_REFUSALS[mode])
         else:
             outcome.update(status="unknown", exit=child.returncode, reason="exit without the exact barrier refusal")
-    except BaseException:
-        child = None  # an unclassified failure keeps its raised error, not a probe outcome
-        raise
     finally:
+        # The probe owns the child from Popen on: on any failure (and on every
+        # return) kill and reap exactly that child's group before letting the
+        # original error propagate, and always remove this run's own directory.
+        # Cleanup failures never replace the original error or claim quiescence.
         if child is not None:
-            outcome["quiescent"] = outcome["reaped"] = _reap_owned(child)
-            outcome["ran_seconds"] = round(time.monotonic() - started, 4)
+            try:
+                quiescent = _reap_owned(child)
+            except BaseException:
+                quiescent = False
+        try:
             shutil.rmtree(directory, ignore_errors=True)
+        except BaseException:
+            pass
+    if child is not None:
+        outcome["quiescent"] = outcome["reaped"] = quiescent
+        outcome["ran_seconds"] = round(time.monotonic() - started, 4)
     assert outcome["status"] in ("refused", "started", "unknown"), "probe outcome is not classified"
     return outcome
 

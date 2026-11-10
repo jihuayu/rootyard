@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backup_blob_barrier_probe as probe  # noqa: E402
@@ -428,6 +429,44 @@ class ProbeTest(unittest.TestCase):
         text = repr(diagnostics)
         for leaked in (unknown_dsn, "Sup3rNewPass", SECRET, DSN, "db.internal", "lifecycle barrier failed"):
             self.assertNotIn(leaked, text)
+
+    @unittest.skipUnless(LINUX, "process-group quiescence proof is Linux /proc only")
+    def test_a_failure_after_popen_still_kills_the_owned_child_and_removes_its_directory(self):
+        # own_lines raises after the real child has started: the error must
+        # propagate, yet the probe's own child must be dead and the run-owned
+        # directory gone, without signalling any unrelated pid or group.
+        pidfile = self.root / "child.pid"
+        script = self.stand_in(f"echo $$ > {pidfile}\nexec sleep 60\n")
+        seen = {"pid": None}
+        original = probe.own_lines
+
+        def failing_after_popen(path, secrets=(), limit=16):
+            if seen["pid"] is None:
+                deadline = time.monotonic() + 5
+                while not pidfile.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(pidfile.exists(), "the owned child never started")
+                seen["pid"] = int(pidfile.read_text())
+                raise RuntimeError("deliberate failure after Popen")
+            return original(path, secrets, limit)
+
+        with mock.patch.object(probe, "own_lines", failing_after_popen):
+            with self.assertRaisesRegex(RuntimeError, "deliberate failure after Popen"):
+                run_probe(script, "external", window=5, root=self.owned)
+        pid = seen["pid"]
+        self.assertIsNotNone(pid, "own_lines was never reached after Popen")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertNotIn(pid, probe._group_members(pid))
+        leftovers = [entry for entry in self.owned.iterdir() if entry.name.startswith("probe-")]
+        self.assertEqual(leftovers, [])
 
     def test_a_guarded_target_data_dir_is_never_used_by_the_child(self):
         # The watched target carries .rootyard-restore.guard; the child must see
