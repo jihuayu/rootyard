@@ -477,7 +477,7 @@ class teams:
         # carries the owner's or writer's push receipt, so event ids and counts are
         # captured here instead of assuming the ref starts with no events.
         base_events_before = self.events_for(base_name)
-        event_ids_before = [event["id"] for event in base_events_before]
+        event_ids_before = [event["event_id"] for event in base_events_before]
         ops_before, events_before = len(self.operations()), len(self.events())
         refs_before = {name: self.ref(name) for name in
                        ("refs/heads/" + base_ref, "refs/heads/" + head_ref)}
@@ -501,7 +501,7 @@ class teams:
                              extra_headers=key)
         assert replay == raw, (user, "replay differs from the first merge response")
         after = self.events_for(base_name)
-        assert [event["id"] for event in after] == event_ids_before + [event["id"]], \
+        assert [event["event_id"] for event in after] == event_ids_before + [event["event_id"]], \
             (user, "replay changed the base ref's event ids")
         assert len(self.events_for(base_name, merged["id"])) == 1, \
             (user, "replay duplicated the merge event")
