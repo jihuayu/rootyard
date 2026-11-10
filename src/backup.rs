@@ -135,7 +135,7 @@ mod snapshot;
 pub use filesystem::ensure_not_restoring;
 use filesystem::*;
 use lifetime::BackupMutex;
-pub(crate) use lifetime::{ensure_database_available, prepare_serving_database};
+pub(crate) use lifetime::{BarrierBusy, ensure_database_available, prepare_serving_database};
 use postgres::*;
 pub use restore::{check, restore};
 pub use snapshot::create;
