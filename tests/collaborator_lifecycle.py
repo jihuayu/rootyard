@@ -220,7 +220,7 @@ class lifecycle:
         assert self.upload_status(token) == 404
         assert self.receive_refs_status(token) == 404
         # No-body receive-pack POST is refused before hooks; the ref must stay absent.
-        status, _, _ = self.http(self.repo["clone_path"] + RECEIVE_ENDPOINT, 404, token=token,
+        status, _, _ = self.http(self.repo["clone_path"] + RECEIVE_ENDPOINT, token=token,
                                  method="POST", body=b"0000", content_type=RECEIVE)
         assert status == 404
         denied = self.git("ls-remote", self.remote, token=token, check=False)
