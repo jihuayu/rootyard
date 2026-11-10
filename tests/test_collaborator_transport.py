@@ -85,8 +85,9 @@ class GitMatrixContract(unittest.TestCase):
                       source.index("    def git_command_coverage(self):")]
         self.assertNotIn("self.setup()", body, "git_matrix_version must not initialize the schema")
         self.assertNotIn('"harness": "git"', body, "a literal git is not the executed binary")
-        self.assertIn('"harness": self.server_git()', body)
-        self.assertIn("len(set(triple.values())) == 1", body)
+        self.assertIn("executable = self.server_git()", body)
+        self.assertIn("assert self.hook_git() == executable", body)
+        self.assertIn("assert self.hook_binary_sha() == git_sha", body)
         lifecycle = (ROOT / "tests" / "collaborator_lifecycle.py").read_text()
         self.assertEqual(lifecycle.count("self.setup()"), 1,
                          "the owned schema/service must be initialized exactly once")

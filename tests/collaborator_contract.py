@@ -105,23 +105,27 @@ class prerequisite:
         return self.server_git()
 
     def git_matrix_version(self):
-        # Bind harness, server and managed hook to one resolved Git and one SHA
-        # before the first owned process exists, so every process below runs
-        # exactly the binary this case measured.
-        triple = {"harness": self.server_git(), "server": self.server_git(),
-                  "hook": self.hook_git()}
-        assert len(set(triple.values())) == 1, triple
-        versions, raw = {}, {}
-        for label, executable in triple.items():
-            raw[label] = self.run([executable, "--version"]).stdout.decode().strip()
-            versions[label] = git_version(raw[label])
-            assert versions[label] >= MIN_GIT, (
-                f"required Git >= {'.'.join(map(str, MIN_GIT))}; {label} is {raw[label]!r}")
-        unique = self.run([triple["harness"], "--version"]).stdout.decode().strip()
-        assert unique == raw["harness"]
-        return {"versions": {k: ".".join(map(str, v)) for k, v in versions.items()},
-                "resolved": triple, "git_sha256": sha256_file(triple["harness"]),
-                "harness_sha256": sha256_file(__file__)}
+        # Resolve one Git for the harness, the server and the managed hook
+        # before any owned process exists, so every process below runs exactly
+        # the binary this case measured. The hook is a copy of this binary
+        # (reliability::install_hooks) re-executed with ROOTYARD_GIT_PATH.
+        executable = self.server_git()
+        assert self.hook_git() == executable, (executable, self.hook_git())
+        raw = {label: self.run([executable, "--version"]).stdout.decode().strip()
+               for label in ("harness", "server", "hook")}
+        assert len(set(raw.values())) == 1, raw
+        version = git_version(raw["harness"])
+        assert version >= MIN_GIT, (
+            f"required Git >= {'.'.join(map(str, MIN_GIT))}; resolved {raw['harness']!r}")
+        git_sha = sha256_file(executable)
+        assert self.hook_binary_sha() == git_sha
+        return {"versions": {k: ".".join(map(str, version)) for k in raw},
+                "resolved": {"harness": executable, "server": executable, "hook": executable},
+                "git_sha256": git_sha, "harness_sha256": sha256_file(__file__)}
+
+    def hook_binary_sha(self):
+        """SHA-256 of the executable Git HTTP re-executes for the managed hook."""
+        return sha256_file(self.server_git())
 
     def git_command_coverage(self):
         """The commands this harness runs, and whether the CI job runs them elsewhere."""
