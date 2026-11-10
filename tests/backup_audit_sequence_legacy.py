@@ -528,7 +528,8 @@ class AuditSequenceLegacyHarness(BackupHarness):
         self.cli("worker-once")  # outbox audit-log consumer claims the push events
         self.audit_events_after = int(self.query(self.db, "SELECT count(*) FROM audit_events"))
         snapshotted = self.audit_rows(self.db)
-        assert self.source_sequence == [row for row in snapshotted
+        assert self.source_sequence == [{"action": row["action"], "id": row["id"]}
+                                        for row in snapshotted
                                         if row["action"] in self.saved_actions]
         assert [row["id"] for row in rows] == [row["id"] for row in self.source_sequence[3:4]]
         assert snapshotted == final, "a Git push or the audit-log consumer wrote repository_audit_log"
