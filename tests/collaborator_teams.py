@@ -22,6 +22,19 @@ Receipts are joined through ``git_operations.operation_id`` (the owning source
 for ``outbox_events``); actor and token come from that table, never from the PR
 response's ``author_id``. Every refusal is preceded by distinct, existing refs
 for a valid ``write``-level PR command, so a denial cannot pass as a ``400``.
+
+Earlier cases of the direct collaborator matrix leave a ``repository_collaborators``
+row on mona (triage), nina (write) and olga (read); an inherited role could then
+not be told apart from ``max(direct, team)``. Before the role matrix the owner
+removes those three direct rows through the real ``DELETE /api/repos/{owner}/
+{name}/collaborators/{user}`` call, reads the absence back from the permissions
+API, the collaborator API and the owner's audit log (``collaborator.removed``),
+and only then does the row's own before-check require no direct role. The
+read actor never pushes: the owner prepares its distinct base/head refs, and
+the read actor's own push is only an expected failure verified as a server-side
+``receive-pack`` 403 with no ref, object or receipt left behind. The write/admin
+actors push their own base/head commits, with ``ops_before``/``events_before``
+taken after the owner's fixture and before the actor's first push.
 """
 import json
 
@@ -33,6 +46,8 @@ from collaborator_contract import ZERO
 TEAM_ACTORS = (("mona", "read"), ("nina", "write"), ("olga", "admin"))
 TEAM_SMOKE_USER = "peggy"
 TEAM_ROLES = ("read", "write", "admin")
+# Direct collaborator rows the earlier cases granted to the same three actors.
+PRIOR_DIRECT_ROLES = {"mona": "triage", "nina": "write", "olga": "read"}
 # Effective-role field matrix of GET /api/repos/alice/demo/permissions/{user}.
 EXPECTED_PERMISSIONS = {
     "read": {"role": "read", "team_role": "read"},
@@ -116,6 +131,37 @@ class teams:
             "'), "
             "'collaborators', (SELECT count(*) FROM repository_collaborators "
             "WHERE repository_id='" + repo_id + "' AND user_id='" + self.users[user]["user_id"] + "'))"))
+
+    def team_clear_direct(self, user):
+        """Owner removes the actor's earlier direct row through the real API and reads it back.
+
+        No SQL row is deleted or forged here: the owner's ``DELETE /collaborators/
+        {user}`` is the only revoker, the permissions API must then resolve no
+        role at all, the direct-row lookup must be 404, and the owner's audit
+        log must attribute one ``collaborator.removed`` for that user. The row
+        above it is the prior direct grant the direct matrix made; a missing row
+        or an unexpected prior role fails instead of being cleared silently.
+        """
+        assert user in PRIOR_DIRECT_ROLES, (user, "not an actor of the direct matrix")
+        removed = json.loads(self.expect("/api/repos/alice/demo/collaborators/" + user, 200,
+                                         method="DELETE", token=self.owner_account("alice")))
+        assert (removed["removed"], removed["username"]) == (True, user), removed
+        after = self.inherited_permission("alice", "demo", user)
+        assert (after["role"], after["direct_role"], after["team_role"]) == (None, None, None), after
+        assert self.http("/api/repos/alice/demo/collaborators/" + user,
+                         token=self.owner_account("alice"))[0] == 404
+        # The owner's own audit rows (target filters do not exist; actor does).
+        events = json.loads(self.expect("/api/repos/alice/demo/audit?actor=alice&limit=100", 200,
+                                        token=self.owner_account("alice")))["items"]
+        attributions = [e for e in events if e["action"] == "collaborator.removed"
+                        and e["target_type"] == "collaborator" and e["target_name"] == user]
+        assert attributions, ("no owner audit row for the removal", events)
+        latest = attributions[-1]
+        assert (latest["actor_name"], latest["actor_id"]) == ("alice", self.alice["user_id"]), latest
+        assert latest["repository_id"] == self.repo["id"], latest
+        return {"cleared": user, "prior_direct_role": PRIOR_DIRECT_ROLES[user],
+                "effective_after": after["role"], "audit_id": latest["id"],
+                "read_back": "no_role"}
 
     # ---- fast-forward relation -------------------------------------------
     def rev_list(self, work, tip, not_rev=None):
@@ -221,20 +267,23 @@ class teams:
 
     def team_role_matrix(self):
         """read/write/admin team roles: clone, fetch, push, ref-transactions, PR merge."""
+        cleared = [self.team_clear_direct(user) for user, _ in TEAM_ACTORS]
         rows = {}
         for user, role in TEAM_ACTORS:
             rows[role] = self.team_role_row(user, role)
         assert [rows[role]["push"] for role in TEAM_ROLES] == ["denied", "recorded", "recorded"]
         assert [rows[role]["merge"] for role in TEAM_ROLES] == ["denied", "merged", "merged"]
         assert all(rows[role]["refs"] == "distinct_existing" for role in TEAM_ROLES)
-        return rows
+        assert all(row["direct_role"] is None and row["effective"] == role
+                   for role, row in rows.items()), rows
+        return {"direct_cleared": cleared, "roles": rows}
 
     def team_role_row(self, user, role):
         """One actor, one team, one inherited role, checked on every surface."""
         demo = self.repo
         team = self.team_create("alice", "demo", "role-" + role + "-" + user, role)
         before = self.inherited_permission("alice", "demo", user)
-        assert (before["role"], before["direct_role"], before["team_role"]) == (None, None, None)
+        assert (before["role"], before["direct_role"], before["team_role"]) == (None, None, None), before
         self.team_add("alice", "demo", team["slug"], user, team["id"], demo["id"])
         permission = self.inherited_permission("alice", "demo", user, role)
         assert (permission["direct_role"], permission["team_role"]) == (None, role), permission
@@ -243,8 +292,22 @@ class teams:
         assert (work / "README.md").read_text() == "collaborator matrix seed\n"
         self.git("fetch", "origin", cwd=work, token=token)
         assert self.git("rev-parse", "origin/main", cwd=work).stdout.decode().strip() == self.seed
-        # One base/head pair per role, real commits, distinct refs, no rule on them.
+        # One base/head pair per role: two distinct, existing refs at distinct OIDs.
         base_ref, head_ref = "team-base-" + user, "team-head-" + user
+        if role == "read":
+            # The read actor never creates a ref: the owner prepares its distinct
+            # base/head refs (already exists), then the read actor tries write paths.
+            base, head = self.team_owner_fixture(base_ref, head_ref, user, role)
+            assert self.ref("refs/heads/" + base_ref) == base
+            assert self.ref("refs/heads/" + head_ref) == head
+            ops_before, events_before = len(self.operations()), len(self.events())
+            return self.team_read_refusals(user, work, base_ref, head_ref, base, head,
+                                           ops_before, events_before)
+        # The write/admin actor pushes its own real base and head commits; the
+        # receipt baseline is taken after the owner's fixture and before the
+        # actor's first push, so both pushes are counted, never replayed.
+        ops_before, events_before = len(self.operations()), len(self.events())
+        assert self.receive_refs_status(token) == 200, user
         self.git("checkout", "-B", base_ref, self.seed, cwd=work)
         base = self.commit(work, "base-" + user + ".txt", "role base " + role)
         self.git("push", "origin", "HEAD:refs/heads/" + base_ref, cwd=work, token=token)
@@ -252,14 +315,14 @@ class teams:
         head = self.commit(work, "head-" + user + ".txt", "role head " + role)
         self.git("push", "origin", "HEAD:refs/heads/" + head_ref, cwd=work, token=token)
         pushed = [self.ref("refs/heads/" + base_ref), self.ref("refs/heads/" + head_ref)]
-        ops_before, events_before = len(self.operations()), len(self.events())
-        assert self.sql("SELECT count(*) FROM forge_branch_rules WHERE repository_id='" +
-                        demo["id"] + "' AND branch_ref IN ('refs/heads/" + base_ref + "',"
-                        " 'refs/heads/" + head_ref + "')") == "0"
-        if role == "read":
-            return self.team_read_refusals(user, work, base_ref, head_ref, base, head,
-                                           ops_before, events_before, pushed)
-        assert pushed == [base, head] and len(self.operations()) == ops_before + 2
+        assert pushed == [base, head] and base != head, pushed
+        self.team_no_rule(base_ref, head_ref)
+        assert len(self.operations()) == ops_before + 2, (user, len(self.operations()), ops_before)
+        assert len(self.events()) == events_before + 2, (user, len(self.events()), events_before)
+        for ref, oid in (("refs/heads/" + base_ref, base), ("refs/heads/" + head_ref, head)):
+            operation = self.team_assert_operation(self.last_operation("recorded"), user, "demo")
+            [event] = self.events_for(ref, operation["id"])
+            assert event["new_oid"] == oid, event
         receipt = self.team_ref_transaction(user, head)
         pull = self.team_pull_merge(user, base_ref, head_ref, base, head)
         return {"role": role, "team": {"slug": team["slug"], "version": team["version"]},
@@ -267,25 +330,59 @@ class teams:
                 "fetch": True, "push": "recorded", "refs": "distinct_existing",
                 "ref_transaction": receipt, "merge": "merged", "pull": pull}
 
+    def team_owner_fixture(self, base_ref, head_ref, user, role):
+        """The owner publishes distinct base/head refs as real commits in the owner's clone."""
+        owner = self.root / "owned-work-alice"
+        self.git("checkout", "-B", base_ref, self.seed, cwd=owner)
+        base = self.commit(owner, "owner-base-" + user + ".txt", "fixture base " + role)
+        self.git("push", "origin", "HEAD:refs/heads/" + base_ref, cwd=owner, token=self.alice)
+        self.git("checkout", "-B", head_ref, base, cwd=owner)
+        head = self.commit(owner, "owner-head-" + user + ".txt", "fixture head " + role)
+        self.git("push", "origin", "HEAD:refs/heads/" + head_ref, cwd=owner, token=self.alice)
+        assert base != head, (base, head)
+        for ref, oid in (("refs/heads/" + base_ref, base), ("refs/heads/" + head_ref, head)):
+            operation = self.last_operation("recorded")
+            self.team_assert_operation(operation, "alice", "demo")
+            [event] = self.events_for(ref, operation["id"])
+            assert event["new_oid"] == oid, event
+        return base, head
+
+    def team_no_rule(self, base_ref, head_ref):
+        """No branch rule may explain a refusal on the pair (an absent row is not a 409)."""
+        assert self.sql("SELECT count(*) FROM forge_branch_rules WHERE repository_id='" +
+                        self.repo["id"] + "' AND branch_ref IN ('refs/heads/" + base_ref + "',"
+                        " 'refs/heads/" + head_ref + "')") == "0"
+
     def team_read_refusals(self, user, work, base_ref, head_ref, base, head, ops_before,
-                           events_before, pushed):
-        """A read team member is refused on every write path, with no ref/outbox change."""
+                           events_before):
+        """A read team member is refused on every write path, with no ref/outbox change.
+
+        The refs and both commits exist already and belong to the owner, so every
+        refusal below targets a valid request; the read actor's own push is only
+        expected to fail and is verified to fail at the server's gate.
+        """
         token = self.users[user]
-        assert pushed == [None, None], pushed
-        assert self.receive_refs_status(token) == 403
         assert self.git("fetch", "origin", cwd=work, token=token).returncode == 0
-        self.git("fetch", "origin", "refs/heads/main", cwd=work, token=token)
+        assert self.receive_refs_status(token) == 403
+        self.team_no_rule(base_ref, head_ref)
+        self.git("checkout", "-B", "read-push-" + user, "origin/main", cwd=work)
         staged = self.commit(work, "read-push.txt", "read team push")
+        assert staged not in (base, head)
         denied = self.git("push", "origin", "HEAD:refs/heads/team-read-push", cwd=work,
                           token=token, check=False)
-        assert denied.returncode != 0 and self.ref("refs/heads/team-read-push") is None
-        # The ref-transaction carries the owner's real, existing commit as its new OID.
+        assert denied.returncode != 0, "a read team member's push was accepted"
+        # The refusal is the server's permission gate (receive-pack 403), not a
+        # client-side preflight: the denied ref, its object and any receipt of it
+        # are absent, while Git ran the push it was asked to run.
+        assert self.ref("refs/heads/team-read-push") is None, "denied push moved a ref"
+        assert not self.events_for("refs/heads/team-read-push"), "denied push left a receipt"
+        assert self.git("--git-dir=" + str(self.bare), "cat-file", "-e", staged + "^{commit}",
+                        check=False).returncode != 0, "denied push transferred its commit"
+        error = denied.stderr.decode(errors="replace")
+        assert "403" in error, ("the push was not refused by the server", error[-400:])
+        # The ref-transaction and pull carry the owner's real, existing commit/refs.
         body = {"updates": [{"ref_name": "refs/heads/team-read-tx", "old_oid": ZERO,
-                             "new_oid": self.seed}], "atomic": True}
-        code, raw, _ = self.http("/api/repos/alice/demo/ref-transactions", token=token,
-                                 method="POST", body=body, extra_headers={"Idempotency-Key":
-                                                                          "team-tx-" + user})
-        assert code == 403, (user, code, raw[:200])
+                             "new_oid": head}], "atomic": True}
         refused = {}
         for label, path, payload in (
                 ("ref_transaction", "/api/repos/alice/demo/ref-transactions", body),
@@ -295,17 +392,21 @@ class teams:
                 ("pull_merge", "/api/repos/alice/demo/pulls/1/merge",
                  {"expected_version": 1, "expected_head_oid": head,
                   "expected_base_oid": base, "strategy": "fast_forward"})):
-            status, raw, _ = self.http(path, token=token, method="POST", body=payload)
+            status, raw, _ = self.http(path, token=token, method="POST", body=payload,
+                                       extra_headers={"Idempotency-Key": "team-" + label + "-" + user})
             assert status == 403, (user, label, status, raw[:200])
             refused[label] = status
         assert refused == {"ref_transaction": 403, "pull_create": 403, "pull_merge": 403}
-        assert self.ref("refs/heads/team-read-tx") is None and self.ref("refs/heads/" + base_ref) is None
+        assert self.ref("refs/heads/team-read-tx") is None, "denied ref transaction applied"
+        assert not self.events_for("refs/heads/team-read-tx"), "denied ref transaction emitted"
         assert self.sql("SELECT count(*) FROM forge_pulls WHERE repository_id='" +
                         self.repo["id"] + "' AND head_ref='refs/heads/" + head_ref + "'") == "0"
         assert len(self.operations()) == ops_before and len(self.events()) == events_before
-        assert staged not in (base, head)
+        # The owner's fixture refs are untouched by every refusal above.
+        assert [self.ref("refs/heads/" + base_ref), self.ref("refs/heads/" + head_ref)] == [base, head]
         return {"role": "read", "effective": "read", "direct_role": None, "clone": True,
-                "fetch": True, "push": "denied", "refs": "distinct_existing", **refused,
+                "fetch": True, "push": "denied", "push_gate": "receive-pack 403",
+                "refs": "distinct_existing", **refused,
                 "ref_transaction": 403, "merge": "denied", "no_new_refs_or_outbox": True}
 
     # ---- write paths -----------------------------------------------------

@@ -275,6 +275,37 @@ class HarnessContract(unittest.TestCase):
         self.assertLess(smoke.index("self.team_write_smoke()"), smoke.index("self.team_role_matrix()"),
                         "the single write smoke precedes the three-role matrix")
 
+    def test_team_fixture_clears_prior_direct_rows_and_orders_baselines(self):
+        """The three team actors had direct rows; the owner clears them via the real API."""
+        teams = ROOT / "tests" / "collaborator_teams.py"
+        source = teams.read_text()
+        clear = self.method_source(teams, "team_clear_direct")
+        self.assertIn('"/api/repos/alice/demo/collaborators/" + user', clear)
+        self.assertIn("method=\"DELETE\"", clear)
+        self.assertIn("(after[\"role\"], after[\"direct_role\"], after[\"team_role\"]) == (None, None, None)",
+                      clear)
+        self.assertIn("collaborator.removed", clear)
+        self.assertNotIn("DELETE FROM", source, "the revoker is the owner API, never SQL")
+        self.assertNotIn("INSERT INTO", source)
+        matrix = self.method_source(teams, "team_role_matrix")
+        self.assertLess(matrix.index("team_clear_direct"), matrix.index("team_role_row"),
+                        "the direct rows are cleared before any role row starts")
+        row = self.method_source(teams, "team_role_row")
+        self.assertNotIn("self.git(\"push\"", row.split("if role == \"read\":")[1]
+                         .split("# The write/admin actor")[0],
+                         "the read actor creates no ref; the owner prepares its pair")
+        self.assertIn("self.team_owner_fixture(", row)
+        baseline = row.index("ops_before, events_before = len(self.operations()), len(self.events())")
+        self.assertLess(baseline, row.index("self.git(\"push\"", baseline),
+                        "ops_before is taken before the writer's first push")
+        self.assertIn("len(self.operations()) == ops_before + 2", row)
+        refusal = self.method_source(teams, "team_read_refusals")
+        push = refusal.index('self.git("push", "origin", "HEAD:refs/heads/team-read-push"')
+        self.assertGreater(refusal.index("self.ref(\"refs/heads/team-read-push\") is None"), push,
+                           "the read push is only an expected failure, checked after it runs")
+        self.assertIn("cat-file", refusal)
+        self.assertIn('"403" in error', refusal)
+
     def test_every_module_compiles_and_has_no_duplicate_statements(self):
         """A text splice once duplicated a statement and shipped invalid Python."""
         for path in HarnessModules.paths():
