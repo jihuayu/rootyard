@@ -310,9 +310,10 @@ async fn committed_response(
         return Ok(response);
     }
     let issue = async {
-        let final_lookup = lookup(state.pool(), identity, owner, name, true, state.store().backend_identity(), deadline)
-            .await
-            .map_err(refused)?;
+        let final_lookup =
+            lookup(state.pool(), identity, owner, name, true, state.store().backend_identity(), deadline)
+                .await
+                .map_err(refused)?;
         let proof = CommittedWriteSessionProof::new(terminal, authorized, &final_lookup).map_err(refused)?;
         let issued = tokens.issue_from_committed_write(&proof).map_err(refused)?;
         Ok::<_, GatewayError>(issued)
