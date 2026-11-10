@@ -42,8 +42,10 @@ import sys
 import time
 import urllib.parse
 import uuid
+from urllib.parse import unquote
 
 from backup import bounded_line
+from backup_blob_barrier_probe import BARRIER_REFUSALS, describe, serving_barrier_probe
 from backup_blob_serving169_support import (
     CHANGED as CORRUPTION_CHANGED, CORRUPTION_CASES as CORRUPTION_NAMES, NativeFixtureRequest, corruption_findings,
     corruption_plan, corruption_sql, format22_manifest_checks, format22_restore_sql, format22_serving_read_checks,
@@ -350,18 +352,29 @@ class Drill(BlobOnlyHarness):
             "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=738390103"
             " AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND mode='ExclusiveLock' AND granted"))
 
-    def serving_barrier_refused(self, env=None):
-        """serve-blob must refuse to start while the exclusive offline barrier is held."""
-        probe = (env or self.env).copy()
-        directory = self.root / "unrelated-probe-data"
-        directory.mkdir(exist_ok=True)
-        probe["ROOTYARD_DATA_DIR"] = str(directory)
-        try:
-            process = subprocess.run([self.args.binary, "serve-blob"], env=probe,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-        except subprocess.TimeoutExpired:
-            return False
-        return process.returncode != 0
+    def serving_barrier_refused(self, env, stage):
+        """Both schema modes must exit with the exact lifecycle barrier refusal.
+
+        The probe runs against the barrier-held database on a run-owned loopback
+        bind and a private data directory. Only the exact per-mode source message
+        (read from the private log, never reported) proves refusal; a live child,
+        a ready listener or any other exit is fail-closed ``unknown``, never a
+        refusal, and the owned process group is killed and proven quiescent.
+        """
+        outcomes = []
+        for mode in ("auto", "external"):
+            outcome = serving_barrier_probe(self.args.binary, env, mode, self.root / "barrier-probe",
+                                            secrets=self.secrets, label=stage + "-" + mode)
+            outcomes.append(outcome)
+            assert outcome.get("reaped") is True, stage + ": " + describe(outcome) + ": probe child was not reaped"
+            assert outcome["status"] == "refused", stage + ": " + describe(outcome)
+            assert outcome.get("expected") == BARRIER_REFUSALS[mode], stage + ": " + describe(outcome)
+            assert outcome.get("exit", 0) != 0, stage + " " + mode + ": refusal must be a non-zero exit"
+            for line in outcome.get("diagnostics", []):
+                for secret in self.secrets:
+                    for value in (secret, unquote(secret)):
+                        assert not value or value not in line, "probe diagnostic leaked a private value"
+        return outcomes
 
     def snapshot(self):
         with self.source_volume.joinpath(".rootyard.lock").open("r+") as lock:
@@ -387,9 +400,7 @@ class Drill(BlobOnlyHarness):
             # a serve-blob started now must refuse, and the backup must wait for
             # this metadata writer instead of taking a snapshot around it.
             self.wait_for_advisory_holder(self.source_db, exclusive=True)
-            for mode in ("auto", "external"):
-                probe = dict(self.env, ROOTYARD_SCHEMA_MODE=mode)
-                assert self.serving_barrier_refused(probe), mode + " serve-blob started while the offline barrier was held"
+            self.serving_barrier_refused(self.env, "offline backup")
             deadline = time.monotonic() + 15
             while not int(self.query(self.source_db,
                     "SELECT count(*) FROM pg_stat_activity WHERE application_name='rootyard-backup' AND wait_event_type='Lock'")):
@@ -494,9 +505,7 @@ class Drill(BlobOnlyHarness):
                 restore = subprocess.Popen([self.args.binary, "restore", str(self.backup), "--isolated", "--trust-backup"],
                                            env=env, stdout=stdout, stderr=stderr)
             self.wait_for_advisory_holder(self.target_db, exclusive=True)
-            for mode in ("auto", "external"):
-                probe = dict(env, ROOTYARD_SCHEMA_MODE=mode)
-                assert self.serving_barrier_refused(probe), mode + " serve-blob started while the restore barrier was held"
+            self.serving_barrier_refused(env, "restore")
             status = restore.wait(timeout=180)
             assert status == 0, "paired restore from the archive failed (exit " + str(status) + ")"
         finally:
