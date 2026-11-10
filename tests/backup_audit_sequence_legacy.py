@@ -418,6 +418,10 @@ class AuditSequenceLegacyHarness(BackupHarness):
     def setup_repos(self):
         # Every real Git push happens here, before the single post-push snapshot,
         # so nothing is written silently between the snapshot and the backup.
+        # The outbox baseline precedes the first ahead/triage/Git push: the
+        # background audit consumer may drain the pushes' events long before
+        # the source window below reads its count.
+        self.audit_events_before = int(self.query(self.db, "SELECT count(*) FROM audit_events"))
         other = self.create_repository({"name": "ahead"}, token=self.alice)
         self.other = other
         assert other["state"] == "ready" and other["id"] != self.repo["id"], other
@@ -493,7 +497,6 @@ class AuditSequenceLegacyHarness(BackupHarness):
     def source_audit_writes_advance_sequence(self):
         # The audit id space advances only through API audit writes; the pushes
         # are Git/receipt facts (Git operations, not repository_audit_log).
-        self.audit_events_before = int(self.query(self.db, "SELECT count(*) FROM audit_events"))
         before = self.audit_rows(self.db)
         # Every row id allocated so far proves the write below advances past it.
         self.ids_before_write = self.all_audit_ids(self.db)
