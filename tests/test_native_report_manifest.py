@@ -50,6 +50,56 @@ class ManifestFixture:
         self.harness.parent.mkdir(parents=True, exist_ok=True)
         self.harness.write_text("# harness\n")
 
+    def enable_batch_receipt(self):
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        target_dir = str(self.binary.parent.parent.resolve())
+        toolchain = {"rustc": receipt["rustc"], "cargo": "cargo 1.99.1"}
+        architecture = {"target_triple": "x86_64-unknown-linux-gnu"}
+        bound_inputs = {"digest": "c" * 64}
+        batch_path = self.root / "test-results/native-build-batch.json"
+        batch_path.parent.mkdir(parents=True, exist_ok=True)
+
+        receipt["toolchain"] = toolchain
+        receipt["architecture"] = architecture
+        receipt["target_dir"] = target_dir
+        receipt["bound_inputs"] = bound_inputs
+        receipt["batch"] = {
+            "kind": "rootyard/native-build-batch",
+            "receipt_version": 1,
+            "binary": "rootyard",
+            "targets": ["rootyard"],
+            "bound_inputs_sha256": "c" * 64,
+            "manifest": str(batch_path.resolve()),
+        }
+        self.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
+        manifest = {
+            "kind": "rootyard/native-build-batch",
+            "manifest_version": 1,
+            "status": "passed",
+            "source_commit": receipt["workspace_commit"],
+            "source_inputs_sha256": receipt["source_inputs_sha256"],
+            "toolchain": toolchain,
+            "architecture": architecture,
+            "target_directory": target_dir,
+            "bound_inputs": bound_inputs,
+            "clean": {"commands": 1},
+            "build": {"commands": 1, "command": receipt["command"]},
+            "artifacts": [
+                {
+                    "kind": "bin",
+                    "target": "rootyard",
+                    "artifact": str(self.binary.resolve()),
+                    "receipt": str(self.receipt.resolve()),
+                    "fresh": False,
+                    "implicit": False,
+                    "sha256": digest(self.binary),
+                }
+            ],
+        }
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return batch_path
+
     def report(self, name="web_sessions", passed=True, binary_sha=None, case_status="passed", **extra):
         path = self.root / f"test-results/{name}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,6 +198,42 @@ class TestJobManifest(unittest.TestCase):
         self.assertEqual(manifest["fixtures"], {"postgres": "postgres:17"})
         self.assertEqual(sorted(manifest["reports"]), ["web_sessions"])
         self.assertEqual(manifest["logs"]["webhook_regressions"]["bytes"], len(self.fixture.log().read_bytes()))
+
+    def test_accepts_and_records_batch_manifest_provenance(self):
+        batch_path = self.fixture.enable_batch_receipt()
+        job = json.loads(self.fixture.job().read_text(encoding="utf-8"))
+
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(
+            job["build_receipt"]["batch_manifest"],
+            {
+                "file": str(batch_path.resolve()),
+                "sha256": digest(batch_path),
+                "target": "rootyard",
+            },
+        )
+
+    def test_rejects_missing_batch_manifest(self):
+        batch_manifest = self.fixture.enable_batch_receipt()
+        Path(batch_manifest).unlink()
+
+        self.fixture.job(expect=1)
+
+        self.assertIn("batch receipt manifest", self.fixture.last_process.stderr)
+        job_manifest_path = Path(self.fixture.root) / "manifests" / "job.json"
+        job_manifest = json.loads(job_manifest_path.read_text())
+        self.assertEqual(job_manifest["status"], "failed")
+
+    def test_rejects_batch_manifest_not_bound_to_binary(self):
+        batch_manifest = self.fixture.enable_batch_receipt()
+        batch_manifest_path = Path(batch_manifest)
+        data = json.loads(batch_manifest_path.read_text())
+        data["artifacts"][0]["artifact"] = str(self.fixture.root / "elsewhere/rootyard")
+        batch_manifest_path.write_text(json.dumps(data))
+
+        self.fixture.job(expect=1)
+
+        self.assertIn("exactly one entry", self.fixture.last_process.stderr)
 
     def test_rejects_report_from_another_binary(self):
         report = self.fixture.report(binary_sha="c" * 64)
