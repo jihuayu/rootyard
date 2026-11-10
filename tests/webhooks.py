@@ -121,6 +121,32 @@ class WebhooksHarness(PullsHarness):
                 ]
             )
 
+    def json_response(self, path: str, expected: int, **kwargs):
+        """Send one request and return its status, parsed JSON body and headers.
+
+        A conflict is only meaningful together with its JSON envelope, so the
+        body is parsed instead of discarded before the caller judges the status.
+        """
+        status, body, headers = self.http(path, token=kwargs.pop("token", None) or self.alice, **kwargs)
+        norm_headers = {k.lower(): v for k, v in headers.items()}
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None
+        if status != expected:
+            raise AssertionError(f"{path}: expected {expected}, got {status}: {body[:200]!r}")
+        assert norm_headers.get("cache-control") == "no-store", norm_headers
+        assert "application/json" in norm_headers.get("content-type", ""), norm_headers
+        assert isinstance(parsed, dict), (status, body[:200])
+        return status, parsed
+
+    def check_rows(self) -> dict:
+        """Current check-run rows for the PR head, keyed by context."""
+        return {
+            c["context"]: c
+            for c in self.document(f"{self.pr1_path}/checks", token=self.reader)["items"]
+        }
+
     def signed_callback(
         self,
         path: str,
@@ -446,46 +472,57 @@ class WebhooksHarness(PullsHarness):
         )
         # Background reconciliation may already have advanced PR #1 from the
         # authoritative `feature` ref (head_oid=feat2_oid, version bumped). Read
-        # the live row instead of assuming the manual PATCH's pre-push version is
-        # still current, and only PATCH against a version just read; a 409 means
-        # a further writer won, so re-read and verify the row is exactly feat2.
+        # the live row instead of assuming the pre-push version is still
+        # current, and only PATCH against a version just read.
         pr_now = self.document(self.pr1_path)
-        if pr_now["head_oid"] == self.feat2_oid and pr_now["version"] > self.pr1["version"]:
-            self.pr1 = pr_now
-        else:
+        if pr_now["head_oid"] != self.feat2_oid:
             # Not yet auto-advanced: the old head must still be stored, so the
             # manual PATCH is the one legitimate single use of a just-read version.
             assert pr_now["head_oid"] == self.pr1["head_oid"], pr_now
-            try:
-                self.pr1 = self.document(
-                    self.pr1_path,
-                    200,
-                    method="PATCH",
-                    body={"expected_version": pr_now["version"], "head_oid": self.feat2_oid},
-                )
-            except AssertionError:
-                # At most one bounded re-read: accept the 409 only if a writer
-                # genuinely landed exactly feat2, never any arbitrary head.
-                self.pr1 = self.document(self.pr1_path)
-        assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
-        assert self.pr1["version"] > self.pr1_version_before_push, self.pr1
-        self.document(self.dispatchpath, 200, method="POST", body={})
-        # Orchestration runs concurrently with the background worker; re-read the
-        # actual version so a later PATCH 409 cannot mask the queued-check result.
+            _, patched = self.json_response(
+                self.pr1_path,
+                200,
+                method="PATCH",
+                body={"expected_version": pr_now["version"], "head_oid": self.feat2_oid},
+            )
+            pr_now = patched
+        assert pr_now["head_oid"] == self.feat2_oid, pr_now
+        assert pr_now["base_oid"] == self.base_oid, pr_now
+        assert pr_now["version"] > self.pr1_version_before_push, pr_now
+        # The feat2 checks must still be queued, so the merge below is refused by
+        # the required-check policy and not by any other conflict.
+        for context in ("ci/test", "ci/lint"):
+            row = self.check_rows()[context]
+            assert row["status"] == "queued" and row["conclusion"] is None, row
         self.pr1 = self.document(self.pr1_path)
         assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
+        self.document(self.dispatchpath, 200, method="POST", body={})
+        # Orchestration runs concurrently with the background worker, so read the
+        # version the merge will fence on from the row as it is now.
+        self.pr1 = self.document(self.pr1_path)
 
-        # Merge at feat2_oid must fail with 409 because feat2_oid's check runs are still 'queued'.
-        self.document(
-            f"{self.pr1_path}/merge",
-            409,
-            method="POST",
-            body={
+        # Merge at feat2_oid must fail with exactly the branch-policy 409 because
+        # feat2_oid's check runs are still 'queued'. A version conflict only means
+        # the background worker advanced the row after our read: re-read the
+        # version a bounded number of times, always re-fencing on feat2_oid, and
+        # fail on any other status or error.
+        for _ in range(5):
+            merge_body = {
                 "expected_version": self.pr1["version"],
                 "expected_head_oid": self.feat2_oid,
                 "expected_base_oid": self.base_oid,
-            },
-        )
+            }
+            _, merge = self.json_response(
+                f"{self.pr1_path}/merge", 409, method="POST", body=merge_body
+            )
+            if merge.get("error") == "required check runs have not succeeded":
+                break
+            assert merge.get("error") == "pull request version conflict", merge
+            self.pr1 = self.document(self.pr1_path)
+            assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
+        else:
+            raise AssertionError(f"merge never reached the check-run oracle: {merge}")
+        assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
 
     def outbox_push_and_pull_request_event_dispatch(self):
         deliveries = self.document(f"{self.hook_path}/deliveries")["items"]
