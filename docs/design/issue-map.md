@@ -61,6 +61,18 @@
 - [#153](https://github.com/jihuayu/rootyard/issues/153)：[State/D] PG 切点+Raft index+Blob closure 配对备份与全新 incarnation 恢复。
 - [#151](https://github.com/jihuayu/rootyard/issues/151)：[State/D] 全局 PG artifact hold 与 Ref-CAS pin/root 的可恢复保留桥。
 
+## 新发布的后继任务（未实现）
+
+维护者另行发布了下列 issue。它们**尚未实现**、没有任何验收结果，也不改变上面任务的完成状态；只登记编号与提议标题，合并与验收完成后才可据实更新。
+
+- [#162](https://github.com/jihuayu/rootyard/issues/162)
+- [#163](https://github.com/jihuayu/rootyard/issues/163)
+- [#164](https://github.com/jihuayu/rootyard/issues/164)
+- [#165](https://github.com/jihuayu/rootyard/issues/165)
+- [#166](https://github.com/jihuayu/rootyard/issues/166)
+
+原 #149 Raft 存储适配仍为 open：PR #160 的 `crates/refcas-log` 只是隔离的实验 crate，仅交付日志存储切片，不完成 #149/#115。
+
 ## 完整保留的产品、缺陷和已关闭历史
 
 以下是重整前其余全部 71 个 issue 的状态快照；“open”不表示本轮新验收失败，“closed”也不推广为新架构资格。原 #48 的仍开放产品子项均在此，未随旧 umbrella 删除。当前运行路径的缺陷继续保留，直到相应修复合并验收或旧路径彻底移除后完成适用性复核。

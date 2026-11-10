@@ -120,12 +120,8 @@ def run_build(args, popen=None):
         command = ['cargo', 'build', '--locked']
         if getattr(args, 'no_default_features', False):
             command += ['--no-default-features']
-        # Recorded evidence may pin the root package's debug level exactly.
-        package_debug = getattr(args, 'package_debug', None)
-        if package_debug is not None:
-            if type(package_debug) is not int or package_debug not in (0, 1, 2):
-                raise BuildError('package debug must be 0, 1 or 2')
-            command += ['--config', f'profile.dev.package.rootyard.debug={package_debug}']
+        if getattr(args, 'package_debug', None) is not None:
+            command += ['--config', 'profile.dev.package.rootyard.debug=' + args.package_debug]
         command += ['--bins'] if args.bins else ['--bin', DEFAULT_BIN]
         if args.features:
             command += ['--features', args.features]
@@ -182,8 +178,7 @@ def run_build(args, popen=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Build a native binary and record its source binding.')
     parser.add_argument('--features')
-    parser.add_argument('--package-debug', type=int, choices=(0, 1, 2),
-                        help='pin the root package debug level in the recorded build')
+    parser.add_argument('--package-debug', choices=('0', '1', '2'))
     parser.add_argument('--no-default-features', action='store_true',
                         help='build the minimal profile without optional default transports')
     parser.add_argument('--bins', action='store_true')

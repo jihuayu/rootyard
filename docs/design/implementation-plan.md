@@ -54,6 +54,20 @@
 | [#157](https://github.com/jihuayu/rootyard/issues/157) | [State/D] 真实 3 主机故障矩阵、ACK 完整性、RPO/RTO 与容量成本 | [#155](https://github.com/jihuayu/rootyard/issues/155), [#156](https://github.com/jihuayu/rootyard/issues/156), [#153](https://github.com/jihuayu/rootyard/issues/153), [#42](https://github.com/jihuayu/rootyard/issues/42), [#151](https://github.com/jihuayu/rootyard/issues/151) |
 | [#123](https://github.com/jihuayu/rootyard/issues/123) | [State/Release] 汇总单机与分布式新架构资格及发布闸门 | [#154](https://github.com/jihuayu/rootyard/issues/154), [#157](https://github.com/jihuayu/rootyard/issues/157) |
 
+## 新发布的后继任务（未实现，待补充范围）
+
+维护者另行发布了 #162—#166。本计划只记录其存在：提议标题、范围、技术前置和验收尚未接入本表，**均未实现**，不计入任何已完成阶段。补充范围时应按上面同一格式加入“任务与技术前置”，并同步 [任务映射](issue-map.md)。
+
+| 任务 | 范围 | 技术前置 |
+| --- | --- | --- |
+| [#162](https://github.com/jihuayu/rootyard/issues/162) | 待补充（未实现） | 待定义 |
+| [#163](https://github.com/jihuayu/rootyard/issues/163) | 待补充（未实现） | 待定义 |
+| [#164](https://github.com/jihuayu/rootyard/issues/164) | 待补充（未实现） | 待定义 |
+| [#165](https://github.com/jihuayu/rootyard/issues/165) | 待补充（未实现） | 待定义 |
+| [#166](https://github.com/jihuayu/rootyard/issues/166) | 待补充（未实现） | 待定义 |
+
+PR #160 的独立实验 crate 只对应 #149 的日志存储切片，不改变 #149 仍为 open，也不构成 #115 的前置完成。
+
 ## 必须守住的验收边界
 
 - 真实入口和身份：标准 Git 双客户端、SHA-1/SHA-256、atomic/subset 与 report-status，API token/浏览器/协作者/组织/团队、分支规则、可信 check、LFS pointer；未支持组合在副作用前拒绝。新 LFS 文件锁协议 #41 属于独立产品功能，不作为保留既有功能的 Blob 接入门槛。

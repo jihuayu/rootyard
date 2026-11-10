@@ -4,35 +4,54 @@
 
 ## 当前基线与剩余工作
 
-源码检查基线：PR #142 最终提交 `49f09c233a88143ce092af556760149aa9571575`。这是尚未合并的候选栈，不把分项完成视作默认服务已替换。
+本页状态对应待集成候选（PR #161 及本地集成分支，尚未推送或合并）。它是**尚未合并、尚未默认激活**的候选栈：分项组件验收不表示默认服务已替换，也不表示任何实施 issue 已关闭。历史基线 PR #142 / `49f09c2` 的四组原生 8+11+12+20=51 场景（零失败、零忽略）及其证据见 [roots/decisions 证据](../../evidence/state-services/roots-decisions144/README.md)，保持原范围（其中的 CI 通过结论限于当时提交，不延伸到本分支）。
 
 | 能力 | 当前状态 | 后续范围 |
 | --- | --- | --- |
-| OpenDAL Blob、KeyProvider、cache/wake | 有独立组件与限定验收 | 全内容/加密路径接入、provider 与部署边界验收 |
-| PgRefStore 操作身份、CAS、pack 发布、快照和物化 | 有库实现；显式 `serve-blob` 候选入口已使用（尚未替换默认服务） | 默认入口替换、全部业务 producer 与权限上下文等价 |
+| OpenDAL Blob、KeyProvider、cache/wake | 有独立组件与限定验收；`state-redis` 为默认关闭的可选 feature，Redis 只作可丢缓存/唤醒 | 全内容/加密路径接入、provider 与部署边界验收 |
+| PgRefStore 操作身份、CAS、pack 发布、快照和物化 | 库实现；显式 `serve-blob` 候选入口已使用 | 默认入口替换、全部业务 producer 与权限上下文等价 |
 | artifact holds / durable roots | 有持久账本和真实 PG/Blob/native Git 验收 | PR/CI/Workspace/LFS producers、GC 与完整恢复闭包 |
 | PG decisions / accepted-subset | PR #142 库增量验收通过 | HTTP/业务入口、浏览器与 Merge producer、远程 Raft 决策桥 |
-| Blob-only standalone | 显式 `serve-blob` 候选：clone/push、浏览、历史 API 与配对备份有验收 | 默认部署替换、LFS/PR/Workspace/CI 接入与默认服务验收 |
-| Raft Ref-CAS distributed | 尚未交付 | 开源库选型、持久运行时、状态机、RPC、权限桥与 PG 投影 |
-| 全新环境恢复与生产资格 | 现有格式组件恢复有证据 | 新架构 PG/Raft/Blob 一致恢复、独立故障域和容量成本验收 |
+| Blob-only standalone（显式 `serve-blob`） | 候选：clone/push、tree/blob 与 refs/历史/compare 浏览、format22 配对备份/恢复有真实验收 | 默认部署替换、LFS/PR/Workspace/CI 接入、默认服务验收 |
+| Raft Ref-CAS distributed | 未交付；仅 PR #160 的独立实验 crate（见下） | 开源库选型、持久运行时、状态机、RPC、权限桥与 PG 投影 |
+| 全新环境恢复与生产资格 | format22 同后端配对恢复有证据；组件恢复有旧证据 | 新架构 PG/Raft/Blob 一致恢复、独立故障域和容量成本验收 |
+| 默认服务与对外 Git 传输 | 默认 `serve` 仍是既有 GitFS/Pando 实现；对外 Git 只承诺 Smart HTTP（HTTPS 由入口代理终止），不实现 SSH | 默认入口切换后补齐其特征接入 |
 
-PR #142 的真实原生四组为 8+11+12+20=51 场景，零失败、零忽略；最终提交的主 CI、Pando lab 和 RefStore 原生工作流均通过。具体源码、二进制、失败历史和隐私扫描见 [证据](../../evidence/state-services/roots-decisions144/README.md)。这些结果不覆盖完整服务启用、真实 Raft 或物理多机 HA。
+## Blob 单机服务候选：`serve-blob`
 
-## Blob 单机服务候选增量
+`rootyard serve-blob` 是显式的候选入口（`src/standalone.rs`），默认 `serve` 不受影响。它基于 schema147 的正常仓库创建、PG RefStore、OpenDAL Blob 和可丢弃 Git 计算视图运行；启动时检查未完成恢复标记、持有数据库级共享生命周期屏障，屏障丢失即关闭准入。
 
-PR [#159](https://github.com/jihuayu/rootyard/pull/159) 提供显式 `serve-blob` 入口，基于 schema147 的正常仓库创建、PG RefStore、OpenDAL 和可丢弃 Git 计算视图运行。它尚未替换默认服务，也不代表整个 #105 路线完成。
+服务能力与验收（同机、真实 PostgreSQL/S3/原生 Git、当前源码绑定二进制）：
 
-当前后续增量补充 tree/blob JSON 浏览和并发提交拒绝终态。浏览复用捕获的 RefStore 快照、Blob 物化及真实 token/session 权限；支持 SHA-1/SHA-256、带注解标签、当前 refs 可达的历史对象、分页及二进制文件。并发收尾仅在原 pending token、请求绑定与同一 realm 的持久 gate 前进得到核对后写入拒绝终态，真正结果未知的提交仍保留未知语义。
+- HTTP/Git：`tests/blob_only_service.py` 11 项；tree/blob 浏览 `tests/blob_gateway_browse.py` 7 项（`f1889aa` 通过）；refs、提交列表/详情和 compare 历史 API 7 项（`7690758` 通过）。浏览复用捕获的 RefStore 快照、Blob 物化和真实 token/session 权限，支持 SHA-1/SHA-256、带注解标签、当前 refs 可达的历史对象、分页及二进制文件；消息、遍历、子进程输出和 JSON 编码都有明确上限。
+- 并发提交收尾只在原 pending token、请求绑定与同一 realm 持久 gate 前进均核对后写入拒绝终态；真正结果未知的提交保持 UNKNOWN。A3 两个指定竞争窗口只有错误分类单元回归，HTTP 竞争验收不保证调度恰落在这两个窗口。
+- 备份：format22/schema147 配对归档（见下节）7 项、旧 format21 备份/恢复 7 项，均在 `1d1ce62` 通过。
+- 本地结构检查（非新增执行记录）：`src/standalone.rs` 只构造 Smart HTTP 路由，不提供 SSH 入口；`state-redis` 默认不在 feature 中，`serve-blob` 目前不使用 Redis；独立实验 crate 不在根依赖中。
 
-可重跑验收入口：`tests/blob_only_service.py`（11 项）与 `tests/blob_gateway_browse.py`（7 项），均要求 `scripts/build_native.py` 生成的当前源码绑定二进制、真实 PostgreSQL、S3 和原生 Git。RefStore 原生工作流已接入这两个服务验收入口。两处 A3 gate 竞争的错误分类有单元回归；HTTP 竞争验收不保证调度恰落在这两个窗口。
+Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上 Rust 库测试 464 通过、9 项服务依赖测试显式忽略，最小依赖 all-targets Clippy 通过（候选 PR #159/#161 的 GitHub 主 CI `verify` 任务当时为失败，记录未追溯根因；独立的 CI 恢复与问题修复在其他分支进行，本页不重复）；`backup_blob_serving147.py` 记录 Python 336 项中 331 通过、5 跳过，外加 3 项 live S3 工作区用例通过。合并后的集成分支尚未重新执行这些门禁（Cargo 构建由 Root 串行调度），因此上述结果绑定的是各自源码，不自动覆盖本分支。详细构建、源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md) 与 [standalone147 证据](../../evidence/state-services/standalone147-followup/README.md)。
 
-2026-11-09，本次干净候选 `f1889aa` 在同一绑定二进制上通过 HTTP/Git 11/11、Browse 7/7、严格 all-targets Clippy 和 456 项 Rust 库测试（另有 9 项显式忽略）。真实验收发现并修复了 LFS 指针扫描无法承载换行文件名的问题，特殊文件名分页夹具完整保留。完整报告、构建记录与失败历史见 [后续验收证据](../../evidence/state-services/standalone147-followup/README.md)。这些是同机功能结果，不等于默认服务、独立备份或分布式发布资格。
+## format22 配对备份与恢复的真实边界
 
-最新干净候选 `7690758` 增加 refs、提交列表/详情和 compare JSON API：原生 Git 负责类型、标签递归剥离、提交遍历、merge-base、ahead/behind 和 diff。带注解标签可以指向 commit、blob 或 tree；历史读取支持当前 refs 可达的祖先 full OID。消息、遍历、子进程输出及 JSON 编码都有明确上限，超限拒绝。独立原生期望值下 SHA-1/SHA-256 历史 7/7、原有 HTTP 11/11、tree/blob 7/7 均零跳过通过；Rust 库测试 464 通过、9 项服务依赖测试显式忽略，最小依赖 all-targets Clippy 通过。实现与独立 review 使用官方 DeepSeek subagent，Root 整合并实测。详细源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md)。这仍不代表整个 #144 的 ref 事务/业务等价性或默认入口替换完成。
+`format22/schema147` 是当前二进制自己的归档格式：归档既包含冻结 catalog 的 PostgreSQL 快照，也包含该快照引用的 **新鲜 PG RefStore pack/idx 闭包**（以校验和与流式行摘要绑定），并记录源物理 Blob 后端身份。备份与恢复使用与 `serve-blob` 相同的数据库级排他/共享生命周期屏障：备份固定单一 PG 快照并拒绝非终态写入切点，恢复在写入完成、发布与 fsync 前保持服务封锁，持久恢复标记同时阻止另一数据路径绕过。
 
-备份仍是明确阻塞：format21/schema147 的 catalog 支持不等于非空 Blob 仓库备份。`backup::git_inventory` 仍要求 ready 仓库存在持久 bare Git，因此 `pg_refstore` 仓库的正向备份会失败；OpenDAL 内容闭包也尚未导出归档。`serve-blob` 当前不持有 legacy volume flock 或检查其 restore guard，不能套用旧服务的在线备份屏障结论。新增 `tests/backup_blob_serving147.py` 保留严格正向失败，未接入 CI；即使后续通过，它在保留原 Blob 的条件下只证明 PG 元数据恢复，独立 PG+Blob 闭包恢复仍需 #120 实现。不得伪造 bare 仓库或跳过检查来标记备份完成。
+已验收（`1d1ce62`，[证据](../../evidence/state-services/paired-blob-archive/README.md)）：删除原始 pack/idx 对象后，在全新数据库、原 Blob 后端同一坐标上重建字节并通过 clone/content/refs/fsck 与精确重放；屏障丢失、离线/快照屏障违规、损坏归档、已有目标、非终态切点均被拒绝；备份后 ACK 的写入被排除。损坏归档包含六种被拒绝的损伤样本，不是穷举的完整性证明。
 
-LFS、PR/Merge、Workspace、CI/Namespace 的新服务接入、默认入口替换，以及 Raft 运行时、远程桥和多主机资格仍待完成。实施 issue 只有在相关实现合并并完成对应真实验收后关闭。
+明确限制：
+
+- 仅覆盖新鲜 PG RefStore 仓库的 pack 闭包，**不是全内容闭包**；LFS、workspace/checkpoint、事件归档等字节尚未进入 format22。
+- 只支持恢复到**同一物理 Blob 后端身份**；不支持改写到其他后端。
+- 混合旧格式/PG 仓库被拒绝；不作旧 format/schema 升级。
+- 中断的 format22 恢复没有专门恢复流程或演练（旧 format21 中断演练不覆盖 format22）；没有物理掉电、HA、多主机或生产 RPO/RTO 资格。
+- 产品物理 GC 仍默认关闭。
+- 本节取代此前“非空 Blob 仓库无法备份”“`backup::git_inventory` 仍要求持久 bare Git”的旧阻塞描述：该阻塞对 `pg_refstore` 仓库已由 format22 解除（旧描述保留在下方历史记录中，仅表示当时状态）。
+
+## 独立实验：Ref-CAS 日志存储（PR #160）
+
+PR #160 新增 `crates/refcas-log`：openraft 0.9.26 `RaftLogStorage`/`RaftLogReader` 的 SQLite 实现，带精确 purge 身份、校验和、有界 append/read、SQLite 提交后才确认日志 flush，以及 1 项真实 SIGKILL/新进程 vote 恢复测试；由独立 workflow 运行。它**只是隔离的实验 crate**：不在 `Cargo.toml` 根依赖、不参与根构建、不激活任何 Raft 运行时，状态机存储、快照、RPC/TLS/ReadIndex、完整 openraft 套件、Ref-CAS 集成和多主机资格均未实现。证据：[refcas-log 证据](../../evidence/state-services/refcas-log-slice/README.md)。
+
+## 仍待完成
+
+LFS、PR/Merge、Workspace、CI/Namespace 的新服务接入、默认入口替换；Raft 运行时、远程决策桥；GC 与容量成本；以及 format22 之外的全内容恢复与独立故障域验收。实施 issue 只有在相关实现合并并完成对应真实验收后关闭。
 
 ## 历史实现与验收索引
 
