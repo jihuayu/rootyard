@@ -61,9 +61,9 @@
 - [#153](https://github.com/jihuayu/rootyard/issues/153)：[State/D] PG 切点+Raft index+Blob closure 配对备份与全新 incarnation 恢复。
 - [#151](https://github.com/jihuayu/rootyard/issues/151)：[State/D] 全局 PG artifact hold 与 Ref-CAS pin/root 的可恢复保留桥。
 
-## 新发布的后继任务与修复 backlog（#166–#168 网关修复已并入 PR #170 集成；集成后 CI 以 PR #170 最终检查为准）
+## 新发布的后继任务与修复 backlog（#166–#168 缺陷修复已并入 PR #170 集成；集成后 CI 以 PR #170 最终检查为准）
 
-维护者另行发布了下列 issue。它们**尚未实现**、没有任何验收结果，也不改变上面任务的完成状态，不构成分布式/HA/GC 能力声明。标题取自 GitHub；合并与验收完成后才可据实更新。范围摘要与技术前置见[实施计划](implementation-plan.md)的“新增任务与修复 backlog”一节。
+维护者另行发布了下列 issue。未实现的后继 backlog（#162–#165、#169、#174）**尚未实现**、没有任何验收结果；#166–#168 已有绑定各自提交的组件修复与测试，最终集成 CI 与 issue 关闭以 PR #170 为准。两者都不改变上面任务的完成状态，不构成分布式/HA/GC 能力声明。标题取自 GitHub；合并与验收完成后才可据实更新。范围摘要与技术前置见[实施计划](implementation-plan.md)的“新增任务与修复 backlog”一节。
 
 | issue | 标题 | 类型 |
 | --- | --- | --- |
