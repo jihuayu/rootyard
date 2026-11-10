@@ -312,7 +312,7 @@ fn only_the_header_carries_a_token() {
 #[test]
 fn errors_and_debug_output_never_render_token_material() {
     let live = realm(10);
-    let issued = codec_with(&[(0, key(1))], 0, &backends().0).issue_for_test(&live, 1, 1_000).expect("issue");
+    let issued = codec_with(&[(0, key(1))], 0, &backends().0).issue(&live, 1, 1_000).expect("issue");
     let text = format!("{issued:?} {:?}", SessionTokens::new(codec(&[(0, key(1))], 0)));
     let token = issued.token();
     assert!(!text.contains(token));
@@ -374,13 +374,15 @@ fn the_gateway_entry_and_compare_agree_without_global_state() {
     let second = tokens.issue_for_test(&live, 3).expect("b");
     assert_eq!(second.revision(), 3);
     assert!(now_seconds() > 1_000_000_000);
-    let token = presented_for_test(&header(second.token())).expect("presented");
+    let headers = header(second.token());
+    let token = presented_for_test(&headers).expect("presented");
     let comparison = tokens.verify(&token, &live, 3).expect("verify");
     assert_eq!(comparison, Some(VersionComparison::Satisfied { bound: 3 }));
     // The same entry point reports Behind for a lagging authoritative read.
     let behind = tokens.verify(&token, &live, 2).expect("verify");
     assert_eq!(behind, Some(VersionComparison::Behind { live_revision: 2 }));
-    let none = presented_for_test(&HeaderMap::new()).expect("presented");
+    let absent = HeaderMap::new();
+    let none = presented_for_test(&absent).expect("presented");
     assert_eq!(tokens.verify(&none, &live, 2).expect("none"), None);
     let mut response = axum::response::Response::new(axum::body::Body::empty());
     second.apply(&mut response);
