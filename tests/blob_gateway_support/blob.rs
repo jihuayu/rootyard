@@ -51,6 +51,45 @@ pub fn root_environment() -> Result<(&'static str, &'static str)> {
     Ok(("ROOTYARD_BLOB_ROOT", root()?))
 }
 
+/// Exactly the variables `blob_store::config::BlobProfile::from_env` reads, in
+/// both provider arms. This is the whole inherited Blob profile an isolated
+/// child service receives; nothing else from the parent environment is copied.
+const PROFILE_KEYS: &[&str] = &[
+    "ROOTYARD_BLOB_DRIVER",
+    "ROOTYARD_BLOB_SERVICE",
+    "ROOTYARD_BLOB_BUCKET",
+    "ROOTYARD_BLOB_CONTAINER",
+    "ROOTYARD_BLOB_ENDPOINT",
+    "ROOTYARD_BLOB_REGION",
+    "ROOTYARD_BLOB_ACCESS_KEY_ID",
+    "ROOTYARD_BLOB_SECRET_ACCESS_KEY",
+    "ROOTYARD_BLOB_SESSION_TOKEN",
+    "ROOTYARD_BLOB_ACCOUNT_NAME",
+    "ROOTYARD_BLOB_ACCOUNT_KEY",
+    "ROOTYARD_BLOB_ACTIVE_UPLOADS",
+    "ROOTYARD_BLOB_ACTIVE_READERS",
+    "ROOTYARD_BLOB_STAGING_BYTES",
+    "ROOTYARD_BLOB_MAX_OBJECT_BYTES",
+    "ROOTYARD_BLOB_RANGE_FULL_GET_MAX_BYTES",
+    "ROOTYARD_BLOB_TIMEOUT_MS",
+    "ROOTYARD_BLOB_IO_TIMEOUT_MS",
+    "ROOTYARD_BLOB_CONCURRENCY",
+    "ROOTYARD_BLOB_RETRY_MAX_TIMES",
+    "ROOTYARD_BLOB_ABORT_TIMEOUT_MS",
+    "ROOTYARD_BLOB_DELETE",
+];
+
+/// The operator's real Blob profile as inherited by the launched service.
+///
+/// The service starts from an empty environment, so the profile this process
+/// successfully opened would otherwise never reach it. Only [`PROFILE_KEYS`]
+/// are carried over, unset keys stay unset; `ROOTYARD_BLOB_ROOT` is neither
+/// inherited nor listed here, and the run-owned prefix is set separately so it
+/// always wins. Values are never printed, logged or persisted.
+pub fn profile_environment() -> Vec<(&'static str, std::ffi::OsString)> {
+    PROFILE_KEYS.iter().filter_map(|name| std::env::var_os(name).map(|value| (*name, value))).collect()
+}
+
 /// A description of the opened profile for the report: provider, bucket/region
 /// lengths, the loopback/located endpoint *shape* and the relative prefix. It
 /// never contains an access key, secret, session token, user info or port.

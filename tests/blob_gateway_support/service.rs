@@ -6,6 +6,11 @@
 //! pins the run-owned coordinates so this suite can never collide with another
 //! run:
 //!
+//! * the service starts from an empty environment. Only the operator's real
+//!   `ROOTYARD_BLOB_*` profile ([`blob::profile_environment`], exactly the keys
+//!   `BlobProfile::from_env` reads) is carried over, so the child opens the same
+//!   backend this process did; no other parent variable, credential or
+//!   unrelated setting is copied;
 //! * `DATABASE_URL` is the operator's URL with one random `search_path`
 //!   ([`Db::database_url`]); the service holds its lifecycle barrier inside this
 //!   database and resolves every table to the schema this process migrated;
@@ -47,7 +52,8 @@ impl Service {
     }
 
     /// Same launch with extra environment entries (tests only). They are set
-    /// first; the fixed run-owned coordinates always win. The scratch directory
+    /// after the operator's Blob profile and may not replace it; the fixed
+    /// run-owned coordinates always win. The scratch directory
     /// carries the run-only `git126-` prefix, so any compute view the service
     /// leaves behind is visibly owned by this suite.
     pub async fn launch_with(binary: &Path, extra: &[(&str, &str)]) -> Result<Self> {
@@ -73,8 +79,16 @@ impl Service {
         let address = reserved.local_addr()?;
         drop(reserved);
         let (root_name, root) = blob::root_environment()?;
+        let profile = blob::profile_environment();
+        ensure!(
+            profile.iter().all(|(name, _)| extra.iter().all(|(extra, _)| extra != name)),
+            "the operator's Blob profile is carried over as-is and is never overridden per service"
+        );
         let mut command = Command::new(binary);
         command.arg("serve-blob").env_clear();
+        // The operator's real profile, copied by name only; the run-owned
+        // coordinates below are set afterwards and always win.
+        command.envs(profile);
         for (name, value) in extra {
             command.env(name, value);
         }
