@@ -9,7 +9,8 @@
 //!
 //! - [`Proxy::hold_connection`] holds the responses of the next `count` POSTs,
 //!   so two stock Git clients compete against one advertised old OID and the
-//!   service sees both complete requests;
+//!   service sees both complete requests; [`Proxy::hold_connection_capturing`]
+//!   arms the same barrier and also yields each held POST's raw service reply;
 //! - [`Proxy::resolve_held`] forwards every held request concurrently, only
 //!   after every held body is complete, and answers each client with **its own**
 //!   service response;
@@ -332,15 +333,19 @@ impl Proxy {
     /// Git pushes). Their service responses are not returned to Git before
     /// [`Proxy::resolve_held`] forwarded all of them concurrently.
     pub async fn hold_connection(&self, count: usize) -> Result<()> {
-        ensure!(count >= 1, "a hold barrier needs at least one request");
-        let mut state = self.shared.state.lock().await;
-        ensure!(state.hold.is_none(), "a hold barrier is already armed");
-        ensure!(state.rules.connection.is_empty(), "a rewrite rule is already armed");
-        state.rules.connection = (0..count)
-            .map(|_| Rule::Hold { outcome: Arc::new(tokio::sync::Mutex::new(None)), captured: None })
-            .collect();
-        state.hold = Some(Hold { count, arrived: Vec::new() });
+        arm_hold(&self.shared, count, None).await?;
         Ok(())
+    }
+
+    /// Arm the same bounded barrier as [`Proxy::hold_connection`], but also
+    /// return the exact raw service responses (status + body) of every held
+    /// receive-pack POST, in the order their client connections resolved them,
+    /// so a caller can parse what the service itself answered rather than rely
+    /// on the client's rendering of it. Exactly `count` values are sent.
+    pub async fn hold_connection_capturing(&self, count: usize) -> Result<mpsc::UnboundedReceiver<Captured>> {
+        let (captured, received) = mpsc::unbounded_channel();
+        arm_hold(&self.shared, count, Some(captured)).await?;
+        Ok(received)
     }
 
     /// Forward the next POST carrying `operation` and then close its client
@@ -464,21 +469,31 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
             operation: None,
             truncated: false,
         };
-        let armed = match operation_of(&target, &headers) {
-            Some(operation) => take_operation_rule(&shared, &operation).await,
-            None => None,
+        let receive_pack_post = is_receive_pack_post(&path, &method);
+        // Only the receive-pack POST may consume a per-operation rule: the same
+        // `http.extraHeader` operation id also rides on the advertisement GET,
+        // which must be forwarded normally instead of taking the POST's rule.
+        let armed = if receive_pack_post {
+            match operation_of(&target, &headers) {
+                Some(operation) => take_operation_rule(&shared, &operation).await,
+                None => None,
+            }
+        } else {
+            None
         };
         let rule = match armed {
             Some(rule) => Some(rule),
-            None if is_receive_pack_post(&path, &method) => take_connection_rule(&shared).await,
+            None if receive_pack_post => take_connection_rule(&shared).await,
             None => None,
         };
         let reply = match rule {
             Some(Rule::Drop { poll, captured }) => {
+                // Forward the complete POST first so the service-side operation
+                // exists and can actually reach a durable terminal.
+                let traffic = shared.exchange(&method, &target, &headers, &body).await?;
                 if let Some(poll) = poll {
                     poll.wait_terminal(Instant::now() + shared.limits.hold).await?;
                 }
-                let traffic = shared.exchange(&method, &target, &headers, &body).await?;
                 record.status = Some(traffic.status);
                 record.truncated = traffic.truncated;
                 shared.state.lock().await.records.push(record);
@@ -504,6 +519,7 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                 });
                 enroll(&shared, deferred.clone()).await?;
                 let reply = await_held_reply(&shared, &deferred).await?;
+                record.status = Some(reply.status);
                 if let Some(captured) = captured {
                     let _ = captured.send(Captured {
                         request_sha256: sha256(&deferred.body),
@@ -511,6 +527,7 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                         response: reply.body.clone(),
                     });
                 }
+                shared.state.lock().await.records.push(record);
                 reply
             }
             None => {
@@ -536,6 +553,21 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+/// Arm the barrier shared by [`Proxy::hold_connection`] and
+/// [`Proxy::hold_connection_capturing`]: `count` bounded Hold rules, each with
+/// its own reply channel and, when given, the same captured sender.
+async fn arm_hold(shared: &Shared, count: usize, captured: Option<mpsc::UnboundedSender<Captured>>) -> Result<()> {
+    ensure!(count >= 1, "a hold barrier needs at least one request");
+    let mut state = shared.state.lock().await;
+    ensure!(state.hold.is_none(), "a hold barrier is already armed");
+    ensure!(state.rules.connection.is_empty(), "a rewrite rule is already armed");
+    state.rules.connection = (0..count)
+        .map(|_| Rule::Hold { outcome: Arc::new(tokio::sync::Mutex::new(None)), captured: captured.clone() })
+        .collect();
+    state.hold = Some(Hold { count, arrived: Vec::new() });
+    Ok(())
 }
 
 async fn take_connection_rule(shared: &Shared) -> Option<Rule> {

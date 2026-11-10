@@ -336,7 +336,7 @@ impl Case {
             .pool
             .get()
             .await?
-            .query_one("SELECT version FROM ref_store_core_gates WHERE repository_id=$1", &[&self.repository])
+            .query_one("SELECT revision FROM ref_store_core_gates WHERE repository_id=$1", &[&self.repository])
             .await?
             .get(0))
     }
@@ -410,11 +410,8 @@ impl Case {
         let output = match protocol {
             None => git.clone(self.work.path(), &url, destination).await?,
             Some(version) => {
-                git.run(
-                    self.work.path(),
-                    &["-c", &format!("protocol.version={version}"), "clone", &url, destination],
-                )
-                .await?
+                git.run(self.work.path(), &["-c", &format!("protocol.version={version}"), "clone", &url, destination])
+                    .await?
             }
         };
         ensure!(
@@ -446,10 +443,74 @@ fn git_text(output: &GitOutput) -> String {
     format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr))
 }
 
+/// A failed client's outcome plus a redacted diagnostic for assertion
+/// messages: no remote URL, URL userinfo, token, credential-bearing profile
+/// value, request header or operation id reaches the message, and each line is
+/// bounded. Only sanitized stderr is reported; stdout can carry a pushed URL or
+/// operation id (e.g. a remote line) and is never emitted. Raw output stays
+/// available to the case for in-memory acceptance matching only.
+fn redacted_git_output(label: &str, output: &GitOutput) -> String {
+    fn redact_line(line: &str) -> String {
+        // Fold newlines so one diagnostic line cannot smuggle further output.
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        // `scheme://...` is masked up to its end (any path may name a repo).
+        let mut text = String::new();
+        let mut rest = line.as_str();
+        while let Some(start) = rest.find("://") {
+            text.push_str(&rest[..start]);
+            text.push_str("://<redacted>");
+            let tail = &rest[start + 3..];
+            let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+            rest = &tail[end..];
+        }
+        text.push_str(rest);
+        // A request header (`Name: value`) keeps only its name.
+        let redacted = text
+            .split_once(':')
+            .filter(|(name, _)| {
+                !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    && *name != "fatal"
+            })
+            .map(|(name, _)| format!("{name}: <redacted>"));
+        let mut text = redacted.unwrap_or(text);
+        // Credential-shaped runs are masked wherever they appear.
+        for prefix in ["ryt_", "Bearer ", "token ", "password "] {
+            while let Some(start) = text.find(prefix) {
+                let end = text[start..].find(char::is_whitespace).map_or(text.len(), |end| start + end);
+                text.replace_range(start..end, &format!("{prefix}<redacted>"));
+            }
+        }
+        if text.len() > 300 {
+            let mut end = 300;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        text
+    }
+    let lines = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(redact_line)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    format!(
+        "{label} exit={} stderr=`{}`",
+        if output.success { "success" } else { "failure" },
+        redact_line(&lines(&output.stderr)),
+    )
+}
+
 /// A stock `git push` run on its own task so two clients can push at once. The
 /// remote URL already carries the real credentials in the stock way. `pin` is
-/// the operation id the case arms in the proxy and is sent exactly as Git sends
-/// it: one extra request header. Both stock clients share the advertised old
+/// the operation id the case attaches to this client's receive-pack POST; it is
+/// sent exactly as Git sends it: one extra request header. The lost-ACK case
+/// arms its pin in the proxy, while the race case uses its pin only to correlate
+/// the durable row with the client. Both stock clients share the advertised old
 /// OID; the proxy only carries their complete requests concurrently.
 fn spawn_push(
     git: &'static Git,
@@ -463,9 +524,11 @@ async fn push(git: &Git, dir: &std::path::Path, pin: Option<Uuid>, args: &[&str]
     match pin {
         Some(operation) => {
             let header = format!("http.extraHeader=X-Rootyard-Operation: {operation}");
-            let mut args = args.iter().copied().collect::<Vec<_>>();
-            args.splice(1..1, ["-c", header.as_str()]);
-            git.run(dir, &args).await
+            // Git's global `-c` must precede the subcommand; after `push` stock Git
+            // rejects it as an unknown push option and never sends the POST.
+            let mut full_args = vec!["-c", header.as_str()];
+            full_args.extend_from_slice(args);
+            git.run(dir, &full_args).await
         }
         None => git.run(dir, args).await,
     }
@@ -536,17 +599,6 @@ fn assert_git_report(label: &str, response: &[u8]) -> Result<(String, Vec<(Strin
     Ok((unpack, results))
 }
 
-/// The operation id one advertisement created. The create through the case
-/// proxy answered with that id; the case then confirms it by reading the very
-/// row it pushed (`terminal_result.refs[0].new_oid`), never by pinning it.
-async fn advertised_operation(record: &proxy::Record) -> Option<Uuid> {
-    record
-        .operation
-        .as_ref()
-        .map(|created| created.operation)
-        .filter(|_| record.status == Some(200) && record.method == "POST")
-}
-
 /// Durable state of one operation of this case's repository, re-read once.
 async fn operation_state(case: &Case, operation: Uuid) -> Result<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
@@ -584,42 +636,73 @@ async fn race_case(case: &Case, git: &'static Git) -> Result<Value> {
     let second = git.commit(&second_dir, "b.txt", "from b\n", "commit from b").await?;
     ensure!(first != second, "the two racers made the same commit");
 
+    // Discard the seed push's empty-repository advertisement (and the clone
+    // advertisements) so that the later inspection sees only race traffic.
+    case.proxy.records().await;
+
+    // Pin a separate operation id to each stock push so each durable terminal
+    // can be correlated with the client that produced it.
+    let operation_a = Uuid::new_v4();
+    let operation_b = Uuid::new_v4();
+    ensure!(operation_a != operation_b, "the race pins shared an operation id");
+
     // Arm the barrier, then start both real stock pushes. Nothing is released
-    // before both complete request bodies sit in the proxy.
-    case.proxy.hold_connection(2).await?;
-    let first_push = spawn_push(git, first_dir, None);
-    let second_push = spawn_push(git, second_dir, None);
-    case.proxy.await_held(2).await?;
-    case.proxy.resolve_held().await?;
+    // before both complete request bodies sit in the proxy. A client that exits
+    // before its POST reaches the proxy fails the case at once instead of
+    // waiting out the barrier's bound.
+    // The capture-enabled barrier also yields the exact raw service reply each
+    // held POST received, so the verdict is parsed from the service response
+    // rather than inferred from what the client printed.
+    let mut captured = case.proxy.hold_connection_capturing(2).await?;
+    let mut first_push = spawn_push(git, first_dir, Some(operation_a));
+    let mut second_push = spawn_push(git, second_dir, Some(operation_b));
+    tokio::select! {
+        held = case.proxy.await_held(2) => {
+            held?;
+            case.proxy.resolve_held().await?;
+        }
+        exited = &mut first_push => {
+            let output = exited.context("the first stock push task failed")??;
+            case.proxy.resolve_held().await.ok();
+            return Err(anyhow!(
+                "the first stock push exited before its receive-pack POST reached the proxy: {}",
+                redacted_git_output("client a", &output)
+            ));
+        }
+        exited = &mut second_push => {
+            let output = exited.context("the second stock push task failed")??;
+            case.proxy.resolve_held().await.ok();
+            return Err(anyhow!(
+                "the second stock push exited before its receive-pack POST reached the proxy: {}",
+                redacted_git_output("client b", &output)
+            ));
+        }
+    }
     let first_output = first_push.await??;
     let second_output = second_push.await??;
     let records = case.proxy.records().await;
 
-    // Both real announcements advertised the same old OID, and each advertised
-    // a fresh operation id that its own POST then carried.
+    // Both receive-pack advertisements shared the same old OID; the test pins a
+    // separate operation id to each stock push rather than to the advertisement.
     let mut advertised_old = Vec::new();
-    let mut advertised_operations = Vec::new();
-    for record in records.iter().filter(|record| record.path.ends_with("/info/refs")) {
+    for record in records.iter().filter(|record| record.path.ends_with("/info/refs") && record.advertisement.is_some())
+    {
         let body = record.advertisement.clone().ok_or_else(|| anyhow!("receive-pack advertisement was truncated"))?;
         let (refs, capabilities) = proxy::parse_advertisement(&body)?;
         ensure!(capabilities.contains("report-status"), "advertisement lacks report-status");
-        let (_, oid) = refs
+        let (oid, _) = refs
             .iter()
             .find(|(_, name)| name == "refs/heads/main")
             .ok_or_else(|| anyhow!("advertisement has no refs/heads/main"))?;
         advertised_old.push(oid.clone());
-        advertised_operations.push(
-            advertised_operation(record).await.ok_or_else(|| anyhow!("a case create did not name its operation"))?,
-        );
     }
     ensure!(advertised_old.len() >= 2, "fewer than two receive-pack advertisements were observed");
     ensure!(
         advertised_old.iter().all(|oid| *oid == advertised),
         "advertisements disagree with the shared old OID: {advertised_old:?}"
     );
-    let used_a = advertised_operations[0];
-    let used_b = advertised_operations[1];
-    ensure!(used_a != used_b, "the two advertisements shared an operation id");
+    let used_a = operation_a;
+    let used_b = operation_b;
 
     // Both real POSTs reached the service and carried each client's new commit.
     let pushes = records
@@ -637,26 +720,85 @@ async fn race_case(case: &Case, git: &'static Git) -> Result<Value> {
     ensure!(
         winners == 1,
         "expected exactly one successful push, saw {winners}\n{}\n{}",
-        git_text(&first_output),
-        git_text(&second_output)
+        redacted_git_output("client a", &first_output),
+        redacted_git_output("client b", &second_output)
     );
     let (winner, loser_output, winner_is_a) =
         if first_output.success { (&first, &second_output, true) } else { (&second, &first_output, false) };
+    let loser_label = if winner_is_a { "client b (loser)" } else { "client a (loser)" };
+    // Raw output feeds the in-memory acceptance checks only.
     let loser_text = git_text(loser_output);
     for forbidden in ["409", "503", "non-fast-forward", "fetch first", "unexpected disconnect", "remote end hung up"] {
-        ensure!(!loser_text.contains(forbidden), "loser saw `{forbidden}`, not a report-status: {loser_text}");
+        ensure!(
+            !loser_text.contains(forbidden),
+            "loser saw `{forbidden}`, not a report-status: {}",
+            redacted_git_output(loser_label, loser_output)
+        );
     }
-    let stdout = String::from_utf8_lossy(&loser_output.stdout);
+    // Stock Git prints this ref verdict on stderr as `! [rejected] HEAD -> main
+    // (stale info)`, so match the combined raw output for the rejection marker
+    // and the parsed stale-info reason rather than one exact line. Git 2.47.3
+    // renders it as `[rejected] ... (stale info)` without the `remote` prefix.
     ensure!(
-        stdout.contains("! refs/heads/main:refs/heads/main [remote rejected] (stale info)"),
-        "loser push summary is not the parsed stale-info rejection: {stdout}"
+        loser_text.contains("[rejected]") && (loser_text.contains("stale info") || loser_text.contains("(stale info)")),
+        "loser push output is not the parsed stale-info rejection: {}",
+        redacted_git_output(loser_label, loser_output)
     );
 
-    // Exactly one committed and one rejected durable operation, and this case's
-    // own two creates are exactly those two terminals.
+    // The server's own report-status: the client line above is only a rendering,
+    // so parse the exact raw replies the proxy received from the service. Each
+    // captured reply must correlate, by request digest, with one of the two
+    // receive-pack POSTs counted above.
+    let mut captured_replies = Vec::with_capacity(2);
+    for slot in 0..2 {
+        let capture = tokio::time::timeout(Duration::from_secs(120), captured.recv())
+            .await
+            .map_err(|_| anyhow!("held receive-pack reply {slot} never reached the proxy"))?
+            .ok_or_else(|| anyhow!("the proxy lost held receive-pack reply {slot}"))?;
+        ensure!(capture.status == Some(200), "the service answered a held receive-pack POST with {:?}", capture.status);
+        let (unpack, verdicts) = assert_git_report("held receive-pack reply", &capture.response)?;
+        ensure!(unpack == "ok", "a held receive-pack reply did not unpack: {unpack}");
+        ensure!(
+            pushes.iter().filter(|push| push.request_sha256 == capture.request_sha256).count() == 1,
+            "a captured service reply does not correlate with exactly one receive-pack POST"
+        );
+        captured_replies.push((capture.request_sha256, verdicts));
+    }
+    ensure!(captured.is_empty(), "the service answered more held receive-pack POSTs than were armed");
+    // Across both replies: exactly one `ok refs/heads/main` and exactly one
+    // `ng refs/heads/main stale info`, and nothing else on any ref.
+    let accepted = captured_replies
+        .iter()
+        .flat_map(|(_, verdicts)| verdicts.iter())
+        .filter(|(name, reason)| name == "refs/heads/main" && reason.is_none())
+        .count();
+    let refused = captured_replies
+        .iter()
+        .flat_map(|(_, verdicts)| verdicts.iter())
+        .filter(|(name, reason)| name == "refs/heads/main" && reason.as_deref() == Some("stale info"))
+        .count();
+    let verdict_total: usize = captured_replies.iter().map(|(_, verdicts)| verdicts.len()).sum();
+    ensure!(
+        accepted == 1 && refused == 1 && verdict_total == 2,
+        "service report-status is not one `ok` and one `ng ... stale info` on main \
+         (ok={accepted}, stale={refused}, total={verdict_total})"
+    );
+    ensure!(
+        captured_replies[0].0 != captured_replies[1].0,
+        "both held receive-pack POSTs carried the same request body"
+    );
+
+    // Terminal states of the two pinned race pushes (`used_a`, `used_b`) only:
+    // the setup seed push also leaves a durable operation row, but it is not an
+    // acceptance target. Exactly one pinned operation is committed and one is
+    // rejected, and they are exactly the two rows read back separately below.
     let bound = tokio::time::Instant::now() + Duration::from_secs(120);
     let states = loop {
-        let states = operation_states(case).await?;
+        let states = operation_states(case)
+            .await?
+            .into_iter()
+            .filter(|(operation, _)| *operation == used_a || *operation == used_b)
+            .collect::<Vec<_>>();
         if states.len() == 2 && states.iter().all(|(_, state)| matches!(state.as_str(), "committed" | "rejected")) {
             break states;
         }
@@ -715,18 +857,29 @@ async fn race_case(case: &Case, git: &'static Git) -> Result<Value> {
     Ok(json!({
         "advertised_old_oid": advertised,
         "advertised_count": advertised_old.len(),
-        "advertised_operations": advertised_operations.iter().map(|operation| operation.to_string()).collect::<Vec<_>>(),
+        "pinned_operations": [operation_a.to_string(), operation_b.to_string()],
         "winner": winner,
         "loser": if winner_is_a { second.clone() } else { first.clone() },
         "winner_is_client_a": winner_is_a,
         "readback": readback,
-        "loser_client_line": "! refs/heads/main:refs/heads/main [remote rejected] (stale info)",
+        "loser_client_verdict": "rejected: stale info",
         "gate_revision": case.gate_revision().await?,
         "operation_states": states.iter().map(|(_, state)| state.clone()).collect::<Vec<_>>(),
         "pushes": pushes.iter().map(|push| json!({
             "status": push.status,
             "request_sha256": push.request_sha256,
             "request_bytes": push.request_bytes,
+        })).collect::<Vec<_>>(),
+        // Parsed server report-status of each held POST, keyed by request digest:
+        // bounded verdict names/reasons only, never a raw response body.
+        "service_report_status": captured_replies.iter().map(|(request_sha256, verdicts)| json!({
+            "request_sha256": request_sha256,
+            "status": 200,
+            "unpack": "ok",
+            "verdicts": verdicts.iter().map(|(name, reason)| json!({
+                "ref": name,
+                "reason": reason,
+            })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     }))
 }
@@ -754,21 +907,37 @@ async fn lost_receive_pack_ack_after_commit_resolves_committed_via_operation_get
 }
 
 async fn lost_ack_case(case: &Case, git: &'static Git) -> Result<Value> {
-    let seed_dir = case.clone_seed(git, "seed", Some("0")).await?;
-    git.commit(&seed_dir, "seed.txt", "seed\n", "seed commit").await?;
-    git.ok(&seed_dir, &["push", "origin", "HEAD:refs/heads/main"]).await?;
-    let (client_dir, advertised) = case.clone_protocol(git, "push", "0").await?;
-    let pushed = git.commit(&client_dir, "ack.txt", "committed before the ACK was lost\n", "ack commit").await?;
+    // Each fixture Git stage fails with its own static message: the underlying
+    // error is discarded (never chained) so no Git URL or stderr can escape.
+    let seed_dir = case.clone_seed(git, "seed", Some("0")).await.map_err(|_| anyhow!("seed clone failed"))?;
+    git.commit(&seed_dir, "seed.txt", "seed\n", "seed commit").await.map_err(|_| anyhow!("seed commit failed"))?;
+    git.ok(&seed_dir, &["push", "origin", "HEAD:refs/heads/main"]).await.map_err(|_| anyhow!("seed push failed"))?;
+    let (client_dir, advertised) =
+        case.clone_protocol(git, "push", "0").await.map_err(|_| anyhow!("post-seed clone failed"))?;
+    let pushed = git
+        .commit(&client_dir, "ack.txt", "committed before the ACK was lost\n", "ack commit")
+        .await
+        .map_err(|_| anyhow!("target commit failed"))?;
     ensure!(advertised != pushed, "the clone already had the new commit");
 
     let pinned = Uuid::new_v4();
     let poll = proxy::Poll::new(case.db, &case.owner, case.name, pinned);
     let mut captured = case.proxy.drop_operation(&pinned.to_string(), Some(poll))?;
-    let output = push(git, &client_dir, Some(pinned), &["push", "origin", "HEAD:refs/heads/main"]).await?;
-    ensure!(!output.success, "the stock push succeeded although its response was dropped: {}", git_text(&output));
+    let output = push(git, &client_dir, Some(pinned), &["push", "origin", "HEAD:refs/heads/main"])
+        .await
+        .map_err(|_| anyhow!("pinned push failed"))?;
     let text = git_text(&output);
+    ensure!(
+        !output.success,
+        "the stock push succeeded although its response was dropped: {}",
+        redacted_git_output("pinned push", &output)
+    );
     for report in ["stale info", "rejected", "non-fast-forward", "403", "409", "503"] {
-        ensure!(!text.contains(report), "the lost ACK was reported as a server verdict `{report}`: {text}");
+        ensure!(
+            !text.contains(report),
+            "the lost ACK was reported as a server verdict `{report}`: {}",
+            redacted_git_output("pinned push", &output)
+        );
     }
     let capture = tokio::time::timeout(Duration::from_secs(120), captured.recv())
         .await
@@ -811,13 +980,14 @@ async fn lost_ack_case(case: &Case, git: &'static Git) -> Result<Value> {
     let (denied, _) = case.service.get(Some(&stranger.token), &path).await?;
     ensure!(denied == 403 || denied == 404, "a foreign actor resolved the operation with {denied}");
 
-    let (_, readback) = case.clone_protocol(git, "readback", "0").await?;
+    let (_, readback) =
+        case.clone_protocol(git, "readback", "0").await.map_err(|_| anyhow!("readback clone failed"))?;
     ensure!(readback == pushed, "the fresh clone read {readback}, not the committed {pushed}");
     Ok(json!({
         "pinned_operation": pinned.to_string(),
         "pushed_commit": pushed,
         "advertised_before": advertised,
-        "client_transport_failure": text.lines().next().unwrap_or_default(),
+        "client_transport_failure": redacted_git_output("pinned push", &output),
         "captured_report_sha256": capture.request_sha256,
         "operation_get_state": view["state"],
         "readback": readback,
