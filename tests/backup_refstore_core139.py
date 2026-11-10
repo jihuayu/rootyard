@@ -37,7 +37,7 @@ import sys
 import urllib.parse
 import uuid
 
-from backup import BackupHarness
+from backup import BackupHarness, repository_operation_counts
 from schema_baseline import CURRENT_BACKUP_FORMAT
 
 
@@ -177,6 +177,7 @@ class BackupRefStoreCore139Harness(BackupHarness):
                 "SELECT count(*) FROM public." + table + " WHERE repository_id='" + repo + "'"))
             assert len(rows) == scoped == count, table + " fixture is not populated exactly"
             self.source_fixture_rows[table] = rows
+        self.capture_operation_fixture()
         self.source_core_rows = self.core_rows()
         self.source_core_repo = self.core_repository_row()
         # The fixture must be internally coherent with the real persisted
@@ -236,6 +237,35 @@ class BackupRefStoreCore139Harness(BackupHarness):
             "SELECT COALESCE(json_agg(t ORDER BY to_jsonb(t)::text), '[]'::json) "
             "FROM public." + table + " t WHERE t.repository_id='" + repo + "'").stdout.decode().strip()
         return json.loads(value)
+
+    def capture_operation_fixture(self):
+        """Record the KNOWN operation rows the manifest column is derived from (#188).
+
+        Git outcomes and RefStore operation states are captured from the source
+        database before the backup, for the fixture repository and for every
+        repository the inherited seed already touched (it performs real pushes).
+        The expected per-repository counts are then derived from these rows,
+        never from the produced archive. Subclasses that seed more registry rows
+        call this again after their seeding.
+        """
+        git = self.known_git_operations()
+        registry = [(row["repository_id"], row["state"])
+                    for row in self.source_fixture_rows["ref_store_operations"]]
+        self.captured_git_operations = git
+        self.captured_ref_store_operations = registry
+        self.operation_counts = repository_operation_counts(
+            [self.unknown_repo["id"], uuid_literal(self.core_repo["id"])], git, registry)
+
+    def known_git_operations(self):
+        """(repository_id, outcome) for every Git operation row in the source."""
+        rows = json.loads(self.metadata_psql(
+            "SELECT COALESCE(json_agg(json_build_array(o.repository_id, o.outcome) "
+            "ORDER BY o.id::text), '[]'::json) FROM public.git_operations o").stdout.decode().strip())
+        return [(str(repository), outcome) for repository, outcome in rows]
+
+    def expected_repository_operations(self):
+        """Expected rows: the Git-unknown one plus any nonterminal seeded RefStore op."""
+        return dict(self.operation_counts)
 
     def core_repository_row(self):
         return json.loads(self.metadata_psql(

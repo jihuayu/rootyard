@@ -399,6 +399,10 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
             assert after_ops[operation_id] == row, "an inherited operation changed during A3 seeding"
         pending = after_ops[parent["operation_id"]]
         assert pending["state"] == "pending" and pending["terminal_at"] is None
+        # This helper adds exactly one pending row against the inherited gate:
+        # that nonterminal row is the archive's additional expected count (#188).
+        assert [row["state"] for row in after_ops.values() if row["state"] == "pending"] == ["pending"], (
+            "the helper did not add exactly one pending RefStore operation")
         assert pending["request_digest"] == parent["operation_digest"]
         assert pending["issuer_id"] == parent["issuer_id"] and pending["lane"] == parent["lane"]
         assert after_lanes[parent_key]["last_reserved_sequence"] >= parent["sequence"]
@@ -408,6 +412,10 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
         self.core_expected_counts["ref_store_issuer_lanes"] += 1
         self.core_expected_counts["ref_store_operations"] += 1
         self.source_fixture_rows = {table: self.core_fixture_rows(table) for table in self.core_expected_counts}
+        # Refresh the KNOWN operation rows so the backup's per-repository
+        # unknown count is derived from the seeded registry (1 Git unknown +
+        # 1 pending parent, terminal replays excluded), not from the archive.
+        self.capture_operation_fixture()
         self.source_core_rows = self.core_rows()
 
     def seed_core_fixture(self):
@@ -492,6 +500,7 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
                        "schema142_pack_ledger_tables": pack_tables,
                        "schema142_pack_tables_empty_and_not_fabricated": True,
                        "gate_pack_mode_default_metadata_only": True,
+                       "unknown_operations_expected": self.manifest_unknown_operations,
                        "parent_snapshot_inspected_dynamic_schema141_tables": list(NEW_TABLES)})
         return result
 

@@ -34,6 +34,39 @@ RESTORE_BARRIER_SECONDS = 30.0
 RESTORE_ORPHAN_SECONDS = 10.0
 RESTORE_EXIT_SECONDS = 5.0
 LOG_TAIL_BYTES = 4096
+# States the backup's per-repository `unknown_operations` count treats as
+# terminal (src/backup/postgres.rs); `pending` is the only other registry state
+# the schema permits (migrations/138_*.sql) and every other state is nonterminal.
+TERMINAL_OPERATION_STATES = ("committed", "rejected", "cancelled")
+
+
+def repository_operation_counts(repositories, git_operations, ref_store_operations):
+    """Per-repository (Git unknown, RefStore nonterminal) counts (#188).
+
+    Derived from the KNOWN rows a fixture captured BEFORE the backup, never from
+    a produced archive. ``git_operations`` and ``ref_store_operations`` are
+    ``(repository_id, state)`` pairs; Git counts ``outcome == "unknown"`` and
+    the RefStore registry counts every nonterminal state, exactly like the
+    per-repository manifest column. A terminal replay (committed/rejected/
+    cancelled) is never counted as unknown, so a fixture seeding only terminal
+    rows expects its terminal count (0), not 1. Every observed state must be a
+    value the schema's CHECK constraint permits; anything else fails loudly
+    instead of being silently counted or skipped.
+    """
+    git_outcomes = ("unknown", "recorded", "no_ref_changes")
+    for repository, outcome in git_operations:
+        assert outcome in git_outcomes, "unknown Git operation outcome " + repr(outcome)
+    unknown = {}
+    for repository, outcome in git_operations:
+        unknown[repository] = unknown.get(repository, 0) + (1 if outcome == "unknown" else 0)
+    nonterminal = {}
+    for repository, state in ref_store_operations:
+        assert state == "pending" or state in TERMINAL_OPERATION_STATES, (
+            "unknown RefStore operation state " + repr(state))
+        nonterminal[repository] = nonterminal.get(repository, 0) + (
+            0 if state in TERMINAL_OPERATION_STATES else 1)
+    return {repository: (unknown.get(repository, 0), nonterminal.get(repository, 0))
+            for repository in repositories}
 
 
 def bounded_line(stream, deadline, label, on_wait=None):
@@ -149,12 +182,66 @@ class BackupHarness(Harness):
             for proc in (writer, backup):
                 if proc.poll() is None: proc.kill(); proc.wait()
         manifest = json.loads((self.backup / "manifest.json").read_text())
-        assert sum(r["unknown_operations"] for r in manifest["repositories"]) == 1
+        self.manifest_unknown_operations = self.assert_manifest_unknown_operations(manifest)
         assert (self.backup / "volume" / self.journal / "operation.json").exists()
         assert not any(secret in (self.backup / "manifest.json").read_text() for secret in self.secrets + [self.db])
         self.cli("backup-verify", str(self.backup))
         return {"snapshot_includes_commit_after_barrier_wait":True,"inherited_volume_lock_rejected":True,
                 "backup_seconds":self.backup_result["elapsed_seconds"]}
+
+    def expected_repository_operations(self):
+        """Known (Git unknown, RefStore nonterminal) rows of the source fixture.
+
+        Fixed explicit model for this harness's own seed: exactly one
+        ``git_operations`` row with outcome ``unknown`` on the unknown-state
+        repository and no seeded RefStore registry rows, so the per-repository
+        column is 1/0 and the archive total is exactly 1. Subclasses that seed
+        a RefStore registry override this with the rows they captured.
+        """
+        return {self.unknown_repo["id"]: (1, 0)}
+
+    def expected_manifest_unknown_operations(self):
+        """Archive-total expectation plus the per-repository rows that form it."""
+        model = self.expected_repository_operations()
+        expected = {repository: unknown + terminal for repository, (unknown, terminal) in model.items()}
+        return sum(expected.values()), model, expected
+
+    def assert_manifest_unknown_operations(self, manifest):
+        """Exact, per-repository ``unknown_operations`` check against known fixture rows.
+
+        The archive total must equal the fixture model exactly (never a ranged
+        or lower-bound comparison), and every repository's Git-unknown +
+        nonterminal-RefStore tuple must match too, so a terminal replay can
+        never be counted as unknown and a dropped pending op can never be
+        waived. Expected values come from ``expected_repository_operations``
+        (the KNOWN seed/fixture), never from the produced archive.
+        """
+        expected_total, model, expected = self.expected_manifest_unknown_operations()
+        # Manifest ids serialize from the schema's `char(36)` column, which is
+        # blank-padded; the fixture model uses canonical UUID text.
+        actual = {str(row.get("id")).strip(): row.get("unknown_operations")
+                  for row in manifest.get("repositories", [])}
+        actual_total = sum(actual.values())
+        assert actual_total == expected_total, (
+            "manifest unknown_operations total is " + repr(actual_total) + ", expected " +
+            repr(expected_total) + " = " + json.dumps(
+                {"git_unknown": {key: value[0] for key, value in model.items()},
+                 "ref_store_nonterminal": {key: value[1] for key, value in model.items()},
+                 "per_repository_actual": actual},
+                sort_keys=True))
+        # Diagnostics name every unexplained count together: a seeded repository
+        # that disagrees with its own fixture rows, and any repository with
+        # unknown operations that no fixture row seeded.
+        disagreeing = {key: [actual.get(key), value] for key, value in expected.items()
+                       if actual.get(key) != value}
+        unexplained = {key: value for key, value in actual.items()
+                       if value != 0 and key not in expected}
+        assert not disagreeing and not unexplained, (
+            "manifest per-repository unknown_operations disagree with the fixture model "
+            "(actual, expected) = " + json.dumps(disagreeing, sort_keys=True) +
+            "; counted for unseeded repositories = " + json.dumps(unexplained, sort_keys=True))
+        return {"expected_total": expected_total, "actual_total": actual_total,
+                "expected_by_repository": expected}
 
     def invalid_inputs(self):
         def damage(name, action):
