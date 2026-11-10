@@ -189,9 +189,15 @@ class prerequisite:
             # HEAD, refs and the status from this source tree.
             common = Path(git_dir).parent.parent
             assert common.name == ".git", f"unexpected worktree git dir {git_dir}"
-            resolved = self.git("rev-parse", "--absolute-git-dir", cwd=root, check=False)
-            if resolved.returncode or resolved.stdout.decode().strip() != str(Path(git_dir).resolve()):
-                checkout_env["GIT_DIR"] = str(common)
+            # --git-common-dir reports the shared dir even when the worktree
+            # git dir cannot be read; a linked worktree's recorded HEAD lives
+            # in <worktree>/HEAD, so the name of the mounted directory decides.
+            shared = self.git("rev-parse", "--git-common-dir", cwd=root, check=False,
+                              env={**checkout_env, "GIT_DIR": str(common)})
+            assert shared.returncode == 0 and shared.stdout.decode().strip() == str(common), (
+                "required dependency missing: the mounted " + str(common) +
+                " is not this checkout's git dir (the worktree git dir " + git_dir + " is absent)")
+            checkout_env["GIT_DIR"] = str(common)
         head_proc = self.git("rev-parse", "HEAD", cwd=root, check=False, env=checkout_env)
         assert head_proc.returncode == 0, (
             "required dependency missing: checkout Git metadata unreachable (mount the "
