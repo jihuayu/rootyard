@@ -621,4 +621,5 @@ fn a_present_capture_that_disagrees_with_its_head_is_never_release_before_regist
 
 // Every stored tombstone row of a key is judged: see `tombstone_tests`.
 #[cfg(test)]
+#[path = "tombstone_tests.rs"]
 mod tombstone_tests;
