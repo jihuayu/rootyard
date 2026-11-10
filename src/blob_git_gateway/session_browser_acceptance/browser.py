@@ -239,8 +239,8 @@ class Client:
         if self.escaped:
             raise Failure("ORIGIN_ESCAPE")
 
-    def remember_cookies(self, context):
-        for cookie in context.cookies(self.origin):
+    async def remember_cookies(self, context):
+        for cookie in await context.cookies(self.origin):
             name, value = cookie.get("name", ""), cookie.get("value", "")
             if name == SESSION_COOKIE and value:
                 self.tokens.add(value)
@@ -331,7 +331,7 @@ class Client:
         extra = {}
 
         # 1. A brand-new profile holds no cookie.
-        if context.cookies(self.origin):
+        if await context.cookies(self.origin):
             raise Failure("COOKIES_BEFORE_SIGN_IN")
 
         # 2. Anonymous navigation is the origin's own sign-in redirect. The
@@ -355,8 +355,8 @@ class Client:
         self.check_origin()
         if await page.evaluate("() => location.pathname") != "/web" + SHELL:
             raise Failure("SIGN_IN_FAILED")
-        self.remember_cookies(context)
-        jars = {cookie["name"]: cookie for cookie in context.cookies(self.origin)}
+        await self.remember_cookies(context)
+        jars = {cookie["name"]: cookie for cookie in await context.cookies(self.origin)}
         session, csrf = jars.get(SESSION_COOKIE, {}), jars.get(CSRF_COOKIE, {})
         if not session.get("value") or session.get("httpOnly") is not True or session.get("sameSite") != "Strict":
             raise Failure("SESSION_COOKIE_INVALID")
