@@ -95,8 +95,20 @@
 //! [`SessionRealm`], [`RepoSession`], [`VersionComparison`], [`SessionTokenError`]).
 //! The signed frame lives in the private `codec` submodule; unit tests live in
 //! the private `tests` submodule. The gateway JSON read routes reach the scoring
-//! boundary only through `super::read_session`; no token is issued yet (the
-//! low-level mint is test-only).
+//! boundary only through `super::read_session`.
+//!
+//! ## Issuance
+//!
+//! [`SessionTokens::issue_from_materialized_read`] takes nothing but the
+//! [`MaterializedServingRead`] the sealed serving materializer produced for the
+//! response being built, after the gateway copied and verified its packs and
+//! after the body was fully encoded and the final authorization re-read the
+//! capture's identical cluster authority incarnation (and the proof carries
+//! that same anchor). Realm, cluster incarnation and
+//! revision all come from that proof; there is no production entry point that
+//! accepts a number, a realm or an incarnation. A checked empty read has no
+//! proof, so it sends no session header and no token is minted. The low-level
+//! `i64` mint stays test-only.
 use std::{fmt, sync::Arc};
 
 use axum::{
@@ -106,7 +118,10 @@ use axum::{
 use uuid::Uuid;
 
 use super::error::GatewayError;
-use crate::ref_store::GitObjectFormat;
+use crate::ref_store::{
+    GitObjectFormat,
+    core::pack_snapshot::{MaterializedServingRead, ProvenScope},
+};
 
 mod codec;
 
@@ -180,6 +195,39 @@ impl SessionRealm {
             group_epoch,
             cluster_incarnation,
         })
+    }
+
+    /// The realm a sealed serving proof states. Every field is the proof's own
+    /// capture value, re-validated by [`Self::new`]; nothing is caller-chosen.
+    /// Shared with the JSON read fence (`super::browse`).
+    pub(super) fn from_proof(scope: &ProvenScope, cluster_incarnation: Uuid) -> Result<Self, SessionTokenError> {
+        Self::new(
+            scope.tenant_id(),
+            scope.repository_id(),
+            scope.object_format(),
+            scope.history_incarnation(),
+            scope.authority_epoch(),
+            scope.group_epoch(),
+            cluster_incarnation,
+        )
+    }
+
+    /// The cluster authority incarnation this realm is bound to.
+    pub(crate) fn cluster_incarnation(&self) -> Uuid {
+        self.cluster_incarnation
+    }
+
+    /// Whether a live serving lookup still authorizes exactly this realm. The
+    /// cluster incarnation is that lookup's own `NOWAIT` read, never a cache.
+    pub(super) fn matches_serving(&self, serving: &crate::ref_store::serving::ServingRepository) -> bool {
+        let gate = &serving.gate;
+        self.tenant_id == gate.tenant_id()
+            && self.repository_id == gate.repository_id()
+            && self.object_format == gate.object_format()
+            && self.history_incarnation == gate.history_incarnation()
+            && self.authority_epoch == gate.authority_epoch()
+            && self.group_epoch == gate.group_epoch()
+            && self.cluster_incarnation == serving.cluster_incarnation
     }
 }
 
@@ -369,6 +417,29 @@ impl SessionTokens {
         self.codec.lifetime_seconds()
     }
 
+    /// Issue the session for a response whose view was verified through this
+    /// exact sealed read.
+    ///
+    /// The realm, the cluster authority incarnation and the version bound are
+    /// all derived from the proof, so a caller cannot supply, raise or rebind
+    /// any of them. The frame is signed with the current key and the trusted
+    /// wall clock by the existing codec. A proof whose realm is not itself
+    /// valid (nil id, nil incarnation, epoch outside the bound) is refused and
+    /// no token exists. The caller must already have completed the final
+    /// authorization and the incarnation fence (`browse::finalize`: the fresh
+    /// lookup's incarnation equals the captured anchor, and the proof's
+    /// incarnation equals that anchor, before this call); this method performs
+    /// no IO.
+    pub(crate) fn issue_from_materialized_read(
+        &self,
+        read: &MaterializedServingRead,
+    ) -> Result<IssuedSession, SessionTokenError> {
+        let proof = read.proof();
+        let cluster_incarnation = proof.cluster_incarnation();
+        let realm = SessionRealm::from_proof(proof.scope(), cluster_incarnation)?;
+        self.codec.issue(&realm, proof.gate_revision(), now_seconds())
+    }
+
     /// Verify a header value against the authorized live realm and the live
     /// gate revision read in this request; `None` is the unchanged token-free
     /// path. Only callers that already parsed the header (see `presented`) use
@@ -392,10 +463,10 @@ impl SessionTokens {
     ///
     /// This is a test-only low-level mint, not the serving API. A bare `i64` is
     /// not a proof of what this server committed or served, so production code
-    /// cannot reach it; the issuance route is added only in a later task, and it
-    /// must take an opaque proof from a real
-    /// [`ServingReadCapture`](crate::ref_store::core::pack_snapshot::ServingReadCapture) /
-    /// committed receipt. It never accepts a client-supplied revision.
+    /// cannot reach it; the production path is
+    /// [`Self::issue_from_materialized_read`], which takes the sealed
+    /// [`MaterializedServingRead`] of a real completed read. It never accepts a
+    /// client-supplied revision.
     #[cfg(test)]
     pub(crate) fn issue_for_test(
         &self,

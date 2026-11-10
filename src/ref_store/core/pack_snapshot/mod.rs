@@ -4,24 +4,19 @@
 //! [`MaterializedPackRead`] is an opaque owned local view; it grants no new
 //! serving or write authority and claims no physical Blob-byte backup.
 //!
-//! # Session proof (#174): NOT wired
+//! # Session proof (#174)
 //!
 //! [`PgPackSnapshotMaterializer::materialize_serving_read_sealed`] returns the
 //! view together with an internal [`VerifiedReadViewProof`] (non-empty
-//! captures only). **No gateway route consumes it.** It is not proof that a
-//! response was served: a later task must, in the gateway, copy packs/index,
-//! check checksums and `verify_refs`, fully encode the body, run the final
-//! authorization and the cluster-incarnation fence, restore the incarnation
-//! and only then seal/issue. The proof carries the cluster authority
-//! incarnation its capture locked `FOR SHARE` (migration 085) and its T2
-//! re-read identically, but a restore rotation between capture and T2 refuses
-//! with no view and no proof; "response and token share the same PG
-//! snapshot/final fence" remains a consumer requirement that is unimplemented
-//! here.
-//!
-//! `snapshot::build_view` still materializes through the unsealed
-//! [`PgPackSnapshotMaterializer::materialize_serving_read`]; dead code remains
-//! until that wiring lands, so this module is not strict-clippy clean.
+//! captures only). `snapshot::build_sealed_view` uses it for every JSON read and
+//! keeps the [`MaterializedServingRead`] in the gateway's computed view only
+//! after the copy and `verify_refs` succeeded; `browse::finalize` then requires
+//! the fresh authorized lookup, the proof and the capture's own anchor to carry
+//! the identical cluster authority incarnation (unconditionally, with or without
+//! a session key set) before it may issue a session from that proof. A checked
+//! empty capture has no proof and never issues a token, but its anchor is still
+//! fenced. Git Smart HTTP still materializes through the unsealed
+//! [`PgPackSnapshotMaterializer::materialize_serving_read`].
 //!
 //! Serving-read addition (#107/#114/#144): [`PgServingReads`] is a separate,
 //! bounded **transient** read-pin family (migration 146). One GET captures the
@@ -100,8 +95,9 @@ pub use read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
 pub use receipt::{PackPinReceipt, PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceipt};
 pub use request::{CreatePackSnapshotRequest, PackSnapshotExpectation, PackSnapshotReceiptQuery, PackSnapshotRef};
 pub(crate) use serving_proof::VerifiedReadViewProof;
+pub(crate) use serving_proof::ProvenScope;
 #[cfg(test)]
-pub(crate) use serving_proof::{ProvenScope, probe_a5a};
+pub(crate) use serving_proof::probe_a5a;
 pub use serving_read::{PgServingReads, ServingReadCapture};
 pub use serving_read_request::{
     MAX_EXPIRED_SERVING_READ_RECLAIM, MAX_SERVING_READ_LEASE_SECONDS, MIN_SERVING_READ_LEASE_SECONDS,

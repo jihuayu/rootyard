@@ -12,25 +12,24 @@
 //!
 //! # What it is not
 //!
-//! It is **not** proof of a served HTTP view. No gateway route consumes it yet,
-//! nothing here copies packs into a served Git view, and nothing proves the
-//! bytes a client received. It is not a `metadata_only` capture, a refs/HEAD
-//! listing without bytes, a write/push receipt, a durable snapshot, a pin/hold,
-//! or a promise that a later push cannot supersede the gate revision.
+//! It is **not** proof that the bytes a client received are the proof's bytes.
+//! It is not a `metadata_only` capture, a refs/HEAD listing without bytes, a
+//! write/push receipt, a durable snapshot, a pin/hold, or a promise that a later
+//! push cannot supersede the gate revision.
 //!
-//! # Consumers must still enforce (not implemented here)
+//! # Consumers
 //!
-//! * A gateway must copy packs/index, check the pack/index checksums and
-//!   `verify_refs` before a proof may describe an encoded response, run the
-//!   final authorization and the cluster incarnation fence, restore the
-//!   incarnation and only then seal/issue.
-//! * The proof carries the cluster authority incarnation its capture locked
-//!   `FOR SHARE` (migration 085) and its T2 re-checked exactly, but an issuer
-//!   ([`crate::blob_git_gateway::repo_session`]) still needs a pre-capture
-//!   authorization in that incarnation, the final authorization and the
-//!   post-response cluster-incarnation fence (short ordered transactions, pool
-//!   max 1) before a token may be issued. None of that is implemented here, and
-//!   a proof never makes an incarnation current again after a restore.
+//! The JSON read gateway keeps the proof beside the computed view:
+//! `snapshot::build_sealed_view` retains the [`MaterializedServingRead`] only
+//! after the gateway copy and `verify_refs` succeeded, and `browse::finalize`
+//! may issue a session from that value ([`Self::scope`] /
+//! [`Self::cluster_incarnation`]) only after the body was fully encoded and the
+//! final authorization re-read the capture's identical cluster incarnation, with
+//! this proof bound to that same anchor. A checked empty capture has no proof
+//! and never issues, though its anchor is still fenced. A proof never makes an
+//! incarnation current again after a restore; it only describes the state the
+//! read was verified at. Git Smart HTTP, push/receipt issuance and any other
+//! consumer are not wired here.
 //!
 //! # Construction
 //!
@@ -196,6 +195,13 @@ impl VerifiedReadViewProof {
     /// a session issuer needs.
     pub fn gate_revision(&self) -> i64 {
         self.gate_revision
+    }
+
+    /// The captured realm the proof was sealed over (read-only). This is the
+    /// only way an issuer in this crate obtains the SessionRealm fields; the
+    /// cluster incarnation stays behind [`Self::cluster_incarnation`].
+    pub(crate) fn scope(&self) -> &ProvenScope {
+        &self.scope
     }
 
     /// The cluster authority incarnation the capture locked and T2 re-proved.

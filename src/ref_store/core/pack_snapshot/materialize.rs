@@ -299,9 +299,11 @@ impl PgPackSnapshotMaterializer {
     /// rotation between capture and T2 makes T2 refuse, so no view and no proof
     /// exist; no caller can pass an incarnation in. A checked empty capture still
     /// returns `Ok(None)`: no bytes, no proof (its anchor is kept only in the
-    /// opaque capture). This is an internal materialization proof only; no
-    /// gateway route consumes it yet (the `serving_proof` module docs list what
-    /// a consumer must still enforce).
+    /// opaque capture). The JSON read gateway keeps this value in its computed
+    /// view and issues a session only from it, after encoding and the final
+    /// authorization fence: the fresh lookup, the proof and the capture anchor
+    /// must all carry the same cluster authority incarnation (see
+    /// `browse::finalize` and `read_session::verify_capture_anchor`).
     pub(crate) async fn materialize_serving_read_sealed(
         &self,
         pool: &Pool,

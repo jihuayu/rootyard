@@ -304,47 +304,12 @@ fn hash_algorithm(format: crate::ref_store::GitObjectFormat) -> String {
     format!("hash-algo={}", format.as_str())
 }
 
-/// Revalidate the captured realm, require the serialized body to fit this
-/// request's captured-output budget, then hand the slot and byte lease to the
-/// shared reserved-response path. `value` is serialized exactly once.
+/// Hand the response to the shared JSON reply path: bounded encoding under this
+/// request's captured-output budget, the final authorization/incarnation fence,
+/// then session issuance from the sealed read. `value` is serialized exactly
+/// once.
 async fn finish<T: Serialize>(session: browse::BrowseSession, value: T) -> Result<Response, GatewayError> {
-    session.finish().await?;
-    let limit = session.budget().min(session.state.limits().max_response_bytes);
-    let encoded = encode_response(&value, limit)?;
-    browse::json_response_bytes(&session.state, encoded, session.slot, session.lease)
-}
-
-// Bound the encoded representation while serializing: JSON escaping can
-// expand a valid commit message or path, so a check after to_vec is too late.
-fn encode_response(value: &impl Serialize, limit: u64) -> Result<Vec<u8>, GatewayError> {
-    struct Buffer {
-        bytes: Vec<u8>,
-        limit: usize,
-        exceeded: bool,
-    }
-    impl std::io::Write for Buffer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
-                self.exceeded = true;
-                return Err(std::io::Error::other("history response exceeds its byte budget"));
-            }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let limit = usize::try_from(limit).map_err(|_| GatewayError::TooLarge)?;
-    let mut buffer = Buffer { bytes: Vec::with_capacity(limit.min(8192)), limit, exceeded: false };
-    if serde_json::to_writer(&mut buffer, value).is_err() {
-        return Err(if buffer.exceeded {
-            GatewayError::TooLarge
-        } else {
-            GatewayError::Internal("repository history response could not be encoded")
-        });
-    }
-    Ok(buffer.bytes)
+    browse::finalize(&session, &value).await
 }
 
 // ---------------------------------------------------------------------------
@@ -811,17 +776,6 @@ mod tests {
         assert!(!exact_oid(models::ZERO_OID, 40));
         assert!(exact_oid(&"a".repeat(64), 64));
         assert_eq!(hash_algorithm(crate::ref_store::GitObjectFormat::Sha256), "hash-algo=sha256");
-    }
-
-    #[test]
-    fn response_budget_applies_after_json_escaping() {
-        let control = "\0".repeat(16);
-        assert!(control.len() < 32);
-        assert_eq!(encode_response(&control, 32).unwrap_err(), GatewayError::TooLarge);
-        let unicode = "中文";
-        let encoded = serde_json::to_vec(unicode).unwrap();
-        assert_eq!(encode_response(&unicode, encoded.len() as u64).unwrap(), encoded);
-        assert_eq!(encode_response(&unicode, encoded.len() as u64 - 1).unwrap_err(), GatewayError::TooLarge);
     }
 
     #[test]

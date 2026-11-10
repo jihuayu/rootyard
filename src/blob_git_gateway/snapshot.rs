@@ -23,7 +23,7 @@ use crate::ref_store::{
     core::{
         MetadataSnapshotScope, PgPackSnapshotMaterializer,
         pack_commit::{PackCommitBaseline, PgPackCommit},
-        pack_snapshot::{PgServingReads, ServingReadCapture},
+        pack_snapshot::{MaterializedServingRead, PgServingReads, ServingReadCapture},
     },
     serving::ServingRepository,
 };
@@ -60,9 +60,15 @@ impl Drop for RefView {
 
 /// Keep the workspace charged until the last streaming/native user drops its
 /// computed view. Drop the files before returning their reserved capacity.
+///
+/// `read` is the sealed materialization proof of exactly the bytes copied into
+/// `git`; it is retained only after the copy and [`verify_refs`] succeeded, and
+/// it is the only value a session token may ever be issued from. A Git Smart
+/// HTTP view is unsealed and carries no read, so it can never issue.
 pub(super) struct ComputedView {
     git: TempGitView,
     _workspace: super::state::WorkspaceLease,
+    read: Option<MaterializedServingRead>,
 }
 
 impl std::ops::Deref for ComputedView {
@@ -70,6 +76,15 @@ impl std::ops::Deref for ComputedView {
 
     fn deref(&self) -> &Self::Target {
         &self.git
+    }
+}
+
+impl ComputedView {
+    /// The sealed materialized read this view was proven over. `None` for a
+    /// checked empty capture or an unsealed Smart HTTP view: no proof, no
+    /// session issuance.
+    pub(super) fn read(&self) -> Option<&MaterializedServingRead> {
+        self.read.as_ref()
     }
 }
 
@@ -135,6 +150,34 @@ pub(super) async fn build_view(
     view: &RefView,
     deadline: tokio::time::Instant,
 ) -> Result<ComputedView, GatewayError> {
+    let sealed = build_view_with(state, view, deadline, Materializer::Unsealed).await?;
+    Ok(ComputedView { read: None, ..sealed })
+}
+
+/// The JSON read path: materialize through the sealed proof producer, copy the
+/// verified packs and keep the [`MaterializedServingRead`] with the view.
+pub(super) async fn build_sealed_view(
+    state: &BlobGitState,
+    view: &RefView,
+    deadline: tokio::time::Instant,
+) -> Result<ComputedView, GatewayError> {
+    build_view_with(state, view, deadline, Materializer::Sealed).await
+}
+
+/// Which materializer produces the copied bytes. Only [`Materializer::Sealed`]
+/// can retain a proof, and only a retained proof can issue a session.
+#[derive(Clone, Copy)]
+enum Materializer {
+    Unsealed,
+    Sealed,
+}
+
+async fn build_view_with(
+    state: &BlobGitState,
+    view: &RefView,
+    deadline: tokio::time::Instant,
+    materializer: Materializer,
+) -> Result<ComputedView, GatewayError> {
     // The sealed descriptor lengths are known before Blob IO. Account for the
     // materializer, the gateway copy and transient copies, plus fresh receive
     // staging, rather than reserving only the request's Content-Length.
@@ -162,29 +205,44 @@ pub(super) async fn build_view(
             return Err(error);
         }
     };
-    let outcome = build_into(state, &git, view, deadline).await;
+    let outcome = build_into(state, &git, view, deadline, materializer).await;
     release_view(state, view, deadline).await;
-    outcome?;
+    let read = outcome?;
     verify_refs(state, &git, view, deadline).await?;
-    Ok(ComputedView { git, _workspace: workspace })
+    Ok(ComputedView { git, _workspace: workspace, read })
 }
 
+/// Copy the verified capture into `git`. Returns the sealed read only when
+/// `materializer` is [`Materializer::Sealed`] and the capture really produced
+/// one; a checked empty capture has nothing to prove and returns `None` for
+/// both materializers.
 async fn build_into(
     state: &BlobGitState,
     git: &TempGitView,
     view: &RefView,
     deadline: tokio::time::Instant,
-) -> Result<(), GatewayError> {
+    mode: Materializer,
+) -> Result<Option<MaterializedServingRead>, GatewayError> {
     let Some(handle) = &view.handle else {
         write_refs(git.repo(), &view.refs, &view.head_ref)?;
-        return Ok(());
+        return Ok(None);
     };
     let materializer =
         PgPackSnapshotMaterializer::new(state.store().clone(), state.git_binary().to_path_buf()).map_err(ref_error)?;
-    let read = materializer.materialize_serving_read(state.pool(), handle, deadline).await.map_err(ref_error)?;
+    let (read, sealed) = match mode {
+        Materializer::Unsealed => (
+            materializer.materialize_serving_read(state.pool(), handle, deadline).await.map_err(ref_error)?,
+            None,
+        ),
+        Materializer::Sealed => {
+            let sealed =
+                materializer.materialize_serving_read_sealed(state.pool(), handle, deadline).await.map_err(ref_error)?;
+            (sealed.as_ref().map(MaterializedServingRead::view), sealed)
+        }
+    };
     let Some(read) = read else {
         write_refs(git.repo(), &view.refs, &view.head_ref)?;
-        return Ok(());
+        return Ok(None);
     };
     let materialized_refs = read
         .refs()
@@ -223,7 +281,8 @@ async fn build_into(
         std::fs::write(pack_dir.join(format!("{stem}.idx")), idx_bytes)
             .map_err(|_| GatewayError::Internal("could not stage a verified index"))?;
     }
-    write_refs(git.repo(), &view.refs, &view.head_ref)
+    write_refs(git.repo(), &view.refs, &view.head_ref)?;
+    Ok(sealed)
 }
 
 /// Release the transient read pin of a view that was not materialized (for

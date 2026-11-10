@@ -27,8 +27,12 @@
 //! Every refusal after capture releases the transient capture through the
 //! bounded `snapshot::release_view` path before it is returned. A refusal never
 //! invites dropping the bound: `Behind` stays a `503` with the same guidance,
-//! a foreign/restored realm is a `409`, and a malformed header a `400`. This
-//! checkpoint does not issue tokens.
+//! a foreign/restored realm is a `409`, and a malformed header a `400`.
+//!
+//! Issuance is the mirror image and lives in `browse::finalize`: after the body
+//! is encoded it re-reads the authorized lookup once and applies the same
+//! unconditional capture-incarnation fence ([`verify_capture_anchor`]) before a
+//! token may be signed from the sealed proof.
 use axum::http::HeaderMap;
 use uuid::Uuid;
 
@@ -39,6 +43,7 @@ use super::{
     snapshot::{self, RefView},
     state::BlobGitState,
 };
+use crate::ref_store::core::pack_snapshot::MaterializedServingRead;
 
 /// Keyring absent: the gateway cannot judge any lower bound.
 pub(super) const SESSIONS_DISABLED: &str = "repository session tokens are not configured on this gateway";
@@ -119,6 +124,36 @@ fn answer(
         // never be served from this older view; the bound is kept, never exposed.
         Some(VersionComparison::Behind { .. }) => Err(GatewayError::Unavailable(BEHIND_MESSAGE)),
     }
+}
+
+/// The final restore/incarnation fence shared by every successful JSON read
+/// (`browse::finalize`), applied after the body was encoded and a fresh
+/// authorized lookup succeeded.
+///
+/// It is unconditional: a missing, nil or rotated anchor refuses with
+/// [`AUTHORITY_CHANGED`] whether or not a key set is configured and whether or
+/// not a token is issued. The fresh lookup raised its own read authorization
+/// error before this fence is consulted. A `Some` view must carry a proof bound
+/// to this same anchor (a proof is the only thing a token may be signed from);
+/// a `None` view has no proof (a checked empty capture), which never issues.
+/// The proof's full realm (including that incarnation) is then compared by the
+/// caller against this same fresh lookup, and the issuance decision repeats the
+/// proof-vs-anchor check, so no path reaches signing outside this fence.
+pub(super) fn verify_capture_anchor(
+    anchor: Option<Uuid>,
+    read: Option<&MaterializedServingRead>,
+    serving: &ServingRepository,
+) -> Result<Uuid, GatewayError> {
+    let anchor = anchor.filter(|anchor| !anchor.is_nil()).ok_or(GatewayError::Unavailable(AUTHORITY_CHANGED))?;
+    if anchor != serving.cluster_incarnation {
+        return Err(GatewayError::Unavailable(AUTHORITY_CHANGED));
+    }
+    if let Some(read) = read
+        && read.proof().cluster_incarnation() != anchor
+    {
+        return Err(GatewayError::Unavailable(AUTHORITY_CHANGED));
+    }
+    Ok(anchor)
 }
 
 /// The full realm of an authorized serving lookup bound to the incarnation the
@@ -316,6 +351,21 @@ mod tests {
                 "repository session belongs to another repository, history or authority generation; re-read the authoritative store and obtain a fresh session there"
             ))
         );
+    }
+
+    /// The final fence (`browse::finalize`) is unconditional: it runs after the
+    /// body was encoded and the fresh authorized lookup succeeded, and a missing,
+    /// nil or rotated capture anchor is the generic `AUTHORITY_CHANGED` with no
+    /// key set and no proof at all — the checked-empty, token-disabled response
+    /// cannot bypass it. A matching anchor passes with or without a key set.
+    #[test]
+    fn the_final_fence_refuses_missing_nil_and_rotated_anchors_without_a_proof() {
+        let live = serving(5, id(4));
+        let rotated = GatewayError::Unavailable(AUTHORITY_CHANGED);
+        for anchor in [None, Some(id(8)), Some(Uuid::nil())] {
+            assert_eq!(verify_capture_anchor(anchor, None, &live), Err(rotated.clone()), "{anchor:?}");
+        }
+        assert_eq!(verify_capture_anchor(Some(id(4)), None, &live), Ok(id(4)));
     }
 
     /// The header is scored only after the anchor matched, against the captured
