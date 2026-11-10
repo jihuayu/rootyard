@@ -231,7 +231,6 @@ async fn packs(
     let mut registrations: Vec<RegisteredPack> = Vec::new();
     let mut last_plan = None;
     for sequence in 1..=PACKS {
-        let files = fixture.pack_all(&format!("format22-{sequence}")).await?;
         let refs = if sequence == 1 {
             vec![pack::main_update(SHA1, None, &head)?]
         } else {
@@ -243,6 +242,9 @@ async fn packs(
             head = next;
             refs
         };
+        // Pack after the fixture ref reaches this sequence's target, so the
+        // registered pack contains the commit the plan names.
+        let files = fixture.pack_all(&format!("format22-{sequence}")).await?;
         let draft = pack_plan::draft(
             db,
             target.repo,
