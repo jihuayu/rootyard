@@ -49,8 +49,8 @@ ubuntu_archive_keyring() {
 # Add deb-src-only entries for the signed Ubuntu Noble archive. Noble is the
 # first Ubuntu release whose Git source is the required 2.43 family; 22.04's
 # own archive only offers 2.34. Binary packages from Noble are never enabled.
-# The owned list is removed first so a re-run cannot keep stale entries, and
-# the refresh fails closed when the signed index cannot be acquired.
+# The refresh is bounded and fails closed when the signed index cannot be
+# acquired; the pinned source version is selected only from that index.
 prepare_ubuntu_archive_source() {
   local keyring list want current
   require_command sudo
@@ -71,10 +71,13 @@ EOF
   current=$(sudo cat "$list" 2>/dev/null || true)
   if [ "$current" = "$want" ]; then
     log "signed Ubuntu Noble source index already configured (deb-src only)"
-    return 0
+  else
+    printf '%s\n' "$want" | sudo tee "$list" >/dev/null
+    log "configured deb-src-only signed Ubuntu Noble source index: $list"
   fi
-  printf '%s\n' "$want" | sudo tee "$list" >/dev/null
-  log "configured deb-src-only signed Ubuntu Noble source index: $list"
+  # Refresh even when the list was already current: a hosted runner can
+  # carry an owned list from a previous attempt without its indexes, and the
+  # pinned source versions below are selected from the refreshed index.
   apt_update
 }
 
@@ -120,10 +123,12 @@ prepare_pgdg_repository() {
   current=$(sudo cat "$list" 2>/dev/null || true)
   if [ "$current" = "$want" ]; then
     log "signed PGDG repository already configured"
-    return 0
+  else
+    printf '%s\n' "$want" | sudo tee "$list" >/dev/null
+    log "configured signed PGDG repository for ${codename}"
   fi
-  printf '%s\n' "$want" | sudo tee "$list" >/dev/null
-  log "configured signed PGDG repository for ${codename}"
+  # A re-run on a hosted runner can start from an owned list whose indexes
+  # were never fetched; refresh bounded here as well as before the install.
   apt_update
 }
 
