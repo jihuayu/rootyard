@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "binary_sha256": "4eacc3aae0344a9d724b68d17a806dde9508be31fd627b354ea71464a624d5ea",
+  "source_inputs_sha256": "6092a7f156e8bdb72fedd088ce499cd32c1cedd18b1a8ff04ed466d72deaa7e1",
+  "workspace_commit": "2a6dbaf7e58c32a7faf5c801f520c42f58c3b86c",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--bin",
+    "rootyard",
+    "--message-format=json-render-diagnostics"
+  ],
+  "package_rebuilt": true,
+  "clean_command": [
+    "cargo",
+    "clean",
+    "--package",
+    "rootyard"
+  ],
+  "target_dir": "/workspace/rootyard/target",
+  "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+  "fresh_false_artifacts": [
+    {
+      "target": "rootyard",
+      "kind": "lib",
+      "fresh": false,
+      "package_id": "path+file:///workspace/scratch/round5-implementation/worker-diagnostics#rootyard@0.1.0"
+    },
+    {
+      "target": "rootyard",
+      "kind": "bin",
+      "fresh": false,
+      "executable": "/workspace/rootyard/target/debug/rootyard",
+      "package_id": "path+file:///workspace/scratch/round5-implementation/worker-diagnostics#rootyard@0.1.0"
+    }
+  ]
+}

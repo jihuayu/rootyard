@@ -26,7 +26,13 @@ pub mod scheduler;
 #[path = "storage_lifecycle/worker.rs"]
 pub mod worker;
 
-use crate::AppState;
+use crate::{
+    AppState,
+    observability::{
+        self as error_observability,
+        worker::{OperationContext, Phase, WorkerKind},
+    },
+};
 use anyhow::Result;
 use axum::{Router, routing::get};
 use std::sync::Arc;
@@ -52,8 +58,17 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) -> Result<()> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! { _=stop.cancelled() => return Ok(()), _=interval.tick() => {} }
-        if let Err(error) = scheduler::schedule_once(&state, &policy).await {
-            eprintln!("rootyard: storage maintenance scheduler deferred: {error:#}");
+        let operation = OperationContext::new(WorkerKind::StorageLifecycle);
+        if let Err(error) =
+            error_observability::worker::run(&operation, Phase::Scan, scheduler::schedule_once(&state, &policy)).await
+        {
+            // The future returned and its scope is gone; re-enter the same
+            // fixed Scan phase so the cause keeps worker + SQLSTATE context.
+            error_observability::worker::run(&operation, Phase::Scan, async {
+                error_observability::observe_internal(&error);
+            })
+            .await;
+            eprintln!("rootyard: storage maintenance scheduler deferred");
         }
         // Drain a bounded batch; no maintenance command consumes the online
         // Git request semaphore. Repository locks still serialize mutations.
@@ -61,11 +76,19 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) -> Result<()> {
             if stop.is_cancelled() {
                 return Ok(());
             }
-            match worker::run_once(&state, &policy, owner).await {
+            match error_observability::worker::run(
+                &operation,
+                Phase::Claim,
+                worker::run_once_scoped(&state, &policy, owner, &operation),
+            )
+            .await
+            {
                 Ok(Some(_)) => {}
                 Ok(None) => break,
-                Err(error) => {
-                    eprintln!("rootyard: storage maintenance worker deferred: {error:#}");
+                Err(_) => {
+                    // Claim/execute/finish observe the cause inside their own
+                    // scoped future; the outer loop only reports a fixed line.
+                    eprintln!("rootyard: storage maintenance worker deferred");
                     break;
                 }
             }

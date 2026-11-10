@@ -1,6 +1,13 @@
 //! Durable orphan cleanup for tenant-scoped remote checkpoint objects.
 use super::{remote, service};
-use crate::{AppState, Error, config, members::models::Role};
+use crate::{
+    AppState, Error, config,
+    members::models::Role,
+    observability::{
+        self,
+        worker::{OperationContext, Phase, WorkerKind},
+    },
+};
 use axum::{
     Json,
     extract::{Path, State},
@@ -158,6 +165,7 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
         tokio::select! { _=stop.cancelled()=>break, _=interval.tick()=>{} }
-        let _ = collect_once(&state).await;
+        let operation = OperationContext::new(WorkerKind::WorkspaceRemoteGc);
+        let _ = observability::worker::run(&operation, Phase::Collect, collect_once(&state)).await;
     }
 }

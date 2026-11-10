@@ -4,6 +4,8 @@
 //! the router's matched path pattern are emitted. Error Display/Debug text, URLs,
 //! headers, query strings, user content and source strings are never formatted.
 use crate::storage::remote_objects::RemoteStoreError;
+
+pub(crate) mod worker;
 use axum::{
     extract::{MatchedPath, Request},
     http::{HeaderName, HeaderValue},
@@ -256,14 +258,29 @@ fn scope_snapshot() -> Option<(Uuid, Option<String>)> {
 }
 
 fn event_json(error: &dyn Any) -> String {
-    let classification = classify(error);
+    event_json_with(classify(error))
+}
+
+fn event_json_with(classification: Classification) -> String {
+    let operation = worker::current();
     let scope = scope_snapshot();
     let mut event = serde_json::Map::new();
     event.insert("event".to_owned(), json!("rootyard_error"));
     event.insert("event_id".to_owned(), json!(Uuid::new_v4().to_string()));
     event.insert("kind".to_owned(), json!(classification.kind));
     event.insert("status".to_owned(), json!(503));
-    if let Some((request_id, route)) = scope {
+    if let Some(operation) = operation {
+        event.insert("scope".to_owned(), json!("worker"));
+        event.insert("worker".to_owned(), json!(operation.worker.as_str()));
+        event.insert("operation_id".to_owned(), json!(operation.operation_id.to_string()));
+        event.insert("phase".to_owned(), json!(operation.phase.as_str()));
+        if let Some(attempt) = operation.attempt {
+            event.insert("attempt".to_owned(), json!(attempt));
+        }
+        if let Some(generation) = operation.generation {
+            event.insert("generation".to_owned(), json!(generation));
+        }
+    } else if let Some((request_id, route)) = scope {
         event.insert("scope".to_owned(), json!("request"));
         event.insert("request_id".to_owned(), json!(request_id.to_string()));
         if let Some(route) = route {
@@ -293,19 +310,36 @@ fn allow_event() -> bool {
     limiter.allow(Instant::now())
 }
 
-pub(crate) fn observe_internal(error: &dyn Any) {
+fn enqueue_event(record: String) {
     if !allow_event() {
         return;
     }
-    // The request path never awaits and never touches stderr: a full queue, a
-    // closed queue or disabled output drops the record and counts it.
+    // The request and worker paths never await and never touch stderr: a full
+    // queue, a closed queue or disabled output drops and counts the record.
     let delivered = match log_sender() {
-        Some(sender) => offer_to(sender, event_json(error)),
+        Some(sender) => offer_to(sender, record),
         None => false,
     };
     if !delivered {
         record_dropped();
     }
+}
+
+pub(crate) fn observe_internal(error: &dyn Any) {
+    enqueue_event(event_json(error));
+}
+
+/// Test-only view of the exact record `Error::internal` would enqueue, so scope
+/// attribution can be asserted without reading the process stderr writer.
+#[cfg(test)]
+pub(crate) fn event_for_test(error: &dyn Any) -> String {
+    event_json(error)
+}
+
+/// A worker's own outer deadline uses only the fixed `timeout` label; no
+/// elapsed value, task text or source error is attached.
+pub(crate) fn observe_timeout() {
+    enqueue_event(event_json_with(Classification::kind("timeout")));
 }
 
 #[cfg(test)]

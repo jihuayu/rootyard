@@ -6,6 +6,10 @@
 //! work, concurrency and cancellation.
 use crate::{
     AppState, Error,
+    observability::{
+        self,
+        worker::{OperationContext, Phase, WorkerKind},
+    },
     pulls::models::{PULL_FIELDS, PullRequest, resolve_ref_oid},
     webhooks::{
         delivery::{
@@ -69,10 +73,27 @@ pub async fn worker(state: Arc<AppState>, stop: CancellationToken) {
         // One anchor for both the outer timeout and the work budget. Taking it
         // before the candidate query is what makes the 60 s tail real.
         let window = ScanWindow::starting_at(Instant::now());
+        let operation = OperationContext::new(WorkerKind::WebhooksBackground);
         let result = tokio::select! {
             _ = stop.cancelled() => break,
-            result = tokio::time::timeout_at(window.scan_deadline, scan_round(&state, &mut scheduler, window, &stop)) => result,
+            result = tokio::time::timeout_at(
+                window.scan_deadline,
+                observability::worker::run(
+                    &operation,
+                    Phase::Round,
+                    scan_round(&state, &mut scheduler, window, &stop, &operation),
+                ),
+            ) => result,
         };
+        if result.is_err() {
+            // The outer deadline fires after the scoped future has been
+            // dropped, so re-enter the same operation for the fixed Round
+            // phase instead of emitting a detached event.
+            observability::worker::run(&operation, Phase::Round, async {
+                observability::observe_timeout()
+            })
+            .await;
+        }
         let failed = !matches!(result, Ok(Ok(ref summary)) if summary.failures == 0);
         if failed && !unavailable {
             eprintln!("rootyard: webhook synchronization unavailable; durable retry scheduled");
@@ -87,10 +108,11 @@ async fn scan_round(
     scheduler: &mut Scheduler,
     window: ScanWindow,
     stop: &CancellationToken,
+    operation: &OperationContext,
 ) -> Result<RoundSummary, Error> {
     // The candidate query itself runs inside the work window: `window` was
     // anchored by the worker before this future started.
-    let candidates = scheduler.next_page(state).await?;
+    let candidates = observability::worker::run(operation, Phase::Scan, scheduler.next_page(state)).await?;
     let mut summary = RoundSummary::default();
     // Stop starting network work early enough that an already-started request
     // can use its full hook timeout before the outer SCAN_TIMEOUT fires. Phase
@@ -105,23 +127,37 @@ async fn scan_round(
     if !pulls.is_empty() && !stop.is_cancelled() && window.work_open(Instant::now()) {
         let state = Arc::clone(state);
         let cursors = scheduler.pull_cursors();
+        let operation = operation.clone();
         let outcome = run_bounded(stop, &pulls, move |candidate| {
             let state = Arc::clone(&state);
             let cursors = cursors.clone();
+            let operation = operation.clone();
             let after = cursors.after(candidate.key.repository_id);
             Box::pin(async move {
-                match tokio::time::timeout(
-                    REPOSITORY_PHASE_TIMEOUT,
-                    reconcile_candidate(&state, candidate, after, &cursors),
+                observability::worker::run(
+                    &operation,
+                    Phase::Reconcile,
+                    async move {
+                        match tokio::time::timeout(
+                            REPOSITORY_PHASE_TIMEOUT,
+                            reconcile_candidate(&state, candidate, after, &cursors),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            // Cancellation drops live local Git children and leases. The
+                            // durable pull/outbox/progress rows make the next round safe,
+                            // and an uncompleted pull page keeps its old cursor.
+                            Err(_) => {
+                                // Reconcile scope is still active here, so the
+                                // timeout keeps the repository phase label.
+                                observability::observe_timeout();
+                                Ok(())
+                            }
+                        }
+                    },
                 )
                 .await
-                {
-                    Ok(result) => result,
-                    // Cancellation drops live local Git children and leases. The
-                    // durable pull/outbox/progress rows make the next round safe,
-                    // and an uncompleted pull page keeps its old cursor.
-                    Err(_) => Ok(()),
-                }
             })
         })
         .await;
@@ -137,12 +173,18 @@ async fn scan_round(
     let deliveries: Vec<Candidate> = candidates.iter().copied().filter(|candidate| candidate.has_webhooks).collect();
     if !deliveries.is_empty() && window.work_open(Instant::now()) {
         let state = Arc::clone(state);
+        let operation = operation.clone();
         let outcome = run_bounded(stop, &deliveries, move |candidate| {
             let state = Arc::clone(&state);
+            let operation = operation.clone();
             // No whole-repository timeout here: a legitimate in-flight request
             // may use up to the hook's declared 30 s transport timeout. The
             // shared round deadline only stops starting new sends.
-            Box::pin(async move { deliver_candidate(&state, candidate, round_deadline).await })
+            Box::pin(async move {
+                observability::worker::run(&operation, Phase::Deliver, async move {
+                    deliver_candidate(&state, candidate, round_deadline).await
+                }).await
+            })
         })
         .await;
         summary.merge(outcome);

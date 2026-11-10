@@ -15,7 +15,14 @@
 //! remaining API-side hash is a follow-up; the long background scan is already
 //! off-thread and out of the transaction.
 use super::{scan, service};
-use crate::{AppState, Error, workspace_lab::core};
+use crate::{
+    AppState, Error,
+    observability::{
+        self,
+        worker::{OperationContext, Phase, WorkerKind},
+    },
+    workspace_lab::core,
+};
 use futures_util::StreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -120,9 +127,17 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
     .await
     {
         Ok(value) => value,
-        // A busy bounded pool or an in-progress slow scan is skipped; the fair
-        // cursor keeps this workspace eligible on the next round.
-        Err(scan::ScanFailure::Busy | scan::ScanFailure::Timeout) => return Ok(false),
+        // A busy bounded pool is skipped; the fair cursor keeps this workspace
+        // eligible on the next round.
+        Err(scan::ScanFailure::Busy) => return Ok(false),
+        // A worker that never returned is reported here, in the async reconcile
+        // scope, with the fixed `timeout` label and no source text. The blocking
+        // thread has no caller left to report to, and turning the timeout into
+        // an error would observe the same scan twice.
+        Err(scan::ScanFailure::Timeout) => {
+            observability::observe_timeout();
+            return Ok(false);
+        }
         Err(scan::ScanFailure::Failed(error)) => return Err(error),
     };
     let mut client = state.pool.get().await.map_err(Error::internal)?;
@@ -188,10 +203,13 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
     Ok(changed)
 }
 
-async fn process_page(state: &AppState, ids: Vec<Uuid>) {
+async fn process_page(state: &AppState, ids: Vec<Uuid>, operation: &OperationContext) {
     futures_util::stream::iter(ids)
-        .map(|id| async move {
-            let _ = reconcile_one(state, id).await;
+        .map(|id| {
+            let operation = operation.clone();
+            async move {
+                let _ = observability::worker::run(&operation, Phase::Reconcile, reconcile_one(state, id)).await;
+            }
         })
         .buffer_unordered(scan::concurrency())
         .collect::<Vec<_>>()
@@ -199,18 +217,24 @@ async fn process_page(state: &AppState, ids: Vec<Uuid>) {
 }
 
 pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
-    tokio::spawn(super::remote_gc::run(state.clone(), stop.child_token()));
+    let remote_operation = OperationContext::new(WorkerKind::WorkspaceRemoteGc);
+    observability::worker::spawn(
+        &remote_operation,
+        Phase::Round,
+        super::remote_gc::run(state.clone(), stop.child_token()),
+    );
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! { _=stop.cancelled()=>break, _=interval.tick()=>{} }
-        let _ = super::mounts::refresh_leases(&state).await;
+        let operation = OperationContext::new(WorkerKind::WorkspaceCapture);
+        let _ = observability::worker::run(&operation, Phase::Scan, super::mounts::refresh_leases(&state)).await;
         let mut cursor = None;
         let mut pages = futures_util::stream::FuturesUnordered::new();
         loop {
             if stop.is_cancelled() {
                 return;
             }
-            let rows = match eligible_page(&state, cursor).await {
+            let rows = match observability::worker::run(&operation, Phase::Scan, eligible_page(&state, cursor)).await {
                 Ok(rows) => rows,
                 Err(_) => break,
             };
@@ -229,7 +253,7 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
             // Pages are processed independently instead of waiting for the
             // previous 100 IDs. A slow or permanently bad early workspace then
             // cannot delay the fair scan of later UUIDs.
-            pages.push(process_page(&state, ids));
+            pages.push(process_page(&state, ids, &operation));
             if pages.len() >= 2 {
                 let _ = pages.next().await;
             }
@@ -313,5 +337,56 @@ mod tests {
         fs::create_dir(dir.path().join("ws/sub")).expect("dir");
         fs::write(dir.path().join("ws/sub/c.txt"), b"c").expect("file");
         assert_ne!(scan_of(&dir), first);
+    }
+
+    /// A failure raised on a real scan-pool thread must still be reported as the
+    /// `workspace_capture`/`reconcile` operation, not as a detached event. The
+    /// scope is installed by `scan::frozen`; nothing here enters a context by
+    /// hand, and the assertion inspects the event `Error::internal` builds from
+    /// that thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_scan_failure_is_observed_in_the_reconcile_worker_scope() {
+        use crate::observability::worker::{self, OperationContext, Phase, WorkerKind};
+
+        let context = OperationContext::new(WorkerKind::WorkspaceCapture);
+        let async_thread = std::thread::current().id();
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let (caller, outcome) = worker::run(&context, Phase::Reconcile, {
+            let observed = observed.clone();
+            async move {
+                let caller = worker::current().expect("reconcile worker scope");
+                let outcome = scan::frozen(Uuid::new_v4(), Duration::from_secs(5), move || {
+                    let error = std::io::Error::other("SECRET-scan-thread-text");
+                    let event = crate::observability::event_for_test(&error);
+                    *observed.lock().expect("observation slot") =
+                        Some((worker::current(), event, std::thread::current().id()));
+                    Err::<(), _>(Error::internal(error))
+                })
+                .await;
+                (caller, outcome)
+            }
+        })
+        .await;
+        let scan::ScanFailure::Failed(error) = outcome.expect_err("scan failure is returned to the caller") else {
+            panic!("expected the filesystem failure from the scan worker");
+        };
+        assert_eq!(error.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let (scope, event, thread) =
+            observed.lock().expect("observation slot").clone().expect("scan thread recorded no observation");
+        assert_ne!(thread, async_thread, "failure was built on the async thread");
+        let scope = scope.expect("scan thread lost the reconcile scope");
+        assert_eq!(scope.worker, WorkerKind::WorkspaceCapture);
+        assert_eq!(scope.phase, Phase::Reconcile);
+        assert_eq!(scope.operation_id, caller.operation_id);
+        assert!(!event.contains("SECRET"), "event formatted the source text");
+        let value: serde_json::Value = serde_json::from_str(&event).expect("event is valid JSON");
+        assert_eq!(value["scope"].as_str(), Some("worker"));
+        assert_eq!(value["worker"].as_str(), Some("workspace_capture"));
+        assert_eq!(value["phase"].as_str(), Some("reconcile"));
+        assert_eq!(value["kind"].as_str(), Some("io"));
+        assert_eq!(value["operation_id"].as_str(), Some(scope.operation_id.to_string().as_str()));
+        for forbidden in ["request_id", "route", "path", "contents"] {
+            assert!(value.get(forbidden).is_none(), "event leaked {forbidden}");
+        }
     }
 }

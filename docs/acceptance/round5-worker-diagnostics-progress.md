@@ -1,0 +1,11 @@
+# Background operation diagnostics — partial issue #80
+
+Detached webhook, workspace capture, workspace remote GC, durable dispatch and storage maintenance work now carry server-generated operation IDs and fixed worker/phase labels. HTTP request IDs/routes do not flow into worker scopes. Raw external error text is replaced with fixed categories. Persisted attempt/generation values are attached where available.
+
+The [native report](round5-worker-diagnostics-evidence/native.json) passes all ten recorded steps against binary `4eacc3aae0344a9d724b68d17a806dde9508be31fd627b354ea71464a624d5ea`, source `2a6dbaf7e58c32a7faf5c801f520c42f58c3b86c`, compiled inputs `6092a7f156e8bdb72fedd088ce499cd32c1cedd18b1a8ff04ed466d72deaa7e1`; the [fresh build receipt](round5-worker-diagnostics-evidence/build.json) binds those bytes. All-target Clippy and [27 workspace unit tests](round5-worker-diagnostics-evidence/scan-workspaces-unit.log) passed, including actual blocking scan-pool context and fingerprint error attribution. Twenty-one observability tests passed on the prior candidate.
+
+Luna Max found scan-thread context loss and silent capture timeouts in the earlier implementation. The fixed candidate explicitly carries only worker scope across the bounded scan pool and observes caller timeouts in the async reconciliation scope. Final focused review found no remaining P1/P2. The added unit tests cover scope on a real pool thread and safe fingerprint error classification; they do not assert every field of the new reconciliation timeout event.
+
+A real PostgreSQL statement timeout (57014) is induced in the storage maintenance scheduler; a separate HTTP trigger raises 23503 with synthetic sensitive text. The test verifies operation/request isolation, fixed error response, log redaction and successful HTTP operation after trigger cleanup. No SQL error classification is mocked.
+
+This is not complete worker fault acceptance. Native faults were not injected into the other wrapped workers. Session GC, sharding, startup journal/provisioning reconciliation, metrics and backup workers remain outside this operation scope. No physical disk or machine failure was exercised. Issue #80 remains open.

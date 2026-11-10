@@ -5,7 +5,13 @@ use super::{
     models::{JobOutcome, Policy},
     pando, scheduler,
 };
-use crate::{AppState, db};
+use crate::{
+    AppState, db,
+    observability::{
+        self,
+        worker::{OperationContext, Phase, WorkerKind},
+    },
+};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
@@ -13,30 +19,65 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Run one bounded claim with a fresh operation context for external callers.
 pub async fn run_once(state: &Arc<AppState>, policy: &Policy, owner: Uuid) -> Result<Option<JobOutcome>> {
-    let Some(job) = jobs::claim(&state.pool, owner, policy).await? else {
+    let operation = OperationContext::new(WorkerKind::StorageLifecycle);
+    observability::worker::run(&operation, Phase::Claim, run_once_scoped(state, policy, owner, &operation)).await
+}
+
+pub(crate) async fn run_once_scoped(
+    state: &Arc<AppState>,
+    policy: &Policy,
+    owner: Uuid,
+    operation: &OperationContext,
+) -> Result<Option<JobOutcome>> {
+    // Observe a claim failure inside the Claim scope before `?` drops it, so
+    // the event keeps the worker, the fixed phase and any SQLSTATE.
+    let Some(job) = observability::worker::run(operation, Phase::Claim, async {
+        match jobs::claim(&state.pool, owner, policy).await {
+            Ok(job) => Ok(job),
+            Err(error) => {
+                observability::observe_internal(&error);
+                Err(error)
+            }
+        }
+    })
+    .await?
+    else {
         return Ok(None);
     };
-    match run_claimed(state, policy, &job).await {
-        Ok(outcome) => Ok(Some(outcome)),
-        Err(error) => {
-            let accepted = jobs::finish(&state.pool, &job, json!({}), Some(&error.to_string()), policy).await?;
-            let status = if !accepted {
-                "superseded"
-            } else if job.attempt < policy.max_attempts {
-                "queued"
-            } else {
-                "failed"
-            };
-            Ok(Some(JobOutcome {
-                job_id: job.id,
-                kind: job.kind.clone(),
-                repository_id: job.repository_id,
-                attempt: job.attempt,
-                state: status.into(),
-            }))
+    // The persisted attempt and repository generation are safe numeric
+    // correlation. The raw job, repository, tenant and actor IDs stay out.
+    let job_operation =
+        operation.clone().with_attempt(Some(i64::from(job.attempt))).with_generation(Some(job.repository_generation));
+    observability::worker::run(&job_operation, Phase::Execute, async {
+        match run_claimed(state, policy, &job).await {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(error) => {
+                observability::observe_internal(&error);
+                let accepted = jobs::finish(&state.pool, &job, json!({}), Some(&error.to_string()), policy)
+                    .await
+                    .inspect_err(|finish_error| {
+                        observability::observe_internal(finish_error);
+                    })?;
+                let status = if !accepted {
+                    "superseded"
+                } else if job.attempt < policy.max_attempts {
+                    "queued"
+                } else {
+                    "failed"
+                };
+                Ok(Some(JobOutcome {
+                    job_id: job.id,
+                    kind: job.kind.clone(),
+                    repository_id: job.repository_id,
+                    attempt: job.attempt,
+                    state: status.into(),
+                }))
+            }
         }
-    }
+    })
+    .await
 }
 
 async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models::Job) -> Result<JobOutcome> {
