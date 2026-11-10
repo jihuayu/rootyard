@@ -119,7 +119,7 @@ jobs:
               'ignored': 0, 'external_blob_backup': False, 'serving_cutover': False,
           }, indent=2) + '\n')
           PY
-      - name: Create the run-owned #174 foundation database
+      - name: "Create the run-owned #174 foundation database"
         id: session174_db
         timeout-minutes: 5
         shell: bash
@@ -176,7 +176,7 @@ jobs:
           python3 -m pip install -r tests/requirements-blob-backup.txt
           python3 tests/backup_blob_serving147.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --report test-results/refstore/standalone-paired-backup.json
-      - name: Exercise the #174 HTTP foundation cases against the owned database and Blob fixture
+      - name: "Exercise the #174 HTTP foundation cases against the owned database and Blob fixture"
         timeout-minutes: 15
         shell: bash
         env:
@@ -480,7 +480,7 @@ jobs:
             echo "session174 cases failed (status $status)" >&2
             exit "$status"
           fi
-      - name: Drop only the run-owned #174 foundation database
+      - name: "Drop only the run-owned #174 foundation database"
         if: always()
         timeout-minutes: 5
         shell: bash
@@ -526,7 +526,7 @@ jobs:
           SQL
           )"
           if [ "$remaining" != "0" ]; then echo "owned database still exists after cleanup" >&2; exit 1; fi
-      - name: Collect #174 acceptance evidence
+      - name: "Collect #174 acceptance evidence"
         if: always()
         shell: bash
         run: |
