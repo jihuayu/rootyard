@@ -199,7 +199,10 @@ class MetricsHarness(BrowserHarness):
                 (active_hook, "dead_letter", 3, 259200, "0"), (inactive_hook, "pending", 0, 345600, "0")]
         for hook, state, attempts, age, next_attempt in rows:
             body = self.sql(f"INSERT INTO forge_webhook_deliveries (id,webhook_id,tenant_id,repository_id,event_id,event_type,payload,request_headers,signature_256,state,attempts,next_attempt_unix,max_attempts,created_at,delivered_at) VALUES ('{uuid.uuid4()}','{hook}','{tenant}','{repo}','{uuid.uuid4()}','ping','{{}}'::jsonb,'{{}}'::jsonb,'sha256=' || repeat('a',64),'{state}',{attempts},{next_attempt},10,clock_timestamp()-make_interval(secs=>{age}::double precision),{'now()' if state == 'delivered' else 'NULL'}) RETURNING state")
-            assert body == state
+            lines = body.splitlines()
+            assert len(lines) == 2, body
+            assert lines[0] == state, body
+            assert lines[1] == "INSERT 0 1", body
         counted = ["pending", "failed", "leased"]
         excluded = ["delivered", "dead_letter", "inactive_hook_pending"]
         counts = self.sql(f"SELECT concat_ws(',', count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='pending'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='failed'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='leased'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='delivered'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='dead_letter'), count(*) FILTER (WHERE webhook_id='{inactive_hook}' AND state='pending'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state IN ('failed','leased') AND next_attempt_unix > EXTRACT(EPOCH FROM clock_timestamp())::bigint), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state IN ('pending','delivered','dead_letter') AND next_attempt_unix = 0)) FROM forge_webhook_deliveries WHERE tenant_id='{tenant}' AND repository_id='{repo}'")
