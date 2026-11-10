@@ -72,7 +72,7 @@ EOF
   if [ "$current" = "$want" ]; then
     log "signed Ubuntu Noble source index already configured (deb-src only)"
   else
-    printf '%s\n' "$want" | sudo tee "$list" >/dev/null
+    printf '%s\n' "$want" | sudo tee -- "$list" >/dev/null
     log "configured deb-src-only signed Ubuntu Noble source index: $list"
   fi
   # Refresh even when the list was already current: a hosted runner can
@@ -124,7 +124,7 @@ prepare_pgdg_repository() {
   if [ "$current" = "$want" ]; then
     log "signed PGDG repository already configured"
   else
-    printf '%s\n' "$want" | sudo tee "$list" >/dev/null
+    printf '%s\n' "$want" | sudo tee -- "$list" >/dev/null
     log "configured signed PGDG repository for ${codename}"
   fi
   # A re-run on a hosted runner can start from an owned list whose indexes
