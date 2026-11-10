@@ -70,26 +70,31 @@ class writes:
         """
         pulls = "/api/repos/alice/demo/pulls"
         vendor = self.root / "owned-work-alice"
-        self.git("checkout", "-B", "pr-base", self.seed, cwd=vendor)
-        self.push_branch(vendor, self.alice, "base")
-        base = self.ref("refs/heads/base")
-        for user in ("carol", "dave"):
-            status, raw, _ = self.http(pulls, token=self.users[user], method="POST",
-                                       body={"title": "denied " + user,
-                                             "head_ref": "refs/heads/main",
-                                             "base_ref": "refs/heads/base"})
-            assert status == 403, (user, status, raw[:200])
-        assert self.sql("SELECT count(*) FROM forge_pulls WHERE repository_id='" +
-                        self.repo["id"] + "'") == "0"
-        self.git("checkout", "-B", "pr-feature", self.seed, cwd=vendor)
-        head = self.commit(vendor, "pr.txt", "pull request head")
-        self.push_branch(vendor, self.alice, "pr-feature")
         merged = {}
         for user, role in (("erin", "write"), ("frank", "maintain"), ("grace", "admin")):
+            # One base/head pair per role: a merged base cannot be rewound for
+            # the next role (receive.denyNonFastForwards would reject it).
+            base_ref = "base-" + user
+            head_ref = "feature-" + user
+            self.git("checkout", "-B", "pr-" + base_ref, self.seed, cwd=vendor)
+            self.push_branch(vendor, self.alice, base_ref)
+            base = self.ref("refs/heads/" + base_ref)
+            for outsider in ("carol", "dave"):
+                status, raw, _ = self.http(pulls, token=self.users[outsider], method="POST",
+                                           body={"title": "denied " + outsider,
+                                                 "head_ref": "refs/heads/main",
+                                                 "base_ref": "refs/heads/" + base_ref})
+                assert status == 403, (outsider, status, raw[:200])
+            assert self.sql("SELECT count(*) FROM forge_pulls WHERE repository_id='" +
+                            self.repo["id"] + "' AND base_ref='refs/heads/" +
+                            base_ref + "'") == "0"
+            self.git("checkout", "-B", head_ref, self.seed, cwd=vendor)
+            head = self.commit(vendor, "pr-" + user + ".txt", "pull request head " + user)
+            assert self.push_branch(vendor, self.alice, head_ref) == head
             status, raw, _ = self.http(pulls, token=self.users[user], method="POST",
                                        body={"title": "collaborator PR " + user,
-                                             "head_ref": "refs/heads/pr-feature",
-                                             "base_ref": "refs/heads/base"})
+                                             "head_ref": "refs/heads/" + head_ref,
+                                             "base_ref": "refs/heads/" + base_ref})
             assert status == 201, (user, role, status, raw[:300])
             pull = json.loads(raw)
             assert (pull["head_oid"], pull["base_oid"], pull["state"]) == (head, base, "open")
@@ -105,18 +110,14 @@ class writes:
             result = json.loads(raw)
             assert (result["state"], result["merge_commit_oid"]) == ("merged", head), result
             assert result["version"] == pull["version"] + 1
-            assert self.ref("refs/heads/base") == head
+            assert self.ref("refs/heads/" + base_ref) == head
             replay = self.expect(merge, 200, token=self.users[user], method="POST", body=body,
                                  extra_headers=key)
             assert replay == raw, (replay[:300], raw[:300])
-            assert self.ref("refs/heads/base") == head
+            assert self.ref("refs/heads/" + base_ref) == head
             again = self.http(merge, token=self.users[user], method="POST", body=body)[0]
             assert again == 409, again
             merged[role] = {"number": pull["number"], "merge_commit_oid": head}
-            if role != "admin":
-                self.git("push", "--force", "origin", base + ":refs/heads/base", cwd=vendor,
-                         token=self.alice)
-                assert self.ref("refs/heads/base") == base
         return {"create_denied_read_and_triage": True, "merged": merged,
                 "replay_same_key": 200, "merge_without_key_after_merge": 409}
 
