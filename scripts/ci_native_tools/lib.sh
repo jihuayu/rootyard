@@ -132,26 +132,36 @@ prepare_pgdg_repository() {
   apt_update
 }
 
-# GitHub-hosted Ubuntu runners ship the Azure archive mirrorlist inside the
-# image's own apt configuration, and the archive is plain HTTP there. Bound
-# every acquisition instead of waiting for the runner's default timeouts:
-# Acquire::http(s)::Timeout is per stalled transfer, and the retry knobs limit
-# connection failures. These are per-invocation options (-o) only; no apt
-# configuration file on the host or in /etc is written or changed here.
+# Hosted Ubuntu runners reach their archive through the image's own (mirror
+# list / sources) configuration, over plain HTTP. These helpers must not
+# rewrite that image configuration, so bound every acquisition instead of
+# inheriting apt's multi-minute defaults. These are the top-level keys from the
+# apt.conf(5) acquire group; Acquire::http(s)::Timeout abandons a transfer
+# after that many seconds without progress, Acquire::Retries reconnects after
+# a method error, and pipelining is off so a stalled connection is retried
+# rather than holding a pipelined request. They are per-invocation -o options
+# only: no apt configuration file is written or changed.
+APT_TIMEOUT_SECONDS=30
+APT_RETRIES=3
 APT_NETWORK_OPTIONS=(
-  -o APT::Acquire::http::Timeout=30
-  -o APT::Acquire::https::Timeout=30
-  -o Acquire::Retries=3
+  -o "Acquire::http::Timeout=$APT_TIMEOUT_SECONDS"
+  -o "Acquire::https::Timeout=$APT_TIMEOUT_SECONDS"
+  -o "Acquire::Retries=$APT_RETRIES"
   -o Acquire::http::Pipeline-Depth=0
 )
 
+# Every acquisition is non-interactive so a daemon restart prompt cannot hold
+# a CI runner.
 apt_run() {
   require_command sudo
-  sudo apt-get "${APT_NETWORK_OPTIONS[@]}" "$@"
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get "${APT_NETWORK_OPTIONS[@]}" "$@"
 }
 
+# A plain `apt-get update` exits 0 when some indexes fail, keeping their stale
+# local copies; these helpers need every signed index they read to be current,
+# so the update reports any hash-sum or other transient index failure.
 apt_update() {
-  apt_run update
+  apt_run update --error-on=any
 }
 
 apt_install() {
