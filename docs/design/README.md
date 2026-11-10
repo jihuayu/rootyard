@@ -31,6 +31,6 @@
 | [09 Workspace 与 Git 预研记录](09-workspace-git-research.md) | 2026-11-03 的本地容器及 PostgreSQL/Smart HTTP 实验和限制 |
 | [10 分布式存储故障预研](10-distributed-storage-research.md) | 2026-11-03 的多进程、本地对象模拟器、租约、晚到 PUT/DELETE、GC 和读取实验 |
 | [11 CI 只读镜像](11-ci-read-mirrors.md) | 固定目标、复制屏障、等待/回源、权限撤销、对象保护与性能验收 |
-| [12 状态服务设计（提案）](12-state-services.md) | PostgreSQL/Ref-CAS/Redis/OpenDAL Blob 目标；W0 为快照、生产者清单、部署契约与基线工具，**尚未实现** |
+| [12 状态服务设计（提案）](12-state-services.md) | 当前 fresh-install 双部署协议：单机 PgRefStore/PG，分布式 Raft Ref-CAS，同一 OpenDAL Blob；HTTP-only、无 PG fallback；**尚未实现**。W0 的原始正文只保留在[历史归档](state-services/historical-w0/README.md)，不是当前协议 |
 
 [原文归档](source-page.md) 和 [来源清单](source-manifest.json) 保持历史正文不变。2026-11-04 的 823 个来源正文块、11 章和原始摘要继续由 `python3 scripts/check_design_docs.py` 校验；当前架构图独立维护并验证源码与嵌入一致。历史图不再放在当前 diagrams 目录。

@@ -3,6 +3,18 @@
 //! Downloads keep the previous contract: stream into a unique staging file,
 //! hash and length-check every byte (provider-declared size or ETag is not
 //! proof), fsync, then atomically rename. Failures remove only this call's file.
+//!
+//! The provider is the OpenDAL adapter in [`crate::storage::remote_provider`]
+//! (`RemoteObjectStore::OpenDal`). SDK failures cross back through
+//! [`object_error`] so `lfs::hydration` and `observability` keep downcasting
+//! to the same typed `RemoteStoreError` (bounded op, numeric status).
+//!
+//! These blocks (`head`, `get_to_file`, `get_range`) were briefly duplicated
+//! while the superseded pre-OpenDAL implementation was still compiled from
+//! `remote_objects.rs`; that module now lives uncompiled in
+//! `historical_s3.rs`. The bounded range limit, expected-size cap, per-byte
+//! digest/length proof, `0600` staging file, deadline mapping and
+//! per-poll body observation below are the reviewed semantics and are kept.
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -22,6 +34,9 @@ use crate::storage::{
     remote_provider_errors::{deadline_error, object_error, observe_body_poll},
 };
 
+/// Same ceiling the OpenDAL adapter (`LegacyS3Store::verify_ceiling`) applies
+/// to a single legacy object, enforced before any byte is downloaded.
+const MAX_OBJECT_BYTES: u64 = crate::blob_store::MAX_OBJECT_BYTES;
 const MAX_RANGE_BYTES: u64 = 1024 * 1024;
 const READ_CHUNK: usize = 64 * 1024;
 
@@ -42,6 +57,7 @@ impl RemoteObjectStore {
         expected_size: u64,
         deadline: Instant,
     ) -> Result<()> {
+        ensure!(expected_size <= MAX_OBJECT_BYTES, "object exceeds the remote object size ceiling");
         let parent = destination.parent().context("object destination parent missing")?;
         fs::create_dir_all(parent).await?;
         let temp = parent.join(format!(".rootyard-object-{}", Uuid::new_v4()));

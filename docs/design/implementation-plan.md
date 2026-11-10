@@ -54,19 +54,26 @@
 | [#157](https://github.com/jihuayu/rootyard/issues/157) | [State/D] 真实 3 主机故障矩阵、ACK 完整性、RPO/RTO 与容量成本 | [#155](https://github.com/jihuayu/rootyard/issues/155), [#156](https://github.com/jihuayu/rootyard/issues/156), [#153](https://github.com/jihuayu/rootyard/issues/153), [#42](https://github.com/jihuayu/rootyard/issues/42), [#151](https://github.com/jihuayu/rootyard/issues/151) |
 | [#123](https://github.com/jihuayu/rootyard/issues/123) | [State/Release] 汇总单机与分布式新架构资格及发布闸门 | [#154](https://github.com/jihuayu/rootyard/issues/154), [#157](https://github.com/jihuayu/rootyard/issues/157) |
 
-## 新发布的后继任务（未实现，待补充范围）
+## 新增任务与修复 backlog（全部未实现）
 
-维护者另行发布了 #162—#166。本计划只记录其存在：提议标题、范围、技术前置和验收尚未接入本表，**均未实现**，不计入任何已完成阶段。补充范围时应按上面同一格式加入“任务与技术前置”，并同步 [任务映射](issue-map.md)。
+下列 issue 是维护者另行发布的后续任务和缺陷修复单。此处登记的是 GitHub 上的确切标题、范围摘要与技术前置；**没有实现、没有验收结果**，不计入任何已完成阶段，也不表示分布式、HA、GC 等新能力已交付。标题与正文以 GitHub 为准，issue 正文更新后须同步本表和 [任务映射](issue-map.md)。
 
 | 任务 | 范围 | 技术前置 |
 | --- | --- | --- |
-| [#162](https://github.com/jihuayu/rootyard/issues/162) | 待补充（未实现） | 待定义 |
-| [#163](https://github.com/jihuayu/rootyard/issues/163) | 待补充（未实现） | 待定义 |
-| [#164](https://github.com/jihuayu/rootyard/issues/164) | 待补充（未实现） | 待定义 |
-| [#165](https://github.com/jihuayu/rootyard/issues/165) | 待补充（未实现） | 待定义 |
-| [#166](https://github.com/jihuayu/rootyard/issues/166) | 待补充（未实现） | 待定义 |
+| [#162](https://github.com/jihuayu/rootyard/issues/162) | [Rubicon] 独立交付无删除 Blob 压实及可扩展维护吞吐（#122 的 subtask：按 pack hash 分 shard 的独立维护角色、持久 lease/fence、open→sealed 分层合并；只发布新 membership，旧输入保留、delete 关闭） | 不新增前置；物理 GC 仍只由 [#122](https://github.com/jihuayu/rootyard/issues/122)/[#151](https://github.com/jihuayu/rootyard/issues/151)/[#153](https://github.com/jihuayu/rootyard/issues/153) 约束 |
+| [#163](https://github.com/jihuayu/rootyard/issues/163) | [Rubicon] 接通版本感知的可丢计算副本缓存与有界路由调度（repo/history/backend/version 绑定的已校验物化视图复用、有界淘汰、单飞、热副本路由与 drain） | [#144](https://github.com/jihuayu/rootyard/issues/144), [#114](https://github.com/jihuayu/rootyard/issues/114)；分布式路由另依赖 [#150](https://github.com/jihuayu/rootyard/issues/150), [#155](https://github.com/jihuayu/rootyard/issues/155) |
+| [#164](https://github.com/jihuayu/rootyard/issues/164) | [Rubicon] 增加同仓 push/read/maintenance 稳态混合负载与扩容基线（真实 Git/HTTP、源码绑定、ACK OID 核对、P50/P95/P99 与资源时间序列） | 不新增架构前置；提供 [#154](https://github.com/jihuayu/rootyard/issues/154)/[#157](https://github.com/jihuayu/rootyard/issues/157) 所需的细分测量工具 |
+| [#165](https://github.com/jihuayu/rootyard/issues/165) | [Rubicon] 将 MIDX、bitmap、commit-graph 作为可重建 Blob 读加速产物（版本绑定、验证后发布、缺失/损坏回退原生读取）——非阻塞优化 | [#144](https://github.com/jihuayu/rootyard/issues/144), [#162](https://github.com/jihuayu/rootyard/issues/162)；收益不足则不默认开启 |
+| [#166](https://github.com/jihuayu/rootyard/issues/166) | [CI] 修复 genuine schema007 备份恢复回归，恢复完整合并门禁（format4/schema007 真实归档恢复失败；不得删除或放宽原断言，旧路径在 #148 前不得静默回归） | 不新增架构前置；与 [#120](https://github.com/jihuayu/rootyard/issues/120)/[#148](https://github.com/jihuayu/rootyard/issues/148) 边界相关 |
+| [#167](https://github.com/jihuayu/rootyard/issues/167) | [Raft/P2] 持久日志范围读取检测内部缺口并失败关闭（`crates/refcas-log` read_range 连续性；待复现的审查发现，不先称为已验证回归） | PR #160 的实验 crate；不替代 [#149](https://github.com/jihuayu/rootyard/issues/149) |
+| [#168](https://github.com/jihuayu/rootyard/issues/168) | [P2] W0 baseline runner 落实运行因子、临时空间与全程绝对期限（workload 准入、贯穿 Git/PG 子进程的绝对 deadline、实际临时空间执行） | 不新增架构前置；关联 [#164](https://github.com/jihuayu/rootyard/issues/164) |
+| [#169](https://github.com/jihuayu/rootyard/issues/169) | [Backup/P2] 配对归档逐项验证注册 pack 的完整 artifact 集合与摘要（pack+idx 角色、slot/locator/proof/hold 绑定、artifact_set_digest；缺件/错摘要拒绝归档） | [#120](https://github.com/jihuayu/rootyard/issues/120)；PR #161 候选能力，不扩大已验收范围 |
+| [#170](https://github.com/jihuayu/rootyard/issues/170) | Integrate the pending Forge and Blob/RefStore PR stack with reviewed recovery fixes | 合并 #89–#161 的候选栈（PR，不是新能力） |
+| [#171](https://github.com/jihuayu/rootyard/issues/171) | [Integration] 分离历史 W0 冻结快照与当前架构，修复合并后的验证契约 | #170；合并契约修复，不宣称新架构任务全部交付 |
 
-PR #160 的独立实验 crate 只对应 #149 的日志存储切片，不改变 #149 仍为 open，也不构成 #115 的前置完成。
+#171 只修复集成门禁：恢复当前第 12 章契约、把 W0 冻结输入放到显式归档、让 feature-only overlay 针对其冻结 parent fixture、修复结构检查。它不新增分布式/HA/GC 能力，也不关闭上述任何任务。
+
+PR #160 的独立实验 crate 只对应 #149 的日志存储切片，不改变 #149 仍为 open，也不构成 #115 的前置完成；#167 只修复其日志读取完整性，不使该 crate 进入根构建。
 
 ## 必须守住的验收边界
 

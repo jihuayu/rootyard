@@ -4,15 +4,20 @@
 
 ## 先读
 
-- 原始 issue 设计快照：[`docs/design/12-state-services.md`](../12-state-services.md)（逐字节复制，SHA-256 见 [`snapshot.json`](snapshot.json)）
-- 历史来源快照（01–11、source-page、source-manifest）未修改；第 12 章不属于归档的 823-block 来源。
+- 当前协议：[第 12 章 `docs/design/12-state-services.md`](../12-state-services.md)，从 canonical 分支
+  `codex/state-services-architecture-v2`（`23334bd`）恢复；合并 PR #124 曾误用旧 W0 正文覆盖它。
+  fresh-install-only、Blob-only 双部署、HTTP-only、无 PG fallback 与签名撤销屏障以该文为准。
+- W0 原始 issue 设计快照：[`historical-w0/state-services-design.md`](historical-w0/state-services-design.md)
+  （逐字节复制，SHA-256 `0187d9c0…`、80072 bytes，见 [`snapshot.json`](snapshot.json)；历史归档，**不是当前协议**）。
+- 历史来源快照（01–11、source-page、source-manifest）未修改；第 12 章和 W0 历史快照不属于归档的 823-block 来源。
 - 设计状态仍是“设计提案，尚未实现或生产验收”；路线仍以 [第 08 章](../08-roadmap.md) 的历史快照为来源，W0 只通过状态/索引页同步，不修改历史正文。
 
 ## W0 资产
 
 | 资产 | 用途 |
 | --- | --- |
-| [`snapshot.json`](snapshot.json) | 设计快照 SHA-256、baseline commit、已复制/未修改边界 |
+| [`snapshot.json`](snapshot.json) | W0 历史设计快照与当前第 12 章的 SHA-256/git blob、baseline commit、已复制/未修改边界 |
+| [`historical-w0/`](historical-w0/README.md) | W0 原始设计正文归档（已被彻底取代；只用于可复现历史） |
 | [`producers.json`](producers.json) | 可执行生产者清单：publish/auth mutation/root/hold/event/backup/durable ACK；实际文件+符号+迁移对象；逻辑根、物理 hold、auth scope 分列；未覆盖项显式列出 |
 | [`deployment-contract.json`](deployment-contract.json) | 已实现/部分/提案/实验 profile 矩阵；目标配置故意不可选；跨字段拒绝规则与 legacy 例外 |
 | [`config.schema.json`](config.schema.json) | 仅接受已实现 profile 的配置 schema；standalone/distributed 被枚举和拒绝规则双重拒绝 |

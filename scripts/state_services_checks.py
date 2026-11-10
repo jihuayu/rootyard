@@ -124,18 +124,47 @@ def reject_rule_matches(document, rule):
 
 
 def validate_snapshot():
+    """Verify the frozen W0 design snapshot and the current protocol entry.
+
+    `design_snapshot` is the immutable W0 body (no longer at
+    `docs/design/12-state-services.md`); its bytes are checked against the
+    recorded SHA-256/git blob and its checksum. `current_design` is the current
+    fresh-install protocol entry, verified separately so a historical byte can
+    never stand in for it again.
+    """
     snapshot = load(STATE / "snapshot.json")
     design = snapshot["design_snapshot"]
     path = ROOT / design["file"]
     require(path.is_file(), f"missing design snapshot {path}")
-    require(sha256_file(path) == design["checked_in_sha256"], "design snapshot hash changed")
+    require(design["file"] != "docs/design/12-state-services.md",
+            "the historical W0 body must stay archived, not at the current entry")
+    data = path.read_bytes()
+    require(len(data) == design["bytes"], "design snapshot byte length changed")
+    require(hashlib.sha256(data).hexdigest() == design["checked_in_sha256"], "design snapshot hash changed")
     require(design["source_sha256"] == design["checked_in_sha256"], "snapshot was not copied verbatim")
+    require(design.get("checked_in_blob") == git_blob_id(data), "design snapshot git blob changed")
     text = path.read_text(encoding="utf-8")
     require(design["baseline_commit"] in text, "baseline commit missing from design snapshot")
     require(snapshot["w0_artifacts"]["producer_inventory"] == "docs/design/state-services/producers.json", "producer path drift")
     for relative in snapshot["w0_artifacts"].values():
         require((ROOT / relative).is_file(), f"missing W0 artifact {relative}")
+    current = snapshot["current_design"]
+    current_path = ROOT / current["file"]
+    require(current_path.is_file(), f"missing current design {current_path}")
+    current_bytes = current_path.read_bytes()
+    require(len(current_bytes) == current["bytes"], "current design byte length changed")
+    require(hashlib.sha256(current_bytes).hexdigest() == current["checked_in_sha256"], "current design hash changed")
+    require(git_blob_id(current_bytes) == current.get("checked_in_blob"), "current design git blob changed")
+    require(current["source_sha256"] == current["checked_in_sha256"], "current design was not restored verbatim")
+    current_text = current_path.read_text(encoding="utf-8")
+    for phrase in current["required_phrases"]:
+        require(phrase in current_text, f"current design lost required contract text {phrase!r}")
     return snapshot
+
+
+def git_blob_id(data):
+    """Git object id of a blob: SHA-1 over `blob <len>\0<data>`."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
 def declares_table(sql, name):
@@ -256,20 +285,23 @@ def canonical_manifest_digest(document):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def check_feature_only_overlay(overlay, parent, manifest_text, file_hashes):
-    """Validate a declared empty, default-OFF feature-only overlay on a frozen parent.
+def check_feature_only_overlay(overlay, parent):
+    """Validate the recorded feature-only overlay on its frozen parent.
 
-    `parent` is the frozen `current_stack_parent` record: its hashes are never
-    relabelled with child hashes, so the only accepted delta is the one declared
-    empty feature in the manifest. The lockfile must stay the parent's, and any
-    dependency, feature or MSRV change fails.
+    `parent` is the frozen W0/phase-metrics input. The overlay record must name
+    that exact commit, reference its manifest/lock hashes (never a relabelled
+    child hash) and declare exactly one empty, default-OFF feature while the
+    lockfile stays the parent's byte-for-byte. The parent manifest archive must
+    match its frozen hash and semantic digest. This check never reads today's
+    root `Cargo.toml`/`Cargo.lock`; the integrated manifest has its own explicit
+    contract (`check_integrated_manifest`).
     """
     require(overlay.get("schema") == OVERLAY_SCHEMA, "implementation overlay schema drift")
     require(overlay.get("stack_base") == parent.get("commit"), "overlay must name the frozen parent commit")
-    parent_bytes = (STATE / "stack-parent.Cargo.toml").read_bytes()
+    parent_bytes = (ROOT / parent["archived"]["Cargo.toml"]).read_bytes()
     require(hashlib.sha256(parent_bytes).hexdigest() == parent["files"]["Cargo.toml"],
             "archived parent manifest does not match its frozen hash")
-    require(canonical_manifest_digest(tomllib.loads(parent_bytes.decode("utf-8")))
+    require(canonical_manifest_digest(parse_manifest(parent_bytes.decode("utf-8")))
             == overlay.get("parent_manifest_semantic_sha256"),
             "parent semantic hash does not describe the archived parent manifest")
     feature = overlay.get("feature") or {}
@@ -281,21 +313,31 @@ def check_feature_only_overlay(overlay, parent, manifest_text, file_hashes):
             "overlay must reference the frozen parent manifest hash, never a relabelled child hash")
     require(overlay.get("parent_lock_sha256") == parent["files"]["Cargo.lock"],
             "overlay must reference the frozen parent lockfile hash")
-    for filename, expected in parent["files"].items():
-        if filename in ("Cargo.toml", "Cargo.lock"):
-            continue
-        require(file_hashes.get(filename) == expected, f"current {filename} hash drift outside the declared overlay")
-    require(file_hashes.get("Cargo.lock") == parent["files"]["Cargo.lock"],
-            "lockfile must remain byte-identical to the frozen parent lockfile")
     recorded = overlay.get("files") or {}
+    require(set(recorded) <= {"Cargo.toml", "Cargo.lock"}, "overlay records unexpected Cargo files")
     require(recorded.get("Cargo.lock") == parent["files"]["Cargo.lock"],
             "the overlay record must keep the parent lockfile hash")
-    require(recorded.get("Cargo.toml") == file_hashes.get("Cargo.toml"),
-            "the overlay record must match the current manifest byte-for-byte")
-    manifest = tomllib.loads(manifest_text)
-    package = manifest.get("package") or {}
-    require(package.get("rust-version") == parent.get("declared_rust_version"),
-            "an implementation overlay must not change or relax the parent MSRV")
+    if overlay.get("child_manifest_sha256") is not None:
+        require(overlay.get("child_manifest_sha256") == recorded.get("Cargo.toml"),
+                "overlay child manifest hash must match its recorded file hash")
+    return overlay
+
+
+def overlay_child_manifest(overlay, manifest_text):
+    """Validate an explicitly supplied overlay-applied (child) manifest.
+
+    Only the archived parent manifest plus exactly one empty, default-OFF
+    feature is accepted. Focused tests use this with the archived parent plus
+    mutations; it is never applied to today's integrated manifest, which is not
+    derived from the frozen parent.
+    """
+    deps = load(STATE / "dependencies.json")
+    parent = deps["current_stack_parent"]
+    name = (overlay.get("feature") or {}).get("name")
+    require(name == OVERLAY_FEATURE, f"an implementation overlay may only declare {OVERLAY_FEATURE}")
+    parent_manifest = parse_manifest((ROOT / parent["archived"]["Cargo.toml"]).read_text(encoding="utf-8"))
+    manifest = parse_manifest(manifest_text)
+    _check_msrv(manifest, parent["declared_rust_version"], "an implementation overlay")
     features = manifest.get("features") or {}
     require(features.get(name) == [], "the overlay feature must stay empty")
     require(name not in (features.get("default") or []), "the overlay feature must not be enabled by default")
@@ -303,28 +345,148 @@ def check_feature_only_overlay(overlay, parent, manifest_text, file_hashes):
     del reduced["features"][name]
     if not reduced["features"]:
         del reduced["features"]
-    require(canonical_manifest_digest(reduced) == overlay.get("parent_manifest_semantic_sha256"),
+    require(canonical_manifest_digest(reduced) == canonical_manifest_digest(parent_manifest),
             "current manifest differs from the frozen parent beyond the declared empty feature")
-    return overlay
+    return manifest
+
+
+INTEGRATED_SCHEMA = "rootyard.state-services.integrated-manifest/v1"
+SUPPORTED_RUST_VERSIONS = {"1.85", "1.88"}
+
+
+def _version_matches(request, version):
+    if version is None:
+        return False
+    try:
+        have = tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return False
+    request = request.strip()
+    if request.startswith("="):
+        return version == request[1:].strip()
+    if request.startswith("^"):
+        request = request[1:].strip()
+    try:
+        want = tuple(int(part) for part in request.split("."))
+    except ValueError:
+        return False
+    if not want:
+        return False
+    # Cargo caret/default semantics: same left-most non-zero component.
+    return have[: len(want) - 1] == want[:-1] and have[len(want) - 1] >= want[-1]
+
+
+def _dependency_ok(spec, expected):
+    """Check one declared dependency spec against its recorded integrated shape."""
+    if isinstance(spec, str):
+        return _version_matches(spec, expected.get("version"))
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("optional", False) != expected.get("optional", False):
+        return False
+    if expected.get("path"):
+        return "version" not in spec
+    if spec.get("path") is not None:
+        return False
+    if expected.get("version") is not None and not _version_matches(spec.get("version", ""), expected["version"]):
+        return False
+    if "default_features" in expected and spec.get("default-features", True) != expected["default_features"]:
+        return False
+    if "features" in expected:
+        have = set(spec.get("features") or [])
+        if not set(expected["features"]) <= have:
+            return False
+    return True
+
+
+def check_integrated_manifest(integrated, manifest_text, lock_text):
+    """Validate today's integrated Cargo inputs explicitly against HEAD.
+
+    The integrated branch legitimately carries new features and dependencies
+    that the frozen W0 parent never had. This contract makes them explicit:
+    every declared feature is either empty or a dependency-activating feature
+    whose `dep:` target is exactly the declared feature name; dependencies are
+    limited to the reviewed list; the recorded MSRV holds; and the lockfile is
+    consistent with that manifest (expected packages present, and the only
+    added packages relative to the frozen W0 lock are the recorded ones).
+    """
+    require(integrated.get("schema") == INTEGRATED_SCHEMA, "integrated manifest schema drift")
+    manifest = parse_manifest(manifest_text)
+    _check_msrv(manifest, integrated.get("declared_rust_version"), "current integrated manifest")
+    if integrated.get("declared_rust_version") not in SUPPORTED_RUST_VERSIONS:
+        raise ValueError("integrated manifest MSRV changed")
+    features = manifest.get("features") or {}
+    declared = integrated.get("features") or {}
+    require(set(features) == set(declared), f"integrated features changed: {sorted(set(features) ^ set(declared))}")
+    for name, spec in features.items():
+        expected = declared[name]
+        require(spec == expected.get("value"), f"feature {name} must stay {expected.get('value')!r}")
+        if spec == []:
+            continue
+        if len(spec) != 1 or not spec[0].startswith("dep:"):
+            raise ValueError(f"feature {name} must be empty or enable exactly its own optional dependency")
+        crate = spec[0][len("dep:"):]
+        require(crate in (manifest.get("dependencies") or {}), f"feature {name} activates undeclared {crate}")
+        require((manifest["dependencies"][crate] or {}).get("optional") is True,
+                f"feature {name} activates a non-optional dependency {crate}")
+        require(crate == name or crate in expected.get("activates", []), f"feature {name} activates unexpected {crate}")
+    default = features.get("default") or []
+    for name in default:
+        if name.startswith("dep:"):
+            continue
+        require(name in features, f"default features reference unknown {name}")
+    for name, spec in (manifest.get("dependencies") or {}).items():
+        if isinstance(spec, dict) and spec.get("optional") and f"dep:{name}" not in {v[0] for v in features.values() if v}:
+            raise ValueError(f"optional dependency {name} has no enabling feature")
+    for key, expected in (integrated.get("dependencies") or {}).items():
+        table, _, name = key.partition(".")
+        if table == "target":
+            raise ValueError("target-specific integrated dependencies are not declared")
+        require(table in ("dependencies", "dev-dependencies"), f"integrated dependency {key} uses an unreviewed table")
+        spec = (manifest.get(table) or {}).get(name)
+        require(spec is not None, f"integrated dependency {name} is missing")
+        require(_dependency_ok(spec, expected), f"integrated dependency {name} changed")
+    reviewed = set(integrated.get("dependencies") or {})
+    actual = _dependency_entries(manifest)
+    require(not any(key.startswith("patch.") for key in actual), "integrated manifest must not patch crates")
+    for key in actual:
+        if key not in reviewed:
+            raise ValueError(f"unreviewed integrated dependency {key}")
+    parent_lock = (ROOT / integrated["baseline_lock"]).read_text(encoding="utf-8")
+    previous = lock_packages(parent_lock)
+    present = lock_packages(lock_text)
+    require(previous <= present, f"lockfile lost frozen packages: {sorted(previous - present)}")
+    added = set(added_lock_packages(parent_lock, lock_text))
+    allowed = set(integrated.get("lock_additions") or [])
+    unreviewed = added - allowed
+    require(not unreviewed, f"lockfile contains unreviewed additions: {sorted(unreviewed)[:10]}")
+    return integrated
 
 
 def validate_dependencies():
     deps = load(STATE / "dependencies.json")
     require(deps["schema"] == "rootyard.state-services.dependencies/v1", "dependency schema drift")
     baseline = deps["baseline"]
-    current = deps["current_stack_parent"]
     require(baseline["declared_rust_version"] == "1.85", "historical baseline MSRV drift")
     require(baseline["planned_rust_version"] == "1.88", "planned MSRV must remain explicit")
-    require(current["declared_rust_version"] == "1.88", "current parent MSRV drift")
-    file_hashes = {filename: sha256_file(ROOT / filename) for filename in current["files"]}
+    parent = check_historical_fixtures(deps)
     overlay = deps.get("implementation_overlay")
     if overlay is None:
-        # No declared overlay: the original strict parent-hash gate applies unchanged.
-        for filename, expected in current["files"].items():
-            require(file_hashes[filename] == expected, f"current {filename} hash drift")
+        # No declared overlay: the original strict parent-hash gate applies.
+        for filename, expected in parent["files"].items():
+            require(sha256_file(ROOT / filename) == expected, f"current {filename} hash drift")
     else:
         check_feature_only_overlay(
-            overlay, current, (ROOT / "Cargo.toml").read_text(encoding="utf-8"), file_hashes)
+            overlay, parent, (ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+            {"Cargo.toml": sha256_file(ROOT / "Cargo.toml")})
+    integrated = deps.get("integrated_manifest")
+    if integrated is None:
+        raise ValueError("the integrated manifest contract is missing")
+    check_integrated_manifest(
+        integrated,
+        (ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+        (ROOT / "Cargo.lock").read_text(encoding="utf-8"),
+    )
     require(deps["selection_policy"]["w0_does_not_modify_cargo"], "W0 Cargo modification guard missing")
     lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     for crate, version in baseline["verified_locked_versions"].items():
