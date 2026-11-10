@@ -482,9 +482,11 @@ class teams:
 
     def team_assert_operation(self, operation, user, repo):
         """The owning receipt names the team user and its token; the tenant stays alice."""
+        # self.users holds the collaborators only; the owner's record is self.alice.
+        account = self.owner_account(user) if user == "alice" else self.users[user]
         assert operation["outcome"] == "recorded", operation
         assert (operation["actor_id"], operation["actor_name"], operation["token_id"]) == (
-            self.users[user]["user_id"], user, self.users[user]["token_id"]), operation
+            account["user_id"], user, account["token_id"]), operation
         assert operation["token_id"] != self.alice["token_id"], "owner token recorded"
         owner = self.sql("SELECT ns.slug FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id"
                          " WHERE r.name='" + repo + "'")
