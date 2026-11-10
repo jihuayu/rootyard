@@ -62,8 +62,11 @@ request red instead of leaving the regression to manual re-verification.
 
 ## 专项与完整 candidate 分层 (specialised suites vs. the complete gate)
 
-The existing workflows already carry the layering; no new orchestrator, suite input or
-externally-triggered dependency is added. Choosing a layer:
+The existing GitHub Actions workflow layering and required checks are unchanged.
+The grouped acceptance runner described at the end of this section is optional
+and does not alter any CI required status. It does not replace the full required
+gate, the candidate-release workflow or the qualified Linux kernel/cgroup
+workflow. Choosing a layer:
 
 | Situation | What runs |
 | --- | --- |
@@ -78,6 +81,81 @@ observed are in `docs/acceptance/ci-trigger-dedup-20261110.md`). Do not add `pat
 those workflows: a required check that is filtered out stays "expected" forever on a PR. The
 path-filtered suites above intentionally have none of their jobs as `main` required checks;
 their `workflow_dispatch` makes them available at any time.
+
+## Optional local grouped runner (`scripts/run_native_acceptance.py`)
+
+Operator-side scheduling evidence only. It is a Linux-only coordinator that
+executes existing suite commands from a JSON plan; it is not a CI job and it
+proves nothing about kernel or cgroup behaviour.
+
+* Every `full` suite must depend, directly or transitively, on a `smoke` suite,
+  and a failed, timed-out, cancelled or blocked dependency blocks its dependants
+  (`blocked` is never a pass). This does not mean all smoke work finishes before
+  any full job starts: every eligible suite may run concurrently, in plan order
+  subject to dependencies, `max_workers` and resource locks.
+* Each suite declares resource keys (`exclusive`, or `shared` with a harness
+  isolation declaration). Stateful `global`/`kernel`/`lifecycle` keys need their
+  own named isolation entry to be shared; `database: owned_schema` supports
+  sharing non-stateful keys; exclusive use needs no declaration. Per-suite
+  `timeout_seconds` (at most 86400) and the optional `total_timeout_seconds`
+  request cancellation only: they are not wall-clock guarantees, because locks
+  stay held until owned descendants are proven quiescent. If that state is
+  unknown, the runner and its locks may stay alive indefinitely with no final
+  pass or report.
+* The runner only executes each suite's `argv` and coordinates flocked resource
+  keys; it never provisions or drops PostgreSQL or Garage. Service and resource
+  setup and cleanup belong to each suite's existing harness.
+* Keep credentials out of plans and pass them through the private runner
+  environment. Validation rejects URI-like values under sensitive top-level
+  environment keys but does not reject every possible secret string.
+* Suite summaries are redacted output, except the supervisor pre-spawn refusal,
+  which uses a fixed summary. The self-test marks the run/report failed if a
+  known sensitive value remains in the rendered report text: it emits only
+  hashed match names and the report file then receives a fixed summary. It is
+  detection, not prevention — the full rendered report is still written to
+  stdout even when the self-test fails, so stdout is not safe to publish.
+  Raw per-suite logs (`<run-dir>/logs/<suite_id>.log`) are mode `0600` but may
+  contain secrets; keep them private.
+* The runner requires a readable Linux `/proc` and working pidfds and refuses
+  to spawn anything when either is unsupported.
+* `--dry-run` validates host support and paths but starts no child and creates no
+  run or report directory. A real run creates the run directory and the report
+  parent. The lock directory must already exist and be operator-created; lock,
+  run, log and report paths must resolve outside `--verify-host` (the plan file
+  itself need not be).
+
+A minimal no-secret plan:
+
+```json
+{"version": 1,
+ "suites": [{"id": "smoke-web-sessions", "phase": "smoke",
+             "argv": ["python3", "tests/web_sessions.py", "--binary",
+                      "target/debug/rootyard", "--report", "{run_dir}/smoke.json"],
+             "depends_on": [],
+             "resources": {"instance:pg17": "shared"},
+             "timeout_seconds": 600,
+             "isolation": {"database": "owned_schema"}}]}
+```
+
+Build, validate and run (placeholders; create only the lock directory and export
+any credentials in the runner process environment before the run; the runner
+creates `/outside/path/runs/run-1` and `report.json`):
+
+```sh
+python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo --bins
+mkdir -p /outside/path/locks
+python3 scripts/run_native_acceptance.py --plan /outside/path/plan.json \
+  --lock-dir /outside/path/locks --log-dir /outside/path/runs/run-1 \
+  --report /outside/path/runs/run-1/report.json --run-id run-1 --dry-run
+python3 scripts/run_native_acceptance.py --plan /outside/path/plan.json \
+  --lock-dir /outside/path/locks --log-dir /outside/path/runs/run-1 \
+  --report /outside/path/runs/run-1/report.json --run-id run-1
+```
+
+`--exclude SUITE` (repeatable) drops a suite after the plan has been validated;
+do not exclude a suite that a remaining suite depends on.
+`--verify-host` names the checkout root used to refuse in-checkout lock, run,
+log and report paths (default: the repository root).
 
 ## Layer 2 — candidate release gate (`.github/workflows/candidate-release-acceptance.yml`)
 

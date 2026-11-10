@@ -2,12 +2,14 @@
 """
 Run a small declarative plan of native acceptance suites on grouped resources.
 
-The runner coordinates existing acceptance campaigns. It never creates or drops
-databases or objects: the existing harness owns a random schema/database and
-drops only what it created. What this runner adds is ordering:
+The runner coordinates existing acceptance campaigns. It only executes each
+suite's ``argv`` and coordinates declared flock resource keys; it does not reuse
+or configure a PostgreSQL 17 / Garage instance and never creates or drops
+databases or objects. Each suite's harness owns its service, data setup and
+cleanup. What this runner adds is ordering: eligible suites run in plan order
+subject to dependencies, ``max_workers`` and resource locks, so no smoke work is
+guaranteed to finish before a full job starts.
 
-* one shared PostgreSQL 17 / Garage instance is reused, with isolated schemas
-  and object prefixes declared per suite;
 * suites that use the same resource key never overlap unless every participant
   explicitly declares the key ``shared`` and its harness isolation;
 * a failed/timed-out smoke suite blocks its full dependants; ``blocked`` is
@@ -15,14 +17,16 @@ drops only what it created. What this runner adds is ordering:
 * the same resource keys are flocked in an operator-owned lock directory, so
   independent runner processes serialize on them too;
 * the report carries only ids, statuses, exit codes, timings, hashed resource
-  keys, fixed summaries and log paths. Known sensitive values are replaced in
-  every free-text field, and a self-test scans the rendered report.
+  keys, summaries and log paths. Only the supervisor pre-spawn refusal uses a
+  fixed summary; other suite summaries are redacted output. Known sensitive
+  values are redacted from summaries and a self-test scans the rendered report.
+  Keep credentials out of plans; raw private mode-0600 logs may still contain
+  secret output.
 
 Plan shape (JSON)::
 
     {"version": 1, "max_workers": 2, "total_timeout_seconds": 1800,
      "lock_dir": "/operator/outside/checkout/locks",
-     "environment": {"ROOTYARD_TEST_DATABASE_URL": "..."},
      "suites": [{"id": "smoke-http-pg", "phase": "smoke",
                  "profile": "portable-service",
                  "argv": ["python3", "tests/web_sessions.py", "--binary",
@@ -38,7 +42,14 @@ Plan shape (JSON)::
 
 ``argv`` runs with ``shell=False`` under ``scripts/native_acceptance_supervisor.py``.
 ``{run_id}``, ``{suite_id}`` and ``{run_dir}`` are substituted in argv, suite
-environment and isolation values.
+environment and isolation values. Sensitive credentials and credential URLs
+belong to the runner process environment, never to the plan. Validation only
+refuses URI-like values under sensitive top-level environment keys. Inherited
+sensitive values are redacted from the report, but suite logs (mode 0600) may
+contain secrets and must stay private. ``--dry-run`` starts nothing and creates
+no run directory; a real run creates the run directory and report parent. The
+lock directory must already exist, and lock, run, log and report paths must
+resolve outside ``--verify-host`` (the plan file need not).
 
 Owned-descendant lifecycle (Linux only): the runner passes suite argv to the
 supervisor. The Linux supervisor is a child subreaper, so orphaned descendants are reparented to it or to an intermediate descendant subreaper rather than to init, remaining within the supervisor's descendant tree. It builds a ``/proc`` parent-child
