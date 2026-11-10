@@ -49,9 +49,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ops_provenance  # noqa: E402
@@ -186,6 +188,11 @@ class AuditSequenceLegacyHarness(BackupHarness):
         # drill refuses anything that carries a Blob closure.
         for key in ("ROOTYARD_SERVE_BLOB", "ROOTYARD_BLOB_ROOT"):
             self.env.pop(key, None)
+        # The restore provisions its own fresh database like the source does.
+        # Without the key the CLI would inherit the source database as the
+        # restore server, and a CREATE after the restore would run on the
+        # positive-state source rather than an empty test server.
+        self.env["ROOTYARD_RESTORE_TEST_DATABASE_URL"] = self.restore_admin
         # The hook runner is the binary already executed (the re-executed copy
         # bootstraps before Config), so a later rebuild must not be mistaken for
         # this run's binary: the runner digest is recorded for the report.
@@ -199,6 +206,21 @@ class AuditSequenceLegacyHarness(BackupHarness):
             return None
         return hashlib.sha256(runner.read_bytes()).hexdigest()
 
+    def query(self, db, sql):
+        """Run SQL with an explicit host/port.
+
+        The runner may have no local account for its uid (``--user``), and
+        libpq then falls back to a unix socket that does not exist; the
+        URL's host and port select the same server explicitly.
+        """
+        parts = urllib.parse.urlsplit(db)
+        env = self.env.copy()
+        env.update(PGHOST=parts.hostname or "", PGPORT=str(parts.port or 5432),
+                   PGDATABASE=parts.path.lstrip("/"), PGUSER=parts.username or "",
+                   PGPASSWORD=parts.password or "")
+        return self.run(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-At", "-c", sql],
+                        env=env).stdout.decode().strip()
+
     def repo_path(self, suffix="", repo="demo"):
         return "/api/repos/alice/" + repo + suffix
 
@@ -209,6 +231,32 @@ class AuditSequenceLegacyHarness(BackupHarness):
         assert headers.get("cache-control") == "no-store", headers
         assert "application/json" in headers.get("content-type", ""), headers
         return json.loads(body)
+
+    def _diagnose_case(self, name, error):
+        """Keep bounded, redacted evidence when the service connection fails.
+
+        A refused connection in ``setup`` says nothing by itself; the retained
+        server log tail, the binary's exit status and a bounded wait for the
+        port distinguish a crash from a slow start without secrets.
+        """
+        if "Connection refused" not in str(error):
+            return
+        base = getattr(self, "base", None)
+        port = int(base.rsplit(":", 1)[1]) if base and base.rsplit(":", 1)[-1].isdigit() else None
+        deadline = time.monotonic() + getattr(getattr(self, "args", None), "connection_debug", 0)
+        ready = False
+        while port and time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    ready = True
+                    break
+            except OSError:
+                time.sleep(0.5)
+        log = Path(self.root) / "server.log"
+        tail = log.read_text(errors="replace")[-3000:] if log.is_file() else ""
+        print(self.redact("case " + name + ": connection refused; port " + repr(port)
+                          + " ready within " + repr(getattr(self.args, "connection_debug", 0))
+                          + "s: " + repr(ready) + "; server log tail: " + tail), file=sys.stderr)
 
     def all_audit_ids(self, db):
         return [int(value) for value in
@@ -301,6 +349,17 @@ class AuditSequenceLegacyHarness(BackupHarness):
         assert updated["version"] == current["version"] + 1, (current, updated)
         return current, updated
 
+    def review_pull(self, number, commit_oid, actor="alice", state="changes_requested"):
+        """Real REST review write; the API audits it as pull_review.submitted.
+
+        The review is a ``changes_requested`` on the open pull, so the
+        publishable merge of the source window is still available later.
+        """
+        path = self.repo_path("/pulls/" + str(number) + "/reviews")
+        return self.document(path, 201, token=getattr(self, actor), method="POST",
+                             body={"state": state, "commit_oid": commit_oid,
+                                   "body": "real REST review before the backup"})
+
     def wait_settled(self, db, label):
         """Wait until the stock server settled every push journal by itself.
 
@@ -319,10 +378,33 @@ class AuditSequenceLegacyHarness(BackupHarness):
             time.sleep(0.05)
 
     def setup(self):
-        # The inherited setup performs the real push/clone round trip of demo.
-        super().setup()
+        # The explicit fixture, in order: migrate, the real alice/bob accounts,
+        # a read-only and a (later revoked on the source) API token, the live
+        # service, its real API/Git round trip, and the volume-lock refusal of
+        # an offline backup while the service holds the lock.  No SQL-seeded
+        # "git outcome unknown" repository or retained operation journal: this
+        # drill backs up a settled source only and recovers through a real push
+        # the stock server settles itself.
+        self.cli("migrate")
+        self.alice = self.account("create-user", "alice")
+        self.bob = self.account("create-user", "bob")
+        self.reader = self.account("create-token", "alice", "--read-only")
+        self.revoked = self.account("create-token", "alice")
+        self.start()
+        self.api()
+        self.roundtrip()
+        # There is a real active server and it owns the volume lock.
+        assert self.backup_command(check=False).returncode != 0
+        assert not self.backup.exists()
+        # A settled source at the live-service point: nothing is left unsettled.
+        assert self.query(self.db, "SELECT count(*) FROM git_operations "
+                          "WHERE outcome='unknown'") == "0"
         self.sequence = self.audit_writer(self.db)
         assert self.query(self.db, "SELECT 1 FROM schema_migrations WHERE version=110") == "1"
+        # Collaborator rows reference real accounts (rc/rbac.rs lookup_user),
+        # so carol and dave exist before they are granted anything.
+        for name in ("carol", "dave"):
+            self.account("create-user", name)
         # Real create semantics: no expected_version means "create" (201,
         # collaborator.added); the API rejects expected_version for a new row.
         # bob, carol and dave all start as triage collaborators of alice/demo.
@@ -330,7 +412,8 @@ class AuditSequenceLegacyHarness(BackupHarness):
             created = self.document(self.authors_path, 201, method="POST",
                                     body={"username": name, "role": "triage"})
             assert created["role"] == "triage" and created["version"] == 1, created
-        return {"audit_sequence": self.sequence, "triage_collaborators": ["bob", "carol", "dave"]}
+        return {"audit_sequence": self.sequence, "triage_collaborators": ["bob", "carol", "dave"],
+                "live_server_backup_rejected": True}
 
     def setup_repos(self):
         # Every real Git push happens here, before the single post-push snapshot,
@@ -403,26 +486,43 @@ class AuditSequenceLegacyHarness(BackupHarness):
         assert rows[0]["id"] > max(self.ids_before_write), (rows, self.ids_before_write)
         walked, _ = self.walk_audit(max(row["id"] for row in before))
         assert walked == [row["id"] for row in rows]
-        # The saved prefix is every collaborator write of the source; the
-        # pushes above added none of these actions.
-        self.saved_actions = ["collaborator.added", "collaborator.updated"]
+        # Real REST forge writes of the source window: a PR create and a
+        # review.  Only these API handlers are audited for forge actions (the
+        # REST issue create is not), so their rows must be exactly these.
+        pull = self.document(self.repo_path("/pulls"), 201, method="POST",
+                             body={"title": "source pull", "head_ref": "refs/heads/main",
+                                   "base_ref": "refs/heads/triage-base"})
+        review = self.review_pull(pull["number"], pull["head_oid"])
+        assert review["state"] == "changes_requested", review
+        self.pull_number = pull["number"]
+        final = self.audit_rows(self.db)
+        forge_rows = final[len(after):]
+        assert [(row["action"], row["target_name"], row["actor_name"]) for row in forge_rows] == [
+            ("pull.created", str(pull["number"]), "alice"),
+            ("pull_review.submitted", "%d:%d" % (pull["number"], review["number"]), "alice"),
+        ], forge_rows
+        # The saved prefix is every audited write of the source window; the
+        # Git pushes above added none of these actions or rows.
+        self.saved_actions = ["collaborator.added", "collaborator.updated",
+                              "pull.created", "pull_review.submitted"]
         self.source_sequence = self.action_sequence(self.db, self.saved_actions)
         self.cli("worker-once")  # outbox audit-log consumer claims the push events
         self.audit_events_after = int(self.query(self.db, "SELECT count(*) FROM audit_events"))
-        final = self.audit_rows(self.db)
-        assert self.source_sequence == [row for row in final
+        snapshotted = self.audit_rows(self.db)
+        assert self.source_sequence == [row for row in snapshotted
                                         if row["action"] in self.saved_actions]
-        assert [row["id"] for row in rows] == [row["id"] for row in self.source_sequence[-1:]]
-        assert final == after, "a Git push or the audit-log consumer wrote repository_audit_log"
+        assert [row["id"] for row in rows] == [row["id"] for row in self.source_sequence[3:4]]
+        assert snapshotted == final, "a Git push or the audit-log consumer wrote repository_audit_log"
         assert self.audit_events_after > self.audit_events_before, \
             "the settled pushes produced no outbox audit_events claim"
-        self.snapshot_rows = final
+        self.snapshot_rows = snapshotted
         self.sequence_before_backup = self.query(
             self.db, "SELECT last_value || '/' || is_called FROM repository_audit_log_id_seq")
-        return {"api_audit_write": "collaborator.updated", "walked_audit_ids": walked[-1:],
+        return {"api_audit_writes": [row["action"] for row in rows + forge_rows],
+                "walked_audit_ids": walked[-1:],
                 "saved_audit_sequence": self.source_sequence,
                 "audit_events_delta": self.audit_events_after - self.audit_events_before,
-                "snapshot_rows": len(final)}
+                "snapshot_rows": len(snapshotted)}
 
     def metadata_only_format_without_blob_service(self):
         self.stop()
@@ -513,9 +613,9 @@ class AuditSequenceLegacyHarness(BackupHarness):
         count = 2 * CONCURRENT_WRITERS
         race_prefix = "refs/heads/audit-race-" + os.urandom(4).hex() + "-"
         branches = [race_prefix + "%02d" % index for index in range(count)]
-        # The prefix known before the race is every collaborator write of the
-        # source plus the restored window's PUT (also collaborator.updated):
-        # four source rows plus one restored row, in id order.
+        # The prefix known before the race is every audited write of the
+        # source plus the restored window's PUT (collaborator.updated): six
+        # source rows plus one restored row, in id order.
         known = self.action_sequence(self.target_db, self.saved_actions)
         expected_prefix = self.source_sequence + self.after_http_rows[len(self.restored_rows):]
         assert known == expected_prefix, (known, expected_prefix)
@@ -683,7 +783,10 @@ def preflight(args, environ=None):
     pg_version = numeric_version(subprocess_version(["psql", "--version"]))
     if pg_version is None or pg_version[0] < MIN_POSTGRES_VERSION:
         raise SystemExit("PostgreSQL 17 client tools are required, found " + repr(pg_version))
-    server = subprocess_version(["psql", environ["ROOTYARD_TEST_DATABASE_URL"], "-XAtc", "SHOW server_version_num"])
+    parts = urllib.parse.urlsplit(environ["ROOTYARD_TEST_DATABASE_URL"])
+    server = subprocess_version(["psql", "-X", environ["ROOTYARD_TEST_DATABASE_URL"], "-h",
+                                 parts.hostname or "", "-p", str(parts.port or 5432),
+                                 "-Atc", "SHOW server_version_num"])
     if not server.isdigit() or int(server) // 10000 < MIN_POSTGRES_VERSION:
         raise SystemExit("a PostgreSQL 17 server is required, found " + repr(server))
     try:
@@ -699,6 +802,7 @@ def main():
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--connection-debug", type=float, default=0, metavar="SECONDS")
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
     runtime, failure = None, None
@@ -714,7 +818,12 @@ def main():
         harness = AuditSequenceLegacyHarness(args)
         harness.runtime_binary_sha256 = ops_provenance.sha256_file(args.binary)
         for name in CASES:
-            harness.case(name, getattr(harness, name))
+            try:
+                harness.case(name, getattr(harness, name))
+            except Exception as error:
+                if name == CASES[0]:
+                    harness._diagnose_case(name, error)
+                raise
         success = True
     except SystemExit:
         raise

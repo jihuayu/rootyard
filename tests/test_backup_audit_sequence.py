@@ -307,8 +307,29 @@ class DrillWiringTest(unittest.TestCase):
                       method_source("source_audit_writes_advance_sequence"))
         # The restored PUT is a collaborator.updated too, so it must be part of
         # the saved action set the race prefix is selected with.
-        self.assertIn('["collaborator.added", "collaborator.updated"]',
-                      method_source("source_audit_writes_advance_sequence"))
+        source_case = method_source("source_audit_writes_advance_sequence")
+        self.assertIn('["collaborator.added", "collaborator.updated",\n'
+                      '                              "pull.created", "pull_review.submitted"]', source_case)
+
+    def test_source_forge_writes_are_audited_handlers_only(self):
+        # The source window extends with a real REST PR create and review,
+        # whose handlers do audit; the REST issue create is not among them.
+        body = method_source("source_audit_writes_advance_sequence")
+        self.assertIn('self.document(self.repo_path("/pulls"), 201', body)
+        self.assertIn("self.review_pull(pull[\"number\"], pull[\"head_oid\"])", body)
+        self.assertIn('("pull.created", str(pull["number"]), "alice")', body)
+        self.assertIn('pull_review.submitted', body)
+        handlers = (ROOT / "src/pulls/handlers.rs").read_text()
+        pulls = handlers[handlers.index("pub async fn create_pull("):]
+        pulls = pulls[:pulls.index("pub async fn update_pull(")]
+        self.assertIn('"pull.created"', pulls)
+        reviews = handlers[handlers.index("pub async fn create_review("):]
+        reviews = reviews[:reviews.index("pub async fn list_reviews(")]
+        self.assertIn('"pull_review.submitted"', reviews)
+        # A changes_requested review leaves the source pull's policy path
+        # open for the restored side; the drill never merges it blindly.
+        self.assertIn('def review_pull(self, number, commit_oid, actor="alice", '
+                      'state="changes_requested")', self.source)
         self.assertEqual(drill.new_audit_ids([1, 2], [1, 2, 4], [4], expected=1), [4])
         with self.assertRaisesRegex(AssertionError, "expected 1"):
             drill.new_audit_ids([1], [1, 2, 3], [2, 3], expected=1)
@@ -321,13 +342,39 @@ class DrillWiringTest(unittest.TestCase):
         # Only real API audit writes are allowed to create audit-log rows.
         code = sql_code(self.source)
         self.assertIsNone(re.search(r"INSERT\s+INTO\s+repository_audit_log", code, re.I))
-        # worker-once only drains the outbox consumers; no other CLI command may
-        # settle a push journal or act as the audit writer for this drill.
+        # worker-once only drains the outbox consumers and migrate only applies
+        # the schema fixture; no other CLI command may settle a push journal or
+        # act as the audit writer for this drill.
         cli_args = {ast.unparse(call.args[0]) for call in ast.walk(ast.parse(self.source))
                     if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
                     and call.func.attr == "cli"}
         # backup-verify only re-checks the archive bytes; it settles nothing.
-        self.assertEqual(cli_args, {"'worker-once'", "'backup-verify'"})
+        self.assertEqual(cli_args, {"'migrate'", "'worker-once'", "'backup-verify'"})
+
+    def test_setup_runs_its_own_ordered_fixture_steps(self):
+        # No dynamic copy of the inherited setup: the drill's own steps run in
+        # the order the service needs them, against the live service only.
+        body = method_source("setup")
+        steps = ['self.cli("migrate")',
+                 'self.alice = self.account("create-user", "alice")',
+                 'self.bob = self.account("create-user", "bob")',
+                 'self.reader = self.account("create-token", "alice", "--read-only")',
+                 'self.revoked = self.account("create-token", "alice")',
+                 "self.start()", "self.api()", "self.roundtrip()",
+                 "assert self.backup_command(check=False).returncode != 0",
+                 "assert not self.backup.exists()",
+                 "self.sequence = self.audit_writer(self.db)"]
+        positions = [body.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions), steps)
+        self.assertNotIn("super().setup()", body)
+        self.assertNotIn("self.stop()", body, "collaborator grants must follow a live service")
+        # A settled source: no SQL-seeded unknown repository, operation or
+        # journal is created, and nothing is compiled or exec'd.
+        self.assertNotIn("INSERT INTO", body)
+        self.assertIn('WHERE outcome=\'unknown\'") == "0"', body)
+        self.assertNotIn("exec(", self.source)
+        self.assertNotIn("inspect", self.source)
+        self.assertNotIn("SEED_", self.source)
 
     def test_control_is_labelled_missing_default_not_the_legacy_algorithm(self):
         body = method_source("missing_default_control_has_no_sequence")
@@ -348,6 +395,16 @@ class DrillWiringTest(unittest.TestCase):
         self.assertIn("raise SystemExit", self.source)
         self.assertIn("SHOW server_version_num", self.source)
         self.assertIn("source_bound_binary.bind(", self.source)
+
+    def test_restore_server_is_passed_explicitly(self):
+        # The harness must hand the restore its own server: with the key unset
+        # the CLI inherits the source database and restores into it.
+        self.assertIn('self.env["ROOTYARD_RESTORE_TEST_DATABASE_URL"] = self.restore_admin',
+                      self.source)
+        # Startup/push/merge all run with the harness env: the merge's route
+        # lookup for the restored shard must not run without the key.
+        self.assertIn('self.env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))',
+                      method_source("offline_backup_and_fresh_database_restore"))
 
     def test_drill_stays_on_the_format21_gitfs_family(self):
         self.assertNotIn("serve-blob", self.source)
@@ -421,8 +478,11 @@ class PartialConstructionCleanupTest(unittest.TestCase):
                 databases_by_admin.get(admin, set()).discard(name)
             return ""
 
+        # The drill re-declares query() to pass -h/-p explicitly, so that
+        # binding is stubbed too or construction would reach psql.
         with mock.patch.object(backup.Harness, "__init__", fake_init), \
                 mock.patch.object(backup.BackupHarness, "query", fake_query), \
+                mock.patch.object(drill.AuditSequenceLegacyHarness, "query", fake_query), \
                 mock.patch.dict("os.environ", {"ROOTYARD_RESTORE_TEST_DATABASE_URL": failing_admin}):
             try:
                 drill.AuditSequenceLegacyHarness(args)
