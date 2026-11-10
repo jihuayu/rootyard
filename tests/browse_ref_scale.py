@@ -355,7 +355,7 @@ def verify_ref_scale(harness):
             large_heads = _check_page(harness, "limit=1&prefix=refs/heads/", heads[0])
             large_starts = _starts(log) - before
             before = _starts(log)
-            walk = _walk(harness, large_expected)
+            walk = _walk(harness, expected_large)
             walk_starts = _starts(log) - before
             assert walk_starts > 0, "walk never started for-each-ref through the wrapper"
         finally:
