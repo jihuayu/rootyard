@@ -71,7 +71,6 @@ fn every_tombstone_row_of_a_key_must_be_the_single_legal_release_fence() {
     // A released root whose only tombstone binds another register digest stays a
     // mismatch of the fence itself.
     let mut bound = valid.clone();
-    bound.tombstones =
-        vec![RootTombstone { expected_register_digest: sha(0x34), ..base_tombstone() }];
+    bound.tombstones = vec![RootTombstone { expected_register_digest: sha(0x34), ..base_tombstone() }];
     assert_root_refused(&bound.violations(), "root_tombstone_mismatch", "register_digest");
 }
