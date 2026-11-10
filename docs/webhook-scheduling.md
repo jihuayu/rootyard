@@ -132,8 +132,9 @@ operation; it does not become the background scheduler.
 is exactly one label-free series. Each scrape evaluates, with the database clock
 (`statement_timestamp()`), the age of the oldest `forge_webhook_deliveries`
 row joined to `forge_webhooks` whose hook is active and whose state is
-`pending`, `failed` or `leased`. Retry-delayed `failed` rows and live `leased`
-rows are part of the scheduler's outstanding work and therefore count;
+`pending`, `failed` or `leased`. Retry-delayed `failed` rows and all still-leased rows,
+including expired leases awaiting reclaim, remain part of the scheduler's
+outstanding work and therefore count;
 `delivered`, `dead_letter` and inactive hooks are excluded. The value is clamped
 at zero and is zero for an empty set. It never reads `event_deliveries` or
 `outbox_events` and carries no hook, repository or tenant label. A failed SQL

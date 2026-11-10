@@ -96,7 +96,7 @@ pub fn router(
 // expiry is already past, so an unexpired session is never the "oldest expired"
 // sample, an empty set reports zero and the database clock is authoritative.
 // The webhook age likewise joins deliveries to their hook and measures only an
-// active hook's pending, retry-delayed failed and live leased rows.
+// For active hooks it includes pending rows, retry-delayed failures, and all leased rows, including expired leases awaiting reclaim.
 const SNAPSHOT_SQL: &str = r#"
 SELECT
  (SELECT count(*) FROM repositories WHERE state='provisioning'),
@@ -319,7 +319,7 @@ fn render(
         gauge(
             &mut output,
             "rootyard_webhook_delivery_oldest_age_seconds",
-            "Database-clock age since creation of the oldest outstanding webhook delivery on an active hook in pending, failed or leased state, retry delays and live leases included; delivered, dead_letter and inactive hooks are excluded and an empty set reports 0.",
+            "Database-clock age since creation of the oldest outstanding webhook delivery on an active hook in pending, failed or leased state. Includes retry-delayed failures and every row still in leased state, even an expired lease awaiting reclaim; delivered, dead_letter and inactive hooks are excluded, and an empty set reports 0.",
             s.webhook_delivery_age,
         );
         gauge(

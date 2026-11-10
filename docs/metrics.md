@@ -30,7 +30,7 @@ labels. Database strings are never interpolated into exposition.
 | `rootyard_operations_unresolved` | gauge | Unknown operations with no corresponding explicit resolution |
 | `rootyard_event_deliveries{state="pending\|leased"}` | gauge | Durable outstanding deliveries, summed across fixed consumers |
 | `rootyard_event_delivery_oldest_age_seconds` | gauge | Age since event creation of oldest undelivered event |
-| `rootyard_webhook_delivery_oldest_age_seconds` | gauge | Database-clock age since creation of the oldest outstanding webhook delivery on an active hook in state `pending`, `failed` or `leased`; retry-delayed `failed` and live `leased` rows count, while `delivered`, `dead_letter` and inactive hooks are excluded; an empty set reports 0 |
+| `rootyard_webhook_delivery_oldest_age_seconds` | gauge | Database-clock age since creation of the oldest outstanding webhook delivery on an active hook in state `pending`, `failed` or `leased`; retry-delayed `failed` and leased rows, including expired/reclaimable leases, count, while `delivered`, `dead_letter` and inactive hooks are excluded; an empty set reports 0 |
 | `rootyard_provisioning_backlog` | gauge | All provisioning rows, including delayed retries |
 | `rootyard_provisioning_due` | gauge | Provisioning rows whose retry time has arrived |
 | `rootyard_provisioning_oldest_age_seconds` | gauge | Age of oldest provisioning row |
@@ -59,7 +59,8 @@ The webhook delivery age is label-free and comes only from
 `forge_webhook_deliveries` joined to `forge_webhooks`; it never uses
 `event_deliveries` or `outbox_events`. Its age is
 `statement_timestamp() - min(created_at)`, clamped at zero, so a retry-delayed
-`failed` row or a live `leased` row is counted under its original creation time,
+`failed` row or any row still in `leased` state, including an expired lease
+awaiting reclaim, is counted under its original creation time,
 while terminal rows and rows of inactive hooks
 never move it. No hook ID, URL or secret is exported.
 A resolved unknown operation remains an unknown historical fact; its explicit
