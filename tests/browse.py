@@ -11,6 +11,7 @@ import shlex
 import shutil
 from pathlib import Path
 import sys
+import time
 import uuid
 import urllib.parse
 
@@ -30,6 +31,8 @@ CASE_NAMES = (
     "commits_and_pagination",
     "tree_and_blob",
     "compare_revisions",
+    "list_commits_deadline",
+    "compare_commits_deadline",
     "ref_transactions_atomic_cas",
     "idempotency_and_concurrency",
     "access_and_fences",
@@ -238,6 +241,264 @@ class BrowseHarness(Harness):
 
     def repo_api(self, suffix="", repo="demo", owner="alice"):
         return f"/api/repos/{owner}/{repo}{suffix}"
+
+    @staticmethod
+    def _deadline_wrapper_script(native_git, marker, log):
+        return (
+            "#!/bin/sh\n"
+            "cmd=''\n"
+            'for arg in "$@"; do\n'
+            '  case "$arg" in\n'
+            '    rev-parse|rev-list|cat-file) cmd="$arg"; break ;;\n'
+            "  esac\n"
+            "done\n"
+            'if [ -n "$cmd" ] && [ -f ' + shlex.quote(str(marker)) + " ]; then\n"
+            "  pid=$$\n"
+            '  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d " ")\n'
+            "  printf '{\"cmd\":\"%s\",\"pid\":%s,\"pgid\":%s,\"timestamp\":%s}\\n' "
+            '"$cmd" "$pid" "${pgid:-$pid}" "$(date +%s%N)" >> '
+            + shlex.quote(str(log))
+            + "\n"
+            "  sleep 0.7\n"
+            "fi\n"
+            "exec " + shlex.quote(str(native_git)) + ' "$@"\n'
+        )
+
+    @contextmanager
+    def _deadline_git_service(self):
+        """Run one case with a transparent, marker-armed slow Git wrapper."""
+        keys = (
+            "ROOTYARD_GIT",
+            "ROOTYARD_GIT_TIMEOUT_SECONDS",
+            "ROOTYARD_MAX_CONCURRENT_GIT",
+        )
+        saved = {key: self.env.get(key) for key in keys}
+        marker = self.root / "browse-deadline-arm"
+        log = self.root / "browse-deadline-git.jsonl"
+        wrapper = self.root / "browse-deadline-git-wrapper"
+        wrapper.write_text(self._deadline_wrapper_script(self.native_git, marker, log))
+        wrapper.chmod(0o700)
+        for path in (marker, log):
+            path.unlink(missing_ok=True)
+        self.stop()
+        self.env["ROOTYARD_GIT"] = str(wrapper)
+        self.env["ROOTYARD_GIT_TIMEOUT_SECONDS"] = "2"
+        self.env["ROOTYARD_MAX_CONCURRENT_GIT"] = "1"
+        try:
+            self.start()
+            yield marker, log
+        finally:
+            marker.unlink(missing_ok=True)
+            self.stop()
+            for key, value in saved.items():
+                if value is None:
+                    self.env.pop(key, None)
+                else:
+                    self.env[key] = value
+            self.start()
+
+    @staticmethod
+    def _deadline_git_events(log):
+        try:
+            lines = log.read_text().splitlines()
+        except FileNotFoundError:
+            return []
+        events = []
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return events
+
+    def _wait_deadline_git_start(self, log, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            events = self._deadline_git_events(log)
+            if events:
+                return events
+            time.sleep(0.02)
+        raise AssertionError("armed Git wrapper never recorded a delayed start")
+
+    @staticmethod
+    def _parse_proc_stat(text):
+        """Return `(state, pgrp)` from `/proc/<pid>/stat`, or None if malformed.
+
+        `comm` is parenthesized and may itself contain spaces or `)`, so the
+        fields are read after the last `)` exactly as the kernel formats them.
+        """
+        end = text.rfind(")")
+        if end < 0:
+            return None
+        fields = text[end + 1:].split()
+        if len(fields) < 3:
+            return None
+        try:
+            return fields[0], int(fields[2])
+        except ValueError:
+            return None
+
+    @classmethod
+    def _live_group_members(cls, pgid, proc_root="/proc"):
+        """Processes still executing in `pgid`.
+
+        A group is quiescent exactly when no member is in a state other than
+        Z (zombie) or X (dead), matching the service's own group_quiescent.
+        Z/X members are already dead: they may be reaped by PID 1 later and
+        must not fail cleanup.  A process or exit file that disappears while
+        read is gone, never live.  Any other error is reported as itself,
+        because an unreadable `/proc` proves nothing about the group.
+        """
+        live = []
+        for entry in os.listdir(proc_root):
+            if not entry.isdigit():
+                continue
+            pid_dir = os.path.join(proc_root, entry)
+            try:
+                with open(os.path.join(pid_dir, "stat")) as handle:
+                    parsed = cls._parse_proc_stat(handle.read())
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise AssertionError(
+                    "cannot read " + os.path.join(pid_dir, "stat")
+                    + ": " + type(error).__name__
+                ) from None
+            if parsed is None or parsed[1] != pgid:
+                continue
+            if parsed[0] not in ("Z", "X"):
+                live.append(int(entry))
+        return sorted(live)
+
+    @staticmethod
+    def _wait_for_deadline_git_cleanup(events, timeout=15):
+        pending = {
+            int(event["pgid"])
+            for event in events
+            if isinstance(event.get("pgid"), int) and event["pgid"] > 0
+        }
+        deadline = time.monotonic() + timeout
+        while pending and time.monotonic() < deadline:
+            for pgid in tuple(pending):
+                if not BrowseHarness._live_group_members(pgid):
+                    pending.discard(pgid)
+            if pending:
+                time.sleep(0.05)
+        assert not pending, (
+            "delayed Git process group(s) still have live members after cleanup: "
+            + repr({pgid: BrowseHarness._live_group_members(pgid) for pgid in sorted(pending)})
+        )
+
+    def _deadline_probe(self, path, verify):
+        with self._deadline_git_service() as (marker, log):
+            status, _, _ = self.http("/health/ready")
+            assert status == 200, status
+            assert not self._deadline_git_events(log), (
+                "health check executed Git before the wrapper was armed"
+            )
+
+            marker.touch()
+            health_started = time.monotonic()
+            status, _, _ = self.http("/health/ready")
+            health_seconds = time.monotonic() - health_started
+            assert status == 200, status
+            assert health_seconds < 1.5, health_seconds
+            assert not self._deadline_git_events(log), (
+                "armed health check executed the delayed Git wrapper"
+            )
+
+            started = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                slow = pool.submit(self.document, path, 504)
+                self._wait_deadline_git_start(log)
+                busy_status, busy_body, _ = self.http(path, token=self.alice)
+                assert busy_status == 503, (
+                    "second request while the first Git slot is held: expected "
+                    "503, got " + repr(busy_status) + ": " + repr(busy_body[:300])
+                )
+                assert b"capacity" in busy_body.lower(), busy_body[:300]
+                slow.result(timeout=20)
+            slow_seconds = time.monotonic() - started
+            assert slow_seconds >= 1.8, (
+                "deadline response was too quick to follow a serial Git chain: "
+                + repr(round(slow_seconds, 3))
+            )
+
+            recorded_events = self._deadline_git_events(log)
+            recorded = len(recorded_events)
+            # Two distinct child starts in series already prove the per-command
+            # timeout (2s) cannot be the whole bound: each child is delayed
+            # only 0.7s, so a 504 returned after a second child began had to
+            # come from a deadline shared by the chain, not from any child's
+            # own timeout.  A slow CI may spend much of the 2s budget on
+            # auth/lease/snapshot work and start fewer than three children;
+            # the shared-budget proof must not require a third start.
+            assert recorded >= 2, recorded_events
+            assert len({int(event["pid"]) for event in recorded_events}) == recorded, recorded_events
+            # Each Git command is its own process-group leader (setpgid(0, 0)) in
+            # a fresh group, and the chain runs them one after another, so the
+            # PGIDs must be distinct, not shared.
+            assert all(int(event["pid"]) == int(event["pgid"]) for event in recorded_events), recorded_events
+            assert len({int(event["pgid"]) for event in recorded_events}) == recorded, recorded_events
+            time.sleep(0.75)
+            assert len(self._deadline_git_events(log)) == recorded, (
+                "a Git step started after the request deadline"
+            )
+
+            cleanup_started = time.monotonic()
+            self._wait_for_deadline_git_cleanup(recorded_events)
+            cleanup_seconds = time.monotonic() - cleanup_started
+
+            marker.unlink()
+            normal = self.document(path, 200)
+            verify(normal)
+            assert len(self._deadline_git_events(log)) == recorded, (
+                "disarmed wrapper still delayed a Git step"
+            )
+            return {
+                "slow_status": 504,
+                "slot_busy_status": 503,
+                "normal_status": 200,
+                "slow_seconds": round(slow_seconds, 3),
+                "health_seconds": round(health_seconds, 3),
+                "cleanup_seconds": round(cleanup_seconds, 3),
+                "delayed_git_starts": recorded,
+                "delayed_git_pids": sorted({int(event["pid"]) for event in recorded_events}),
+                "delayed_git_pgids": sorted({int(event["pgid"]) for event in recorded_events}),
+            }
+
+    def list_commits_deadline(self):
+        path = self.repo_api("/commits?rev=refs/heads/feature&limit=20")
+
+        def verify(page):
+            assert [item["oid"] for item in page["items"]] == [
+                self.feature_oid,
+                self.third,
+                self.second,
+                self.first,
+            ], page
+
+        return self._deadline_probe(path, verify)
+
+    def compare_commits_deadline(self):
+        path = self.repo_api(f"/compare?base={self.first}&head={self.third}")
+
+        def verify(comparison):
+            assert comparison["base_oid"] == self.first
+            assert comparison["head_oid"] == self.third
+            assert comparison["merge_base_oid"] == self.first
+            assert comparison["ahead"] == 2
+            assert comparison["behind"] == 0
+            assert comparison["fast_forward"] is True
+            assert [item["oid"] for item in comparison["commits"]] == [
+                self.third,
+                self.second,
+            ]
+            assert "src/lib.rs" in comparison["diff"]
+
+        return self._deadline_probe(path, verify)
 
     def setup_repos(self):
         super().setup()
