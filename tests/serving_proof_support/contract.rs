@@ -47,7 +47,7 @@ use super::PgPackSnapshotMaterializer;
 use crate::blob_store::config::BlobProfile;
 use crate::blob_store::opendal::BlobStore;
 use crate::blob_store::protected::{ProtectedPublication, ProtectedUploader, UploadSource};
-use crate::blob_store::{BlobProvider, ContentDigestBytes};
+use crate::blob_store::BlobProvider;
 use crate::ref_store::artifact_hold::{
     AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldPurpose, ArtifactSpec, HoldScope, PgArtifactHoldStore,
 };
@@ -346,7 +346,8 @@ async fn commit_first_pack(
 
 async fn register(fixture: &Fixture, plan: &PackCommitPlan, publication: &ProtectedPublication) -> Result<()> {
     let mut client = fixture.pool.get().await?;
-    let request = PackRegistrationRequest::new(plan, publication)?;
+    ensure!(plan.packs().len() == 1, "this fixture registers exactly one planned pack");
+    let request = PackRegistrationRequest::new(plan, plan.packs()[0].pack_id(), publication)?;
     PgPackCommit.register_publication(&mut client, request, operation_deadline()).await?;
     Ok(())
 }
@@ -404,7 +405,7 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
             ensure!(!capture.is_empty(), "a pack_verified gate with one registered pack must not capture as empty");
             let (snapshot, binding) = capture.registered_parts()?;
             let a5a = probe_a5a(&snapshot);
-            Ok::<_, anyhow::Error>(Result::<_, anyhow::Error>::Ok((binding, a5a)))
+            Ok::<_, anyhow::Error>((binding, a5a))
         })();
         let outcome = async {
             let (binding, a5a) = prepared?;
