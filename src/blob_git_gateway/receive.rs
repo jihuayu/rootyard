@@ -273,6 +273,13 @@ fn terminal_response(
 /// same `x-rootyard-operation` so the client resolves that exact operation.
 const COMMITTED_SESSION_UNAVAILABLE: &str = "push committed but its repository session could not be issued; resolve this same operation and retry against the authoritative store";
 
+/// Collapse any failure after the commit into the single generic retryable
+/// [`COMMITTED_SESSION_UNAVAILABLE`]: the final lookup's own differentiated
+/// error, a proof refusal, an issue refusal and the outer timeout all map here.
+fn refused<E>(_: E) -> GatewayError {
+    GatewayError::Unavailable(COMMITTED_SESSION_UNAVAILABLE)
+}
+
 /// Render the `report-status` of a durable terminal that is already fully
 /// encoded into `body` (no session/DB work happens here, so a replayed or
 /// freshly committed terminal that is *not* committed stays token-free).
@@ -305,20 +312,14 @@ async fn committed_response(
     let issue = async {
         let final_lookup = lookup(state.pool(), identity, owner, name, true, state.store().backend_identity(), deadline)
             .await
-            .map_err(GatewayError::from)?;
+            .map_err(refused)?;
         let proof = CommittedWriteSessionProof::new(terminal, authorized, &final_lookup).map_err(refused)?;
         let issued = tokens.issue_from_committed_write(&proof).map_err(refused)?;
         Ok::<_, GatewayError>(issued)
     };
-    let issued = tokio::time::timeout_at(deadline, issue)
-        .await
-        .map_err(|_| GatewayError::Unavailable(COMMITTED_SESSION_UNAVAILABLE))??;
+    let issued = tokio::time::timeout_at(deadline, issue).await.map_err(refused)??;
     issued.apply(&mut response);
     Ok(response)
-}
-
-fn refused(_: SessionTokenError) -> GatewayError {
-    GatewayError::Unavailable(COMMITTED_SESSION_UNAVAILABLE)
 }
 
 /// Git wire reason literals; fixed text only, never a SQL/native message.

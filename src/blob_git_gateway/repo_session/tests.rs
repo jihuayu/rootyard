@@ -496,7 +496,19 @@ mod committed_write {
         let tokens = SessionTokens::new(codec(&[(0, key(3))], 0));
         let first = serving(0, 4, 40, 20, 20);
         let terminal = committed(20, 5);
-        assert_eq!(admit(&terminal, &first, &first).expect("exact").revision, 5);
+        // The final lookup must be exactly at the terminal's gate revision: a
+        // final gate behind it cannot admit the terminal, even though the
+        // initial (authorizing) lookup at revision 4 is fine.
+        assert_eq!(admit(&terminal, &first, &first).err(), Some(SessionTokenError::Invalid));
+        let exact = serving(0, 5, 40, 20, 20);
+        let proof = admit(&terminal, &first, &exact).expect("exact");
+        assert_eq!(proof.revision, 5);
+        let issued = tokens.issue_from_committed_write(&proof).expect("issue");
+        assert_eq!(issued.revision(), 5);
+        let live = SessionRealm::of_serving(&exact).expect("realm");
+        let presented = header(issued.token());
+        let presented: Presented<'_> = presented_for_test(&presented).expect("presented");
+        assert_eq!(tokens.verify(&presented, &live, 5), Ok(Some(VersionComparison::Satisfied { bound: 5 })));
 
         // A concurrent higher revision in the same realm is acceptable, but the
         // bound stays the durable terminal revision, never the live one.
