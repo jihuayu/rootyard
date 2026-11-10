@@ -83,8 +83,8 @@ pub(super) async fn blob_by_oid(
 /// The pipeline is fixed and mirrored from [`read_tree`]: authenticate the
 /// current token, take the gateway slot and byte lease (released with the
 /// response body), resolve the repository through the shared serving
-/// authority, score a presented session lower bound after that authorization,
-/// capture the RefStore ref view under the authorized cluster incarnation,
+/// authority, capture the RefStore ref view under the authorized cluster
+/// incarnation, score any session lower bound against that captured revision,
 /// build its computed view, then require the captured realm to still match.
 /// `finish` runs the second authorization revalidation right before the
 /// response is encoded.
@@ -123,11 +123,11 @@ impl BrowseSession {
         let serving = lookup(state.pool(), &actor, &owner, &name, false, state.store().backend_identity(), deadline)
             .await
             .map_err(authority_error)?;
-        // Only after authorization: the one place an incoming session lower
-        // bound is scored, against this lookup's realm and gate revision.
-        read_session::admit(state.sessions(), &headers, &serving)?;
+        // Only after authorization: capture, then score any session lower
+        // bound against the captured revision before any materialization.
         let authorization = read_authorization(state.clone(), &actor, &serving);
-        let refs = read_session::capture(&state, &serving, deadline).await?;
+        read_session::admit(state.sessions(), &headers, &serving)?;
+        let refs = read_session::capture(&state, &headers, &serving, deadline).await?;
         let view = snapshot::build_view(&state, &refs, deadline).await?;
         authorization.revalidate(deadline).await?;
         Ok(Self {
@@ -203,11 +203,11 @@ async fn read_tree(
     let serving = lookup(state.pool(), &actor, &owner, &name, false, state.store().backend_identity(), deadline)
         .await
         .map_err(authority_error)?;
-    // Only after authorization: the one place an incoming session lower
-    // bound is scored, against this lookup's realm and gate revision.
-    read_session::admit(state.sessions(), &headers, &serving)?;
+    // Only after authorization: capture, then score any session lower bound
+    // against the captured revision before any materialization.
     let authorization = read_authorization(state.clone(), &actor, &serving);
-    let refs = read_session::capture(&state, &serving, deadline).await?;
+    read_session::admit(state.sessions(), &headers, &serving)?;
+    let refs = read_session::capture(&state, &headers, &serving, deadline).await?;
     let spec = captured_revision(&refs, spec)?;
     let view = snapshot::build_view(&state, &refs, deadline).await?;
     authorization.revalidate(deadline).await?;
@@ -248,11 +248,11 @@ async fn read_blob(
     let serving = lookup(state.pool(), &actor, &owner, &name, false, state.store().backend_identity(), deadline)
         .await
         .map_err(authority_error)?;
-    // Only after authorization: the one place an incoming session lower
-    // bound is scored, against this lookup's realm and gate revision.
-    read_session::admit(state.sessions(), &headers, &serving)?;
+    // Only after authorization: capture, then score any session lower bound
+    // against the captured revision before any materialization.
     let authorization = read_authorization(state.clone(), &actor, &serving);
-    let refs = read_session::capture(&state, &serving, deadline).await?;
+    read_session::admit(state.sessions(), &headers, &serving)?;
+    let refs = read_session::capture(&state, &headers, &serving, deadline).await?;
     let spec = captured_revision(&refs, spec)?;
     let view = snapshot::build_view(&state, &refs, deadline).await?;
     authorization.revalidate(deadline).await?;

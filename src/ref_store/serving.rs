@@ -171,7 +171,12 @@ fn commit_unknown_error() -> Error {
 
 fn map_refstore(error: RefStoreError) -> Error {
     match error {
-        RefStoreError::Timeout => deadline_error(),
+        // A timed-out or `NOWAIT`-contended lock wrote nothing: the generic
+        // retryable service error (never SQLSTATE).
+        RefStoreError::Timeout => Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ref-store authority is busy or the deadline expired; retry the same request",
+        ),
         RefStoreError::CommitUnknown { .. } | RefStoreError::MetadataCommitUnknown { .. } => commit_unknown_error(),
         RefStoreError::GateConflict
         | RefStoreError::DigestConflict
@@ -516,11 +521,16 @@ pub(crate) async fn lookup_in_tx(
     let (min_role, action) =
         if writable { (Role::Write, RepoAction::ContentsWrite) } else { (Role::Read, RepoAction::ContentsRead) };
     let access = auth::authorize_repo_with_role(tx, actor, owner, name, min_role, action).await?;
-    // Only an authorized caller reads the restore incarnation. It is read in
-    // this same narrow read-only transaction before any repository/scope/gate
-    // row, stays inside it, and is nil-free. (`LockedScope::lock` takes its own
-    // short read-only transaction, exactly as the capture does.)
-    let cluster_incarnation = read_cluster_incarnation(tx).await.map_err(map_refstore)?;
+    // Only an authorized caller reads the restore incarnation, as the first
+    // shared-lock statement after auth and inside this same read-only `tx`
+    // (every later read, including `LockedScope::lock`, reuses it; none opens
+    // another transaction). `NOWAIT` is required: auth already holds
+    // tokens/users/repository `FOR SHARE` and `backup::authority::fence` updates
+    // the cluster row before its token rows, so a *blocking* cluster
+    // `FOR SHARE` here could deadlock (token->cluster vs cluster->token). A
+    // contended lock is the generic retryable service error, never an
+    // incarnation or SQLSTATE.
+    let cluster_incarnation = read_cluster_incarnation_nowait(tx).await.map_err(map_refstore)?;
     // The tenant identity is the owner namespace resolved by that
     // authorization, never the actor id.
     let scope =
@@ -544,15 +554,21 @@ pub(crate) async fn lookup_in_tx(
     Ok(ServingRepository { repository, gate, cluster_incarnation })
 }
 
-/// Read the global restore incarnation (migration 085) in the caller's
-/// already-authorized transaction. Exactly one non-nil singleton row is
-/// required; anything else is a typed store failure, never an empty anchor.
-async fn read_cluster_incarnation(tx: &Transaction<'_>) -> Result<Uuid, RefStoreError> {
-    let row = tx
-        .query_opt("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
+/// Lock and read the global restore incarnation (migration 085) `FOR SHARE NOWAIT`
+/// in the caller's already-authorized transaction. Exactly one non-nil
+/// singleton row is required; anything else is a typed store failure, never an
+/// empty anchor.
+async fn read_cluster_incarnation_nowait(tx: &Transaction<'_>) -> Result<Uuid, RefStoreError> {
+    let rows = tx
+        .query("SELECT incarnation FROM public.cluster_authority WHERE singleton=true FOR SHARE NOWAIT", &[])
         .await
-        .map_err(crate::ref_store::pg::db_error)?
-        .ok_or_else(|| RefStoreError::Database("cluster authority singleton row is missing".into()))?;
+        .map_err(crate::ref_store::pg::db_error)?;
+    let [row] = rows.as_slice() else {
+        return Err(RefStoreError::Database(format!(
+            "cluster authority has {} singleton incarnation rows, expected exactly one",
+            rows.len()
+        )));
+    };
     let incarnation: Uuid = row
         .try_get(0)
         .map_err(|_| RefStoreError::Database("cluster authority row has no uuid incarnation".into()))?;
@@ -622,7 +638,8 @@ mod tests {
 
     #[test]
     fn refstore_errors_map_to_retryable_or_terminal_statuses() {
-        assert_eq!(map_refstore(RefStoreError::Timeout).0, StatusCode::GATEWAY_TIMEOUT);
+        // Timeout also covers a `FOR SHARE NOWAIT` contention: both retry.
+        assert_eq!(map_refstore(RefStoreError::Timeout).0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             map_refstore(RefStoreError::CommitUnknown { repository_id: Uuid::new_v4(), operation_id: None }).0,
             StatusCode::SERVICE_UNAVAILABLE
