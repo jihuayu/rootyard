@@ -323,6 +323,56 @@ class BrowseHarness(Harness):
         raise AssertionError("armed Git wrapper never recorded a delayed start")
 
     @staticmethod
+    def _parse_proc_stat(text):
+        """Return `(state, pgrp)` from `/proc/<pid>/stat`, or None if malformed.
+
+        `comm` is parenthesized and may itself contain spaces or `)`, so the
+        fields are read after the last `)` exactly as the kernel formats them.
+        """
+        end = text.rfind(")")
+        if end < 0:
+            return None
+        fields = text[end + 1:].split()
+        if len(fields) < 3:
+            return None
+        try:
+            return fields[0], int(fields[2])
+        except ValueError:
+            return None
+
+    @classmethod
+    def _live_group_members(cls, pgid, proc_root="/proc"):
+        """Processes still executing in `pgid`.
+
+        A group is quiescent exactly when no member is in a state other than
+        Z (zombie) or X (dead), matching the service's own group_quiescent.
+        Z/X members are already dead: they may be reaped by PID 1 later and
+        must not fail cleanup.  A process or exit file that disappears while
+        read is gone, never live.  Any other error is reported as itself,
+        because an unreadable `/proc` proves nothing about the group.
+        """
+        live = []
+        for entry in os.listdir(proc_root):
+            if not entry.isdigit():
+                continue
+            pid_dir = os.path.join(proc_root, entry)
+            try:
+                with open(os.path.join(pid_dir, "stat")) as handle:
+                    parsed = cls._parse_proc_stat(handle.read())
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise AssertionError(
+                    "cannot read " + os.path.join(pid_dir, "stat")
+                    + ": " + type(error).__name__
+                ) from None
+            if parsed is None or parsed[1] != pgid:
+                continue
+            if parsed[0] not in ("Z", "X"):
+                live.append(int(entry))
+        return sorted(live)
+
+    @staticmethod
     def _wait_for_deadline_git_cleanup(events, timeout=15):
         pending = {
             int(event["pgid"])
@@ -332,17 +382,13 @@ class BrowseHarness(Harness):
         deadline = time.monotonic() + timeout
         while pending and time.monotonic() < deadline:
             for pgid in tuple(pending):
-                try:
-                    os.killpg(pgid, 0)
-                except ProcessLookupError:
+                if not BrowseHarness._live_group_members(pgid):
                     pending.discard(pgid)
-                except PermissionError:
-                    pass
             if pending:
                 time.sleep(0.05)
         assert not pending, (
-            "delayed Git process group(s) still alive after cleanup: "
-            + repr(sorted(pending))
+            "delayed Git process group(s) still have live members after cleanup: "
+            + repr({pgid: BrowseHarness._live_group_members(pgid) for pgid in sorted(pending)})
         )
 
     def _deadline_probe(self, path, verify):
