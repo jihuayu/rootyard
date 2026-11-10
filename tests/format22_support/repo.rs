@@ -162,9 +162,22 @@ pub async fn decided_pair(
         .select(&db.pool, *prepared, actor, mode, deadline())
         .await
         .map_err(|error| anyhow!("authorized select refused ({}): {error:?}", error.code()))?;
+    // Diagnostic only: counts and the all-rejected flag on the failing path.
+    // `AuthorizedSelection` keeps its sealed decision private, so per-ref
+    // verdicts (name + shared reason + bounded detail) are not reachable here and
+    // no free-form string from any other source may stand in for them.
+    let selection_state = || {
+        format!(
+            "accepted={} planned={} all_rejected={}",
+            selection.accepted_refs(),
+            selection.planned_refs(),
+            selection.is_all_rejected()
+        )
+    };
     ensure!(
         selection.accepted_refs() == draft.plan.refs().len() && !selection.is_all_rejected(),
-        "the decision did not accept every planned ref"
+        "the decision did not accept every planned ref: {}",
+        selection_state()
     );
     let verified = authorized
         .verify(selection, deadline())
