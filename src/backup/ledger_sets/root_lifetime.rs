@@ -38,14 +38,8 @@ pub(super) fn check_heads(
     for head in heads {
         let key = (head.repository_id, head.root_id);
         let at = format!("{}:{}", key.0, key.1);
-        let scope = |tenant: Uuid, owner: Uuid, purpose: &str, intent: &str| {
-            tenant == head.tenant_id
-                && owner == head.owner_id
-                && purpose == head.purpose
-                && intent == head.business_intent_digest
-        };
         let rows = tombstones.iter().filter(|t| by_key(t) == key).collect::<Vec<_>>();
-        let fence = rows.iter().any(|t| release_fence(t, head, &scope));
+        let fence = rows.iter().any(|t| release_fence(t, head));
         // Existence is decided by the key alone: a capture that is present but
         // carries another scope, owner or register digest is a violation, never a
         // release-before-register. Only a key with no capture row at all may be
@@ -54,7 +48,13 @@ pub(super) fn check_heads(
         let capture = captures.get(&key).copied();
         let valid = capture.is_some_and(|capture| {
             capture.generation == 1
-                && scope(capture.tenant_id, capture.owner_id, &head.purpose, &head.business_intent_digest)
+                && same_scope(
+                    head,
+                    capture.tenant_id,
+                    capture.owner_id,
+                    &capture.purpose,
+                    &capture.business_intent_digest,
+                )
                 && capture.register_digest == head.register_digest
                 && source_owner(capture, declared).is_some()
         });
@@ -106,16 +106,10 @@ pub(super) fn check_heads(
     for head in heads {
         let key = (head.repository_id, head.root_id);
         let at = format!("{}:{}", key.0, key.1);
-        let scope = |tenant: Uuid, owner: Uuid, purpose: &str, intent: &str| {
-            tenant == head.tenant_id
-                && owner == head.owner_id
-                && purpose == head.purpose
-                && intent == head.business_intent_digest
-        };
         let rows = tombstones.iter().filter(|t| by_key(t) == key).collect::<Vec<_>>();
         let shape = |t: &RootTombstone| {
             t.generation == 2
-                && scope(t.tenant_id, t.owner_id, &t.purpose, &t.business_intent_digest)
+                && same_scope(head, t.tenant_id, t.owner_id, &t.purpose, &t.business_intent_digest)
                 && canonical_digest(&t.release_digest)
         };
         let lifetime = match (head.state.as_str(), head.last_generation) {
@@ -132,7 +126,9 @@ pub(super) fn check_heads(
             (Lifecycle::Released, [row]) if !shape(row) => {
                 lines.push(format!("root_head_mismatch:{at}:tombstone_mismatch"));
             }
-            (Lifecycle::Released, [row]) if !release_fence(row, head, &scope) => {
+            // A release digest is already canonical above, so only the bound
+            // register digest can still disagree here.
+            (Lifecycle::Released, [row]) if row.expected_register_digest != head.register_digest => {
                 lines.push(format!("root_tombstone_mismatch:{at}:register_digest"));
             }
             (Lifecycle::Released, [_]) => {}
@@ -163,12 +159,27 @@ fn canonical_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Whether a row's own full scope (tenant, producer owner, purpose and business
+/// intent digest) is exactly the head's.
+fn same_scope(head: &RootHead, tenant: Uuid, owner: Uuid, purpose: &str, intent: &str) -> bool {
+    tenant == head.tenant_id
+        && owner == head.owner_id
+        && purpose == head.purpose
+        && intent == head.business_intent_digest
+}
+
 /// One generation-2 release tombstone that fences exactly this head's scope and
 /// its bound register digest.
-fn release_fence(tombstone: &RootTombstone, head: &RootHead, scope: &impl Fn(Uuid, Uuid, &str, &str) -> bool) -> bool {
+fn release_fence(tombstone: &RootTombstone, head: &RootHead) -> bool {
     tombstone.generation == 2
         && tombstone.expected_register_digest == head.register_digest
-        && scope(tombstone.tenant_id, tombstone.owner_id, &tombstone.purpose, &tombstone.business_intent_digest)
+        && same_scope(
+            head,
+            tombstone.tenant_id,
+            tombstone.owner_id,
+            &tombstone.purpose,
+            &tombstone.business_intent_digest,
+        )
         && canonical_digest(&tombstone.release_digest)
 }
 

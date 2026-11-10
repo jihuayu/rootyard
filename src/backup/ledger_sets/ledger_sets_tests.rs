@@ -323,6 +323,12 @@ fn assert_root_refused(lines: &[String], prefix: &str, reason: &str) {
     assert!(lines.contains(&expected), "expected {expected} in {lines:?}");
 }
 
+/// The capture disagrees with its stored head: exactly that, never missing.
+fn assert_capture_mismatched(lines: &[String], state: &str) {
+    assert_root_refused(lines, "root_capture_mismatch", state);
+    assert!(!lines.iter().any(|line| line.starts_with("root_capture_missing")), "{lines:?}");
+}
+
 #[test]
 fn a_valid_pair_and_released_root_chain_has_no_violations() {
     let sets = valid_source();
@@ -476,7 +482,7 @@ fn root_lifetime_covers_heads_captures_and_tombstones() {
     let lines = nothing.violations();
     assert!(lines.contains(&format!("root_capture_missing:{REPO}:{ROOT}:active")), "{lines:?}");
     assert!(!lines.iter().any(|line| line.starts_with("root_capture_mismatch")), "{lines:?}");
-    // A capture without its head is invisible and refused.
+    // A capture without its head is refused.
     let mut headless = valid.clone();
     headless.heads.clear();
     assert!(headless.violations().contains(&format!("root_head_missing:{REPO}:{ROOT}")));
@@ -501,16 +507,17 @@ fn root_lifetime_covers_heads_captures_and_tombstones() {
     let mut stale = registered.clone();
     stale.tombstones = vec![RootTombstone { expected_register_digest: sha(0x34), ..tombstone() }];
     assert_root_refused(&stale.violations(), "root_head_mismatch", "unreleased");
+    // The capture exists under the head's key but under another scope.
     let mut tenant = registered.clone();
     tenant.heads[0].tenant_id = Uuid::from_u128(0x1700);
-    assert_root_refused(&tenant.violations(), "root_capture_missing", "released");
+    assert_capture_mismatched(&tenant.violations(), "released");
     let mut intent = registered.clone();
     intent.heads[0].business_intent_digest = sha(0x36);
     assert_root_refused(&intent.violations(), "root_head_mismatch", "tombstone_mismatch");
     // The capture must itself carry the head's register digest, owner and tenant.
     let mut digest = registered.clone();
     digest.roots[0].register_digest = sha(0x35);
-    assert_root_refused(&digest.violations(), "root_capture_mismatch", "released");
+    assert_capture_mismatched(&digest.violations(), "released");
     let mut producer = active.clone();
     producer.roots[0].owner_id = Uuid::from_u128(0x1600);
     assert_root_refused(&producer.violations(), "root_capture_mismatch", "active");
@@ -558,16 +565,21 @@ fn a_present_capture_that_disagrees_with_its_head_is_never_release_before_regist
     active.heads = vec![head("active", 1)];
     active.tombstones.clear();
     assert!(active.violations().is_empty(), "{:?}", active.violations());
-    // Each capture field alone, with the legal tombstone still in place: the
-    // release decision must see the capture row and report it as a mismatch,
-    // never fall back to "no capture, so this is a release-before-register root".
+    // Each capture field alone must be a mismatch, never a missing capture.
     let fields: [(&str, fn(&mut RootCapture)); 6] = [
         ("generation", |root| root.generation = 2),
-        ("scope", |root| root.tenant_id = Uuid::from_u128(0x1700)),
-        ("scope", |root| root.purpose = "other".into()),
-        ("scope", |root| root.business_intent_digest = sha(0x36)),
+        ("tenant", |root| root.tenant_id = Uuid::from_u128(0x1700)),
+        ("purpose", |root| root.purpose = "other".into()),
+        ("intent", |root| root.business_intent_digest = sha(0x36)),
         ("owner", |root| root.owner_id = Uuid::from_u128(0x1600)),
         ("register_digest", |root| root.register_digest = sha(0x35)),
+    ];
+    // Only the head side moves away from the stored capture.
+    let scopes: [(&str, fn(&mut RootHead)); 4] = [
+        ("tenant", |head| head.tenant_id = Uuid::from_u128(0x1700)),
+        ("purpose", |head| head.purpose = "other".into()),
+        ("intent", |head| head.business_intent_digest = sha(0x36)),
+        ("owner", |head| head.owner_id = Uuid::from_u128(0x1600)),
     ];
     for (field, change) in fields {
         for (state, generation, tombstones) in [("released", 2, vec![tombstone()]), ("active", 1, Vec::new())] {
@@ -576,88 +588,37 @@ fn a_present_capture_that_disagrees_with_its_head_is_never_release_before_regist
             sets.tombstones = tombstones;
             change(&mut sets.roots[0]);
             let lines = sets.violations();
-            // A present capture is a *mismatch*: its own verdict must be reported...
             let mismatch = format!("root_capture_mismatch:{REPO}:{ROOT}:{state}");
             assert!(lines.contains(&mismatch), "{field} on {state}: expected {mismatch} in {lines:?}");
-            // ...and it must never be reported as a missing capture, which is the
-            // path that would read it as a release-before-register root.
             assert!(
                 !lines.iter().any(|line| line.starts_with("root_capture_missing")),
                 "{field} on {state}: a present capture is not missing: {lines:?}"
             );
-            // The capture and the legal tombstone are the only facts that changed:
-            // the root is not accepted by accident either.
-            assert!(!lines.is_empty(), "{field} on {state} must be refused");
+        }
+    }
+    for (field, change) in scopes {
+        for state in ["released", "active"] {
+            // Only the head changes; the capture keeps its own rows.
+            let mut sets = valid_source();
+            sets.heads = vec![head(state, if state == "released" { 2 } else { 1 })];
+            if state == "active" {
+                sets.tombstones.clear();
+            }
+            change(&mut sets.heads[0]);
+            let lines = sets.violations();
+            assert_root_refused(&lines, "root_capture_mismatch", state);
+            assert!(
+                !lines.iter().any(|line| line.starts_with("root_capture_missing")),
+                "{field} on {state}: a present capture is not missing: {lines:?}"
+            );
+            // A stored tombstone no longer fences a head whose scope changed.
+            if state == "released" {
+                assert_root_refused(&lines, "root_head_mismatch", "tombstone_mismatch");
+            }
         }
     }
 }
 
-/// Every stored tombstone row of a key is judged, never only the one row that
-/// matches: an active root has none, a released root (captured or released
-/// before `register`) has exactly one generation-2 row carrying its scope, the
-/// expected register digest and a canonical release digest.
-#[test]
-fn every_tombstone_row_of_a_key_must_be_the_single_legal_release_fence() {
-    let valid = valid_source();
-    assert!(valid.violations().is_empty(), "{:?}", valid.violations());
-    // An active root never carries a tombstone, even a well-formed one.
-    let mut active = valid.clone();
-    active.heads = vec![head("active", 1)];
-    assert_root_refused(&active.violations(), "root_head_mismatch", "tombstone_without_release");
-    // A recorded-then-released and a released-before-register root are valid.
-    let mut released_first = valid.clone();
-    released_first.roots.clear();
-    assert!(released_first.violations().is_empty(), "{:?}", released_first.violations());
-    // One bad extra row beside the legal fence, under every released shape: an
-    // extra generation-3 row, a foreign scope or a malformed release digest must
-    // be refused, and so must a released root whose only tombstone is one of them.
-    let broken: [(&str, RootTombstone); 6] = [
-        ("generation-3", RootTombstone { generation: 3, ..tombstone() }),
-        ("owner", RootTombstone { owner_id: Uuid::from_u128(0x1600), ..tombstone() }),
-        ("purpose", RootTombstone { purpose: "other".into(), ..tombstone() }),
-        ("uppercase-release", RootTombstone { release_digest: "AB".repeat(32), ..tombstone() }),
-        ("short-release", RootTombstone { release_digest: "ab".repeat(31), ..tombstone() }),
-        ("non-hex-release", RootTombstone { release_digest: "zz".repeat(32), ..tombstone() }),
-    ];
-    // `sha(0x33)` is all digits, so upper-casing it would change nothing; the
-    // uppercase row must really differ from the legal fence.
-    let uppercase = &broken[3].1.release_digest;
-    assert_eq!(uppercase.len(), 64);
-    assert_ne!(uppercase, &sha(0x33));
-    assert!(uppercase.bytes().any(|byte| byte.is_ascii_uppercase()));
-    for (name, row) in broken {
-        for captured in [true, false] {
-            let mut sets = valid.clone();
-            sets.tombstones.push(row.clone());
-            if !captured {
-                sets.roots.clear();
-            }
-            assert_root_refused(&sets.violations(), "root_head_mismatch", "tombstone_mismatch");
-            // The same bad row as the only tombstone is refused too: a malformed
-            // row is a tombstone mismatch, a foreign-scope row simply never fences.
-            sets.tombstones = vec![row.clone()];
-            let reason = match name {
-                "generation-3" | "uppercase-release" | "short-release" | "non-hex-release" => "tombstone_mismatch",
-                _ if captured => "unreleased",
-                _ => "released",
-            };
-            let lines = sets.violations();
-            let refused = lines.iter().any(|line| line.starts_with("root_") && line.ends_with(reason));
-            assert!(refused, "{name} alone (captured={captured}): expected {reason} in {lines:?}");
-        }
-    }
-    // A duplicate of the legal fence is an extra row too.
-    for captured in [true, false] {
-        let mut sets = valid.clone();
-        sets.tombstones.push(tombstone());
-        if !captured {
-            sets.roots.clear();
-        }
-        assert_root_refused(&sets.violations(), "root_head_mismatch", "tombstone_mismatch");
-    }
-    // A released root whose only tombstone binds another register digest stays a
-    // mismatch of the fence itself.
-    let mut bound = valid.clone();
-    bound.tombstones = vec![RootTombstone { expected_register_digest: sha(0x34), ..tombstone() }];
-    assert_root_refused(&bound.violations(), "root_tombstone_mismatch", "register_digest");
-}
+// Every stored tombstone row of a key is judged: see `tombstone_tests`.
+#[cfg(test)]
+mod tombstone_tests;
