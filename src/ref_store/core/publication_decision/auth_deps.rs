@@ -166,7 +166,11 @@ pub(super) async fn load_live_authority(
         .map_err(|_| DecisionError::Unverifiable("live repository authority resolution failed"))?
         .ok_or(DecisionError::Denied(DenialCode::RepositoryNotFound))?;
     let owner_id: Uuid = locked.owner_id();
-    if owner_id != plan.tenant_id() || owner_id != plan.owner_id() {
+    // The first equality is the repository/tenant binding. The plan's `owner_id` is the independent
+    // publication producer (the A3/A4 producer), which may be a real collaborator rather than the
+    // tenant; it is bound to this repository by the A4 registration/producer checks and must never
+    // be equated with the repository owner here.
+    if owner_id != plan.tenant_id() {
         return Err(DecisionError::Denied(DenialCode::TenantMismatch));
     }
     let realm = super::super::serving_scope::CoreRealm::new(

@@ -353,6 +353,12 @@ pub async fn run(options: &Options) -> Result<Value> {
     );
     let repo_id = provision_with(&db.pool, &owner, "bound", &store).await?;
     let tenant = owner.id;
+    // The A3/A4 producer owner of every plan is this collaborator, never the
+    // tenant: `select` resolves RBAC for the actor and must not equate the two.
+    ensure!(
+        producer_identity.id == producer && producer != tenant,
+        "the pack producer/issuer is not a distinct real user from the repository tenant"
+    );
     // The producer is a collaborator with `write`, through the owner's real HTTP
     // route, before any of its packs commits: the decision-gated `select`
     // resolves exactly this live role and refuses anything lower.
