@@ -98,5 +98,6 @@ opens a PR and the actual event counts are read from `actions/runs`.
 
 See "专项与完整 candidate 分层" in `docs/ci-acceptance.md`: during development the affected
 specialised workflows are dispatched manually on the branch, and the complete gate is the full
-`pull_request` run plus the post-merge `main` push run. Dispatch is always available because
-`workflow_dispatch` is kept on every workflow that had it.
+`pull_request` run plus the post-merge `main` push run. No new suite input or orchestrator was
+added; `workflow_dispatch` is available on every workflow, including the two that gained it
+here.
