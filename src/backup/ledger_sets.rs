@@ -630,6 +630,10 @@ pub(super) fn check_heads(
     // regenerated register digest, and a release-before-register root has exactly
     // one such tombstone whose expected register digest is the intent it fences.
     // An extra, duplicate, generation-3, foreign-scope or malformed row is refused.
+    //
+    // Any other lifetime shape was already refused above; it is refused here too
+    // (its own shape, not its tombstones) and never reaches the row access, so a
+    // corrupted source is always a violation instead of a validator panic.
     for head in heads {
         let key = (head.repository_id, head.root_id);
         let at = format!("{}:{}", key.0, key.1);
@@ -645,18 +649,25 @@ pub(super) fn check_heads(
                 && scope(t.tenant_id, t.owner_id, &t.purpose, &t.business_intent_digest)
                 && canonical_digest(&t.release_digest)
         };
-        let problem = match (head.state.as_str(), head.last_generation) {
-            ("active", 1) => (!rows.is_empty()).then_some("tombstone_without_release"),
-            ("released", 2) if rows.len() != 1 => Some("tombstone_mismatch"),
-            ("released", 2) if !shape(rows[0]) => Some("tombstone_mismatch"),
-            _ => None,
+        let lifetime = match (head.state.as_str(), head.last_generation) {
+            ("active", 1) => Lifecycle::Active,
+            ("released", 2) => Lifecycle::Released,
+            _ => Lifecycle::Invalid,
         };
-        match problem {
-            Some(reason) => lines.push(format!("root_head_mismatch:{at}:{reason}")),
-            None if head.state == "released" && !release_fence(rows[0], head, &scope) => {
+        match (lifetime, rows.as_slice()) {
+            (Lifecycle::Invalid, _) => lines.push(format!("root_head_mismatch:{at}:state")),
+            (Lifecycle::Active, []) => {}
+            (Lifecycle::Active, _) => lines.push(format!("root_head_mismatch:{at}:tombstone_without_release")),
+            // The only place a tombstone row is indexed: exactly one row, after
+            // the released/2 shape is known.
+            (Lifecycle::Released, [row]) if !shape(row) => {
+                lines.push(format!("root_head_mismatch:{at}:tombstone_mismatch"));
+            }
+            (Lifecycle::Released, [row]) if !release_fence(row, head, &scope) => {
                 lines.push(format!("root_tombstone_mismatch:{at}:register_digest"));
             }
-            None => {}
+            (Lifecycle::Released, [_]) => {}
+            (Lifecycle::Released, _) => lines.push(format!("root_head_mismatch:{at}:tombstone_mismatch")),
         }
     }
     for tombstone in tombstones {
@@ -666,6 +677,16 @@ pub(super) fn check_heads(
         }
     }
     lines
+}
+
+/// The head's lifetime state as `retention_root` writes it.
+enum Lifecycle {
+    /// `register`: generation 1, no tombstone yet.
+    Active,
+    /// `release` (recorded) or release-before-register: generation 2, one fence.
+    Released,
+    /// Any other pair of state and generation.
+    Invalid,
 }
 
 /// A release digest as `release` stores it: canonical lowercase SHA-256 hex.

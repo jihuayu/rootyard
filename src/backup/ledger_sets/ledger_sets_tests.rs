@@ -521,11 +521,17 @@ fn root_lifetime_covers_heads_captures_and_tombstones() {
     let mut early = active.clone();
     early.tombstones = vec![tombstone()];
     assert_root_refused(&early.violations(), "root_head_mismatch", "tombstone_without_release");
-    // Any other lifetime shape is refused.
-    for (state, generation) in [("released", 1), ("active", 2), ("released", 3)] {
-        let mut shape = active.clone();
-        shape.heads = vec![head(state, generation)];
-        assert_root_refused(&shape.violations(), "root_head_mismatch", "state");
+    // Any other lifetime shape is refused, and is a violation (never a panic)
+    // whatever tombstones it carries: none, a legal-looking row or a corrupted one.
+    let shapes =
+        [("released", 1), ("released", 3), ("active", 2), ("active", 3), ("released", 0), ("", 1), ("Active", 1)];
+    for (state, generation) in shapes {
+        for tombstones in [Vec::new(), vec![tombstone()], vec![RootTombstone { generation: 3, ..tombstone() }]] {
+            let mut shape = active.clone();
+            shape.heads = vec![head(state, generation)];
+            shape.tombstones = tombstones;
+            assert_root_refused(&shape.violations(), "root_head_mismatch", "state");
+        }
     }
     // A released root head with a stale tombstone that no release fences is released
     // but unfenced, and the head scope check alone refuses it.
@@ -543,7 +549,7 @@ fn root_lifetime_covers_heads_captures_and_tombstones() {
 /// even when a legal release tombstone fences the head.
 #[test]
 fn a_present_capture_that_disagrees_with_its_head_is_never_release_before_register() {
-    let mut released = valid_source();
+    let released = valid_source();
     assert!(released.violations().is_empty(), "{:?}", released.violations());
     let mut active = released.clone();
     active.heads = vec![head("active", 1)];

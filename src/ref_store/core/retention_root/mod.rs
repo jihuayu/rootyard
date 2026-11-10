@@ -62,7 +62,6 @@ mod sql_read;
 mod usage;
 mod view;
 
-use crate::ref_store::contract::RequestDigest;
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
