@@ -4,27 +4,30 @@
 //! * ready `pg_refstore` repositories from `ref_store::serving::provision` (the
 //!   real create path, bound to the live store's immutable backend identity);
 //! * three packs on the bound repository through A3 acquire/consume/upload, A4
-//!   `register_publication` and native verified commits (a real multi-pack
-//!   membership), reusing the unchanged `retention_roots_support::pack` helpers;
-//! * one A5 snapshot + pin, released after the roots so the retained roots are
-//!   the only protection;
-//! * one active and one released retention root whose producer owner is a real
-//!   token user that is neither the repository tenant nor a pack owner.
+//!   `register_publication` and native verified commits as the *producer* owner
+//!   (a real token user distinct from the repository tenant), a real multi-pack
+//!   membership;
+//! * one A5 snapshot + pin owned by that producer, released after the roots so
+//!   the retained roots are the only protection;
+//! * one active and one released retention root prepared and registered by the
+//!   same producer owner from that producer-owned snapshot (the feature under
+//!   test: a root owner that is not the repository tenant).
 //!
-//! Ordering matters: the gate pins pack ownership to the repository tenant, so
-//! the bound repository is provisioned *first* and the empty/unrelated
-//! repositories *after* its packs, so they stay genuinely empty.
+//! Ordering matters: the bound repository is provisioned *first* and gets its
+//! packs, and the empty/unrelated repositories are provisioned *after*, so they
+//! stay genuinely empty. The producer never creates a repository of its own.
 //!
-//! No SQL row here creates an artifact, publication, membership, snapshot, pin
-//! or root. The only direct writes are the token rows of the production
-//! `db::issue_token` and the fixture-local offline `data/.volume-id`.
+//! No SQL row here creates a repository, artifact, publication, membership,
+//! snapshot, pin or root, and no repository row is edited afterwards. The only
+//! direct writes are the token rows of the production `db::issue_token` and the
+//! fixture-local offline `data/.volume-id`.
 use anyhow::{Result, anyhow, ensure};
 use base64::Engine as _;
 use deadpool_postgres::Pool;
 use rootyard::blob_store::config::BlobProfile;
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::db;
-use rootyard::ref_store::core::pack_commit::RegisteredPack;
+use rootyard::ref_store::core::pack_commit::{PackCommitPlan, RegisteredPack};
 use rootyard::ref_store::core::retention_root::PgRetentionRoots;
 use rootyard::ref_store::serving::{ProvisionRequest, provision};
 use rootyard::ref_store::{CoreGateVersion, GitObjectFormat, PgRefStoreCore, VersionCheck};
@@ -34,9 +37,9 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::db::{Db, deadline};
-use super::marker::{self, RegistrationBadge};
-use super::pack::{self, Verified};
-use super::{pack_plan, roots};
+use super::marker;
+use super::pack;
+use super::{pack_plan, repo, roots};
 
 const SHA1: GitObjectFormat = GitObjectFormat::Sha1;
 const PACKS: i64 = 3;
@@ -144,28 +147,6 @@ async fn provision_with(pool: &Pool, actor: &db::Identity, name: &str, store: &B
     Ok(receipt.repository.id)
 }
 
-/// One A3/A4/native verified registration of `files` at the current gate, with
-/// an explicit producer owner (reusing the shared `publish`/`register`/`prove`/
-/// `commit` helpers unchanged).
-async fn commit_pair(
-    db: &Db,
-    store: &BlobStore,
-    git: &Path,
-    plan: &rootyard::ref_store::core::pack_commit::PackCommitPlan,
-    token: &rootyard::ref_store::core::pack_commit::PackPendingToken,
-    files: &super::git::PairFiles,
-) -> Result<RegisteredPack> {
-    let pack_id = plan.packs().first().ok_or_else(|| anyhow!("plan has no pack"))?.pack_id();
-    let publication = pack_plan::publish(db, store, plan, files).await?;
-    pack_plan::register(db, plan, pack_id, &publication).await?;
-    let context = pack::closure(db, plan).await?;
-    ensure!(context.new_packs().len() == 1, "one publication must close exactly one new pack");
-    let proof = pack::prove(store, git, plan, &context).await?;
-    let receipt = pack::commit(db, plan, token, &proof).await?;
-    ensure!(receipt.is_committed() && !receipt.replayed, "verified commit did not commit");
-    Ok(context.new_packs()[0].clone())
-}
-
 /// Fixture-local offline data directory: the operator-initialized volume
 /// identity the real `backup --offline` CLI requires (no server runs).
 fn write_volume_identity(dir: &Path) -> Result<()> {
@@ -176,6 +157,58 @@ fn write_volume_identity(dir: &Path) -> Result<()> {
     std::fs::write(&volume, format!("{}\n", Uuid::new_v4()))?;
     std::fs::set_permissions(&volume, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+/// Register `PACKS` verified packs as `producer` on the provisioned repository.
+async fn packs(
+    db: &Db,
+    store: &BlobStore,
+    target: &repo::Existing,
+    git: &std::path::Path,
+    fixture: &super::git::GitRepo,
+    producer: Uuid,
+) -> Result<(Vec<RegisteredPack>, PackCommitPlan, String)> {
+    let mut gate = target.gate.clone();
+    let first = fixture.build_commit("file.txt", b"root fixture\n", "format22 main").await?;
+    fixture.update_ref("refs/heads/main", &first).await?;
+    let mut head = first;
+    let mut registrations: Vec<RegisteredPack> = Vec::new();
+    let mut last_plan = None;
+    for sequence in 1..=PACKS {
+        let files = fixture.pack_all(&format!("format22-{sequence}")).await?;
+        let refs = if sequence == 1 {
+            vec![pack::main_update(SHA1, None, &head)?]
+        } else {
+            let next = fixture
+                .build_commit("advance.txt", format!("pack {sequence}\n").as_bytes(), "format22 advance")
+                .await?;
+            fixture.update_ref("refs/heads/main", &next).await?;
+            let refs = vec![pack::main_update(SHA1, Some(&head), &next)?];
+            head = next;
+            refs
+        };
+        let draft = pack_plan::draft(
+            db,
+            target.repo,
+            target.tenant,
+            producer,
+            sequence,
+            &gate,
+            refs,
+            std::slice::from_ref(&files),
+        )
+        .await?;
+        let new = if sequence == 1 {
+            repo::finish_pair(db, store, git, &draft, &files).await?
+        } else {
+            repo::advance_pair(db, store, git, &draft, &files).await?
+        };
+        registrations.extend(new);
+        gate = current_gate(&db.pool, target.repo, target.tenant).await?;
+        last_plan = Some(draft.plan);
+    }
+    ensure!(head == fixture.rev_parse("refs/heads/main").await?, "fixture HEAD changed during packing");
+    Ok((registrations, last_plan.ok_or_else(|| anyhow!("no pack was planned"))?, head))
 }
 
 pub async fn run(options: &Options) -> Result<Value> {
@@ -189,39 +222,40 @@ pub async fn run(options: &Options) -> Result<Value> {
     write_volume_identity(&options.data_dir)?;
     let db = Db::setup().await?;
 
-    // 1. The bound repository through the real create path, then its three packs.
-    //    Every user row exists before its token: a refusal never orphans a
-    //    credential.
+    // 1. The bound repository through the real create path. Every user row
+    //    exists before its token: a refusal never orphans a credential.
     let owner_user = issued_user(&db.pool, "fmt22owner").await?;
     let producer_user = issued_user(&db.pool, "fmt22producer").await?;
     let owner = authenticate(&db.pool, &owner_user).await?;
     authenticate(&db.pool, &producer_user).await?;
-    let repo = provision_with(&db.pool, &owner, "bound", &store).await?;
+    let repo_id = provision_with(&db.pool, &owner, "bound", &store).await?;
     let tenant = owner.id;
-    let mut verified: Verified = pack::verify_new(&db, &store, &options.git, SHA1).await?;
-    // `verify_new` creates its own provisioning gitfs fixture; this format22
-    // source must instead be the API-provisioned pg_refstore repository.
-    verified.repo = repo;
-    verified.tenant = tenant;
-    verified.gate = current_gate(&db.pool, repo, tenant).await?;
-    let mut registrations: Vec<RegisteredPack> = Vec::new();
-    for sequence in 1..=PACKS {
-        let files = verified.fixture.pack_all(&format!("format22-{sequence}")).await?;
-        let refs = if sequence == 1 { vec![pack::main_update(SHA1, None, &verified.commit_oid)?] } else { Vec::new() };
-        let draft =
-            pack_plan::draft(&db, repo, tenant, tenant, sequence, &verified.gate, refs, std::slice::from_ref(&files))
-                .await?;
-        registrations.push(commit_pair(&db, &store, &options.git, &draft.plan, &draft.token, &files).await?);
-        verified.gate = current_gate(&db.pool, repo, tenant).await?;
-    }
+    let producer = producer_user.user_id;
+    let (target, fixture) = repo::open(&db, repo_id, tenant, &options.git).await?;
+    // The pack producer (durable hold/publication/acquirer owner) is the real
+    // token user, while the storage tenant/RAM-prefix identity of every blob
+    // locator stays the repository tenant's; both are read from the real rows
+    // by the drill and never assumed equal.
+    let (registrations, last_plan, head) = packs(&db, &store, &target, &options.git, &fixture, producer).await?;
+    ensure!(registrations.len() as i64 == PACKS, "not every planned pack registered");
 
-    // 2. A5 snapshot + pin of the multi-pack membership.
-    let source = pack::create_snapshot(&db, &verified, ROOT_SLOTS).await?;
+    // 2. A5 snapshot + pin of the multi-pack membership, owned by the producer.
+    let verified = pack::Verified {
+        tenant,
+        repo: repo_id,
+        gate: current_gate(&db.pool, repo_id, tenant).await?,
+        fixture,
+        commit_oid: head,
+        plan: last_plan.clone(),
+        new_packs: registrations.clone(),
+    };
+    let snapshot = repo::producer_snapshot(&db, &verified, producer, ROOT_SLOTS).await?;
+    let source = repo::as_source(&snapshot);
 
-    // 3. Roots whose producer owner differs from the repository tenant.
+    // 3. Roots registered by the same producer owner as the snapshot/pin.
     let adapter = PgRetentionRoots::new(store.clone(), options.git.clone())
         .map_err(|error| anyhow!("retention roots adapter rejected the Blob/Git configuration: {error:?}"))?;
-    let scope = roots::producer_scope(repo, tenant, producer_user.user_id, &verified.gate)?;
+    let scope = roots::producer_scope(repo_id, tenant, producer, &verified.gate)?;
     let mut root_rows = Vec::new();
     for state in ["active", "released"] {
         let root_id = Uuid::new_v4();
@@ -236,10 +270,19 @@ pub async fn run(options: &Options) -> Result<Value> {
             .await
             .map_err(|error| anyhow!("{state} root register refused: {error:?}"))?;
         if state == "released" {
-            let released =
-                roots::release(&adapter, &db.pool, scope, root_id, Uuid::new_v4(), &register_digest, deadline())
-                    .await
-                    .map_err(|error| anyhow!("released root release refused: {error:?}"))?;
+            let release_digest = marker::release_digest("format22-released");
+            let released = roots::release(
+                &adapter,
+                &db.pool,
+                scope,
+                root_id,
+                Uuid::new_v4(),
+                &register_digest,
+                &release_digest,
+                deadline(),
+            )
+            .await
+            .map_err(|error| anyhow!("released root release refused: {error:?}"))?;
             ensure!(released.state() == "released", "the released root did not reach released");
         } else {
             ensure!(
@@ -252,15 +295,13 @@ pub async fn run(options: &Options) -> Result<Value> {
             "operation_id": operation_id.to_string(),
             "state": state,
             "tenant_id": tenant.to_string(),
-            "owner_id": producer_user.user_id.to_string(),
+            "owner_id": producer.to_string(),
             "register_digest": register_digest,
         }));
     }
     // The source pin is released: the retained roots are now the only
     // protection of the registered packs (no snapshot/read declaration).
-    pack::release_pin(&db.pool, source.scope, source.pin_id)
-        .await
-        .map_err(|error| anyhow!("A5 source pin release failed: {error}"))?;
+    repo::release_snapshot_pin(&db, &snapshot).await?;
 
     // 4. Empty and unrelated repositories last: created through the same API and
     //    never written, so they stay genuinely empty.
@@ -268,8 +309,7 @@ pub async fn run(options: &Options) -> Result<Value> {
     let empty = provision_with(&db.pool, &empty_owner, "empty", &store).await?;
     let unrelated = provision_with(&db.pool, &owner, "unrelated", &store).await?;
 
-    let registration_ids = registrations.iter().map(|pack| pack.registration_id()).collect::<Vec<_>>();
-    let badges: Vec<RegistrationBadge> = marker::registration_badges(&db.pool, &registration_ids).await?;
+    let badges = repo::registration_badges(&db, &last_plan, &registrations).await?;
     let mut retainable = Vec::new();
     for badge in &badges {
         let counts = marker::retainable_counts(&db.pool, badge.registration_id).await?;
@@ -286,6 +326,7 @@ pub async fn run(options: &Options) -> Result<Value> {
             json!({
                 "registration_id": badge.registration_id.to_string(),
                 "pack_id": badge.pack_id.to_string(),
+                "artifact_set_digest": badge.artifact_set_digest,
                 "pack_sha256": badge.pack_sha256,
                 "idx_sha256": badge.idx_sha256,
                 "roles": ["idx", "pack"],
@@ -300,21 +341,22 @@ pub async fn run(options: &Options) -> Result<Value> {
         "kind": marker::KIND,
         "format": 22,
         "schema_version": 147,
-        "bound_repository_id": repo.to_string(),
+        "bound_repository_id": repo_id.to_string(),
         "empty_repository_id": empty.to_string(),
         "unrelated_repository_id": unrelated.to_string(),
         "repositories": [
-            repository(repo, tenant),
+            repository(repo_id, tenant),
             repository(empty, empty_owner.id),
             repository(unrelated, tenant),
         ],
         "tenant_id": tenant.to_string(),
-        "producer_owner_id": producer_user.user_id.to_string(),
-        "pack_owner_id": tenant.to_string(),
-        "root_owner_id": producer_user.user_id.to_string(),
+        "producer_owner_id": producer.to_string(),
+        "pack_owner_id": producer.to_string(),
+        "storage_tenant_id": tenant.to_string(),
+        "root_owner_id": producer.to_string(),
         "gate_revision": verified.gate.revision(),
-        "source_snapshot_id": source.snapshot_id.to_string(),
-        "source_pin_id": source.pin_id.to_string(),
+        "source_snapshot_id": snapshot.snapshot_id.to_string(),
+        "source_pin_id": snapshot.pin_id.to_string(),
         "registrations": registration_json,
         "retainable": retainable,
         "packs": PACKS,

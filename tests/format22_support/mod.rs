@@ -12,6 +12,7 @@
 pub mod digest_vectors;
 pub mod marker;
 pub mod pack_plan;
+pub mod repo;
 pub mod roots;
 pub mod seed;
 
