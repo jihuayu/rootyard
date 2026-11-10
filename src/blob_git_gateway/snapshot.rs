@@ -122,6 +122,12 @@ pub(super) fn capture_incarnation(view: &RefView) -> Option<Uuid> {
     view.handle.as_ref().map(ServingReadCapture::capture_incarnation)
 }
 
+/// The core gate revision the capture actually locked. Unlike the lookup's
+/// revision (read before PostgreSQL), this is the only input to a lower bound.
+pub(super) fn capture_gate_revision(view: &RefView) -> Option<i64> {
+    view.handle.as_ref().map(ServingReadCapture::gate_revision)
+}
+
 /// Compose one private bare Git view from the verified snapshot bytes. The
 /// transient read pin is released on every outcome (success or typed failure).
 pub(super) async fn build_view(

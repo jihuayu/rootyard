@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use super::{
     error::GatewayError,
-    repo_session::{Presented, SESSION_HEADER, SessionRealm, SessionTokens, presented},
+    repo_session::{SESSION_HEADER, SessionRealm, SessionTokens, presented},
     serving::ServingRepository,
     snapshot::{self, RefView},
     state::BlobGitState,
@@ -80,9 +80,13 @@ pub(super) async fn capture(
     deadline: tokio::time::Instant,
 ) -> Result<RefView, GatewayError> {
     let view = snapshot::load_ref_view(state, serving, deadline).await?;
-    if let Err(error) =
-        answer(snapshot::capture_incarnation(&view), state.sessions(), headers, serving, view.gate_revision())
-    {
+    let verdict = match snapshot::capture_gate_revision(&view) {
+        Some(captured_revision) => {
+            answer(snapshot::capture_incarnation(&view), state.sessions(), headers, serving, captured_revision)
+        }
+        None => Err(GatewayError::Unavailable(AUTHORITY_CHANGED)),
+    };
+    if let Err(error) = verdict {
         snapshot::release_view(state, &view, deadline).await;
         return Err(error);
     }
@@ -132,7 +136,9 @@ fn live_realm(serving: &ServingRepository, captured: Uuid) -> Result<SessionReal
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob_git_gateway::repo_session::{BEHIND_MESSAGE, SessionTokenCodec, TEST_MAX_TOKEN_LEN};
+    use crate::blob_git_gateway::repo_session::{
+        BEHIND_MESSAGE, SessionTokenCodec, SessionTokenError, TEST_MAX_TOKEN_LEN, presented_for_test,
+    };
     use crate::ref_store::{GitObjectFormat, RefName};
     use axum::http::{HeaderName, HeaderValue};
     use uuid::Uuid;
@@ -217,11 +223,13 @@ mod tests {
     #[test]
     fn malformed_and_duplicate_headers_are_bad_requests() {
         for value in ["", "rs1.", "rs2.abc.def", &"x".repeat(TEST_MAX_TOKEN_LEN + 1)] {
-            assert_eq!(presented(&header(value)).map_err(|error| error.for_repo()), Err(malformed()));
+            assert_eq!(presented(&header(value)).err(), Some(SessionTokenError::Invalid), "{value:?}");
+            assert_eq!(presented_for_test(&header(value)).map_err(|error| error.for_repo()), Err(malformed()));
         }
         let mut duplicate = header("rs1.a.b");
         duplicate.append(HeaderName::from_static(SESSION_HEADER), HeaderValue::from_static("rs1.a.b"));
-        assert_eq!(presented(&duplicate).map_err(|error| error.for_repo()), Err(malformed()));
+        assert_eq!(presented(&duplicate).err(), Some(SessionTokenError::Invalid));
+        assert_eq!(presented_for_test(&duplicate).map_err(|error| error.for_repo()), Err(malformed()));
         // A nil capture/lookup incarnation is never compared.
         assert_eq!(live_realm(&serving(3, Uuid::nil()), id(4)), Err(malformed()));
     }
@@ -250,8 +258,9 @@ mod tests {
         // not the rotated lookup's.
         let issued = tokens().issue_for_test(&live_realm(&live, id(4)).expect("realm"), 5).expect("issue");
         let foreign = live_realm(&live, id(8)).expect("realm");
+        let presented = presented_for_test(&header(&issued.token())).expect("presented");
         assert_eq!(
-            tokens().verify(&Presented::Token(issued.token()), &foreign, 5).map_err(|error| error.for_repo()),
+            tokens().verify(&presented, &foreign, 5).map_err(|error| error.for_repo()),
             Err(GatewayError::Conflict(
                 "repository session belongs to another repository, history or authority generation; re-read the authoritative store and obtain a fresh session there"
             ))
