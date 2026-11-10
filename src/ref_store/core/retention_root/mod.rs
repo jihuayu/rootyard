@@ -62,6 +62,10 @@ mod sql_read;
 mod usage;
 mod view;
 
+use crate::ref_store::contract::RequestDigest;
+use tokio_postgres::GenericClient;
+use uuid::Uuid;
+
 pub use candidate::RootCandidate;
 pub use error::RootError;
 pub use handle::{RootReadAuthority, RootReadRequest, RootReceiptQuery, RootRef};
@@ -77,3 +81,103 @@ pub use usage::{
     TENANT_MAX_RECEIPTS, TENANT_MAX_ROOT_OID_REFS, TENANT_MAX_ROOTS,
 };
 pub use view::RootReadView;
+
+/// Re-proven metadata of one retained capture, as the core itself stores it.
+///
+/// It holds only values the public [`RootRecord`] already exposes; the core's row structs stay private.
+/// The capture is addressed by its key, so it carries no repository/root id of its own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedCapture {
+    tenant_id: Uuid,
+    owner_id: Uuid,
+    purpose: RootPurpose,
+    business_intent_digest: String,
+    register_digest: String,
+    head_ref: String,
+    head_oid: Option<String>,
+    selector_kind: RootSelectorKind,
+    oids: Vec<String>,
+    refs_digest: String,
+    pack_set_digest: String,
+    native_binding_digest: String,
+}
+
+impl ValidatedCapture {
+    fn of(capture: capture::RawCapture) -> Result<Self, RootError> {
+        let binding = capture.binding_digest()?;
+        let header = capture.header;
+        let header_register = header.register_digest.clone();
+        if header_register != capture::register_digest(binding, header.root_id, header.purpose.as_str()).as_hex() {
+            return Err(RootError::RootDigestConflict("retained root register digest disagrees with its binding"));
+        }
+        Ok(Self {
+            tenant_id: header.tenant_id,
+            owner_id: header.owner_id,
+            purpose: header.purpose,
+            business_intent_digest: header.business_intent_digest,
+            register_digest: header_register,
+            head_ref: header.head_ref,
+            head_oid: header.head_oid,
+            selector_kind: header.selector_kind,
+            oids: capture.oids,
+            refs_digest: header.refs_digest,
+            pack_set_digest: header.pack_set_digest,
+            native_binding_digest: header.native_binding_digest,
+        })
+    }
+
+    pub(crate) fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+    /// The producer/requester; it may differ from the tenant.
+    pub(crate) fn owner_id(&self) -> Uuid {
+        self.owner_id
+    }
+    pub(crate) fn purpose(&self) -> RootPurpose {
+        self.purpose
+    }
+    pub(crate) fn business_intent_digest_hex(&self) -> &str {
+        &self.business_intent_digest
+    }
+    /// Recomputed by [`capture::register_digest`] from the binding; `register` stores the same value.
+    pub(crate) fn register_digest_hex(&self) -> &str {
+        &self.register_digest
+    }
+    pub(crate) fn head_ref(&self) -> &str {
+        &self.head_ref
+    }
+    pub(crate) fn head_oid_hex(&self) -> Option<&str> {
+        self.head_oid.as_deref()
+    }
+    pub(crate) fn selector_kind(&self) -> RootSelectorKind {
+        self.selector_kind
+    }
+    /// The exact selector oids, already required to equal `resolve_oids` of the stored kind.
+    pub(crate) fn root_oids(&self) -> &[String] {
+        &self.oids
+    }
+    pub(crate) fn refs_digest_hex(&self) -> &str {
+        &self.refs_digest
+    }
+    pub(crate) fn pack_set_digest_hex(&self) -> &str {
+        &self.pack_set_digest
+    }
+    pub(crate) fn native_binding_digest_hex(&self) -> &str {
+        &self.native_binding_digest
+    }
+}
+
+/// Read one retained capture and re-prove it with the real core algorithm (`RawCapture::binding_digest`:
+/// selector shape/order/format, snapshot selector equality, native refs and the binding-domain digest, then
+/// the register digest) on the caller's own transaction. Data only: no lock, no source pin, no gate, no new
+/// transaction or connection; the caller owns its absolute deadline. `None` if no such capture exists.
+pub(crate) async fn validate_capture(
+    client: &(impl GenericClient + Sync),
+    repository_id: Uuid,
+    root_id: Uuid,
+    generation: i64,
+) -> Result<Option<ValidatedCapture>, RootError> {
+    let root = RootRef::new(repository_id, root_id, generation)?;
+    let capture = sql_read::read_capture(client, root).await?;
+    capture.map(ValidatedCapture::of).transpose()
+}

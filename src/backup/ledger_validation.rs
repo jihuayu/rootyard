@@ -15,16 +15,18 @@
 //!    packs, serving read leases) with its publication, artifacts, durable
 //!    holds and consume receipts;
 //! 3. every pack-verified A5 snapshot header with its descriptors;
-//! 4. every retained root capture with its complete pack rows;
+//! 4. every retained root capture with its complete pack rows, re-proven by the
+//!    core's own `retention_root` capture validator on this same transaction;
 //! 5. root heads and release tombstones, so a lost capture is visible;
 //! 6. the declared rows of registrations that (2) cannot see at all.
 use super::ledger_sets::{
     DeclaredPair, HoldRow, PairArtifact, PublishedPack, Realm, RetainedArtifact, RetainedPack, RootCapture, RootHead,
-    RootTombstone, SnapshotSet, SourceSets,
+    RootProof, RootTombstone, SnapshotSet, SourceSets,
 };
 use super::*;
 use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::pack_commit::ArtifactSetDigest;
+use crate::ref_store::core::retention_root;
 use std::collections::BTreeMap;
 use tokio_postgres::GenericClient;
 
@@ -145,7 +147,8 @@ const SNAPSHOTS: &str = "SELECT s.repository_id,s.snapshot_id,s.tenant_id,s.hist
 /// Retained root captures with their complete pack rows.
 const ROOTS: &str = "SELECT r.repository_id,r.root_id,r.generation,r.tenant_id,r.history_incarnation,
             r.authority_epoch,r.group_epoch,r.object_format,r.ref_count,r.oid_count,r.pack_count,r.refs_digest,
-            r.pack_set_digest,r.register_digest,r.owner_id,
+            r.pack_set_digest,r.register_digest,r.owner_id,r.purpose,r.business_intent_digest,r.selector_kind,
+            r.head_ref,r.head_oid,r.native_binding_digest,
             k.pack_id,k.registration_id,k.artifact_set_digest,k.joined_revision,
             k.pack_slot,k.pack_hold_id,k.pack_storage_tenant_id,k.pack_authority_id,k.pack_authority_generation,
             k.pack_attempt_id,k.pack_namespace,k.pack_sha256,k.pack_length,k.pack_provider,k.pack_backend_identity,
@@ -158,10 +161,11 @@ const ROOTS: &str = "SELECT r.repository_id,r.root_id,r.generation,r.tenant_id,r
          ON k.repository_id=r.repository_id AND k.root_id=r.root_id AND k.generation=r.generation
       ORDER BY r.repository_id,r.root_id,k.pack_id";
 
-const ROOT_REFS: &str = "SELECT repository_id,root_id,ref_name,oid FROM public.ref_store_core_root_refs
-       ORDER BY repository_id,root_id,ref_name";
+const ROOT_REFS: &str = "SELECT repository_id,root_id,generation,ref_name,oid FROM public.ref_store_core_root_refs
+       ORDER BY repository_id,root_id,generation,ref_name";
 
-const ROOT_OIDS: &str = "SELECT repository_id,root_id,ordinal,oid FROM public.ref_store_core_root_oids ORDER BY repository_id,root_id,ordinal";
+const ROOT_OIDS: &str = "SELECT repository_id,root_id,generation,ordinal,oid FROM public.ref_store_core_root_oids
+       ORDER BY repository_id,root_id,generation,ordinal";
 
 const HEADS: &str = "SELECT repository_id,root_id,tenant_id,owner_id,purpose,business_intent_digest,
             register_digest,state,last_generation
@@ -195,6 +199,9 @@ pub(super) async fn validate_source(
     let refs = rows(client, ROOT_REFS, &[], deadline).await?;
     let oids = rows(client, ROOT_OIDS, &[], deadline).await?;
     sets.roots = decode_roots(rows(client, ROOTS, &[], deadline).await?, &refs, &oids)?;
+    for root in &mut sets.roots {
+        root.proof = prove_capture(client, root, deadline).await?;
+    }
     sets.heads = decode_heads(rows(client, HEADS, &[], deadline).await?);
     sets.tombstones = decode_tombstones(rows(client, TOMBSTONES, &[], deadline).await?);
     let missing = super::ledger_sets::undeclared(&sets.declared, &sets.snapshots, &sets.roots);
@@ -209,6 +216,40 @@ pub(super) async fn validate_source(
     violations.dedup();
     ensure!(violations.is_empty(), "{}", violation_report(&violations));
     Ok(())
+}
+
+/// Re-prove one retained capture with the core's own validator (`register`'s
+/// algorithm, private row structs included) on the same client and under the
+/// same absolute deadline: no new connection, no `BEGIN`, no second snapshot.
+async fn prove_capture(
+    client: &(impl GenericClient + Sync),
+    root: &RootCapture,
+    deadline: tokio::time::Instant,
+) -> Result<Option<RootProof>> {
+    let proven = tokio::time::timeout_at(
+        deadline,
+        retention_root::validate_capture(client, root.repository_id, root.root_id, root.generation),
+    )
+    .await
+    .context(TIMED_OUT)?;
+    match proven {
+        Ok(Some(capture)) => Ok(Some(RootProof {
+            tenant_id: capture.tenant_id(),
+            owner_id: capture.owner_id(),
+            purpose: capture.purpose().as_str().to_owned(),
+            business_intent_digest: capture.business_intent_digest_hex().to_owned(),
+            register_digest: capture.register_digest_hex().to_owned(),
+            head_ref: capture.head_ref().to_owned(),
+            head_oid: capture.head_oid_hex().map(str::to_owned),
+            selector_kind: capture.selector_kind().as_str().to_owned(),
+            oids: capture.root_oids().to_vec(),
+            refs_digest: capture.refs_digest_hex().to_owned(),
+            pack_set_digest: capture.pack_set_digest_hex().to_owned(),
+            native_binding_digest: capture.native_binding_digest_hex().to_owned(),
+        })),
+        // A capture the core itself refuses can never be archived faithfully.
+        Ok(None) | Err(_) => Ok(None),
+    }
 }
 
 /// One read on the caller's client under the caller's absolute deadline.
@@ -386,10 +427,6 @@ fn retained(row: &tokio_postgres::Row, start: usize) -> RetainedArtifact {
     }
 }
 
-fn owned(row: &tokio_postgres::Row, repository: Uuid, root: Uuid) -> bool {
-    row.get::<_, Uuid>(0) == repository && row.get::<_, Uuid>(1) == root
-}
-
 fn decode_roots(
     rows: Vec<tokio_postgres::Row>,
     refs: &[tokio_postgres::Row],
@@ -398,13 +435,17 @@ fn decode_roots(
     let mut roots: Vec<RootCapture> = Vec::new();
     for row in rows {
         let id: (Uuid, Uuid) = (row.get(0), row.get(1));
+        let owned = |r: &tokio_postgres::Row| r.get::<_, Uuid>(0) == id.0 && r.get::<_, Uuid>(1) == id.1;
+        let generation: i64 = row.get(2);
         if roots.last().map(|root| (root.repository_id, root.root_id)) != Some(id) {
             roots.push(RootCapture {
                 repository_id: id.0,
                 root_id: id.1,
-                generation: row.get(2),
+                generation,
                 tenant_id: row.get(3),
-                owner_id: row.get(41),
+                owner_id: row.get(14),
+                purpose: row.get(15),
+                business_intent_digest: row.get(16),
                 realm: realm_of(&row, 3, 7),
                 ref_count: row.get(8),
                 oid_count: row.get(9),
@@ -412,19 +453,24 @@ fn decode_roots(
                 refs_digest: row.get(11),
                 pack_set_digest: row.get(12),
                 register_digest: row.get(13),
-                refs: refs.iter().filter(|r| owned(r, id.0, id.1)).map(|r| (r.get(2), r.get(3))).collect(),
-                oids: oids.iter().filter(|r| owned(r, id.0, id.1)).map(|r| (r.get(2), r.get(3))).collect(),
+                selector_kind: row.get(17),
+                head_ref: row.get(18),
+                head_oid: row.get(19),
+                native_binding_digest: row.get(20),
+                refs: refs.iter().filter(|r| owned(r)).map(|r| (r.get(3), r.get(4))).collect(),
+                oids: oids.iter().filter(|r| owned(r)).map(|r| (r.get(3), r.get(4))).collect(),
+                proof: None,
                 packs: Vec::new(),
             });
         }
-        if let Some(pack_id) = row.get::<_, Option<Uuid>>(15) {
+        if let Some(pack_id) = row.get::<_, Option<Uuid>>(21) {
             roots.last_mut().unwrap().packs.push(RetainedPack {
                 pack_id,
-                registration_id: row.get(16),
-                artifact_set_digest: row.get(17),
-                joined_revision: row.get(18),
-                pack: retained(&row, 19),
-                idx: retained(&row, 32),
+                registration_id: row.get(22),
+                artifact_set_digest: row.get(23),
+                joined_revision: row.get(24),
+                pack: retained(&row, 25),
+                idx: retained(&row, 38),
             });
         }
     }

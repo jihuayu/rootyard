@@ -26,6 +26,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_stored_selector_is_bounded_sorted_unique_and_canonical() {
+        let format = GitObjectFormat::Sha1;
+        let refs = [("a".repeat(40)), ("b".repeat(40))]
+            .iter()
+            .enumerate()
+            .map(|(index, oid)| {
+                CapturedRef::new(
+                    RefName::new(format!("refs/tags/t{index}")).unwrap(),
+                    GitOid::parse(format, oid).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let head = "c".repeat(40);
+        let snapshot = RootSelector::from_kind(RootSelectorKind::Snapshot, Vec::new());
+        assert_eq!(
+            resolve_oids(&snapshot, format, &refs, Some(&head)).unwrap(),
+            ["a".repeat(40), "b".repeat(40), head.clone()]
+        );
+        // A stored explicit capture must be rejected for exactly what it holds: each case builds its own
+        // selector from the stored rows, so an empty selector can never stand in for the real one.
+        for (stored, head) in [
+            (vec!["b".repeat(40), "a".repeat(40)], None),
+            (vec!["a".repeat(40), "a".repeat(40)], None),
+            (vec!["A".repeat(40)], None),
+            (vec!["a".repeat(38)], None),
+            (vec!["0".repeat(40)], None),
+            (Vec::new(), None),
+        ] {
+            let explicit = RootSelector::from_kind(RootSelectorKind::Oids, stored.clone());
+            assert_eq!(explicit.kind(), RootSelectorKind::Oids);
+            assert!(resolve_oids(&explicit, format, &refs, head).is_err(), "{stored:?}");
+        }
+        // A non-empty explicit capture resolves to its own canonical sorted, unique set.
+        let explicit = RootSelector::from_kind(RootSelectorKind::Oids, vec!["b".repeat(40), "a".repeat(40)]);
+        assert_eq!(resolve_oids(&explicit, format, &refs, None).unwrap(), ["a".repeat(40), "b".repeat(40)]);
+    }
+
+    #[test]
     fn a_whole_snapshot_does_not_inherit_the_explicit_oid_limit() {
         let refs = (1u32..=300)
             .map(|index| {
@@ -84,6 +123,15 @@ impl RootSelectorKind {
 }
 
 impl RootSelector {
+    /// The selector that a stored discriminator names: the whole captured snapshot, or the
+    /// explicit oid set held by the same capture.
+    pub(super) fn from_kind(kind: RootSelectorKind, stored_oids: Vec<String>) -> Self {
+        match kind {
+            RootSelectorKind::Snapshot => Self::Snapshot,
+            RootSelectorKind::Oids => Self::ObjectIds(stored_oids),
+        }
+    }
+
     pub fn kind(&self) -> RootSelectorKind {
         match self {
             Self::Snapshot => RootSelectorKind::Snapshot,

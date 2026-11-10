@@ -188,10 +188,7 @@ impl RootCandidate {
             packs: &packs,
             membership_digest: snapshot.membership_digest_hex(),
         });
-        let register_digest = RequestDigest::of(
-            REGISTER_DIGEST_DOMAIN,
-            &[binding.as_bytes(), root_id.as_bytes(), b"generation-1", scope.purpose().as_str().as_bytes()],
-        );
+        let register_digest = super::capture::register_digest(binding, root_id, scope.purpose().as_str());
         Ok(Self {
             scope,
             reference,

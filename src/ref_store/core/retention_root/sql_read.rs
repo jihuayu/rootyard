@@ -7,7 +7,7 @@ use super::rows::{CaptureRow, PackRow};
 use crate::ref_store::core::pack_commit::CapturedRef;
 use crate::ref_store::core::types::GitObjectFormat;
 use crate::ref_store::pg;
-use tokio_postgres::Transaction;
+use tokio_postgres::GenericClient;
 
 const CAPTURE_COLUMNS: &str = "repository_id,root_id,generation,tenant_id,owner_id,purpose,business_intent_digest,
     operation_id,operation_digest,request_id,selector_kind,object_format,history_incarnation,authority_epoch,
@@ -22,8 +22,12 @@ const PACK_COLUMNS: &str = "pack_id,registration_id,artifact_set_digest,joined_r
     idx_attempt_id,idx_namespace,idx_sha256,idx_length,idx_provider,idx_backend_identity,idx_verified_sha256,
     idx_verified_length";
 
-/// Read one complete retained capture (header + refs + oids + packs) without any lock.
-pub(super) async fn read_capture(tx: &Transaction<'_>, root: RootRef) -> Result<Option<RawCapture>, RootError> {
+/// Read one complete retained capture (header + refs + oids + packs) without any lock, on the caller's own
+/// transaction or connection. The caller owns its deadline; a [`GenericClient`] exposes no clock.
+pub(super) async fn read_capture(
+    tx: &(impl GenericClient + Sync),
+    root: RootRef,
+) -> Result<Option<RawCapture>, RootError> {
     let query = format!(
         "SELECT {CAPTURE_COLUMNS} FROM ref_store_core_roots
          WHERE repository_id=$1 AND root_id=$2 AND generation=$3"
@@ -38,7 +42,7 @@ pub(super) async fn read_capture(tx: &Transaction<'_>, root: RootRef) -> Result<
 }
 
 /// Read the complete capture row set for an already decoded header (used by T2 revalidation).
-pub(super) async fn read_rows(tx: &Transaction<'_>, header: CaptureRow) -> Result<RawCapture, RootError> {
+pub(super) async fn read_rows(tx: &(impl GenericClient + Sync), header: CaptureRow) -> Result<RawCapture, RootError> {
     let repository_id = header.repository_id;
     let root_id = header.root_id;
     let generation = header.generation;
