@@ -138,6 +138,9 @@ mod restore;
 mod snapshot;
 pub use filesystem::ensure_not_restoring;
 use filesystem::*;
+/// The one typed source-ledger consistency refusal (`ledger_validation`), so
+/// the CLI can name it without exposing any other backup failure.
+pub use ledger_validation::LedgerValidationRefusal;
 use lifetime::BackupMutex;
 pub(crate) use lifetime::{BarrierBusy, ensure_database_available, prepare_serving_database};
 use postgres::*;

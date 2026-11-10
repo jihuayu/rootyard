@@ -36,9 +36,6 @@ use crate::ref_store::core::retention_root;
 use std::collections::BTreeMap;
 use tokio_postgres::GenericClient;
 
-/// Bounded violation list carried by the single refusal message.
-const MAX_REPORTED_VIOLATIONS: usize = 20;
-
 const TIMED_OUT: &str = "source artifact validator deadline exceeded";
 
 /// Every declared set row: source kind, declaring header and the complete pack
@@ -262,8 +259,139 @@ pub(super) async fn validate_source(
     violations.extend(realm_violations(rows(client, REALM, &[], deadline).await?));
     violations.sort();
     violations.dedup();
-    ensure!(violations.is_empty(), "{}", violation_report(&violations));
-    Ok(())
+    // The only construction site of the typed refusal: every SQL read, decode,
+    // timeout, root proof and backend error above propagates as itself instead.
+    match LedgerValidationRefusal::of(&violations) {
+        Some(refusal) => Err(anyhow::Error::new(refusal)),
+        None => Ok(()),
+    }
+}
+
+/// The fixed summary code of a violation prefix outside [`VIOLATION_CODES`].
+/// The input prefix is never echoed.
+pub const OTHER_VIOLATION_CODE: &str = "other";
+
+/// The source artifact ledger is inconsistent: [`validate_source`] completed
+/// every read and check and found a non-empty, sorted, de-duplicated violation
+/// set. Its only constructor, [`Self::of`], is called at that final branch and
+/// nowhere else, and no field is public, so a generic backup, query, decode,
+/// timeout, root-proof, backend or filesystem error can never be constructed
+/// as this type and never reaches the CLI's typed classification.
+///
+/// The public summary is bounded on purpose: the total count and the sorted,
+/// unique summary codes. Violation ids, free-form reason tails, raw messages,
+/// SQL, paths and credentials are never retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerValidationRefusal {
+    count: usize,
+    codes: Vec<&'static str>,
+}
+
+impl LedgerValidationRefusal {
+    /// `None` for the consistent empty set, else the typed refusal carrying
+    /// only the count and the sorted, unique summary codes.
+    fn of(violations: &[String]) -> Option<Self> {
+        if violations.is_empty() {
+            return None;
+        }
+        Some(Self { count: violations.len(), codes: summary_codes(violations.iter().map(String::as_str)) })
+    }
+
+    /// The total number of distinct violations.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Sorted, unique summary codes: a fixed vocabulary, never an id or reason
+    /// tail.
+    pub fn codes(&self) -> &[&'static str] {
+        &self.codes
+    }
+
+    /// The one deterministic, fixed-vocabulary summary the CLI appends.
+    pub fn diagnostic(&self) -> String {
+        format!("source artifact ledger is inconsistent ({} violations; codes: {})", self.count, self.codes.join(","))
+    }
+}
+
+impl std::fmt::Display for LedgerValidationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.diagnostic())
+    }
+}
+
+impl std::error::Error for LedgerValidationRefusal {}
+
+/// A whole-line known violation: the exact prefix such a line starts with.
+struct ViolationCode {
+    prefix: &'static str,
+    code: &'static str,
+}
+
+/// Every violation line the checkers can emit, matched as the whole text before
+/// the first `:`. The prefixes are listed longest first within a family, so the
+/// first match is decisive even for a discriminator that itself contains `:`
+/// (an artifact `role:slot` of the `owner_scope_mismatch` line). Derived from
+/// `ledger_sets`, `ledger_sets/declared_owner_scope`, `ledger_sets/root_lifetime`,
+/// `ledger_sets/serving_reads` and [`realm_violations`]; a prefix missing here
+/// is collapsed to [`OTHER_VIOLATION_CODE`] and cannot be spoofed.
+const VIOLATION_CODES: [ViolationCode; 38] = [
+    ViolationCode { prefix: "serving_read_artifact_mismatch", code: "serving_read_artifact_mismatch" },
+    ViolationCode { prefix: "serving_read_backend_mismatch", code: "serving_read_backend_mismatch" },
+    ViolationCode { prefix: "serving_read_capture_mismatch", code: "serving_read_capture_mismatch" },
+    ViolationCode { prefix: "serving_read_membership_mismatch", code: "serving_read_membership_mismatch" },
+    ViolationCode { prefix: "serving_read_pack_mismatch", code: "serving_read_pack_mismatch" },
+    ViolationCode { prefix: "serving_read_pack_missing", code: "serving_read_pack_missing" },
+    ViolationCode { prefix: "serving_read_realm_mismatch", code: "serving_read_realm_mismatch" },
+    ViolationCode { prefix: "serving_read_unregistered_pack", code: "serving_read_unregistered_pack" },
+    ViolationCode { prefix: "serving_read_orphan", code: "serving_read_orphan" },
+    ViolationCode { prefix: "snapshot_membership_mismatch", code: "snapshot_membership_mismatch" },
+    ViolationCode { prefix: "snapshot_set_mismatch", code: "snapshot_set_mismatch" },
+    ViolationCode { prefix: "root_tombstone_without_head", code: "root_tombstone_without_head" },
+    ViolationCode { prefix: "root_tombstone_mismatch", code: "root_tombstone_mismatch" },
+    ViolationCode { prefix: "root_selector_mismatch", code: "root_selector_mismatch" },
+    ViolationCode { prefix: "root_capture_mismatch", code: "root_capture_mismatch" },
+    ViolationCode { prefix: "root_capture_missing", code: "root_capture_missing" },
+    ViolationCode { prefix: "root_capture_invalid", code: "root_capture_invalid" },
+    ViolationCode { prefix: "root_pack_set_mismatch", code: "root_pack_set_mismatch" },
+    ViolationCode { prefix: "root_head_mismatch", code: "root_head_mismatch" },
+    ViolationCode { prefix: "root_head_missing", code: "root_head_missing" },
+    ViolationCode { prefix: "root_refs_mismatch", code: "root_refs_mismatch" },
+    ViolationCode { prefix: "root_set_mismatch", code: "root_set_mismatch" },
+    ViolationCode { prefix: "unregistered_publication", code: "unregistered_publication" },
+    ViolationCode { prefix: "canonical_pair_mismatch", code: "canonical_pair_mismatch" },
+    ViolationCode { prefix: "publication_binding_mismatch", code: "publication_binding_mismatch" },
+    ViolationCode { prefix: "owner_scope_mismatch", code: "owner_scope_mismatch" },
+    // The whole publication-key line: its key holds no `:` itself.
+    ViolationCode { prefix: "publication_key", code: "publication_key" },
+    ViolationCode { prefix: "declared_set_digest_mismatch", code: "declared_set_digest_mismatch" },
+    ViolationCode { prefix: "declared_joined_revision_mismatch", code: "declared_joined_revision_mismatch" },
+    ViolationCode { prefix: "missing_artifacts", code: "missing_artifacts" },
+    ViolationCode { prefix: "incomplete_pair", code: "incomplete_pair" },
+    ViolationCode { prefix: "extra_artifacts", code: "extra_artifacts" },
+    ViolationCode { prefix: "illegal_roles", code: "illegal_roles" },
+    ViolationCode { prefix: "foreign_hold_binding", code: "foreign_hold_binding" },
+    ViolationCode { prefix: "missing_receipt", code: "missing_receipt" },
+    ViolationCode { prefix: "hold_mismatch", code: "hold_mismatch" },
+    ViolationCode { prefix: "repository_realm_mismatch", code: "repository_realm_mismatch" },
+    // The fixed fallback must stay last.
+    ViolationCode { prefix: OTHER_VIOLATION_CODE, code: OTHER_VIOLATION_CODE },
+];
+
+/// The allowlisted summary code of one violation line: the text before its first
+/// `:`, exactly one [`VIOLATION_CODES`] prefix, else the fixed
+/// [`OTHER_VIOLATION_CODE`]. Never echoes the input.
+pub fn violation_code(line: &str) -> &'static str {
+    let prefix = line.split(':').next().unwrap_or("");
+    VIOLATION_CODES.iter().find(|code| code.prefix == prefix).map_or(OTHER_VIOLATION_CODE, |code| code.code)
+}
+
+/// The sorted, unique summary codes of `lines` in first-seen order.
+fn summary_codes<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<&'static str> {
+    let mut codes = lines.map(violation_code).collect::<Vec<_>>();
+    codes.sort_unstable();
+    codes.dedup();
+    codes
 }
 
 /// Re-prove one retained capture with the core's own validator (`register`'s
@@ -309,14 +437,6 @@ pub(super) async fn rows(
 ) -> Result<Vec<tokio_postgres::Row>> {
     let rows = tokio::time::timeout_at(deadline, client.query(statement, params)).await.context(TIMED_OUT)?;
     rows.context("source artifact ledger cannot be read")
-}
-
-/// One deterministic, bounded refusal listing the first violations and the total.
-fn violation_report(violations: &[String]) -> String {
-    let listed = violations.iter().take(MAX_REPORTED_VIOLATIONS).cloned().collect::<Vec<_>>().join("; ");
-    let more = violations.len().saturating_sub(MAX_REPORTED_VIOLATIONS);
-    let tail = if more > 0 { format!("; ... {more} more") } else { String::new() };
-    format!("source artifact ledger is inconsistent ({} violations): {listed}{tail}", violations.len())
 }
 
 /// A deployment-level violation per repository whose serving binding and core
@@ -597,4 +717,98 @@ fn decode_tombstones(rows: Vec<tokio_postgres::Row>) -> Vec<RootTombstone> {
             release_digest: row.get(8),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// Every prefix the checkers can emit maps to itself, the fallback stays
+    /// `other`, and no line ever leaks its id, reason tail or an unknown prefix.
+    #[test]
+    fn the_typed_refusal_exposes_only_count_and_summary_codes() {
+        let violations = lines(&[
+            "canonical_pair_mismatch:00000000-0000-0000-0000-000000000001:secret/reason:tail",
+            "root_set_mismatch:00000000-0000-0000-0000-000000000002:bad_free_text",
+            "canonical_pair_mismatch:another:pair",
+            "canonical_pair:not-a-known-prefix",
+            "cd_secret:postgres://user:password@host/db",
+            "owner_scope_mismatch:a:b:c:pack:0",
+            "publication_key:a:b:c",
+            "",
+        ]);
+        let refusal = LedgerValidationRefusal::of(&violations).expect("a non-empty set is a refusal");
+        assert_eq!(refusal.count(), 8);
+        assert_eq!(
+            refusal.codes(),
+            [
+                "canonical_pair_mismatch",
+                OTHER_VIOLATION_CODE,
+                "owner_scope_mismatch",
+                "publication_key",
+                "root_set_mismatch"
+            ]
+        );
+        assert_eq!(
+            refusal.diagnostic(),
+            "source artifact ledger is inconsistent (8 violations; codes: canonical_pair_mismatch,other,owner_scope_mismatch,publication_key,root_set_mismatch)"
+        );
+        for leaked in ["00000000", "secret", "postgres", "cd_secret", "pack:0", "reason"] {
+            assert!(!refusal.diagnostic().contains(leaked), "{leaked} leaked: {}", refusal.diagnostic());
+        }
+        // Every allowlisted code is reachable from its own line and is never `other`.
+        for entry in &VIOLATION_CODES[..VIOLATION_CODES.len() - 1] {
+            assert_ne!(entry.code, OTHER_VIOLATION_CODE);
+            assert_eq!(violation_code(&format!("{}:id", entry.prefix)), entry.code, "{}", entry.prefix);
+        }
+        assert_eq!(violation_code(&format!("{OTHER_VIOLATION_CODE}:id")), OTHER_VIOLATION_CODE);
+        let all = VIOLATION_CODES.map(|entry| format!("{}:id", entry.prefix));
+        assert_eq!(summary_codes(all.iter().map(String::as_str)).len(), VIOLATION_CODES.len());
+        assert!(LedgerValidationRefusal::of(&[]).is_none());
+        assert!(LedgerValidationRefusal::of(&lines(&["", ""])).is_some());
+    }
+
+    /// A real damaged set becomes the typed refusal through its only
+    /// construction site, while any other failure (even one whose text looks
+    /// like the summary) stays foreign to the type.
+    #[test]
+    fn a_real_violation_set_becomes_the_typed_refusal_and_a_deeper_error_stays_generic() {
+        // The released root is dropped so only the damaged membership remains.
+        let mut sets = super::super::ledger_sets::ledger_sets_tests::valid_source_without(&["idx"]);
+        sets.roots.clear();
+        sets.heads.clear();
+        sets.tombstones.clear();
+        sets.declared[0].publication.as_mut().unwrap().digest = "00".repeat(32);
+        let violations = sets.violations();
+        let mut codes = violations.iter().map(|line| violation_code(line)).collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        assert!(codes.contains(&"canonical_pair_mismatch") && codes.contains(&"incomplete_pair"), "{violations:?}");
+        let error = prove(violations.clone()).unwrap_err().context("wrapped");
+        let found = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<LedgerValidationRefusal>())
+            .expect("the typed cause is found through its context");
+        assert_eq!(found.codes(), codes);
+        assert_eq!(found.count(), violations.len());
+        // A different failure underneath the same context is not the refusal.
+        let error = anyhow::anyhow!("source artifact ledger cannot be archived: Caused by: {}", {
+            let refusal = LedgerValidationRefusal::of(&violations).unwrap();
+            refusal.diagnostic()
+        })
+        .context("source artifact ledger cannot be archived");
+        assert!(error.chain().all(|cause| cause.downcast_ref::<LedgerValidationRefusal>().is_none()));
+    }
+
+    /// Calls [`validate_source`]'s final branch: refused iff a violation exists.
+    fn prove(violations: Vec<String>) -> anyhow::Result<()> {
+        match LedgerValidationRefusal::of(&violations) {
+            Some(refusal) => Err(anyhow::Error::new(refusal)),
+            None => Ok(()),
+        }
+    }
 }

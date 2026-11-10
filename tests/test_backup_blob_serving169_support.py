@@ -410,31 +410,21 @@ class CorruptionEvidenceTest(unittest.TestCase):
                     '"intact_triggers": %d' % len(support.IMMUTABLE_TRIGGERS), '"intact_triggers": 0')))
 
 
-VALIDATOR_PROMPT = ("rootyard: backup failed; requires stopped writers, supported dedicated database and safe new "
-                    "destination; partial files may remain: Caused by: source artifact ledger cannot be archived: "
-                    "Caused by: source artifact ledger is inconsistent (")
+EXPECTED_PREFIX = ("Error: backup failed; requires stopped writers, supported dedicated database and safe new "
+                   "destination; partial files may remain: source artifact ledger cannot be archived: ")
 
 
-def validator_line(case, entries=None, count=None):
-    entries = entries if entries is not None else required_violations(case)
-    count = len(entries) if count is None else count
-    return VALIDATOR_PROMPT + str(count) + " violations): " + "; ".join(entries) + "\n"
+def summary_line(codes, count=None):
+    """Exactly the one line the backup CLI prints for the typed refusal."""
+    codes = sorted(codes)
+    count = len(codes) if count is None else count
+    return (EXPECTED_PREFIX + "source artifact ledger is inconsistent (" + str(count) + " violations; codes: " +
+            ",".join(codes) + ")\n")
 
 
-def required_violations(case):
-    """The two violations every damaged A4 set yields, in sorted order."""
-    registration = case.registration
-    canonical = ":".join(("canonical_pair_mismatch", *registration.scope()))
-    return sorted((canonical, case.refusal.cause_violation(registration)))
-
-
-def dependent(repo, suffix="the declared realm differs from the publication"):
-    snapshot, root = str(uuid.uuid4()), str(uuid.uuid4())
-    return ["root_set_mismatch:" + repo + ":" + root + ":" + suffix,
-            "root_pack_set_mismatch:" + repo + ":" + root,
-            "serving_read_pack_mismatch:" + repo + ":" + root,
-            "snapshot_membership_mismatch:" + repo + ":" + snapshot,
-            "snapshot_set_mismatch:" + repo + ":" + snapshot + ":" + suffix]
+def required_codes(case):
+    """The two summary codes every damaged A4 set must yield."""
+    return sorted(case.refusal.required)
 
 
 class ValidatorRefusalTest(unittest.TestCase):
@@ -442,136 +432,131 @@ class ValidatorRefusalTest(unittest.TestCase):
         (self.cases, *_rest) = planned_cases()
         self.by_name = {case.name: case for case in self.cases}
 
-    def test_each_case_requires_canonical_and_cause_violations(self):
+    def test_the_cli_summary_names_exactly_the_two_required_codes(self):
         for case in self.cases:
-            registration = case.registration
-            canonical = ":".join(("canonical_pair_mismatch", *registration.scope()))
-            cause = case.refusal.cause_violation(registration)
-            line = validator_line(case, [canonical, cause])
-            self.assertEqual(support.validator_refusal(line, case), "2|" + canonical + "; " + cause)
-            self.assertTrue(support.validator_refusal(line.encode(), case))
-            # Neither half is sufficient, and the declared-set digest detail
-            # shape of another validator is not this product's token.
-            with self.assertRaises(AssertionError):
-                support.validator_refusal(validator_line(case, [canonical]), case)
-            with self.assertRaises(AssertionError):
-                support.validator_refusal(validator_line(case, [cause]), case)
-            with self.assertRaises(AssertionError):
-                support.validator_refusal(validator_line(case, [canonical, cause.replace(":", " ", 1)]), case)
-            detailed = canonical + " : declared_set_digest=" + "ab" * 32
-            with self.assertRaises(AssertionError):
-                support.validator_refusal(validator_line(case, [detailed, cause]), case)
-            # A repeated entry is not the product's de-duplicated list.
-            with self.assertRaises(AssertionError):
-                support.validator_refusal(validator_line(case, [canonical, canonical, cause]), case)
+            codes = required_codes(case)
+            line = summary_line(codes)
+            self.assertTrue(line.startswith(EXPECTED_PREFIX))
+            self.assertEqual(support.validator_refusal(line, case), "2|" + ",".join(codes))
+            self.assertEqual(support.validator_refusal(line.encode(), case), "2|" + ",".join(codes))
+            # The summary carries names only: no ids, reason tails or leaks.
+            for leaked in case.registration.scope() + (case.registration.digest, "Caused by"):
+                self.assertNotIn(leaked, line)
+            # Neither required half is sufficient.
+            with self.assertRaisesRegex(AssertionError, "lacks"):
+                support.validator_refusal(summary_line(codes[:1]), case)
+            with self.assertRaisesRegex(AssertionError, "lacks"):
+                support.validator_refusal(summary_line(codes[1:]), case)
+        self.assertEqual([required_codes(case) for case in self.cases],
+                         [["canonical_pair_mismatch", "incomplete_pair"],
+                          ["canonical_pair_mismatch", "incomplete_pair"],
+                          ["canonical_pair_mismatch", "missing_artifacts"],
+                          ["canonical_pair_mismatch", "declared_set_digest_mismatch"]])
 
-    def test_multi_violation_refusals_of_the_same_affected_registration_are_accepted(self):
+    def test_multi_code_summaries_admit_only_existing_dependent_codes(self):
         for case in self.cases:
-            registration = case.registration
-            repo = registration.repository_id
-            entries = required_violations(case) + dependent(repo)
-            detail = support.validator_refusal(validator_line(case, entries), case)
-            self.assertTrue(detail.startswith(str(len(entries)) + "|"))
-            for entry in entries:
-                self.assertIn(entry, detail)
-        # The same affected repository may recheck a second snapshot/root pair.
-        case = self.by_name["missing_pack"]
-        entries = required_violations(case) + dependent(case.registration.repository_id) + dependent(
-            case.registration.repository_id)
-        self.assertTrue(support.validator_refusal(validator_line(case, entries), case))
-
-    def test_a_rewritten_digest_may_name_several_declared_set_sources(self):
+            required = required_codes(case)
+            with self.assertRaisesRegex(AssertionError, "unrelated"):
+                support.validator_refusal(summary_line(required + ["repository_realm_mismatch"]), case)
+            for token in support.SET_TOKENS:
+                if token in required:
+                    continue
+                with self.assertRaisesRegex(AssertionError, "unrelated code"):
+                    support.validator_refusal(summary_line(required + [token]), case)
+            for further in (["root_set_mismatch"], ["snapshot_set_mismatch"], list(support.DEPENDENT_TOKENS)):
+                codes = sorted(set(required + further))
+                valid = support.validator_refusal(summary_line(codes), case)
+                self.assertEqual(valid.split("|", 1)[1], ",".join(codes))
         case = self.by_name["wrong_artifact_set_digest"]
-        registration = case.registration
-        repo, pack, rid = registration.scope()
-        canonical = "canonical_pair_mismatch:" + ":".join((repo, pack, rid))
-        sources = ["declared_set_digest_mismatch:" + source + ":" + ":".join((repo, pack, rid))
-                   for source in support.DECLARED_SOURCES]
-        entries = sorted([canonical, *sources])
-        detail = support.validator_refusal(validator_line(case, entries), case)
-        self.assertEqual(detail.split("|", 1)[0], str(len(entries)))
-        # Any single one of the product's four declared sets is sufficient.
-        canonical = "canonical_pair_mismatch:" + ":".join((repo, pack, rid))
-        self.assertEqual(support.validator_refusal(validator_line(case, [canonical, sources[1]]), case),
-                         "2|" + canonical + "; " + sources[1])
-        # A source outside the product's four declared sets, or no source, is refused.
-        with self.assertRaises(AssertionError):
-            support.validator_refusal(
-                validator_line(case, [canonical, "declared_set_digest_mismatch:lfs:" + ":".join((repo, pack, rid))]),
-                case)
-        with self.assertRaises(AssertionError):
-            support.validator_refusal(validator_line(case, [canonical, "declared_set_digest_mismatch:" + ":".join(
-                (repo, pack, rid))]), case)
-        with self.assertRaises(AssertionError):
-            support.validator_refusal(validator_line(case, [canonical]), case)
+        codes = sorted({"canonical_pair_mismatch", "declared_set_digest_mismatch"} | set(support.DEPENDENT_TOKENS))
+        self.assertTrue(support.validator_refusal(summary_line(codes), case))
 
-    def test_wrong_ids_and_unrelated_tokens_are_never_accepted(self):
+    def test_every_safe_code_name_is_accepted(self):
+        self.assertEqual(support.OTHER_CODE, "other")
+        self.assertEqual({"canonical_pair_mismatch", "incomplete_pair", "missing_artifacts",
+                          "declared_set_digest_mismatch"}, set(support.SET_TOKENS))
+        self.assertFalse(set(support.SET_TOKENS) & set(support.DEPENDENT_TOKENS))
+        self.assertFalse(set(support.SET_TOKENS + support.DEPENDENT_TOKENS) & set(support.CLI_POLICY_TOKENS))
+
+    def test_ids_dependent_codes_and_other_are_never_accepted(self):
         for case in self.cases:
-            registration = case.registration
-            repo, pack, rid = registration.scope()
-            pair = ":".join((repo, pack, rid))
-            canonical = "canonical_pair_mismatch:" + pair
-            cause = case.refusal.cause_violation(registration)
-            other_repo, other_pack, other_reg = (str(uuid.uuid4()) for _ in range(3))
-            swapped = ":".join((repo, other_pack, rid))
-            negatives = [
-                [canonical, "canonical_pair_mismatch:" + swapped],
-                [canonical, "canonical_pair_mismatch:" + ":".join((other_repo, pack, rid))],
-                [canonical, "canonical_pair_mismatch:" + ":".join((repo, pack, other_reg))],
-                [canonical, cause, "repository_realm_mismatch:" + repo],
-                [canonical, cause, "declared_set_digest=<digest>"],
-                [canonical, cause, "unregistered_publication:" + pair],
-                [canonical, cause, "canonical_pair_mismatch:" + pair + ":extra"],
-                [canonical, cause, "snapshot_set_mismatch:" + other_repo + ":" + str(uuid.uuid4())],
-                [canonical, cause, "root_pack_set_mismatch:" + str(uuid.uuid4()) + ":" + str(uuid.uuid4())],
-                [canonical, cause, "... 1 more"],
-            ]
-            for entries in negatives:
-                with self.assertRaises(AssertionError, msg=case.name + ": " + "; ".join(entries)):
-                    support.validator_refusal(validator_line(case, entries), case)
+            required = required_codes(case)
+            canonical = case.refusal.required[0]
+            with self.assertRaisesRegex(AssertionError, "unrelated code"):
+                support.validator_refusal(summary_line(required + ["repository_realm_mismatch"]), case)
+            with self.assertRaisesRegex(AssertionError, "unrelated code"):
+                support.validator_refusal(summary_line(required + ["publication_binding_mismatch"]), case)
+            with self.assertRaisesRegex(AssertionError, "other"):
+                support.validator_refusal(summary_line(required + [support.OTHER_CODE]), case)
+            with self.assertRaisesRegex(AssertionError, "CLI policy"):
+                support.validator_refusal(summary_line(required + [support.CLI_POLICY_TOKENS[0]]), case)
+            with self.assertRaisesRegex(AssertionError, "typed source-ledger summary"):
+                support.validator_refusal(EXPECTED_PREFIX + "source artifact ledger is inconsistent (2 violations): " +
+                                          canonical + ":" + ":".join(case.registration.scope()) + "\n", case)
         # The wrong cause token of another mutation is not this case's cause.
-        case = self.by_name["missing_pack"]
-        canonical = "canonical_pair_mismatch:" + ":".join(case.registration.scope())
-        for wrong in ("missing_artifacts", "declared_set_digest_mismatch:membership"):
-            with self.assertRaises(AssertionError):
-                support.validator_refusal(
-                    validator_line(case, [canonical, wrong + ":" + ":".join(case.registration.scope())]), case)
+        case = self.by_name["wrong_artifact_set_digest"]
+        for wrong in (["canonical_pair_mismatch", "incomplete_pair"],
+                      ["canonical_pair_mismatch", "missing_artifacts"]):
+            with self.assertRaisesRegex(AssertionError, "lacks declared_set_digest_mismatch"):
+                support.validator_refusal(summary_line(wrong), case)
 
-    def test_truncation_count_and_shape_are_refused(self):
+    def test_count_order_duplicates_and_shape_are_refused(self):
         case = self.by_name["missing_all_artifacts"]
-        entries = required_violations(case)
-        with self.assertRaises(AssertionError):
-            support.validator_refusal(validator_line(case, entries, count=len(entries) + 1), case)
-        with self.assertRaisesRegex(AssertionError, "truncated"):
-            support.validator_refusal(validator_line(case, entries + ["... 3 more"]), case)
-        with self.assertRaises(AssertionError):
-            support.validator_refusal(validator_line(case, entries) + "Caused by: connection refused\n", case)
-
-    def test_unrelated_nonzero_exits_are_not_acceptances(self):
-        case = self.cases[0]
-        line = validator_line(case)
-        plain = "rootyard: backup failed; requires stopped writers, supported dedicated database and safe new " \
-                "destination; partial files may remain\n"
-        backend = plain + "Caused by: Blob closure backend differs\n"
-        missing = plain + "Caused by: source artifact ledger cannot be archived: Caused by: source Blob artifact " \
-                          "failed verified read-back: NotFound\n"
-        wrong_ledger = plain + "Caused by: source artifact ledger cannot be archived: Caused by: " \
-                               "repository_realm_mismatch:" + str(uuid.uuid4()) + "\n"
-        decode = line.rstrip("\n") + " Caused by: stored declared set is malformed\n"
-        for text in (plain, backend, missing, wrong_ledger, decode, line + "rootyard: second line\n"):
-            with self.assertRaises(AssertionError):
+        codes = required_codes(case)
+        reversed_codes = ",".join(reversed(codes))
+        refusals = (
+            (summary_line(codes, count=0), "typed source-ledger summary"),
+            (summary_line(codes, count=-1), "typed source-ledger summary"),
+            (EXPECTED_PREFIX + "source artifact ledger is inconsistent (0 violations; codes: " + ",".join(codes) +
+             ")\n", "typed source-ledger summary"),
+            (EXPECTED_PREFIX + "source artifact ledger is inconsistent (2 violations; codes: " + reversed_codes +
+             ")\n", "not sorted"),
+            (EXPECTED_PREFIX + "source artifact ledger is inconsistent (3 violations; codes: " +
+             ",".join([codes[0], codes[0], codes[1]]) + ")\n", "repeats"),
+            (EXPECTED_PREFIX + "source artifact ledger is inconsistent (3 violations; codes: " +
+             ",".join([codes[1], codes[0], codes[0]]) + ")\n", "not sorted|repeats"),
+            (summary_line(codes + ["Other"]), "code name"),
+            (summary_line(codes + ["private-ref"]), "code name"),
+            (summary_line(codes + ["1"]), "code name"),
+            (summary_line(codes).rstrip("\n"), "exactly one"),
+            (summary_line(codes) + "Caused by: source artifact ledger cannot be read\n", "exactly one"),
+            (summary_line(codes).replace(" violations; codes: ", " violations: "), "typed source-ledger summary"),
+            (EXPECTED_PREFIX + "source artifact ledger is inconsistent (2 violations; codes: " +
+             ", ".join(codes) + ")\n", "typed source-ledger summary"),
+            (EXPECTED_PREFIX + "source artifact ledger is inconsistent (2 violations; codes: " + ",".join(codes) +
+             "); Caused by: connection refused\n", "typed source-ledger summary"),
+        )
+        for text, message in refusals:
+            with self.assertRaisesRegex(AssertionError, message, msg=text):
                 support.validator_refusal(text, case)
-        for forged in ("rootyard: backup failed: timeout\n", "", "\n\n"):
+        self.assertEqual(
+            support.validator_refusal(summary_line(codes, count=3), case),
+            "3|" + ",".join(codes),
+        )
+
+    def test_generic_and_unrelated_refusals_are_refused(self):
+        case = self.by_name["missing_pack"]
+        required = required_codes(case)
+        generic = support.GENERIC_REFUSAL
+        self.assertEqual(generic, "Error: backup failed; requires stopped writers, supported dedicated database "
+                                  "and safe new destination; partial files may remain\n")
+        plain = "backup failed; requires stopped writers, supported dedicated database and safe new destination; " \
+                "partial files may remain\n"
+        backend = generic + "Caused by: Blob closure backend differs\n"
+        missing = generic + "Caused by: source artifact ledger cannot be archived: Caused by: source Blob artifact " \
+                            "failed verified read-back: NotFound\n"
+        old_list = EXPECTED_PREFIX + "source artifact ledger is inconsistent (2 violations): " + "\n"
+        forged = "rootyard: backup failed: validator refused " + ",".join(required) + "\n"
+        for text in (generic, plain, backend, missing, old_list, forged, "", "\n\n", summary_line(required)[:40] + "\n"):
+            with self.assertRaises(AssertionError, msg=text):
+                support.validator_refusal(text, case)
+        for other in (summary_line(["canonical_pair_mismatch", "missing_artifacts"]),
+                      summary_line([support.OTHER_CODE] + required)):
             with self.assertRaises(AssertionError):
-                support.validator_refusal(forged, case)
-        with self.assertRaisesRegex(AssertionError, "planned corruption"):
-            support.validator_refusal(line, support.BUILDERS["missing_pack"](case.registration.id))
-        # Another registration of the same violation is not this case's target.
-        other = support.Registration(str(uuid.uuid4()), "ab" * 32, str(uuid.uuid4()), str(uuid.uuid4()))
-        with self.assertRaises(AssertionError):
-            support.validator_refusal(
-                validator_line(case, ["canonical_pair_mismatch:" + ":".join(other.scope()), case.refusal.cause_violation(
-                    case.registration)]), case)
+                support.validator_refusal(other, case)
+        # An unplanned (not database-proven) case is never an acceptance.
+        other_case = support.BUILDERS["missing_pack"](case.registration.id)
+        self.assertFalse(other_case.planned)
 
 
 def ready_repo(repo_id, tenant):

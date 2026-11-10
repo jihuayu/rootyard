@@ -678,7 +678,7 @@ pub(super) fn require_archive_registrations<A: DeclaredArtifact>(archived: &[A],
 
 mod declared_owner_scope;
 #[cfg(test)]
-mod ledger_sets_tests;
+pub(in crate::backup) mod ledger_sets_tests;
 mod root_lifetime;
 #[cfg(test)]
 mod serving_read_tests;

@@ -348,6 +348,15 @@ pub(super) fn valid_source() -> SourceSets {
     sets
 }
 
+/// [`valid_source`] whose first declared pair loses the artifacts whose `role`
+/// is in `remove` (e.g. `["idx"]`), for sibling-module refusal regressions
+/// (`ledger_validation`'s typed-refusal tests).
+pub(in crate::backup) fn valid_source_without(remove: &[&str]) -> SourceSets {
+    let mut sets = valid_source();
+    sets.declared[0].artifacts.retain(|artifact| !remove.contains(&artifact.role.as_str()));
+    sets
+}
+
 fn assert_refused(lines: &[String], prefix: &str) {
     assert!(lines.iter().any(|line| line.starts_with(prefix)), "expected {prefix} in {lines:?}");
 }

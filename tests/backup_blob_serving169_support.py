@@ -18,8 +18,10 @@ Three independent pieces live here:
   source corruption negatives. Each case is applied by one clone-local,
   explicitly privileged transaction inside its own throw-away ``pg_dump`` clone
   of the API-produced base source, the clone must prove exactly the intended
-  row changed, and the backup may refuse only with that case's precise
-  source-ledger violation.
+  row changed (exact changed row count), and the backup may refuse only with
+  the typed one-line source-ledger summary: a positive count of the case's two
+  required codes plus only existing dependent codes. The product's violation
+  IDs are intentionally not part of the CLI summary.
 * :class:`NativeFixtureRequest` + :func:`native_fixture_argv` and
   :func:`native_marker_checks` -- the contract of the source-bound Rust helper
   (``tests/ref_store_format22_backup_fixture.rs``) that creates the real
@@ -801,9 +803,12 @@ def slot_of(role):
 
 
 HEXDIGEST = re.compile(r"[0-9a-f]{64}")
-VALIDATOR_PREFIX = ("rootyard: backup failed; requires stopped writers, supported dedicated database and safe new "
-                    "destination; partial files may remain: Caused by: source artifact ledger cannot be archived: "
-                    "Caused by: source artifact ledger is inconsistent (")
+VALIDATOR_PREFIX = ("Error: backup failed; requires stopped writers, supported dedicated database and safe new "
+                    "destination; partial files may remain: source artifact ledger cannot be archived: ")
+# The suffix every other backup failure keeps byte-for-byte: a typed-refusal
+# parser must never accept it as a source-ledger refusal.
+GENERIC_REFUSAL = ("Error: backup failed; requires stopped writers, supported dedicated database and safe new "
+                   "destination; partial files may remain\n")
 # Any of these means the failure was not the source-ledger validator: another
 # backend/root, an absent or changed Blob byte, a missing source file, or a
 # broken fixture/CLI invocation. A nonzero exit alone therefore proves nothing.
@@ -820,107 +825,82 @@ UNRELATED_ERRORS = (
 # set. ``canonical_pair_mismatch`` is the per-publication digest check; the
 # missing-pair and rewritten-digest tokens are cause-specific.
 SET_TOKENS = ("canonical_pair_mismatch", "incomplete_pair", "missing_artifacts", "declared_set_digest_mismatch")
-# Snapshot/root/serving-read rechecks of that same registration. They are
-# keyed by ``<repository_id>:<snapshot-or-root-id>`` before any free-text
-# reason, so only the repository can be required exactly; the affected
-# registration is proven by the SET_TOKENS above.
+# Snapshot/root/serving-read rechecks of that same damaged A4 set. They are a
+# real consequence of it, so they may appear as additional summary codes.
 DEPENDENT_TOKENS = ("snapshot_set_mismatch", "snapshot_membership_mismatch", "root_set_mismatch",
                     "root_pack_set_mismatch", "serving_read_pack_mismatch")
+# The CLI's denied-by-policy base refs. They are a local git policy refusal, not
+# a source-ledger violation: a summary naming one is not this validator's line.
+CLI_POLICY_TOKENS = ("private_ref", "hidden_ref", "disallowed_ref", "refspec")
 # The validator stamps its own message with any decode failure before any
 # violation is emitted, so these can never be a plain token violation.
 DECODE_ERRORS = ("stored declared set is malformed", "stored publication digest is invalid",
                  "stored declared joined revision is invalid", "negative artifact length",
                  "negative hold length", "source artifact ledger cannot be read")
-UUID_TEXT = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-VIOLATION = re.compile("(?P<token>" + "|".join(SET_TOKENS + DEPENDENT_TOKENS) + "):(?P<ids>.*)")
+# The fixed collapse of every prefix outside the product's allowlist.
+OTHER_CODE = "other"
+# Exactly the one line the backup CLI prints for the typed source-ledger
+# refusal: the generic prefix, the validator context and the fixed summary.
+SUMMARY_LINE = re.compile(re.escape(VALIDATOR_PREFIX) + r"source artifact ledger is inconsistent "
+                          r"\((?P<count>[1-9][0-9]*) violations; codes: (?P<codes>[^\s:;()]+)\)")
 
 
-def split_violations(listed):
-    """The violations of the canonical ``; ``-joined report (count = their len)."""
-    if not listed:
-        return [], 0
-    entries = listed.split("; ")
-    need(len(entries) == len(set(entries)), "the violation list repeats an entry: " + listed[:300])
-    return entries, len(entries)
+def summary_lines(case):
+    """The summary codes ``validator_refusal`` may accept for one planned case.
 
-
-def _exact(entry, pattern):
-    need(re.fullmatch(pattern, entry) is not None, "malformed violation: " + entry[:300])
-
-
-def _target_violation(entry, case):
-    """Classify one exact violation of this case's actual target registration."""
-    registration = case.registration
-    repository, pack, identity = registration.scope()
-    match = VIOLATION.fullmatch(entry)
-    need(match is not None, "the refusal lists an unrelated violation: " + entry[:300])
-    token, ids = match.group("token"), match.group("ids")
-    scope = ":".join((repository, pack, identity))
-    pair = re.escape(pack) + ":" + re.escape(identity)
-    if token in DEPENDENT_TOKENS:
-        # The snapshot/root rechecks are keyed by the affected repository and
-        # the snapshot/root id (plus a free-text reason); a serving-read recheck
-        # may instead name the exact target pair.
-        keyed = re.fullmatch(re.escape(repository) + ":" + UUID_TEXT + r"(:[^:]+)*", ids)
-        pair_keyed = token == "serving_read_pack_mismatch" and ids == pack + ":" + identity
-        need(keyed is not None or pair_keyed, "dependent violation names another repository: " + entry[:300])
-        return token
-    if token == "declared_set_digest_mismatch":
-        noted = re.fullmatch("(?P<source>[a-z_]+):" + re.escape(scope), ids)
-        need(noted is not None or ids == scope, "declared-set violation names another set: " + entry[:300])
-        return token
-    _exact(ids, re.escape(scope))
-    return token
+    The two required codes (the canonical-pair digest check first) and the
+    further existing codes a damaged A4 set can legitimately produce:
+    ``incomplete_pair``/``missing_artifacts`` are already required for their
+    case, ``incomplete_pair`` is implicit in an empty pair, a rewritten digest
+    also breaks every declaring set row, and the snapshot/root/serving-read
+    rechecks of the same registration are dependent codes.
+    """
+    required = case.refusal.required
+    further = set(DEPENDENT_TOKENS) - set(required)
+    return required, tuple(sorted(further))
 
 
 def validator_refusal(stderr, case):
     """Strict causal check of one precise source-ledger validator refusal.
 
-    The backup CLI prints exactly one deterministic line: ``rootyard: <backup
-    failure>: Caused by: source artifact ledger cannot be archived: Caused by:
-    source artifact ledger is inconsistent (N violations): <violations>``.
-    Every violation must be an exact ``<token>:<ids>`` token of this case's
-    actual repository/pack/registration: the canonical-pair violation always,
-    the cause-specific ``incomplete_pair``/``missing_artifacts`` or a
-    ``declared_set_digest_mismatch`` for one of the four declared-set sources,
-    and only the dependent tokens of that same affected registration. The list
-    need not have length one, but a count mismatch, duplicate, truncation,
-    unrelated token/ids, malformed entry or any other failure text is refused.
+    The backup CLI prints exactly one deterministic line: ``rootyard: <generic
+    backup refusal>: source artifact ledger cannot be archived: source artifact
+    ledger is inconsistent (N violations; codes: <sorted,deduplicated codes>)``.
+    ``N`` must be positive and the codes must be a sorted, unique, comma-joined
+    list of safe code names that carries exactly this case's two required codes
+    and only existing dependent codes as its others. The product's IDs and
+    reason tails are intentionally absent from the CLI summary. The generic
+    refusal, the fixed ``other`` collapse, an arbitrary ``Caused by:`` chain,
+    unrelated or CLI policy codes, duplicates, malformed lines and trailing
+    text are all refused.
     """
     need(isinstance(case, CorruptionCase) and case.planned, "planned corruption case expected")
     text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else (stderr or "")
-    lines = text.strip().splitlines()
-    need(len(lines) == 1, "backup did not print exactly one deterministic refusal line")
+    lines = text.splitlines()
+    need(len(lines) == 1 and text.endswith("\n"), "backup did not print exactly one deterministic refusal line")
     line = lines[0]
-    need(line.startswith(VALIDATOR_PREFIX), "backup refusal is not the source-ledger validator: " + line[-600:])
-    rest = line[len(VALIDATOR_PREFIX):]
-    match = re.match(r"(\d+) violations\): (.+)$", rest)
-    need(match is not None, "the validator line has no bounded violation list")
-    listed, count = split_violations(match.group(2))
-    need(int(match.group(1)) == count, "the validator violation count does not match its list")
+    match = SUMMARY_LINE.fullmatch(line)
+    need(match is not None, "backup refusal is not the typed source-ledger summary: " + line[-600:])
+    count = int(match.group("count"))
+    need(count > 0, "the validator reported no violation")
+    codes = match.group("codes").split(",")
+    need(all(re.fullmatch(r"[a-z][a-z0-9_]*", code) for code in codes), "a summary code is not a code name")
+    need(codes == sorted(codes), "the summary codes are not sorted: " + match.group("codes")[:400])
+    need(len(codes) == len(set(codes)), "the summary repeats a code: " + match.group("codes")[:400])
     lowered = line.lower()
-    need("... " not in match.group(2) and " more" not in lowered, "the refusal list is truncated")
     need(not [phrase for phrase in UNRELATED_ERRORS if phrase in lowered],
          "the refusal also names an unrelated failure: " + line[-300:])
     need(not [phrase for phrase in DECODE_ERRORS if phrase in lowered],
-         "the refusal carries a decode error instead of token violations: " + line[-300:])
-    tokens = [_target_violation(entry, case) for entry in listed]
-    required = case.refusal.required
-    need(tokens.count(required[0]) == 1,
-         "the refusal does not carry exactly one " + required[0] + " for the target: " + "; ".join(listed)[:400])
-    allowed = {required[0], required[1]}
-    need(set(tokens) <= allowed | set(DEPENDENT_TOKENS),
-         "the refusal carries a cause token from the wrong mutation: " + "; ".join(listed)[:400])
-    if case.name == "wrong_artifact_set_digest":
-        sources = {entry.split(":", 2)[1] for entry in listed
-                   if entry.startswith("declared_set_digest_mismatch:")}
-        need(sources and sources <= set(DECLARED_SOURCES),
-             "the refusal does not name only declared-set sources of the target digest: " + "; ".join(listed)[:400])
-    elif case.name in ("missing_pack", "missing_idx"):
-        need(tokens.count("incomplete_pair") == 1, "the refusal does not carry the cause-specific incomplete_pair")
-    elif case.name == "missing_all_artifacts":
-        need(tokens.count("missing_artifacts") == 1, "the refusal does not carry missing_artifacts")
-    return str(count) + "|" + "; ".join(listed)
+         "the refusal carries a decode error instead of summary codes: " + line[-300:])
+    required, further = summary_lines(case)
+    need(OTHER_CODE not in codes, "the summary collapses a violation to other: " + match.group("codes")[:400])
+    need(not set(codes) & set(CLI_POLICY_TOKENS),
+         "the refusal carries a CLI policy code: " + match.group("codes")[:400])
+    missing = [code for code in required if code not in codes]
+    need(not missing, "the summary lacks " + ",".join(missing) + " for the target: " + match.group("codes")[:400])
+    unrelated = [code for code in codes if code not in required + further]
+    need(not unrelated, "the summary carries an unrelated code: " + ",".join(unrelated)[:400])
+    return str(count) + "|" + ",".join(codes)
 
 
 # ---------------------------------------------------------------------------
