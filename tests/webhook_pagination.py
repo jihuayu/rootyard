@@ -4,8 +4,9 @@
 Runs the real Rust service against a disposable PostgreSQL database. Ping events
 create deliveries through the HTTP handler; direct SQL only supplies historical
 rows with duplicate `sequence` values that the old global `MAX(sequence)+1`
-allocator could leave behind. Every cursor page must then return each delivery
-ID exactly once.
+allocator could leave behind. Following `next_cursor` at page sizes 1, 2 and 50
+must then return every such delivery ID exactly once in `(sequence, id)` order,
+while the legacy numeric `after=N` remains accepted as lossy.
 
 The barrier cases use a real psql transaction that holds the parent
 `forge_webhooks` row `FOR UPDATE`. A concurrent ping must wait at the allocator
@@ -30,6 +31,10 @@ from webhooks import WebhooksHarness  # noqa: E402
 
 
 SIGNATURE = "sha256=" + ("0" * 64)
+
+
+class PagingError(AssertionError):
+    pass
 
 
 class PaginationHarness(WebhooksHarness):
@@ -143,6 +148,46 @@ class PaginationHarness(WebhooksHarness):
         assert keys == sorted(keys) and keys == sorted(set(keys))
         return {"deliveries": 60, "page1": 50, "page2": 10}
 
+    def walk(self, hook_id, limit):
+        """Follow next_cursor to exhaustion; every non-final cursor must advance."""
+        pages, items, cursors = [], [], []
+        cursor = None
+        while True:
+            query = f"limit={limit}" + (f"&cursor={cursor}" if cursor else "")
+            page = self.page(hook_id, query)
+            self.check(0 < len(page["items"]) <= limit, f"limit={limit} page size out of range")
+            items.extend(page["items"])
+            next_cursor = page.get("next_cursor")
+            if next_cursor is not None:
+                # next_cursor is the position of the last item on this page, so
+                # its key must equal that item's (sequence, id) exactly.
+                last = page["items"][-1]
+                self.check(self.cursor_key(next_cursor) == (last["sequence"], uuid.UUID(last["id"])),
+                           f"limit={limit} next_cursor does not address the last item")
+                self.check(next_cursor not in cursors, "cursor repeated")
+                if cursor is not None:
+                    self.check(self.cursor_key(next_cursor) > self.cursor_key(cursor), "cursor did not advance")
+                cursors.append(next_cursor)
+            pages.append({"limit": limit, "items": len(page["items"]),
+                          "next_cursor": "present" if next_cursor else None,
+                          "next_after": page["next_after"]})
+            cursor = next_cursor
+            if cursor is None:
+                break
+        return items, pages
+
+    @staticmethod
+    def check(condition, message):
+        # Explicit raise: `python3 -O` hides bare asserts, and this suite may
+        # reject but never be silently skipped.
+        if not condition:
+            raise PagingError(message)
+
+    @staticmethod
+    def cursor_key(cursor):
+        _, _, sequence, item_id = cursor.split(".")
+        return int(sequence), uuid.UUID(item_id)
+
     def cursor_pagination(self):
         hook = self.hook()
         # Historical global MAX allocation could produce these ties.
@@ -150,19 +195,19 @@ class PaginationHarness(WebhooksHarness):
         inserted = [(seq, self.insert_delivery(hook["id"], seq, f"tie-{i}"))
                     for i, seq in enumerate(sequence_values)]
         tied = [item_id for seq, item_id in sorted(inserted, key=lambda item: (item[0], uuid.UUID(item[1])))]
-        seen = []
-        cursor = None
-        while True:
-            query = "limit=2" + (f"&cursor={cursor}" if cursor else "")
-            page = self.page(hook["id"], query)
-            seen.extend(page["items"])
-            cursor = page.get("next_cursor")
-            if cursor is None:
-                break
-        assert [item["id"] for item in seen] == tied, "tied sequence rows were skipped or repeated"
-        assert len({item["id"] for item in seen}) == 7
-        keys = [(item["sequence"], uuid.UUID(item["id"])) for item in seen]
-        assert keys == sorted(keys)
+        # Issue #70 acceptance: page sizes 1 and 50 must also walk the complete
+        # tied history exactly once, not only page size 2.
+        walked = {}
+        for limit in (1, 2, 50):
+            seen, pages = self.walk(hook["id"], limit)
+            self.check([item["id"] for item in seen] == tied,
+                       f"limit={limit} tied rows were skipped or repeated")
+            self.check(len({item["id"] for item in seen}) == 7, f"limit={limit} wrong distinct count")
+            keys = [(item["sequence"], uuid.UUID(item["id"])) for item in seen]
+            self.check(keys == sorted(keys), f"limit={limit} rows were not in (sequence, id) order")
+            self.check(pages[-1]["next_cursor"] is None, f"limit={limit} last page kept a cursor")
+            walked[str(limit)] = {"pages": len(pages), "per_page": [p["items"] for p in pages],
+                                  "exactly_once": True, "final_next_cursor": None}
 
         # Legacy after=N is accepted but intentionally lossy for tied values.
         after_two = self.page(hook["id"], "after=2")["items"]
@@ -170,12 +215,12 @@ class PaginationHarness(WebhooksHarness):
         assert all(item["id"] not in tied[:4] for item in after_two)
 
         self.document(
-            f"{self.webhookspath}/{hook['id']}/deliveries?after=1&cursor={self.delivery_cursor(hook['id'], seen[0])}",
+            f"{self.webhookspath}/{hook['id']}/deliveries?after=1&cursor=v1.{hook['id']}.1.{tied[0]}",
             400,
         )
         other = self.hook()
         self.document(
-            f"{self.webhookspath}/{other['id']}/deliveries?cursor={self.delivery_cursor(hook['id'], seen[0])}",
+            f"{self.webhookspath}/{other['id']}/deliveries?cursor=v1.{hook['id']}.1.{tied[0]}",
             400,
         )
         for bad in ("v2.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000",
@@ -183,7 +228,7 @@ class PaginationHarness(WebhooksHarness):
                     "v1.00000000-0000-0000-0000-000000000000.0.00000000-0000-0000-0000-000000000000",
                     "v1.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.extra"):
             self.document(f"{self.webhookspath}/{hook['id']}/deliveries?cursor={bad}", 400)
-        return {"tied_rows": 7, "legacy_skipped_ties": True}
+        return {"tied_rows": 7, "walked_page_sizes": walked, "legacy_skipped_ties": True}
 
     @staticmethod
     def delivery_cursor(hook_id, item):
