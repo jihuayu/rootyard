@@ -644,6 +644,24 @@ class RunnerContractTest(unittest.TestCase):
         finally:
             os.close(lock)
 
+    def test_excluding_every_suite_refuses_an_empty_plan(self):
+        """Excluding the only suite must not leave an empty report whose gate could pass."""
+        plan = self.fx.plan([self.fx.suite("only-smoke", {"loopback:7773": "exclusive"})])
+        completed, report = self.fx.run(self.tracker, plan, extra_args=("--exclude", "only-smoke"))
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stdout + completed.stderr)
+        self.assertTrue(completed.stderr.strip())
+        self.assertLessEqual(len(completed.stderr), 1024)
+        self.assertIn("no suites", completed.stderr)
+        self.assertIsNone(report)
+        self.assertEqual(self.fx.markers.read_text(), "")
+        lock = os.open(self.fx.lock_dir / lock_name("loopback:7773"), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            os.close(lock)
+
     def test_plan_rejects_credentials_without_echo(self):
         plan = self.fx.plan([self.fx.suite("a", {"loopback:free": "exclusive"})],
                             environment_from_plan={"ROOTYARD_TEST_DATABASE_URL":

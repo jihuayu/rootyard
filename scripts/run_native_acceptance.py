@@ -1145,6 +1145,10 @@ def main(argv=None):
         # Before the host preflight, lock dir or any spawn: a dependant whose
         # prerequisite --exclude removed can never run (and must not run unlocked).
         require_dependencies_kept(plan)
+        # And a filter that removed every suite leaves nothing to inspect: an
+        # empty report proves nothing, so it is refused here, never gated as passed.
+        # The message is fixed and bounded: never echo the repeatable --exclude values.
+        require(plan["suites"], "--exclude leaves no suites; refusing an empty plan")
         root = Path(args.verify_host).expanduser().resolve()
         run_id = args.run_id or "run-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
         require(RUN_ID.match(run_id), "run id must be 1-64 characters of [A-Za-z0-9-]")
