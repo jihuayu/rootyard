@@ -437,7 +437,11 @@ class BrowseHarness(Harness):
             # the shared-budget proof must not require a third start.
             assert recorded >= 2, recorded_events
             assert len({int(event["pid"]) for event in recorded_events}) == recorded, recorded_events
-            assert len({int(event["pgid"]) for event in recorded_events}) == 1, recorded_events
+            # Each Git command is its own process-group leader (setpgid(0, 0)) in
+            # a fresh group, and the chain runs them one after another, so the
+            # PGIDs must be distinct, not shared.
+            assert all(int(event["pid"]) == int(event["pgid"]) for event in recorded_events), recorded_events
+            assert len({int(event["pgid"]) for event in recorded_events}) == recorded, recorded_events
             time.sleep(0.75)
             assert len(self._deadline_git_events(log)) == recorded, (
                 "a Git step started after the request deadline"
