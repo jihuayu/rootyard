@@ -253,8 +253,14 @@ class CorruptionPlanTest(unittest.TestCase):
             target = support._target_sql("'" + case.registration.id + "'::uuid")
             self.assertIn(target, support.corruption_sql(case), case.name)
             # The hold is joined on the artifact's own hold_id, never on a
-            # repository/tenant/namespace heuristic.
-            self.assertIn("FROM public.artifact_holds h WHERE h.hold_id = a.row->>'hold_id'", target, case.name)
+            # repository/tenant/namespace heuristic. The projected JSON value
+            # originates from the UUID column, so it is cast back to uuid: a
+            # bare ``uuid = text`` comparison can fail PostgreSQL type
+            # resolution.
+            self.assertIn("FROM public.artifact_holds h WHERE h.hold_id = (a.row->>'hold_id')::uuid",
+                          target, case.name)
+            self.assertNotIn("h.hold_id = a.row->>'hold_id'", target, case.name)
+            self.assertEqual(target.count("(a.row->>'hold_id')::uuid"), 1, case.name)
             self.assertNotIn("FROM public.artifact_holds h LEFT JOIN", target, case.name)
             self.assertEqual(target.count("public.artifact_holds"), 1, case.name)
             self.assertIn("public.ref_store_core_pack_artifacts a WHERE a.registration_id="

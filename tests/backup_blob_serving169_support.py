@@ -680,7 +680,7 @@ def _target_sql(registration):
             "FROM public.ref_store_core_pack_publications t WHERE t.registration_id=" + registration + "), "
             "(SELECT COALESCE(jsonb_agg(a.row || jsonb_build_object(" + q(HOLD_ROW) + ", COALESCE(("
             "SELECT jsonb_agg(to_jsonb(h) ORDER BY to_jsonb(h)::text) FROM public.artifact_holds h "
-            "WHERE h.hold_id = a.row->>'hold_id'), '[]'::jsonb)) ORDER BY a.row->>'role'), '[]'::jsonb) FROM ("
+            "WHERE h.hold_id = (a.row->>'hold_id')::uuid), '[]'::jsonb)) ORDER BY a.row->>'role'), '[]'::jsonb) FROM ("
             "SELECT to_jsonb(a) AS row FROM public.ref_store_core_pack_artifacts a "
             "WHERE a.registration_id=" + registration + ") a)")
 
