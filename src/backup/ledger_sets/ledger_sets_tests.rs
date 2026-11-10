@@ -205,12 +205,14 @@ fn root_capture() -> RootCapture {
         root_id: ROOT,
         generation: 1,
         tenant_id: TENANT,
+        owner_id: PRODUCER,
         realm: realm(),
         ref_count: 1,
         oid_count: 1,
         pack_count: 1,
         refs_digest: String::new(),
         pack_set_digest: String::new(),
+        register_digest: sha(0x32),
         refs: vec![("refs/heads/main".to_owned(), oid.clone())],
         oids: vec![(0, oid)],
         packs: vec![RetainedPack {
@@ -291,6 +293,12 @@ fn valid_source() -> SourceSets {
 
 fn assert_refused(lines: &[String], prefix: &str) {
     assert!(lines.iter().any(|line| line.starts_with(prefix)), "expected {prefix} in {lines:?}");
+}
+
+/// A root violation carries its root id between the prefix and the reason.
+fn assert_root_refused(lines: &[String], prefix: &str, reason: &str) {
+    let expected = format!("{prefix}:{REPO}:{ROOT}:{reason}");
+    assert!(lines.contains(&expected), "expected {expected} in {lines:?}");
 }
 
 #[test]
@@ -394,45 +402,71 @@ fn a_retained_root_that_is_not_the_canonical_pair_is_refused() {
 fn root_lifetime_covers_heads_captures_and_tombstones() {
     let valid = valid_source();
     assert!(valid.violations().is_empty(), "{:?}", valid.violations());
-    // An active head whose capture is gone is a lost closure.
-    let mut lost = valid.clone();
-    lost.heads = vec![head("active", 1)];
-    lost.roots.clear();
-    assert!(lost.violations().contains(&format!("root_capture_missing:{REPO}:{ROOT}:active")));
+    // `register` writes only an active head and its capture: that must be valid.
+    let mut active = valid_source();
+    active.heads = vec![head("active", 1)];
+    active.tombstones.clear();
+    assert!(active.violations().is_empty(), "{:?}", active.violations());
+    // Nothing registered: refused.
+    let mut nothing = active.clone();
+    nothing.roots.clear();
+    assert!(nothing.violations().contains(&format!("root_capture_missing:{REPO}:{ROOT}:active")));
     // A capture without its head is invisible and refused.
     let mut headless = valid.clone();
     headless.heads.clear();
+    assert!(headless.violations().contains(&format!("root_head_missing:{REPO}:{ROOT}")));
     // Release-before-register: a released head, its tombstone and no capture.
     let mut released_first = valid.clone();
     released_first.roots.clear();
-    assert!(released_first.violations().contains(&format!("root_capture_missing:{REPO}:{ROOT}:released")));
-    // Classified as release-before-register, not as a lost capture.
-    assert!(!released_first.violations().contains(&format!("root_capture_missing:{REPO}:{ROOT}:active")));
+    assert!(released_first.violations().is_empty(), "{:?}", released_first.violations());
     // Without its tombstone that head is not a legal release-before-register.
     let mut unregistered = released_first.clone();
     unregistered.tombstones.clear();
-    assert_refused(&unregistered.violations(), "root_head_mismatch");
-    // A registered root must carry its release tombstone.
-    let mut unserialised = valid;
-    unserialised.tombstones.clear();
-    assert_refused(&unserialised.violations(), "root_head_mismatch");
-    // A tombstone for a different producer is a different scope than the head.
-    let mut foreign = valid_source();
-    foreign.tombstones[0].owner_id = Uuid::from_u128(0x1600);
-    assert_refused(&foreign.violations(), "root_head_mismatch");
-    // A root head with another tenant than its capture is a realm mismatch.
-    let mut tenant = valid_source();
+    assert_refused(&unregistered.violations(), "root_capture_missing");
+    // A released root keeps its capture but must carry the release tombstone.
+    let mut registered = valid_source();
+    registered.heads = vec![head("released", 2)];
+    registered.tombstones.clear();
+    assert_root_refused(&registered.violations(), "root_head_mismatch", "unreleased");
+    // The tombstone must fence exactly the capture scope and register digest.
+    // A tombstone that does not fence leaves the released capture unreleased.
+    let mut foreign = registered.clone();
+    foreign.tombstones = vec![RootTombstone { owner_id: Uuid::from_u128(0x1600), ..tombstone() }];
+    assert_root_refused(&foreign.violations(), "root_head_mismatch", "unreleased");
+    let mut stale = registered.clone();
+    stale.tombstones = vec![RootTombstone { expected_register_digest: sha(0x34), ..tombstone() }];
+    assert_root_refused(&stale.violations(), "root_head_mismatch", "unreleased");
+    let mut tenant = registered.clone();
     tenant.heads[0].tenant_id = Uuid::from_u128(0x1700);
-    assert_refused(&tenant.violations(), "root_head_mismatch");
+    assert_root_refused(&tenant.violations(), "root_capture_missing", "released");
+    let mut intent = registered.clone();
+    intent.heads[0].business_intent_digest = sha(0x36);
+    assert_root_refused(&intent.violations(), "root_head_mismatch", "unreleased");
+    // The capture must itself carry the head's register digest, owner and tenant.
+    let mut digest = registered.clone();
+    digest.roots[0].register_digest = sha(0x35);
+    assert_root_refused(&digest.violations(), "root_capture_missing", "released");
+    let mut producer = active.clone();
+    producer.roots[0].owner_id = Uuid::from_u128(0x1600);
+    assert_root_refused(&producer.violations(), "root_capture_missing", "active");
     // A release-before-register head that the capture proves was registered is
     // not a release-before-register root.
     let mut contradiction = valid_source();
     contradiction.heads = vec![head("active", 1)];
     contradiction.roots.clear();
-    contradiction.tombstones = vec![tombstone()];
     assert_refused(&contradiction.violations(), "root_capture_missing");
+    // A tombstone never follows an active capture.
+    let mut early = active.clone();
+    early.tombstones = vec![tombstone()];
+    assert_root_refused(&early.violations(), "root_head_mismatch", "tombstone_without_release");
+    // Any other lifetime shape is refused.
+    for (state, generation) in [("released", 1), ("active", 2), ("released", 3)] {
+        let mut shape = active.clone();
+        shape.heads = vec![head(state, generation)];
+        assert_root_refused(&shape.violations(), "root_head_mismatch", "state");
+    }
     // A stale headless tombstone is refused.
-    let mut orphan_tombstone = headless.clone();
+    let mut orphan_tombstone = headless;
     orphan_tombstone.tombstones = vec![tombstone()];
     assert_refused(&orphan_tombstone.violations(), "root_tombstone_without_head");
 }

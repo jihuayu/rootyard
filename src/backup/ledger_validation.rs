@@ -145,7 +145,7 @@ const SNAPSHOTS: &str = "SELECT s.repository_id,s.snapshot_id,s.tenant_id,s.hist
 /// Retained root captures with their complete pack rows.
 const ROOTS: &str = "SELECT r.repository_id,r.root_id,r.generation,r.tenant_id,r.history_incarnation,
             r.authority_epoch,r.group_epoch,r.object_format,r.ref_count,r.oid_count,r.pack_count,r.refs_digest,
-            r.pack_set_digest,
+            r.pack_set_digest,r.register_digest,r.owner_id,
             k.pack_id,k.registration_id,k.artifact_set_digest,k.joined_revision,
             k.pack_slot,k.pack_hold_id,k.pack_storage_tenant_id,k.pack_authority_id,k.pack_authority_generation,
             k.pack_attempt_id,k.pack_namespace,k.pack_sha256,k.pack_length,k.pack_provider,k.pack_backend_identity,
@@ -404,25 +404,27 @@ fn decode_roots(
                 root_id: id.1,
                 generation: row.get(2),
                 tenant_id: row.get(3),
+                owner_id: row.get(41),
                 realm: realm_of(&row, 3, 7),
                 ref_count: row.get(8),
                 oid_count: row.get(9),
                 pack_count: row.get(10),
                 refs_digest: row.get(11),
                 pack_set_digest: row.get(12),
+                register_digest: row.get(13),
                 refs: refs.iter().filter(|r| owned(r, id.0, id.1)).map(|r| (r.get(2), r.get(3))).collect(),
                 oids: oids.iter().filter(|r| owned(r, id.0, id.1)).map(|r| (r.get(2), r.get(3))).collect(),
                 packs: Vec::new(),
             });
         }
-        if let Some(pack_id) = row.get::<_, Option<Uuid>>(13) {
+        if let Some(pack_id) = row.get::<_, Option<Uuid>>(15) {
             roots.last_mut().unwrap().packs.push(RetainedPack {
                 pack_id,
-                registration_id: row.get(14),
-                artifact_set_digest: row.get(15),
-                joined_revision: row.get(16),
-                pack: retained(&row, 17),
-                idx: retained(&row, 30),
+                registration_id: row.get(16),
+                artifact_set_digest: row.get(17),
+                joined_revision: row.get(18),
+                pack: retained(&row, 19),
+                idx: retained(&row, 32),
             });
         }
     }
