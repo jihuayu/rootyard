@@ -3,7 +3,7 @@
 
 These checks need no binary, database or network: they prove the harness
 declares the Git commands it runs, parses Git versions fail-closed, registers
-its nineteen cases once each, keeps every module under the size cap, and binds
+its twenty cases once each, keeps every module under the size cap, and binds
 the corrected product contracts (single initialization, one resolved Git,
 Idempotency-Key on the first merge, real maintain/admin authority). They are a
 focused oracle, not native evidence.
@@ -26,7 +26,7 @@ CASE_METHODS = (
     "role_matrix", "fetch_propagation", "outsider_isolation", "read_only_token",
     "non_fast_forward", "ref_transactions", "pull_lifecycle", "git_command_coverage",
     "rule_refusals", "maintain_rule_matrix", "admin_management", "pull_merge_under_rule",
-    "withdrawal", "audit_boundary", "token_revocation",
+    "withdrawal", "audit_boundary", "token_revocation", "team_matrix",
 )
 MAX_MODULE_LINES = 700
 # tests/source_bound_binary.py copied from the P1 lane (commit a4b9d49), unmodified.
@@ -40,7 +40,7 @@ REGISTERED_CASES = (
     "branch_rule_role_matrix", "maintain_branch_rule_matrix",
     "admin_management_not_owner_only", "pull_merge_under_collaborator_rule",
     "withdrawal_revokes_new_requests", "git_receipts_are_not_repository_audit_log",
-    "token_revocation_401",
+    "team_inherited_read_write_admin", "token_revocation_401",
 )
 
 
@@ -127,7 +127,7 @@ class HarnessContract(unittest.TestCase):
                                 Path(harness.__file__).read_text())
         names = [name for name, _ in registered]
         self.assertEqual(len(names), len(set(names)), "duplicate case registration")
-        self.assertEqual(len(names), 19, names)
+        self.assertEqual(len(names), 20, names)
         for method in CASE_METHODS:
             self.assertIn(method, methods, f"{method} is not defined in a harness module")
         for _, method in registered:
@@ -146,7 +146,7 @@ class HarnessContract(unittest.TestCase):
         """main() unpacks ``for name, fn in h.execute()``; the shape must hold."""
         harness_cls = object.__new__(harness.CollaboratorTransportHarness)
         steps = harness_cls.execute()
-        self.assertEqual(len(steps), 19)
+        self.assertEqual(len(steps), 20)
         for name, method in steps:
             self.assertIsInstance(name, str)
             self.assertIsInstance(method, type(self.assertEqual))
@@ -231,6 +231,49 @@ class HarnessContract(unittest.TestCase):
         audit = self.method_source(writes, "audit_boundary")
         self.assertIn('self.expect("/api/repos/alice/demo/events", 200', audit)
         self.assertNotIn("SELECT count(*) FROM outbox_events", audit)
+
+    def test_team_case_is_ordered_between_audit_boundary_and_revocation(self):
+        steps = object.__new__(harness.CollaboratorTransportHarness).execute()
+        names = [name for name, _ in steps]
+        self.assertEqual(names[names.index("git_receipts_are_not_repository_audit_log") + 1],
+                         "team_inherited_read_write_admin")
+        self.assertEqual(names[names.index("team_inherited_read_write_admin") + 1],
+                         "token_revocation_401")
+        self.assertEqual(names[:18], list(REGISTERED_CASES[:18]),
+                         "the pre-existing cases keep their order and names")
+
+    def test_team_grants_and_receipts_read_the_owning_source(self):
+        """Team rows come from the team API; receipts from git_operations, never the PR."""
+        teams = ROOT / "tests" / "collaborator_teams.py"
+        source = teams.read_text()
+        self.assertNotIn("INSERT INTO repository_team", source)
+        self.assertNotIn("INSERT INTO repository_collaborators", source)
+        self.assertIn('f"/api/repos/{owner}/{repo}/teams/{slug}/members/{user}"', source)
+        permission = self.method_source(teams, "inherited_permission")
+        self.assertIn("/permissions/", permission)
+        self.assertIn("EXPECTED_PERMISSIONS[role]", permission)
+        self.assertIn('"direct_role"', (teams).read_text())
+        self.assertIn('permission["direct_role"], permission["team_role"]) == (None, role)',
+                      source)
+        receipt = self.method_source(teams, "team_assert_operation")
+        for field in ('"actor_id"', '"actor_name"', '"token_id"', '"outcome"'):
+            self.assertIn(field, receipt)
+        merge = self.method_source(teams, "team_pull_merge")
+        self.assertIn('self.team_assert_operation(self.last_operation("recorded"), user, "demo")',
+                      merge)
+        self.assertIn("merge_commit_oid", merge)
+        refusal = self.method_source(teams, "team_read_refusals")
+        self.assertIn("distinct", (teams.parent / "collaborator_teams.py").read_text().lower())
+        self.assertIn("len(self.operations()) == ops_before", refusal)
+        self.assertIn("len(self.events()) == events_before", refusal)
+        self.assertNotIn("assert status == 400", refusal)
+        # The followed product route (src/members.rs) carries the member username.
+        self.assertIn('teams/{slug}/members/{user}"', teams.read_text())
+        matrix = self.method_source(teams, "team_role_row")
+        self.assertIn('base_ref, head_ref = "team-base-" + user, "team-head-" + user', matrix)
+        smoke = self.method_source(teams, "team_matrix")
+        self.assertLess(smoke.index("self.team_write_smoke()"), smoke.index("self.team_role_matrix()"),
+                        "the single write smoke precedes the three-role matrix")
 
     def test_every_module_compiles_and_has_no_duplicate_statements(self):
         """A text splice once duplicated a statement and shipped invalid Python."""

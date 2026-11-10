@@ -12,8 +12,10 @@ and the report; the contract constants and prerequisite checks live in
 ``collaborator_writes.py``.
 
 Cases in this order: prerequisites and the single initialization first, then
-the transport matrix, then the write endpoints. Each case depends only on the
-state its predecessors recorded; every receipt query is scoped to alice/demo.
+the transport matrix, then the write endpoints, then the inheritable team check
+(``collaborator_teams.py``) once the direct matrix has proved the surfaces, and
+finally the token-revocation check. Each case depends only on the state its
+predecessors recorded; every receipt query is scoped to alice/demo.
 """
 import argparse
 import hashlib
@@ -29,18 +31,20 @@ sys.path.insert(0, str(PACKAGE_ROOT / "scripts"))
 from reliability import ReliabilityHarness  # noqa: E402
 import collaborator_contract  # noqa: E402
 import collaborator_lifecycle  # noqa: E402
+import collaborator_teams  # noqa: E402
 import collaborator_writes  # noqa: E402
 from collaborator_contract import (  # noqa: E402,F401  (re-exported for tests)
     EXECUTED_GIT_COMMANDS, MIN_GIT, ZERO, git_version, invoked_git_commands,
 )
 
 CASE_MODULES = (collaborator_contract.__file__, collaborator_lifecycle.__file__,
-                collaborator_writes.__file__)
+                collaborator_writes.__file__, collaborator_teams.__file__)
 
 
 class CollaboratorTransportHarness(collaborator_contract.prerequisite,
                                    collaborator_lifecycle.lifecycle,
                                    collaborator_writes.writes,
+                                   collaborator_teams.teams,
                                    ReliabilityHarness):
     case_module_files = CASE_MODULES
 
@@ -48,7 +52,8 @@ class CollaboratorTransportHarness(collaborator_contract.prerequisite,
         super().__init__(args)
         self.limits = [
             "Owned loopback service, owned PostgreSQL schema and temporary data directory only.",
-            "Direct repository_collaborators roles only; teams/organizations are other suites.",
+            "Direct repository_collaborators roles, plus one case of repository-team inheritance "
+            "(read/write/admin) on alice/demo; organization teams are other suites.",
             "Git refs, git_operations and outbox_events are authoritative; Git HTTP status is observed.",
             "No object store, kernel fault, power loss or production connection is exercised.",
             "source_commit is the mounted checkout's HEAD, read by tests/source_bound_binary.py; "
@@ -59,7 +64,7 @@ class CollaboratorTransportHarness(collaborator_contract.prerequisite,
         self.member_mutations = 0
 
     def execute(self):
-        """Register all nineteen cases; the main loop runs them in order."""
+        """Register all twenty cases; the main loop runs them in order."""
         self.steps = (
             ("git_matrix_version", self.git_matrix_version),
             ("git_command_coverage", self.git_command_coverage),
@@ -79,10 +84,11 @@ class CollaboratorTransportHarness(collaborator_contract.prerequisite,
             ("pull_merge_under_collaborator_rule", self.pull_merge_under_rule),
             ("withdrawal_revokes_new_requests", self.withdrawal),
             ("git_receipts_are_not_repository_audit_log", self.audit_boundary),
+            ("team_inherited_read_write_admin", self.team_matrix),
             ("token_revocation_401", self.token_revocation),
         )
         names = [name for name, _ in self.steps]
-        assert len(names) == len(set(names)) == 19, names
+        assert len(names) == len(set(names)) == 20, names
         return self.steps
 
 
@@ -92,6 +98,8 @@ def main():
     parser.add_argument("--binary", required=True, help="built rootyard binary from scripts/build_native.py")
     parser.add_argument("--report", type=Path, help="write the JSON report here")
     parser.add_argument("--keep", action="store_true", help="retain the owned fixture directory")
+    parser.add_argument("--only", action="append", default=[], metavar="CASE",
+                        help="run only the named registered case(s); count is not claimed")
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
@@ -104,7 +112,13 @@ def main():
     success = False
     failed_case = None
     try:
-        for name, fn in h.execute():
+        steps = h.execute()
+        if args.only:
+            unknown = set(args.only) - {name for name, _ in steps}
+            if unknown:
+                parser.error("unknown --only case(s): " + ", ".join(sorted(unknown)))
+            steps = [(name, fn) for name, fn in steps if name in args.only]
+        for name, fn in steps:
             failed_case = name
             h.case(name, fn)
         failed_case = None
@@ -120,7 +134,7 @@ def main():
         report = dict(
             passed=success, failed_case=failed_case,
             executed=len(h.results), case_names=[case["name"] for case in h.results],
-            cases=h.results, limitations=h.limits, runtime={
+            cases=h.results, limitations=h.limits, only=args.only, runtime={
                 "git_client": h.run([h.server_git(), "--version"]).stdout.decode().strip(),
                 "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                 "native_executed_by_implementer": h.native_executed_by_implementer(),

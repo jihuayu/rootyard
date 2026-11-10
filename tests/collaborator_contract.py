@@ -26,7 +26,7 @@ MIN_GIT = (2, 39)
 # are reported by ``git_command_coverage``.
 EXECUTED_GIT_COMMANDS = frozenset({
     "add", "checkout", "clone", "commit", "config", "fetch", "ls-remote",
-    "push", "reset", "rev-parse",
+    "push", "reset", "rev-list", "rev-parse",
 })
 RECEIVE = "application/x-git-receive-pack-request"
 RECEIVE_ENDPOINT = "/git-receive-pack"
