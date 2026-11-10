@@ -148,6 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p test-results/refstore
+          cp target/debug/rootyard.build.json test-results/refstore/lfs-build-receipt.json
           set -a
           . "$RUNNER_TEMP/refstore-object-store.env"
           set +a
@@ -230,7 +231,7 @@ jobs:
           set -euo pipefail
           python3 scripts/native_report_manifest.py --mode job --expect-commit "$GITHUB_SHA" \
             --manifest-out test-results/refstore/lfs-native-job.json \
-            --build-receipt target/debug/rootyard.build.json \
+            --build-receipt test-results/refstore/lfs-build-receipt.json \
             --binary target/debug/rootyard \
             --report lfs=test-results/refstore/lfs.json \
             --log lfs-migrate=test-results/refstore/lfs-migrate.log \
