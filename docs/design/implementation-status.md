@@ -4,7 +4,7 @@
 
 ## 当前基线与剩余工作
 
-本页状态以 [PR #170](https://github.com/jihuayu/rootyard/pull/170)（`codex/rubicon-all-pr-merge` → `main`）作为当前集成的权威记录；其最终合并状态、CI 结论与产出以该 PR 的最终检查和 artifacts 为准，本页不预先断言。该 PR 集成 32 个组件 PR（原 30 个及后来加入的 #172、#173），各组件 head 保留在集成 ancestry 中，组件基线均已进入 `main`；集成过程中的修复与合并结果见下节“集成状态”。集成状态不改变运行时边界：默认入口仍是既有 `serve`（legacy GitFS/Pando），Blob 单机仍是显式 `serve-blob` 候选，Raft 运行时未启用；分项组件验收不表示默认服务已替换，也不表示任何实施任务 epic 已全部完成。历史基线 PR #142 / `49f09c2` 的四组原生 8+11+12+20=51 场景（零失败、零忽略）及其证据见 [roots/decisions 证据](../../evidence/state-services/roots-decisions144/README.md)，保持原范围（其中的 CI 通过结论限于当时提交，不延伸到本分支）。
+本页状态以 [PR #170](https://github.com/jihuayu/rootyard/pull/170)（`codex/rubicon-all-pr-merge` → `main`）作为当前集成的权威记录；其最终合并状态、CI 结论与产出以该 PR 的最终检查和 artifacts 为准，本页不预先断言。该 PR 集成 32 个组件 PR（原 30 个及后来加入的 #172、#173），各组件 PR 的目标分支已统一为 `main`，实际合并状态以 PR #170 和原始 PR 记录为准；集成过程中的修复与合并结果见下节“集成状态”。集成状态不改变运行时边界：默认入口仍是既有 `serve`（legacy GitFS/Pando），Blob 单机仍是显式 `serve-blob` 候选，Raft 运行时未启用；分项组件验收不表示默认服务已替换，也不表示任何实施任务 epic 已全部完成。历史基线 PR #142 / `49f09c2` 的四组原生 8+11+12+20=51 场景（零失败、零忽略）及其证据见 [roots/decisions 证据](../../evidence/state-services/roots-decisions144/README.md)，保持原范围（其中的 CI 通过结论限于当时提交，不延伸到本分支）。
 
 | 能力 | 当前状态 | 后续范围 |
 | --- | --- | --- |
@@ -32,21 +32,21 @@ Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上
 
 ## 集成状态（PR #170）
 
-- **范围与 ancestry**：集成 32 个组件 PR；每个组件 PR 的 head 保留在集成 history 中（经真实 merge 提交而非 squash/rebase），组件基线均已进入 `main`。集成后仅新增集成门禁修复（issue #171）及后并入的 #172、#173。
+- **范围与 ancestry**：集成 32 个组件 PR；每个组件 PR 的 head 保留在集成 history 中（经真实 merge 提交而非 squash/rebase）；各组件 PR 的目标分支已统一为 `main`，实际合并状态以 PR #170 和原始 PR 记录为准。集成后仅新增集成门禁修复（issue #171）及后并入的 #172、#173。
 - **验收依据**：集成后的最终 CI 与 native/remote 结果见 PR #170 的最终检查和 artifacts；最终通过与否以该处为准，本页不在验证前给出全量通过结论。
 - **缺陷修复组件**（结果绑定各自提交的证据；当时集成后的 CI 仍待完成，未把分项结果推广为整体通过）：
-  - [PR #166](https://github.com/jihuayu/rootyard/pull/166)（`bc0cff1`，LunaMax 已审）：备份 9 项；源码绑定二进制以当前 format21 恢复，并以真实的旧 format4 归档完成恢复与升级；此前失败的原始归档用例（Root 原样校验）恢复运行，完成约 6.3 秒。
-  - [PR #167](https://github.com/jihuayu/rootyard/pull/167)（`a323f87`）并入 [PR #173](https://github.com/jihuayu/rootyard/pull/173)（head `18e4884`）：集成后保留 #167 的日志读取实现，`crates/refcas-log` 21 项单元测试加 1 项真实 SIGKILL/新进程用例通过；仍是隔离实验 crate，不是运行时。
-  - [PR #168](https://github.com/jihuayu/rootyard/pull/168)（`a72cd4e`，LunaMax 已审）：41 项 W0 测试及真实 Git 的默认小规模运行通过。
-  - [PR #171](https://github.com/jihuayu/rootyard/pull/171)（`9f161c9`，LunaMax 已审）：21 项 overlay 负向检查及实际 `cargo check --locked --lib --tests`（0 错误、0 警告）通过；Root 在私有 `TMPDIR` 下重跑组合 overlay/W0 62 项通过。
+  - [issue #166](https://github.com/jihuayu/rootyard/issues/166)（本地集成修复提交 `bc0cff1`，LunaMax 已审）：备份 9 项；源码绑定二进制以当前 format21 恢复，并以真实的旧 format4 归档完成恢复与升级；此前失败的原始归档用例（Root 原样校验）恢复运行，完成约 6.3 秒。
+  - [issue #167](https://github.com/jihuayu/rootyard/issues/167)（本地集成修复提交 `a323f87`）并入 [PR #173](https://github.com/jihuayu/rootyard/pull/173)（head `18e4884`）：集成后保留 #167 的日志读取实现，`crates/refcas-log` 21 项单元测试加 1 项真实 SIGKILL/新进程用例通过；仍是隔离实验 crate，不是运行时。
+  - [issue #168](https://github.com/jihuayu/rootyard/issues/168)（本地集成修复提交 `a72cd4e`，LunaMax 已审）：41 项 W0 测试及真实 Git 的默认小规模运行通过。
+  - [issue #171](https://github.com/jihuayu/rootyard/issues/171)（本地集成修复提交 `9f161c9`，LunaMax 已审）：21 项 overlay 负向检查及实际 `cargo check --locked --lib --tests`（0 错误、0 警告）通过；Root 在私有 `TMPDIR` 下重跑组合 overlay/W0 62 项通过。
   - [PR #172](https://github.com/jihuayu/rootyard/pull/172)（`fbe27cd`）：仅新增一致性/会话契约草案文档，未交付代码。
 - **未包含**：issue #169（配对归档 corrupt-ledger 加固）仍 OPEN，其未批准本地补丁未合并；#162–#165 及新的 #174（按 [PR #172](https://github.com/jihuayu/rootyard/pull/172) 提案实现会话读取，尚未实现）仍是 backlog（见[实施计划](implementation-plan.md)）。
 
 ## issue #169 边界
 
-配对归档目前验证注册 pack 的 API/归档路径，但没有为完整 corruption guard 提供通过证据。LunaMax 独立审查确认：由 API 创建并在静止状态固定的 root pack 能原子地从已登记的永久 artifact 派生。手工或特权直接改 DB 造成的损坏（root 到 A4 的等价性）未被 PR #161 语义验证。关闭 #169 前须有证据：正例为 root 填充的 format22 归档（report-v6/artifact 绑定），负例为该归档损坏 ledger 后被拒绝。
+配对归档当前仅在受支持的 API 产生的静止配对流程上有资格，且只验证 API 验证过的 pack；不能据此声称已实现完整 canonical 注册 pack 校验或 root 发布等价性。PR #161 未实现完整的 ledger corruption guard，#169 的加固仍待完成。LunaMax 独立审查确认：由 API 创建并在静止状态固定的 root pack 能原子地从已登记的永久 artifact 派生。手工或特权直接改 DB 造成的损坏（root 到 A4 的等价性）未被 PR #161 语义验证。关闭 #169 前须有证据：正例为带非空、由 API 创建的活动与已释放 retention roots 的 format22 配对归档恢复；负例为损坏的 root/A4 artifact identity、摘要或缺失 idx 时必须在发布前被拒绝。不另称新的专项报告版本。
 
-历史集成门禁修复（#171）只在当时的工作分支发布，现已进入 PR #170 的集成提交；它只处理合并后的契约缺陷，未新增或声称任何分布式、HA、GC 或容量能力：
+#171 的修复随 PR #170 整合，最终 CI 状态以 PR 为准；它只处理合并后的契约缺陷，未新增或声称任何分布式、HA、GC 或容量能力：
 
 - 合并 PR #124 曾用旧 W0 正文覆盖 [第 12 章](12-state-services.md)，覆盖了 PR142 之后加入的 HTTP-only 段落，并带回旧 GitFS/Pando 导入与在线 transition。当前章节已从 canonical 分支 `codex/state-services-architecture-v2`（`23334bd`）逐字节恢复，W0 原始字节（SHA-256 `0187d9c0…`，80072 bytes）移到[显式历史归档](state-services/historical-w0/README.md)，`snapshot.json` 同时记录两者哈希。
 - W0/phase-metrics 的 feature-only overlay 检查改为只针对其冻结的 parent fixture（`bcd3918` manifest/lock）；当前集成 manifest 单独做显式契约验证。历史 v1/v5/v6 原始测量报告未修改。
