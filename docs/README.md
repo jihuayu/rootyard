@@ -31,6 +31,7 @@
 - [Local-envelope KeyProvider 组件：密钥环、AAD、轮换与未接入边界](key-provider.md)
 - [开发与测试、MSRV 1.88 与 fmt/Clippy 门禁工具链](development.md)
 - [仓库列表严格键集分页 API](repository-pagination.md)
+- [组织、成员与团队管理 Web UI（#87 部分实现）](organization-web-ui.md)
 - [并行开发与模块边界](parallel-development.md)
 - [配对离线备份与恢复](backup-restore.md)
 - [Schema 134：仓库/租户复合外键与 #90 关系完整性](storage-identity-fks.md)
