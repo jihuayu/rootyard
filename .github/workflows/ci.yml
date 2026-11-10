@@ -1,6 +1,14 @@
 name: CI
+# pull_request is the single full gate for a PR head; an unfiltered `push:`
+# ran the same verify/container checks a second time for the same commit
+# (e.g. push 42783486160 vs pull_request 42783651096 for PR #191). push is
+# limited to main, the only long-lived branch (no release/maintenance branches
+# or tags exist), so the post-merge gate on main stays complete. No paths:
+# filter, so required checks can never be left permanently pending.
+# See docs/acceptance/ci-trigger-dedup-20261110.md.
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
