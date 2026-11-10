@@ -487,7 +487,8 @@ class teams:
         assert operation["outcome"] == "recorded", operation
         assert (operation["actor_id"], operation["actor_name"], operation["token_id"]) == (
             account["user_id"], user, account["token_id"]), operation
-        assert operation["token_id"] != self.alice["token_id"], "owner token recorded"
+        assert (operation["token_id"] == self.alice["token_id"]) == (user == "alice"), \
+            "non-owner token recorded" if user != "alice" else "owner must use its own token"
         owner = self.sql("SELECT ns.slug FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id"
                          " WHERE r.name='" + repo + "'")
         assert owner == "alice", owner
