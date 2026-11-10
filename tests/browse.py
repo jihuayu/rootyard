@@ -9,11 +9,13 @@ import json
 import os
 import shlex
 import shutil
+import signal
 from pathlib import Path
 import sys
 import time
 import uuid
 import urllib.parse
+import urllib.error
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness  # noqa: E402
@@ -40,6 +42,7 @@ CASE_NAMES = (
     "bounded_ref_and_commit_pages",
     "selective_ref_prefix",
     "protected_writes_and_ref_ack_failure",
+    "ref_transaction_crash_recovery",
 )
 
 
@@ -241,6 +244,23 @@ class BrowseHarness(Harness):
 
     def repo_api(self, suffix="", repo="demo", owner="alice"):
         return f"/api/repos/{owner}/{repo}{suffix}"
+
+    @staticmethod
+    def _ref_transaction_connection_failed(error):
+        """True only for a connection-level failure, never for an HTTP answer.
+
+        `urllib.error.URLError` is an `OSError` subclass and stores its cause
+        in `.reason`; the message alone does not establish the cause. The
+        expected `URLError(reason=ConnectionResetError)` is accepted only when
+        `.reason` is an `OSError`. A direct `OSError`, such as
+        `ConnectionResetError`, is also accepted. Any other exception is a
+        different failure and must make the test fail.
+        """
+        if isinstance(error, urllib.error.URLError) and not isinstance(
+            error.reason, OSError
+        ):
+            return False
+        return isinstance(error, OSError)
 
     @staticmethod
     def _deadline_wrapper_script(native_git, marker, log):
@@ -764,6 +784,157 @@ class BrowseHarness(Harness):
         replay = self.document(self.repo_api("/ref-transactions"), 200, method="POST",
                                body=payload, extra_headers={"Idempotency-Key": "fault-after"})
         assert replay == response
+
+    def ref_transaction_crash_recovery(self):
+        """SIGKILL this harness's own server right after a native ref CAS.
+
+        The wrapper records its own `$$` and the real Git child's `$!` in
+        separate files and leaves stdin untouched, so `git update-ref --stdin`
+        still reads the request bytes. Only an armed, successful `update-ref`
+        kills exactly the service PID written immediately before the POST:
+        Git has already published the ref, but its success never reaches the
+        service. The restart must classify the journal as an interrupted,
+        finished operation with the requested intent, fence the repository as
+        recovering/push_outcome_unknown, publish no ref event, and reject the
+        next valid write with 409.
+        """
+        ref = "refs/heads/crash-recovery"
+        payload = {"updates": [{"ref_name": ref, "old_oid": ZERO_OID,
+                                "new_oid": self.feature_oid}]}
+        repo_id = self._sql_literal(self.repo["id"])
+        requested_json = json.dumps([{"ref_name": ref, "old_oid": ZERO_OID,
+                                      "new_oid": self.feature_oid}], separators=(",", ":"))
+        arm = self.root / "browse-crash-arm"
+        pid_file = self.root / "browse-crash-server-pid"
+        wrapper_pid_file = self.root / "browse-crash-wrapper-pid"
+        git_pid_file = self.root / "browse-crash-git-child-pid"
+        done = self.root / "browse-crash-wrapper-done"
+        wrapper = self.root / "browse-crash-git-wrapper"
+        for stale in (arm, pid_file, wrapper_pid_file, git_pid_file, done):
+            stale.unlink(missing_ok=True)
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$$\" > " + shlex.quote(str(wrapper_pid_file)) + "\n"
+            "update=0\n"
+            'for a in "$@"; do\n'
+            '  case "$a" in\n'
+            "    update-ref) update=1; break ;;\n"
+            "  esac\n"
+            "done\n"
+            + shlex.quote(str(self.native_git)) + ' "$@" <&0 &\n'
+            "child=$!\n"
+            "printf '%s\\n' \"$child\" > " + shlex.quote(str(git_pid_file)) + "\n"
+            'wait "$child"\n'
+            "rc=$?\n"
+            'if [ "$update" = 1 ] && [ "$rc" = 0 ] && [ -f '
+            + shlex.quote(str(arm)) + " ]; then\n"
+            "  kill -KILL \"$(cat " + shlex.quote(str(pid_file)) + ")\"\n"
+            "  printf done > " + shlex.quote(str(done)) + "\n"
+            "  exit 1\n"
+            "fi\n"
+            'exit "$rc"\n'
+        )
+        wrapper.chmod(0o700)
+        self.stop()
+        self.env["ROOTYARD_GIT"] = str(wrapper)
+        self.start()
+        try:
+            arm.touch()
+            server_pid = self.proc.pid
+            pid_file.write_text(str(server_pid) + "\n")
+            try:
+                status, body, _ = self.http(self.repo_api("/ref-transactions"),
+                                            token=self.alice, method="POST", body=payload)
+            except (OSError, urllib.error.URLError) as error:
+                # Only a connection-level disconnect is expected; any HTTP
+                # response is handled by the `else` branch and is a failure.
+                error_type = type(error).__name__
+                reason_type = (type(error.reason).__name__
+                               if isinstance(error, urllib.error.URLError) else None)
+                assert self._ref_transaction_connection_failed(error), (
+                    "unexpected transport error, not a connection-level failure: "
+                    + error_type + " reason=" + str(reason_type)
+                )
+            else:
+                raise AssertionError(
+                    "expected a broken connection from the killed server, got HTTP "
+                    + str(status) + " (" + str(len(body)) + " body bytes)"
+                )
+            deadline = time.monotonic() + 10
+            while self.proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(.05)
+            exited = self.proc.poll()
+            marker_deadline = time.monotonic() + 5
+            while time.monotonic() < marker_deadline:
+                if done.is_file():
+                    break
+                time.sleep(0.05)
+            else:
+                if not done.is_file() and exited is not None:
+                    try:
+                        os.killpg(server_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        finally:
+            arm.unlink(missing_ok=True)
+            # The fault wrapper sends SIGKILL only to the recorded service PID,
+            # never to the whole process group. In failure cleanup, inherited
+            # Harness.stop() may signal this harness-created service process
+            # group if it is still live; that is owned teardown, not the fault.
+            self.stop()
+        assert done.is_file(), "fault wrapper did not complete before restart"
+        assert exited is not None, "killed service PID was still running"
+        wrapper_pid = int(wrapper_pid_file.read_text().strip())
+        git_pid = int(git_pid_file.read_text().strip())
+        pids = {"service_pid": server_pid, "wrapper_pid": wrapper_pid,
+                "git_child_pid": git_pid}
+        for name, pid in pids.items():
+            assert pid > 0, name + " must be positive, got " + str(pid)
+        assert len(set(pids.values())) == 3, "PIDs must be pairwise distinct: " + str(pids)
+        self.start()
+
+        assert self.git("--git-dir=" + str(self.bare), "rev-parse", "--verify", ref).stdout.decode().strip() == self.feature_oid
+        rows = json.loads(self.sql(
+            "SELECT coalesce(json_agg(json_build_object('outcome',o.outcome,'evidence',o.evidence)),"
+            "'[]'::json)::text FROM git_operations o WHERE o.repository_id='"
+            + repo_id + "' AND o.evidence->'requested' @> '"
+            + self._sql_literal(requested_json) + "'::jsonb"
+        ) or "[]")
+        assert len(rows) == 1, "expected exactly one operation for " + ref
+        operation = rows[0]
+        details = operation["evidence"]
+        assert operation["outcome"] == "unknown", operation["outcome"]
+        assert details.get("finished") is True, "operation must be finished"
+        assert details.get("interrupted") is True, "operation must be interrupted"
+        assert details.get("requested") == [
+            {"ref_name": ref, "old_oid": ZERO_OID, "new_oid": self.feature_oid}
+        ], details.get("requested")
+        state, reason = self.sql(
+            "SELECT state || '|' || coalesce(recovery_reason,'') FROM repositories WHERE id='"
+            + repo_id + "'"
+        ).split("|", 1)
+        assert (state, reason) == ("recovering", "push_outcome_unknown"), (state, reason)
+        assert int(self.sql(
+            "SELECT count(*) FROM outbox_events e JOIN git_operations o ON o.id=e.operation_id "
+            "WHERE e.repository_id='" + repo_id + "' AND o.evidence->'requested' @> '"
+            + self._sql_literal(requested_json) + "'::jsonb"
+        )) == 0, "an unresolved unknown outcome must not publish ref events"
+        next_ref = "refs/heads/crash-recovery-next"
+        self.document(self.repo_api("/ref-transactions"), 409, method="POST", body={
+            "updates": [{"ref_name": next_ref, "old_oid": ZERO_OID,
+                         "new_oid": self.feature_oid}]})
+        assert self.git("--git-dir=" + str(self.bare), "show-ref", "--verify", next_ref,
+                        check=False).returncode != 0
+        return {
+            "service_pid": server_pid,
+            "wrapper_pid": wrapper_pid,
+            "git_child_pid": git_pid,
+            "transport_error": error_type,
+            "transport_reason": reason_type,
+            "outcome": operation["outcome"],
+            "repository_state": state,
+            "recovery_reason": reason,
+        }
 
     def commits_and_pagination(self):
         log_doc = self.document(self.repo_api("/commits"))

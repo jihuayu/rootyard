@@ -229,11 +229,16 @@ ORIGINAL_BROWSE_CASES = (
     "selective_ref_prefix",
     "protected_writes_and_ref_ack_failure",
 )
-# The only permitted additions: one deadline case per read path whose read,
-# exit and group quiescence now share a single deadline.
+# Deadline cases only: one such case per read path whose read, exit and
+# group quiescence now share a single deadline; fault cases are held separately.
 BROWSE_DEADLINE_CASES = (
     "list_commits_deadline",
     "compare_commits_deadline",
+)
+# The only permitted fault case: a real SIGKILL of this harness's own server
+# between a successful native ref CAS and its acknowledgement.
+BROWSE_FAULT_CASES = (
+    "ref_transaction_crash_recovery",
 )
 
 class GitReadStepsSourceTest(unittest.TestCase):
@@ -469,19 +474,24 @@ class GitReadStepsSourceTest(unittest.TestCase):
         browse = (TESTS / "browse.py").read_text()
         # The inventory is parsed from the source rather than counted as a raw
         # number: every original contract case stays named and ordered, and the
-        # two deadline cases are asserted as the only additions. A count alone
-        # would accept either adding unrelated cases or dropping, say,
-        # `idempotency_and_concurrency` to keep the unit passing.
+        # two deadline cases plus the single SIGKILL fault case are asserted as
+        # the only additions. A count alone would accept either adding unrelated
+        # cases or dropping, say, `idempotency_and_concurrency` to keep the unit
+        # passing.
         cases = re.search(r"CASE_NAMES = \((.*?)\n\)", browse, re.S).group(1)
         names = re.findall(r'"([^"]+)"', cases)
         # Order is runtime order, so the new cases may interleave; what is pinned
         # is that the inventory is exactly the original contracts plus the two
-        # deadline cases, with no duplicate, dropped or unrelated entry.
+        # deadline cases and the fault case, with no duplicate, dropped or
+        # unrelated entry.
         self.assertEqual(len(names), len(set(names)))
         self.assertEqual(sorted(names),
-                         sorted(ORIGINAL_BROWSE_CASES + BROWSE_DEADLINE_CASES))
+                         sorted(ORIGINAL_BROWSE_CASES + BROWSE_DEADLINE_CASES
+                                + BROWSE_FAULT_CASES))
         self.assertEqual(len(ORIGINAL_BROWSE_CASES), 12)
         self.assertEqual(len(BROWSE_DEADLINE_CASES), 2)
+        self.assertEqual(BROWSE_FAULT_CASES, ("ref_transaction_crash_recovery",))
+        self.assertEqual(len(names), 15)
         # Every listed case is still dispatched to its own implementation and the
         # suite fails when the executed inventory differs from `CASE_NAMES`.
         self.assertIn("for name in CASE_NAMES:\n            harness.case(name, getattr(harness, name))",
