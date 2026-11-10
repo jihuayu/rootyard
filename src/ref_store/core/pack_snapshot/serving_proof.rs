@@ -208,12 +208,6 @@ impl VerifiedReadViewProof {
     pub(crate) fn cluster_incarnation(&self) -> Uuid {
         self.cluster_incarnation
     }
-
-    /// Consume the proof into its verified gate revision and realm. The cluster
-    /// incarnation stays behind [`Self::cluster_incarnation`].
-    pub(crate) fn into_parts(self) -> (i64, ProvenScope) {
-        (self.gate_revision, self.scope)
-    }
 }
 
 impl MaterializedPackRead {
@@ -231,14 +225,6 @@ impl MaterializedPackRead {
             .complete_transient_pack_read()
             .filter(|_| self.proven_binding() == *binding)
             .map(|_| ProvenScope::of(self.snapshot().scope()))
-    }
-
-    /// The A5a per-read digest of the proven snapshot (`read_digest_hex`), as a
-    /// probe value for tests that must show it is never mistaken for the A5b
-    /// binding. Test-only so it can never become a proof input.
-    #[cfg(test)]
-    pub(crate) fn a5a_probe(&self) -> RequestDigest {
-        self.snapshot().read_digest_hex().parse().expect("the snapshot's own A5a hex parses")
     }
 }
 

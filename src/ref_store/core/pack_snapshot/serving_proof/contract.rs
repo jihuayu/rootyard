@@ -56,7 +56,7 @@ impl super::VerifiedReadViewProof {
 
     /// The cluster authority incarnation the proof sealed.
     pub(crate) fn contract_cluster_incarnation(&self) -> uuid::Uuid {
-        self.cluster_incarnation()
+        self.cluster_incarnation
     }
 }
 

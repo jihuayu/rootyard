@@ -212,11 +212,6 @@ impl SessionRealm {
         )
     }
 
-    /// The cluster authority incarnation this realm is bound to.
-    pub(crate) fn cluster_incarnation(&self) -> Uuid {
-        self.cluster_incarnation
-    }
-
     /// Whether a live serving lookup still authorizes exactly this realm. The
     /// cluster incarnation is that lookup's own `NOWAIT` read, never a cache.
     pub(super) fn matches_serving(&self, serving: &crate::ref_store::serving::ServingRepository) -> bool {
