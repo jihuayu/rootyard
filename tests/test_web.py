@@ -48,6 +48,12 @@ class WebTrack1ContractTest(unittest.TestCase):
         # be attached in the root over the completed router, so no table can
         # escape the cookie/Origin/CSRF layer.
         self.assertIn("pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>>", web_src)
+        # The state-carrying signature is root-only: tables are editable over
+        # the same state and are merged by the root, but may not publish a
+        # second `routes(state)` entry point of their own.
+        for rel, text in composition.items():
+            if rel != "src/web.rs":
+                self.assertNotIn("pub fn routes(", text, f"{rel} must not publish its own router entry")
         for table in ("navigation::routes()", "repository_pages::router()", "org_admin::routes()"):
             self.assertIn(f".merge({table})", web_src, f"src/web.rs must merge {table}")
         routes_body = re.search(
@@ -59,7 +65,7 @@ class WebTrack1ContractTest(unittest.TestCase):
         body_lines = [line.strip() for line in routes_body.group(1).splitlines() if line.strip()]
         self.assertEqual(
             body_lines[-1],
-            "router.layer(axum::middleware::from_fn_with_state(SessionContext { state }, session::middleware))",
+            ".layer(axum::middleware::from_fn_with_state(state, session::middleware))",
             "the session/Origin/CSRF middleware must be the last layer over the merged router",
         )
         merged = [table for table in ("navigation::routes()", "repository_pages::router()", "org_admin::routes()")

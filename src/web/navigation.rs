@@ -3,9 +3,10 @@
 //! These routes serve the login/app/logout shell, the repository listing and
 //! the personal access token / browser session management pages under
 //! `/web/settings/*`. They are mounted below the same cookie/Origin/CSRF
-//! middleware as every other `/web` page; this module only owns their paths.
+//! middleware as every other `/web` page; this module only owns their paths
+//! and stays state-agnostic so `src/web.rs` owns the router state and layer.
 
-use crate::{application::MetadataState, web};
+use crate::{AppState, web};
 
 use axum::{
     Router,
@@ -13,7 +14,10 @@ use axum::{
 };
 use std::sync::Arc;
 
-pub fn routes() -> Router<MetadataState> {
+/// Editable route table over the application state `src/web.rs` merges it into.
+pub(in crate::web) type NavigationRouter = Router<Arc<AppState>>;
+
+pub(in crate::web) fn routes() -> NavigationRouter {
     Router::new()
         .route("/web/login", get(web::session::login_page).post(web::session::login))
         .route("/web/app.js", get(web::session::app_js))

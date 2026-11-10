@@ -121,7 +121,8 @@
       "default": {
         "value": [
           "kafka-wake"
-        ]
+        ],
+        "note": "Transitional full profile; `--no-default-features` omits the Kafka wake dependency."
       },
       "kafka-wake": {
         "value": [
@@ -137,7 +138,11 @@
       "blob-azblob": {
         "value": [
           "opendal/services-azblob"
-        ]
+        ],
+        "activates": [
+          "opendal"
+        ],
+        "note": "Enables the reviewed `services-azblob` cargo feature on the pinned OpenDAL crate; it does not make OpenDAL optional and is default-OFF."
       },
       "state-baseline-metrics": {
         "value": []
@@ -316,6 +321,14 @@
       },
       "dev-dependencies.tempfile": {
         "version": "3"
+      },
+      "patch.crates-io.opendal-service-s3": {
+        "path": "vendor/opendal-service-s3",
+        "note": "Root-authorized bounded vendor of opendal-service-s3 0.57.0 with one documented public shim; provenance in vendor/opendal-service-s3/README.vendor.md."
+      },
+      "path.opendal-service-s3": {
+        "path": "vendor/opendal-service-s3",
+        "note": "Root-authorized bounded vendor of crates.io opendal-service-s3 0.57.0 with one documented public shim; it must target only this in-repo path, never an external manifest, and leaves patch.crates-io as the only patch table."
       }
     },
     "lock_additions": [
@@ -408,7 +421,8 @@
       "wasm-streams",
       "webpki-root-certs",
       "winapi-util"
-    ]
+    ],
+    "lock_additions_note": "Sorted names. A name listed here that already exists in the frozen lock (e.g. `rand`, `hashbrown`, `reqwest`) means an additional locked version appears; names absent from the lock are a no-op."
   },
   "open_items_before_add": [
     "Compile OpenRaft 0.9.25 against the planned MSRV and prove its durable storage/network adapter contract.",
@@ -429,9 +443,11 @@
     "measurement_note": "The historical d689 native receipt was not rerun against this parent and does not qualify it.",
     "archived": {
       "Cargo.toml": "docs/design/state-services/stack-parent.Cargo.toml",
-      "Cargo.lock": "docs/design/state-services/stack-parent.Cargo.lock"
+      "Cargo.lock": "docs/design/state-services/stack-parent.Cargo.lock",
+      "LICENSE": "LICENSE"
     },
-    "archived_note": "Frozen W0/phase-metrics parent inputs. Verified against these archives and the hashes below, never against today's Cargo.toml/Cargo.lock."
+    "archived_note": "Frozen W0/phase-metrics parent inputs. Verified against these archives and the hashes above, never against today's Cargo.toml/Cargo.lock.",
+    "files_note": "Frozen W0/phase-metrics parent. Cargo.toml/Cargo.lock are archived under `archived` and pinned to these hashes; Cargo.lock stays the d689-evidenced lock, LICENSE is unchanged."
   },
   "implementation_overlay": {
     "schema": "rootyard.state-services.implementation-overlay/v1",
@@ -446,19 +462,29 @@
       "purpose": "Default-OFF phase instrumentation; adds no dependency, sub-feature or profile change."
     },
     "files": {
-      "Cargo.toml": "b396480705eacfc799a5467cf7d9b3101931b710ad211754ca8108fdba976ace",
       "Cargo.lock": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034"
     },
     "parent_manifest_sha256": "f11958990599c8803322f3c51b88c167025e6ce786ae26c9fc2060d23612be72",
     "parent_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
     "parent_manifest_semantic_sha256": "d5d3f84b15150bfb4ae0f51f8a83490a14c005b9545d711c20a088281cd36aa5",
-    "scope": "Feature-only overlay of the frozen W0/phase-metrics parent. It is a historical record of how the measured parent became the feature stack (one empty, default-OFF feature, unchanged lockfile); today's integrated manifest is validated separately by `integrated_manifest`.",
+    "scope": "Historical feature-only overlay of the frozen W0/phase-metrics parent (archived bytes only). Today's integrated manifest/lockfile are validated separately by `integrated_manifest`; neither contract rewrites the other.",
     "rejected": [
       "any dependency, dev-dependency, profile or patch change",
       "any second feature or a non-empty overlay feature",
       "any MSRV change or relaxation",
       "any Cargo.lock change",
       "relabelling the frozen parent hash with the child manifest hash"
-    ]
+    ],
+    "child_manifest_sha256": null,
+    "child_manifest_semantic_sha256": "d51bd478a4c020becb3d77b8d57ffe5b66540390d12d553434b41fc3a50c8df2",
+    "child_manifest_note": "The overlay-applied child manifest bytes were not kept in this tree (only the frozen parent archive is); the record therefore pins the child's semantic digest = archived parent plus exactly the empty, default-OFF `state-baseline-metrics` feature. A fixture that reaches a supported child only by bumping `combine`, an undeclared transitive crate, contradicts the recorded no-dependency overlay and is not used."
+  },
+  "historical_manifest": {
+    "schema": "rootyard.state-services.historical-manifest/v1",
+    "baseline_commit": "d689bf8062a73cfadbc0a72abf3f1546d992e09c",
+    "Cargo.toml": "c867ebfd10a3e19f16c729706bfefd9ab20d20ce25a7e7ece3dff775f5d7324e",
+    "Cargo.lock": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "note": "d689 is the historical W0 measurement/documentation point. Its manifest, lockfile and LICENSE are frozen in `docs/design/state-services/historical-d689/` and its own evidence; the checker never compares them with today's Cargo, and today's integrated Cargo is never written back into them."
   }
 }

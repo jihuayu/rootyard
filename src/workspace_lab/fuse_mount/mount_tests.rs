@@ -1,10 +1,10 @@
 //! Ownership, option-list and teardown-contract tests for the FUSE mount.
-
+//!
 //! The identity helpers are named once through `super::ownership`, the module
 //! whose functions `unmount_owned` actually calls, so these cases exercise the
 //! implementation that gates a real unmount.
 
-use super::{MountHandle, mount_id_in, mount_options, owns_current_mount};
+use super::{MountHandle, mount_options, ownership, ownership::owns_current_mount};
 use std::{io, path::Path};
 
 #[test]
@@ -51,7 +51,7 @@ fn mountinfo_identity_is_the_single_exact_mount_at_the_owned_path() {
 ";
     // Stacked mounts at one path are ambiguous: never pick one, and do not
     // assume the largest (or newest) opaque kernel ID is the visible mount.
-    let err = mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt"))
+    let err = ownership::mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt"))
         .expect_err("stacked mounts must not resolve to one identity");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     // The same stack in the reverse ID order is just as ambiguous.
@@ -60,17 +60,20 @@ fn mountinfo_identity_is_the_single_exact_mount_at_the_owned_path() {
 36 35 0:32 / /srv/rootyard/workspaces/a/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
 ";
     assert_eq!(
-        mount_id_in(reversed, Path::new("/srv/rootyard/workspaces/a/mnt"))
+        ownership::mount_id_in(reversed, Path::new("/srv/rootyard/workspaces/a/mnt"))
             .expect_err("stacked mounts are ambiguous in either ID order")
             .kind(),
         io::ErrorKind::InvalidData
     );
     // A single exact match is the owned identity.
-    assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt-extra")).unwrap(), Some(38));
+    assert_eq!(ownership::mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt-extra")).unwrap(), Some(38));
     // An absent path has no identity at all.
-    assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a")).unwrap(), None);
+    assert_eq!(ownership::mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a")).unwrap(), None);
     // mountinfo escapes whitespace octally; the comparison is on the path.
-    assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/with space/mnt")).unwrap(), Some(39));
+    assert_eq!(
+        ownership::mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/with space/mnt")).unwrap(),
+        Some(39)
+    );
 }
 
 #[test]
