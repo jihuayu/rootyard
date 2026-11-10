@@ -61,7 +61,9 @@ mod tests {
     /// The command section of a real stock client: two commands under
     /// `report-status` and `atomic`, followed by a body that stands for the
     /// client's PACK.
-    const REAL: &[u8] = b"008d1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 refs/heads/main\0report-status side-band-64k atomic\n00671111111111111111111111111111111111111111 3333333333333333333333333333333333333333 refs/heads/stale\n0000PACK-UNTOUCHED";
+    // pkt-line lengths include their own 4-byte prefix: 0x89 = 4 + 133 bytes
+    // for the capability command, 0x67 = 4 + 99 bytes for the stale one.
+    const REAL: &[u8] = b"00891111111111111111111111111111111111111111 2222222222222222222222222222222222222222 refs/heads/main\0report-status side-band-64k atomic\n00671111111111111111111111111111111111111111 3333333333333333333333333333333333333333 refs/heads/stale\n0000PACK-UNTOUCHED";
 
     #[test]
     fn without_atomic_removes_only_the_capability() {

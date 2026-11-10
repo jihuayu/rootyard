@@ -471,8 +471,9 @@ mod tests {
         let bad: [&[u8]; 3] = [
             b"HTTP/1.1 200 OK\r\nno-colon-here\r\nContent-Type: x\r\n\r\n",
             b"HTTP/1.1 200 OK\r\nContent-Type: x\r\nno-colon-here\r\n\r\n",
-            // Two empty lines: only the final one is the terminator.
-            b"HTTP/1.1 200 OK\r\nContent-Type: x\r\n\r\nY: z\r\n\r\n",
+            // Trailing whitespace on the looks-like-a-header line still leaves it
+            // without a colon inside the terminated head.
+            b"HTTP/1.1 200 OK\r\nContent-Type: x\r\nno-colon-here \r\n\r\n",
         ];
         for raw in bad {
             let error = read(raw).await.unwrap_err().to_string();
