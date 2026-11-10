@@ -1005,6 +1005,29 @@ mod tests {
     }
 
     #[test]
+    fn range_reads_fail_closed_on_internal_gap_and_keep_valid_short_reads() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..6).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        assert_eq!(logs(&rt, &mut s, 0..8), (2..6).map(|i| blank(1, i)).collect::<Vec<_>>());
+        assert!(logs(&rt, &mut s, 6..9).is_empty());
+        rt.block_on(s.truncate(lid(1, 5))).unwrap();
+        assert_eq!(logs(&rt, &mut s, 2..9), (2..5).map(|i| blank(1, i)).collect::<Vec<_>>());
+        drop(s);
+        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        assert_eq!(conn.execute("DELETE FROM log_entry WHERE idx=3", []).unwrap(), 1);
+        drop(conn);
+        let mut s = open(&rt, dir.path());
+        assert!(rt.block_on(s.try_get_log_entries(2..5)).is_err(), "full reader accepted an internal gap");
+        let mut reader = rt.block_on(s.get_log_reader());
+        assert!(rt.block_on(reader.limited_get_log_entries(2, 5)).is_err(), "limited reader accepted an internal gap");
+        assert_eq!(logs(&rt, &mut s, 4..5), vec![blank(1, 4)]);
+        assert!(logs(&rt, &mut s, 2..2).is_empty());
+    }
+
+    #[test]
     fn identity_format_and_lock_fail_closed() {
         let rt = rt();
         let dir = tempfile::tempdir().unwrap();
