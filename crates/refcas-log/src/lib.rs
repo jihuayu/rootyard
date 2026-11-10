@@ -208,18 +208,69 @@ fn write_meta_vote(conn: &Connection, v: &Vote<u64>) -> Res<()> {
 
 /// Durable last log id, computed from stored rows (never a cached pointer):
 /// highest stored row, else the purge boundary.
+///
+/// `purge` is inclusive and deletes rows through the boundary. The only row it can leave at the
+/// boundary is its own, because a purge writes `meta` in the same transaction that deletes rows: a
+/// crash restores both, and a resume keeps a row only if nothing changed `meta`. An
+/// [`is_invalid_residue`] row at or below the boundary therefore cannot come from this store and fails
+/// closed, wherever it sits. That check is what [`read_last`] relies on, so a disallowed row hidden
+/// beneath a valid live tail is never reported as part of the log.
 fn read_last(conn: &Connection) -> Res<Option<LogId<u64>>> {
     let purged = purged_boundary(conn)?;
+    invalid_residue(conn, purged.as_ref())?;
     match stored_max(conn)? {
-        Some((_, lid)) => {
-            if let Some(p) = &purged
-                && lid.index < p.index
-            {
-                return Err(E::Refused(format!("last stored {lid} is below purge boundary {p}")));
-            }
-            Ok(Some(lid))
-        }
+        Some((_, lid)) => Ok(Some(lid)),
         None => Ok(purged),
+    }
+}
+
+/// True for a row `purge` may legitimately leave behind: exactly the boundary row it addressed
+/// (same index, same full `LogId`). Every other row at or below the boundary is [`is_invalid_residue`].
+fn same_boundary_row(row: &LogId<u64>, purged: &LogId<u64>) -> bool {
+    row == purged
+}
+
+/// The consistent fail-closed rule for rows the inclusive purge should have deleted: a row below
+/// the boundary is invalid, and a row at it is valid only with the boundary's own `LogId`.
+fn is_invalid_residue(row: &LogId<u64>, purged: &LogId<u64>) -> bool {
+    row.index < purged.index || (row.index == purged.index && !same_boundary_row(row, purged))
+}
+
+/// Fail closed if any stored row at or below the boundary is invalid residue. With no boundary no
+/// row exists, and without rows the index scan is empty.
+///
+/// Per level this is a jump to the greatest index `<= level` (the `INTEGER PRIMARY KEY` index, so
+/// bounded by rows and never false on a sparse index), then one row: an invalid row is reported,
+/// the boundary's own row lets the scan end, and any other row repeats one level lower. Only
+/// residue costs iterations, at most one per distinct level.
+fn residue_scan(conn: &Connection, boundary: LogId<u64>) -> Res<Option<(LogId<u64>, LogId<u64>)>> {
+    let mut level = boundary.index;
+    loop {
+        let key = idx_to_i64(level)?;
+        let Some(row) =
+            read_indexed_row(conn, "SELECT {cols} FROM log_entry WHERE idx <= ?1 ORDER BY idx DESC LIMIT 1", [key])?
+        else {
+            return Ok(None);
+        };
+        let row_id = *row.get_log_id();
+        if is_invalid_residue(&row_id, &boundary) {
+            return Ok(Some((row_id, boundary)));
+        }
+        match row_id.index.checked_sub(1) {
+            Some(next) => level = next,
+            None => return Ok(None),
+        }
+    }
+}
+
+/// [`residue_scan`] with its refusal; the message names the invalid row and the boundary.
+fn invalid_residue(conn: &Connection, purged: Option<&LogId<u64>>) -> Res<()> {
+    let Some(boundary) = purged else { return Ok(()) };
+    match residue_scan(conn, *boundary)? {
+        Some((row, boundary)) => {
+            Err(E::Refused(format!("stored {row} is invalid residue at or below purge boundary {boundary}")))
+        }
+        None => Ok(()),
     }
 }
 
@@ -255,9 +306,16 @@ fn decode_entry_row(row: &rusqlite::Row<'_>) -> Res<(LogId<u64>, EntryOf)> {
     Ok((lid, entry))
 }
 fn stored_max(conn: &Connection) -> Res<Option<(i64, LogId<u64>)>> {
-    let mut st = conn.prepare(&format!("SELECT {ENTRY_COLUMNS} FROM log_entry ORDER BY idx DESC LIMIT 1"))?;
-    let mut rows = st.query([])?;
-    rows.next()?.map(|row| decode_entry_row(row).map(|(lid, _)| (lid.index as i64, lid))).transpose()
+    Ok(read_indexed_row(conn, "SELECT {cols} FROM log_entry ORDER BY idx DESC LIMIT 1", [])?
+        .map(|entry| (entry.get_log_id().index as i64, *entry.get_log_id())))
+}
+
+/// First row (with full checksum/identity validation) of an `{cols}`-templated index query, or
+/// `None` when the query yields no row.
+fn read_indexed_row<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Res<Option<EntryOf>> {
+    let mut st = conn.prepare(&sql.replace("{cols}", ENTRY_COLUMNS))?;
+    let mut rows = st.query(params)?;
+    rows.next()?.map(decode_entry_row).transpose().map(|row| row.map(|(_, entry)| entry))
 }
 fn read_row(conn: &Connection, idx: i64) -> Res<Option<(LogId<u64>, EntryOf)>> {
     let mut st = conn.prepare(&format!("SELECT {ENTRY_COLUMNS} FROM log_entry WHERE idx=?1"))?;
@@ -265,37 +323,98 @@ fn read_row(conn: &Connection, idx: i64) -> Res<Option<(LogId<u64>, EntryOf)>> {
     rows.next()?.map(decode_entry_row).transpose()
 }
 
+/// Why [`read_rows`] stopped before `to`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// Every row in `[from, to)` was read.
+    Complete,
+    /// Limited read: the entry-count budget is full, later rows were not read.
+    Count,
+    /// Limited read: the next row would exceed the byte budget, it was not read.
+    Bytes,
+}
+
+/// Read stored rows in `[from, to)` as `(index, entry)` pairs.
+///
+/// A full read refuses a range over the count or byte budget. A limited read returns as many
+/// leading rows as fit and reports why it stopped; it never returns an empty result.
+fn read_rows(conn: &Connection, from: i64, to: i64, limited: bool) -> Res<(Vec<(u64, EntryOf)>, Stop)> {
+    let mut st =
+        conn.prepare(&format!("SELECT {ENTRY_COLUMNS} FROM log_entry WHERE idx >= ?1 AND idx < ?2 ORDER BY idx"))?;
+    let mut rows = st.query([from, to])?;
+    let mut out: Vec<(u64, EntryOf)> = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(r) = rows.next()? {
+        let (lid, entry) = decode_entry_row(r)?;
+        let sid: String = r.get(1)?;
+        let sdata: String = r.get(2)?;
+        if !limited && out.len() >= MAX_BATCH_ENTRIES {
+            return Err(E::Refused("requested log range exceeds its read budget".into()));
+        }
+        if !limited && bytes.saturating_add(sid.len() + sdata.len()) > MAX_BATCH_BYTES {
+            return Err(E::Refused("requested log range exceeds its read budget".into()));
+        }
+        if out.len() >= MAX_BATCH_ENTRIES {
+            return Ok((out, Stop::Count));
+        }
+        let next_bytes = bytes.saturating_add(sid.len() + sdata.len());
+        if next_bytes > MAX_BATCH_BYTES {
+            return Ok((out, Stop::Bytes));
+        }
+        bytes = next_bytes;
+        out.push((lid.index, entry));
+    }
+    Ok((out, Stop::Complete))
+}
+
 /// Read rows in `[lo, hi)` (or `[lo, unbounded)`), bounded by count and encoded bytes.
 /// Returns empty for an empty range; there is no "first row only" special case.
+///
+/// Fail closed on a genuine hole. `append`, `truncate` and `purge` each commit in one transaction
+/// and never leave a hole, so the stored log is exactly the indices `(last_purged_log_id,
+/// last_log_id]`; `RaftLogReader` states a missing entry is allowed.
+///
+/// `known = stored max + 1` is the end of any possible log, even after a row was deleted, and
+/// `purged + 1` is the first index that can still be stored. So rows before
+/// `first = max(lo, purged + 1)` can only be purged, and every index in `[first, known)` must be
+/// stored. Whatever is returned must begin with `first` and have no internal gap, including a
+/// limited read stopped by its count or byte budget. Only a complete read must also reach
+/// `min(known, hi)`; past that end (and past `hi`) short reads and empty results stay valid.
 fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res<Vec<EntryOf>> {
     if hi.is_some_and(|h| h <= lo) {
         return Ok(Vec::new()); // empty range: never touches SQL
     }
-    if lo >= i64::MAX as u64 {
-        return Ok(Vec::new());
+    let purged = purged_boundary(conn)?;
+    // Same rule as `read_last`; the scan is empty without a boundary.
+    invalid_residue(conn, purged.as_ref())?;
+    let first = purged.as_ref().map_or(lo, |p| lo.max(p.index.saturating_add(1)));
+    let known = match stored_max(conn)? {
+        Some((max, _)) => idx_from_i64(max)?.saturating_add(1),
+        None => 0,
+    };
+    let end = known.min(hi.unwrap_or(u64::MAX));
+    if end <= first {
+        return Ok(Vec::new()); // nothing stored can be requested
     }
-    let lo = idx_to_i64(lo)?;
-    let hi = hi.unwrap_or(u64::MAX).min(i64::MAX as u64) as i64;
-    let mut st =
-        conn.prepare(&format!("SELECT {ENTRY_COLUMNS} FROM log_entry WHERE idx >= ?1 AND idx < ?2 ORDER BY idx"))?;
-    let mut rows = st.query([lo, hi])?;
-    let mut out: Vec<EntryOf> = Vec::new();
-    let mut bytes = 0usize;
-    while let Some(r) = rows.next()? {
-        let (_, entry) = decode_entry_row(r)?;
-        let sid: String = r.get(1)?;
-        let sdata: String = r.get(2)?;
-        let next_bytes = bytes.saturating_add(sid.len() + sdata.len());
-        if out.len() >= MAX_BATCH_ENTRIES || next_bytes > MAX_BATCH_BYTES {
-            if limited && !out.is_empty() {
-                break;
-            }
-            return Err(E::Refused("requested log range exceeds its read budget".into()));
-        }
-        bytes = next_bytes;
-        out.push(entry);
+    let (rows, stop) = read_rows(conn, idx_to_i64(first)?, idx_to_i64(end)?, limited)?;
+    // The head is required for every result, budget stops included.
+    if rows.first().is_none_or(|(idx, _)| *idx != first) {
+        return Err(E::Refused(format!("log entry {first} is missing although it is stored")));
     }
-    Ok(out)
+    // No gap may follow either: a later row cannot stand in for a lost one.
+    if let Some(w) = rows.windows(2).find(|w| w[1].0 - w[0].0 != 1) {
+        return Err(E::Refused(format!(
+            "log entry {} is missing although it is stored; stored entry {} follows",
+            w[0].0.saturating_add(1),
+            w[1].0
+        )));
+    }
+    // A budget stop is a contract-valid prefix; only a complete read must reach `end`.
+    let reached = rows.last().map_or(first, |(idx, _)| idx.saturating_add(1));
+    if stop == Stop::Complete && reached < end {
+        return Err(E::Refused(format!("log entry {reached} is missing although it is stored")));
+    }
+    Ok(rows.into_iter().map(|(_, e)| e).collect())
 }
 
 /// Create the directory and take the process-exclusive directory lock.
@@ -758,6 +877,18 @@ mod tests {
     }
 
     #[test]
+    fn residue_rule_is_consistent() {
+        // Below the boundary any row is invalid; at the boundary only its own full `LogId` is valid.
+        let b = LogId::new(CommittedLeaderId::new(3, 1), 5);
+        let at = |term: u64, node: u64| LogId::new(CommittedLeaderId::new(term, node), 5);
+        assert!(!is_invalid_residue(&at(3, 1), &b), "the boundary's own row");
+        assert!(is_invalid_residue(&at(2, 1), &b), "same index, older log id");
+        assert!(is_invalid_residue(&at(3, 9), &b), "same index, other node");
+        assert!(is_invalid_residue(&lid(3, 4), &b), "below the boundary, even the same leader");
+        assert!(!is_invalid_residue(&lid(3, 6), &b), "above the boundary is live");
+    }
+
+    #[test]
     fn restart_preserves_vote_committed_purge_and_logs() {
         let rt = rt();
         let dir = tempfile::tempdir().unwrap();
@@ -942,5 +1073,638 @@ mod tests {
             drop(conn);
             assert!(rt.block_on(PersistentLog::open(dir.path(), 7, false)).is_err(), "bad {key} accepted");
         }
+    }
+
+    /// Delete rows straight from SQLite, as silent file/runtime corruption would (`quick_check`
+    /// still passes; callers reopen with it enabled).
+    fn delete_rows(dir: &Path, sql: &str) {
+        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        conn.execute(sql, []).unwrap();
+        let ok: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(ok, "ok", "in-row deletion leaves SQLite itself consistent");
+    }
+    fn indices(es: &[EntryOf]) -> Vec<u64> {
+        es.iter().map(|e| e.log_id.index).collect()
+    }
+    fn empty() -> Vec<EntryOf> {
+        Vec::new()
+    }
+    /// True only for this store's explicit "required log index is missing" refusal.
+    fn is_missing(r: &Result<Vec<EntryOf>, StorageError<u64>>) -> bool {
+        let msg = match r {
+            Ok(_) => return false,
+            Err(StorageError::IO { source }) => source.to_string(),
+            Err(other) => panic!("unexpected error kind: {other:?}"),
+        };
+        msg.contains("refused: log entry ") && msg.contains(" is missing although it is stored")
+    }
+    /// Adapter for the in-crate peers that return [`E`].
+    fn missing_in_core(r: &Res<Vec<EntryOf>>) -> bool {
+        is_missing(&r.as_ref().cloned().map_err(|e| ioerr(ErrorSubject::Logs, ErrorVerb::Read, e)))
+    }
+
+    #[test]
+    fn read_fails_closed_on_deleted_internal_row() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..8).map(|i| blank(1, i)).collect());
+        // Committed stays below the tail: a tail row must never be mistaken for a purge boundary.
+        rt.block_on(s.save_committed(Some(lid(1, 5)))).unwrap();
+        let mut r = rt.block_on(s.get_log_reader());
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(1..5)).unwrap()), vec![1, 2, 3, 4]);
+        drop(r);
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=3");
+
+        let mut s = open(&rt, dir.path());
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (None, Some(lid(1, 7))), "state is unchanged");
+        let mut r = rt.block_on(s.get_log_reader());
+        // Previously: `Ok([1, 2, 4])`, `Ok([])` and `Ok(len 7)` — silent holes.
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(1..5))), "range spanning the hole");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(3..4))), "the hole alone");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(3..8))), "from the hole to the tail");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(0..8))), "whole log");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(..))), "unbounded read");
+        assert!(is_missing(&rt.block_on(r.limited_get_log_entries(2, 5))), "limited read, gap mid-chunk");
+        assert!(is_missing(&rt.block_on(r.limited_get_log_entries(3, 4))), "limited read of the hole");
+        assert!(is_missing(&rt.block_on(r.limited_get_log_entries(3, 4))), "repeat stays failed");
+        // The same hole through the store's own reader implementation.
+        assert!(is_missing(&rt.block_on(s.try_get_log_entries(1..5))));
+        assert!(is_missing(&rt.block_on(s.limited_get_log_entries(1, 5))));
+        // Ranges with no index in the required prefix `(purged, last]` keep valid short reads.
+        assert!(rt.block_on(r.try_get_log_entries(1..3)).map(|v| indices(&v)).unwrap() == vec![1, 2]);
+        assert!(rt.block_on(r.try_get_log_entries(0..3)).map(|v| indices(&v)).unwrap() == vec![0, 1, 2]);
+        assert!(rt.block_on(r.try_get_log_entries(8..20)).unwrap().is_empty(), "past the end");
+        assert!(rt.block_on(r.try_get_log_entries(100..)).unwrap().is_empty(), "far past the end");
+        assert!(rt.block_on(r.try_get_log_entries(5..5)).unwrap().is_empty(), "empty range");
+        let exact: Vec<EntryOf> = (4..8).map(|i| blank(1, i)).collect();
+        assert_eq!(rt.block_on(r.try_get_log_entries(4..8)).unwrap(), exact, "after the hole");
+        drop(r);
+
+        // Append still uses the stored last index; it cannot see the hole and must not repair it
+        // silently: the next read still fails.
+        append_ok(&rt, &s, vec![blank(1, 8)]);
+        assert!(missing_in_core(&rt.block_on(with_inner(s.inner.clone(), |i| read_range(&i.conn, 2, Some(9), false)))));
+        // Bootstrap entry and multiple holes are found too.
+        drop(s);
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..10).map(|i| blank(1, i)).collect());
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx IN (0, 4, 7)");
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(0..2))), "bootstrap entry lost");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(0..10))), "three holes");
+        assert!(rt.block_on(r.try_get_log_entries(1..4)).unwrap().len() == 3, "hole-free range below the gap");
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(5..7)).unwrap()), vec![5, 6], "between holes");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(6..8))), "second hole");
+        drop(r);
+    }
+
+    #[test]
+    fn read_fails_closed_on_missing_required_prefix_and_tail() {
+        let rt = rt();
+        // The stored last row (the tail) is gone: `get_log_state` still reports the purge boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        let mut r = rt.block_on(s.get_log_reader());
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(2..10)).unwrap()), vec![2, 3, 4]);
+        drop(r);
+        drop(s);
+        // Row 2 is required: it is the live row right after the boundary and the start of every
+        // engine read of the committed log; losing it silently shifts the prefix's first row.
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=2");
+        let mut s = open(&rt, dir.path());
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (Some(lid(1, 1)), Some(lid(1, 4))));
+        let mut r = rt.block_on(s.get_log_reader());
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(2..10))), "prefix head lost");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(2..3))), "the lost row alone");
+        assert!(is_missing(&rt.block_on(r.limited_get_log_entries(2, 10))), "limited prefix lost");
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(3..5)).unwrap()), vec![3, 4], "after it");
+        assert!(rt.block_on(r.try_get_log_entries(0..2)).unwrap().is_empty(), "wholly purged");
+        assert!(rt.block_on(r.try_get_log_entries(1..2)).unwrap().is_empty(), "at the purge boundary");
+        assert!(rt.block_on(r.try_get_log_entries(10..12)).unwrap().is_empty(), "past the stored last");
+
+        // Deletes from a prefix back to the tail: the later deletes remove the very rows that would
+        // otherwise reveal the hole, so the derived end itself shrinks.
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx >= 2");
+        let mut s = open(&rt, dir.path());
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (None, Some(lid(1, 1))), "tail moved");
+        let mut r = rt.block_on(s.get_log_reader());
+        // Without a persisted end there is no evidence of a hole here; these are valid short reads,
+        // never an error, and the reader reports the reduced log exactly.
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(0..10)).unwrap()), vec![0, 1]);
+        assert!(rt.block_on(r.try_get_log_entries(2..5)).unwrap().is_empty(), "past the new end");
+        assert_eq!(indices(&rt.block_on(s.try_get_log_entries(1..)).unwrap()), vec![1], "unbounded");
+    }
+
+    #[test]
+    fn read_short_results_stay_valid_at_boundaries() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        assert!(rt.block_on(r.try_get_log_entries(0..10)).unwrap().is_empty(), "fresh store: no log");
+        assert!(rt.block_on(r.limited_get_log_entries(0, 10)).unwrap().is_empty());
+        append_ok(&rt, &s, (0..4).map(|i| blank(1, i)).collect());
+        let four = |a: u64, b: u64| -> Vec<EntryOf> { (a..b).map(|i| blank(1, i)).collect() };
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(0..10)).unwrap()), vec![0, 1, 2, 3]);
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(2..)).unwrap()), vec![2, 3]);
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(3..=3)).unwrap()), vec![3]);
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(..)).unwrap()), vec![0, 1, 2, 3]);
+        assert_eq!(rt.block_on(r.try_get_log_entries(4..5)).unwrap(), empty(), "index == last + 1");
+        assert_eq!(rt.block_on(r.try_get_log_entries(9..u64::MAX)).unwrap(), empty(), "huge end");
+        assert_eq!(rt.block_on(r.try_get_log_entries(u64::MAX..)).unwrap(), empty(), "at u64::MAX");
+        assert_eq!(rt.block_on(r.try_get_log_entries(i64::MAX as u64 - 2..)).unwrap(), empty(), "budget cap");
+        assert_eq!(rt.block_on(r.try_get_log_entries(4..4)).unwrap(), empty(), "empty at last + 1");
+        assert_eq!(
+            rt.block_on(r.try_get_log_entries((Bound::Included(9_u64), Bound::Excluded(4_u64)))).unwrap(),
+            empty(),
+            "inverted range"
+        );
+        assert_eq!(rt.block_on(r.limited_get_log_entries(2, 2)).unwrap(), empty(), "limited empty");
+        assert_eq!(rt.block_on(r.limited_get_log_entries(0, u64::MAX)).unwrap(), four(0, 4), "limited huge end");
+        drop(r);
+
+        // A limited read may stop at its budget: a contract-valid nonempty prefix, never a hole.
+        // (The budget test also fetches the stored last row, so it is detected at once; a row that
+        // is truncated right after the last budgeted entry is caught by the next engine read.)
+        append_ok(&rt, &s, (4..MAX_BATCH_ENTRIES as u64 + 1).map(|i| blank(1, i)).collect());
+        let mut r = rt.block_on(s.get_log_reader());
+        let got = rt.block_on(r.limited_get_log_entries(10, u64::MAX)).unwrap();
+        assert!(got.len() <= MAX_BATCH_ENTRIES && !got.is_empty(), "bounded, nonempty prefix");
+        assert_eq!(indices(&got)[..2], [10, 11]);
+        assert!(rt.block_on(r.limited_get_log_entries(0, 0)).unwrap().is_empty());
+        drop(r);
+
+        // Purge through 4: the boundary index is gone, the next index is required.
+        rt.block_on(s.purge(lid(1, 4))).unwrap();
+        drop(s);
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(4..8)).unwrap()), vec![5, 6, 7], "first stored");
+        drop(r);
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=5");
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(5..8))), "row after the boundary lost");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(4..8))), "including the boundary index");
+        assert!(rt.block_on(r.try_get_log_entries(0..5)).unwrap().is_empty(), "wholly purged");
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(6..8)).unwrap()), vec![6, 7]);
+        // Snapshot-style purge past the local tail: no stored log exists at all.
+        rt.block_on(s.purge(LogId::new(CommittedLeaderId::new(9, 3), 5000))).unwrap();
+        assert!(rt.block_on(r.try_get_log_entries(0..6000)).unwrap().is_empty());
+        assert!(rt.block_on(r.limited_get_log_entries(0, 6000)).unwrap().is_empty());
+        assert!(rt.block_on(r.try_get_log_entries(5001..)).unwrap().is_empty());
+    }
+
+    /// Pins the purge boundary with a matching meta checksum (upsert).
+    fn set_purged(dir: &Path, boundary: LogId<u64>) {
+        let value = je(&boundary).unwrap();
+        let hash = checksum(&[b"meta", K_PURGED.as_bytes(), value.as_bytes()]);
+        Connection::open(dir.join(DB_FILE))
+            .unwrap()
+            .execute(
+                "INSERT INTO meta(k, v, checksum) VALUES(?1, ?2, ?3) ON CONFLICT(k) DO UPDATE SET v=excluded.v, checksum=excluded.checksum",
+                (K_PURGED, &value, hash),
+            )
+            .unwrap();
+    }
+    /// Replaces a row's whole `LogId` (leader id included) with valid, checksum-consistent data.
+    fn rewrite_row(dir: &Path, idx: u64, new_id: LogId<u64>) {
+        let entry: EntryOf = Entry { log_id: new_id, payload: EntryPayload::Blank };
+        let id = je(&new_id).unwrap();
+        let data = je(&entry).unwrap();
+        let hash = entry_checksum(idx as i64, &id, &data);
+        let changed = Connection::open(dir.join(DB_FILE))
+            .unwrap()
+            .execute("UPDATE log_entry SET log_id=?2, data=?3, checksum=?4 WHERE idx=?1", (idx as i64, id, data, hash))
+            .unwrap();
+        assert_eq!(changed, 1, "row {idx} was rewritten");
+    }
+    /// A real stored row for `idx` from a throwaway store, so leftovers carry valid data and checksums.
+    fn seeded_row(rt: &tokio::runtime::Runtime, idx: u64) -> (String, String, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(rt, dir.path());
+        append_ok(rt, &s, (0..=idx).map(|i| blank(1, i)).collect());
+        drop(s);
+        Connection::open(dir.path().join(DB_FILE))
+            .unwrap()
+            .query_row("SELECT log_id, data, checksum FROM log_entry WHERE idx=?1", [idx as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+    }
+    fn insert_row(dir: &Path, idx: u64, row: &(String, String, Vec<u8>)) {
+        let changed = Connection::open(dir.join(DB_FILE))
+            .unwrap()
+            .execute(
+                "INSERT INTO log_entry(idx, log_id, data, checksum) VALUES(?1, ?2, ?3, ?4)",
+                (idx as i64, &row.0, &row.1, &row.2),
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn equal_purge_row_with_other_log_id_is_not_live() {
+        let rt = rt();
+        // `purge(.., lid(1, 1))` is inclusive: the only row it may leave at index 1 is its own log id.
+        // A row there with another full `LogId` (`T9-N9-1`) cannot come from this store, yet fcb only
+        // rejected rows *below* the boundary, so it read this one as the live tail.
+        let row = seeded_row(&rt, 1);
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..3).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx > 1"); // the leftover is the tail
+        insert_row(dir.path(), 1, &row); // the purge's own row back on disk
+        rewrite_row(dir.path(), 1, LogId::new(CommittedLeaderId::new(9, 9), 1));
+        let stored = stored_max(&Connection::open(dir.path().join(DB_FILE)).unwrap()).unwrap().unwrap().1;
+        assert_eq!(stored, LogId::new(CommittedLeaderId::new(9, 9), 1), "the fcb input state");
+        // Grading: fcb's `index < boundary` comparison accepted exactly this state as the live tail,
+        // while this store refuses to open it.
+        let via_fcb = with_copy(dir.path(), fcb_read_last);
+        assert_eq!(format!("{via_fcb:?}"), format!("Ok(Some({:?}))", LogId::new(CommittedLeaderId::new(9, 9), 1)));
+        assert!(
+            rt.block_on(PersistentLog::open(dir.path(), 7, false)).is_err(),
+            "a leftover row with another LogId at the boundary must fail closed"
+        );
+        let err = match rt.block_on(PersistentLog::open(dir.path(), 7, false)) {
+            Ok(_) => panic!("a leftover row with another LogId at the boundary must fail closed"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("at or below purge boundary"), "{err}");
+    }
+
+    #[test]
+    fn hidden_residue_beneath_valid_live_tail_fails_closed() {
+        let rt = rt();
+        // Disallowed leftovers hidden below a valid live tail: the max row is valid, so 8a8ceb9's
+        // max-only check accepted it. Each is caught by the bounded index scan on open, on state and
+        // on reads; the boundary's own row stays supported.
+        let rows: Vec<_> = (0..=4).map(|i| seeded_row(&rt, i)).collect();
+        let leftovers: [(u64, LogId<u64>, &str); 3] = [
+            (1, lid(2, 1), "below the boundary, same leader, older term"),
+            (2, LogId::new(CommittedLeaderId::new(9, 9), 2), "below the boundary, other node"),
+            (3, LogId::new(CommittedLeaderId::new(9, 9), 3), "at the boundary, another LogId"),
+        ];
+        for (idx, other, what) in leftovers {
+            let dir = tempfile::tempdir().unwrap();
+            let mut s = open(&rt, dir.path());
+            append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+            rt.block_on(s.purge(lid(1, 3))).unwrap();
+            rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+            drop(s);
+            insert_row(dir.path(), idx, &rows[idx as usize]);
+            rewrite_row(dir.path(), idx, other);
+            // Grading: 8a8ceb9 saw only the live tail (4) and accepted the residue beneath it, and
+            // its range read never looked below the boundary.
+            let prior = with_copy(dir.path(), prior_read_last);
+            assert_eq!(format!("{prior:?}"), format!("Ok(Some({:?}))", lid(1, 4)), "{what}: 8a8ceb9 input");
+            // This store refuses before it can report anything: open, state and every read path.
+            let err = match rt.block_on(PersistentLog::open(dir.path(), 7, true)) {
+                Ok(_) => panic!("{what}: residue accepted on open"),
+                Err(e) => e,
+            };
+            assert!(format!("{err}").contains("invalid residue at or below purge boundary"), "{what}: {err}");
+            // To observe state and reads on their own, a handle is opened with the rule's input
+            // momentarily absent (no boundary pinned), then the boundary is restored, as a purge
+            // would, through another connection; the handle's state and read paths must still refuse.
+            let probe_dir = tempfile::tempdir().unwrap();
+            std::fs::copy(dir.path().join(DB_FILE), probe_dir.path().join(DB_FILE)).unwrap();
+            Connection::open(probe_dir.path().join(DB_FILE))
+                .unwrap()
+                .execute("DELETE FROM meta WHERE k=?1", [K_PURGED])
+                .unwrap();
+            let mut s = open(&rt, probe_dir.path());
+            set_purged(probe_dir.path(), lid(1, 3));
+            let state_err = rt.block_on(s.get_log_state()).expect_err("residue on state");
+            assert!(format!("{state_err}").contains("invalid residue"), "{what}: {state_err}");
+            let mut r = rt.block_on(s.get_log_reader());
+            for err in [
+                rt.block_on(r.try_get_log_entries(4..5)).expect_err("full read"),
+                rt.block_on(r.try_get_log_entries(0..10)).expect_err("whole-log read"),
+                rt.block_on(r.limited_get_log_entries(0, 10)).expect_err("limited read"),
+            ] {
+                assert!(format!("{err}").contains("invalid residue"), "{what}: {err}");
+            }
+            drop(r);
+            drop(s);
+        }
+
+        // The matching boundary row (what `purge` may leave) stays supported, hidden or not.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 3))).unwrap();
+        drop(s);
+        insert_row(dir.path(), 3, &rows[3]);
+        let mut s = open(&rt, dir.path());
+        assert_eq!(state(&rt, &mut s).last_log_id, Some(lid(1, 4)), "live tail");
+        let mut r = rt.block_on(s.get_log_reader());
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(0..10)).unwrap()), vec![4], "boundary not live");
+        assert_eq!(indices(&rt.block_on(r.limited_get_log_entries(3, 10)).unwrap()), vec![4]);
+        drop(r);
+        drop(s);
+    }
+
+    #[test]
+    fn leftover_purge_row_survives_reads_and_keeps_boundary_semantics() {
+        let rt = rt();
+        // Crash-style leftover of the purge's own row (same full `LogId` at the boundary index): the
+        // purge contract admits it, so the store neither invents a failure nor treats it as live.
+        // Reads start at the first live index; fcb returned the boundary row itself.
+        let row = seeded_row(&rt, 1);
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..4).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        drop(s);
+        insert_row(dir.path(), 1, &row);
+        let mut s = open(&rt, dir.path());
+        // Grading: fcb had no boundary-row filter. Its purge pin moved whole-range starts to the
+        // boundary, but an unpinned read that starts exactly at the boundary row (a single-index
+        // lookup) returned it as live; this store filters it and reports the row missing.
+        let row_one = with_copy(dir.path(), |conn| {
+            conn.execute("DELETE FROM meta WHERE k=?1", [K_PURGED]).unwrap();
+            fcb_read_range(conn, 1, Some(2), false)
+        });
+        assert_eq!(format!("{:?}", row_one.map(|v| indices(&v))), "Ok([1])", "fcb returned the boundary row");
+        let mut r = rt.block_on(s.get_log_reader());
+        assert_eq!(rt.block_on(r.try_get_log_entries(0..10)).unwrap(), vec![blank(1, 2), blank(1, 3)]);
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(1..10)).unwrap()), vec![2, 3], "from boundary");
+        assert!(rt.block_on(r.try_get_log_entries(0..2)).unwrap().is_empty(), "through the boundary only");
+        let limited = rt.block_on(r.limited_get_log_entries(0, 10)).unwrap();
+        assert_eq!(indices(&limited), vec![2, 3], "limited read too");
+        drop(r);
+        drop(s);
+    }
+
+    #[test]
+    fn row_at_purge_boundary_with_other_log_id_fails_closed() {
+        let rt = rt();
+        // The same leftover above an empty log: `purge(.., 3)` removed every row, so anything left
+        // at or below 3 is residue; another `LogId` must not become the reported tail.
+        let row = seeded_row(&rt, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..3).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 3))).unwrap();
+        drop(s);
+        insert_row(dir.path(), 2, &row);
+        rewrite_row(dir.path(), 2, LogId::new(CommittedLeaderId::new(9, 9), 2));
+        // This store refuses the leftover outright.
+        let err = match rt.block_on(PersistentLog::open(dir.path(), 7, false)) {
+            Ok(_) => panic!("a leftover row with another LogId at the boundary must fail closed"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("at or below purge boundary"), "{err}");
+        // Grading: fcb's comparison rejects rows *below* the boundary, so a row one index *above* it
+        // becomes the tail it reports (here `T9-N9-2` above `T1-N1-1`).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..3).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx <> 2");
+        rewrite_row(dir.path(), 2, LogId::new(CommittedLeaderId::new(9, 9), 2));
+        let via_fcb = with_copy(dir.path(), fcb_read_last);
+        assert_eq!(format!("{via_fcb:?}"), format!("Ok(Some({:?}))", LogId::new(CommittedLeaderId::new(9, 9), 2)));
+        let mut s = open(&rt, dir.path());
+        assert_eq!(
+            state(&rt, &mut s).last_log_id,
+            Some(LogId::new(CommittedLeaderId::new(9, 9), 2)),
+            "same answer today"
+        );
+    }
+
+    /// fcb22c5's byte handling, kept only as a probe of that defect.
+    fn fcb_read_rows(conn: &Connection, from: i64, to: i64, limited: bool) -> Res<Vec<(u64, EntryOf)>> {
+        let mut st = conn
+            .prepare(&format!("SELECT {ENTRY_COLUMNS} FROM log_entry WHERE idx >= ?1 AND idx < ?2 ORDER BY idx"))
+            .unwrap();
+        let mut rows = st.query([from, to]).unwrap();
+        let mut out: Vec<(u64, EntryOf)> = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(r) = rows.next().unwrap() {
+            let (lid, entry) = decode_entry_row(r).unwrap();
+            let sid: String = r.get(1).unwrap();
+            let sdata: String = r.get(2).unwrap();
+            let next_bytes = bytes.saturating_add(sid.len() + sdata.len());
+            if out.len() >= MAX_BATCH_ENTRIES || next_bytes > MAX_BATCH_BYTES {
+                if limited && !out.is_empty() {
+                    break;
+                }
+                return Err(E::Refused("requested log range exceeds its read budget".into()));
+            }
+            bytes = next_bytes;
+            out.push((lid.index, entry));
+        }
+        Ok(out)
+    }
+    /// Runs `f` against a byte-for-byte copy of the database (no lock, no WAL), for grading code
+    /// that cannot be reached through a refused `open`.
+    fn with_copy<R>(dir: &Path, f: impl FnOnce(&Connection) -> R) -> R {
+        let copy = tempfile::tempdir().unwrap();
+        std::fs::copy(dir.join(DB_FILE), copy.path().join("copy.sqlite3")).unwrap();
+        let conn = Connection::open(copy.path().join("copy.sqlite3")).unwrap();
+        f(&conn)
+    }
+    /// 8a8ceb9's `read_last`, kept only to grade the hidden-residue regression against it: it judged
+    /// only the highest row, so invalid residue beneath a valid live tail was accepted.
+    fn prior_read_last(conn: &Connection) -> Res<Option<LogId<u64>>> {
+        let purged = purged_boundary(conn)?;
+        match stored_max(conn)? {
+            Some((_, lid)) => match &purged {
+                Some(p) if lid.index <= p.index && !same_boundary_row(&lid, p) => {
+                    Err(E::Refused(format!("last stored {lid} is at or below purge boundary {p}")))
+                }
+                _ => Ok(Some(lid)),
+            },
+            None => Ok(purged),
+        }
+    }
+    /// fcb22c5's `read_last`, kept only to grade the purge-residue regression against it.
+    fn fcb_read_last(conn: &Connection) -> Res<Option<LogId<u64>>> {
+        let purged = purged_boundary(conn)?;
+        match stored_max(conn)? {
+            Some((_, lid)) => {
+                if let Some(p) = &purged
+                    && lid.index < p.index
+                {
+                    return Err(E::Refused(format!("last stored {lid} is below purge boundary {p}")));
+                }
+                Ok(Some(lid))
+            }
+            None => Ok(purged),
+        }
+    }
+    /// fcb22c5's `read_range`, kept only as a probe of its count-stop early return.
+    fn fcb_read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res<Vec<EntryOf>> {
+        if hi.is_some_and(|h| h <= lo) {
+            return Ok(Vec::new());
+        }
+        let purged = purged_boundary(conn)?;
+        let first = purged.as_ref().map_or(lo, |p| lo.max(p.index.saturating_add(1)));
+        let known = match stored_max(conn)? {
+            Some((max, _)) => idx_from_i64(max)?.saturating_add(1),
+            None => 0,
+        };
+        let end = known.min(hi.unwrap_or(u64::MAX));
+        if end <= first {
+            return Ok(Vec::new());
+        }
+        let rows = fcb_read_rows(conn, idx_to_i64(first)?, idx_to_i64(end)?, limited)?;
+        if limited && rows.len() >= MAX_BATCH_ENTRIES {
+            return Ok(rows.into_iter().map(|(_, e)| e).collect());
+        }
+        if let Some(w) = rows.windows(2).find(|w| w[1].0 - w[0].0 != 1) {
+            return Err(E::Refused(format!("gap after {}", w[0].0)));
+        }
+        if rows.first().is_none_or(|(idx, _)| *idx != first)
+            || rows.last().is_none_or(|(idx, _)| idx.saturating_add(1) < end)
+        {
+            return Err(E::Refused(format!("log entry {first} is missing although it is stored")));
+        }
+        Ok(rows.into_iter().map(|(_, e)| e).collect())
+    }
+    fn rows_of(r: &Result<Vec<EntryOf>, StorageError<u64>>) -> Vec<u64> {
+        indices(r.as_ref().unwrap())
+    }
+
+    #[test]
+    fn limited_read_checks_head_and_gap_at_count_budget() {
+        let rt = rt();
+        // The head is missing but later rows fill the count budget: fcb returned them unchecked.
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..MAX_BATCH_ENTRIES as u64).map(|i| blank(1, i)).collect());
+        append_ok(&rt, &s, vec![blank(1, MAX_BATCH_ENTRIES as u64)]);
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=0");
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        // fcb's count-budget early return skipped the head check; the regression sees it returning.
+        assert!(
+            rt.block_on(with_inner(s.inner.clone(), |i| { fcb_read_range(&i.conn, 0, Some(u64::MAX), true) })).is_ok(),
+            "probe: fcb no longer skips the head check at the count budget"
+        );
+        let got = rt.block_on(r.limited_get_log_entries(0, u64::MAX));
+        assert!(is_missing(&got), "lost head, later rows fill the budget: {got:?}");
+        drop(r);
+        drop(s);
+
+        // A middle index is missing and the later rows still fill the count budget.
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..MAX_BATCH_ENTRIES as u64).map(|i| blank(1, i)).collect());
+        append_ok(&rt, &s, vec![blank(1, MAX_BATCH_ENTRIES as u64)]);
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=1");
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        assert!(
+            rt.block_on(with_inner(s.inner.clone(), |i| { fcb_read_range(&i.conn, 0, Some(u64::MAX), true) })).is_ok(),
+            "probe: fcb no longer skips the gap check at the count budget"
+        );
+        assert!(is_missing(&rt.block_on(r.limited_get_log_entries(0, u64::MAX))), "lost middle at budget");
+        // A full read of the same range reports the middle index, not the head.
+        let msg = format!("{}", rt.block_on(r.try_get_log_entries(0..)).unwrap_err());
+        assert!(msg.contains("log entry 1 is missing"), "{msg}");
+        // A hole-free part of the log still reads normally.
+        assert_eq!(indices(&rt.block_on(r.limited_get_log_entries(2, u64::MAX)).unwrap()).len(), MAX_BATCH_ENTRIES - 1);
+    }
+
+    #[test]
+    fn limited_read_accepts_byte_budget_prefix() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        // Change-log style batches: each 110 KiB ASCII payload stores at ~330 KB (3x), so rows 0..24
+        // fit the 8 MiB byte budget, read 24 rows, and the 25th cannot be read.
+        let big = vec![b'A'; 110 * 1024];
+        for chunk in (0..25u64).collect::<Vec<_>>().chunks(12) {
+            append_ok(&rt, &s, chunk.iter().map(|i| normal(1, *i, &big)).collect());
+        }
+        let mut r = rt.block_on(s.get_log_reader());
+        let got = rt.block_on(r.limited_get_log_entries(0, 30));
+        assert_eq!(rows_of(&got), (0..24).collect::<Vec<_>>(), "byte budget stops below the count budget");
+        assert!(rows_of(&got).len() < MAX_BATCH_ENTRIES);
+        // The stored budget is checked with the same stop reason a limited read sees.
+        let (rows, stop) = rt.block_on(with_inner(s.inner.clone(), |i| read_rows(&i.conn, 0, 25, true))).unwrap();
+        assert_eq!(stop, Stop::Bytes);
+        assert_eq!(rows.len(), 24);
+        // fcb's tail check called exactly this valid prefix a hole; the regression asserts that it
+        // does, and the store's own result above is the correct one.
+        let via_fcb = rt.block_on(with_inner(s.inner.clone(), |i| fcb_read_range(&i.conn, 0, Some(30), true)));
+        assert!(missing_in_core(&via_fcb), "fcb's tail check no longer misreads the byte prefix: {via_fcb:?}");
+        // A full read of the same range still refuses to exceed the budget.
+        let msg = format!("{}", rt.block_on(r.try_get_log_entries(0..30)).unwrap_err());
+        assert!(msg.contains("exceeds its read budget"), "{msg}");
+        // A hole inside a byte-limited prefix still fails closed.
+        drop(r);
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=1");
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        assert!(is_missing(&rt.block_on(r.limited_get_log_entries(0, 30))), "gap inside a byte prefix");
+        // An empty or wholly-purged request keeps returning an empty result, never an error.
+        rt.block_on(s.purge(lid(1, 40))).unwrap();
+        assert!(rt.block_on(r.limited_get_log_entries(0, 30)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_range_boundaries_remain_valid() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        // Empty store: empty results, never errors.
+        assert!(rt.block_on(r.try_get_log_entries(0..10)).unwrap().is_empty());
+        assert!(rt.block_on(r.limited_get_log_entries(0, 10)).unwrap().is_empty());
+        assert!(rt.block_on(r.try_get_log_entries(5..5)).unwrap().is_empty());
+        assert!(rt.block_on(r.limited_get_log_entries(5, 5)).unwrap().is_empty());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        // Complete reads return the whole stored range, whatever the requested end.
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(0..u64::MAX)).unwrap()), (0..5).collect::<Vec<_>>());
+        assert_eq!(indices(&rt.block_on(r.limited_get_log_entries(0, 100)).unwrap()), (0..5).collect::<Vec<_>>());
+        // Short reads past the end, past the budget cap, and beyond u64 stay valid.
+        assert!(rt.block_on(r.try_get_log_entries(5..10)).unwrap().is_empty());
+        assert!(rt.block_on(r.try_get_log_entries(u64::MAX..)).unwrap().is_empty());
+        assert!(rt.block_on(r.try_get_log_entries(i64::MAX as u64 - 2..)).unwrap().is_empty());
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(3..)).unwrap()), vec![3, 4], "short inside the log");
+        drop(r);
+        // Purged boundaries: the boundary index is deleted (inclusive purge), its predecessor is
+        // purged, and a request starting at the boundary is served by the first live index.
+        rt.block_on(s.purge(lid(1, 2))).unwrap();
+        let mut r = rt.block_on(s.get_log_reader());
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(3..10)).unwrap()), vec![3, 4], "first live");
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(2..10)).unwrap()), vec![3, 4], "from the boundary");
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(1..10)).unwrap()), vec![3, 4], "below it");
+        assert!(rt.block_on(r.try_get_log_entries(0..3)).unwrap().is_empty(), "wholly purged");
+        drop(r);
+        drop(s);
+        // With the first live row deleted, a request spanning it fails closed.
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=3");
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(3..10))), "first live row lost");
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(4..10)).unwrap()), vec![4], "after the hole");
+        assert!(rt.block_on(r.try_get_log_entries(0..3)).unwrap().is_empty(), "purged reads unchanged");
     }
 }
