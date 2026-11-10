@@ -353,12 +353,16 @@ class teams:
         self.git("checkout", "-B", base_ref, self.seed, cwd=owner)
         base = self.commit(owner, "owner-base-" + user + ".txt", "fixture base " + role)
         self.git("push", "origin", "HEAD:refs/heads/" + base_ref, cwd=owner, token=self.alice)
+        base_operation = self.last_operation("recorded")
         self.git("checkout", "-B", head_ref, base, cwd=owner)
         head = self.commit(owner, "owner-head-" + user + ".txt", "fixture head " + role)
         self.git("push", "origin", "HEAD:refs/heads/" + head_ref, cwd=owner, token=self.alice)
+        head_operation = self.last_operation("recorded")
         assert base != head, (base, head)
-        for ref, oid in (("refs/heads/" + base_ref, base), ("refs/heads/" + head_ref, head)):
-            operation = self.last_operation("recorded")
+        assert base_operation["id"] != head_operation["id"], (base_operation, head_operation)
+        for ref, oid, operation in (
+                ("refs/heads/" + base_ref, base, base_operation),
+                ("refs/heads/" + head_ref, head, head_operation)):
             self.team_assert_operation(operation, "alice", "demo")
             [event] = self.events_for(ref, operation["id"])
             assert event["new_oid"] == oid, event
