@@ -678,7 +678,11 @@ def corruption_sql(case):
         "SET LOCAL session_replication_role = replica; " + case.statement + ";\n"
         "\\echo " + CHANGED + " :ROW_COUNT\n"
         "RESET session_replication_role; "
-        "COPY (SELECT jsonb_build_object("
+        # A plain SELECT under the runner's psql -qAt mode prints the JSON
+        # object as one line. COPY ... TO STDOUT would apply COPY text
+        # escaping (doubling backslashes inside nested JSON strings), so its
+        # payload is not parseable JSON.
+        "SELECT jsonb_build_object("
         "'registration', CAST(" + registration + " AS text), "
         "'superuser', (SELECT rolsuper FROM pg_roles WHERE rolname=current_user), "
         "'replication_role_default', current_setting('session_replication_role')='origin', "
@@ -686,7 +690,7 @@ def corruption_sql(case):
         "AND g.tgname IN (" + ", ".join(q(name) for name in IMMUTABLE_TRIGGERS) + ")), "
         "'target', jsonb_build_array(" + _target_sql(registration) + "), "
         "'after', " + _fact_sql(AFTER_TABLES, registration) + ", 'guarded', " + _fact_sql(GUARDED_TABLES) + ", "
-        "'before', (SELECT snapshot FROM issue169_before))::text) TO STDOUT; COMMIT")
+        "'before', (SELECT snapshot FROM issue169_before))::text; COMMIT")
 
 
 def corruption_findings(case, changed, observed):

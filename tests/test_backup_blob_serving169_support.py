@@ -213,6 +213,17 @@ class CorruptionPlanTest(unittest.TestCase):
             for trigger in support.IMMUTABLE_TRIGGERS:
                 self.assertIn("'" + trigger + "'", sql)
             self.assertIn("issue169_before ON COMMIT DROP", sql)
+            # The evidence row is a normal SELECT so psql -qAt prints the JSON
+            # object verbatim; COPY output would re-escape nested JSON strings.
+            self.assertNotIn("COPY", sql, case.name)
+            self.assertNotIn("TO STDOUT", sql, case.name)
+            self.assertEqual(sql.count("\\echo " + support.CHANGED + " :ROW_COUNT\n"), 1, case.name)
+            protocol = sql.split("\\echo " + support.CHANGED + " :ROW_COUNT\n", 1)[1]
+            self.assertTrue(protocol.startswith("RESET session_replication_role; SELECT jsonb_build_object("),
+                            case.name)
+            self.assertTrue(protocol.endswith(")::text; COMMIT"), case.name)
+            self.assertEqual(protocol.count(";"), 2, case.name)  # RESET, one SELECT, COMMIT
+            self.assertEqual(sql.split("\\echo ", 1)[0].count("jsonb_build_object("), 4, case.name)
         for case in cases:
             self.assertEqual(support.corruption_sql(case).count("SET LOCAL"), 3)
 
