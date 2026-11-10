@@ -288,6 +288,7 @@ jobs:
             --report repository_pagination=test-results/repository-pagination.json \
             --report organization_pagination=test-results/organization-pagination.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
+            --report browse=test-results/browse.json \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
@@ -300,6 +301,7 @@ jobs:
             --harness tests/repository_pagination.py \
             --harness tests/organization_pagination.py \
             --harness tests/web_detail_pagination.py \
+            --harness tests/browse.py \
             --fixture postgres=postgres:17 \
             --fixture rust="$(rustc -V)" \
             --fixture git="$(git --version)" \

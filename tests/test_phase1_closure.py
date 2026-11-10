@@ -119,6 +119,13 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         for binding in pagination_commands + pagination_reports + pagination_harnesses:
             self.assertIn(binding, ci_text, f"Missing pagination wiring in .github/workflows/ci.yml: {binding}")
 
+        # Browse real-service report and harness evidence bindings
+        for binding in (
+            "--report browse=test-results/browse.json",
+            "--harness tests/browse.py",
+        ):
+            self.assertIn(binding, ci_text, f"Missing browse wiring in .github/workflows/ci.yml: {binding}")
+
         # initdb requires non-root. Container jobs switch user; the qualified
         # plain-host profile executes as runner and verifies its uid at runtime.
         self.assertIn("tests/pando_lab.py", ci_text)
