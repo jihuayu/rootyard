@@ -49,6 +49,8 @@ ubuntu_archive_keyring() {
 # Add deb-src-only entries for the signed Ubuntu Noble archive. Noble is the
 # first Ubuntu release whose Git source is the required 2.43 family; 22.04's
 # own archive only offers 2.34. Binary packages from Noble are never enabled.
+# The owned list is removed first so a re-run cannot keep stale entries, and
+# the refresh fails closed when the signed index cannot be acquired.
 prepare_ubuntu_archive_source() {
   local keyring list want current
   require_command sudo
@@ -56,10 +58,14 @@ prepare_ubuntu_archive_source() {
   keyring=$(ubuntu_archive_keyring)
   [ -f "$keyring" ] || fail "trusted Ubuntu archive keyring is missing: $keyring"
   list=/etc/apt/sources.list.d/rootyard-ubuntu-noble-src.list
+  # Reviewed HTTPS endpoints, not the plain-HTTP hostnames: hosted runners
+  # resolve archive.ubuntu.com to CDN edges that reset connections, while
+  # azure.archive.ubuntu.com offers only jammy. The signed-by keyring and the
+  # Release/InRelease signature checks are unchanged.
   want=$(cat <<EOF
-deb-src [signed-by=$keyring] http://archive.ubuntu.com/ubuntu noble main universe
-deb-src [signed-by=$keyring] http://archive.ubuntu.com/ubuntu noble-updates main universe
-deb-src [signed-by=$keyring] http://security.ubuntu.com/ubuntu noble-security main universe
+deb-src [signed-by=$keyring] https://archive.ubuntu.com/ubuntu noble main universe
+deb-src [signed-by=$keyring] https://archive.ubuntu.com/ubuntu noble-updates main universe
+deb-src [signed-by=$keyring] https://security.ubuntu.com/ubuntu noble-security main universe
 EOF
 )
   current=$(sudo cat "$list" 2>/dev/null || true)
