@@ -460,7 +460,8 @@ const READ_COLUMNS: &str = "pin_id,snapshot_id,generation,repository_id,tenant_i
     (extract(epoch FROM expires_at)*1000000)::bigint,expires_at <= clock_timestamp()";
 
 /// One stored transient serving read header.
-pub(super) struct ServingReadRow {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServingReadRow {
     pub pin_id: Uuid,
     pub snapshot_id: Uuid,
     pub generation: i64,

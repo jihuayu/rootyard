@@ -130,6 +130,7 @@ mod filesystem;
 mod inventory_tests;
 mod ledger;
 mod ledger_canonical;
+mod ledger_serving_reads;
 mod ledger_sets;
 mod ledger_validation;
 mod postgres;

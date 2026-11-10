@@ -18,8 +18,13 @@
 //! 3. every pack-verified A5 snapshot header with its descriptors;
 //! 4. every retained root capture with its complete pack rows, re-proven by the
 //!    core's own `retention_root` capture validator on this same transaction;
-//! 5. root heads and release tombstones, so a lost capture is visible;
-//! 6. the declared rows of registrations that (2) cannot see at all.
+//! 5. every transient serving read capture header with its own refs, complete
+//!    pack descriptors and artifact rows (migration 146), re-proven by the core's
+//!    own serving-read re-derivation (`pack_snapshot::check_membership`,
+//!    `check_canonical_serving`); a header with no packs and a descriptor whose
+//!    header is missing are both enumerated, never joined away;
+//! 6. root heads and release tombstones, so a lost capture is visible;
+//! 7. the declared rows of registrations that (2) cannot see at all.
 use super::ledger_sets::{
     ActualRepository, DeclaredPair, HoldRow, PairArtifact, PublishedPack, Realm, ReceiptRow, RequestRow,
     RetainedArtifact, RetainedPack, RootCapture, RootHead, RootProof, RootTombstone, SnapshotSet, SourceSets,
@@ -235,6 +240,7 @@ pub(super) async fn validate_source(
 ) -> Result<()> {
     let mut sets = SourceSets {
         declared: decode_declared(&rows(client, &declared_query(false), &[], deadline).await?)?,
+        serving_reads: super::ledger_serving_reads::decode_serving_reads(client, deadline).await?,
         ..Default::default()
     };
     sets.snapshots = decode_snapshots(rows(client, SNAPSHOTS, &[], deadline).await?)?;
@@ -246,7 +252,7 @@ pub(super) async fn validate_source(
     }
     sets.heads = decode_heads(rows(client, HEADS, &[], deadline).await?);
     sets.tombstones = decode_tombstones(rows(client, TOMBSTONES, &[], deadline).await?);
-    let missing = super::ledger_sets::undeclared(&sets.declared, &sets.snapshots, &sets.roots);
+    let missing = super::ledger_sets::undeclared(&sets.declared, &sets.snapshots, &sets.roots, &sets.serving_reads);
     if !missing.is_empty() {
         let ids = missing.iter().map(|id| id as &(dyn tokio_postgres::types::ToSql + Sync)).collect::<Vec<_>>();
         let orphans = decode_declared(&rows(client, &declared_query(true), &ids, deadline).await?)?;
@@ -295,7 +301,7 @@ async fn prove_capture(
 }
 
 /// One read on the caller's client under the caller's absolute deadline.
-async fn rows(
+pub(super) async fn rows(
     client: &(impl GenericClient + Sync),
     statement: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],

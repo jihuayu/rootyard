@@ -15,12 +15,12 @@ use crate::ref_store::core::pack_commit::{
     ArtifactLocator, ArtifactSetDigest, ContentDigest, PackArtifactRole, RegisteredArtifact, RegisteredPack,
 };
 
-const REPO: Uuid = Uuid::from_u128(0x0100);
-const TENANT: Uuid = Uuid::from_u128(0x0200);
+pub(super) const REPO: Uuid = Uuid::from_u128(0x0100);
+pub(super) const TENANT: Uuid = Uuid::from_u128(0x0200);
 const PRODUCER: Uuid = Uuid::from_u128(0x0300);
 const PACK: Uuid = Uuid::from_u128(0x0400);
 const REGISTRATION: Uuid = Uuid::from_u128(0x0500);
-const INCARNATION: Uuid = Uuid::from_u128(0x0600);
+pub(super) const INCARNATION: Uuid = Uuid::from_u128(0x0600);
 const ACQUIRE: Uuid = Uuid::from_u128(0x0700);
 const CONSUME: Uuid = Uuid::from_u128(0x0800);
 const PACK_HOLD: Uuid = Uuid::from_u128(0x0900);
@@ -29,7 +29,7 @@ const AUTH: Uuid = Uuid::from_u128(0x0b00);
 const PACK_ATTEMPT: Uuid = Uuid::from_u128(0x0c00);
 const IDX_ATTEMPT: Uuid = Uuid::from_u128(0x0d00);
 const ROOT: Uuid = Uuid::from_u128(0x0e00);
-const GATE_REVISION: i64 = 7;
+pub(super) const GATE_REVISION: i64 = 7;
 const JOINED: i64 = GATE_REVISION + 1;
 fn realm() -> Realm {
     Realm {
@@ -203,7 +203,8 @@ fn pair(artifacts: Vec<PairArtifact>) -> DeclaredPair {
 /// repository: its memoized scope is empty, so only `check_declared` can refuse.
 #[test]
 fn a_legal_fixture_has_no_scope_lines() {
-    for declared in [pair(base_artifacts())] {
+    {
+        let declared = pair(base_artifacts());
         assert_eq!(declared.scope, Vec::<String>::new());
         assert!(check_declared(std::slice::from_ref(&declared)).is_empty());
     }
@@ -432,8 +433,13 @@ fn an_unpublished_set_wrong_digest_or_stale_joined_revision_is_refused() {
     unpublished.publication = None;
     assert_refused(&check_declared(std::slice::from_ref(&unpublished)), "unregistered_publication");
     // A snapshot or root that still names it is refused through the missing path.
-    let missing = check_declared_missing(&[], &[root_capture()], &BTreeSet::new());
+    let missing = check_declared_missing(&[], &[root_capture()], &BTreeSet::new(), &BTreeSet::new());
     assert_refused(&missing, "unregistered_publication:root_packs");
+    // A serving read header's descriptor is enumerated from its own decoded keys,
+    // so it is refused too and can never shrink the expected set.
+    let header = BTreeSet::from([(REPO, PACK, REGISTRATION)]);
+    let missing = check_declared_missing(&[], &[], &header, &BTreeSet::new());
+    assert_refused(&missing, "unregistered_publication:serving_read_packs");
     let mut wrong = unpublished;
     wrong.publication = valid_source().declared[0].publication.clone();
     wrong.publication.as_mut().unwrap().digest = sha(0x44);

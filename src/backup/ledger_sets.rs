@@ -40,6 +40,7 @@
 //!   owner, the core gate tenant).
 use self::declared_owner_scope::declared_binding;
 use self::root_lifetime::check_heads;
+use self::serving_reads::ServingReads;
 use super::ledger_canonical::{canonical, declared_agrees, retained_pair};
 use crate::ref_store::core::pack_commit::{MembershipDigest, PackMembershipEntry, packs_digest, refs_digest};
 use std::collections::{BTreeMap, BTreeSet};
@@ -323,16 +324,26 @@ pub(super) struct SourceSets {
     pub roots: Vec<RootCapture>,
     pub heads: Vec<RootHead>,
     pub tombstones: Vec<RootTombstone>,
+    /// The transient serving read headers and their own decoded rows (#169).
+    pub serving_reads: ServingReads,
 }
 
 impl SourceSets {
     /// Every violation line, sorted and de-duplicated.
     pub(super) fn violations(&self) -> Vec<String> {
         let mut lines = check_declared(&self.declared);
-        lines.extend(check_declared_missing(&self.snapshots, &self.roots, &self.registrations()));
+        lines.extend(check_declared_missing(
+            &self.snapshots,
+            &self.roots,
+            &self.serving_reads.declared_keys(),
+            &self.registrations(),
+        ));
         lines.extend(check_snapshots(&self.snapshots, &self.declared));
         lines.extend(check_roots(&self.roots, &self.declared));
         lines.extend(check_heads(&self.heads, &self.tombstones, &self.roots, &self.declared));
+        lines.extend(self.serving_reads.violations.iter().cloned());
+        lines.extend(self.serving_reads.cross_violations(&self.declared));
+        lines.extend(self.serving_reads.descriptor_violations(&self.declared));
         lines.sort();
         lines.dedup();
         lines
@@ -391,12 +402,20 @@ pub(super) fn key_of(pair: &DeclaredPair) -> (Uuid, Uuid, Uuid) {
 /// Registration ids of declared snapshot/root packs that have no declared A4
 /// set at all, ascending. These rows are invisible to a read restricted to
 /// [`SourceSets::declared`], so they are looked up by id instead of dropped.
-pub(super) fn undeclared(declared: &[DeclaredPair], snapshots: &[SnapshotSet], roots: &[RootCapture]) -> Vec<Uuid> {
+pub(super) fn undeclared(
+    declared: &[DeclaredPair],
+    snapshots: &[SnapshotSet],
+    roots: &[RootCapture],
+    serving_reads: &ServingReads,
+) -> Vec<Uuid> {
     let known = declared.iter().map(|pair| pair.registration_id).collect::<BTreeSet<_>>();
     let mut missing = snapshots
         .iter()
         .flat_map(|snapshot| snapshot.packs.iter().map(|(_, registration_id, _, _)| *registration_id))
         .chain(roots.iter().flat_map(|root| root.packs.iter().map(|pack| pack.registration_id)))
+        // Every stored serving read descriptor names its registration without a
+        // join, so a descriptor whose declaration is invisible is still refused.
+        .chain(serving_reads.declared_keys().iter().map(|(_, _, registration_id)| *registration_id))
         .filter(|registration_id| !known.contains(registration_id))
         .collect::<BTreeSet<_>>();
     std::mem::take(&mut missing).into_iter().collect()
@@ -506,10 +525,13 @@ fn hold_matches(repository_id: Uuid, artifact: &PairArtifact) -> bool {
     })
 }
 
-/// A snapshot or root pack row whose registration is not declared in A4 at all.
+/// A snapshot, root or serving read pack row whose registration is not declared
+/// in A4 at all. Serving read headers are passed through their own descriptor
+/// keys, so an orphaned descriptor is still an `unregistered_publication`.
 pub(super) fn check_declared_missing(
     snapshots: &[SnapshotSet],
     roots: &[RootCapture],
+    serving_reads: &BTreeSet<(Uuid, Uuid, Uuid)>,
     declared: &BTreeSet<(Uuid, Uuid, Uuid)>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
@@ -527,6 +549,9 @@ pub(super) fn check_declared_missing(
         for pack in &root.packs {
             missing(&mut lines, "root_packs", root.repository_id, pack.pack_id, pack.registration_id);
         }
+    }
+    for (repository_id, pack_id, registration_id) in serving_reads {
+        missing(&mut lines, "serving_read_packs", *repository_id, *pack_id, *registration_id);
     }
     lines
 }
@@ -655,6 +680,9 @@ mod declared_owner_scope;
 #[cfg(test)]
 mod ledger_sets_tests;
 mod root_lifetime;
+#[cfg(test)]
+mod serving_read_tests;
+pub(super) mod serving_reads;
 
 // Owner/tenant/repository/pack scopes of one registration: see
 // `owner_scope_tests`. A sibling file, hence the explicit `#[path]`.

@@ -47,6 +47,7 @@
 //! (so an old body stays byte-identical and replays exactly), an old metadata
 //! pin mutation on a pack-aware pin is routed through this ledger/counter path,
 //! and a fresh metadata-only create is refused on a `pack_verified` gate.
+mod backup_read;
 mod contract;
 mod materialize;
 mod pg;
@@ -58,6 +59,15 @@ mod serving_read;
 mod serving_read_request;
 mod serving_read_sql;
 pub(super) mod sql;
+
+#[cfg(test)]
+pub(crate) use backup_read::scope_of;
+#[cfg(test)]
+pub(crate) use backup_read::{ServingCaptureDigest, captured_logical_bytes, captured_refs_digest};
+pub(crate) use backup_read::{
+    check_canonical_serving, check_membership, check_refs_and_membership, descriptor_membership,
+};
+pub(crate) use serving_read_sql::ServingReadRow;
 pub(crate) mod usage;
 
 pub(crate) use contract::history_logical_bytes;
