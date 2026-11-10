@@ -22,12 +22,19 @@ fn config(git: &Path) -> Config {
 }
 
 fn git() -> std::path::PathBuf {
-    std::env::var_os("ROOTYARD_TEST_GIT")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("ROOTYARD_GIT").map(std::path::PathBuf::from))
-        .unwrap_or_else(|| "git".into())
-        .canonicalize()
-        .expect("test Git executable must exist")
+    let selected = std::env::var_os("ROOTYARD_TEST_GIT")
+        .or_else(|| std::env::var_os("ROOTYARD_GIT"))
+        .map(std::path::PathBuf::from);
+    // Mirror Config::from_env: an explicit override wins, otherwise search PATH
+    // like the server does instead of relying on execve's own PATH lookup.
+    let git = match selected {
+        Some(path) => path,
+        None => std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("git"))
+            .find(|path| path.is_file())
+            .expect("git executable is required on PATH"),
+    };
+    git.canonicalize().expect("test Git executable must exist")
 }
 
 fn repo(backend: &str) -> Repository {
