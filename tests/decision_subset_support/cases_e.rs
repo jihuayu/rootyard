@@ -156,7 +156,7 @@ async fn plan_claiming_another_tenant_is_refused_by_begin_pending() -> Result<()
             baseline.membership_digest(),
             baseline.old_packs().iter().map(PackMembershipEntry::from_pack).collect::<Result<Vec<_>, _>>()?,
             Vec::new(),
-            baseline.mode(),
+            draft.plan.commit_mode(),
         )?;
         ensure!(
             plan.tenant_id() == world.verified.tenant
