@@ -264,7 +264,7 @@ async fn packs(
         // The provisioned repository is already under the irreversible
         // decision-required fence, so its packs commit through the same
         // decision-gated pipeline the serving first push uses.
-        let new = repo::decided_pair(db, store, git, &draft, &files, producer).await.map_err(|error| {
+        let new = repo::decided_pair(db, store, git, &draft, &files, producer, sequence).await.map_err(|error| {
             anyhow!("sequence {sequence} stage=decided_pair expected_revision={expected_revision}: {error:#}")
         })?;
         registrations.extend(new);
@@ -393,7 +393,11 @@ pub async fn run(options: &Options) -> Result<Value> {
         plan: last_plan.clone(),
         new_packs: registrations.clone(),
     };
-    let snapshot = repo::producer_snapshot(&db, &verified, producer, ROOT_SLOTS).await?;
+    // Diagnostic only: an unchanged typed error behind this boundary names the
+    // A5 snapshot step and the verified gate revision it expects.
+    let snapshot = repo::producer_snapshot(&db, &verified, producer, ROOT_SLOTS).await.map_err(|error| {
+        anyhow!("stage=producer_snapshot expected_revision={}: {error:#}", verified.gate.revision())
+    })?;
     let source = repo::as_source(&snapshot);
 
     // 3. Roots registered by the same producer owner as the snapshot/pin.
@@ -448,7 +452,9 @@ pub async fn run(options: &Options) -> Result<Value> {
     // `snapshot_packs` with the snapshot), so both roots and that retained
     // snapshot still declare every registration; the transient serving read
     // below adds the third declaring set.
-    repo::release_snapshot_pin(&db, &snapshot).await?;
+    repo::release_snapshot_pin(&db, &snapshot, &verified.gate).await.map_err(|error| {
+        anyhow!("stage=release_snapshot_pin expected_revision={}: {error:#}", verified.gate.revision())
+    })?;
 
     // 3b. One nonempty transient serving read by the third real user, over the
     //     same verified gate, captured only by the production

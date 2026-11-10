@@ -32,7 +32,8 @@
 use anyhow::{Result, anyhow, ensure};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::core::pack_commit::{
-    AuthorizedCommitMode, PackCommitPlan, PackPendingToken, PgAuthorizedCommit, PrepareOutcome, RegisteredPack,
+    AuthorizedCommitMode, PackArtifactRole, PackCommitPlan, PackPendingToken, PgAuthorizedCommit, PrepareOutcome,
+    RegisteredPack,
 };
 use rootyard::ref_store::core::{
     CreatePackSnapshotRequest, MetadataPinOutcome, MetadataSnapshotScope, PackReadSnapshot, PackSnapshotExpectation,
@@ -52,6 +53,34 @@ pub struct Existing {
     pub tenant: Uuid,
     pub repo: Uuid,
     pub gate: CoreGateVersion,
+}
+
+/// Diagnostic form of one fixture-owned pack step: a fixed stage label, the
+/// seed loop sequence when there is one, and the gate revision the plan expects.
+///
+/// It never replaces the typed error: the `{error:#}` chain (and every
+/// `PackCommitError` source) is kept verbatim. Labels and the plan's expected
+/// revision are plain integers/literals, so nothing sensitive is added.
+#[derive(Clone, Copy)]
+struct Stage {
+    name: &'static str,
+    sequence: Option<i64>,
+    revision: i64,
+}
+
+impl Stage {
+    fn of(name: &'static str, sequence: Option<i64>, plan: &PackCommitPlan) -> Self {
+        Self { name, sequence, revision: plan.expected().revision() }
+    }
+
+    fn tag(&self, error: impl std::fmt::Display) -> anyhow::Error {
+        match self.sequence {
+            Some(sequence) => {
+                anyhow!("sequence {sequence} stage={} expected_revision={}: {error:#}", self.name, self.revision)
+            }
+            None => anyhow!("stage={} expected_revision={}: {error:#}", self.name, self.revision),
+        }
+    }
 }
 
 /// A5 pack snapshot whose owner (the pin/snapshot scope owner) is `owner`.
@@ -125,6 +154,9 @@ pub async fn advance_pair(
 /// same transaction as the gate advance, so a context requested afterwards can
 /// only be reached with `expected_v1`. The registrations it reads are the durable
 /// A4 rows of this plan (same ids, digests, locators); nothing is synthesized.
+///
+/// `sequence` is the seed's pack-loop position, used only to tag the untagged
+/// `publish`/`register`/`closure` rejections.
 pub async fn decided_pair(
     db: &Db,
     store: &BlobStore,
@@ -132,6 +164,7 @@ pub async fn decided_pair(
     draft: &pack_plan::Draft,
     files: &PairFiles,
     actor: &rootyard::db::Identity,
+    sequence: i64,
 ) -> Result<Vec<RegisteredPack>> {
     let mode = match draft.plan.commit_mode().as_str() {
         "accepted_subset" => AuthorizedCommitMode::AcceptedSubset,
@@ -140,14 +173,16 @@ pub async fn decided_pair(
     };
     ensure!(draft.plan.identity().issuer_id() == actor.id, "the producer token is not the operation issuer");
     let pack_id = draft.plan.packs().first().ok_or_else(|| anyhow!("plan has no pack"))?.pack_id();
-    let publication = pack_plan::publish(db, store, &draft.plan, files).await?;
-    pack_plan::register(db, &draft.plan, pack_id, &publication).await?;
-    // Diagnostic only: `pack::closure` (via `capture_context`) returns an
-    // untagged bare rejection, so name it with the plan's expected revision to
-    // tell a closure failure apart from the authorized stages below.
-    let context = pack::closure(db, &draft.plan).await.map_err(|error| {
-        anyhow!("closure stage=closure expected_revision={}: {error:#}", draft.plan.expected().revision())
-    })?;
+    // Diagnostic only: `publish` and `register` (A4 `register_publication`)
+    // return untagged bare `PackCommitError`s, so name those stages with the
+    // plan's expected revision too. `closure` (via `capture_context`) is named
+    // for the same reason, keeping apart each untagged sibling callsite.
+    let stage = Stage::of("publish", Some(sequence), &draft.plan);
+    let publication = pack_plan::publish(db, store, &draft.plan, files).await.map_err(|error| stage.tag(error))?;
+    let stage = Stage::of("register", Some(sequence), &draft.plan);
+    pack_plan::register(db, &draft.plan, pack_id, &publication).await.map_err(|error| stage.tag(error))?;
+    let stage = Stage::of("closure", Some(sequence), &draft.plan);
+    let context = pack::closure(db, &draft.plan).await.map_err(|error| stage.tag(error))?;
     ensure!(
         context.new_packs().len() == 1 && context.old_packs().len() == draft.plan.old_memberships().len(),
         "the planned closure is not one new pack on the planned membership"
@@ -227,7 +262,10 @@ pub async fn producer_snapshot(db: &Db, verified: &Verified, producer: Uuid, lea
     let pin_id = Uuid::new_v4();
     let expected = PackSnapshotExpectation::new(verified.gate.revision(), *verified.gate.digest())?;
     let request = CreatePackSnapshotRequest::new(scope, request_id, pin_id, snapshot_id, lease, expected)?;
-    let outcome = pack::a5_create(&db.pool, &request).await?;
+    // Diagnostic only: name the A5 stages with the verified gate the snapshot
+    // expectation is built from; the typed error is kept unchanged.
+    let stage = Stage { name: "a5_create", sequence: None, revision: verified.gate.revision() };
+    let outcome = pack::a5_create(&db.pool, &request).await.map_err(|error| stage.tag(error))?;
     ensure!(!outcome.replayed, "fresh pack snapshot replayed");
     let stored_owner = db
         .pool
@@ -237,7 +275,10 @@ pub async fn producer_snapshot(db: &Db, verified: &Verified, producer: Uuid, lea
         .await?
         .get::<_, Uuid>(0);
     ensure!(stored_owner == producer, "the stored A5 snapshot owner is not the producer");
-    let read = pack::a5_read(&db.pool, verified.repo, verified.tenant, snapshot_id, pin_id, 1).await?;
+    let stage = Stage { name: "a5_read", sequence: None, revision: verified.gate.revision() };
+    let read = pack::a5_read(&db.pool, verified.repo, verified.tenant, snapshot_id, pin_id, 1)
+        .await
+        .map_err(|error| stage.tag(error))?;
     ensure!(read.pack_mode() == "pack_verified", "source snapshot is not pack_verified");
     ensure!(read.pack_count() > 0, "source snapshot has no registered pack membership");
     Ok(ProducerSnapshot { snapshot_id, pin_id, scope, read })
@@ -256,10 +297,13 @@ pub fn as_source(snapshot: &ProducerSnapshot) -> pack::SourceSnapshot {
 }
 
 /// Release the A5 pin through the shared `release_pin` with its own scope.
-pub async fn release_snapshot_pin(db: &Db, snapshot: &ProducerSnapshot) -> Result<MetadataPinOutcome> {
-    pack::release_pin(&db.pool, snapshot.scope, snapshot.pin_id)
-        .await
-        .map_err(|error| anyhow!("A5 source pin release failed: {error}"))
+pub async fn release_snapshot_pin(
+    db: &Db,
+    snapshot: &ProducerSnapshot,
+    gate: &CoreGateVersion,
+) -> Result<MetadataPinOutcome> {
+    let stage = Stage { name: "release_pin", sequence: None, revision: gate.revision() };
+    pack::release_pin(&db.pool, snapshot.scope, snapshot.pin_id).await.map_err(|error| stage.tag(error))
 }
 
 /// One registration as the archive stores it: publication digest (the real
