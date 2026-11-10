@@ -249,6 +249,9 @@ jobs:
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
         run: python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
+      - name: Exercise webhook fairness
+        timeout-minutes: 20
+        run: python3 tests/webhook_fairness.py --binary target/debug/rootyard --report test-results/webhook-fairness.json
       - name: Exercise repository collaborators, teams, 5-role RBAC, and audit log
         run: python3 tests/members.py --binary target/debug/rootyard --report test-results/members.json
       - name: Exercise server-side HTML Web UI views, XSS sanitization, and PR/Issue workflows
@@ -272,6 +275,7 @@ jobs:
             --binary target/debug/rootyard \
             --report web_sessions=test-results/web-sessions.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
+            --report webhook_fairness=test-results/webhook-fairness.json \
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
@@ -280,6 +284,14 @@ jobs:
             --log-marker "webhook_regressions=untrusted certificate rejected:" \
             --harness tests/web_sessions.py \
             --harness tests/webhook_worker_recovery.py \
+            --harness tests/webhook_fairness.py \
+            --harness tests/webhooks.py \
+            --harness tests/pulls.py \
+            --harness tests/forge.py \
+            --harness tests/e2e.py \
+            --harness tests/schema_baseline.py \
+            --harness tests/native_evidence.py \
+            --harness tests/owned_fuse_cleanup.py \
             --harness tests/ci_webhook_regressions.py \
             --harness tests/backup_audit_sequence_legacy.py \
             --fixture postgres=postgres:17 \
