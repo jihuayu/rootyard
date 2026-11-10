@@ -223,7 +223,8 @@ class CorruptionPlanTest(unittest.TestCase):
                             case.name)
             self.assertTrue(protocol.endswith(")::text; COMMIT"), case.name)
             self.assertEqual(protocol.count(";"), 2, case.name)  # RESET, one SELECT, COMMIT
-            self.assertEqual(sql.split("\\echo ", 1)[0].count("jsonb_build_object("), 4, case.name)
+            # Two target subselects, two after facts, plus the joined-hold key.
+            self.assertEqual(sql.split("\\echo ", 1)[0].count("jsonb_build_object("), 5, case.name)
         for case in cases:
             self.assertEqual(support.corruption_sql(case).count("SET LOCAL"), 3)
 
@@ -246,6 +247,28 @@ class CorruptionPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "pack id is not a uuid"):
             support.Registration(registration_id(), "ab" * 32, str(uuid.uuid4()), "")
 
+    def test_target_sql_joins_the_immutable_hold_by_hold_id(self):
+        cases, _ = self.plan()
+        for case in cases:
+            target = support._target_sql("'" + case.registration.id + "'::uuid")
+            self.assertIn(target, support.corruption_sql(case), case.name)
+            # The hold is joined on the artifact's own hold_id, never on a
+            # repository/tenant/namespace heuristic.
+            self.assertIn("FROM public.artifact_holds h WHERE h.hold_id = a.row->>'hold_id'", target, case.name)
+            self.assertNotIn("FROM public.artifact_holds h LEFT JOIN", target, case.name)
+            self.assertEqual(target.count("public.artifact_holds"), 1, case.name)
+            self.assertIn("public.ref_store_core_pack_artifacts a WHERE a.registration_id="
+                          "'" + case.registration.id + "'::uuid", target, case.name)
+            # A missing or repeated hold join is an empty/ambiguous JSON array
+            # that _digest_rows refuses, never a silent fallback value.
+            self.assertIn("jsonb_build_object('" + support.HOLD_ROW + "', COALESCE((SELECT jsonb_agg(",
+                          target)
+            self.assertIn("), '[]'::jsonb))", target)
+            self.assertNotEqual(support.HOLD_ROW, "tenant_id")
+            self.assertNotIn("storage_tenant_id AS tenant_id", target)
+            artifacts_sql = target.split("public.ref_store_core_pack_publications t", 1)[1]
+            self.assertNotIn("repositories", artifacts_sql, case.name)
+
     def test_corruption_sql_includes_broken_rows_fields_only(self):
         cases, _ = self.plan()
         allowed = {"DELETE FROM public.ref_store_core_pack_artifacts WHERE registration_id='%s'::uuid AND role='%s'"
@@ -253,6 +276,7 @@ class CorruptionPlanTest(unittest.TestCase):
                    "DELETE FROM public.ref_store_core_pack_artifacts WHERE registration_id='%s'::uuid"
                    % case.registration.id for case, role in zip(cases[:3], ("pack", "idx", None))}
         self.assertEqual(len(allowed), 3)
+        self.assertEqual({case.statement for case in cases[:3]}, allowed)
         self.assertIn("UPDATE public.ref_store_core_pack_publications SET artifact_set_digest='%s' WHERE "
                       "registration_id='%s'::uuid AND artifact_set_digest<>'%s'" % (cases[3].wrong_value,
                                                                                  cases[3].registration.id,
@@ -272,29 +296,91 @@ class CorruptionPlanTest(unittest.TestCase):
         self.assertEqual(support.uuid_array(["a"]), "ARRAY['a'::uuid]::uuid[]")
         self.assertEqual(support.text_array([]), "'{}'::text[]")
 
-def digests_of(publication, rows):
-    """The stored digest of one pair, encoded like ``Artifact::line``."""
+
+def evidence_artifact(row, locator_tenant=None):
+    """One stored A4 artifact row plus its joined migration-141 hold row.
+
+    ``row`` keeps exactly the columns migration 142 stores: its ``tenant_id`` is
+    the repository/gate tenant. The hold's ``storage_tenant_id`` is the locator
+    tenant; ``locator_tenant`` defaults to the row's repository tenant, but the
+    adversarial cases make them differ on purpose.
+    """
+    row = dict(row)
+    hold = {"hold_id": row["hold_id"], "tenant_id": row["tenant_id"],
+            "storage_tenant_id": locator_tenant or row["tenant_id"],
+            "authority_id": row["authority_id"], "authority_generation": row["authority_generation"],
+            "attempt_id": row["attempt_id"], "namespace": row["namespace"], "sha256": row["sha256"],
+            "content_length": row["content_length"], "provider": row["provider"],
+            "backend_identity": row["backend_identity"]}
+    return dict(row, **{support.HOLD_ROW: [hold]})
+
+
+def hold_digest(hold):
+    """The canonical digest of one pair from the migration-141 hold rows alone."""
     return support.artifact_set_digest(
-        [dict({key: row[key] for key in support.DIGEST_IDENTITY}, role=role, slot=slot, sha256=row["sha256"],
-              content_length=row["content_length"]) for role, slot in support.PAIR_ROLES for row in (rows[role],)])
+        [dict({key: hold[role][key] for key in support.LOCATOR_FIELDS}, role=role, slot=slot,
+              hold_id=hold[role]["hold_id"], tenant_id=hold[role]["storage_tenant_id"],
+              sha256=hold[role]["sha256"], content_length=hold[role]["content_length"],
+              provider=hold[role]["provider"], backend_identity=hold[role]["backend_identity"])
+         for role, slot in support.PAIR_ROLES])
+
+
+def digests_of(publication, rows):
+    """The stored digest of one pair, as production hashes it.
+
+    ``rows`` maps role to the canonical identity built from the hold ledger:
+    locator fields, ``storage_tenant_id``, physical ``sha256``/``content_length``,
+    ``provider`` and ``backend_identity``. A publication digest is never used.
+    """
+    del publication
+    columns = []
+    for role, slot in support.PAIR_ROLES:
+        row = rows[role]
+        columns.append(dict({key: row[key] for key in support.LOCATOR_FIELDS}, role=role, slot=slot,
+                            hold_id=row["hold_id"], tenant_id=row["storage_tenant_id"],
+                            sha256=row["sha256"], content_length=row["content_length"],
+                            provider=row["provider"], backend_identity=row["backend_identity"]))
+    return support.artifact_set_digest(columns)
+
+
+def locator_identity(rows):
+    """Per role, the identity production hashes from the joined holds."""
+    identity = {}
+    for role, row in rows.items():
+        hold = row[support.HOLD_ROW][0]
+        identity[role] = dict({key: hold[key] for key in support.LOCATOR_FIELDS},
+                              storage_tenant_id=hold["storage_tenant_id"], hold_id=row["hold_id"],
+                              sha256=row["sha256"], content_length=row["content_length"],
+                              provider=row["provider"], backend_identity=row["backend_identity"])
+    return identity
 
 
 def planned_cases():
     """Four planned cases built exactly like the native drill builds them."""
     first, second = sorted(registration_id() for _ in range(2))
+    # The A4 artifact/hold ledger identity. The locator tenant is deliberately a
+    # different tenant than the repository tenant the A4 row stores.
+    repository_tenant, locator_tenant = str(uuid.uuid4()), str(uuid.uuid4())
+    common = {"tenant_id": repository_tenant, "authority_id": str(uuid.uuid4()), "authority_generation": 3,
+              "provider": "s3", "backend_identity": "ab" * 32}
+    holds = {
+        "pack": dict(common, role="pack", slot=0, hold_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+                     namespace="core-pack", sha256="ef" * 32, content_length=4096),
+        "idx": dict(common, role="idx", slot=1, hold_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+                    namespace="core-pack", sha256="12" * 32, content_length=1200),
+    }
+    # The publication row as migration 142 stores it: it has no authority or
+    # attempt identity and its tenant is the repository/gate tenant.
     publication = {"repository_id": str(uuid.uuid4()), "pack_id": str(uuid.uuid4()),
-                   "hold_id": str(uuid.uuid4()), "tenant_id": str(uuid.uuid4()), "authority_id": str(uuid.uuid4()),
-                   "authority_generation": 3, "attempt_id": str(uuid.uuid4()), "namespace": "core-pack",
-                   "provider": "s3", "backend_identity": "ab" * 32}
-    rows = {"pack": dict(publication, role="pack", slot=0, sha256="ef" * 32, content_length=4096),
-            "idx": dict(publication, role="idx", slot=1, sha256="12" * 32, content_length=1200)}
-    digest = digests_of(publication, rows)
+                   "tenant_id": repository_tenant}
+    rows = {role: evidence_artifact(hold, locator_tenant) for role, hold in holds.items()}
+    digest = digests_of(publication, locator_identity(rows))
     cases = support.corruption_plan([second, first], [second, first],
                                     scope_pairs([first, second]),
                                     {first: ("pack", "idx"), second: ("pack", "idx")},
                                     {first: {digest}, second: {"34" * 32}})
-    # The publication mirrors the A4 row; the enclosing repository/pack only
-    # come from the target registration (the read join), as in the clone SQL.
+    # The enclosing repository/pack only come from the target registration (the
+    # read join), as in the clone SQL.
     publication_row = dict(publication, registration_id=first, artifact_set_digest=digest,
                            repository_id=cases[0].registration.repository_id,
                            pack_id=cases[0].registration.pack_id)
@@ -322,6 +408,103 @@ def oracle_evidence(cases, publication, rows, facts, guarded):
                               "target": target, "after": facts, "guarded": guarded}
 
 
+class DigestIdentityTest(unittest.TestCase):
+    """The canonical locator tenant is the joined hold, not the A4 artifact row."""
+
+    def pair(self, pack_tenant=None, idx_tenant=None):
+        common = {"tenant_id": str(uuid.uuid4()), "authority_id": str(uuid.uuid4()), "authority_generation": 2,
+                  "provider": "s3", "backend_identity": "ab" * 32}
+        rows = [dict(common, role="pack", slot=0, hold_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+                     namespace="core-pack", sha256="11" * 32, content_length=4096),
+                dict(common, role="idx", slot=1, hold_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+                     namespace="core-pack", sha256="22" * 32, content_length=1200)]
+        tenants = (pack_tenant, idx_tenant)
+        return {row["role"]: evidence_artifact(row, tenants[index])
+                for index, row in enumerate(rows)}
+
+    def test_locator_tenant_comes_from_the_hold_not_the_artifact_row(self):
+        pair = self.pair()
+        rebuilt = support._digest_rows({}, pair)
+        by_role = {row["role"]: row for row in rebuilt}
+        for role in ("pack", "idx"):
+            artifact, hold = pair[role], pair[role][support.HOLD_ROW][0]
+            # The real A4 row keeps its repository/gate tenant untouched.
+            self.assertEqual(artifact["tenant_id"], hold["tenant_id"])
+            self.assertEqual(by_role[role]["tenant_id"], hold["storage_tenant_id"])
+            for field in ("authority_id", "authority_generation", "attempt_id", "namespace"):
+                self.assertEqual(by_role[role][field], hold[field], field)
+            for field in ("hold_id", "sha256", "content_length", "provider", "backend_identity"):
+                self.assertEqual(by_role[role][field], artifact[field], field)
+        # The digest is the canonical projection: it equals a digest built from
+        # the hold ledger alone.
+        self.assertEqual(support.artifact_set_digest(rebuilt), hold_digest({r: v[support.HOLD_ROW][0]
+                                                                            for r, v in pair.items()}))
+
+    def held(self, pair, role, **changes):
+        """A copy of ``pair`` whose ``role`` hold carries ``changes``."""
+        copy = {name: dict(row, **{support.HOLD_ROW: [dict(hold) for hold in row[support.HOLD_ROW]]})
+                for name, row in pair.items()}
+        copy[role][support.HOLD_ROW][0].update(changes)
+        return copy
+
+    def test_a_differing_locator_tenant_changes_the_digest(self):
+        pair = self.pair()
+        same = support.artifact_set_digest(support._digest_rows({}, pair))
+        # One role's locator tenant differs from the shared repository tenant
+        # while the other role's still equals it: the hold tenant decides.
+        adversarial = self.held(pair, "pack", storage_tenant_id=str(uuid.uuid4()))
+        other = support.artifact_set_digest(support._digest_rows({}, adversarial))
+        self.assertNotEqual(same, other)
+        self.assertEqual(adversarial["idx"][support.HOLD_ROW][0]["storage_tenant_id"], adversarial["idx"]["tenant_id"])
+        self.assertNotEqual(adversarial["pack"][support.HOLD_ROW][0]["storage_tenant_id"],
+                            adversarial["pack"]["tenant_id"])
+        # Substituting the artifact (repository) tenant for the pack role repeats
+        # the base identity: the two inputs are distinct, so an artifact tenant
+        # can never stand in for the locator tenant.
+        self.assertEqual(support.artifact_set_digest(support._digest_rows(
+            {}, self.held(pair, "pack", storage_tenant_id=pair["pack"]["tenant_id"]))), same)
+        # A non-tenant locator field from the hold is equally significant.
+        moved = self.held(pair, "idx", authority_generation=3)
+        self.assertNotEqual(support.artifact_set_digest(support._digest_rows({}, moved)), same)
+
+    def test_missing_or_ambiguous_hold_join_is_refused(self):
+        pair = self.pair()
+        broken = {
+            "no hold key": {"pack": dict({key: value for key, value in pair["pack"].items()
+                                          if key != support.HOLD_ROW}), "idx": pair["idx"]},
+            "empty join": {role: dict(row, **{support.HOLD_ROW: []}) for role, row in pair.items()},
+            "repeated join": {role: dict(row, **{support.HOLD_ROW: list(row[support.HOLD_ROW]) * 2})
+                              for role, row in pair.items()},
+        }
+        for message in broken:
+            try:
+                support._digest_rows({}, broken[message])
+            except AssertionError as error:
+                self.assertIn("exactly one joined artifact_holds row", str(error), message)
+            else:
+                self.fail(message + ": a missing or repeated hold join was accepted")
+        other_hold = [dict(pair["pack"][support.HOLD_ROW][0], hold_id=str(uuid.uuid4()))]
+        with self.assertRaisesRegex(AssertionError, "not the artifact's own hold"):
+            support._digest_rows({}, {"pack": dict(pair["pack"], **{support.HOLD_ROW: other_hold}),
+                                      "idx": pair["idx"]})
+        with self.assertRaisesRegex(AssertionError, "lacks a digest field"):
+            support._digest_rows({}, {"pack": {key: value for key, value in pair["pack"].items()
+                                               if key != "provider"}})
+        with self.assertRaisesRegex(AssertionError, "disagrees with the artifact hash/length"):
+            bad = dict(pair["idx"][support.HOLD_ROW][0], sha256="33" * 32)
+            support._digest_rows({}, {"pack": pair["pack"], "idx": dict(pair["idx"], **{support.HOLD_ROW: [bad]})})
+        # A publication digest or repository tenant is never an identity source:
+        # it cannot stand in for a missing authority/attempt locator.
+        publication = {"artifact_set_digest": "44" * 32, "tenant_id": str(uuid.uuid4()),
+                       "authority_id": str(uuid.uuid4()), "attempt_id": str(uuid.uuid4())}
+        no_locator = {role: dict({key: value for key, value in row.items() if key != support.HOLD_ROW},
+                                 **{support.HOLD_ROW: [{key: value for key, value in row[support.HOLD_ROW][0].items()
+                                                        if key not in ("authority_id", "attempt_id")}]})
+                      for role, row in pair.items()}
+        with self.assertRaisesRegex(AssertionError, "lacks a digest field"):
+            support._digest_rows(publication, no_locator)
+
+
 class CorruptionEvidenceTest(unittest.TestCase):
     def setUp(self):
         (cases, self.publication, self.rows, self.facts, self.guarded) = planned_cases()
@@ -332,7 +515,8 @@ class CorruptionEvidenceTest(unittest.TestCase):
         return list(oracle_evidence(self.cases, self.publication, self.rows, self.facts, self.guarded))
 
     def test_exactly_the_intended_row_is_proven_for_every_case(self):
-        self.assertEqual(self.cases[0].registration.digest, digests_of(self.publication, self.rows))
+        self.assertEqual(self.cases[0].registration.digest,
+                         digests_of(self.publication, locator_identity(self.rows)))
         self.assertNotEqual(self.rows["pack"]["sha256"], self.rows["idx"]["sha256"])
         for case, changed, observed in self.expectations():
             detail = support.corruption_findings(case, changed, observed)
@@ -340,6 +524,36 @@ class CorruptionEvidenceTest(unittest.TestCase):
             self.assertEqual(detail["finding"], support.finding(case))
             self.assertTrue(detail["clone_local_superuser"])
             self.assertTrue(detail["guarded_ledgers_unchanged"])
+
+    def test_wrong_digest_case_rehashes_the_locator_identity_from_the_holds(self):
+        case = self.by_name["wrong_artifact_set_digest"]
+        identity = locator_identity(self.rows)
+        self.assertEqual(case.registration.digest, digests_of(self.publication, identity))
+        self.assertNotEqual(case.wrong_value, case.registration.digest)
+        # The artifact rows carry a repository tenant; the holds carry the
+        # locator tenant. They differ, and only the hold tenant rehashes.
+        for role, row in self.rows.items():
+            self.assertNotEqual(row["tenant_id"], row[support.HOLD_ROW][0]["storage_tenant_id"], role)
+        self.assertNotIn("authority_id", self.publication)
+        self.assertNotIn("attempt_id", self.publication)
+        for case, changed, observed in self.expectations():
+            if case.name == "wrong_artifact_set_digest":
+                after = observed["target"][0]["artifact_set_digest"]
+                self.assertEqual(after, case.wrong_value)
+                self.assertEqual(observed["target"][1], observed["before"]["target"][1])
+                self.assertEqual(support.corruption_findings(case, changed, observed)["stored_digest"], after)
+
+    def test_a_digest_from_the_artifact_tenant_is_not_the_stored_digest(self):
+        case = self.by_name["wrong_artifact_set_digest"]
+        # Rehashing with the A4 repository tenant in place of the locator tenant
+        # is a different (wrong) digest, so it can never be the stored one.
+        for role, row in self.rows.items():
+            forged = locator_identity(self.rows)
+            forged[role] = dict(forged[role], storage_tenant_id=row["tenant_id"])
+            self.assertNotEqual(digests_of(self.publication, forged), case.registration.digest, role)
+        observed = next(state for case, _, state in self.expectations()
+                        if case.name == "wrong_artifact_set_digest")
+        self.assertEqual(support.corruption_findings(case, 1, observed)["stored_digest"], case.wrong_value)
 
     def test_an_unchanged_row_fails_setup(self):
         for case, changed, observed in self.expectations():

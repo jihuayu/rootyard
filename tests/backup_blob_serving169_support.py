@@ -30,7 +30,12 @@ Three independent pieces live here:
 
 The artifact-set digest (``core-pack-artifact-set-v2``) is rebuilt here with the
 same canonical field encoding as ``ArtifactSetDigest::of`` so the "wrong digest"
-negative case changes exactly the stored digest column and nothing else.
+negative case changes exactly the stored digest column and nothing else. The
+canonical locator identity is not stored by A4 (migration 142) and its
+``tenant_id`` column is the repository tenant, so the clone target evidence joins
+every artifact to its immutable migration-141 ``artifact_holds`` row by
+``hold_id`` and the rebuild takes the locator tenant/authority/attempt from
+that hold only.
 """
 import hashlib
 import json
@@ -649,14 +654,35 @@ def _fact_sql(tables, exclude=None):
         for table in tables) + ")"
 
 
+# The JSON key under which one target artifact carries its joined migration-141
+# hold row. The hold is nested, never merged into the artifact row, so the
+# artifact's own ``tenant_id`` (the repository/gate tenant) and the locator
+# ``tenant_id`` (``artifact_holds.storage_tenant_id``) stay distinct.
+HOLD_ROW = "hold"
+
+
 def _target_sql(registration):
+    """The target publication and artifacts, each artifact with its exact hold.
+
+    Migration 142 does not store the locator authority/attempt identity, and the
+    artifact ``tenant_id`` column is the repository tenant, not the locator
+    tenant. The full canonical identity only exists in the immutable migration
+    141 ``artifact_holds`` row that the artifact's ``hold_id`` names, so every
+    artifact is projected with its own row untouched plus exactly one joined
+    hold row under ``HOLD_ROW``; the recomputation refuses a missing or repeated
+    join instead of guessing. A subselect (never a lateral join) keeps the
+    meaning identical on PostgreSQL 17.
+    """
     return ("(SELECT to_jsonb(t) || jsonb_build_object('repository_id', (SELECT r.id FROM public.repositories r "
             "WHERE r.id = (SELECT g.repository_id FROM public.ref_store_core_pack_publications g "
             "WHERE g.registration_id=" + registration + ")), 'pack_id', (SELECT g.pack_id "
             "FROM public.ref_store_core_pack_publications g WHERE g.registration_id=" + registration + ")) "
             "FROM public.ref_store_core_pack_publications t WHERE t.registration_id=" + registration + "), "
-            "(SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.role), '[]'::jsonb) "
-            "FROM public.ref_store_core_pack_artifacts a WHERE a.registration_id=" + registration + ")")
+            "(SELECT COALESCE(jsonb_agg(a.row || jsonb_build_object(" + q(HOLD_ROW) + ", COALESCE(("
+            "SELECT jsonb_agg(to_jsonb(h) ORDER BY to_jsonb(h)::text) FROM public.artifact_holds h "
+            "WHERE h.hold_id = a.row->>'hold_id'), '[]'::jsonb)) ORDER BY a.row->>'role'), '[]'::jsonb) FROM ("
+            "SELECT to_jsonb(a) AS row FROM public.ref_store_core_pack_artifacts a "
+            "WHERE a.registration_id=" + registration + ") a)")
 
 
 def corruption_sql(case):
@@ -774,26 +800,70 @@ def _target(value):
     return publication, {row["role"]: row for row in artifacts}
 
 
+# Physical fields written by A4 (migration 142) on the artifact row itself.
+DIGEST_ARTIFACT_PHYSICAL = ("provider", "backend_identity")
+# Locator fields the canonical digest takes ONLY from the joined migration-141
+# hold row. ``sha256`` and ``content_length`` also live on the hold row; the
+# recomputation requires them equal to the artifact's physical row.
+LOCATOR_FIELDS = ("storage_tenant_id", "authority_id", "authority_generation", "attempt_id", "namespace")
+HOLD_DIGEST_FIELDS = LOCATOR_FIELDS + ("sha256", "content_length")
+# Canonical digest inputs of one artifact, in ``ArtifactSetDigest::of`` order.
+# ``tenant_id`` here is the locator tenant (``artifact_holds.storage_tenant_id``).
+DIGEST_IDENTITY = ("hold_id", "tenant_id") + LOCATOR_FIELDS + DIGEST_ARTIFACT_PHYSICAL + (
+    "sha256", "content_length")
+# Stored A4 artifact row (migration 142), unchanged, plus the joined hold row.
 DIGEST_COLUMNS = ("role", "slot", "hold_id", "tenant_id", "authority_id", "authority_generation", "attempt_id",
                   "namespace", "sha256", "content_length", "provider", "backend_identity")
-
-
-DIGEST_IDENTITY = ("hold_id", "tenant_id", "authority_id", "authority_generation", "attempt_id", "namespace",
-                   "provider", "backend_identity")
+U64_MAX = 2 ** 64 - 1
 
 
 def _digest_rows(publication, artifacts):
-    """The pair encoded like ``Artifact::line``: hold/tenant/authority identity
-    from the publication (or the artifact row), physical fields per role."""
+    """The pair rebuilt as ``ArtifactSetDigest::of`` sees it, without the product.
+
+    The canonical locator ``tenant_id`` is the joined hold's
+    ``storage_tenant_id`` -- never the artifact row's repository/gate
+    ``tenant_id``. ``authority_id``, ``authority_generation``, ``attempt_id`` and
+    ``namespace`` come only from that same hold row. ``sha256``,
+    ``content_length``, ``provider`` and ``backend_identity`` are the exact
+    physical A4 values production hashes, and the hold must agree on hold id,
+    hash and length. ``publication`` is accepted for the caller but nothing is
+    ever inferred from it: its digest is not an identity source.
+    """
+    del publication
+    need(isinstance(artifacts, dict), "the target artifacts are not role-indexed rows")
     rows = []
     for role, artifact in artifacts.items():
-        need(all(name in publication or name in artifact for name in DIGEST_IDENTITY),
-             "the artifact row lacks a digest field")
-        row = {name: artifact[name] if name in artifact else publication[name] for name in DIGEST_IDENTITY}
-        row.update(role=role, slot=artifact.get("slot"), sha256=artifact.get("sha256"),
-                   content_length=artifact.get("content_length"))
-        need(slot_of(role) == row["slot"] and HEXDIGEST.match(str(row["sha256"]))
-             and int(row["content_length"] or 0) > 0, "the artifact row is not a canonical pair member")
+        need(isinstance(artifact, dict), "the artifact row is not a JSON object")
+        physical = ("hold_id", "role", "slot", "sha256", "content_length") + DIGEST_ARTIFACT_PHYSICAL
+        missing = [name for name in physical if name not in artifact]
+        need(not missing, "the artifact row lacks a digest field: " + ",".join(missing))
+        hold = artifact.get(HOLD_ROW)
+        need(isinstance(hold, list) and len(hold) == 1 and isinstance(hold[0], dict),
+             "the artifact evidence lacks exactly one joined artifact_holds row")
+        hold = hold[0]
+        need(not [name for name in HOLD_DIGEST_FIELDS + ("hold_id",) if name not in hold],
+             "the joined artifact hold row lacks a digest field")
+        need(UUID_HEX.match(str(artifact["hold_id"])) and str(hold["hold_id"]) == str(artifact["hold_id"]),
+             "the joined artifact hold row is not the artifact's own hold")
+        need(str(artifact["role"]) == role and slot_of(role) == artifact["slot"]
+             and HEXDIGEST.fullmatch(str(artifact["sha256"]))
+             and 0 < int(artifact["content_length"]) <= U64_MAX,
+             "the artifact row is not a canonical pair member")
+        need(str(hold["sha256"]) == str(artifact["sha256"])
+             and int(hold["content_length"]) == int(artifact["content_length"]),
+             "the joined artifact hold row disagrees with the artifact hash/length")
+        need(UUID_HEX.match(str(hold["storage_tenant_id"])) and UUID_HEX.match(str(hold["authority_id"]))
+             and UUID_HEX.match(str(hold["attempt_id"])) and int(hold["authority_generation"]) > 0
+             and isinstance(hold["namespace"], str) and hold["namespace"],
+             "the joined artifact hold row is not a complete locator")
+        row = {name: artifact[name] for name in DIGEST_COLUMNS if name in artifact}
+        row.update(role=role, slot=artifact["slot"], sha256=artifact["sha256"],
+                   content_length=artifact["content_length"])
+        for name in DIGEST_ARTIFACT_PHYSICAL:
+            row[name] = artifact[name]
+        row["tenant_id"] = hold["storage_tenant_id"]
+        for name in LOCATOR_FIELDS:
+            row[name] = hold[name]
         rows.append(row)
     return rows
 
