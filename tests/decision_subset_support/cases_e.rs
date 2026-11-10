@@ -42,7 +42,7 @@ async fn foreign_draft(world: &fixture::World) -> Result<(Uuid, Draft)> {
         1,
         &gate,
         vec![crate::retention_roots_support::pack::main_update(SHA1, None, &commit)?],
-        &files,
+        std::slice::from_ref(&files),
     )
     .await?;
     Ok((tenant, draft))
