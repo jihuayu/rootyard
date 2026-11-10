@@ -41,7 +41,11 @@ network namespaces with a mounted tmpfs. Nothing is skipped and no global
 subreaper, sysctl or AppArmor policy is changed.
 
 Cheap but real native security, tenancy and concurrency regressions run against
-the binary built once by `scripts/build_native.py --features pando-lab --bins`:
+a single `scripts/build_native_batch.py` invocation that builds `target/debug/rootyard`
+together with the feature-enabled Cargo metadata bins and both selected RefStore
+fixture integration-test executables, recording the batch in
+`test-results/native-build-batch.json`; the fixture outputs are written to
+`test-results/refstore-snapshot-fixture` and `test-results/refstore-holds-fixture`:
 
 | Suite | What it proves | Evidence |
 | --- | --- | --- |
@@ -59,6 +63,9 @@ digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
 `git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
 the native tool provenance file. Injecting any of those defects turns the pull
 request red instead of leaving the regression to manual re-verification.
+The `e2e-report` artifact includes `target/debug/rootyard.build.json` and
+`test-results/native-build-batch.json`, so downloaded job manifests can be
+checked against the build receipt and batch manifest.
 
 ## 专项与完整 candidate 分层 (specialised suites vs. the complete gate)
 
@@ -162,7 +169,15 @@ scripts/install_ci_native_tools.sh preflight --prefix "$RUNNER_TEMP/rootyard-ci-
 Then run the per-pull-request regressions exactly as CI does after building once:
 
 ```sh
-python3 scripts/build_native.py --features pando-lab --bins
+python3 scripts/build_native_batch.py \
+  --all-bins \
+  --features pando-lab \
+  --strip-debuginfo \
+  --test ref_store_snapshot_backup_fixture \
+  --output test-results/refstore-snapshot-fixture \
+  --test ref_store_holds_backup_fixture \
+  --output test-results/refstore-holds-fixture \
+  --manifest-out test-results/native-build-batch.json
 python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
 python3 tests/ci_webhook_regressions.py --binary target/debug/rootyard | tee test-results/ci-webhook-regressions.log
 python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
