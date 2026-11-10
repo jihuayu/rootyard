@@ -13,12 +13,11 @@ use super::auth;
 use super::common::seeded;
 use super::fixture;
 use crate::retention_roots_support::db::deadline;
-use crate::retention_roots_support::pack::{Draft, PackCommitError, PackCommitRejectCode};
+use crate::retention_roots_support::pack::Draft;
 use anyhow::{Result, anyhow, ensure};
 use rootyard::ref_store::core::pack_commit::{
-    AuthorizedCommitError, PackCommitPlan, PackCommitScope, PackMembershipEntry, PgPackCommit,
+    PackCommitError, PackCommitPlan, PackCommitRejectCode, PackCommitScope, PackMembershipEntry, PgPackCommit,
 };
-use rootyard::ref_store::pg::PgRefStore;
 use rootyard::ref_store::{GitObjectFormat, HeadUpdate, OperationState};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -27,8 +26,9 @@ const SHA1: GitObjectFormat = GitObjectFormat::Sha1;
 
 /// A second real repository on the unserved fixture lane (real `users`,
 /// `repositories` and gate rows) owned by its own tenant, plus the first-pack
-/// draft the shared builder produces for it. Only the scope's `tenant_id` is
-/// replaced below; nothing else about the draft is re-derived.
+/// draft the shared builder produces for it together with its durable Pending
+/// operation. Only the scope's `tenant_id` is replaced below; nothing else
+/// about the draft is re-derived.
 async fn foreign_draft(world: &fixture::World) -> Result<(Uuid, Draft)> {
     let (tenant, repo) = world.db.business(SHA1).await?;
     let gate = world.db.gate(repo, tenant, SHA1).await?;
@@ -47,24 +47,6 @@ async fn foreign_draft(world: &fixture::World) -> Result<(Uuid, Draft)> {
     )
     .await?;
     Ok((tenant, draft))
-}
-
-/// Register the operation with the A4 step (on an equivalent transaction, then
-/// rolled back), then return the typed outcome of the production
-/// `PgPackCommit.begin_pending` that follows it on the same exact plan.
-async fn begin_pending_after_registration(world: &fixture::World, plan: &PackCommitPlan) -> Result<PackCommitError> {
-    let mut client = world.db.pool.get().await?;
-    let tx = client.transaction().await?;
-    tx.batch_execute(
-        "SET LOCAL statement_timeout = '30s'; SET LOCAL lock_timeout = '5s';\
-         SET LOCAL idle_in_transaction_session_timeout = '60s'",
-    )
-    .await?;
-    let begun = PgRefStore.begin(&tx, plan.identity(), deadline()).await;
-    tx.rollback().await?;
-    let begun = begun.map_err(|error| anyhow!("the A4 operation registration refused: {error}"))?;
-    ensure!(begun.created && begun.record.state() == OperationState::Pending, "registration is not a fresh pending");
-    PgPackCommit.begin_pending(&mut client, plan, deadline()).await.map_err(|error| anyhow!("begin_pending: {error}"))
 }
 
 #[tokio::test]
@@ -116,10 +98,29 @@ async fn plan_claiming_another_tenant_is_refused_by_begin_pending_and_prepare() 
         ensure!(tenant != world.verified.tenant, "the second repository belongs to the world tenant");
         let built = draft.plan.scope().clone();
         let repo = built.repository_id();
+        let original = draft.plan.identity().clone();
+        let operation = original.operation_id();
+        let before_refs = facts::refs(&world.db.pool, repo).await?;
+        let before_revision = facts::gate_revision(&world.db.pool, repo).await?;
+        ensure!(
+            draft.token.tenant_id() == tenant && draft.token.operation_id() == operation,
+            "the foreign draft token does not name its own tenant and operation"
+        );
+        // Same-tenant positive control: the operational A4 registration of the
+        // real draft, produced under the second repository's tenant, is still
+        // exactly Pending and has no decision. Only the claimed tenant of the
+        // plan below differs from it.
+        let control = facts::operation(&world.db.pool, repo, operation).await?;
+        ensure!(
+            control.state == OperationState::Pending.as_str() && control.terminal.is_none(),
+            "the foreign draft registration is not exactly pending: {control:?}"
+        );
+        ensure!(
+            facts::decision(&world.db.pool, repo, operation).await?.is_none(),
+            "the foreign draft registration already wrote a decision"
+        );
         let mut client = world.db.pool.get().await?;
         let baseline = PgPackCommit.capture_baseline(&mut client, repo, tenant, deadline()).await?;
-        drop(client);
-        let original = draft.plan.identity().clone();
         let expected = draft.plan.expected().clone();
         let claimed = PackCommitScope::new(
             repo,
@@ -142,46 +143,23 @@ async fn plan_claiming_another_tenant_is_refused_by_begin_pending_and_prepare() 
             baseline.mode(),
         )?;
         ensure!(
-            plan.tenant_id() == world.verified.tenant && plan.repository_id() == repo,
-            "the plan does not claim the world tenant on the real second repository"
+            plan.tenant_id() == world.verified.tenant && plan.repository_id() == repo && plan.identity() == &original,
+            "the plan does not claim the world tenant on the real second repository with the draft identity"
         );
-        // Positive control: the same plan under its real tenant (the
-        // fixture's own produced `operation_id`) is admitted, so the refusal
-        // below is caused by the claimed tenant alone.
-        let (_, control) = crate::retention_roots_support::pack::draft(
-            &world.db,
-            repo,
-            tenant,
-            2,
-            &world.db.gate(repo, tenant, SHA1).await?,
-            draft.plan.refs().to_vec(),
-            &[],
-        )
-        .await?;
-        let preview = PgPackCommit.begin_pending(&mut client, &control.plan, deadline()).await;
-        ensure!(preview.is_ok(), "the same plan under its real tenant was refused: {preview:?}");
-        ensure!(
-            facts::operation_opt(&world.db.pool, repo, control.plan.identity().operation_id()).await?.is_some(),
-            "the control plan did not durably register"
-        );
-
-        let refused = begin_pending_after_registration(&world, &plan).await?;
+        let refused = PgPackCommit.begin_pending(&mut client, &plan, deadline()).await;
         match refused {
-            PackCommitError::Rejected(rejection) => {
+            Err(PackCommitError::Rejected(rejection)) => {
                 ensure!(rejection.code == PackCommitRejectCode::TenantMismatch, "another refusal: {rejection:?}")
             }
-            other => return Err(anyhow!("begin_pending refused for another reason: {other}")),
+            other => return Err(anyhow!("begin_pending refused for another reason: {other:?}")),
         }
-        let operation = original.operation_id();
-        ensure!(
-            facts::operation_opt(&world.db.pool, repo, operation).await?.is_none(),
-            "the refused begin_pending left a durable operation row"
-        );
+        let after = facts::operation(&world.db.pool, repo, operation).await?;
+        ensure!(after == control, "the refused begin_pending changed the original pending operation: {after:?}");
         ensure!(
             facts::decision(&world.db.pool, repo, operation).await?.is_none(),
-            "the refused begin_pending left a decision"
+            "the refused begin_pending wrote a decision"
         );
-        facts::assert_unchanged(&world.db.pool, repo, &BTreeMap::new(), 1).await?;
+        facts::assert_unchanged(&world.db.pool, repo, &before_refs, before_revision).await?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -215,7 +193,7 @@ async fn unauthorized_actor_cannot_select_a_producers_plan() -> Result<()> {
             .err()
             .ok_or_else(|| anyhow!("another session selected the producer's plan"))?;
         ensure!(
-            mismatched.to_string().contains("issuer_mismatch"),
+            mismatched.to_string().ends_with("denied: issuer_mismatch"),
             "the mismatched issuer was not refused: {mismatched}"
         );
         ensure!(
@@ -246,8 +224,10 @@ async fn unauthorized_actor_cannot_select_a_producers_plan() -> Result<()> {
             .await
             .err()
             .ok_or_else(|| anyhow!("a no-role issuer selected its own plan"))?;
+        // `fixture::select` wraps the typed refusal in `anyhow`; assert only the
+        // stable safe denial literal it renders, never raw internals.
         ensure!(
-            matches!(denied, AuthorizedCommitError::Denied("role_denied")),
+            denied.to_string().ends_with("denied: role_denied"),
             "the no-role issuer was refused otherwise: {denied}"
         );
         ensure!(
