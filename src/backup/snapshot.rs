@@ -43,10 +43,11 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     let boundary = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let postgres_version: String = tx.query_one("SHOW server_version", &[]).await?.get(0);
     ensure!(postgres_version.starts_with("17."), "this format is verified only with PostgreSQL 17");
-    let mut repos = repositories(&tx).await?;
+    // A source database always carries the schema138 RefStore registry.
+    let mut repos = repositories(&tx, true).await?;
     if format == FORMAT_PAIRED {
         ensure!(
-            repos.iter().all(|r| r.backend == "pg_refstore"),
+            repos.iter().all(|r| r.backend.as_deref() == Some("pg_refstore")),
             "paired Blob archives currently require only pg_refstore repositories"
         );
     }

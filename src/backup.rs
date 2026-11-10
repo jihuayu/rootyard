@@ -65,8 +65,11 @@ struct Repository {
     recovery_reason: Option<String>,
     /// Storage backend (`gitfs`, `pando` or `pg_refstore`); decides whether a
     /// persistent bare repository must exist (native) or must not (served).
-    #[serde(default)]
-    backend: String,
+    /// `None` when the archive itself carries no backend field: historical
+    /// formats (4..=19) never recorded one, so an absent field must not
+    /// decode as an empty string. The restored database is then the only
+    /// authority and restore compares this in place of it.
+    backend: Option<String>,
     unknown_operations: i64,
     // Diagnostic refs are not synthesized push receipts or an event watermark.
     refs: Option<String>,
@@ -123,6 +126,8 @@ struct Manifest {
 }
 
 mod filesystem;
+#[cfg(test)]
+mod inventory_tests;
 mod ledger;
 mod postgres;
 mod restore;
