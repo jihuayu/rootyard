@@ -25,10 +25,10 @@ def digest(path):
 
 WORKSPACE_CAPTURE_REQUIRED_CASES = (
     "WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix",
-    "WorkspaceCaptureAcceptance.test_capture_waits_for_file_read_before_advancing",
-    "WorkspaceCaptureAcceptance.test_capture_retries_failed_upload",
-    "WorkspaceCaptureAcceptance.test_capture_recovers_after_restart",
-    "WorkspaceCaptureAcceptance.test_capture_preserves_uploaded_files_after_restart",
+    "WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture",
+    "WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive",
+    "WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision",
+    "WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing",
 )
 
 
