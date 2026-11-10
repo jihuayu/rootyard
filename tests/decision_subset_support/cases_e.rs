@@ -7,7 +7,7 @@
 //! RBAC/scope rows instead of equating producer and repository owner. The
 //! tenant binding itself stays strict. The full positive A3/A4/decision seed
 //! remains the `format22` native path (`tests/format22_support/seed.rs`), not
-//! these unit-level cases.
+//! these ignored PG integration cases.
 use super::assert as facts;
 use super::auth;
 use super::common::seeded;
@@ -19,7 +19,6 @@ use rootyard::ref_store::core::pack_commit::{
     PackCommitError, PackCommitPlan, PackCommitRejectCode, PackCommitScope, PackMembershipEntry, PgPackCommit,
 };
 use rootyard::ref_store::{GitObjectFormat, HeadUpdate, OperationState};
-use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const SHA1: GitObjectFormat = GitObjectFormat::Sha1;
@@ -91,7 +90,7 @@ async fn non_tenant_producer_collaborator_selects_with_producer_owner_different_
 
 #[tokio::test]
 #[ignore = "requires real PG/S3/Git and the integrated decision/subset pipeline"]
-async fn plan_claiming_another_tenant_is_refused_by_begin_pending_and_prepare() -> Result<()> {
+async fn plan_claiming_another_tenant_is_refused_by_begin_pending() -> Result<()> {
     let world = seeded().await?;
     let outcome = async {
         let (tenant, draft) = foreign_draft(&world).await?;
@@ -106,10 +105,11 @@ async fn plan_claiming_another_tenant_is_refused_by_begin_pending_and_prepare() 
             draft.token.tenant_id() == tenant && draft.token.operation_id() == operation,
             "the foreign draft token does not name its own tenant and operation"
         );
-        // Same-tenant positive control: the operational A4 registration of the
-        // real draft, produced under the second repository's tenant, is still
-        // exactly Pending and has no decision. Only the claimed tenant of the
-        // plan below differs from it.
+        // Same-tenant positive control: the migration-138 Pending operation that
+        // `PgPackCommit.begin_pending` created/retains for the real draft (not an
+        // A4 publication registration), produced under the second repository's
+        // tenant, is still exactly Pending and has no decision. Only the claimed
+        // tenant of the plan below differs from it.
         let control = facts::operation(&world.db.pool, repo, operation).await?;
         ensure!(
             control.state == OperationState::Pending.as_str() && control.terminal.is_none(),
