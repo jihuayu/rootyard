@@ -217,8 +217,8 @@ class BackupHarness(Harness):
         (the KNOWN seed/fixture), never from the produced archive.
         """
         expected_total, model, expected = self.expected_manifest_unknown_operations()
-        # Manifest ids serialize from the schema's `char(36)` column, which is
-        # blank-padded; the fixture model uses canonical UUID text.
+        # Manifest ids are canonical UUID text (Repository.id is a Uuid); the
+        # string normalization keeps manifest keys and fixture keys aligned.
         actual = {str(row.get("id")).strip(): row.get("unknown_operations")
                   for row in manifest.get("repositories", [])}
         actual_total = sum(actual.values())
