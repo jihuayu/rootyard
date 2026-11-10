@@ -99,14 +99,18 @@ jobs:
       - name: Verify PostgreSQL RefStore registry and metadata-core contracts
         timeout-minutes: 5
         run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds -- --ignored --test-threads=1
-      - name: Build selected source-bound populated snapshot fixture integration test
+      - name: Build native bins and RefStore fixtures in one batch
         timeout-minutes: 10
-        run: python3 scripts/build_native_test.py --test ref_store_snapshot_backup_fixture --features pando-lab --output test-results/refstore-snapshot-fixture --strip-debuginfo
-      - name: Build selected source-bound populated artifact-hold fixture integration test
-        timeout-minutes: 10
-        run: python3 scripts/build_native_test.py --test ref_store_holds_backup_fixture --features pando-lab --output test-results/refstore-holds-fixture --strip-debuginfo
-      - run: python3 scripts/build_native.py --features pando-lab --bins --strip-debuginfo
-      - run: cargo build --locked --bin rootyard-view-lab
+        run: |
+          python3 scripts/build_native_batch.py \
+            --all-bins \
+            --features pando-lab \
+            --strip-debuginfo \
+            --test ref_store_snapshot_backup_fixture \
+            --output test-results/refstore-snapshot-fixture \
+            --test ref_store_holds_backup_fixture \
+            --output test-results/refstore-holds-fixture \
+            --manifest-out test-results/native-build-batch.json
       - name: Verify design documentation integrity
         run: python3 scripts/check_design_docs.py
       - name: Verify schema-030 catalog and dump round trip
@@ -314,6 +318,7 @@ jobs:
           name: e2e-report
           path: |
             test-results/*.json
+            target/debug/rootyard.build.json
             test-results/ci-webhook-regressions.log
             test-results/evidence/*.jsonl
             test-results/ci-native-tools/provenance.json

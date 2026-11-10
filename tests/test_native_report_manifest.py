@@ -50,6 +50,63 @@ class ManifestFixture:
         self.harness.parent.mkdir(parents=True, exist_ok=True)
         self.harness.write_text("# harness\n")
 
+    def enable_batch_receipt(self):
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        target_dir = str(self.binary.parent.parent.resolve())
+        toolchain = {"rustc": receipt["rustc"], "cargo": "cargo 1.99.1"}
+        architecture = {"target_triple": "x86_64-unknown-linux-gnu"}
+        bound_inputs = {"digest": "c" * 64}
+        batch_path = self.root / "test-results/native-build-batch.json"
+        batch_path.parent.mkdir(parents=True, exist_ok=True)
+
+        receipt["toolchain"] = toolchain
+        receipt["architecture"] = architecture
+        receipt["target_dir"] = target_dir
+        receipt["bound_inputs"] = bound_inputs
+        receipt["batch"] = {
+            "kind": "rootyard/native-build-batch",
+            "receipt_version": 1,
+            "binary": "rootyard",
+            "targets": ["rootyard", "rootyard"],
+            "bound_inputs_sha256": "c" * 64,
+            "manifest": str(batch_path.resolve()),
+        }
+        self.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
+        manifest = {
+            "kind": "rootyard/native-build-batch",
+            "manifest_version": 1,
+            "status": "passed",
+            "source_commit": receipt["workspace_commit"],
+            "source_inputs_sha256": receipt["source_inputs_sha256"],
+            "toolchain": toolchain,
+            "architecture": architecture,
+            "target_directory": target_dir,
+            "bound_inputs": bound_inputs,
+            "clean": {"commands": 1},
+            "build": {
+                "commands": 1,
+                "command": receipt["command"],
+                "fresh_false_artifacts": [
+                    {"kind": "lib", "target": "rootyard", "fresh": False},
+                    {"kind": "bin", "target": "rootyard", "fresh": False},
+                ],
+            },
+            "artifacts": [
+                {
+                    "kind": "bin",
+                    "target": "rootyard",
+                    "artifact": str(self.binary.resolve()),
+                    "receipt": str(self.receipt.resolve()),
+                    "fresh": False,
+                    "implicit": False,
+                    "sha256": digest(self.binary),
+                }
+            ],
+        }
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return batch_path
+
     def report(self, name="web_sessions", passed=True, binary_sha=None, case_status="passed", **extra):
         path = self.root / f"test-results/{name}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +137,19 @@ class ManifestFixture:
                 if target.exists() or target.is_symlink():
                     target.unlink()
                 target.write_bytes(source.read_bytes())
+        receipt = data.get("build_receipt") or {}
+        receipt_source = Path(receipt["file"])
+        receipt_target = directory / receipt_source.name
+        if receipt_target.exists() or receipt_target.is_symlink():
+            receipt_target.unlink()
+        receipt_target.write_bytes(receipt_source.read_bytes())
+        batch = receipt.get("batch_manifest")
+        if isinstance(batch, dict):
+            source = Path(batch["file"])
+            target = directory / source.name
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            target.write_bytes(source.read_bytes())
         return directory
 
     def run(self, *arguments, expect=0, env=None):
@@ -148,6 +218,75 @@ class TestJobManifest(unittest.TestCase):
         self.assertEqual(manifest["fixtures"], {"postgres": "postgres:17"})
         self.assertEqual(sorted(manifest["reports"]), ["web_sessions"])
         self.assertEqual(manifest["logs"]["webhook_regressions"]["bytes"], len(self.fixture.log().read_bytes()))
+
+    def test_accepts_and_records_batch_manifest_provenance(self):
+        batch_path = self.fixture.enable_batch_receipt()
+        job = json.loads(self.fixture.job().read_text(encoding="utf-8"))
+
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(
+            job["build_receipt"]["batch_manifest"],
+            {
+                "file": str(batch_path.resolve()),
+                "sha256": digest(batch_path),
+                "target": "rootyard",
+            },
+        )
+
+    def test_accepts_batch_receipt_copied_outside_target(self):
+        self.fixture.enable_batch_receipt()
+        copied_receipt = self.fixture.root / "test-results" / "rootyard.build.json"
+        copied_receipt.parent.mkdir(parents=True, exist_ok=True)
+        copied_receipt.write_bytes(self.fixture.receipt.read_bytes())
+        self.fixture.receipt = copied_receipt
+        job = json.loads(self.fixture.job().read_text(encoding="utf-8"))
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(job["build_receipt"]["file"], str(copied_receipt))
+
+    def test_rejects_missing_batch_manifest(self):
+        batch_manifest = self.fixture.enable_batch_receipt()
+        Path(batch_manifest).unlink()
+
+        self.fixture.job(expect=1)
+
+        self.assertIn("batch receipt manifest", self.fixture.last_process.stderr)
+        job_manifest_path = Path(self.fixture.root) / "manifests" / "job.json"
+        job_manifest = json.loads(job_manifest_path.read_text())
+        self.assertEqual(job_manifest["status"], "failed")
+
+    def test_rejects_batch_manifest_not_bound_to_binary(self):
+        batch_manifest = self.fixture.enable_batch_receipt()
+        batch_manifest_path = Path(batch_manifest)
+        data = json.loads(batch_manifest_path.read_text())
+        data["artifacts"][0]["artifact"] = str(self.fixture.root / "elsewhere/rootyard")
+        batch_manifest_path.write_text(json.dumps(data))
+
+        self.fixture.job(expect=1)
+
+        self.assertIn("exactly one entry", self.fixture.last_process.stderr)
+
+    def test_rejects_duplicate_batch_artifacts_and_targets(self):
+        batch_path = self.fixture.enable_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["build"]["fresh_false_artifacts"] = [
+            {"kind": "lib", "target": "rootyard", "fresh": False},
+            {"kind": "bin", "target": "rootyard", "fresh": False},
+        ]
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        receipt = json.loads(self.fixture.receipt.read_text(encoding="utf-8"))
+        receipt["batch"]["targets"] = ["rootyard", "rootyard"]
+        self.fixture.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
+        manifest["build"]["fresh_false_artifacts"].append(
+            {"kind": "bin", "target": "rootyard", "fresh": False}
+        )
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        receipt["batch"]["targets"].append("rootyard")
+        self.fixture.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
+        self.fixture.job(expect=1)
+
+        self.assertIn("duplicate", self.fixture.last_process.stderr.lower())
 
     def test_rejects_report_from_another_binary(self):
         report = self.fixture.report(binary_sha="c" * 64)
@@ -249,6 +388,64 @@ class TestReleaseGate(unittest.TestCase):
         process = self.fixture.run(*command, *arguments, expect=expect)
         return process, output
 
+    def enable_batch_jobs(self):
+        self.fixture.enable_batch_receipt()
+        self.browser = self.fixture.job(
+            "browser.json",
+            reports={"browser_ui": self.fixture.report("browser_ui")},
+        )
+        self.store = self.fixture.job(
+            "object-store.json",
+            reports={
+                "lfs_hydration": self.fixture.report("lfs_hydration"),
+                "lfs_retention": self.fixture.report("lfs_retention"),
+            },
+            extra=(
+                "--fixture", "garage=garage 2.1.0",
+                "--fixture", "git_lfs=git-lfs/3.6.1",
+            ),
+        )
+        self.staged = {
+            "browser": self.fixture.artifact_directory("browser", self.browser),
+            "object-store": self.fixture.artifact_directory("object-store", self.store),
+        }
+
+    def test_release_verifies_downloaded_batch_manifest(self):
+        self.enable_batch_jobs()
+        process, gate_path = self.release()
+        self.assertEqual(process.returncode, 0)
+        gate = json.loads(gate_path.read_text())
+        self.assertIn(
+            "build:batch_manifest",
+            gate["jobs"]["browser"]["artifacts"],
+        )
+        self.assertIn(
+            "build:receipt",
+            gate["jobs"]["browser"]["artifacts"],
+        )
+        batch_path = self.staged["browser"] / "native-build-batch.json"
+        original = batch_path.read_bytes()
+        try:
+            batch_path.unlink()
+            process, _ = self.release(expect=1)
+            self.assertIn("batch manifest", process.stderr)
+            batch_path.write_bytes(original + b"\n")
+            process, _ = self.release(expect=1)
+            self.assertIn("downloaded file does not match the manifest sha256", process.stderr)
+        finally:
+            batch_path.write_bytes(original)
+
+    def test_release_rejects_removed_batch_manifest_pointer(self):
+        self.enable_batch_jobs()
+        data = json.loads(self.browser.read_text())
+        del data["build_receipt"]["batch_manifest"]
+        self.browser.write_text(json.dumps(data))
+        process, _ = self.release(expect=1)
+        self.assertIn(
+            "requires a build_receipt.batch_manifest object",
+            process.stderr,
+        )
+
     def test_accepts_consistent_job_manifests(self):
         _, output = self.release()
         gate = json.loads(output.read_text())
@@ -261,7 +458,7 @@ class TestReleaseGate(unittest.TestCase):
         self.assertEqual(gate["reports"], ["browser_ui", "lfs_hydration", "lfs_retention"])
         self.assertEqual(
             sorted(gate["jobs"]["browser"]["artifacts"]),
-            ["log:webhook_regressions", "report:browser_ui"],
+            ["build:receipt", "log:webhook_regressions", "report:browser_ui"],
         )
 
     def test_rejects_missing_required_report_and_wrong_fixture_pin(self):
