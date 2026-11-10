@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from forge import ForgeHarness  # noqa: E402
 from pulls import PullsHarness  # noqa: E402
 from schema_baseline import SCHEMA_VERSION_CSV, SCHEMA_VERSIONS  # noqa: E402
+from webhook_tenant_matrix import run_matrix  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -956,6 +957,9 @@ class WebhooksHarness(PullsHarness):
         self.document("/api/repos/alice/other/webhooks", 404, token=carol)
         self.document(org_hooks, 404, token=carol)
 
+    def tenant_role_matrix(self):
+        return run_matrix(self)
+
     def access_and_boundaries(self):
         # Non-owner (bob) receives 404 Not Found; read-only token receives 403 Forbidden on mutations.
         self.document(self.webhookspath, 404, token=self.bob)
@@ -995,6 +999,7 @@ def main():
             "exponential_backoff_retry_and_dead_letter",
             "webhook_loopback_default_deny_and_operator_opt_in",
             "collaborator_team_and_organization_tenant_scope",
+            "tenant_role_matrix",
             "access_and_boundaries",
         ):
             harness.case(name, getattr(harness, name))
