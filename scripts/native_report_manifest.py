@@ -181,10 +181,6 @@ def verify_batch_receipt(receipt, receipt_file, binary):
         all(isinstance(target, str) and target for target in targets),
         "batch receipt targets must be nonempty strings",
     )
-    require(
-        len(targets) == len(set(targets)),
-        "batch receipt targets must be unique",
-    )
 
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -271,6 +267,40 @@ def verify_batch_receipt(receipt, receipt_file, binary):
         "batch receipt manifest build.commands must be exactly 1",
     )
 
+    fresh_false_artifacts = manifest_build.get("fresh_false_artifacts")
+    require(
+        isinstance(fresh_false_artifacts, list) and len(fresh_false_artifacts) > 0,
+        "fresh_false_artifacts must be a non-empty list",
+    )
+    require(
+        all(isinstance(item, dict) for item in fresh_false_artifacts),
+        "fresh_false_artifacts items must be dicts",
+    )
+    require(
+        all(item.get("kind") in ("lib", "bin") for item in fresh_false_artifacts),
+        "fresh_false_artifacts kind must be lib or bin",
+    )
+    require(
+        all(
+            isinstance(item.get("target"), str) and item.get("target") != ""
+            for item in fresh_false_artifacts
+        ),
+        "fresh_false_artifacts target must be a non-empty string",
+    )
+    require(
+        all(item.get("fresh") is False for item in fresh_false_artifacts),
+        "fresh_false_artifacts fresh must be exactly False",
+    )
+    typed_targets = [(item.get("kind"), item.get("target")) for item in fresh_false_artifacts]
+    require(
+        len(typed_targets) == len(set(typed_targets)),
+        "Duplicate (kind, target) pair detected in fresh_false_artifacts",
+    )
+    require(
+        targets == [target for kind, target in typed_targets],
+        "targets must match typed_targets order",
+    )
+
     artifacts = manifest.get("artifacts")
     require(
         isinstance(artifacts, list) and artifacts,
@@ -315,6 +345,10 @@ def verify_batch_receipt(receipt, receipt_file, binary):
     require(
         entry.get("target") in targets,
         "batch receipt binary entry target is not listed in the batch targets",
+    )
+    require(
+        ("bin", entry.get("target")) in typed_targets,
+        "bin entry target must be in typed_targets",
     )
     require(
         entry.get("sha256") == receipt.get("binary_sha256"),

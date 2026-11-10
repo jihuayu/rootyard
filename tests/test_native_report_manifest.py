@@ -67,7 +67,7 @@ class ManifestFixture:
             "kind": "rootyard/native-build-batch",
             "receipt_version": 1,
             "binary": "rootyard",
-            "targets": ["rootyard"],
+            "targets": ["rootyard", "rootyard"],
             "bound_inputs_sha256": "c" * 64,
             "manifest": str(batch_path.resolve()),
         }
@@ -84,7 +84,14 @@ class ManifestFixture:
             "target_directory": target_dir,
             "bound_inputs": bound_inputs,
             "clean": {"commands": 1},
-            "build": {"commands": 1, "command": receipt["command"]},
+            "build": {
+                "commands": 1,
+                "command": receipt["command"],
+                "fresh_false_artifacts": [
+                    {"kind": "lib", "target": "rootyard", "fresh": False},
+                    {"kind": "bin", "target": "rootyard", "fresh": False},
+                ],
+            },
             "artifacts": [
                 {
                     "kind": "bin",
@@ -234,6 +241,29 @@ class TestJobManifest(unittest.TestCase):
         self.fixture.job(expect=1)
 
         self.assertIn("exactly one entry", self.fixture.last_process.stderr)
+
+    def test_rejects_duplicate_batch_artifacts_and_targets(self):
+        batch_path = self.fixture.enable_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["build"]["fresh_false_artifacts"] = [
+            {"kind": "lib", "target": "rootyard", "fresh": False},
+            {"kind": "bin", "target": "rootyard", "fresh": False},
+        ]
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        receipt = json.loads(self.fixture.receipt.read_text(encoding="utf-8"))
+        receipt["batch"]["targets"] = ["rootyard", "rootyard"]
+        self.fixture.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
+        manifest["build"]["fresh_false_artifacts"].append(
+            {"kind": "bin", "target": "rootyard", "fresh": False}
+        )
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        receipt["batch"]["targets"].append("rootyard")
+        self.fixture.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
+        self.fixture.job(expect=1)
+
+        self.assertIn("duplicate", self.fixture.last_process.stderr.lower())
 
     def test_rejects_report_from_another_binary(self):
         report = self.fixture.report(binary_sha="c" * 64)
