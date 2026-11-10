@@ -188,6 +188,9 @@ fn the_publication_producer_is_each_artifact_owner() {
     for (field, mutate) in mutations {
         let mut declared = declared();
         mutate(&mut declared);
+        // The real SQL decoder finishes by recomputing this stage from the
+        // decoded rows; do the same instead of trusting the pre-mutation cache.
+        declared.scope = declared_violations(&declared);
         let expected: Vec<_> = if *field == "publication_owner" {
             vec![0, 1]
         } else if field.ends_with("pack") {
@@ -196,8 +199,10 @@ fn the_publication_producer_is_each_artifact_owner() {
             vec![1]
         };
         let lines = check_declared(std::slice::from_ref(&declared));
-        let expected =
+        let mut expected =
             expected.into_iter().map(|index| format!("owner_scope_mismatch:{}", at(index))).collect::<Vec<_>>();
+        // `declared_violations` sorts its lines; compare on that same order.
+        expected.sort();
         assert_eq!(declared.scope, expected, "{field}: {lines:?}");
         assert!(!lines.iter().any(|line| line.contains("digest")), "{field}: {lines:?}");
         assert!(canonical(&declared).is_ok() || *field == "publication_owner", "{field}: {lines:?}");
@@ -322,8 +327,18 @@ fn every_artifact_tenant_is_the_publication_tenant() {
             mutate(&mut pair.artifacts[index]);
             resealed(&mut pair);
             let lines = check_declared(std::slice::from_ref(&pair));
-            let expected = format!("owner_scope_mismatch:{}", at(index));
+            // The durable hold's own tenant and storage tenant are judged by
+            // `hold_matches`, whose existing (and precise) reason is
+            // `hold_mismatch`; only the decoded owner scope uses
+            // `owner_scope_mismatch`.
+            let expected = match *field {
+                "hold_tenant" | "storage_tenant" => format!("hold_mismatch:{}", at(index)),
+                _ => format!("owner_scope_mismatch:{}", at(index)),
+            };
             assert!(lines.contains(&expected), "{field}/{expected}: {lines:?}");
+            if matches!(*field, "hold_tenant" | "storage_tenant") {
+                assert!(!lines.iter().any(|line| line.starts_with("owner_scope_mismatch")), "{field}: {lines:?}");
+            }
             assert!(!lines.iter().any(|line| line.contains("canonical_pair_mismatch")), "{field}: {lines:?}");
         }
     }
@@ -357,11 +372,18 @@ fn the_artifact_repository_and_pack_are_the_declared_key() {
     for (field, mutate) in [
         ("request", (|a: &mut PairArtifact| a.request = None) as fn(&mut PairArtifact)),
         ("hold", |a| a.hold = None),
-        ("receipt", |a| a.receipt = false),
+        // A SQL row with `receipt = false` decodes no receipt scope at all;
+        // keeping the row-cached scope would fabricate a receipt.
+        ("receipt", |a| {
+            a.receipt = false;
+            a.receipt_scope = None;
+        }),
         ("hold_slot", |a| a.hold_slot = None),
     ] {
         let mut pair = declared();
         mutate(&mut pair.artifacts[0]);
+        // Mirror the decoder's final stage: recompute the scope from the rows.
+        pair.scope = declared_violations(&pair);
         let lines = check_declared(std::slice::from_ref(&pair));
         assert!(lines.contains(&format!("owner_scope_mismatch:{}", at(0))), "{field}: {lines:?}");
     }
