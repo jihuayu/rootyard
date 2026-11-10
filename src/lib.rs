@@ -8,6 +8,7 @@ pub mod standalone;
 pub mod auth;
 pub mod auth_admission;
 pub mod backup;
+pub mod baseline_metrics;
 pub mod blob_store;
 #[rustfmt::skip]
 pub mod browse;

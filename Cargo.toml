@@ -19,6 +19,9 @@ pando-lab = []
 # Optional Azure Blob provider for the standalone OpenDAL Blob profile.
 # S3 is always compiled; no fs/memory service is enabled for this profile.
 blob-azblob = ["opendal/services-azblob"]
+# Opt-in, default-OFF phase instrumentation for #106 baseline evidence. Adds no
+# dependencies; a default build compiles no recording code.
+state-baseline-metrics = []
 
 [[bin]]
 name = "rootyard-pando-lab"

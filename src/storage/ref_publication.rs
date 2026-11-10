@@ -3,6 +3,7 @@
 //! attempt to keep a PostgreSQL transaction alive after they exit.
 use crate::{
     Error,
+    baseline_metrics::{Outcome, Phase, Timer, timed_result},
     db::Identity,
     storage::{Storage, admission, read_leases},
 };
@@ -157,11 +158,17 @@ impl PublicationGuard {
     ) -> Result<PublicationWindow<'a>, Error> {
         self.ensure_active()?;
         let (send, recv) = oneshot::channel();
-        tokio::time::timeout_at(deadline, self.window_tx.send(WindowRequest::Enter(send)))
-            .await
-            .map_err(|_| unavailable())?
-            .map_err(|_| unavailable())?;
-        tokio::time::timeout_at(deadline, recv).await.map_err(|_| unavailable())?.map_err(|_| unavailable())??;
+        // Whole window acquisition: request delivery, then the grant that the
+        // owner obtains under the repository advisory lock.
+        timed_result(Phase::RepoPublicationWindow, async {
+            tokio::time::timeout_at(deadline, self.window_tx.send(WindowRequest::Enter(send)))
+                .await
+                .map_err(|_| unavailable())?
+                .map_err(|_| unavailable())?;
+            tokio::time::timeout_at(deadline, recv).await.map_err(|_| unavailable())?.map_err(|_| unavailable())??;
+            Ok::<(), Error>(())
+        })
+        .await?;
         let local = tokio::time::timeout_at(deadline, storage.write_lock(self.repository_id))
             .await
             .map_err(|_| unavailable())?;
@@ -311,10 +318,17 @@ pub async fn acquire(
     }
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     let slots = SLOTS.get_or_init(|| Arc::new(Semaphore::new(4))).clone();
-    let slot = tokio::time::timeout_at(deadline, slots.acquire_owned())
-        .await
-        .map_err(|_| unavailable())?
-        .map_err(|_| unavailable())?;
+    let slot_timer = Timer::start(Phase::PublicationSlot);
+    let slot = match tokio::time::timeout_at(deadline, slots.acquire_owned()).await {
+        Ok(Ok(slot)) => {
+            slot_timer.finish(Outcome::Ok);
+            slot
+        }
+        _ => {
+            slot_timer.finish(Outcome::Error);
+            return Err(unavailable());
+        }
+    };
     let data = read_leases::shared(pool, repository_id, deadline).await?;
     // Durable admission records the writer epoch so a committed GC fence
     // cannot be crossed even if a future path stops using advisory locks.
@@ -438,7 +452,9 @@ pub async fn acquire(
         }
         active_send.send_replace(None);
     })));
-    let result = tokio::time::timeout_at(deadline, ready_recv).await;
+    // Includes the owner task's bounded retry sleeps between exact-ref lock
+    // attempts, its pooled session, and the generation check.
+    let result = timed_result(Phase::RefAdvisory, tokio::time::timeout_at(deadline, ready_recv)).await;
     match result {
         Ok(Ok(Ok(()))) => Ok(PublicationGuard {
             repository_id,

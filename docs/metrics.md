@@ -197,6 +197,18 @@ capture age, on due backlog growth and expired running leases, and on
 `rootyard_postgres_up == 0` / scrape failure. Treat terminal-failure history as
 an investigation input, not a permanent fault or retryable-backlog alert.
 
+## Opt-in state-services baseline series
+
+Building with `--features state-baseline-metrics` (default OFF, no dependency)
+additionally appends the fixed `rootyard_baseline_phase_*` counter, histogram and
+byte series described in
+[state-services-baseline-metrics.md](state-services-baseline-metrics.md). They
+report bounded wall-clock spans of awaited Pando state-service operations, plus
+logical bytes for S3-backed transfers only (the local filesystem object store
+produces none). Spans nest and are not additive, they are client round trips
+rather than pure server lock waits, and they are never exposed on the
+application listener. A default build emits exactly the series above.
+
 ## Tests
 
 `cargo test metrics::tests` checks loopback binding, fixed labels/numeric format,

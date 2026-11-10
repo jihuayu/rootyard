@@ -124,5 +124,33 @@
       "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
     },
     "measurement_note": "The historical d689 native receipt was not rerun against this parent and does not qualify it."
+  },
+  "implementation_overlay": {
+    "schema": "rootyard.state-services.implementation-overlay/v1",
+    "stack_base": "bcd391809c8b0d2a16409b6a28fe1147d7ed5c66",
+    "branch": "codex/state-services-baseline-metrics",
+    "recorded_manifest_commit": "7c9f424",
+    "recorded_note": "Informational provenance only; the file hashes below are authoritative.",
+    "feature": {
+      "name": "state-baseline-metrics",
+      "included": [],
+      "default_enabled": false,
+      "purpose": "Default-OFF phase instrumentation; adds no dependency, sub-feature or profile change."
+    },
+    "files": {
+      "Cargo.toml": "b396480705eacfc799a5467cf7d9b3101931b710ad211754ca8108fdba976ace",
+      "Cargo.lock": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034"
+    },
+    "parent_manifest_sha256": "f11958990599c8803322f3c51b88c167025e6ce786ae26c9fc2060d23612be72",
+    "parent_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+    "parent_manifest_semantic_sha256": "d5d3f84b15150bfb4ae0f51f8a83490a14c005b9545d711c20a088281cd36aa5",
+    "scope": "Feature-only overlay from the stacked implementation branch. W0 itself did not modify Cargo; this record lets the validator accept exactly one empty, default-OFF feature while keeping the frozen parent hashes for every other file and requiring the unchanged parent lockfile.",
+    "rejected": [
+      "any dependency, dev-dependency, profile or patch change",
+      "any second feature or a non-empty overlay feature",
+      "any MSRV change or relaxation",
+      "any Cargo.lock change",
+      "relabelling the frozen parent hash with the child manifest hash"
+    ]
   }
 }

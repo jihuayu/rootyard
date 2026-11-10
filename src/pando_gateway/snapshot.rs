@@ -1,7 +1,13 @@
 //! Disposable native Git read view reconstructed from PostgreSQL refs and
 //! encrypted remote pack manifests. Nothing in this directory is authority.
 use super::pack_store::PackStore;
-use crate::{AppState, Error, db::Repository, git_http, storage::read_leases::Lease};
+use crate::{
+    AppState, Error,
+    baseline_metrics::{Phase, timed_result},
+    db::Repository,
+    git_http,
+    storage::read_leases::Lease,
+};
 use anyhow::{Result, ensure};
 use std::{
     collections::BTreeMap,
@@ -39,7 +45,14 @@ impl Drop for Snapshot {
     }
 }
 
-async fn run_git(state: &AppState, path: &Path, args: &[&str], lease: &Lease, deadline: Instant) -> Result<Vec<u8>> {
+async fn run_git(
+    state: &AppState,
+    path: &Path,
+    args: &[&str],
+    lease: &Lease,
+    deadline: Instant,
+    phase: Phase,
+) -> Result<Vec<u8>> {
     active(lease)?;
     let mut cmd = Command::new(&state.config.git);
     cmd.env_clear()
@@ -53,8 +66,9 @@ async fn run_git(state: &AppState, path: &Path, args: &[&str], lease: &Lease, de
         .stdin(Stdio::null());
     let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
     ensure!(!timeout.is_zero(), "Pando read view deadline elapsed");
-    let bytes = lease
-        .guard(git_http::collect_git_output(cmd, 32 * 1024, timeout))
+    // Wall clock of the awaited subprocess, so it contains that subprocess's CPU
+    // time. It is not a separate CPU measurement.
+    let bytes = timed_result(phase, lease.guard(git_http::collect_git_output(cmd, 32 * 1024, timeout)))
         .await
         .map_err(|error| anyhow::anyhow!(error.1))??;
     Ok(bytes)
@@ -70,7 +84,7 @@ pub async fn materialize(
 ) -> Result<Snapshot, Error> {
     async fn inner(state: &Arc<AppState>, repo: &Repository, lease: &Lease, deadline: Instant) -> Result<Snapshot> {
         active(lease)?;
-        let client = state.pool.get().await?;
+        let client = timed_result(Phase::PoolCheckout, state.pool.get()).await?;
         let row = client
             .query_one(
                 "SELECT r.owner_id,r.storage_backend,r.storage_generation,r.object_format, \
@@ -151,17 +165,29 @@ pub async fn materialize(
             source_packs: pack_ids.clone(),
         };
         let format_arg = format!("--object-format={}", repo.object_format);
-        run_git(state, snapshot.path(), &["init", "--bare", &format_arg], lease, deadline).await?;
+        run_git(state, snapshot.path(), &["init", "--bare", &format_arg], lease, deadline, Phase::NativeGitPrepare)
+            .await?;
         let store = PackStore::from_env(state.storage.root.join("pando-pack-work"), state.config.git.clone())?;
         let pack_dir = snapshot.path.join("objects/pack");
         let cache_dir = PackStore::cache_dir(&state.storage.root, repo.id);
         let mut total_bytes = 0u64;
         for pack_id in pack_ids {
             active(lease)?;
-            let manifest = lease
-                .guard(Box::pin(store.recover_cached(&state.pool, repo.id, pack_id, &pack_dir, &cache_dir, deadline)))
-                .await
-                .map_err(|error| anyhow::anyhow!(error.1))??;
+            // Hydration of one declared pack into the disposable snapshot; it
+            // contains any remote GET and decryption performed underneath.
+            let manifest = timed_result(
+                Phase::NativeGitHydration,
+                lease.guard(Box::pin(store.recover_cached(
+                    &state.pool,
+                    repo.id,
+                    pack_id,
+                    &pack_dir,
+                    &cache_dir,
+                    deadline,
+                ))),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.1))??;
             ensure!(
                 manifest.tenant_id == tenant && manifest.object_format == repo.object_format,
                 "Pando snapshot pack identity mismatch"
@@ -178,14 +204,16 @@ pub async fn materialize(
                     && oid.bytes().all(|b| b.is_ascii_hexdigit()),
                 "Pando ref has wrong object format"
             );
-            run_git(state, snapshot.path(), &["update-ref", "--no-deref", name, oid], lease, deadline).await?;
+            let args: [&str; 4] = ["update-ref", "--no-deref", name.as_str(), oid.as_str()];
+            run_git(state, snapshot.path(), &args, lease, deadline, Phase::NativeGitPrepare).await?;
         }
         // The advertised HEAD is part of the authoritative snapshot. A disposable
         // bare repository must not invent a default branch from git init.
-        run_git(state, snapshot.path(), &["symbolic-ref", "HEAD", &snapshot.head_ref], lease, deadline).await?;
-        run_git(state, snapshot.path(), &["fsck", "--full", "--strict"], lease, deadline).await?;
+        let args: [&str; 3] = ["symbolic-ref", "HEAD", snapshot.head_ref.as_str()];
+        run_git(state, snapshot.path(), &args, lease, deadline, Phase::NativeGitPrepare).await?;
+        run_git(state, snapshot.path(), &["fsck", "--full", "--strict"], lease, deadline, Phase::NativeGitFsck).await?;
         active(lease)?;
-        let client = state.pool.get().await?;
+        let client = timed_result(Phase::PoolCheckout, state.pool.get()).await?;
         let current = client
             .query_one(
                 "SELECT r.storage_generation,s.ref_generation,s.state \

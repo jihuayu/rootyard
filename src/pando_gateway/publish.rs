@@ -7,6 +7,7 @@
 use super::{prepare::PreparedPush, snapshot::Snapshot};
 use crate::{
     AppState, Error, auth,
+    baseline_metrics::{Phase, timed_result},
     browse::policy,
     db::{Identity, Repository},
     events::{self, OperationRecord, RefEventInput},
@@ -119,7 +120,7 @@ pub async fn publish(
     let window = guard.enter_window(&state.storage, deadline).await?;
     window.ensure_active()?;
     crate::sharding::fencing::check_before_push(state, repo).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let mut client = timed_result(Phase::PoolCheckout, state.pool.get()).await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(
         &tx,
@@ -133,16 +134,21 @@ pub async fn publish(
     if access.repo_id != repo.id || access.owner_id != tenant_id {
         return Err(conflict());
     }
-    let current = tx
-        .query_one(
+    // Spans the whole client round trip of this statement: submission, PostgreSQL
+    // execution plus the `FOR UPDATE OF s` row-lock wait, and the row coming back.
+    // It is not a pure server-side lock wait and not the later work in this tx.
+    let current = timed_result(
+        Phase::StateRow,
+        tx.query_one(
             "SELECT r.storage_generation,r.storage_backend,r.object_format,r.transition_state,
         s.state,s.storage_generation AS pando_generation,s.ref_generation,s.operation_sequence,
         s.object_format AS pando_format,s.pack_ids,s.head_ref FROM repositories r JOIN pando_repository_states s
         ON s.repository_id=r.id WHERE r.id=$1 AND s.tenant_id=$2 FOR UPDATE OF s",
             &[&repo.id, &tenant_id],
-        )
-        .await
-        .map_err(Error::internal)?;
+        ),
+    )
+    .await
+    .map_err(Error::internal)?;
     if current.get::<_, i64>("storage_generation") != repo.storage_generation
         || current.get::<_, i64>("pando_generation") != repo.storage_generation
         || current.get::<_, &str>("storage_backend") != "pando"

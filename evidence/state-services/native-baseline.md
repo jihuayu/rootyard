@@ -29,7 +29,21 @@ Use an isolated test database and real S3-compatible/Vault fixture. Supply the s
 python3 scripts/state_services_native_baseline.py --binary /absolute/immutable/rootyard --source-root /absolute/compiled-checkout --report /absolute/report.json
 ```
 
-The runner stops only its owned process group and drops only its random SQL schema. It retains its private temporary fixture directory for inspection; operators may remove that exact owned directory afterwards. It does not modify host FUSE, kernel, PostgreSQL or provider configuration.
+Add `--keep` only when the owned fixture must be inspected after a passed run;
+failed runs retain it automatically as recorded in `fixture_retention`.
+
+The runner stops only its owned process group and drops only its random SQL
+schema. A passed run removes its owned temporary fixture directory by default.
+`--keep` retains it explicitly; any failed run also retains the owned fixture for
+diagnosis. The JSON report records `fixture_retention.requested`,
+`retained`, `root` and `reason`, so an unexpected leftover is visible rather
+than silent. Operators may remove that exact owned directory afterwards. It
+does not modify host FUSE, kernel, PostgreSQL or provider configuration.
+
+This cleanup change applies only to future runner invocations. The historical
+v4/v5 reports and their recorded `fixture_root` paths remain immutable; the
+rebased head is still unqualified until the root agent runs the fresh
+feature-enabled binary and 32-case native workload.
 
 ## Earlier measurements
 

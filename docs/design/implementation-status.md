@@ -9,10 +9,10 @@
 | 能力 | 当前状态 | 后续范围 |
 | --- | --- | --- |
 | OpenDAL Blob、KeyProvider、cache/wake | 有独立组件与限定验收 | 全内容/加密路径接入、provider 与部署边界验收 |
-| PgRefStore 操作身份、CAS、pack 发布、快照和物化 | 有未接服务的库实现 | 统一服务读写入口、正常仓库创建和权限上下文 |
+| PgRefStore 操作身份、CAS、pack 发布、快照和物化 | 有库实现；显式 `serve-blob` 候选入口已使用（尚未替换默认服务） | 默认入口替换、全部业务 producer 与权限上下文等价 |
 | artifact holds / durable roots | 有持久账本和真实 PG/Blob/native Git 验收 | PR/CI/Workspace/LFS producers、GC 与完整恢复闭包 |
 | PG decisions / accepted-subset | PR #142 库增量验收通过 | HTTP/业务入口、浏览器与 Merge producer、远程 Raft 决策桥 |
-| Blob-only standalone | 尚未交付为默认部署 | 一个 app + PG + Blob，在无可选服务和空计算目录下完整运行 |
+| Blob-only standalone | 显式 `serve-blob` 候选：clone/push、浏览、历史 API 与配对备份有验收 | 默认部署替换、LFS/PR/Workspace/CI 接入与默认服务验收 |
 | Raft Ref-CAS distributed | 尚未交付 | 开源库选型、持久运行时、状态机、RPC、权限桥与 PG 投影 |
 | 全新环境恢复与生产资格 | 现有格式组件恢复有证据 | 新架构 PG/Raft/Blob 一致恢复、独立故障域和容量成本验收 |
 
