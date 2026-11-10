@@ -40,16 +40,15 @@ use super::super::pack_commit::{
     self, CapturedRef, NativeReadClosure, NativeReadEngine, NativeReadRequest, PackArtifactRole, PackCommitError,
     RegisteredPack,
 };
-use super::super::snapshot_contract::MetadataSnapshotScope;
 use super::contract as pack_contract;
 use super::pg::PgPackSnapshot;
 use super::read_snapshot::PackReadSnapshot;
 use super::request::PackSnapshotRef;
-use super::serving_proof::VerifiedReadView;
-use super::serving_proof::VerifiedReadViewProof;
+use super::serving_proof::{VerifiedReadView, VerifiedReadViewProof};
 use super::serving_read::{RegisteredServingRead, ServingReadCapture, revalidate_serving_capture};
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
+use crate::ref_store::core::snapshot_contract::MetadataSnapshotScope;
 use crate::ref_store::core::snapshot_sql;
 use crate::ref_store::pg;
 use crate::ref_store::tx::begin_bounded;
@@ -248,7 +247,7 @@ impl PgPackSnapshotMaterializer {
         let deadline = effective_deadline(deadline)?;
         let (snapshot, binding) = capture.registered_parts()?;
         let registered = RegisteredServingRead { snapshot, binding };
-        if !registered.snapshot.complete_transient_pack_read() {
+        if registered.snapshot.complete_transient_pack_read().is_none() {
             return Err(RefStoreError::Unsupported(
                 "serving read materialization requires a transient complete pack-verified capture",
             ));
@@ -282,14 +281,19 @@ impl PgPackSnapshotMaterializer {
         {
             return Err(RefStoreError::Unsupported("materialized view exceeds its workspace bound"));
         }
-        self.revalidate_serving(pool, &registered, native, deadline).await
+        match self.revalidate_serving(pool, &registered, native, deadline).await? {
+            Some(view) => Ok(Some(view)),
+            None => Err(RefStoreError::Database("serving read transaction cleanup left no view".into())),
+        }
     }
 
     /// The proof-producing form of [`Self::materialize_serving_read`] (#174).
     ///
     /// Exactly the same download, verification, native `fsck` and fresh T2
     /// recheck, but the returned value keeps the verified native view and the
-    /// sealed [`VerifiedReadViewProof`] alive together. A checked empty capture
+    /// sealed [`VerifiedReadViewProof`] alive together. The proof is built by
+    /// [`VerifiedReadView::of_materialized`], which accepts nothing but the
+    /// T2-completed [`MaterializedPackRead`] itself. A checked empty capture
     /// still returns `Ok(None)`: no bytes, no proof. This is an internal
     /// materialization proof only; no gateway route consumes it yet (the
     /// `serving_proof` module docs list what a consumer must still enforce).
@@ -316,7 +320,7 @@ impl PgPackSnapshotMaterializer {
         registered: &RegisteredServingRead,
         native: NativeReadClosure,
         deadline: Instant,
-    ) -> Result<MaterializedPackRead, RefStoreError> {
+    ) -> Result<Option<MaterializedPackRead>, RefStoreError> {
         let mut client = pooled_client(pool, deadline).await?;
         let tx = begin_bounded(&mut client, deadline).await?;
         let result = async {
@@ -344,10 +348,7 @@ impl PgPackSnapshotMaterializer {
             Ok(fresh)
         }
         .await;
-        let sealed = result.map(|fresh| {
-            let read_digest = native.read_digest_hex();
-            MaterializedPackRead { snapshot: fresh, native, read_digest }
-        });
+        let sealed = result.map(|fresh| Some(MaterializedPackRead::sealed(fresh, native)));
         let cleanup = match tokio::time::timeout_at(deadline, tx.rollback()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(RefStoreError::Database("serving read transaction cleanup failed".into())),
@@ -427,8 +428,7 @@ impl PgPackSnapshotMaterializer {
                     "materialized native closure binding differs from the revalidated read",
                 ));
             }
-            let read_digest = native.read_digest_hex();
-            Ok(MaterializedPackRead { snapshot: fresh, native, read_digest })
+            Ok(MaterializedPackRead::sealed(fresh, native))
         });
         // Bounded cleanup under the SAME absolute deadline. The sealed value is
         // returned only when cleanup succeeded; a timeout or a failed rollback
@@ -451,12 +451,14 @@ impl PgPackSnapshotMaterializer {
 pub struct MaterializedPackRead {
     snapshot: PackReadSnapshot,
     native: NativeReadClosure,
-    read_digest: String,
 }
 
 /// Pure binding step of the sealed builder: the capture must be the very
-/// snapshot T2 revalidated, and only the native closure's A5b digest — compared
-/// with the capture's own A5b binding — may seal.
+/// snapshot T2 revalidated, and the proof is sealed over the view's own A5b
+/// binding — which T2 compared with the capture's A5b binding, and which
+/// [`VerifiedReadView::of_materialized`] re-checks against the snapshot's
+/// recomputed A5b materialization digest. The capture's digest alone is never a
+/// proof input.
 fn serving_materialization(
     view: MaterializedPackRead,
     capture: &ServingReadCapture,
@@ -465,7 +467,10 @@ fn serving_materialization(
     if *view.snapshot() != captured {
         return Err(RefStoreError::MetadataScopeMismatch("materialized serving read is not its capture"));
     }
-    let proof = VerifiedReadView::of_revalidated(view.snapshot(), binding)?.seal();
+    if view.proven_binding() != binding {
+        return Err(RefStoreError::MetadataScopeMismatch("materialized serving read binding"));
+    }
+    let proof = VerifiedReadView::of_materialized(&view)?.seal();
     Ok(MaterializedServingRead { view, proof })
 }
 
@@ -491,7 +496,25 @@ impl MaterializedServingRead {
     }
 }
 
+/// Test-only: build the production view shape over a fixture snapshot and a
+/// stand-in native closure, so offline unit cases can drive the same pure step
+/// the materializer runs. Never reachable outside this crate's test builds.
+#[cfg(test)]
+pub(crate) fn test_materialized_view(snapshot: PackReadSnapshot, native: NativeReadClosure) -> MaterializedPackRead {
+    assert_eq!(native.read_digest(), snapshot.materialization_digest(), "a test view must bind its own snapshot");
+    MaterializedPackRead::sealed(snapshot, native)
+}
+
 impl MaterializedPackRead {
+    /// The one place a view exists: after T2 revalidated `snapshot`, compared
+    /// the native closure's A5b digest with its own recomputation and finished
+    /// cleanup. The view keeps the single source of truth (`native`); the public
+    /// [`Self::read_digest_hex`] is derived from it, never stored separately, so
+    /// the A5b binding cannot drift from the bytes it describes.
+    fn sealed(snapshot: PackReadSnapshot, native: NativeReadClosure) -> Self {
+        Self { snapshot, native }
+    }
+
     pub(super) fn snapshot(&self) -> &PackReadSnapshot {
         &self.snapshot
     }
@@ -556,10 +579,11 @@ impl MaterializedPackRead {
         self.snapshot.snapshot_digest_hex()
     }
     /// Complete A5b binding: full scope, expiry, pin/generation, refs+HEAD,
-    /// membership and full pack identity digests. Never the incomplete A5a
-    /// read digest alone.
-    pub fn read_digest_hex(&self) -> &str {
-        &self.read_digest
+    /// membership and full pack identity digests — exactly the native closure's
+    /// digest T2 compared with its own recomputation. Never the incomplete A5a
+    /// read digest.
+    pub fn read_digest_hex(&self) -> String {
+        self.native.read_digest_hex()
     }
     pub fn logical_bytes(&self) -> i64 {
         self.snapshot.logical_bytes()

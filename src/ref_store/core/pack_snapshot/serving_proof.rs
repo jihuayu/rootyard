@@ -33,27 +33,35 @@
 //!
 //! # Construction
 //!
-//! The fields are private. The sealed value has no public constructor, no
-//! `Clone`, no `Serialize` and no extension point. It is created only by the
-//! parent materialize step from a T2-revalidated native view; test code uses a
-//! separate `cfg(test)` path that can never be a production proof.
+//! The proof has private fields and no public constructor, no `Clone`, no
+//! `Serialize` and no extension point. Its only factory,
+//! [`VerifiedReadView::of_materialized`], accepts nothing but the opaque
+//! [`MaterializedPackRead`] the materializer builds **only after** T2 finished,
+//! so a bare [`PackReadSnapshot`] plus a caller-chosen digest can never be
+//! turned into a proof, not even from a sibling module of this crate. The view
+//! keeps its own A5b binding and the proof is sealed on exactly that value, and
+//! only when it equals the snapshot's recomputed A5b materialization digest.
+//! Test code uses separate `cfg(test)` helpers; they never feed a production
+//! seal site.
 
-/// Read-only accessors for the out-of-crate native contract suite (`cfg(test)`
-/// only, so it is never part of a production build).
+/// Crate-private read-only accessors for the `cfg(test)` contract suite that
+/// lives in the sibling `materialize::serving_tests` subtree; never compiled
+/// into a production build, so it widens no production visibility.
 #[cfg(test)]
 pub(crate) mod contract;
 
 use uuid::Uuid;
 
-use super::PackReadSnapshot;
-use crate::ref_store::contract::RequestDigest;
+use super::materialize::MaterializedPackRead;
+use crate::ref_store::contract::{RefStoreError, RequestDigest};
+use crate::ref_store::core::snapshot_contract::MetadataSnapshotScope;
 
 /// A T2-revalidated native serving read whose verified A5b binding cannot be
 /// separated from the native bytes they describe.
 ///
-/// Not `Clone`, no public constructor. The binding is the materialization
-/// digest T2 recomputed and the native closure reproduced, never the narrower
-/// A5a read digest.
+/// Not `Clone`, no constructor other than [`Self::of_materialized`]. The binding
+/// is the materialization digest T2 recomputed and the native closure
+/// reproduced, never the narrower A5a read digest.
 pub(crate) struct VerifiedReadView {
     gate_revision: i64,
     scope: ProvenScope,
@@ -61,19 +69,27 @@ pub(crate) struct VerifiedReadView {
 }
 
 impl VerifiedReadView {
-    /// Check that the materialized view's own T2-revalidated snapshot is a
-    /// complete transient pack read. The parent passes the capture's A5b
-    /// binding only after T2 re-proved it against this same snapshot.
-    pub(super) fn of_revalidated(
-        snapshot: &PackReadSnapshot,
-        binding: RequestDigest,
-    ) -> Result<Self, crate::ref_store::RefStoreError> {
-        if !snapshot.complete_transient_pack_read() {
-            return Err(crate::ref_store::RefStoreError::Database(
-                "materialized serving read is not a verified transient read".into(),
+    /// Prove exactly this materialized view.
+    ///
+    /// The value is a complete transient pack read (never a retained A5a
+    /// snapshot or a `metadata_only` shape), its A5b binding is the native
+    /// closure's digest T2 compared with its own recomputation, and that binding
+    /// must equal the A5b materialization digest recomputed from the view's
+    /// snapshot. Nothing else is accepted: there is no other factory, and the
+    /// view keeps its native closure and its snapshot together, so its binding
+    /// can neither be chosen by a caller nor drift from the snapshot.
+    pub(crate) fn of_materialized(view: &MaterializedPackRead) -> Result<Self, RefStoreError> {
+        let snapshot = view.snapshot();
+        if snapshot.complete_transient_pack_read().is_none() {
+            return Err(RefStoreError::Unsupported(
+                "serving proof requires a transient complete pack-verified read",
             ));
         }
-        Ok(Self { gate_revision: snapshot.gate_revision(), scope: ProvenScope::of(snapshot), binding })
+        let binding = view.proven_binding();
+        if snapshot.materialization_digest() != binding {
+            return Err(RefStoreError::MetadataScopeMismatch("serving proof binding"));
+        }
+        Ok(Self { gate_revision: snapshot.gate_revision(), scope: ProvenScope::of(snapshot.scope()), binding })
     }
 
     /// Consume the view into the sealed proof. Only the materializer calls it.
@@ -132,7 +148,7 @@ impl ProvenScope {
         self.group_epoch
     }
 
-    fn of(scope: &super::MetadataSnapshotScope) -> Self {
+    fn of(scope: &MetadataSnapshotScope) -> Self {
         Self {
             repository_id: scope.repository_id(),
             tenant_id: scope.tenant_id(),
@@ -143,12 +159,6 @@ impl ProvenScope {
         }
     }
 }
-
-#[cfg(test)]
-pub(crate) use contract::{
-    contract_a5a_probe, contract_binding, contract_gate_revision, contract_history_incarnation, contract_repository_id,
-    contract_scope, contract_tenant_id,
-};
 
 impl VerifiedReadViewProof {
     /// The verified gate revision. Consuming the proof (not this borrow) is what
@@ -164,69 +174,31 @@ impl VerifiedReadViewProof {
 }
 
 impl MaterializedPackRead {
-    /// Prove this view is exactly a complete, T2-revalidated transient serving
-    /// read whose A5b binding is `binding`: never a retained A5a snapshot, a
-    /// metadata-only shape, or a view the native closure did not cover. The
-    /// binding is compared with the full A5b materialization digest, not the
-    /// narrower A5a read digest.
+    /// Prove this materialized view is exactly a complete, T2-revalidated
+    /// transient serving read whose A5b binding is `binding`: never a retained
+    /// A5a snapshot, a `metadata_only` shape, or a view the native closure did
+    /// not cover. The binding is compared with the full A5b materialization
+    /// digest, not the narrower A5a read digest.
     #[cfg(test)]
     pub(crate) fn verified_read_scope(&self, binding: &RequestDigest) -> Option<ProvenScope> {
         self.snapshot()
             .complete_transient_pack_read()
             .filter(|_| self.proven_binding() == *binding)
-            .map(ProvenScope::of)
+            .map(|_| ProvenScope::of(self.snapshot().scope()))
+    }
+
+    /// The A5a per-read digest of the proven snapshot (`read_digest_hex`), as a
+    /// probe value for tests that must show it is never mistaken for the A5b
+    /// binding. Test-only so it can never become a proof input.
+    #[cfg(test)]
+    pub(crate) fn a5a_probe(&self) -> RequestDigest {
+        self.snapshot().read_digest_hex().parse().expect("the snapshot's own A5a hex parses")
     }
 }
 
-/// Test-only: seal a proof over a synthetic scope after a test proved its own
-/// realm. This never touches the production seal site and is unavailable in
-/// non-test builds, so it cannot stand in for the materializer's proof.
+/// Test-only: the A5a per-read digest of a transient snapshot. Never a proof.
 #[cfg(test)]
-pub(crate) fn seal_for_test(revision: i64, scope: ProvenScope, binding: RequestDigest) -> VerifiedReadViewProof {
-    VerifiedReadViewProof { gate_revision: revision, scope, binding }
-}
-
-/// Test-only: build a synthetic scope. The produced proof is never a receipt.
-#[cfg(test)]
-pub(crate) fn test_scope(
-    tenant_id: Uuid,
-    repository_id: Uuid,
-    object_format: crate::ref_store::GitObjectFormat,
-    history_incarnation: Uuid,
-    authority_epoch: i64,
-    group_epoch: i64,
-) -> ProvenScope {
-    ProvenScope { repository_id, tenant_id, object_format, history_incarnation, authority_epoch, group_epoch }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ref_store::GitObjectFormat;
-
-    fn scope(seed: u8) -> ProvenScope {
-        ProvenScope {
-            repository_id: Uuid::from_bytes([seed; 16]),
-            tenant_id: Uuid::from_bytes([seed.wrapping_add(1); 16]),
-            object_format: GitObjectFormat::Sha1,
-            history_incarnation: Uuid::from_bytes([seed.wrapping_add(2); 16]),
-            authority_epoch: 1,
-            group_epoch: 1,
-        }
-    }
-
-    #[test]
-    fn a_sealed_proof_states_exactly_the_revision_it_was_sealed_with() {
-        let binding = RequestDigest::of("serving-proof-unit", &[b"read"]);
-        let proof = seal_for_test(17, scope(1), binding);
-        // Debug output is identity-only: the revision and repository id, never
-        // the A5b binding.
-        let debug = format!("{proof:?}");
-        assert!(debug.contains("gate_revision: 17"), "{debug}");
-        assert!(!debug.contains(&binding.as_hex()), "{debug}");
-        assert_eq!(proof.gate_revision(), 17);
-        let (revision, proven) = proof.into_parts();
-        assert_eq!(revision, 17);
-        assert_eq!(proven, scope(1));
-    }
+#[allow(unused_imports)]
+pub(crate) fn probe_a5a(snapshot: &super::read_snapshot::PackReadSnapshot) -> RequestDigest {
+    snapshot.read_digest_hex().parse().expect("a snapshot's own A5a hex parses")
 }

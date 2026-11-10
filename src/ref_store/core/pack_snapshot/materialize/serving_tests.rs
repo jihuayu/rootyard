@@ -1,23 +1,27 @@
 //! Offline unit coverage for the sealed serving proof (#174).
 //!
 //! These cases isolate the pure binding step of the production builder
-//! (`serving_materialization`) with test-revalidated snapshots. They prove that
-//! only a T2-revalidated transient snapshot whose A5b materialization digest is
-//! the native closure's digest can become a sealed proof, and that the narrower
-//! A5a read digest — the digest the previous code compared — never can.
+//! (`serving_materialization`) together with its only factory,
+//! `VerifiedReadView::of_materialized`, over fixture snapshots. They prove that
+//! only a complete transient read whose A5b materialization digest is the native
+//! closure's own digest can become a sealed proof, that a retained A5a snapshot
+//! never can, and that the narrower A5a read digest — the digest the previous
+//! code compared — is never sealed and never equals the A5b binding.
 //!
 //! They are NOT native evidence: no pack, Blob or Git binary is involved here.
-//! The real-PostgreSQL + native-Git contract suite
-//! (`tests/ref_store_serving_proof.rs`) drives the actual builder end to end.
+//! The real-PostgreSQL + native-Git contract cases live in the `contract`
+//! `#[path]` submodule below (`cfg(test)` + `#[ignore]`), because the production
+//! builder is crate-private by design and an integration-test binary must never
+//! widen it just to reach a test.
 
-use super::super::serving_proof::{
-    contract_a5a_probe, contract_binding, contract_gate_revision, contract_history_incarnation, contract_repository_id,
-    contract_scope, contract_tenant_id,
-};
+use super::super::serving_proof::{VerifiedReadView, probe_a5a};
+use super::super::serving_proof::contract::{contract_parts, contract_refactory};
+use super::test_materialized_view;
 use super::*;
 use crate::ref_store::core::pack_commit::{
     ArtifactLocator, ArtifactSetDigest, CapturedRef, ContentDigest, RegisteredArtifact, RegisteredPack,
 };
+use crate::ref_store::{GitObjectFormat, GitOid, MetadataPinPurpose, RefName};
 use uuid::Uuid;
 
 fn hex32(byte: u8) -> String {
@@ -41,7 +45,10 @@ fn artifact(role: PackArtifactRole, byte: u8) -> RegisteredArtifact {
     let locator = locator(byte);
     RegisteredArtifact::new(
         role,
-        crate::ref_store::core::pack_commit::role_slot(role),
+        match role {
+            PackArtifactRole::Pack => 0,
+            PackArtifactRole::Idx => 1,
+        },
         Uuid::from_bytes([byte; 16]),
         locator.clone(),
         "s3",
@@ -93,39 +100,103 @@ fn parts() -> super::super::read_snapshot::ReadSnapshotParts {
     }
 }
 
-#[test]
-fn the_a5b_binding_is_the_native_digest_not_the_a5a_read_digest() {
-    let snapshot = PackReadSnapshot::new_serving_transient(parts()).expect("fixture transient snapshot");
-    let a5b = snapshot.materialization_digest();
-    let a5a: RequestDigest = snapshot.read_digest_hex().parse().expect("fixture a5a hex");
-    assert_ne!(a5a, a5b, "the fixture must distinguish the two digests");
-    // The previous code compared A5a against the A5b binding, so every real
-    // non-empty sealed read was refused. A5a must still be refused...
-    assert!(VerifiedReadView::of_revalidated(&snapshot, a5a).is_err());
-    // ...and only the A5b digest seals, with the proof stating that digest.
-    let proof = VerifiedReadView::of_revalidated(&snapshot, a5b).expect("A5b must seal").seal();
-    assert_eq!(contract_binding(&proof), a5b);
-    assert_eq!(contract_a5a_probe(&proof), a5a);
-    assert_eq!(contract_a5a_probe(&proof).as_hex(), snapshot.read_digest_hex());
+fn transient(parts: super::super::read_snapshot::ReadSnapshotParts) -> PackReadSnapshot {
+    PackReadSnapshot::new_serving_transient(parts).expect("fixture transient snapshot")
+}
+
+/// A view over the fixture snapshot. `native_digest` is whatever digest the
+/// stand-in native closure carries; production only ever builds this shape from
+/// a closure whose digest T2 re-proved against the same snapshot.
+fn view_bound_to(
+    snapshot: PackReadSnapshot,
+    native_digest: RequestDigest,
+) -> (MaterializedPackRead, PackReadSnapshot, RequestDigest) {
+    let binding = snapshot.materialization_digest();
+    (MaterializedPackRead::sealed(snapshot.clone(), NativeReadClosure::for_test(native_digest)), snapshot, binding)
+}
+
+fn view() -> (MaterializedPackRead, PackReadSnapshot, RequestDigest) {
+    let snapshot = transient(parts());
+    let binding = snapshot.materialization_digest();
+    view_bound_to(snapshot, binding)
+}
+
+/// A test-registered capture of the fixture snapshot with its A5b binding.
+fn registered_capture() -> (ServingReadCapture, RequestDigest) {
+    let snapshot = transient(parts());
+    let binding = snapshot.materialization_digest();
+    (ServingReadCapture::for_test(snapshot, binding), binding)
 }
 
 #[test]
-fn a_sealed_proof_copies_the_revalidated_gate_revision_and_realm() {
-    let snapshot = PackReadSnapshot::new_serving_transient(parts()).expect("fixture transient snapshot");
-    let proof =
-        VerifiedReadView::of_revalidated(&snapshot, snapshot.materialization_digest()).expect("A5b must seal").seal();
-    assert_eq!(contract_gate_revision(&proof), 11);
-    let scope = contract_scope(&proof);
-    assert_eq!(contract_repository_id(&scope), Uuid::from_bytes([5; 16]));
-    assert_eq!(contract_tenant_id(&scope), Uuid::from_bytes([6; 16]));
-    assert_eq!(contract_history_incarnation(&scope), Uuid::from_bytes([8; 16]));
+fn the_fixture_distinguishes_the_a5a_read_digest_from_the_a5b_binding() {
+    let snapshot = transient(parts());
+    let a5b = snapshot.materialization_digest();
+    let a5a = probe_a5a(&snapshot);
+    assert_ne!(a5a, a5b, "the fixture must distinguish the two digests");
+    // The view's public A5b binding is the native closure's digest, never A5a.
+    let (view, _, binding) = view();
+    assert_eq!(binding, a5b);
+    assert_eq!(view.read_digest_hex(), a5b.as_hex());
+    assert_ne!(view.read_digest_hex(), a5a.as_hex());
+}
+
+#[test]
+fn the_production_step_keeps_the_view_and_its_proof_on_the_same_a5b_binding() {
+    let (capture, binding) = registered_capture();
+    let (view, snapshot, view_binding) = view();
+    assert_eq!(view_binding, binding);
+    let a5a = probe_a5a(&snapshot);
+    assert_eq!(snapshot.read_digest_hex(), a5a.as_hex(), "A5a comes from the snapshot, A5b from the view");
+    assert_ne!(a5a, binding);
+    let sealed = serving_materialization(view, &capture)
+        .expect("the production step must seal its own capture on the A5b binding");
+    // One value owns both halves: the verified view survives the call with the
+    // proof that describes exactly it.
+    assert_eq!(sealed.view().verified_pairs(), 1);
+    let (revision, scope, proof_binding) = contract_parts(&sealed);
+    assert_eq!(revision, 11);
+    assert_eq!(proof_binding, binding);
+    assert_eq!(scope.repository_id(), Uuid::from_bytes([5; 16]));
+    assert_eq!(scope.tenant_id(), Uuid::from_bytes([6; 16]));
+    assert_eq!(scope.history_incarnation(), Uuid::from_bytes([8; 16]));
+    // The seal site's own factory re-proves the sealed view on the same A5b
+    // binding; A5a is never an input to it.
+    assert!(contract_refactory(&sealed).is_ok());
+    let view = sealed.view();
+    assert!(view.verified_read_scope(&binding).is_some());
+    assert!(view.verified_read_scope(&probe_a5a(view.snapshot())).is_none());
+}
+
+#[test]
+fn a_view_from_another_capture_never_seals() {
+    let (capture, binding) = registered_capture();
+    let mut other = parts();
+    other.snapshot_id = Uuid::from_bytes([9; 16]);
+    let (view, _, _) = view_bound_to(transient(other), binding);
+    assert!(serving_materialization(view, &capture).is_err());
+}
+
+#[test]
+fn a_view_whose_binding_is_not_its_snapshot_never_proves() {
+    // The one test seam refuses to build a view whose closure does not carry
+    // its snapshot's A5b digest: a binding can never be chosen independently.
+    let snapshot = transient(parts());
+    let a5a = probe_a5a(&snapshot);
+    assert_ne!(a5a, snapshot.materialization_digest());
+    let refused = std::panic::catch_unwind(|| test_materialized_view(snapshot, NativeReadClosure::for_test(a5a)));
+    assert!(refused.is_err(), "a view bound to A5a must never be built");
 }
 
 #[test]
 fn a_retained_a5a_snapshot_never_seals() {
     let retained = PackReadSnapshot::new(parts()).expect("fixture retained snapshot");
-    let binding = retained.materialization_digest();
-    assert!(VerifiedReadView::of_revalidated(&retained, binding).is_err());
+    let retained_digest = retained.materialization_digest();
+    let (view, snapshot, _) = view_bound_to(retained, retained_digest);
+    assert_eq!(view.proven_binding(), retained_digest, "even a correctly bound retained view");
+    assert!(snapshot.complete_transient_pack_read().is_none());
+    assert!(VerifiedReadView::of_materialized(&view).is_err());
+    assert!(view.verified_read_scope(&retained_digest).is_none());
 }
 
 #[test]
@@ -133,4 +204,12 @@ fn a_shape_with_no_registered_pack_is_never_built() {
     let mut empty = parts();
     empty.packs.clear();
     assert!(PackReadSnapshot::new_serving_transient(empty).is_err());
+}
+
+// The real-PostgreSQL contract cases must run inside this crate (the sealed
+// builder is crate-private by design), so they are `#[path]`-included here and
+// reuse the existing `tests/` fixtures rather than an integration binary.
+#[path = "../../../../../tests/serving_proof_support/contract.rs"]
+mod contract {
+    #![path = "tests"]
 }

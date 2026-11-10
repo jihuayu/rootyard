@@ -136,6 +136,14 @@ impl ServingReadCapture {
         }
     }
 
+    /// Test-only registered capture of an already-built test snapshot; the
+    /// binding must be that snapshot's own A5b digest.
+    #[cfg(test)]
+    pub(super) fn for_test(snapshot: PackReadSnapshot, binding: RequestDigest) -> Self {
+        debug_assert_eq!(binding, snapshot.materialization_digest());
+        Self { inner: CaptureInner::Registered(Box::new(RegisteredServingRead { snapshot, binding })) }
+    }
+
     fn registered(snapshot: PackReadSnapshot) -> Self {
         let binding = snapshot.materialization_digest();
         Self { inner: CaptureInner::Registered(Box::new(RegisteredServingRead { snapshot, binding })) }

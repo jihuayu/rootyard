@@ -1,12 +1,15 @@
-//! Crate-private accessors for the native contract suite only (`cfg(test)`).
+//! Crate-private read-only accessors for the sealed proof (`cfg(test)` only).
 //!
-//! The integration test drives the *production* builder
-//! (`materialize_serving_read_sealed`) and then checks the sealed proof against
-//! its own capture; it lives outside the crate, so it needs these very small
-//! typed accessors instead of reaching into private fields. Nothing here
-//! constructs a proof, seals one, or is compiled outside test builds.
+//! The real-PostgreSQL contract case lives inside this crate subtree
+//! (`materialize::serving_tests`) because the production builder is
+//! crate-private by design. These accessors let it inspect the sealed proof and
+//! the materialized view without widening any production visibility: nothing
+//! here constructs a proof, seals one, mints a view, or is compiled outside test
+//! builds. Integration-test binaries are separate crates, so no `pub(crate)`
+//! type can ever reach them.
 
-use crate::ref_store::contract::RequestDigest;
+use super::super::materialize::MaterializedServingRead;
+use crate::ref_store::contract::{RefStoreError, RequestDigest};
 
 impl super::ProvenScope {
     /// The captured tenant.
@@ -40,9 +43,29 @@ impl super::ProvenScope {
     }
 }
 
-impl super::super::MaterializedServingRead {
-    /// `(proof gate revision, proof scope, proof binding, view A5a probe)`.
-    pub(crate) fn contract_parts(&self) -> (i64, super::ProvenScope, RequestDigest, RequestDigest) {
-        (self.proof.gate_revision, self.proof.scope, self.proof.binding, self.proof.contract_a5a_probe())
+impl super::VerifiedReadViewProof {
+    /// The A5b binding the proof states.
+    pub(crate) fn contract_binding(&self) -> RequestDigest {
+        self.binding
+    }
+
+    /// The realm the proof states.
+    pub(crate) fn contract_scope(&self) -> super::ProvenScope {
+        self.scope
+    }
+}
+
+impl MaterializedServingRead {
+    /// `(proof gate revision, proof realm, proof A5b binding)`.
+    pub(crate) fn contract_parts(&self) -> (i64, super::ProvenScope, RequestDigest) {
+        (self.proof.gate_revision(), self.proof.contract_scope(), self.proof.contract_binding())
+    }
+
+    /// The same factory the materializer's seal site uses, re-run over the
+    /// sealed view: a contract case can therefore prove that the view and its
+    /// proof bind the identical A5b materialization digest, and that the
+    /// factory refuses again if the two could ever disagree.
+    pub(crate) fn contract_refactory(&self) -> Result<super::VerifiedReadView, RefStoreError> {
+        super::VerifiedReadView::of_materialized(self.view())
     }
 }

@@ -86,6 +86,8 @@ pub use contract::{
     TENANT_MAX_PACK_LOGICAL_BYTES, TENANT_MAX_PACK_PINS, TENANT_MAX_PACK_RECEIPTS, TENANT_MAX_PACK_REFS,
     TENANT_MAX_PACK_SNAPSHOTS, TENANT_PACK_FACTOR,
 };
+#[cfg(test)]
+pub(crate) use materialize::test_materialized_view;
 pub(crate) use materialize::MaterializedServingRead;
 pub use materialize::{MaterializedPackRead, PgPackSnapshotMaterializer};
 pub use pg::PgPackSnapshot;
@@ -94,7 +96,7 @@ pub use receipt::{PackPinReceipt, PackSnapshotLookup, PackSnapshotOutcome, PackS
 pub use request::{CreatePackSnapshotRequest, PackSnapshotExpectation, PackSnapshotReceiptQuery, PackSnapshotRef};
 pub(crate) use serving_proof::VerifiedReadViewProof;
 #[cfg(test)]
-pub(crate) use serving_proof::{ProvenScope, seal_for_test, test_scope};
+pub(crate) use serving_proof::{ProvenScope, probe_a5a};
 pub use serving_read::{PgServingReads, ServingReadCapture};
 pub use serving_read_request::{
     MAX_EXPIRED_SERVING_READ_RECLAIM, MAX_SERVING_READ_LEASE_SECONDS, MIN_SERVING_READ_LEASE_SECONDS,

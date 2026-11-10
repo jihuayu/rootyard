@@ -69,6 +69,17 @@ impl VerificationLease {
         Ok(Arc::new(Self { root, _view_budget: Some(budget), native: Mutex::new(None) }))
     }
 
+    /// Test-only empty lease for unit cases that never run a native child (an
+    /// owned workspace with no native permit and no view budget).
+    #[cfg(test)]
+    pub(super) fn for_test() -> Arc<Self> {
+        Arc::new(Self {
+            root: TempRoot::create().expect("test lease root"),
+            _view_budget: None,
+            native: Mutex::new(None),
+        })
+    }
+
     /// Install the one native permit for the pending native steps. Callers must
     /// have acquired the view budget first.
     pub(super) fn admit_native(&self, permit: OwnedSemaphorePermit) {
