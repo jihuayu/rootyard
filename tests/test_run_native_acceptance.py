@@ -594,6 +594,29 @@ class RunnerContractTest(unittest.TestCase):
         self.assertIn("[REDACTED]", summary)
         self.assertIn(public_marker, summary)
 
+    def test_excluding_a_smoke_prerequisite_refuses_its_dependant(self):
+        """The removed prerequisite must not be dropped from its dependant's edges."""
+        plan = self.fx.plan([
+            self.fx.suite("excluded-smoke", {"loopback:7771": "exclusive"}),
+            self.fx.suite("dependent-full", {"loopback:7772": "exclusive"},
+                          depends_on=["excluded-smoke"], phase="full"),
+        ])
+        completed, report = self.fx.run(self.tracker, plan, extra_args=("--exclude", "excluded-smoke"))
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stdout + completed.stderr)
+        self.assertNotIn("KeyError", completed.stdout + completed.stderr)
+        self.assertIn("dependent-full", completed.stderr)
+        self.assertIn("excluded-smoke", completed.stderr)
+        self.assertLessEqual(len(completed.stderr), 1024)
+        self.assertIsNone(report)
+        self.assertEqual(self.fx.markers.read_text(), "")
+        lock = os.open(self.fx.lock_dir / lock_name("loopback:7772"), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            os.close(lock)
+
     def test_plan_rejects_credentials_without_echo(self):
         plan = self.fx.plan([self.fx.suite("a", {"loopback:free": "exclusive"})],
                             environment_from_plan={"ROOTYARD_TEST_DATABASE_URL":
@@ -966,6 +989,28 @@ class PlanValidationTest(unittest.TestCase):
                   {"id": "b", "phase": "smoke", "argv": ["true"], "timeout_seconds": 5,
                    "resources": {"loopback:2": "exclusive"}, "depends_on": ["a"]}]
         self.assert_rejected({"suites": cyclic}, "cycle")
+
+    def test_exclude_keeps_an_unreferenced_suite_removed(self):
+        plan = acceptance.validate_plan({
+            "suites": [{"id": "kept", "phase": "smoke", "argv": ["true"], "timeout_seconds": 5,
+                        "resources": {"loopback:1": "exclusive"}},
+                       {"id": "dropped", "phase": "smoke", "argv": ["true"], "timeout_seconds": 5,
+                        "resources": {"loopback:2": "exclusive"}}]})
+        plan["suites"] = [suite for suite in plan["suites"] if suite["id"] != "dropped"]
+        acceptance.require_dependencies_kept(plan)
+        self.assertEqual([suite["id"] for suite in plan["suites"]], ["kept"])
+
+    def test_exclude_removed_prerequisite_is_refused(self):
+        plan = acceptance.validate_plan({
+            "suites": [{"id": "excluded-smoke", "phase": "smoke", "argv": ["true"], "timeout_seconds": 5,
+                        "resources": {"loopback:1": "exclusive"}},
+                       {"id": "dependent-full", "phase": "full", "argv": ["true"], "timeout_seconds": 5,
+                        "resources": {"loopback:2": "exclusive"}, "depends_on": ["excluded-smoke"]}]})
+        plan["suites"] = [suite for suite in plan["suites"] if suite["id"] != "excluded-smoke"]
+        with self.assertRaises(acceptance.PlanError) as caught:
+            acceptance.require_dependencies_kept(plan)
+        self.assertIn("dependent-full", str(caught.exception))
+        self.assertIn("excluded-smoke", str(caught.exception))
 
     def test_cli_refuses_lock_dir_inside_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:

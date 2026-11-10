@@ -297,6 +297,16 @@ def validate_plan(plan):
     return plan
 
 
+def require_dependencies_kept(plan):
+    """Every remaining dependency must still be in the plan; a removed prerequisite refuses the run."""
+    present = {suite["id"] for suite in plan["suites"]}
+    for suite in plan["suites"]:
+        for dep in suite.get("depends_on", []):
+            require(dep in present,
+                    f"{suite['id']}: depends_on {dep!r}, which --exclude removed; refusing to run a dependant "
+                    "whose prerequisite is not in the plan")
+
+
 def ancestors(suite_id, by_id):
     seen, stack = set(), list(by_id[suite_id].get("depends_on", []))
     while stack:
@@ -1132,6 +1142,9 @@ def main(argv=None):
         known = {suite["id"] for suite in plan["suites"]}
         require(all(suite_id in known for suite_id in args.exclude), "--exclude names an unknown suite")
         plan["suites"] = [suite for suite in plan["suites"] if suite["id"] not in args.exclude]
+        # Before the host preflight, lock dir or any spawn: a dependant whose
+        # prerequisite --exclude removed can never run (and must not run unlocked).
+        require_dependencies_kept(plan)
         root = Path(args.verify_host).expanduser().resolve()
         run_id = args.run_id or "run-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
         require(RUN_ID.match(run_id), "run id must be 1-64 characters of [A-Za-z0-9-]")
