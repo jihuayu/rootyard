@@ -167,13 +167,28 @@ class prerequisite:
         current = build_native.source_digest()
         assert current == receipt["source_inputs_sha256"], (
             "current src/Cargo/migrations/schema/vendor inputs differ from the binary's build")
-        head = self.git("rev-parse", "HEAD", cwd=root).stdout.decode().strip()
+        # Discover the checkout exactly as packaged CI does: ROOTYARD_GIT_DIR
+        # when this path is a linked worktree whose git dir lies outside the
+        # mounted source, else the ordinary discovery from cwd.
+        checkout_env = dict(self.env, GIT_OPTIONAL_LOCKS="0")
+        git_dir = os.environ.get("ROOTYARD_GIT_DIR")
+        if git_dir:
+            resolved = self.git("rev-parse", "--absolute-git-dir", cwd=root, check=False)
+            if resolved.returncode or resolved.stdout.decode().strip() != git_dir:
+                checkout_env["GIT_DIR"] = git_dir
+        head_proc = self.git("rev-parse", "HEAD", cwd=root, check=False, env=checkout_env)
+        assert head_proc.returncode == 0, (
+            "required dependency missing: checkout Git metadata unreachable (set "
+            "ROOTYARD_GIT_DIR to this worktree's git dir): " +
+            self.redact(head_proc.stderr.decode(errors="replace")[-300:]))
+        head = head_proc.stdout.decode().strip()
         tracked = self.git("status", "--porcelain", "--untracked-files=no", cwd=root,
-                           env=dict(self.env, GIT_OPTIONAL_LOCKS="0")).stdout
+                           env=checkout_env).stdout
         assert not tracked.strip(), "tracked inputs are dirty: console builds embed differing debug paths"
         parent = receipt["workspace_commit"]
         assert self.git("merge-base", "--is-ancestor", parent, head, cwd=root,
-                        check=False).returncode == 0
+                        check=False, env=checkout_env).returncode == 0, (
+            f"binary source commit {parent} is not an ancestor of HEAD {head}")
         return {"source_commit": head, "binary_source_commit": parent,
                 "binary_commit_is_ancestor": True,
                 "source_inputs_sha256": current, "binary_sha256": binary_sha,
