@@ -82,6 +82,10 @@ tempfile = "3"
 # never compiles or accepts `memory`; features are additive, no extra crate is
 # pulled in and the lockfile is unchanged.
 opendal = { version = "=0.57.0", default-features = false, features = ["services-memory"] }
+# Test-only: the HTTP acceptance sign-in form uses the same
+# application/x-www-form-urlencoded rules the server's `Form` extractor
+# decodes. Already in Cargo.lock (through reqwest/url); no new crate is added.
+form_urlencoded = "1"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

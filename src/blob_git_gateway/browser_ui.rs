@@ -25,17 +25,20 @@
 //! content-write route exists in the browser subtree.
 use std::sync::Arc;
 
+#[path = "browser_ui/assets.rs"]
+mod inline;
+
 use axum::{
     Form, Router,
     extract::{Path, Query, Request, State, rejection::PathRejection},
-    http::{HeaderMap, Uri, header},
+    http::{HeaderMap, HeaderValue, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::Value;
 
-use super::{api, browse, error::GatewayError, history, session::authenticate, state::BlobGitState};
+use super::{api, browse, error::GatewayError, history, state::BlobGitState};
 use crate::{
     application::MetadataState,
     browse::models::{BlobByOidQuery, BlobQuery, CommitsQuery, CompareQuery, RefsQuery, TreeByOidQuery, TreeQuery},
@@ -90,10 +93,11 @@ async fn normalize_session_headers(request: Request, next: Next) -> Response {
     next.run(Request::from_parts(parts, body)).await
 }
 
-/// The shared sign-in pages, mounted on this router's own state. The shared
-/// handlers take `MetadataState`, which the state provides via `FromRef`.
-async fn login_page(State(state): State<MetadataState>, Query(query): Query<session::ReturnTo>) -> Response {
-    session::login_page(State(state), Query(query)).await
+/// The shared sign-in page, mounted on this router's own state. The shared
+/// page handler takes no state at all; only the sign-in mutation below needs
+/// the `MetadataState` the gateway provides via `FromRef`.
+async fn login_page(Query(query): Query<session::ReturnTo>) -> Response {
+    session::login_page(Query(query)).await
 }
 
 async fn login(
@@ -139,9 +143,26 @@ fn static_asset(content_type: &'static str, body: &'static str) -> Response {
 /// without a live cookie is a 401 here, so the outer session middleware applies
 /// its shared login redirect with a safe `return_to` instead of delivering a
 /// shell that could never read data.
+///
+/// The check goes through the shared Web cookie-aware helper: this handler sees
+/// the raw request headers (the session middleware validates the cookie but does
+/// not rewrite them), so only that helper turns the HttpOnly browser cookie into
+/// the credential `auth::authenticate` reads. A cookie never rescues an explicit
+/// bad credential (`normalize_web_headers` keeps an existing `Authorization`
+/// untouched).
+///
+/// A helper failure is converted through [`GatewayError::from`], which keeps
+/// only its status class and is opaque (no provider or SQL text), so only
+/// invalid credentials become the `401` the middleware turns into its shared
+/// login redirect; a database or other failure is never answered as a sign-in
+/// redirect, and an expired deadline is the gateway [`GatewayError::Timeout`].
 async fn spa_shell(State(state): State<Arc<BlobGitState>>, headers: HeaderMap) -> Response {
-    if authenticate(&state, &headers).await.is_err() {
-        return GatewayError::Unauthorized.into_response();
+    let deadline = state.deadline();
+    let admitted = tokio::time::timeout_at(deadline, crate::web::session::authenticate_web(state.pool(), &headers));
+    match admitted.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return GatewayError::from(error).into_response(),
+        Err(_) => return GatewayError::Timeout.into_response(),
     }
     let mut response = html_response(axum::http::StatusCode::OK, inline::shell());
     if let Ok(value) = axum::http::HeaderValue::from_str(inline::CSP) {
@@ -187,8 +208,10 @@ fn presented_bound(headers: &HeaderMap) -> Option<&HeaderValue> {
 ///   a keyed one answers with the pair the browser then adopts.
 /// * With a presented bound, a `Behind` refusal is returned as-is (its body is
 ///   the framework's generic refusal), and a successful answer must carry a
-///   complete pair with a positive, non-regressing revision; anything else
-///   becomes a generic refusal, so a malformed answer never renders data.
+///   complete pair with a positive, non-regressing revision. Anything else is
+///   dropped whole — the success response and its repository JSON body — and
+///   replaced by a fresh generic [`GatewayError::Unavailable`], so a malformed
+///   answer never renders data.
 ///
 /// The framework stays the only admission decision point. This wrapper only
 /// checks the shape of a whole-body answer (complete pair, positive revision,
@@ -198,7 +221,7 @@ async fn admit_bound(
     response: Result<Response, GatewayError>,
     presented: Option<&HeaderValue>,
 ) -> Result<Response, GatewayError> {
-    let mut response = response?;
+    let response = response?;
     let Some(presented) = presented else { return Ok(response) };
     if !response.status().is_success() {
         return Ok(response);
@@ -220,10 +243,15 @@ async fn admit_bound(
     if complete && fresh {
         return Ok(response);
     }
-    let refusal = GatewayError::Unavailable("repository read was refused").into_response();
-    *response.status_mut() = refusal.status();
-    *response.headers_mut() = refusal.headers().clone();
-    Ok(response)
+    // Drop the whole success answer (status, headers and repository JSON body)
+    // and answer with a fresh generic refusal instead of patching it in place.
+    drop(response);
+    Err(bound_refusal())
+}
+
+/// The generic refusal for an incomplete or regressing successful answer.
+fn bound_refusal() -> GatewayError {
+    GatewayError::Unavailable("repository read was refused")
 }
 
 async fn alias_refs(
@@ -232,11 +260,11 @@ async fn alias_refs(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
-    let presented = presented_bound(&headers);
+    let presented = presented_bound(&headers).cloned();
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: RefsQuery = optional_query(&uri)?;
     let answer = history::refs(State(state), Path((owner, name)), Query(query), headers).await;
-    admit_bound(answer, presented).await
+    admit_bound(answer, presented.as_ref()).await
 }
 
 async fn alias_commits(
@@ -245,11 +273,11 @@ async fn alias_commits(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
-    let presented = presented_bound(&headers);
+    let presented = presented_bound(&headers).cloned();
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: CommitsQuery = optional_query(&uri)?;
     let answer = history::commits(State(state), Path((owner, name)), Query(query), headers).await;
-    admit_bound(answer, presented).await
+    admit_bound(answer, presented.as_ref()).await
 }
 
 async fn alias_compare(
@@ -258,13 +286,13 @@ async fn alias_compare(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
-    let presented = presented_bound(&headers);
+    let presented = presented_bound(&headers).cloned();
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
     // `base` and `head` are required; a missing pair is the same generic input
     // refusal the handler gives for an invalid revision.
     let query: CompareQuery = optional_query(&uri)?;
     let answer = history::compare(State(state), Path((owner, name)), Query(query), headers).await;
-    admit_bound(answer, presented).await
+    admit_bound(answer, presented.as_ref()).await
 }
 
 async fn alias_tree(
@@ -273,11 +301,11 @@ async fn alias_tree(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
-    let presented = presented_bound(&headers);
+    let presented = presented_bound(&headers).cloned();
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: TreeQuery = optional_query(&uri)?;
     let answer = browse::tree(State(state), Path((owner, name)), Query(query), headers).await;
-    admit_bound(answer, presented).await
+    admit_bound(answer, presented.as_ref()).await
 }
 
 async fn alias_tree_by_oid(
@@ -286,11 +314,11 @@ async fn alias_tree_by_oid(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
-    let presented = presented_bound(&headers);
+    let presented = presented_bound(&headers).cloned();
     let Path((owner, name, oid)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: TreeByOidQuery = optional_query(&uri)?;
     let answer = browse::tree_by_oid(State(state), Path((owner, name, oid)), Query(query), headers).await;
-    admit_bound(answer, presented).await
+    admit_bound(answer, presented.as_ref()).await
 }
 
 async fn alias_blob(
@@ -299,11 +327,11 @@ async fn alias_blob(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
-    let presented = presented_bound(&headers);
+    let presented = presented_bound(&headers).cloned();
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: BlobQuery = optional_query(&uri)?;
     let answer = browse::blob(State(state), Path((owner, name)), Query(query), headers).await;
-    admit_bound(answer, presented).await
+    admit_bound(answer, presented.as_ref()).await
 }
 
 async fn alias_blob_by_oid(
@@ -312,11 +340,11 @@ async fn alias_blob_by_oid(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
-    let presented = presented_bound(&headers);
+    let presented = presented_bound(&headers).cloned();
     let Path((owner, name, oid)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: BlobByOidQuery = optional_query(&uri)?;
     let answer = browse::blob_by_oid(State(state), Path((owner, name, oid)), Query(query), headers).await;
-    admit_bound(answer, presented).await
+    admit_bound(answer, presented.as_ref()).await
 }
 
 fn optional_query<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, GatewayError> {
@@ -330,9 +358,6 @@ fn optional_query<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, Gatewa
     serde_json::from_value(Value::Object(fields))
         .map_err(|_| GatewayError::BadRequest("invalid repository browse parameters"))
 }
-
-#[path = "browser_ui/assets.rs"]
-mod inline;
 
 #[cfg(test)]
 mod tests {
@@ -369,56 +394,220 @@ mod tests {
         }
         assert!(inline::SCRIPT.contains("credentials: 'same-origin'"));
         assert!(inline::SCRIPT.contains("textContent"));
-        // Whole-body wire objects nest their rows under `items`.
+        // Whole-body wire objects nest their rows under `items`; the page list
+        // handler itself issues no session, so it reads plain arrays.
         assert!(inline::SCRIPT.contains("Array.isArray(data.items)"));
         assert!(!inline::SCRIPT.contains("data.page"));
+        // A boundless read is still cookie-authenticated and RBAC-checked; only
+        // the repository consistency bound may be missing.
+        assert!(inline::SCRIPT.contains("This server did not provide a bounded session."));
+        assert!(!inline::SCRIPT.contains("reads are anonymous"));
+    }
+
+    /// A valid signed frame of revision `revision`, minted only by the cfg(test)
+    /// codec helper for this isolated unit fixture.
+    fn framed_token(revision: i64) -> String {
+        let backend = crate::blob_store::test_support::blob_backend_identity("browser-ui-tests");
+        let codec = super::super::repo_session::SessionTokenCodec::new(
+            [(0_u8, zeroize::Zeroizing::new([0x5a; 32]))],
+            0,
+            &backend,
+            120,
+        )
+        .expect("test codec");
+        let realm = super::super::repo_session::SessionRealm::new(
+            uuid::Uuid::from_bytes([1; 16]),
+            uuid::Uuid::from_bytes([2; 16]),
+            crate::ref_store::GitObjectFormat::Sha1,
+            uuid::Uuid::from_bytes([3; 16]),
+            1,
+            1,
+            uuid::Uuid::from_bytes([4; 16]),
+        )
+        .expect("test realm");
+        super::super::repo_session::SessionTokens::new(codec)
+            .issue_for_test(&realm, revision)
+            .expect("test token")
+            .token()
+            .to_owned()
+    }
+
+    /// One answer with only the named session headers; `None` means absent.
+    fn answer(status: u16, token: Option<&str>, revision: Option<&str>) -> axum::http::Response<axum::body::Body> {
+        let mut builder = axum::http::Response::builder().status(status);
+        for (name, value) in [(SESSION_HEADER, token), (REVISION_HEADER, revision)] {
+            if let Some(value) = value {
+                builder = builder.header(name, value);
+            }
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    /// The presented bound exactly as a request header carries it.
+    fn presented(token: &str) -> HeaderValue {
+        HeaderValue::from_str(token).expect("a framed token is a valid header value")
     }
 
     #[test]
     fn a_presented_bound_requires_a_complete_non_regressing_answer() {
+        // Revision 3 of the fixture frame: a valid frame, as the framework's
+        // own admission would have required before this wrapper saw an answer.
+        let presented_token = framed_token(3);
+        assert_eq!(super::super::repo_session::presented_bound(&presented_token), Some(3));
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let answer = |status: u16, token: Option<&'static str>, revision: Option<&'static str>| {
-            let mut builder = axum::http::Response::builder().status(status);
-            for (name, value) in [(SESSION_HEADER, token), (REVISION_HEADER, revision)] {
-                if let Some(value) = value {
-                    builder = builder.header(name, value);
+        // Returns the status plus the whole answer body of an admitted answer.
+        let run = |response: axum::http::Response<axum::body::Body>, bound: Option<HeaderValue>| {
+            runtime.block_on(async move {
+                match admit_bound(Ok(response), bound.as_ref()).await {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap_or_default();
+                        Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+                    }
+                    Err(error) => Err(error),
                 }
-            }
-            builder.body(axum::body::Body::empty()).unwrap()
+            })
         };
-        let run = |response: axum::http::Response<axum::body::Body>, presented: Option<&HeaderValue>| {
-            runtime
-                .block_on(async move { admit_bound(Ok(response), presented).await })
-                .map(|response| response.status().as_u16())
+        let status = |response: axum::http::Response<axum::body::Body>, bound: Option<HeaderValue>| {
+            run(response, bound).map(|(status, _)| status)
         };
-        // The framework admitted this minimal frame at revision 3; this module
-        // only compares the whole answer against that same reported bound.
-        let bound = super::super::repo_session::presented_bound("rs1.test").unwrap_or(3);
-        let fresh = HeaderValue::from_str(&format!("rs1.at{bound}")).unwrap();
-        let stale = HeaderValue::from_str(&format!("rs1.at{}", bound.saturating_add(1))).unwrap();
-        let high = (bound.saturating_add(1)).to_string();
         // Token-free compatibility reads are passed through unchanged.
-        assert_eq!(run(answer(200, None, None), None).unwrap(), 200);
+        assert_eq!(status(answer(200, None, None), None).unwrap(), 200);
         // Every refusal, including Behind, passes as the framework's generic
         // refusal without being rewritten.
-        for status in [503, 401, 403, 404, 400, 422] {
-            assert_eq!(run(answer(status, None, None), Some(&fresh)).unwrap(), status);
+        for code in [503, 401, 403, 404, 400, 422] {
+            assert_eq!(status(answer(code, None, None), Some(presented(&presented_token))).unwrap(), code);
         }
-        // A successful but incomplete or malformed answer is refused.
-        let empty = Some("");
-        let incomplete = [
-            (None, Some("3")),
-            (Some("rs1.next"), None),
-            (Some("rs1.next"), Some("0")),
-            (empty, Some("3")),
-        ];
-        for (token, revision) in incomplete {
-            assert_eq!(run(answer(200, token, revision), Some(&fresh)).unwrap(), 503, "{token:?} {revision:?}");
+        // A successful but incomplete or malformed answer is refused. A fresh
+        // refusal carries no part of the refused answer, in particular no
+        // byte of its distinctive repository JSON body.
+        const MARKER: &str = "REPO-DATA-MARKER-7f3a";
+        let with_body = |token: Option<&str>, revision: Option<&str>| {
+            let repository = format!(r#"{{"items":[{{"name":"{}"}}]}}"#, MARKER);
+            let mut response = answer(200, token, revision).map(|_| axum::body::Body::from(repository));
+            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            response
+        };
+        let partial: [(&str, Option<&str>, Option<&str>); 2] =
+            [("a revision without a token", None, Some("3")), ("a token without a revision", Some("rs1.next"), None)];
+        let malformed: [(&str, Option<&str>, Option<&str>); 2] =
+            [("a non-positive revision", Some("rs1.next"), Some("0")), ("an empty token", Some(""), Some("3"))];
+        for (what, token, revision) in partial.into_iter().chain(malformed) {
+            let refused = run(with_body(token, revision), Some(presented(&presented_token)));
+            assert_eq!(refused.err(), Some(bound_refusal()), "{what} was admitted");
         }
-        // An answer that would move the browser backwards is refused.
-        assert_eq!(run(answer(200, Some("rs1.next"), Some(&high)), Some(&fresh)).unwrap(), 503);
-        // A complete, non-regressing pair is admitted for the script to adopt.
-        assert_eq!(run(answer(200, Some("rs1.next"), Some("3")), Some(&fresh)).unwrap(), 200);
-        assert_eq!(run(answer(200, Some("rs1.next"), Some("3")), Some(&stale)).unwrap(), 503);
+        // An answer that would move the browser backwards is refused the same
+        // way, with its body dropped, and the rendering carries no marker.
+        let regressing = framed_token(4);
+        assert_eq!(super::super::repo_session::presented_bound(&regressing), Some(4));
+        let refused = run(with_body(Some(&regressing), Some("4")), Some(presented(&presented_token)));
+        let rendered = match refused {
+            Err(error) => {
+                assert_eq!(error, bound_refusal());
+                error.into_response()
+            }
+            // A fresh success answer reaches the client unchanged; render it
+            // as-is, so the marker assertions below would catch any leak.
+            Ok((_status, body)) => axum::http::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .body(axum::body::Body::from(body))
+                .expect("a fresh rendering"),
+        };
+        assert_eq!(rendered.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = runtime.block_on(axum::body::to_bytes(rendered.into_body(), usize::MAX)).unwrap();
+        let rendered = String::from_utf8_lossy(&bytes);
+        assert!(!rendered.contains(MARKER), "the refused answer retained its repository body");
+        assert!(!rendered.contains(r#""items""#), "the refused answer retained its repository shape");
+        // A complete, non-regressing pair is admitted for the script to adopt,
+        // and the same complete pair is refused against a newer bound.
+        assert_eq!(status(answer(200, Some("rs1.next"), Some("3")), Some(presented(&presented_token))).unwrap(), 200);
+        assert_eq!(status(answer(200, Some("rs1.next"), Some("3")), Some(presented(&regressing))).unwrap(), 503);
+    }
+
+    #[test]
+    fn a_boundless_answer_is_passed_through_and_only_a_presented_bound_is_checked() {
+        // The first answer, whether it is the index list (no session headers)
+        // or a bounded repository read, has no bound to check against and is
+        // passed through unchanged; only a presented bound is ever checked.
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let admit = |response: axum::http::Response<axum::body::Body>, bound: Option<HeaderValue>| {
+            runtime.block_on(async move {
+                match admit_bound(Ok(response), bound.as_ref()).await {
+                    Ok(response) => Ok((response.status().as_u16(), response.headers().len())),
+                    Err(error) => Err(error),
+                }
+            })
+        };
+        assert_eq!(admit(answer(200, None, None), None), Ok((200, 0)));
+        assert_eq!(admit(answer(200, Some("rs1.next"), Some("3")), None), Ok((200, 2)));
+        // With a presented bound the answer is checked; a complete pair at or
+        // above it passes and a headerless answer does not.
+        let bound = presented(&framed_token(3));
+        assert_eq!(admit(answer(200, Some("rs1.next"), Some("3")), Some(bound.clone())).err(), None);
+        assert_eq!(admit(answer(200, None, None), Some(bound)).err(), Some(bound_refusal()));
+        // Only the script knows whether a bound was adopted: a whole-body
+        // answer with no session header at all is accepted while nothing was
+        // adopted, a half pair never is, and a headerless answer after an
+        // adopted pair is refused. These are the exact script rules.
+        let script = inline::SCRIPT;
+        assert!(
+            script.contains(
+                "const hasToken = response.headers.has(TOKEN), hasRevision = response.headers.has(REVISION);"
+            )
+        );
+        assert!(script.contains("const headerless = !hasToken && !hasRevision;"));
+        assert!(script.contains("if (headerless) return bound === null && revision === null ? NO_BOUND : null;"));
+        assert!(
+            script
+                .contains("if (!hasToken || !hasRevision || !token || raw === null || raw.trim() === '') return null;")
+        );
+        assert!(!script.contains("const headerless = !token && (raw === null || raw.trim() === '');"));
+    }
+
+    /// The page admission uses the shared cookie-aware helper, not the raw
+    /// bearer-only gateway check on unnormalised request headers, and it keeps
+    /// a missing credential (401) apart from a failure and an expired deadline.
+    #[test]
+    fn the_shell_authenticates_through_the_shared_cookie_helper() {
+        let source = include_str!("browser_ui.rs");
+        let shell = body_of(source, "async fn spa_shell(", "// Read aliases", "the shell handler");
+        assert!(shell.contains("crate::web::session::authenticate_web(state.pool(), &headers)"));
+        assert!(shell.contains("tokio::time::timeout_at(deadline,"), "the page check is deadline-bounded");
+        assert!(shell.contains("Ok(Err(error)) => return GatewayError::from(error).into_response()"));
+        assert!(shell.contains("Err(_) => return GatewayError::Timeout.into_response()"));
+        assert!(!shell.contains("super::session::authenticate("), "the shell must not read raw bearer headers");
+        // Invalid credentials are no longer collapsed into a 401 here: the
+        // helper's own answer is already one.
+        assert_eq!(shell.matches("GatewayError::Unauthorized").count(), 0, "no failure may collapse into a 401");
+    }
+
+    /// The source text of one item: from `from` up to the next `to` marker.
+    fn body_of<'a>(source: &'a str, from: &str, to: &str, what: &str) -> &'a str {
+        let start = source.find(from).unwrap_or_else(|| panic!("missing {what}"));
+        let rest = &source[start..];
+        let end = rest.find(to).unwrap_or_else(|| panic!("missing the end of the source"));
+        &rest[..end]
+    }
+
+    /// The script's single `adopt` updates the closure's `bound` and `revision`
+    /// from its own parameters (never shadowing the revision it replaces), and
+    /// bound adoption happens only after the headers were admitted and the
+    /// whole body was read and parsed into the expected `{items: [...]}` shape.
+    #[test]
+    fn the_script_parses_the_whole_body_before_adopting_a_bound() {
+        let script = inline::SCRIPT;
+        let adopt = body_of(script, "function adopt(", "// Validate response headers", "the adopt function");
+        assert!(adopt.contains("function adopt(nextToken, nextRevision)"), "the revision parameter must not shadow");
+        assert!(adopt.contains("bound = nextToken;"), "the token is adopted");
+        assert!(adopt.contains("revision = nextRevision;"), "the outer revision is updated");
+        let read = body_of(script, "async function read(scope, url)", "async function repository(", "the read path");
+        let headers = read.find("const next = admit(response);").expect("headers are admitted");
+        let body = read.find("await response.json()").expect("the whole body is parsed");
+        let shape = read.find("Array.isArray(data.items)").expect("the body shape is checked");
+        let adopt = read.find("adopt(next.token, next.revision);").expect("the pair is adopted together");
+        assert!(headers < body && body < shape && shape < adopt, "admission and parsing must precede adoption");
+        assert!(read.contains("if (next !== NO_BOUND)"), "a headerless answer must keep the browser boundless");
+        assert_eq!(read.matches("adopt(").count(), 1, "the read path adopts at exactly one site");
+        assert!(!script.contains("currentScript"));
     }
 }

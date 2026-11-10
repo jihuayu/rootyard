@@ -2,8 +2,7 @@
 
 /// The CSP of the SPA shell only: the page renders dynamic lists through the
 /// injected style tag the shell itself carries.
-const SHELL_CSP: &str =
-    "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+const SHELL_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// The inline style tag of the shell, part of its CSP.
 pub(super) const SHELL_STYLE: &str = "<style>body{font:14px/1.5 system-ui,sans-serif;margin:0;color:#1d2327}header{padding:.6rem 1rem;border-bottom:1px solid #d0d4d9}main{padding:1rem}h1{font-size:1.2rem}h2{font-size:1rem;margin-top:1.4rem}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.25rem .5rem;border-bottom:1px solid #e6e8ea}code,.oid{font-family:ui-monospace,monospace;font-size:.85em}[data-kind=error]{color:#8a1c1c}</style>";
@@ -28,11 +27,19 @@ pub(super) const SHELL: &str = "<!doctype html>
 /// Session contract (read only):
 ///
 /// * the first repository read presents no bound, so a keyless gateway stays
-///   usable; its successful answer may establish the bound, and a keyless one
-///   is labelled "no session bound" with no session headers;
+///   usable: while no bound was ever adopted, a successful answer with no
+///   session headers at all (the index list handler issues none) is read and
+///   labelled "no session bound", and the browser stays boundless; the index
+///   list is such a read on every page;
+/// * a half pair (only one session header) is always refused, and once a bound
+///   was adopted even a headerless successful read is refused;
+/// * a successful answer is read and parsed whole and must have the exact
+///   `{items: [...]}` shape before anything is admitted; only then are its
+///   headers validated against the previous bound and both token and revision
+///   updated together;
 /// * once a bound exists, every next read presents it and requires a complete,
-///   valid, non-regressing bound in return; a refusal, a malformed answer or a
-///   `Behind` refusal keeps the old bound and renders no data;
+///   valid, non-regressing bound in return; a fetch, body, schema, header or
+///   `Behind` refusal keeps the old bound and renders no response data;
 /// * the bound lives in closure variables, in memory only, and is never placed
 ///   in a URL, storage, a cookie or a DOM attribute.
 pub(super) const SCRIPT: &str = "'use strict';
@@ -40,8 +47,11 @@ pub(super) const SCRIPT: &str = "'use strict';
   const TOKEN = 'x-rootyard-session', REVISION = 'x-rootyard-session-revision';
   const status = document.getElementById('status'), title = document.getElementById('title');
   const nav = document.getElementById('nav'), content = document.getElementById('content');
-  const READ = 'Read complete.', NO_SESSION = 'Read complete. No session bound: reads are anonymous.';
+  const READ = 'Read complete.', NO_SESSION = 'Read complete. This server did not provide a bounded session.';
   const REFUSED = 'This read was refused. Reload the page to try again.';
+  // The result of an accepted answer that carried no session headers at all:
+  // nothing is adopted and the browser stays boundless.
+  const NO_BOUND = Object.freeze({token: null, revision: null});
   let bound = null;
   let revision = null;
   let page = null;
@@ -82,25 +92,44 @@ pub(super) const SCRIPT: &str = "'use strict';
     return data && Array.isArray(data.items) ? data.items : null;
   }
 
-  // Adopt a bound only from a complete, non-regressing success. Without a
-  // presented bound (the first read) a keyless answer with no session headers
-  // stays boundless; any complete pair establishes the bound. With a
-  // presented bound, both headers are required and the revision must not
-  // regress.
+  function isObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  // Adopt the pair this answer established. This is the only place that
+  // changes the in-memory bound, and it runs only after the whole body was
+  // read and parsed into the expected shape. Token and revision change
+  // together, in one step; `nextRevision` is the parameter, never the closure
+  // variable it replaces.
+  function adopt(nextToken, nextRevision) {
+    bound = nextToken;
+    revision = nextRevision;
+  }
+
+  // Validate response headers against the previous bound; nothing is adopted
+  // here. Without a bound ever adopted before (the first read of every page,
+  // including the index list whose handler issues no session) an answer with
+  // no session headers at all is accepted and returns the NO_BOUND result, so
+  // a keyless gateway stays readable and stays boundless. A complete pair with
+  // a positive, safe, non-regressing revision returns the pair to adopt. Every
+  // other shape is refused with null: a partial pair always, any session
+  // header set once a bound exists, a non-success and a regressing revision.
   function admit(response) {
-    if (!response.ok) return false;
+    if (!response.ok) return null;
     const token = response.headers.get(TOKEN), raw = response.headers.get(REVISION);
-    if (!token || raw === null || raw.trim() === '') return false;
-    const next = Number(raw.trim());
-    if (!Number.isSafeInteger(next) || next <= 0) return false;
-    if (revision !== null && next < revision) return false;
-    bound = token;
-    revision = next;
-    return true;
+    const hasToken = response.headers.has(TOKEN), hasRevision = response.headers.has(REVISION);
+    const headerless = !hasToken && !hasRevision;
+    if (headerless) return bound === null && revision === null ? NO_BOUND : null;
+    if (!hasToken || !hasRevision || !token || raw === null || raw.trim() === '') return null;
+    const nextRevision = Number(raw.trim());
+    if (!Number.isSafeInteger(nextRevision) || nextRevision <= 0) return null;
+    if (revision !== null && nextRevision < revision) return null;
+    return {token: token, revision: nextRevision};
   }
 
   // One same-origin read. The cookie carries the browser session; the bound,
-  // when known, travels only as a header.
+  // when known, travels only as a header. The bound advances only after the
+  // status, headers and complete body all passed.
   async function read(scope, url) {
     const headers = {Accept: 'application/json'};
     if (bound) headers[TOKEN] = bound;
@@ -110,13 +139,19 @@ pub(super) const SCRIPT: &str = "'use strict';
       if (page === scope) show('Your sign-in has ended. Reload to sign in again.', true);
       return null;
     }
-    if (!admit(response)) {
+    const next = admit(response);
+    if (!next) {
       if (page === scope) show(bound ? REFUSED : 'This read was refused. Reload to sign in again.', true);
       return null;
     }
     let data;
-    try { data = await response.json(); } catch (_) { if (page === scope) show(REFUSED, true); return null; }
-    const list = items(data);
+    try { data = await response.json(); } catch (_) { data = undefined; }
+    const list = isObject(data) && Array.isArray(data.items) ? data.items : null;
+    if (!list) {
+      if (page === scope) show(REFUSED, true);
+      return null;
+    }
+    if (next !== NO_BOUND) adopt(next.token, next.revision);
     return page === scope ? list : null;
   }
 
@@ -164,7 +199,7 @@ pub(super) const SCRIPT: &str = "'use strict';
         repo.owner + '/' + repo.name),
       el('span', repo.object_format)
     ])) : el('p', 'No repositories are visible to this account.'));
-    show('Read complete.', false);
+    show(bound ? READ : NO_SESSION, false);
   }
 
   const match = /^\\/web\\/blob\\/repos\\/([^/]+)\\/([^/]+)\\/?$/.exec(location.pathname);

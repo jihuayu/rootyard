@@ -49,8 +49,10 @@
 //! * a real `POST /web/login` API-token exchange with the exact same-origin
 //!   `Origin`; its `Set-Cookie` values are retained privately in a cookie jar;
 //! * `GET /web/blob` and the new `GET /web/blob/repos/{owner}/{name}` page load
-//!   with that cookie, and their HTML must carry no API token, cookie value or
-//!   session value;
+//!   with that cookie, observed directly with redirects disabled: each must be
+//!   the shell itself (its script path, its CSP) and must carry no API token,
+//!   cookie value or session value; the same navigations without a cookie must
+//!   be the shared `303` login redirect and never the shell;
 //! * the `/web/blob/api/...` read aliases, with only the browser cookie plus the
 //!   actual session token/revision captured from the real Git push, return the
 //!   pushed ref + OID (`/refs`), the pushed commit and `COMMIT_FILE`
@@ -281,7 +283,8 @@ async fn case(db: &Db) -> Result<()> {
     let cookie = browser_cookie_header(&login)?;
     let origin = format!("http://{address}");
     for path in ["/web/blob".to_owned(), format!("/web/blob/repos/{owner_name}/{name}")] {
-        browser_page(&client, &origin, &path, &cookie, &login).await?;
+        browser_page(&origin, &path, &cookie, &login).await?;
+        browser_page_requires_login(&origin, &path, &login).await?;
     }
 
     // The index alias lists the authorized repository through the browser cookie
@@ -375,9 +378,8 @@ async fn browser_login(address: SocketAddr, owner: &Actor) -> Result<BrowserLogi
     let response = client
         .post(format!("{origin}/web/login"))
         .header(header::ORIGIN, origin.as_str())
-        // `serde_json::to_string` of strings is exactly the form-urlencoded
-        // percent encoding; the body is built without the client's `form`
-        // feature and is never printed.
+        // The body is built without the client's `form` feature and is never
+        // printed.
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(login_form(&owner.username, &owner.token))
         .send()
@@ -406,45 +408,104 @@ async fn browser_login(address: SocketAddr, owner: &Actor) -> Result<BrowserLogi
 }
 
 /// The url-encoded sign-in form of one username and API token.
+///
+/// Values are serialized with `form_urlencoded`, the encoding the server's
+/// `Form` extractor decodes (`application/x-www-form-urlencoded` rules). A
+/// JSON string is not that encoding. The result is never printed.
 fn login_form(username: &str, token: &str) -> String {
-    let field = |value: &str| serde_json::to_string(value).unwrap_or_default();
-    format!("username={}&token={}&return_to={}", field(username), field(token), field("/web/blob"))
+    form_urlencoded::Serializer::new(String::new())
+        .append_pair("username", username)
+        .append_pair("token", token)
+        .append_pair("return_to", "/web/blob")
+        .finish()
 }
 
-/// One signed-in page load: `200`, HTML, and none of the credentials in it.
-async fn browser_page(
-    client: &reqwest::Client,
-    origin: &str,
-    path: &str,
-    cookie: &str,
-    login: &BrowserLogin,
-) -> Result<()> {
-    let response = client
-        .get(format!("{origin}{path}"))
-        .header(header::COOKIE, cookie)
-        .header(header::ACCEPT, "text/html")
-        .header("sec-fetch-mode", "navigate")
-        .send()
-        .await
-        .context("browser page request failed")?;
-    ensure!(status_succeeds(response.status().as_u16()), "a signed-in browser page was not served");
-    let body = String::from_utf8_lossy(&response.bytes().await?).into_owned();
-    ensure!(body.contains("</html>"), "a signed-in browser page was not HTML");
+/// The `src` of the only script the browser shell loads.
+const SHELL_SCRIPT: &str = r#"<script src="/web/app.js" defer>"#;
+
+/// The shared sign-in page title, never part of a served shell.
+const LOGIN_TITLE: &str = "<title>Rootyard sign in</title>";
+
+/// One request for a browser page, redirects never followed, so a login
+/// redirect or login page can never stand in for the page itself.
+async fn browser_page_request(origin: &str, path: &str, cookie: Option<&str>) -> Result<(u16, HeaderMap, String)> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("browser page client could not be built")?;
+    let mut request =
+        client.get(format!("{origin}{path}")).header(header::ACCEPT, "text/html").header("sec-fetch-mode", "navigate");
+    if let Some(cookie) = cookie {
+        request = request.header(header::COOKIE, cookie);
+    }
+    let response = request.send().await.context("browser page request failed")?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let bytes = response.bytes().await.context("browser page body failed")?;
+    Ok((status, headers, String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// One signed-in page load observed directly (no redirect following): the
+/// server must answer `200` itself with the shell-specific markup, the shell
+/// script path, its CSP, and none of the credentials, rather than redirect to
+/// or serve the generic login page.
+async fn browser_page(origin: &str, path: &str, cookie: &str, login: &BrowserLogin) -> Result<()> {
+    let (status, headers, body) = browser_page_request(origin, path, Some(cookie)).await?;
+    ensure!(status_succeeds(status), "a signed-in browser page was redirected or refused (status {status})");
+    ensure!(headers.get(header::LOCATION).is_none(), "a signed-in browser page answered with a redirect");
+    ensure!(body.contains(SHELL_SCRIPT), "a signed-in browser page was not the Blob shell (missing its script path)");
+    ensure!(body.contains("Blob repositories"), "a signed-in browser page was not the Blob shell");
+    ensure!(!body.contains(LOGIN_TITLE), "the login page stood in for a signed-in browser page");
+    ensure!(
+        headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .is_some_and(|value| { value.to_str().is_ok_and(|value| value.contains("script-src 'self'")) }),
+        "a signed-in browser page was not served under its shell CSP"
+    );
     for secret in [&login.session, &login.csrf] {
         ensure!(!secret.is_empty() && !body.contains(secret), "a browser page carried a credential");
     }
     Ok(())
 }
 
+/// A navigation without any cookie never receives the shell: it is the shared
+/// `303` login redirect with a safe `return_to`, not a login page served at the
+/// page's own URL.
+async fn browser_page_requires_login(origin: &str, path: &str, login: &BrowserLogin) -> Result<()> {
+    let (status, headers, body) = browser_page_request(origin, path, None).await?;
+    ensure!(status == 303, "an anonymous browser page was not redirected to sign in (status {status})");
+    let location = headers.get(header::LOCATION).and_then(|value| value.to_str().ok()).unwrap_or("");
+    let Some(target) = location.strip_prefix("/web/login?return_to=") else {
+        return Err(anyhow!("an anonymous browser page did not redirect to the shared login page"));
+    };
+    ensure!(target == shared_redirect_encoding(path), "the login redirect return_to escaped the requested page");
+    ensure!(target.chars().all(|c| c.is_ascii_graphic() && c != '?'), "the login redirect return_to was not encoded");
+    ensure!(
+        !location.contains(&login.session) && !location.contains(&login.csrf),
+        "a login redirect carried a credential"
+    );
+    ensure!(!body.contains(SHELL_SCRIPT), "an anonymous browser page received the shell");
+    Ok(())
+}
+
+/// The exact query-value encoding the shared login redirect uses for the
+/// requested page.
+fn shared_redirect_encoding(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 /// One same-origin browser read with only the cookie and an optional session
 /// header. Redirects are disabled so a refused navigation cannot hide behind a
 /// login page.
-async fn browser_get(
-    client: &reqwest::Client,
-    url: &str,
-    cookie: &str,
-    session: Option<&str>,
-) -> Result<RawAnswer> {
+async fn browser_get(client: &reqwest::Client, url: &str, cookie: &str, session: Option<&str>) -> Result<RawAnswer> {
     let mut request = client.get(url).header(header::COOKIE, cookie);
     if let Some(session) = session {
         request = request.header(SESSION_HEADER, session);
@@ -459,6 +520,31 @@ async fn browser_get(
 /// One read alias URL of the browser subtree for a repository.
 fn web_scope(origin: &str, owner: &str, name: &str, tail: &str) -> String {
     format!("{origin}/web/blob/api/repos/{owner}/{name}/{tail}")
+}
+
+#[cfg(test)]
+mod form_tests {
+    use super::login_form;
+
+    #[test]
+    fn the_login_form_percent_encodes_reserved_bytes() {
+        let form = login_form("a b+c", "&=%");
+        assert_eq!(
+            form, "username=a+b%2Bc&token=%26%3D%25&return_to=%2Fweb%2Fblob",
+            "reserved bytes must be form-encoded, not JSON-quoted"
+        );
+        // Every field is decoded by the server's form rules into its original.
+        let decoded: Vec<_> =
+            form_urlencoded::parse(form.as_bytes()).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        assert_eq!(
+            decoded,
+            vec![
+                ("username".to_owned(), "a b+c".to_owned()),
+                ("token".to_owned(), "&=%".to_owned()),
+                ("return_to".to_owned(), "/web/blob".to_owned()),
+            ]
+        );
+    }
 }
 
 fn is_denial(status: u16) -> bool {
