@@ -241,7 +241,7 @@ class Supervisor:
                 ambiguity = None
             except Ambiguous as exc:
                 ours, ambiguity = {}, str(exc)
-            if self.reason is None and exited and ours:
+            if self.reason is None and self.cli_status is not None and ours:
                 self.cancel("leaked-descendants")  # the CLI ended, this did not
             stuck = bool(ours) or ambiguity is not None
             if not stuck:
