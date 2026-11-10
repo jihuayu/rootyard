@@ -508,9 +508,9 @@ async fn provision_verified_pack(fixture: &Fixture, repo: &RepoFixture) -> Resul
 }
 
 /// Seal one real capture and run `check` inside the pin window, then release
-/// the transient pin on **every** exit path (success, a failed check or a
-/// panicking check, whichever way `check` reports) before returning the check's
-/// own outcome.
+/// the transient pin once `check` returns its capture, whether it returns
+/// `Ok` or an `Err`, before returning the check's own outcome. A panicking
+/// `check` never hands the capture back, so no release runs on that path.
 ///
 /// `check` owns the capture for the duration of the window and must hand it
 /// back: the released pin is exactly the capture the case checked. The helper
