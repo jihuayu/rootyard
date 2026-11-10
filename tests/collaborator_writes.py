@@ -209,12 +209,16 @@ class writes:
                             body={**fresh, "expected_version": rule["version"],
                                   "prevent_deletion": False})[0]
         assert updated == 200, updated
-        for username in ("alice", "heidi"):
-            status, raw, _ = self.http(f"/api/repos/alice/demo/collaborators/{username}",
-                                       token=self.users["heidi"], method="PUT",
-                                       body={"role": "admin"})
-            assert status == 409, (username, status, raw[:200])
-            assert b"cannot modify or remove repository owner" in raw, raw[:200]
+        # Only the owner row is refused: the admin's own row is a normal
+        # collaborator row and stays writable by that admin.
+        status, raw, _ = self.http("/api/repos/alice/demo/collaborators/alice",
+                                   token=self.users["heidi"], method="PUT",
+                                   body={"role": "admin"})
+        assert status == 409, (status, raw[:200])
+        assert b"cannot modify or remove repository owner" in raw, raw[:200]
+        own = self.http("/api/repos/alice/demo/collaborators/heidi",
+                        token=self.users["heidi"], method="PUT", body={"role": "admin"})
+        assert own[0] == 200, (own[0], own[1][:200])
         removed = json.loads(self.expect("/api/repos/alice/demo/collaborators/olga", 200,
                                          method="DELETE", token=self.users["heidi"]))
         assert (removed["removed"], removed["username"]) == (True, "olga")
