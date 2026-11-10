@@ -170,6 +170,9 @@ jobs:
         run: python3 tests/backup_ci_pins.py --binary target/debug/rootyard --report test-results/backup-ci-pins.json
       - name: Exercise durable push recovery
         run: python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
+      - name: Exercise direct collaborator Git transport and write-endpoint authorization (#4)
+        timeout-minutes: 15
+        run: python3 tests/collaborator_transport.py --binary target/debug/rootyard --report test-results/collaborator-transport.json
       - name: Recover native Git receipts after collaborator and organization withdrawal
         run: python3 tests/recorded_membership_recovery.py --binary target/debug/rootyard --report test-results/recorded-membership-recovery.json
       - name: Recover native Git receipts after token revocation
@@ -221,6 +224,9 @@ jobs:
         run: python3 tests/backup_pulls.py --binary target/debug/rootyard --report test-results/backup-pulls.json
       - name: Exercise repository read-only Browse API and atomic multi-ref CAS transactions
         run: python3 tests/browse.py --binary target/debug/rootyard --report test-results/browse.json
+      - name: Exercise repository pagination against real PostgreSQL
+        timeout-minutes: 10
+        run: python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json
       - name: Exercise Git LFS Batch API, streaming object storage, and paired backup
         run: python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json
       - name: Exercise local workspace semantics
@@ -255,8 +261,14 @@ jobs:
         run: python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
       - name: Exercise repository collaborators, teams, 5-role RBAC, and audit log
         run: python3 tests/members.py --binary target/debug/rootyard --report test-results/members.json
+      - name: Exercise organization and member pagination against real PostgreSQL
+        timeout-minutes: 10
+        run: python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json
       - name: Exercise server-side HTML Web UI views, XSS sanitization, and PR/Issue workflows
         run: python3 tests/web.py --binary target/debug/rootyard --report test-results/web.json
+      - name: Exercise web detail pagination against real PostgreSQL
+        timeout-minutes: 10
+        run: python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json
       - name: Exercise real browser sessions, CSRF, expiry and revocation
         timeout-minutes: 10
         env:
@@ -277,6 +289,9 @@ jobs:
             --report web_sessions=test-results/web-sessions.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
+            --report repository_pagination=test-results/repository-pagination.json \
+            --report organization_pagination=test-results/organization-pagination.json \
+            --report web_detail_pagination=test-results/web-detail-pagination.json \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
@@ -286,6 +301,9 @@ jobs:
             --harness tests/webhook_worker_recovery.py \
             --harness tests/ci_webhook_regressions.py \
             --harness tests/backup_audit_sequence_legacy.py \
+            --harness tests/repository_pagination.py \
+            --harness tests/organization_pagination.py \
+            --harness tests/web_detail_pagination.py \
             --fixture postgres=postgres:17 \
             --fixture rust="$(rustc -V)" \
             --fixture git="$(git --version)" \
