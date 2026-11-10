@@ -23,6 +23,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import schema_baseline  # noqa: E402
+from e2e_tiers import Phase1ClosureAndDocsFixture  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CI_YML = ROOT / ".github/workflows/ci.yml"
@@ -46,10 +47,29 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
 
         # Must build standard binaries and pando-lab feature binary
         self.assertIn("cargo build --locked", ci_text)
-        self.assertRegex(
-            ci_text,
-            r"python3\s+scripts/build_native\.py\s+--features\s+pando-lab\s+--bins\b",
-            "ci.yml must invoke the attested native build for all pando-lab binaries",
+        self.assertEqual(
+            Phase1ClosureAndDocsFixture.ci_build_native_batch_tokens(
+                Phase1ClosureAndDocsFixture.live_ci_run_commands(ci_text)
+            ),
+            [
+                "python3",
+                "scripts/build_native_batch.py",
+                "--all-bins",
+                "--features",
+                "pando-lab",
+                "--strip-debuginfo",
+                "--test",
+                "ref_store_snapshot_backup_fixture",
+                "--output",
+                "test-results/refstore-snapshot-fixture",
+                "--test",
+                "ref_store_holds_backup_fixture",
+                "--output",
+                "test-results/refstore-holds-fixture",
+                "--manifest-out",
+                "test-results/native-build-batch.json",
+            ],
+            "ci.yml must invoke the attested native batch build for all pando-lab binaries",
         )
         build_script = (ROOT / "scripts/build_native.py").read_text(encoding="utf-8")
         for required in (
