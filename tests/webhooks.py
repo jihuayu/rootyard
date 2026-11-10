@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -120,6 +121,78 @@ class WebhooksHarness(PullsHarness):
                     str(migration_040_path()),
                 ]
             )
+
+    def json_response(self, path: str, expected, **kwargs):
+        """Send one raw request and return its status and parsed JSON body.
+
+        ``expected`` is one status or a minimal tuple of statuses the caller
+        judges further from the parsed error vocabulary. Any other status, a
+        missing Cache-Control/Content-Type header or a non-object JSON body
+        fails here, so no caller can absorb a 401, 500 or opaque conflict.
+        """
+        allowed = expected if isinstance(expected, tuple) else (expected,)
+        assert allowed, "at least one expected status is required"
+        status, body, headers = self.http(
+            path, token=kwargs.pop("token", None) or self.alice, **kwargs
+        )
+        norm_headers = {k.lower(): v for k, v in headers.items()}
+        assert status in allowed, f"{path}: expected {expected}, got {status}: {body[:200]!r}"
+        assert norm_headers.get("cache-control") == "no-store", norm_headers
+        assert "application/json" in norm_headers.get("content-type", ""), norm_headers
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None
+        assert isinstance(parsed, dict), (status, body[:200])
+        return status, parsed
+
+    def check_rows(self) -> dict:
+        """Current check-run rows for the PR head, keyed by context."""
+        return {
+            c["context"]: c
+            for c in self.document(f"{self.pr1_path}/checks", token=self.reader)["items"]
+        }
+
+    def wait_for_queued_head(self, deadline: float = 10.0) -> dict:
+        """Poll until PR #1 is exactly feat2/base and its required checks are queued.
+
+        Dispatch synchronizes pull orchestration, but the background pull-ref
+        worker runs concurrently, so the feat2 checks may not exist yet while
+        the PR head is already feat2. A present but wrong row fails at once;
+        only absent contexts sleep, up to the caller's absolute deadline, and
+        a timeout is a clear failure.
+        """
+        stop = time.monotonic() + deadline
+        last = None
+        while True:
+            pr = self.document(self.pr1_path)
+            checks = self.document(f"{self.pr1_path}/checks")
+            last = (pr, checks)
+            head_ok = pr.get("head_oid") == self.feat2_oid and pr.get("base_oid") == self.base_oid
+            rows = checks.get("items")
+            assert checks.get("head_oid") == self.feat2_oid, last
+            assert isinstance(rows, list), last
+            contexts = [row.get("context") for row in rows]
+            assert len(contexts) == len(set(contexts)), last
+            by_ctx = {row["context"]: row for row in rows}
+            queued = {}
+            for context in ("ci/test", "ci/lint"):
+                if context not in by_ctx:
+                    continue
+                row = by_ctx[context]
+                if row.get("commit_oid") != self.feat2_oid or row.get("status") != "queued":
+                    raise AssertionError(f"{context} is not queued on feat2: {row}")
+                assert row.get("conclusion") is None, row
+                queued[context] = row
+            if head_ok and len(queued) == 2:
+                return checks
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"feat2 PR head {self.feat2_oid} never had queued ci/test and ci/lint "
+                    f"before the {deadline}s deadline: {last}"
+                )
+            time.sleep(min(0.1, remaining))
 
     def signed_callback(
         self,
@@ -436,6 +509,7 @@ class WebhooksHarness(PullsHarness):
         )
 
         # Now update feature branch and PR #1 head_oid to feat2_oid: old CI on feat1_oid must NOT allow merge!
+        self.pr1_version_before_push = self.pr1["version"]
         self.git(
             "push",
             "origin",
@@ -443,28 +517,78 @@ class WebhooksHarness(PullsHarness):
             cwd=self.work,
             token=self.alice,
         )
-        self.pr1 = self.document(
-            self.pr1_path,
-            200,
-            method="PATCH",
-            body={
-                "expected_version": self.pr1["version"],
-                "head_oid": self.feat2_oid,
-            },
-        )
+        # Background reconciliation may already have advanced PR #1 from the
+        # authoritative `feature` ref (head_oid=feat2_oid, version bumped). Read
+        # the live row instead of assuming the pre-push version is still
+        # current, and only PATCH against a version just read.
+        pr_now = self.document(self.pr1_path)
+        assert pr_now["base_oid"] == self.base_oid, pr_now
+        if pr_now["head_oid"] == self.feat2_oid:
+            # Already advanced: the returned row itself must be the feat2 bump.
+            assert pr_now["version"] > self.pr1_version_before_push, pr_now
+        else:
+            # Not yet auto-advanced: the old head must still be stored, so the
+            # manual PATCH is the one legitimate single use of a just-read version.
+            assert pr_now["head_oid"] == self.pr1["head_oid"], pr_now
+            status, patched = self.json_response(
+                self.pr1_path,
+                (200, 409),
+                method="PATCH",
+                body={"expected_version": pr_now["version"], "head_oid": self.feat2_oid},
+            )
+            if status == 409:
+                # A 409 is only the legitimate background win when it is exactly
+                # the version conflict, i.e. a concurrent writer committed a
+                # version bump. Any other 409 (head_oid/base_oid mismatch,
+                # closed/merged PR, ...) fails here. The one bounded read-back
+                # must then prove the writer landed exactly feat2/base and a
+                # version past the pre-push one; a stale old-head row fails on
+                # the shared oracle below instead of being retried.
+                assert patched.get("error") == "pull request version conflict", patched
+                # Exactly one bounded read-back; it must show the feat2 bump.
+                pr_now = self.document(self.pr1_path)
+            else:
+                pr_now = patched
+        # 200 uses the real returned row; both paths must satisfy the same
+        # feat2/base/version oracle before the merge below can mean anything.
+        assert pr_now["head_oid"] == self.feat2_oid, pr_now
+        assert pr_now["base_oid"] == self.base_oid, pr_now
+        assert pr_now["version"] > self.pr1_version_before_push, pr_now
+        # Dispatch synchronizes pull orchestration (in the handler, before it
+        # answers); only after that can the feat2 head's checks be asserted.
         self.document(self.dispatchpath, 200, method="POST", body={})
+        # The feat2 checks must be queued on the final feat2 head, so the merge
+        # below is refused by the required-check policy, not any other conflict.
+        checks = self.wait_for_queued_head()
+        self.pr1 = self.document(self.pr1_path)
+        assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
+        assert checks["head_oid"] == self.feat2_oid, checks
+        # Orchestration runs concurrently with the background worker, so read the
+        # version the merge will fence on from the row as it is now.
+        self.pr1 = self.document(self.pr1_path)
 
-        # Merge at feat2_oid must fail with 409 because feat2_oid's check runs are still 'queued'.
-        self.document(
-            f"{self.pr1_path}/merge",
-            409,
-            method="POST",
-            body={
+        # Merge at feat2_oid must fail with exactly the branch-policy 409 because
+        # feat2_oid's check runs are still 'queued'. A version conflict only means
+        # the background worker advanced the row after our read: re-read the
+        # version a bounded number of times, always re-fencing on feat2_oid, and
+        # fail on any other status or error.
+        for _ in range(5):
+            merge_body = {
                 "expected_version": self.pr1["version"],
                 "expected_head_oid": self.feat2_oid,
                 "expected_base_oid": self.base_oid,
-            },
-        )
+            }
+            _, merge = self.json_response(
+                f"{self.pr1_path}/merge", 409, method="POST", body=merge_body
+            )
+            if merge.get("error") == "required check runs have not succeeded":
+                break
+            assert merge.get("error") == "pull request version conflict", merge
+            self.pr1 = self.document(self.pr1_path)
+            assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
+        else:
+            raise AssertionError(f"merge never reached the check-run oracle: {merge}")
+        assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
 
     def outbox_push_and_pull_request_event_dispatch(self):
         deliveries = self.document(f"{self.hook_path}/deliveries")["items"]
