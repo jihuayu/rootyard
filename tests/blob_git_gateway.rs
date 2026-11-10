@@ -24,13 +24,12 @@
 //! 2. a stock push whose committed receive-pack ACK is lost on the wire: the
 //!    client sees a transport failure, its operation is terminal `committed`,
 //!    the durable ref names its commit and the fresh clone reads it back;
-//! 3. a real `git push --atomic` of two refs where one command advertises a
-//!    stale old OID: the service refuses both refs with parsed report-status
-//!    lines and neither durable ref nor the gate revision moves.
-//!
-//! The case-3 fault is injected on the wire: stock Git's own atomic preflight
-//! is satisfied and the proxy rewrites only the `old` OID of one real command
-//! in the captured body before the requests reach the service concurrently.
+//! 3. one real `git push --atomic` of two refs: stock Git's own local atomic
+//!    preflight passes with the normally advertised old OIDs, then the proxy
+//!    rewrites only the old OID of the `refs/heads/side` command after the client
+//!    formed its POST and forwards that single mutated request; the service
+//!    refuses both refs with parsed report-status lines and neither durable ref
+//!    nor the gate revision moves.
 //!
 //! TODO(Root, honest): schema/source-binding negative cases (a second schema
 //! naming the same repository UUID, or a foreign physical Blob backend) are not
@@ -468,9 +467,7 @@ fn redacted_git_output(label: &str, output: &GitOutput) -> String {
         let redacted = text
             .split_once(':')
             .filter(|(name, _)| {
-                !name.is_empty()
-                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-                    && *name != "fatal"
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && *name != "fatal"
             })
             .map(|(name, _)| format!("{name}: <redacted>"));
         let mut text = redacted.unwrap_or(text);
@@ -553,10 +550,13 @@ fn report_status(response: &[u8]) -> Result<(String, Vec<(String, Option<String>
             break;
         }
         anyhow::ensure!(length >= 4 && position + length - 4 <= response.len(), "report-status pkt-line is malformed");
-        let line = std::str::from_utf8(&response[position..position + length - 4])
-            .map_err(|_| anyhow!("report-status line is not UTF-8"))?
-            .trim_end_matches('\n')
-            .to_owned();
+        let raw = std::str::from_utf8(&response[position..position + length - 4])
+            .map_err(|_| anyhow!("report-status line is not UTF-8"))?;
+        anyhow::ensure!(
+            raw.ends_with('\n') && !raw[..raw.len() - 1].contains('\n') && !raw.contains('\r'),
+            "report-status pkt-line must end in exactly one LF and contain no CR: {raw:?}"
+        );
+        let line = raw[..raw.len() - 1].to_owned();
         position += length - 4;
         if let Some(value) = line.strip_prefix("unpack ") {
             anyhow::ensure!(unpack.is_none(), "report-status repeats unpack");
@@ -710,8 +710,9 @@ async fn race_case(case: &Case, git: &'static Git) -> Result<Value> {
         .filter(|record| record.method == "POST" && record.path.ends_with("/git-receive-pack"))
         .collect::<Vec<_>>();
     ensure!(pushes.len() == 2, "expected exactly two receive-pack POSTs, saw {}", pushes.len());
-    for push in &pushes {
-        ensure!(push.status == Some(200), "a receive-pack POST did not reach the service: {:?}", push.status);
+    for (index, push) in pushes.iter().enumerate() {
+        ensure!(push.status == Some(200), "receive-pack POST {index} did not reach the service: {:?}", push.status);
+        ensure!(!push.truncated, "receive-pack POST {index} record is truncated");
     }
 
     // Git verdicts: exactly one push succeeded.
@@ -756,6 +757,7 @@ async fn race_case(case: &Case, git: &'static Git) -> Result<Value> {
             .map_err(|_| anyhow!("held receive-pack reply {slot} never reached the proxy"))?
             .ok_or_else(|| anyhow!("the proxy lost held receive-pack reply {slot}"))?;
         ensure!(capture.status == Some(200), "the service answered a held receive-pack POST with {:?}", capture.status);
+        ensure!(!capture.truncated, "held receive-pack reply {slot} is truncated");
         let (unpack, verdicts) = assert_git_report("held receive-pack reply", &capture.response)?;
         ensure!(unpack == "ok", "a held receive-pack reply did not unpack: {unpack}");
         ensure!(
@@ -1009,5 +1011,340 @@ async fn lost_ack_case(case: &Case, git: &'static Git) -> Result<Value> {
         "captured_report_sha256": capture.request_sha256,
         "operation_get_state": view["state"],
         "readback": readback,
+    }))
+}
+
+/// Issue-126 requirement 3: one real `git push --atomic` of two refs. Stock
+/// Git's own local atomic preflight passes with the normally advertised old
+/// OIDs; only after the client formed its receive-pack POST does the proxy
+/// rewrite the old OID of the `refs/heads/side` command (never the
+/// capability-carrying first command) to a different valid OID and forward that
+/// single mutated request. The service refuses both refs of the atomic batch and
+/// neither durable ref nor the gate revision moves; a fresh clone reads the
+/// unchanged tips back.
+#[tokio::test]
+#[ignore = "requires real PG/S3/Git, a built serve-blob binary and stock clients"]
+async fn atomic_push_with_rewritten_old_oid_rejects_both_refs_and_leaves_gate_unchanged() -> Result<()> {
+    let node = node().await?;
+    let git: &'static Git = Box::leak(Box::new(Git::new()?));
+    let owner = actor::owner(&node.db.pool).await?;
+    let case = Case::new(node, owner, "atomic-rewrite").await?;
+    let result = atomic_rewrite_case(&case, git).await;
+    let value = case.finish(result).await?;
+    println!("atomic-rewrite: {}", serde_json::to_string(&value)?);
+    Ok(())
+}
+
+async fn atomic_rewrite_case(case: &Case, git: &'static Git) -> Result<Value> {
+    const MAIN: &str = "refs/heads/main";
+    const SIDE: &str = "refs/heads/side";
+    let zero = "0".repeat(40);
+
+    // Real seed clone + push: both branches start at the same `base`.
+    let seed_dir = case.clone_seed(git, "seed", None).await?;
+    let base = git.commit(&seed_dir, "seed.txt", "seed\n", "seed commit").await?;
+    git.ok(&seed_dir, &["push", "--atomic", "origin", "HEAD:refs/heads/main", "HEAD:refs/heads/side"]).await?;
+
+    // A fresh stock client whose remote-tracking refs name both advertised tips.
+    let (client, advertised) = case.clone(git, "client").await?;
+    ensure!(advertised == base, "the client clone read {advertised} for main, not {base}");
+    let side_advertised = git.text(&client, &["rev-parse", "refs/remotes/origin/side"]).await?;
+    ensure!(side_advertised == base, "the client clone read {side_advertised} for side, not {base}");
+
+    // Two distinct fast-forwards from `base`; nothing here rewrites history, so
+    // stock Git's own atomic preflight accepts both updates.
+    git.ok(&client, &["checkout", "-q", "-B", "main", "refs/remotes/origin/main"]).await?;
+    let main_new = git.commit(&client, "main.txt", "main fast-forward\n", "main commit").await?;
+    git.ok(&client, &["checkout", "-q", "-B", "side", "refs/remotes/origin/side"]).await?;
+    let side_new = git.commit(&client, "side.txt", "side fast-forward\n", "side commit").await?;
+    ensure!(
+        main_new != side_new && main_new != base && side_new != base,
+        "the two fast-forwards are not distinct commits ({main_new}, {side_new}, base {base})"
+    );
+    git.ok(&client, &["merge-base", "--is-ancestor", &base, &main_new]).await?;
+    git.ok(&client, &["merge-base", "--is-ancestor", &base, &side_new]).await?;
+
+    // Drop clone/seed traffic so the later inspection sees only the push.
+    case.proxy.records().await;
+    let refs_before = case.durable_refs().await?;
+    ensure!(
+        refs_before.get(MAIN) == Some(&base) && refs_before.get(SIDE) == Some(&base),
+        "durable refs do not start at base: {refs_before:?}"
+    );
+    let refs_before_json = serde_json::to_value(&refs_before)?;
+    let gate_before = case.gate_revision().await?;
+
+    let pinned = Uuid::new_v4();
+    let mut captured = case.proxy.arm_old_oid_rewrite(proxy::OldOidRewrite {
+        ref_name: SIDE.to_owned(),
+        expected_old_oid: base.clone(),
+        new_old_oid: zero.clone(),
+    })?;
+    let output = push(
+        git,
+        &client,
+        Some(pinned),
+        &["push", "--atomic", "origin", "main:refs/heads/main", "side:refs/heads/side"],
+    )
+    .await
+    .map_err(|_| anyhow!("the atomic push could not be run"))?;
+    ensure!(
+        !output.success,
+        "the stock atomic push succeeded although one command named a wrong old OID: {}",
+        redacted_git_output("atomic push", &output)
+    );
+    // Raw output feeds in-memory matching only; diagnostics use the redaction.
+    let text = git_text(&output);
+    ensure!(
+        text.contains("[rejected]"),
+        "the refused push is not a parsed rejection: {}",
+        redacted_git_output("atomic push", &output)
+    );
+    for report in ["non-fast-forward", "fetch first", "unexpected disconnect", "remote end hung up"] {
+        ensure!(
+            !text.contains(report),
+            "the refusal was reported as `{report}`, not a report-status: {}",
+            redacted_git_output("atomic push", &output)
+        );
+    }
+
+    // The exact service reply to the mutated bytes.
+    let capture = tokio::time::timeout(Duration::from_secs(120), captured.recv())
+        .await
+        .map_err(|_| anyhow!("the armed rewrite never saw a receive-pack POST"))?
+        .ok_or_else(|| anyhow!("the proxy lost the rewritten receive-pack capture"))?;
+    ensure!(capture.status == Some(200), "the service answered the rewritten POST with {:?}", capture.status);
+    let (unpack, results) = assert_git_report("captured", &capture.response)?;
+    ensure!(unpack == "ok", "the captured report did not unpack: {unpack}");
+    ensure!(results.len() == 2, "the captured report covers {} refs, not 2", results.len());
+    let verdict = |name: &str| {
+        results
+            .iter()
+            .find(|(ref_name, _)| ref_name == name)
+            .map(|(_, reason)| reason.clone())
+            .ok_or_else(|| anyhow!("the captured report does not name {name}"))
+    };
+    let main_reason = verdict(MAIN)?;
+    let side_reason = verdict(SIDE)?;
+    ensure!(main_reason.is_some(), "the captured report still accepted refs/heads/main");
+    ensure!(side_reason.as_deref() == Some("stale info"), "side was refused with {side_reason:?}, not stale info");
+
+    // The rewrite proof: exactly one 40-byte old-OID change in the body that
+    // reached the service.
+    let proof = capture.rewrite.clone();
+    ensure!(proof.ref_name == SIDE, "the rewrite proof names {:?}, not refs/heads/side", proof.ref_name);
+    ensure!(proof.original_old_oid == base, "the rewrite proof started from the wrong old OID");
+    ensure!(proof.rewritten_old_oid == zero, "the rewrite proof wrote another OID");
+    ensure!(proof.command_index >= 1, "the rewrite touched the capability-carrying first command");
+    ensure!(proof.commands == 2, "the rewrite proof saw {} commands, not 2", proof.commands);
+    ensure!(proof.old_oid_offset >= 4, "the rewrite proof has no plausible old-OID offset");
+    ensure!(proof.original_bytes == proof.rewritten_bytes, "the rewrite changed the request length");
+    ensure!(proof.original_sha256 != proof.rewritten_sha256, "the rewritten bytes are unchanged");
+    ensure!(proof.only_old_oid_changed, "the rewrite changed bytes outside the old OID");
+    ensure!(proof.unchanged_other_commands, "the rewrite changed another command");
+    ensure!(proof.rewritten_sha256 == capture.request_sha256, "the capture digest is not the rewritten body");
+
+    // Body-free command tuples: the client sent exactly main/base/main_new and
+    // side/base/side_new; the rewritten request differs only in side's old OID.
+    let original_tuples =
+        vec![(MAIN.to_owned(), base.clone(), main_new.clone()), (SIDE.to_owned(), base.clone(), side_new.clone())];
+    let rewritten_tuples =
+        vec![(MAIN.to_owned(), base.clone(), main_new.clone()), (SIDE.to_owned(), zero.clone(), side_new.clone())];
+    ensure!(
+        proof.original_command_tuples == original_tuples,
+        "the original push commands are not main/side from base: {:?}",
+        proof.original_command_tuples
+    );
+    ensure!(
+        proof.rewritten_command_tuples == rewritten_tuples,
+        "the rewritten push commands are not main unchanged plus side on the zero old OID: {:?}",
+        proof.rewritten_command_tuples
+    );
+    ensure!(
+        proof
+            .original_command_tuples
+            .iter()
+            .zip(proof.rewritten_command_tuples.iter())
+            .enumerate()
+            .all(|(index, (old, new))| (old != new) == (index == proof.command_index)),
+        "the command tuples changed beyond the one armed command"
+    );
+
+    // The service saw exactly one receive-pack POST carrying the captured
+    // (mutated) bytes: locate it by digest, then require it completed, was
+    // answered with 200 and was recorded without truncation.
+    let records = case.proxy.records().await;
+    let pushes = records
+        .iter()
+        .filter(|record| record.method == "POST" && record.path.ends_with("/git-receive-pack"))
+        .collect::<Vec<_>>();
+    ensure!(pushes.len() == 1, "expected exactly one receive-pack POST, saw {}", pushes.len());
+    let matching = pushes.iter().filter(|record| record.request_sha256 == capture.request_sha256).collect::<Vec<_>>();
+    ensure!(
+        matching.len() == 1,
+        "expected exactly one receive-pack POST with the captured digest, saw {}",
+        matching.len()
+    );
+    let matched = matching[0];
+    ensure!(
+        matched.status == Some(200),
+        "the captured receive-pack POST did not reach the service: {:?}",
+        matched.status
+    );
+    ensure!(!matched.truncated, "the captured receive-pack POST record is truncated");
+    ensure!(matched.request_bytes == proof.rewritten_bytes, "the recorded request length is not the rewritten one");
+
+    // Bind stock Git's expected old values to the advertisement it really saw:
+    // exactly one receive-pack advertisement since the setup traffic was drained.
+    let advertisements = records
+        .iter()
+        .filter(|record| {
+            record.method == "GET" && record.path.ends_with("/info/refs") && record.advertisement.is_some()
+        })
+        .collect::<Vec<_>>();
+    ensure!(advertisements.len() == 1, "expected exactly one receive-pack advertisement, saw {}", advertisements.len());
+    let advertisement = advertisements[0];
+    ensure!(!advertisement.truncated, "the receive-pack advertisement record is truncated");
+    ensure!(advertisement.status == Some(200), "the advertisement answered {:?}", advertisement.status);
+    let body =
+        advertisement.advertisement.clone().ok_or_else(|| anyhow!("the receive-pack advertisement was truncated"))?;
+    let (advertised_refs, capabilities) = proxy::parse_advertisement(&body)?;
+    ensure!(capabilities.contains("report-status"), "the advertisement lacks report-status");
+    ensure!(capabilities.contains("atomic"), "the advertisement lacks atomic");
+    let mut advertised = advertised_refs.into_iter().collect::<Vec<_>>();
+    advertised.sort_unstable();
+    let mut expected_advertised = vec![(base.clone(), MAIN.to_owned()), (base.clone(), SIDE.to_owned())];
+    expected_advertised.sort_unstable();
+    ensure!(
+        advertised == expected_advertised,
+        "the advertisement is not exactly main and side at base: {advertised:?}"
+    );
+
+    // Nothing durable moved.
+    let refs_after = case.durable_refs().await?;
+    ensure!(refs_after == refs_before, "durable refs changed: before {refs_before:?}, after {refs_after:?}");
+    let gate_after = case.gate_revision().await?;
+    ensure!(gate_after == gate_before, "the gate revision moved from {gate_before} to {gate_after}");
+
+    let (readback_dir, readback) = case.clone(git, "readback").await?;
+    ensure!(readback == base, "the fresh clone read {readback} for main, not {base}");
+    let readback_side = git.text(&readback_dir, &["rev-parse", "refs/remotes/origin/side"]).await?;
+    ensure!(readback_side == base, "the fresh clone read {readback_side} for side, not {base}");
+
+    // The pinned operation is terminal `rejected` and covers exactly both refs.
+    let bound = tokio::time::Instant::now() + Duration::from_secs(120);
+    let (state, terminal) = loop {
+        let row = case.operation_row(pinned).await?;
+        if let Some((state, Some(terminal))) = row
+            && matches!(state.as_str(), "committed" | "rejected" | "cancelled")
+        {
+            break (state, terminal);
+        }
+        ensure!(tokio::time::Instant::now() < bound, "the pinned operation did not reach a durable terminal");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    ensure!(state == "rejected", "the pinned operation is {state}, not rejected");
+    let terminal_refs = terminal["refs"].as_array().ok_or_else(|| anyhow!("rejected terminal has no refs"))?;
+    let mut names = terminal_refs.iter().filter_map(|result| result["name"].as_str()).collect::<Vec<_>>();
+    names.sort_unstable();
+    let mut expected_names = vec![MAIN, SIDE];
+    expected_names.sort_unstable();
+    ensure!(names == expected_names, "the rejected terminal does not cover exactly both refs: {terminal}");
+    let refusal = |name: &str| {
+        let result = terminal_refs
+            .iter()
+            .find(|result| result["name"].as_str() == Some(name))
+            .ok_or_else(|| anyhow!("the rejected terminal does not name {name}"))?;
+        ensure!(result["outcome"].as_str() == Some("not_applied"), "the terminal applied {name}: {terminal}");
+        let code =
+            result["reason"]["code"].as_str().or_else(|| result["reason"].as_str()).unwrap_or_default().to_owned();
+        Ok(code)
+    };
+    let side_code = refusal(SIDE)?;
+    let main_code = refusal(MAIN)?;
+    ensure!(side_code == "old_oid_mismatch", "side's terminal reason is {side_code:?}, not old_oid_mismatch");
+
+    // The issuing client resolves the same rejection through the operation API.
+    let path = case.path(&format!("/operations/{pinned}"));
+    let (status, view) = case.service.get(Some(&case.owner.token), &path).await?;
+    ensure!(status == 200, "operation GET answered {status}");
+    ensure!(
+        view["operation_id"].as_str() == Some(pinned.to_string().as_str()),
+        "operation GET named another id: {view}"
+    );
+    ensure!(view["state"].as_str() == Some("rejected"), "operation GET state is not rejected: {view}");
+    let view_refs = view["terminal"]["refs"].as_array().ok_or_else(|| anyhow!("operation GET has no terminal refs"))?;
+    for name in [MAIN, SIDE] {
+        ensure!(
+            view_refs.iter().any(
+                |result| result["name"].as_str() == Some(name) && result["outcome"].as_str() == Some("not_applied")
+            ),
+            "operation GET terminal does not refuse {name}: {view}"
+        );
+    }
+
+    Ok(json!({
+        "base": base,
+        "main_new": main_new,
+        "side_new": side_new,
+        "pinned_operation": pinned.to_string(),
+        "gate_revision_before": gate_before,
+        "gate_revision_after": gate_after,
+        "durable_refs_before": refs_before_json,
+        "durable_refs_unchanged": true,
+        "client_verdict": "rejected",
+        "capture": {
+            "request_sha256": capture.request_sha256,
+            "request_bytes": capture.request_bytes,
+            "status": capture.status,
+            "unpack": unpack,
+            "verdicts": results.iter().map(|(name, reason)| json!({
+                "ref": name,
+                "reason": reason,
+            })).collect::<Vec<_>>(),
+        },
+        "rewrite": {
+            "ref_name": proof.ref_name,
+            "original_old_oid": proof.original_old_oid,
+            "rewritten_old_oid": proof.rewritten_old_oid,
+            "command_index": proof.command_index,
+            "commands": proof.commands,
+            "old_oid_offset": proof.old_oid_offset,
+            "original_sha256": proof.original_sha256,
+            "rewritten_sha256": proof.rewritten_sha256,
+            "original_bytes": proof.original_bytes,
+            "rewritten_bytes": proof.rewritten_bytes,
+            "only_old_oid_changed": proof.only_old_oid_changed,
+            "unchanged_other_commands": proof.unchanged_other_commands,
+            "original_command_tuples": proof.original_command_tuples.iter().map(|(ref_name, old_oid, new_oid)| json!({
+                "ref": ref_name,
+                "old_oid": old_oid,
+                "new_oid": new_oid,
+            })).collect::<Vec<_>>(),
+            "rewritten_command_tuples": proof.rewritten_command_tuples.iter().map(|(ref_name, old_oid, new_oid)| json!({
+                "ref": ref_name,
+                "old_oid": old_oid,
+                "new_oid": new_oid,
+            })).collect::<Vec<_>>(),
+        },
+        "advertisement": {
+            "refs": advertised.iter().map(|(oid, name)| json!({
+                "ref": name,
+                "oid": oid,
+            })).collect::<Vec<_>>(),
+            "report_status": capabilities.contains("report-status"),
+            "atomic": capabilities.contains("atomic"),
+        },
+        "record": {
+            "request_sha256": matched.request_sha256,
+            "request_bytes": matched.request_bytes,
+            "status": matched.status,
+            "truncated": matched.truncated,
+        },
+        "operation_state": state,
+        "terminal_reasons": { "refs/heads/main": main_code, "refs/heads/side": side_code },
+        "operation_get_state": view["state"],
+        "readback_main": readback,
+        "readback_side": readback_side,
     }))
 }

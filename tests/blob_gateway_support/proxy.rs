@@ -12,15 +12,24 @@
 //!   service sees both complete requests; [`Proxy::hold_connection_capturing`]
 //!   arms the same barrier and also yields each held POST's raw service reply;
 //! - [`Proxy::resolve_held`] forwards every held request concurrently, only
-//!   after every held body is complete, and answers each client with **its own**
-//!   service response;
+//!   after every held body is complete, and answers each client with the
+//!   service response to that client's own bytes;
 //! - [`Proxy::drop_operation`] forwards one POST with the caller's
 //!   `X-Rootyard-Operation`, consumes the complete service response (after the
 //!   service-side operation is durably terminal when a [`Poll`] is attached) and
-//!   then closes the client connection without writing one byte.
+//!   then closes the client connection without writing one byte;
+//! - [`Proxy::arm_old_oid_rewrite`] rewrites only the old OID of exactly one
+//!   non-first receive-pack command, once the client already formed its POST,
+//!   forwards those mutated bytes once and answers the client with the real
+//!   service response to them; the [`Rewritten`] capture proves, by digest and
+//!   byte offset, that nothing but those 40 bytes changed.
 //!
-//! The proxy replaces only the client transport: every client reads exactly the
-//! service response to its own bytes.
+//! The proxy replaces only the client transport, and what a client reads depends
+//! on the rule: ordinary forwarding returns the service reply to the client's
+//! original bytes, while the one-shot [`Rule::Rewrite`] sends one mutated body
+//! upstream and returns the service reply to those exact mutated bytes. A rule
+//! that cannot be applied exactly as armed fails closed: nothing is forwarded,
+//! the proxy records the failure and the client ends with a transport error.
 //!
 //! Bounds: a barrier admits exactly `count` requests and every held response is
 //! bounded by [`Limits::hold`]; bodies are read under [`Limits::max_body`],
@@ -121,6 +130,60 @@ pub struct Captured {
     pub request_sha256: String,
     pub status: Option<u16>,
     pub response: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// One push command as `(ref_name, old_oid, new_oid)`: names and OIDs only,
+/// never any body byte.
+pub type CommandTuple = (String, String, String);
+
+/// The bounded, body-free proof of one old-OID rewrite: which command changed,
+/// where its old OID sits and that every other byte is identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteProof {
+    pub ref_name: String,
+    pub original_old_oid: String,
+    pub rewritten_old_oid: String,
+    pub command_index: usize,
+    pub commands: usize,
+    /// Every command tuple of the original client request, in command order.
+    pub original_command_tuples: Vec<CommandTuple>,
+    /// Every command tuple of the rewritten request the service received.
+    pub rewritten_command_tuples: Vec<CommandTuple>,
+    /// Absolute offset of the 40 old-OID bytes inside the request body.
+    pub old_oid_offset: usize,
+    pub original_sha256: String,
+    pub rewritten_sha256: String,
+    pub original_bytes: usize,
+    pub rewritten_bytes: usize,
+    /// `true` only after both byte ranges around the OID compared equal.
+    pub only_old_oid_changed: bool,
+    /// Every other command's old/new OID and ref name stayed as the client sent
+    /// them (and the capability-carrying first command was not touched).
+    pub unchanged_other_commands: bool,
+}
+
+/// One armed, exact old-OID rewrite. OIDs are compared and written as exact
+/// lowercase hex, so a mismatch fails closed instead of mutating other bytes.
+#[derive(Debug, Clone)]
+pub struct OldOidRewrite {
+    /// The one command (by ref name) whose old OID is replaced. It must not be
+    /// the first command, which carries the push capabilities.
+    pub ref_name: String,
+    /// The exact old OID the client is expected to have sent for `ref_name`.
+    pub expected_old_oid: String,
+    /// The old OID written in its place.
+    pub new_old_oid: String,
+}
+
+/// One rewritten receive-pack POST as the service saw it. Sent exactly once per
+/// armed [`OldOidRewrite`].
+pub struct Rewritten {
+    pub request_sha256: String,
+    pub request_bytes: usize,
+    pub status: Option<u16>,
+    pub response: Vec<u8>,
+    pub rewrite: RewriteProof,
 }
 
 #[derive(Clone)]
@@ -132,6 +195,8 @@ struct Reply {
     /// `X-Rootyard-Operation`. Empty when the answer is not a backend response.
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// The backend answer ended before its declared length.
+    truncated: bool,
 }
 
 /// One held request whose answer is forwarded after the barrier opened. It is
@@ -158,6 +223,9 @@ enum Rule {
     Hold { outcome: Arc<tokio::sync::Mutex<Option<Outcome>>>, captured: Option<mpsc::UnboundedSender<Captured>> },
     /// Consume the service response, then drop the client connection.
     Drop { poll: Option<Poll>, captured: mpsc::UnboundedSender<Captured> },
+    /// Rewrite one non-first command's old OID, forward the mutated body once
+    /// and answer the client with the service response to it.
+    Rewrite { rewrite: OldOidRewrite, captured: mpsc::UnboundedSender<Rewritten> },
 }
 
 /// The complete answer of one forwarded request, or why it was lost.
@@ -363,6 +431,25 @@ impl Proxy {
         Ok(received)
     }
 
+    /// Arm one exact old-OID rewrite for the next receive-pack POST that reaches
+    /// the proxy (whatever its operation). The rule is used once; it is
+    /// validated at arm time and the rewrite itself fails closed. The capture
+    /// yields the mutated request digest, the real service response and the
+    /// bounded [`RewriteProof`].
+    pub fn arm_old_oid_rewrite(&self, rewrite: OldOidRewrite) -> Result<mpsc::UnboundedReceiver<Rewritten>> {
+        ensure!(valid_oid(&rewrite.expected_old_oid), "an armed rewrite needs a 40-char lowercase old OID");
+        ensure!(valid_oid(&rewrite.new_old_oid), "a rewritten old OID must be 40 lowercase hex chars");
+        ensure!(rewrite.expected_old_oid != rewrite.new_old_oid, "a rewritten old OID must differ from the original");
+        ensure!(rewrite.ref_name.starts_with("refs/"), "an armed rewrite must name one refs/ ref");
+        let mut state =
+            self.shared.state.try_lock().map_err(|_| anyhow!("proxy state is busy; arm the rewrite before pushing"))?;
+        ensure!(state.rules.connection.is_empty(), "another connection rule is already armed");
+        ensure!(state.hold.is_none(), "a hold barrier is already armed");
+        let (captured, received) = mpsc::unbounded_channel();
+        state.rules.connection.push(Rule::Rewrite { rewrite, captured });
+        Ok(received)
+    }
+
     /// Wait until `count` requests sit in the armed barrier.
     pub async fn await_held(&self, count: usize) -> Result<()> {
         let bound = Instant::now() + Duration::from_secs(120);
@@ -501,9 +588,42 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                     request_sha256: sha256(&body),
                     status: Some(traffic.status),
                     response: traffic.body,
+                    truncated: traffic.truncated,
                 });
                 // The Git client must observe a transport failure, not a response.
                 return Ok(());
+            }
+            Some(Rule::Rewrite { rewrite, captured }) => {
+                // Fail closed: a body that is not exactly one rewritable command
+                // section is never forwarded, and the client sees a transport
+                // error instead of a fabricated reply.
+                let (mutated, proof) = match old_oid_rewrite(&body, &rewrite) {
+                    Ok(rewritten) => rewritten,
+                    Err(error) => {
+                        shared.fail(format!("old-OID rewrite refused: {error:#}"));
+                        return Ok(());
+                    }
+                };
+                let traffic = shared.exchange(&method, &target, &headers, &mutated).await?;
+                record.status = Some(traffic.status);
+                record.request_sha256 = proof.rewritten_sha256.clone();
+                record.request_bytes = proof.rewritten_bytes;
+                record.truncated = traffic.truncated;
+                shared.state.lock().await.records.push(record);
+                let _ = captured.send(Rewritten {
+                    request_sha256: proof.rewritten_sha256.clone(),
+                    request_bytes: proof.rewritten_bytes,
+                    status: Some(traffic.status),
+                    response: traffic.body.clone(),
+                    rewrite: proof,
+                });
+                Reply {
+                    status: traffic.status,
+                    reason: "OK",
+                    headers: traffic.headers,
+                    body: traffic.body,
+                    truncated: traffic.truncated,
+                }
             }
             Some(Rule::Hold { outcome, captured }) => {
                 let deferred = Arc::new(Deferred {
@@ -520,11 +640,13 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                 enroll(&shared, deferred.clone()).await?;
                 let reply = await_held_reply(&shared, &deferred).await?;
                 record.status = Some(reply.status);
+                record.truncated = reply.truncated;
                 if let Some(captured) = captured {
                     let _ = captured.send(Captured {
                         request_sha256: sha256(&deferred.body),
                         status: Some(reply.status),
                         response: reply.body.clone(),
+                        truncated: reply.truncated,
                     });
                 }
                 shared.state.lock().await.records.push(record);
@@ -543,7 +665,13 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                         .map(|operation| CreatedOperation { operation });
                 }
                 shared.state.lock().await.records.push(record);
-                Reply { status: traffic.status, reason: "OK", headers: traffic.headers, body: traffic.body }
+                Reply {
+                    status: traffic.status,
+                    reason: "OK",
+                    headers: traffic.headers,
+                    body: traffic.body,
+                    truncated: traffic.truncated,
+                }
             }
         };
         let closed = wire::connection_closed(&headers);
@@ -562,7 +690,7 @@ async fn arm_hold(shared: &Shared, count: usize, captured: Option<mpsc::Unbounde
     ensure!(count >= 1, "a hold barrier needs at least one request");
     let mut state = shared.state.lock().await;
     ensure!(state.hold.is_none(), "a hold barrier is already armed");
-    ensure!(state.rules.connection.is_empty(), "a rewrite rule is already armed");
+    ensure!(state.rules.connection.is_empty(), "a connection rule (hold or rewrite) is already armed");
     state.rules.connection = (0..count)
         .map(|_| Rule::Hold { outcome: Arc::new(tokio::sync::Mutex::new(None)), captured: captured.clone() })
         .collect();
@@ -625,7 +753,13 @@ async fn forward(request: &DeferredRef) -> Outcome {
     else {
         return Err("forward failed".to_owned());
     };
-    Ok(Reply { status: traffic.status, reason: "OK", headers: traffic.headers, body: traffic.body })
+    Ok(Reply {
+        status: traffic.status,
+        reason: "OK",
+        headers: traffic.headers,
+        body: traffic.body,
+        truncated: traffic.truncated,
+    })
 }
 
 /// Advertisement body after the `# service=git-receive-pack` pkt-line prefix.
@@ -676,4 +810,128 @@ pub fn parse_advertisement(body: &[u8]) -> Result<(Vec<(String, String)>, String
         }
     }
     Ok((refs, capabilities))
+}
+
+/// Exactly 40 lowercase hex digits, the only OID form a rewrite compares or
+/// writes.
+fn valid_oid(oid: &str) -> bool {
+    oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// One command of the receive-pack command section and where it sits in the body.
+struct CommandLine {
+    /// Absolute offset of the payload (and so of `<old> <new> <ref>`) in the body.
+    payload_start: usize,
+    old_oid: String,
+    new_oid: String,
+    ref_name: String,
+    /// The command the client appended `\0<caps>` to (always the first one).
+    carries_capabilities: bool,
+}
+
+/// Parse the command section strictly, mirroring the service parser: every
+/// pkt-line is `<payload>`, the section ends at the first `0000`, a command is
+/// `<old> <new> <ref>` with an optional single trailing `\n`, and only the first
+/// command may carry `\0<caps>`.
+fn command_lines(body: &[u8]) -> Result<(Vec<CommandLine>, usize)> {
+    let (payloads, section_end) = wire::pkt_lines_until_flush(body)?;
+    ensure!(!payloads.is_empty(), "push command section is empty");
+    let mut commands = Vec::with_capacity(payloads.len());
+    let mut position = 0usize;
+    for (index, payload) in payloads.iter().enumerate() {
+        let payload_start = position + 4;
+        position = payload_start + payload.len();
+        let (line, caps) = match payload.iter().position(|byte| *byte == 0) {
+            Some(at) => (&payload[..at], Some(&payload[at + 1..])),
+            None => (&payload[..], None),
+        };
+        ensure!(
+            caps.is_none() || index == 0,
+            "push capabilities appear on command {index}, not only the first command"
+        );
+        let line = match line.strip_suffix(b"\n") {
+            Some(line) => {
+                ensure!(!line.ends_with(b"\n"), "command {index} has more than one trailing newline");
+                line
+            }
+            None => line,
+        };
+        let text = std::str::from_utf8(line).map_err(|_| anyhow!("command {index} is not UTF-8"))?;
+        let mut fields = text.split(' ');
+        let (Some(old), Some(new), Some(name), None) = (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            bail!("command {index} is not `<old> <new> <ref>`");
+        };
+        ensure!(valid_oid(old) && valid_oid(new), "command {index} carries a non-lowercase or non-40-char OID");
+        ensure!(name.starts_with("refs/") && name.len() > "refs/".len(), "command {index} names no refs/ ref");
+        commands.push(CommandLine {
+            payload_start,
+            old_oid: old.to_owned(),
+            new_oid: new.to_owned(),
+            ref_name: name.to_owned(),
+            carries_capabilities: caps.is_some(),
+        });
+    }
+    Ok((commands, section_end))
+}
+
+/// Rewrite only the old OID of the one command naming `rewrite.ref_name` and
+/// prove that no other byte changed. Anything unexpected is refused before a
+/// single byte is forwarded.
+fn old_oid_rewrite(body: &[u8], rewrite: &OldOidRewrite) -> Result<(Vec<u8>, RewriteProof)> {
+    ensure!(valid_oid(&rewrite.expected_old_oid), "the armed expected old OID is malformed");
+    ensure!(valid_oid(&rewrite.new_old_oid), "the armed replacement old OID is malformed");
+    let (commands, section_end) = command_lines(body)?;
+    let mut matching = commands.iter().enumerate().filter(|(_, command)| command.ref_name == rewrite.ref_name);
+    let (index, command) = matching.next().ok_or_else(|| anyhow!("no command names the armed ref"))?;
+    ensure!(matching.next().is_none(), "more than one command names the armed ref");
+    ensure!(index >= 1 && !command.carries_capabilities, "the armed ref is the capability-carrying first command");
+    ensure!(command.old_oid == rewrite.expected_old_oid, "the armed ref's old OID is not the expected one");
+    let offset = command.payload_start;
+    let end = offset + 40;
+    ensure!(
+        body.get(offset..end).and_then(|bytes| std::str::from_utf8(bytes).ok()) == Some(command.old_oid.as_str()),
+        "the command's old OID does not sit where the pkt-line says it does"
+    );
+    let mut mutated = body.to_vec();
+    mutated[offset..end].copy_from_slice(rewrite.new_old_oid.as_bytes());
+    let only_old_oid_changed = mutated.len() == body.len()
+        && mutated[..offset] == body[..offset]
+        && mutated[offset..end] == rewrite.new_old_oid.as_bytes()[..]
+        && mutated[end..] == body[end..];
+    ensure!(only_old_oid_changed, "the rewrite changed bytes outside the old OID");
+    let (after, after_end) = command_lines(&mutated)?;
+    ensure!(after_end == section_end, "the rewrite moved the command section flush");
+    ensure!(after.len() == commands.len(), "the rewrite changed the command count");
+    let unchanged_other_commands = after.iter().zip(commands.iter()).enumerate().all(|(other, (new, old))| {
+        new.ref_name == old.ref_name
+            && new.new_oid == old.new_oid
+            && new.carries_capabilities == old.carries_capabilities
+            && (other == index || new.old_oid == old.old_oid)
+    });
+    ensure!(unchanged_other_commands, "the rewrite changed another command");
+    ensure!(after[index].old_oid == rewrite.new_old_oid, "the rewritten command does not carry the new old OID");
+    let tuples = |section: &[CommandLine]| {
+        section
+            .iter()
+            .map(|command| (command.ref_name.clone(), command.old_oid.clone(), command.new_oid.clone()))
+            .collect::<Vec<CommandTuple>>()
+    };
+    let proof = RewriteProof {
+        ref_name: command.ref_name.clone(),
+        original_old_oid: command.old_oid.clone(),
+        rewritten_old_oid: rewrite.new_old_oid.clone(),
+        command_index: index,
+        commands: commands.len(),
+        original_command_tuples: tuples(&commands),
+        rewritten_command_tuples: tuples(&after),
+        old_oid_offset: offset,
+        original_sha256: sha256(body),
+        rewritten_sha256: sha256(&mutated),
+        original_bytes: body.len(),
+        rewritten_bytes: mutated.len(),
+        only_old_oid_changed,
+        unchanged_other_commands,
+    };
+    Ok((mutated, proof))
 }
