@@ -213,8 +213,8 @@ fn a_proof_incarnation_is_fixed_to_the_view_its_t2_bound() {
     let (view, _, _) = view_bound_to(transient(parts()), binding, Some(ROTATED_INCARNATION));
     assert!(serving_materialization(view, &capture).is_err());
     // A nil anchor is refused by the factory itself.
-    let (view, _, _) = view_bound_to(transient(parts()), binding, Some(Uuid::nil()));
-    assert!(VerifiedReadView::of_materialized(&view).is_err());
+    let (nil_anchored, _, _) = view_bound_to(transient(parts()), binding, Some(Uuid::nil()));
+    assert!(VerifiedReadView::of_materialized(&nil_anchored).is_err());
     // The proof seals exactly the view's own anchor, which is the capture's
     // T2-compared value; no seal-site argument can change it.
     let (view, _, _) = view();

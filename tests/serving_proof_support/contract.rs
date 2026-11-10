@@ -46,7 +46,7 @@ mod serving_reads_support;
 #[path = "../serving_support/mod.rs"]
 mod serving_support;
 
-use self::serving_reads_support::{ensure_migration_146, operation_deadline, provision_ready};
+use self::serving_reads_support::{ensure_migration_146, operation_deadline, provision_ready, RepoFixture};
 use self::serving_support::{actor, Fixture};
 use super::PgPackSnapshotMaterializer;
 use crate::blob_store::config::BlobProfile;
@@ -545,9 +545,13 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
     };
     with_sealed_capture(&fixture, &repo, |capture| async {
         ensure!(!capture.is_empty(), "a pack_verified gate with one registered pack must not capture as empty");
-        let (snapshot, binding) = capture.registered_parts()?;
+        let (snapshot, binding, capture_anchor) = capture.registered_parts()?;
         let a5a = probe_a5a(&snapshot);
         let captured_incarnation = capture.capture_incarnation();
+        ensure!(
+            capture_anchor == captured_incarnation,
+            "the registered parts must carry the capture's own cluster authority incarnation"
+        );
         ensure!(!captured_incarnation.is_nil(), "the capture anchor must be a non-nil incarnation");
         ensure!(
             captured_incarnation == current_incarnation(&fixture).await?,
