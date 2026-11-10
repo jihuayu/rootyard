@@ -556,8 +556,8 @@ fn a_present_capture_that_disagrees_with_its_head_is_never_release_before_regist
     active.tombstones.clear();
     assert!(active.violations().is_empty(), "{:?}", active.violations());
     // Each capture field alone, with the legal tombstone still in place: the
-    // release decision must see the capture row and refuse it, never fall back to
-    // "no capture, so this is a release-before-register root".
+    // release decision must see the capture row and report it as a mismatch,
+    // never fall back to "no capture, so this is a release-before-register root".
     let fields: [(&str, fn(&mut RootCapture)); 6] = [
         ("generation", |root| root.generation = 2),
         ("scope", |root| root.tenant_id = Uuid::from_u128(0x1700)),
@@ -573,17 +573,18 @@ fn a_present_capture_that_disagrees_with_its_head_is_never_release_before_regist
             sets.tombstones = tombstones;
             change(&mut sets.roots[0]);
             let lines = sets.violations();
-            let reason = format!("{state}:capture_mismatch");
-            let refused = lines.iter().any(|line| line.starts_with("root_capture_missing") && line.ends_with(&reason));
-            assert!(refused, "{field} on {state}: expected {reason} in {lines:?}");
-            // The capture is present (its key is unchanged), so the missing-capture
-            // paths must never fire for it.
-            for line in &lines {
-                assert!(!line.ends_with(":released"), "{field} on {state} read as release-before-register: {lines:?}");
-                if state == "released" {
-                    assert!(!line.ends_with(":unreleased"), "{field} on {state}: the tombstone is legal: {lines:?}");
-                }
-            }
+            // A present capture is a *mismatch*: its own verdict must be reported...
+            let mismatch = format!("root_capture_mismatch:{REPO}:{ROOT}:{state}");
+            assert!(lines.contains(&mismatch), "{field} on {state}: expected {mismatch} in {lines:?}");
+            // ...and it must never be reported as a missing capture, which is the
+            // path that would read it as a release-before-register root.
+            assert!(
+                !lines.iter().any(|line| line.starts_with("root_capture_missing")),
+                "{field} on {state}: a present capture is not missing: {lines:?}"
+            );
+            // The capture and the legal tombstone are the only facts that changed:
+            // the root is not accepted by accident either.
+            assert!(!lines.is_empty(), "{field} on {state} must be refused");
         }
     }
 }
