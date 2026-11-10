@@ -13,12 +13,7 @@ fn membership_only(declared: &[DeclaredPair]) -> SourceSets {
         .iter()
         .map(|pair| DeclaredPair {
             declared_by: Vec::new(),
-            declared_sets: pair
-                .declared_sets
-                .iter()
-                .filter(|(source, _, _)| source == "membership")
-                .cloned()
-                .collect(),
+            declared_sets: pair.declared_sets.iter().filter(|(source, _, _)| source == "membership").cloned().collect(),
             ..pair.clone()
         })
         .collect::<Vec<_>>();
