@@ -29,9 +29,14 @@ The `id` is a stable, ascending cursor:
   committed later with a lower `id`: a transaction that reserved an id before
   an earlier page read and committed after that page's cursor passed it is
   not returned. Restart at `after=0` to re-scan.
-- Once writes finish, walking from 0 (or from a saved floor) in ascending
-  `id` order returns the complete stable set. Persist the last observed `id`
-  as the floor for the next incremental read.
+- A complete `id` floor exists only while audit writers are quiescent. Walking
+  from 0 in ascending `id` order then returns the complete stable set, and the
+  last observed `id` may be persisted as the floor. During concurrent writes,
+  a full incremental read requires either re-scanning from `after=0` (or the
+  previous floor) across the whole concurrent window, or a floor saved before
+  that window began. The last `id` of a live page read is not a
+  no-loss watermark. A smaller `id` committed late can fall below it, so
+  advancing the floor past it would silently skip that row.
 - `actor`, `action`, `since` and `until` filters apply after the id lower
   bound; tightening a filter while keeping `after` keeps that numeric floor,
   so restart from 0 when the full filtered result is required.
