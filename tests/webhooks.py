@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -151,6 +152,47 @@ class WebhooksHarness(PullsHarness):
             c["context"]: c
             for c in self.document(f"{self.pr1_path}/checks", token=self.reader)["items"]
         }
+
+    def wait_for_queued_head(self, deadline: float = 10.0) -> dict:
+        """Poll until PR #1 is exactly feat2/base and its required checks are queued.
+
+        Dispatch synchronizes pull orchestration, but the background pull-ref
+        worker runs concurrently, so the feat2 checks may not exist yet while
+        the PR head is already feat2. A present but wrong row fails at once;
+        only absent contexts sleep, up to the caller's absolute deadline, and
+        a timeout is a clear failure.
+        """
+        stop = time.monotonic() + deadline
+        last = None
+        while True:
+            pr = self.document(self.pr1_path)
+            checks = self.document(f"{self.pr1_path}/checks")
+            last = (pr, checks)
+            head_ok = pr.get("head_oid") == self.feat2_oid and pr.get("base_oid") == self.base_oid
+            rows = checks.get("items")
+            assert checks.get("head_oid") == self.feat2_oid, last
+            assert isinstance(rows, list), last
+            contexts = [row.get("context") for row in rows]
+            assert len(contexts) == len(set(contexts)), last
+            by_ctx = {row["context"]: row for row in rows}
+            queued = {}
+            for context in ("ci/test", "ci/lint"):
+                if context not in by_ctx:
+                    continue
+                row = by_ctx[context]
+                if row.get("commit_oid") != self.feat2_oid or row.get("status") != "queued":
+                    raise AssertionError(f"{context} is not queued on feat2: {row}")
+                assert row.get("conclusion") is None, row
+                queued[context] = row
+            if head_ok and len(queued) == 2:
+                return checks
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"feat2 PR head {self.feat2_oid} never had queued ci/test and ci/lint "
+                    f"before the {deadline}s deadline: {last}"
+                )
+            time.sleep(min(0.1, remaining))
 
     def signed_callback(
         self,
@@ -512,14 +554,15 @@ class WebhooksHarness(PullsHarness):
         assert pr_now["head_oid"] == self.feat2_oid, pr_now
         assert pr_now["base_oid"] == self.base_oid, pr_now
         assert pr_now["version"] > self.pr1_version_before_push, pr_now
-        # The feat2 checks must still be queued, so the merge below is refused by
-        # the required-check policy and not by any other conflict.
-        for context in ("ci/test", "ci/lint"):
-            row = self.check_rows()[context]
-            assert row["status"] == "queued" and row["conclusion"] is None, row
+        # Dispatch synchronizes pull orchestration (in the handler, before it
+        # answers); only after that can the feat2 head's checks be asserted.
+        self.document(self.dispatchpath, 200, method="POST", body={})
+        # The feat2 checks must be queued on the final feat2 head, so the merge
+        # below is refused by the required-check policy, not any other conflict.
+        checks = self.wait_for_queued_head()
         self.pr1 = self.document(self.pr1_path)
         assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
-        self.document(self.dispatchpath, 200, method="POST", body={})
+        assert checks["head_oid"] == self.feat2_oid, checks
         # Orchestration runs concurrently with the background worker, so read the
         # version the merge will fence on from the row as it is now.
         self.pr1 = self.document(self.pr1_path)
