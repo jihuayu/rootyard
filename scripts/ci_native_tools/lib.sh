@@ -164,8 +164,16 @@ apt_update() {
   apt_run update --error-on=any
 }
 
+# Indexes and packages change system state, so they run through sudo.
 apt_install() {
   apt_run install -y --no-install-recommends "$@"
+}
+
+# Source packages are downloaded and extracted as the invoking runner user,
+# with the same bounded options and apt Release/signature verification, so the
+# extracted tree stays writable for the following unprivileged build.
+apt_source() {
+  apt-get "${APT_NETWORK_OPTIONS[@]}" source "$@"
 }
 
 source_versions() {
@@ -190,7 +198,7 @@ fetch_source() {
   mkdir -p -- "$work"
   [ -z "$(find "$work" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
     fail "source work directory is not empty: $work"
-  (cd "$work" && apt_run source "$package=$version")
+  (cd "$work" && apt_source "$package=$version")
 }
 
 find_source_directory() {
