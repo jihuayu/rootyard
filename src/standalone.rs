@@ -123,13 +123,11 @@ async fn serve(
             let _ = tokio::time::timeout(Duration::from_secs(5), &mut serving).await;
             Err(error.context("Blob service lost its lifecycle barrier"))
         }
-        Stop::Worker | Stop::Signal => {
-            match tokio::time::timeout(Duration::from_secs(120), &mut serving).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(_)) => Err(anyhow!("Blob service listener failed during drain")),
-                Err(_) => Err(anyhow!("Blob service drain deadline exceeded")),
-            }
-        }
+        Stop::Worker | Stop::Signal => match tokio::time::timeout(Duration::from_secs(120), &mut serving).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(anyhow!("Blob service listener failed during drain")),
+            Err(_) => Err(anyhow!("Blob service drain deadline exceeded")),
+        },
     };
     // Cancel and bounded-await the one GC task on every exit path, including a
     // refused configuration (where it has already returned).
