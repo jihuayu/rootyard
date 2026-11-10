@@ -48,10 +48,16 @@ labels. Database strings are never interpolated into exposition.
 | `rootyard_storage_maintenance_oldest_queued_age_seconds{backend,kind}` | gauge | Database-clock age since creation of the oldest queued job, retry delays included; empty set reports 0 |
 | `rootyard_storage_maintenance_repos{backend,state}` | gauge | Ready cluster-wide eligible repositories per fixed scheduled-scan state: `missing_scan`, `due_scan`, `stale_generation` |
 | `rootyard_storage_maintenance_oldest_overdue_scan_age_seconds{backend}` | gauge | Seconds past the scheduler scan due time for the oldest overdue repository; 0 when nothing is overdue |
+| `rootyard_lfs_remote_failures_total` | counter | Process-local count of typed LFS remote-store operation failures, including cold hydration leader failures, deferred repair failures, and remote publication failures. |
+| `rootyard_lfs_remote_repair_backlog` | gauge | Process-local count of admitted in-flight deferred repair tasks currently holding a bounded repair semaphore permit. |
 
 The `|` notation in this table enumerates distinct label values; it is not a
-literal label value. A healthy scrape always exports all 91 time series,
-including zero-valued backend/kind/state combinations. Delivery age includes leased entries (including
+literal label value. A healthy scrape always exports all 93 time series,
+including zero-valued backend/kind/state combinations.
+
+`rootyard_lfs_remote_failures_total` aggregates typed LFS remote operation failures only (cold hydration, deferred repair, and remote publication); it is process-local and resets on process restart, and warm verified local reads that do not consult the remote store do not increment it. `rootyard_lfs_remote_repair_backlog` counts admitted in-flight repair attempts that hold the existing bounded repair semaphore permit; it is not a durable queue, does not count repair requests that fail to acquire a permit, and drops to zero as tasks finish or fail. Neither series has labels.
+
+Delivery age includes leased entries (including
 expired leases) and delayed retries. Counts represent delivery rows, so one
 event assigned to two consumers contributes two outstanding deliveries.
 A resolved unknown operation remains an unknown historical fact; its explicit
