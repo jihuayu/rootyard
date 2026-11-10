@@ -284,7 +284,7 @@ mod tests {
         let tokens = tokens();
         let live = serving(9, id(4));
         let issued = tokens.issue_for_test(&live_realm(&live, id(4)).expect("realm"), 10).expect("issue");
-        let presented = header(&issued.token());
+        let presented = header(issued.token());
         // The lookup saw gate 9 while the capture locked the committed 10.
         assert_eq!(answer(Some(id(4)), Some(&tokens), &presented, &live, 10), Ok(()));
         // The same bound-10 token against a capture at 9 is the existing Behind.
@@ -303,7 +303,7 @@ mod tests {
         // not the rotated lookup's.
         let issued = tokens().issue_for_test(&live_realm(&live, id(4)).expect("realm"), 5).expect("issue");
         let foreign = live_realm(&live, id(8)).expect("realm");
-        let headers = header(&issued.token());
+        let headers = header(issued.token());
         let presented = presented_for_test(&headers).expect("presented");
         assert_eq!(
             tokens().verify(&presented, &foreign, 5).map_err(|error| error.for_repo()),
@@ -325,13 +325,9 @@ mod tests {
         let tokens = tokens();
         for captured in [None, Some(id(8)), Some(Uuid::nil())] {
             // Tokens disabled and no header: the anchor still gates materialization.
-            assert_eq!(answer(captured, None, &HeaderMap::new(), &live, 5), Err(rotated.clone()), "{captured:?}");
+            assert_eq!(answer(captured, None, &HeaderMap::new(), &live, 5), Err(rotated), "{captured:?}");
             // Tokens enabled and no header: the same refusal, not a token verdict.
-            assert_eq!(
-                answer(captured, Some(&tokens), &HeaderMap::new(), &live, 5),
-                Err(rotated.clone()),
-                "{captured:?}"
-            );
+            assert_eq!(answer(captured, Some(&tokens), &HeaderMap::new(), &live, 5), Err(rotated), "{captured:?}");
         }
         // A matching anchor is admitted token-free, with or without a key set.
         assert_eq!(answer(Some(id(4)), None, &HeaderMap::new(), &live, 5), Ok(()));
@@ -346,7 +342,7 @@ mod tests {
         let foreign = live_realm(&serving(5, id(8)), id(8)).expect("realm");
         let issued = tokens().issue_for_test(&foreign, 5).expect("issue");
         assert_eq!(
-            answer(Some(id(4)), Some(&tokens()), &header(&issued.token()), &rotated, 5),
+            answer(Some(id(4)), Some(&tokens()), &header(issued.token()), &rotated, 5),
             Err(GatewayError::Conflict(
                 "repository session belongs to another repository, history or authority generation; re-read the authoritative store and obtain a fresh session there"
             ))
@@ -363,7 +359,7 @@ mod tests {
         let live = serving(5, id(4));
         let rotated = GatewayError::Unavailable(AUTHORITY_CHANGED);
         for anchor in [None, Some(id(8)), Some(Uuid::nil())] {
-            assert_eq!(verify_capture_anchor(anchor, None, &live), Err(rotated.clone()), "{anchor:?}");
+            assert_eq!(verify_capture_anchor(anchor, None, &live), Err(rotated), "{anchor:?}");
         }
         assert_eq!(verify_capture_anchor(Some(id(4)), None, &live), Ok(id(4)));
     }
@@ -375,7 +371,7 @@ mod tests {
         let tokens = tokens();
         let live = serving(9, id(4));
         let issued = tokens.issue_for_test(&live_realm(&live, id(4)).expect("realm"), 5).expect("issue");
-        let presented = header(&issued.token());
+        let presented = header(issued.token());
         assert_eq!(answer(Some(id(4)), Some(&tokens), &presented, &live, 5), Ok(()));
         assert_eq!(
             answer(Some(id(8)), Some(&tokens), &presented, &live, 5),

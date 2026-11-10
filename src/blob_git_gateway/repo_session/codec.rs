@@ -89,6 +89,8 @@ impl SessionTokenCodec {
         Ok(Self { keys: slots, current, backend: backend_digest(backend)?, lifetime_seconds })
     }
 
+    /// Test-only: the configured lifetime, for descriptor/lifetime fixtures.
+    #[cfg(test)]
     pub(super) fn lifetime_seconds(&self) -> u32 {
         self.lifetime_seconds
     }
@@ -198,6 +200,7 @@ impl SessionTokenCodec {
         Ok(IssuedSession {
             token: format!("{PREFIX}{}.{}", URL_SAFE_NO_PAD.encode(body), URL_SAFE_NO_PAD.encode(mac.as_ref())),
             revision: served_revision,
+            #[cfg(test)]
             lifetime_seconds: self.lifetime_seconds,
             realm: *live,
         })

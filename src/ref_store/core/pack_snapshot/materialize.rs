@@ -530,6 +530,17 @@ impl MaterializedServingRead {
     pub(crate) fn proof(&self) -> &VerifiedReadViewProof {
         &self.proof
     }
+
+    /// Production admission of the sealed A5b binding (#174): `true` only when
+    /// the proof's sealed A5b [`RequestDigest`] equals the actual
+    /// [`MaterializedPackRead::proven_binding`] of **this** value's own view —
+    /// the native closure's read digest that T2 compared with its freshly
+    /// recomputed materialization digest. Never the narrower A5a read digest, a
+    /// bare `i64` revision or a caller-chosen digest. The session issuer calls
+    /// this before signing; a `false` answer must fail closed.
+    pub(crate) fn admit_sealed_binding(&self) -> bool {
+        self.proof.binding() == self.view.proven_binding()
+    }
 }
 
 /// Test-only: build the production view shape over a fixture snapshot and a

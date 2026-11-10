@@ -186,6 +186,22 @@ fn the_production_step_keeps_the_view_and_its_proof_on_the_same_a5b_binding() {
 }
 
 #[test]
+fn the_session_issuer_admits_the_sealed_a5b_binding_of_its_exact_view() {
+    // The sealed production value is admitted on its own native A5b digest.
+    let (capture, binding) = registered_capture();
+    let (view, snapshot, _) = view();
+    let sealed = serving_materialization(view, &capture).expect("seal its own capture");
+    assert_eq!(sealed.proof().binding(), binding);
+    assert!(sealed.admit_sealed_binding());
+    // The fixture distinguishes the digests: A5a is never the admitted binding,
+    // and the view's native digest is A5b (the same value the proof seals).
+    let a5a = probe_a5a(&snapshot);
+    assert_ne!(a5a, sealed.proof().binding());
+    assert_eq!(sealed.view().read_digest_hex(), binding.as_hex());
+    assert_ne!(sealed.view().read_digest_hex(), a5a.as_hex());
+}
+
+#[test]
 fn a_view_from_another_capture_never_seals() {
     let (capture, binding) = registered_capture();
     let mut other = parts();

@@ -563,7 +563,7 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
             );
             ensure!(!captured_incarnation.is_nil(), "the capture anchor must be a non-nil incarnation");
             ensure!(
-                captured_incarnation == current_incarnation(&fixture).await?,
+                captured_incarnation == current_incarnation(fixture).await?,
                 "the capture anchor must be the current cluster authority incarnation"
             );
             let materializer: PgPackSnapshotMaterializer = repo.materializer()?;
@@ -581,7 +581,7 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
             );
             let (proof_revision, proven, proof_binding) = sealed.contract_parts();
             let capture_pin = capture.pin_id().ok_or_else(|| anyhow!("the non-empty capture must carry a pin id"))?;
-            let expected_packs = protected_pack_count(&fixture, capture_pin).await?;
+            let expected_packs = protected_pack_count(fixture, capture_pin).await?;
             ensure!(expected_packs > 0, "the capture must register at least one pack");
             ensure!(view.pack_count() == expected_packs, "the sealed view must expose every captured pack");
             ensure!(view.verified_pairs() == 1, "the sealed view must cover one native-verified pair");
@@ -658,10 +658,10 @@ async fn a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materializ
             let pin_id = capture.pin_id().ok_or_else(|| anyhow!("the non-empty capture must carry a pin id"))?;
             // The restore rotation runs while Blob/native IO is in flight, i.e.
             // between the capture and T2.
-            let rotated = rotate_incarnation(&fixture).await?;
+            let rotated = rotate_incarnation(fixture).await?;
             ensure!(rotated != captured_incarnation, "the rotation must change the incarnation");
             ensure!(
-                current_incarnation(&fixture).await? == rotated,
+                current_incarnation(fixture).await? == rotated,
                 "the rotation must be committed before the sealed builder runs"
             );
             let materializer: PgPackSnapshotMaterializer = repo.materializer()?;

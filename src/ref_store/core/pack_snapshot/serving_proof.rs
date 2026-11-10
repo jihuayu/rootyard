@@ -208,6 +208,16 @@ impl VerifiedReadViewProof {
     pub(crate) fn cluster_incarnation(&self) -> Uuid {
         self.cluster_incarnation
     }
+
+    /// The sealed A5b binding (the materialization digest T2 recomputed and the
+    /// native closure reproduced). Crate/super-private and read-only: the only
+    /// production consumer is the session admission
+    /// [`super::MaterializedServingRead::admit_sealed_binding`], which compares
+    /// it with that exact view's own native read digest before a token is
+    /// signed. It never mints, retargets or replaces a proof.
+    pub(super) fn binding(&self) -> RequestDigest {
+        self.binding
+    }
 }
 
 impl MaterializedPackRead {

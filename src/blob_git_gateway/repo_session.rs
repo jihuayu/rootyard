@@ -76,10 +76,10 @@
 //!
 //! ## Refusals are not an invitation to drop the bound
 //!
-//! [`SessionTokenError::Expired`], [`SessionTokenError::Realm`] and
-//! [`SessionTokenError::Behind`] all mean "the lower bound cannot be proven at
-//! this authority": the client re-reads the authoritative gate (or resumes the
-//! queue and retries against the *same* bound) and obtains a fresh token from a
+//! [`SessionTokenError::Expired`] and [`SessionTokenError::Realm`], and the
+//! scored [`VersionComparison::Behind`] answer, all mean "the lower bound cannot
+//! be proven at this authority": the client re-reads the authoritative gate (or
+//! resumes the queue and retries against the *same* bound) and obtains a fresh token from a
 //! real serving capture or committed receipt. None of them is satisfied by an
 //! unbounded read, a replica or cache read, or a relaxed read-your-writes or
 //! monotonic guarantee. [`VersionComparison::Behind`] is the only scoring place
@@ -107,8 +107,11 @@
 //!   for the response being built, after the gateway copied and verified its
 //!   packs and after the body was fully encoded and the final authorization
 //!   re-read the capture's identical cluster authority incarnation (the proof
-//!   carries that same anchor). A checked empty read has no proof, so it sends
-//!   no session header and no token is minted.
+//!   carries that same anchor). Before signing, the sealed proof's A5b binding
+//!   is compared with that exact view's native read digest
+//!   ([`MaterializedServingRead::admit_sealed_binding`]); a mismatch is
+//!   [`SessionTokenError::Invalid`] and no token exists. A checked empty read
+//!   has no proof, so it sends no session header and no token is minted.
 //! * pushes — [`SessionTokens::issue_from_committed_write`] takes nothing but
 //!   the [`CommittedWriteSessionProof`] derived from a **durable committed**
 //!   `PackCommitTerminal` and two real writable serving lookups (the original,
@@ -318,14 +321,27 @@ impl CommittedWriteSessionProof {
 pub(crate) struct RepoSession {
     realm: SessionRealm,
     bound: i64,
+    /// The signed frame's lifetime. Only the authentication/expiry step inside
+    /// this module reads it; production carries no other state from it.
     lifetime_seconds: u32,
     issued_unix: i64,
 }
 
 impl RepoSession {
+    /// Test-only: proves a parsed frame states the bound it was signed with.
+    ///
+    /// This module's `cfg(test)` build compiles as part of both the library
+    /// test binary and the binary's own unit tests; in the latter only
+    /// `compare` (which reads the field directly) and the codec are reachable,
+    /// so the accessor is dead there alone, never in production.
+    #[cfg(test)]
+    #[allow(dead_code, reason = "cfg(test)-only frame accessor for the unit tests in `repo_session::tests`")]
     pub(crate) fn bound(&self) -> i64 {
         self.bound
     }
+
+    /// Test-only: proves a parsed frame keeps the exact signed realm.
+    #[cfg(test)]
     pub(crate) fn realm(&self) -> &SessionRealm {
         &self.realm
     }
@@ -365,12 +381,14 @@ pub(crate) fn compare(
 
 /// A token handed back with the actual served revision.
 ///
-/// Its fields are what [`IssuedSession::descriptor`] and
-/// [`IssuedSession::apply`] are built from; a verifier trusts only the signed
-/// frame it re-parses.
+/// [`IssuedSession::apply`] attaches it to the response from its private
+/// fields; a verifier trusts only the signed frame it re-parses.
 pub(crate) struct IssuedSession {
     token: String,
     revision: i64,
+    /// The lifetime signed into the frame. Production derives it from the
+    /// signed frame itself; only the test-only descriptor reports it.
+    #[cfg(test)]
     lifetime_seconds: u32,
     realm: SessionRealm,
 }
@@ -382,6 +400,8 @@ impl IssuedSession {
         &self.token
     }
 
+    /// Test-only: proves an issued session names the exact served revision.
+    #[cfg(test)]
     pub(crate) fn revision(&self) -> i64 {
         self.revision
     }
@@ -413,9 +433,11 @@ impl fmt::Debug for IssuedSession {
     }
 }
 
-/// Non-secret session metadata, the body of the issuance reply. It omits the
-/// token, both incarnations and the tenant id, and says nothing about any
-/// other repository.
+/// Non-secret session metadata for a JSON body. It omits the token, both
+/// incarnations and the tenant id, and says nothing about any other
+/// repository. Test-only: the gateway sends the token and served revision as
+/// headers ([`IssuedSession::apply`]) and builds no JSON body from it.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct SessionDescriptor {
     pub(crate) revision: i64,
@@ -423,10 +445,11 @@ pub(crate) struct SessionDescriptor {
     pub(crate) repository_id: Uuid,
 }
 
+#[cfg(test)]
 impl IssuedSession {
-    /// Non-secret facts for a JSON body. The token itself is never serialized.
-    /// Every issuance reply is built from this pair, so a token is never sent
-    /// without the revision and lifetime it is bound to.
+    /// Test-only: non-secret facts for a JSON body. The token itself is never
+    /// serialized; the descriptor states exactly the revision and lifetime the
+    /// token was issued with.
     pub(crate) fn descriptor(&self) -> SessionDescriptor {
         SessionDescriptor {
             revision: self.revision,
@@ -449,11 +472,15 @@ pub(crate) enum SessionTokenError {
     /// repository, object format, history, authority/group epoch or cluster
     /// authority incarnation).
     Realm,
-    /// Authentic, same realm, but the live gate is behind the bound.
+    /// Test-only stand-in for the scored [`VersionComparison::Behind`] answer.
+    /// Production never constructs it: `compare` is the only scoring place and
+    /// `read_session` maps that comparison to the same refusal.
+    #[cfg(test)]
     Behind,
 }
 
-/// The refusal text of [`SessionTokenError::Behind`], naming the exact lower
+/// The refusal text of the scored [`VersionComparison::Behind`] answer (and of
+/// the test-only [`SessionTokenError::Behind`] mapping), naming the exact lower
 /// bound the client must keep. Kept as one constant so the message and every
 /// client-facing promise about it can be tested verbatim.
 pub(crate) const BEHIND_MESSAGE: &str = "repository session lower bound is not yet served by the authoritative store; wait for the authoritative store to reach that bound and retry against the same bound, keeping read-your-writes and monotonic reads (do not fall back to a stale, replica or cache read)";
@@ -471,6 +498,7 @@ impl SessionTokenError {
             Self::Realm => GatewayError::Conflict(
                 "repository session belongs to another repository, history or authority generation; re-read the authoritative store and obtain a fresh session there",
             ),
+            #[cfg(test)]
             Self::Behind => GatewayError::Unavailable(BEHIND_MESSAGE),
         }
     }
@@ -494,6 +522,9 @@ impl SessionTokens {
         Self { codec: Arc::new(codec) }
     }
 
+    /// Test-only: the codec's configured bounded lifetime, as the descriptor
+    /// test reports it.
+    #[cfg(test)]
     pub(crate) fn lifetime_seconds(&self) -> u32 {
         self.codec.lifetime_seconds()
     }
@@ -503,18 +534,24 @@ impl SessionTokens {
     ///
     /// The realm, the cluster authority incarnation and the version bound are
     /// all derived from the proof, so a caller cannot supply, raise or rebind
-    /// any of them. The frame is signed with the current key and the trusted
-    /// wall clock by the existing codec. A proof whose realm is not itself
-    /// valid (nil id, nil incarnation, epoch outside the bound) is refused and
-    /// no token exists. The caller must already have completed the final
-    /// authorization and the incarnation fence (`browse::finalize`: the fresh
-    /// lookup's incarnation equals the captured anchor, and the proof's
-    /// incarnation equals that anchor, before this call); this method performs
-    /// no IO.
+    /// any of them. Before anything is signed, the sealed proof's A5b binding
+    /// is admitted only when it equals this exact view's own native read digest
+    /// ([`MaterializedServingRead::admit_sealed_binding`]); a separated proof or
+    /// view is [`SessionTokenError::Invalid`] and no token exists. The frame is
+    /// then signed with the current key and the trusted wall clock by the
+    /// existing codec; a proof whose realm is not itself valid (nil id, nil
+    /// incarnation, epoch outside the bound) is likewise refused. The caller
+    /// must already have completed the final authorization and the incarnation
+    /// fence (`browse::finalize`: the fresh lookup's incarnation equals the
+    /// captured anchor, and the proof's incarnation equals that anchor, before
+    /// this call); this method performs no IO.
     pub(crate) fn issue_from_materialized_read(
         &self,
         read: &MaterializedServingRead,
     ) -> Result<IssuedSession, SessionTokenError> {
+        if !read.admit_sealed_binding() {
+            return Err(SessionTokenError::Invalid);
+        }
         let proof = read.proof();
         let cluster_incarnation = proof.cluster_incarnation();
         let realm = SessionRealm::from_proof(proof.scope(), cluster_incarnation)?;
