@@ -523,7 +523,10 @@ mod tests {
         // A complete, non-regressing pair is admitted for the script to adopt,
         // and the same complete pair is refused against its newer presented bound.
         assert_eq!(status(answer(200, Some("rs1.next"), Some("3")), Some(presented(&presented_token))).unwrap(), 200);
-        assert_eq!(status(answer(200, Some("rs1.next"), Some("3")), Some(presented(&newer_bound))).unwrap(), 503);
+        assert_eq!(
+            status(answer(200, Some("rs1.next"), Some("3")), Some(presented(&newer_bound))).err(),
+            Some(bound_refusal())
+        );
     }
 
     #[test]
