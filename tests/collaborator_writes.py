@@ -28,8 +28,12 @@ class writes:
             ref = "refs/heads/tx-" + user
             body = {"updates": [{"ref_name": ref, "old_oid": ZERO, "new_oid": oid}],
                     "atomic": True, "storage_generation": 1}
+            # The documented contract (docs/design/02-git-storage.md) requires
+            # Idempotency-Key on ref transactions; the first write carries it.
+            key = {"Idempotency-Key": "tx-" + user + "-key"}
             status, raw, _ = self.http("/api/repos/alice/demo/ref-transactions",
-                                       token=self.users[user], method="POST", body=body)
+                                       token=self.users[user], method="POST", body=body,
+                                       extra_headers=key)
             if role in ("read", "triage"):
                 assert status == 403, (user, role, status, raw[:200])
                 assert self.ref(ref) is None and not self.events_for(ref)
@@ -45,12 +49,10 @@ class writes:
                 self.users[user]["user_id"], user, self.users[user]["token_id"])
             events = self.events_for(ref, operation["id"])
             assert [(e["old_oid"], e["new_oid"]) for e in events] == [(ZERO, oid)], events
-            key = {"Idempotency-Key": "tx-" + user + "-key"}
-            first = self.expect("/api/repos/alice/demo/ref-transactions", 200, token=self.users[user],
-                                method="POST", body=body, extra_headers=key)
-            second = self.expect("/api/repos/alice/demo/ref-transactions", 200, token=self.users[user],
-                                 method="POST", body=body, extra_headers=key)
-            assert first == second == raw and len(self.events_for(ref)) == 1
+            replay = self.expect("/api/repos/alice/demo/ref-transactions", 200,
+                                 token=self.users[user], method="POST", body=body,
+                                 extra_headers=key)
+            assert replay == raw and len(self.events_for(ref)) == 1, (replay[:300], raw[:300])
             changed = {"updates": [{"ref_name": "refs/heads/other-" + user, "old_oid": ZERO,
                                     "new_oid": oid}], "atomic": True}
             conflict = self.http("/api/repos/alice/demo/ref-transactions", token=self.users[user],
