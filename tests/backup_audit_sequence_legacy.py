@@ -709,6 +709,11 @@ class AuditSequenceLegacyHarness(BackupHarness):
         self.git("add", "after-restore.txt", cwd=branch)
         self.git("commit", "-m", "push after restore", cwd=branch)
         oid = self.git("rev-parse", "HEAD", cwd=branch).stdout.decode().strip()
+        # Both baselines precede the push: the audit consumer may drain the
+        # push's events before the post-clone reads, and the log count here
+        # proves directly that the push itself wrote no repository_audit_log.
+        logs_before = int(self.query(self.target_db, "SELECT count(*) FROM repository_audit_log"))
+        events_before = int(self.query(self.target_db, "SELECT count(*) FROM audit_events"))
         self.git("push", "origin", "HEAD:refs/heads/main", cwd=branch, token=self.alice)
         outcomes = self.wait_settled(self.target_db, "restored push")
         assert self.git("ls-remote", self.remote, "main", token=self.alice).stdout.decode().strip() \
@@ -717,8 +722,6 @@ class AuditSequenceLegacyHarness(BackupHarness):
         self.git("clone", self.remote, str(checkout), token=self.reader)
         self.git("fsck", "--full", "--strict", cwd=checkout)
         assert (checkout / "after-restore.txt").read_text() == "pushed into the restored service\n"
-        logs_before = int(self.query(self.target_db, "SELECT count(*) FROM repository_audit_log"))
-        events_before = int(self.query(self.target_db, "SELECT count(*) FROM audit_events"))
         self.cli("worker-once")
         logs_after = int(self.query(self.target_db, "SELECT count(*) FROM repository_audit_log"))
         events_after = int(self.query(self.target_db, "SELECT count(*) FROM audit_events"))

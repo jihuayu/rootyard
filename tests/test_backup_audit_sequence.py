@@ -345,6 +345,20 @@ class DrillWiringTest(unittest.TestCase):
         self.assertIn("audit_events", push)
         self.assertIn("repository_audit_log", push)
         self.assertIn('"the restored Git push wrote repository_audit_log"', push)
+        # Both baselines precede the push itself: the background consumer may
+        # legally drain the push's events before any post-clone read.
+        self.assertIn("events_after > events_before", push)
+        self.assertNotIn("delta", push)
+        # Order: log/event baselines, push, worker-once, then log/event reads.
+        steps = ['logs_before = int(self.query(self.target_db, "SELECT count(*) '
+                 'FROM repository_audit_log"))',
+                 'events_before = int(self.query(self.target_db, "SELECT count(*) FROM audit_events"))',
+                 'self.git("push", "origin", "HEAD:refs/heads/main", cwd=branch, token=self.alice)',
+                 'self.cli("worker-once")',
+                 'logs_after = int(self.query(self.target_db, "SELECT count(*) FROM repository_audit_log"))',
+                 'events_after = int(self.query(self.target_db, "SELECT count(*) FROM audit_events"))']
+        positions = [push.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions), push)
         # Only real API audit writes are allowed to create audit-log rows.
         code = sql_code(self.source)
         self.assertIsNone(re.search(r"INSERT\s+INTO\s+repository_audit_log", code, re.I))
