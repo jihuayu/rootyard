@@ -15,9 +15,35 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use std::sync::Arc;
-use tokio::sync::OwnedSemaphorePermit;
+use std::{future::Future, sync::Arc};
+use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 use uuid::Uuid;
+
+/// Run the post-authorization browse Git phase under one absolute deadline.
+///
+/// `read_leases::shared` already takes the same deadline, but the local
+/// snapshot lock and [`Lease::guard`](crate::storage::read_leases::Lease::guard)
+/// carry no deadline of their own. A commit page or comparison runs several
+/// Git steps in series and every Git step restarts its own per-command timeout,
+/// so without this bound the whole operation could run for a multiple of
+/// `git_timeout`. On expiry `timeout_at` cancels the in-flight operation and
+/// Git future first; dropping that future runs `Process::Drop`, which SIGKILLs
+/// the Git process group and waits for it to become quiescent. The snapshot
+/// guard and lease are released only after that wait, and the outer handler's
+/// Git slot permit is released last. Because an unconfirmed quiescence wait can
+/// outlast the deadline, expiry bounds the Git work itself but does not promise
+/// a hard HTTP response-latency bound.
+async fn within_deadline<F, Fut>(timeout: std::time::Duration, operation: F) -> Result<Response, Error>
+where
+    F: FnOnce(Instant) -> Fut,
+    Fut: Future<Output = Result<Response, Error>>,
+{
+    let deadline = Instant::now() + timeout;
+    match tokio::time::timeout_at(deadline, operation(deadline)).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::timeout()),
+    }
+}
 
 pub(crate) fn json_ok(value: impl serde::Serialize) -> Response {
     (
@@ -98,15 +124,23 @@ pub async fn list_commits(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
-        tokio::time::Instant::now() + state.config.git_timeout).await?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
-    let payload = _lease.guard(git_read::list_commits(&state, repo_id, spec, after, limit)).await??;
+    // Every Git step below restarts its own timeout; only one absolute deadline
+    // bounds lease acquisition, the local snapshot wait, the whole commit page
+    // and the final lease/authorization rechecks. Cleanup after expiry can
+    // outlast that deadline.
+    within_deadline(state.config.git_timeout, |deadline| async move {
+        let lease = crate::storage::read_leases::shared(&state.pool, repo_id, deadline).await?;
+        let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+        auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
+        let payload = lease
+            .guard(git_read::list_commits(&state, repo_id, spec, after, limit))
+            .await??;
 
-    _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
-    Ok(json_ok(payload))
+        lease.ensure_active()?;
+        auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
+        Ok(json_ok(payload))
+    })
+    .await
 }
 
 pub async fn get_commit(
@@ -288,16 +322,28 @@ pub async fn compare_commits(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
-        tokio::time::Instant::now() + state.config.git_timeout).await?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
-    let comparison = _lease.guard(git_read::compare_commits(
-        &state, repo_id, &query.base, &query.head)).await??;
+    // Resolving both revisions, the merge base, the counts, the commit batch
+    // and the diff are separate Git steps with a fresh per-command timeout each;
+    // one absolute deadline bounds the whole comparison up to cancellation.
+    // Cleanup after expiry can outlast that deadline.
+    within_deadline(state.config.git_timeout, |deadline| async move {
+        let lease = crate::storage::read_leases::shared(&state.pool, repo_id, deadline).await?;
+        let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+        auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
+        let comparison = lease
+            .guard(git_read::compare_commits(
+                &state,
+                repo_id,
+                &query.base,
+                &query.head,
+            ))
+            .await??;
 
-    _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
-    Ok(json_ok(comparison))
+        lease.ensure_active()?;
+        auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
+        Ok(json_ok(comparison))
+    })
+    .await
 }
 
 pub async fn get_storage_route(
