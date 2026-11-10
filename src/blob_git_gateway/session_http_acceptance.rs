@@ -60,8 +60,6 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use anyhow::{Context, Result, anyhow, ensure};
-use serde_json::{Value, json};
 use super::{
     BlobGitConfig, BlobGitState,
     repo_session::{SessionTokenCodec, SessionTokens},
@@ -73,6 +71,8 @@ use crate::{
         serving::lookup,
     },
 };
+use anyhow::{Context, Result, anyhow, ensure};
+use serde_json::{Value, json};
 
 /// Request header carrying the session token.
 const SESSION_HEADER: &str = "x-rootyard-session";
