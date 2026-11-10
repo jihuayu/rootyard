@@ -24,6 +24,21 @@
 //! repository tenant: only the realm fields (`tenant_id`,
 //! `history_incarnation`, epochs and object format) bind a declared set to the
 //! registration. A producer owner distinct from the repository tenant is valid.
+//!
+//! The two identities inside one A4 registration are never conflated (see
+//! `declared_owner_scope`: the publication binding and each artifact row's
+//! request/hold/receipt scope; the typed consume ACK body is judged by
+//! [`super::ledger::ack_scope_differs`]):
+//!
+//! * the **producer** (`owner_id` of the publication) is the A3 artifact-hold
+//!   requester: it equals the acquire request's owner, both durable holds'
+//!   owners and both consume receipts' owners (typed ACK body included). It may
+//!   differ from the repository tenant, and is never required to equal a root
+//!   head/capture/tombstone requester;
+//! * the **tenant** (`tenant_id` of the publication, locator, holds, storage
+//!   tenants and receipts) is the actual repository tenant (`repositories`
+//!   owner, the core gate tenant).
+use self::declared_owner_scope::{declared_binding, declared_violations};
 use self::root_lifetime::check_heads;
 use super::ledger_canonical::{canonical, declared_agrees, retained_pair};
 use crate::ref_store::core::pack_commit::{MembershipDigest, PackMembershipEntry, packs_digest, refs_digest};
@@ -46,13 +61,23 @@ pub(super) struct DeclaredPair {
     pub declared_sets: Vec<(String, String, i64)>,
     /// Registration realm; `None` only when no publication row exists.
     pub publication: Option<PublishedPack>,
+    /// The actual repository tenant and core gate tenant.
+    pub actual: ActualRepository,
     pub artifacts: Vec<PairArtifact>,
+    /// Every owner/tenant/repository/pack scope violation of the rows above,
+    /// in a stable order; empty when they all agree with the publication.
+    pub scope: Vec<String>,
 }
 
 /// Publication realm, live issuer ids and stored artifact-set digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct PublishedPack {
+    pub repository_id: Uuid,
+    pub pack_id: Uuid,
+    /// The repository tenant (`repositories.owner_id` / core gate tenant).
     pub tenant_id: Uuid,
+    /// The pack producer, i.e. the A3 artifact-hold requester. Not the tenant.
+    pub owner_id: Uuid,
     pub history_incarnation: Uuid,
     pub authority_epoch: i64,
     pub group_epoch: i64,
@@ -61,6 +86,16 @@ pub(super) struct PublishedPack {
     pub acquire_request_id: Uuid,
     pub consume_request_id: Uuid,
     pub digest: String,
+}
+
+/// What the actual repository and the core gate say about one declared
+/// registration: the repository tenant must be exactly the publication tenant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ActualRepository {
+    /// `repositories.owner_id` (`None` only when the repository row is absent).
+    pub owner_id: Option<Uuid>,
+    /// `ref_store_core_gates.tenant_id` (`None` only when the gate row is absent).
+    pub gate_tenant_id: Option<Uuid>,
 }
 
 /// One `ref_store_core_pack_artifacts` row joined with its durable hold,
@@ -76,16 +111,46 @@ pub(super) struct PairArtifact {
     pub backend_identity: String,
     pub sha256: String,
     pub length: u64,
-    /// Locator tenant of the artifact row.
+    /// Locator tenant of the artifact row: the actual repository tenant.
     pub tenant_id: Uuid,
     pub authority_id: Uuid,
     pub generation: i64,
     pub attempt_id: Uuid,
     pub namespace: String,
+    /// The artifact row's own repository and pack. Neither is part of the
+    /// locator digest, so each is checked directly against the declared key.
+    pub repository_id: Uuid,
+    pub pack_id: Uuid,
+    /// The acquire request the hold was minted for: its repository, tenant and
+    /// owner (`None` only when the `artifact_hold_requests` row is absent).
+    pub request: Option<RequestRow>,
     /// `None` when the durable `artifact_holds` row is absent.
     pub hold: Option<HoldRow>,
     pub receipt: bool,
+    /// The consume receipt's own repository, tenant and owner (`None` only when
+    /// the `artifact_hold_consume_receipts` row is absent).
+    pub receipt_scope: Option<ReceiptRow>,
     pub issuer_operation: bool,
+    /// The durable hold's own slot, read through its LEFT JOIN (`None` only when
+    /// the hold row is absent).
+    pub hold_slot: Option<i32>,
+}
+
+/// The issuing scope of one `artifact_hold_requests` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RequestRow {
+    pub repository_id: Uuid,
+    pub tenant_id: Uuid,
+    /// The A3 owner: the pack producer, never the repository tenant.
+    pub owner_id: Uuid,
+}
+
+/// The scope of one `artifact_hold_consume_receipts` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReceiptRow {
+    pub repository_id: Uuid,
+    pub tenant_id: Uuid,
+    pub owner_id: Uuid,
 }
 
 /// The physical coordinates of one durable `artifact_holds` row.
@@ -96,6 +161,8 @@ pub(super) struct HoldRow {
     pub repository_id: Uuid,
     /// The hold's own `tenant_id` column, never copied from the artifact row.
     pub tenant_id: Uuid,
+    /// The hold's own `owner_id` column: the A3 owner of the hold.
+    pub owner_id: Uuid,
     pub provider: String,
     pub backend_identity: String,
     pub storage_tenant_id: Uuid,
@@ -336,7 +403,7 @@ pub(super) fn undeclared(declared: &[DeclaredPair], snapshots: &[SnapshotSet], r
 }
 
 fn tag(pair: &DeclaredPair) -> String {
-    format!("{}:{}:{}", pair.repository_id, pair.pack_id, pair.registration_id)
+    ledger_sets::tag_of(pair.repository_id, pair.pack_id, pair.registration_id)
 }
 
 /// Legal slot/role pair: exactly slot 0 for the `.pack` and slot 1 for the `.idx`.
@@ -363,6 +430,14 @@ pub(super) fn check_declared(declared: &[DeclaredPair]) -> Vec<String> {
         if canonical(pair).is_err() {
             lines.push(format!("canonical_pair_mismatch:{key}"));
         }
+        // The publication tenant is the actual repository tenant / gate tenant,
+        // and its owner is the A3 pack producer. Neither identity is the other.
+        if !declared_binding(pair) {
+            lines.push(format!("publication_binding_mismatch:{key}"));
+        }
+        // Pre-computed by the decoder, so the exact row that is selected for
+        // the archive can be judged without the SQL decoder in the unit tests.
+        lines.extend(pair.scope.iter().cloned());
         match pair.artifacts.len() {
             0 => lines.push(format!("missing_artifacts:{key}")),
             1 => lines.push(format!("incomplete_pair:{key}")),
@@ -568,6 +643,12 @@ pub(super) fn require_archive_registrations<A: DeclaredArtifact>(archived: &[A],
     Ok(())
 }
 
+mod declared_owner_scope;
 #[cfg(test)]
 mod ledger_sets_tests;
 mod root_lifetime;
+
+// Owner/tenant/repository/pack scopes of one registration: see
+// `owner_scope_tests`. A sibling file, hence the explicit `#[path]`.
+#[cfg(test)]
+mod owner_scope_tests;

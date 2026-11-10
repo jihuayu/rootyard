@@ -101,6 +101,39 @@ impl ledger_sets::DeclaredArtifact for Artifact {
     }
 }
 
+/// Whether the typed consume ACK body names another A3 owner than the pack
+/// producer recorded in its own publication. An owner distinct from the
+/// repository tenant is legal; an owner distinct from the producer is not.
+pub(super) fn ack_owner_differs(ack: &ConsumeAck, producer: Uuid) -> bool {
+    ack.owner_id != producer
+}
+
+/// Whether the typed consume ACK body names another repository than its own
+/// publication.
+pub(super) fn ack_repository_differs(ack: &ConsumeAck, repository_id: Uuid) -> bool {
+    ack.repository_id != repository_id
+}
+
+/// Whether the typed consume ACK body names another tenant than its own
+/// publication (i.e. than the actual repository tenant).
+pub(super) fn ack_tenant_differs(ack: &ConsumeAck, repository_tenant: Uuid) -> bool {
+    ack.tenant_id != repository_tenant
+}
+
+/// The typed consume ACK body agrees with its own publication: it names the
+/// pack producer as its owner (never the repository tenant) and the actual
+/// repository and tenant.
+pub(super) fn ack_scope_differs(
+    ack: &ConsumeAck,
+    producer: Uuid,
+    repository_id: Uuid,
+    repository_tenant: Uuid,
+) -> bool {
+    ack_owner_differs(ack, producer)
+        || ack_repository_differs(ack, repository_id)
+        || ack_tenant_differs(ack, repository_tenant)
+}
+
 fn digest_lines(lines: &[String]) -> String {
     let mut hasher = Sha256::new();
     for line in lines {
@@ -288,10 +321,21 @@ fn length_of(row: &tokio_postgres::Row, column: usize) -> Result<u64> {
     u64::try_from(row.get::<_, i64>(column)).context("negative artifact length")
 }
 
-/// Every `pg_refstore` artifact row exactly as stored, with its publication hold,
-/// consume receipt and publisher provenance. The rows are raw: `inventory`
-/// validates them through one decode path and the source validator reports a
-/// missing hold or receipt through its own SQL instead of shrinking the list.
+/// Every `pg_refstore` artifact row exactly as stored, with its publication
+/// scope, consume receipt and publisher provenance. The rows are raw:
+/// `inventory` validates them through one decode path (the typed ACK and owner
+/// scopes are refused there, before the declared selection can drop a row) and
+/// the source validator reports a missing hold or receipt through its own SQL
+/// instead of shrinking the list.
+///
+/// Positions: 0..11 and 25.. the artifact/hold/receipt columns of the archive
+/// row; 12..13 publication realm; 14..20 hold coordinates; 21..24 the hold's
+/// own provider/backend/sha256/length; 26 `consumed_at_unix_micros` (the body's
+/// exact clock, compared after decoding); 27 the publication repository tenant;
+/// 28 the publication owner (pack producer / A3 requester); 29..30 the
+/// publication's own repository and pack; 31..34 the acquire request scope;
+/// 35 the hold owner; 36..38 the consume receipt's own scope; 39 the exact
+/// receipt identified by the hold and consume id.
 async fn inventory_rows(client: &(impl GenericClient + Sync), deadline: tokio::time::Instant) -> Result<Vec<Artifact>> {
     let rows = read(
         client,
@@ -299,10 +343,17 @@ async fn inventory_rows(client: &(impl GenericClient + Sync), deadline: tokio::t
                     a.consume_request_id,a.provider,a.backend_identity,a.sha256,a.content_length,
                     p.history_incarnation,p.authority_epoch,h.authority_id,h.authority_generation,h.attempt_id,
                     h.namespace,h.tenant_id,h.storage_tenant_id,h.provider,h.backend_identity,h.sha256,
-                    h.content_length,h.repository_id,c.body
+                    h.content_length,h.repository_id,c.body,c.consumed_at_unix_micros,
+                    p.tenant_id,p.owner_id,p.repository_id,p.pack_id,
+                    q.request_id,q.repository_id,q.tenant_id,q.owner_id,
+                    h.owner_id,
+                    c.repository_id,c.tenant_id,c.owner_id,
+                    (SELECT count(*) FROM public.artifact_hold_consume_receipts x
+                       WHERE x.consume_request_id=a.consume_request_id AND x.hold_id=a.hold_id)
                FROM public.ref_store_core_pack_artifacts a
                JOIN public.ref_store_core_pack_publications p ON p.registration_id=a.registration_id
                JOIN public.artifact_holds h ON h.hold_id=a.hold_id AND h.request_id=a.acquire_request_id
+               JOIN public.artifact_hold_requests q ON q.request_id=h.request_id
                JOIN public.artifact_hold_consume_receipts c ON c.hold_id=a.hold_id
                  AND c.consume_request_id=a.consume_request_id AND c.request_id=a.acquire_request_id
               WHERE EXISTS (SELECT 1 FROM public.repositories r
@@ -362,6 +413,7 @@ async fn inventory_rows(client: &(impl GenericClient + Sync), deadline: tokio::t
                 && ack.authority_epoch == row.get::<_, i64>(13),
             "consume receipt scope differs from the artifact ledger"
         );
+        ensure!(row.get::<_, i64>(26) == ack.consumed_at_unix_micros, "consume receipt clock differs from its body");
         ensure!(
             row.get::<_, Uuid>(19) == artifact.tenant_id
                 && row.get::<_, Uuid>(24) == artifact.repository_id
@@ -371,6 +423,7 @@ async fn inventory_rows(client: &(impl GenericClient + Sync), deadline: tokio::t
                 && row.get::<_, i64>(23) == length,
             "artifact row and its durable hold disagree on physical identity"
         );
+        require_publisher_scope(&row, &ack, &artifact)?;
         ensure!(
             (artifact.slot == 0) == (artifact.role == "pack") && (artifact.slot == 1) == (artifact.role == "idx"),
             "artifact role and slot disagree"
@@ -386,4 +439,36 @@ async fn inventory_rows(client: &(impl GenericClient + Sync), deadline: tokio::t
         "Blob closure rows are not unique and sorted"
     );
     Ok(artifacts)
+}
+
+/// One artifact row's publisher scope: the publication tenant is the actual
+/// repository tenant (`repositories` owner and core gate tenant), the
+/// publication owner is the A3 pack producer of the acquire request, both
+/// durable holds, both consume receipts and the typed ACK body, and the
+/// artifact row's repository/pack are the publication's own key. Every one of
+/// these is refused here, on the single joined row, before the declared
+/// selection can drop it.
+fn require_publisher_scope(row: &tokio_postgres::Row, ack: &ConsumeAck, artifact: &Artifact) -> Result<()> {
+    let tenant: Uuid = row.get(27);
+    let producer: Uuid = row.get(28);
+    let published = |repository_id: Uuid, tenant_id: Uuid, owner_id: Uuid| {
+        repository_id == artifact.repository_id
+            && repository_id == row.get::<_, Uuid>(29)
+            && tenant_id == tenant
+            && owner_id == producer
+    };
+    ensure!(
+        row.get::<_, Uuid>(30) == artifact.pack_id
+            && tenant == artifact.tenant_id
+            && published(row.get(31), row.get(33), row.get(34))
+            && published(artifact.repository_id, row.get(19), row.get(35))
+            && published(row.get(36), row.get(37), row.get(38))
+            && row.get::<_, i64>(39) == 1,
+        "artifact scope differs from its publication repository tenant and producer"
+    );
+    ensure!(
+        !ack_scope_differs(ack, producer, artifact.repository_id, tenant),
+        "consume receipt names another producer, repository or tenant than its publication"
+    );
+    Ok(())
 }

@@ -6,6 +6,7 @@
 //! its own and never refused merely because the artifact-set digest differs. A
 //! producer owner distinct from the repository tenant and a released root are
 //! valid.
+use super::declared_owner_scope::declared_violations;
 use super::*;
 use crate::backup::ledger::captured_refs;
 use crate::backup::ledger_canonical::canonical;
@@ -60,11 +61,15 @@ fn pair_artifact(role: &str, slot: i32, hold: Uuid, attempt: Uuid, digest: u8, l
         generation: 3,
         attempt_id: attempt,
         namespace: "core-pack".into(),
+        repository_id: REPO,
+        pack_id: PACK,
+        request: Some(RequestRow { repository_id: REPO, tenant_id: TENANT, owner_id: PRODUCER }),
         hold: Some(HoldRow {
             request_id: ACQUIRE,
             slot,
             repository_id: REPO,
             tenant_id: TENANT,
+            owner_id: PRODUCER,
             provider: "s3".into(),
             backend_identity: sha(0x11),
             storage_tenant_id: TENANT,
@@ -76,7 +81,9 @@ fn pair_artifact(role: &str, slot: i32, hold: Uuid, attempt: Uuid, digest: u8, l
             length,
         }),
         receipt: true,
+        receipt_scope: Some(ReceiptRow { repository_id: REPO, tenant_id: TENANT, owner_id: PRODUCER }),
         issuer_operation: true,
+        hold_slot: Some(slot),
     }
 }
 
@@ -143,6 +150,13 @@ fn raw_digest(artifacts: &[PairArtifact]) -> String {
     RequestDigest::of("core-pack-artifact-set-v2", &parts).as_hex()
 }
 
+/// The decoded row shape of `pair`/`corrupt_pair`: the scope lines the SQL
+/// decoder stores on the pair are recomputed by the same pure checker.
+fn scoped(mut declared: DeclaredPair) -> DeclaredPair {
+    declared.scope = declared_violations(&declared);
+    declared
+}
+
 /// `pair` with a digest that covers the raw rows exactly as stored.
 fn corrupt_pair(artifacts: Vec<PairArtifact>) -> DeclaredPair {
     let digest = raw_digest(&artifacts);
@@ -151,12 +165,12 @@ fn corrupt_pair(artifacts: Vec<PairArtifact>) -> DeclaredPair {
         vec![("membership".into(), digest.clone(), JOINED), ("root_packs".into(), digest.clone(), JOINED)];
     declared.publication.as_mut().unwrap().digest = digest;
     declared.artifacts = artifacts;
-    declared
+    scoped(declared)
 }
 
 fn pair(artifacts: Vec<PairArtifact>) -> DeclaredPair {
     let digest = digest_of(&artifacts);
-    DeclaredPair {
+    scoped(DeclaredPair {
         repository_id: REPO,
         pack_id: PACK,
         registration_id: REGISTRATION,
@@ -165,8 +179,12 @@ fn pair(artifacts: Vec<PairArtifact>) -> DeclaredPair {
             ("membership".into(), digest.clone(), JOINED),
             ("root_packs".into(), digest.clone(), JOINED),
         ],
+        actual: ActualRepository { owner_id: Some(TENANT), gate_tenant_id: Some(TENANT) },
         publication: Some(PublishedPack {
+            repository_id: REPO,
+            pack_id: PACK,
             tenant_id: TENANT,
+            owner_id: PRODUCER,
             history_incarnation: INCARNATION,
             authority_epoch: 1,
             group_epoch: 1,
@@ -177,7 +195,23 @@ fn pair(artifacts: Vec<PairArtifact>) -> DeclaredPair {
             digest,
         }),
         artifacts,
+        scope: Vec::new(),
+    })
+}
+
+/// A fixture whose artifact rows agree with the publication and its actual
+/// repository: its memoized scope is empty, so only `check_declared` can refuse.
+#[test]
+fn a_legal_fixture_has_no_scope_lines() {
+    for declared in [pair(base_artifacts())] {
+        assert_eq!(declared.scope, Vec::<String>::new());
+        assert!(check_declared(std::slice::from_ref(&declared)).is_empty());
     }
+    let mut foreign = base_artifacts();
+    foreign[0].hold.as_mut().unwrap().owner_id = Uuid::from_u128(0x1a00);
+    let declared = pair(foreign);
+    assert_eq!(declared.scope.len(), 1, "{:?}", declared.scope);
+    assert_eq!(check_declared(std::slice::from_ref(&declared)), declared.scope);
 }
 
 fn retained_artifact(slot: i32, hold: Uuid, attempt: Uuid, digest: u8, length: u64) -> RetainedArtifact {
@@ -619,6 +653,33 @@ fn a_present_capture_that_disagrees_with_its_head_is_never_release_before_regist
             }
         }
     }
+}
+
+/// A third, distinct owner: the root head/capture/tombstone requester.
+const REQUESTER: Uuid = Uuid::from_u128(0x1a00);
+
+/// A producer owner distinct from the repository tenant is valid, and so is a
+/// root requester that is a third identity: it is compared with its own head
+/// and tombstone only, never with the publication owner.
+#[test]
+fn a_producer_and_a_root_requester_are_independent_identities() {
+    let sets = valid_source();
+    assert_eq!(sets.violations(), Vec::<String>::new());
+    assert_eq!(sets.declared[0].publication.as_ref().unwrap().owner_id, PRODUCER);
+    assert_eq!(sets.declared[0].publication.as_ref().unwrap().tenant_id, TENANT);
+    assert_ne!(PRODUCER, TENANT);
+    let mut requester = valid_source();
+    requester.roots[0].owner_id = REQUESTER;
+    requester.roots[0].proof.as_mut().unwrap().owner_id = REQUESTER;
+    requester.heads[0].owner_id = REQUESTER;
+    requester.tombstones[0].owner_id = REQUESTER;
+    assert_ne!(REQUESTER, PRODUCER);
+    assert_eq!(requester.violations(), Vec::<String>::new());
+    // The requester must still be one identity across head, capture and
+    // tombstone: only the head moves.
+    let mut moved = requester;
+    moved.heads[0].owner_id = PRODUCER;
+    assert_refused(&moved.violations(), "root_capture_mismatch");
 }
 
 // Every stored tombstone row of a key is judged: see `tombstone_tests`.

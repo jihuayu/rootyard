@@ -12,16 +12,17 @@
 //! 1. the deployed realm of every `pg_refstore` repository (serving binding and
 //!    core gate must agree with each other and with the repository owner);
 //! 2. every declared set row (membership, A5 snapshot packs, retained root
-//!    packs, serving read leases) with its publication, artifacts, durable
-//!    holds and consume receipts;
+//!    packs, serving read leases) with its publication, the actual repository
+//!    and core gate tenants, its artifacts, the acquire request, the durable
+//!    holds and the consume receipts;
 //! 3. every pack-verified A5 snapshot header with its descriptors;
 //! 4. every retained root capture with its complete pack rows, re-proven by the
 //!    core's own `retention_root` capture validator on this same transaction;
 //! 5. root heads and release tombstones, so a lost capture is visible;
 //! 6. the declared rows of registrations that (2) cannot see at all.
 use super::ledger_sets::{
-    DeclaredPair, HoldRow, PairArtifact, PublishedPack, Realm, RetainedArtifact, RetainedPack, RootCapture, RootHead,
-    RootProof, RootTombstone, SnapshotSet, SourceSets,
+    ActualRepository, DeclaredPair, HoldRow, PairArtifact, PublishedPack, Realm, ReceiptRow, RequestRow,
+    RetainedArtifact, RetainedPack, RootCapture, RootHead, RootProof, RootTombstone, SnapshotSet, SourceSets,
 };
 use super::*;
 use crate::ref_store::contract::RequestDigest;
@@ -76,7 +77,9 @@ pub(super) const DECLARED_SETS: &str = "WITH scoped AS (
             GROUP BY d.repository_id,d.pack_id,d.registration_id),
          published AS (
            SELECT s.*,g.registration_id IS NOT NULL registered,
-                  g.tenant_id,g.history_incarnation,g.authority_epoch,g.group_epoch,g.object_format,
+                  g.repository_id publication_repository_id,g.pack_id publication_pack_id,
+                  g.tenant_id,g.owner_id,ge.tenant_id gate_tenant_id,r.owner_id actual_repository_owner,
+                  g.history_incarnation,g.authority_epoch,g.group_epoch,g.object_format,
                   g.gate_revision,g.acquire_request_id,g.consume_request_id,g.artifact_set_digest publication_digest,
                   ARRAY(SELECT DISTINCT q.operation_id FROM public.artifact_holds h
                           JOIN public.artifact_hold_requests q ON q.request_id=h.request_id
@@ -85,32 +88,73 @@ pub(super) const DECLARED_SETS: &str = "WITH scoped AS (
                             WHERE f.registration_id=s.registration_id)) issuer_operations
              FROM sets s
              LEFT JOIN public.ref_store_core_pack_publications g
-               ON g.registration_id=s.registration_id AND g.repository_id=s.repository_id AND g.pack_id=s.pack_id)";
+               ON g.registration_id=s.registration_id AND g.repository_id=s.repository_id AND g.pack_id=s.pack_id
+             LEFT JOIN public.repositories r ON r.id=s.repository_id
+             LEFT JOIN public.ref_store_core_gates ge ON ge.repository_id=s.repository_id)";
 
 /// The declared rows only (no artifact join), for [`super::ledger::inventory`].
+/// Every absent artifact position is typed NULL in exactly the order and types
+/// of [`ARTIFACT_COLUMNS`].
 pub(super) fn declared_sql() -> String {
     format!(
         "{DECLARED_SETS}
-         SELECT {DECLARED_COLUMNS},NULL::text,NULL::int,NULL::uuid,NULL::uuid,NULL::uuid,NULL::text,NULL::text,
-                NULL::text,NULL::bigint,NULL::uuid,NULL::text,NULL::uuid,NULL::bool,NULL::bool
+         SELECT {DECLARED_COLUMNS},{ABSENT_ARTIFACT_COLUMNS}
            FROM published p
           ORDER BY p.repository_id,p.pack_id,p.registration_id"
     )
 }
 
 /// The registration columns of a declared set, used by both declared reads.
-const DECLARED_COLUMNS: &str = "p.repository_id,p.pack_id,p.registration_id,p.registered,p.tenant_id,
+/// Positions (the `ORDER BY` key block first):
+///
+/// * 0..2 `(repository_id, pack_id, registration_id)` key, 3 registered;
+/// * 4 publication tenant, 5 publication owner (the A3 pack producer);
+/// * 6..12 realm (`history_incarnation`, `authority_epoch`, `group_epoch`,
+///   `object_format`), gate revision, acquire and consume request;
+/// * 13 publication digest, 14 declaring set kinds, 15 declaring sets;
+/// * 16 actual `repositories.owner_id`, 17 core gate `tenant_id`;
+/// * 18..19 the publication's own repository and pack.
+const DECLARED_COLUMNS: &str = "p.repository_id,p.pack_id,p.registration_id,p.registered,p.tenant_id,p.owner_id,
         p.history_incarnation,p.authority_epoch,p.group_epoch,p.object_format,p.gate_revision,p.acquire_request_id,
-        p.consume_request_id,p.publication_digest,p.declared_by,p.declared_sets";
+        p.consume_request_id,p.publication_digest,p.declared_by,p.declared_sets,
+        p.actual_repository_owner,p.gate_tenant_id,p.publication_repository_id,p.publication_pack_id";
 
 /// The artifact columns of one declared registration (LEFT JOINed, so a missing
-/// artifact, hold or receipt is a NULL row rather than a shrunk result).
+/// artifact, acquire request, hold or receipt is a NULL row rather than a
+/// shrunk result). Positions 20..:
+///
+/// * 20..29 artifact row (`role`, `slot`, `hold_id`, acquire/consume request,
+///   provider, backend identity, sha256, length, locator tenant);
+/// * 30..31 the artifact row's own repository and pack (not in the locator
+///   digest, so each is judged against the declared key);
+/// * 32..35 acquire request (`request_id`, repository, tenant, owner) joined on
+///   the hold's `request_id`;
+/// * 36..48 hold (`request_id`, slot, repository, provider, backend identity,
+///   storage tenant, authority id, authority generation, attempt, namespace,
+///   sha256, length, tenant), then 49 hold owner;
+/// * 50 receipt present, 51..53 consume receipt repository/tenant/owner (same
+///   hold/request/consume ids as before), 54 receipts of this exact
+///   hold/consume pair (outside the inner joins), 55 live issuer operation,
+///   56 the hold's target slot.
 const ARTIFACT_COLUMNS: &str = "a.role,a.slot,a.hold_id,a.acquire_request_id,a.consume_request_id,a.provider,
-        a.backend_identity,a.sha256,a.content_length,a.tenant_id,
+        a.backend_identity,a.sha256,a.content_length,a.tenant_id,a.repository_id,a.pack_id,
+        q.request_id,q.repository_id,q.tenant_id,q.owner_id,
         h.request_id,h.slot,h.repository_id,h.provider,h.backend_identity,h.storage_tenant_id,
         h.authority_id,h.authority_generation,h.attempt_id,h.namespace,h.sha256,h.content_length,h.tenant_id,
-        c.hold_id IS NOT NULL,
-        COALESCE(h.operation_id=ANY(p.issuer_operations),FALSE)";
+        h.owner_id,
+        c.hold_id IS NOT NULL,c.repository_id,c.tenant_id,c.owner_id,
+        (SELECT count(*) FROM public.artifact_hold_consume_receipts x
+           WHERE x.consume_request_id=a.consume_request_id AND x.hold_id=a.hold_id),
+        COALESCE(h.operation_id=ANY(p.issuer_operations),FALSE),h.slot";
+
+/// The absent-artifact row of [`declared_sql`]: typed NULLs in the exact order
+/// and types of [`ARTIFACT_COLUMNS`].
+const ABSENT_ARTIFACT_COLUMNS: &str =
+    "NULL::text,NULL::int,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,
+        NULL::bigint,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,
+        NULL::uuid,NULL::int,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::bigint,
+        NULL::uuid,NULL::uuid,NULL::uuid,NULL::bigint,NULL::uuid,NULL::uuid,NULL::bool,NULL::uuid,
+        NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::int";
 
 /// Every declared registration with its publication, artifacts, durable hold
 /// and consume receipt, optionally restricted to `ids` (a `uuid[]` parameter).
@@ -129,6 +173,7 @@ pub(super) fn declared_query(restrict: bool) -> String {
            FROM published p{join}
            LEFT JOIN public.ref_store_core_pack_artifacts a ON a.registration_id=p.registration_id
            LEFT JOIN public.artifact_holds h ON h.hold_id=a.hold_id AND h.request_id=a.acquire_request_id
+           LEFT JOIN public.artifact_hold_requests q ON q.request_id=h.request_id
            LEFT JOIN public.artifact_hold_consume_receipts c ON c.hold_id=a.hold_id
              AND c.consume_request_id=a.consume_request_id AND c.request_id=a.acquire_request_id
           ORDER BY p.repository_id,p.pack_id,p.registration_id,a.slot"
@@ -303,65 +348,107 @@ pub(super) fn decode_declared(rows: &[tokio_postgres::Row]) -> Result<Vec<Declar
             pair.repository_id = key.0;
             pair.pack_id = key.1;
             pair.registration_id = key.2;
-            pair.declared_by = row.get(13);
-            pair.declared_sets = decode_sets(&row.get::<_, Vec<String>>(14))?;
+            pair.declared_by = row.get(14);
+            pair.declared_sets = decode_sets(&row.get::<_, Vec<String>>(15))?;
+            pair.actual = ActualRepository { owner_id: row.get(16), gate_tenant_id: row.get(17) };
             if registered {
-                let stored: String = row.get(12);
-                let parsed: RequestDigest = stored.parse().context("stored publication digest is invalid")?;
-                pair.publication = Some(PublishedPack {
-                    tenant_id: row.get(4),
-                    history_incarnation: row.get(5),
-                    authority_epoch: row.get(6),
-                    group_epoch: row.get(7),
-                    object_format: row.get(8),
-                    gate_revision: row.get(9),
-                    acquire_request_id: row.get(10),
-                    consume_request_id: row.get(11),
-                    digest: ArtifactSetDigest::from_digest(parsed).as_hex(),
-                });
+                pair.publication = Some(decode_publication(row)?);
             }
         }
-        let Some(role) = row.get::<_, Option<String>>(15) else { continue };
-        let hold = match row.get::<_, Option<Uuid>>(25) {
+        let Some(role) = row.get::<_, Option<String>>(20) else { continue };
+        let hold = match row.get::<_, Option<Uuid>>(36) {
             Some(request_id) => Some(HoldRow {
                 request_id,
-                slot: row.get(26),
-                repository_id: row.get(27),
-                provider: row.get(28),
-                backend_identity: row.get(29),
-                storage_tenant_id: row.get(30),
-                authority_id: row.get(31),
-                generation: row.get(32),
-                attempt_id: row.get(33),
-                namespace: row.get(34),
-                sha256: row.get(35),
-                length: length_of(row, 36).context("negative hold length")?,
+                slot: row.get(37),
+                repository_id: row.get(38),
+                provider: row.get(39),
+                backend_identity: row.get(40),
+                storage_tenant_id: row.get(41),
+                authority_id: row.get(42),
+                generation: row.get(43),
+                attempt_id: row.get(44),
+                namespace: row.get(45),
+                sha256: row.get(46),
+                length: length_of(row, 47).context("negative hold length")?,
                 // The durable hold's own tenant column, never the artifact's.
-                tenant_id: row.get(37),
+                tenant_id: row.get(48),
+                owner_id: row.get(49),
             }),
             None => None,
         };
         pair.artifacts.push(PairArtifact {
             role,
-            slot: row.get(16),
-            hold_id: row.get(17),
-            acquire_request_id: row.get(18),
-            consume_request_id: row.get(19),
-            provider: row.get(20),
-            backend_identity: row.get(21),
-            sha256: row.get(22),
-            length: length_of(row, 23)?,
-            tenant_id: row.get(24),
-            authority_id: row.get(31),
-            generation: row.get(32),
-            attempt_id: row.get(33),
-            namespace: row.get(34),
+            slot: row.get(21),
+            hold_id: row.get(22),
+            acquire_request_id: row.get(23),
+            consume_request_id: row.get(24),
+            provider: row.get(25),
+            backend_identity: row.get(26),
+            sha256: row.get(27),
+            length: length_of(row, 28)?,
+            tenant_id: row.get(29),
+            repository_id: row.get(30),
+            pack_id: row.get(31),
+            authority_id: row.get(42),
+            generation: row.get(43),
+            attempt_id: row.get(44),
+            namespace: row.get(45),
+            request: row.get::<_, Option<Uuid>>(32).map(|request_id| RequestRow {
+                repository_id: row.get(33),
+                tenant_id: row.get(34),
+                owner_id: row.get(35),
+            }),
             hold,
-            receipt: row.get(38),
-            issuer_operation: row.get(39),
+            // A present receipt needs its complete scope: a partial row is
+            // refused, never decoded as an absent receipt.
+            receipt: row.get(50),
+            receipt_scope: decode_receipt(row)?,
+            issuer_operation: row.get(55),
+            hold_slot: row.get(56),
         });
     }
-    Ok(pairs.into_values().collect())
+    let mut pairs = pairs.into_values().collect::<Vec<_>>();
+    for pair in &mut pairs {
+        pair.scope = super::ledger_sets::declared_violations(pair);
+    }
+    Ok(pairs)
+}
+
+/// The publication of one declared registration, joined on the three-key
+/// identity. Its own repository and pack are decoded next to the key so a
+/// re-pointed publication is a mismatch, never hidden by the join.
+fn decode_publication(row: &tokio_postgres::Row) -> Result<PublishedPack> {
+    let stored: String = row.get(13);
+    let parsed: RequestDigest = stored.parse().context("stored publication digest is invalid")?;
+    Ok(PublishedPack {
+        repository_id: row.get(18),
+        pack_id: row.get(19),
+        tenant_id: row.get(4),
+        owner_id: row.get(5),
+        history_incarnation: row.get(6),
+        authority_epoch: row.get(7),
+        group_epoch: row.get(8),
+        object_format: row.get(9),
+        gate_revision: row.get(10),
+        acquire_request_id: row.get(11),
+        consume_request_id: row.get(12),
+        digest: ArtifactSetDigest::from_digest(parsed).as_hex(),
+    })
+}
+
+/// The complete scope of a present consume receipt; a present but incomplete
+/// scope is refused instead of being treated as a missing receipt.
+fn decode_receipt(row: &tokio_postgres::Row) -> Result<Option<ReceiptRow>> {
+    if !row.get::<_, bool>(50) {
+        return Ok(None);
+    }
+    let scope = (row.get::<_, Option<Uuid>>(51), row.get::<_, Option<Uuid>>(52), row.get::<_, Option<Uuid>>(53));
+    let receipt = match scope {
+        (Some(repository_id), Some(tenant_id), Some(owner_id)) => ReceiptRow { repository_id, tenant_id, owner_id },
+        _ => bail!("stored consume receipt has an incomplete scope"),
+    };
+    ensure!(row.get::<_, i64>(54) == 1, "stored consume receipt is not exactly identified by its hold and consume id");
+    Ok(Some(receipt))
 }
 
 /// Split the `source=digest@joined_revision` strings of one declaring row.
