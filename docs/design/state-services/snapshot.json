@@ -7,14 +7,17 @@
     "title": "state services base design, producer inventory, deployment contract and bounded baseline"
   },
   "design_snapshot": {
-    "file": "docs/design/12-state-services.md",
+    "file": "docs/design/state-services/historical-w0/state-services-design.md",
     "source_name": "state-services-design.md",
     "source_sha256": "0187d9c00472a3b794661c450cbf6dd78440268b2ef5ce66d3ff9de54a957abf",
     "checked_in_sha256": "0187d9c00472a3b794661c450cbf6dd78440268b2ef5ce66d3ff9de54a957abf",
+    "checked_in_blob": "92b22d0c1ff1827ac2da3720d14467b60f0e03f5",
     "bytes": 80072,
     "copied_verbatim": true,
+    "writer_commit": "9d8373f",
+    "formerly_at": "docs/design/12-state-services.md",
     "baseline_commit": "d689bf8062a73cfadbc0a72abf3f1546d992e09c",
-    "document_status": "design proposal; not implemented for production",
+    "document_status": "historical W0 design proposal; superseded, not implemented, not the current protocol",
     "is_part_of_archived_source_snapshot": false,
     "historical_sources_untouched": [
       "docs/design/source-page.md",
@@ -34,6 +37,33 @@
     "baseline_scope": "historical pre-evolution measurement/documentation point; NOT the rebased stack parent and NOT a new-backend qualification",
     "current_stack_parent": "bcd391809c8b0d2a16409b6a28fe1147d7ed5c66",
     "current_stack_parent_role": "security/token/membership recovery parent for this rebase; the native d689 receipt was not rerun on it"
+  },
+  "current_design": {
+    "file": "docs/design/12-state-services.md",
+    "checked_in_sha256": "d55c95c6959c217aed419d333fbc5bcc27c68b852aa0ac48ead5fa6ff34299dd",
+    "checked_in_blob": "05721af598cbb654db41846e806d536aa27bd9e9",
+    "bytes": 25912,
+    "lines": 249,
+    "canonical_branch": "codex/state-services-architecture-v2",
+    "canonical_commit": "23334bd",
+    "source_name": "state-services-design.md",
+    "source_sha256": "d55c95c6959c217aed419d333fbc5bcc27c68b852aa0ac48ead5fa6ff34299dd",
+    "restored_reason": "merge PR #124 replaced this file with the older W0 body; the fresh-install Blob-only dual deployment protocol was restored from the canonical architecture branch, and the W0 bytes now live in design_snapshot",
+    "document_status": "current protocol for fresh installs; proposed, not activated",
+    "required_phrases": [
+      "repo authority",
+      "PgRefStore",
+      "Raft Ref-CAS",
+      "snapshot + read pin",
+      "durable root",
+      "repo retained quota",
+      "签发",
+      "版本化签名密钥",
+      "撤销",
+      "PG fallback",
+      "fresh install",
+      "HTTP"
+    ]
   },
   "w0_artifacts": {
     "producer_inventory": "docs/design/state-services/producers.json",

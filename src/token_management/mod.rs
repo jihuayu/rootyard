@@ -14,10 +14,15 @@
 //! deny-all), owned by the acting user, and bounded to 128 grants. Lists are
 //! keyset-paginated with a default of 50 and a hard maximum of 100.
 //!
-//! Release state: the CAS parent-token lock for Git publication and the
-//! restricted browser-child inheritance are tracked on a separate branch. This
-//! module is a private implementation branch; it does not claim those pieces
-//! are released.
+//! Release state: the parent-token publication lock and restricted
+//! browser-child inheritance are part of this integrated tree, not a separate
+//! branch. The lock is the token `FOR SHARE` row lock taken by the native
+//! publication path (`storage::ref_publication`, held through the ref CAS) and
+//! re-verified by [`service`] for every management request; browser sessions
+//! (`web::session`) are children of an authenticated parent token and restricted
+//! parents cannot mint one. The new Blob-only service is still a candidate
+//! entrypoint in this unreleased tree, so this comment makes no deployment
+//! claim.
 //!
 //! State: the handlers depend on [`MetadataState`] (one PostgreSQL pool) only,
 //! so [`routes`] is generic over the router state. The legacy application router

@@ -76,6 +76,42 @@ def _extract_route_registrations(rs_path: Path) -> list[tuple[str, list[str]]]:
     return results
 
 
+def _expand_page_table(rs_path: str, prefixes: tuple[str, ...]) -> list[tuple[str, list[str]]]:
+    """Expands a shared page table that is mounted under several prefixes.
+
+    `src/web/repository_pages.rs` mounts one literal page table under
+    ``/web/repos/{owner}/{name}`` and the legacy ``/ui/repos/{owner}/{name}``
+    alias; an empty prefix list means the file's table is already absolute
+    (``org_admin``). The table's root page ``""`` is the repository overview,
+    so it is read from the same `.route(&page(""), …)` table.
+    """
+    text = (ROOT / rs_path).read_text(encoding="utf-8")
+    if not prefixes:
+        if 'format!("{prefix}' in text or re.search(r"pages\(\"/", text):
+            raise AssertionError(f"{rs_path} uses page prefixes but none were declared")
+        return _extract_route_registrations(ROOT / rs_path)
+    mounted = [prefix.strip('"') for prefix in re.findall(r"pages\((\"/[A-Za-z-]+\")\)", text)]
+    if sorted(mounted) != sorted(prefixes):
+        raise AssertionError(f"{rs_path} mounts page prefixes {mounted}, expected {list(prefixes)}")
+    if re.search(r'format!\("\{prefix\}/repos/\{\{owner\}\}/\{\{name\}\}\{tail\}"\)', text) is None:
+        raise AssertionError(f"{rs_path} does not build its pages from one shared format! table")
+    registrations = _extract_route_registrations(ROOT / rs_path)
+    root = re.findall("page\(\"\"\)\s*,(\s*get\([\w:]+\))", text)
+    if len(root) != 1:
+        raise AssertionError(f"{rs_path}: expected exactly one repository root page, found {len(root)}")
+    methods = [m.upper() for m in re.findall(r"\b(get|post|put|patch|delete)\s*\(", root[0])]
+    registrations.insert(0, ("", methods))
+    expanded: list[tuple[str, list[str]]] = []
+    for tail, page_methods in registrations:
+        # Tails: "" (repository overview), "/…", or the extractor's own
+        # leading parameter "/{oid}"; nothing may consume owner or name.
+        if tail and (not tail.startswith("/") or tail.split("/")[1] in ("{owner}", "{name}")):
+            raise AssertionError(f"{rs_path}: page '{tail}' is not a repository page tail")
+        for prefix in prefixes:
+            expanded.append((prefix + "/repos/{owner}/{name}" + tail, list(page_methods)))
+    return expanded
+
+
 def _normalize_route_pattern(route_path: str) -> str:
     """Replaces {param} with {} and {*wildcard} with {*} for collision detection."""
     segments = []
@@ -190,7 +226,17 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         seen_bindings: dict[tuple[str, str], tuple[str, str]] = {}
         total_bindings = 0
         for rel in self.ALL_PRIMARY_ROUTER_FILES:
-            regs = _extract_route_registrations(ROOT / rel)
+            if rel == "src/web.rs":
+                # Web UI is composed from page tables; `test_web` cross-checks
+                # their exact contents, here they join the shared collision map.
+                self.assertEqual(_extract_route_registrations(ROOT / rel), [], "src/web.rs must stay declarative")
+                regs = [
+                    *_extract_route_registrations(ROOT / "src/web/navigation.rs"),
+                    *_expand_page_table("src/web/repository_pages.rs", ("/web", "/ui")),
+                    *_expand_page_table("src/web/org_admin.rs", ()),
+                ]
+            else:
+                regs = _extract_route_registrations(ROOT / rel)
             self.assertGreater(len(regs), 0, f"No routes found in {rel}")
             for raw_path, methods in regs:
                 self.assertGreater(len(methods), 0, f"No HTTP methods extracted for {raw_path} in {rel}")
@@ -884,6 +930,80 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
             for sql_kw in ("SELECT ", "INSERT ", "UPDATE ", "DELETE "):
                 self.assertNotIn(sql_kw, src, f"Router entry {entry_rel} must not embed inline SQL ({sql_kw})")
             self.assertNotIn("Command::new", src, f"Router entry {entry_rel} must not spawn subprocesses directly")
+
+    RUST_MODULE_RE = re.compile(r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_][a-z0-9_]*)\s*;')
+
+    def _rust_module_closure(self, rel: str) -> set[str]:
+        """Files reachable from `rel` through `mod x;` declarations.
+
+        Rust-only: the root and every in-repo (or `#[path]`-redirected) child
+        module. Used to prove that a refactored composition still compiles all
+        the modules it used to.
+        """
+        pending, seen = [rel], set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            path = ROOT / current
+            self.assertTrue(path.is_file(), f"{rel} declares a missing module file: {current}")
+            text = path.read_text(encoding="utf-8")
+            parent = path.parent
+            for match in re.finditer(r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_][a-z0-9_]*)\s*;', text):
+                prefix = text[max(0, match.start() - 200) : match.start()]
+                attr = re.search(r'#\[path\s*=\s*"([^"]+)"\]\s*$', prefix)
+                if attr is not None:
+                    pending.append((parent / attr.group(1)).relative_to(ROOT).as_posix())
+                    continue
+                name = match.group(1)
+                owned = path.with_suffix("")
+                candidates = (
+                    parent / f"{name}.rs",
+                    parent / name / "mod.rs",
+                    parent / f"{name}.rs",
+                    owned / f"{name}.rs",
+                    owned / name / "mod.rs",
+                )
+                for candidate in candidates:
+                    if candidate.is_file():
+                        pending.append(candidate.relative_to(ROOT).as_posix())
+                        break
+                else:
+                    # `#[cfg(...)]`-only, generated or external modules are not
+                    # composition files; anything else must resolve.
+                    cfg_only = re.search(r'#\[cfg\([^\]]*\)\]\s*$', prefix) is not None
+                    self.assertTrue(cfg_only, f"{current}: mod {name}; has no module file")
+        return seen
+
+    def test_web_composition_builds_every_web_module(self) -> None:
+        # The Web UI root is a thin composition file; every page module it used
+        # to declare in one piece must remain part of its Rust module closure,
+        # and each composition table must be reachable from it.
+        expected = {
+            "src/web.rs",
+            "src/web/detail_pagination.rs",
+            "src/web/handlers.rs",
+            "src/web/models.rs",
+            "src/web/native_reads.rs",
+            # Organization pages are owned by the files the admin UI imports.
+            "src/web/org_admin.rs",
+            "src/web/org_admin_actions.rs",
+            "src/web/org_admin_views.rs",
+            "src/web/repository_listing.rs",
+            "src/web/sanitize.rs",
+            "src/web/session.rs",
+            "src/web/session_gc.rs",
+            "src/web/templates.rs",
+            "src/web/tokens.rs",
+            "src/web/navigation.rs",
+            "src/web/repository_pages.rs",
+        }
+        closure = self._rust_module_closure("src/web.rs")
+        self.assertEqual(closure & expected, expected, "src/web.rs lost a Web UI module")
+        root = (ROOT / "src/web.rs").read_text(encoding="utf-8")
+        for table in ("navigation", "repository_pages", "org_admin"):
+            self.assertIn(f"pub mod {table};", root, f"src/web.rs must declare {table}")
 
     def test_serde_deny_unknown_fields_and_shared_auth_fencing_across_tracks(self) -> None:
         model_files = (

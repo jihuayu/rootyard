@@ -61,15 +61,22 @@
 - [#153](https://github.com/jihuayu/rootyard/issues/153)：[State/D] PG 切点+Raft index+Blob closure 配对备份与全新 incarnation 恢复。
 - [#151](https://github.com/jihuayu/rootyard/issues/151)：[State/D] 全局 PG artifact hold 与 Ref-CAS pin/root 的可恢复保留桥。
 
-## 新发布的后继任务（未实现）
+## 新发布的后继任务与修复 backlog（未实现）
 
-维护者另行发布了下列 issue。它们**尚未实现**、没有任何验收结果，也不改变上面任务的完成状态；只登记编号与提议标题，合并与验收完成后才可据实更新。
+维护者另行发布了下列 issue。它们**尚未实现**、没有任何验收结果，也不改变上面任务的完成状态，不构成分布式/HA/GC 能力声明。标题取自 GitHub；合并与验收完成后才可据实更新。范围摘要与技术前置见[实施计划](implementation-plan.md)的“新增任务与修复 backlog”一节。
 
-- [#162](https://github.com/jihuayu/rootyard/issues/162)
-- [#163](https://github.com/jihuayu/rootyard/issues/163)
-- [#164](https://github.com/jihuayu/rootyard/issues/164)
-- [#165](https://github.com/jihuayu/rootyard/issues/165)
-- [#166](https://github.com/jihuayu/rootyard/issues/166)
+| issue | 标题 | 类型 |
+| --- | --- | --- |
+| [#162](https://github.com/jihuayu/rootyard/issues/162) | [Rubicon] 独立交付无删除 Blob 压实及可扩展维护吞吐 | #122 的 subtask；不是物理 GC |
+| [#163](https://github.com/jihuayu/rootyard/issues/163) | [Rubicon] 接通版本感知的可丢计算副本缓存与有界路由调度 | 功能 backlog |
+| [#164](https://github.com/jihuayu/rootyard/issues/164) | [Rubicon] 增加同仓 push/read/maintenance 稳态混合负载与扩容基线 | 测量 backlog；不是容量声明 |
+| [#165](https://github.com/jihuayu/rootyard/issues/165) | [Rubicon] 将 MIDX、bitmap、commit-graph 作为可重建 Blob 读加速产物 | 非阻塞优化 |
+| [#166](https://github.com/jihuayu/rootyard/issues/166) | [CI] 修复 genuine schema007 备份恢复回归，恢复完整合并门禁 | 缺陷修复 |
+| [#167](https://github.com/jihuayu/rootyard/issues/167) | [Raft/P2] 持久日志范围读取检测内部缺口并失败关闭 | 实验 crate 缺陷（待复现） |
+| [#168](https://github.com/jihuayu/rootyard/issues/168) | [P2] W0 baseline runner 落实运行因子、临时空间与全程绝对期限 | 工具缺陷 |
+| [#169](https://github.com/jihuayu/rootyard/issues/169) | [Backup/P2] 配对归档逐项验证注册 pack 的完整 artifact 集合与摘要 | 备份缺陷（待原生验证） |
+| [#170](https://github.com/jihuayu/rootyard/issues/170) | Integrate the pending Forge and Blob/RefStore PR stack with reviewed recovery fixes | 集成 PR |
+| [#171](https://github.com/jihuayu/rootyard/issues/171) | [Integration] 分离历史 W0 冻结快照与当前架构，修复合并后的验证契约 | 合并契约修复 |
 
 原 #149 Raft 存储适配仍为 open：PR #160 的 `crates/refcas-log` 只是隔离的实验 crate，仅交付日志存储切片，不完成 #149/#115。
 

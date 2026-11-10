@@ -12,7 +12,7 @@
 use fuser::{FileAttr, FileType, MountOption};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::{CString, OsStr, OsString},
+    ffi::{OsStr, OsString},
     fs::{self, File},
     io,
     os::{
@@ -55,6 +55,13 @@ fn open_lower(lazy: Option<&dyn LazySource>, relative: &Path, source: &Entry) ->
 // `crate::workspace_lab::fuse_mount::MutationGate` callers.
 pub use super::mutation_gate::{FreezeDecision, GatePhase, LeaseObservation, MutationGate, MutationGuard};
 
+/// Identity of an owned mount, captured from `/proc/self/mountinfo`.
+///
+/// Mount IDs are unique in the kernel's mount-ID allocator, so comparing the
+/// captured ID proves that a path still carries the mount this handle created
+/// and not a newer mount stacked on top of it.
+pub(crate) type MountId = u64;
+
 #[path = "fuse_dispatch.rs"]
 mod fuse_dispatch;
 #[path = "fuse_io.rs"]
@@ -65,18 +72,17 @@ mod fuse_ops;
 mod inner_ops;
 #[path = "owned_ops.rs"]
 mod owned_ops;
+#[path = "fuse_mount/ownership.rs"]
+mod ownership;
 
 use fuse_dispatch::MountFs;
 use fuse_io::{Entry, safe_link_at, walk_dir};
 
-pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
+// Kept at the historical `fuse_mount::` path for existing callers and tests;
+// the implementation lives in `ownership`.
+pub(crate) use ownership::{mount_id_at_path, mount_id_in, mount_options, unmount_owned, owns_current_mount};
 
-/// Identity of an owned mount, captured from `/proc/self/mountinfo`.
-///
-/// Mount IDs are unique in the kernel's mount-ID allocator, so comparing the
-/// captured ID proves that a path still carries the mount this handle created
-/// and not a newer mount stacked on top of it.
-type MountId = u64;
+pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
 
 /// Live kernel mount. Dropping the session unmounts and drops the shim, which
 /// stops the actor and drains every queued reply.
@@ -393,7 +399,7 @@ impl Overlay {
 /// Mount options shared by every mount.
 ///
 /// `AutoUnmount` is added only for the independent helper. The in-process
-/// service mount and the lab mount keep the historical option list so an
+/// service mount and the lab mount keep the legacy option list so an
 /// existing deployment is not switched onto the fusermount3 path by accident.
 fn mount_options(auto_unmount: bool) -> Vec<MountOption> {
     let mut options = vec![MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions];
@@ -445,103 +451,12 @@ fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Re
     Ok(MountHandle { session, dispatcher, mountpoint, mount_id })
 }
 
-/// Normal (non-lazy) unmount of exactly the mount this handle captured.
-///
-/// Fails closed in every other case: an unreadable mount table and a path that
-/// now holds a different mount (or an ambiguous stack of mounts) are reported
-/// instead of guessed at; an already-unmounted path is a no-op. `MNT_DETACH`
-/// and a `fusermount -u` fallback are deliberately not used: a lazy detach
-/// leaves the session thread parked on its descriptor, and a blind path unmount
-/// could remove a mount this handle does not own.
-fn unmount_owned(mountpoint: &Path, mount_id: MountId) -> io::Result<()> {
-    match mount_id_at_path(mountpoint)? {
-        Some(current) if owns_current_mount(mount_id, Some(current)) => {
-            let path = CString::new(mountpoint.as_os_str().as_bytes())
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-            // SAFETY: `path` is NUL-terminated, and flags 0 request a normal,
-            // non-lazy unmount of the identity verified above.
-            if unsafe { libc::umount2(path.as_ptr(), 0) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-        }
-        // Already unmounted: nothing to remove, `join` still reaps the session.
-        None => Ok(()),
-        // A different mount owns the path now; never unmount a foreign mount.
-        Some(_) => Err(io::Error::from_raw_os_error(libc::EBUSY)),
-    }
-}
-
-/// True only for the exact mount this handle created.
-fn owns_current_mount(captured: MountId, current: Option<MountId>) -> bool {
-    current == Some(captured)
-}
-
-fn mount_id_at_path(mountpoint: &Path) -> io::Result<Option<MountId>> {
-    mount_id_in(&fs::read_to_string("/proc/self/mountinfo")?, mountpoint)
-}
-
-/// The single mount recorded exactly at `mountpoint` in a `mountinfo` text.
-///
-/// Kernel mount IDs are opaque and may be reused, so numeric order says nothing
-/// about which mount a path lookup sees. Two or more matching entries for the
-/// same decoded mount point are therefore reported as ambiguous
-/// (`InvalidData`) and never resolved to a "topmost" one. A private helper
-/// mountpoint plus its per-workspace reservation rules out internal stacking, so
-/// rejecting a stack is the conservative answer rather than a guess.
-fn mount_id_in(mountinfo: &str, mountpoint: &Path) -> io::Result<Option<MountId>> {
-    let target = mountpoint.as_os_str().as_bytes();
-    let mut found: Option<MountId> = None;
-    for line in mountinfo.lines() {
-        let mut fields = line.split(' ');
-        let Some(id) = fields.next().and_then(|field| field.parse::<MountId>().ok()) else {
-            continue;
-        };
-        // Field 1 is the mount ID and field 5 the mount point. A short line is
-        // not an error, it just cannot describe the mount asked about.
-        let Some(point) = fields.nth(3) else { continue };
-        if unescape_mountinfo(point).as_slice() != target {
-            continue;
-        }
-        if found.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "multiple mounts recorded at the owned FUSE mountpoint",
-            ));
-        }
-        found = Some(id);
-    }
-    Ok(found)
-}
-
-/// Undo the octal escapes mountinfo uses for spaces, tabs, newlines and
-/// backslashes.
-fn unescape_mountinfo(field: &str) -> Vec<u8> {
-    let bytes = field.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let octal = index + 3 < bytes.len()
-            && bytes[index] == b'\\'
-            && bytes[index + 1..index + 4].iter().all(|byte| (b'0'..=b'7').contains(byte));
-        if octal {
-            // Widen to u32 so a maximal octal escape cannot overflow a byte.
-            let value = u32::from(bytes[index + 1] - b'0') * 64
-                + u32::from(bytes[index + 2] - b'0') * 8
-                + u32::from(bytes[index + 3] - b'0');
-            out.push(value as u8);
-            index += 4;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-    out
-}
-
 /// Spawn the bounded per-mount dispatcher and mount `overlay` in the background.
 ///
 /// Every mount owns its own queue and actor, so a slow read on one mount cannot
 /// stall another mount. Queue limits are shared per helper and per process.
 ///
-/// This is the legacy option list (no `AutoUnmount`): used by the in-process
+/// This is the historical option list (no `AutoUnmount`): used by the in-process
 /// service mount, whose unmount is driven by the owning API process.
 pub fn spawn(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
     spawn_with(overlay, mountpoint, false)
@@ -583,6 +498,13 @@ pub fn mount(lower: PathBuf, upper: PathBuf, mountpoint: PathBuf) -> io::Result<
     let fs = MountFs::new(Overlay::new(lower, upper)?)?;
     fuser::mount2(fs, mountpoint, &mount_options(false))
 }
+
+// The mount identity/teardown tests live in a submodule so this file stays
+// below the workspace_lab anti-monolith bound; they load `super::*` of
+// `fuse_mount` and cover the `ownership` helpers `unmount_owned` calls.
+#[cfg(test)]
+#[path = "fuse_mount/mount_tests.rs"]
+mod mount_tests;
 
 #[cfg(test)]
 mod tests {

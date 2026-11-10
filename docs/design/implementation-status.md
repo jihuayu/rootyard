@@ -4,7 +4,7 @@
 
 ## 当前基线与剩余工作
 
-本页状态对应待集成候选（PR #161 及本地集成分支，尚未推送或合并）。它是**尚未合并、尚未默认激活**的候选栈：分项组件验收不表示默认服务已替换，也不表示任何实施 issue 已关闭。历史基线 PR #142 / `49f09c2` 的四组原生 8+11+12+20=51 场景（零失败、零忽略）及其证据见 [roots/decisions 证据](../../evidence/state-services/roots-decisions144/README.md)，保持原范围（其中的 CI 通过结论限于当时提交，不延伸到本分支）。
+本页状态对应待集成候选：[PR #170](https://github.com/jihuayu/rootyard/pull/170)（`codex/rubicon-all-pr-merge` → `main`）及其集成修复分支 `codex/rubicon-integration-gates`（issue [#171](https://github.com/jihuayu/rootyard/issues/171)，本地提交，尚未推送）。PR #170 已推送为草稿、**未合并、未默认激活**；它合并的是 #89–#161 的候选栈，不是已验收的发布。分项组件验收不表示默认服务已替换，也不表示任何实施 issue 已关闭。历史基线 PR #142 / `49f09c2` 的四组原生 8+11+12+20=51 场景（零失败、零忽略）及其证据见 [roots/decisions 证据](../../evidence/state-services/roots-decisions144/README.md)，保持原范围（其中的 CI 通过结论限于当时提交，不延伸到本分支）。
 
 | 能力 | 当前状态 | 后续范围 |
 | --- | --- | --- |
@@ -28,7 +28,15 @@
 - 备份：format22/schema147 配对归档（见下节）7 项、旧 format21 备份/恢复 7 项，均在 `1d1ce62` 通过。
 - 本地结构检查（非新增执行记录）：`src/standalone.rs` 只构造 Smart HTTP 路由，不提供 SSH 入口；`state-redis` 默认不在 feature 中，`serve-blob` 目前不使用 Redis；独立实验 crate 不在根依赖中。
 
-Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上 Rust 库测试 464 通过、9 项服务依赖测试显式忽略，最小依赖 all-targets Clippy 通过（候选 PR #159/#161 的 GitHub 主 CI `verify` 任务当时为失败，记录未追溯根因；独立的 CI 恢复与问题修复在其他分支进行，本页不重复）；`backup_blob_serving147.py` 记录 Python 336 项中 331 通过、5 跳过，外加 3 项 live S3 工作区用例通过。合并后的集成分支尚未重新执行这些门禁（Cargo 构建由 Root 串行调度），因此上述结果绑定的是各自源码，不自动覆盖本分支。详细构建、源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md) 与 [standalone147 证据](../../evidence/state-services/standalone147-followup/README.md)。
+Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上 Rust 库测试 464 通过、9 项服务依赖测试显式忽略，最小依赖 all-targets Clippy 通过（候选 PR #159/#161 的 GitHub 主 CI `verify` 任务当时为失败，记录未追溯根因；独立的 CI 恢复与问题修复在其他分支进行，本页不重复）；`backup_blob_serving147.py` 记录 Python 336 项中 331 通过、5 跳过，外加 3 项 live S3 工作区用例通过。合并后的集成分支 **尚未重新执行**这些门禁（Cargo 构建由 Root 串行调度；#171 未运行任何根 Cargo 构建），因此上述结果绑定的是各自源码，不自动覆盖本分支，也**不表示 PR #170 或本分支测试已全部通过**。
+
+集成门禁修复（#171，本地提交，未推送）只处理合并后的契约缺陷，未新增或声称任何分布式、HA、GC 或容量能力：
+
+- 合并 PR #124 曾用旧 W0 正文覆盖 [第 12 章](12-state-services.md)，覆盖了 PR142 之后加入的 HTTP-only 段落，并带回旧 GitFS/Pando 导入与在线 transition。当前章节已从 canonical 分支 `codex/state-services-architecture-v2`（`23334bd`）逐字节恢复，W0 原始字节（SHA-256 `0187d9c0…`，80072 bytes）移到[显式历史归档](state-services/historical-w0/README.md)，`snapshot.json` 同时记录两者哈希。
+- W0/phase-metrics 的 feature-only overlay 检查改为只针对其冻结的 parent fixture（`bcd3918` manifest/lock）；当前集成 manifest 单独做显式契约验证。历史 v1/v5/v6 原始测量报告未修改。
+- `src/web.rs` 路由合成整理到原有 100 行结构上限内，全部 48 条路由与 session/Origin/CSRF 中间件保持不变；`src/token_management/mod.rs` 的过时发布声明注释已更正（父 token 发布锁已包含在当前代码）。
+
+本页不以缺失前提条件代替回归证据；需要二进制/PG 的原生门禁仍待 Root 重新执行。仍需完成：[#166](https://github.com/jihuayu/rootyard/issues/166) 的真实 schema007 恢复回归、[#167](https://github.com/jihuayu/rootyard/issues/167)–[#169](https://github.com/jihuayu/rootyard/issues/169) 的缺陷修复，以及 #162–#165 的 backlog（见[实施计划](implementation-plan.md)）。详细构建、源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md) 与 [standalone147 证据](../../evidence/state-services/standalone147-followup/README.md)。
 
 ## format22 配对备份与恢复的真实边界
 
@@ -61,7 +69,7 @@ LFS、PR/Merge、Workspace、CI/Namespace 的新服务接入、默认入口替�
 
 ## 当前：状态服务 W0（提案，不是已实现能力）
 
-issue #105/#106 W0 已提交 [第 12 章设计快照](12-state-services.md)、[可执行生产者清单](state-services/producers.json)、[部署契约/配置 schema](state-services/deployment-contract.json)、[provisional 预算](state-services/budgets.json)、[依赖冻结证据](state-services/dependencies.json)与[有限基线工具](state-services/README.md)。设计仍为**提案**：RefStore、BlobStore/OpenDAL、Scope CLOSING/CancelDecision、W1–W9 均未实现；现有 GitFS/PG 与 Pando remote+Vault 路径仍是 legacy/既有边界，不是 target 新部署。
+issue #105/#106 W0 已提交[原始第 12 章设计快照](state-services/historical-w0/README.md)（后来被彻底取代，当前章节以其后 canonical 分支为准）、[可执行生产者清单](state-services/producers.json)、[部署契约/配置 schema](state-services/deployment-contract.json)、[provisional 预算](state-services/budgets.json)、[依赖冻结证据](state-services/dependencies.json)与[有限基线工具](state-services/README.md)。设计仍为**提案**：RefStore、BlobStore/OpenDAL、Scope CLOSING/CancelDecision、W1–W9 均未实现；现有 GitFS/PG 与 Pando remote+Vault 路径仍是 legacy/既有边界，不是 target 新部署。
 
 历史 `d689bf8` 的 legacy Pando 基线回执记录于 [native-baseline](../../evidence/state-services/native-baseline.md)：可重跑脚本、原生二进制/源码/锁文件绑定、stock Git、真实 PG/Garage/Vault、冷暖 clone、竞争写入与 atomic 成功路径。该回执是**历史 pre-evolution 基线**，不回算到本次 rebase 的 security/token/membership parent，也不代表新后端或多主机资格。内部阶段等待、Blob bytes、精确 old-OID CAS 竞态、完整 producer coverage 与冻结预算仍待验收，**#106 保持 OPEN**。
 

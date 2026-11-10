@@ -27,7 +27,12 @@
     "planned_rust_version": "1.88",
     "planned_rust_version_reason": "A pending security PR #92 raises the MSRV to 1.88 because of the existing lock. This is a planned target, not the W0 baseline; no Cargo change was made here.",
     "scope": "historical pre-evolution d689 measurement/documentation point; not the rebased stack parent",
-    "files_note": "Historical hashes recorded from d689; current files are verified separately under current_stack_parent."
+    "files_note": "Historical hashes recorded from d689; current files are verified separately under current_stack_parent.",
+    "archived": {
+      "Cargo.toml": "docs/design/state-services/historical-d689/Cargo.toml",
+      "Cargo.lock": "docs/design/state-services/historical-d689/Cargo.lock"
+    },
+    "archived_note": "Historical d689 inputs. Already part of the archived native receipt and its evidence."
   },
   "selection_policy": {
     "no_large_dependency_added_in_w0": true,
@@ -107,6 +112,304 @@
       "notes": "No version/license/build-cost verification performed in W0; do not claim qualification."
     }
   ],
+  "integrated_manifest": {
+    "schema": "rootyard.state-services.integrated-manifest/v1",
+    "note": "Explicit contract for the integrated candidate manifest (issue #170). The integrated branch legitimately carries features and dependencies the frozen W0 parent never had; the frozen-parent overlay checks never read today's Cargo.toml/Cargo.lock. Verifying this block is a standard-library parse, not a Cargo build.",
+    "declared_rust_version": "1.88",
+    "baseline_lock": "docs/design/state-services/stack-parent.Cargo.lock",
+    "features": {
+      "default": {
+        "value": [
+          "kafka-wake"
+        ]
+      },
+      "kafka-wake": {
+        "value": [
+          "dep:rdkafka"
+        ],
+        "activates": [
+          "rdkafka"
+        ]
+      },
+      "pando-lab": {
+        "value": []
+      },
+      "blob-azblob": {
+        "value": [
+          "opendal/services-azblob"
+        ]
+      },
+      "state-baseline-metrics": {
+        "value": []
+      },
+      "state-redis": {
+        "value": [
+          "dep:redis"
+        ],
+        "activates": [
+          "redis"
+        ]
+      }
+    },
+    "dependencies": {
+      "dependencies.anyhow": {
+        "version": "1"
+      },
+      "dependencies.async-compression": {
+        "version": "0.4",
+        "features": [
+          "tokio",
+          "gzip"
+        ]
+      },
+      "dependencies.async-stream": {
+        "version": "0.3"
+      },
+      "dependencies.axum": {
+        "version": "0.8"
+      },
+      "dependencies.base64": {
+        "version": "0.22"
+      },
+      "dependencies.bytes": {
+        "version": "1"
+      },
+      "dependencies.deadpool-postgres": {
+        "version": "0.14"
+      },
+      "dependencies.fs2": {
+        "version": "0.4"
+      },
+      "dependencies.fuser": {
+        "version": "0.16",
+        "default_features": false,
+        "features": [
+          "abi-7-31"
+        ]
+      },
+      "dependencies.futures-util": {
+        "version": "0.3"
+      },
+      "dependencies.hex": {
+        "version": "0.4"
+      },
+      "dependencies.hmac": {
+        "version": "0.12"
+      },
+      "dependencies.libc": {
+        "version": "0.2"
+      },
+      "dependencies.opendal": {
+        "version": "=0.57.0",
+        "default_features": false,
+        "features": [
+          "services-s3",
+          "reqwest-rustls-no-provider-tls",
+          "executors-tokio",
+          "layers-concurrent-limit",
+          "layers-retry",
+          "layers-timeout"
+        ]
+      },
+      "dependencies.opendal-service-s3": {
+        "version": "=0.57.0",
+        "default_features": false
+      },
+      "dependencies.rand": {
+        "version": "0.9"
+      },
+      "dependencies.rdkafka": {
+        "version": "0.39",
+        "optional": true,
+        "default_features": false,
+        "features": [
+          "tokio",
+          "ssl"
+        ]
+      },
+      "dependencies.redis": {
+        "version": "=0.32.7",
+        "optional": true,
+        "default_features": false,
+        "features": [
+          "tokio-rustls-comp",
+          "connection-manager",
+          "acl"
+        ]
+      },
+      "dependencies.reqwest": {
+        "version": "0.12",
+        "default_features": false,
+        "features": [
+          "rustls-tls",
+          "stream",
+          "json"
+        ]
+      },
+      "dependencies.ring": {
+        "version": "0.17"
+      },
+      "dependencies.rustls": {
+        "version": "0.23",
+        "default_features": false,
+        "features": [
+          "ring",
+          "std"
+        ]
+      },
+      "dependencies.rustls-pemfile": {
+        "version": "2"
+      },
+      "dependencies.serde": {
+        "version": "1",
+        "features": [
+          "derive"
+        ]
+      },
+      "dependencies.serde_json": {
+        "version": "1"
+      },
+      "dependencies.sha2": {
+        "version": "0.10"
+      },
+      "dependencies.tokio": {
+        "version": "1",
+        "features": [
+          "full"
+        ]
+      },
+      "dependencies.tokio-postgres": {
+        "version": "0.7",
+        "features": [
+          "with-uuid-1",
+          "with-serde_json-1"
+        ]
+      },
+      "dependencies.tokio-postgres-rustls": {
+        "version": "0.14",
+        "features": [
+          "ring"
+        ]
+      },
+      "dependencies.tokio-util": {
+        "version": "0.7",
+        "features": [
+          "io"
+        ]
+      },
+      "dependencies.uuid": {
+        "version": "1",
+        "features": [
+          "v4",
+          "serde"
+        ]
+      },
+      "dependencies.zeroize": {
+        "version": "1.9"
+      },
+      "dev-dependencies.opendal": {
+        "version": "=0.57.0",
+        "default_features": false,
+        "features": [
+          "services-memory"
+        ]
+      },
+      "dev-dependencies.tempfile": {
+        "version": "3"
+      }
+    },
+    "lock_additions": [
+      "aes",
+      "arc-swap",
+      "asyncband",
+      "autocfg",
+      "backon",
+      "block-padding",
+      "cbc",
+      "cipher",
+      "combine",
+      "const-random",
+      "const-random-macro",
+      "core-foundation",
+      "core-foundation-sys",
+      "crc32c",
+      "crunchy",
+      "dlv-list",
+      "futures",
+      "gloo-timers",
+      "hashbrown",
+      "inout",
+      "jiff",
+      "jiff-core",
+      "jiff-static",
+      "jiff-tzdb",
+      "jiff-tzdb-platform",
+      "jni",
+      "jni-macros",
+      "jni-sys",
+      "jni-sys-macros",
+      "lazy_static",
+      "libm",
+      "mea",
+      "num-bigint",
+      "num-bigint-dig",
+      "num-integer",
+      "num-iter",
+      "num-traits",
+      "opendal",
+      "opendal-core",
+      "opendal-layer-concurrent-limit",
+      "opendal-layer-retry",
+      "opendal-layer-timeout",
+      "opendal-service-azblob",
+      "opendal-service-azure-common",
+      "opendal-service-s3",
+      "openssl-probe",
+      "ordered-multimap",
+      "pbkdf2",
+      "pem",
+      "pem-rfc7468",
+      "pkcs1",
+      "pkcs5",
+      "pkcs8",
+      "portable-atomic",
+      "portable-atomic-util",
+      "quick-xml",
+      "rand",
+      "rand_chacha",
+      "rand_core",
+      "redis",
+      "reqsign-aws-core",
+      "reqsign-aws-v4",
+      "reqsign-azure-storage",
+      "reqsign-core",
+      "reqsign-file-read-tokio",
+      "reqwest",
+      "rsa",
+      "rust-ini",
+      "rustc_version",
+      "rustls-native-certs",
+      "rustls-platform-verifier",
+      "rustls-platform-verifier-android",
+      "salsa20",
+      "same-file",
+      "schannel",
+      "scrypt",
+      "security-framework",
+      "security-framework-sys",
+      "semver",
+      "sha1",
+      "signature",
+      "simd_cesu8",
+      "simdutf8",
+      "spin",
+      "tiny-keccak",
+      "walkdir",
+      "wasm-streams",
+      "webpki-root-certs",
+      "winapi-util"
+    ]
+  },
   "open_items_before_add": [
     "Compile OpenRaft 0.9.25 against the planned MSRV and prove its durable storage/network adapter contract.",
     "Record historical 1.85 versus current-parent 1.88 explicitly (security PR #102); never silently bump Cargo in a W0 feature commit.",
@@ -123,7 +426,12 @@
       "Cargo.lock": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
       "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
     },
-    "measurement_note": "The historical d689 native receipt was not rerun against this parent and does not qualify it."
+    "measurement_note": "The historical d689 native receipt was not rerun against this parent and does not qualify it.",
+    "archived": {
+      "Cargo.toml": "docs/design/state-services/stack-parent.Cargo.toml",
+      "Cargo.lock": "docs/design/state-services/stack-parent.Cargo.lock"
+    },
+    "archived_note": "Frozen W0/phase-metrics parent inputs. Verified against these archives and the hashes below, never against today's Cargo.toml/Cargo.lock."
   },
   "implementation_overlay": {
     "schema": "rootyard.state-services.implementation-overlay/v1",
@@ -144,7 +452,7 @@
     "parent_manifest_sha256": "f11958990599c8803322f3c51b88c167025e6ce786ae26c9fc2060d23612be72",
     "parent_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
     "parent_manifest_semantic_sha256": "d5d3f84b15150bfb4ae0f51f8a83490a14c005b9545d711c20a088281cd36aa5",
-    "scope": "Feature-only overlay from the stacked implementation branch. W0 itself did not modify Cargo; this record lets the validator accept exactly one empty, default-OFF feature while keeping the frozen parent hashes for every other file and requiring the unchanged parent lockfile.",
+    "scope": "Feature-only overlay of the frozen W0/phase-metrics parent. It is a historical record of how the measured parent became the feature stack (one empty, default-OFF feature, unchanged lockfile); today's integrated manifest is validated separately by `integrated_manifest`.",
     "rejected": [
       "any dependency, dev-dependency, profile or patch change",
       "any second feature or a non-empty overlay feature",
