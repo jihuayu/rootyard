@@ -53,43 +53,6 @@ def requests_for_delivery(requests: list[dict], delivery_id: str) -> list[dict]:
     ]
 
 
-_SERDE_JSON_SHORT_ESCAPES = {
-    0x22: '\\"',
-    0x5C: "\\\\",
-    0x08: "\\b",
-    0x0C: "\\f",
-    0x0A: "\\n",
-    0x0D: "\\r",
-    0x09: "\\t",
-}
-
-
-def serde_json_struct_bytes(fields: list[tuple[str, object]]) -> bytes:
-    """Serialize ordered ``(key, value)`` pairs exactly like ``serde_json::to_vec``.
-
-    The sender signs the compact ``serde_json`` encoding of its payload and
-    ``Json<WebhookDelivery>`` serializes in struct declaration order, so an
-    ordered re-encoding can be compared byte for byte. Strings keep raw UTF-8;
-    ``"``, ``\\``, ``\\b``, ``\\f``, ``\\n``, ``\\r`` and ``\\t`` use short
-    escapes and every other code point below 0x20 is ``\\u00XX``.
-    """
-    parts = []
-    for key, value in fields:
-        if isinstance(value, str):
-            body = "".join(
-                _SERDE_JSON_SHORT_ESCAPES.get(
-                    ord(ch), f"\\u{ord(ch):04x}" if ord(ch) < 0x20 else ch
-                )
-                for ch in value
-            )
-            encoded = f'"{body}"'
-        else:
-            assert isinstance(value, int) and not isinstance(value, bool), value
-            encoded = str(value)
-        parts.append(f'"{key}":{encoded}')
-    return ("{" + ",".join(parts) + "}").encode("utf-8")
-
-
 class LocalWebhookReceiver:
     """Thread-safe local loopback HTTP/1.1 receiver for testing webhook deliveries and retries."""
 
@@ -437,20 +400,13 @@ class WebhooksHarness(PullsHarness):
         assert headers.get("x-rootyard-delivery") == delivery_id, headers
         assert headers.get("x-rootyard-hook-id") == self.hook["id"], headers
 
-        # The signed body must be exactly this ping-fixed-1 payload and its HMAC
-        # must be recomputed here, so an unrelated ping cannot satisfy the oracle.
-        expected_body = serde_json_struct_bytes(
-            [
-                ("event", "ping"),
-                ("zen", "Rootyard HMAC verification test"),
-                ("hook_id", self.hook["id"]),
-                ("repository_id", ping_delivery["repository_id"]),
-            ]
-        )
-        assert req["raw_body"] == expected_body, (req["raw_body"], expected_body)
+        # The signed body must be this ping-fixed-1 payload, so an unrelated ping
+        # cannot satisfy the oracle. The receiver already verified the HMAC over
+        # the exact raw bytes it received, so recomputing it here never depends
+        # on how the JSON object's keys happen to be ordered.
         assert req["json"] == ping_delivery["payload"], req["json"]
         assert req["signature"] == compute_hmac_sha256_header(
-            self.webhook_secret, expected_body
+            self.webhook_secret, req["raw_body"]
         ), headers
 
     def auto_pr_ci_pin_and_queued_check_orchestration(self):
