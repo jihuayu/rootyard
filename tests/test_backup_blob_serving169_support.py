@@ -68,6 +68,31 @@ class ArtifactSetDigestTest(unittest.TestCase):
                         content_length=rows[0]["content_length"])]
         self.assertNotEqual(support.artifact_set_digest(swapped), support.artifact_set_digest(rows))
 
+    def test_role_order_is_pack_before_idx_like_the_rust_vector(self):
+        # tests/format22_support/digest_vectors.rs: the idx row (hold 0x11) is
+        # first in input and sorts before pack on hold id, but Rust emits pack
+        # (hold 0x31) first because PackArtifactRole derives Pack < Idx.
+        vector_rows = [
+            {"role": "idx", "slot": 1, "hold_id": str(uuid.UUID(bytes=bytes([0x11]) * 16)),
+             "tenant_id": str(uuid.UUID(bytes=bytes([0x10]) * 16)),
+             "authority_id": str(uuid.UUID(bytes=bytes([0x12]) * 16)),
+             "authority_generation": 1, "attempt_id": str(uuid.UUID(bytes=bytes([0x13]) * 16)),
+             "namespace": "core-pack", "sha256": "21" * 32, "content_length": 5,
+             "provider": "s3", "backend_identity": "bb" * 32},
+            {"role": "pack", "slot": 0, "hold_id": str(uuid.UUID(bytes=bytes([0x31]) * 16)),
+             "tenant_id": str(uuid.UUID(bytes=bytes([0x10]) * 16)),
+             "authority_id": str(uuid.UUID(bytes=bytes([0x12]) * 16)),
+             "authority_generation": 2, "attempt_id": str(uuid.UUID(bytes=bytes([0x32]) * 16)),
+             "namespace": "core-pack", "sha256": "41" * 32, "content_length": 4096,
+             "provider": "s3", "backend_identity": "bb" * 32},
+        ]
+        self.assertEqual(support.artifact_set_digest(vector_rows),
+                         "7477cb8de43a3c4cd2b2db62dcddc8b12697ccfadc15a38a9ea65f4aaa83cec5")
+        self.assertEqual(support.artifact_set_digest(list(reversed(vector_rows))),
+                         support.artifact_set_digest(vector_rows))
+        with self.assertRaisesRegex(AssertionError, "role is not recognized"):
+            support.artifact_set_digest([dict(vector_rows[0], role="other")])
+
     def test_production_parity_vector_when_provided(self):
         path = os.environ.get("ROOTYARD_FORMAT22_FIXTURE_DIGEST_VECTOR")
         if not path:

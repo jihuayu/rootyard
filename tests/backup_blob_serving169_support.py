@@ -79,8 +79,22 @@ def _field(name, length=None):
     return len(payload).to_bytes(8, "big") + payload
 
 
-def _int(value, bits=64):
-    return int(value).to_bytes(bits, "big", signed=False)
+def _int(value, width=8):
+    """Big-endian unsigned integer of exactly ``width`` bytes.
+
+    The default mirrors Rust ``u64/i64::to_be_bytes()`` (8 bytes), never a
+    ``bits`` count: callers pass an explicit slot width of 4.
+    """
+    return int(value).to_bytes(width, "big", signed=False)
+
+
+# ``PackArtifactRole`` declaration order in Rust: Pack then Idx.
+_ROLE_RANK = {"pack": 0, "idx": 1}
+
+
+def _role_rank(value):
+    need(value in _ROLE_RANK, "stored pack artifact role is not recognized")
+    return _ROLE_RANK[value]
 
 
 def artifact_set_digest(columns):
@@ -92,35 +106,42 @@ def artifact_set_digest(columns):
     ``content_length``, ``provider``, ``backend_identity``. Artifacts are
     sorted on their canonical ``RegisteredArtifact`` derivation, which is
     equivariant under the row order, so a stable sort reproduces the Rust sort.
+    The leading field is ``PackArtifactRole``'s declaration order (pack before
+    idx), not the role string.
     """
     rows = columns if isinstance(columns, list) else [columns]
     keyed = []
     for row in rows:
         row = parse_columns(row)
         canonical = (
-            str(row["role"]), int(row["slot"]), str(row["hold_id"]), str(row["tenant_id"]),
+            _role_rank(row["role"]), int(row["slot"]), str(row["hold_id"]), str(row["tenant_id"]),
             str(row["authority_id"]), int(row["authority_generation"]), str(row["attempt_id"]),
             str(row["namespace"]), str(row["sha256"]), int(row["content_length"]), str(row["provider"]),
             str(row["backend_identity"]),
         )
         keyed.append((canonical, row))
     keyed.sort(key=lambda item: item[0])
+    # Raw payload bytes only: ``RequestDigest::of`` length-prefixes each field
+    # exactly once in the final loop, so a field must never be pre-prefixed.
     fields = [_int(len(keyed))]
     for _, row in keyed:
+        sha256 = str(row["sha256"]).encode()
+        content_length = _int(row["content_length"])
         fields.extend((
-            _field(row["role"]), _int(row["slot"], 4),
-            _field(bytes.fromhex(str(row["hold_id"]).replace("-", ""))),
-            _field(bytes.fromhex(str(row["tenant_id"]).replace("-", ""))),
-            _field(bytes.fromhex(str(row["authority_id"]).replace("-", ""))),
+            str(row["role"]).encode(), _int(row["slot"], 4),
+            bytes.fromhex(str(row["hold_id"]).replace("-", "")),
+            bytes.fromhex(str(row["tenant_id"]).replace("-", "")),
+            bytes.fromhex(str(row["authority_id"]).replace("-", "")),
             _int(row["authority_generation"]),
-            _field(bytes.fromhex(str(row["attempt_id"]).replace("-", ""))),
-            _field(row["namespace"]),
-            _field(row["sha256"]),
-            _int(row["content_length"]),
-            _field(row["provider"]),
-            _field(row["backend_identity"]),
-            _field(row["sha256"]),
-            _int(row["content_length"]),
+            bytes.fromhex(str(row["attempt_id"]).replace("-", "")),
+            str(row["namespace"]).encode(),
+            sha256,
+            content_length,
+            str(row["provider"]).encode(),
+            str(row["backend_identity"]).encode(),
+            # verified_sha256 == locator sha256, verified_length == length.
+            sha256,
+            content_length,
         ))
     digest = hashlib.sha256()
     digest.update(b"rootyard-ref-store-request-v1\0")
