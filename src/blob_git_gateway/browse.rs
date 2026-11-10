@@ -337,13 +337,15 @@ fn memory_budget(state: &BlobGitState) -> u64 {
     MAX_MEMORY_BYTES.min(state.limits().max_inflight_bytes)
 }
 
-fn captured_revision(refs: &snapshot::RefView, spec: &str) -> Result<String, GatewayError> {
+/// Resolve a short revision against the captured ref pairs (`refs/*` name and
+/// stored object id), never against Git's own name resolution.
+fn captured_revision(refs: &[(String, String)], spec: &str) -> Result<String, GatewayError> {
     if models::valid_non_zero_oid(spec) || spec == "HEAD" {
         return Ok(spec.to_owned());
     }
     // A short revision denotes a captured branch/tag, never Git's object-id
     // abbreviation or another native revision fallback.
-    let mut found = refs.refs.iter().filter(|(name, _)| {
+    let mut found = refs.iter().filter(|(name, _)| {
         name == spec || name.strip_prefix("refs/heads/") == Some(spec) || name.strip_prefix("refs/tags/") == Some(spec)
     });
     let Some((name, _)) = found.next() else {
@@ -514,7 +516,7 @@ pub(super) async fn finalize<T: Serialize>(session: BrowseSession, value: &T) ->
     let bytes = encode_response(value, limit)?;
     let serving = session.authorization.revalidate_serving(session.deadline).await?;
     read_session::verify_capture_anchor(session.capture_incarnation, session.materialized_read(), &serving)?;
-    let issued = match session_claim(&session, &serving)? {
+    let issued = match session_claim(&session)? {
         SessionClaim::Disabled | SessionClaim::NoProof => None,
         SessionClaim::Issue(read) => Some(issue(&session, read, &serving)?),
     };
@@ -618,7 +620,7 @@ pub(super) fn encode_response(value: &impl Serialize, limit: u64) -> Result<Vec<
             GatewayError::Internal("repository response could not be encoded")
         });
     }
-    debug_assert!(buffer.bytes.len() as u64 <= limit);
+    debug_assert!(buffer.bytes.len() <= limit);
     Ok(buffer.bytes)
 }
 

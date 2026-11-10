@@ -23,7 +23,7 @@ use crate::ref_store::{
     core::{
         MetadataSnapshotScope, PgPackSnapshotMaterializer,
         pack_commit::{PackCommitBaseline, PgPackCommit},
-        pack_snapshot::{MaterializedServingRead, PgServingReads, ServingReadCapture},
+        pack_snapshot::{MaterializedPackRead, MaterializedServingRead, PgServingReads, ServingReadCapture},
     },
     serving::ServingRepository,
 };
@@ -229,17 +229,25 @@ async fn build_into(
     };
     let materializer =
         PgPackSnapshotMaterializer::new(state.store().clone(), state.git_binary().to_path_buf()).map_err(ref_error)?;
-    let (read, sealed) = match mode {
-        Materializer::Unsealed => {
-            (materializer.materialize_serving_read(state.pool(), handle, deadline).await.map_err(ref_error)?, None)
-        }
+    // The sealed read owns its view, so it stays a local until the final
+    // return; every copy below borrows that same owned view.
+    let sealed = match mode {
         Materializer::Sealed => {
-            let sealed = materializer
-                .materialize_serving_read_sealed(state.pool(), handle, deadline)
-                .await
-                .map_err(ref_error)?;
-            (sealed.as_ref().map(MaterializedServingRead::view), sealed)
+            materializer.materialize_serving_read_sealed(state.pool(), handle, deadline).await.map_err(ref_error)?
         }
+        Materializer::Unsealed => None,
+    };
+    // Smart HTTP materializes an owned unsealed view in its own local; the
+    // sealed path never builds one, so no proof is ever cloned or invented.
+    let unsealed = match mode {
+        Materializer::Unsealed => {
+            materializer.materialize_serving_read(state.pool(), handle, deadline).await.map_err(ref_error)?
+        }
+        Materializer::Sealed => None,
+    };
+    let read: Option<&MaterializedPackRead> = match mode {
+        Materializer::Unsealed => unsealed.as_ref(),
+        Materializer::Sealed => sealed.as_ref().map(MaterializedServingRead::view),
     };
     let Some(read) = read else {
         write_refs(git.repo(), &view.refs, &view.head_ref)?;
