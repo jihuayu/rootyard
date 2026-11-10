@@ -47,7 +47,7 @@ mod serving_reads_support;
 mod serving_support;
 
 use self::serving_reads_support::{ensure_migration_146, operation_deadline, provision_ready, RepoFixture};
-use self::serving_support::{actor, Fixture};
+use self::serving_support::{actor, Actor, Fixture};
 use super::PgPackSnapshotMaterializer;
 use crate::blob_store::config::BlobProfile;
 use crate::blob_store::opendal::BlobStore;
@@ -460,21 +460,25 @@ async fn rotate_incarnation(fixture: &Fixture) -> Result<Uuid> {
     Ok(rotated)
 }
 
-/// A real-PostgreSQL `metadata_only` repository with a real owner, for the
-/// captured-but-refused cases that still need a transient pin row.
-async fn provision_empty_repository(fixture: &Fixture, name: &str) -> Result<RepoFixture> {
+/// A real-PostgreSQL `metadata_only` repository together with the owner actor
+/// that provisioned it, for the captured-but-refused cases that still need a
+/// transient pin row. Every later authorized write must go through this same
+/// owner: the owner identity is what the real `PgAuthorizedCommit` decision
+/// resolves an effective RBAC role from, so a second actor would be denied.
+async fn provision_empty_repository(fixture: &Fixture, name: &str) -> Result<(Actor, RepoFixture)> {
     ensure_migration_146(fixture).await?;
     let owner = actor(&fixture.pool, false).await?;
-    provision_ready(fixture, &owner.identity, name).await
+    let repo = provision_ready(fixture, &owner.identity, name).await?;
+    Ok((owner, repo))
 }
 
-/// Make one registered pack + one ref through the real authorized pipeline, so
-/// a subsequent capture is a real non-empty `pack_verified` serving read.
-async fn provision_verified_pack(fixture: &Fixture, repo: &RepoFixture) -> Result<()> {
+/// Make one registered pack + one ref through the real authorized pipeline
+/// under the repository's owner `identity` (the actor that provisioned `repo`),
+/// so a subsequent capture is a real non-empty `pack_verified` serving read.
+async fn provision_verified_pack(fixture: &Fixture, repo: &RepoFixture, owner: &crate::db::Identity) -> Result<()> {
     let store = open_store()?;
     let format = repo.ready.object_format;
     let git = git_binary()?;
-    let owner = actor(&fixture.pool, false).await?;
     let source = GitRepo::new(git.clone(), format).await?;
     let commit_oid = source.build_commit("file.txt", b"serving proof fixture\n", "serving proof main").await?;
     source.update_ref("refs/heads/main", &commit_oid).await?;
@@ -488,7 +492,7 @@ async fn provision_verified_pack(fixture: &Fixture, repo: &RepoFixture) -> Resul
         repo.ready.repository_id,
         gate,
         &git,
-        &owner.identity,
+        owner,
         vec![main_update(format, &commit_oid)?],
         &files,
     )
@@ -536,8 +540,8 @@ where
 async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() -> Result<()> {
     let fixture = Fixture::new().await?;
     let provisioned = async {
-        let repo = provision_empty_repository(&fixture, "serving-proof-native").await?;
-        provision_verified_pack(&fixture, &repo).await?;
+        let (owner, repo) = provision_empty_repository(&fixture, "serving-proof-native").await?;
+        provision_verified_pack(&fixture, &repo, &owner.identity).await?;
         Ok::<_, anyhow::Error>(repo)
     }
     .await;
@@ -639,8 +643,8 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
 async fn a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materialization() -> Result<()> {
     let fixture = Fixture::new().await?;
     let provisioned = async {
-        let repo = provision_empty_repository(&fixture, "serving-proof-rotation").await?;
-        provision_verified_pack(&fixture, &repo).await?;
+        let (owner, repo) = provision_empty_repository(&fixture, "serving-proof-rotation").await?;
+        provision_verified_pack(&fixture, &repo, &owner.identity).await?;
         Ok::<_, anyhow::Error>(repo)
     }
     .await;
@@ -709,7 +713,8 @@ async fn sealed_materialization_returns_none_for_a_checked_empty_capture() -> Re
     let _blob_root = BlobRootIsolation::new();
     let fixture = Fixture::new().await?;
     let outcome = async {
-        let repo = provision_empty_repository(&fixture, "serving-proof-empty").await?;
+        // Only the provisioned repository matters here; nothing writes to it.
+        let (_owner, repo) = provision_empty_repository(&fixture, "serving-proof-empty").await?;
         let current = current_incarnation(&fixture).await?;
         ensure!(!current.is_nil(), "the cluster authority incarnation must never be nil");
         let scope = repo.ready.scope()?;
