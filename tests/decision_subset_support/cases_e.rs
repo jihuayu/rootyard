@@ -14,7 +14,7 @@ use super::common::seeded;
 use super::fixture;
 use crate::retention_roots_support::db::deadline;
 use crate::retention_roots_support::pack::Draft;
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
 use rootyard::ref_store::core::pack_commit::{
     PackCommitError, PackCommitPlan, PackCommitRejectCode, PackCommitScope, PackMembershipEntry, PgPackCommit,
 };
