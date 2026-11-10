@@ -41,6 +41,9 @@ mod smart_http;
 mod snapshot;
 mod state;
 
+#[cfg(test)]
+mod session_http_acceptance;
+
 use std::sync::Arc;
 
 use axum::{
