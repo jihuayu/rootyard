@@ -9,6 +9,7 @@ Idempotency-Key on the first merge, real maintain/admin authority). They are a
 focused oracle, not native evidence.
 """
 import ast
+import hashlib
 import re
 from pathlib import Path
 import subprocess
@@ -18,6 +19,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 import collaborator_transport as harness  # noqa: E402
+import source_bound_binary  # noqa: E402
 
 CASE_METHODS = (
     "git_matrix_version", "source_binding", "environment", "staff_fixtures",
@@ -27,6 +29,8 @@ CASE_METHODS = (
     "withdrawal", "audit_boundary", "token_revocation",
 )
 MAX_MODULE_LINES = 700
+# tests/source_bound_binary.py copied from the P1 lane (commit a4b9d49), unmodified.
+HELPER_SHA256 = "714d08ea518b6ac84a3f8f32329f9f9e172338f917bcc6e0d131eea7e3860b09"
 # Registered case name -> case method, in execution order (see execute()).
 REGISTERED_CASES = (
     "git_matrix_version", "git_command_coverage", "source_bound_receipt", "environment",
@@ -138,19 +142,6 @@ class HarnessContract(unittest.TestCase):
                 return ast.get_source_segment(path.read_text(), node)
         raise AssertionError(f"{klass_method} not found in {path.name}")
 
-    @unittest.skip("FIXME(#4): reproduces the native defect; re-enable with its fix")
-    def test_checkout_head_never_falls_back_to_a_repository_through_cwd(self):
-        """An unavailable GIT_DIR must fail, not yield whatever repo cwd can reach."""
-        try:
-            harness.prerequisite.checkout_head(
-                object.__new__(harness.CollaboratorTransportHarness),
-                ROOT, {}, str(ROOT / "tests"), "0000000000000000000000000000000000000000")
-        except AssertionError as error:
-            self.assertTrue("name the same repository" in str(error)
-                            or "dubious checkout state" in str(error), error)
-        else:
-            self.fail("a git dir that does not describe the checkout was accepted")
-
     def test_registration_yields_name_and_callable_pairs(self):
         """main() unpacks ``for name, fn in h.execute()``; the shape must hold."""
         harness_cls = object.__new__(harness.CollaboratorTransportHarness)
@@ -198,51 +189,17 @@ class HarnessContract(unittest.TestCase):
                 self.assertEqual(undefined, [],
                                  f"{path.name}:{fn.lineno} {fn.name} references undefined names")
 
-    def test_checkout_head_prefers_discovery_and_refuses_dubious_success(self):
-        import subprocess
-        import tempfile
-        base = object.__new__(harness.CollaboratorTransportHarness)
-        base.env = {}
-        calls = []
-
-        def ok(argv):
-            return subprocess.CompletedProcess(argv, 0, b"a" * 40 + b"\n", b"")
-
-        def fake_git(*argv, cwd=None, check=True, env=None):
-            calls.append(dict(env or {}))
-            if (env or {}).get("GIT_DIR"):
-                return subprocess.CompletedProcess(argv, 0, b"b" * 40 + b"\n",
-                                                   b"warning: ignoring ref storage format\n")
-            return ok(argv)
-        base.git = fake_git
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as shared:
-            (Path(root) / ".git").write_text(f"gitdir: {shared}/worktrees/x\n")
-            head, env, via = base.checkout_head(Path(root), {}, shared)
-        self.assertEqual((head, via, env), ("a" * 40, "discovery", {}))
-        self.assertEqual(len(calls), 1)
-        # A shared dir that answers with a warning is not evidence of this HEAD.
-        base.git = lambda *argv, cwd=None, check=True, env=None: subprocess.CompletedProcess(
-            argv, 0, b"a" * 40 + b"\n", b"warning: ignoring ref storage format\n")
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as shared:
-            (Path(root) / ".git").write_text(f"gitdir: {shared}/worktrees/x\n")
-            with self.assertRaisesRegex(AssertionError, "with a warning"):
-                base.checkout_head(Path(root), {}, shared)
-
     def test_source_binding_compares_production_bytes_not_ancestry(self):
         """A build from a sibling tests-only branch binds when production bytes match."""
-        import source_bound_binary
-        self.assertNotIn("merge-base", Path(source_bound_binary.__file__).read_text())
-        self.assertNotIn("checkout_head", Path(source_bound_binary.__file__).read_text())
-        for path in ("Cargo.toml", "Cargo.lock", "src/main.rs", "migrations/110_audit_sequence.sql",
-                     "schema/147_catalog.json", "vendor/x/y.rs", "build.rs"):
-            self.assertTrue(source_bound_binary._production_path(path), path)
-        for path in ("tests/test_collaborator_transport.py", "docs/README.md", "srcx/y.rs"):
-            self.assertFalse(source_bound_binary._production_path(path), path)
-        digest = source_bound_binary.production_source_digest()
-        self.assertRegex(digest, r"^[0-9a-f]{64}$")
-        builder = (ROOT / "scripts" / "build_native.py").read_text()
-        self.assertIn("for directory in ('src', 'migrations', 'schema', 'vendor')", builder)
-        # No receipt: the bind fails, it never degrades to a bare HEAD match.
+        contract = HarnessModules.sources()["collaborator_contract.py"]
+        binding = self.method_source(ROOT / "tests" / "collaborator_contract.py", "source_binding")
+        self.assertIn("bind(self.args.binary, environ=environ)", binding)
+        self.assertNotIn("merge-base", contract)
+        for removed in ("checkout_head", "GIT_DIR", "--git-common-dir", "is-ancestor"):
+            self.assertNotIn(removed, binding, removed)
+        helper = (ROOT / "tests" / "source_bound_binary.py").read_text()
+        self.assertEqual(hashlib.sha256(helper.encode()).hexdigest(), HELPER_SHA256,
+                         "the reviewed binding helper must be reused verbatim")
         with self.assertRaises(source_bound_binary.SourceBindingError):
             source_bound_binary.bind(ROOT / "target" / "does-not-exist-rootyard", environ={})
 

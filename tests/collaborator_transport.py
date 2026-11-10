@@ -51,9 +51,9 @@ class CollaboratorTransportHarness(collaborator_contract.prerequisite,
             "Direct repository_collaborators roles only; teams/organizations are other suites.",
             "Git refs, git_operations and outbox_events are authoritative; Git HTTP status is observed.",
             "No object store, kernel fault, power loss or production connection is exercised.",
-            "source_commit is the mounted checkout's HEAD. If the eval records that worktree's "
-            "HEAD inside an unmounted worktree git dir, HEAD here is the eval's source state; "
-            "the production input digest and binary receipt still bind the executed binary.",
+            "source_commit is the mounted checkout's HEAD, read by tests/source_bound_binary.py; "
+            "the executed binary binds to the current production input bytes via its real build "
+            "receipt, not to an ancestor relation with the receipt's commit.",
         ]
         self.users = {}
         self.member_mutations = 0

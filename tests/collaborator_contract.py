@@ -9,7 +9,6 @@ by ``tests/organizations.py`` and ``tests/members.py``.
 """
 import ast
 import hashlib
-import json
 import os
 from pathlib import Path
 import sys
@@ -22,11 +21,12 @@ MIN_GIT = (2, 39)
 # (``Config::from_env``: ROOTYARD_GIT or the first ``git`` on PATH, then
 # canonicalized) and the managed hook (the running binary re-executed with
 # ROOTYARD_GIT_PATH set to that same Config.git), so only exact binary/version
-# equality is meaningful. The commands below are this module tree's own argv;
-# anything the job runs elsewhere is reported by ``git_command_coverage``.
+# equality is meaningful. The commands below are the case modules' own argv,
+# discovered with ``invoked_git_commands``; binary/version checks run elsewhere
+# are reported by ``git_command_coverage``.
 EXECUTED_GIT_COMMANDS = frozenset({
-    "add", "checkout", "clone", "commit", "config", "fetch", "ls-remote", "merge-base",
-    "push", "reset", "rev-parse", "status",
+    "add", "checkout", "clone", "commit", "config", "fetch", "ls-remote",
+    "push", "reset", "rev-parse",
 })
 RECEIVE = "application/x-git-receive-pack-request"
 RECEIVE_ENDPOINT = "/git-receive-pack"
@@ -151,87 +151,34 @@ class prerequisite:
             return True
         return {"sys.platform": sys.platform, "machine": os.uname().machine}
 
-    def checkout_head(self, root, env, shared):
-        """HEAD of the mounted checkout, discovered the way Git itself would.
-
-        Plain discovery honours the checkout's ``.git`` file (a run sandbox may
-        point it at a headless git dir). If that fails, the shared git dir the
-        rules mount is tried as ``GIT_DIR``. A success that Git itself marks
-        dubious (``warning:`` on stderr) is refused rather than reported as
-        this worktree's HEAD.
-        """
-        strategies = {"discovery": {}}
-        try:
-            pointer = (Path(root) / ".git").read_text().strip()
-        except OSError:
-            pointer = ""
-        linked = pointer.startswith("gitdir:")
-        if linked:
-            strategies["linked worktree " + pointer.split(":", 1)[1].strip()] = {}
-            if Path(shared).is_dir():
-                strategies["shared " + shared] = {"GIT_DIR": shared, "GIT_WORK_TREE": str(root)}
-        tried = []
-        for label, extra in strategies.items():
-            proc = self.git("rev-parse", "HEAD", cwd=root, check=False, env={**env, **extra})
-            if proc.returncode:
-                tried.append(label + ": " + proc.stderr.decode(errors="replace").strip()[-160:])
-                continue
-            assert not proc.stderr.strip(), (
-                f"{label} resolved HEAD {proc.stdout.decode().strip()} with a warning: " +
-                proc.stderr.decode(errors="replace").strip()[-300:])
-            # When GIT_DIR is set Git stops searching for the work tree and
-            # rev-parse runs in a bare-style repository; pin it to this source.
-            if extra:
-                extra = {**extra, "GIT_WORK_TREE": str(root)}
-            return proc.stdout.decode().strip(), {**env, **extra}, label
-        raise AssertionError("required dependency missing: checkout HEAD unreachable (" +
-                             "; ".join(tried) + ")")
-
     def source_binding(self):
-        """Bind the executed binary to the current production inputs via its build receipt."""
-        root = Path(__file__).resolve().parents[1]
-        receipt_path = Path(self.args.binary).with_suffix(".build.json")
-        assert receipt_path.is_file(), (
-            "required dependency missing: no scripts/build_native.py receipt beside "
-            + str(self.args.binary))
-        receipt = json.loads(receipt_path.read_text())
-        binary_sha = sha256_file(self.args.binary)
-        assert receipt.get("binary_sha256") == binary_sha, "executed binary differs from its receipt"
-        if str(PACKAGE_ROOT / "scripts") not in sys.path:
-            sys.path.insert(0, str(PACKAGE_ROOT / "scripts"))
-        import build_native  # scripts/ is not a package; same digest function as the build
-        current = build_native.source_digest()
-        assert current == receipt["source_inputs_sha256"], (
-            "current src/Cargo/migrations/schema/vendor inputs differ from the binary's build")
-        checkout_env = dict(self.env, GIT_OPTIONAL_LOCKS="0")
-        # First: is the mounted .git really this checkout's? rev-parse can walk
-        # into a repository through cwd even when GIT_DIR names nothing, so a
-        # lookup must not count as evidence until --git-common-dir agrees.
-        probe = self.git("rev-parse", "--git-common-dir", cwd=root, check=False, env=checkout_env)
-        shared = probe.stdout.decode().strip() if probe.returncode == 0 else ""
-        if shared and not shared.startswith("/"):
-            shared = str((root / shared).resolve())
-        if not shared or not Path(shared).is_dir():
-            raise AssertionError("required dependency missing: mount the shared .git dir (" +
-                                 (probe.stderr.decode(errors="replace").strip()[-200:] or
-                                  shared or "no git metadata"))
-        assert probe.stderr.decode().strip() == "", (
-            "checkout metadata reported: " + probe.stderr.decode(errors="replace").strip()[-300:])
-        head, checkout_env, discovered_via = self.checkout_head(root, checkout_env, shared)
-        tracked = self.git("status", "--porcelain", "--untracked-files=no", cwd=root,
-                           env=checkout_env).stdout
-        assert not tracked.strip(), "tracked inputs are dirty: console builds embed differing debug paths"
-        parent = receipt["workspace_commit"]
-        assert self.git("merge-base", "--is-ancestor", parent, head, cwd=root,
-                        check=False, env=checkout_env).returncode == 0, (
-            f"binary source commit {parent} is not an ancestor of HEAD {head}")
-        return {"source_commit": head, "checkout_discovered_via": discovered_via,
-                "binary_source_commit": parent,
-                "binary_commit_is_ancestor": True,
-                "source_inputs_sha256": current, "binary_sha256": binary_sha,
-                "rustc": receipt.get("rustc"), "build_command": receipt.get("command"),
-                "harness": {"file": str(Path(__file__).relative_to(root)),
+        """Bind the executed binary to the current production inputs via its build receipt.
+
+        ``tests/source_bound_binary.py`` compares the receipt's production input
+        digest with ``scripts/build_native.source_digest()`` and the receipt with
+        the binary, and records the receipt's source commit next to the current
+        HEAD. An ancestor relation between them is deliberately not required: the
+        baseline is built just before the checkout's own tests-only commits, and
+        identical production bytes are the binding that matters.
+        """
+        from source_bound_binary import SourceBindingError, bind
+        env = getattr(self, "env", {})
+        environ = {name: env[name] for name in ("ROOTYARD_EXPECTED_SOURCE_COMMIT",) if name in env}
+        try:
+            evidence = bind(self.args.binary, environ=environ)
+        except SourceBindingError as error:
+            raise AssertionError("required dependency missing: source binding failed: " + str(error))
+        assert evidence["source_inputs_sha256"] == evidence["current_source_inputs_sha256"]
+        assert not evidence["current_head_production_dirty"], (
+            "production inputs differ from HEAD: " + ", ".join(evidence["current_head_production_dirty"]))
+        return {"source_commit": evidence["current_head"],
+                "binary_source_commit": evidence["workspace_commit"],
+                "source_inputs_sha256": evidence["source_inputs_sha256"],
+                "binary_sha256": evidence["binary_sha256"],
+                "rustc": evidence["receipt_toolchain"]["rustc"],
+                "build_command": evidence["receipt_toolchain"]["command"],
+                "harness": {"file": str(Path(__file__).relative_to(PACKAGE_ROOT)),
                             "sha256": sha256_file(Path(__file__)),
-                            "modules": [str(p.relative_to(root)) for p in
+                            "modules": [str(Path(p).relative_to(PACKAGE_ROOT)) for p in
                                         getattr(self, "case_module_files", ())]},
-                "identity": "owned schema " + self.schema}
+                "identity": "owned e2e schema"}
