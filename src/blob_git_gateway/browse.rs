@@ -261,7 +261,7 @@ async fn read_tree(
     let result = TreeResponse { oid: root_oid, tree_oid, path, items: entries, next_after };
     // This includes empty trees, just as the Blob handler includes empty files:
     // the session ends in the same final fence and issuance path either way.
-    finalize(&session, &result).await
+    finalize(session, &result).await
 }
 
 async fn read_blob(
@@ -311,7 +311,7 @@ async fn read_blob(
     let content = if is_binary { None } else { std::str::from_utf8(&raw).ok().map(str::to_owned) };
     let content_base64 = base64::engine::general_purpose::STANDARD.encode(&raw);
     let result = BlobResponse { oid, size, is_binary, content, content_base64 };
-    finalize(&session, &result).await
+    finalize(session, &result).await
 }
 
 fn bad_input(_: crate::Error) -> GatewayError {
@@ -513,7 +513,7 @@ fn parse_tree(raw: &[u8], path: &str, after: Option<&str>, limit: usize) -> Resu
 ///    attached with [`IssuedSession::apply`]; a token-disabled gateway or a
 ///    checked empty read leaves the response token-free.
 pub(super) async fn finalize<T: Serialize>(
-    session: &BrowseSession,
+    session: BrowseSession,
     value: &T,
 ) -> Result<Response, GatewayError> {
     let state = &session.state;
@@ -521,11 +521,13 @@ pub(super) async fn finalize<T: Serialize>(
     let bytes = encode_response(value, limit)?;
     let serving = session.authorization.revalidate_serving(session.deadline).await?;
     read_session::verify_capture_anchor(session.capture_incarnation, session.materialized_read(), &serving)?;
-    let issued = match session_claim(session, &serving)? {
+    let issued = match session_claim(&session, &serving)? {
         SessionClaim::Disabled | SessionClaim::NoProof => None,
-        SessionClaim::Issue(read) => Some(issue(session, read, &serving)?),
+        SessionClaim::Issue(read) => Some(issue(&session, read, &serving)?),
     };
-    Ok(body_response(bytes, &session.slot, &session.lease, issued.as_ref()))
+    // The slot and byte leases are unique bounded permits: they move into the
+    // response stream state and are never cloned.
+    Ok(body_response(bytes, session.slot, session.lease, issued.as_ref()))
 }
 
 /// The session decision for an encoded response, made only after the universal
@@ -570,13 +572,13 @@ fn issue(
 
 fn body_response(
     bytes: Vec<u8>,
-    slot: &tokio::sync::OwnedSemaphorePermit,
-    lease: &ByteLease,
+    slot: tokio::sync::OwnedSemaphorePermit,
+    lease: ByteLease,
     issued: Option<&IssuedSession>,
 ) -> Response {
     // Keep the bounded response's capacity charged until its body is consumed
-    // or discarded, even after the request future has returned.
-    let (slot, lease) = (slot.clone(), lease.clone());
+    // or discarded, even after the request future has returned: the moved
+    // leases live in the stream state.
     let stream =
         futures_util::stream::unfold((Some(Bytes::from(bytes)), slot, lease), |(bytes, slot, lease)| async move {
             bytes.map(|bytes| (Ok::<_, std::convert::Infallible>(bytes), (None, slot, lease)))

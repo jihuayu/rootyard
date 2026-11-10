@@ -309,7 +309,7 @@ fn hash_algorithm(format: crate::ref_store::GitObjectFormat) -> String {
 /// then session issuance from the sealed read. `value` is serialized exactly
 /// once.
 async fn finish<T: Serialize>(session: browse::BrowseSession, value: T) -> Result<Response, GatewayError> {
-    browse::finalize(&session, &value).await
+    browse::finalize(session, &value).await
 }
 
 // ---------------------------------------------------------------------------
