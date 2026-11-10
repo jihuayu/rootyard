@@ -104,6 +104,10 @@ REASONS = frozenset(
         "REPO_PAGE_STATUS_INVALID",
         "READ_CHAIN_INVALID",
         "COOKIE_ONLY_DENIAL_MISSING",
+        "API_COOKIE_ONLY_FETCH_FAILED",
+        "API_COOKIE_ONLY_STATUS_INVALID",
+        "GIT_COOKIE_ONLY_FETCH_FAILED",
+        "GIT_COOKIE_ONLY_STATUS_INVALID",
         "API_READ_BOUND_INVALID",
         "FAULT_BOUND_INVALID",
         "FAULT_NOT_APPLIED",
@@ -491,8 +495,10 @@ class Client:
 
         # 5. Cookie-only denial of the unchanged bearer-only routes.
         extra["denials"] = {
-            "api": await self.cookie_only(page, "/api/repos"),
-            "git": await self.cookie_only(page, f"/git/{self.owner}/{self.repo}.git/info/refs?service=git-upload-pack"),
+            "api": await self.cookie_only(page, "/api/repos", "api"),
+            "git": await self.cookie_only(
+                page, f"/git/{self.owner}/{self.repo}.git/info/refs?service=git-upload-pack", "git"
+            ),
         }
         if extra["denials"] != {"api": 401, "git": 401}:
             raise Failure("COOKIE_ONLY_DENIAL_MISSING")
@@ -547,17 +553,29 @@ class Client:
             "complete": all(later >= earlier for earlier, later in zip(seen, seen[1:])),
         }
 
-    async def cookie_only(self, page, path):
-        return await evaluate(
+    async def cookie_only(self, page, path, route):
+        """One cookie-only fetch of a bearer-only route, reduced to its status.
+
+        The bounded `evaluate` turns an in-page fetch rejection or a step
+        timeout into the route's fixed fetch reason; a resolved fetch whose
+        status is not the required `401` is the route's fixed status failure.
+        Neither the path, the request headers, the cookies, the response body
+        nor any exception text crosses this boundary: only the integer status
+        of a `401` is returned.
+        """
+        status = await evaluate(
             page,
             """async (path) => {
                 const response = await fetch(path, {credentials: 'same-origin',
                     headers: {Accept: 'application/json'}});
                 return response.status;
             }""",
-            "COOKIE_ONLY_DENIAL_MISSING",
+            f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED",
             path,
         )
+        if isinstance(status, bool) or not isinstance(status, int) or status != 401:
+            raise Failure(f"{route.upper()}_COOKIE_ONLY_STATUS_INVALID")
+        return status
 
     async def no_shell(self, page, reason):
         scripts = await evaluate(page, "() => Array.from(document.scripts).map((node) => node.src)", reason)
