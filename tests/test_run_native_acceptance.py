@@ -562,10 +562,13 @@ class RunnerContractTest(unittest.TestCase):
     def test_inherited_sensitive_environment_is_redacted(self):
         url_value = "postgresql://db.invalid/parent-db-secret-marker-6392"
         token_value = "parent-env-token-secret-marker-8261"
+        api_key_value = "parent-api-key-value-marker-5127"
+        postgres_url_value = "postgresql://pg.invalid/parent-pg-secret-marker-3046"
         public_marker = "public-build-marker-2026"
         script = (
             "import os, sys\n"
-            "for name in ('DATABASE_URL', 'PARENT_ACCESS_TOKEN', 'ROOTYARD_PUBLIC_MARKER'):\n"
+            "for name in ('DATABASE_URL', 'PARENT_ACCESS_TOKEN', 'PARENT_API_KEY', 'POSTGRES_URL',\n"
+            "             'ROOTYARD_PUBLIC_MARKER'):\n"
             "    sys.stdout.write(os.environ[name] + '\\n')\n"
             "sys.exit(2)\n"
         )
@@ -575,17 +578,19 @@ class RunnerContractTest(unittest.TestCase):
         completed, report = self.fx.run(self.tracker, plan, extra_env={
             "DATABASE_URL": url_value,
             "PARENT_ACCESS_TOKEN": token_value,
+            "PARENT_API_KEY": api_key_value,
+            "POSTGRES_URL": postgres_url_value,
             "ROOTYARD_PUBLIC_MARKER": public_marker})
         text = (self.fx.root / "run-run-test" / "report.json").read_text()
         summary = by_id(report, "smoke-inherited")["summary"]
+        # No URL userinfo in the PostgreSQL URL: only environment-value collection can hide it.
+        self.assertNotIn("@", postgres_url_value)
         self.assertTrue(completed.returncode == 1)
-        self.assertFalse(url_value in completed.stderr)
-        self.assertFalse(token_value in completed.stderr)
         self.assertEqual(report["selftest"]["status"], "passed")
-        self.assertFalse(url_value in text)
-        self.assertFalse(token_value in text)
-        self.assertFalse(url_value in summary)
-        self.assertFalse(token_value in summary)
+        for leaked in (url_value, token_value, api_key_value, postgres_url_value):
+            self.assertFalse(leaked in completed.stderr)
+            self.assertFalse(leaked in text)
+            self.assertFalse(leaked in summary)
         self.assertIn("[REDACTED]", summary)
         self.assertIn(public_marker, summary)
 
@@ -980,13 +985,20 @@ class RedactorTest(unittest.TestCase):
                              "Authorization: Bearer ryt_abcdefgh12345\n"
                              "ROOTYARD_OBJECT_STORE_SECRET_KEY=abc\n"
                              "export ROOTYARD_TEST_PASSWORD='quoted'\n"
+                             "PARENT_API_KEY=api-key-assignment-77\n"
+                             "POSTGRES_URL=postgresql://pg.invalid/pg-assignment-88\n"
+                             "DATABASE_URL=postgresql://db.invalid/db-assignment-99\n"
                              "Error: suite id 'a.b' is invalid\n"
                              "top-secret-value\n")
-        for needle in ("pa55@", "ryt_abcdefgh12345", "SECRET_KEY=abc", "quoted", "top-secret-value"):
+        for needle in ("pa55@", "ryt_abcdefgh12345", "SECRET_KEY=abc", "quoted", "top-secret-value",
+                       "api-key-assignment-77", "pg-assignment-88", "db-assignment-99"):
             self.assertNotIn(needle, text)
         self.assertIn("[REDACTED]@127.0.0.1:55432", text)
         self.assertIn("Authorization: [REDACTED]", text)
         self.assertIn("ROOTYARD_OBJECT_STORE_SECRET_KEY=[REDACTED]", text)
+        self.assertIn("PARENT_API_KEY=[REDACTED]", text)
+        self.assertIn("POSTGRES_URL=[REDACTED]", text)
+        self.assertIn("DATABASE_URL=[REDACTED]", text)
         self.assertIn("Error:", text)  # a plain error prefix is not redacted
 
     def test_summary_is_bounded(self):

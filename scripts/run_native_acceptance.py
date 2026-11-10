@@ -102,12 +102,14 @@ SELF_ENV = ("ROOTYARD_ACCEPTANCE_RUN_ID", "ROOTYARD_ACCEPTANCE_SUITE", "ROOTYARD
 # Object-store settings are supplied by the plan itself; an inherited endpoint,
 # bucket or credential must not silently reach a suite that did not declare it.
 LEASE_ENV_PREFIXES = ("ROOTYARD_OBJECT_STORE_", "ROOTYARD_BLOB_")
-SENSITIVE_ENV = re.compile(r"SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|DATABASE_URL", re.I)
+SENSITIVE_ENV = re.compile(r"SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|API_KEY"
+                           r"|DATABASE_URL|POSTGRES_URL", re.I)
 URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
 AUTH_HEADER = re.compile(r"(?i)((?:authorization|proxy-authorization)\s*:\s*)(?:basic|bearer|token)\s+\S+")
 SENSITIVE_ASSIGNMENT = re.compile(
     r"(?<![A-Za-z0-9_])((?=[A-Z0-9_]*[A-Z](?:[A-Z0-9_]|$))(?=[A-Z0-9_]*"
-    r"(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|ACCESS_KEY|PRIVATE_KEY))"
+    r"(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|ACCESS_KEY|PRIVATE_KEY|API_KEY"
+    r"|DATABASE_URL|POSTGRES_URL))"
     r"[A-Z0-9_]*[ \t]*[=:][ \t]*)(\"[^\"]*\"|'[^']*'|[^\s,;]*)")
 KNOWN_TOKEN = re.compile(r"\b(?:ryt|ghp|gho|glpat|xox[abp])_[A-Za-z0-9._-]{8,}")
 # The supervisor's only pre-spawn refusal code, the exact frame key set, and the
