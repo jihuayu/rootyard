@@ -50,11 +50,11 @@ use std::sync::{
 };
 
 #[path = "fuse_dispatch/budget.rs"]
-pub(super) mod budget;
+mod budget;
 #[path = "fuse_dispatch/read.rs"]
-pub(super) mod read;
+mod read;
 #[path = "fuse_dispatch/read_pool.rs"]
-pub(super) mod read_pool;
+mod read_pool;
 
 pub const MOUNT_QUEUE_OPS: usize = 128;
 pub const MOUNT_QUEUE_BYTES: usize = 8 * 1024 * 1024;

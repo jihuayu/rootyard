@@ -4,7 +4,8 @@
 //! unit into the read pool and sends exactly one reply. Shutdown drains every
 //! read whose reply is still in its slot; a read already doing I/O re-checks
 //! the shutdown flag and replies `EIO` instead of a late success.
-use super::super::inner_ops::ReadPlan;
+use super::super::inner_ops::{ReadPlan, read_at};
+use super::read_pool::ReadJob;
 use super::*;
 
 /// A lazy read whose reply and budget charge travel to the read pool together.
@@ -72,9 +73,7 @@ impl Actor {
             }
         }
     }
-}
 
-impl Actor {
     /// Hand a lazy read to the global pool. If the pool is saturated the reply is
     /// `EAGAIN`; the read is never executed inline on the actor.
     fn submit_deferred(&self, deferred: DeferredRead) {
