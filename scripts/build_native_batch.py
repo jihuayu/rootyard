@@ -17,6 +17,11 @@ property of those two transactions but pays for the clean once:
   ``--test`` in one invocation, so the application binaries and the selected
   integration tests come from one compiler run (``cargo rustc --profile
   test`` takes a single target and cannot);
+* Cargo events are filtered by package: artifacts of the selected rootyard
+  package are indexed by their real ``target.kind`` (``lib``/``bin``/``test``),
+  name, executable and profile; artifacts of dependencies Cargo happens to
+  rebuild in the same invocation are skipped and never receipted, because a
+  legal dependency must not make a build fail;
 * it fails closed unless every selected artifact is reported ``Fresh=false``,
   the rootyard lib is ``Fresh=false`` and is bound to every binary receipt,
   the exact-rootyard-package binary artifacts carry their executable path and
@@ -454,49 +459,72 @@ def _profile(event):
 
 
 def artifact_index(events, package):
-    """Index fresh=False lib/bin/test compiler artifacts of one package; anything else fails closed."""
+    """Index the fresh=False lib/bin/test compiler artifacts of exactly one selected package.
+
+    Cargo reports every unit it built or found fresh in this invocation, so a
+    selected package with a dependency that is rebuilt reports that
+    dependency's artifacts in the same stream (a ``depcrate`` lib next to
+    ``rootyard``). Only events whose
+    ``package_id`` is the selected package are indexed: a foreign artifact
+    says nothing about what this batch compiled (a fresh or dirty foreign
+    dependency is Cargo's own concern, not a receipt for a selected target),
+    so it is skipped rather than failed on. Inside the selected package the
+    checks stay closed: any Fresh=true selected artifact, a lib other than
+    the package-named one, a duplicate, a kind other than lib/bin/test, or a
+    bin/test without an executable is rejected.
+
+    ``target.kind`` (``["test"]``) is the classification of a target, not
+    ``profile.test``: a ``harness = false`` integration test has kind
+    ``["test"]`` and Cargo still reports ``profile.test`` for it.
+    """
     if not package:
         raise BuildError('no rootyard package id to bind artifacts to')
     lib = None
     bins, tests = {}, {}
+    skipped = {}
     for event in events:
         if event.get('reason') != 'compiler-artifact':
+            continue
+        if event.get('package_id') != package:
+            skipped[event.get('package_id')] = skipped.get(event.get('package_id'), 0) + 1
             continue
         target = event.get('target') or {}
         name = target.get('name')
         kinds = list(target.get('kind') or [])
-        if event.get('package_id') != package:
-            raise BuildError('Cargo reported an artifact for unexpected package ' + repr(event.get('package_id')))
         if event.get('fresh') is not False:
-            raise BuildError(f'Cargo reported a Fresh {name} artifact; refusing a stale receipt')
+            raise BuildError(f'Cargo reported a Fresh {name} artifact of {PACKAGE}; refusing a stale receipt')
         if kinds == ['lib']:
+            if name != PACKAGE:
+                raise BuildError(f'{PACKAGE} reported an unexpected lib target {name!r}; the batch binds '
+                                 f'the {PACKAGE} lib to every receipt')
             if lib is not None:
-                raise BuildError('Cargo reported two rootyard lib artifacts for one build')
+                raise BuildError(f'Cargo reported two {PACKAGE} lib artifacts for one build')
             lib = {'target': name, 'kind': 'lib', 'fresh': False, 'package_id': event.get('package_id')}
         elif kinds == ['bin']:
             executable = event.get('executable')
             if not executable:
-                raise BuildError(f'rootyard binary artifact {name} has no executable path')
+                raise BuildError(f'{PACKAGE} binary artifact {name} has no executable path')
             if not name or name in bins:
-                raise BuildError(f'Cargo reported a duplicate or unnamed bin artifact: {name!r}')
+                raise BuildError(f'Cargo reported a duplicate or unnamed {PACKAGE} bin artifact: {name!r}')
             bins[name] = {'target': name, 'kind': 'bin', 'fresh': False,
                           'executable': str(Path(executable).resolve()),
                           'package_id': event.get('package_id'), 'profile': _profile(event)}
         elif kinds == ['test']:
             executable = event.get('executable')
             if not executable:
-                raise BuildError(f'integration-test artifact {name} has no executable path')
+                raise BuildError(f'{PACKAGE} integration-test artifact {name} has no executable path')
             if not name or name in tests:
-                raise BuildError(f'Cargo reported duplicate {name!r} test artifacts; expected exactly one')
+                raise BuildError(f'Cargo reported duplicate {name!r} {PACKAGE} test artifacts; '
+                                 'expected exactly one')
             tests[name] = {'target': name, 'kind': 'test', 'fresh': False,
                            'profile': _profile(event), 'executable': str(Path(executable).resolve()),
                            'package_id': event.get('package_id')}
         else:
-            raise BuildError(f'unexpected rootyard artifact {name!r} {kinds}; only lib, bin and test '
+            raise BuildError(f'unexpected {PACKAGE} artifact {name!r} {kinds}; only lib, bin and test '
                              'artifacts belong in this batch')
     if lib is None:
-        raise BuildError('Cargo did not report a rootyard lib compiler-artifact')
-    return lib, bins, tests
+        raise BuildError(f'Cargo did not report a {PACKAGE} lib compiler-artifact')
+    return lib, bins, tests, skipped
 
 
 def require_build_finished(events):
@@ -506,8 +534,12 @@ def require_build_finished(events):
 
 
 def select_artifacts(events, package, bin_specs, test_specs):
-    """Return ``(lib, [bin artifacts], [test artifacts])`` for exactly the selected targets."""
-    lib, bins, tests = artifact_index(events, package)
+    """Return ``(lib, [bin artifacts], [test artifacts])`` for exactly the selected targets.
+
+    Foreign-package artifacts (dependencies Cargo rebuilt alongside the
+    selected package) are skipped by artifact_index and never receipted.
+    """
+    lib, bins, tests, _ = artifact_index(events, package)
     require_build_finished(events)
     wanted_bins = [spec['name'] for spec in bin_specs]
     missing = [name for name in wanted_bins if name not in bins]
@@ -531,6 +563,9 @@ def select_artifacts(events, package, bin_specs, test_specs):
     selected_tests = []
     for spec in test_specs:
         artifact = tests[spec['name']]
+        # The test profile is the recorded build selection (--profile test),
+        # not a re-derivation: a harness = false integration test is still a
+        # kind ["test"] target and Cargo reports profile.test for it.
         if artifact['profile'].get('test') is not True:
             raise BuildError('selected test artifact ' + spec['name'] + ' was not built with a test profile')
         if not Path(artifact['executable']).is_file():

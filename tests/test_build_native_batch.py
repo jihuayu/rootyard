@@ -237,6 +237,11 @@ class BatchTest(unittest.TestCase):
     def compiled_test(self, name):
         return str(os.path.join(self.target, 'debug', 'deps', name + '-0123456789abcdef'))
 
+    def compiled_harness_false(self, name):
+        """Where Cargo puts a harness = false test executable (real cargo 1.99.1)."""
+        return str(os.path.join(self.target, 'debug', 'build', 'rootyard', '0123456789abcdef', 'out',
+                                name + '-0123456789abcdef'))
+
     def binary(self, name):
         return str(os.path.join(self.target, 'debug', name))
 
@@ -501,16 +506,126 @@ class BatchTest(unittest.TestCase):
         events[1] = artifact('bin', 'rootyard', executable=str(self.root / 'elsewhere' / 'rootyard'))
         self.assert_failure(events, 'does not match')
 
-    def test_artifact_of_another_package_is_rejected(self):
-        events = self.default_events()[:-1] + [artifact('bin', 'sneaky', package='path+file:///x#other@0.1.0',
-                                                        executable=self.binary('sneaky')), finished()]
-        self.assert_failure(events, 'unexpected package')
+    def test_foreign_package_artifacts_are_skipped_not_receipted(self):
+        # Real Cargo reports the dependency it rebuilt before the selected
+        # package's units; only the selected package's events may reach a receipt.
+        foreign = 'path+file:///ws#depcrate@0.1.0'
+        events = self.default_events()
+        events.insert(0, artifact('lib', 'depcrate', package=foreign))
+        # A foreign bin is skipped too, even though its kind/name are not selected.
+        events.insert(-1, artifact('bin', 'sneaky', package=foreign, executable=self.binary('sneaky')))
+        report = self.build(events=events)
+        recorded = report['build']['fresh_false_artifacts']
+        self.assertEqual([(item['kind'], item['target']) for item in recorded],
+                         [('lib', 'rootyard')] + [('bin', name) for name in BINS])
+        self.assertTrue(all(item['package_id'] == PACKAGE_ID for item in recorded))
+        receipt = json.loads((self.target / 'debug' / 'rootyard.build.json').read_text())
+        self.assertEqual(receipt['fresh_false_artifacts'], recorded)
+        # One receipt per selected bin and test; nothing for the dependency.
+        self.assertEqual(
+            sorted(Path(entry['receipt']).resolve() for entry in report['artifacts']),
+            sorted([(self.target / 'debug' / (name + '.build.json')).resolve() for name in BINS] +
+                   [(self.outdir / (name.replace('_', '-') + '.build.json')).resolve() for name in TESTS]))
+        self.assertFalse(list(self.outdir.rglob('*depcrate*.build.json')))
 
-    def test_test_with_a_dev_profile_is_rejected(self):
-        events = self.default_events()[:-1]
-        events[1 + len(BINS)] = artifact('test', TESTS[0], test_profile=False,
-                                         executable=self.compiled_test(TESTS[0]))
-        self.assert_failure(events + [finished()], 'test profile')
+    def test_foreign_package_artifacts_are_named_in_index_and_never_in_receipts(self):
+        foreign = 'path+file:///ws#depcrate@0.1.0'
+        events = [artifact('lib', 'depcrate', package=foreign),
+                  artifact('bin', 'depcrate-tool', package=foreign,
+                           executable=self.binary('dependency-only-tool')),
+                  # A fresh (dirty-reused) dependency is Cargo's business; it is
+                  # not one of the selected artifacts a receipt vouches for.
+                  artifact('lib', 'depcrate', package=foreign, fresh=True)] + self.default_events()
+        lib, bins, tests, skipped = batch.artifact_index(events, PACKAGE_ID)
+        self.assertEqual(lib, {'target': 'rootyard', 'kind': 'lib', 'fresh': False,
+                               'package_id': PACKAGE_ID})
+        self.assertEqual(sorted(bins), sorted(BINS))
+        self.assertEqual(sorted(tests), sorted(TESTS))
+        self.assertEqual(skipped, {foreign: 3})
+        self.assertTrue(all(item['package_id'] == PACKAGE_ID
+                            for item in [lib, *bins.values(), *tests.values()]))
+        self.assertNotIn('depcrate-tool', bins)
+        self.assertNotIn('depcrate', [item['target'] for item in [lib, *bins.values(), *tests.values()]])
+
+    def test_foreign_artifacts_do_not_relax_selected_package_checks(self):
+        foreign = 'path+file:///ws#depcrate@0.1.0'
+        # A foreign package's lib must not stand in for a missing rootyard lib.
+        missing = [artifact('lib', 'rootyard', package=foreign)] + self.default_events(lib=False)
+        self.assert_failure(missing, 'did not report a rootyard lib')
+        # A fresh foreign lib neither fails the batch nor is receipted.
+        fresh_foreign = [artifact('lib', 'depcrate', package=foreign, fresh=True)] + self.default_events()
+        report = self.build(events=fresh_foreign)
+        self.assertEqual([(item['kind'], item['target'], item['fresh'])
+                          for item in report['build']['fresh_false_artifacts']],
+                         [('lib', 'rootyard', False)] + [('bin', name, False) for name in BINS])
+        # Duplicate, unexpected-kind, renamed-lib and Fresh=true artifacts of
+        # the selected package stay fatal even when a foreign event is present.
+        foreign_lib = artifact('lib', 'depcrate', package=foreign)
+        duplicate = self.default_events() + [artifact('lib', 'rootyard'), foreign_lib]
+        self.assert_failure(duplicate, 'two rootyard lib artifacts')
+        example = self.default_events() + [artifact('example', 'demo', executable=self.binary('demo')),
+                                           foreign_lib]
+        self.assert_failure(example, 'unexpected rootyard artifact')
+        renamed = self.default_events()
+        renamed[0] = artifact('lib', 'rootyard_core')
+        self.assert_failure([foreign_lib] + renamed, 'unexpected lib target')
+        stale_bin = self.default_events()
+        stale_bin[1] = artifact('bin', 'rootyard', fresh=True, executable=self.binary('rootyard'))
+        stale_bin.insert(-1, foreign_lib)
+        self.assert_failure(stale_bin, 'Fresh rootyard artifact of rootyard')
+        # A selected bin is still required when only a foreign lib was reported.
+        missing_bin = [foreign_lib] + self.default_events(bins=BINS[1:])
+        self.assert_failure(missing_bin, 'did not report the requested binaries')
+
+    def test_harness_false_test_is_classified_by_kind_not_profile_test(self):
+        # Real Cargo 1.99.1 for a [[test]] harness = false fixture: target
+        # kind ["test"], an executable under
+        # target/debug/build/<pkg>/<hash>/out, profile.test = true (recorded
+        # as reported, not re-derived from harness or kind).
+        events = self.default_events(tests=())
+        events.insert(-1, artifact('test', TESTS[0], executable=self.compiled_harness_false(TESTS[0])))
+        report = self.build(events=events, args=self.args(tests=TESTS[:1],
+                                                          outputs=[str(self.outdir / 'fixture')]))
+        entry = report['artifacts'][-1]
+        self.assertEqual((entry['kind'], entry['target'], entry['fresh']), ('test', TESTS[0], False))
+        self.assertEqual(entry['original_artifact'], self.compiled_harness_false(TESTS[0]))
+        self.assertEqual(entry['artifact'], str((self.outdir / 'fixture').resolve()))
+        self.assertEqual(entry['source'], str(self.root / 'tests' / (TESTS[0] + '.rs')))
+        self.assertEqual(entry['source_sha256'], batch.sha256_file(self.root / 'tests' / (TESTS[0] + '.rs')))
+        self.assertTrue(Path(entry['artifact']).is_file())
+        self.assertNotIn(self.target, Path(entry['artifact']).resolve().parents)
+        # The compiled harness = false binary stays in place; the copy is ours.
+        self.assertTrue(Path(self.compiled_harness_false(TESTS[0])).is_file())
+        receipt = json.loads(Path(entry['receipt']).read_text())
+        self.assertEqual(receipt['kind'], 'rust-integration-test')
+        self.assertEqual(len(receipt['fresh_false_artifacts']), 1)
+        harness = receipt['fresh_false_artifacts'][0]
+        self.assertEqual((harness['kind'], harness['target'], harness['fresh']), ('test', TESTS[0], False))
+        self.assertEqual(harness['executable'], self.compiled_harness_false(TESTS[0]))
+        self.assertIs(harness['profile']['test'], True)
+        self.assertIs(harness['profile']['debug_assertions'], True)
+        self.assertEqual(receipt['binary_sha256'], batch.sha256_file(entry['artifact']))
+        self.assertEqual(receipt['original_artifact_sha256'],
+                         batch.sha256_file(self.compiled_harness_false(TESTS[0])))
+
+    def test_harness_false_test_stays_a_selected_test_for_fresh_and_kind(self):
+        # A harness = false fixture is a selected test: Fresh=true is a stale
+        # receipt, even though its executable lives under target/debug/build.
+        stale = self.default_events(tests=())
+        stale.insert(-1, artifact('test', TESTS[0], fresh=True,
+                                  executable=self.compiled_harness_false(TESTS[0])))
+        self.assert_failure(stale, 'Fresh ' + TESTS[0] + ' artifact',
+                            args=self.args(tests=TESTS[:1], outputs=[str(self.outdir / 'stale')]))
+        # profile.test = false on that same kind ["test"] artifact is rejected.
+        dev = self.default_events(tests=())
+        dev.insert(-1, artifact('test', TESTS[0], test_profile=False,
+                                executable=self.compiled_harness_false(TESTS[0])))
+        self.assert_failure(dev, 'test profile', args=self.args(tests=TESTS[:1],
+                                                                outputs=[str(self.outdir / 'dev')]))
+        # The same artifact reported under another name is an extra test.
+        extra = self.default_events() + [artifact('test', 'other_fixture',
+                                                  executable=self.compiled_harness_false('other_fixture'))]
+        self.assert_failure(extra, 'tests that were not selected')
 
     def test_missing_test_executable_on_disk_is_rejected(self):
         vanished = self.compiled_test(TESTS[0])
