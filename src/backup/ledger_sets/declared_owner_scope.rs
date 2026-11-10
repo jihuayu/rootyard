@@ -37,7 +37,7 @@ pub(super) fn declared_violations(pair: &DeclaredPair) -> Vec<String> {
     let Some(publication) = &pair.publication else {
         return lines;
     };
-    let key = super::tag_of(pair.repository_id, pair.pack_id, pair.registration_id);
+    let key = super::tag(pair);
     if publication.repository_id != pair.repository_id || publication.pack_id != pair.pack_id {
         lines.push(format!("publication_key:{key}"));
     }

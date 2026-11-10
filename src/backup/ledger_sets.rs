@@ -38,7 +38,7 @@
 //! * the **tenant** (`tenant_id` of the publication, locator, holds, storage
 //!   tenants and receipts) is the actual repository tenant (`repositories`
 //!   owner, the core gate tenant).
-use self::declared_owner_scope::{declared_binding, declared_violations};
+use self::declared_owner_scope::declared_binding;
 use self::root_lifetime::check_heads;
 use super::ledger_canonical::{canonical, declared_agrees, retained_pair};
 use crate::ref_store::core::pack_commit::{MembershipDigest, PackMembershipEntry, packs_digest, refs_digest};
@@ -402,8 +402,16 @@ pub(super) fn undeclared(declared: &[DeclaredPair], snapshots: &[SnapshotSet], r
     std::mem::take(&mut missing).into_iter().collect()
 }
 
+/// Stable `repository_id:pack_id:registration_id` tag of one declared pair.
 fn tag(pair: &DeclaredPair) -> String {
-    ledger_sets::tag_of(pair.repository_id, pair.pack_id, pair.registration_id)
+    format!("{}:{}:{}", pair.repository_id, pair.pack_id, pair.registration_id)
+}
+
+/// Owner/publication scope lines of one declared registration, produced by the
+/// `declared_owner_scope` child and only visible inside `backup`. The child
+/// implementation stays `pub(super)` to `ledger_sets`.
+pub(super) fn declared_violations(pair: &DeclaredPair) -> Vec<String> {
+    declared_owner_scope::declared_violations(pair)
 }
 
 /// Legal slot/role pair: exactly slot 0 for the `.pack` and slot 1 for the `.idx`.

@@ -393,7 +393,7 @@ pub(super) fn decode_declared(rows: &[tokio_postgres::Row]) -> Result<Vec<Declar
             generation: row.get(43),
             attempt_id: row.get(44),
             namespace: row.get(45),
-            request: row.get::<_, Option<Uuid>>(32).map(|request_id| RequestRow {
+            request: row.get::<_, Option<Uuid>>(32).map(|_| RequestRow {
                 repository_id: row.get(33),
                 tenant_id: row.get(34),
                 owner_id: row.get(35),

@@ -255,7 +255,7 @@ fn the_typed_consume_ack_body_carries_the_publication_producer() {
     assert!(!ack_repository_differs(&legal, REPO));
     assert!(!ack_tenant_differs(&legal, TENANT));
     // Each field alone is refused by the pure helper.
-    let moved = [
+    let moved: [(&str, fn(&ConsumeAck, Uuid) -> bool, ConsumeAck, Uuid); 4] = [
         ("owner", ack_owner_differs, ack(OTHER_OWNER, REPO, TENANT), publication.owner_id),
         ("repository", ack_repository_differs, ack(PRODUCER, Uuid::from_u128(0x1c00), TENANT), REPO),
         ("tenant", ack_tenant_differs, ack(PRODUCER, REPO, OTHER_TENANT), TENANT),
