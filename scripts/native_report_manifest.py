@@ -101,6 +101,18 @@ def pairs(values, flag):
     return result
 
 
+def required_cases(values):
+    result = {}
+    for value in values or []:
+        report, separator, case_name = value.partition("=")
+        require(
+            separator and report and case_name,
+            f"--require-case expects REPORT=CASE_NAME, got {value!r}",
+        )
+        result.setdefault(report, []).append(case_name)
+    return result
+
+
 def secret_values():
     return [value for value in (os.environ.get(name) for name in SECRET_ENVIRONMENT) if value and len(value) >= 8]
 
@@ -385,6 +397,12 @@ def job_manifest(args):
 
     reports = pairs(args.report, "--report")
     require(reports, "at least one --report is required; a gate cannot pass without executed evidence")
+    case_requirements = required_cases(args.require_case)
+    missing_reports = [name for name in case_requirements if name not in reports]
+    require(
+        not missing_reports,
+        f"--require-case names report(s) not supplied by --report: {', '.join(repr(name) for name in missing_reports)}",
+    )
     report_records = {}
     for name, path in reports.items():
         text = read_text(path, f"report {name}")
@@ -404,6 +422,16 @@ def job_manifest(args):
         for case in cases:
             require(isinstance(case, dict), f"report {name}: malformed case record")
             require(case.get("status") == "passed", f"report {name}: case {case.get('name')!r} is not passed")
+        executed_names = set()
+        for case in cases:
+            case_name = case.get("name")
+            if isinstance(case_name, str):
+                executed_names.add(case_name)
+        for required_name in case_requirements.get(name, []):
+            require(
+                required_name in executed_names,
+                f"report {name}: required case {required_name!r} is absent",
+            )
         require(not data.get("failure_traceback"), f"report {name}: records a failure traceback")
         head = data.get("source_head")
         require(head in (None, commit), f"report {name}: produced from commit {head}, expected {commit}")
@@ -910,6 +938,7 @@ def main():
     parser.add_argument("--build-receipt")
     parser.add_argument("--binary")
     parser.add_argument("--report", action="append", default=[])
+    parser.add_argument("--require-case", action="append", default=[])
     parser.add_argument("--log", action="append", default=[])
     parser.add_argument("--log-marker", action="append", default=[])
     parser.add_argument("--harness", action="append", default=[])

@@ -23,6 +23,15 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+WORKSPACE_CAPTURE_REQUIRED_CASES = (
+    "__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix",
+    "__main__.WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture",
+    "__main__.WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive",
+    "__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision",
+    "__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing",
+)
+
+
 class ManifestFixture:
     """Ephemeral build receipt, binary, report and log in a temporary tree."""
 
@@ -287,6 +296,53 @@ class TestJobManifest(unittest.TestCase):
         self.fixture.job(expect=1)
 
         self.assertIn("duplicate", self.fixture.last_process.stderr.lower())
+    def test_accepts_reports_with_required_cases_present(self):
+        report = self.fixture.report(name="workspace_capture")
+        manifest = json.loads(report.read_text())
+        manifest["cases"] = [{"name": case, "status": "passed"} for case in WORKSPACE_CAPTURE_REQUIRED_CASES]
+        report.write_text(json.dumps(manifest))
+        harness_path = self.fixture.root / "tests/workspace_capture_acceptance.py"
+        harness_path.parent.mkdir(parents=True, exist_ok=True)
+        harness_path.write_text("# harness\n")
+        self.fixture.harness = harness_path
+        extra = tuple(
+            pair
+            for case in WORKSPACE_CAPTURE_REQUIRED_CASES
+            for pair in ("--require-case", f"workspace_capture={case}")
+        )
+        result = self.fixture.job(reports={"workspace_capture": report}, extra=extra)
+        accepted = json.loads(result.read_text())
+        self.assertEqual(accepted["status"], "passed")
+        self.assertEqual(
+            accepted["reports"]["workspace_capture"]["case_names"],
+            list(WORKSPACE_CAPTURE_REQUIRED_CASES),
+        )
+        self.assertEqual(
+            accepted["harnesses"],
+            {str(harness_path): digest(harness_path)},
+        )
+
+    def test_fails_closed_when_required_case_is_absent(self):
+        report = self.fixture.report(name="workspace_capture")
+        manifest = json.loads(report.read_text())
+        manifest["cases"] = [
+            {"name": case, "status": "passed"} for case in WORKSPACE_CAPTURE_REQUIRED_CASES[:-1]
+        ]
+        report.write_text(json.dumps(manifest))
+        harness_path = self.fixture.root / "tests/workspace_capture_acceptance.py"
+        harness_path.parent.mkdir(parents=True, exist_ok=True)
+        harness_path.write_text("# harness\n")
+        self.fixture.harness = harness_path
+        extra = tuple(
+            pair
+            for case in WORKSPACE_CAPTURE_REQUIRED_CASES
+            for pair in ("--require-case", f"workspace_capture={case}")
+        )
+        self.fixture.job(reports={"workspace_capture": report}, extra=extra, expect=1)
+        self.assertIn("required case", self.fixture.last_process.stderr)
+        self.assertIn("is absent", self.fixture.last_process.stderr)
+        failed = json.loads((self.fixture.root / "manifests/job.json").read_text())
+        self.assertEqual(failed["status"], "failed")
 
     def test_rejects_report_from_another_binary(self):
         report = self.fixture.report(binary_sha="c" * 64)

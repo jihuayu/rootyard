@@ -233,6 +233,12 @@ jobs:
         run: python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json
       - name: Exercise workspace incremental sync, ignore rules, and read-only views
         run: python3 tests/workspace.py --binary target/debug/rootyard-workspace-lab --report test-results/workspace.json
+      - name: Exercise native workspace autocapture acceptance
+        timeout-minutes: 20
+        env:
+          ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
+          ROOTYARD_WORKSPACE_MOUNT_MODE: direct
+        run: python3 tests/workspace_capture_acceptance.py --binary target/debug/rootyard --report test-results/workspace-capture.json
       - name: Exercise Namespace, Git View and cross-repository ChangeSet semantics
         run: python3 tests/git_views.py --binary target/debug/rootyard-view-lab --report test-results/git-views.json
       - name: Exercise Pando object store delta resolution, graph traversal, and differential export
@@ -289,6 +295,7 @@ jobs:
             --report web_sessions=test-results/web-sessions.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
+            --report workspace_capture=test-results/workspace-capture.json \
             --report repository_pagination=test-results/repository-pagination.json \
             --report organization_pagination=test-results/organization-pagination.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
@@ -301,10 +308,18 @@ jobs:
             --harness tests/webhook_worker_recovery.py \
             --harness tests/ci_webhook_regressions.py \
             --harness tests/backup_audit_sequence_legacy.py \
+            --harness tests/workspace_capture_acceptance.py \
+            --harness tests/fixtures/capture_read_gate.c \
             --harness tests/repository_pagination.py \
             --harness tests/organization_pagination.py \
             --harness tests/web_detail_pagination.py \
             --fixture postgres=postgres:17 \
+            --fixture workspace_mount_mode=direct \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision \
+            --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing \
             --fixture rust="$(rustc -V)" \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \

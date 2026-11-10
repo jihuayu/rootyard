@@ -7674,6 +7674,7 @@ class Phase1ClosureAndDocsFixture:
         "tests/ci_mirror.py",
         "tests/workspaces.py",
         "tests/workspace.py",
+        "tests/workspace_capture_acceptance.py",
         "tests/pando_lab.py",
         "tests/webhooks.py",
         "tests/members.py",
