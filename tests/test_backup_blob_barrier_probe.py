@@ -174,6 +174,27 @@ class ProbeTest(unittest.TestCase):
                 self.assertFalse(probe._exact_refusal(log, SECRETS, mode), name + "/" + mode)
             self.assertIn("startup refusal context (" + FAILURE + ")", probe.own_lines(log, SECRETS))
 
+    def test_full_cause_block_is_required_for_a_refusal(self):
+        """The complete remaining block decides: a truncated fixed prefix is not a refusal."""
+        path = self.root / "backup.log"
+
+        # Seven fixed causes then one arbitrary eighth: a matching prefix must
+        # never be accepted as a complete refusal, in any mode.
+        lines = ["Error: " + FAILURE, "Caused by:"]
+        lines += ["    {0}: {1}".format(index, EXTERNAL) for index in range(7)]
+        lines.append("    7: unrelated failure")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertFalse(probe._exact_refusal(path, SECRETS, "external"))
+        self.assertFalse(probe._exact_refusal(path, SECRETS, "auto"))
+
+        # A long block of only the fixed cause is still classified for its
+        # proper mode (not capped by count) and rejected for the other mode.
+        lines = ["Error: " + FAILURE, "Caused by:"]
+        lines += ["    {0}: {1}".format(index, EXTERNAL) for index in range(24)]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertTrue(probe._exact_refusal(path, SECRETS, "external"))
+        self.assertFalse(probe._exact_refusal(path, SECRETS, "auto"))
+
     def test_single_cause_form_needs_the_context_and_the_mode(self):
         # The unnumbered message is only the refusal inside its own adjacent
         # startup block and for the mode it belongs to.

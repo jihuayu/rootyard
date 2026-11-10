@@ -165,7 +165,10 @@ def _exact_refusal(path, secrets, mode):
         # empty separator line, and starts with `Caused by:`. Its causes carry
         # exactly this mode's fixed message and nothing else: an arbitrary
         # surrounding cause, a mixed form or a second block fails the match.
-        block = lines[index + 1:index + 9]
+        # The whole remaining block is parsed, never a truncated prefix: a
+        # matching run of causes followed by any unrelated cause, blank line
+        # inside the block or second block must fail the match (fail closed).
+        block = lines[index + 1:]
         if block and not block[0].strip():
             block = block[1:]  # the one optional separator after the context
         causes = [scrub(message, secrets) for message in _cause_messages(block)]
