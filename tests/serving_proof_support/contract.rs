@@ -41,6 +41,7 @@ mod serving_support;
 
 use self::serving_reads_support::{ensure_migration_146, operation_deadline, provision_ready};
 use self::serving_support::{actor, Fixture};
+use super::super::ServingReadCapture;
 use super::PgPackSnapshotMaterializer;
 use crate::blob_store::config::BlobProfile;
 use crate::blob_store::opendal::BlobStore;
@@ -383,14 +384,14 @@ async fn register(fixture: &Fixture, plan: &PackCommitPlan, publication: &Protec
     Ok(())
 }
 
-async fn protected_pack_count(fixture: &Fixture, repository_id: Uuid) -> Result<i64> {
+async fn protected_pack_count(fixture: &Fixture, pin_id: Uuid) -> Result<i64> {
     Ok(fixture
         .pool
         .get()
         .await?
         .query_one(
-            "SELECT count(*)::bigint FROM ref_store_core_serving_read_packs WHERE repository_id=$1",
-            &[&repository_id],
+            "SELECT count(*)::bigint FROM ref_store_core_serving_read_packs WHERE pin_id=$1",
+            &[&pin_id],
         )
         .await?
         .get(0))
@@ -461,7 +462,10 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
             };
             let view = sealed.view();
             let (proof_revision, proven, proof_binding) = sealed.contract_parts();
-            let expected_packs = protected_pack_count(&fixture, repo.ready.repository_id).await?;
+            let capture_pin = capture
+                .pin_id()
+                .ok_or_else(|| anyhow!("the non-empty capture must carry a pin id"))?;
+            let expected_packs = protected_pack_count(&fixture, capture_pin).await?;
             ensure!(expected_packs > 0, "the capture must register at least one pack");
             ensure!(view.pack_count() == expected_packs, "the sealed view must expose every captured pack");
             ensure!(view.verified_pairs() == 1, "the sealed view must cover one native-verified pair");
