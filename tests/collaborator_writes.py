@@ -241,40 +241,50 @@ class writes:
                 "collaborator_roles": rows}
 
     def pull_merge_under_rule(self):
-        """A real PR merged under the fast-forward rule karl maintains."""
-        rules = self.rules()
-        assert [(r["branch_ref"], r["require_fast_forward"]) for r in rules] == [
-            ("refs/heads/maint-base", True)], rules
+        """A maintainer creates the fast-forward rule and merges under it.
+
+        No earlier case may be assumed to leave a rule behind: maintenance
+        rules are deleted in their own case, and maintain_rule_matrix ends on
+        an empty set. This case creates the rule on its own base branch.
+        """
         vendor = self.root / "owned-work-alice"
         self.git("checkout", "-B", "rule-base", self.seed, cwd=vendor)
         base = self.push_branch(vendor, self.alice, "rule-base")
         self.git("checkout", "-B", "rule-head", self.seed, cwd=vendor)
         head = self.commit(vendor, "rule-merge.txt", "rule head")
         assert self.push_branch(vendor, self.alice, "rule-head") == head
-        self.git("checkout", "-B", "rule-under-maint-base", self.seed, cwd=vendor)
-        assert self.push_branch(vendor, self.alice, "rule-under-maint-base") == self.seed
+        rule_path = "/api/repos/alice/demo/branch-rules/refs/heads/rule-base"
+        rule = {"required_approvals": 0, "required_checks": [], "require_fast_forward": True,
+                "prevent_deletion": True, "prevent_force_push": True}
+        status, raw, _ = self.http(rule_path, token=self.users["karl"], method="PUT", body=rule)
+        assert status == 201, (status, raw[:300])
+        assert [(r["branch_ref"], r["require_fast_forward"]) for r in self.rules()] == [
+            ("refs/heads/rule-base", True)], self.rules()
         pull = json.loads(self.expect("/api/repos/alice/demo/pulls", 201,
                                       token=self.users["karl"], method="POST",
                                       body={"title": "merge under maintainer rule",
                                             "head_ref": "refs/heads/rule-head",
-                                            "base_ref": "refs/heads/maint-base"}))
+                                            "base_ref": "refs/heads/rule-base"}))
+        assert (pull["head_oid"], pull["base_oid"]) == (head, base), pull
         pr = f"/api/repos/alice/demo/pulls/{pull['number']}/merge"
         body = {"expected_version": pull["version"], "expected_head_oid": head,
-                "expected_base_oid": self.seed, "strategy": "merge_commit"}
+                "expected_base_oid": base, "strategy": "merge_commit"}
         status, raw, _ = self.http(pr, token=self.users["karl"], method="POST", body=body,
                                    extra_headers={"Idempotency-Key": "rule-merge-1"})
         assert status == 409, (status, raw[:200])
         # The frozen product text proves the rule, not an unrelated conflict, refused it.
         assert b"requires fast-forward merge" in raw, raw[:200]
-        assert self.ref("refs/heads/maint-base") == self.seed
+        assert self.ref("refs/heads/rule-base") == base
         body["strategy"] = "fast_forward"
         status, raw, _ = self.http(pr, token=self.users["karl"], method="POST", body=body)
         assert status == 200, (status, raw[:300])
-        assert self.ref("refs/heads/maint-base") == head
-        return {"rule_creator": "karl(maintain)", "rule_branch": "refs/heads/maint-base",
+        assert self.ref("refs/heads/rule-base") == head
+        removed = self.http(rule_path, token=self.users["karl"], method="DELETE")[0]
+        assert removed == 200, removed
+        assert self.rules() == []
+        return {"rule_creator": "karl(maintain)", "rule_branch": "refs/heads/rule-base",
                 "merger": "karl(maintain)", "merge_commit_under_rule": status,
-                "fast_forward_merge": 200, "base": head, }
-
+                "fast_forward_merge": 200, "base": head}
 
     def audit_boundary(self):
         """Git transport writes git_operations/outbox_events, never repository_audit_log.

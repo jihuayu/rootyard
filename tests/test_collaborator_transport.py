@@ -223,8 +223,11 @@ class HarnessContract(unittest.TestCase):
         self.assertIn("cannot modify or remove repository owner", admin)
         self.assertIn("assert status == 409", admin)
         managed = self.method_source(writes, "pull_merge_under_rule")
-        self.assertIn('("refs/heads/maint-base", True)', managed,
-                      "the merge-under-rule case must use a rule an earlier case created")
+        self.assertIn('branch-rules/refs/heads/rule-base', managed,
+                      "the merge-under-rule case must create the rule it tests")
+        self.assertIn('("refs/heads/rule-base", True)', managed)
+        self.assertIn("requires fast-forward merge", managed)
+        self.assertIn('body["strategy"] = "fast_forward"', managed)
         audit = self.method_source(writes, "audit_boundary")
         self.assertIn('self.expect("/api/repos/alice/demo/events", 200', audit)
         self.assertNotIn("SELECT count(*) FROM outbox_events", audit)
