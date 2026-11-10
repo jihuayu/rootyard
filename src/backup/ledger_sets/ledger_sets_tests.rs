@@ -543,11 +543,13 @@ fn root_lifetime_covers_heads_captures_and_tombstones() {
             assert_root_refused(&shape.violations(), "root_head_mismatch", "state");
         }
     }
-    // A released root head with a stale tombstone that no release fences is released
-    // but unfenced, and the head scope check alone refuses it.
+    // A head whose owner moved away from the stored capture is a scope error, not
+    // an unfenced release: the capture disagrees with its head, and the legal
+    // tombstone no longer fences that head.
     let mut head_scope = registered.clone();
     head_scope.heads[0].owner_id = Uuid::from_u128(0x1800);
-    assert_root_refused(&head_scope.violations(), "root_head_mismatch", "unreleased");
+    assert_capture_mismatched(&head_scope.violations(), "released");
+    assert_root_refused(&head_scope.violations(), "root_head_mismatch", "tombstone_mismatch");
     // A stale headless tombstone is refused.
     let mut orphan_tombstone = headless;
     orphan_tombstone.tombstones = vec![tombstone()];
