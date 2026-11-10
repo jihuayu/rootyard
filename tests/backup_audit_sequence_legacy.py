@@ -638,9 +638,13 @@ class AuditSequenceLegacyHarness(BackupHarness):
         branches = [race_prefix + "%02d" % index for index in range(count)]
         # The prefix known before the race is every audited write of the
         # source plus the restored window's PUT (collaborator.updated): six
-        # source rows plus one restored row, in id order.
+        # source rows plus one restored row, in id order.  The saved prefix
+        # holds {"action","id"} only, so the restored window is projected the
+        # same way; its full rows are already checked by audit_subrows.
+        restored_window = [{"action": row["action"], "id": row["id"]}
+                           for row in self.after_http_rows[len(self.restored_rows):]]
         known = self.action_sequence(self.target_db, self.saved_actions)
-        expected_prefix = self.source_sequence + self.after_http_rows[len(self.restored_rows):]
+        expected_prefix = self.source_sequence + restored_window
         assert known == expected_prefix, (known, expected_prefix)
         assert known[:len(self.source_sequence)] == self.source_sequence
         self.prefix_sequence = known

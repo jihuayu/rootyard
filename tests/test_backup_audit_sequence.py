@@ -290,7 +290,13 @@ class DrillWiringTest(unittest.TestCase):
         # PUT (also collaborator.updated), not the source sequence alone, and
         # it is re-read and compared byte-identically after the race.
         self.assertIn("known == expected_prefix", body)
-        self.assertIn("self.source_sequence + self.after_http_rows[len(self.restored_rows):]", body)
+        # Both sides use the {"action","id"} projection: the restored window is
+        # not compared as full rows against the projected known prefix.
+        self.assertIn('{"action": row["action"], "id": row["id"]}\n'
+                      '                           for row in '
+                      'self.after_http_rows[len(self.restored_rows):]]', body)
+        self.assertIn("self.source_sequence + restored_window", body)
+        self.assertNotIn("self.after_http_rows[len(self.restored_rows):]\n", body)
         self.assertNotIn("known == self.source_sequence", body)
         self.assertIn("self.action_sequence(self.target_db, self.saved_actions) == "
                       "self.prefix_sequence", body)
