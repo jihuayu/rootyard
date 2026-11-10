@@ -789,12 +789,19 @@ class BrowseHarness(Harness):
         """SIGKILL this harness's own server right after a native ref CAS.
 
         The wrapper records its own `$$` and the real Git child's `$!` in
-        separate files and leaves stdin untouched, so `git update-ref --stdin`
-        still reads the request bytes. Only an armed, successful `update-ref`
-        kills exactly the service PID written immediately before the POST:
-        Git has already published the ref, but its success never reaches the
-        service. The restart must classify the journal as an interrupted,
-        finished operation with the requested intent, fence the repository as
+        separate files only for the armed invocation that targets the
+        requested ref. While armed, an `update-ref` call has its stdin
+        captured once into a unique scratch file under this test's root, and
+        that unchanged file is replayed as the real Git child's stdin. The
+        fault fires only when the captured bytes contain exactly the line
+        `update refs/heads/crash-recovery`, compared NUL-safely and byte for
+        byte (`LC_ALL=C`, `grep -Fxq`). Only that matched, successful
+        `update-ref` kills exactly the service PID written immediately
+        before the POST: Git has already published the ref, but its success
+        never reaches the service. Unarmed, non-`update-ref`, and armed
+        non-matching calls forward stdin directly and never kill. The
+        restart must classify the journal as an interrupted, finished
+        operation with the requested intent, fence the repository as
         recovering/push_outcome_unknown, publish no ref event, and reject the
         next valid write with 409.
         """
@@ -814,23 +821,46 @@ class BrowseHarness(Harness):
             stale.unlink(missing_ok=True)
         wrapper.write_text(
             "#!/bin/sh\n"
-            "printf '%s\\n' \"$$\" > " + shlex.quote(str(wrapper_pid_file)) + "\n"
-            "update=0\n"
+            "wrapper_pid=$$\n"
+            "update_ref=0\n"
             'for a in "$@"; do\n'
             '  case "$a" in\n'
-            "    update-ref) update=1; break ;;\n"
+            "    update-ref) update_ref=1 ;;\n"
             "  esac\n"
             "done\n"
-            + shlex.quote(str(self.native_git)) + ' "$@" <&0 &\n'
+            "matched=0\n"
+            "stdin_file=\n"
+            'if [ "$update_ref" = 1 ] && [ -f ' + shlex.quote(str(arm)) + " ]; then\n"
+            "  stdin_file=$(mktemp " + shlex.quote(str(self.root) + "/browse-crash-stdin.XXXXXX")
+            + ") || exit 125\n"
+            "  cat <&0 > \"$stdin_file\" || { rm -f \"$stdin_file\"; exit 125; }\n"
+            "  if LC_ALL=C tr '\\000' '\\n' < \"$stdin_file\" | grep -Fxq 'update "
+            + ref + "'; then\n"
+            "    matched=1\n"
+            "  fi\n"
+            "  if [ \"$matched\" = 1 ]; then\n"
+            "    printf '%s\\n' \"$wrapper_pid\" > " + shlex.quote(str(wrapper_pid_file)) + "\n"
+            "  fi\n"
+            "  " + shlex.quote(str(self.native_git)) + ' "$@" < "$stdin_file" &\n'
+            "  child=$!\n"
+            "  if [ \"$matched\" = 1 ]; then\n"
+            "    printf '%s\\n' \"$child\" > " + shlex.quote(str(git_pid_file)) + "\n"
+            "  fi\n"
+            "else\n"
+            "  " + shlex.quote(str(self.native_git)) + ' "$@" <&0 &\n'
             "child=$!\n"
-            "printf '%s\\n' \"$child\" > " + shlex.quote(str(git_pid_file)) + "\n"
+            "fi\n"
             'wait "$child"\n'
             "rc=$?\n"
-            'if [ "$update" = 1 ] && [ "$rc" = 0 ] && [ -f '
+            'if [ "$matched" = 1 ] && [ "$rc" = 0 ] && [ -f '
             + shlex.quote(str(arm)) + " ]; then\n"
+            "  rm -f \"$stdin_file\"\n"
             "  kill -KILL \"$(cat " + shlex.quote(str(pid_file)) + ")\"\n"
             "  printf done > " + shlex.quote(str(done)) + "\n"
             "  exit 1\n"
+            "fi\n"
+            'if [ -n "$stdin_file" ]; then\n'
+            "  rm -f \"$stdin_file\"\n"
             "fi\n"
             'exit "$rc"\n'
         )
