@@ -49,6 +49,9 @@ use super::{
     git::clone_url,
     wire::{self, Bounds},
 };
+#[cfg(test)]
+#[path = "proxy_reply.rs"]
+mod proxy_reply;
 
 /// Bounds of one proxy: bodies, responses, connections, socket I/O and held
 /// receive-pack answers.
