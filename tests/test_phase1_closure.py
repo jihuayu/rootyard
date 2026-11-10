@@ -96,9 +96,20 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
             "python3 tests/ci_mirror.py --binary target/debug/rootyard --report test-results/ci-mirror.json",
             "python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json",
             "python3 tests/workspace.py --binary target/debug/rootyard-workspace-lab --report test-results/workspace.json",
+            "python3 tests/webhooks.py --binary target/debug/rootyard --report test-results/webhooks.json",
         )
         for cmd in expected_commands:
             self.assertIn(cmd, ci_text, f"Missing CI step command in .github/workflows/ci.yml: {cmd}")
+
+        # Webhook report and its exact matrix source are part of the native gate.
+        manifest_start = ci_text.index("python3 scripts/native_report_manifest.py --mode job")
+        manifest_step = ci_text[manifest_start:].split("\n      - name:", 1)[0]
+        for argument in (
+            "--report webhooks=test-results/webhooks.json",
+            "--harness tests/webhooks.py",
+            "--harness tests/webhook_tenant_matrix.py",
+        ):
+            self.assertIn(argument, manifest_step)
 
         # initdb requires non-root. Container jobs switch user; the qualified
         # plain-host profile executes as runner and verifies its uid at runtime.

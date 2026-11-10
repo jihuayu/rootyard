@@ -273,6 +273,7 @@ jobs:
             --report web_sessions=test-results/web-sessions.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
+            --report webhooks=test-results/webhooks.json \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
@@ -282,6 +283,8 @@ jobs:
             --harness tests/webhook_worker_recovery.py \
             --harness tests/ci_webhook_regressions.py \
             --harness tests/backup_audit_sequence_legacy.py \
+            --harness tests/webhooks.py \
+            --harness tests/webhook_tenant_matrix.py \
             --fixture postgres=postgres:17 \
             --fixture rust="$(rustc -V)" \
             --fixture git="$(git --version)" \
