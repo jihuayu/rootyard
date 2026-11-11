@@ -1,5 +1,5 @@
 //! Only settings used by the Blob serving profile are parsed here.
-use crate::blob_git_gateway::BlobGitConfig;
+use crate::blob_git_gateway::{BlobGitConfig, SessionTokens};
 use crate::blob_store::opendal::BlobStore;
 use anyhow::{Result, anyhow, ensure};
 use deadpool_postgres::Pool;
@@ -11,7 +11,10 @@ use std::{
     time::Duration,
 };
 
-pub(super) fn gateway_config(pool: Pool, store: BlobStore) -> Result<(SocketAddr, BlobGitConfig)> {
+pub(super) fn gateway_config(
+    pool: Pool,
+    store: BlobStore,
+) -> Result<(SocketAddr, BlobGitConfig, Option<SessionTokens>)> {
     let bind = env::var("ROOTYARD_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
         .parse()
@@ -35,6 +38,10 @@ pub(super) fn gateway_config(pool: Pool, store: BlobStore) -> Result<(SocketAddr
     let max_request_bytes = number("ROOTYARD_MAX_REQUEST_BYTES", 128 << 20, 64 << 10, 4 << 30)?;
     let max_inflight_bytes = number("ROOTYARD_MAX_INFLIGHT_BYTES", 256 << 20, 64 << 10, 16 << 30)?;
     ensure!(max_inflight_bytes >= max_request_bytes, "inflight byte budget is smaller than a request");
+    // Repository session tokens are opt-in: no keyring means the session
+    // routes answer an explicit 501 instead of using any default key.
+    let sessions =
+        super::session_keyring::from_environment(store.backend_identity()).map_err(|error| anyhow!("{error}"))?;
     Ok((
         bind,
         BlobGitConfig {
@@ -49,6 +56,7 @@ pub(super) fn gateway_config(pool: Pool, store: BlobStore) -> Result<(SocketAddr
             operation_deadline: Duration::from_secs(number("ROOTYARD_GIT_TIMEOUT_SECONDS", 120, 5, 900)?),
             native_limits: Default::default(),
         },
+        sessions,
     ))
 }
 

@@ -31,7 +31,8 @@ use super::{
     operation::{self, Claim},
     protocol::{self, PushRequest},
     publish::{self, Pair, PushOutcome},
-    serving::lookup,
+    repo_session::CommittedWriteSessionProof,
+    serving::{ServingRepository, lookup},
     session::{authenticate, authorize_write, operation_id, validate_git_protocol},
     snapshot,
     state::BlobGitState,
@@ -97,7 +98,19 @@ pub(super) async fn receive_pack(
         }
         Claim::Replay(terminal) => {
             let results = report_results(&request, &terminal)?;
-            return terminal_response(&request, &results, operation);
+            let body = protocol::report_status(request.wants_report(), &results);
+            return committed_response(CommittedResponse {
+                state: &state,
+                identity: &identity,
+                owner: &owner,
+                name,
+                authorized: &serving,
+                terminal: &terminal,
+                body,
+                operation,
+                deadline,
+            })
+            .await;
         }
         Claim::Fresh => {}
     }
@@ -142,7 +155,19 @@ pub(super) async fn receive_pack(
         // exactly as recorded.
         Ok(PushOutcome::Terminal(terminal)) => {
             let results = report_results(&request, &terminal)?;
-            terminal_response(&request, &results, operation)
+            let body = protocol::report_status(request.wants_report(), &results);
+            committed_response(CommittedResponse {
+                state: &state,
+                identity: &identity,
+                owner: &owner,
+                name,
+                authorized: &serving,
+                terminal: &terminal,
+                body,
+                operation,
+                deadline,
+            })
+            .await
         }
         Ok(PushOutcome::Cancelled(reason)) => {
             let results = cancelled_results(&request, reason);
@@ -261,6 +286,75 @@ fn terminal_response(
 ) -> Result<Response, GatewayError> {
     let body = protocol::report_status(request.wants_report(), results);
     response(StatusCode::OK, "application/x-git-receive-pack-result", body, operation)
+}
+
+/// The single generic, retryable failure for a committed push whose session
+/// could not be issued after the durable commit. It names no repository,
+/// incarnation or underlying error; the request middleware re-attaches the
+/// same `x-rootyard-operation` so the client resolves that exact operation.
+const COMMITTED_SESSION_UNAVAILABLE: &str = "push committed but its repository session could not be issued; resolve this same operation and retry against the authoritative store";
+
+/// Collapse any failure after the commit into the single generic retryable
+/// [`COMMITTED_SESSION_UNAVAILABLE`]: the final lookup's own differentiated
+/// error, a proof refusal, an issue refusal and the outer timeout all map here.
+fn refused<E>(_: E) -> GatewayError {
+    GatewayError::Unavailable(COMMITTED_SESSION_UNAVAILABLE)
+}
+
+/// Render the `report-status` of a durable terminal that is already fully
+/// encoded into `body` (no session/DB work happens here, so a replayed or
+/// freshly committed terminal that is *not* committed stays token-free).
+///
+/// With a key set configured, a committed terminal additionally gets exactly
+/// one fresh writable lookup taken only now, after the whole body exists, and
+/// a session signed from the opaque committed-write proof bound to the
+/// terminal's exact revision. The lookup's own bounded connection is released
+/// before this returns, so nothing database- or access-related outlives the
+/// response. Any final lookup/proof/issue failure is the fixed retryable
+/// [`COMMITTED_SESSION_UNAVAILABLE`]; a token-free `200` is never returned when
+/// a key set is configured. Without a key set no extra lookup happens.
+/// Everything one committed push response needs after the durable terminal
+/// exists. Bundling it keeps the async boundary readable without suppressing
+/// Clippy's argument-count lint.
+struct CommittedResponse<'a> {
+    state: &'a BlobGitState,
+    identity: &'a crate::db::Identity,
+    owner: &'a str,
+    name: &'a str,
+    authorized: &'a ServingRepository,
+    terminal: &'a crate::ref_store::core::pack_commit::PackCommitTerminal,
+    body: Vec<u8>,
+    operation: Uuid,
+    deadline: tokio::time::Instant,
+}
+
+async fn committed_response(request: CommittedResponse<'_>) -> Result<Response, GatewayError> {
+    let mut response =
+        response(StatusCode::OK, "application/x-git-receive-pack-result", request.body, request.operation)?;
+    let Some(tokens) = request.state.sessions() else { return Ok(response) };
+    if !request.terminal.is_committed() {
+        return Ok(response);
+    }
+    let issue = async {
+        let final_lookup = lookup(
+            request.state.pool(),
+            request.identity,
+            request.owner,
+            request.name,
+            true,
+            request.state.store().backend_identity(),
+            request.deadline,
+        )
+        .await
+        .map_err(refused)?;
+        let proof =
+            CommittedWriteSessionProof::new(request.terminal, request.authorized, &final_lookup).map_err(refused)?;
+        let issued = tokens.issue_from_committed_write(&proof).map_err(refused)?;
+        Ok::<_, GatewayError>(issued)
+    };
+    let issued = tokio::time::timeout_at(request.deadline, issue).await.map_err(refused)??;
+    issued.apply(&mut response);
+    Ok(response)
 }
 
 /// Git wire reason literals; fixed text only, never a SQL/native message.

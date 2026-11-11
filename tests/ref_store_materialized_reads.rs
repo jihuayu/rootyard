@@ -946,7 +946,7 @@ async fn sha1_complete_view_exact_local_bytes_and_pinned_older_revision() -> Res
         ensure!(view.scope().purpose() == MetadataPinPurpose::Verification, "view purpose differs");
         ensure!(view.gate_revision() == first_rev && view.pack_mode() == "pack_verified", "view gate/mode differs");
         ensure!(view.gate_digest_hex() == v.gate.digest().as_hex(), "view gate digest differs");
-        ensure!(is_hex64(view.read_digest_hex()), "view read digest is not sha256 hex");
+        ensure!(is_hex64(&view.read_digest_hex()), "view read digest is not sha256 hex");
         ensure!(
             is_hex64(view.membership_digest_hex()) && is_hex64(view.snapshot_digest_hex()),
             "view binding digests are not sha256 hex"
