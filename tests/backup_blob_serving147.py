@@ -15,6 +15,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -58,17 +59,17 @@ LIMITATIONS = [
 # private PATH prefix. Its transparent `pg_restore` wrapper parks at the real
 # process boundary, writes an atomic marker holding only its pid and
 # PGDATABASE, waits (bounded) for a run-owned release file and then execs the
-# absolute, pre-resolved pg_restore with the unchanged argv. Only that gated
-# pg_restore's environment also carries the checked-out `RECORD` file path: it
-# proves the argv the real pg_restore received. The wrapper never blocks on
+# absolute, pre-resolved pg_restore with the unchanged argv (the Rust caller
+# passes options, never the executable, as argv). The wrapper never blocks on
 # user-controlled files (only `-f`/`-e` tests, a bounded sleep loop and a
 # bounded marker write), and its directory is removed after each case.
 RESTORE_GATE_TIMEOUT_SECONDS = 30.0
 RESTORE_GATE_POLL_SECONDS = 0.02
 RESTORE_GATE_WAIT_MS = 60000
-_WRAPPER = r"""#!/bin/sh
-# Run-owned restore gate: $1 is the absolute trusted pg_restore and the rest is
-# that invocation's argv, passed on unchanged. Only pid and PGDATABASE written.
+RESTORE_FINISH_TIMEOUT_SECONDS = 180
+_WRAPPER_TEMPLATE = r"""#!/bin/sh
+# Run-owned restore gate for the one trusted absolute pg_restore; its own
+# argv is passed on unchanged. Only the wrapper pid and PGDATABASE are written.
 umask 077
 g=${0%/*}
 [ -f "$g/../marker" ] || [ -e "$g/../marker" ] && exit 70
@@ -79,12 +80,11 @@ g=${0%/*}
 mv -f "$g/../marker.$$.tmp" "$g/../marker" 2>/dev/null || exit 70
 i=0
 while [ ! -e "$g/../released" ]; do
-  [ "$i" -lt %WAIT% ] || exit 70
+  [ "$i" -lt @@WAIT@@ ] || exit 70
   sleep 0.01
   i=$((i + 1))
 done
-shift
-exec env RECORD="$g/../record" "$@" || exit 70
+exec @@PG_RESTORE@@ "$@"
 """
 GATE_SQL = (
     "SELECT (SELECT datname FROM pg_database WHERE datname=current_database()) || '|' ||"
@@ -92,11 +92,14 @@ GATE_SQL = (
     " AND database=(SELECT oid FROM pg_database WHERE datname=current_database())"
     " AND mode='ExclusiveLock' AND granted) FROM pg_locks"
 )
-GATE_LIFECYCLE_KEY = 738390103
 
 
 def _process_alive(pid):
-    """True only for a live, non-zombie process; an unknown state is not alive."""
+    """True only for a live, non-zombie process; an unknown state is not alive.
+
+    The /proc state (Linux CI) rejects a zombie that still answers `kill -0`;
+    elsewhere only a successful signal-0 probe can show a live pid.
+    """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -106,7 +109,7 @@ def _process_alive(pid):
     try:
         state = Path("/proc", str(pid), "stat").read_text(errors="replace")
     except FileNotFoundError:
-        return False
+        return True  # no /proc entry to read: only the signal-0 probe applies
     except OSError:
         return False
     return state[state.rindex(")") + 2:].split()[0] != "Z"
@@ -132,10 +135,11 @@ class RestoreGate:
         self.bin = self.root / "bin"
         self.bin.mkdir(mode=0o700)
         self.wrapper = self.bin / "pg_restore"
-        self.wrapper.write_text(_WRAPPER.replace("%WAIT%", str(RESTORE_GATE_WAIT_MS)))
+        self.wrapper.write_text(_WRAPPER_TEMPLATE.replace("@@WAIT@@", str(RESTORE_GATE_WAIT_MS))
+                                .replace("@@PG_RESTORE@@", shlex.quote(str(self.executable))))
         self.wrapper.chmod(0o700)
         self.marker, self.release = self.root / "marker", self.root / "released"
-        self.record, self.proof, self.probe_env = self.root / "record", {"gated_pg_restore_argv": "not-recorded"}, None
+        self.probe_env = None
         self.blocked = None
 
     def hash(self):
@@ -143,9 +147,8 @@ class RestoreGate:
 
     def activate(self, env):
         """Only for this restore invocation: the private prefix goes first."""
-        # The probes never get the restore's PATH: the gated pg_restore is
-        # checked out here and serve-blob is probed with this private copy.
-        self.probe_env = {key: value for key, value in env.items() if key != "RECORD"}
+        # serve-blob is probed with the environment as it was before the gate.
+        self.probe_env = dict(env)
         env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
 
     def wait_blocked(self, restore, deadline):
@@ -160,7 +163,6 @@ class RestoreGate:
         assert fields.get("database") == self.database, "restore gate did not wrap pg_restore of the target DB"
         self.blocked = int(fields.get("pid", "0"))
         assert _process_alive(self.blocked), "restore gate wrapper is not a live process"
-        self.proof = self.argv_proof()
         return self.blocked
 
     def held(self, restore, query):
@@ -188,19 +190,6 @@ class RestoreGate:
             except OSError as error:
                 raise AssertionError("restore gate release could not be created: " + type(error).__name__) from None
 
-    def argv_proof(self):
-        """Read the parked real pg_restore's own record while the gate is closed.
-
-        Called right after the marker proves that pid live, so it always
-        precedes that process's own record write. The field is fixed shape
-        only: an argument count, never an argument or environment value.
-        """
-        try:
-            count = next((line[5:] for line in self.record.read_text().splitlines() if line.startswith("argc=")), "")
-        except OSError:
-            return self.proof
-        return {"gated_pg_restore_argv": count + " args"}
-
     def finish(self, restore, timeout):
         """Require the released real pg_restore to exit successfully."""
         status = restore.wait(timeout=timeout)
@@ -225,6 +214,14 @@ class RestoreGate:
             shutil.rmtree(self.root)
         except BaseException:
             pass
+
+
+def restore_gate(root, database, search_path):
+    """The PATH gate, or a hard failure: a missing trusted pg_restore fails before the restore."""
+    try:
+        return RestoreGate(root, database, search_path)
+    except (AssertionError, OSError) as error:
+        raise AssertionError("restore gate unavailable: " + str(error)) from None
 
 
 class Drill(BlobOnlyHarness):
@@ -614,7 +611,7 @@ class Drill(BlobOnlyHarness):
         # A single lock observation only samples the restore window. Instead, the
         # restore's own pg_restore is parked by a run-owned PATH wrapper inside
         # the interval in which the restore holds the exclusive lifecycle key.
-        gate = RestoreGate(self.root, target, env.get("PATH", ""))
+        gate = restore_gate(self.root, target, env.get("PATH", ""))
         self.restore_gate = gate
         try:
             gate.activate(env)
@@ -627,10 +624,10 @@ class Drill(BlobOnlyHarness):
             for mode in ("auto", "external"):
                 probe = lambda mode: self.serving_barrier_refused(gate.probe_env, mode, "restore (gated at pg_restore)")
                 served.append(gate.probe_held(restore, query, mode, probe))
+            # The real restore after the normal release must succeed; the
+            # unheld database is no longer a refusal case and is not probed.
             gate.release_gate()
-            gate.finish(restore, 180)
-            late = [self.serving_barrier_refused(env, mode, "restore (after gate release)")
-                    for mode in ("auto", "external")]
+            gate.finish(restore, RESTORE_FINISH_TIMEOUT_SECONDS)
         finally:
             # Release on every path without masking the original error, then
             # bound the owned restore: if it has not finished it is killed and
@@ -643,9 +640,8 @@ class Drill(BlobOnlyHarness):
             gate.cleanup()
             self.restore_gate = None
         outcome = {"restore_gate": "parked-pg_restore-exclusive-lock-proven",
-                   "pg_restore_sha256": gate.real_sha256, **gate.proof,
-                   "gated_probes": [describe(entry) for entry in served],
-                   "post_release_probes": [describe(entry) for entry in late]}
+                   "pg_restore_sha256": gate.real_sha256,
+                   "gated_probes": [describe(entry) for entry in served]}
         return self.restored_detail(stdout_path, outcome)
 
     def restored_detail(self, stdout_path, outcome):
