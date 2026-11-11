@@ -277,6 +277,13 @@ def result_entries(result, scheduled_ids):
 
 def build_report(result, scheduled_ids, binary, binary_sha256):
     entries = result_entries(result, scheduled_ids) if result is not None else []
+    cases = [
+        {
+            "name": entry["name"],
+            "status": "passed" if entry["status"] == "success" else entry["status"],
+        }
+        for entry in entries
+    ]
     counts = Counter(entry["status"] for entry in entries)
     total_scheduled = len(scheduled_ids)
     passed = (
@@ -290,6 +297,7 @@ def build_report(result, scheduled_ids, binary, binary_sha256):
         "binary": str(binary),
         "binary_sha256": binary_sha256,
         "tests": entries,
+        "cases": cases,
         "summary": {
             "total_scheduled": total_scheduled,
             "tests_run": result.testsRun if result is not None else 0,
