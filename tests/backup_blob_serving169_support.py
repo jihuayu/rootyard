@@ -13,6 +13,10 @@ Three independent pieces live here:
   distinct from the repository tenant, and one nonempty transient serving read
   owned by a third real requester. It reads only the public manifest
   surface (repositories, pack closure, files, refstore carry, blob artifacts).
+  ``blob_artifacts`` are the serialized ``ledger::Artifact`` wire rows: their
+  byte length is ``length`` (:func:`archive_length`), never the A4 /
+  ``artifact_holds`` column name ``content_length`` that the SQL evidence and
+  the artifact-set digest below do use.
 * :class:`CorruptionCase`/:func:`corruption_plan` and :func:`corruption_sql`/
   :func:`corruption_findings`/:func:`validator_refusal` -- the dedicated raw-SQL
   source corruption negatives. Each case is applied by one clone-local,
@@ -103,7 +107,9 @@ def artifact_set_digest(columns):
     ``columns`` is either one artifact row or a list of them; each row carries
     ``role``, ``slot``, ``hold_id``, ``tenant_id``, ``authority_id``,
     ``authority_generation``, ``attempt_id``, ``namespace``, ``sha256``,
-    ``content_length``, ``provider``, ``backend_identity``. Artifacts are
+    ``content_length``, ``provider``, ``backend_identity``. These are the real
+    A4 / ``artifact_holds`` SQL column names, not the archive's ``length`` wire
+    field. Artifacts are
     sorted on their canonical ``RegisteredArtifact`` derivation, which is
     equivariant under the row order, so a stable sort reproduces the Rust sort.
     The leading field is ``PackArtifactRole``'s declaration order (pack before
@@ -235,7 +241,8 @@ def format22_manifest_checks(manifest, expected):
                        if str(entry["registration_id"]) == str(registration))
         need(roles == sorted(PAIR_ROLES), "a registration is not exactly one pack(slot 0) + idx(slot 1)")
     need(len({str(entry["hold_id"]) for entry in artifacts}) == len(artifacts), "artifact hold ids are not unique")
-    need(all(HEX64.match(str(entry["sha256"])) and int(entry["content_length"]) > 0 for entry in artifacts),
+    lengths = [archive_length(entry) for entry in artifacts]
+    need(all(HEX64.match(str(entry["sha256"])) and length > 0 for entry, length in zip(artifacts, lengths)),
          "an archived artifact has no positive byte proof")
     need(all(str(entry["provider"]) == closure.get("provider") for entry in artifacts),
          "an archived artifact names another provider")
@@ -244,8 +251,11 @@ def format22_manifest_checks(manifest, expected):
     blob_files = [name for name, entry in manifest["files"].items()
                   if name.startswith("blob/") and entry["kind"] == "file"]
     need(len(blob_files) == len(artifacts), "archived blob members differ from the closure")
-    need(sum(manifest["files"][name]["bytes"] for name in blob_files) == closure.get("bytes") > 0,
+    need(sum(_archive_bytes(manifest["files"][name]) for name in blob_files) == closure.get("bytes") > 0,
          "archived blob bytes differ from the closure")
+    # Format22 writes `blob_closure.bytes` as the sum of the wired `length`
+    # fields, so the archive's own byte totals must agree with them.
+    need(sum(lengths) == closure.get("bytes") > 0, "archived artifact lengths differ from the closure bytes")
     # RefStore carry: every registered-set and roots ledger must travel too.
     carry = manifest.get("refstore") or {}
     for table in _CARRY_TABLES:
@@ -268,6 +278,32 @@ def format22_manifest_checks(manifest, expected):
             "producer_distinct_from_tenant": True, "carry_tables": len(carry),
             "serving_read": {key: serving_read[key] for key in ("pin_id", "repository_id", "tenant_id", "owner_id",
                                                                 "pack_count")}}
+
+
+def archive_length(artifact):
+    """The positive wire length of one ``manifest.blob_artifacts`` entry.
+
+    Format22 stores ``Vec<ledger::Artifact>`` and Rust serializes its unrenamed
+    ``length: u64`` field as ``length``, so the archive never carries the A4 /
+    ``artifact_holds`` column name ``content_length``. A missing, wrongly named
+    or non-integer field is refused as an explicit assertion, never as a raw
+    ``KeyError`` or ``ValueError``; no alias is accepted.
+    """
+    need(isinstance(artifact, dict), "an archived artifact entry is not a JSON object")
+    need("length" in artifact, "an archived artifact entry carries no length field")
+    for alias in ("content_length", "verified_length", "locator_length"):
+        need(alias not in artifact, "an archived artifact entry carries the non-archive field " + alias)
+    value = artifact["length"]
+    need(isinstance(value, int) and not isinstance(value, bool) and value > 0,
+         "an archived artifact length is not a positive integer")
+    return value
+
+
+def _archive_bytes(entry):
+    """The positive wire byte count of one ``manifest.files`` member."""
+    need(isinstance(entry, dict) and isinstance(entry.get("bytes"), int) and not isinstance(entry.get("bytes"), bool),
+         "an archived Blob member carries no integer byte count")
+    return entry["bytes"]
 
 
 def _archive_serving_read(serving_read, repos, tenants, registrations, producer):

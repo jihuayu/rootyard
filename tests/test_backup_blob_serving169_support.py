@@ -815,14 +815,44 @@ def serving_read_marker(repo_id, tenant, owner=None, pack_count=2):
             "owner_id": owner or str(uuid.uuid4()), "pack_count": pack_count, "requester_distinct": True}
 
 
+def archive_artifact():
+    """One ``manifest.blob_artifacts`` entry in its real serialized shape.
+
+    Format22 stores ``Vec<ledger::Artifact>``, whose unrenamed ``length: u64``
+    field is written as ``length``; the A4 / ``artifact_holds`` column name
+    ``content_length`` never reaches the archive. The optional
+    ``artifact_set_digest``/``declared_by`` fields are omitted as the
+    serializer omits them when unset.
+    """
+    return {
+        "repository_id": str(uuid.uuid4()),
+        "registration_id": registration_id(),
+        "pack_id": str(uuid.uuid4()),
+        "role": "pack",
+        "slot": 0,
+        "hold_id": str(uuid.uuid4()),
+        "acquire_request_id": str(uuid.uuid4()),
+        "consume_request_id": str(uuid.uuid4()),
+        "provider": "s3",
+        "backend_identity": "ab" * 32,
+        "sha256": "11" * 32,
+        "length": 4096,
+        "tenant_id": str(uuid.uuid4()),
+        "authority_id": str(uuid.uuid4()),
+        "generation": 1,
+        "attempt_id": str(uuid.uuid4()),
+        "namespace": "core-pack",
+    }
+
+
 def positive_inputs(producer=None):
     tenant = str(uuid.uuid4())
     producer = producer or str(uuid.uuid4())
     registrations = [registration_id(), registration_id()]
-    artifacts = []
-    for registration in registrations:
-        for row in artifact_rows():
-            artifacts.append(dict(row, registration_id=registration))
+    # The archive carries the pack/idx pair of each registered pack (skipping
+    # the idx slot of the scratch row), in the real wire shape.
+    artifacts = [dict(archive_artifact(), registration_id=registration, role=role, slot=slot)
+                 for registration in registrations for role, slot in support.PAIR_ROLES]
     repos = [ready_repo(str(uuid.uuid4()), tenant), ready_repo(str(uuid.uuid4()), tenant)]
     roots = [{"root_id": str(uuid.uuid4()), "state": "active", "owner_id": producer},
              {"root_id": str(uuid.uuid4()), "state": "released", "owner_id": producer}]
@@ -834,10 +864,12 @@ def positive_inputs(producer=None):
     carry = {table: {"rows": 2, "sha256": "00" * 32} for table in support._CARRY_TABLES}
     manifest = {"format": 22, "schema_versions": list(versions),
                 "repositories": [{"id": repo["id"], "backend": "pg_refstore"} for repo in repos],
-                "blob_closure": {"artifacts": len(artifacts), "bytes": sum(row["content_length"] for row in artifacts),
+                # `closure_of` and the file entries are both derived from the
+                # archived `length`, never from an A4 column.
+                "blob_closure": {"artifacts": len(artifacts), "bytes": sum(row["length"] for row in artifacts),
                                  "provider": "s3", "backend_identity": "ab" * 32},
                 "blob_artifacts": artifacts, "refstore": carry, "files": {
-                    "blob/" + row["hold_id"]: {"kind": "file", "bytes": row["content_length"]} for row in artifacts}}
+                    "blob/" + row["hold_id"]: {"kind": "file", "bytes": row["length"]} for row in artifacts}}
     return manifest, expected
 
 
@@ -903,6 +935,61 @@ class Format22ManifestTest(unittest.TestCase):
             support.format22_manifest_checks(
                 manifest, dict(expected, serving_read=dict(
                     expected["serving_read"], owner_id=expected["repos"][0]["owner_id"])))
+
+    def test_archive_artifacts_use_the_serialized_length_field(self):
+        # A real archive carries `ledger::Artifact`'s `length`, never the A4
+        # column name `content_length`; the positive fixture proves the wire
+        # shape the native archive actually writes.
+        manifest, expected = positive_inputs()
+        for entry in manifest["blob_artifacts"]:
+            self.assertIn("length", entry)
+            self.assertNotIn("content_length", entry)
+        support.format22_manifest_checks(manifest, expected)
+
+    def test_missing_or_wrong_archive_length_is_refused_without_key_error(self):
+        def without(entry, field):
+            return {key: value for key, value in entry.items() if key != field}
+
+        def with_(entry, field, value):
+            return dict(entry, **{field: value})
+
+        # A non-object entry is only reachable through the reader itself: the
+        # manifest checks index earlier archive fields before the byte proof.
+        cases = (
+            ("no length field", lambda row: without(row, "length"), "carries no length field", True),
+            ("A4 column name only", lambda row: with_(without(row, "length"), "content_length", row["length"]),
+             "carries no length field", True),
+            ("length plus A4 column", lambda row: with_(row, "content_length", row["length"]), "content_length", True),
+            ("verified locator length", lambda row: with_(row, "verified_length", row["length"]), "verified_length", True),
+            ("null length", lambda row: with_(row, "length", None), "not a positive integer", True),
+            ("boolean length", lambda row: with_(row, "length", True), "not a positive integer", True),
+            ("zero length", lambda row: with_(row, "length", 0), "not a positive integer", True),
+            ("negative length", lambda row: with_(row, "length", -4096), "not a positive integer", True),
+            ("string length", lambda row: with_(row, "length", "4096"), "not a positive integer", True),
+            ("not an object", lambda row: "4096", "not a JSON object", False),
+        )
+        for name, mutate, message, reachable in cases:
+            with self.subTest(name):
+                with self.assertRaisesRegex(AssertionError, message):
+                    support.archive_length(mutate(archive_artifact()))
+                if reachable:
+                    manifest, expected = positive_inputs()
+                    manifest["blob_artifacts"][0] = mutate(manifest["blob_artifacts"][0])
+                    with self.assertRaisesRegex(AssertionError, message):
+                        support.format22_manifest_checks(manifest, expected)
+
+    def test_archive_length_must_agree_with_the_closure_bytes(self):
+        manifest, expected = positive_inputs()
+        self.assertEqual(support.archive_length(archive_artifact()), 4096)
+        # An internally positive but inconsistent length must not pass: the
+        # closure byte total is derived from these very fields.
+        manifest["blob_artifacts"][0]["length"] += 1
+        with self.assertRaisesRegex(AssertionError, "lengths differ from the closure bytes"):
+            support.format22_manifest_checks(manifest, expected)
+        manifest, expected = positive_inputs()
+        del manifest["files"][next(name for name in manifest["files"])]["bytes"]
+        with self.assertRaisesRegex(AssertionError, "no integer byte count"):
+            support.format22_manifest_checks(manifest, expected)
 
     def test_missing_artifact_is_refused(self):
         manifest, expected = positive_inputs()
