@@ -139,15 +139,30 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         )
         for binding in pagination_commands + pagination_reports + pagination_harnesses:
             self.assertIn(binding, ci_text, f"Missing pagination wiring in .github/workflows/ci.yml: {binding}")
-        # Webhook report and its exact matrix source are part of the native gate.
+        # Webhook and Browse reports and their exact source inputs are part of
+        # the native gate.
         manifest_start = ci_text.index("python3 scripts/native_report_manifest.py --mode job")
         manifest_step = ci_text[manifest_start:].split("\n      - name:", 1)[0]
         for argument in (
             "--report webhooks=test-results/webhooks.json",
             "--harness tests/webhooks.py",
             "--harness tests/webhook_tenant_matrix.py",
+            # Browse report, its runtime harness and the imported scale helper
+            # are part of the native gate, with its key cases required to pass.
+            "--report browse=test-results/browse.json",
+            "--harness tests/browse.py",
+            "--harness tests/browse_ref_scale.py",
+            "--require-case browse=protected_writes_and_ref_ack_failure",
+            "--require-case browse=ref_transaction_settlement_recovery",
+            "--require-case browse=ref_transaction_crash_recovery",
+            "--require-case browse=ref_scale_complete_traversal",
         ):
             self.assertIn(argument, manifest_step)
+        # One Browse report and harness entry; the scale helper is the only
+        # other Browse-named source binding.
+        self.assertEqual(manifest_step.count("--report browse="), 1)
+        self.assertEqual(sum(1 for line in manifest_step.splitlines()
+                             if line.strip() == "--harness tests/browse.py \\"), 1)
 
         # initdb requires non-root. Container jobs switch user; the qualified
         # plain-host profile executes as runner and verifies its uid at runtime.

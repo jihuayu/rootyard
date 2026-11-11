@@ -194,7 +194,7 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
                     // no hook evidence, its native ref CAS was impossible: the
                     // managed reference-transaction hook requires that grant.
                     // Every I/O error other than definite NotFound stays unknown.
-                    let ungranted_without_hooks = no_parent_publication_possible(
+                    let ungranted_without_hooks = journal::no_parent_publication_possible(
                         &operation,
                         raw.is_empty(),
                         receipt.is_none(),
@@ -232,7 +232,15 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
-                    let evidence = serde_json::json!({"version":1,"finished":finished,"interrupted":interrupted,"reference_events":raw,"requested":requested,"post_receive":receipt,"storage_generation_matches":operation.storage_generation==generation,"repeated_receipt_refs":repeated,"ungranted_without_hooks":ungranted_without_hooks});
+                    let evidence = journal::ref_transaction_evidence(
+                        &operation,
+                        generation,
+                        finished,
+                        interrupted,
+                        &raw,
+                        requested.as_deref(),
+                        receipt.as_deref(),
+                    );
                     if ungranted_without_hooks && outcome == "no_ref_changes" {
                         // Re-derives every condition from the same journal; any
                         // material difference yields no proof and keeps the
@@ -296,19 +304,6 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
     Ok(clear)
 }
 
-fn no_parent_publication_possible(
-    operation: &journal::Operation,
-    no_events: bool,
-    no_receipt: bool,
-    no_request: bool,
-) -> bool {
-    operation.requires_parent_publication
-        && no_events
-        && no_receipt
-        && no_request
-        && matches!(std::fs::symlink_metadata(operation.path.join("publication.grant")),
-            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
-}
 async fn recovering(state: &AppState, repo: Uuid, reason: &str) -> Result<()> {
     state.pool.get().await?.execute("UPDATE repositories SET state='recovering',recovery_reason=CASE WHEN state<>'recovering' OR recovery_reason IS NULL OR recovery_reason='push_outcome_unknown' THEN $2 ELSE recovery_reason END WHERE id=$1 AND state<>'provisioning'",&[&repo,&reason]).await?;
     Ok(())
@@ -557,16 +552,16 @@ mod tests {
             journal::begin_active(root.path(), Uuid::new_v4(), Uuid::new_v4(), "actor".into(), Uuid::new_v4(), 1)
                 .unwrap();
         drop(active);
-        assert!(no_parent_publication_possible(&operation, true, true, true));
-        assert!(!no_parent_publication_possible(&operation, false, true, true));
-        assert!(!no_parent_publication_possible(&operation, true, false, true));
-        assert!(!no_parent_publication_possible(&operation, true, true, false));
+        assert!(journal::no_parent_publication_possible(&operation, true, true, true));
+        assert!(!journal::no_parent_publication_possible(&operation, false, true, true));
+        assert!(!journal::no_parent_publication_possible(&operation, true, false, true));
+        assert!(!journal::no_parent_publication_possible(&operation, true, true, false));
         let marker = operation.path.join("publication.grant");
         std::fs::write(&marker, b"granted").unwrap();
-        assert!(!no_parent_publication_possible(&operation, true, true, true));
+        assert!(!journal::no_parent_publication_possible(&operation, true, true, true));
         std::fs::remove_file(&marker).unwrap();
         std::os::unix::fs::symlink("missing", &marker).unwrap();
-        assert!(!no_parent_publication_possible(&operation, true, true, true));
+        assert!(!journal::no_parent_publication_possible(&operation, true, true, true));
     }
     #[test]
     fn executable_access_checks_capability_not_just_file_presence() {

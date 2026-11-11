@@ -24,7 +24,7 @@ mod paging;
 
 pub(crate) use command::{GitStep, git_cmd, invalid_output, run_git};
 use commit_decode::parse_batch_commits;
-pub use commit_decode::parse_commit_raw;
+pub use commit_decode::{parse_commit_raw, parse_ls_tree_output};
 pub(crate) use paging::page_refs;
 pub use paging::parse_for_each_ref_output;
 
@@ -250,29 +250,6 @@ pub(crate) async fn list_commits(
     let selected: Vec<String> = oids.into_iter().take(limit).collect();
     let items = read_commit_batch(state, repo_id, &selected).await?;
     Ok(CommitsResponse { repository_id: repo_id, items, next_after: more.then_some(after + limit) })
-}
-
-pub fn parse_ls_tree_output(raw: &[u8], rel_path: &str) -> Result<Vec<TreeEntry>, Error> {
-    let mut entries = Vec::new();
-    for record in raw.split(|&b| b == 0).filter(|r| !r.is_empty()) {
-        let line = String::from_utf8_lossy(record);
-        let Some((meta, name)) = line.split_once('\t') else { continue };
-        let parts: Vec<&str> = meta.split_whitespace().collect();
-        if name.is_empty() || parts.len() < 4 || !models::valid_non_zero_oid(parts[2]) {
-            continue;
-        }
-        let path = if rel_path.is_empty() { name.to_owned() } else { format!("{rel_path}/{name}") };
-        entries.push(TreeEntry {
-            name: name.to_owned(),
-            path,
-            mode: parts[0].to_owned(),
-            kind: parts[1].to_owned(),
-            oid: parts[2].to_owned(),
-            size: parts[3].parse::<u64>().ok(),
-        });
-    }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(entries)
 }
 
 async fn resolve_commit_or_tree_oid(state: &AppState, repo_id: Uuid, spec_opt: Option<&str>) -> Result<String, Error> {

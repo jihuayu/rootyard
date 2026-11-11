@@ -2,8 +2,11 @@
 use crate::{
     AppState, Error, auth,
     browse::{
-        git_read,
-        models::{AppliedRefUpdate, RefTransactionRequest, RefTransactionResponse},
+        git_read, idempotency,
+        ref_transaction::{
+            AppliedRefUpdate, RefTransactionRequest, RefTransactionResponse, prepare_stdin_file,
+            validate_applied_updates,
+        },
     },
     db::{self, Identity}, events, journal,
     members::models::RepoAccess, reliability, storage,
@@ -14,90 +17,21 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use deadpool_postgres::Transaction;
-use serde_json::Value;
-use std::{
-    collections::HashMap,
-    fs::OpenOptions,
-    io::{Seek, SeekFrom, Write},
-    os::unix::fs::OpenOptionsExt,
-    process::Stdio,
-    sync::Arc,
-};
+use std::{process::Stdio, sync::Arc};
 use uuid::Uuid;
 
-// The key namespace is scoped to the repository owner (its tenant), never to
-// the actor: any authorized collaborator may replay the owner's stored key.
-async fn creation_replay(
-    tx: &Transaction<'_>,
-    tenant: Uuid,
-    repo: Uuid,
-    key: &str,
-    request: &Value,
-) -> Result<Option<Value>, Error> {
-    let inserted = tx
-        .execute(
-            "INSERT INTO forge_creation_requests (tenant_id,repository_id,idempotency_key,request) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
-            &[&tenant, &repo, &key, &request],
-        )
-        .await
-        .map_err(Error::internal)?;
-    if inserted == 1 {
-        return Ok(None);
-    }
-    let row = tx
-        .query_one(
-            "SELECT request,response FROM forge_creation_requests WHERE tenant_id=$1 AND repository_id=$2 AND idempotency_key=$3",
-            &[&tenant, &repo, &key],
-        )
-        .await
-        .map_err(Error::internal)?;
-    if row.get::<_, Value>("request") != *request {
-        return Err(Error(StatusCode::CONFLICT, "idempotency key conflict"));
-    }
-    row.get::<_, Option<Value>>("response")
-        .map(Some)
-        .ok_or_else(|| Error::internal("incomplete creation record"))
+pub fn build_update_ref_stdin_payload(updates: &[AppliedRefUpdate]) -> Vec<u8> {
+    crate::browse::ref_transaction::build_update_ref_stdin_payload(updates)
 }
 
 async fn record_creation(
-    tx: &Transaction<'_>,
+    tx: &deadpool_postgres::Transaction<'_>,
     tenant: Uuid,
     repo: Uuid,
     key: Option<&str>,
-    response: &Value,
+    response: &serde_json::Value,
 ) -> Result<(), Error> {
-    if let Some(key) = key {
-        let changed = tx
-            .execute(
-                "UPDATE forge_creation_requests SET response=$4 WHERE tenant_id=$1 AND repository_id=$2 AND idempotency_key=$3 AND response IS NULL",
-                &[&tenant, &repo, &key, &response],
-            )
-            .await
-            .map_err(Error::internal)?;
-        if changed != 1 {
-            return Err(Error::internal("creation record was not finalized"));
-        }
-    }
-    Ok(())
-}
-
-pub fn build_update_ref_stdin_payload(updates: &[AppliedRefUpdate]) -> Vec<u8> {
-    let mut sorted = updates.to_vec();
-    sorted.sort_by(|a, b| a.ref_name.cmp(&b.ref_name));
-    let mut buf = Vec::with_capacity(64 + sorted.len() * 128);
-    buf.extend_from_slice(b"start\0");
-    for u in &sorted {
-        buf.extend_from_slice(b"update ");
-        buf.extend_from_slice(u.ref_name.as_bytes());
-        buf.push(0);
-        buf.extend_from_slice(u.new_oid.as_bytes());
-        buf.push(0);
-        buf.extend_from_slice(u.old_oid.as_bytes());
-        buf.push(0);
-    }
-    buf.extend_from_slice(b"prepare\0commit\0");
-    buf
+    idempotency::record(tx, tenant, repo, key, response).await
 }
 
 pub async fn execute_ref_transaction(
@@ -126,7 +60,7 @@ pub(crate) async fn create_proposal_pin(
     let request = RefTransactionRequest {
         storage_generation: Some(storage_generation),
         atomic: true,
-        updates: vec![crate::browse::models::RefUpdateInput {
+        updates: vec![crate::browse::ref_transaction::RefUpdateInput {
             ref_name: crate::namespace_service::proposal_pin_ref(proposal_id),
             old_oid: None,
             new_oid: Some(target_oid),
@@ -168,8 +102,26 @@ async fn execute_ref_transaction_inner(
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
-    let mut repo = db::Repository::from_row(&repo_row);
+    let repo = db::Repository::from_row(&repo_row);
     crate::pando_gateway::transition::admit_write(&state.pool, repo.id, &repo.storage_backend).await?;
+
+    // Fail an unauthorized caller before acquiring durable publication and
+    // admission rows or reserving journal state. The transaction-scoped
+    // authorize below still binds token locks to the long settlement; this
+    // preflight only closes the side-effect window for a read-only or
+    // unaffiliated caller.
+    {
+        let client = state.pool.get().await.map_err(Error::internal)?;
+        auth::verify_repo_write_access(
+            &**client,
+            actor.id,
+            actor.token_id,
+            repo.id,
+            auth::web_scope_enabled(),
+            crate::token_scopes::RepoAction::ContentsWrite,
+        )
+        .await?;
+    }
 
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(
@@ -194,6 +146,17 @@ async fn execute_ref_transaction_inner(
         tokio::time::Instant::now() + state.config.git_timeout,
     )
     .await?;
+    // Reconcile before opening the settlement transaction: reconciliation may
+    // update `repositories` under its own lock, and doing that here avoids
+    // waiting on this request's `FOR SHARE` row lock.
+    if repo.state != "ready" {
+        return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
+    }
+    if let Some(expected_gen) = input.storage_generation
+        && expected_gen != repo.storage_generation {
+            return Err(Error(StatusCode::CONFLICT, "storage generation mismatch"));
+        }
+    reliability::before_gitfs_push(&state, &repo).await?;
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
@@ -207,17 +170,22 @@ async fn execute_ref_transaction_inner(
         .await
         .map_err(Error::internal)?
         .get(0);
-
     let request_json = serde_json::json!({
         "operation": "ref_transaction",
         "storage_generation": input.storage_generation,
         "atomic": input.atomic,
         "updates": normalized_updates,
     });
-    if let Some(ref key) = idem_key
-        && let Some(saved_response) =
-            creation_replay(&tx, tenant_id, repo_id, key, &request_json).await?
-        {
+    if let Some(ref key) = idem_key {
+        // A crash after native publication rolls back the claim row with the
+        // settlement transaction. The journal fingerprint proves the recorded
+        // operation already belongs to this exact key/request pair, so replay
+        // it instead of running a second CAS against the published refs.
+        let saved = match idempotency::replay_terminal(&tx, tenant_id, repo_id, key, &request_json).await? {
+            Some(saved) => Some(saved),
+            None => idempotency::claim(&tx, tenant_id, repo_id, key, &request_json).await?,
+        };
+        if let Some(saved_response) = saved {
             auth::finish_tx(tx, &actor, true).await?;
             return Ok((
                 StatusCode::OK,
@@ -226,14 +194,12 @@ async fn execute_ref_transaction_inner(
             )
                 .into_response());
         }
+    }
 
     if let Some(expected_gen) = input.storage_generation
         && expected_gen != current_generation {
             return Err(Error(StatusCode::CONFLICT, "storage generation mismatch"));
         }
-    repo.storage_generation = current_generation;
-    reliability::before_gitfs_push(&state, &repo).await?;
-
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     let quota = state.config.max_repo_bytes;
     let check_path = repo_path.clone();
@@ -251,47 +217,15 @@ async fn execute_ref_transaction_inner(
     let repo_format = crate::browse::object_format::detect_repo_object_format(&state, repo_id).await?;
     let zero_oid = repo_format.zero_oid();
     let (head, current_refs) = git_read::read_head_and_refs(&state, repo_id).await?;
-    let refs_map: HashMap<&str, &str> = current_refs
-        .iter()
-        .map(|r| (r.name.as_str(), r.oid.as_str()))
-        .collect();
-
-    for u in &normalized_updates {
-        if !crate::browse::object_format::valid_oid_for_format(&u.old_oid, repo_format)
-            || !crate::browse::object_format::valid_oid_for_format(&u.new_oid, repo_format)
-        {
-            return Err(Error(
-                StatusCode::CONFLICT,
-                "ref transaction object format does not match repository",
-            ));
-        }
-        let actual_old = refs_map.get(u.ref_name.as_str()).copied().unwrap_or(zero_oid);
-        if actual_old != u.old_oid {
-            return Err(Error(StatusCode::CONFLICT, "reference old_oid mismatch"));
-        }
-        if u.new_oid == zero_oid {
-            if head.target.as_deref() == Some(u.ref_name.as_str()) {
-                return Err(Error(
-                    StatusCode::CONFLICT,
-                    "cannot delete current HEAD branch",
-                ));
-            }
-        } else {
-            let kind = git_read::object_type(&state, repo_id, &u.new_oid).await?;
-            let Some(kind_str) = kind else {
-                return Err(Error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "target object does not exist",
-                ));
-            };
-            if u.ref_name.starts_with("refs/heads/") && kind_str != "commit" {
-                return Err(Error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "branch reference target must be a commit",
-                ));
-            }
-        }
-    }
+    validate_applied_updates(
+        &state,
+        repo_id,
+        repo_format,
+        &current_refs,
+        &head,
+        &normalized_updates,
+    )
+    .await?;
 
     let requested: Vec<journal::RefChange> = normalized_updates.iter().map(|u| journal::RefChange {
         ref_name: u.ref_name.clone(), old_oid: u.old_oid.clone(), new_oid: u.new_oid.clone(),
@@ -305,37 +239,53 @@ async fn execute_ref_transaction_inner(
 
     let journal_root = state.storage.root.join("journal");
     journal::mkdir(&journal_root).map_err(Error::internal)?;
-    let stdin_path = journal_root.join(format!(".tmp-stdin-{}", Uuid::new_v4()));
-    let mut stdin_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&stdin_path)
-        .map_err(Error::internal)?;
-    let _ = std::fs::remove_file(&stdin_path);
     let stdin_payload = build_update_ref_stdin_payload(&normalized_updates);
-    stdin_file
-        .write_all(&stdin_payload)
-        .map_err(Error::internal)?;
-    stdin_file
-        .seek(SeekFrom::Start(0))
-        .map_err(Error::internal)?;
+    let stdin_file = prepare_stdin_file(&journal_root, &stdin_payload)?;
 
+    let idempotency = idem_key.as_deref().map(|key| {
+        let (key_sha256, request_sha256) = idempotency::fingerprint(key, &request_json);
+        journal::IdempotencyIntent { key_sha256, request_sha256 }
+    });
     let operation = if let Some(proposal_id)=proposal_pin {
         let intent=crate::namespace_service::ProposalIntent{
             proposal_id,repository_id:repo_id,target_oid:requested[0].new_oid.clone(),
         };
         journal::begin_proposal(&state.storage.root,repo_id,actor.id,
-            actor.username.clone(),actor.token_id,current_generation,intent)
+            actor.username.clone(),actor.token_id,current_generation,intent,idempotency)
     } else {
-        journal::begin(&state.storage.root,repo_id,actor.id,
-            actor.username.clone(),actor.token_id,current_generation)
+        journal::begin_ref_transaction(&state.storage.root,repo_id,actor.id,
+            actor.username.clone(),actor.token_id,current_generation,idempotency)
     }.map_err(Error::internal)?;
-    journal::record_ref_transaction_intent(&operation, &requested).map_err(Error::internal)?;
 
-    let mut cmd = git_read::git_cmd(&state, repo_id)?;
+    // Any setup failure after the durable intent exists but before the native
+    // CAS is provably ref-free: finish and retire the journal, then roll the
+    // claim back so a retry cannot wedge on this request's own lock.
+    let pre_cas = async {
+        journal::record_ref_transaction_intent(&operation, &requested).map_err(Error::internal)?;
+        // Test-only rendezvous for revoking a token while this request is still
+        // before native publication. It is an inert no-op unless explicitly set.
+        if let Some(millis) = test_pause_before_cas() {
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+        }
+        // Re-check the caller's token and effective role BEFORE the native CAS.
+        // A revoked writer must abort the intent while refs are still untouched.
+        auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repo_id,
+            auth::web_scope_enabled(), crate::token_scopes::RepoAction::ContentsWrite).await?;
+        if test_failpoint("before_cas") {
+            return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction aborted before CAS"));
+        }
+        git_read::git_cmd(&state, repo_id)
+    }.await;
+    let mut cmd = match pre_cas {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            let _ = journal::finish(&operation);
+            let rollback = tx.rollback().await.map_err(Error::internal);
+            journal::retire(&operation).map_err(Error::internal)?;
+            rollback?;
+            return Err(error);
+        }
+    };
     cmd.args(["update-ref", "--stdin", "-z", "--no-deref"]);
     if let Err(err) = crate::git_http::collect_git_output_input(
         cmd,
@@ -380,9 +330,15 @@ async fn execute_ref_transaction_inner(
             return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction outcome requires recovery"));
         }
     }
-    journal::record_ref_transaction_receipt(&operation, &requested).map_err(Error::internal)?;
-    journal::finish(&operation).map_err(Error::internal)?;
-
+    if let Err(error) = journal::record_ref_transaction_receipt(&operation, &requested)
+        .and_then(|()| journal::finish(&operation))
+        .map_err(Error::internal)
+    {
+        // The intent is now provably post-CAS; never retire it unsettled.
+        let _ = tx.rollback().await;
+        let _ = reliability::reconcile(&state, repo_id, current_generation, false).await;
+        return Err(error);
+    }
     let event_inputs: Vec<events::RefEventInput> = normalized_updates
         .iter()
         .enumerate()
@@ -393,32 +349,42 @@ async fn execute_ref_transaction_inner(
             new_oid: u.new_oid.clone(),
         })
         .collect();
-    let changes_json: Vec<Value> = normalized_updates
-        .iter()
-        .map(|u| {
-            serde_json::json!({
-                "ref_name": u.ref_name,
-                "old_oid": u.old_oid,
-                "new_oid": u.new_oid,
-            })
-        })
-        .collect();
-    let evidence = serde_json::json!({
-        "version": 1,
-        "kind": "ref_transaction",
-        "finished": true,
-        "interrupted": false,
-        "storage_generation_matches": true,
-        "reference_events": [{
-            "ordinal": 1,
-            "phase": "Committed",
-            "changes": changes_json,
-        }],
-        "post_receive": changes_json,
-    });
+    // Read back the journal records that reconciliation will see instead of
+    // re-deriving a second shape. Live settlement and startup recovery now
+    // produce byte-identical evidence for the same committed operation.
+    let reference_events = journal::events(&operation).map_err(Error::internal)?;
+    let requested_evidence = journal::requests(&operation).map_err(Error::internal)?;
+    let receipt_evidence = journal::receipts(&operation).map_err(Error::internal)?;
+    let evidence = journal::ref_transaction_evidence(
+        &operation,
+        current_generation,
+        true,
+        false,
+        &reference_events,
+        requested_evidence.as_deref(),
+        receipt_evidence.as_deref(),
+    );
 
-    events::publish(
-        &state.pool,
+    let response_body = RefTransactionResponse {
+        operation_id: operation.id,
+        repository_id: repo_id,
+        storage_generation: current_generation,
+        sequence: operation.sequence,
+        atomic: true,
+        updates: normalized_updates,
+    };
+    let response_value = serde_json::to_value(&response_body).map_err(Error::internal)?;
+
+    if test_failpoint("after_receipt") {
+        tx.rollback().await.map_err(Error::internal)?;
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction settlement interrupted"));
+    }
+
+    // Operation + exact outbox set + Idempotency-Key response are one
+    // PostgreSQL transaction. Native Git already published the refs, but no
+    // durable SQL settlement exists until this commit succeeds.
+    if let Err(error) = events::publish_in_tx(
+        &tx,
         &events::OperationRecord {
             id: operation.id,
             repository_id: repo_id,
@@ -435,33 +401,39 @@ async fn execute_ref_transaction_inner(
         &event_inputs,
     )
     .await
-    .map_err(Error::internal)?;
+    {
+        let _ = tx.rollback().await;
+        let _ = reliability::reconcile(&state, repo_id, current_generation, false).await;
+        return Err(Error::internal(error));
+    }
+    // Test-only crash point after the outbox set has been inserted but before
+    // the claim finalization/commit. Rolling the caller-owned transaction back
+    // is exactly what a process death here does: neither the operation nor its
+    // events are durable, while the Git receipt and journal remain.
+    if test_failpoint("after_publish") {
+        tx.rollback().await.map_err(Error::internal)?;
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction settlement interrupted"));
+    }
+    if let Err(error) =
+        record_creation(&tx, tenant_id, repo_id, idem_key.as_deref(), &response_value).await
+    {
+        let _ = tx.rollback().await;
+        let _ = reliability::reconcile(&state, repo_id, current_generation, false).await;
+        return Err(error);
+    }
+    if let Err(error) = tx.commit().await {
+        // Commit may have applied before the client observed an error. The
+        // journal is authoritative either way; reconcile replays or settles it.
+        let _ = reliability::reconcile(&state, repo_id, current_generation, false).await;
+        return Err(Error::internal(error));
+    }
+    if test_failpoint("after_commit") {
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction retirement interrupted"));
+    }
     state.dispatch.committed();
+    // Retire only after the settlement commit. A crash here leaves a finished
+    // journal beside an identical recorded operation; reconciliation retires it.
     journal::retire(&operation).map_err(Error::internal)?;
-
-    let response_body = RefTransactionResponse {
-        operation_id: operation.id,
-        repository_id: repo_id,
-        storage_generation: current_generation,
-        sequence: operation.sequence,
-        atomic: true,
-        updates: normalized_updates,
-    };
-    let response_value = serde_json::to_value(&response_body).map_err(Error::internal)?;
-    record_creation(
-        &tx,
-        tenant_id,
-        repo_id,
-        idem_key.as_deref(),
-        &response_value,
-    )
-    .await?;
-    // The exact-ref CAS may have waited behind another writer. Re-read the
-    // caller's token and effective role inside this same transaction so a
-    // revocation during the transfer cannot publish refs or outbox events.
-    auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repo_id,
-        auth::web_scope_enabled(), crate::token_scopes::RepoAction::ContentsWrite).await?;
-    tx.commit().await.map_err(Error::internal)?;
 
     Ok((
         StatusCode::OK,
@@ -469,4 +441,21 @@ async fn execute_ref_transaction_inner(
         Json(response_value),
     )
         .into_response())
+}
+
+/// Native-boundary rendezvous. Inert unless the process environment explicitly
+/// sets `ROOTYARD_TEST_REF_TRANSACTION_PAUSE_BEFORE_CAS_MS`; production never does.
+fn test_pause_before_cas() -> Option<u64> {
+    let value = std::env::var("ROOTYARD_TEST_REF_TRANSACTION_PAUSE_BEFORE_CAS_MS").ok()?;
+    value.parse().ok().map(|millis: u64| millis.min(10_000))
+}
+
+/// Native-boundary crash hook. Inert unless explicitly armed by a native
+/// boundary test through `ROOTYARD_TEST_REF_TRANSACTION_FAILPOINT`, either as
+/// this exact name or as `file:<path>` whose trimmed content names it.
+fn test_failpoint(name: &str) -> bool {
+    let Ok(value) = std::env::var("ROOTYARD_TEST_REF_TRANSACTION_FAILPOINT") else { return false };
+    value == name || value.strip_prefix("file:").is_some_and(|path| {
+        std::fs::read_to_string(path).is_ok_and(|contents| contents.trim() == name)
+    })
 }

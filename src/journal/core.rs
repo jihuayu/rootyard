@@ -1,71 +1,13 @@
 //! Durable operation identity, admission, and filesystem records.
+use super::operation::{ActiveGuard, Operation, load, op_name};
 use super::*;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Operation {
-    pub id: Uuid,
-    pub repository_id: Uuid,
-    pub actor_id: Uuid,
-    pub actor_name: String,
-    pub token_id: Uuid,
-    /// Non-login CI scheduler principal; human IDs are nil only for this variant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_principal_id: Option<Uuid>,
-    pub sequence: i64,
-    pub storage_generation: i64,
-    #[serde(default)]
-    pub requires_parent_publication: bool,
-    /// Admitted shard route epoch. Zero denotes a pre-admission legacy journal.
-    #[serde(default)]
-    pub shard_epoch: i64,
-    /// Exact maintenance capability, persisted before spawning Git. Never supplied by push clients.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ci_pin: Option<crate::ci_pins::Intent>,
-    /// Internal, absent-to-target proposal pin. Never supplied by Git clients.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) proposal_pin: Option<crate::namespace_service::ProposalIntent>,
-    #[serde(skip)]
-    pub path: PathBuf,
-}
-pub struct ActiveGuard {
-    _file: File,
-}
-impl ActiveGuard {
-    pub fn operation_is_live(op: &Operation) -> Result<bool> {
-        let path = op.path.join("active.lock");
-        if !exists(&path)? {
-            return Ok(false);
-        }
-        let file = OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOFOLLOW).open(&path)?;
-        ensure!(file.metadata()?.is_file(), "invalid active operation lock");
-        match file.try_lock_exclusive() {
-            Ok(()) => Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
-            Err(error) => Err(error.into()),
-        }
-    }
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RefChange {
-    pub ref_name: String,
-    pub old_oid: String,
-    pub new_oid: String,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum HookPhase {
-    Preparing,
-    Prepared,
-    Committed,
-    Aborted,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct HookEvent {
-    pub ordinal: i64,
-    pub phase: HookPhase,
-    pub changes: Vec<RefChange>,
-}
+use anyhow::{Context, Result, ensure};
+use fs2::FileExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
+use uuid::Uuid;
 
 pub(crate) fn safe_path(path: &Path) -> Result<()> {
     ensure!(path.is_absolute(), "journal path must be absolute");
@@ -148,62 +90,6 @@ pub(super) fn entries(path: &Path) -> Result<Vec<PathBuf>> {
     }
     Ok(result)
 }
-pub(super) fn op_name(op: &Operation) -> String {
-    format!("{:020}-{}", op.sequence, op.id)
-}
-pub(super) fn load(path: &Path) -> Result<Operation> {
-    safe_path(path)?;
-    let mut op: Operation = serde_json::from_slice(&read(&path.join("operation.json"))?)?;
-    ensure!(
-        op.sequence > 0 && op.storage_generation > 0 && op.shard_epoch >= 0,
-        "invalid operation sequence, generation or shard epoch"
-    );
-    ensure!(!op.actor_name.is_empty() && op.actor_name.len() <= 4096, "invalid actor name");
-    ensure!(
-        path.file_name().and_then(|s| s.to_str()) == Some(op_name(&op).as_str()),
-        "operation path identity mismatch"
-    );
-    let repo = path.parent().context("missing repository directory")?;
-    ensure!(
-        repo.file_name().and_then(|s| s.to_str()) == Some(op.repository_id.to_string().as_str()),
-        "repository identity mismatch"
-    );
-    ensure!(
-        repo.parent().and_then(Path::file_name).and_then(|s| s.to_str()) == Some("journal"),
-        "unexpected journal layout"
-    );
-    op.path = path.to_path_buf();
-    if let Some(intent) = &op.ci_pin {
-        ensure!(op.proposal_pin.is_none(), "mixed controller capabilities");
-        intent.validate()?;
-        ensure!(
-            intent.repository_id == op.repository_id && intent.storage_generation == op.storage_generation,
-            "maintenance identity mismatch"
-        );
-        if op.service_principal_id.is_some() {
-            ensure!(
-                op.actor_id.is_nil() && op.token_id.is_nil() && op.actor_name == "ci-scheduler",
-                "invalid service principal journal"
-            );
-        } else {
-            ensure!(intent.owner_id == op.actor_id && !op.token_id.is_nil(), "maintenance human identity mismatch");
-        }
-    } else {
-        ensure!(
-            op.service_principal_id.is_none() && !op.actor_id.is_nil() && !op.token_id.is_nil(),
-            "invalid human journal identity"
-        );
-        if let Some(intent) = &op.proposal_pin {
-            intent.validate()?;
-            ensure!(intent.repository_id == op.repository_id, "proposal pin repository mismatch");
-        }
-    }
-    Ok(op)
-}
-pub(super) fn validate(op: &Operation) -> Result<()> {
-    ensure!(load(&op.path)? == *op, "operation metadata mismatch");
-    Ok(())
-}
 
 pub fn begin(
     data_root: &Path,
@@ -226,6 +112,39 @@ pub fn begin(
         false,
         Uuid::new_v4(),
         0,
+        None,
+        None,
+    )?
+    .0)
+}
+
+/// Admit a server-side exact-ref transaction carrying optional idempotency
+/// fingerprints. The fingerprints are persisted with the intent so recovery
+/// can replay the committed response after a settlement crash.
+pub fn begin_ref_transaction(
+    data_root: &Path,
+    repository_id: Uuid,
+    actor_id: Uuid,
+    actor_name: String,
+    token_id: Uuid,
+    storage_generation: i64,
+    idempotency: Option<super::IdempotencyIntent>,
+) -> Result<Operation> {
+    Ok(begin_inner(
+        data_root,
+        repository_id,
+        actor_id,
+        actor_name,
+        token_id,
+        storage_generation,
+        None,
+        None,
+        None,
+        false,
+        Uuid::new_v4(),
+        0,
+        idempotency,
+        Some(OperationKind::RefTransaction),
     )?
     .0)
 }
@@ -270,6 +189,8 @@ pub fn begin_active_with(
         true,
         writer_id,
         shard_epoch,
+        None,
+        None,
     )?;
     Ok((op, guard.context("missing active admission lock")?))
 }
@@ -294,6 +215,8 @@ pub(crate) fn begin_ci(
         false,
         Uuid::new_v4(),
         0,
+        None,
+        None,
     )?
     .0)
 }
@@ -319,6 +242,8 @@ pub(crate) fn begin_ci_service(
         false,
         Uuid::new_v4(),
         0,
+        None,
+        None,
     )?
     .0)
 }
@@ -331,6 +256,7 @@ pub(crate) fn begin_proposal(
     token_id: Uuid,
     storage_generation: i64,
     intent: crate::namespace_service::ProposalIntent,
+    idempotency: Option<super::IdempotencyIntent>,
 ) -> Result<Operation> {
     intent.validate()?;
     ensure!(intent.repository_id == repository_id, "proposal pin repository mismatch");
@@ -347,6 +273,8 @@ pub(crate) fn begin_proposal(
         false,
         Uuid::new_v4(),
         0,
+        idempotency,
+        Some(OperationKind::RefTransaction),
     )
     .map(|(op, _)| op)
 }
@@ -365,6 +293,8 @@ fn begin_inner(
     active: bool,
     writer_id: Uuid,
     shard_epoch: i64,
+    idempotency: Option<super::IdempotencyIntent>,
+    kind: Option<OperationKind>,
 ) -> Result<(Operation, Option<ActiveGuard>)> {
     safe_path(data_root)?;
     ensure!(storage_generation > 0 && !actor_name.is_empty() && actor_name.len() <= 4096, "invalid operation metadata");
@@ -399,10 +329,12 @@ fn begin_inner(
         service_principal_id,
         sequence,
         storage_generation,
+        kind,
         requires_parent_publication: active,
         shard_epoch,
         ci_pin,
         proposal_pin,
+        idempotency,
         path: PathBuf::new(),
     };
     op.path = repo.join(op_name(&op));

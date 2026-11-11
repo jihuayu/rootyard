@@ -789,26 +789,19 @@ mod tests {
         let refs = vec!["refs/heads/main".to_string()];
         let admission = admit(&pool, repo, 1, &actor, &refs, Instant::now() + Duration::from_secs(5)).await.unwrap();
         let client = db::connect_url(&url).await.unwrap();
-        ensure_hook_admitted(
-            &client,
-            &journal::Operation {
-                id: admission.writer_id,
-                repository_id: repo,
-                actor_id: actor.id,
-                actor_name: actor.username.clone(),
-                token_id: actor.token_id,
-                service_principal_id: None,
-                sequence: 1,
-                storage_generation: 1,
-                requires_parent_publication: true,
-                shard_epoch: admission.shard_epoch,
-                ci_pin: None,
-                proposal_pin: None,
-                path: std::path::PathBuf::new(),
-            },
+        let root = tempfile::tempdir().unwrap();
+        let (operation, _active) = journal::begin_active_with(
+            root.path(),
+            repo,
+            actor.id,
+            actor.username.clone(),
+            actor.token_id,
+            1,
+            admission.writer_id,
+            admission.shard_epoch,
         )
-        .await
         .unwrap();
+        ensure_hook_admitted(&client, &operation).await.unwrap();
         pool.get()
             .await
             .unwrap()
