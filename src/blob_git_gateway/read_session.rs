@@ -27,7 +27,7 @@
 //! Every refusal after capture releases the transient capture through the
 //! bounded `snapshot::release_view` path before it is returned. A refusal never
 //! invites dropping the bound: `Behind` stays a `503` with the same guidance,
-//! a foreign/restored realm is a `409`, and a malformed header a `400`.
+//! a foreign/restored realm and a malformed header are both a generic `400`.
 //!
 //! Issuance is the mirror image and lives in `browse::finalize`: after the body
 //! is encoded it re-reads the authorized lookup once and applies the same
@@ -38,7 +38,10 @@ use uuid::Uuid;
 
 use super::{
     error::GatewayError,
-    repo_session::{BEHIND_MESSAGE, SESSION_HEADER, SessionRealm, SessionTokens, VersionComparison, presented},
+    repo_session::{
+        AuthorityKind, BEHIND_MESSAGE, Presented, SESSION_HEADER, SessionRealm, SessionRealmFields, SessionTokens,
+        VersionComparison, presented,
+    },
     serving::ServingRepository,
     snapshot::{self, RefView},
     state::BlobGitState,
@@ -70,7 +73,11 @@ pub(super) fn admit(
         }
         return Ok(());
     };
-    presented(headers).map_err(|error| error.for_repo())?;
+    // Header admission comes first: no token-free request may be refused by a
+    // realm limit that only matters to a token it did not present.
+    if matches!(presented(headers).map_err(|error| error.for_repo())?, Presented::None) {
+        return Ok(());
+    }
     live_realm(serving, serving.cluster_incarnation).map(|_| ())
 }
 
@@ -116,8 +123,14 @@ fn answer(
         .filter(|captured| !captured.is_nil() && *captured == serving.cluster_incarnation)
         .ok_or(GatewayError::Unavailable(AUTHORITY_CHANGED))?;
     let Some(tokens) = tokens else { return Ok(()) };
-    let realm = live_realm(serving, captured)?;
+    // Inspect the header before constructing the realm. A token-free read must
+    // stay token-free even when the live realm cannot be represented (for
+    // example an otherwise valid epoch the old i32 frame bound refused).
     let header = presented(headers).map_err(|error| error.for_repo())?;
+    if matches!(header, Presented::None) {
+        return Ok(());
+    }
+    let realm = live_realm(serving, captured)?;
     match tokens.verify(&header, &realm, captured_revision).map_err(|error| error.for_repo())? {
         None | Some(VersionComparison::Satisfied { .. }) => Ok(()),
         // An authentic same-realm token bound above the captured revision must
@@ -161,15 +174,17 @@ pub(super) fn verify_capture_anchor(
 /// so a nil/non-canonical live value is never compared.
 fn live_realm(serving: &ServingRepository, captured: Uuid) -> Result<SessionRealm, GatewayError> {
     let gate = &serving.gate;
-    SessionRealm::new(
-        gate.tenant_id(),
-        gate.repository_id(),
-        gate.object_format(),
-        gate.history_incarnation(),
-        gate.authority_epoch(),
-        gate.group_epoch(),
-        captured,
-    )
+    SessionRealm::new(SessionRealmFields {
+        tenant_id: gate.tenant_id(),
+        repository_id: gate.repository_id(),
+        object_format: gate.object_format(),
+        history_incarnation: gate.history_incarnation(),
+        authority: AuthorityKind::PgRefStore,
+        authority_epoch: gate.authority_epoch(),
+        group_id: super::repo_session::STANDALONE_GROUP_ID,
+        group_epoch: gate.group_epoch(),
+        cluster_incarnation: captured,
+    })
     .map_err(|error| error.for_repo())
 }
 
@@ -202,13 +217,17 @@ mod tests {
 
     /// A real core gate at `revision`; the fixture never touches PostgreSQL.
     fn serving(revision: i64, cluster: Uuid) -> ServingRepository {
+        serving_with_epochs(revision, cluster, 1, 1)
+    }
+
+    fn serving_with_epochs(revision: i64, cluster: Uuid, authority_epoch: i64, group_epoch: i64) -> ServingRepository {
         let gate = crate::ref_store::CoreGate::new(
             id(11),
             id(12),
             GitObjectFormat::Sha1,
             id(13),
-            1,
-            1,
+            authority_epoch,
+            group_epoch,
             RefName::new("refs/heads/main").expect("ref"),
             revision,
         )
@@ -307,9 +326,7 @@ mod tests {
         let presented = presented_for_test(&headers).expect("presented");
         assert_eq!(
             tokens().verify(&presented, &foreign, 5).map_err(|error| error.for_repo()),
-            Err(GatewayError::Conflict(
-                "repository session belongs to another repository, history or authority generation; re-read the authoritative store and obtain a fresh session there"
-            ))
+            Err(SessionTokenError::Realm.for_repo())
         );
         assert_eq!(GatewayError::Unavailable(AUTHORITY_CHANGED).status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -343,9 +360,36 @@ mod tests {
         let issued = tokens().issue_for_test(&foreign, 5).expect("issue");
         assert_eq!(
             answer(Some(id(4)), Some(&tokens()), &header(issued.token()), &rotated, 5),
-            Err(GatewayError::Conflict(
-                "repository session belongs to another repository, history or authority generation; re-read the authoritative store and obtain a fresh session there"
-            ))
+            Err(SessionTokenError::Realm.for_repo())
+        );
+    }
+
+    /// The epoch bound is the PostgreSQL BIGINT domain, not i32: a token-free
+    /// read at an epoch above i32::MAX still succeeds, a valid high-epoch token
+    /// succeeds, and a mismatched/behind high-epoch token fails closed.
+    #[test]
+    fn epochs_above_i32_max_stay_token_free_and_fail_closed_for_foreign_tokens() {
+        let high = i64::from(i32::MAX) + 1;
+        let live = serving_with_epochs(9, id(4), high, high);
+        let tokens = tokens();
+        let realm = live_realm(&live, id(4)).expect("high-epoch realm");
+        assert_eq!(realm.authority_epoch, high);
+        // Token-free reads are not blocked by the epoch width.
+        assert_eq!(answer(Some(id(4)), Some(&tokens), &HeaderMap::new(), &live, 9), Ok(()));
+        assert_eq!(admit(Some(&tokens), &HeaderMap::new(), &live), Ok(()));
+        // A valid token at the high epoch verifies and scores normally.
+        let issued = tokens.issue_for_test(&realm, 9).expect("high-epoch issue");
+        assert_eq!(answer(Some(id(4)), Some(&tokens), &header(issued.token()), &live, 9), Ok(()));
+        // Behind at the high epoch is the existing retryable refusal.
+        assert_eq!(
+            answer(Some(id(4)), Some(&tokens), &header(issued.token()), &live, 8),
+            Err(GatewayError::Unavailable(BEHIND_MESSAGE))
+        );
+        // Another epoch is a foreign realm, refused generically.
+        let foreign = serving_with_epochs(9, id(4), high + 1, high);
+        assert_eq!(
+            answer(Some(id(4)), Some(&tokens), &header(issued.token()), &foreign, 9),
+            Err(SessionTokenError::Realm.for_repo())
         );
     }
 

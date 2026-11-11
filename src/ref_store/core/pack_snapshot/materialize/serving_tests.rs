@@ -21,9 +21,10 @@ use super::super::serving_proof::{VerifiedReadView, probe_a5a};
 use super::test_materialized_view;
 use super::*;
 use crate::ref_store::core::pack_commit::{
-    ArtifactLocator, ArtifactSetDigest, CapturedRef, ContentDigest, RegisteredArtifact, RegisteredPack,
+    ArtifactLocator, ArtifactSetDigest, CapturedRef, ContentDigest, PackArtifactRole, RegisteredArtifact,
+    RegisteredPack,
 };
-use crate::ref_store::{GitObjectFormat, GitOid, MetadataPinPurpose, RefName};
+use crate::ref_store::{GitObjectFormat, GitOid, MetadataPinPurpose, MetadataSnapshotScope, RefName};
 use uuid::Uuid;
 
 fn hex32(byte: u8) -> String {

@@ -10,6 +10,21 @@
 //! signed frame (see `standalone/session_keyring.rs`). They are never list
 //! positions, so retiring or reordering one key never re-labels another. A
 //! frame whose id is not in this codec's key set is [`SessionTokenError::Invalid`].
+//!
+//! The signed frame binds an explicit authority kind and group id next to the
+//! tenant, repository, history and epoch fields, so a future Raft Ref-CAS
+//! authority can never accept a standalone PostgreSQL token by comparing epochs
+//! alone. The MAC transcript length-prefixes every field with a canonical
+//! two-byte big-endian length and includes the body exactly once.
+//!
+//! ## Clock rule
+//!
+//! Verification uses the verifier's trusted wall clock with **zero** future
+//! `iat` allowance: `now_unix < issued_unix` fails as
+//! [`SessionTokenError::Expired`], and
+//! `now_unix >= issued_unix.saturating_add(lifetime_seconds)` also fails as
+//! `Expired`. Multi-process or multi-host deployments must run synchronized NTP
+//! clocks; the signed lifetime is never extended to hide skew.
 use std::fmt;
 
 use axum::http::{HeaderMap, HeaderName};
@@ -18,15 +33,18 @@ use ring::hmac;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::{IssuedSession, RepoSession, SESSION_HEADER, SessionRealm, SessionTokenError, VersionComparison, compare};
+use super::{
+    AuthorityKind, IssuedSession, RepoSession, SESSION_HEADER, SessionRealm, SessionRealmFields, SessionTokenError,
+    VersionComparison, compare,
+};
 use crate::{blob_git_gateway::error::GatewayError, blob_store::BlobBackendIdentity, ref_store::GitObjectFormat};
 
 pub(super) const PREFIX: &str = "rs1.";
-pub(super) const FORMAT_BYTE: u8 = 1;
+pub(super) const FORMAT_BYTE: u8 = 2;
 pub(super) const TRAILER: &[u8; 10] = b"session/v1";
-pub(super) const BODY_LEN: usize = 111;
+pub(super) const BODY_LEN: usize = 119;
 const MAC_LEN: usize = 32;
-const BODY_B64_LEN: usize = 148;
+const BODY_B64_LEN: usize = 159;
 const MAC_B64_LEN: usize = 43;
 /// `rs1.` + body + `.` + MAC. The ceiling is checked before any decoding.
 pub(crate) const MAX_TOKEN_LEN: usize = PREFIX.len() + BODY_B64_LEN + 1 + MAC_B64_LEN;
@@ -95,14 +113,15 @@ impl SessionTokenCodec {
         self.lifetime_seconds
     }
 
-    /// The exact message the MAC covers: domain transcript, then the body.
+    /// The exact message the MAC covers: canonical two-byte big-endian field
+    /// lengths, then each field, with the body included exactly once.
     pub(super) fn message(&self, id: u8, body: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(96 + body.len());
+        let mut out = Vec::with_capacity(2 * 4 + DOMAIN.len() + self.backend.len() + 1 + body.len());
         for field in [DOMAIN, &self.backend[..], &[id][..], body] {
-            out.push(u8::try_from(field.len()).unwrap_or(u8::MAX));
+            let length = u16::try_from(field.len()).expect("session transcript fields are bounded");
+            out.extend_from_slice(&length.to_be_bytes());
             out.extend_from_slice(field);
         }
-        out.extend_from_slice(body);
         out
     }
 
@@ -134,8 +153,9 @@ impl SessionTokenCodec {
             return Err(SessionTokenError::Invalid);
         }
         let session = parse_body(body)?;
-        // A frame issued in the future (clock skew) or older than its own
-        // lifetime is refused; the caller's clock never extends a token's life.
+        // Zero future-`iat` skew: a verifier behind the issuer refuses rather
+        // than extending the token's life. The upper bound is half-open and
+        // saturating, so the signed lifetime is never widened.
         if now_unix < session.issued_unix
             || now_unix >= session.issued_unix.saturating_add(i64::from(session.lifetime_seconds))
         {
@@ -172,11 +192,12 @@ impl SessionTokenCodec {
         served_revision: i64,
         now_unix: i64,
     ) -> Result<IssuedSession, SessionTokenError> {
-        if served_revision < MIN_REVISION || now_unix < 0 {
+        if served_revision < MIN_REVISION || now_unix < 0 || now_unix > i64::from(u32::MAX) {
             return Err(SessionTokenError::Invalid);
         }
         let mut body = [0u8; BODY_LEN];
         body[0] = FORMAT_BYTE;
+        body[1] = live.authority.wire();
         body[2] = self.current;
         body[3..7].copy_from_slice(&self.lifetime_seconds.to_be_bytes());
         body[7..15].copy_from_slice(&served_revision.to_be_bytes());
@@ -190,8 +211,9 @@ impl SessionTokenCodec {
         body[65..73].copy_from_slice(&live.authority_epoch.to_be_bytes());
         body[73..81].copy_from_slice(&live.group_epoch.to_be_bytes());
         body[81..97].copy_from_slice(live.cluster_incarnation.as_bytes());
-        body[97..101].copy_from_slice(&u32::try_from(now_unix).unwrap_or(u32::MAX).to_be_bytes());
-        body[101..111].copy_from_slice(TRAILER);
+        body[97..105].copy_from_slice(&live.group_id.to_be_bytes());
+        body[105..109].copy_from_slice(&u32::try_from(now_unix).expect("issue time was range-checked").to_be_bytes());
+        body[109..119].copy_from_slice(TRAILER);
         let key = hmac::Key::new(
             hmac::HMAC_SHA256,
             &self.keys[self.current as usize].as_ref().ok_or(SessionTokenError::Invalid)?[..],
@@ -208,9 +230,10 @@ impl SessionTokenCodec {
 }
 
 fn parse_body(body: &[u8]) -> Result<RepoSession, SessionTokenError> {
-    if body.len() != BODY_LEN || body[0] != FORMAT_BYTE || body[1] != 0 || body[48] != 0 || &body[101..111] != TRAILER {
+    if body.len() != BODY_LEN || body[0] != FORMAT_BYTE || body[48] != 0 || &body[109..119] != TRAILER {
         return Err(SessionTokenError::Invalid);
     }
+    let authority = AuthorityKind::from_wire(body[1]).ok_or(SessionTokenError::Malformed)?;
     let lifetime_seconds = u32::from_be_bytes(read::<4>(&body[3..7]));
     if !(MIN_LIFETIME_SECONDS..=MAX_LIFETIME_SECONDS).contains(&lifetime_seconds) {
         return Err(SessionTokenError::Invalid);
@@ -221,15 +244,17 @@ fn parse_body(body: &[u8]) -> Result<RepoSession, SessionTokenError> {
         _ => return Err(SessionTokenError::Invalid),
     };
     // Re-check the realm through the same constructor the issuer used.
-    let realm = SessionRealm::new(
-        Uuid::from_bytes(read::<16>(&body[15..31])),
-        Uuid::from_bytes(read::<16>(&body[31..47])),
+    let realm = SessionRealm::new(SessionRealmFields {
+        tenant_id: Uuid::from_bytes(read::<16>(&body[15..31])),
+        repository_id: Uuid::from_bytes(read::<16>(&body[31..47])),
         object_format,
-        Uuid::from_bytes(read::<16>(&body[49..65])),
-        i64::from_be_bytes(read::<8>(&body[65..73])),
-        i64::from_be_bytes(read::<8>(&body[73..81])),
-        Uuid::from_bytes(read::<16>(&body[81..97])),
-    )?;
+        history_incarnation: Uuid::from_bytes(read::<16>(&body[49..65])),
+        authority,
+        authority_epoch: i64::from_be_bytes(read::<8>(&body[65..73])),
+        group_id: u64::from_be_bytes(read::<8>(&body[97..105])),
+        group_epoch: i64::from_be_bytes(read::<8>(&body[73..81])),
+        cluster_incarnation: Uuid::from_bytes(read::<16>(&body[81..97])),
+    })?;
     let bound = i64::from_be_bytes(read::<8>(&body[7..15]));
     if bound < MIN_REVISION {
         return Err(SessionTokenError::Invalid);
@@ -238,7 +263,7 @@ fn parse_body(body: &[u8]) -> Result<RepoSession, SessionTokenError> {
         realm,
         bound,
         lifetime_seconds,
-        issued_unix: i64::from(u32::from_be_bytes(read::<4>(&body[97..101]))),
+        issued_unix: i64::from(u32::from_be_bytes(read::<4>(&body[105..109]))),
     })
 }
 

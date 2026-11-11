@@ -7,7 +7,7 @@ use std::{future::IntoFuture, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 mod config;
-mod session_keyring;
+pub(crate) mod session_keyring;
 
 /// Explicit integration entry while business endpoint equivalence is completed.
 pub async fn run_from_env() -> Result<()> {

@@ -60,6 +60,7 @@ use uuid::Uuid;
 use super::materialize::MaterializedPackRead;
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use crate::ref_store::core::snapshot_contract::MetadataSnapshotScope;
+use crate::ref_store::serving::AuthorityKind;
 
 /// A T2-revalidated native serving read whose verified A5b binding cannot be
 /// separated from the native bytes they describe.
@@ -147,7 +148,9 @@ pub(crate) struct ProvenScope {
     tenant_id: Uuid,
     object_format: crate::ref_store::GitObjectFormat,
     history_incarnation: Uuid,
+    authority_kind: AuthorityKind,
     authority_epoch: i64,
+    group_id: u64,
     group_epoch: i64,
 }
 
@@ -168,8 +171,16 @@ impl ProvenScope {
         self.history_incarnation
     }
 
+    pub(crate) fn authority_kind(&self) -> AuthorityKind {
+        self.authority_kind
+    }
+
     pub(crate) fn authority_epoch(&self) -> i64 {
         self.authority_epoch
+    }
+
+    pub(crate) fn group_id(&self) -> u64 {
+        self.group_id
     }
 
     pub(crate) fn group_epoch(&self) -> i64 {
@@ -182,7 +193,11 @@ impl ProvenScope {
             tenant_id: scope.tenant_id(),
             object_format: scope.object_format(),
             history_incarnation: scope.history_incarnation(),
+            // The sealed serving proof is produced only by the standalone
+            // PostgreSQL authority; group 0 is its explicit no-group value.
+            authority_kind: AuthorityKind::PgRefStore,
             authority_epoch: scope.authority_epoch(),
+            group_id: 0,
             group_epoch: scope.group_epoch(),
         }
     }
@@ -240,7 +255,6 @@ impl MaterializedPackRead {
 
 /// Test-only: the A5a per-read digest of a transient snapshot. Never a proof.
 #[cfg(test)]
-#[allow(unused_imports)]
 pub(crate) fn probe_a5a(snapshot: &super::read_snapshot::PackReadSnapshot) -> RequestDigest {
     snapshot.read_digest_hex().parse().expect("a snapshot's own A5a hex parses")
 }

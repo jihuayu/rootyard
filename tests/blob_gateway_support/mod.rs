@@ -21,6 +21,7 @@ pub mod actor;
 pub mod blob;
 pub mod capture;
 pub mod db;
+pub mod db_run;
 pub mod git;
 pub mod preflight;
 pub mod proxy;

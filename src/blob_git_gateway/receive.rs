@@ -99,8 +99,18 @@ pub(super) async fn receive_pack(
         Claim::Replay(terminal) => {
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
-            return committed_response(&state, &identity, &owner, name, &serving, &terminal, body, operation, deadline)
-                .await;
+            return committed_response(CommittedResponse {
+                state: &state,
+                identity: &identity,
+                owner: &owner,
+                name,
+                authorized: &serving,
+                terminal: &terminal,
+                body,
+                operation,
+                deadline,
+            })
+            .await;
         }
         Claim::Fresh => {}
     }
@@ -146,7 +156,18 @@ pub(super) async fn receive_pack(
         Ok(PushOutcome::Terminal(terminal)) => {
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
-            committed_response(&state, &identity, &owner, name, &serving, &terminal, body, operation, deadline).await
+            committed_response(CommittedResponse {
+                state: &state,
+                identity: &identity,
+                owner: &owner,
+                name,
+                authorized: &serving,
+                terminal: &terminal,
+                body,
+                operation,
+                deadline,
+            })
+            .await
         }
         Ok(PushOutcome::Cancelled(reason)) => {
             let results = cancelled_results(&request, reason);
@@ -292,33 +313,46 @@ fn refused<E>(_: E) -> GatewayError {
 /// response. Any final lookup/proof/issue failure is the fixed retryable
 /// [`COMMITTED_SESSION_UNAVAILABLE`]; a token-free `200` is never returned when
 /// a key set is configured. Without a key set no extra lookup happens.
-#[allow(clippy::too_many_arguments)]
-async fn committed_response(
-    state: &BlobGitState,
-    identity: &crate::db::Identity,
-    owner: &str,
-    name: &str,
-    authorized: &ServingRepository,
-    terminal: &crate::ref_store::core::pack_commit::PackCommitTerminal,
+/// Everything one committed push response needs after the durable terminal
+/// exists. Bundling it keeps the async boundary readable without suppressing
+/// Clippy's argument-count lint.
+struct CommittedResponse<'a> {
+    state: &'a BlobGitState,
+    identity: &'a crate::db::Identity,
+    owner: &'a str,
+    name: &'a str,
+    authorized: &'a ServingRepository,
+    terminal: &'a crate::ref_store::core::pack_commit::PackCommitTerminal,
     body: Vec<u8>,
     operation: Uuid,
     deadline: tokio::time::Instant,
-) -> Result<Response, GatewayError> {
-    let mut response = response(StatusCode::OK, "application/x-git-receive-pack-result", body, operation)?;
-    let Some(tokens) = state.sessions() else { return Ok(response) };
-    if !terminal.is_committed() {
+}
+
+async fn committed_response(request: CommittedResponse<'_>) -> Result<Response, GatewayError> {
+    let mut response =
+        response(StatusCode::OK, "application/x-git-receive-pack-result", request.body, request.operation)?;
+    let Some(tokens) = request.state.sessions() else { return Ok(response) };
+    if !request.terminal.is_committed() {
         return Ok(response);
     }
     let issue = async {
-        let final_lookup =
-            lookup(state.pool(), identity, owner, name, true, state.store().backend_identity(), deadline)
-                .await
-                .map_err(refused)?;
-        let proof = CommittedWriteSessionProof::new(terminal, authorized, &final_lookup).map_err(refused)?;
+        let final_lookup = lookup(
+            request.state.pool(),
+            request.identity,
+            request.owner,
+            request.name,
+            true,
+            request.state.store().backend_identity(),
+            request.deadline,
+        )
+        .await
+        .map_err(refused)?;
+        let proof =
+            CommittedWriteSessionProof::new(request.terminal, request.authorized, &final_lookup).map_err(refused)?;
         let issued = tokens.issue_from_committed_write(&proof).map_err(refused)?;
         Ok::<_, GatewayError>(issued)
     };
-    let issued = tokio::time::timeout_at(deadline, issue).await.map_err(refused)??;
+    let issued = tokio::time::timeout_at(request.deadline, issue).await.map_err(refused)??;
     issued.apply(&mut response);
     Ok(response)
 }

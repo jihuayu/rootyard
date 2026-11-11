@@ -41,8 +41,9 @@ FEATURES = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]*(,[A-Za-z_][A-Za-z0-9_-]*)*$')
 PROFILE_KEYS = ('opt_level', 'debuginfo', 'debug_assertions', 'overflow_checks', 'test')
 # Narrow, explicit closure of test-support sources the rootyard lib harness
 # reaches from under `tests/` (all are outside `source_digest`'s `src` tree):
-# - tests/blob_gateway_support: `#[path = "../../tests/blob_gateway_support/mod.rs"]`
-#   in src/blob_git_gateway/session_http_acceptance.rs.
+# - tests/blob_gateway_support: the narrow
+#   `#[path = "../../tests/blob_gateway_support/session.rs"]` fixture include in
+#   src/blob_git_gateway/session_http_acceptance.rs (actor/db/git subset only).
 # - tests/serving_proof_support: `#[path = "../../../../../tests/serving_proof_support/contract.rs"]`
 #   in src/ref_store/core/pack_snapshot/materialize/serving_tests.rs.
 # - tests/serving_reads_support and tests/serving_support: `#[path]` includes

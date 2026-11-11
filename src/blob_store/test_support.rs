@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    BlobBackendIdentity, UploadIntent,
+    BlobBackendIdentity, BlobLocator, UploadIntent,
     budget::{ResourceContext, ResourceLimits},
     config::BlobProfile,
     opendal::BlobStore,
@@ -71,4 +71,19 @@ pub(crate) fn write_source(dir: &Path, bytes: &[u8]) -> PathBuf {
     let path = dir.join("source");
     std::fs::write(&path, bytes).expect("test source write");
     path
+}
+
+/// Delete exactly one already-published object by its read-only locator.
+///
+/// Test-only: the production `BlobStore::delete` remains disabled. The fixture
+/// uses this to prove that a token issued before the bytes disappeared cannot
+/// make a serving read succeed.
+pub(crate) async fn delete_exact(store: &BlobStore, locator: &BlobLocator) -> anyhow::Result<()> {
+    let path = store.object_path(locator);
+    store
+        .operator()
+        .delete(&path)
+        .await
+        .map_err(|error| anyhow::anyhow!("fixture Blob delete failed ({})", error.kind()))?;
+    Ok(())
 }

@@ -542,7 +542,15 @@ jobs:
           hex64 = re.compile(r'^[0-9a-f]{64}$')
           names = [
               'blob_git_gateway::session_http_acceptance::push_token_bounds_repeated_http_reads',
+              'blob_git_gateway::session_http_acceptance::negative_tests::cross_repository_session_replay_is_refused',
+              'blob_git_gateway::session_http_acceptance::negative_tests::cross_tenant_session_replay_is_refused',
+              'blob_git_gateway::session_http_acceptance::negative_tests::expired_session_token_is_refused_over_http',
+              'blob_git_gateway::session_http_acceptance::negative_tests::tampered_session_token_is_refused_over_http',
+              'blob_git_gateway::session_http_acceptance::negative_tests::revoked_collaborator_session_is_refused_before_token_scoring',
+              'blob_git_gateway::session_http_acceptance::negative_tests::missing_registered_pack_fails_closed_without_a_session',
+              'blob_git_gateway::session_http_acceptance::negative_tests::keyring_loaded_gateway_issues_and_validates_sessions',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materialization',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::corrupting_a_registered_pack_after_capture_refuses_the_sealed_materialization',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_returns_none_for_a_checked_empty_capture',
           ]
@@ -698,7 +706,15 @@ jobs:
           secrets = [value for value in secrets if len(value) >= 4]
           names = [
               'blob_git_gateway::session_http_acceptance::push_token_bounds_repeated_http_reads',
+              'blob_git_gateway::session_http_acceptance::negative_tests::cross_repository_session_replay_is_refused',
+              'blob_git_gateway::session_http_acceptance::negative_tests::cross_tenant_session_replay_is_refused',
+              'blob_git_gateway::session_http_acceptance::negative_tests::expired_session_token_is_refused_over_http',
+              'blob_git_gateway::session_http_acceptance::negative_tests::tampered_session_token_is_refused_over_http',
+              'blob_git_gateway::session_http_acceptance::negative_tests::revoked_collaborator_session_is_refused_before_token_scoring',
+              'blob_git_gateway::session_http_acceptance::negative_tests::missing_registered_pack_fails_closed_without_a_session',
+              'blob_git_gateway::session_http_acceptance::negative_tests::keyring_loaded_gateway_issues_and_validates_sessions',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materialization',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::corrupting_a_registered_pack_after_capture_refuses_the_sealed_materialization',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_returns_none_for_a_checked_empty_capture',
           ]
@@ -780,10 +796,12 @@ jobs:
                                    + str(ignored_total) + ' ignored'),
                        'cases': results}
           complete = complete and all(item['result'] == 'passed' for item in results)
-          ok = (complete and (passed_total, failed_total, ignored_total) == (4, 0, 0)
+          expected_total = len(names)
+          ok = (complete and (passed_total, failed_total, ignored_total) == (expected_total, 0, 0)
                 and all(item['exit_code'] == 0 for item in results))
           aggregate['ok'] = ok
-          aggregate['summary'] = '4 passed, 0 failed, 0 ignored' if ok else aggregate['summary']
+          aggregate['summary'] = (str(expected_total) + ' passed, 0 failed, 0 ignored' if ok
+                                  else aggregate['summary'])
           save(evidence / 'session174-foundation.json', json.dumps(aggregate, indent=2) + '\n')
           print('session174 cases: ' + aggregate['summary']
                 + (' (ok)' if ok else ' (FAILED; report written with ' + str(len(results)) + ' case records)'))
@@ -797,9 +815,12 @@ jobs:
           cp "$evidence/preflight.json" "$evidence/preflight.log" \
             "$evidence/session174-lib-tests.build.json" "$evidence/session174-lib-tests.stdout.log" \
             "$evidence/rootyard-cli.build.json" "$evidence/standalone-build.json" \
-            "$evidence/case-1.log" "$evidence/case-2.log" "$evidence/case-3.log" "$evidence/case-4.log" \
             "$evidence/cases.log" "$evidence/session174-foundation.json" \
             test-results/refstore/session174-foundation/ 2>/dev/null || true
+          # Every required case writes its own case-N.log; copy all of them.
+          for log in "$evidence"/case-*.log; do
+            if [ -f "$log" ]; then cp "$log" test-results/refstore/session174-foundation/; fi
+          done
           if [ "$status" -ne 0 ]; then
             echo "session174 cases failed (status $status)" >&2
             exit "$status"
@@ -864,9 +885,12 @@ jobs:
           mkdir -p "$upload"
           for name in preflight.json preflight.log session174-lib-tests.build.json \
                       session174-lib-tests.stdout.log rootyard-cli.build.json standalone-build.json \
-                      case-1.log case-2.log case-3.log case-4.log cases.log session174-foundation.json \
-                      database-cleanup.log; do
+                      cases.log session174-foundation.json database-cleanup.log; do
             [ -f "$evidence/$name" ] && cp "$evidence/$name" "$upload/"
+          done
+          # One case-N.log per required case; never a fixed case-1..case-4 list.
+          for log in "$evidence"/case-*.log; do
+            if [ -f "$log" ]; then cp "$log" "$upload/"; fi
           done
           ls -la "$upload"
       - name: Stop only the job-owned Garage fixture
