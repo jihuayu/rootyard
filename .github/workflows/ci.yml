@@ -223,7 +223,7 @@ jobs:
       - name: Exercise populated Pull Request paired backup and fresh restore
         run: python3 tests/backup_pulls.py --binary target/debug/rootyard --report test-results/backup-pulls.json
       - name: Exercise repository read-only Browse API and atomic multi-ref CAS transactions
-        run: python3 tests/browse.py --binary target/debug/rootyard --report test-results/browse.json
+        run: python3 tests/browse.py --binary target/debug/rootyard --report test-results/browse.json --mixed-refs --git "$(command -v git)"
       - name: Exercise repository pagination against real PostgreSQL
         timeout-minutes: 10
         run: python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json

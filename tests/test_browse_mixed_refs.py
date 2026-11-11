@@ -18,9 +18,13 @@ import ast
 import base64
 import contextlib
 import json
+import io
+import inspect
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -85,8 +89,9 @@ def source(name):
     return ast.get_source_segment(CASES.read_text(), method(name))
 
 
-class FixtureHarness(mixed_ref_cases.MixedRefPolicyCases, browse.BrowseHarness):
-    """The queue harness once Phase 2 opts the mixin in; built without ``__init__``."""
+# The queue harness used by every instance-level test; the runner now builds
+# exactly this class, built here without ``Harness.__init__`` (no socket/temp DB).
+FixtureHarness = browse.BrowseHarness
 
 
 def completed(stdout, returncode=1, stderr=""):
@@ -191,11 +196,23 @@ class CaseContractTest(unittest.TestCase):
         for name in mixed_ref_cases.MIXED_REF_CASES:
             self.assertNotIn(name, browse.CASE_NAMES)
 
-    def test_mixin_is_separate_from_the_queue_harness(self):
-        # The cases are a mixin the runner opts into; they are never its base
-        # until Phase 2 wires them, and never part of the fixed inventory.
-        self.assertFalse(issubclass(browse.BrowseHarness, mixed_ref_cases.MixedRefPolicyCases))
-        self.assertNotIn("mixed_ref_cases", ast.unparse(ast.parse(BROWSE.read_text())))
+    def test_mixin_is_the_harness_base_and_runner_imports_the_exact_ids(self):
+        self.assertTrue(issubclass(browse.BrowseHarness, mixed_ref_cases.MixedRefPolicyCases))
+        self.assertIsInstance(object.__new__(browse.BrowseHarness), mixed_ref_cases.MixedRefPolicyCases)
+        text = BROWSE.read_text()
+        # The runner imports the exact IDs from the case module, never a copy.
+        self.assertIn("from mixed_ref_cases import MIXED_REF_CASES, MixedRefPolicyCases, "
+                      "release_git_option", text)
+        self.assertEqual(tuple(re.search(r"MIXED_REF_CASES == \((.*?)\)", text, re.S).group(0)
+                               .replace("\n", " ").split('"')[1::2]), mixed_ref_cases.MIXED_REF_CASES)
+        # The fixed inventory is byte-for-byte the pre-integration tuple.
+        head = subprocess.run(["git", "show", "89f4bb17535bba8c9df5f0514bc3cfb050579aba:tests/browse.py"],
+                              cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if head.returncode:
+            self.skipTest("pre-integration queue commit unavailable")
+        before = re.search(r"CASE_NAMES = \(.*?\n\)", head.stdout.decode(), re.S).group(0)
+        now = re.search(r"CASE_NAMES = \(.*?\n\)", text, re.S).group(0)
+        self.assertEqual(now, before)
 
     def test_queue_harness_still_supplies_every_primitive(self):
         needed = ("args", "env", "secrets", "bare", "work", "repo", "alice", "sql", "cli", "run",
@@ -210,21 +227,82 @@ class CaseContractTest(unittest.TestCase):
         self.assertIn('assert names == ["refs/heads/feature", "refs/heads/main", "refs/tags/v1.0"], names',
                       text)
 
-    def test_runner_contract_for_phase_two(self):
-        """The Phase 2 integration must opt in without touching CASE_NAMES."""
-        runner = source_of(BROWSE, "main")
-        # Pinned as not yet wired: the runner still executes exactly CASE_NAMES.
-        self.assertIn("for name in CASE_NAMES:", runner)
+    def test_selection_is_the_fixed_inventory_then_the_two_mixed_cases(self):
+        fixed, mixed = list(browse.CASE_NAMES), list(mixed_ref_cases.MIXED_REF_CASES)
+        deadlines = ("list_commits_deadline", "compare_commits_deadline")
+        self.assertEqual(len(fixed), 15)
+        # 14 main cases (the deadline cases are part of them) + the one scale case.
+        self.assertEqual((len(fixed) - 1, fixed.count("ref_scale_complete_traversal")), (14, 1))
+        for deadline in deadlines:
+            self.assertEqual(fixed.count(deadline), 1)
+        self.assertEqual(sum(name.endswith("_deadline") for name in fixed), 2)
+        self.assertEqual(browse.selected_cases(False), fixed)
+        selected = browse.selected_cases(True)
+        self.assertEqual(len(selected), 17)
+        self.assertEqual(selected[-2:], [
+            "mixed_protected_unprotected_atomic_push",
+            "mixed_protected_unprotected_ref_transaction"])
+        self.assertEqual(selected[:-2], fixed)
+        self.assertEqual(set(selected) - set(fixed), set(mixed))
+        self.assertNotIn(True, [name in fixed for name in mixed])
+
+    def test_runner_keeps_the_fixed_assertion_before_the_opt_in(self):
+        runner = source_of(BROWSE, "execute")
+        # The original fixed-inventory assertion is kept, byte for byte, first.
+        self.assertIn("for name in CASE_NAMES:\n            harness.case(name, getattr(harness, name))", runner)
         self.assertIn("if executed != list(CASE_NAMES):", runner)
-        self.assertNotIn("MIXED_REF_CASES", runner)
-        # The option object the cases read exists on the queue runner today.
+        self.assertLess(runner.index("if executed != list(CASE_NAMES):"),
+                        runner.index("for name in MIXED_REF_CASES:"))
+        self.assertIn("if args.mixed_refs:\n            for name in MIXED_REF_CASES:", runner)
+        self.assertIn("if completed != selected:", runner)
+        # A bare --mixed-refs is rejected before any harness is built.
+        self.assertIn('if args.mixed_refs and not (args.git or os.environ.get("ROOTYARD_GIT")):', runner)
+        self.assertLess(runner.index("if args.mixed_refs and not (args.git"),
+                        runner.index("harness = harness_type(args)"))
+        self.assertIn('raise RunnerError("--mixed-refs requires a declared --git', runner)
+        # --mixed-refs and the trusted Git option, in that order, after base args.
+        parser_source = source_of(BROWSE, "build_parser")
+        self.assertLess(parser_source.index('"--keep"'), parser_source.index('"--mixed-refs"'))
+        self.assertLess(parser_source.index('"--mixed-refs"'), parser_source.index("release_git_option(parser)"))
+        self.assertIn("release_git_option(parser)", parser_source)
+        self.assertEqual(parser_source.count("return parser"), 1)
+        self.assertIn("parse_args()", source_of(BROWSE, "main"))
+        self.assertIn("execute(args, BrowseHarness)", source_of(BROWSE, "main"))
         parser = argparse.ArgumentParser()
+        parser.add_argument("--keep", action="store_true")
+        parser.add_argument("--mixed-refs", action="store_true")
         mixed_ref_cases.release_git_option(parser)
-        self.assertEqual(parser.parse_args(["--git", "/x/git"]).git, "/x/git")
+        opts = parser.parse_args(["--mixed-refs", "--git", "/usr/bin/git"])
+        self.assertTrue(opts.mixed_refs)
+        self.assertEqual(opts.git, "/usr/bin/git")
+        self.assertFalse(parser.parse_args([]).mixed_refs)
         self.assertIsNone(parser.parse_args([]).git)
-        browse_parser = ast.unparse(ast.parse(runner))
-        self.assertIn("--binary", browse_parser)
-        self.assertNotIn("--mixed-refs", browse_parser)
+
+    def test_report_carries_the_fixed_record_and_the_two_results(self):
+        runner = source_of(BROWSE, "execute")
+        for field in ("case_count=len(selected)", "fixed_case_count=len(CASE_NAMES)",
+                      "fixed_cases=list(CASE_NAMES)", "selected_cases=selected",
+                      "mixed_ref_cases=list(MIXED_REF_CASES) if args.mixed_refs else []",
+                      'mixed_ref_results={item["name"]: item["status"] for item in harness.results',
+                      "git=harness.git_binding", 'git_evidence=getattr(harness, "git_evidence", None)'):
+            self.assertIn(field, runner, field)
+        self.assertIn("cases=harness.results", runner)
+
+    def test_ci_browse_step_runs_the_seventeen_case_mode(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        command = ('run: python3 tests/browse.py --binary target/debug/rootyard '
+                   '--report test-results/browse.json --mixed-refs --git "$(command -v git)"')
+        self.assertEqual(workflow.count(command), 1)
+        self.assertEqual(workflow.count("tests/browse.py"), 1, "only the Browse step may change")
+        # Other suites keep their exact commands.
+        for untouched in ("python3 tests/pulls.py --binary target/debug/rootyard --report test-results/pulls.json",
+                          "python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json"):
+            self.assertIn("run: " + untouched, workflow)
+        if shutil.which("git"):
+            # The shell substitution yields an absolute path accepted by --git.
+            parsed = argparse.ArgumentParser()
+            mixed_ref_cases.release_git_option(parsed)
+            self.assertTrue(Path(parsed.parse_args(["--git", shutil.which("git")]).git).is_absolute())
 
     def test_module_stays_modular(self):
         # Refusal audit SQL/verdict live in refusal_audit_sql.py; the cap stays.
@@ -495,7 +573,8 @@ class MixedRefWiringTest(unittest.TestCase):
         # Real subprocess behaviour: the per-push header reaches Git (a wrapper
         # records argv), and the raw credential never reaches a diagnostic.
         harness = object.__new__(FixtureHarness)
-        harness.args = SimpleNamespace(git="/usr/bin/git")
+        harness.args = SimpleNamespace(git="/usr/bin/git", mixed_refs=True)
+        harness.git_binding = {"declared": "/usr/bin/git", "env": None, "mixed_refs": True}
         harness.env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                            GIT_TERMINAL_PROMPT="0")
         harness.secrets = []
@@ -528,6 +607,325 @@ class MixedRefWiringTest(unittest.TestCase):
         self.assertEqual(argv[-3:], ["push", "origin", "a:b"])
         self.assertEqual(harness.env["ROOTYARD_GIT"], str(wrapper))
         self.assertNotIn("s3cr3t-token", harness.redact(" ".join(argv)))
+
+
+class BrowseIntegrationTest(unittest.TestCase):
+    """The wired runner: one harness, 17 selected IDs, one bound Git."""
+
+    GIT = str(Path(shutil.which("git")).resolve()) if shutil.which("git") else None
+
+    def setUp(self):
+        if self.GIT is None:
+            self.skipTest("no stock git on PATH")
+        saved = {key: os.environ.get(key) for key in ("ROOTYARD_GIT", "ROOTYARD_TEST_DATABASE_URL")}
+        self.addCleanup(self._restore_env, saved)
+        os.environ.pop("ROOTYARD_GIT", None)
+
+    @staticmethod
+    def _restore_env(saved):
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def harness(self, **options):
+        """A real ``BrowseHarness.__init__``; it starts no server.
+
+        ``Harness.__init__`` only reads the database URL, picks a loopback port
+        and creates a temporary root, which the cleanup removes.
+        """
+        os.environ["ROOTYARD_TEST_DATABASE_URL"] = "postgres://probe/run"
+        parsed = dict(binary="/opt/rootyard", git=None, mixed_refs=False)
+        parsed.update(options)
+        harness = browse.BrowseHarness(SimpleNamespace(**parsed))
+        # What the server child actually receives at start time.
+        harness.runtime_env = dict(harness.env)
+        harness.run = self.run_for(harness)
+        self.addCleanup(shutil.rmtree, harness.root, True)
+        return harness
+
+    @staticmethod
+    def run_for(harness):
+        """``Harness.run`` with the timeout widened; it executes, never starts."""
+        def run(argv, cwd=None, check=True, data=None, env=None):
+            done = subprocess.run(argv, cwd=cwd, env=harness.env if env is None else env, input=data,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            if check and done.returncode:
+                raise AssertionError("command failed: " + done.stderr.decode(errors="replace")[-600:])
+            return done
+        return run
+
+    @staticmethod
+    def browse_class():
+        return next(n for n in ast.parse(BROWSE.read_text()).body
+                    if isinstance(n, ast.ClassDef) and n.name == "BrowseHarness")
+
+    def test_native_git_is_the_callable_resolver_not_the_wrapper_string(self):
+        harness = self.harness()
+        self.assertTrue(callable(harness.native_git))
+        self.assertEqual(harness.native_git()["executable"], self.GIT)
+        self.assertIsInstance(harness.wrapper_git, str)
+        # No class-level string shadows the resolver either: it comes only
+        # from the mixin, and __init__ never assigns an instance string.
+        self.assertNotIn("native_git", browse.BrowseHarness.__dict__)
+        self.assertNotIn("native_git", browse.BrowseHarness.__init__.__code__.co_names)
+        self.assertIn("native_git", mixed_ref_cases.MixedRefPolicyCases.__dict__)
+        initializer = next(n for n in self.browse_class().body
+                           if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+        assigned = {t.attr for n in ast.walk(initializer) if isinstance(n, ast.Assign)
+                    for t in n.targets if isinstance(t, ast.Attribute)}
+        self.assertIn("wrapper_git", assigned)
+        self.assertNotIn("native_git", assigned, "an instance string would shadow the method")
+        # The rename touches exactly the wrapper field and its four use sites.
+        text = BROWSE.read_text()
+        self.assertEqual(text.count("self.wrapper_git"), 4)
+        self.assertIsNone(re.search(r"self\.native_git\b", text))
+        probe = ast.unparse(next(n for n in self.browse_class().body
+                                 if isinstance(n, ast.FunctionDef) and n.name == "native_git_probe"))
+        self.assertIn("self._native_git_probe", probe)
+        self.assertIn("super().native_git_probe()", probe)
+
+    def test_wrapper_git_is_the_bound_declaration_not_path_git(self):
+        """An explicit ``--git`` elsewhere on disk is what the wrappers exec."""
+        self.assertNotEqual(Path(shutil.which("git")).resolve(), Path(shutil.which("sh")).resolve())
+        other = str(Path(shutil.which("sh")).resolve())
+        # Fixed inventory only: no --mixed-refs, so no Git probe is needed.
+        harness = self.harness(git=other)
+        self.assertEqual(harness.git_binding["declared"], other)
+        self.assertEqual(harness.runtime_env["ROOTYARD_GIT"], other)
+        self.assertEqual(harness.wrapper_git, other)
+        self.assertNotEqual(harness.wrapper_git, shutil.which("git"))
+        # Bind the executable of a declared PATH Git: it is the same file.
+        via_path = self.harness(git=shutil.which("git"))
+        self.assertEqual(Path(via_path.wrapper_git), Path(self.GIT))
+        self.assertEqual(Path(via_path.native_git()["executable"]), Path(via_path.wrapper_git))
+        # An inherited-only declaration binds the wrapper the same way.
+        os.environ["ROOTYARD_GIT"] = other
+        inherited = self.harness()
+        self.assertEqual(inherited.runtime_env["ROOTYARD_GIT"], other)
+        self.assertEqual(inherited.wrapper_git, other)
+        os.environ.pop("ROOTYARD_GIT")
+        fixed_only = self.harness()
+        self.assertIsNone(fixed_only.git_binding["declared"])
+        self.assertNotIn("ROOTYARD_GIT", fixed_only.runtime_env)
+        self.assertEqual(fixed_only.wrapper_git, shutil.which("git"))
+
+    def test_both_transparent_wrappers_execute_the_bound_declaration(self):
+        """The wrappers really run the bound executable, not the PATH Git."""
+        sh = Path(shutil.which("sh")).resolve()
+        # ``/bin/sh`` does not speak Git, so any fallback to PATH Git would
+        # either fail (``--version``) or run Git; the evidence must be sh.
+        harness = self.harness(git=str(sh))
+        self.assertEqual(harness.wrapper_git, str(sh))
+        script = harness._deadline_wrapper_script(harness.wrapper_git, harness.root / "arm",
+                                                  harness.root / "log")
+        self.assertIn("exec " + shlex.quote(str(sh)) + ' "$@"', script)
+        for case, size in (("deadline", None), ("cat-file", 1)):
+            with self.subTest(wrapper=case):
+                path = harness.root / ("wrapper-" + case)
+                path.write_text(script if size is None else
+                                "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then :; fi\n"
+                                "done\nexec " + shlex.quote(harness.wrapper_git) + " \"$@\"\n")
+                path.chmod(0o700)
+                # Never ``git --version``: an unarmed/wrapper-transparent call.
+                done = harness.run([str(path)], check=False)
+                self.assertEqual(done.returncode, 0, done.stderr[:300])
+        # The native client resolves the same executable as the wrappers.
+        self.assertEqual(Path(harness.native_git()["executable"]), sh)
+
+    def test_explicit_git_is_bound_before_any_start(self):
+        harness = self.harness(git=self.GIT, mixed_refs=True)
+        self.assertEqual(harness.runtime_env["ROOTYARD_GIT"], self.GIT)
+        self.assertEqual(harness.git_binding, {"declared": self.GIT, "env": self.GIT, "mixed_refs": True})
+        self.assertIsNone(harness.proc, "construction must not start the server")
+        init = inspect.getsource(browse.BrowseHarness.__init__)
+        self.assertLess(init.index("_bind_declared_git"), init.index("_native_git_probe"))
+        # wrapper_git is derived from the validated binding, never from the env.
+        self.assertLess(init.index("_bind_declared_git"), init.index("self.wrapper_git ="))
+        self.assertIn('self.wrapper_git = self.git_binding["env"] or shutil.which("git") or "git"', init)
+        self.assertNotIn("self.wrapper_git = os.environ", init)
+        self.assertIn("super().__init__(args)", init)
+        self.assertNotIn("start", browse.BrowseHarness.__dict__)
+        # Every server start (Harness.start) therefore sees the bound value.
+        self.assertIn("env=self.env", inspect.getsource(harness.start))
+
+    def test_conflicting_git_declarations_are_rejected(self):
+        # Two real, distinct executables: validation passes and the
+        # resolve-and-compare check is what refuses the pair.
+        other = shutil.which("sh") or shutil.which("sh", path="/bin")
+        self.assertTrue(other)
+        self.assertNotEqual(Path(other).resolve(), Path(self.GIT).resolve())
+        os.environ["ROOTYARD_GIT"] = other
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(git=self.GIT)
+        self.assertIn("disagree", str(caught.exception))
+        self.assertIn(str(Path(other).resolve()), str(caught.exception))
+        self.assertIn(self.GIT, str(caught.exception))
+        # A distinct absolute spelling of the same file is accepted once both
+        # sides resolve.  ``Path(a) / "." / b`` and ``a + "/.//" + b`` normalize
+        # to ``a/b``, so the fixture concatenates without building a Path.
+        resolved = Path(self.GIT).resolve()
+        spelling = str(resolved.parent) + "/.//" + resolved.name
+        self.assertNotEqual(spelling, self.GIT)
+        self.assertIn("/.//", spelling)
+        self.assertEqual(Path(spelling).resolve(), resolved)
+        os.environ["ROOTYARD_GIT"] = spelling
+        agreeing = self.harness(git=self.GIT)
+        self.assertEqual(agreeing.runtime_env["ROOTYARD_GIT"], self.GIT)
+        self.assertEqual(agreeing.git_binding["declared"], self.GIT)
+
+    def test_mixed_refs_requires_a_declared_git(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(mixed_refs=True)
+        self.assertIn("--mixed-refs requires a declared --git", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(git="git", mixed_refs=True)
+        self.assertIn("absolute", str(caught.exception))
+        # An inherited ROOTYARD_GIT alone satisfies the requirement without
+        # --git, is validated, and is bound to that binary before any start.
+        os.environ["ROOTYARD_GIT"] = self.GIT
+        inherited_only = self.harness(mixed_refs=True)
+        self.assertEqual(inherited_only.git_binding, {"declared": self.GIT, "env": self.GIT,
+                                                      "mixed_refs": True})
+        self.assertEqual(inherited_only.runtime_env["ROOTYARD_GIT"], self.GIT)
+        self.assertIsNone(inherited_only.proc, "binding must precede any server start")
+        # An inherited declaration gets the same absolute/executable validation.
+        os.environ["ROOTYARD_GIT"] = "git"
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(mixed_refs=True)
+        self.assertIn("ROOTYARD_GIT must be an absolute path", str(caught.exception))
+        os.environ["ROOTYARD_GIT"] = str(Path(self.GIT).parent / "git-not-declared-here")
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(mixed_refs=True)
+        self.assertIn("ROOTYARD_GIT is not an executable file", str(caught.exception))
+        # The fixed inventory alone needs no declaration and adds none.
+        os.environ.pop("ROOTYARD_GIT")
+        fixed_only = self.harness()
+        self.assertIsNone(fixed_only.git_binding["declared"])
+        self.assertNotIn("ROOTYARD_GIT", fixed_only.runtime_env)
+
+    def test_wrapper_behavior_unchanged_and_restores_the_bound_git(self):
+        harness = self.harness(git=self.GIT, mixed_refs=True)
+        script = harness._deadline_wrapper_script(harness.wrapper_git, harness.root / "arm", harness.root / "log")
+        self.assertIn("exec " + shlex.quote(harness.wrapper_git) + ' "$@"', script)
+        service = ast.unparse(self.browse_class())
+        body = service[service.index("def _deadline_git_service"):service.index("def _deadline_git_events")]
+        self.assertIn("bound_git = self.env.get('ROOTYARD_GIT', self.git_binding['env'])", body)
+        self.assertIn("self.env['ROOTYARD_GIT'] = bound_git", body)
+        # ROOTYARD_GIT is no longer snapped from the inherited env and restored.
+        self.assertNotIn("'ROOTYARD_GIT', 'ROOTYARD_GIT_TIMEOUT_SECONDS'", body)
+        self.assertIn("if bound_git is None:\n                self.env.pop('ROOTYARD_GIT', None)",
+                      body + "\n")
+
+    class FakeHarness:
+        """Records the cases ``execute`` runs, exactly as ``Harness.case`` does."""
+
+        def __getattr__(self, name):
+            if name in browse.CASE_NAMES or name in browse.MIXED_REF_CASES:
+                calls = self.calls  # bound to the instance at access time
+
+                def case():
+                    calls.append(name)
+                return case
+            raise AttributeError(name)
+
+        def __init__(self, args):
+            self.args, self.results, self.calls = args, [], []
+            self.git_binding = {"declared": args.git, "mixed_refs": args.mixed_refs}
+            self.git_evidence = None
+
+        def case(self, name, fn):
+            self.calls.append(name)
+            self.results.append({"name": name, "status": "passed", "seconds": 0.0, "detail": {}})
+
+        def redact(self, value):
+            return str(value)
+
+        def cleanup(self):
+            pass
+
+    def run_execute(self, argv, harness_type=None):
+        """Parse real argv and run ``execute`` against a fake harness."""
+        report = Path(tempfile.mkdtemp()) / "browse.json"
+        self.addCleanup(shutil.rmtree, report.parent, True)
+        # Real builtin defaults: FakeHarness must not leak into the namespace.
+        argv = ["--report", str(report), "--binary", sys.executable, *argv]
+        args = browse.build_parser().parse_args(argv)
+        args.binary = str(Path(args.binary).resolve())
+        built = []
+
+        def build(value):
+            harness = (harness_type or self.FakeHarness)(value)
+            built.append(harness)
+            return harness
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = browse.execute(args, build)
+        return code, (json.loads(report.read_text()) if report.is_file() else None), built, err.getvalue()
+
+    def test_runner_selects_executes_and_reports_seventeen(self):
+        code, report, created, err = self.run_execute(["--mixed-refs", "--git", self.GIT])
+        self.assertEqual(code, 0, err)
+        expected = list(browse.CASE_NAMES) + list(mixed_ref_cases.MIXED_REF_CASES)
+        self.assertEqual(report["selected_cases"], expected)
+        self.assertEqual(report["case_count"], 17)
+        self.assertEqual(report["fixed_case_count"], 15)
+        self.assertEqual(report["fixed_cases"], list(browse.CASE_NAMES))
+        self.assertEqual(report["mixed_ref_cases"], list(mixed_ref_cases.MIXED_REF_CASES))
+        self.assertEqual(list(report["mixed_ref_results"]), list(mixed_ref_cases.MIXED_REF_CASES))
+        self.assertEqual(set(report["mixed_ref_results"].values()), {"passed"})
+        self.assertEqual([item["name"] for item in report["cases"]], expected)
+        self.assertEqual(created[0].calls, expected)
+        self.assertEqual(report["git"]["declared"], self.GIT)
+
+    def test_runner_without_opt_in_is_the_fixed_inventory_only(self):
+        code, report, created, err = self.run_execute([])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["selected_cases"], list(browse.CASE_NAMES))
+        self.assertEqual(report["case_count"], 15)
+        self.assertEqual(report["mixed_ref_cases"], [])
+        self.assertEqual(report["mixed_ref_results"], {})
+        self.assertEqual(report["fixed_cases"], list(browse.CASE_NAMES))
+        self.assertEqual(created[0].calls, list(browse.CASE_NAMES))
+
+    def test_runner_rejects_mixed_refs_without_a_declared_git(self):
+        os.environ.pop("ROOTYARD_GIT", None)
+        with self.assertRaises(SystemExit) as caught:
+            self.run_execute(["--mixed-refs"])
+        self.assertIn("--mixed-refs requires a declared --git", str(caught.exception))
+
+    def test_runner_fails_when_a_selected_case_is_not_executed(self):
+        """A skipped case fails the assertion that owns it, in both modes."""
+        fixed_last, mixed_last = browse.CASE_NAMES[-1], mixed_ref_cases.MIXED_REF_CASES[-1]
+        base_case = self.FakeHarness.case  # captured from the base, not the subclass
+
+        def skipping(skip):
+            def case(harness, name, fn):
+                if name != skip:
+                    base_case(harness, name, fn)
+            return type("SkippingHarness", (self.FakeHarness,), {"case": case})
+
+        # Fixed mode: the fixed-inventory assertion owns the skip.
+        code, report, built, err = self.run_execute([], skipping(fixed_last))
+        self.assertEqual(code, 1, err)
+        self.assertIn("native case inventory mismatch", err)
+        self.assertEqual([item["name"] for item in report["cases"]], list(browse.CASE_NAMES[:-1]))
+        self.assertFalse(report["passed"])
+        # Opt-in mode: the fixed suite is intact, so the skip falls through the
+        # fixed assertion and is caught by the selected-case completion check.
+        code, report, built, err = self.run_execute(["--mixed-refs", "--git", self.GIT],
+                                                    skipping(mixed_last))
+        self.assertEqual(code, 1, err)
+        self.assertIn("selected cases were not all executed", err)
+        self.assertEqual([item["name"] for item in report["cases"]],
+                         list(browse.CASE_NAMES) + [mixed_ref_cases.MIXED_REF_CASES[0]])
+        self.assertEqual(report["selected_cases"], list(browse.CASE_NAMES) + list(
+            mixed_ref_cases.MIXED_REF_CASES))
+        self.assertFalse(report["passed"])
+        # The harness ran every selected case except the skipped one.
+        self.assertEqual(built[0].calls,
+                         [name for name in browse.selected_cases(True) if name != mixed_last])
 
 
 class RefusalAuditSqlTest(unittest.TestCase):

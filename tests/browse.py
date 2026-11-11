@@ -18,6 +18,7 @@ import urllib.parse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness  # noqa: E402
 from browse_ref_scale import verify_ref_scale  # noqa: E402
+from mixed_ref_cases import MIXED_REF_CASES, MixedRefPolicyCases, release_git_option  # noqa: E402
 
 ZERO_OID = "0" * 40
 
@@ -43,13 +44,74 @@ CASE_NAMES = (
     "selective_ref_prefix",
     "protected_writes_and_ref_ack_failure",
 )
+# The #18 mixed protected/unprotected multi-ref refusal cases are an explicit
+# opt-in beyond the fixed inventory above; they never join ``CASE_NAMES``.
+assert len(CASE_NAMES) == 15 and MIXED_REF_CASES == (
+    "mixed_protected_unprotected_atomic_push",
+    "mixed_protected_unprotected_ref_transaction")
 
 
-class BrowseHarness(Harness):
+class RunnerError(SystemExit):
+    """A configuration refusal raised from ``execute``; the CLI exits with it."""
+
+
+def selected_cases(mixed_refs):
+    """One run's runtime order: the fixed inventory, then the opt-in cases."""
+    return list(CASE_NAMES) + (list(MIXED_REF_CASES) if mixed_refs else [])
+
+
+class BrowseHarness(MixedRefPolicyCases, Harness):
     def __init__(self, args):
         super().__init__(args)
         self.actor_labels = {}
-        self.native_git = os.environ.get("ROOTYARD_GIT") or shutil.which("git") or "git"
+        # One declared Git first: the binding validates and resolves it.  The
+        # transparent wrappers below exec exactly that executable, the same one
+        # the mixed cases' ``native_git()`` resolves; the PATH Git is only the
+        # fixed inventory's fallback when nothing is declared.
+        self.git_binding = self._bind_declared_git(args)
+        self.wrapper_git = self.git_binding["env"] or shutil.which("git") or "git"
+        self._native_git_probe = None  # one probe per run; see native_git_probe()
+
+    def _bind_declared_git(self, args):
+        """Bind one stock Git as client AND server before any server start.
+
+        Either an explicit ``--git`` or an inherited ``ROOTYARD_GIT`` declares
+        the client.  Every declaration present must be an absolute executable
+        and all of them must resolve to one file; otherwise construction is
+        refused.  The resolved path is placed in the environment so every server
+        ``start()`` (and every ``stop()``/``start()`` restart) runs that same
+        Git.  ``--mixed-refs`` needs such a declaration so the two proofs can
+        never run against different executables.
+        """
+        explicit = getattr(args, "git", None)
+        declarations = [(source, value) for source, value in (
+            ("--git", explicit), ("ROOTYARD_GIT", os.environ.get("ROOTYARD_GIT"))) if value]
+        resolved = []
+        for source, value in declarations:
+            path = Path(value)
+            if not path.is_absolute():
+                raise RunnerError(source + " must be an absolute path: " + repr(value))
+            if not (path.is_file() and os.access(path, os.X_OK)):
+                raise RunnerError(source + " is not an executable file: " + repr(value))
+            if str(path.resolve()) not in resolved:
+                resolved.append(str(path.resolve()))
+        if len(resolved) > 1:
+            raise RunnerError("--git and the inherited ROOTYARD_GIT disagree: "
+                              + " and ".join(repr(path) for path in resolved))
+        bound = resolved[0] if resolved else None
+        if getattr(args, "mixed_refs", False) and bound is None:
+            raise RunnerError("--mixed-refs requires a declared --git (or ROOTYARD_GIT): the push "
+                              "client and the server must be the same stock Git")
+        if bound:
+            self.env["ROOTYARD_GIT"] = bound
+        return {"declared": bound, "env": self.env.get("ROOTYARD_GIT"),
+                "mixed_refs": bool(getattr(args, "mixed_refs", False))}
+
+    def native_git_probe(self):
+        """The resolved stock Git, probed once per run (pushes check it per call)."""
+        if getattr(self, "_native_git_probe", None) is None:
+            self._native_git_probe = super().native_git_probe()
+        return self._native_git_probe
 
     def account(self, *args):
         account = super().account(*args)
@@ -270,7 +332,6 @@ class BrowseHarness(Harness):
     def _deadline_git_service(self):
         """Run one case with a transparent, marker-armed slow Git wrapper."""
         keys = (
-            "ROOTYARD_GIT",
             "ROOTYARD_GIT_TIMEOUT_SECONDS",
             "ROOTYARD_MAX_CONCURRENT_GIT",
         )
@@ -278,8 +339,11 @@ class BrowseHarness(Harness):
         marker = self.root / "browse-deadline-arm"
         log = self.root / "browse-deadline-git.jsonl"
         wrapper = self.root / "browse-deadline-git-wrapper"
-        wrapper.write_text(self._deadline_wrapper_script(self.native_git, marker, log))
+        wrapper.write_text(self._deadline_wrapper_script(self.wrapper_git, marker, log))
         wrapper.chmod(0o700)
+        # The wrapper execs the declared Git, so it stays the bound server Git
+        # and is restored to the declared path rather than to an inherited value.
+        bound_git = self.env.get("ROOTYARD_GIT", self.git_binding["env"])
         for path in (marker, log):
             path.unlink(missing_ok=True)
         self.stop()
@@ -297,6 +361,10 @@ class BrowseHarness(Harness):
                     self.env.pop(key, None)
                 else:
                     self.env[key] = value
+            if bound_git is None:
+                self.env.pop("ROOTYARD_GIT", None)
+            else:
+                self.env["ROOTYARD_GIT"] = bound_git
             self.start()
 
     @staticmethod
@@ -617,7 +685,7 @@ class BrowseHarness(Harness):
         self.git("push", "origin", "HEAD:refs/heads/batch-page", cwd=self.work, token=self.alice)
         count_path = self.root / "cat-file-count"
         wrapper = self.root / "git-count-wrapper"
-        wrapper.write_text("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then echo x >> '" + str(count_path) + "'; fi\ndone\nexec " + shlex.quote(self.native_git) + " \"$@\"\n")
+        wrapper.write_text("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then echo x >> '" + str(count_path) + "'; fi\ndone\nexec " + shlex.quote(self.wrapper_git) + " \"$@\"\n")
         wrapper.chmod(0o700)
         self.stop()
         self.env["ROOTYARD_GIT"] = str(wrapper)
@@ -738,7 +806,7 @@ class BrowseHarness(Harness):
         wrapper = self.root / "git-fault-wrapper"
         wrapper.write_text("#!/bin/sh\nupdate=0\nfor a in \"$@\"; do [ \"$a\" = update-ref ] && update=1; done\n"
                            + "if [ \"$update\" = 1 ] && [ -f '" + str(before_marker) + "' ]; then exit 42; fi\n"
-                           + shlex.quote(self.native_git) + " \"$@\"\nrc=$?\n"
+                           + shlex.quote(self.wrapper_git) + " \"$@\"\nrc=$?\n"
                            + "if [ \"$update\" = 1 ] && [ \"$rc\" = 0 ] && [ -f '" + str(after_marker) + "' ]; then exit 42; fi\n"
                            + "exit \"$rc\"\n")
         wrapper.chmod(0o700)
@@ -1266,16 +1334,36 @@ class BrowseHarness(Harness):
         )
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--mixed-refs", action="store_true",
+                        help="also run the #18 mixed protected/unprotected multi-ref cases")
+    release_git_option(parser)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
         parser.error("ROOTYARD_TEST_DATABASE_URL is required")
-    harness = BrowseHarness(args)
+    return execute(args, BrowseHarness)
+
+
+def execute(args, harness_type):
+    """Run the selected cases and write the report; ``harness_type`` builds it.
+
+    The fixed inventory is asserted on its own before the ``--mixed-refs``
+    extension runs, so an opt-in case can never hide a changed fixed suite.
+    """
+    if args.mixed_refs and not (args.git or os.environ.get("ROOTYARD_GIT")):
+        raise RunnerError("--mixed-refs requires a declared --git (or ROOTYARD_GIT)")
+    harness = harness_type(args)
+    selected = selected_cases(args.mixed_refs)
     success = False
     try:
         for name in CASE_NAMES:
@@ -1287,6 +1375,17 @@ def main():
                 + repr(list(CASE_NAMES))
                 + ", executed "
                 + repr(executed)
+            )
+        if args.mixed_refs:
+            for name in MIXED_REF_CASES:
+                harness.case(name, getattr(harness, name))
+        completed = [item["name"] for item in harness.results]
+        if completed != selected:
+            raise AssertionError(
+                "selected cases were not all executed: expected "
+                + repr(selected)
+                + ", executed "
+                + repr(completed)
             )
         success = True
     except Exception as error:
@@ -1307,7 +1406,15 @@ def main():
         )
         report = dict(
             passed=success,
-            case_count=len(CASE_NAMES),
+            case_count=len(selected),
+            fixed_case_count=len(CASE_NAMES),
+            fixed_cases=list(CASE_NAMES),
+            selected_cases=selected,
+            mixed_ref_cases=list(MIXED_REF_CASES) if args.mixed_refs else [],
+            mixed_ref_results={item["name"]: item["status"] for item in harness.results
+                               if item["name"] in MIXED_REF_CASES} if args.mixed_refs else {},
+            git=harness.git_binding,
+            git_evidence=getattr(harness, "git_evidence", None),
             cases_run=len(harness.results),
             cases_passed=sum(1 for item in harness.results if item["status"] == "passed"),
             cases_failed=sum(1 for item in harness.results if item["status"] == "failed"),
