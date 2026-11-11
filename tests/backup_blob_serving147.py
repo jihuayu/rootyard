@@ -1030,9 +1030,15 @@ class Drill(BlobOnlyHarness):
         manifest = json.loads(self.root.joinpath("format22-forward", "manifest.json").read_text())
         markers = self.format22_marker
         registrations = [row["registration_id"] for row in markers["registrations"]]
+        # The source's own publications, not the archive rows: every registration
+        # is bound to the marker's bound repository and its own pack, so a
+        # self-consistent archive that repoints both members' repository/pack
+        # identity is still refused.
+        registration_scopes = {str(row["registration_id"]): (str(markers["bound_repository_id"]), str(row["pack_id"]))
+                               for row in markers["registrations"]}
         detail = format22_manifest_checks(manifest, {
             "format": 22, "schema_versions": SCHEMA_VERSIONS, "schema_baseline": SCHEMA_VERSIONS,
-            "registered_packs": registrations,
+            "registered_packs": registrations, "registration_scopes": registration_scopes,
             "artifacts": len(registrations) * 2, "roots": markers["roots"], "repos": markers["repositories"],
             "producer": markers["producer_owner_id"], "serving_read": markers["serving_read"]})
         assert result["format"] == 22 and result["blob_artifacts"] == detail["closure_artifacts"], result
