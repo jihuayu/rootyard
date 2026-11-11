@@ -16,7 +16,12 @@ Three independent pieces live here:
   ``blob_artifacts`` are the serialized ``ledger::Artifact`` wire rows: their
   byte length is ``length`` (:func:`archive_length`), never the A4 /
   ``artifact_holds`` column name ``content_length`` that the SQL evidence and
-  the artifact-set digest below do use.
+  the artifact-set digest below do use. Each registration's pack and idx rows
+  share one repository, one generated pack id and one repository tenant
+  (:data:`REGISTRATION_IDENTITY`), and every artifact's exact
+  :func:`archive_path` must be one regular ``file`` entry whose ``bytes`` is
+  that artifact's ``length`` and whose ``sha256`` is its digest -- the same
+  per-member binding Rust restore applies.
 * :class:`CorruptionCase`/:func:`corruption_plan` and :func:`corruption_sql`/
   :func:`corruption_findings`/:func:`validator_refusal` -- the dedicated raw-SQL
   source corruption negatives. Each case is applied by one clone-local,
@@ -51,6 +56,10 @@ ARTIFACT_SET_DOMAIN = "core-pack-artifact-set-v2"
 ROOT_STATES = ("active", "released")
 # Roles a registration must carry exactly once each, in the canonical slots.
 PAIR_ROLES = (("pack", 0), ("idx", 1))
+# Identity both artifacts of one A4 registration share. Real pack/idx rows are
+# committed under one publication, so they carry the same repository, generated
+# pack id and repository tenant; only hold/request ids, digests and lengths differ.
+REGISTRATION_IDENTITY = ("repository_id", "pack_id", "tenant_id")
 TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 UUID_HEX = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -218,8 +227,17 @@ def format22_manifest_checks(manifest, expected):
     with at least one active and one released root), ``repos``
     (``[{id, owner_id, tenant_id}]``), ``producer`` (the owner of every root
     capture) and ``serving_read`` (the validated ``markers["serving_read"]``
-    entry of :func:`native_marker_checks`). ``manifest`` is the parsed archive
-    manifest.
+    entry of :func:`native_marker_checks`). An optional ``registration_scopes``
+    (``{registration_id: (repository_id, pack_id)}``, read from the source's
+    own publications) independently pins each registration's identity; without
+    it the artifact rows themselves are the only identity source. ``manifest``
+    is the parsed archive manifest.
+
+    The byte proof follows Rust restore exactly: each artifact's
+    :func:`archive_path` must be one regular ``file`` entry whose ``bytes`` is
+    that artifact's serialized ``length`` and whose ``sha256`` is its digest.
+    Aggregate totals alone are never accepted, because one member's surplus can
+    otherwise mask another member's deficit.
     """
     need(manifest.get("format") == 22 == expected["format"], "archive is not format22")
     schema_versions = expected_schema_versions(expected["schema_versions"], expected["schema_baseline"], 147)
@@ -248,14 +266,46 @@ def format22_manifest_checks(manifest, expected):
          "an archived artifact names another provider")
     need(all(str(entry["backend_identity"]) == closure.get("backend_identity") for entry in artifacts),
          "an archived artifact names another backend identity")
-    blob_files = [name for name, entry in manifest["files"].items()
-                  if name.startswith("blob/") and entry["kind"] == "file"]
+    # Real A4 pack/idx artifacts share registration, repository, pack and tenant
+    # identity (one repository, one generated pack id, one repository tenant per
+    # registration); only hold/request ids, digests and lengths are per artifact.
+    # One scope per registration collapses only when both its roles agree, and a
+    # second registration can never hold the same repository/pack pair as its
+    # own archive path would then collide.
+    scopes = {str(entry["registration_id"]): (str(entry.get("repository_id")), str(entry.get("pack_id")))
+              for entry in artifacts}
+    need(len(scopes) == len(artifacts) // len(PAIR_ROLES)
+         and set(scopes) == {str(value) for value in expected["registered_packs"]},
+         "a registration's pack and idx artifacts disagree on their repository or pack identity")
+    _expected_registration_scopes(artifacts, expected, scopes)
+    invalid = [str(entry.get("hold_id")) for entry in artifacts
+               if not isinstance(entry.get("hold_id"), str) or not UUID_HEX.match(entry["hold_id"])]
+    need(not invalid, "an archived artifact has no hold id")
+    files = manifest.get("files")
+    need(isinstance(files, dict), "the archive carries no file entry map")
+    blob_files = [name for name, entry in files.items()
+                  if isinstance(entry, dict) and name.startswith("blob/") and entry.get("kind") == "file"]
     need(len(blob_files) == len(artifacts), "archived blob members differ from the closure")
-    need(sum(_archive_bytes(manifest["files"][name]) for name in blob_files) == closure.get("bytes") > 0,
+    need(sum(_archive_bytes(files[name]) for name in blob_files) == closure.get("bytes") > 0,
          "archived blob bytes differ from the closure")
     # Format22 writes `blob_closure.bytes` as the sum of the wired `length`
     # fields, so the archive's own byte totals must agree with them.
     need(sum(lengths) == closure.get("bytes") > 0, "archived artifact lengths differ from the closure bytes")
+    # Rust restore looks every artifact up by its exact archive path and binds
+    # that member to the artifact's own length and digest.
+    paths = _archive_paths(artifacts)
+    need(len(set(paths)) == len(artifacts), "archived artifacts do not have distinct archive paths")
+    for entry, path, length in zip(artifacts, paths, lengths):
+        need(path in files, "the archive is missing the Blob member at an artifact's archive path")
+        member = files[path]
+        need(isinstance(member, dict) and member.get("kind") == "file",
+             "the archive Blob member at an artifact's archive path is not a regular file")
+        need(_archive_bytes(member) == length, "an archived Blob member length differs from its artifact length")
+        need(member.get("sha256") == str(entry["sha256"]),
+             "an archived Blob member digest differs from its artifact digest")
+    extra = sorted(name for name, entry in files.items() if name.startswith("blob/")
+                   and not (isinstance(entry, dict) and name in set(paths)))
+    need(not extra, "the archive carries extra Blob members")
     # RefStore carry: every registered-set and roots ledger must travel too.
     carry = manifest.get("refstore") or {}
     for table in _CARRY_TABLES:
@@ -274,8 +324,10 @@ def format22_manifest_checks(manifest, expected):
     serving_read = _archive_serving_read(expected.get("serving_read"), expected["repos"], tenants,
                                          expected["registered_packs"], expected["producer"])
     return {"format": 22, "repositories": len(repos), "closure_artifacts": len(artifacts),
+            "closure_bytes": closure.get("bytes"), "blob_members": len(blob_files),
             "registrations": len(registrations), "roots": {state: states.count(state) for state in ROOT_STATES},
             "producer_distinct_from_tenant": True, "carry_tables": len(carry),
+            "pair_identity_shared": True, "member_paths_exact": True,
             "serving_read": {key: serving_read[key] for key in ("pin_id", "repository_id", "tenant_id", "owner_id",
                                                                 "pack_count")}}
 
@@ -296,6 +348,9 @@ def archive_length(artifact):
     value = artifact["length"]
     need(isinstance(value, int) and not isinstance(value, bool) and value > 0,
          "an archived artifact length is not a positive integer")
+    # ``slot`` is the other member of the archive path: ``True == 1`` in Python,
+    # so it must be a real integer or a ``slot: true`` row would pass as slot 1.
+    need(type(artifact.get("slot")) is int, "an archived artifact slot is not an integer")
     return value
 
 
@@ -304,6 +359,64 @@ def _archive_bytes(entry):
     need(isinstance(entry, dict) and isinstance(entry.get("bytes"), int) and not isinstance(entry.get("bytes"), bool),
          "an archived Blob member carries no integer byte count")
     return entry["bytes"]
+
+
+def archive_path(artifact):
+    """The exact archive-relative path of one wire artifact, as Rust computes it.
+
+    Mirrors ``ledger::Artifact::archive_path`` -- ``blob/{repository_id}/
+    {pack_id}/{role}.{role}`` with the ids in their dashed lowercase uuid form --
+    instead of guessing a file name from the hold id. The path is only formed
+    from valid identities, so a malformed id is an explicit refusal.
+    """
+    need(isinstance(artifact, dict), "an archived artifact entry is not a JSON object")
+    for field in ("repository_id", "pack_id"):
+        need(isinstance(artifact.get(field), str) and UUID_HEX.match(artifact[field]),
+             "an archived artifact " + field + " is not a valid uuid")
+    role = artifact.get("role")
+    need(isinstance(role, str) and role in _ROLE_RANK, "an archived artifact role is not pack or idx")
+    return "blob/" + artifact["repository_id"] + "/" + artifact["pack_id"] + "/" + role + "." + role
+
+
+def _archive_paths(artifacts):
+    return [archive_path(entry) for entry in artifacts]
+
+
+def _registration_scope(artifacts, registration, field):
+    """The one uuid ``field`` value both rows of ``registration``'s pair carry."""
+    need(field in REGISTRATION_IDENTITY, "artifact identity field is not part of the pair identity")
+    members = [entry for entry in artifacts if str(entry["registration_id"]) == str(registration)]
+    need(len(members) == len(PAIR_ROLES), "a registration is not exactly one pack(slot 0) + idx(slot 1)")
+    values = {str(member.get(field)) for member in members}
+    need(len(values) == 1 and UUID_HEX.match(values.pop()),
+         "a registration's pack and idx artifacts disagree on their " + field)
+    return str(members[0][field])
+
+
+def _expected_registration_scopes(artifacts, expected, scopes):
+    """Cross-registration identity: one repository set, tenant, unique packs.
+
+    Each archived pair is one registration of one repository, so every
+    repository it names must be exactly an API-created repository, the archived
+    tenant must be that repository's expected tenant, and two registrations can
+    never share a pack id (their archive paths would then collide too).
+    """
+    bindings = {str(repo["id"]): str(repo.get("owner_id")) for repo in expected["repos"]}
+    called = {str(registration): tuple(scopes[str(registration)]) for registration in expected["registered_packs"]}
+    need(all(repository in bindings for repository, _ in called.values()),
+         "an archived artifact names a repository the API did not create")
+    for registration, (repository_id, _) in called.items():
+        need(_registration_scope(artifacts, registration, "tenant_id") == bindings[repository_id],
+             "an archived artifact tenant is not the tenant of its repository")
+    need(len({pack_id for _, pack_id in called.values()}) == len(called),
+         "two registrations share a pack id")
+    scopes = expected.get("registration_scopes")
+    if scopes is not None:
+        need(isinstance(scopes, dict), "the expected registration scopes are not a mapping")
+        need({str(registration): (str(repository_id), str(pack_id))
+              for registration, (repository_id, pack_id) in scopes.items()} == called,
+             "the archived registration scopes differ from the source publications")
+    return called
 
 
 def _archive_serving_read(serving_read, repos, tenants, registrations, producer):
