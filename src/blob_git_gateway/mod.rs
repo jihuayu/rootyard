@@ -65,6 +65,7 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
         .route("/api/repos", post(api::create_repo).get(api::list_repos))
         .route("/api/repos/{owner}/{name}", get(api::get_repo))
         .route("/api/repos/{owner}/{name}/operations/{operation}", get(api::get_operation))
+        .route("/api/repos/{owner}/{name}/operations/{operation}/cancel", post(api::cancel_operation))
         .route("/api/repos/{owner}/{name}/merges", post(api::unsupported_merge))
         .route("/api/repos/{owner}/{name}/tree", get(browse::tree))
         .route("/api/repos/{owner}/{name}/tree/{oid}", get(browse::tree_by_oid))

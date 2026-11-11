@@ -50,7 +50,9 @@ use blob_gateway_support::{
     service::Service,
 };
 use rootyard::blob_git_gateway::{BlobGitConfig, BlobGitState, router};
+use rootyard::blob_store::BlobBackendIdentity;
 use rootyard::ref_store::{
+    IssuerLane, OperationIdentity, PgRefStore, PgRefStoreCore, RequestDigest, VersionCheck,
     core::decision_commit::{PgDecisionProtocol, RealmExpectation},
     serving::lookup,
 };
@@ -1017,6 +1019,1372 @@ async fn lost_ack_case(case: &Case, git: &'static Git) -> Result<Value> {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Issue #107, first normal service-route slice: POST
+// /api/repos/{owner}/{name}/operations/{operation}/cancel.
+//
+// This is a narrow route regression, not completion of issue #107. It runs the
+// real Axum router over a loopback TCP listener with real PostgreSQL (one
+// disposable schema) and the real Blob profile, and drives real stock Git
+// clients, so committed/rejected operation rows and the cancellation race come
+// from the real gateway receive/decision pipeline.
+//
+// The repository lives in the owner fixture's namespace. A collaborator is only
+// ever authenticated by its own token; every request still addresses the
+// repository under its actual owner slug, never the collaborator's username.
+//
+// The embedded router is fixed (no test-only probe hook), and a push that is
+// legitimately blocked before the service (outside this route's scope) must not
+// leave a durable row behind. The pending rows these cases cancel are therefore
+// registered by the fixture inside one caller-owned transaction exactly as the
+// gateway's fresh receive path registers one (`reserve_sequence` +
+// `PgRefStore::begin` + the migration-147 producer binding). The identity is
+// explicit and no client request is claimed; the route is the only code that
+// decides whether such a row may be cancelled.
+// ---------------------------------------------------------------------------
+
+/// Provision the same migration-144 decision realm the service provisions at
+/// create time, for a repository that only its owner (and collaborators) sees.
+async fn provision_decision_realm_for(
+    db: &Db,
+    backend: &BlobBackendIdentity,
+    actor: &Actor,
+    owner_slug: &str,
+    name: &str,
+) -> Result<()> {
+    let serving = lookup(&db.pool, &actor.identity, owner_slug, name, true, backend, deadline())
+        .await
+        .map_err(|error| anyhow!("serving lookup refused the created repository: {}", error.1))?;
+    let gate = serving.gate;
+    let expectation = RealmExpectation::new(
+        gate.repository_id(),
+        gate.tenant_id(),
+        gate.object_format(),
+        gate.history_incarnation(),
+        gate.authority_epoch(),
+        gate.group_epoch(),
+    )?;
+    let mut client = db.pool.get().await?;
+    PgDecisionProtocol
+        .provision(&mut client, &expectation, deadline())
+        .await
+        .map_err(|error| anyhow!("decision realm provisioning refused: {error}"))?;
+    Ok(())
+}
+
+struct CancelRouteCase {
+    name: &'static str,
+    /// The namespace slug the repository actually lives in (the owner fixture's
+    /// username). Collaborators never replace it in any URL or lookup.
+    owner_slug: String,
+    repository: Uuid,
+    proxy: Proxy,
+    address: std::net::SocketAddr,
+    work: tempfile::TempDir,
+    first: String,
+    second: String,
+}
+
+impl CancelRouteCase {
+    /// Real Smart HTTP setup: `first` is pushed and a second clone branches from
+    /// it. Neither work tree is pushed again with new commits here, so a later
+    /// pinned push of `seed` must first advance it.
+    async fn new(
+        name: &'static str,
+        repository: Uuid,
+        proxy: Proxy,
+        address: std::net::SocketAddr,
+        git: &Git,
+        owner: &Actor,
+    ) -> Result<Self> {
+        let work = tempfile::tempdir()?;
+        let url = proxy.url(owner, name);
+        let seed = work.path().join("seed");
+        let cloned = git.clone(work.path(), &url, "seed").await?;
+        // The clone URL embeds the credential as userinfo, which stock Git may
+        // echo on failure: only the redacted diagnostic is used.
+        ensure!(cloned.success, "{}", redacted_git_output("first clone", &cloned));
+        let first = git.commit(&seed, "a.txt", "first\n", "first commit").await?;
+        let pushed = git.run(&seed, &["push", "origin", "HEAD:refs/heads/main"]).await?;
+        ensure!(pushed.success, "the first push failed: {}", redacted_git_output("first push", &pushed));
+        let divergence = work.path().join("diverged");
+        let cloned = git.clone(work.path(), &url, "diverged").await?;
+        ensure!(cloned.success, "{}", redacted_git_output("divergent clone", &cloned));
+        let raced = git.text(&divergence, &["rev-parse", "refs/remotes/origin/main"]).await?;
+        ensure!(raced == first, "the divergent clone read {raced} for main, not the pushed {first}");
+        let second = git.commit(&divergence, "b.txt", "second\n", "second commit").await?;
+        ensure!(first != second, "the fixture commits are not distinct");
+        Ok(Self { name, owner_slug: owner.username.clone(), repository, proxy, address, work, first, second })
+    }
+
+    fn repo_path(&self) -> String {
+        format!("/api/repos/{}/{}", self.owner_slug, self.name)
+    }
+
+    fn operation_path(&self, operation: Uuid) -> String {
+        format!("{}/operations/{operation}", self.repo_path())
+    }
+
+    fn cancel_path(&self, operation: Uuid) -> String {
+        format!("{}/operations/{operation}/cancel", self.repo_path())
+    }
+
+    fn url(&self, actor: &Actor) -> String {
+        self.proxy.url(actor, self.name)
+    }
+
+    async fn operation_state(&self, db: &Db, operation: Uuid) -> Result<Option<String>> {
+        Ok(db
+            .pool
+            .get()
+            .await?
+            .query_opt(
+                "SELECT state FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2",
+                &[&self.repository, &operation],
+            )
+            .await?
+            .map(|row| row.get(0)))
+    }
+}
+
+/// Give `member` the given collaborator role on the case repository (owner's
+/// tenant column included), then prove the *collaborator's* identity resolves
+/// this repository through the owner slug with the expected minimum role.
+async fn grant_role(
+    db: &Db,
+    backend: &BlobBackendIdentity,
+    case: &CancelRouteCase,
+    member: &Actor,
+    role: &'static str,
+    writable: bool,
+) -> Result<()> {
+    let tenant: Uuid = db
+        .pool
+        .get()
+        .await?
+        .query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&case.repository])
+        .await?
+        .get(0);
+    db.pool
+        .get()
+        .await?
+        .execute(
+            "INSERT INTO repository_collaborators (repository_id, tenant_id, user_id, role) VALUES ($1,$2,$3,$4)",
+            &[&case.repository, &tenant, &member.identity.id, &role],
+        )
+        .await?;
+    // The collaborator is authenticated as itself, but the repository is looked
+    // up under its actual owner slug.
+    let serving = lookup(&db.pool, &member.identity, &case.owner_slug, case.name, writable, backend, deadline())
+        .await
+        .map_err(|error| anyhow!("the {role} collaborator was refused the lookup: {}", error.1))?;
+    ensure!(serving.gate.repository_id() == case.repository, "the collaborator resolved another repository");
+    ensure!(
+        serving.repository.owner == case.owner_slug,
+        "the collaborator resolved the repository under another owner slug"
+    );
+    Ok(())
+}
+
+/// A real restricted token of `actor` granting exactly `actions` (`contents_*`)
+/// on this repository, minted through `POST /api/tokens`. The secret is only
+/// ever placed in an Authorization header, never formatted.
+async fn scoped_token(
+    pool: &deadpool_postgres::Pool,
+    case: &CancelRouteCase,
+    holder: &Actor,
+    actions: &[&str],
+) -> Result<String> {
+    let body = json!({
+        "display_name": "cancel-route fixture",
+        "repository_grants": [{"repository_id": case.repository, "actions": actions}],
+    });
+    let (status, issued) = json_request(case.address, "POST", "/api/tokens", Some(&holder.token), Some(&body)).await?;
+    ensure!(
+        status == 201,
+        "token creation answered {status}: {}",
+        issued.get("error").and_then(Value::as_str).unwrap_or("invalid error body")
+    );
+    ensure!(
+        issued["is_restricted"].as_bool() == Some(true) && issued["read_only"].as_bool() == Some(false),
+        "the scoped token is not a restricted writable token"
+    );
+    let secret = issued["secret"].as_str().ok_or_else(|| anyhow!("the issued token has no secret"))?;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {secret}"))
+            .map_err(|_| anyhow!("the issued token is not a valid header"))?,
+    );
+    rootyard::auth::authenticate(pool, &headers)
+        .await
+        .map_err(|error| anyhow!("the issued token did not authenticate: {}", error.1))?;
+    Ok(secret.to_owned())
+}
+
+/// Durable refs, gate and membership snapshot of one repository.
+struct DurableState {
+    refs: std::collections::BTreeMap<String, String>,
+    gate_revision: i64,
+    gate_digest: String,
+    memberships: i64,
+}
+
+async fn durable_state(db: &Db, repository: Uuid) -> Result<DurableState> {
+    let mut client = db.pool.get().await?;
+    let refs = client
+        .query("SELECT ref_name, oid FROM ref_store_core_refs WHERE repository_id=$1 ORDER BY ref_name", &[&repository])
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let tenant: Uuid = client.query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&repository]).await?.get(0);
+    let (gate_revision, gate_digest) =
+        match PgRefStoreCore.check_version(&mut client, repository, tenant, None, deadline()).await? {
+            VersionCheck::Unchanged(version) | VersionCheck::Changed(version) => {
+                (version.revision(), version.digest().as_hex())
+            }
+            VersionCheck::Unknown => return Err(anyhow!("the core gate of {repository} is missing")),
+        };
+    let memberships = client
+        .query_one("SELECT count(*) FROM ref_store_core_pack_memberships WHERE repository_id=$1", &[&repository])
+        .await?
+        .get(0);
+    Ok(DurableState { refs, gate_revision, gate_digest, memberships })
+}
+
+/// `true` when `refs` maps `name` to exactly `oid`.
+fn first_ref_matches(refs: &std::collections::BTreeMap<String, String>, name: &str, oid: &str) -> bool {
+    refs.get(name).is_some_and(|value| value == oid)
+}
+
+/// Refs, gate revision/digest and active pack membership are exactly unchanged.
+/// Publication decisions are deliberately not compared: a terminal
+/// rejected/cancelled decision may remain.
+fn assert_unchanged(label: &str, before: &DurableState, after: &DurableState) -> Result<()> {
+    ensure!(after.refs == before.refs, "{label} changed durable refs: {:?} -> {:?}", before.refs, after.refs);
+    ensure!(after.gate_revision == before.gate_revision, "{label} moved the gate revision");
+    ensure!(after.gate_digest == before.gate_digest, "{label} moved the gate digest");
+    ensure!(after.memberships == before.memberships, "{label} changed active pack membership");
+    Ok(())
+}
+
+const LEGACY_SQL: &str =
+    "SELECT request_digest FROM ref_store_cancellations WHERE repository_id=$1 AND operation_id=$2";
+const DECISION_SQL: &str =
+    "SELECT request_digest FROM ref_store_decision_cancellations WHERE repository_id=$1 AND operation_id=$2";
+
+/// The single migration-138 cancellation row of exactly this operation, if any.
+async fn legacy_cancellation(db: &Db, repository: Uuid, operation: Uuid) -> Result<Option<String>> {
+    cancellation_row(db, LEGACY_SQL, repository, operation).await
+}
+
+/// The single decision-level cancellation row of exactly this operation, if any.
+async fn decision_cancellation(db: &Db, repository: Uuid, operation: Uuid) -> Result<Option<String>> {
+    cancellation_row(db, DECISION_SQL, repository, operation).await
+}
+
+async fn cancellation_row(db: &Db, sql: &'static str, repository: Uuid, operation: Uuid) -> Result<Option<String>> {
+    Ok(db.pool.get().await?.query_opt(sql, &[&repository, &operation]).await?.map(|row| row.get(0)))
+}
+
+/// Rows in **both** cancellation tables of the whole repository.
+async fn tombstone_count(db: &Db, repository: Uuid) -> Result<i64> {
+    Ok(db
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT (SELECT count(*) FROM ref_store_cancellations WHERE repository_id=$1)
+                  + (SELECT count(*) FROM ref_store_decision_cancellations WHERE repository_id=$1)",
+            &[&repository],
+        )
+        .await?
+        .get(0))
+}
+
+/// Register one durable **pending** operation and its migration-147 producer
+/// binding in a single caller-owned transaction, with the gateway's own core
+/// writes: reserve the issuer sequence, insert the migration-138 operation row
+/// (`PgRefStore::begin`), and insert the binding. The issuer is authenticated
+/// as itself; the repository is resolved under its actual owner slug.
+async fn insert_pending_fixture(
+    db: &Db,
+    backend: &BlobBackendIdentity,
+    issuer: &Actor,
+    case: &CancelRouteCase,
+    operation: Uuid,
+) -> Result<()> {
+    let gate = lookup(&db.pool, &issuer.identity, &case.owner_slug, case.name, true, backend, deadline())
+        .await
+        .map_err(|error| anyhow!("serving lookup refused the pending fixture issuer: {}", error.1))?
+        .gate;
+    let lane = IssuerLane::new("blob-git-receive")?;
+    let mut client = db.pool.get().await?;
+    let tx = client.transaction().await?;
+    tx.execute("SET LOCAL synchronous_commit = 'on'", &[]).await?;
+    let sequence = PgRefStore
+        .reserve_sequence(&tx, gate.repository_id(), issuer.identity.id, operation, &lane, deadline())
+        .await
+        .map_err(|error| anyhow!("the fixture could not reserve an issuer sequence: {error}"))?;
+    let identity = OperationIdentity::new(
+        gate.repository_id(),
+        issuer.identity.id,
+        lane,
+        sequence.sequence(),
+        operation,
+        RequestDigest::from_bytes([0x5a; 32]),
+    )?;
+    let begun = PgRefStore
+        .begin(&tx, &identity, deadline())
+        .await
+        .map_err(|error| anyhow!("the fixture pending operation was refused: {error}"))?;
+    ensure!(begun.created, "the fixture pending operation already existed");
+    let inserted = tx
+        .execute(
+            "INSERT INTO ref_store_serving_operations
+                 (repository_id,operation_id,issuer_id,producer_request_digest,plan_parent_digest)
+             VALUES ($1,$2,$3,$4,$4)",
+            &[&identity.repository_id(), &identity.operation_id(), &identity.issuer_id(), &identity.digest().as_hex()],
+        )
+        .await
+        .map_err(|error| anyhow!("the fixture producer binding was refused: {error}"))?;
+    ensure!(inserted == 1, "the fixture producer binding was not created");
+    tx.commit().await?;
+    Ok(())
+}
+
+fn assert_no_store(label: &str, headers: &reqwest::header::HeaderMap) -> Result<()> {
+    ensure!(
+        headers.get("cache-control").and_then(|value| value.to_str().ok()) == Some("no-store"),
+        "the {label} response is not Cache-Control: no-store"
+    );
+    Ok(())
+}
+
+/// The success body is exactly this operation and an outcome from `allowed`.
+fn assert_cancel_view(label: &str, body: &Value, operation: Uuid, allowed: &[&str]) -> Result<()> {
+    let object = body.as_object().ok_or_else(|| anyhow!("the {label} body is not a JSON object: {body}"))?;
+    let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    ensure!(keys == ["operation_id", "outcome"], "the {label} body is not minimal: {body}");
+    ensure!(
+        body["operation_id"].as_str() == Some(operation.to_string().as_str()),
+        "the {label} body names another operation: {body}"
+    );
+    let outcome = body["outcome"].as_str().unwrap_or_default();
+    ensure!(allowed.contains(&outcome), "the {label} outcome {outcome:?} is not one of {allowed:?}: {body}");
+    Ok(())
+}
+
+/// One request through the real loopback listener. Only the status, parsed JSON
+/// and headers are returned; the Authorization header and any body are never
+/// logged or formatted.
+async fn http_request(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&Value>,
+) -> Result<(u16, Value, reqwest::header::HeaderMap)> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).no_proxy().build()?;
+    let request = match method {
+        "POST" => client.post(format!("http://{address}{path}")),
+        "GET" => client.get(format!("http://{address}{path}")),
+        _ => return Err(anyhow!("unsupported fixture HTTP method")),
+    };
+    let request = match token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+    let request = match body {
+        Some(body) => request.json(body),
+        None => request,
+    };
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response.json().await.unwrap_or(Value::Null);
+    Ok((status, body, headers))
+}
+
+async fn json_request(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&Value>,
+) -> Result<(u16, Value)> {
+    let (status, body, _) = http_request(address, method, path, token, body).await?;
+    Ok((status, body))
+}
+
+async fn get_json(address: std::net::SocketAddr, token: Option<&str>, path: &str) -> Result<(u16, Value)> {
+    json_request(address, "GET", path, token, None).await
+}
+
+async fn post_cancel(
+    address: std::net::SocketAddr,
+    token: &str,
+    path: &str,
+) -> Result<(u16, Value, reqwest::header::HeaderMap)> {
+    http_request(address, "POST", path, Some(token), None).await
+}
+
+/// `(clone succeeded, refs/heads/main OID of a fresh fsck'd clone or null)` of a
+/// fresh authoritative read through the loopback proxy.
+async fn clone_main(
+    case: &CancelRouteCase,
+    git: &Git,
+    actor: &Actor,
+    destination: &str,
+) -> Result<(bool, Option<String>)> {
+    let url = case.url(actor);
+    let output = git.clone(case.work.path(), &url, destination).await?;
+    if !output.success {
+        return Ok((false, None));
+    }
+    let path = case.work.path().join(destination);
+    git.ok(&path, &["fsck", "--strict"]).await?;
+    let resolved = git.run(&path, &["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"]).await?;
+    if !resolved.success {
+        return Ok((true, None));
+    }
+    Ok((true, Some(String::from_utf8_lossy(&resolved.stdout).trim().to_owned())))
+}
+
+#[tokio::test]
+#[ignore = "requires real PG/S3/Git and stock Git clients"]
+async fn registered_operation_cancel_route_reports_the_persisted_outcome() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = cancel_route_case(&db).await;
+    db.finish(outcome).await
+}
+
+async fn cancel_route_case(db: &Db) -> Result<()> {
+    const REPO: &str = "cancel-route";
+
+    let store = open_store()?;
+    let backend = store.backend_identity().clone();
+    let git: &'static Git = Box::leak(Box::new(Git::new()?));
+    let scratch = tempfile::tempdir()?;
+    let owner = actor::owner(&db.pool).await?;
+    let stranger = actor::stranger(&db.pool).await?;
+    let state = Arc::new(
+        BlobGitState::new(BlobGitConfig {
+            pool: db.pool.clone(),
+            store: store.clone(),
+            git_binary: git.binary().to_path_buf(),
+            scratch_root: scratch.path().to_path_buf(),
+            max_concurrent_requests: 4,
+            max_request_bytes: 16 * 1024 * 1024,
+            max_response_bytes: 64 * 1024 * 1024,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            operation_deadline: Duration::from_secs(120),
+            native_limits: Default::default(),
+        })
+        .map_err(|error| anyhow!("gateway configuration was refused: {error}"))?,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let outcome = async {
+        let created = create_repository(address, &owner, REPO).await?;
+        let repository = Uuid::parse_str(created["id"].as_str().unwrap_or_default())?;
+        provision_decision_realm_for(db, &backend, &owner, &owner.username, REPO).await?;
+        let proxy = Proxy::start(address, proxy::Limits::default()).await?;
+        let case = CancelRouteCase::new(REPO, repository, proxy, address, git, &owner).await?;
+        let result = async {
+            cancel_route_body(db, &case, &backend, git, &owner, &stranger).await?;
+            terminal_race_body(db, &case, git, &owner).await
+        }
+        .await;
+        let failure = case.proxy.failure();
+        let _ = case.proxy.stop().await;
+        match result {
+            Ok(()) => {
+                ensure!(
+                    failure.is_none(),
+                    "the loopback proxy failed during the case: {}",
+                    failure.unwrap_or_default()
+                );
+                Ok(())
+            }
+            Err(error) => match failure {
+                Some(failure) => Err(error.context(format!("proxy failure: {failure}"))),
+                None => Err(error),
+            },
+        }
+    }
+    .await;
+    server.abort();
+    outcome
+}
+
+/// Steps 1-9: authorization, persistence and the reported outcomes of the
+/// registered-operation cancel route, without any concurrent push.
+async fn cancel_route_body(
+    db: &Db,
+    case: &CancelRouteCase,
+    backend: &BlobBackendIdentity,
+    git: &Git,
+    owner: &Actor,
+    stranger: &Actor,
+) -> Result<()> {
+    const MAIN: &str = "refs/heads/main";
+    let address = case.address;
+
+    // A committed operation from a real push. `seed` is advanced first, because
+    // its last push was `first` and an unchanged work tree would be up-to-date
+    // and register no operation.
+    let seed = case.work.path().join("seed");
+    let committed_oid = git.commit(&seed, "c.txt", "third\n", "third commit").await?;
+    ensure!(committed_oid != case.first, "the seed was not advanced");
+    let committed = Uuid::new_v4();
+    let output = push(git, &seed, Some(committed), &["push", "origin", "HEAD:refs/heads/main"])
+        .await
+        .map_err(|_| anyhow!("the authorized push could not be run"))?;
+    ensure!(output.success, "the authorized push failed: {}", redacted_git_output("authorized push", &output));
+    ensure!(
+        case.operation_state(db, committed).await?.as_deref() == Some("committed"),
+        "the authorized push did not register a committed operation"
+    );
+
+    // A server-side rejected terminal from one real stock push. A divergent
+    // local branch would be refused by stock Git after the advertisement,
+    // before any receive-pack POST, leaving no durable operation. Instead the
+    // proxy rewrites the old OID of the second command (`side`, absent, so the
+    // client sends the zero OID) to a different valid OID, so the service itself
+    // rejects the stale `side` command; the `main` command is sent untouched.
+    // A fresh commit advances `seed` without being pushed by the mutation.
+    let rejected = Uuid::new_v4();
+    let zero = "0".repeat(40);
+    let side = "refs/heads/side";
+    let rejected_oid = git.commit(&seed, "d.txt", "fourth\n", "fourth commit").await?;
+    ensure!(
+        rejected_oid != committed_oid && rejected_oid != case.first && rejected_oid != case.second,
+        "the rejected fixture commit is not distinct"
+    );
+    // Drop the setup pushes' records so later inspection sees only this push.
+    case.proxy.records().await;
+    let mut rewritten = case
+        .proxy
+        .arm_old_oid_rewrite(proxy::OldOidRewrite {
+            ref_name: side.to_owned(),
+            expected_old_oid: zero.clone(),
+            new_old_oid: committed_oid.clone(),
+        })
+        .map_err(|error| anyhow!("the old-OID rewrite could not be armed: {error}"))?;
+    let output = push(
+        git,
+        &seed,
+        Some(rejected),
+        &["push", "--atomic", "origin", "HEAD:refs/heads/main", "HEAD:refs/heads/side"],
+    )
+    .await
+    .map_err(|_| anyhow!("the stale push could not be run"))?;
+    ensure!(
+        !output.success,
+        "the stock push succeeded although the service saw a wrong old OID: {}",
+        redacted_git_output("stale push", &output)
+    );
+    // The capture of the mutated request and the exact service reply.
+    let capture = tokio::time::timeout(Duration::from_secs(120), rewritten.recv())
+        .await
+        .map_err(|_| anyhow!("the armed rewrite never saw a receive-pack POST"))?
+        .ok_or_else(|| anyhow!("the proxy lost the rewritten receive-pack capture"))?;
+    ensure!(capture.status == Some(200), "the service answered the rewritten POST with {:?}", capture.status);
+    let (unpack, results) = assert_git_report("rejected capture", &capture.response)?;
+    ensure!(unpack == "ok", "the rejected report did not unpack: {unpack}");
+    ensure!(results.len() == 2, "the rejected report covers {} refs, not 2", results.len());
+    let verdict = |name: &str| {
+        results
+            .iter()
+            .find(|(ref_name, _)| ref_name == name)
+            .map(|(_, reason)| reason.clone())
+            .ok_or_else(|| anyhow!("the rejected report does not name {name}"))
+    };
+    let main_reason = verdict(MAIN)?;
+    let side_reason = verdict(side)?;
+    ensure!(main_reason.is_some(), "the rejected report still accepted refs/heads/main");
+    ensure!(side_reason.as_deref() == Some("stale info"), "side was refused with {side_reason:?}, not stale info");
+
+    // The rewrite proof: the original side command carried the zero old OID, the
+    // rewritten one carries `committed_oid`, and only that old OID changed.
+    let proof = &capture.rewrite;
+    ensure!(proof.ref_name == side, "the rewrite proof names {:?}, not refs/heads/side", proof.ref_name);
+    ensure!(proof.original_old_oid == zero, "the rewrite proof did not start from the zero old OID");
+    ensure!(
+        proof.rewritten_old_oid == committed_oid,
+        "the rewrite proof did not write the current committed OID for side"
+    );
+    ensure!(proof.commands == 2, "the rewrite proof saw {} commands, not 2", proof.commands);
+    ensure!(proof.command_index == 1, "the rewrite proof touched command {}, not the second", proof.command_index);
+    ensure!(proof.only_old_oid_changed, "the rewrite changed bytes outside the old OID");
+    ensure!(proof.unchanged_other_commands, "the rewrite changed another command");
+    ensure!(proof.original_bytes == proof.rewritten_bytes, "the rewrite changed the request length");
+    ensure!(proof.original_sha256 != proof.rewritten_sha256, "the rewritten bytes are unchanged");
+    let original_tuples = vec![
+        (MAIN.to_owned(), committed_oid.clone(), rejected_oid.clone()),
+        (side.to_owned(), zero.clone(), rejected_oid.clone()),
+    ];
+    let rewritten_tuples = vec![
+        (MAIN.to_owned(), committed_oid.clone(), rejected_oid.clone()),
+        (side.to_owned(), committed_oid.clone(), rejected_oid.clone()),
+    ];
+    ensure!(
+        proof.original_command_tuples == original_tuples,
+        "the original push commands are not main and side from the zero and committed OIDs: {:?}",
+        proof.original_command_tuples
+    );
+    ensure!(
+        proof.rewritten_command_tuples == rewritten_tuples,
+        "the rewritten push commands are not main unchanged plus side on the committed OID: {:?}",
+        proof.rewritten_command_tuples
+    );
+    ensure!(
+        case.operation_state(db, rejected).await?.as_deref() == Some("rejected"),
+        "the stale push did not register a rejected operation"
+    );
+    let before = durable_state(db, case.repository).await?;
+    ensure!(before.refs.get(MAIN) == Some(&committed_oid), "durable main is not the third commit");
+    ensure!(
+        !before.refs.values().any(|oid| oid == &case.first || oid == &case.second),
+        "a durable ref still names a non-committed fixture commit"
+    );
+    ensure!(!before.refs.contains_key(side), "the rejected push created the side ref");
+    ensure!(before.memberships >= 2, "the two successful pushes registered {} memberships", before.memberships);
+
+    // A real non-admin actor with an effective `write` role on this repository,
+    // plus a read-only token of the owner.
+    let writer = actor::stranger(&db.pool).await?;
+    grant_role(db, backend, case, &writer, "write", true).await?;
+    let writer_scoped_read = scoped_token(&db.pool, case, &writer, &["contents_read"]).await?;
+    let writer_scoped_write = scoped_token(&db.pool, case, &writer, &["contents_write"]).await?;
+    let read_only_value = rootyard::db::issue_token(&db.pool, &owner.username, false, true).await?;
+    let read_only = read_only_value["token"].as_str().ok_or_else(|| anyhow!("no read-only secret"))?.to_owned();
+
+    // An admin collaborator using a restricted `contents_write`-only token of
+    // its own; it is also the issuer of the operation it cancels below.
+    let admin = actor::stranger(&db.pool).await?;
+    grant_role(db, backend, case, &admin, "admin", true).await?;
+    let scoped_admin = scoped_token(&db.pool, case, &admin, &["contents_write"]).await?;
+    let scoped_admin_pending = Uuid::new_v4();
+    insert_pending_fixture(db, backend, &admin, case, scoped_admin_pending).await?;
+
+    // Every cancellation below is made from this baseline.
+    let rows_before = tombstone_count(db, case.repository).await?;
+
+    // 1. The issuer (owner) cancels a durably pending operation. Because the
+    //    pending decision has not installed yet, this writes both rows.
+    let pending = Uuid::new_v4();
+    insert_pending_fixture(db, backend, owner, case, pending).await?;
+    ensure!(
+        case.operation_state(db, pending).await?.as_deref() == Some("pending"),
+        "the fixture operation is not durably pending"
+    );
+    let (status, body, headers) = post_cancel(address, &owner.token, &case.cancel_path(pending)).await?;
+    ensure!(status == 200, "cancel answered {status}: {body}");
+    assert_no_store("cancel", &headers)?;
+    ensure!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json")),
+        "the cancel response is not JSON"
+    );
+    assert_cancel_view("cancel", &body, pending, &["cancelled"])?;
+    assert_pending_cancelled_ledger(db, case.repository, pending).await?;
+    ensure!(
+        tombstone_count(db, case.repository).await? == rows_before + 2,
+        "a pending cancellation did not write exactly its two cancellation rows"
+    );
+    let (status, view) = get_json(address, Some(&owner.token), &case.operation_path(pending)).await?;
+    ensure!(status == 200, "operation GET answered {status}: {view}");
+    ensure!(view["state"].as_str() == Some("cancelled"), "operation GET does not show cancelled: {view}");
+    assert_unchanged("cancelling", &before, &durable_state(db, case.repository).await?)?;
+
+    // 2. Identical replay of the same identity adds no row and writes no
+    //    ref/membership/gate. A decision-less tombstone replays `cancelled`.
+    let (status, body, headers) = post_cancel(address, &owner.token, &case.cancel_path(pending)).await?;
+    ensure!(status == 200, "replayed cancel answered {status}: {body}");
+    assert_no_store("replayed cancel", &headers)?;
+    assert_cancel_view("replayed cancel", &body, pending, &["already_cancelled", "cancelled"])?;
+    ensure!(
+        tombstone_count(db, case.repository).await? == rows_before + 2,
+        "the replayed cancel wrote another cancellation row"
+    );
+    assert_unchanged("the replayed cancel", &before, &durable_state(db, case.repository).await?)?;
+
+    // 3. A committed operation is reported as committed (never cancelled). The
+    //    coordinator still inserts its migration-138 cancellation row, but
+    //    returns before any decision row; the terminal stays committed.
+    let (status, body, headers) = post_cancel(address, &owner.token, &case.cancel_path(committed)).await?;
+    ensure!(status == 200, "cancel of a committed operation answered {status}: {body}");
+    assert_no_store("committed cancel", &headers)?;
+    assert_cancel_view("committed cancel", &body, committed, &["committed"])?;
+    assert_terminal_legacy_cancellation(db, case.repository, committed).await?;
+    ensure!(
+        tombstone_count(db, case.repository).await? == rows_before + 3,
+        "cancelling a committed operation did not add exactly one migration-138 row"
+    );
+    ensure!(
+        case.operation_state(db, committed).await?.as_deref() == Some("committed"),
+        "cancelling a committed operation rewrote its durable state"
+    );
+    assert_unchanged("committed cancel", &before, &durable_state(db, case.repository).await?)?;
+
+    // 4. A rejected operation is reported as rejected, same ledger shape.
+    let (status, body, _) = post_cancel(address, &owner.token, &case.cancel_path(rejected)).await?;
+    ensure!(status == 200, "cancel of a rejected operation answered {status}: {body}");
+    assert_cancel_view("rejected cancel", &body, rejected, &["rejected"])?;
+    assert_terminal_legacy_cancellation(db, case.repository, rejected).await?;
+    ensure!(
+        tombstone_count(db, case.repository).await? == rows_before + 4,
+        "cancelling a rejected operation did not add exactly one migration-138 row"
+    );
+    ensure!(
+        case.operation_state(db, rejected).await?.as_deref() == Some("rejected"),
+        "cancelling a rejected operation rewrote its durable state"
+    );
+
+    // 5. A real non-admin issuer (write collaborator) registers a pending row and
+    //    is refused when its own token cancels it through the repository owner's
+    //    URL: the route and the A4 coordinator both require a current owner/admin.
+    let foreign_pending = Uuid::new_v4();
+    insert_pending_fixture(db, backend, &writer, case, foreign_pending).await?;
+    ensure!(
+        case.operation_state(db, foreign_pending).await?.as_deref() == Some("pending"),
+        "the non-admin fixture operation is not durably pending"
+    );
+    for (label, token) in [
+        ("non-admin issuer", writer.token.clone()),
+        ("write-only non-admin", writer_scoped_write.clone()),
+        ("read-scoped writer", writer_scoped_read.clone()),
+    ] {
+        let (status, body, headers) = post_cancel(address, &token, &case.cancel_path(foreign_pending)).await?;
+        ensure!(status == 403, "a {label} cancel answered {status}: {body}");
+        assert_no_store(&format!("{label} refusal"), &headers)?;
+    }
+    // A read-only owner token is refused by the writable lookup before any
+    // operation is resolved, and a role-less stranger (no collaborator row)
+    // cannot reach the repository.
+    let (status, body, headers) = post_cancel(address, &read_only, &case.cancel_path(foreign_pending)).await?;
+    ensure!(status == 403, "a read-only token's cancel answered {status}: {body}");
+    assert_no_store("read-only refusal", &headers)?;
+    let (status, body, _) = post_cancel(address, &stranger.token, &case.cancel_path(foreign_pending)).await?;
+    ensure!(status == 403 || status == 404, "a role-less stranger's cancel answered {status}: {body}");
+    ensure!(
+        case.operation_state(db, foreign_pending).await?.as_deref() == Some("pending"),
+        "a refused cancel changed the non-admin operation"
+    );
+    assert!(legacy_cancellation(db, case.repository, foreign_pending).await?.is_none());
+    assert!(decision_cancellation(db, case.repository, foreign_pending).await?.is_none());
+    assert_unchanged("refused cancels", &before, &durable_state(db, case.repository).await?)?;
+
+    // 6. Malformed and nil identifiers are typed bad requests.
+    for raw in ["not-a-uuid", "00000000-0000-0000-0000-000000000000"] {
+        let path = format!("{}/operations/{raw}/cancel", case.repo_path());
+        let (status, body, _) = post_cancel(address, &owner.token, &path).await?;
+        ensure!(status == 400, "cancel of {raw:?} answered {status}: {body}");
+        ensure!(
+            body["error"].as_str() == Some("invalid operation identifier"),
+            "the malformed refusal body changed: {body}"
+        );
+    }
+    let (status, _) = get_json(address, None, &case.operation_path(committed)).await?;
+    ensure!(status == 401, "an unauthenticated operation GET answered {status}");
+
+    // 7. Unknown ids: a writable owner token is refused by the missing row (404),
+    //    a read-only token is refused earlier by the writable lookup (403).
+    //    Neither writes a row or a cancellation row.
+    let rows_before_unknown = tombstone_count(db, case.repository).await?;
+    let unknown = Uuid::new_v4();
+    let (status, body, headers) = post_cancel(address, &owner.token, &case.cancel_path(unknown)).await?;
+    ensure!(status == 404, "a writable owner cancel of an unknown operation answered {status}: {body}");
+    assert_no_store("unknown cancel", &headers)?;
+    let (status, body, headers) = post_cancel(address, &read_only, &case.cancel_path(unknown)).await?;
+    ensure!(status == 403, "a read-only cancel of an unknown operation answered {status}: {body}");
+    assert_no_store("read-only unknown cancel", &headers)?;
+    ensure!(case.operation_state(db, unknown).await?.is_none(), "an unknown operation acquired a durable row");
+    assert!(legacy_cancellation(db, case.repository, unknown).await?.is_none());
+    assert!(decision_cancellation(db, case.repository, unknown).await?.is_none());
+    ensure!(
+        tombstone_count(db, case.repository).await? == rows_before_unknown,
+        "an unknown-id cancel wrote a cancellation row"
+    );
+
+    // 8. A current admin using a restricted `contents_write`-only token that has
+    //    no `contents_read` grant: GetOperation deliberately falls back to the
+    //    writable lookup for its own issuer, so it reads `pending`; the cancel
+    //    then succeeds through the same write-only serving path.
+    let rows_before_admin_get = tombstone_count(db, case.repository).await?;
+    let (status, view) = get_json(address, Some(&scoped_admin), &case.operation_path(scoped_admin_pending)).await?;
+    ensure!(status == 200, "the contents_write-only admin GET answered {status}: {view}");
+    ensure!(view["state"].as_str() == Some("pending"), "the contents_write-only admin GET is not pending: {view}");
+    // Reading the identity never cancels anything by itself.
+    ensure!(
+        tombstone_count(db, case.repository).await? == rows_before_admin_get,
+        "reading the pending operation wrote a cancellation row"
+    );
+    let (status, body, headers) = post_cancel(address, &scoped_admin, &case.cancel_path(scoped_admin_pending)).await?;
+    ensure!(status == 200, "a contents_write-only admin cancel answered {status}: {body}");
+    assert_no_store("scoped admin cancel", &headers)?;
+    assert_cancel_view("scoped admin cancel", &body, scoped_admin_pending, &["cancelled"])?;
+    assert_pending_cancelled_ledger(db, case.repository, scoped_admin_pending).await?;
+    let (status, view) = get_json(address, Some(&scoped_admin), &case.operation_path(scoped_admin_pending)).await?;
+    ensure!(
+        status == 200 && view["state"].as_str() == Some("cancelled"),
+        "the contents_write-only admin GET does not show cancelled ({status}): {view}"
+    );
+
+    // 9. Exactly six cancellation rows were added (2 + 0 + 1 + 1 + 0 + 2), no
+    //    ref, gate revision/digest or membership moved, and a fresh read still
+    //    sees exactly the committed tip.
+    ensure!(
+        tombstone_count(db, case.repository).await? == rows_before + 6,
+        "the route sequence did not write exactly six cancellation rows"
+    );
+    let after = durable_state(db, case.repository).await?;
+    assert_unchanged("the cancel route sequence", &before, &after)?;
+    let (cloned, observed) = clone_main(case, git, owner, "readback").await?;
+    ensure!(cloned, "the readback clone failed");
+    ensure!(observed.as_deref() == Some(committed_oid.as_str()), "the readback clone did not read the committed tip");
+    Ok(())
+}
+
+/// A durably pending operation cancelled through the route has both its
+/// migration-138 tombstone and its decision-level row, bound to one digest.
+async fn assert_pending_cancelled_ledger(db: &Db, repository: Uuid, operation: Uuid) -> Result<()> {
+    let legacy = legacy_cancellation(db, repository, operation).await?;
+    let decision = decision_cancellation(db, repository, operation).await?;
+    match (legacy.as_deref(), decision.as_deref()) {
+        (Some(legacy), Some(decision)) => {
+            ensure!(legacy == decision, "the cancellation rows of {operation} bind different digests")
+        }
+        _ => return Err(anyhow!("a cancelled pending operation {operation} lacks one of its cancellation rows")),
+    }
+    Ok(())
+}
+
+/// Cancelling an already terminal operation still inserts the migration-138
+/// cancellation row, but the coordinator returns before any decision row.
+async fn assert_terminal_legacy_cancellation(db: &Db, repository: Uuid, operation: Uuid) -> Result<()> {
+    ensure!(
+        legacy_cancellation(db, repository, operation).await?.is_some(),
+        "a terminal operation {operation} has no migration-138 cancellation row"
+    );
+    ensure!(
+        decision_cancellation(db, repository, operation).await?.is_none(),
+        "a terminal operation {operation} acquired a decision cancellation row"
+    );
+    Ok(())
+}
+
+/// A bounded concurrency proof between this route's POST cancel and one real
+/// stock push carrying a single operation id.
+///
+/// The fixture creates concurrent route/service execution after a bounded
+/// loopback barrier; it does not force which side wins.
+///
+/// * the stock push POST reaches the loopback proxy and stays there
+///   ([`Proxy::await_held`]); registration of the operation happens only inside
+///   the service, so the row genuinely does not exist yet;
+/// * the cancel loop calls the real route while the push is still held; a 404 is
+///   the route's genuine "not registered (yet)" answer (nothing is created on
+///   the fixture side), and it is retried within a strict bound;
+/// * a 503 is accepted only as the fixed `outcome_unknown` refusal, then resolved
+///   through the authorized GET operation route until its durable state is a
+///   terminal, and a repeated POST cancel must answer that exact terminal; any
+///   other 503 and every other non-200/404 status fails. The 503 is never a
+///   terminal winner;
+/// * the release future is signalled by the first HTTP response or error of the
+///   loop (so a 403/503/transport failure can never leave the push blocked),
+///   waits the round's small bounded hold, then opens the barrier
+///   ([`Proxy::resolve_held`]) concurrently with the remaining retries;
+/// * the stock push finishes after the barrier is open, the `Captured` reply is
+///   received, and exactly one durable terminal must exist, match the route's
+///   outcome and be coherent with the cancellation ledger (`cancelled` adds
+///   both rows, a per-operation check below; `committed`/`rejected` add only the
+///   migration-138 row of its own coordinator cancel). A lost/unknown COMMIT is
+///   never a winner.
+const RACE_HOLDS: [Duration; 3] = [Duration::ZERO, Duration::from_millis(50), Duration::from_millis(200)];
+/// Bound for the stock client to finish after the barrier opened, and for any
+/// cleanup of a held or aborted push.
+const RACE_STOCK_TIMEOUT: Duration = Duration::from_secs(120);
+const RACE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn terminal_race_body(db: &Db, case: &CancelRouteCase, git: &'static Git, owner: &Actor) -> Result<()> {
+    for (index, hold) in RACE_HOLDS.into_iter().enumerate() {
+        let seed = case.work.path().join("seed");
+        let target =
+            git.commit(&seed, "race.txt", &format!("race step {index}\n"), &format!("race commit {index}")).await?;
+        let operation = Uuid::new_v4();
+        let before = durable_state(db, case.repository).await?;
+        ensure!(
+            !before.refs.values().any(|oid| oid == &target),
+            "the race target {target} is already a durable ref value"
+        );
+        let rows_before = tombstone_count(db, case.repository).await?;
+
+        // Arm the bounded barrier, then start the real stock push carrying this
+        // operation id. It stops at the proxy: the service has not seen it.
+        let mut captured = case.proxy.hold_connection_capturing(1).await?;
+        let mut stock = {
+            let seed = seed.clone();
+            tokio::spawn(
+                async move { push(git, &seed, Some(operation), &["push", "origin", "HEAD:refs/heads/main"]).await },
+            )
+        };
+        let (outcome, service_reply, output) =
+            match race_round(db, case, owner, operation, hold, &mut stock, &mut captured).await {
+                // The barrier is open and the push was forwarded: the stock
+                // client is a legitimate participant now and is never cancelled
+                // here. Only a hung client (bounded) is aborted.
+                Ok(round) => match tokio::time::timeout(RACE_STOCK_TIMEOUT, &mut stock).await {
+                    Ok(joined) => (round.outcome, round.reply, joined.context("the race push task panicked")??),
+                    Err(_) => {
+                        stock.abort();
+                        let _ = tokio::time::timeout(RACE_CLEANUP_TIMEOUT, &mut stock).await;
+                        return Err(anyhow!("the forwarded race push did not finish its client transaction in time"));
+                    }
+                },
+                // The round failed at any stage. Always attempt to open the
+                // barrier (safe when nothing is held or it is already open), so
+                // a held request is never left blocked. If the request had
+                // reached the hold, drain its capture boundedly so the next
+                // round never reads it. Only a stock task that is still running is
+                // aborted; the round's own error is the result and expected
+                // cleanup cancellation never replaces it.
+                Err(RaceRoundError { error, held }) => {
+                    case.proxy.resolve_held().await.ok();
+                    if held {
+                        let _ = tokio::time::timeout(RACE_CLEANUP_TIMEOUT, captured.recv()).await;
+                    }
+                    if !stock.is_finished() {
+                        stock.abort();
+                    }
+                    let _ = tokio::time::timeout(RACE_CLEANUP_TIMEOUT, &mut stock).await;
+                    return Err(error);
+                }
+            };
+        let service_reply =
+            service_reply.ok_or_else(|| anyhow!("the proxy did not capture the forwarded race push"))?;
+        assert_race_terminal(
+            db,
+            case,
+            git,
+            owner,
+            index,
+            operation,
+            &target,
+            &before,
+            rows_before,
+            &outcome,
+            &output,
+            &service_reply,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// What a successful round produced: the route's outcome and the real
+/// receive-pack reply of the forwarded push.
+struct RaceRound {
+    outcome: String,
+    reply: Option<proxy::Captured>,
+}
+
+/// A failed round, and whether its request had reached the proxy hold (so a
+/// capture may be in flight and the barrier may need opening).
+struct RaceRoundError {
+    error: anyhow::Error,
+    held: bool,
+}
+
+/// A `503` from POST cancel is accepted only as the fixed
+/// `GatewayError::OutcomeUnknown` refusal (`outcome_unknown`), resolved through
+/// the authorized GET operation route with the same owner token, bounded by the
+/// cancel loop's own deadline, until the durable `state` is exactly `cancelled`,
+/// `committed` or `rejected`. `pending` is retried; every other status/state
+/// fails. The 503 itself is never a terminal winner.
+async fn resolve_unknown_cancel(
+    case: &CancelRouteCase,
+    owner: &Actor,
+    operation: Uuid,
+    body: &Value,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<String> {
+    ensure!(
+        race_reply_error_value(body) == "outcome_unknown",
+        "the race cancel answered 503 with the `{}` gateway label, not `outcome_unknown`",
+        race_reply_error_value(body)
+    );
+    let state = loop {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the unknown race cancel was never resolved to a durable terminal before the cancel deadline"
+        );
+        let (status, view) = get_json(case.address, Some(&owner.token), &case.operation_path(operation)).await?;
+        ensure!(
+            status == 200,
+            "the race operation GET answered {status} with the `{}` gateway label",
+            race_reply_error_value(&view)
+        );
+        ensure!(
+            view["operation_id"].as_str() == Some(operation.to_string().as_str()),
+            "the race operation GET named another operation"
+        );
+        match view["state"].as_str().unwrap_or_default() {
+            state @ ("cancelled" | "committed" | "rejected") => break state.to_owned(),
+            "pending" => tokio::time::sleep(Duration::from_millis(5)).await,
+            state => return Err(anyhow!("the race operation GET reported the non-terminal state `{state}`")),
+        }
+    };
+    // Repeating POST cancel now must answer its normal HTTP 200 canonical view,
+    // naming exactly that terminal state.
+    let (status, cancel, _) = post_cancel(case.address, &owner.token, &case.cancel_path(operation)).await?;
+    ensure!(
+        status == 200,
+        "the post-of-unknown race cancel answered {status} with the `{}` gateway label",
+        race_reply_error_value(&cancel)
+    );
+    assert_cancel_view(
+        "resolved race cancel",
+        &cancel,
+        operation,
+        &["cancelled", "already_cancelled", "committed", "rejected"],
+    )?;
+    let outcome = cancel["outcome"].as_str().unwrap_or_default().to_owned();
+    let expected = match state.as_str() {
+        "cancelled" => "already_cancelled",
+        "committed" => "committed",
+        "rejected" => "rejected",
+        other => return Err(anyhow!("the operation GET resolved to `{other}`, not a terminal")),
+    };
+    ensure!(outcome == expected, "the race operation is durably {state} but the resolved cancel reported {outcome}");
+    Ok(outcome)
+}
+
+/// One concurrency round: wait for the held push, then run the route's cancel
+/// loop concurrently with the bounded barrier release, and return the route's
+/// outcome. Nothing is created on the fixture side while the push is held.
+///
+/// On failure the helper neither aborts nor awaits the stock task: it reports
+/// the error and whether the request had reached the hold, and the caller owns
+/// its lifecycle (open the barrier, drain the capture when needed, abort only a
+/// still-running client).
+async fn race_round(
+    db: &Db,
+    case: &CancelRouteCase,
+    owner: &Actor,
+    operation: Uuid,
+    hold: Duration,
+    stock: &mut tokio::task::JoinHandle<Result<GitOutput>>,
+    captured: &mut tokio::sync::mpsc::UnboundedReceiver<proxy::Captured>,
+) -> Result<RaceRound, RaceRoundError> {
+    // Before `await_held` no request is proven held; every later refusal happens
+    // once the POST is known to be at the proxy.
+    let fail = |error: anyhow::Error, held: bool| RaceRoundError { error, held };
+    let address = case.address;
+    // Only the wait for the barrier races the client's early exit: once
+    // `await_held` returned, the POST is definitely held at the proxy.
+    tokio::select! {
+        held = case.proxy.await_held(1) => held.map_err(|error| fail(error, false))?,
+        exited = &mut *stock => {
+            return Err(fail(match exited {
+                Ok(Ok(output)) => anyhow!(
+                    "the race push exited before its POST was held: {}",
+                    redacted_git_output("race push", &output)
+                ),
+                Ok(Err(error)) => error.context("the race push failed before its POST was held"),
+                Err(error) => anyhow!("the race push task was cancelled before its POST was held: {error}"),
+            }, false));
+        }
+    }
+    if let Some(state) = case.operation_state(db, operation).await.map_err(|error| fail(error, true))? {
+        return Err(fail(
+            anyhow!("the held push already registered its operation ({state}) before the cancel started"),
+            true,
+        ));
+    }
+
+    let (started, arrived) = tokio::sync::watch::channel(false);
+    let cancel = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            ensure!(attempts < 800, "the race cancel exceeded its attempt bound");
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "the race operation was never registered before the cancel deadline"
+            );
+            let attempt = post_cancel(address, &owner.token, &case.cancel_path(operation)).await;
+            // The first HTTP answer (whatever it is, a transport error included)
+            // releases the barrier, so the push can never stay held.
+            started.send_replace(true);
+            let (status, body, _) = attempt?;
+            if status == 200 {
+                assert_cancel_view(
+                    "race cancel",
+                    &body,
+                    operation,
+                    &["cancelled", "already_cancelled", "committed", "rejected"],
+                )?;
+                return Ok(body["outcome"].as_str().unwrap_or_default().to_owned());
+            }
+            if status == 503 {
+                return resolve_unknown_cancel(case, owner, operation, &body, deadline).await;
+            }
+            ensure!(
+                status == 404,
+                "the race cancel answered {status} with the `{}` gateway label",
+                race_reply_error_label(&body.to_string().into_bytes())
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let release = async {
+        let mut arrived = arrived;
+        while !*arrived.borrow_and_update() {
+            arrived.changed().await.map_err(|_| anyhow!("the cancel loop ended before reaching the route"))?;
+        }
+        tokio::time::sleep(hold).await;
+        case.proxy.resolve_held().await
+    };
+    let (cancelled, released) = tokio::join!(cancel, release);
+    if let Err(error) = released {
+        // Reached the hold; the caller's cleanup opens the barrier again and
+        // drains whatever may still be captured.
+        return Err(fail(error.context("the race barrier could not be released"), true));
+    }
+    let outcome = match cancelled {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // The barrier is open and the push was forwarded: drain its capture
+            // boundedly so a later round never reads this round's reply.
+            let _ = tokio::time::timeout(RACE_CLEANUP_TIMEOUT, captured.recv()).await;
+            return Err(fail(error, true));
+        }
+    };
+    let reply = match captured.recv().await {
+        Some(reply) => reply,
+        None => return Err(fail(anyhow!("the proxy did not capture the forwarded race push"), true)),
+    };
+    Ok(RaceRound { outcome, reply: Some(reply) })
+}
+
+/// The static label of the gateway error a raw HTTP reply body carries: the
+/// fixed `GatewayError` messages map to their own labels, an unparseable body is
+/// `non_json`, and no message text is ever echoed.
+fn race_reply_error_label(response: &[u8]) -> &'static str {
+    serde_json::from_slice::<Value>(response).map_or("non_json", |body| race_reply_error_value(&body))
+}
+
+/// [`race_reply_error_label`] for an already parsed body; a body that is not the
+/// gateway's single `{"error": "<fixed label>"}` object is `other_gateway_error`.
+///
+/// Only exact, known fixed messages are labelled. The `GatewayError::Internal`
+/// refusals of the receive path's A3 artifact hold, A3 protected upload/consume
+/// and A4 publication-ledger verification each keep their own static label so a
+/// diagnostic can tell them apart; any other text stays `other_gateway_error`.
+/// The message itself is never printed or returned.
+fn race_reply_error_value(value: &Value) -> &'static str {
+    match value.get("error").and_then(Value::as_str) {
+        Some("operation is durably cancelled") => "operation_durably_cancelled",
+        Some("publication was rejected by the core ledger") => "publication_rejected",
+        Some("publication outcome is unknown; query the operation or inspect refs") => "outcome_unknown",
+        Some("service temporarily unavailable") => "service_unavailable",
+        Some("Git gateway request exceeded its bounded deadline") => "gateway_timeout",
+        Some("artifact hold acquisition was refused") => "artifact_hold_acquire_refused",
+        Some("protected Blob upload was refused") => "protected_upload_refused",
+        Some("publication ledger could not be verified") => "publication_ledger_refused",
+        _ => "other_gateway_error",
+    }
+}
+
+/// The receive-pack status of a captured race reply, or `none` when the service
+/// never answered it.
+fn race_reply_status(reply: &proxy::Captured) -> String {
+    reply.status.map_or_else(|| "none".to_owned(), |status| status.to_string())
+}
+
+/// The only two wire answers of a durable cancellation: the fixed 409
+/// `operation_durably_cancelled` refusal, or a 200 replay whose complete
+/// report-status is exactly one `ng refs/heads/main operation was cancelled`.
+/// The reason is matched here only, never added to [`GIT_REASONS`].
+///
+/// `canonical` is the durable state already verified by the caller; a failure
+/// reports it as a literal field beside the HTTP status and static label, and
+/// never the raw response body.
+fn assert_cancelled_wire(reply: &proxy::Captured, canonical: &str) -> Result<()> {
+    const CANCELLED_REASON: &str = "operation was cancelled";
+    const MAIN: &str = "refs/heads/main";
+    match reply.status {
+        Some(409) => {
+            let label = race_reply_error_label(&reply.response);
+            ensure!(
+                label == "operation_durably_cancelled",
+                "the cancelled race answered HTTP 409 with the `{label}` gateway label, canonical_outcome={canonical}"
+            );
+        }
+        Some(200) => {
+            let (unpack, results) = report_status(&reply.response).with_context(|| {
+                format!("the cancelled race reply is not a Git report-status, canonical_outcome={canonical}")
+            })?;
+            ensure!(unpack == "ok", "the cancelled race reply did not unpack: {unpack}, canonical_outcome={canonical}");
+            ensure!(
+                results == [(MAIN.to_owned(), Some(CANCELLED_REASON.to_owned()))],
+                "the cancelled race reply is not exactly one `ng {MAIN} {CANCELLED_REASON}`: {results:?}, canonical_outcome={canonical}"
+            );
+        }
+        _ => {
+            return Err(anyhow!(
+                "the cancelled race answered HTTP {} with the `{}` gateway label, neither 409 nor a 200 replay, canonical_outcome={canonical}",
+                race_reply_status(reply),
+                race_reply_error_label(&reply.response)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The post-round proof: one coherent durable terminal, exactly the route's
+/// outcome, the right cancellation-ledger rows, and refs/gate/membership
+/// coherent with that terminal.
+#[allow(clippy::too_many_arguments)]
+async fn assert_race_terminal(
+    db: &Db,
+    case: &CancelRouteCase,
+    git: &Git,
+    owner: &Actor,
+    index: usize,
+    operation: Uuid,
+    target: &str,
+    before: &DurableState,
+    rows_before: i64,
+    outcome: &str,
+    output: &GitOutput,
+    service_reply: &proxy::Captured,
+) -> Result<()> {
+    const MAIN: &str = "refs/heads/main";
+    let state = case
+        .operation_state(db, operation)
+        .await?
+        .ok_or_else(|| anyhow!("the race operation has no durable row after both requests"))?;
+    ensure!(
+        matches!(state.as_str(), "committed" | "rejected" | "cancelled"),
+        "the race operation is {state}, not a terminal"
+    );
+    let expected = match outcome {
+        "cancelled" | "already_cancelled" => "cancelled",
+        "committed" => "committed",
+        "rejected" => "rejected",
+        "unknown" => return Err(anyhow!("the race route reported an unknown outcome; not a winner")),
+        other => return Err(anyhow!("the race route reported `{other}`, which is not a terminal")),
+    };
+    ensure!(state == expected, "the route reported {outcome} but the durable operation is {state}");
+
+    // A real, complete service answer: never a truncated capture. The accepted
+    // status is decided per durable state below (`cancelled` has the typed 409
+    // winner; `committed`/`rejected` require exactly 200).
+    ensure!(!service_reply.truncated, "the captured race reply is truncated");
+
+    // Cancellation-ledger coherence for exactly this race operation.
+    let legacy = legacy_cancellation(db, case.repository, operation).await?;
+    let decision = decision_cancellation(db, case.repository, operation).await?;
+    if state == "cancelled" {
+        match (legacy.as_deref(), decision.as_deref()) {
+            (Some(legacy), Some(decision)) => {
+                ensure!(legacy == decision, "the A4 cancellation rows of the race operation bind different digests")
+            }
+            _ => return Err(anyhow!("a cancelled race operation lacks one of its cancellation rows")),
+        }
+    } else {
+        ensure!(legacy.is_some(), "a {state} race operation has no migration-138 cancellation row");
+        ensure!(decision.is_none(), "a {state} race operation acquired a decision cancellation row");
+    }
+    let after = durable_state(db, case.repository).await?;
+    ensure!(
+        tombstone_count(db, case.repository).await? == rows_before + if state == "cancelled" { 2 } else { 1 },
+        "the race wrote an unexpected number of cancellation rows"
+    );
+    match state.as_str() {
+        "committed" => {
+            ensure!(
+                output.success,
+                "a committed race operation has no successful push: {}",
+                redacted_git_output("race push", output)
+            );
+            // The wire answer of a committed terminal is its 200 replay: a
+            // complete report-status with `unpack ok` and exactly one `ok` for
+            // main carrying no reason.
+            ensure!(
+                service_reply.status == Some(200),
+                "the committed race did not receive a receive-pack reply (status={})",
+                race_reply_status(service_reply)
+            );
+            let (unpack, results) = report_status(&service_reply.response)
+                .with_context(|| "the committed race reply is not a Git report-status")?;
+            ensure!(unpack == "ok", "the committed race reply did not unpack: {unpack}");
+            ensure!(
+                results == [(MAIN.to_owned(), None)],
+                "the committed race reply is not exactly one `ok` for {MAIN}: {results:?}"
+            );
+            ensure!(first_ref_matches(&after.refs, MAIN, target), "the committed race did not publish the pushed OID");
+            ensure!(after.gate_revision > before.gate_revision, "the committed race did not advance the gate");
+            ensure!(after.memberships > before.memberships, "the committed race added no pack membership");
+            let (cloned, observed) = clone_main(case, git, owner, &format!("race-readback-{index}")).await?;
+            ensure!(cloned, "the race readback clone failed");
+            ensure!(observed.as_deref() == Some(target), "the race readback did not see the pushed OID");
+        }
+        "cancelled" | "rejected" => {
+            assert_unchanged(&format!("the {state} race"), before, &after)?;
+            ensure!(
+                !after.refs.values().any(|oid| oid == target),
+                "a {state} race operation left its commit on a durable ref"
+            );
+            // The client must have seen a failure: a false successful Git ACK
+            // cannot pass even though no durable ref moved.
+            ensure!(
+                !output.success,
+                "a {state} race push reported success: {}",
+                redacted_git_output("race push", output)
+            );
+            if state == "cancelled" {
+                assert_cancelled_wire(service_reply, &state)?;
+            } else {
+                // The client verdict must come from the captured report-status: one
+                // result, for main, whose per-ref verdict is `ng` with a known reason.
+                ensure!(
+                    service_reply.status == Some(200),
+                    "the rejected race did not receive a receive-pack reply (status={})",
+                    race_reply_status(service_reply)
+                );
+                let (_, results) = assert_git_report("race receive-pack reply", &service_reply.response)?;
+                ensure!(results.len() == 1, "the {state} race reply does not cover exactly one ref: {results:?}");
+                let (ref_name, reason) = &results[0];
+                ensure!(
+                    ref_name == MAIN && reason.is_some(),
+                    "the {state} race reply does not reject {MAIN} as `ng`: {results:?}"
+                );
+            }
+            let text = git_text(output);
+            for verdict in ["[new branch]", "Everything up-to-date"] {
+                ensure!(
+                    !text.contains(verdict),
+                    "the {state} race push was reported as `{verdict}`: {}",
+                    redacted_git_output("race push", output)
+                );
+            }
+        }
+        _ => unreachable!("the state was matched above"),
+    }
+    Ok(())
+}
 /// Issue-126 requirement 3: one real `git push --atomic` of two refs. Stock
 /// Git's own local atomic preflight passes with the normally advertised old
 /// OIDs; only after the client formed its receive-pack POST does the proxy

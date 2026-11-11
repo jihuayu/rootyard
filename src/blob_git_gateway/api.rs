@@ -21,7 +21,9 @@ use super::{
 use crate::{
     db,
     members::models::Role,
-    ref_store::{GitObjectFormat, OperationLookup, PgRefStore},
+    ref_store::{
+        GitObjectFormat, OperationLookup, OperationRecord, PgRefStore, core::pack_commit::AuthorizedCancelOutcome,
+    },
 };
 
 /// One page of repositories. A cursor names only the last returned
@@ -264,11 +266,7 @@ pub(super) async fn get_operation(
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
     let name = strip_name(&raw_name)?;
-    let operation_id =
-        Uuid::parse_str(&operation).map_err(|_| GatewayError::BadRequest("invalid operation identifier"))?;
-    if operation_id.is_nil() {
-        return Err(GatewayError::BadRequest("invalid operation identifier"));
-    }
+    let operation_id = operation_id(&operation)?;
     let identity = authenticate(&state, &headers).await?;
     let deadline = state.deadline();
     // Reading a historical operation is a read: it must not require write
@@ -343,6 +341,130 @@ pub(super) async fn get_operation(
     let terminal = record.terminal_result().map(|result| result.value().clone());
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(OperationView { operation_id, state: current_state, terminal }))
         .into_response())
+}
+
+/// Minimal result of one authorized cancellation: the operation it names and the
+/// exact race outcome the durable coordinator persisted. No digest, decision id,
+/// token or reason detail is serialized.
+#[derive(Serialize)]
+pub(super) struct OperationCancelView {
+    operation_id: Uuid,
+    outcome: &'static str,
+}
+
+/// `POST /api/repos/{owner}/{name}/operations/{operation}/cancel`
+///
+/// Only an **already registered** operation can be cancelled here, and only by
+/// the same authority the A4 coordinator accepts: a live writable repository
+/// owner/admin (`publication_decision::cancel::authorize`). The handler:
+///
+/// 1. authenticates with the shared session helper, then requires a current
+///    *writable* serving authority for this repository (both the first lookup
+///    and the fresh in-transaction re-check use `writable = true`, so write
+///    tokens/scopes and write-or-higher roles are required exactly as for the
+///    push path);
+/// 2. in one bounded short transaction re-checks that authority in the captured
+///    realm, requires an effective owner/admin role, and only then reads the
+///    exact durable row with [`PgRefStore::get`]. A missing row is `404` (never a
+///    tombstone for an unknown id); the transaction and pooled client are
+///    released before any mutation;
+/// 3. passes the identity **cloned from that durable row** to the existing A4
+///    facade [`PgAuthorizedCommit::cancel`], which re-checks the live token,
+///    owner/admin role and the publication decision/terminal in its coordinating
+///    transaction. Nothing is synthesized, and the handler never calls the
+///    underlying `PgRefStore`/`PgRefStoreCore` cancel;
+/// 4. returns the exact facade outcome (`cancelled`, `already_cancelled`,
+///    `committed`, `rejected`). An unknown/ambiguous `COMMIT` stays
+///    [`GatewayError::OutcomeUnknown`] (`503`), never a fabricated cancellation.
+pub(super) async fn cancel_operation(
+    State(state): State<Arc<BlobGitState>>,
+    Path((owner, raw_name, operation)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, GatewayError> {
+    let name = strip_name(&raw_name)?;
+    let operation_id = operation_id(&operation)?;
+    let identity = authenticate(&state, &headers).await?;
+    let deadline = state.deadline();
+    let serving = lookup(state.pool(), &identity, &owner, name, true, state.store().backend_identity(), deadline)
+        .await
+        .map_err(authority_error)?;
+    let authorization = read_authorization(state.clone(), &identity, &serving);
+    let repository_id = serving.gate.repository_id();
+    let owner_id = serving.gate.tenant_id();
+
+    // Bounded short read: fresh writable same-realm authority, the caller's
+    // current owner/admin role, then the exact durable row. The transaction is
+    // always rolled back and the client released before the A4 cancel opens its
+    // own coordinating transaction.
+    let mut client = state.pooled(deadline).await?;
+    let tx = tokio::time::timeout_at(deadline, client.transaction())
+        .await
+        .map_err(|_| GatewayError::Timeout)?
+        .map_err(|_| GatewayError::Internal("authorization transaction failed"))?;
+    let loaded: Result<OperationRecord, GatewayError> = async {
+        crate::ref_store::pg::bound(&tx, deadline).await.map_err(GatewayError::from)?;
+        let fresh = crate::ref_store::serving::lookup_in_tx(
+            &tx,
+            &identity,
+            &owner,
+            name,
+            true,
+            state.store().backend_identity(),
+            deadline,
+        )
+        .await
+        .map_err(authority_error)?;
+        authorization.ensure_same_realm(&fresh)?;
+        if fresh.gate.repository_id() != repository_id || fresh.gate.tenant_id() != owner_id {
+            return Err(GatewayError::Conflict("repository authority changed; retry"));
+        }
+        // Reading an operation identity is protected exactly as cancelling it:
+        // only a current owner/admin may resolve it, and only from live rows.
+        let role = crate::members::rbac::resolve_effective_role(&*tx, repository_id, owner_id, identity.id)
+            .await
+            .map_err(GatewayError::from)?;
+        if role.map(|(effective, _, _)| effective).is_none_or(|role| role < Role::Admin) {
+            return Err(GatewayError::Forbidden("operation is cancellable only by a repository owner or admin"));
+        }
+        match PgRefStore.get(&tx, repository_id, operation_id, deadline).await.map_err(GatewayError::from)? {
+            OperationLookup::Known(record) => Ok(record),
+            OperationLookup::Unknown => Err(GatewayError::NotFound),
+        }
+    }
+    .await;
+    let cleanup = tokio::time::timeout_at(deadline, tx.rollback()).await;
+    drop(client);
+    let record = match (loaded, cleanup) {
+        (_, Err(_)) => return Err(GatewayError::Timeout),
+        (_, Ok(Err(_))) => return Err(GatewayError::Internal("operation lookup cleanup failed")),
+        (record, Ok(Ok(()))) => record?,
+    };
+    let exact_identity = record.identity().clone();
+    if exact_identity.repository_id() != repository_id || exact_identity.operation_id() != operation_id {
+        return Err(GatewayError::Internal("operation lookup returned a foreign identity"));
+    }
+
+    let receipt = super::publish::authorized(&state)?
+        .cancel(state.pool(), &identity, &exact_identity, "client_requested", deadline)
+        .await
+        .map_err(super::publish::map_authorized)?;
+    let outcome = match receipt.outcome {
+        AuthorizedCancelOutcome::Cancelled => "cancelled",
+        AuthorizedCancelOutcome::AlreadyCancelled => "already_cancelled",
+        AuthorizedCancelOutcome::AlreadyCommitted => "committed",
+        AuthorizedCancelOutcome::AlreadyRejected => "rejected",
+    };
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(OperationCancelView { operation_id, outcome })).into_response())
+}
+
+/// Parse the path operation identifier exactly as [`get_operation`] does: a
+/// malformed or nil UUID is a typed bad request.
+fn operation_id(raw: &str) -> Result<Uuid, GatewayError> {
+    let operation_id = Uuid::parse_str(raw).map_err(|_| GatewayError::BadRequest("invalid operation identifier"))?;
+    if operation_id.is_nil() {
+        return Err(GatewayError::BadRequest("invalid operation identifier"));
+    }
+    Ok(operation_id)
 }
 
 /// Explicit refusal: the smart HTTP vertical does not implement an LFS media
