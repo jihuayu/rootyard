@@ -111,6 +111,25 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         ):
             self.assertIn(argument, manifest_step)
 
+        # Real-service pagination harnesses and their evidence bindings
+        pagination_commands = (
+            "python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json",
+            "python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json",
+            "python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json",
+        )
+        pagination_reports = (
+            "--report repository_pagination=test-results/repository-pagination.json",
+            "--report organization_pagination=test-results/organization-pagination.json",
+            "--report web_detail_pagination=test-results/web-detail-pagination.json",
+        )
+        pagination_harnesses = (
+            "--harness tests/repository_pagination.py",
+            "--harness tests/organization_pagination.py",
+            "--harness tests/web_detail_pagination.py",
+        )
+        for binding in pagination_commands + pagination_reports + pagination_harnesses:
+            self.assertIn(binding, ci_text, f"Missing pagination wiring in .github/workflows/ci.yml: {binding}")
+
         # initdb requires non-root. Container jobs switch user; the qualified
         # plain-host profile executes as runner and verifies its uid at runtime.
         self.assertIn("tests/pando_lab.py", ci_text)

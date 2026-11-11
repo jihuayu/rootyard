@@ -213,6 +213,34 @@ def large_packed_refs(repo, third):
     return packed
 
 
+# The Browse native suite inventory as reviewed before the deadline work. These
+# named business contracts must survive any addition to the suite.
+ORIGINAL_BROWSE_CASES = (
+    "setup_repos",
+    "refs_and_pagination",
+    "commits_and_pagination",
+    "tree_and_blob",
+    "compare_revisions",
+    "ref_transactions_atomic_cas",
+    "idempotency_and_concurrency",
+    "access_and_fences",
+    "object_format_and_negotiation",
+    "bounded_ref_and_commit_pages",
+    "selective_ref_prefix",
+    "protected_writes_and_ref_ack_failure",
+)
+# The only permitted additions: one deadline case per read path whose read,
+# exit and group quiescence now share a single deadline.
+BROWSE_DEADLINE_CASES = (
+    "list_commits_deadline",
+    "compare_commits_deadline",
+)
+# The only permitted scale case: the Issue #8 native ref-scale acceptance that
+# walks the complete large-refset cursor traversal.
+BROWSE_SCALE_CASES = (
+    "ref_scale_complete_traversal",
+)
+
 class GitReadStepsSourceTest(unittest.TestCase):
     """Static contract of the focused production fix."""
 
@@ -444,8 +472,29 @@ class GitReadStepsSourceTest(unittest.TestCase):
 
     def test_browse_contract_is_unchanged(self):
         browse = (TESTS / "browse.py").read_text()
+        # The inventory is parsed from the source rather than counted as a raw
+        # number: every original contract case stays named and ordered, and the
+        # two deadline cases are asserted as the only additions. A count alone
+        # would accept either adding unrelated cases or dropping, say,
+        # `idempotency_and_concurrency` to keep the unit passing.
         cases = re.search(r"CASE_NAMES = \((.*?)\n\)", browse, re.S).group(1)
-        self.assertEqual(len([line for line in cases.splitlines() if line.strip()]), 12)
+        names = re.findall(r'"([^"]+)"', cases)
+        # Order is runtime order, so the new cases may interleave; what is pinned
+        # is that the inventory is exactly the original contracts plus the two
+        # deadline cases and the one scale case, with no duplicate, dropped or
+        # unrelated entry.
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(sorted(names),
+                         sorted(ORIGINAL_BROWSE_CASES + BROWSE_DEADLINE_CASES
+                                + BROWSE_SCALE_CASES))
+        self.assertEqual(len(ORIGINAL_BROWSE_CASES), 12)
+        self.assertEqual(len(BROWSE_DEADLINE_CASES), 2)
+        self.assertEqual(len(BROWSE_SCALE_CASES), 1)
+        # Every listed case is still dispatched to its own implementation and the
+        # suite fails when the executed inventory differs from `CASE_NAMES`.
+        self.assertIn("for name in CASE_NAMES:\n            harness.case(name, getattr(harness, name))",
+                      browse)
+        self.assertIn("if executed != list(CASE_NAMES):", browse)
         self.assertIn('"selective_ref_prefix",', browse)
         self.assertIn('"kind": "symbolic",', browse)
         self.assertIn('"target": "refs/heads/main",', browse)
