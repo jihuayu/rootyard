@@ -10,9 +10,11 @@ building or running anything:
   profile, and gains an opt-in ``format22-fixture`` gate through
   ``required-features = ["pando-lab", "format22-fixture"]``, where the opt-in
   feature is declared and not enabled by the all-targets commands;
-* the workflow: the fixture is built first with
-  ``scripts/build_native_test.py`` (which clears the rootyard package), the
-  product afterwards with ``scripts/build_native.py``, both under
+* the workflow: the fixture is built first with one
+  ``scripts/build_native_test.py --test ref_store_format22_backup_fixture``
+  command (which clears the rootyard package), the standalone product for the
+  paired drill afterwards with ``scripts/build_native.py``; unrelated builder
+  targets in the same workflow are ignored. Outputs stay under
   ``test-results/refstore/`` so the executable and its adjacent ``.build.json``
   receipt are uploaded, and the receipt reaches the drill through
   ``--format22-fixture`` next to ``--binary``/``--git``/``--report``;
@@ -204,6 +206,32 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertGreaterEqual(index, 0, f"workflow has no `{needle}`")
         return index, self._continued(index)
 
+    def _builder_commands(self, script: str) -> list[tuple[int, str]]:
+        """Every run line invoking ``script`` (after ``python3``), as
+        ``(line index, logical line)``."""
+        commands = []
+        for index, line in enumerate(self.lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            tokens = stripped.split()
+            if tokens[0] in ("python3", "python") and len(tokens) > 1:
+                tokens = tokens[1:]
+            if tokens and tokens[0] == script:
+                commands.append((index, self._continued(index)))
+        return commands
+
+    def _fixture_builders(self) -> list[tuple[int, str]]:
+        """Commands building exactly the issue #169 fixture under its stages."""
+        return [(index, line) for index, line in self._builder_commands("scripts/build_native_test.py")
+                if re.search(r"(^|\s)--test(\s+|=)" + re.escape(FIXTURE) + r"(\s|$)", line)]
+
+    def _product_builders(self, start: int) -> list[tuple[int, str]]:
+        """Standalone product builds exiting between ``start`` and the drill."""
+        drill_index, _ = self._find_command("tests/backup_blob_serving147.py")
+        return [(index, line) for index, line in self._builder_commands("scripts/build_native.py")
+                if start < index < drill_index]
+
     def _pr_paths(self) -> list[str]:
         """Entries of the ``pull_request.paths`` list, in order."""
         try:
@@ -239,12 +267,19 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertNotIn("paths-ignore", self.text)
 
     def test_fixture_builder_precedes_product_builder(self) -> None:
-        fixture_index, fixture_line = self._find_command("scripts/build_native_test.py")
-        product_index, _ = self._find_command("scripts/build_native.py")
-        self.assertLess(fixture_index, product_index,
+        # Main also builds other native targets (e.g. blob_git_gateway), so the
+        # contract is scoped to the fixture command and the product build that
+        # feeds the paired drill, not to every builder invocation in the file.
+        fixture_builders = self._fixture_builders()
+        self.assertEqual(len(fixture_builders), 1,
+                         f"expected one builder command with `--test {FIXTURE}`: {fixture_builders}")
+        fixture_index, fixture_line = fixture_builders[0]
+        product_builders = self._product_builders(fixture_index)
+        self.assertEqual(len(product_builders), 1,
+                         f"expected one standalone product build between the fixture build and the "
+                         f"paired drill: {product_builders}")
+        self.assertLess(fixture_index, product_builders[0][0],
                         "build_native_test.py clears the rootyard package before the product build")
-        self.assertEqual(self.text.count("scripts/build_native_test.py"), 1)
-        self.assertEqual(len(re.findall(r"^\s*python3 scripts/build_native\.py\b", self.text, re.MULTILINE)), 1)
         self.assertIn(f"--test {FIXTURE}", fixture_line)
         self.assertIn(f"--features {FIXTURE_FEATURES}", fixture_line)
         for replaced_profile in (f"--features {FIXTURE_FEATURE} ", f"--features {EXISTING_FEATURE} "):
