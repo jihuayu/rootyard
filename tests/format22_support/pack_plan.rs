@@ -16,7 +16,7 @@ use rootyard::ref_store::artifact_hold::{
 };
 use rootyard::ref_store::core::pack_commit::{
     ContentDigest, PackArtifactRole, PackCommitBaseline, PackCommitExpectation, PackCommitPlan, PackCommitScope,
-    PackMembershipEntry, PackPendingToken, PackRegistrationRequest, PgPackCommit, PlannedArtifact, PlannedPack,
+    PackMembershipEntry, PackRegistrationRequest, PgPackCommit, PlannedArtifact, PlannedPack,
 };
 use rootyard::ref_store::{CoreGateVersion, HeadUpdate, IssuerLane, OperationIdentity, RefUpdate, RequestDigest};
 use uuid::Uuid;
@@ -28,7 +28,6 @@ pub const HOLD_NAMESPACE: &str = "core-pack";
 
 pub struct Draft {
     pub plan: PackCommitPlan,
-    pub token: PackPendingToken,
 }
 
 /// The shared `draft` with `owner_id` = the pack producer instead of the tenant.
@@ -37,16 +36,22 @@ pub struct Draft {
 /// tenant). That is the same relationship a real serving receive request has:
 /// `db::Identity.id` is both the request owner and the issuer lane actor, and
 /// the decision-gated commit refuses any other issuer (`issuer_mismatch`).
+pub struct DraftInput {
+    pub repo: Uuid,
+    pub tenant: Uuid,
+    pub owner: Uuid,
+    pub sequence: i64,
+}
+
+/// The shared `draft` with `owner_id` = the pack producer instead of the tenant.
 pub async fn draft(
     db: &Db,
-    repo: Uuid,
-    tenant: Uuid,
-    owner: Uuid,
-    sequence: i64,
+    input: DraftInput,
     gate: &CoreGateVersion,
     refs: Vec<RefUpdate>,
     files: &[PairFiles],
 ) -> Result<Draft> {
+    let DraftInput { repo, tenant, owner, sequence } = input;
     let mut client = db.pool.get().await?;
     let baseline: PackCommitBaseline = PgPackCommit.capture_baseline(&mut client, repo, tenant, deadline()).await?;
     ensure!(
@@ -93,9 +98,9 @@ pub async fn draft(
         old_entries,
         planned,
     )?;
-    let token = PgPackCommit.begin_pending(&mut client, &plan, deadline()).await?;
+    let _pending = PgPackCommit.begin_pending(&mut client, &plan, deadline()).await?;
     drop(client);
-    Ok(Draft { plan, token })
+    Ok(Draft { plan })
 }
 
 fn hold_scope(plan: &PackCommitPlan) -> Result<HoldScope> {

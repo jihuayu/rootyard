@@ -58,6 +58,7 @@ import json
 from pathlib import Path
 import re
 import types
+import uuid
 
 ARTIFACT_SET_DOMAIN = "core-pack-artifact-set-v2"
 ROOT_STATES = ("active", "released")
@@ -72,7 +73,8 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 UUID_HEX = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 TARGET_LITERAL = re.compile(r"^'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'::uuid$")
 MARKER_KIND = "rootyard/format22-backup-fixture-seed"
-CORRUPTION_CASES = ("missing_pack", "missing_idx", "missing_all_artifacts", "wrong_artifact_set_digest")
+CORRUPTION_CASES = ("missing_pack", "missing_idx", "missing_all_artifacts", "wrong_artifact_set_digest",
+                    "missing_hold", "mismatched_hold_locator")
 # The declared-set sources of ledger_validation::DECLARED_SETS.
 DECLARED_SOURCES = ("membership", "snapshot_packs", "root_packs", "serving_read_packs")
 
@@ -721,6 +723,9 @@ class ValidatorRefusal:
     ``incomplete_pair``, no artifact rows is ``missing_artifacts``, and a
     rewritten publication digest is ``declared_set_digest_mismatch:<source>:
     <repository_id>:<pack_id>:<registration_id>`` for each declaring set kind.
+    A missing durable hold makes the set unrebuildable and a rewritten locator
+    disagrees with its artifact row; both are ``hold_mismatch`` (a missing hold
+    also drops the owner scope, which the summary admits as a dependent code).
     The snapshot/root/serving-read rechecks of that same registration may add
     only the dependent tokens below.
     """
@@ -744,7 +749,9 @@ class ValidatorRefusal:
         """The violations every refusal carries; the last one names the cause."""
         return ("canonical_pair_mismatch", {"missing_pack": "incomplete_pair", "missing_idx": "incomplete_pair",
                                             "missing_all_artifacts": "missing_artifacts",
-                                            "wrong_artifact_set_digest": "declared_set_digest_mismatch"}[self.cause])
+                                            "wrong_artifact_set_digest": "declared_set_digest_mismatch",
+                                            "missing_hold": "hold_mismatch",
+                                            "mismatched_hold_locator": "hold_mismatch"}[self.cause])
 
     def violation(self, registration):
         """The first required violation for ``registration``'s actual ids."""
@@ -768,11 +775,11 @@ class CorruptionCase:
     """One privileged raw-SQL source corruption and the rows it must break.
 
     ``statement`` is a single DML statement that only removes rows or changes
-    the stored artifact-set digest; it never touches a column the pack tables
-    guard with CHECK constraints, so the corruption is the logical damage of
-    issue #169 and nothing else. A planned case also carries the registration
-    it damages, the single-row target the clone must prove changed, and the
-    source-ledger violation the backup must refuse with.
+    the stored artifact-set digest or one durable hold locator; it never touches
+    a column the pack tables guard with CHECK constraints, so the corruption is
+    the logical damage of issue #169 and nothing else. A planned case also
+    carries the registration it damages, the single-row target the clone must
+    prove changed, and the source-ledger violation the backup must refuse with.
     """
 
     def __init__(self, name, statement, broken_rows, requires=(), registration=None, wrong_value=None,
@@ -793,7 +800,12 @@ class CorruptionCase:
 
     @property
     def targets_digest(self):
-        return self.statement.startswith("UPDATE ")
+        return self.statement.startswith("UPDATE public.ref_store_core_pack_publications ")
+
+    @property
+    def targets_hold(self):
+        return self.statement.startswith(("DELETE FROM public.artifact_holds ",
+                                          "UPDATE public.artifact_holds "))
 
     def fingerprint_tables(self):
         return sorted({*self.broken_rows, *self.requires})
@@ -838,25 +850,58 @@ def wrong_digest(registration, value):
                  "UPDATE public.ref_store_core_pack_publications SET artifact_set_digest=" + q(value)
                  + " WHERE registration_id=" + registration + " AND artifact_set_digest<>" + q(value),
                  ("ref_store_core_pack_publications",), ("ref_store_core_pack_artifacts",
-                                                         "ref_store_core_pack_memberships"))
+                                                         "ref_store_core_pack_memberships"),
+                 wrong_value=value)
 
 
-# The four acceptance negatives of issue #169 and the source-ledger violations
+def missing_hold(registration):
+    registration = _registration(registration)
+    return CorruptionCase("missing_hold",
+                 "DELETE FROM public.artifact_holds WHERE hold_id IN ("
+                 "SELECT hold_id FROM public.ref_store_core_pack_artifacts WHERE registration_id="
+                 + registration + " AND role='pack')",
+                 ("artifact_holds",), ("ref_store_core_pack_artifacts",
+                                       "ref_store_core_pack_publications"))
+
+
+def mismatched_hold_locator(registration, value):
+    registration = _registration(registration)
+    need(isinstance(value, str) and UUID_HEX.match(value), "mismatched hold tenant is not a uuid")
+    return CorruptionCase("mismatched_hold_locator",
+                 "UPDATE public.artifact_holds SET storage_tenant_id=" + q(value) + " WHERE hold_id IN ("
+                 "SELECT hold_id FROM public.ref_store_core_pack_artifacts WHERE registration_id="
+                 + registration + " AND role='pack')",
+                 ("artifact_holds",), ("ref_store_core_pack_artifacts",
+                                       "ref_store_core_pack_publications"),
+                 wrong_value=value)
+
+
+def mismatched_hold_tenant(registration):
+    """Deterministic replacement locator tenant for one registration."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "issue169:mismatched-hold-locator:" + str(registration)))
+
+
+# The six acceptance negatives of issue #169 and the source-ledger violations
 # each produces once a complete API registration is damaged exactly that way
 # (ledger_sets::check_declared).
 BUILDERS = {"missing_pack": missing_pack, "missing_idx": missing_idx,
-            "missing_all_artifacts": missing_all, "wrong_artifact_set_digest": wrong_digest}
+            "missing_all_artifacts": missing_all, "wrong_artifact_set_digest": wrong_digest,
+            "missing_hold": missing_hold, "mismatched_hold_locator": mismatched_hold_locator}
 # A missing artifact is still declared by the pair check (canonical_pair_mismatch)
 # plus its own cause token; a rewritten stored digest keeps every declaring set
 # row, so each kind that still holds the old digest reports
 # declared_set_digest_mismatch with its source. ``membership`` is the
 # representative source used for one concrete expected line; the oracle accepts
-# any of DECLARED_SOURCES that the product actually emits.
+# any of DECLARED_SOURCES that the product actually emits. A hold corruption
+# leaves the publication declaration intact but makes the A4 set unrebuildable,
+# so both hold cases require canonical_pair_mismatch plus hold_mismatch.
 REFUSALS = {
     "missing_pack": ValidatorRefusal("missing_pack"),
     "missing_idx": ValidatorRefusal("missing_idx"),
     "missing_all_artifacts": ValidatorRefusal("missing_all_artifacts"),
     "wrong_artifact_set_digest": ValidatorRefusal("wrong_artifact_set_digest", DECLARED_SOURCES[0]),
+    "missing_hold": ValidatorRefusal("missing_hold"),
+    "mismatched_hold_locator": ValidatorRefusal("mismatched_hold_locator"),
 }
 
 
@@ -921,18 +966,27 @@ def corruption_plan(registered, retainable, scopes, pairs=None, digests=None):
 
 def _planned(name, registration, target, value):
     """One case statement bound to the actual ids of ``registration``."""
-    plan = wrong_digest(target, value) if name == "wrong_artifact_set_digest" else BUILDERS[name](target)
+    if name == "wrong_artifact_set_digest":
+        plan = wrong_digest(target, value)
+    elif name == "mismatched_hold_locator":
+        plan = mismatched_hold_locator(target, mismatched_hold_tenant(target))
+    else:
+        plan = BUILDERS[name](target)
     return CorruptionCase(plan.name, plan.statement, plan.broken_rows, plan.requires,
                           registration=registration,
-                          wrong_value=value if plan.name == "wrong_artifact_set_digest" else None,
+                          wrong_value=plan.wrong_value,
                           refusal=REFUSALS[plan.name])
 
 
 def finding(case):
-    """The one artifact field the case removes or rewrites."""
+    """The one stored field the case removes or rewrites."""
+    role = registration_role(case.statement)
     if case.targets_digest:
         return "publication:artifact_set_digest"
-    return "artifact:" + (registration_role(case.statement) or "pack+idx")
+    if case.targets_hold:
+        suffix = ":storage_tenant_id" if case.name == "mismatched_hold_locator" else ""
+        return "hold:" + (role or "pack") + suffix
+    return "artifact:" + (role or "pack+idx")
 
 
 def registration_role(statement):
@@ -1101,6 +1155,28 @@ def corruption_findings(case, changed, observed):
         need(after_publication == dict(publication, artifact_set_digest=case.wrong_value),
              "the wrong-digest corruption changed another publication field")
         need(after == before, "the wrong-digest corruption changed an artifact row")
+    elif case.targets_hold:
+        role = registration_role(case.statement)
+        need(role in before and role in after, case.name + ": the corrupted artifact role is absent")
+        need(changed == 1, case.name + ": exactly one hold row must change, got " + str(changed))
+        need(after_publication == publication, case.name + ": the publication row changed")
+        need(set(after) == set(before), case.name + ": an artifact row disappeared")
+        for name in after:
+            before_row, after_row = dict(before[name]), dict(after[name])
+            before_hold, after_hold = before_row.pop(HOLD_ROW), after_row.pop(HOLD_ROW)
+            need(after_row == before_row, case.name + ": another artifact field changed")
+            if name != role:
+                need(after_hold == before_hold, case.name + ": another artifact hold changed")
+                continue
+            if case.name == "missing_hold":
+                need(len(before_hold) == 1 and after_hold == [], "the target durable hold was not removed")
+            else:
+                need(len(before_hold) == 1 and len(after_hold) == 1,
+                     "the mismatched hold is not exactly one durable row")
+                need(after_hold[0] == dict(before_hold[0], storage_tenant_id=case.wrong_value),
+                     "the hold locator was not changed to the intended tenant")
+                need(after_hold[0]["storage_tenant_id"] != before_hold[0]["storage_tenant_id"],
+                     "the hold locator was not changed")
     else:
         removed = registration_role(case.statement)
         kept = set(before) - ({removed} if removed else set(before))
@@ -1224,7 +1300,8 @@ SET_TOKENS = ("canonical_pair_mismatch", "incomplete_pair", "missing_artifacts",
 # Snapshot/root/serving-read rechecks of that same damaged A4 set. They are a
 # real consequence of it, so they may appear as additional summary codes.
 DEPENDENT_TOKENS = ("snapshot_set_mismatch", "snapshot_membership_mismatch", "root_set_mismatch",
-                    "root_pack_set_mismatch", "serving_read_pack_mismatch")
+                    "root_pack_set_mismatch", "serving_read_pack_mismatch", "hold_mismatch",
+                    "owner_scope_mismatch")
 # The CLI's denied-by-policy base refs. They are a local git policy refusal, not
 # a source-ledger violation: a summary naming one is not this validator's line.
 CLI_POLICY_TOKENS = ("private_ref", "hidden_ref", "disallowed_ref", "refspec")

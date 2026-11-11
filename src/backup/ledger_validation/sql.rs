@@ -173,7 +173,7 @@ pub(in crate::backup) const ROOTS: &str =
        FROM public.ref_store_core_roots r
        LEFT JOIN public.ref_store_core_root_packs k
          ON k.repository_id=r.repository_id AND k.root_id=r.root_id AND k.generation=r.generation
-      ORDER BY r.repository_id,r.root_id,k.pack_id";
+      ORDER BY r.repository_id,r.root_id,r.generation,k.pack_id";
 
 pub(in crate::backup) const ROOT_REFS: &str =
     "SELECT repository_id,root_id,generation,ref_name,oid FROM public.ref_store_core_root_refs

@@ -95,10 +95,6 @@ fn pair_artifacts() -> Vec<PairArtifact> {
             sha256: sha(digest),
             length,
             tenant_id: TENANT,
-            authority_id: AUTH,
-            generation: 3,
-            attempt_id: attempt,
-            namespace: "core-pack".into(),
             repository_id: REPO,
             pack_id: PACK,
             request: Some(RequestRow { repository_id: REPO, tenant_id: TENANT, owner_id: PRODUCER }),
@@ -128,16 +124,17 @@ fn pair_artifacts() -> Vec<PairArtifact> {
 
 fn registered(artifact: &PairArtifact) -> Result<RegisteredArtifact, ()> {
     let sha = ContentDigest::parse(artifact.sha256.clone()).map_err(|_| ())?;
+    let hold = artifact.hold.as_ref().ok_or(())?;
     RegisteredArtifact::new(
         PackArtifactRole::parse(&artifact.role).unwrap(),
         artifact.slot,
         artifact.hold_id,
         ArtifactLocator::new(
             artifact.tenant_id,
-            artifact.authority_id,
-            artifact.generation,
-            artifact.attempt_id,
-            artifact.namespace.clone(),
+            hold.authority_id,
+            hold.generation,
+            hold.attempt_id,
+            hold.namespace.clone(),
             sha.clone(),
             artifact.length,
         )

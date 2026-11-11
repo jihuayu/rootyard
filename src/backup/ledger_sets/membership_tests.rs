@@ -55,7 +55,6 @@ fn a_membership_only_pair_must_be_the_canonical_a4_set() {
     // A locator and its hold that agree with each other but not with the stored
     // digest are refused the same way.
     let mut artifacts = base_artifacts();
-    artifacts[0].generation = 4;
     artifacts[0].hold.as_mut().unwrap().generation = 4;
     let mut moved = membership_only(&[pair(artifacts)]);
     relabel(&mut moved, &valid.declared[0].publication.as_ref().unwrap().digest.clone());

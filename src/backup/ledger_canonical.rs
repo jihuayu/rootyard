@@ -26,12 +26,16 @@ pub(super) fn canonical(pair: &DeclaredPair) -> Result<(RegisteredPack, Canonica
         .map(|artifact| {
             let sha = content_digest(&artifact.sha256).map_err(|_| "invalid artifact digest")?;
             let role = PackArtifactRole::parse(&artifact.role).map_err(|_| "invalid artifact role")?;
+            // The authority locator lives only on the durable hold row (the
+            // artifact table stores no authority/generation/attempt columns).
+            // A missing hold is therefore an unrebuildable set, never a panic.
+            let hold = artifact.hold.as_ref().ok_or("missing artifact hold")?;
             let locator = ArtifactLocator::new(
                 artifact.tenant_id,
-                artifact.authority_id,
-                artifact.generation,
-                artifact.attempt_id,
-                artifact.namespace.clone(),
+                hold.authority_id,
+                hold.generation,
+                hold.attempt_id,
+                hold.namespace.clone(),
                 sha.clone(),
                 artifact.length,
             )

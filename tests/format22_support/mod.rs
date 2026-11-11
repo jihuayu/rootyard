@@ -9,9 +9,6 @@
 //! serves the production router in process so the owner grants the producer its
 //! collaborator role over the real `POST /api/repos/{owner}/{name}/collaborators`
 //! route instead of a SQL grant.
-#![allow(clippy::too_many_arguments)]
-#![allow(dead_code)]
-
 pub mod digest_vectors;
 pub mod http;
 pub mod marker;
@@ -20,12 +17,10 @@ pub mod repo;
 pub mod roots;
 pub mod seed;
 
-#[path = "../retention_roots_support/db.rs"]
-pub mod db;
-#[path = "../retention_roots_support/git.rs"]
-pub mod git;
-#[path = "../retention_roots_support/pack.rs"]
-pub mod pack;
+// These three shared fixture modules are a superset of what this binary uses;
+// the retention-root suites exercise the rest. Re-export the shared wrapper's
+// modules so this fixture keeps its existing `super::{db,git,pack}` paths.
+pub use crate::retention_roots_support::{db, git, pack};
 
 use anyhow::Result;
 

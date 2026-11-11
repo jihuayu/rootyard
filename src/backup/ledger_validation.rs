@@ -9,8 +9,9 @@
 //!
 //! The reads are deliberately independent of the artifact rows:
 //!
-//! 1. the deployed realm of every `pg_refstore` repository (serving binding and
-//!    core gate must agree with each other and with the repository owner);
+//! 1. the deployed realm of every `pg_refstore` repository: its serving binding
+//!    and core gate must agree with each other on tenant/owner, object format
+//!    and epochs (the repository row only enumerates that binding/gate pair);
 //! 2. every declared set row (membership, A5 snapshot packs, retained root
 //!    packs, serving read leases) with its publication, the actual repository
 //!    and core gate tenants, its artifacts, the acquire request, the durable
@@ -213,10 +214,6 @@ pub(super) fn decode_declared(rows: &[tokio_postgres::Row]) -> Result<Vec<Declar
             tenant_id: row.get(29),
             repository_id: row.get(30),
             pack_id: row.get(31),
-            authority_id: row.get(42),
-            generation: row.get(43),
-            attempt_id: row.get(44),
-            namespace: row.get(45),
             request: row.get::<_, Option<Uuid>>(32).map(|_| RequestRow {
                 repository_id: row.get(33),
                 tenant_id: row.get(34),
@@ -345,14 +342,17 @@ fn decode_roots(
 ) -> Result<Vec<RootCapture>> {
     let mut roots: Vec<RootCapture> = Vec::new();
     for row in rows {
-        let id: (Uuid, Uuid) = (row.get(0), row.get(1));
-        let owned = |r: &tokio_postgres::Row| r.get::<_, Uuid>(0) == id.0 && r.get::<_, Uuid>(1) == id.1;
-        let generation: i64 = row.get(2);
-        if roots.last().map(|root| (root.repository_id, root.root_id)) != Some(id) {
+        let key: (Uuid, Uuid, i64) = (row.get(0), row.get(1), row.get(2));
+        // The decode key includes the generation so a corrupt second generation
+        // for one `(repository_id, root_id)` stays a separate capture instead of
+        // being folded into the first one and disappearing before the ledger can
+        // refuse it in `root_lifetime`.
+        let owned = |r: &tokio_postgres::Row| (r.get::<_, Uuid>(0), r.get::<_, Uuid>(1), r.get::<_, i64>(2)) == key;
+        if roots.last().map(|root| (root.repository_id, root.root_id, root.generation)) != Some(key) {
             roots.push(RootCapture {
-                repository_id: id.0,
-                root_id: id.1,
-                generation,
+                repository_id: key.0,
+                root_id: key.1,
+                generation: key.2,
                 tenant_id: row.get(3),
                 owner_id: row.get(14),
                 purpose: row.get(15),

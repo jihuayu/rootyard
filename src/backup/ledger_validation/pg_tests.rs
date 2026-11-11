@@ -256,3 +256,36 @@ async fn mismatched_hold_locator_and_slot_are_refused() -> Result<()> {
     }
     Ok(())
 }
+
+/// The durable hold is LEFT JOINed, so deleting it makes every `h.*` column
+/// NULL. The decoder must fail closed with the typed ledger refusal instead of
+/// calling `Row::get` for a non-Option locator column.
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL seeded by ref_store_format22_backup_fixture"]
+async fn deleted_hold_row_is_refused_without_panicking() -> Result<()> {
+    let registration = registered_pack().await?;
+    assert_refused(
+        "DELETE FROM public.artifact_holds h
+           WHERE h.hold_id IN (SELECT hold_id FROM public.ref_store_core_pack_artifacts
+                                WHERE registration_id=$1 AND role='pack')",
+        registration,
+        "hold_mismatch",
+    )
+    .await
+}
+
+/// A tampered `request_id` breaks the hold's join key on the LEFT JOIN exactly
+/// like a missing row, yielding NULL `h.*` columns for every locator field.
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL seeded by ref_store_format22_backup_fixture"]
+async fn repointed_hold_request_id_is_refused_without_panicking() -> Result<()> {
+    let registration = registered_pack().await?;
+    assert_refused(
+        "UPDATE public.artifact_holds h SET request_id=gen_random_uuid()
+           WHERE h.hold_id IN (SELECT hold_id FROM public.ref_store_core_pack_artifacts
+                                WHERE registration_id=$1 AND role='pack')",
+        registration,
+        "hold_mismatch",
+    )
+    .await
+}

@@ -360,6 +360,8 @@ class WorkflowWiringTest(unittest.TestCase):
             "missing_idx",
             "missing_all_artifacts",
             "wrong_artifact_set_digest",
+            "missing_hold",
+            "mismatched_hold_locator",
             "post_backup_acknowledged_write_excluded",
             "fresh_database_restore_clone_refs_content_fsck",
             "restored_exact_receive_replay_without_second_effect",
@@ -367,21 +369,32 @@ class WorkflowWiringTest(unittest.TestCase):
         )
         self.assertEqual(names, expected)
         # Every corruption callback the harness advertises is one of the cases,
-        # and the four issue-#169 negatives are exactly the advertised set.
+        # and the six issue-#169 negatives are exactly the advertised set.
         callbacks = re.search(r'^CORRUPTION_CALLBACKS = \{(.*?)^\}', harness, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(callbacks)
         advertised = tuple(re.findall(r'^\s+"([a-z0-9_]+)":\s*"([a-z0-9_]+)",?$', callbacks.group(1),
                                       re.MULTILINE))
         self.assertEqual(tuple(name for name, _ in advertised),
-                         ("missing_pack", "missing_idx", "missing_all_artifacts", "wrong_artifact_set_digest"))
+                         ("missing_pack", "missing_idx", "missing_all_artifacts", "wrong_artifact_set_digest",
+                          "missing_hold", "mismatched_hold_locator"))
         self.assertEqual(tuple(callback for _, callback in advertised),
                          ("corrupt_source_missing_pack_refused_before_publication",
                           "corrupt_source_missing_idx_refused_before_publication",
                           "corrupt_source_missing_all_artifacts_refused_before_publication",
-                          "corrupt_source_wrong_artifact_set_digest_refused_before_publication"))
+                          "corrupt_source_wrong_artifact_set_digest_refused_before_publication",
+                          "corrupt_source_missing_hold_refused_before_publication",
+                          "corrupt_source_mismatched_hold_locator_refused_before_publication"))
         self.assertIn('"skips": 0', harness)
         # The drill's own help keeps naming the same two-feature profile.
         self.assertIn(f"--features {FIXTURE_FEATURES} --no-default-features", harness)
+
+    def test_workflow_runs_the_seeded_ledger_validation_pg_tests(self) -> None:
+        runs = [self._continued(index) for index, line in enumerate(self.lines)
+                if "backup::ledger_validation::pg_tests" in line]
+        self.assertEqual(len(runs), 1, "the workflow must run the seeded pg_tests suite exactly once")
+        self.assertIn("cargo test --locked --lib --features pando-lab "
+                      "backup::ledger_validation::pg_tests", runs[0])
+        self.assertIn("-- --ignored --test-threads=1", runs[0])
 
     def test_ci_discovers_the_issue169_tests_and_runs_the_native_drill(self) -> None:
         # ci.yml's full unittest discovery is what executes the static #169

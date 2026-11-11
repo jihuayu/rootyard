@@ -31,9 +31,17 @@ pub(super) fn check_heads(
     roots: &[RootCapture],
     declared: &[DeclaredPair],
 ) -> Vec<String> {
-    let captures: BTreeMap<(Uuid, Uuid), &RootCapture> =
-        roots.iter().map(|root| ((root.repository_id, root.root_id), root)).collect();
+    let mut captures: BTreeMap<(Uuid, Uuid), &RootCapture> = BTreeMap::new();
     let mut lines = Vec::new();
+    for root in roots {
+        let key = (root.repository_id, root.root_id);
+        // A (repository, root) key owns exactly one generation-1 capture. A
+        // duplicate key is corruption, never a later row silently replacing the
+        // one that was already seen.
+        if captures.insert(key, root).is_some() {
+            lines.push(format!("root_capture_mismatch:{}:{}:duplicate_capture", key.0, key.1));
+        }
+    }
     let by_key = |tombstone: &RootTombstone| (tombstone.repository_id, tombstone.root_id);
     for head in heads {
         let key = (head.repository_id, head.root_id);
@@ -192,4 +200,25 @@ fn source_owner(capture: &RootCapture, declared: &[DeclaredPair]) -> Option<()> 
         .find_map(|pack| declared.iter().find(|pair| pair.registration_id == pack.registration_id))
         .and_then(|pair| pair.publication.as_ref())
         .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two capture rows for one `(repository_id, root_id)` key are refused even
+    /// when each row alone would be valid, instead of a later row overwriting
+    /// the earlier one in the lookup map.
+    #[test]
+    fn duplicate_capture_generations_are_refused_instead_of_overwritten() {
+        let mut sets = super::super::ledger_sets_tests::valid_source();
+        let duplicate = sets.roots[0].clone();
+        sets.roots.push(duplicate);
+        let lines = check_heads(&sets.heads, &sets.tombstones, &sets.roots, &sets.declared);
+        let root = &sets.roots[0];
+        assert!(
+            lines.contains(&format!("root_capture_mismatch:{}:{}:duplicate_capture", root.repository_id, root.root_id)),
+            "{lines:?}"
+        );
+    }
 }

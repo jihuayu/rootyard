@@ -10,7 +10,7 @@ product result, not a fixture drift:
   the source-bound fixture's ``--digest-vector`` mode, the rebuild must equal
   ``ArtifactSetDigest::of`` exactly; without it the rebuild is checked against
   its own canonical properties;
-* the corruption plan and its oracle: exactly the four issue-#169 negatives,
+* the corruption plan and its oracle: exactly the six issue-#169 negatives,
   each bound to one API-produced registration, one clone-local privileged
   statement, the exact row/field the clone must prove changed, and the exact
   source-ledger validator violation a backup may refuse with (any other
@@ -120,15 +120,21 @@ class CorruptionPlanTest(unittest.TestCase):
         scopes = scope_pairs([first, second])
         return support.corruption_plan([second, first], [second, first], scopes, pairs, digests), first
 
-    def test_plan_is_exactly_the_four_issue_negatives(self):
+    def test_plan_is_exactly_the_six_issue_negatives(self):
         cases, first = self.plan()
         self.assertEqual([case.name for case in cases], list(support.CORRUPTION_CASES))
-        self.assertEqual(len({case.statement for case in cases}), 4)
+        self.assertEqual(len({case.statement for case in cases}), 6)
         for case in cases:
             self.assertIn("'" + first + "'", case.statement, case.name)
             self.assertEqual(case.statement.count("::uuid"), 1, case.name)
-            self.assertTrue(case.statement.startswith(("DELETE FROM public.ref_store_core_pack_artifacts ",
-                                                       "UPDATE public.ref_store_core_pack_publications ")))
+            if case.targets_hold:
+                self.assertTrue(case.statement.startswith(("DELETE FROM public.artifact_holds ",
+                                                           "UPDATE public.artifact_holds ")), case.name)
+                self.assertIn("public.ref_store_core_pack_artifacts", case.statement, case.name)
+            else:
+                self.assertTrue(case.statement.startswith(("DELETE FROM public.ref_store_core_pack_artifacts ",
+                                                           "UPDATE public.ref_store_core_pack_publications ")),
+                                case.name)
             for guarded in (" slot=", " repository_id=", " pack_id=", " tenant_id=", " backend_identity=",
                             " sha256=", " content_length=", " hold_id="):
                 self.assertNotIn(guarded, case.statement, case.name)
@@ -138,6 +144,9 @@ class CorruptionPlanTest(unittest.TestCase):
         self.assertNotIn("role=", by_name["missing_all_artifacts"].statement)
         self.assertIn("SET artifact_set_digest=", by_name["wrong_artifact_set_digest"].statement)
         self.assertIn("artifact_set_digest<>", by_name["wrong_artifact_set_digest"].statement)
+        self.assertIn("DELETE FROM public.artifact_holds", by_name["missing_hold"].statement)
+        self.assertIn("UPDATE public.artifact_holds SET storage_tenant_id='",
+                      by_name["mismatched_hold_locator"].statement)
 
     def test_every_case_is_bound_to_one_registration_and_its_validator_violation(self):
         cases, first = self.plan()
@@ -147,12 +156,17 @@ class CorruptionPlanTest(unittest.TestCase):
         self.assertTrue(all(case.planned and case.registration.digest for case in cases))
         self.assertTrue(all(case.refusal is not None for case in cases))
         self.assertEqual([support.finding(case) for case in cases],
-                         ["artifact:pack", "artifact:idx", "artifact:pack+idx", "publication:artifact_set_digest"])
-        self.assertEqual([case.targets_digest for case in cases], [False, False, False, True])
+                         ["artifact:pack", "artifact:idx", "artifact:pack+idx", "publication:artifact_set_digest",
+                          "hold:pack", "hold:pack:storage_tenant_id"])
+        self.assertEqual([case.targets_digest for case in cases], [False, False, False, True, False, False])
+        self.assertEqual([case.targets_hold for case in cases], [False, False, False, False, True, True])
         self.assertEqual([case.refusal.token for case in cases],
-                         ["incomplete_pair", "incomplete_pair", "missing_artifacts", "declared_set_digest_mismatch"])
-        self.assertNotEqual(cases[-1].wrong_value, cases[0].registration.digest)
+                         ["incomplete_pair", "incomplete_pair", "missing_artifacts", "declared_set_digest_mismatch",
+                          "hold_mismatch", "hold_mismatch"])
+        self.assertNotEqual(cases[3].wrong_value, cases[0].registration.digest)
         self.assertEqual([case.wrong_value for case in cases[:3]], [None, None, None])
+        self.assertIsNone(cases[4].wrong_value)
+        self.assertRegex(cases[5].wrong_value, r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
     def test_plan_skips_a_registration_an_earlier_case_already_damaged(self):
         first, second = sorted((registration_id(), registration_id()))
@@ -217,6 +231,12 @@ class CorruptionPlanTest(unittest.TestCase):
         self.assertEqual(wrong.fingerprint_tables(),
                          ["ref_store_core_pack_artifacts", "ref_store_core_pack_memberships",
                           "ref_store_core_pack_publications"])
+        missing = support.BUILDERS["missing_hold"](target)
+        self.assertEqual(missing.broken_rows, ("artifact_holds",))
+        self.assertIn("ref_store_core_pack_artifacts", missing.requires)
+        mismatched = support.BUILDERS["mismatched_hold_locator"](target, str(uuid.uuid4()))
+        self.assertEqual(mismatched.broken_rows, ("artifact_holds",))
+        self.assertEqual(mismatched.wrong_value, mismatched.statement.split("'")[1])
 
     def test_corruption_sql_is_transaction_local_privileged_and_evidence_producing(self):
         cases, _ = self.plan()
@@ -315,6 +335,12 @@ class CorruptionPlanTest(unittest.TestCase):
                                                                                  cases[3].registration.id,
                                                                                  cases[3].wrong_value),
                       cases[3].statement)
+        self.assertIn("DELETE FROM public.artifact_holds", cases[4].statement)
+        self.assertIn("UPDATE public.artifact_holds SET storage_tenant_id='%s'" % cases[5].wrong_value,
+                      cases[5].statement)
+        for case in cases[4:]:
+            self.assertIn("registration_id='%s'::uuid AND role='pack'" % case.registration.id,
+                          case.statement)
 
     def test_sql_literals_refuse_injection_and_bad_identifiers(self):
         with self.assertRaises(AssertionError):
@@ -424,12 +450,20 @@ def planned_cases():
 
 def oracle_evidence(cases, publication, rows, facts, guarded):
     """Per-case evidence: the state only that case's DML leaves behind."""
+    by_name = {case.name: case for case in cases}
+    missing_hold = [dict(rows["pack"], **{support.HOLD_ROW: []}), rows["idx"]]
+    moved_hold = dict(rows["pack"][support.HOLD_ROW][0],
+                      storage_tenant_id=by_name["mismatched_hold_locator"].wrong_value)
+    mismatched_hold = [dict(rows["pack"], **{support.HOLD_ROW: [moved_hold]}), rows["idx"]]
     states = {
         "missing_pack": ([publication, [rows["idx"]]], 1),
         "missing_idx": ([publication, [rows["pack"]]], 1),
         "missing_all_artifacts": ([publication, []], 2),
-        "wrong_artifact_set_digest": ([dict(publication, artifact_set_digest=cases[3].wrong_value),
+        "wrong_artifact_set_digest": ([dict(publication,
+                                            artifact_set_digest=by_name["wrong_artifact_set_digest"].wrong_value),
                                        list(rows.values())], 1),
+        "missing_hold": ([publication, missing_hold], 1),
+        "mismatched_hold_locator": ([publication, mismatched_hold], 1),
     }
     for case in cases:
         target, changed = states[case.name]
@@ -633,6 +667,12 @@ class CorruptionEvidenceTest(unittest.TestCase):
             mutate("missing_pack", lambda o: o["target"][0].update(pack_id=str(uuid.uuid4())))
         with self.assertRaises(AssertionError):
             mutate("missing_pack", lambda o: o["target"][0].update(artifact_set_digest="77" * 32))
+        with self.assertRaises(AssertionError):
+            mutate("missing_hold",
+                   lambda o: o["target"][1][0].update({support.HOLD_ROW: self.rows["pack"][support.HOLD_ROW]}))
+        with self.assertRaises(AssertionError):
+            mutate("mismatched_hold_locator",
+                   lambda o: o["target"][1][0][support.HOLD_ROW][0].update(storage_tenant_id=str(uuid.uuid4())))
 
     def test_privilege_and_guard_evidence_is_required(self):
         for case, changed, observed in self.expectations():
@@ -698,7 +738,9 @@ class ValidatorRefusalTest(unittest.TestCase):
                          [["canonical_pair_mismatch", "incomplete_pair"],
                           ["canonical_pair_mismatch", "incomplete_pair"],
                           ["canonical_pair_mismatch", "missing_artifacts"],
-                          ["canonical_pair_mismatch", "declared_set_digest_mismatch"]])
+                          ["canonical_pair_mismatch", "declared_set_digest_mismatch"],
+                          ["canonical_pair_mismatch", "hold_mismatch"],
+                          ["canonical_pair_mismatch", "hold_mismatch"]])
 
     def test_multi_code_summaries_admit_only_existing_dependent_codes(self):
         for case in self.cases:
@@ -724,6 +766,8 @@ class ValidatorRefusalTest(unittest.TestCase):
                           "declared_set_digest_mismatch"}, set(support.SET_TOKENS))
         self.assertFalse(set(support.SET_TOKENS) & set(support.DEPENDENT_TOKENS))
         self.assertFalse(set(support.SET_TOKENS + support.DEPENDENT_TOKENS) & set(support.CLI_POLICY_TOKENS))
+        self.assertIn("hold_mismatch", support.DEPENDENT_TOKENS)
+        self.assertIn("owner_scope_mismatch", support.DEPENDENT_TOKENS)
 
     def test_ids_dependent_codes_and_other_are_never_accepted(self):
         for case in self.cases:

@@ -57,10 +57,6 @@ fn pair_artifact(role: &str, slot: i32, hold: Uuid, attempt: Uuid, digest: u8, l
         sha256: sha(digest),
         length,
         tenant_id: TENANT,
-        authority_id: AUTH,
-        generation: 3,
-        attempt_id: attempt,
-        namespace: "core-pack".into(),
         repository_id: REPO,
         pack_id: PACK,
         request: Some(RequestRow { repository_id: REPO, tenant_id: TENANT, owner_id: PRODUCER }),
@@ -96,16 +92,17 @@ fn base_artifacts() -> Vec<PairArtifact> {
 
 fn registered(artifact: &PairArtifact) -> Result<RegisteredArtifact, ()> {
     let sha = ContentDigest::parse(artifact.sha256.clone()).map_err(|_| ())?;
+    let hold = artifact.hold.as_ref().ok_or(())?;
     RegisteredArtifact::new(
         PackArtifactRole::parse(&artifact.role).unwrap(),
         artifact.slot,
         artifact.hold_id,
         ArtifactLocator::new(
             artifact.tenant_id,
-            artifact.authority_id,
-            artifact.generation,
-            artifact.attempt_id,
-            artifact.namespace.clone(),
+            hold.authority_id,
+            hold.generation,
+            hold.attempt_id,
+            hold.namespace.clone(),
             sha.clone(),
             artifact.length,
         )
@@ -131,14 +128,15 @@ fn raw_digest(artifacts: &[PairArtifact]) -> String {
     sorted.sort_by_key(|a| (a.role.clone(), a.slot));
     let mut fields: Vec<Vec<u8>> = vec![(sorted.len() as u64).to_be_bytes().to_vec()];
     for a in &sorted {
+        let hold = a.hold.as_ref().expect("the raw digest needs each artifact hold");
         fields.push(a.role.as_bytes().to_vec());
         fields.push(a.slot.to_be_bytes().to_vec());
         fields.push(a.hold_id.as_bytes().to_vec());
         fields.push(a.tenant_id.as_bytes().to_vec());
-        fields.push(a.authority_id.as_bytes().to_vec());
-        fields.push(a.generation.to_be_bytes().to_vec());
-        fields.push(a.attempt_id.as_bytes().to_vec());
-        fields.push(a.namespace.as_bytes().to_vec());
+        fields.push(hold.authority_id.as_bytes().to_vec());
+        fields.push(hold.generation.to_be_bytes().to_vec());
+        fields.push(hold.attempt_id.as_bytes().to_vec());
+        fields.push(hold.namespace.as_bytes().to_vec());
         fields.push(a.sha256.as_bytes().to_vec());
         fields.push(a.length.to_be_bytes().to_vec());
         fields.push(a.provider.as_bytes().to_vec());
@@ -424,7 +422,13 @@ fn a_hold_with_another_tenant_is_refused_even_with_a_synced_digest() {
 fn a_missing_hold_or_receipt_is_refused() {
     let mut missing_hold = base_artifacts();
     missing_hold[0].hold = None;
-    assert_refused(&check_declared(&[pair(missing_hold)]), "hold_mismatch");
+    let declared = pair(missing_hold);
+    let lines = check_declared(std::slice::from_ref(&declared));
+    assert_refused(&lines, "hold_mismatch");
+    // The row can no longer be rebuilt canonically and its decoded scope has no
+    // hold, but the checks still fail closed instead of reading a NULL column.
+    assert_refused(&lines, "canonical_pair_mismatch");
+    assert_refused(&lines, "owner_scope_mismatch");
     let mut missing_receipt = base_artifacts();
     missing_receipt[1].receipt = false;
     assert_refused(&check_declared(&[pair(missing_receipt)]), "missing_receipt");

@@ -128,11 +128,13 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     // export, the inventory reads and the RefStore carry; never restarted.
     let until = tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600));
     let (blob_closure, blob_artifacts) = if format == FORMAT_PAIRED {
-        // Fail closed before a single byte is exported: every registration a
-        // live membership, retained snapshot/root (active or released) or
-        // serving read still declares must have its exact pack/idx pair, hold
-        // binding and recomputed digest, or the archive is refused. This runs
-        // on the exported-snapshot transaction above, not on a second snapshot.
+        // Fail closed after the metadata dump, volume copy and Pando closure
+        // have been staged, but before the Blob closure export, manifest write
+        // and COMPLETE publication: every registration a live membership,
+        // retained snapshot/root (active or released) or serving read still
+        // declares must have its exact pack/idx pair, hold binding and
+        // recomputed digest, or the archive is refused. This runs on the
+        // exported-snapshot transaction above, not on a second snapshot.
         ledger_validation::validate_source(&tx, until).await.context("source artifact ledger cannot be archived")?;
         // Missing scope or an unsupported backend is an explicit refusal, never
         // a silently byte-less archive.

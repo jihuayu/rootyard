@@ -242,10 +242,6 @@ fn hold_matches(repository_id: Uuid, artifact: &PairArtifact) -> bool {
             && hold.backend_identity == artifact.backend_identity
             && hold.sha256 == artifact.sha256
             && hold.length == artifact.length
-            && hold.authority_id == artifact.authority_id
-            && hold.generation == artifact.generation
-            && hold.attempt_id == artifact.attempt_id
-            && hold.namespace == artifact.namespace
     })
 }
 

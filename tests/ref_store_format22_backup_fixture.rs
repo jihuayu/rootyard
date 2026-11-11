@@ -34,6 +34,12 @@ fn main() {
     }
 }
 
+// The shared retention-root fixture modules are a superset of what this binary
+// uses; the retention-root suites exercise the rest. Declare the directory's
+// own module file so its shared dead-code/clippy suppressions apply unchanged.
+#[path = "retention_roots_support/mod.rs"]
+mod retention_roots_support;
+
 // Module path is explicit: the modules live in the `format22_support/` directory.
 #[path = "format22_support/mod.rs"]
 mod format22_support;

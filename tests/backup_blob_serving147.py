@@ -9,9 +9,10 @@ rebuild them from the archive at unchanged locators before clone/fsck/replay.
 Product GC stays disabled. This is fresh PG/Blob functionality, not LFS,
 workspace, interrupted-restore, physical durability or HA qualification.
 
-Issue #169 (corruption hardening + positive format22 roots). The four
+Issue #169 (corruption hardening + positive format22 roots). The six
 dedicated corruption negatives (missing pack, missing idx, missing pack+idx,
-wrong artifact_set_digest) run against their own throw-away `pg_dump` clone of
+wrong artifact_set_digest, missing durable hold, mismatched hold locator) run
+against their own throw-away `pg_dump` clone of
 the API-produced source, while its original Blob objects still exist and before
 the restore case deletes them. Each clone is imported and corrupted inside one
 statement-timeout-bounded transaction whose only privileged act is a
@@ -73,6 +74,8 @@ CORRUPTION_CALLBACKS = {
     "missing_idx": "corrupt_source_missing_idx_refused_before_publication",
     "missing_all_artifacts": "corrupt_source_missing_all_artifacts_refused_before_publication",
     "wrong_artifact_set_digest": "corrupt_source_wrong_artifact_set_digest_refused_before_publication",
+    "missing_hold": "corrupt_source_missing_hold_refused_before_publication",
+    "mismatched_hold_locator": "corrupt_source_mismatched_hold_locator_refused_before_publication",
 }
 assert tuple(CORRUPTION_CALLBACKS) == CORRUPTION_NAMES
 # The corruption negatives run while the original store is complete: before the
@@ -87,6 +90,8 @@ CASES = (
     CORRUPTION_CALLBACKS["missing_idx"],
     CORRUPTION_CALLBACKS["missing_all_artifacts"],
     CORRUPTION_CALLBACKS["wrong_artifact_set_digest"],
+    CORRUPTION_CALLBACKS["missing_hold"],
+    CORRUPTION_CALLBACKS["mismatched_hold_locator"],
     "post_backup_acknowledged_write_excluded",
     "fresh_database_restore_clone_refs_content_fsck",
     "restored_exact_receive_replay_without_second_effect",
@@ -1148,7 +1153,8 @@ class Drill(BlobOnlyHarness):
             self.originals == self.original_locators(), name + ": the API source changed during the clone"
         assert self.ledger_digests(self.source_db) == self.source_rows, name + ": the API source ledgers changed"
         assert self.corruption_base.joinpath("COMPLETE").is_file(), name + ": the clean archive changed"
-        detail = {"case": case.name, "finding": finding(case), "statement_changed": case.targets_digest,
+        detail = {"case": case.name, "finding": finding(case),
+                  "statement_changed": case.targets_digest or case.targets_hold,
                   "breaks": list(case.broken_rows),
                   "clone_dropped": True, "failed_closed": True,
                   "validator_refusal": violation.split("|", 1)[0],
@@ -1192,6 +1198,12 @@ class Drill(BlobOnlyHarness):
 
     def corrupt_source_wrong_artifact_set_digest_refused_before_publication(self):
         return self.corrupt_source_negative("wrong_artifact_set_digest")
+
+    def corrupt_source_missing_hold_refused_before_publication(self):
+        return self.corrupt_source_negative("missing_hold")
+
+    def corrupt_source_mismatched_hold_locator_refused_before_publication(self):
+        return self.corrupt_source_negative("mismatched_hold_locator")
 
     def format22_unavailable(self, reason):
         """Only a missing Root-supplied fixture is an environment gap; every
@@ -1360,6 +1372,8 @@ def main(argv=None):
                    harness.corrupt_source_missing_idx_refused_before_publication,
                    harness.corrupt_source_missing_all_artifacts_refused_before_publication,
                    harness.corrupt_source_wrong_artifact_set_digest_refused_before_publication,
+                   harness.corrupt_source_missing_hold_refused_before_publication,
+                   harness.corrupt_source_mismatched_hold_locator_refused_before_publication,
                    harness.write_after_backup,
                    harness.restore_and_clone, harness.restored_replay,
                    harness.format22_active_released_roots_distinct_producer_roundtrip)

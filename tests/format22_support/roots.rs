@@ -45,19 +45,30 @@ pub fn reference(source: &SourceSnapshot) -> Result<PackSnapshotRef> {
     )?)
 }
 
+pub struct RootRequestIds {
+    pub root_id: Uuid,
+    pub operation_id: Uuid,
+    pub request_id: Uuid,
+}
+
 pub async fn prepare(
     adapter: &PgRetentionRoots,
     pool: &Pool,
     scope: RootsScope,
     source: &SourceSnapshot,
-    root_id: Uuid,
-    operation_id: Uuid,
-    request_id: Uuid,
+    ids: RootRequestIds,
     deadline: Instant,
 ) -> Result<RootCandidate, RootError> {
     let reference =
         reference(source).map_err(|_| RootError::RootSourceChanged("fixture snapshot reference invalid"))?;
-    let request = PrepareRootRequest::new(scope, reference, root_id, operation_id, RootSelector::Snapshot, request_id)?;
+    let request = PrepareRootRequest::new(
+        scope,
+        reference,
+        ids.root_id,
+        ids.operation_id,
+        RootSelector::Snapshot,
+        ids.request_id,
+    )?;
     adapter.prepare(pool, request, deadline).await
 }
 
@@ -71,23 +82,27 @@ pub async fn register(
     adapter.register(pool, RegisterRootRequest::new(candidate, request_id)?, deadline).await
 }
 
+pub struct ReleaseRequest<'a> {
+    pub scope: RootsScope,
+    pub root_id: Uuid,
+    pub request_id: Uuid,
+    pub expected_register_digest: &'a str,
+    pub release_digest: &'a str,
+}
+
 pub async fn release(
     adapter: &PgRetentionRoots,
     pool: &Pool,
-    scope: RootsScope,
-    root_id: Uuid,
-    request_id: Uuid,
-    expected_register_digest: &str,
-    release_digest: &str,
+    request: ReleaseRequest<'_>,
     deadline: Instant,
 ) -> Result<RootReceipt, RootError> {
     let request = ReleaseRootRequest::new(
-        scope,
-        root_id,
+        request.scope,
+        request.root_id,
         1,
-        request_id,
-        expected_register_digest,
-        release_digest,
+        request.request_id,
+        request.expected_register_digest,
+        request.release_digest,
         "operator released retained root",
     )?;
     adapter.release(pool, request, deadline).await

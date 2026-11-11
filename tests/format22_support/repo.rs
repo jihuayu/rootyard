@@ -34,8 +34,8 @@
 use anyhow::{Result, anyhow, ensure};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::core::pack_commit::{
-    AuthorizedCommitMode, PackArtifactRole, PackCommitPlan, PackPendingToken, PgAuthorizedCommit, PgPackCommit,
-    PrepareOutcome, RegisteredArtifact, RegisteredPack,
+    AuthorizedCommitMode, PackArtifactRole, PackCommitPlan, PgAuthorizedCommit, PgPackCommit, PrepareOutcome,
+    RegisteredArtifact, RegisteredPack,
 };
 use rootyard::ref_store::core::{
     CreatePackSnapshotRequest, MetadataPinOutcome, MetadataSnapshotScope, PackReadSnapshot, PackSnapshotExpectation,
@@ -48,7 +48,6 @@ use super::db::{Db, deadline};
 use super::git::{GitRepo, PairFiles};
 use super::pack::{self, Verified};
 use super::pack_plan;
-use super::roots;
 
 /// The pre-existing API repository the format22 packs are registered on.
 pub struct Existing {
@@ -98,51 +97,6 @@ pub async fn open(db: &Db, repo: Uuid, tenant: Uuid, git: &Path) -> Result<(Exis
     let gate = super::db::gate_version(&db.pool, repo, tenant).await?;
     let fixture = GitRepo::new(git.to_path_buf(), gate.object_format()).await?;
     Ok((Existing { tenant, repo, gate }, fixture))
-}
-
-/// `verify_new`'s verified-commit tail for the *first* pack on an existing
-/// repository (main absent -> `refs/heads/main`), with an explicit producer
-/// owner. The shared `closure`/`prove`/`commit` calls are used unchanged.
-pub async fn finish_pair(
-    db: &Db,
-    store: &BlobStore,
-    git: &Path,
-    draft: &pack_plan::Draft,
-    files: &PairFiles,
-) -> Result<Vec<RegisteredPack>> {
-    let pack_id = draft.plan.packs().first().ok_or_else(|| anyhow!("plan has no pack"))?.pack_id();
-    let publication = pack_plan::publish(db, store, &draft.plan, files).await?;
-    pack_plan::register(db, &draft.plan, pack_id, &publication).await?;
-    let context = pack::closure(db, &draft.plan).await?;
-    ensure!(context.new_packs().len() == 1 && context.old_packs().is_empty(), "first closure is not one new pack");
-    let proof = pack::prove(store, git, &draft.plan, &context).await?;
-    let receipt = pack::commit(db, &draft.plan, &draft.token, &proof).await?;
-    ensure!(receipt.is_committed() && !receipt.replayed, "fresh verified commit did not commit");
-    let gate = super::db::gate_version(&db.pool, draft.plan.repository_id(), draft.plan.tenant_id()).await?;
-    ensure!(gate.revision() == receipt.terminal.revision, "gate after commit differs");
-    Ok(context.new_packs().to_vec())
-}
-
-/// `verify_advance`'s verified-commit tail (one more pack advancing `main`),
-/// with an explicit producer owner.
-pub async fn advance_pair(
-    db: &Db,
-    store: &BlobStore,
-    git: &Path,
-    draft: &pack_plan::Draft,
-    files: &PairFiles,
-) -> Result<Vec<RegisteredPack>> {
-    let pack_id = draft.plan.packs().first().ok_or_else(|| anyhow!("plan has no pack"))?.pack_id();
-    let publication = pack_plan::publish(db, store, &draft.plan, files).await?;
-    pack_plan::register(db, &draft.plan, pack_id, &publication).await?;
-    let context = pack::closure(db, &draft.plan).await?;
-    ensure!(context.new_packs().len() == 1, "advance closure is not one new pack");
-    let proof = pack::prove(store, git, &draft.plan, &context).await?;
-    let receipt = pack::commit(db, &draft.plan, &draft.token, &proof).await?;
-    ensure!(receipt.is_committed() && !receipt.replayed, "advance verified commit did not commit");
-    let gate = super::db::gate_version(&db.pool, draft.plan.repository_id(), draft.plan.tenant_id()).await?;
-    ensure!(gate.revision() == receipt.terminal.revision, "advanced gate revision differs");
-    Ok(context.new_packs().to_vec())
 }
 
 /// `finish_pair`/`advance_pair`'s upload tail through the decision-gated
@@ -414,17 +368,4 @@ pub async fn registration_badges(
         });
     }
     Ok(out)
-}
-
-/// Pin a draft so its lifetime is explicit: the token is consumed exactly once.
-pub fn single(draft: pack_plan::Draft) -> (PackCommitPlan, PackPendingToken) {
-    (draft.plan, draft.token)
-}
-
-/// Shared root scope for the producer (root owner) of one repository.
-pub fn root_scope(
-    existing: &Existing,
-    producer: Uuid,
-) -> Result<rootyard::ref_store::core::retention_root::RootsScope> {
-    roots::producer_scope(existing.repo, existing.tenant, producer, &existing.gate)
 }

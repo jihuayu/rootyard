@@ -74,10 +74,6 @@ pub(in crate::backup) struct PairArtifact {
     pub length: u64,
     /// Locator tenant of the artifact row: the actual repository tenant.
     pub tenant_id: Uuid,
-    pub authority_id: Uuid,
-    pub generation: i64,
-    pub attempt_id: Uuid,
-    pub namespace: String,
     /// The artifact row's own repository and pack. Neither is part of the
     /// locator digest, so each is checked directly against the declared key.
     pub repository_id: Uuid,
