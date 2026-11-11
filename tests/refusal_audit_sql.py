@@ -9,80 +9,74 @@ Every SQL *value* comes from ``BrowseHarness._sql_literal``, which only escapes
 (``'`` -> ``''``) and adds no delimiters: ``literal(value)`` wraps that escaped
 result in single quotes, so a value can never become a SQL expression.
 """
+import collections
 import json
 import re
 import time
 
 # The durable operation evidence written by the receive-pack path
-# (``src/reliability.rs``).  ``finished`` and ``storage_generation_matches``
-# are JSON booleans there and are projected with ``->`` so the interval JSON
-# keeps them as booleans end to end.  ``interrupted`` and
-# ``ungranted_without_hooks`` are the schema-backed text flags (the same text
-# ``tests/pat_git_publication_fence.py`` and ``tests/independent_refs.py`` read
-# with ``->>``).  A JSON ``null`` receipt is absence; a missing key is not.
-EVIDENCE_TEXT_KEYS = ("interrupted", "ungranted_without_hooks")
-EVIDENCE_BOOL_KEYS = ("finished", "storage_generation_matches")
-EVIDENCE_KEYS = (*EVIDENCE_BOOL_KEYS, *EVIDENCE_TEXT_KEYS)
+# (``src/reliability.rs``).  All four keys are Rust ``bool`` values serialized
+# directly by ``serde_json::json!``, so they are JSON booleans end to end: the
+# interval query projects every one with ``->`` and the decoder requires bool.
+# Two of them are also *proof* facts that must be exactly ``true`` for a valid
+# refusal (``EVIDENCE_REQUIRED_TRUE_KEYS``); the other two are recorded facts
+# and either boolean is accepted.  A JSON ``null`` receipt is absence; a
+# missing boolean key surfaces as ``EVIDENCE_MISSING_BOOL``, never as false.
+EVIDENCE_BOOL_KEYS = ("finished", "storage_generation_matches", "interrupted",
+                      "ungranted_without_hooks")
+EVIDENCE_REQUIRED_TRUE_KEYS = ("finished", "storage_generation_matches")
+EVIDENCE_KEYS = EVIDENCE_BOOL_KEYS
 
 # A missing boolean key stays absent as the JSON string ``"missing"``, which the
 # decoder and contract both reject: absence is never mistaken for ``false``.
 EVIDENCE_MISSING_BOOL = "'\"missing\"'::jsonb"
+# ``reference_events`` is always a ``Vec<HookEvent>`` (``src/reliability.rs``
+# serializes ``journal::events()`` directly).  A missing key keeps the same
+# non-array sentinel, so it fails the decoder instead of reading as no changes.
+EVIDENCE_MISSING_ARRAY = EVIDENCE_MISSING_BOOL
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
+# Outbox OIDs are the schema's lowercase 40- or 64-hex strings of one length
+# (``old_oid``/``new_oid`` CHECKs in migration 002, equal-length CHECK).
+_OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
-def audit_where(repo, actor, token):
-    """One joined row: the operation carries this run's actor and token, and its admission agrees.
 
-    ``repo``/``actor``/``token`` are complete SQL literals (``literal(...)``).
-    The predicate is equality against exactly one identity: there is no lookup,
-    no aggregation and no role inference, and no matching row is a failure.
+def zero_oid_like(oid):
+    """The all-zero OID of ``oid``'s object format (an absent ref's value)."""
+    return "0" * len(oid)
+
+
+def event_transition(event):
+    """``(ref_name, old_oid, new_oid)`` of one validated outbox event object."""
+    return event["ref_name"], event["old_oid"], event["new_oid"]
+
+
+def physical_transition(value, event, creating):
+    """One side of a physical move, normalized to the zero OID when absent.
+
+    ``value`` is the ref's OID on that side or None when the ref does not exist
+    there.  ``creating`` says whether this side is the *old* side, which
+    decides a create (absent old) from a delete (absent new) so the absent side
+    is paired with the zero of the other, event-sourced OID's format.
     """
-    return ("o.actor_id=" + actor + "::uuid AND o.token_id=" + token + "::uuid AND o.repository_id=" + repo
-            + " AND a.actor_id=o.actor_id AND a.token_id=o.token_id AND a.repository_id=o.repository_id")
+    if value is not None:
+        return value
+    return zero_oid_like(event["new_oid"] if creating else event["old_oid"])
 
 
-def audit_pairs(repo, refs, same):
-    """``jsonb_build_object`` key/expression pairs for the newest row.
+def observed_transition(before_refs, after_refs, name, event):
+    """The physical ``(old, new)`` move of ``name``, or None if it did not change.
 
-    ``refs`` are SQL literals of the pushed ref names (already sorted);
-    ``same`` is ``audit_where``.  The SQL ``status`` only says settled/pending/
-    missing; the judge re-derives every field so a bad invariant can never read
-    as pending.
+    An absent side normalizes to the zero OID of the *other* (present,
+    event-sourced) side's format: creating a ref is zero -> new, deleting it is
+    old -> zero.  Both sides zero (an all-zero event) is nil, never a move.
     """
-    return [
-        ("status", "CASE WHEN o.id IS NULL THEN 'missing' WHEN o.outcome='no_ref_changes' "
-                         "AND o.settled_at IS NOT NULL AND a.state='ABORTED' AND " + same
-                         + " THEN 'settled' ELSE 'pending' END"),
-        ("created_at", "coalesce(o.created_at::text, '')"),
-        ("outcome", "coalesce(o.outcome, '')"), ("settled", "o.settled_at IS NOT NULL"),
-        ("aborted", "coalesce(a.state='ABORTED', false)"), ("repository_matches", same),
-        ("ref_names", "coalesce(to_jsonb(a.ref_names), '[]'::jsonb)"),
-        # The admission stores the sorted set; compare it to the same sorted set.
-        ("refs_exactly", "coalesce(a.ref_names=ARRAY[" + ",".join(refs) + "]::text[], false)"),
-        # A JSON null is not absence: ``-> ... IS NULL`` is also true for a
-        # missing key, so the receipt must be absent by both tests.
-        ("no_receipt", "o.evidence->'post_receive' IS NULL OR o.evidence->'post_receive'='null'::jsonb"),
-        *((key, "coalesce(o.evidence->>'" + key + "', 'missing')") for key in EVIDENCE_KEYS),
-        ("events", "coalesce((SELECT count(*) FROM outbox_events x WHERE x.operation_id=o.id), 0)"),
-        ("admitted_now", "EXISTS (SELECT 1 FROM git_ref_admissions w WHERE w.repository_id=" + repo
-                         + " AND w.state='ADMITTED')"),
-        ("newer", "EXISTS (SELECT 1 FROM git_operations y WHERE y.repository_id=" + repo
-                  + " AND y.sequence>o.sequence)"),
-        ("reference_events", "coalesce(o.evidence->'reference_events', '[]'::jsonb)")]
-
-
-def audit_query(pairs, repo, literal):
-    """One statement: the newest operation row joined to its admission, as JSON.
-
-    ``repo`` is a complete SQL literal; ``literal`` is ``_sql_literal``, wrapped
-    in quotes here, and builds both the ``jsonb_build_object`` keys and the
-    repository predicate.  The key expression is not a value the helper escapes.
-    """
-    obj = "jsonb_build_object(" + ",".join(literal(key) + ", " + expression for key, expression in pairs) + ")"
-    return ("SELECT " + obj + "::text FROM git_operations o LEFT JOIN git_ref_admissions a ON a.writer_id=o.id "
-            "WHERE o.id=coalesce((SELECT o.id FROM git_operations o WHERE o.repository_id=" + repo
-            + " ORDER BY o.sequence DESC LIMIT 1), '00000000-0000-0000-0000-000000000000')")
+    if name not in before_refs and name not in after_refs:
+        return None
+    old = physical_transition(before_refs.get(name), event, creating=True)
+    new = physical_transition(after_refs.get(name), event, creating=False)
+    return old, new
 
 
 def operation_highwater_query(repo_id, escape):
@@ -131,13 +125,13 @@ def operations_after_query(repo_id, sequence, actor_id, token_id, escape):
             "(COALESCE(o.evidence->'post_receive' IS NULL"
             " OR o.evidence->'post_receive' = 'null'::jsonb, false))",
             "'interrupted'",
-            "(COALESCE(o.evidence->>'interrupted', 'missing'))",
+            "(COALESCE(o.evidence->'interrupted', " + EVIDENCE_MISSING_BOOL + "))",
             "'storage_generation_matches'",
             "(COALESCE(o.evidence->'storage_generation_matches', " + EVIDENCE_MISSING_BOOL + "))",
             "'ungranted_without_hooks'",
-            "(COALESCE(o.evidence->>'ungranted_without_hooks', 'missing'))",
+            "(COALESCE(o.evidence->'ungranted_without_hooks', " + EVIDENCE_MISSING_BOOL + "))",
             "'reference_events'",
-            "(COALESCE(o.evidence->'reference_events', '[]'::jsonb))",
+            "(COALESCE(o.evidence->'reference_events', " + EVIDENCE_MISSING_ARRAY + "))",
             "'admission_present'", "(COALESCE(a.writer_id IS NOT NULL, false))",
             "'admission_state'", "a.state",
             "'admission_settled'", "(COALESCE(a.settled_at IS NOT NULL, false))",
@@ -152,6 +146,13 @@ def operations_after_query(repo_id, sequence, actor_id, token_id, escape):
             "COALESCE((SELECT jsonb_agg(e.ref_name ORDER BY e.transaction_sequence, e.ref_name)"
             " FROM outbox_events e WHERE e.operation_id = o.id AND e.ref_name IS NOT NULL),"
             " '[]'::jsonb)",
+            # The exact OID transition each outbox event recorded: a service
+            # event may only explain a physical ref move that matches it.
+            "'outbox_events'",
+            "COALESCE((SELECT jsonb_agg(jsonb_build_object('ref_name', e.ref_name,"
+            " 'old_oid', e.old_oid, 'new_oid', e.new_oid)"
+            " ORDER BY e.transaction_sequence, e.ref_name)"
+            " FROM outbox_events e WHERE e.operation_id = o.id), '[]'::jsonb)",
         ]
     )
 
@@ -264,18 +265,18 @@ def evidence_problems(evidence):
     """Keys of a mapping whose evidence value does not have its schema type.
 
     Callers pass the complete evidence mapping (or a complete row): every key
-    in both ``EVIDENCE_KEYS`` tuples is required, so a partial subset mapping
-    is reported as missing the keys it does not carry.
+    in ``EVIDENCE_KEYS`` is required, so a partial subset mapping is reported
+    as missing the keys it does not carry.  All four values are JSON booleans;
+    the proof keys must be exactly ``True``.
     """
     if not isinstance(evidence, dict):
         return list(EVIDENCE_KEYS)
     problems = []
     for key in EVIDENCE_BOOL_KEYS:
-        if evidence.get(key) is not True:
-            problems.append(key)
-    for key in EVIDENCE_TEXT_KEYS:
         value = evidence.get(key)
-        if not (isinstance(value, str) and value in ("true", "false")):
+        if not isinstance(value, bool):
+            problems.append(key)
+        elif key in EVIDENCE_REQUIRED_TRUE_KEYS and value is not True:
             problems.append(key)
     return problems
 
@@ -283,11 +284,12 @@ def evidence_problems(evidence):
 def assert_evidence_contract(label, evidence):
     """The refusal receipt keys, typed exactly as the server stores them.
 
-    ``finished``/``storage_generation_matches`` must be the JSON boolean
-    ``True`` (``"true"`` as a string, ``1`` or a missing key all fail).
-    ``interrupted``/``ungranted_without_hooks`` are the text flags and must be
-    present as ``"true"`` or ``"false"``.  ``refusal_audit_verdict`` uses the
-    same two key tuples, so SQL, decoder, verdict and this contract agree.
+    All four keys are JSON booleans.  ``finished``/``storage_generation_matches``
+    must be exactly ``True`` for a valid refusal (``false``, ``"true"`` as a
+    string, ``1`` or a missing key all fail).  ``interrupted``/
+    ``ungranted_without_hooks`` accept either boolean (a string, an integer,
+    null or a missing key fails).  ``refusal_audit_verdict`` uses the same key
+    tuples, so SQL, decoder, verdict and this contract agree.
     """
     if not isinstance(evidence, dict):
         raise AssertionError(f"{label}: folded evidence must be an object, got {type(evidence).__name__}")
@@ -309,6 +311,51 @@ def fold_operation_evidence(audit, operations):
             f"found {len(matching)}"
         )
     return {key: matching[0][key] for key in EVIDENCE_KEYS}
+
+
+def service_allow_map(label, events):
+    """``{ref_name: event}`` for validated service events; duplicates fail closed.
+
+    Two service events for one ref name inside an interval are ambiguous: the
+    physical move cannot be attributed to one transition, so it is refused
+    rather than resolved by picking one.
+    """
+    allowed = {}
+    for event in events:
+        name = event["ref_name"]
+        if name in allowed:
+            raise AssertionError(
+                f"{label}: duplicate validated service outbox events for ref {name!r} "
+                f"in one interval: {[dict(allowed[name]), dict(event)]!r}")
+        allowed[name] = event
+    return allowed
+
+
+def check_service_ref_transitions(label, before_refs, after_refs, allowed, requested):
+    """Every physical change must be exactly a validated service event's move.
+
+    Requested refs never move; an unchanged ref need not materialize an event;
+    a changed ref whose before/after OIDs are not the event's ``old_oid`` /
+    ``new_oid`` (an absent side being the zero OID of the event's format) is an
+    out-of-band overwrite and fails.
+    """
+    for name in sorted(set(before_refs) | set(after_refs)):
+        if before_refs.get(name) == after_refs.get(name):
+            continue
+        if name in requested:
+            raise AssertionError(
+                f"{label}: requested ref {name!r} changed during the refusal: "
+                f"before={before_refs.get(name)!r}, after={after_refs.get(name)!r}")
+        event = allowed.get(name)
+        if event is None:
+            raise AssertionError(
+                f"{label}: ref {name!r} changed without a validated service outbox event "
+                f"(validated service refs: {sorted(allowed)!r})")
+        observed = observed_transition(before_refs, after_refs, name, event)
+        if observed != event_transition(event)[1:]:
+            raise AssertionError(
+                f"{label}: ref {name!r} moved out of band: observed {observed!r}, but the "
+                f"validated service event {name!r} recorded {event_transition(event)[1:]!r}")
 
 
 def refusal_audit_verdict(row, journal, refs):
@@ -359,18 +406,22 @@ def refusal_audit_verdict(row, journal, refs):
 
     interrupted = row.get("interrupted")
     ungranted = row.get("ungranted_without_hooks")
-    if interrupted == "true" and ungranted != "true":
+    if interrupted is True and ungranted is not True:
         problems.append("interrupted_ungranted_order")
 
     if not isinstance(journal, list) or journal != []:
         problems.append("journal")
 
+    outbox_events = row.get("outbox_events", [])
+    if not isinstance(outbox_events, list) or outbox_events:
+        # A human refusal publishes nothing: no outbox event object at all.
+        problems.append("outbox_events")
+
     reference_events = row.get("reference_events")
-    if not isinstance(reference_events, (list, dict)):
+    if not isinstance(reference_events, list):
         problems.append("reference_events")
     else:
-        events = [reference_events] if isinstance(reference_events, dict) else reference_events
-        for event in events:
+        for event in reference_events:
             if not isinstance(event, dict) or event.get("changes") != []:
                 problems.append("reference_event_changes")
                 break
@@ -403,22 +454,25 @@ def decode_operation_interval(raw, highwater):
         "admission_ref_names",
         "outbox_count",
         "outbox_ref_names",
+        "outbox_events",
     )
     _ALLOWED = frozenset(_KEY)
 
+    # Every evidence key is a stored JSON boolean; there is no text-key path.
     _BOOL_KEYS = (
         "settled",
-        *EVIDENCE_BOOL_KEYS,
         "actor_and_token_match",
         "human_principal",
         "service_principal",
         "evidence_no_receipt",
+        *EVIDENCE_BOOL_KEYS,
         "admission_present",
         "admission_settled",
         "admission_identity_matches",
     )
 
-    _STR_KEYS = EVIDENCE_TEXT_KEYS
+    # The serialized ``HookPhase`` names (``src/journal/core.rs``).
+    _HOOK_PHASES = ("Preparing", "Prepared", "Committed", "Aborted")
 
     _UUID_RE = re.compile(
         r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
@@ -429,6 +483,47 @@ def decode_operation_interval(raw, highwater):
 
     def _is_str_list(value):
         return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+    def _check_outbox_events(events, names):
+        # Exact event objects with one object format and equal-length OIDs; the
+        # legacy name array is only a projection of the same rows.
+        if not isinstance(events, list):
+            raise ValueError(_ERR)
+        for event in events:
+            if not isinstance(event, dict) or set(event) != {"ref_name", "old_oid", "new_oid"}:
+                raise ValueError(_ERR)
+            if not all(isinstance(event[name], str) for name in ("ref_name", "old_oid", "new_oid")):
+                raise ValueError(_ERR)
+            if _OID_RE.fullmatch(event["old_oid"]) is None or _OID_RE.fullmatch(event["new_oid"]) is None:
+                raise ValueError(_ERR)
+            if len(event["old_oid"]) != len(event["new_oid"]):
+                raise ValueError(_ERR)
+        if sorted(event["ref_name"] for event in events) != sorted(names):
+            raise ValueError(_ERR)
+
+    def _check_reference_events(events):
+        # ``Vec<HookEvent>``: ``ordinal`` int, ``phase`` one of the serialized
+        # HookPhase names, ``changes`` a list of ``RefChange`` objects.  Like
+        # ``src/journal.rs`` (positive, filename-matching ordinals), the
+        # stored array must be exactly the ordered contiguous ``1..N``.
+        if not isinstance(events, list):
+            raise ValueError(_ERR)
+        for index, event in enumerate(events):
+            if not isinstance(event, dict) or set(event) != {"ordinal", "phase", "changes"}:
+                raise ValueError(_ERR)
+            ordinal = event["ordinal"]
+            if not _is_int(ordinal) or ordinal != index + 1:
+                raise ValueError(_ERR)
+            if event["phase"] not in _HOOK_PHASES:
+                raise ValueError(_ERR)
+            changes = event["changes"]
+            if not isinstance(changes, list):
+                raise ValueError(_ERR)
+            for change in changes:
+                if not isinstance(change, dict) or set(change) != {"ref_name", "old_oid", "new_oid"}:
+                    raise ValueError(_ERR)
+                if not all(isinstance(change[name], str) for name in ("ref_name", "old_oid", "new_oid")):
+                    raise ValueError(_ERR)
 
     if not _is_int(highwater) or highwater < 0:
         raise ValueError(_ERR)
@@ -467,9 +562,7 @@ def decode_operation_interval(raw, highwater):
             if not isinstance(row[name], bool):
                 raise ValueError(_ERR)
 
-        for name in _STR_KEYS:
-            if not isinstance(row[name], str):
-                raise ValueError(_ERR)
+        _check_reference_events(row["reference_events"])
 
         admission_state = row["admission_state"]
         if admission_state is not None and not isinstance(admission_state, str):
@@ -484,7 +577,8 @@ def decode_operation_interval(raw, highwater):
         if not _is_int(outbox_count) or outbox_count < 0:
             raise ValueError(_ERR)
 
-        # reference_events is intentionally opaque here.
+        _check_outbox_events(row["outbox_events"], row["outbox_ref_names"])
+
 
         if operation_id in seen_ids:
             raise ValueError(_ERR)
@@ -540,22 +634,26 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
                 f"rootyard-ci job outbox event"
             )
         outbox_refs = row["outbox_ref_names"]
+        events = row["outbox_events"]
         if (
             not isinstance(outbox_refs, list)
             or len(outbox_refs) != 1
             or not isinstance(outbox_refs[0], str)
             or not outbox_refs[0].startswith(ci_prefix)
+            or not isinstance(events, list)
+            or len(events) != 1
+            or events[0].get("ref_name") != outbox_refs[0]
         ):
             raise AssertionError(
                 f"{label}: settled service operation {op_id!r} must link exactly "
-                f"one '{ci_prefix}<job UUID>' outbox event, got {outbox_refs!r}"
+                f"one '{ci_prefix}<job UUID>' outbox event, got {outbox_refs!r} / {events!r}"
             )
-        return outbox_refs[0]
+        return events[0]
 
     def classify(rows):
         human = None
         service_rows = []
-        service_ref_names = set()
+        service_events = []
         by_operation_id = {}
         for row in rows:
             op_id = row["operation_id"]
@@ -569,7 +667,7 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
                 human = row
             elif is_service_row(row):
                 if row["settled"]:
-                    service_ref_names.add(validate_service_row(row))
+                    service_events.append(validate_service_row(row))
                 service_rows.append(row)
             else:
                 raise AssertionError(
@@ -578,7 +676,15 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
                     f"service_principal={row['service_principal']!r}, "
                     f"actor_and_token_match={row['actor_and_token_match']!r}"
                 )
-        return human, service_rows, service_ref_names, by_operation_id
+        # Duplicate job refs are ambiguous: fail closed on the ref name, not on
+        # the per-row event count (the same job may report an idempotent move).
+        for ref_name, count in collections.Counter(
+                event["ref_name"] for event in service_events).items():
+            if count > 1:
+                raise AssertionError(
+                    f"{label}: duplicate validated service outbox events for ref {ref_name!r} "
+                    f"in one interval ({count})")
+        return human, service_rows, service_events, by_operation_id
 
     def check_human_verdict(human_row, journal):
         verdict = refusal_audit_verdict(human_row, journal, requested_refs)
@@ -694,7 +800,7 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
     seen_unmatched = set()
     human = None
     service_rows_seen = []
-    service_ref_names = set()
+    service_events = []
     after = None
 
     while True:
@@ -706,7 +812,7 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
             )
 
         rows = operation_rows_since(highwater)
-        human, service_rows, service_names, by_operation_id = classify(rows)
+        human, service_rows, current_events, by_operation_id = classify(rows)
         current_journal = journal_entries(pending_journal())
         validate_journal_links(current_journal, by_operation_id, seen_unmatched)
 
@@ -714,8 +820,7 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
             human is not None and human["settled"] and not unsettled(service_rows)
         )
         if human_ready:
-            service_rows_seen = service_rows
-            service_ref_names = set(service_names)
+            service_rows_seen, service_events = service_rows, list(current_events)
 
         if human_ready and not current_journal:
             after_candidate = ref_state()
@@ -731,7 +836,7 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
             (
                 reread_human,
                 reread_service,
-                reread_names,
+                reread_events,
                 reread_by_id,
             ) = classify(reread_rows)
             reread_journal = journal_entries(pending_journal())
@@ -749,8 +854,7 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
                 time.sleep(0.05)
                 continue
 
-            human, service_rows_seen = reread_human, reread_service
-            service_ref_names = set(reread_names)
+            human, service_rows_seen, service_events = reread_human, reread_service, list(reread_events)
             after = after_candidate
             break
 
@@ -790,12 +894,8 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
                 f"{label}: requested ref {name!r} changed during Git refusal: "
                 f"before={before_refs.get(name)!r}, after={after_refs.get(name)!r}"
             )
-    unexpected = sorted(changed_refs - service_ref_names)
-    if unexpected:
-        raise AssertionError(
-            f"{label}: refs changed without a validated CI service operation: "
-            f"{unexpected!r} (validated service refs: {sorted(service_ref_names)!r})"
-        )
+    allowed = service_allow_map(label, service_events)
+    check_service_ref_transitions(label, before_refs, after_refs, allowed, requested_refs)
 
     if before.get("api_refs") != after.get("api_refs"):
         raise AssertionError(
@@ -823,7 +923,7 @@ def audit_git_refusal_interval(before, label, refs, operation_rows_since, servic
             for row in service_rows_seen
             if row["settled"]
         ],
-        "service_ref_names": sorted(service_ref_names),
+        "service_ref_names": sorted(allowed),
         "changed_refs": sorted(changed_refs),
         "final_verdict": final_verdict,
         "diagnostics": {
@@ -843,7 +943,7 @@ def audit_api_refusal_interval(before, after, label, refs, operation_rows_since,
     deadline = time.monotonic() + 30
 
     def classify(rows):
-        settled_service_rows, pending_service_rows, allowed_service_ref_names = [], [], set()
+        settled_service_rows, pending_service_rows, allowed_service_events = [], [], []
         for row in rows:
             if row["human_principal"] is True:
                 raise AssertionError(f"{label}: human operation row in response interval")
@@ -857,33 +957,81 @@ def audit_api_refusal_interval(before, after, label, refs, operation_rows_since,
             if service_release_valid(row) is not True:
                 raise AssertionError(f"{label}: service row not source-validated")
             outbox_names = row["outbox_ref_names"]
+            events = row["outbox_events"]
             if (not isinstance(outbox_names, list) or len(outbox_names) != 1
                     or not isinstance(outbox_names[0], str)
-                    or not outbox_names[0].startswith("refs/rootyard-ci/jobs/")):
-                raise AssertionError(f"{label}: service row outbox ref invalid")
+                    or not outbox_names[0].startswith("refs/rootyard-ci/jobs/")
+                    or not isinstance(events, list) or len(events) != 1
+                    or events[0].get("ref_name") != outbox_names[0]):
+                raise AssertionError(f"{label}: service row outbox event invalid")
             settled_service_rows.append(row)
-            allowed_service_ref_names.add(outbox_names[0])
-        return settled_service_rows, pending_service_rows, allowed_service_ref_names
+            allowed_service_events.append(events[0])
+        # Duplicate job refs are ambiguous: fail closed on the ref name.
+        duplicated = sorted(name for name, count in collections.Counter(
+            event["ref_name"] for event in allowed_service_events).items() if count > 1)
+        if duplicated:
+            raise AssertionError(
+                f"{label}: duplicate validated service outbox events for ref {duplicated!r} "
+                f"in one interval")
+        return settled_service_rows, pending_service_rows, allowed_service_events
 
     def wait(moment):
         if moment >= deadline:
             raise AssertionError(f"{label}: timed out waiting for service operations to settle")
         time.sleep(0.05)
 
-    # The rows read once the refs are final are the proof, not a recount: every
-    # read is classified (any human or unknown-principal row fails), and the
-    # figures reported below come from that same last classified set.
+    # The stable-read pattern of the Git interval, mirrored here: the interval
+    # rows are read and classified, the final physical/public refs are
+    # captured, and the rows are read and classified again.  Every read is
+    # classified (any human or unknown-principal row fails); pending service
+    # rows are waited for as before.  The reread's rows are the proof and are
+    # never accepted against an older snapshot: an operation id absent from the
+    # pre-snapshot read, or a sequence above the snapshot's own highwater,
+    # arrived after the snapshot, so the loop repeats and the next snapshot
+    # follows those operations.  The reported figures (user count, service
+    # operations, ref names, transitions) come from that same final classified
+    # row set.
+    def deduplicated(rows):
+        # One operation can be observed by more than one read shape: keep the
+        # last classified version of each id so no row is reported twice.
+        return list({row["operation_id"]: row for row in rows}.values())
+
+    def is_sequence(value):
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    def snapshot_highwater(snapshot):
+        value = snapshot.get("operation_highwater")
+        if not is_sequence(value):
+            raise AssertionError(
+                f"{label}: ref snapshot has no integer operation_highwater: {value!r}")
+        return value
+
+    # ``highwater`` stays the interval bound from ``before``: every
+    # ``operation_rows_since`` call receives that original integer.
     while True:
-        _, pending_service_rows, _ = classify(operation_rows_since(highwater))
+        pre_rows = operation_rows_since(highwater)
+        _, pending_service_rows, _ = classify(pre_rows)
         if pending_service_rows:
             wait(time.monotonic())
             continue
         final_after = ref_state()
         final_rows = operation_rows_since(highwater)
-        settled_service_rows, pending_service_rows, allowed_service_ref_names = classify(final_rows)
+        settled_service_rows, pending_service_rows, allowed_service_events = classify(final_rows)
         if pending_service_rows:
             wait(time.monotonic())
             continue
+        refs_highwater = snapshot_highwater(final_after)
+        # A service row that arrived after the physical snapshot is never
+        # accepted: its event may describe changes the snapshot cannot show.
+        pre_ids = {pre["operation_id"] for pre in pre_rows}
+        stale = sorted(
+            row["operation_id"] for row in final_rows
+            if row["operation_id"] not in pre_ids
+            or not (is_sequence(row["sequence"]) and row["sequence"] <= refs_highwater))
+        if stale:
+            wait(time.monotonic())
+            continue
+        classified_rows = deduplicated(final_rows)
         break
 
     for name, snapshot in (("before", before), ("after", final_after)):
@@ -909,9 +1057,9 @@ def audit_api_refusal_interval(before, after, label, refs, operation_rows_since,
     for name in requested:
         if before_refs.get(name) != after_refs.get(name):
             raise AssertionError(f"{label}: requested ref {name!r} changed")
-    disallowed = [name for name in changed if name not in allowed_service_ref_names]
-    if disallowed:
-        raise AssertionError(f"{label}: refs changed outside service outbox: {disallowed}")
+    # Physical moves must match the validated event's exact old -> new OIDs.
+    check_service_ref_transitions(label, before_refs, after_refs,
+                                  service_allow_map(label, allowed_service_events), requested)
 
     service_operations = [
         {
@@ -924,8 +1072,9 @@ def audit_api_refusal_interval(before, after, label, refs, operation_rows_since,
     return {
         "label": label,
         # Zero by construction: classify() already failed on any human row.
-        "user_operation_count": len([row for row in final_rows if row["human_principal"] is True]),
+        "user_operation_count": len([row for row in classified_rows if row["human_principal"] is True]),
         "service_operations": service_operations,
+        "service_ref_names": sorted({event["ref_name"] for event in allowed_service_events}),
         "changed_refs": changed,
         "diagnostics": {
             "response_highwater": after["operation_highwater"],

@@ -1278,7 +1278,7 @@ class RefusalAuditSqlTest(unittest.TestCase):
         sql = refusal_audit_sql.operations_after_query(repo, 7, actor, token, escape)
         self.assertIsInstance(sql, str)
         self.assertIn("WHERE o.repository_id = 'ESC[%s]'::uuid AND o.sequence > 7" % repo, sql)
-        self.assertEqual(sql.count("jsonb_agg(jsonb_build_object("), 1)
+        self.assertEqual(sql.count("jsonb_agg(jsonb_build_object("), 2)
         self.assertIn("ORDER BY o.sequence, o.id", sql)
         join = "LEFT JOIN git_ref_admissions a ON a.writer_id = o.id AND a.repository_id = o.repository_id"
         self.assertIn(join, sql)
@@ -1289,15 +1289,11 @@ class RefusalAuditSqlTest(unittest.TestCase):
                 "storage_generation_matches", "ungranted_without_hooks", "reference_events"]
         for key in keys:
             self.assertIn("'%s'" % key, sql)
-        # Booleans stay booleans: ``->`` keeps the JSONB value in the object.
-        self.assertIn("(COALESCE(o.evidence->'finished', '\"missing\"'::jsonb))", sql)
-        self.assertIn("(COALESCE(o.evidence->'storage_generation_matches', '\"missing\"'::jsonb))", sql)
-        self.assertNotIn("o.evidence->>'finished'", sql)
-        self.assertNotIn("o.evidence->>'storage_generation_matches'", sql)
-        # The two packet-line flags stay the schema-backed text.
-        self.assertIn("o.evidence->>'interrupted'", sql)
-        self.assertIn("o.evidence->>'ungranted_without_hooks'", sql)
-        self.assertNotIn("o.evidence->'interrupted'", sql)
+        # All four stored booleans stay booleans: ``->`` keeps the JSONB value.
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            expected = "(COALESCE(o.evidence->'" + key + "', " + refusal_audit_sql.EVIDENCE_MISSING_BOOL + "))"
+            self.assertIn(expected, sql, key)
+            self.assertNotIn("o.evidence->>'" + key + "'", sql, key)
         self.assertIn("o.evidence->'reference_events'", sql)
         self.assertIn("o.evidence->'post_receive' IS NULL", sql)
         self.assertIn("o.evidence->'post_receive' = 'null'::jsonb", sql)
@@ -1316,12 +1312,36 @@ class RefusalAuditSqlTest(unittest.TestCase):
         self.assertEqual(seen, [])
 
     def test_schema_pins_the_evidence_json_types(self):
-        """``finished``/``storage_generation_matches`` are JSON booleans."""
+        """All four evidence values are Rust bools serialized as JSON booleans."""
         evidence = (ROOT / "src/reliability.rs").read_text()
+        # The receive-pack evidence object serializes each key from a value that
+        # is a Rust bool: changing any of these to a string needs review here.
         self.assertIn('"finished":finished', evidence)
+        self.assertIn('"interrupted":interrupted', evidence)
         self.assertIn('"storage_generation_matches":operation.storage_generation==generation', evidence)
-        self.assertEqual(refusal_audit_sql.EVIDENCE_BOOL_KEYS, ("finished", "storage_generation_matches"))
-        self.assertEqual(refusal_audit_sql.EVIDENCE_TEXT_KEYS, ("interrupted", "ungranted_without_hooks"))
+        self.assertIn('"ungranted_without_hooks":ungranted_without_hooks', evidence)
+        self.assertIn("let ungranted_without_hooks = no_parent_publication_possible(", evidence)
+        self.assertRegex(evidence, r"fn no_parent_publication_possible\([^)]*\) -> bool")
+        self.assertIn("pub fn is_interrupted(op: &Operation) -> Result<bool>",
+                      (ROOT / "src/journal.rs").read_text())
+        self.assertIn("pub fn is_finished(op: &Operation) -> Result<bool>",
+                      (ROOT / "src/journal.rs").read_text())
+        # ``reference_events`` is serialized directly from ``journal::events``,
+        # a ``Vec<HookEvent>``: it is always a JSON array in stored evidence.
+        self.assertIn('"reference_events":raw', evidence)
+        self.assertIn("journal::events(&operation)", evidence)
+        journal = (ROOT / "src/journal.rs").read_text()
+        self.assertRegex(journal, r"pub fn events\(op: &Operation\) -> Result<Vec<HookEvent>>")
+        hook = (ROOT / "src/journal/core.rs").read_text()
+        self.assertRegex(hook, r"pub struct HookEvent \{\s+pub ordinal: i64,\s+pub phase: HookPhase,\s+"
+                               r"pub changes: Vec<RefChange>,")
+        self.assertRegex(hook, r"pub struct RefChange \{\s+pub ref_name: String,\s+pub old_oid: String,\s+"
+                               r"pub new_oid: String,")
+        self.assertIn("pub enum HookPhase {\n    Preparing,\n    Prepared,\n    Committed,\n    Aborted,",
+                      hook)
+        self.assertEqual(refusal_audit_sql.EVIDENCE_KEYS,
+                         ("finished", "storage_generation_matches", "interrupted",
+                          "ungranted_without_hooks"))
 
     def test_release_valid_query_binds_source_evidence_and_outbox(self):
         operation_id = "44444444-4444-4444-8444-444444444444"
@@ -1444,46 +1464,107 @@ class RefusalAuditSqlTest(unittest.TestCase):
         self.assertIn("self._sql_literal", source_text)
         self.assertIn("decode_operation_interval(self.sql(query), highwater)", source_text)
 
-    def test_one_json_object_from_the_newest_operation(self):
-        self.assertTrue(self.query.startswith("SELECT jsonb_build_object("))
-        self.assertIn(")::text FROM git_operations o LEFT JOIN git_ref_admissions a ON a.writer_id=o.id", self.query)
-        self.assertIn("ORDER BY o.sequence DESC LIMIT 1", self.query)
-        self.assertNotIn("chr(", self.query)
-        self.assertEqual(list(self.pairs), ["status", "created_at", "outcome", "settled", "aborted",
-                                            "repository_matches", "ref_names", "refs_exactly", "no_receipt",
-                                            "finished", "storage_generation_matches", "interrupted",
-                                            "ungranted_without_hooks", "events", "admitted_now", "newer",
-                                            "reference_events"])
-        # The pushed refs are the exact sorted ARRAY[...]::text[] set.
-        self.assertEqual(self.pairs["refs_exactly"],
-                         "coalesce(a.ref_names=ARRAY['refs/heads/a','refs/heads/b']::text[], false)")
-
-    def columns(self, table):
+    @staticmethod
+    def columns(table):
+        """Columns a table has after every migration, index-keyed."""
         schema = "\n".join(path.read_text() for path in sorted((ROOT / "migrations").glob("*.sql")))
         block = re.search(r"CREATE TABLE (?:IF NOT EXISTS )?" + table + r" \((.*?)\n\);", schema, re.S)
-        self.assertIsNotNone(block, "table " + table + " is not in the migrations")
-        return set(re.findall(r"^\s+(\w+) ", block.group(1), re.M))
+        assert block is not None, "table " + table + " is not in the migrations"
+        columns = set(re.findall(r"^\s+(\w+) ", block.group(1), re.M))
+        for added in re.findall(r"ALTER TABLE " + table + r" ADD COLUMN (?:IF NOT EXISTS )?(\w+)", schema):
+            columns.add(added)
+        return columns
 
-    def test_only_schema_tables_and_columns(self):
+    def test_interval_query_uses_only_schema_tables_and_columns(self):
+        sql = self.interval_sql()
         schema = "\n".join(path.read_text() for path in sorted((ROOT / "migrations").glob("*.sql")))
         created = set(re.findall(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)", schema))
-        tables = set(re.findall(r"\b(?:FROM|JOIN)\s+(\w+)", self.query))
-        self.assertEqual(tables, {"git_operations", "git_ref_admissions", "outbox_events"})
-        self.assertNotIn("journal_item", schema, "no such table exists")
-        self.assertLessEqual(tables, created)
-        # Every ``alias.column`` belongs to the table that alias names.
-        aliases = {"o": "git_operations", "a": "git_ref_admissions", "x": "outbox_events",
-                   "w": "git_ref_admissions", "y": "git_operations"}
-        seen = 0
-        for alias, table in aliases.items():
-            used = set(re.findall(r"(?<!\w)" + alias + r"\.(\w+)", self.query))
-            seen += len(used)
-            self.assertTrue(used, alias)
-            self.assertLessEqual(used, self.columns(table), alias)
-        for alias in set(re.findall(r"(?<!\w)([a-z]+)\.(\w+)", self.query.split("FROM", 1)[1])) - set(aliases):
-            self.assertIn(alias[0], aliases)
-        # The admission really stores a sorted ``ref_names TEXT[]``.
+        # Every alias is bound to exactly the schema table the query names;
+        # ``FROM|JOIN <table> <alias>`` yields ``{table: alias}``, so turn it
+        # into ``{alias: table}`` rather than inverting the lookup.
+        declared = re.findall(r"\b(?:FROM|JOIN)\s+(\w+)\s+([a-z])\b", sql)
+        bound = {alias: table for table, alias in declared}
+        self.assertEqual(bound, {"o": "git_operations", "a": "git_ref_admissions",
+                                 "e": "outbox_events"})
+        self.assertLessEqual(set(bound.values()), created)
+        # Each alias.column is a real column of that alias's table, after the
+        # migrations' ALTER TABLE additions (``service_principal_id``).
+        referenced = {}
+        for alias, table in bound.items():
+            used = set(re.findall(r"(?<!\w)" + alias + r"\.(\w+)", sql))
+            if used:
+                referenced[alias] = len(used)
+            known = self.columns(table)
+            self.assertEqual(used - known, set(), (alias, table, sorted(known)[:5]))
+        # Measured column usage: operations (9), admissions (7) and the outbox
+        # rows the name and event-object aggregations order, filter and project
+        # with their recorded old/new OIDs (5).
+        self.assertEqual(referenced, {"o": 9, "a": 7, "e": 5})
+        self.assertEqual(set(re.findall(r"(?<!\w)o\.(\w+)", sql)),
+                         {"id", "sequence", "outcome", "settled_at", "repository_id", "actor_id",
+                          "token_id", "service_principal_id", "evidence"})
+        self.assertEqual(set(re.findall(r"(?<!\w)a\.(\w+)", sql)),
+                         {"writer_id", "repository_id", "state", "settled_at", "actor_id",
+                          "token_id", "ref_names"})
+        self.assertEqual(set(re.findall(r"(?<!\w)e\.(\w+)", sql)),
+                         {"operation_id", "transaction_sequence", "ref_name", "old_oid", "new_oid"})
+        for column in ("actor_id", "token_id", "repository_id", "sequence", "evidence",
+                       "settled_at", "service_principal_id"):
+            self.assertIn(column, self.columns("git_operations"), column)
+        for column in ("writer_id", "state", "settled_at", "ref_names", "actor_id",
+                       "token_id", "repository_id"):
+            self.assertIn(column, self.columns("git_ref_admissions"), column)
+        # The joined admission really stores a sorted ``ref_names TEXT[]``.
+        self.assertIn("ref_names", self.columns("git_ref_admissions"))
         self.assertIn("ref_names TEXT[] NOT NULL", (ROOT / "migrations/126_ref_admissions.sql").read_text())
+
+    def test_reference_events_projection_keeps_absence_visible(self):
+        sql = self.interval_sql()
+        # ``src/reliability.rs`` always serializes a ``Vec``; a missing key must
+        # therefore surface as the non-array sentinel, never as ``[]``.
+        self.assertIn("'reference_events', (COALESCE(o.evidence->'reference_events', "
+                      + refusal_audit_sql.EVIDENCE_MISSING_ARRAY + "))", sql)
+        self.assertNotIn("o.evidence->'reference_events', '[]'::jsonb", sql)
+        self.assertEqual(refusal_audit_sql.EVIDENCE_MISSING_ARRAY,
+                         refusal_audit_sql.EVIDENCE_MISSING_BOOL)
+        self.assertNotIn("o.evidence->>'reference_events'", sql)
+        # The decoder enforces the array contract, not an opaque passthrough.
+        decoder = source_of(SQL, "decode_operation_interval")
+        self.assertIn('_check_reference_events(row["reference_events"])', decoder)
+
+    def test_interval_query_projection_types_match_storage(self):
+        sql = self.interval_sql()
+        # All four evidence fields are stored JSON booleans: ``->`` (never
+        # ``->>``) and an absent key is a JSON string the decoder rejects.
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            self.assertIn("'" + key + "', (COALESCE(o.evidence->'" + key + "', "
+                          + refusal_audit_sql.EVIDENCE_MISSING_BOOL + "))", sql, key)
+            self.assertNotIn("o.evidence->>'" + key + "'", sql, key)
+        self.assertEqual(refusal_audit_sql.EVIDENCE_KEYS,
+                         ("finished", "storage_generation_matches", "interrupted",
+                          "ungranted_without_hooks"))
+        self.assertEqual(refusal_audit_sql.EVIDENCE_REQUIRED_TRUE_KEYS,
+                         ("finished", "storage_generation_matches"))
+        self.assertFalse(hasattr(refusal_audit_sql, "EVIDENCE_TEXT_KEYS"))
+        # The same key tuples the decoder and verdict enforce.
+        decoder = source_of(SQL, "decode_operation_interval")
+        self.assertIn("*EVIDENCE_BOOL_KEYS", decoder)
+        self.assertNotIn("_STR_KEYS", decoder, "no evidence text-key path may remain")
+        self.assertNotIn("jsonb_each", sql)
+        self.assertIn("o.evidence->'post_receive' IS NULL", sql)
+        self.assertIn("o.evidence->'post_receive' = 'null'::jsonb", sql)
+
+    def test_interval_query_is_one_statement_without_global_limits(self):
+        sql = self.interval_sql()
+        self.assertTrue(sql.startswith("SELECT COALESCE(jsonb_agg(jsonb_build_object("))
+        # One row aggregation plus one exact event-object aggregation.
+        self.assertEqual(sql.count("jsonb_agg(jsonb_build_object("), 2)
+        self.assertIn("'outbox_events'", sql)
+        self.assertIn("ORDER BY o.sequence, o.id", sql)
+        self.assertIn("WHERE o.repository_id = '" + self.REPO + "'::uuid AND o.sequence > 7", sql)
+        self.assertNotIn("MAX(", sql)
+        self.assertNotIn("LIMIT", sql)
+        self.assertNotIn("COPY", sql.upper())
 
     def test_operation_tables_used_by_the_interval_reader_exist(self):
         schema = "\n".join(path.read_text() for path in sorted((ROOT / "migrations").glob("*.sql")))
@@ -1493,10 +1574,15 @@ class RefusalAuditSqlTest(unittest.TestCase):
         self.assertIn("ALTER TABLE git_operations ADD COLUMN service_principal_id UUID",
                       (ROOT / "migrations/109_ci_integration_jobs.sql").read_text())
 
-    def test_evidence_flags_are_strings_not_jsonb_each(self):
-        self.assertEqual(self.pairs["interrupted"], "coalesce(o.evidence->>'interrupted', 'missing')")
-        self.assertNotIn("jsonb_each", self.query)
-        self.assertIn("o.evidence->'post_receive'='null'::jsonb", self.pairs["no_receipt"])
+    def test_evidence_keys_are_jsonb_booleans_not_text(self):
+        sql = self.interval_sql()
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            self.assertIn("'" + key + "', (COALESCE(o.evidence->'" + key + "', "
+                          + refusal_audit_sql.EVIDENCE_MISSING_BOOL + "))", sql, key)
+            # The obsolete text projection is gone for every evidence key.
+            self.assertIsNone(re.search(r"o\.evidence->>'" + key + "'", sql), key)
+        self.assertNotIn("jsonb_each", sql)
+        self.assertIn("o.evidence->'post_receive' = 'null'::jsonb", sql)
 
     def test_interval_decoder_enforces_complete_json_contract(self):
         decode = refusal_audit_sql.decode_operation_interval
@@ -1505,10 +1591,11 @@ class RefusalAuditSqlTest(unittest.TestCase):
             return {"operation_id": operation_id, "sequence": sequence,
                     "outcome": "no_ref_changes", "settled": True, "finished": True,
                     "actor_and_token_match": True, "human_principal": True, "service_principal": False,
-                    "evidence_no_receipt": True, "interrupted": "false", "storage_generation_matches": True,
-                    "ungranted_without_hooks": "false", "reference_events": [], "admission_present": True,
+                    "evidence_no_receipt": True, "interrupted": False, "storage_generation_matches": True,
+                    "ungranted_without_hooks": False, "reference_events": [], "admission_present": True,
                     "admission_state": "ABORTED", "admission_settled": True, "admission_identity_matches": True,
-                    "admission_ref_names": ["refs/heads/main"], "outbox_count": 0, "outbox_ref_names": []}
+                    "admission_ref_names": ["refs/heads/main"], "outbox_count": 0,
+                    "outbox_ref_names": [], "outbox_events": []}
 
         def reject(rows):
             with self.assertRaises(ValueError):
@@ -1539,20 +1626,19 @@ class RefusalAuditSqlTest(unittest.TestCase):
         integer_settled = row()
         integer_settled["settled"] = 1
         reject([integer_settled])
-        # ``finished``/``storage_generation_matches`` are JSON booleans: text fails.
-        for key in refusal_audit_sql.EVIDENCE_BOOL_KEYS:
-            for bad in ("true", "false", 1, None):
+        # All four evidence keys are JSON booleans: text, ints and null fail.
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            for bad in ("true", "false", 1, 0, None):
                 wrong = row()
                 wrong[key] = bad
                 reject([wrong])
+            for good in (True, False):
+                acceptable = row()
+                acceptable[key] = good
+                self.assertEqual(decode(json.dumps([acceptable]), 7)[0][key], good)
             missing_bool = row()
             del missing_bool[key]
             reject([missing_bool])
-        # The two packet-line flags stay text: a JSON boolean fails.
-        for key in refusal_audit_sql.EVIDENCE_TEXT_KEYS:
-            wrong = row()
-            wrong[key] = False
-            reject([wrong])
         boolean_outbox_count = row()
         boolean_outbox_count["outbox_count"] = True
         reject([boolean_outbox_count])
@@ -1594,7 +1680,8 @@ class RefusalAuditSqlTest(unittest.TestCase):
         self.assertIn("E[" + actor_uuid + "]", query)
         self.assertIn("E[" + token_uuid + "]", query)
         self.assertIn("o.sequence > 7", query)
-        self.assertEqual(query.count("jsonb_agg(jsonb_build_object("), 1)
+        self.assertEqual(query.count("jsonb_agg(jsonb_build_object("), 2)   # rows + events
+        self.assertIn("'outbox_events'", query)
         self.assertNotIn("COPY", query.upper())
 
     def test_service_release_valid_escapes_ids_and_requires_literal_true(self):
@@ -1633,13 +1720,13 @@ class RefusalOracleTest(unittest.TestCase):
     def row(self, **changes):
         row = {"settled": True, "outcome": "no_ref_changes",
                "actor_and_token_match": True, "human_principal": True, "service_principal": False,
-               "evidence_no_receipt": True, "finished": True, "interrupted": "false",
-               "storage_generation_matches": True, "ungranted_without_hooks": "false",
+               "evidence_no_receipt": True, "finished": True, "interrupted": False,
+               "storage_generation_matches": True, "ungranted_without_hooks": False,
                "reference_events": [],
                "admission_present": True, "admission_state": "ABORTED", "admission_settled": True,
                "admission_identity_matches": True,
                "admission_ref_names": ["refs/heads/main", "refs/heads/mixed-topic"],
-               "outbox_count": 0, "outbox_ref_names": []}
+               "outbox_count": 0, "outbox_ref_names": [], "outbox_events": []}
         row.update(changes)
         return row
 
@@ -1650,10 +1737,10 @@ class RefusalOracleTest(unittest.TestCase):
 
     def test_exact_settled_no_ref_changes_passes(self):
         self.assertEqual(self.verdict({}), {"status": "settled", "problems": []})
-        self.assertEqual(self.verdict({"reference_events": {
-            "ordinal": 1, "phase": "Aborted", "changes": []}}, [])["problems"], [])
-        self.assertEqual(self.verdict({"reference_events": [{
-            "ordinal": 1, "phase": "Aborted", "requested": ["refs/heads/main"], "changes": []}]}, [])["problems"], [])
+        # ``reference_events`` is a stored array; every event records no change.
+        self.assertEqual(self.verdict({"reference_events": [
+            {"ordinal": 1, "phase": "Aborted", "changes": []},
+            {"ordinal": 2, "phase": "Prepared", "changes": []}]}, [])["problems"], [])
 
     def test_unknown_recorded_or_unsettled_is_never_a_pass(self):
         unsettled = self.verdict({"settled": False, "outcome": "unknown"})
@@ -1689,7 +1776,12 @@ class RefusalOracleTest(unittest.TestCase):
             {"storage_generation_matches": "true"},
             {"interrupted": "maybe"},
             {"ungranted_without_hooks": "maybe"},
-            {"interrupted": "true", "ungranted_without_hooks": "false"},
+            {"interrupted": "true"},                     # text is not a bool
+            {"ungranted_without_hooks": "false"},
+            {"interrupted": 1},
+            # Boolean ordering rule: interrupted True requires ungranted True.
+            {"interrupted": True, "ungranted_without_hooks": False},
+            {"interrupted": True},                       # and presence is required
             {"reference_events": None},
         )
         for changes in defects:
@@ -1711,14 +1803,26 @@ class RefusalOracleTest(unittest.TestCase):
     def test_recorded_ref_change_is_a_defect(self):
         for evidence in (
             [{"changes": [{"ref_name": "refs/heads/main"}]}],
-            {"changes": [{"ref_name": "x"}]},
+            [{"ordinal": 1, "phase": "Committed",
+              "changes": [{"ref_name": "refs/heads/main", "old_oid": "a", "new_oid": "b"}]}],
             [{"changes": []}, {"changes": [{"ref_name": "refs/heads/main"}]}],
             ["not a dict"],
+            [{"ordinal": 1, "phase": "Aborted"}],          # no changes list is not []
         ):
             problems = self.verdict({"reference_events": evidence})["problems"]
             self.assertIn("reference_event_changes", problems, evidence)
-        requested_only = self.verdict({"reference_events": [{"requested": ["refs/heads/main"], "changes": []}]})
-        self.assertNotIn("reference_event_changes", requested_only["problems"])
+
+    def test_reference_events_must_be_a_stored_array(self):
+        """Only the stored ``Vec`` array passes; absence and other shapes fail."""
+        for bad in (None, "missing", {"ordinal": 1, "phase": "Aborted", "changes": []},
+                    "[]", 0, True):
+            with self.subTest(reference_events=bad):
+                self.assertIn("reference_events", self.verdict({"reference_events": bad})["problems"])
+        row = self.row()
+        del row["reference_events"]                        # an omitted key
+        self.assertIn("reference_events",
+                      refusal_audit_sql.refusal_audit_verdict(
+                          row, [], row["admission_ref_names"])["problems"])
 
     def test_requested_is_validation_not_a_grant(self):
         for ref in ("refs/heads/main", "refs/heads/other"):
@@ -1729,9 +1833,11 @@ class RefusalOracleTest(unittest.TestCase):
         self.assertNotIn("jsonb_each", source_text)
 
     def test_filesystem_pending_journal_is_checked_separately_from_reference_events(self):
-        row_changes = {"reference_events": {"changes": []}}
-        self.assertEqual(self.verdict(row_changes)["problems"], [])
-        result = self.verdict(row_changes, journal=["operation-directory"])
+        # The stored events record no change, so only the journal can fail.
+        self.assertEqual(self.verdict({"reference_events": []})["problems"], [])
+        result = self.verdict({"reference_events": [
+            {"ordinal": 1, "phase": "Aborted", "changes": []}]},
+            journal=["operation-directory"])
         self.assertEqual(result["status"], "settled")
         self.assertIn("journal", result["problems"])
 
@@ -1741,21 +1847,26 @@ class EvidenceContractTest(unittest.TestCase):
 
     def evidence(self, **changes):
         evidence = {"finished": True, "storage_generation_matches": True,
-                    "interrupted": "false", "ungranted_without_hooks": "false"}
+                    "interrupted": False, "ungranted_without_hooks": False}
         evidence.update(changes)
         return evidence
 
     def test_accepts_the_real_packet_line_evidence(self):
         self.assertEqual(refusal_audit_sql.assert_evidence_contract("t", self.evidence()),
                          self.evidence())
-        self.assertEqual(refusal_audit_sql.assert_evidence_contract(
-            "t", self.evidence(interrupted="true", ungranted_without_hooks="true"))["interrupted"], "true")
+        # Both recorded flags accept either boolean.
+        self.assertIs(refusal_audit_sql.assert_evidence_contract(
+            "t", self.evidence(interrupted=True, ungranted_without_hooks=True))["interrupted"], True)
+        self.assertIs(refusal_audit_sql.assert_evidence_contract(
+            "t", self.evidence(interrupted=True, ungranted_without_hooks=False))["interrupted"], True)
 
     def test_rejects_each_defect(self):
         for changes in ({"finished": "true"}, {"finished": 1}, {"finished": None},
-                        {"storage_generation_matches": None}, {"interrupted": True},
-                        {"interrupted": "missing"}, {"ungranted_without_hooks": "missing"},
-                        {"interrupted": None}):
+                        {"storage_generation_matches": None}, {"interrupted": "true"},
+                        {"interrupted": "false"}, {"interrupted": 1}, {"interrupted": None},
+                        {"ungranted_without_hooks": "missing"}, {"ungranted_without_hooks": 0},
+                        # The proof keys must be exactly true, even as booleans.
+                        {"finished": False}, {"storage_generation_matches": False}):
             with self.subTest(changes=changes), self.assertRaises(AssertionError):
                 refusal_audit_sql.assert_evidence_contract("t", self.evidence(**changes))
         for key in refusal_audit_sql.EVIDENCE_KEYS:
@@ -1808,31 +1919,38 @@ class OperationsIntervalTypeRegressionTest(unittest.TestCase):
     def projected(self):
         """A representative row with the runtime types the SQL projection emits.
 
-        ``->`` yields the stored JSON value (booleans here); ``->>`` yields the
-        stored text (the two packet-line flags).  A missing boolean key becomes
-        the JSON string ``EVIDENCE_MISSING_BOOL``, which the decoder rejects;
-        it is never mapped to ``False``.
+        ``->`` yields the stored JSON value; all four evidence keys are stored
+        booleans (``src/reliability.rs`` serializes Rust ``bool``).  A missing
+        key becomes the JSON string ``EVIDENCE_MISSING_BOOL``, which the
+        decoder rejects; it is never mapped to ``False``.
         """
         values = self.projection_values()
         emitted = {}
         for key, expression in values.items():
-            if "o.evidence->'finished'" in expression or "o.evidence->'storage_generation_matches'" in expression:
-                emitted[key] = True                      # stored JSON boolean, returned by ``->``
-            elif "o.evidence->>'interrupted'" in expression or "o.evidence->>'ungranted_without_hooks'" in expression:
-                emitted[key] = "false"                   # stored text, returned by ``->>``
+            projected = [name for name in refusal_audit_sql.EVIDENCE_KEYS
+                         if "o.evidence->'" + name + "'" in expression]
+            if projected:
+                # A representative aborted refusal: the two proof facts hold,
+                # the two recorded flags are false -- all as stored booleans.
+                emitted[key] = key in refusal_audit_sql.EVIDENCE_REQUIRED_TRUE_KEYS
         return emitted
 
     def test_sql_projects_booleans_with_the_json_operator(self):
         values = self.projection_values()
-        for key in refusal_audit_sql.EVIDENCE_BOOL_KEYS:
+        self.assertEqual(refusal_audit_sql.EVIDENCE_KEYS,
+                         ("finished", "storage_generation_matches", "interrupted",
+                          "ungranted_without_hooks"))
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
             self.assertIn("o.evidence->'" + key + "'", values[key], key)
             self.assertNotIn("o.evidence->>'" + key + "'", values[key], key)
             self.assertIn(refusal_audit_sql.EVIDENCE_MISSING_BOOL, values[key], key)
-        for key in refusal_audit_sql.EVIDENCE_TEXT_KEYS:
-            self.assertIn("o.evidence->>'" + key + "'", values[key], key)
-            self.assertNotIn("o.evidence->'" + key + "'", values[key], key)
         self.assertEqual(sorted(self.projected()), sorted(refusal_audit_sql.EVIDENCE_KEYS))
-        self.assertEqual({type(v) for v in self.projected().values()}, {bool, str})
+        self.assertEqual({type(v) for v in self.projected().values()}, {bool})
+        # The SQL text has no text projection of any evidence key left.
+        sql = refusal_audit_sql.operations_after_query(
+            self.REPO, 7, self.ACTOR, self.TOKEN, str)
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            self.assertNotIn("o.evidence->>'" + key + "'", sql, key)
 
     def row(self, **changes):
         row = {"operation_id": self.OPERATION, "sequence": 8, "outcome": "no_ref_changes",
@@ -1842,7 +1960,7 @@ class OperationsIntervalTypeRegressionTest(unittest.TestCase):
                "admission_present": True, "admission_state": "ABORTED", "admission_settled": True,
                "admission_identity_matches": True,
                "admission_ref_names": ["refs/heads/main", "refs/heads/mixed-topic"],
-               "outbox_count": 0, "outbox_ref_names": []}
+               "outbox_count": 0, "outbox_ref_names": [], "outbox_events": []}
         row.update(self.projected())
         row.update(changes)
         return row
@@ -1863,23 +1981,24 @@ class OperationsIntervalTypeRegressionTest(unittest.TestCase):
         self.assertEqual(contract, folded)
         self.assertIs(folded["finished"], True)
         self.assertIs(folded["storage_generation_matches"], True)
-        self.assertEqual(folded["interrupted"], "false")
-        self.assertEqual(folded["ungranted_without_hooks"], "false")
+        self.assertIs(folded["interrupted"], False)
+        self.assertIs(folded["ungranted_without_hooks"], False)
         # The verdict consumes the same decoded row without a type problem.
         self.assertEqual(refusal_audit_sql.refusal_audit_verdict(rows[0], [], rows[0]["admission_ref_names"]),
                          {"status": "settled", "problems": []})
 
-    def test_either_boolean_as_text_breaks_the_chain(self):
-        for key in refusal_audit_sql.EVIDENCE_BOOL_KEYS:
+    def test_either_booleans_text_form_breaks_the_chain(self):
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
             with self.subTest(key=key):
                 # The SQL projection really emits a JSON value, not text.
                 self.assertIn(refusal_audit_sql.EVIDENCE_MISSING_BOOL, self.projection_values()[key])
+                # A string in either previously stringified field fails too.
                 with self.assertRaises(ValueError):
                     refusal_audit_sql.decode_operation_interval(
                         json.dumps([self.row(**{key: "true"})]), 7)
 
     def test_text_at_the_contract_and_verdict_stages_is_rejected(self):
-        for key in refusal_audit_sql.EVIDENCE_BOOL_KEYS:
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
             with self.subTest(key=key):
                 folded = dict(self.projected(), **{key: "true"})
                 with self.assertRaises(AssertionError):
@@ -1887,13 +2006,127 @@ class OperationsIntervalTypeRegressionTest(unittest.TestCase):
                 verdict = refusal_audit_sql.refusal_audit_verdict(
                     self.row(**{key: "true"}), [], self.row()["admission_ref_names"])
                 self.assertIn(key, verdict["problems"], verdict)
+                # "false" as text fails at every stage too: it is not a bool.
+                with self.assertRaises(ValueError):
+                    refusal_audit_sql.decode_operation_interval(
+                        json.dumps([self.row(**{key: "false"})]), 7)
+                with self.assertRaises(AssertionError):
+                    refusal_audit_sql.assert_evidence_contract(
+                        "interval", dict(self.projected(), **{key: "false"}))
+                self.assertIn(key, refusal_audit_sql.refusal_audit_verdict(
+                    self.row(**{key: "false"}), [], self.row()["admission_ref_names"])["problems"])
+
+    def test_reference_events_array_contract_end_to_end(self):
+        """Only a stored array of exact journal events survives the chain."""
+        real = [{"ordinal": 1, "phase": "Prepared", "changes": []},
+                {"ordinal": 2, "phase": "Aborted", "changes": []}]
+        rows = refusal_audit_sql.decode_operation_interval(
+            json.dumps([self.row(reference_events=real)]), 7)
+        self.assertEqual(rows[0]["reference_events"], real)
+        self.assertEqual(refusal_audit_sql.refusal_audit_verdict(
+            rows[0], [], rows[0]["admission_ref_names"])["problems"], [])
+        # A recorded change decodes (it is a real RefChange); the verdict refuses it.
+        changed = [{"ref_name": "refs/heads/main", "old_oid": "a" * 40, "new_oid": "b" * 40}]
+        decoded = refusal_audit_sql.decode_operation_interval(json.dumps([self.row(
+            reference_events=[{"ordinal": 1, "phase": "Committed", "changes": changed}])]), 7)
+        self.assertIn("reference_event_changes", refusal_audit_sql.refusal_audit_verdict(
+            decoded[0], [], decoded[0]["admission_ref_names"])["problems"])
+        # Missing, null, string, object and malformed entries fail the decoder.
+        for bad in ("missing", None, "[]", {}, 0, True,
+                    [{"ordinal": "1", "phase": "Aborted", "changes": []}],
+                    [{"ordinal": 1, "phase": "Aborting", "changes": []}],
+                    [{"ordinal": 1, "phase": "Aborted"}],
+                    [{"ordinal": 1, "phase": "Aborted", "changes": [], "extra": 1}],
+                    [{"ordinal": 1, "phase": "Aborted", "changes": {}}],
+                    [{"ordinal": 1, "phase": "Aborted",
+                      "changes": [{"ref_name": "refs/heads/main", "old_oid": "a" * 40}]}],
+                    [{"ordinal": 1, "phase": "Aborted",
+                      "changes": [{"ref_name": 1, "old_oid": "a" * 40, "new_oid": "b" * 40}]}],
+                    ["event"]):
+            with self.subTest(reference_events=bad):
+                with self.assertRaises(ValueError):
+                    refusal_audit_sql.decode_operation_interval(
+                        json.dumps([self.row(reference_events=bad)]), 7)
+        omitted = self.row()
+        del omitted["reference_events"]
+        with self.assertRaises(ValueError):
+            refusal_audit_sql.decode_operation_interval(json.dumps([omitted]), 7)
+
+    def test_reference_event_ordinals_are_positive_contiguous_and_ordered(self):
+        """``src/journal.rs`` keeps 1..N; impossible ordinals fail the decoder."""
+        def event(ordinal):
+            return {"ordinal": ordinal, "phase": "Aborted", "changes": []}
+
+        for bad in ([event(0)],                     # zero ordinal
+                    [event(-1)],                    # negative ordinal
+                    [event(1), event(1)],           # duplicate
+                    [event(2)],                     # gap from one
+                    [event(1), event(3)],           # gap in the middle
+                    [event(2), event(1)],           # out of order
+                    [event(1), {"ordinal": True, "phase": "Aborted", "changes": []}],
+                    ):
+            with self.subTest(ordinals=[entry["ordinal"] for entry in bad]):
+                with self.assertRaises(ValueError):
+                    refusal_audit_sql.decode_operation_interval(
+                        json.dumps([self.row(reference_events=bad)]), 7)
+        for good in ([], [event(1)], [event(1), event(2), event(3)]):
+            with self.subTest(ordinals=[entry["ordinal"] for entry in good]):
+                rows = refusal_audit_sql.decode_operation_interval(
+                    json.dumps([self.row(reference_events=good)]), 7)
+                self.assertEqual(rows[0]["reference_events"], good)
 
     def test_folded_bool_is_the_only_bool_family(self):
         _, folded, _ = self.run_pipeline()
         self.assertEqual({key for key in folded if isinstance(folded[key], bool)},
-                         set(refusal_audit_sql.EVIDENCE_BOOL_KEYS))
-        self.assertEqual({key for key in folded if isinstance(folded[key], str)},
-                         set(refusal_audit_sql.EVIDENCE_TEXT_KEYS))
+                         set(refusal_audit_sql.EVIDENCE_KEYS))
+        self.assertEqual({key for key in folded if isinstance(folded[key], str)}, set())
+
+    def test_either_boolean_is_accepted_for_the_recorded_flags(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                rows, folded, contract = self.run_pipeline()
+                row = dict(rows[0], interrupted=value, ungranted_without_hooks=value)
+                rows = refusal_audit_sql.decode_operation_interval(json.dumps([row]), 7)
+                folded = refusal_audit_sql.fold_operation_evidence(
+                    {"label": "interval", "operation_id": self.OPERATION}, rows)
+                self.assertIs(refusal_audit_sql.assert_evidence_contract("interval", folded)
+                              ["interrupted"], value)
+                # The ordering rule reads booleans; with both flags equal the
+                # verdict is clean either way.
+                verdict = refusal_audit_sql.refusal_audit_verdict(
+                    rows[0], [], rows[0]["admission_ref_names"])
+                self.assertEqual(verdict["problems"], [])
+
+    def test_boolean_ordering_rule_requires_ungranted_when_interrupted(self):
+        """``interrupted is True`` demands ``ungranted_without_hooks is True``."""
+        clean = refusal_audit_sql.refusal_audit_verdict(
+            self.row(interrupted=True, ungranted_without_hooks=True), [],
+            self.row()["admission_ref_names"])
+        self.assertEqual(clean["problems"], [])
+        broken = refusal_audit_sql.refusal_audit_verdict(
+            self.row(interrupted=True, ungranted_without_hooks=False), [],
+            self.row()["admission_ref_names"])
+        self.assertEqual(broken["problems"], ["interrupted_ungranted_order"])
+        # Not interrupted: the other flag is free.
+        for ungranted in (True, False):
+            verdict = refusal_audit_sql.refusal_audit_verdict(
+                self.row(interrupted=False, ungranted_without_hooks=ungranted), [],
+                self.row()["admission_ref_names"])
+            self.assertEqual(verdict["problems"], [], ungranted)
+
+    def test_finished_must_be_exactly_true(self):
+        for key in refusal_audit_sql.EVIDENCE_REQUIRED_TRUE_KEYS:
+            with self.subTest(key=key):
+                # Decodable (it is a bool) but not a valid refusal proof.
+                rows = refusal_audit_sql.decode_operation_interval(
+                    json.dumps([self.row(**{key: False})]), 7)
+                folded = refusal_audit_sql.fold_operation_evidence(
+                    {"label": "interval", "operation_id": self.OPERATION}, rows)
+                with self.assertRaisesRegex(AssertionError, key):
+                    refusal_audit_sql.assert_evidence_contract("interval", folded)
+                verdict = refusal_audit_sql.refusal_audit_verdict(
+                    rows[0], [], rows[0]["admission_ref_names"])
+                self.assertIn(key, verdict["problems"], verdict)
 
 
 class FinalApiReadRegressionTest(unittest.TestCase):
@@ -1911,83 +2144,418 @@ class FinalApiReadRegressionTest(unittest.TestCase):
         return snapshot
 
     @classmethod
-    def human(cls):
+    def human(cls, settled=False):
         return {"operation_id": cls.OPERATION, "sequence": 8, "human_principal": True,
-                "service_principal": False, "actor_and_token_match": True, "settled": False,
-                "outbox_ref_names": []}
+                "service_principal": False, "actor_and_token_match": True, "settled": settled,
+                "outbox_ref_names": [], "outbox_events": []}
+
+    JOB_OLD, JOB_NEW = "c" * 40, "d" * 40
 
     @classmethod
-    def service(cls, settled=True):
-        return {"operation_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "sequence": 9,
+    def service(cls, settled=True, old_oid=None, new_oid=None, sequence=9,
+                operation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"):
+        """One CI service row linking its exact job outbox event."""
+        event = {"ref_name": cls.JOB_REF, "old_oid": old_oid or cls.JOB_OLD,
+                 "new_oid": new_oid or cls.JOB_NEW}
+        return {"operation_id": operation_id, "sequence": sequence,
                 "human_principal": False, "service_principal": True, "actor_and_token_match": False,
-                "settled": settled, "outbox_ref_names": [cls.JOB_REF]}
+                "settled": settled, "outbox_ref_names": [cls.JOB_REF], "outbox_events": [event]}
 
-    def rows(self, human_on_final, service_rows=()):
-        """Empty earlier reads; only the post-refs(final) read returns rows.
+    # -- interval snapshot race: a service row settled after the ref read -----
+    STALE_LOOP_PRE = """
+    while True:
+        _, pending_service_rows, _ = classify(operation_rows_since(highwater))
+        if pending_service_rows:
+            wait(time.monotonic())
+            continue
+        final_after = ref_state()
+        final_rows = operation_rows_since(highwater)
+        settled_service_rows, pending_service_rows, allowed_service_events = classify(final_rows)
+        if pending_service_rows:
+            wait(time.monotonic())
+            continue
+        break
+    """
 
-        ``ref_state()`` is called exactly once, by the final proof block, so a
-        ``refs`` read marks the last read in this regression's trace.
-        """
+    STALE_LOOP_CURRENT = """
+    while True:
+        _, pending_service_rows, _ = classify(operation_rows_since(highwater))
+        final_after = ref_state()
+        sed_rows = operation_rows_since(highwater)
+        if pending_service_rows:
+            wait(time.monotonic())
+            continue
+        settled_service_rows, pending_service_rows, allowed_service_events = classify(sed_rows)
+        if pending_service_rows:
+            wait(time.monotonic())
+            continue
+        break
+    """
+
+    def test_human_row_only_on_the_final_read_fails_the_audit(self):
         reads, refs = [], []
 
-        def operation_rows_since(highwater):
-            reads.append(highwater)
-            if not refs:
-                return []
-            return [*service_rows, self.human()] if human_on_final else list(service_rows)
+        def operation_rows_since(before_highwater):
+            reads.append(before_highwater)
+            return [self.human()] if refs else []
 
         def ref_state():
             refs.append(True)
-            return self.snapshot()
-        return reads, operation_rows_since, ref_state
-
-    def test_human_row_only_on_the_final_read_fails_the_audit(self):
-        reads, rows_since, ref_state = self.rows(human_on_final=True)
+            return self.snapshot(operation_highwater=9)
         validated = []
         with self.assertRaisesRegex(AssertionError, "human operation row"):
             refusal_audit_sql.audit_api_refusal_interval(
-                self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"], rows_since,
-                lambda row: validated.append(row) or True, ref_state)
-        # The pre-final read(s) were empty and the human row was never validated.
+                self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"],
+                operation_rows_since, lambda row: validated.append(row) or True, ref_state)
+        # The pre-snapshot read was empty; the human row was only seen by the
+        # post-snapshot re-read and was never accepted.
         self.assertEqual(reads, [7, 7])
         self.assertEqual(validated, [])
 
     def test_user_count_comes_from_the_classified_final_rows(self):
-        reads, rows_since, ref_state = self.rows(human_on_final=False, service_rows=[self.service()])
+        # The settled row is visible only after the first snapshot (which is
+        # taken before it, highwater 7); one re-snapshot follows it, and the
+        # proof rows come from that second read.
+        reads, refs = [], []
+
+        def operation_rows_since(before_highwater):
+            reads.append(before_highwater)
+            return [self.creation()] if refs else []
+
+        def ref_state():
+            refs.append(True)
+            return self.snapshot(operation_highwater=7) if len(refs) == 1 \
+                else self.late_snapshot(with_before_main=True)
+        result = refusal_audit_sql.audit_api_refusal_interval(
+            self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"],
+            operation_rows_since, lambda row: True, ref_state)
+        # Pre-read (empty), snapshot 7, reread (row), fresh snapshot 8, reread.
+        self.assertEqual(reads, [7, 7, 7, 7])
+        self.assertEqual(len(refs), 2)
+        self.assertEqual(result["user_operation_count"], 0)
+        self.assertEqual([op["operation_id"] for op in result["service_operations"]],
+                         [self.creation()["operation_id"]])
+
+    def test_pending_service_row_still_settles_before_the_final_proof(self):
+        reads, snapshots = [], []
+        # One operation, sequence 8, one zero -> new event: pending first, then
+        # the same row settled.  The pending snapshot stops at highwater 7 (no
+        # job ref); the settled snapshot is highwater 8 with main + job ref.
+        pending = self.creation(settled=False)
+        settled = self.creation()
+        # The first pass only sees the pending row and cannot reach the
+        # snapshot; once settled, the snapshot taken is still the highwater-7
+        # one, so the audit re-snapshots and proves against highwater 8.
+        snapshots_iter = iter([self.snapshot(operation_highwater=7,
+                                             refs=[("refs/heads/main", "a")]),
+                               self.late_snapshot(with_before_main=True)])
+
+        def rows_since(highwater):
+            reads.append(highwater)
+            # The first read sees the row pending; from the reread on, the
+            # same operation is settled in place.
+            return [pending if len(reads) == 1 else settled]
+
+        def ref_state():
+            snapshots.append(len(reads))
+            return next(snapshots_iter)
         result = refusal_audit_sql.audit_api_refusal_interval(
             self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"], rows_since,
             lambda row: True, ref_state)
         self.assertEqual(result["user_operation_count"], 0)
-        self.assertEqual([op["operation_id"] for op in result["service_operations"]],
-                         [self.service()["operation_id"]])
-        self.assertGreaterEqual(len(reads), 2)
-
-    def test_pending_service_row_still_settles_before_the_final_proof(self):
-        reads = []
-        snapshots = iter([self.snapshot(refs=[("refs/heads/main", "a")]),
-                          self.snapshot(refs=[("refs/heads/main", "a"), (self.JOB_REF, "b")])])
-
-        def rows_since(highwater):
-            reads.append(highwater)
-            if len(reads) == 1:
-                return [self.service(settled=False)]
-            return [self.service(settled=True)]
-
-        result = refusal_audit_sql.audit_api_refusal_interval(
-            self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"], rows_since,
-            lambda row: True, lambda: next(snapshots))
-        self.assertEqual(result["user_operation_count"], 0)
-        # The pending row made the audit wait (one more read) and a fresh final
-        # snapshot was taken; it was never accepted as proof while unsettled.
-        self.assertEqual(reads, [7, 7, 7])
-        self.assertEqual(len(result["service_operations"]), 1)
+        # The pending row made the audit wait and repeat the pass.  Pending
+        # read (wait); settled pass: pre-read, snapshot at 7, reread (sequence
+        # 8 > 7, stale); fresh snapshot at 8; final reread, then the settled
+        # row is reported.  Never accepted while unsettled.
+        self.assertEqual(reads, [7, 7, 7, 7, 7])
+        self.assertEqual(snapshots, [2, 4])
+        self.assertEqual(result["service_operations"],
+                         [{"operation_id": settled["operation_id"], "sequence": 8,
+                           "outbox_ref": self.JOB_REF}])
+        self.assertEqual(result["changed_refs"], [self.JOB_REF])
+        self.assertEqual(result["diagnostics"]["final_highwater"], 8)
 
     def test_unvalidated_service_row_on_the_final_read_still_fails(self):
-        _, rows_since, ref_state = self.rows(human_on_final=False, service_rows=[self.service()])
+        reads, refs = [], []
+
+        def operation_rows_since(before_highwater):
+            reads.append(before_highwater)
+            return [self.creation()] if refs else []
+
+        def ref_state():
+            refs.append(True)
+            return self.late_snapshot(with_before_main=True)
         with self.assertRaisesRegex(AssertionError, "not source-validated"):
             refusal_audit_sql.audit_api_refusal_interval(
-                self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"], rows_since,
-                lambda row: False, ref_state)
+                self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"],
+                operation_rows_since, lambda row: False, ref_state)
+        self.assertEqual(reads, [7, 7])
+
+    # -- interval snapshot race: a service row settled after the ref read -----
+    def late_snapshot(self, with_before_main):
+        """The refs once the settled service create (sequence 8) is durable."""
+        refs = [(self.JOB_REF, self.JOB_NEW)]
+        if with_before_main:
+            refs.insert(0, ("refs/heads/main", "a"))
+        return self.snapshot(operation_highwater=8, refs=refs)
+
+    @classmethod
+    def creation(cls, settled=True):
+        """The creation event: zero -> new for an absent job ref."""
+        return cls.service(sequence=8, old_oid="0" * 40, new_oid=cls.JOB_NEW, settled=settled)
+
+    @staticmethod
+    def stale_loop(loop, highwater, classify, operation_rows_since, ref_state):
+        """Run one reviewed pre-fix loop verbatim against this test's fakes."""
+        namespace = {}
+        exec(compile(textwrap.dedent(
+            "def stale_loop(highwater, classify, operation_rows_since, ref_state, wait):"
+            + loop), "<pre-fix final api read>", "exec"),
+             {"time": refusal_audit_sql.time}, namespace)
+        namespace["stale_loop"](highwater, classify, operation_rows_since, ref_state,
+                                lambda _moment: None)
+
+    @classmethod
+    def stale_classify(cls, rows):
+        """The pre-fix loops' permissive service classification."""
+        return None, [row for row in rows if not row["settled"]], []
+
+    def test_late_settled_service_row_forces_a_new_ref_snapshot(self):
+        # One deterministic interleaving: the pre-read before the first
+        # snapshot returns no rows; the read after that snapshot returns the
+        # settled sequence-8 service create (zero -> d...d); every later read
+        # returns that same row.  The first snapshot keeps only
+        # refs/heads/main at operation_highwater 7; the second also has the
+        # job ref at d...d with operation_highwater 8.
+        late = self.creation()
+        pre_snapshot = self.snapshot(operation_highwater=7, refs=[("refs/heads/main", "a")])
+        fresh_snapshot = self.late_snapshot(with_before_main=True)
+
+        # Pre-fix loops, verbatim, on the same interleaving: the pending check
+        # reads first, the refs are read, and only then does the reread gain
+        # the operation.  The stale highwater-7 snapshot is accepted with the
+        # settled zero -> d...d event, and the unchanged refs pass the
+        # transition check.  That is the bug.
+        for name, loop in (("first", self.STALE_LOOP_PRE), ("current", self.STALE_LOOP_CURRENT)):
+            with self.subTest(pre_fix_loop=name):
+                reads = []
+
+                def stale_rows(before_highwater):
+                    reads.append(before_highwater)
+                    return [] if len(reads) == 1 else [late]
+
+                def stale_refs():
+                    self.assertEqual(len(reads), 1)
+                    return pre_snapshot
+                self.stale_loop(loop, 7, self.stale_classify, stale_rows, stale_refs)
+                self.assertEqual(pre_snapshot["refs"], [("refs/heads/main", "a")])
+                self.assertEqual(pre_snapshot["operation_highwater"], 7)
+                refusal_audit_sql.check_service_ref_transitions(
+                    "stale", dict(pre_snapshot["refs"]), dict(pre_snapshot["refs"]),
+                    refusal_audit_sql.service_allow_map("stale", [late["outbox_events"][0]]),
+                    ["refs/heads/main"])
+
+        # The real audit, same interleaving: pre-read (empty), snapshot at
+        # highwater 7, reread (row), next pre-read (same row), fresh snapshot
+        # at highwater 8, reread (row) -- then the row is reported.
+        reads, snapshots = [], []
+
+        def audited_rows(before_highwater):
+            reads.append(before_highwater)
+            return [] if len(reads) == 1 else [late]
+
+        def audited_refs():
+            snapshots.append(len(reads))
+            return pre_snapshot if len(snapshots) == 1 else fresh_snapshot
+
+        result = refusal_audit_sql.audit_api_refusal_interval(
+            self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"],
+            audited_rows, lambda row: True, audited_refs)
+        self.assertEqual(reads, [7, 7, 7, 7])
+        self.assertEqual(snapshots, [1, 3])
+        self.assertEqual(result["user_operation_count"], 0)
+        self.assertEqual(result["service_operations"],
+                         [{"operation_id": late["operation_id"], "sequence": 8,
+                           "outbox_ref": self.JOB_REF}])
+        self.assertEqual(result["changed_refs"], [self.JOB_REF])
+        self.assertEqual(result["diagnostics"]["final_highwater"], 8)
+
+
+class ServiceRefTransitionTest(unittest.TestCase):
+    """A service event whitelists one exact ref transition, never a ref name."""
+
+    JOB_REF = "refs/rootyard-ci/jobs/11111111-1111-4111-8111-111111111111"
+    OLD, NEW, OTHER = "c" * 40, "d" * 40, "e" * 40
+    SNAPSHOT = {"journal": [], "state": "ready/-", "outcomes": {}, "admissions": {}, "outbox": 0,
+                "operation_highwater": 7, "api_refs": [("refs/heads/main", "a")]}
+
+    def event(self, old=None, new=None):
+        return {"ref_name": self.JOB_REF, "old_oid": old or self.OLD, "new_oid": new or self.NEW}
+
+    def snapshot(self, refs, highwater=None):
+        snapshot = dict(self.SNAPSHOT, refs=refs)
+        if highwater is not None:
+            snapshot["operation_highwater"] = highwater
+        return snapshot
+
+    # -- Git refusal interval -------------------------------------------------
+    def git_rows(self, events):
+        return [{"operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "sequence": 8,
+                 "outcome": "no_ref_changes", "settled": True, "finished": True,
+                 "actor_and_token_match": True, "human_principal": True, "service_principal": False,
+                 "evidence_no_receipt": True, "interrupted": False, "storage_generation_matches": True,
+                 "ungranted_without_hooks": False, "reference_events": [],
+                 "admission_present": True, "admission_state": "ABORTED", "admission_settled": True,
+                 "admission_identity_matches": True, "admission_ref_names": ["refs/heads/main"],
+                 "outbox_count": 0, "outbox_ref_names": [], "outbox_events": []},
+                {"operation_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "sequence": 9,
+                 "human_principal": False, "service_principal": True, "actor_and_token_match": False,
+                 "settled": True, "outbox_ref_names": [events[0]["ref_name"]] if events else [],
+                 "outbox_events": events}]
+
+    def run_git(self, events, before_refs, after_refs):
+        def ref_state():
+            # Every interval read observes the same settled post-refusal state.
+            return self.snapshot(after_refs)
+        return refusal_audit_sql.audit_git_refusal_interval(
+            self.snapshot(before_refs), "git refusal", ["refs/heads/main"],
+            lambda highwater: self.git_rows(events), lambda row: True, lambda: [],
+            ref_state)
+
+    # -- API refusal interval -------------------------------------------------
+    def run_api(self, events, before_refs, after_refs):
+        row = {"operation_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "sequence": 9,
+               "human_principal": False, "service_principal": True, "actor_and_token_match": False,
+               "settled": True, "outbox_ref_names": [event["ref_name"] for event in events],
+               "outbox_events": events}
+        return refusal_audit_sql.audit_api_refusal_interval(
+            self.snapshot(before_refs), self.snapshot(before_refs), "api 403", ["refs/heads/main"],
+            lambda highwater: [row], lambda row: True,
+            lambda: self.snapshot(after_refs, highwater=row["sequence"]))
+
+    def test_exact_service_transition_is_allowed_in_both_audits(self):
+        before = [("refs/heads/main", "a"), (self.JOB_REF, self.OLD)]
+        after = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        for name, run in (("git", self.run_git), ("api", self.run_api)):
+            with self.subTest(audit=name):
+                result = run([self.event()], before, after)
+                self.assertEqual(result["service_ref_names"], [self.JOB_REF])
+                if name == "api":
+                    self.assertEqual(result["changed_refs"], [self.JOB_REF])
+
+    def test_absent_ref_materializing_at_the_event_target_is_allowed(self):
+        # The real CI path: the service operation *creates* the job ref, so its
+        # event is zero -> target and the absent physical side is the zero OID.
+        event = self.event(old="0" * 40, new=self.NEW)
+        before = [("refs/heads/main", "a")]
+        after = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        for name, run in (("git", self.run_git), ("api", self.run_api)):
+            with self.subTest(audit=name):
+                run([event], before, after)
+
+    def test_out_of_band_overwrite_of_the_same_ref_is_rejected_in_both_audits(self):
+        # The ref name is the validated one, but the physical move is not the
+        # event's old -> new transition: an unrelated overwrite must fail.
+        for event, before, after in (
+            (self.event(), [("refs/heads/main", "a"), (self.JOB_REF, self.OLD)],
+             [("refs/heads/main", "a"), (self.JOB_REF, self.OTHER)]),
+            # A creation event whose physical target is a different OID.
+            (self.event(old="0" * 40, new=self.NEW), [("refs/heads/main", "a")],
+             [("refs/heads/main", "a"), (self.JOB_REF, self.OTHER)]),
+        ):
+            for name, run in (("git", self.run_git), ("api", self.run_api)):
+                with self.subTest(audit=name, event=event):
+                    with self.assertRaisesRegex(AssertionError, "moved out of band|without a validated"):
+                        run([event], before, after)
+
+    def test_unchanged_ref_is_not_forced_to_materialize_an_event(self):
+        # A recorded event whose target was already in place: nothing moved, so
+        # the audit neither requires nor rejects the ref on that account.
+        before = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        for name, run in (("git", self.run_git), ("api", self.run_api)):
+            with self.subTest(audit=name):
+                run([self.event()], before, before)
+
+    def test_absent_event_old_must_be_the_zero_oid_of_its_format(self):
+        # An event claiming a non-zero old OID for a ref that did not exist is
+        # a source/observed disagreement, not a legal creation.
+        before = [("refs/heads/main", "a")]
+        after = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        for name, run in (("git", self.run_git), ("api", self.run_api)):
+            with self.subTest(audit=name):
+                with self.assertRaisesRegex(AssertionError, "moved out of band"):
+                    run([self.event()], before, after)
+
+    def test_duplicate_service_events_for_one_ref_are_ambiguous(self):
+        # Same ref name, two validated events: which move it must match cannot
+        # be decided, so both audits fail closed.
+        before = [("refs/heads/main", "a"), (self.JOB_REF, self.OLD)]
+        after = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        first = self.event()
+        second = {"ref_name": self.JOB_REF, "old_oid": self.OLD, "new_oid": self.OTHER}
+        # Two settled service rows: each links its own job event, but both name
+        # the same ref, so the physical move cannot be attributed to one.
+        duplicate_rows = self.git_rows([first])
+        duplicate_rows.append(dict(duplicate_rows[1],
+                                   operation_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                                   sequence=10, outbox_ref_names=[self.JOB_REF],
+                                   outbox_events=[second]))
+        with self.assertRaisesRegex(AssertionError, "duplicate validated service outbox events"):
+            refusal_audit_sql.audit_git_refusal_interval(
+                self.snapshot(before), "duplicate", ["refs/heads/main"],
+                lambda highwater: duplicate_rows, lambda row: True, lambda: [],
+                lambda: self.snapshot(after))
+        with self.assertRaisesRegex(AssertionError, "duplicate validated service outbox events"):
+            refusal_audit_sql.audit_api_refusal_interval(
+                self.snapshot(before), self.snapshot(before), "duplicate api", ["refs/heads/main"],
+                lambda highwater: duplicate_rows[1:], lambda row: True, lambda: self.snapshot(after))
+        # The shared allow-map helper stays the last-line guard.
+        with self.assertRaisesRegex(AssertionError, "duplicate validated service outbox events"):
+            refusal_audit_sql.service_allow_map("t", [first, second])
+
+    def test_human_refusal_must_have_no_outbox_event_objects(self):
+        row = {"settled": True, "outcome": "no_ref_changes", "actor_and_token_match": True,
+               "human_principal": True, "service_principal": False, "evidence_no_receipt": True,
+               "finished": True, "interrupted": False, "storage_generation_matches": True,
+               "ungranted_without_hooks": False, "reference_events": [], "admission_present": True,
+               "admission_state": "ABORTED", "admission_settled": True,
+               "admission_identity_matches": True, "admission_ref_names": ["refs/heads/main"],
+               "outbox_count": 0, "outbox_ref_names": []}
+        for bad in ([],):
+            self.assertEqual(refusal_audit_sql.refusal_audit_verdict(
+                dict(row, outbox_events=bad), [], ["refs/heads/main"])["problems"], [])
+        for bad in ([self.event()], None, "[]"):
+            self.assertIn("outbox_events", refusal_audit_sql.refusal_audit_verdict(
+                dict(row, outbox_events=bad), [], ["refs/heads/main"])["problems"], bad)
+
+    def test_decoder_requires_exact_event_objects(self):
+        base = {"operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "sequence": 8,
+                "outcome": "no_ref_changes", "settled": True, "finished": True,
+                "actor_and_token_match": True, "human_principal": True, "service_principal": False,
+                "evidence_no_receipt": True, "interrupted": False, "storage_generation_matches": True,
+                "ungranted_without_hooks": False, "reference_events": [], "admission_present": True,
+                "admission_state": "ABORTED", "admission_settled": True,
+                "admission_identity_matches": True, "admission_ref_names": ["refs/heads/main"],
+                "outbox_count": 0}
+
+        def decode(events, names=None):
+            derived = ([event["ref_name"] for event in events
+                        if isinstance(event, dict) and "ref_name" in event]
+                       if names is None and isinstance(events, list) else
+                       ([] if names is None else names))
+            row = dict(base, outbox_events=events, outbox_ref_names=derived)
+            return refusal_audit_sql.decode_operation_interval(json.dumps([row]), 7)
+        self.assertEqual(decode([self.event()])[0]["outbox_events"], [self.event()])
+        for bad in ({}, "event", None, [{"ref_name": self.JOB_REF, "old_oid": self.OLD}],
+                    [dict(self.event(), extra=1)], [self.event(new=self.OLD.upper())],
+                    [self.event(new=self.NEW[:-1])], [self.event(old="f" * 64)],
+                    [dict(self.event(), new_oid="g" * 40)]):
+            with self.subTest(outbox_events=bad):
+                with self.assertRaises(ValueError):
+                    decode(bad)
+        # The legacy name array must still describe exactly these events.
+        with self.assertRaises(ValueError):
+            decode([self.event()], names=["refs/rootyard-ci/jobs/other"])
 
 
 class NativeRefusalAccountingTest(unittest.TestCase):
@@ -2021,13 +2589,16 @@ class NativeRefusalAccountingTest(unittest.TestCase):
     def test_api_interval_allows_valid_ci_release_and_ignores_global_count_deltas(self):
         job_ref = "refs/rootyard-ci/jobs/11111111-1111-4111-8111-111111111111"
         operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        old_oid, new_oid = "c" * 40, "d" * 40
         service_row = {"operation_id": operation_id, "sequence": 8, "human_principal": False,
                        "service_principal": True, "actor_and_token_match": False, "settled": True,
-                       "outbox_ref_names": [job_ref]}
-        before = {"operation_highwater": 7, "refs": [("refs/heads/main", "a"), (job_ref, "b")],
+                       "outbox_ref_names": [job_ref],
+                       "outbox_events": [{"ref_name": job_ref, "old_oid": old_oid,
+                                          "new_oid": new_oid}]}
+        before = {"operation_highwater": 7, "refs": [("refs/heads/main", "a"), (job_ref, old_oid)],
                   "journal": [], "state": "ready/-", "outcomes": {"recorded": 1}, "admissions": {},
                   "outbox": 1, "api_refs": [("refs/heads/main", "a")]}
-        final = {"operation_highwater": 8, "refs": [("refs/heads/main", "a")],
+        final = {"operation_highwater": 8, "refs": [("refs/heads/main", "a"), (job_ref, new_oid)],
                  "journal": [], "state": "ready/-", "outcomes": {"recorded": 2},
                  "admissions": {"ABORTED": 1}, "outbox": 2, "api_refs": [("refs/heads/main", "a")]}
         highwaters = []
