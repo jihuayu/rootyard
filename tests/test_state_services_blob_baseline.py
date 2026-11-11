@@ -754,6 +754,97 @@ class WorkloadTest(unittest.TestCase):
                 baseline.validate_workload({**declared, "files": files})
 
 
+class ServiceAdmissionTest(unittest.TestCase):
+    """Configured admission facts: defaults, overrides and fail-closed capacity."""
+
+    DEFAULT = "src/standalone/config.rs default"
+    OVERRIDE = "environment_override"
+
+    def test_defaults_come_from_the_config_rs_values(self):
+        env = {}
+        facts = baseline.service_admission_facts(env)
+        self.assertEqual(env, {})  # read only, never written or overridden
+        settings = facts["settings"]
+        self.assertEqual(settings["max_concurrent_git"]["value"], 8)
+        self.assertEqual(settings["max_request_bytes"]["value"], 128 << 20)
+        self.assertEqual(settings["max_inflight_bytes"]["value"], 256 << 20)
+        for name in ("max_concurrent_git", "max_request_bytes", "max_inflight_bytes"):
+            self.assertEqual(settings[name]["source"], self.DEFAULT)
+        self.assertEqual(facts["upload_pack_reservation_bytes"], 128 << 20)
+        self.assertEqual(facts["byte_budget_capacity"], 2)
+        self.assertEqual(facts["effective_upload_pack_capacity"], 2)
+        self.assertEqual(facts["measured_clone_concurrency"], 2)
+        self.assertIs(facts["capacity_covers_measured_concurrency"], True)
+        self.assertIn("before spooling", facts["explanation"])
+        self.assertIn("neither", facts["scope"])
+
+    def test_config_rs_defaults_match_the_runner(self):
+        source = (ROOT / "src/standalone/config.rs").read_text()
+        for name, default in (("ROOTYARD_MAX_CONCURRENT_GIT", "8"),
+                              ("ROOTYARD_MAX_REQUEST_BYTES", "128 << 20"),
+                              ("ROOTYARD_MAX_INFLIGHT_BYTES", "256 << 20")):
+            self.assertIn('number("%s", %s,' % (name, default), source)
+
+    def test_overrides_keep_their_source_and_derive_capacity(self):
+        facts = baseline.service_admission_facts({"ROOTYARD_MAX_CONCURRENT_GIT": "3",
+                                                  "ROOTYARD_MAX_REQUEST_BYTES": str(64 << 20),
+                                                  "ROOTYARD_MAX_INFLIGHT_BYTES": str(300 << 20)})
+        settings = facts["settings"]
+        self.assertEqual([settings[name]["value"] for name in
+                          ("max_concurrent_git", "max_request_bytes", "max_inflight_bytes")],
+                         [3, 64 << 20, 300 << 20])
+        for name in ("max_concurrent_git", "max_request_bytes", "max_inflight_bytes"):
+            self.assertEqual(settings[name]["source"], self.OVERRIDE)
+        self.assertEqual(facts["upload_pack_reservation_bytes"], 64 << 20)
+        self.assertEqual(facts["byte_budget_capacity"], 4)
+        self.assertEqual(facts["effective_upload_pack_capacity"], 3)  # bounded by max concurrent Git
+        # A Git limit alone is the binding one when the byte budget is wider.
+        git_bound = baseline.service_admission_facts({"ROOTYARD_MAX_CONCURRENT_GIT": "2"})
+        self.assertEqual(git_bound["byte_budget_capacity"], 2)
+        self.assertEqual(git_bound["effective_upload_pack_capacity"], 2)
+
+    def test_byte_budget_of_one_fails_closed(self):
+        for env in ({"ROOTYARD_MAX_INFLIGHT_BYTES": str(128 << 20)},
+                    {"ROOTYARD_MAX_REQUEST_BYTES": str(200 << 20)},
+                    {"ROOTYARD_MAX_CONCURRENT_GIT": "1"}):
+            with self.subTest(env=env), self.assertRaises(baseline.BaselineError) as raised:
+                baseline.service_admission_facts(env)
+            for value in env.values():
+                self.assertNotIn(value, str(raised.exception))
+
+    def test_invalid_values_fail_closed_without_echoing_them(self):
+        for env in ({"ROOTYARD_MAX_CONCURRENT_GIT": "four"}, {"ROOTYARD_MAX_REQUEST_BYTES": "-1"},
+                    {"ROOTYARD_MAX_INFLIGHT_BYTES": "1_000"},
+                    {"ROOTYARD_MAX_INFLIGHT_BYTES": " 1024"}, {"ROOTYARD_MAX_CONCURRENT_GIT": ""},
+                    {"ROOTYARD_MAX_REQUEST_BYTES": "\u0661"}, {"ROOTYARD_MAX_CONCURRENT_GIT": "257"},
+                    {"ROOTYARD_MAX_REQUEST_BYTES": str(64 << 10 - 1)},
+                    {"ROOTYARD_MAX_INFLIGHT_BYTES": str(16 << 30 + 1)},
+                    {"ROOTYARD_MAX_CONCURRENT_GIT": None}):
+            with self.subTest(env=env), self.assertRaises(baseline.BaselineError) as raised:
+                baseline.service_admission_facts(env)
+            for value in env.values():
+                if isinstance(value, str) and len(value) > 1:
+                    self.assertNotIn(value.strip(), str(raised.exception))
+
+    def test_report_refuses_tampered_admission_facts(self):
+        facts = baseline.service_admission_facts({})
+        tampered = [
+            {"byte_budget_capacity": 4},
+            {"effective_upload_pack_capacity": 8},
+            {"measured_clone_concurrency": 4},
+            {"capacity_covers_measured_concurrency": False},
+            {"upload_pack_reservation_bytes": 1},
+            {"scope": "measured throughput"},
+        ]
+        for override in tampered:
+            with self.subTest(override=override), self.assertRaises(baseline.BaselineError):
+                report_payload(admission={**facts, **override})
+        settings = json.loads(json.dumps(facts["settings"]))
+        settings["max_request_bytes"]["value"] = 64 << 20
+        with self.assertRaises(baseline.BaselineError):
+            report_payload(admission={**facts, "settings": settings})
+
+
 class PushTest(unittest.TestCase):
     def test_validated_summaries_are_not_measurements(self):
         # A report must be assembled from the measured push, never from its summary.
@@ -836,7 +927,7 @@ class SingleCloneTest(unittest.TestCase):
         self.assertFalse(record["includes_local_verification"])
         self.assertIn("never compared or summed", record["verification_scope"])
         self.assertFalse(record["concurrent_write_pushes"])
-        # Every clone took at least `delay`, and the four really overlapped: the
+        # Every clone took at least `delay`, and the two really overlapped: the
         # aggregate is far below their sum (serial clones would take the sum).
         for worker_record in workers:
             self.assertGreaterEqual(worker_record["seconds"], self.harness.delay)
@@ -847,7 +938,7 @@ class SingleCloneTest(unittest.TestCase):
     def test_delayed_verification_cannot_extend_aggregate_seconds(self):
         """Real wall time: slow local checks run only after the aggregate window closes."""
         self.harness.delay = 0.02
-        self.harness.verification_delay = 0.1   # four workers => ~0.4 s of local checks
+        self.harness.verification_delay = 0.1   # two workers => ~0.2 s of local checks
         started = time.monotonic()
         workers, aggregate_seconds, record = baseline.run_concurrent_reads(self.harness, self.seed)
         elapsed = time.monotonic() - started
@@ -951,14 +1042,15 @@ class SingleCloneTest(unittest.TestCase):
         record = baseline.aggregate_wall(workers, 0.9, OID)
         self.assertEqual(record["mode"], baseline.READ_MODE)
         self.assertFalse(record["includes_local_verification"])
-        self.assertEqual(record["concurrency_window_ratio"], 2.25)
+        self.assertEqual(record["concurrency_window_ratio"],
+                         round(record["aggregate_seconds"] / max(record["worker_seconds"]), 6))
         shared = [workers[0], worker(1, destination="concurrent-worker-1")] + workers[2:]
         with self.assertRaises(baseline.BaselineError):
             baseline.aggregate_wall(shared, 0.9, OID)
         with self.assertRaises(baseline.BaselineError):
             baseline.aggregate_wall(workers, 0.1, OID)  # shorter than a worker
         with self.assertRaises(baseline.BaselineError):
-            baseline.aggregate_wall(workers[:3], 1.0, OID)
+            baseline.aggregate_wall(workers[:baseline.CONCURRENCY - 1], 1.0, OID)
 
 
 class SetupAndRestartTest(unittest.TestCase):
@@ -1218,6 +1310,19 @@ class ReportValidationTest(unittest.TestCase):
     def test_report_labels_and_bounds(self):
         payload = report_payload()
         self.assertEqual(payload["status"], "passed")
+        admission = payload["service_admission"]
+        self.assertEqual(admission["settings"]["max_concurrent_git"],
+                         {"value": 8, "source": "src/standalone/config.rs default", "range": [1, 256]})
+        self.assertEqual(admission["settings"]["max_request_bytes"]["value"], 128 << 20)
+        self.assertEqual(admission["settings"]["max_inflight_bytes"]["value"], 256 << 20)
+        self.assertEqual(admission["upload_pack_reservation_bytes"], 128 << 20)
+        self.assertEqual(admission["byte_budget_capacity"], 2)
+        self.assertEqual(admission["effective_upload_pack_capacity"], 2)
+        self.assertEqual(admission["measured_clone_concurrency"], baseline.CONCURRENCY)
+        self.assertIs(admission["capacity_covers_measured_concurrency"], True)
+        self.assertIn("max_request_bytes per upload-pack body before spooling", admission["explanation"])
+        self.assertEqual(payload["workload"]["concurrency"], 2)
+        self.assertEqual(payload["workload"]["read_repositories"], ["blob-baseline"] * 2)
         self.assertFalse(payload["issue"]["issue_complete"])
         self.assertFalse(payload["issue"]["budgets_frozen"])
         self.assertFalse(payload["legacy_pando_profile_used"])
@@ -1238,8 +1343,8 @@ class ReportValidationTest(unittest.TestCase):
 
     def test_report_version_scope_and_no_four_tuple_claim(self):
         payload = report_payload()
-        self.assertEqual(baseline.REPORT_VERSION, 2)
-        self.assertEqual(payload["report_version"], 2)
+        self.assertEqual(baseline.REPORT_VERSION, 3)
+        self.assertEqual(payload["report_version"], 3)
         ownership = payload["pg_ownership_samples"]
         for field in ("limits", "limitations"):
             self.assertEqual(payload[field], baseline.LIMITS)
@@ -1309,7 +1414,7 @@ def expected_report_error(case, categories):
     raise AssertionError("report accepted " + repr(case))
 
 
-def report_payload(*, case_list=None, cold_record=None, concurrent=None, setup=None):
+def report_payload(*, case_list=None, cold_record=None, concurrent=None, setup=None, admission=None):
     return baseline.report_payload(
         binding=BINDING, blob_profile={"driver": "opendal", "service": "s3", "root_configured": True},
         runtime=RUNTIME, workload=workload(), cases=case_list if case_list is not None else case_fixture(),
@@ -1317,7 +1422,9 @@ def report_payload(*, case_list=None, cold_record=None, concurrent=None, setup=N
         seeding={"push": push(), "object_format": "sha1"},
         concurrent=concurrent or {"workers": [worker(index) for index in range(baseline.CONCURRENCY)],
                                   "aggregate_seconds": 1.0, "worker_oid": OID},
-        cold=cold_record or baseline.validate_cold(cold_fixture()))
+        cold=cold_record or baseline.validate_cold(cold_fixture()),
+        # Default admission facts from an empty environment, never the ambient host env.
+        service_admission=admission or baseline.service_admission_facts({}))
 
 
 class FakeRunHarness(FakeGitHarness):
@@ -1441,9 +1548,11 @@ class RunOrchestrationTest(unittest.TestCase):
         self.args.report = Path(tempfile.mkdtemp(prefix="blob-baseline-report-")) / "report.json"
         FakeSampler.instances = []
 
-    def run_once(self, restart_changes_pid=True, session_rows=None):
+    def run_once(self, restart_changes_pid=True, session_rows=None, service_env=None):
         files = baseline.select_workload()
         harness = FakeRunHarness(files, restart_changes_pid=restart_changes_pid)
+        if service_env:
+            harness.env.update(service_env)
         if session_rows is not None:
             harness.session_rows = list(session_rows)
         profile = mock.Mock(working_tree_clean=True, build={"binary_sha256": "a" * 64,
@@ -1452,7 +1561,8 @@ class RunOrchestrationTest(unittest.TestCase):
                             receipt_sha256="d" * 64, harness_sha256="e" * 64, git_sha256="f" * 64)
         def capture(*args, **kwargs):
             # Record the run's own case records, then build the report normally.
-            harness.captured = {"cases": kwargs["cases"], "setup": kwargs["setup"], "seeding": kwargs["seeding"]}
+            harness.captured = {"cases": kwargs["cases"], "setup": kwargs["setup"], "seeding": kwargs["seeding"],
+                                "service_admission": kwargs["service_admission"]}
             return real_report_payload(*args, **kwargs)
 
         real_report_payload = baseline.report_payload
@@ -1486,6 +1596,26 @@ class RunOrchestrationTest(unittest.TestCase):
         self.assertEqual(report["seed_push"]["push_wall_seconds"] > 0, True)
         self.assertNotIn("super-secret", json.dumps(report))
         self.assertNotIn("database.fixture.internal", json.dumps(report))
+
+    def test_report_carries_the_effective_service_admission(self):
+        code, harness, report, captured = self.run_once(
+            service_env={"ROOTYARD_MAX_REQUEST_BYTES": str(64 << 20), "ROOTYARD_MAX_INFLIGHT_BYTES": str(128 << 20)})
+        self.assertEqual(code, 0, report.get("error"))
+        admission = report["service_admission"]
+        self.assertEqual(report["report_version"], 3)
+        self.assertEqual(admission["settings"]["max_concurrent_git"]["source"], "src/standalone/config.rs default")
+        self.assertEqual(admission["settings"]["max_request_bytes"],
+                         {"value": 64 << 20, "source": "environment_override", "range": [64 << 10, 4 << 30]})
+        self.assertEqual(admission["settings"]["max_inflight_bytes"]["source"], "environment_override")
+        self.assertEqual(admission["byte_budget_capacity"], 2)
+        self.assertEqual(admission["effective_upload_pack_capacity"], 2)
+        self.assertEqual(admission, captured["service_admission"])
+        self.assertEqual(len(captured["cases"][2]["detail"]["workers"]), 2)
+        # The reported values are the profile's effective settings, never a runner override.
+        self.assertEqual({name: harness.env[name] for name in ("ROOTYARD_MAX_REQUEST_BYTES",
+                                                               "ROOTYARD_MAX_INFLIGHT_BYTES")},
+                         {"ROOTYARD_MAX_REQUEST_BYTES": str(64 << 20),
+                          "ROOTYARD_MAX_INFLIGHT_BYTES": str(128 << 20)})
 
     def test_restart_is_never_sampled_and_samples_follow_the_pid(self):
         code, harness, report, captured = self.run_once()
