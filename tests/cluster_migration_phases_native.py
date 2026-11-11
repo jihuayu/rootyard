@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Genuine SIGKILL/restart acceptance for the six residual migration phases.
+"""Genuine SIGKILL/restart acceptance for migration and shard-marker transitions.
 
-The six fault boundaries covered are three migration-phase crashes
-(`copy-before-transfer`, `copy-after-transfer`, `target-delta-before-verified`)
-and three takeover-phase crashes (`takeover-after-source-verify`,
-`takeover-before-promote`, `takeover-after-source-marker`).
+The matrix covers three migration-phase crashes (`copy-before-transfer`,
+`copy-after-transfer`, `target-delta-before-verified`), three takeover-phase
+crashes (`takeover-after-source-verify`, `takeover-before-promote`,
+`takeover-after-source-marker`), and both sides of every explicit shard marker
+transition (`degrade`, `recover`, `fence`, `unfence`): a kill after the marker
+intent is staged but before PostgreSQL commit must roll back without moving the
+volume marker, and a kill after commit but before marker publication must leave
+a pending transition that blocks writes until restart reconciliation publishes
+the exact committed marker.
 
 This harness owns a disposable PostgreSQL database and its own temporary Git
-volumes. Each case drives the public migration or takeover flow, uses the
-opt-in native fault hook to SIGKILL a real Rust process at one exact durable
-boundary, inspects durable operation state (including the still-running
+volumes. Each case drives the public migration, takeover or transition flow,
+uses the opt-in native fault hook to SIGKILL a real Rust process at one exact
+durable boundary, inspects durable operation state (including the still-running
 target's public shard-fence status, sampled while the target process is paused
 at the pre-commit fault boundary and before SIGKILL), then recovers. Migration
 cases retry the same operation through the public migration API after restart;
@@ -26,6 +31,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -170,10 +177,12 @@ def route(h, name):
 
 
 def sql_route(h, repo_id):
-    row = h.sql("SELECT primary_node_id,route_epoch,draining::text,read_only_degraded::text "
+    row = h.sql("SELECT primary_node_id,route_epoch,fencing_token,fenced_epoch,"
+                "draining::text,read_only_degraded::text "
                 "FROM repository_shard_routes WHERE repository_id='" + repo_id + "'")
-    primary, epoch, draining, degraded = row.split("|")
+    primary, epoch, token, fenced, draining, degraded = row.split("|")
     return {"primary_node_id": primary, "route_epoch": int(epoch),
+            "fencing_token": int(token), "fenced_epoch": int(fenced),
             "draining": draining == "true", "read_only_degraded": degraded == "true"}
 
 
@@ -619,7 +628,7 @@ def takeover_case(args, phase):
         kill_child(target, tlog)
         target, tlog = start_child(h, args, TARGET, target_url, node1_data, tag="node1",
                                    extra={FAULT: phase, FAULT_ACTION: "pause",
-                                          FAULT_PAUSE: "8000"})
+                                          FAULT_PAUSE: "20000"})
         marker = wait_marker_alive(node1_data, phase, target, timeout=40)
         assert_marker_binding(marker, phase, h.repo["id"], op, target.pid)
         if phase == "takeover-after-source-marker":
@@ -663,14 +672,20 @@ def takeover_case(args, phase):
         assert after["route"]["draining"] is False, after
         assert after["operation_state"] == "verified", after
         assert after["promotion_rows"] == 0, "killed controller recorded a promotion"
-        assert after["pending_marker_transition_rows"] == 0, \
-            "killed controller left a pending marker transition before commit"
+        expected_pending = 1 if phase == "takeover-after-source-marker" else 0
+        assert after["pending_marker_transition_rows"] == expected_pending, \
+            ("killed controller left the wrong pending marker intent count", after)
         if phase == "takeover-after-source-marker":
-            # The retired source marker was fsynced and verified inside the
-            # promotion transaction, which was then killed before commit.
-            # Read it from the durable old volume, never from process memory.
+            # The retired source marker and its durable intent were fsynced
+            # before the promotion transaction was killed. Read the marker from
+            # the old volume and the intent from PostgreSQL, never process memory.
             assert after["source_volume_marker_present"] is True, \
                 "durable source volume marker was not published before the kill"
+            source_pending = int(h.sql(
+                "SELECT COUNT(*) FROM shard_marker_transitions WHERE repository_id='"
+                + h.repo["id"] + "' AND state='pending' AND target_marker->>'primary_node_id'='"
+                + SYSTEM + "'"))
+            assert source_pending == 1, ("source marker intent is not bound to its volume", source_pending)
             retired = json.loads((h.bare / "rootyard-shard-fence.json").read_text())
             after["source_volume_marker"] = {"primary_node_id": retired["primary_node_id"],
                                              "route_epoch": retired["route_epoch"],
@@ -743,8 +758,10 @@ def takeover_case(args, phase):
                 "SELECT COUNT(*) FROM shard_marker_transitions WHERE repository_id='"
                 + h.repo["id"] + "' AND state='complete'"))
             assert post["pending_marker_transition_rows"] == 0, post
-            assert post["complete_marker_transition_rows"] == 1, \
-                ("expected one reconciled marker transition", post)
+            # One restored rollback intent from the interrupted promotion, then
+            # the retried source and target marker transitions.
+            assert post["complete_marker_transition_rows"] == 3, \
+                ("expected the rollback intent plus retried source/target transitions", post)
         rejected = h.run([args.binary, "serve"], check=False)
         assert rejected.returncode != 0, "old writer restarted after durable fence"
         assert (b"durable physical fence" in rejected.stderr
@@ -757,7 +774,8 @@ def takeover_case(args, phase):
         assert rev(h, h.bare, "refs/heads/main") == tip
         git_ok(h, dest)
         assert_retained(h, dest, job, tip)
-        result = {"phase": phase, "scope": "target controller Rust process in takeover",
+        result = {"name": phase, "status": "passed",
+                  "phase": phase, "scope": "target controller Rust process in takeover",
                   "fault_marker": {"phase": marker["phase"], "pid": marker["pid"],
                                    "repository_bound": True, "operation_bound": True},
                   "fault_pid": marker["pid"], "controller_pid": target_pid,
@@ -787,6 +805,268 @@ def takeover_case(args, phase):
         kill_child(target, tlog)
 
 
+def registered_hooks():
+    source = (Path(__file__).resolve().parent.parent / "src/sharding/faults.rs").read_text()
+    block = source.split("const PHASES: &[&str] = &[", 1)[1].split("];", 1)[0]
+    return re.findall(r'"([^"]+)"', block)
+
+
+def volume_marker(h):
+    path = h.bare / "rootyard-shard-fence.json"
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def route_view(route):
+    return {key: route[key] for key in (
+        "primary_node_id", "route_epoch", "fencing_token",
+        "fenced_epoch", "draining", "read_only_degraded")}
+
+
+def expected_after(route, action, body):
+    result = dict(route)
+    if action == "fence":
+        fenced = body.get("fenced_epoch", route["route_epoch"])
+        result["fenced_epoch"] = max(route["fenced_epoch"], fenced)
+        result["route_epoch"] = max(route["route_epoch"], result["fenced_epoch"])
+        result["fencing_token"] = max(route["fencing_token"], result["route_epoch"]) + 1
+    elif action in ("unfence", "recover"):
+        result["route_epoch"] = max(route["route_epoch"], route["fenced_epoch"]) + 1
+        result["fencing_token"] = max(route["fencing_token"], result["route_epoch"]) + 1
+        result["read_only_degraded"] = False
+    elif action == "degrade":
+        result["read_only_degraded"] = True
+    return result
+
+
+def expected_fenced_node(action, route, previous):
+    if action == "fence":
+        return route["primary_node_id"]
+    if action == "unfence":
+        return None
+    return (previous or {}).get("fenced_node_id")
+
+
+def assert_volume_marker(h, route, fenced_node, present):
+    marker = volume_marker(h)
+    if not present:
+        assert marker is None, ("unexpected volume marker after rollback", marker)
+        return None
+    assert marker is not None, "committed transition did not publish a volume marker"
+    generation = int(h.sql("SELECT storage_generation FROM repositories WHERE id='"
+                            + h.repo["id"] + "'"))
+    expected = {
+        "repository_id": h.repo["id"],
+        "primary_node_id": route["primary_node_id"],
+        "route_epoch": route["route_epoch"],
+        "fencing_token": route["fencing_token"],
+        "fenced_epoch": route["fenced_epoch"],
+        "storage_generation": max(generation, route["required_generation"]),
+        "read_only_degraded": route["read_only_degraded"],
+        "fenced_node_id": fenced_node,
+    }
+    observed = {key: marker.get(key) for key in expected}
+    assert observed == expected, ("volume marker differs from committed route", observed, expected)
+    return marker
+
+
+def pending_transition_rows(h):
+    return int(h.sql("SELECT COUNT(*) FROM shard_marker_transitions WHERE repository_id='"
+                     + h.repo["id"] + "' AND state='pending'"))
+
+
+def fence_status(h):
+    status, raw, _ = h.http("/api/repos/alice/demo/shard-fence", token=h.alice)
+    assert status == 200, (status, raw[:300])
+    return json.loads(raw)
+
+
+def route_admits(route_value):
+    return not route_value["read_only_degraded"] and \
+        route_value["fenced_epoch"] < route_value["route_epoch"]
+
+
+def probe_write(h, expected_admitted, label):
+    push_commit(h, h.work, "barrier probe " + label + "\n")
+    attempted = h.git("push", "origin", "HEAD:main", cwd=h.work,
+                      token=h.alice, check=False)
+    if attempted.returncode:
+        h.git("reset", "--hard", "HEAD~1", cwd=h.work)
+    assert (attempted.returncode == 0) == expected_admitted, (
+        "actual write barrier disagrees with route", label, expected_admitted,
+        attempted.returncode, attempted.stderr.decode(errors="replace")[-500:])
+    return attempted.returncode
+
+
+def audit_rollback_case(h, action, body, before_route, before_marker):
+    endpoint = "/api/repos/alice/demo/shard-" + (
+        "degrade" if action in ("degrade", "recover") else "fence")
+    function = "native_audit_rollback"
+    try:
+        h.sql("CREATE OR REPLACE FUNCTION " + function
+              + "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+              + "RAISE EXCEPTION 'native audit rollback'; END $$")
+        h.sql("CREATE TRIGGER " + function + " BEFORE INSERT ON repository_audit_log "
+              + "FOR EACH ROW EXECUTE FUNCTION " + function + "()")
+        status, raw, _ = h.http(endpoint, token=h.alice, method="POST", body=body)
+    finally:
+        h.sql("DROP FUNCTION IF EXISTS " + function + "() CASCADE")
+    assert status >= 500, ("audit failure did not abort the transition", status, raw[:300])
+    assert sql_route(h, h.repo["id"]) == route_view(before_route)
+    assert volume_marker(h) == before_marker
+    assert pending_transition_rows(h) == 0
+    h.stop()
+    h.start()
+    expected_admitted = route_admits(before_route)
+    fence = fence_status(h)
+    assert fence["write_admitted"] == expected_admitted, \
+        ("audit rollback restart admitted writes unexpectedly", action, fence)
+    push_rc = probe_write(h, expected_admitted, action + " audit rollback")
+    return {
+        "name": action + "-audit-rollback",
+        "status": "passed",
+        "phase": "audit-rollback",
+        "action": action,
+        "http_status": status,
+        "durable_state_after_fault": {
+            "route": sql_route(h, h.repo["id"]),
+            "marker": before_marker,
+            "pending_marker_transition_rows": 0,
+            "postgresql_committed": False,
+        },
+        "restart_reconciliation": {
+            "route": route_view(route(h, "demo")),
+            "marker": volume_marker(h),
+            "pending_marker_transition_rows": 0,
+            "write_admitted": fence["write_admitted"],
+            "push_returncode": push_rc,
+        },
+    }
+
+
+def crash_transition(h, action, body, phase):
+    endpoint = "/api/repos/alice/demo/shard-" + (
+        "degrade" if action in ("degrade", "recover") else "fence")
+    # Phases repeat across actions; a leftover marker from the previous action
+    # would otherwise be mistaken for this process's fault boundary.
+    clear_marker(h.root / "data", phase)
+    h.env[FAULT] = phase
+    h.env[FAULT_ACTION] = "kill"
+    h.stop(hard=True)
+    h.start()
+    fault_pid = h.proc.pid
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(h.http, endpoint, token=h.alice, method="POST", body=body)
+        marker = wait_marker_alive(h.root / "data", phase, h.proc, timeout=30)
+        assert_marker_binding(marker, phase, h.repo["id"])
+        assert marker.get("pid") == fault_pid, (marker.get("pid"), fault_pid)
+        detail = marker.get("detail") or {}
+        assert detail.get("route_epoch") is not None and detail.get("transition_id"), marker
+        h.proc.wait(timeout=20)
+        assert h.proc.returncode == -signal.SIGKILL, h.proc.returncode
+        killed_rc = h.proc.returncode
+        try:
+            pending.result(timeout=5)
+        except Exception:  # noqa: BLE001 - the process was intentionally killed
+            pass
+    h.stop(hard=True)
+    return marker, killed_rc
+
+
+def transition_cases(args):
+    h = Harness(args)
+    h.env[FAULT_ALLOW] = "1"
+    records = []
+    try:
+        h.setup()
+        h.api()
+        h.roundtrip()
+        for action in ("fence", "unfence", "degrade", "recover"):
+            before_route = route(h, "demo")
+            before_marker = volume_marker(h)
+            if action == "fence":
+                body = {"action": "fence", "fenced_epoch": before_route["route_epoch"]}
+            elif action == "unfence":
+                body = {"action": "unfence"}
+            elif action == "degrade":
+                body = {"mode": "degrade", "reason": "transition crash matrix"}
+            else:
+                body = {"mode": "recover"}
+            committed_route = expected_after(before_route, action, body)
+            fenced_node = expected_fenced_node(action, before_route, before_marker)
+            records.append(audit_rollback_case(
+                h, action, body, before_route, before_marker))
+            before_admitted = route_admits(before_route)
+            committed_admitted = route_admits(committed_route)
+            for phase in ("transition-before-commit", "cutover-after-commit"):
+                marker, killed_rc = crash_transition(h, action, body, phase)
+                after_route = sql_route(h, h.repo["id"])
+                after_marker = volume_marker(h)
+                pending = pending_transition_rows(h)
+                committed = phase == "cutover-after-commit"
+                expected_route = committed_route if committed else before_route
+                if committed:
+                    assert after_route == route_view(expected_route), (
+                        "committed transition differs from the durable route", after_route,
+                        route_view(expected_route))
+                    assert pending == 1, ("committed transition lost its pending marker intent", pending)
+                else:
+                    assert after_route == route_view(before_route), (
+                        "rolled-back transition changed PostgreSQL state", after_route,
+                        route_view(before_route))
+                    assert pending == 0, ("rolled-back transition left a pending intent", pending)
+                assert after_marker == before_marker, (
+                    "fault mutated the volume marker before the durable boundary", after_marker,
+                    before_marker)
+                h.env.pop(FAULT, None)
+                h.env.pop(FAULT_ACTION, None)
+                h.start()
+                final_route = route(h, "demo")
+                assert route_view(final_route) == route_view(expected_route), (
+                    "restart reconciliation route mismatch", route_view(final_route),
+                    route_view(expected_route))
+                restored_fenced_node = (before_marker or {}).get("fenced_node_id")
+                final_marker = assert_volume_marker(
+                    h, final_route, fenced_node if committed else restored_fenced_node,
+                    committed or before_marker is not None)
+                assert pending_transition_rows(h) == 0, \
+                    "restart reconciliation left a pending marker transition"
+                expected_admitted = committed_admitted if committed else before_admitted
+                fence = fence_status(h)
+                assert fence["write_admitted"] == expected_admitted, (
+                    "shard-fence admission disagrees with durable transition boundary",
+                    action, phase, fence)
+                push_rc = probe_write(h, expected_admitted, action + " " + phase)
+                barrier = {"write_admitted": fence["write_admitted"],
+                           "push_returncode": push_rc}
+                records.append({
+                    "name": action + "-" + phase,
+                    "status": "passed",
+                    "phase": phase,
+                    "action": action,
+                    "fault_marker": {"phase": marker["phase"], "pid": marker["pid"],
+                                     "repository_bound": True, "transition_bound": True},
+                    "process_returncode": killed_rc,
+                    "durable_state_after_fault": {
+                        "route": after_route,
+                        "marker": after_marker,
+                        "pending_marker_transition_rows": pending,
+                        "marker_mutated_before_commit": after_marker != before_marker,
+                        "postgresql_committed": committed,
+                    },
+                    "restart_reconciliation": {
+                        "route": route_view(final_route),
+                        "marker": final_marker,
+                        "pending_marker_transition_rows": 0,
+                    },
+                    "write_barrier_after_recovery": barrier,
+                })
+            # The committed phase is the observable state for the next action.
+            assert route_view(route(h, "demo")) == route_view(committed_route)
+        return records
+    finally:
+        h.cleanup()
+
+
 def write_report(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -810,68 +1090,125 @@ def source_revision():
         return None
 
 
+def isolated_tmpdir(args):
+    """Return a writable TMPDIR outside the shared temporary root."""
+    configured = os.environ.get("TMPDIR")
+    if configured and Path(configured).resolve() != Path(os.path.sep, "tmp").resolve():
+        return Path(configured), False
+    base = args.report.parent if args.report else Path.cwd() / "test-results"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / ("native-migration-tmp-" + uuid.uuid4().hex)
+    path.mkdir(mode=0o700)
+    return path, True
+
+
+def normalize_cases(records):
+    cases = []
+    for record in records:
+        case = dict(record)
+        case.setdefault("name", str(record.get("phase", "unknown")))
+        case["status"] = "passed" if case.get("status") in (None, "passed") else case["status"]
+        cases.append(case)
+    return cases
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--transitions-only", action="store_true",
+                        help="run only the explicit shard marker transition crash matrix")
     args = parser.parse_args()
     args.binary = str(args.binary.resolve())
+    revision = source_revision()
+    if not revision:
+        raise SystemExit("source revision could not be resolved; refusing to emit an unbound report")
     admin_url = os.environ.get("ROOTYARD_TEST_DATABASE_URL")
     if not admin_url:
         raise SystemExit("ROOTYARD_TEST_DATABASE_URL must point at a disposable admin database")
-    os.environ["TMPDIR"] = "/tmp"
+    tmpdir, created_tmpdir = isolated_tmpdir(args)
+    os.environ["TMPDIR"] = str(tmpdir)
     database, database_url = disposable_database(admin_url)
     os.environ["ROOTYARD_TEST_DATABASE_URL"] = database_url
-    success = False
+    records = []
+    failure = None
+    postgres_version = None
     try:
-        migration_harness, records = migration_phases(args)
-        postgres_version = migration_harness.sql("SHOW server_version")
-        migration_harness.cleanup()
-        records.append(takeover_case(args, "takeover-after-source-verify"))
-        records.append(takeover_case(args, "takeover-before-promote"))
-        records.append(takeover_case(args, "takeover-after-source-marker"))
-        binary = Path(args.binary)
-        report = {
-            "kind": "native_migration_residual_phase_crash_acceptance",
-            "result": "passed",
-            "source_base_commit": source_revision(),
-            "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-            "binary_size_bytes": binary.stat().st_size,
-            "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-            "postgres_version": postgres_version,
-            "disposable_database": database,
-            "topology": "one PostgreSQL authority and separate Rust storage processes on one Linux host",
-            "port_allocation": "OS-assigned ephemeral loopback free_port; fixed HA/infra ports not used",
-            "fault_hook_env_gated": True,
-            "hooks_registered": 6,
-            "hooks_exercised": [record["phase"] for record in records],
-            "phases_actual": [record["phase"] for record in records],
-            "hooks_unexercised": [],
-            "hook_registration_counted_as_pass": False,
-            "artificial_sql_route_or_replica_readiness": False,
-            "public_migration_or_takeover_flow_used": True,
-            "each_case_own_repo_and_durable_operation": True,
-            "cases": records,
-            "limits": [
-                "single trusted Linux host; no cross-host storage fence or PostgreSQL HA",
-                "takeover cases use SIGSTOP to let the real node lease expire, then a real SIGKILL",
-                "old generic 409 takeover transient observed historically remains unclassified and is not claimed fixed",
-            ],
-        }
-        if args.report:
-            write_report(args.report, report)
-        print(json.dumps(report))
-        success = True
-    finally:
-        if success:
-            try:
-                admin_psql(admin_url, 'DROP DATABASE IF EXISTS "' + database + '" WITH (FORCE)')
-            except Exception as error:  # noqa: BLE001 - preserve the real test failure
-                print("database cleanup deferred:", type(error).__name__, file=sys.stderr)
+        if args.transitions_only:
+            records.append(takeover_case(args, "takeover-after-source-marker"))
+            records.extend(transition_cases(args))
+            postgres_version = admin_psql(database_url, "SHOW server_version")
         else:
-            print("retained disposable database for failure evidence:", database, file=sys.stderr)
+            migration_harness, migration_records = migration_phases(args)
+            records.extend(migration_records)
+            postgres_version = migration_harness.sql("SHOW server_version")
+            migration_harness.cleanup()
+            records.append(takeover_case(args, "takeover-after-source-verify"))
+            records.append(takeover_case(args, "takeover-before-promote"))
+            records.append(takeover_case(args, "takeover-after-source-marker"))
+            records.extend(transition_cases(args))
+    except Exception as error:  # noqa: BLE001 - a failed matrix must still emit a failed report
+        failure = error
+        records.append({"name": "__main__", "status": "failed", "phase": "__main__",
+                        "error": str(error)[:2000]})
+    cleanup_ok = False
+    cleanup_error = None
+    try:
+        admin_psql(admin_url, 'DROP DATABASE IF EXISTS "' + database + '" WITH (FORCE)')
+        cleanup_ok = True
+    except Exception as error:  # noqa: BLE001 - report the cleanup failure and exit non-zero
+        cleanup_error = type(error).__name__
+        print("database cleanup failed:", cleanup_error, file=sys.stderr)
+    success = failure is None and cleanup_ok
+    cases = normalize_cases(records)
+    hooks = registered_hooks()
+    phases = [case["phase"] for case in cases if case.get("phase") not in (None, "__main__")]
+    exercised = [phase for phase in phases if phase in hooks]
+    binary = Path(args.binary)
+    report = {
+        "kind": "native_migration_residual_phase_crash_acceptance",
+        "result": "passed" if success else "failed",
+        "passed": success,
+        "source_head": revision,
+        "source_base_commit": revision,
+        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else None,
+        "binary_size_bytes": binary.stat().st_size if binary.is_file() else None,
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "postgres_version": postgres_version,
+        "disposable_database": database,
+        "database_cleanup_succeeded": cleanup_ok,
+        "topology": "one PostgreSQL authority and separate Rust storage processes on one Linux host",
+        "port_allocation": "OS-assigned ephemeral loopback free_port; fixed HA/infra ports not used",
+        "fault_hook_env_gated": True,
+        "hooks_registered": len(hooks),
+        "hooks_exercised": exercised,
+        "phases_actual": phases,
+        "hooks_unexercised": [hook for hook in hooks if hook not in exercised],
+        "hook_registration_counted_as_pass": False,
+        "artificial_sql_route_or_replica_readiness": False,
+        "public_migration_or_takeover_flow_used": True,
+        "transition_matrix_uses_real_public_fence_and_degrade_routes": True,
+        "each_case_own_repo_and_durable_operation": not args.transitions_only,
+        "cases": cases,
+        "limits": [
+            "single trusted Linux host; no cross-host storage fence or PostgreSQL HA",
+            "takeover cases use SIGSTOP to let the real node lease expire, then a real SIGKILL",
+            "old generic 409 takeover transient observed historically remains unclassified and is not claimed fixed",
+            "transition cases share one real repository; each crash/reconcile cycle is separately asserted",
+        ],
+    }
+    if failure is not None:
+        report["error"] = str(failure)[:2000]
+    if cleanup_error is not None:
+        report["database_cleanup_error"] = cleanup_error
+    if args.report:
+        write_report(args.report, report)
+    print(json.dumps(report))
+    if created_tmpdir:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -94,6 +94,62 @@ async fn verify_target(state: &AppState, candidate: &Candidate, lease: &Lease) -
 async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
     proof: &local_fence::ProcessIdentity, lease: &Lease) -> Result<bool> {
     lease.ensure_active().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    // Snapshot the committed route and durably stage the source-retirement
+    // marker before mutating that source volume. A crash after the marker but
+    // before the promotion commit therefore leaves a pending transition that
+    // startup reconciliation resolves back to the still-committed route.
+    let mut setup_client = state.pool.get().await?;
+    let setup_tx = setup_client.transaction().await?;
+    let route_query = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1");
+    let Some(route) = setup_tx.query_opt(&route_query, &[&candidate.repo_id]).await?
+        .map(|row| RepoShardRoute::row(&row)) else { return Ok(false); };
+    let generation: i64 = setup_tx.query_one(
+        "SELECT storage_generation FROM repositories WHERE id=$1", &[&candidate.repo_id]).await?.get(0);
+    if route.primary_node_id != candidate.old_node || route.route_epoch != candidate.route_epoch
+        || route.draining || route.read_only_degraded { return Ok(false); }
+    let new_epoch = route.route_epoch + 1;
+    let new_token = route.fencing_token.max(new_epoch) + 1;
+    let new_generation = generation + 1;
+    let retired_source = VolumeFenceMarker {
+        version: 1,
+        repository_id: candidate.repo_id,
+        primary_node_id: candidate.old_node.clone(),
+        route_epoch: new_epoch,
+        fencing_token: new_token,
+        fenced_epoch: route.route_epoch,
+        storage_generation: new_generation,
+        fenced_node_id: Some(candidate.old_node.clone()),
+        read_only_degraded: true,
+        updated_unix: models::unix_now(),
+    };
+    drop(setup_tx);
+    drop(setup_client);
+    let registration = local_fence::registered_volume(&candidate.old_node)?
+        .context("old node volume registration is missing")?;
+    ensure!(registration.volume_id != Uuid::nil(), "old node volume registration is empty");
+    let mut source_client = state.pool.get().await?;
+    let source_tx = source_client.transaction().await?;
+    let _source_transition = transitions::stage_on_volume(
+        &source_tx, registration.volume_id, &retired_source,
+    ).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    source_tx.commit().await?;
+    // Retire the old source volume before this promotion commits. The physical
+    // process fence and the post-fence source re-verification already proved the
+    // old session is gone and its refs still match the measured snapshot, so the
+    // marker can only land on a quiescent source. The helper fsyncs and verifies
+    // the marker before returning: a failed or unverifiable write returns Err and
+    // leaves the pending transition for restart reconciliation, so a committed
+    // promotion always has a durable retired marker.
+    local_fence::retire_volume_repository(
+        &candidate.old_node, candidate.repo_id, &retired_source,
+    ).map_err(|error| anyhow::anyhow!("retired source marker is not durable: {error:#}"))?;
+    faults::hit(
+        &state.storage.root,
+        "takeover-after-source-marker",
+        serde_json::json!({"repository_id": candidate.repo_id,
+                          "operation_id": candidate.operation_id,
+                          "old_node": candidate.old_node}),
+    );
     let mut client = state.pool.get().await?;
     let tx = client.transaction().await?;
     let elected: bool = tx.query_one(
@@ -107,7 +163,10 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
     let query = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1 FOR UPDATE");
     let route = RepoShardRoute::row(&tx.query_one(&query, &[&candidate.repo_id]).await?);
     if route.primary_node_id != candidate.old_node || route.route_epoch != candidate.route_epoch
-        || route.draining || route.read_only_degraded { return Ok(false); }
+        || route.draining || route.read_only_degraded
+        || locked_generation != generation {
+        return Ok(false);
+    }
     // Fence the old epoch before inspecting ADMITTED writers. The route row is
     // already locked, so no settlement can acquire a fresh share lock; any
     // settlement that began earlier either commits before us or is fenced.
@@ -137,7 +196,7 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
     ensure!(repo_state == "ready" && lease_expiry > 0 && lease_expiry < models::unix_now()
         && op_state == "verified" && source_generation == generation && source_epoch == route.route_epoch
         && digest == candidate.refs_sha256 && sequence == candidate.journal_sequence
-        && generation == locked_generation,
+        && generation == locked_generation && generation + 1 == new_generation,
         "takeover evidence or expired lease changed");
     let operation_status = tx.query_one(
         "SELECT COALESCE(MAX(sequence),0), COUNT(*) FILTER (WHERE outcome='unknown') FROM git_operations WHERE repository_id=$1",
@@ -152,9 +211,6 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
     let target_lease: i64 = target.get(2);
     ensure!(status == "healthy" && role == "replica" && target_lease > models::unix_now(),
         "target node lost its healthy lease");
-    let new_epoch = route.route_epoch + 1;
-    let new_token = route.fencing_token.max(new_epoch) + 1;
-    let new_generation = generation + 1;
     tx.execute("UPDATE shard_nodes SET role='fenced',status='fenced',fenced_epoch=GREATEST(fenced_epoch,$2),version=version+1 WHERE node_id=$1",
         &[&candidate.old_node,&new_epoch]).await?;
     tx.execute("UPDATE shard_nodes SET role='primary',lease_epoch=GREATEST(lease_epoch,$2),         lease_expires_unix=GREATEST(lease_expires_unix,$3),status='healthy',version=version+1 WHERE node_id=$1",
@@ -169,34 +225,6 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
             version=version+1,updated_at=clock_timestamp() WHERE repository_id=$1 RETURNING {REPO_ROUTE_FIELDS}"),
         &[&candidate.repo_id,&node_id,&new_epoch,&new_token,&route.route_epoch,&new_generation,&sequence],
     ).await?);
-    // Retire the old source volume before this promotion commits. The physical
-    // process fence and the post-fence source re-verification already proved the
-    // old session is gone and its refs still match the measured snapshot, so the
-    // marker can only land on a quiescent source. It is built from the new route
-    // and generation and marked read-only, so a process that mounts the old
-    // volume and claims the new node id without a fence driver is still rejected
-    // by the on-disk barrier. The helper fsyncs and verifies the marker before
-    // returning: a failed or unverifiable write returns Err and rolls this
-    // transaction back, so promotion never commits without a durable retired
-    // marker. If the rollback happens after the marker was published, the old
-    // volume stays read-only (fail-closed availability loss), never a split
-    // brain, until an operator completes recovery.
-    let retired_source = VolumeFenceMarker {
-        primary_node_id: candidate.old_node.clone(),
-        read_only_degraded: true,
-        ..VolumeFenceMarker::from_route(&moved, new_generation,
-            Some(candidate.old_node.clone()), models::unix_now())
-    };
-    local_fence::retire_volume_repository(
-        &candidate.old_node, candidate.repo_id, &retired_source,
-    ).map_err(|error| anyhow::anyhow!("retired source marker is not durable: {error:#}"))?;
-    faults::hit(
-        &state.storage.root,
-        "takeover-after-source-marker",
-        serde_json::json!({"repository_id": candidate.repo_id,
-                          "operation_id": candidate.operation_id,
-                          "old_node": candidate.old_node}),
-    );
     tx.execute("UPDATE shard_replication_operations SET state='completed',updated_at=clock_timestamp() WHERE id=$1 AND state='verified'",
         &[&candidate.operation_id]).await?;
     tx.execute(
@@ -222,6 +250,14 @@ pub async fn run(state: Arc<AppState>) {
     let Ok(Some(node_id)) = super::transport::node_id() else { return; };
     let physical_fence = std::env::var_os("ROOTYARD_LOCAL_FENCE_DIR").is_some();
     loop {
+        // Clear a source-retirement intent left by an interrupted promotion
+        // before scanning for a new candidate. A rolled-back route restores the
+        // old marker; a committed route finishes the retired-source publication.
+        if let Err(error) = transitions::reconcile_pending(&state).await {
+            eprintln!("rootyard: shard marker reconciliation blocked takeover: {error:?}");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        }
         if let Err(error) = heartbeat(&state, &node_id).await { eprintln!("rootyard: cluster heartbeat failed: {error:#}"); }
         if !physical_fence {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
