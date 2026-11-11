@@ -22,6 +22,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backup_blob_barrier_probe as probe  # noqa: E402
+import backup_blob_serving147  # noqa: E402
 
 AUTO = probe.BARRIER_REFUSALS["auto"]
 EXTERNAL = probe.BARRIER_REFUSALS["external"]
@@ -666,6 +667,70 @@ class ProbeTest(unittest.TestCase):
                          "Error: could not open the lifecycle barrier session at [REDACTED]")
         self.assertEqual(probe.describe({"mode": "external", "status": "unknown", "reason": "exit 0"}),
                          "external; unknown; exit 0")
+
+    def test_the_two_argument_refusal_helper_keeps_its_auto_then_external_contract(self):
+        # The old snapshot caller keeps `serving_barrier_refused(env, stage)`:
+        # it must invoke the per-mode helper for auto, then external, with the
+        # exact env/stage and return both outcomes in that order.
+        class Drill(backup_blob_serving147.Drill):
+            def __init__(self, responses):
+                self.calls = []
+                self.responses = responses
+
+            def serving_barrier_refused_mode(self, env, mode, stage):
+                self.calls.append((env, mode, stage))
+                return self.responses[mode]
+
+        env = {"K": "v"}
+        responses = {"auto": {"mode": "auto", "status": "refused"},
+                     "external": {"mode": "external", "status": "refused"}}
+        drill = Drill(responses)
+        outcomes = drill.serving_barrier_refused(env, "offline backup")
+        self.assertEqual(drill.calls, [(env, "auto", "offline backup"), (env, "external", "offline backup")])
+        self.assertEqual(outcomes, [responses["auto"], responses["external"]])
+        self.assertIs(outcomes[0], responses["auto"])
+        self.assertIs(outcomes[1], responses["external"])
+
+    def test_restore_gate_wrapper_keeps_the_pg_restore_symlink_basename_and_argv(self):
+        # pg_restore is a symlink to a multicall stand-in with another basename:
+        # resolving the symlink would make the stand-in refuse its own argv[0].
+        multicall = r"""#!/bin/sh
+case ${0##*/} in
+pg_restore) ;;
+*) exit 64 ;;
+esac
+for arg in "$@"; do printf '%s\0' "$arg"; done > "$PG_RESTORE_ARGV_RECORD"
+"""
+        stand_in = Path(self.stand_in(multicall))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "pg_restore").symlink_to(stand_in)
+        search_path = str(bin_dir)
+        database = "rootyard_restore_gate_unit"
+        argv = ["database=rootyard gate unit", "label='single' and \"double\"", "", "--no-owner"]
+        self.owned.mkdir(exist_ok=True)
+        record = self.owned / "argv"
+        gate, restore = None, None
+        try:
+            gate = backup_blob_serving147.restore_gate(str(self.owned), database, search_path)
+            self.assertEqual(gate.executable, bin_dir / "pg_restore")
+            env = dict(os.environ, PGDATABASE=database, PG_RESTORE_ARGV_RECORD=str(record))
+            restore = subprocess.Popen([str(gate.wrapper), *argv], env=env)
+            gate.wait_blocked(restore, time.monotonic() + backup_blob_serving147.RESTORE_GATE_TIMEOUT_SECONDS)
+            self.assertIn("database=" + database, gate.marker.read_text().splitlines())
+            gate.release_gate()
+            restore.communicate(timeout=backup_blob_serving147.RESTORE_GATE_TIMEOUT_SECONDS)
+        finally:
+            if gate is not None and not gate.release.exists():
+                gate.release_gate()
+            if restore is not None and restore.poll() is None:
+                restore.kill()
+                restore.wait(timeout=10)
+            if gate is not None:
+                gate.cleanup()
+        self.assertEqual(restore.returncode, 0, "released pg_restore did not exit successfully")
+        self.assertEqual(record.read_bytes().split(b"\0")[:-1], [item.encode() for item in argv])
+        self.assertFalse(gate.root.exists(), "restore gate directory was not cleaned")
 
 
 def _reachable(bind):
