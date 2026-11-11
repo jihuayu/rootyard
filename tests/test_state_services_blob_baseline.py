@@ -371,6 +371,29 @@ class EndpointResolutionTest(unittest.TestCase):
         self.assertIn("TCP host", str(raised.exception))
 
 
+class PgEndpointTest(unittest.TestCase):
+    """pg_endpoint accepts a Docker published port: DSN 55433 -> server listen 5432."""
+
+    def test_published_host_port_is_accepted_and_server_listen_port_is_not_queried(self):
+        resolver = resolver_for(["127.0.0.1"], port=55433)
+        harness = mock.Mock()
+        harness.db = "postgresql://u:pw@db-published.invalid:55433/svc"
+        with mock.patch.object(baseline.socket, "getaddrinfo", side_effect=resolver) as getaddrinfo:
+            endpoint = baseline.pg_endpoint(harness)
+        # The resolver ran exactly once for the configured host, TCP port and stream type.
+        getaddrinfo.assert_called_once_with("db-published.invalid", 55433, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        self.assertEqual(resolver.calls, [("db-published.invalid", 55433, socket.AF_UNSPEC, socket.SOCK_STREAM)])
+        # The parsed client endpoint is returned verbatim; no server-side port comparison exists.
+        self.assertEqual(endpoint, (["127.0.0.1"], 55433))
+        harness.sql.assert_not_called()
+        # Even a server reporting the container-internal listen port changes nothing.
+        with mock.patch.object(baseline, "resolve_pg_endpoint", return_value=(["127.0.0.1"], 55433)):
+            harness.sql.return_value = "5432"
+            self.assertEqual(baseline.pg_endpoint(harness), (["127.0.0.1"], 55433))
+        harness.sql.assert_not_called()
+        self.assertNotIn("db-published.invalid", repr(endpoint))
+
+
 class OwnershipTest(unittest.TestCase):
     """Only the service process's own sockets to the configured database endpoint count."""
 

@@ -733,7 +733,7 @@ def client_address(address):
 
 def pg_pair_list(fd_links, tcp_tables, pg_endpoint):
     """Sorted, de-duplicated ``((address, port), ...)`` of owned database sockets."""
-    addresses, server_port = validate_pg_endpoint(pg_endpoint)
+    addresses, dsn_port = validate_pg_endpoint(pg_endpoint)
     targets = set(addresses)
     owned = parse_fd_links(fd_links)
     if not owned:
@@ -743,7 +743,8 @@ def pg_pair_list(fd_links, tcp_tables, pg_endpoint):
     for entry in entries:
         if entry["inode"] not in owned or entry["state"] != CONNECTION_ESTABLISHED:
             continue
-        if entry["peer_port"] == server_port and entry["peer_address"] in targets:
+        # Match the client-configured DSN destination port (host/NAT may differ from the server's listen port).
+        if entry["peer_port"] == dsn_port and entry["peer_address"] in targets:
             pairs.add((client_address(entry["local_address"]), int(entry["local_port"])))
     return tuple(sorted(pairs))
 
@@ -828,7 +829,12 @@ def resolve_pg_endpoint(db_url, resolver=None):
 
 
 def validate_pg_endpoint(endpoint):
-    """The configured database endpoint as (sorted address list, server port)."""
+    """The configured database endpoint as (sorted address list, client-configured DSN port).
+
+    ``port`` is the client-configured destination port from the DSN (the peer
+    port of every owned /proc socket); it may differ from the PostgreSQL
+    server's internal listen port behind a Docker host/NAT port mapping.
+    """
     need(isinstance(endpoint, tuple) and len(endpoint) == 2, "the database endpoint is malformed")
     addresses, port = endpoint
     need(isinstance(addresses, (list, tuple, set)) and addresses, "the configured database has no resolved address")
@@ -836,7 +842,7 @@ def validate_pg_endpoint(endpoint):
     # an IPv4-mapped configured address compares as its IPv4 form.
     mapped = sorted({client_address(address) for address in addresses})
     need(isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536,
-         "the database server port is unknown")
+         "the client-configured database DSN port is unknown")
     return mapped, port
 
 
@@ -1207,11 +1213,16 @@ def runtime_facts(harness, profile, *, cpuinfo=None, meminfo=None, cgroup_root=N
 
 
 def pg_endpoint(harness):
-    """Resolve the configured database endpoint once; its value never enters a report."""
-    endpoint = resolve_pg_endpoint(harness.db)
-    if harness.sql("SELECT current_setting('port')") != str(endpoint[1]):
-        raise ScanFailure("the database server port does not match the configured endpoint")
-    return validate_pg_endpoint(endpoint)
+    """Resolve the configured database endpoint once; its value never enters a report.
+
+    The returned port is the client-configured destination (the DSN port the
+    harness connects to), not the PostgreSQL server's internal listen port. A
+    Docker published port such as host 127.0.0.1:55433 -> container :5432 is a
+    legitimate host/NAT mapping, so it is never compared with
+    ``current_setting('port')``; the strict DSN host/TCP/port/address checks in
+    ``resolve_pg_endpoint`` and ``validate_pg_endpoint`` still apply.
+    """
+    return validate_pg_endpoint(resolve_pg_endpoint(harness.db))
 
 
 def binding_record(profile):
