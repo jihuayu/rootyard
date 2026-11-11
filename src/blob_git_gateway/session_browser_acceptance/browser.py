@@ -136,6 +136,8 @@ REASONS = frozenset(
         "API_READ_BOUND_INVALID",
         "FAULT_BOUND_INVALID",
         "FAULT_NOT_APPLIED",
+        "FAULT_TARGET_MISMATCH",
+        "FAULT_ROUTE_NOT_DISPATCHED",
         "FAULT_REFUSAL_MISSING",
         "FAULT_MARKER_RENDERED",
         "FAULT_COMMITS_RENDERED",
@@ -748,7 +750,13 @@ class Client:
         # the page already attached its response/request capture exactly once;
         # a second ``self.listen(page)`` would duplicate both.
         fault_page = await context.new_page()
-        facts = {"intercepted": 0, "commits": 0, "failed": False}
+        facts = {
+            "intercepted": 0,
+            "commits": 0,
+            "failed": False,
+            "tree_requests": 0,
+            "tree_target_mismatch": 0,
+        }
 
         def observe_request(request):
             # Commits requests of this page only; the global count also holds
@@ -757,12 +765,19 @@ class Client:
                 path = request.url[len(origin):].split("?", 1)[0]
                 if path == self.alias + "/commits":
                     facts["commits"] += 1
+                # Tree requests of this page only: a path hit counts even when
+                # its query differs; only the exact-target boolean is kept.
+                if path == self.alias + "/tree":
+                    facts["tree_requests"] += 1
+                    if request.url != target:
+                        facts["tree_target_mismatch"] += 1
 
         fault_page.on("request", observe_request)
 
         async def fault(route, request):
             # This handler confines on its own: a request that left the origin
             # is aborted and fails the run, whatever other confinement exists.
+            # It runs for this fault page only.
             if not self.confined(request.url):
                 self.escaped = True
                 facts["failed"] = True
@@ -829,7 +844,15 @@ class Client:
         if facts["failed"]:
             raise Failure("FAULT_BOUND_INVALID")
         if facts["intercepted"] != 1:
-            raise Failure("FAULT_NOT_APPLIED")
+            # Distinguish, by fixed counts only, a page that sent no tree
+            # request from one whose tree request missed the exact target
+            # (e.g. a differing `?oid=`) from one whose exact target request
+            # never reached the route callback.
+            if facts["tree_requests"] == 0:
+                raise Failure("FAULT_NOT_APPLIED")
+            if facts["tree_target_mismatch"] > 0:
+                raise Failure("FAULT_TARGET_MISMATCH")
+            raise Failure("FAULT_ROUTE_NOT_DISPATCHED")
         if facts["commits"] != 0:
             raise Failure("FAULT_COMMITS_REQUESTED")
         refusal_shown = "Read complete." not in status and "refused" in status
@@ -854,11 +877,13 @@ class Client:
     async def fault_status(self, page, facts):
         """Wait, within the fixed bound, for the page's own rendered refusal.
 
-        A wait that ends without one is classified by what the injection itself
-        established, with fixed reasons only: no exact request was intercepted
-        (`FAULT_NOT_APPLIED`), the request was seen but its facts or the route
-        operation failed (`FAULT_BOUND_INVALID`), or a valid synthetic answer
-        was really fulfilled and the page still rendered no refusal
+        A wait that ends without one is classified by fixed reasons only: no
+        exact request was intercepted and no tree path was requested
+        (`FAULT_NOT_APPLIED`), a tree path request differed from the exact
+        target (`FAULT_TARGET_MISMATCH`), the exact target did not reach the
+        callback (`FAULT_ROUTE_NOT_DISPATCHED`), the request was seen but its
+        facts or route operation failed (`FAULT_BOUND_INVALID`), or a valid
+        synthetic answer was fulfilled but the page rendered no refusal
         (`FAULT_REFUSAL_MISSING`).
         """
         try:
@@ -872,7 +897,11 @@ class Client:
             if facts.get("failed"):
                 raise Failure("FAULT_BOUND_INVALID") from None
             if facts.get("intercepted") != 1:
-                raise Failure("FAULT_NOT_APPLIED") from None
+                if facts.get("tree_requests") == 0:
+                    raise Failure("FAULT_NOT_APPLIED") from None
+                if facts.get("tree_target_mismatch"):
+                    raise Failure("FAULT_TARGET_MISMATCH") from None
+                raise Failure("FAULT_ROUTE_NOT_DISPATCHED") from None
             if facts.get("fulfilled") is not True:
                 raise Failure("FAULT_BOUND_INVALID") from None
             raise Failure("FAULT_REFUSAL_MISSING") from None
