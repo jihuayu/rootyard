@@ -835,7 +835,7 @@ class Client:
             facts["fulfilled"] = True
 
         await fault_page.route("**/*", fault)
-        await self.goto(fault_page, self.web + self.scope, "FAULT_NAVIGATION_FAILED")
+        await self.goto(fault_page, self.origin + self.scope, "FAULT_NAVIGATION_FAILED")
         # The tree request alone produces the generic refusal; refs may already
         # have rendered before it.
         await self.fault_status(fault_page, facts)

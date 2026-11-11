@@ -109,6 +109,12 @@ const COMMIT_FILE: &str = "readme.txt";
 const SECOND_FILE: &str = "unsafe-name with spaces.txt";
 const PUSHED_REF: &str = "refs/heads/main";
 
+#[test]
+fn fault_page_goto_uses_origin_scope() {
+    assert!(BROWSER_SCRIPT.contains("self.goto(fault_page, self.origin + self.scope, "));
+    assert!(!BROWSER_SCRIPT.contains("self.web + self.scope"));
+}
+
 #[tokio::test]
 #[ignore = "requires real PostgreSQL, S3-compatible Blob, native Git, a compiled production CLI, Playwright Python and Chromium"]
 async fn standalone_cli_browser_session_is_bound_in_chromium() -> Result<()> {
