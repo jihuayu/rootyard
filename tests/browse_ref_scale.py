@@ -171,13 +171,27 @@ exec {git} "$@"
 """
 
 
+def _bound_git(harness):
+    """The executable string the Browse service was bound to.
+
+    ``BrowseHarness.native_git`` is now the mixed cases' callable resolver, so
+    the fixed-suite executable is ``wrapper_git``: the validated ``--git`` (or
+    inherited ``ROOTYARD_GIT``) binary, else the PATH Git for the fixed-only
+    inventory.  It is an argv entry, never a callable.
+    """
+    bound = getattr(harness, "wrapper_git", None)
+    assert isinstance(bound, str) and bound, (
+        "harness.wrapper_git must be the bound Git executable string, got " + repr(bound))
+    return bound
+
+
 def _install_wrapper(harness, log):
     """Point only ``harness.env`` at a logging exec wrapper; return its path."""
-    native = Path(harness.native_git)
+    native = Path(_bound_git(harness))
     # A bare command (e.g. the "git" fallback) resolves through PATH just as
     # the harness wrapper would; given paths keep their absolute/relative form.
     if not native.is_absolute() and len(native.parts) == 1:
-        located = shutil.which(harness.native_git)
+        located = shutil.which(_bound_git(harness))
         if located is None:
             raise AssertionError("harness native Git command was not found on PATH")
         native = Path(located)
@@ -268,7 +282,7 @@ def verify_ref_scale(harness):
     """Measure native Browse ref paging at a small and a 20,000-tag size."""
     bare = Path(harness.bare)
     assert bare.is_dir(), "no isolated bare repository"
-    git = harness.native_git
+    git = _bound_git(harness)
     packed = bare / "packed-refs"
     # Prior bytes are only a fallback if packing never yields a baseline; the
     # restore below prefers the complete logical refs that pack-refs --all saw.

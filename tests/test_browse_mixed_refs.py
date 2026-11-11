@@ -28,12 +28,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
+import urllib.parse
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import browse  # noqa: E402
+import browse_ref_scale  # noqa: E402
 import mixed_ref_cases  # noqa: E402
 import refusal_audit_sql  # noqa: E402
 
@@ -628,6 +631,144 @@ class _FakeProcess:
 
     def wait(self, timeout=None):
         return 0
+
+
+class BrowseRefScaleGitContractTest(unittest.TestCase):
+    """The fixed ref-scale case runs the bound executable string.
+
+    ``verify_ref_scale`` is the fixed inventory's case 13; it runs before the
+    mixed proof, so it must find the executable in ``wrapper_git`` and never
+    treat the callable ``native_git()`` resolver as an argv entry.
+    """
+
+    GIT = str(Path(shutil.which("git")).resolve()) if shutil.which("git") else None
+
+    def setUp(self):
+        if self.GIT is None:
+            self.skipTest("no stock git on PATH")
+        self.root = Path(tempfile.mkdtemp(prefix="ref-scale-contract-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.bare = self.root / "bare.git"
+        self.bare.mkdir()
+        subprocess.run([self.GIT, "init", "--quiet", "--bare", str(self.bare)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # A real commit ref: the scan counts what Git actually reports.
+        git_dir = ["--git-dir", str(self.bare)]
+        tree = subprocess.run([self.GIT, *git_dir, "mktree"], input=b"", check=True,
+                              stdout=subprocess.PIPE).stdout.decode().strip()
+        identity = dict(os.environ, GIT_AUTHOR_NAME="ref-scale", GIT_AUTHOR_EMAIL="scale@example.invalid",
+                        GIT_COMMITTER_NAME="ref-scale", GIT_COMMITTER_EMAIL="scale@example.invalid",
+                        GIT_AUTHOR_DATE="2000-01-01T00:00:00Z",
+                        GIT_COMMITTER_DATE="2000-01-01T00:00:00Z")
+        commit = subprocess.run([self.GIT, *git_dir, "commit-tree", tree, "-m", "ref-scale"],
+                                check=True, stdout=subprocess.PIPE,
+                                env=identity).stdout.decode().strip()
+        self.harness = SimpleNamespace(
+            bare=self.bare, root=self.root, third=commit,
+            env={"ROOTYARD_GIT": self.GIT}, wrapper_git=self.GIT, native_git=self.bound_resolver,
+            alice={"username": "alice", "token": "test-only"})
+        (self.bare / "packed-refs").write_text(
+            "# pack-refs with: peeled fully-peeled sorted\n" + commit + " refs/heads/main\n")
+        self.scans, self.wrappers = [], []
+        saved = {name: getattr(browse_ref_scale, name) for name in ("_native_scan", "_walk",
+                                                                    "_install_wrapper")}
+        self.addCleanup(lambda: [setattr(browse_ref_scale, name, value) for name, value in saved.items()])
+        real_native_scan, real_wrapper = browse_ref_scale._native_scan, browse_ref_scale._install_wrapper
+        real_walk = browse_ref_scale._walk
+
+        def native_scan(git, bare):
+            self.scans.append(git)
+            return real_native_scan(git, bare)
+
+        def install_wrapper(harness, log):
+            wrapper = real_wrapper(harness, log)
+            self.wrappers.append(wrapper.read_text())
+            return wrapper
+        browse_ref_scale._native_scan = native_scan
+        browse_ref_scale._install_wrapper = install_wrapper
+        # The HTTP walk proves the same ref set, so it is answered offline.
+        # Keep the real ``_walk``: it pages through ``harness.http`` below, and
+        # it is the phase that asserts the wrapper really ran ``for-each-ref``.
+        # The HTTP pages come from the same packed fixture, parsed by the real
+        # ``_read_records``; no Browse service is contacted.
+        self.harness.repo_api = lambda suffix="": suffix
+        self.harness.http = self.serve_refs_page
+
+    def bound_resolver(self):
+        """The real contract: ``native_git`` is the callable mixed resolver."""
+        return {"executable": self.GIT, "declared": True, "notes": []}
+
+    def serve_refs_page(self, path, token=None):
+        """Answer ``/refs?limit=..&after=..`` from the packed fixture's refs/tags.
+
+        Every refs page makes the service run ``for-each-ref`` through its
+        ``ROOTYARD_GIT`` wrapper, so that wrapper start is recorded here.
+        """
+        log = self.root / "browse-ref-scale-for-each-ref.log"
+        with open(log, "a") as handle:
+            handle.write("start\n")
+        query = urllib.parse.parse_qs(path.split("?", 1)[1])
+        limit = int(query.get("limit", ["100"])[0])
+        after = query.get("after", [None])[0]
+        # The public view is ordered by name: heads first, then the tags.
+        names = sorted(name for name, _oid in browse_ref_scale._read_records(
+            self.bare / "packed-refs") if name.startswith(("refs/heads/", "refs/tags/")))
+        remaining = [name for name in names if after is None or name > after]
+        page = remaining[:limit]
+        body = {"items": [{"name": name} for name in page],
+                "next_after": page[-1] if len(remaining) > limit else None}
+        return 200, json.dumps(body).encode(), {}
+
+    def test_scale_runs_the_bound_executable_string(self):
+        harness = SimpleNamespace(**vars(self.harness))
+        harness.git = lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        harness.stop = lambda: None
+        harness.start = lambda: None   # each restart: the scale case owns the service
+        # The RSS measurement guard needs Linux /proc; this test proves the
+        # executable handoff, so the probe is answered as present.
+        saved_probe = browse_ref_scale._read_peak_kib
+        self.addCleanup(setattr, browse_ref_scale, "_read_peak_kib", saved_probe)
+        browse_ref_scale._read_peak_kib = lambda pid: 1
+        result = browse_ref_scale.verify_ref_scale(harness)
+        # Every native scan and the installed wrapper carry the bound string.
+        self.assertEqual(len(self.scans), 2)
+        self.assertEqual(self.scans, [self.GIT, self.GIT])
+        self.assertEqual(len(self.wrappers), 1)
+        self.assertIn("exec " + shlex.quote(self.GIT) + ' "$@"', self.wrappers[0])
+        # The resolver is a method: it can never be an argv entry.
+        self.assertTrue(callable(harness.native_git))
+        for value in self.scans + [self.wrappers[0]]:
+            self.assertNotIn("native_git", str(value))
+            self.assertNotIn("bound_resolver", str(value))
+        # The scan is ``refs/tags`` only, so it counts exactly the fixture tags.
+        self.assertEqual(result["native_fallback"]["small"]["records"],
+                         browse_ref_scale.SMALL_TAG_COUNT)
+        self.assertEqual(result["fixture"]["baseline_refs"], 1)
+        # Each service page ran for-each-ref through the installed wrapper, and
+        # the wrapper execs the bound executable string.
+        self.assertGreater(result["for_each_ref_process_starts"]["walk"], 0)
+        self.assertGreater(result["for_each_ref_process_starts"]["small"], 0)
+        # Cleanup restarted the service once more; never through a callable.
+        self.assertEqual(self.scans, [self.GIT, self.GIT])
+        self.assertIn("exec " + shlex.quote(self.GIT) + ' "$@"', self.wrappers[0])
+
+    def test_scale_helper_never_treats_the_resolver_as_an_argv_string(self):
+        method = SimpleNamespace(wrapper_git=self.GIT, native_git=self.bound_resolver)
+        self.assertEqual(browse_ref_scale._bound_git(method), self.GIT)
+        # Without the bound string the helper fails closed instead of handing
+        # a callable (or its repr) to ``Path``/``Popen``.
+        callable_only = SimpleNamespace(native_git=self.bound_resolver)
+        with self.assertRaisesRegex(AssertionError, "executable string"):
+            browse_ref_scale._bound_git(callable_only)
+        with self.assertRaisesRegex(AssertionError, "executable string"):
+            browse_ref_scale._bound_git(SimpleNamespace(wrapper_git=None))
+        scale = (ROOT / "tests/browse_ref_scale.py").read_text()
+        self.assertIsNone(re.search(r"harness\.native_git\b", scale),
+                          "the scale helper must not use the resolver as a string")
+        # The three runtime handoffs that need the executable string.
+        self.assertEqual(scale.count("    native = Path(_bound_git(harness))"), 1)
+        self.assertEqual(scale.count("        located = shutil.which(_bound_git(harness))"), 1)
+        self.assertEqual(scale.count("    git = _bound_git(harness)\n"), 1)
 
 
 class BrowseIntegrationTest(unittest.TestCase):
