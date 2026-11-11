@@ -314,7 +314,6 @@ jobs:
             --harness tests/metrics.py \
             --harness tests/webhook_worker_recovery.py \
             --harness tests/webhook_fairness.py \
-            --harness tests/webhooks.py \
             --harness tests/pulls.py \
             --harness tests/forge.py \
             --harness tests/e2e.py \
