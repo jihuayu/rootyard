@@ -445,17 +445,180 @@ def validate_cold(entry):
                                   "as for every concurrent worker"}
 
 
+UNAVAILABLE = "unavailable"
+# /proc/cpuinfo fields that carry a CPU model, in preference order (x86, ARM, POWER, s390, ...).
+CPU_MODEL_FIELDS = ("model name", "Model", "Hardware", "cpu model", "cpu", "Processor", "machine")
+CGROUP_FILES = {"cpu.max": "cpu_max", "cpuset.cpus.effective": "cpuset_cpus_effective",
+                "memory.max": "memory_max"}
+
+
+def cpu_model(text, machine=None):
+    """CPU model from Linux /proc/cpuinfo, or ``unavailable`` (never the architecture).
+
+    Bounded and cleaned: at most one 200-character line, no control characters,
+    and a value that merely repeats ``machine`` (some /proc/cpuinfo "cpu" or
+    "Processor" fields hold an architecture) is reported as ``unavailable``.
+    """
+    if not isinstance(text, str):
+        return UNAVAILABLE
+    for field in CPU_MODEL_FIELDS:
+        for line in text.splitlines():
+            key, separator, value = line.partition(":")
+            if not separator or key.strip() != field:
+                continue
+            cleaned = " ".join(value.replace("\0", " ").split())[:200]
+            if not cleaned or cleaned == machine:
+                continue
+            return cleaned
+    return UNAVAILABLE
+
+
+def _decimal(text):
+    """True for a plain decimal integer literal (no sign, spaces, underscores or exponents)."""
+    return bool(text) and text.isascii() and text.isdigit()
+
+
+def parse_cpu_max(raw):
+    """A cgroup-v2 ``cpu.max`` value: ``('limited', raw, True)``, ``('unlimited', raw, False)`` or None."""
+    parts = raw.split()
+    if len(parts) != 2:
+        return None
+    quota, period = parts
+    if not _decimal(period) or int(period) <= 0:
+        return None
+    if quota == "max":
+        return "unlimited", raw, False
+    if _decimal(quota):
+        return "limited", raw, True
+    return None
+
+
+def parse_memory_max(raw):
+    """A cgroup-v2 ``memory.max`` value: a single ``max`` token or decimal digits, inside a u64."""
+    if raw == "max":
+        return "unlimited", raw, False
+    if _decimal(raw) and int(raw) <= 2 ** 64 - 1:
+        return "limited", raw, True
+    return None
+
+
+def parse_cpuset(raw):
+    """A cgroup-v2 ``cpuset.cpus.effective`` CPU set: ``(cpu_count, observed)`` or None.
+
+    The list is validated strictly as ordered ``N`` / ``N-M`` items (``N <= M``)
+    so an observation always describes a well-formed CPU set.
+    """
+    count, previous_end = 0, -1
+    for item in raw.split(","):
+        if not item or item != item.strip():
+            return None
+        first, dash, last = item.partition("-")
+        if not _decimal(first) or (dash and not _decimal(last)):
+            return None
+        low = int(first)
+        high = int(last) if dash else low
+        if high < low or low <= previous_end:
+            return None
+        count += high - low + 1
+        previous_end = high
+    return count
+
+
+def read_cgroup_view(root=None):
+    """The runner's own cgroup-v2 resource evidence; no path is ever reported.
+
+    Each field is validated against its documented v2 format. ``status`` is
+    ``observed``, ``unlimited`` or ``unavailable``; malformed or missing content
+    is ``unavailable`` and never becomes a claimed limit. ``cpu.max`` and
+    ``memory.max`` carry an explicit ``limited`` boolean; ``cpuset.cpus.effective``
+    is an observed CPU set (``cpu_count``), which has no unlimited meaning.
+    """
+    base = Path(root) if root is not None else Path("/sys/fs/cgroup")
+
+    def unavailable(key):
+        return {"status": UNAVAILABLE, "raw": UNAVAILABLE, "format": "cgroup-v2", "source": "unavailable"}
+
+    view = {"version": "v2"}
+    for filename, key in CGROUP_FILES.items():
+        try:
+            text = (base / filename).read_text()
+        except OSError:
+            view[key] = unavailable(key)
+            continue
+        raw = " ".join(text.split())[:64]
+        parsed = None if not raw else (
+            parse_cpuset(raw) if key == "cpuset_cpus_effective" else
+            parse_cpu_max(raw) if key == "cpu_max" else parse_memory_max(raw))
+        if parsed is None:
+            view[key] = {**unavailable(key), "source": "malformed" if raw else "empty"}
+        elif key == "cpuset_cpus_effective":
+            view[key] = {"status": "observed", "raw": raw, "format": "cgroup-v2", "source": "cgroup-v2",
+                         "cpu_count": parsed}
+        else:
+            view[key] = {"status": parsed[0], "raw": raw, "format": "cgroup-v2", "source": "cgroup-v2",
+                         "limited": parsed[2]}
+    return view
+
+
+CGROUP_LIMITS = ("cpu_max", "memory_max")
+CGROUP_FIELDS = ("cpu_max", "cpuset_cpus_effective", "memory_max")
+
+
+def validate_cgroup_view(view):
+    """Validate the cgroup evidence; a missing or malformed value is never unlimited."""
+    need(isinstance(view, dict), "cgroup evidence is missing")
+    need(view.get("version") == "v2", "cgroup evidence is malformed")
+    need(set(view) == {"version"} | set(CGROUP_FIELDS), "cgroup evidence has unexpected fields")
+    for key in CGROUP_FIELDS:
+        entry = view.get(key)
+        # An observed limit/cpuset carries its value key; an unavailable one carries none.
+        value_key = ("cpu_count",) if key == "cpuset_cpus_effective" else ("limited",)
+        expected = {"status", "raw", "format", "source"}
+        if isinstance(entry, dict) and entry.get("status") != UNAVAILABLE:
+            expected |= set(value_key)
+        need(isinstance(entry, dict) and set(entry) == expected, "cgroup field shape is invalid: " + key)
+        raw = entry["raw"]
+        need(isinstance(raw, str) and raw and len(raw) <= 64 and "\n" not in raw, "cgroup raw value is invalid: " + key)
+        need(entry["format"] == "cgroup-v2", "cgroup format label is invalid: " + key)
+        if entry["status"] == UNAVAILABLE:
+            need(raw == UNAVAILABLE and entry["source"] in ("unavailable", "malformed", "empty"),
+                 "an unavailable cgroup field must not carry a value: " + key)
+            if key in CGROUP_LIMITS:
+                need("limited" not in entry, "an unavailable field must not claim a limit: " + key)
+            else:
+                need("cpu_count" not in entry, "an unavailable cpuset must not carry a CPU count: " + key)
+            continue
+        need(entry["source"] == "cgroup-v2", "an observed cgroup field must have a v2 source: " + key)
+        if key == "cpuset_cpus_effective":
+            need(entry["status"] == "observed", "a cpuset is an observation, never limited/unlimited: " + key)
+            count = entry.get("cpu_count")
+            need(isinstance(count, int) and not isinstance(count, bool) and count > 0,
+                 "cpuset CPU count is invalid: " + key)
+            need(parse_cpuset(raw) == entry["cpu_count"], "cpuset raw value does not match its count: " + key)
+            continue
+        parsed = parse_cpu_max(raw) if key == "cpu_max" else parse_memory_max(raw)
+        need(parsed is not None, "cgroup raw value is malformed: " + key)
+        need(entry["status"] == parsed[0], "cgroup status disagrees with its value: " + key)
+        need(entry.get("limited") is parsed[2], "cgroup limited flag disagrees with its value: " + key)
+    return view
+
+
 def validate_runtime(runtime):
     """Require every environment fact the report binds itself to."""
     need(isinstance(runtime, dict), "runtime facts are missing")
     for name in ("git_version", "psql_version", "postgres_server_version", "python", "kernel", "machine",
-                 "architecture", "cpu", "hostname"):
+                 "architecture", "hostname"):
         value = runtime.get(name)
         need(isinstance(value, str) and value.strip() and "\n" not in value, "runtime fact is missing: " + name)
-    for name in ("logical_cpus", "mem_total_kb"):
+    for name in ("logical_cpus", "host_memory_total_kb"):
         value = runtime.get(name)
         need(isinstance(value, int) and not isinstance(value, bool) and value > 0, "runtime fact is missing: " + name)
     need(runtime.get("procfs") is True, "procfs is not available")
+    # A CPU model is a /proc/cpuinfo fact; when absent it is "unavailable", never the architecture.
+    model = runtime.get("cpu_model")
+    need(isinstance(model, str) and model.strip() and "\n" not in model, "cpu_model is missing")
+    need(model != runtime["machine"], "cpu_model must never merely repeat the machine architecture")
+    validate_cgroup_view(runtime.get("cgroup"))
     return dict(runtime)
 
 
@@ -1010,25 +1173,35 @@ def run_cold_clone(harness, seed, *, restarted):
 
 
 # --- environment facts ----------------------------------------------------------
-def runtime_facts(harness, profile):
-    """Bind the report to the real environment; missing facts fail the run."""
+def runtime_facts(harness, profile, *, cpuinfo=None, meminfo=None, cgroup_root=None, procfs=None):
+    """Bind the report to the real environment; missing facts fail the run.
+
+    ``cpuinfo``, ``meminfo``, ``cgroup_root`` and ``procfs`` default to this
+    host's files and exist only so tests can inject fixtures; the reported
+    fields are plain values.
+    """
     memory = None
-    for line in Path("/proc/meminfo").read_text().splitlines():
+    meminfo = Path("/proc/meminfo").read_text() if meminfo is None else meminfo
+    for line in meminfo.splitlines():
         if line.startswith("MemTotal:"):
             memory = int(line.split()[1])
             break
+    machine = platform.machine()
     return validate_runtime({
         "git_version": harness.run([str(profile.git), "--version"]).stdout.decode().strip(),
         "psql_version": harness.run(["psql", "--version"]).stdout.decode().strip(),
         "postgres_server_version": harness.sql("SHOW server_version"),
         "python": platform.python_version(),
         "kernel": platform.release(),
-        "machine": platform.machine(),
-        "architecture": platform.machine(),
-        "cpu": platform.processor() or platform.machine(),
+        "machine": machine,
+        "architecture": machine,
+        "cpu_model": cpu_model(Path("/proc/cpuinfo").read_text(errors="replace") if cpuinfo is None else cpuinfo,
+                               machine),
         "logical_cpus": os.cpu_count(),
-        "mem_total_kb": memory,
-        "procfs": Path("/proc/self/fd").is_dir() and Path("/proc/net/tcp").is_file(),
+        "host_memory_total_kb": memory,
+        "cgroup": read_cgroup_view(cgroup_root),
+        "procfs": (Path("/proc/self/fd").is_dir() and Path("/proc/net/tcp").is_file())
+                  if procfs is None else procfs,
         "hostname": harness.run(["hostname"]).stdout.decode().strip(),
     })
 
