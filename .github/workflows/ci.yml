@@ -99,14 +99,18 @@ jobs:
       - name: Verify PostgreSQL RefStore registry and metadata-core contracts
         timeout-minutes: 5
         run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds -- --ignored --test-threads=1
-      - name: Build selected source-bound populated snapshot fixture integration test
+      - name: Build native bins and RefStore fixtures in one batch
         timeout-minutes: 10
-        run: python3 scripts/build_native_test.py --test ref_store_snapshot_backup_fixture --features pando-lab --output test-results/refstore-snapshot-fixture --strip-debuginfo
-      - name: Build selected source-bound populated artifact-hold fixture integration test
-        timeout-minutes: 10
-        run: python3 scripts/build_native_test.py --test ref_store_holds_backup_fixture --features pando-lab --output test-results/refstore-holds-fixture --strip-debuginfo
-      - run: python3 scripts/build_native.py --features pando-lab --bins --strip-debuginfo
-      - run: cargo build --locked --bin rootyard-view-lab
+        run: |
+          python3 scripts/build_native_batch.py \
+            --all-bins \
+            --features pando-lab \
+            --strip-debuginfo \
+            --test ref_store_snapshot_backup_fixture \
+            --output test-results/refstore-snapshot-fixture \
+            --test ref_store_holds_backup_fixture \
+            --output test-results/refstore-holds-fixture \
+            --manifest-out test-results/native-build-batch.json
       - name: Verify design documentation integrity
         run: python3 scripts/check_design_docs.py
       - name: Verify schema-030 catalog and dump round trip
@@ -261,6 +265,9 @@ jobs:
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
         run: python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
+      - name: Exercise webhook fairness
+        timeout-minutes: 20
+        run: python3 tests/webhook_fairness.py --binary target/debug/rootyard --report test-results/webhook-fairness.json
       - name: Exercise repository collaborators, teams, 5-role RBAC, and audit log
         run: python3 tests/members.py --binary target/debug/rootyard --report test-results/members.json
       - name: Exercise organization and member pagination against real PostgreSQL
@@ -289,19 +296,30 @@ jobs:
             --build-receipt target/debug/rootyard.build.json \
             --binary target/debug/rootyard \
             --report web_sessions=test-results/web-sessions.json \
+            --report metrics=test-results/metrics.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
+            --report webhook_fairness=test-results/webhook-fairness.json \
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
             --report workspace_capture=test-results/workspace-capture.json \
             --report repository_pagination=test-results/repository-pagination.json \
             --report organization_pagination=test-results/organization-pagination.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
+            --report webhooks=test-results/webhooks.json \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
             --log-marker "webhook_regressions=verified TLS and plaintext rejection: passed" \
             --log-marker "webhook_regressions=untrusted certificate rejected:" \
             --harness tests/web_sessions.py \
+            --harness tests/metrics.py \
             --harness tests/webhook_worker_recovery.py \
+            --harness tests/webhook_fairness.py \
+            --harness tests/pulls.py \
+            --harness tests/forge.py \
+            --harness tests/e2e.py \
+            --harness tests/schema_baseline.py \
+            --harness tests/native_evidence.py \
+            --harness tests/owned_fuse_cleanup.py \
             --harness tests/ci_webhook_regressions.py \
             --harness tests/backup_audit_sequence_legacy.py \
             --harness tests/workspace_capture_acceptance.py \
@@ -309,6 +327,8 @@ jobs:
             --harness tests/repository_pagination.py \
             --harness tests/organization_pagination.py \
             --harness tests/web_detail_pagination.py \
+            --harness tests/webhooks.py \
+            --harness tests/webhook_tenant_matrix.py \
             --fixture postgres=postgres:17 \
             --fixture workspace_mount_mode=direct \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix \
@@ -329,6 +349,7 @@ jobs:
           name: e2e-report
           path: |
             test-results/*.json
+            target/debug/rootyard.build.json
             test-results/ci-webhook-regressions.log
             test-results/evidence/*.jsonl
             test-results/ci-native-tools/provenance.json

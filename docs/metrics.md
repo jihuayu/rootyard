@@ -30,6 +30,7 @@ labels. Database strings are never interpolated into exposition.
 | `rootyard_operations_unresolved` | gauge | Unknown operations with no corresponding explicit resolution |
 | `rootyard_event_deliveries{state="pending\|leased"}` | gauge | Durable outstanding deliveries, summed across fixed consumers |
 | `rootyard_event_delivery_oldest_age_seconds` | gauge | Age since event creation of oldest undelivered event |
+| `rootyard_webhook_delivery_oldest_age_seconds` | gauge | Database-clock age since creation of the oldest outstanding webhook delivery on an active hook in state `pending`, `failed` or `leased`; retry-delayed `failed` and leased rows, including expired/reclaimable leases, count, while `delivered`, `dead_letter` and inactive hooks are excluded; an empty set reports 0 |
 | `rootyard_provisioning_backlog` | gauge | All provisioning rows, including delayed retries |
 | `rootyard_provisioning_due` | gauge | Provisioning rows whose retry time has arrived |
 | `rootyard_provisioning_oldest_age_seconds` | gauge | Age of oldest provisioning row |
@@ -48,12 +49,26 @@ labels. Database strings are never interpolated into exposition.
 | `rootyard_storage_maintenance_oldest_queued_age_seconds{backend,kind}` | gauge | Database-clock age since creation of the oldest queued job, retry delays included; empty set reports 0 |
 | `rootyard_storage_maintenance_repos{backend,state}` | gauge | Ready cluster-wide eligible repositories per fixed scheduled-scan state: `missing_scan`, `due_scan`, `stale_generation` |
 | `rootyard_storage_maintenance_oldest_overdue_scan_age_seconds{backend}` | gauge | Seconds past the scheduler scan due time for the oldest overdue repository; 0 when nothing is overdue |
+| `rootyard_lfs_remote_failures_total` | counter | Process-local count of typed LFS remote-store operation failures, including cold hydration leader failures, deferred repair failures, and remote publication failures. |
+| `rootyard_lfs_remote_repair_backlog` | gauge | Process-local count of admitted in-flight deferred repair tasks currently holding a bounded repair semaphore permit. |
 
 The `|` notation in this table enumerates distinct label values; it is not a
-literal label value. A healthy scrape always exports all 91 time series,
-including zero-valued backend/kind/state combinations. Delivery age includes leased entries (including
+literal label value. A healthy scrape always exports all 94 time series,
+including zero-valued backend/kind/state combinations.
+
+`rootyard_lfs_remote_failures_total` aggregates typed LFS remote operation failures only (cold hydration, deferred repair, and remote publication); it is process-local and resets on process restart, and warm verified local reads that do not consult the remote store do not increment it. `rootyard_lfs_remote_repair_backlog` counts admitted in-flight repair attempts that hold the existing bounded repair semaphore permit; it is not a durable queue, does not count repair requests that fail to acquire a permit, and drops to zero as tasks finish or fail. Neither series has labels.
+
+Delivery age includes leased entries (including
 expired leases) and delayed retries. Counts represent delivery rows, so one
 event assigned to two consumers contributes two outstanding deliveries.
+The webhook delivery age is label-free and comes only from
+`forge_webhook_deliveries` joined to `forge_webhooks`; it never uses
+`event_deliveries` or `outbox_events`. Its age is
+`statement_timestamp() - min(created_at)`, clamped at zero, so a retry-delayed
+`failed` row or any row still in `leased` state, including an expired lease
+awaiting reclaim, is counted under its original creation time,
+while terminal rows and rows of inactive hooks
+never move it. No hook ID, URL or secret is exported.
 A resolved unknown operation remains an unknown historical fact; its explicit
 resolution removes it from the unresolved gauge without rewriting history.
 
@@ -79,7 +94,9 @@ server-side statement timeout bounds each query; pool acquisition and the whole
 snapshot have a combined five-second timeout. On
 any database/schema/query failure or timeout, the endpoint returns HTTP 503,
 exports `rootyard_postgres_up 0` plus the process-local pool gauges, transfer
-counters and four GC counters, and omits every database-derived gauge,
+counters, `rootyard_lfs_remote_failures_total` (the LFS failure counter),
+`rootyard_lfs_remote_repair_backlog` (the LFS backlog gauge), and four GC counters,
+and omits every database-derived gauge,
 including all four browser-session gauges. The process-local metrics remain
 exported because they do not assert database health. The endpoint never
 substitutes an empty/healthy backlog or serves a stale cached snapshot. Alert on both

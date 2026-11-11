@@ -36,7 +36,12 @@ pub async fn publish_remote(
     };
     let key = ObjectKey::new(tenant_id, "lfs", oid).map_err(Error::internal)?;
     let path = object_path(&state.storage.root, repo_id, oid).map_err(Error::internal)?;
-    store.put_file(&key, &path, size, Instant::now() + state.config.git_timeout).await.map_err(Error::internal)?;
+    store.put_file(&key, &path, size, Instant::now() + state.config.git_timeout).await.map_err(|error| {
+        if error.downcast_ref::<crate::storage::remote_objects::RemoteStoreError>().is_some() {
+            super::remote_metrics::counters().record_remote_failure();
+        }
+        Error::internal(error)
+    })?;
     Ok(())
 }
 
