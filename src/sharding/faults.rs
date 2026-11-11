@@ -15,13 +15,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const MAX_PAUSE_MS: u64 = 15_000;
+const MAX_PAUSE_MS: u64 = 30_000;
 
 const PHASES: &[&str] = &[
     "copy-before-transfer",
     "copy-after-transfer",
     "final-delta-before-transfer",
     "cutover-before-commit",
+    "transition-before-commit",
     "cutover-after-commit",
     "cutover-before-sidecar-finalize",
     "target-copy-after-receive",
@@ -31,6 +32,7 @@ const PHASES: &[&str] = &[
     "recover-before-reconcile",
     "takeover-after-source-verify",
     "takeover-before-promote",
+    "takeover-after-source-marker",
 ];
 
 fn marker_directory(root: &Path) -> Result<PathBuf, std::io::Error> {
@@ -96,7 +98,20 @@ pub(crate) fn hit(root: &Path, phase: &str, detail: Value) {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(5_000)
                 .min(MAX_PAUSE_MS);
-            std::thread::sleep(Duration::from_millis(millis));
+            // A bare `thread::sleep` here would pin a Tokio worker for the whole
+            // pause. On a 2-vCPU runner that parks half the pool, so unrelated
+            // request handlers (e.g. `GET /shard-fence`) stall until the pause
+            // ends. `block_in_place` hands the worker's queued tasks to a
+            // replacement thread while this one sleeps.
+            let pause = || std::thread::sleep(Duration::from_millis(millis));
+            if matches!(
+                tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            ) {
+                tokio::task::block_in_place(pause);
+            } else {
+                pause();
+            }
         }
         _ => {}
     }

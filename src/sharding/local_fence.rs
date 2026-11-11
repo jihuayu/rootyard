@@ -115,6 +115,29 @@ pub fn registered_repository(node_id: &str, repository_id: Uuid) -> Result<(Volu
     Ok((registration, repo_dir))
 }
 
+/// Write a staged marker directly on a still-attached registered volume. The
+/// caller must have a pending `shard_marker_transitions` row for the same
+/// volume and marker; an unverifiable write is always an error.
+pub fn write_volume_repository(
+    node_id: &str,
+    repository_id: Uuid,
+    marker: &VolumeFenceMarker,
+) -> Result<VolumeRegistration> {
+    ensure!(marker.repository_id == repository_id,
+        "volume marker belongs to another repository");
+    let (registration, repo_dir) = registered_repository(node_id, repository_id)?;
+    crate::journal::atomic(
+        &repo_dir.join(crate::sharding::models::VOLUME_FENCE_MARKER_FILE),
+        &serde_json::to_vec_pretty(marker)?,
+        true,
+    )?;
+    let observed = crate::sharding::fencing::read_volume_marker_at(&repo_dir)
+        .map_err(|error| anyhow::anyhow!("volume marker is unreadable: {}", error.1))?
+        .context("volume marker did not publish")?;
+    ensure!(&observed == marker, "volume marker verification failed");
+    Ok(registration)
+}
+
 /// After the old process session is verifiably gone, write a retired read-only
 /// marker directly on its still-attached volume. This is same-host fencing:
 /// a detached or inaccessible source volume must block promotion instead.
@@ -123,19 +146,9 @@ pub fn retire_volume_repository(
     repository_id: Uuid,
     marker: &VolumeFenceMarker,
 ) -> Result<VolumeRegistration> {
-    ensure!(marker.repository_id == repository_id && marker.read_only_degraded,
+    ensure!(marker.read_only_degraded,
         "retired source marker is not read-only for this repository");
-    let (registration, repo_dir) = registered_repository(node_id, repository_id)?;
-    crate::journal::atomic(
-        &repo_dir.join(crate::sharding::models::VOLUME_FENCE_MARKER_FILE),
-        &serde_json::to_vec_pretty(marker)?,
-        true,
-    )?;
-    let observed = crate::sharding::fencing::read_volume_marker_at(&repo_dir)
-        .map_err(|error| anyhow::anyhow!("retired source marker is unreadable: {}", error.1))?
-        .context("retired source marker did not publish")?;
-    ensure!(&observed == marker, "retired source marker verification failed");
-    Ok(registration)
+    write_volume_repository(node_id, repository_id, marker)
 }
 
 /// Called before accepting traffic; the service must run as its own session leader.
