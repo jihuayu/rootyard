@@ -2017,6 +2017,23 @@ class OperationsIntervalTypeRegressionTest(unittest.TestCase):
         self.assertEqual(refusal_audit_sql.refusal_audit_verdict(rows[0], [], rows[0]["admission_ref_names"]),
                          {"status": "settled", "problems": []})
 
+    def test_non_bool_value_is_rejected_and_names_its_key(self):
+        """Every bool key stays strict, and a failure says which key failed."""
+        # The unmodified row still decodes; only the bad value is rejected.
+        self.assertEqual(refusal_audit_sql.decode_operation_interval(
+            json.dumps([self.row()]), 7), [self.row()])
+        for bad in ("true", "false", 1, 0, None, [True]):
+            with self.subTest(key="interrupted", value=bad):
+                with self.assertRaisesRegex(
+                        ValueError,
+                        r"\binvalid operations interval: interrupted\b"):
+                    refusal_audit_sql.decode_operation_interval(
+                        json.dumps([self.row(interrupted=bad)]), 7)
+        with self.assertRaisesRegex(ValueError,
+                                    r"\binvalid operations interval: service_principal\b"):
+            refusal_audit_sql.decode_operation_interval(
+                json.dumps([self.row(service_principal="false")]), 7)
+
     def test_either_booleans_text_form_breaks_the_chain(self):
         for key in refusal_audit_sql.EVIDENCE_KEYS:
             with self.subTest(key=key):

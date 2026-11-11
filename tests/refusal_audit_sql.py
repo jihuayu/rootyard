@@ -560,7 +560,9 @@ def decode_operation_interval(raw, highwater):
 
         for name in _BOOL_KEYS:
             if not isinstance(row[name], bool):
-                raise ValueError(_ERR)
+                # Name the offending key: every failure here is "invalid
+                # operations interval", so the field must be identifiable.
+                raise ValueError("{}: {} is not a JSON boolean".format(_ERR, name))
 
         _check_reference_events(row["reference_events"])
 
