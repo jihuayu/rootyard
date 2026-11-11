@@ -37,6 +37,7 @@ use std::collections::BTreeMap;
 use tokio_postgres::GenericClient;
 
 const TIMED_OUT: &str = "source artifact validator deadline exceeded";
+const CAPTURE_UNPROVEN: &str = "retained root capture cannot be re-proven";
 
 /// Every declared set row: source kind, declaring header and the complete pack
 /// descriptor it stored. Only `pg_refstore` repositories declare packs, and each
@@ -408,6 +409,15 @@ async fn prove_capture(
     )
     .await
     .context(TIMED_OUT)?;
+    capture_proof(proven)
+}
+
+/// The capture validator's outcome as a proof: `Ok(None)` stays proof-less (the
+/// ledger then reports `root_capture_invalid`), every inner refusal propagates
+/// as an ordinary error under fixed context, never reclassified.
+fn capture_proof(
+    proven: Result<Option<retention_root::ValidatedCapture>, retention_root::RootError>,
+) -> Result<Option<RootProof>> {
     match proven {
         Ok(Some(capture)) => Ok(Some(RootProof {
             tenant_id: capture.tenant_id(),
@@ -423,8 +433,9 @@ async fn prove_capture(
             pack_set_digest: capture.pack_set_digest_hex().to_owned(),
             native_binding_digest: capture.native_binding_digest_hex().to_owned(),
         })),
-        // A capture the core itself refuses can never be archived faithfully.
-        Ok(None) | Err(_) => Ok(None),
+        // A missing capture is the ledger's own `root_capture_invalid` decision.
+        Ok(None) => Ok(None),
+        Err(error) => Err(anyhow::Error::new(error).context(CAPTURE_UNPROVEN)),
     }
 }
 
@@ -802,6 +813,25 @@ mod tests {
         })
         .context("source artifact ledger cannot be archived");
         assert!(error.chain().all(|cause| cause.downcast_ref::<LedgerValidationRefusal>().is_none()));
+    }
+
+    /// [`capture_proof`] (called by [`prove_capture`]) only erases a *missing*
+    /// capture: a core refusal stays an ordinary error carrying its own typed
+    /// cause and is never turned into the ledger's typed refusal.
+    #[test]
+    fn an_unprovable_root_capture_propagates_and_a_missing_one_stays_proof_less() {
+        use crate::ref_store::contract::RefStoreError;
+        assert!(capture_proof(Ok(None)).expect("a missing capture is not an error").is_none());
+        let error = capture_proof(Err(retention_root::RootError::Store(RefStoreError::Timeout)))
+            .expect_err("a refused capture must propagate");
+        assert!(error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<retention_root::RootError>(),
+                Some(retention_root::RootError::Store(RefStoreError::Timeout))
+            )
+        }));
+        assert!(error.chain().all(|cause| cause.downcast_ref::<LedgerValidationRefusal>().is_none()));
+        assert_eq!(error.to_string(), CAPTURE_UNPROVEN);
     }
 
     /// Calls [`validate_source`]'s final branch: refused iff a violation exists.
