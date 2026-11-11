@@ -313,10 +313,10 @@ class CaseContractTest(unittest.TestCase):
             self.assertTrue(Path(parsed.parse_args(["--git", shutil.which("git")]).git).is_absolute())
 
     def test_module_stays_modular(self):
-        # Refusal audit SQL/verdict live in refusal_audit_sql.py; the cap stays.
-        self.assertLessEqual(len(CASES.read_text().splitlines()), 645)
-        self.assertNotIn("def audit_where", CASES.read_text())
-        self.assertNotIn("def operations_after_query", CASES.read_text())
+        # Refusal audit SQL/verdict live in refusal_audit_sql.py.  The module
+        # also carries the shared public-refs cursor walk used by ``ref_state``.
+        self.assertLessEqual(len(CASES.read_text().splitlines()), 700)
+        self.assertEqual(CASES.read_text().count("def operations_after_query"), 0)
 
     def test_reference_events_shape(self):
         real = [{"ordinal": 1, "phase": "Aborted", "changes": []},
@@ -324,25 +324,6 @@ class CaseContractTest(unittest.TestCase):
         self.assertEqual(mixed_ref_cases.reference_events(real), real)
         self.assertEqual(mixed_ref_cases.reference_events({"changes": []}), [{"changes": []}])
         self.assertEqual(mixed_ref_cases.reference_events(None), [])
-
-    def test_judge_audit_never_passes_a_missing_operation(self):
-        missing = mixed_ref_cases.judge_audit({"status": "missing", "reference_events": []}, [])
-        self.assertEqual(missing["status"], "missing")
-        self.assertEqual(missing["problems"], ["no operation"])
-        settled = mixed_ref_cases.judge_audit({
-            "status": "settled", "settled": True, "outcome": "no_ref_changes",
-            "actor_and_token_match": True, "human_principal": True, "service_principal": False,
-            "admission_present": True, "admission_state": "ABORTED", "admission_settled": True,
-            "admission_identity_matches": True, "admission_ref_names": ["refs/heads/main"],
-            "outbox_count": 0, "outbox_ref_names": [], "evidence_no_receipt": True,
-            "finished": True, "storage_generation_matches": True, "interrupted": "false",
-            "ungranted_without_hooks": "false", "reference_events": [], "ref_names": ["refs/heads/main"]},
-            [])
-        self.assertEqual(settled["problems"], [])
-        # A row that stored the boolean as text is not the projected contract.
-        text = dict(settled["audit"], finished="true")
-        self.assertIn("finished", mixed_ref_cases.judge_audit(text, [])["problems"])
-
 
 class MixedRefWiringTest(unittest.TestCase):
     def test_isolated_rules_is_a_context_manager(self):
@@ -1234,11 +1215,20 @@ class BrowseIntegrationTest(unittest.TestCase):
 
 
 class RefusalAuditSqlTest(unittest.TestCase):
-    """The audit SQL names only real tables/columns; one JSON object, no split."""
+    """The active interval SQL names only real tables/columns, types included."""
 
-    def setUp(self):
-        self.pairs = dict(refusal_audit_sql.audit_pairs("'r'", ["'refs/heads/a'", "'refs/heads/b'"], "SAME"))
-        self.query = refusal_audit_sql.audit_query(list(self.pairs.items()), "'r'", str)
+    REPO = "11111111-1111-4111-8111-111111111111"
+    ACTOR = "22222222-2222-4222-8222-222222222222"
+    TOKEN = "33333333-3333-4333-8333-333333333333"
+
+    def interval_sql(self):
+        """The real ``operations_after_query()`` text the interval reader runs."""
+        return refusal_audit_sql.operations_after_query(
+            self.REPO, 7, self.ACTOR, self.TOKEN, self.escape)
+
+    def escape(self, value):
+        """``BrowseHarness._sql_literal``: escape only, no delimiters added."""
+        return browse.BrowseHarness._sql_literal(value)
 
     def test_operation_highwater_query_validates_uuid_and_quotes_once(self):
         uuid_value = "0f8fad5b-d9cb-469f-a165-70867728950e"
@@ -2157,8 +2147,10 @@ class SourceBindingTest(unittest.TestCase):
         # Never through the PATH wrapper and never through a Git config.
         self.assertNotIn("self.git(", body)
         self.assertNotIn("self.git_as(", body)
-        # The public view is a separate API read, checked before/after.
-        self.assertIn('self.document(self.repo_api(\'/refs\'))', body)
+        # The public view is a separate, fully paginated API read: the cursor
+        # walk helper, never a single page that could stop at the limit.
+        self.assertIn("public_refs(self, self.repo_api(''))", body)
+        self.assertNotIn("self.document(self.repo_api('/refs'))", body)
         self.assertLess(body.index("api_refs"), body.index("subprocess.run("))
         # The snapshot carries the physical refs, the API refs, and the bounds.
         returns = [n for n in ast.walk(method("ref_state")) if isinstance(n, ast.Return)]
@@ -2169,6 +2161,83 @@ class SourceBindingTest(unittest.TestCase):
         self.assertIn('before_refs = {name: oid for name, oid in before["refs"]}', helper)
         api_helper = source_of(SQL, "audit_api_refusal_interval")
         self.assertIn('before_refs = dict(before["refs"])', api_helper)
+
+    def test_public_refs_walk_follows_every_cursor_page(self):
+        """More public refs than one page: the snapshot must see every one."""
+        names = ["refs/heads/main"] + ["refs/tags/tag-%04d" % index for index in range(200)]
+        self.assertEqual(len(names), 201)              # limit=100 -> three pages
+        oid = "a" * 40
+        harness = SimpleNamespace(requests=[], last_cursor=None)
+
+        def document(path, code=200, token=None, **kwargs):
+            self.assertTrue(path.startswith("/api/repos/alice/demo/refs?"), path)
+            query = urllib.parse.parse_qs(path.split("?", 1)[1])
+            limit = int(query["limit"][0])
+            self.assertEqual(limit, mixed_ref_cases.PUBLIC_REFS_PAGE_LIMIT)
+            self.assertLessEqual(limit, 100, "the supported page size is 100")
+            after = query.get("after", [None])[0]
+            harness.requests.append((limit, after))
+            remaining = [name for name in names if after is None or name > after]
+            page = remaining[:limit]
+            return {"items": [{"name": name, "oid": oid} for name in page],
+                    "next_after": page[-1] if len(remaining) > limit else None}
+        harness.document = document
+        refs = mixed_ref_cases.public_refs(harness, "/api/repos/alice/demo")
+        # Every ref is present, and the walk made exactly the cursor requests
+        # for them: limit only, then one cursor per completed page.
+        self.assertEqual(sorted(refs), [(name, oid) for name in names])
+        self.assertEqual(harness.requests,
+                         [(100, None), (100, names[99]), (100, names[199])])
+        self.assertEqual(len(harness.requests), 3)
+        # A single default-limit read would have truncated at 50.
+        self.assertGreater(len(refs), 50)
+
+    @staticmethod
+    def refs_page(items, next_after):
+        """A fake ``/refs`` server returning the same page for every cursor."""
+        return SimpleNamespace(document=lambda path, code=200, token=None, **kwargs: {
+            "items": [{"name": name, "oid": "a" * 40} for name in items],
+            "next_after": next_after})
+
+    def test_public_refs_walk_rejects_stalled_or_non_terminating_cursors(self):
+        # A cursor that does not advance must fail rather than loop or truncate.
+        with self.assertRaisesRegex(AssertionError, "did not advance"):
+            mixed_ref_cases.public_refs(
+                self.refs_page(["refs/heads/main"], "refs/heads/main"), "/r")
+        # A single page whose last ref runs past its own cursor would be skipped
+        # by that cursor, so the full public set is unknown: fail closed.
+        with self.assertRaisesRegex(AssertionError, "not bounded by its own next_after"):
+            mixed_ref_cases.public_refs(
+                self.refs_page(["refs/tags/a", "refs/tags/z"], "refs/tags/m"), "/r")
+        # A page whose cursor sits before its last ref is just as unbounded.
+        with self.assertRaisesRegex(AssertionError, "not bounded by its own next_after"):
+            mixed_ref_cases.public_refs(
+                self.refs_page(["refs/tags/m", "refs/tags/a"], "refs/tags/m"), "/r")
+        # An empty page with a cursor cannot make progress either.
+        with self.assertRaisesRegex(AssertionError, "not bounded by its own next_after"):
+            mixed_ref_cases.public_refs(self.refs_page([], "refs/tags/m"), "/r")
+        # A page without an items list is not evidence of an empty repository.
+        with self.assertRaisesRegex(AssertionError, "items list"):
+            mixed_ref_cases.public_refs(SimpleNamespace(document=lambda *a, **k: {}), "/r")
+        # A page with a non-string cursor is not a page at all.
+        with self.assertRaisesRegex(AssertionError, "did not advance"):
+            mixed_ref_cases.public_refs(
+                SimpleNamespace(document=lambda *a, **k: {
+                    "items": [], "next_after": 5}), "/r")
+        # An unbounded server is refused instead of walking forever.
+        saved = mixed_ref_cases.PUBLIC_REFS_MAX_PAGES
+        page_number = iter(range(100_000))
+
+        def endless(path, code=200, token=None, **kwargs):
+            number = next(page_number)
+            return {"items": [{"name": "refs/tags/x%07d" % number, "oid": "a" * 40}],
+                    "next_after": "refs/tags/x%07d" % number}
+        mixed_ref_cases.PUBLIC_REFS_MAX_PAGES = 3
+        try:
+            with self.assertRaisesRegex(AssertionError, "did not terminate"):
+                mixed_ref_cases.public_refs(SimpleNamespace(document=endless), "/r")
+        finally:
+            mixed_ref_cases.PUBLIC_REFS_MAX_PAGES = saved
 
     def test_ref_oids_uses_rev_parse_on_the_bare_repository(self):
         body = ast.unparse(method("ref_oids"))

@@ -22,14 +22,53 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import urllib.parse
 
 from refusal_audit_sql import (
     audit_api_refusal_interval,
     audit_git_refusal_interval,
-    refusal_audit_verdict,
 )
 
 ZERO_OID = "0" * 40
+# ``GET /refs`` serves at most 100 per page (``validate_limit``); the walk asks
+# for that explicit limit instead of the 50 default.
+PUBLIC_REFS_PAGE_LIMIT = 100
+PUBLIC_REFS_MAX_PAGES = 1000
+
+
+def public_refs(harness, path):
+    """Every public ref from ``/refs``, following ``next_after`` to the end.
+
+    One page would silently truncate at the default limit, so the cursor is
+    followed until the server reports no successor.  Cursors must advance
+    strictly and the walk must terminate, or the full public set is unknown.
+    """
+    refs, cursor, pages = [], None, 0
+    while True:
+        suffix = "/refs?limit=" + str(PUBLIC_REFS_PAGE_LIMIT) + (
+            "&after=" + urllib.parse.quote(cursor, safe="") if cursor is not None else "")
+        page = harness.document(path + suffix)
+        items = page.get("items")
+        if not isinstance(items, list):
+            raise AssertionError("/refs page without an items list: " + repr(page)[:400])
+        for item in items:
+            refs.append((item["name"], item["oid"]))
+        following = page.get("next_after")
+        if following is None:
+            return refs
+        if not isinstance(following, str) or (cursor is not None and following <= cursor):
+            raise AssertionError("/refs cursor did not advance: " + repr((cursor, following)))
+        # ``next_after`` is the last name the server placed on this page, so the
+        # page must end exactly there: a ref beyond it would be skipped by the
+        # cursor and a shorter page boundary would repeat refs already read.
+        names = [item["name"] for item in items]
+        if not names or names[-1] != following:
+            raise AssertionError("/refs page is not bounded by its own next_after: "
+                                 + repr({"next_after": following, "last": names[-1] if names else None}))
+        cursor = following
+        pages += 1
+        if pages > PUBLIC_REFS_MAX_PAGES:
+            raise AssertionError("/refs walk did not terminate in " + str(PUBLIC_REFS_MAX_PAGES) + " pages")
 
 # These case IDs are the native contract; the full #18 port keeps them verbatim.
 MIXED_REF_CASES = (
@@ -41,21 +80,6 @@ MIXED_REF_CASES = (
 def reference_events(journal):
     """One transaction per stored JSON-array entry; a bare object is one."""
     return [journal] if isinstance(journal, dict) else list(journal or [])
-
-
-def judge_audit(row, pending_journal):
-    """SQL ``status`` + ``refusal_audit_verdict`` and the real FS journal count.
-
-    ``finished``/``storage_generation_matches`` must be the booleans the interval
-    query projects, so a row that stored a text ``"true"`` fails here too.
-    """
-    journal = row.get("reference_events", [])
-    if row["status"] == "missing":
-        verdict = {"status": "missing", "problems": ["no operation"]}
-    else:
-        verdict = refusal_audit_verdict(dict(row, journal_rows=len(pending_journal)), journal, row["ref_names"])
-    return {"status": row["status"], "problems": verdict["problems"], "audit": row,
-            "journal": journal, "journal_rows": len(pending_journal)}
 
 
 class MixedRefPolicyCases:
@@ -236,7 +260,7 @@ class MixedRefPolicyCases:
         from refusal_audit_sql import operation_highwater_query
         repo = self._sql_literal(self.repo["id"])
         operation_highwater = int(self.sql(operation_highwater_query(self.repo["id"], self._sql_literal)))
-        api_refs = sorted((item["name"], item["oid"]) for item in self.document(self.repo_api("/refs"))["items"])
+        api_refs = sorted(public_refs(self, self.repo_api("")))
         probe = subprocess.run([self.native_git()["executable"], "--git-dir=" + str(self.bare),
                                 "for-each-ref", "--format=%(refname)%00%(objectname)"],
                                cwd=self.root, capture_output=True, timeout=60)
