@@ -287,9 +287,15 @@ BINDING = {"attested": True, "inputs_unchanged": True, "binary_sha256": "a" * 64
            "source_inputs_sha256": "b" * 64, "build_receipt_sha256": "c" * 64, "runner_sha256": "d" * 64,
            "harness_sha256": "e" * 64, "trusted_git_sha256": "f" * 64, "workspace_commit": "0" * 40,
            "rustc": "rustc 1", "inputs": {"runner": "d" * 64, "tests/blob_only_service.py": "e" * 64}}
+CGROUP_UNAVAILABLE = {"version": "v2",
+                      **{key: {"status": "unavailable", "raw": "unavailable", "format": "cgroup-v2",
+                               "source": "unavailable"}
+                         for key in ("cpu_max", "cpuset_cpus_effective", "memory_max")}}
 RUNTIME = {"git_version": "git version 2", "psql_version": "psql (17)", "postgres_server_version": "17.1",
            "python": "3.12.0", "kernel": "6.1.0", "machine": "x86_64", "architecture": "x86_64",
-           "cpu": "test", "hostname": "fixture", "logical_cpus": 4, "mem_total_kb": 1024, "procfs": True}
+           "cpu_model": "Fixture CPU Model 1", "hostname": "fixture", "logical_cpus": 4,
+           "host_memory_total_kb": 1024, "procfs": True,
+           "cgroup": {**CGROUP_UNAVAILABLE}}
 
 
 class SocketAddressTest(unittest.TestCase):
@@ -856,6 +862,173 @@ class SetupAndRestartTest(unittest.TestCase):
             baseline.validate_cold(cold_fixture(samples_across_restart=True))
 
 
+class HardwareProvenanceTest(unittest.TestCase):
+    """CPU model and cgroup evidence: explicit, bounded, and never guessed."""
+
+    def test_cpu_model_from_common_cpuinfo_fields(self):
+        x86 = "processor\t: 0\nmodel name\t: Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz\nModel\t: 173\n"
+        self.assertEqual(baseline.cpu_model(x86, "x86_64"), "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz")
+        # ARM lists the SoC under Hardware; a bare board name is still a model, never the arch.
+        arm = "processor\t: 0\nBogoMIPS\t: 50.00\n\nHardware\t: BCM2711\nRevision\t: c03114\n"
+        self.assertEqual(baseline.cpu_model(arm, "aarch64"), "BCM2711")
+        self.assertEqual(baseline.cpu_model("Model\t: Raspberry Pi 4 Model B Rev 1.4\n", "aarch64"),
+                         "Raspberry Pi 4 Model B Rev 1.4")
+        power = "processor\t: 0\ncpu\t\t: POWER9 (architected), altivec supported\n"
+        self.assertEqual(baseline.cpu_model(power, "ppc64le"), "POWER9 (architected), altivec supported")
+
+    def test_cpu_model_is_unavailable_rather_than_the_architecture(self):
+        self.assertEqual(baseline.cpu_model("", "x86_64"), "unavailable")
+        self.assertEqual(baseline.cpu_model("processor\t: 0\ncpu\t\t: x86_64\n", "x86_64"), "unavailable")
+        self.assertEqual(baseline.cpu_model("model name\t: \n", "x86_64"), "unavailable")
+        self.assertEqual(baseline.cpu_model(None, "x86_64"), "unavailable")
+        # Bounded and single-line, even for hostile content.
+        hostile = "model name\t: A\x00B  " + "x" * 500 + "\n"
+        model = baseline.cpu_model(hostile, "x86_64")
+        self.assertLessEqual(len(model), 200)
+        self.assertNotIn("\0", model)
+        self.assertNotIn("\n", model)
+
+    def test_cgroup_view_distinguishes_missing_from_max(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            view = baseline.read_cgroup_view(root)
+            for key in ("cpu_max", "cpuset_cpus_effective", "memory_max"):
+                self.assertEqual(view[key], {"status": "unavailable", "raw": "unavailable",
+                                             "format": "cgroup-v2", "source": "unavailable"})
+                self.assertNotIn("limited", view[key])   # a missing limit is never "unlimited"
+                self.assertNotIn("cpu_count", view[key])
+            (root / "cpu.max").write_text("max 100000\n")
+            (root / "cpuset.cpus.effective").write_text("0-3,8\n")
+            (root / "memory.max").write_text("max\n")
+            view = baseline.read_cgroup_view(root)
+            self.assertEqual(view["cpu_max"], {"status": "unlimited", "raw": "max 100000", "format": "cgroup-v2",
+                                               "source": "cgroup-v2", "limited": False})
+            self.assertEqual(view["memory_max"], {"status": "unlimited", "raw": "max", "format": "cgroup-v2",
+                                                  "source": "cgroup-v2", "limited": False})
+            self.assertEqual(view["cpuset_cpus_effective"], {"status": "observed", "raw": "0-3,8",
+                                                             "format": "cgroup-v2", "source": "cgroup-v2",
+                                                             "cpu_count": 5})
+            (root / "cpu.max").write_text("2 100000\n")
+            (root / "memory.max").write_text("536870912\n")
+            view = baseline.read_cgroup_view(root)
+            self.assertEqual((view["cpu_max"]["status"], view["cpu_max"]["limited"]), ("limited", True))
+            self.assertEqual((view["memory_max"]["status"], view["memory_max"]["limited"]), ("limited", True))
+            baseline.validate_cgroup_view(view)
+
+    def test_cgroup_view_reports_no_path(self):
+        root = self._fixture({"cpu.max": "2 100000", "cpuset.cpus.effective": "0", "memory.max": "max"})
+        view = baseline.read_cgroup_view(root)
+        self.assertEqual(set(view), {"version", "cpu_max", "cpuset_cpus_effective", "memory_max"})
+        self.assertNotIn("root", view)
+        self.assertNotIn("path", json.dumps(view))
+        self.assertNotIn(root, json.dumps(view))
+        self.assertNotIn("/sys/fs/cgroup", json.dumps(view))   # not even a fixed path label
+        baseline.validate_cgroup_view(view)
+
+    def test_cpu_max_format(self):
+        cases = {"2 100000": ("limited", True), "max 100000": ("unlimited", False),
+                 "1 1": ("limited", True), "0 100000": ("limited", True)}
+        for raw, (status, limited) in cases.items():
+            with self.subTest(raw=raw):
+                parsed = baseline.parse_cpu_max(raw)
+                self.assertEqual(parsed[0], status)
+                self.assertIs(parsed[2], limited)
+        for raw in ("", "2", "2 100000 7", "max", "max 0", "2 0", "-1 100000", "2.5 100000", "2 x",
+                    "２ 100000", "2\t100000x"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(baseline.parse_cpu_max(raw))
+
+    def test_memory_max_format(self):
+        self.assertEqual(baseline.parse_memory_max("max"), ("unlimited", "max", False))
+        self.assertEqual(baseline.parse_memory_max("0"), ("limited", "0", True))
+        self.assertEqual(baseline.parse_memory_max(str(2 ** 64 - 1))[0], "limited")
+        for raw in ("", "1 2", "max ", "12x", "-1", "+5", "2.5", "1e9", "２", str(2 ** 64)):
+            with self.subTest(raw=raw):
+                self.assertIsNone(baseline.parse_memory_max(raw))
+
+    def test_cpuset_format_is_an_observation_not_a_limit(self):
+        for raw, count in (("0", 1), ("0-3", 4), ("0-3,8", 5), ("0,2,4", 3), ("8-9", 2)):
+            with self.subTest(raw=raw):
+                self.assertEqual(baseline.parse_cpuset(raw), count)
+        for raw in ("", "0,", ",0", "0,,1", "3-1", "0-3,2", "0,0", "a", "0 - 3", " 0", "0-", "-1", "0, 1"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(baseline.parse_cpuset(raw))
+        view = baseline.read_cgroup_view(self._fixture({"cpuset.cpus.effective": "0-1"}))
+        self.assertEqual(view["cpuset_cpus_effective"]["status"], "observed")
+        self.assertNotIn("limited", view["cpuset_cpus_effective"])  # a CPU set is never limited/unlimited
+
+    def test_malformed_content_is_unavailable_not_a_limit(self):
+        root = self._fixture({"cpu.max": "max 0\n", "cpuset.cpus.effective": "3-1\n", "memory.max": "lots\n"})
+        view = baseline.read_cgroup_view(root)
+        for key in ("cpu_max", "cpuset_cpus_effective", "memory_max"):
+            self.assertEqual(view[key]["status"], "unavailable")
+            self.assertEqual(view[key]["source"], "malformed")
+            self.assertNotIn("limited", view[key])  # never claimed bounded or unlimited
+            self.assertNotIn("cpu_count", view[key])
+        baseline.validate_cgroup_view(view)
+        empty = self._fixture({"cpu.max": ""})
+        self.assertEqual(baseline.read_cgroup_view(empty)["cpu_max"]["source"], "empty")
+
+    def test_cgroup_view_rejects_contradictory_evidence(self):
+        bounded = baseline.read_cgroup_view(self._fixture({"cpu.max": "max 100000", "cpuset.cpus.effective": "0-3",
+                                                           "memory.max": "max"}))
+        self.assertIs(bounded["memory_max"]["limited"], False)
+        baseline.validate_cgroup_view(bounded)
+        for key, override in (("cpu_max", {"limited": True}),                     # max claimed bounded
+                              ("cpu_max", {"status": "limited"}),                  # status vs raw
+                              ("memory_max", {"status": "limited"}),               # max vs status
+                              ("memory_max", {"limited": True}),                   # max vs flag
+                              ("cpu_max", {"raw": "x\ny"}),                        # multi-line raw value
+                              ("cpu_max", {"raw": "2"}),                           # raw that no longer parses
+                              ("cpuset_cpus_effective", {"status": "limited"}),    # a cpuset is not a limit
+                              ("cpuset_cpus_effective", {"limited": False}),       # ... and has no flag
+                              ("cpuset_cpus_effective", {"cpu_count": 9}),         # count vs raw
+                              ("cpu_max", {"source": "unavailable"}),              # observed, unknown source
+                              ("memory_max", {"format": "v1"})):                   # wrong label
+            with self.subTest(key=key, override=override), self.assertRaises(baseline.BaselineError):
+                broken = json.loads(json.dumps(bounded))
+                broken[key].update(override)
+                baseline.validate_cgroup_view(broken)
+        for mutate in (lambda view: view.update({"root": "/sys/fs/cgroup"}),          # path field
+                       lambda view: view.update({"cpu_max": {**view["cpu_max"], "path": "present"}}),
+                       lambda view: view.update({"cpu_max": {**view["cpu_max"], "limited": None}}),
+                       lambda view: view.update({"memory_max": {"status": "unavailable", "raw": "unavailable",
+                                                                "format": "cgroup-v2", "source": "unavailable",
+                                                                "limited": False}})):
+            broken = json.loads(json.dumps(bounded))
+            mutate(broken)
+            with self.subTest(mutation=mutate), self.assertRaises(baseline.BaselineError):
+                baseline.validate_cgroup_view(broken)
+
+    def _fixture(self, files):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for name, content in files.items():
+            (Path(directory.name) / name).write_text(content)
+        return directory.name
+
+    def test_runtime_facts_reads_injected_cpuinfo_and_cgroup_root(self):
+        harness = mock.Mock()
+        harness.run.side_effect = lambda argv: mock.Mock(stdout=(argv[-1] + " 1").encode())
+        harness.sql.return_value = "17.1"
+        root = self._fixture({"cpu.max": "max 100000", "cpuset.cpus.effective": "0-1"})
+        facts = baseline.runtime_facts(harness, mock.Mock(git="/trusted/git"),
+                                       cpuinfo="Hardware\t: Fixture SoC\n",
+                                       meminfo="MemTotal:       2048 kB\n", cgroup_root=root, procfs=True)
+        self.assertEqual(facts["cpu_model"], "Fixture SoC")
+        self.assertEqual(facts["architecture"], facts["machine"])          # architecture is kept
+        self.assertIsInstance(facts["logical_cpus"], int)
+        self.assertEqual(facts["host_memory_total_kb"], 2048)
+        cgroup = facts["cgroup"]
+        self.assertEqual((cgroup["cpu_max"]["status"], cgroup["cpu_max"]["limited"]), ("unlimited", False))
+        self.assertEqual((cgroup["cpuset_cpus_effective"]["status"], cgroup["cpuset_cpus_effective"]["cpu_count"]),
+                         ("observed", 2))
+        self.assertEqual(cgroup["memory_max"]["status"], "unavailable")    # missing != unlimited
+        self.assertNotIn("root", cgroup)
+        for leaked in (root, "/trusted/git", "/sys/fs/cgroup"):
+            self.assertNotIn(leaked, json.dumps(facts))
+
+
 class ReportValidationTest(unittest.TestCase):
     def test_cold_rules(self):
         self.assertEqual(baseline.validate_cold(cold_fixture())["head_oid"], OID)
@@ -867,8 +1040,8 @@ class ReportValidationTest(unittest.TestCase):
 
     def test_runtime_facts_must_be_complete(self):
         self.assertEqual(baseline.validate_runtime(RUNTIME)["hostname"], "fixture")
-        for key, value in (("hostname", ""), ("logical_cpus", None), ("mem_total_kb", 0), ("procfs", False),
-                           ("kernel", "a\nb")):
+        for key, value in (("hostname", ""), ("logical_cpus", None), ("host_memory_total_kb", 0),
+                           ("procfs", False), ("kernel", "a\nb"), ("cpu_model", "x86_64")):
             with self.subTest(key=key), self.assertRaises(baseline.BaselineError):
                 baseline.validate_runtime({**RUNTIME, key: value})
 
