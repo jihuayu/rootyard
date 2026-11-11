@@ -1,7 +1,12 @@
 //! Source-bound fixture for the issue #169 positive format22 paired archive.
 //!
 //! This target is declared with `harness = false` in `Cargo.toml`: its modes are
-//! programs (argv, exit status), not libtest cases. `scripts/build_native_test.py`
+//! programs (argv, exit status), not libtest cases. `required-features =
+//! ["pando-lab", "format22-fixture"]` keeps its existing `pando-lab` profile,
+//! the opt-in `format22-fixture` gate keeps it out of every normal all-targets
+//! test/clippy run, and an unsupported invocation (no arguments) must exit
+//! nonzero.
+//! `scripts/build_native_test.py`
 //! builds it from the same candidate as the executed binary and records a
 //! receipt (`<binary>.build.json`); the Python drill refuses a fixture built from
 //! another commit or another source-input digest.

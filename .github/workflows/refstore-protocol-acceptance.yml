@@ -12,11 +12,14 @@ on:
       - 'migrations/**'
       - 'tests/ref_store_*.rs'
       - 'tests/retention_roots_support/**'
+      - 'tests/format22_support/**'
       - 'tests/decision_subset_support/**'
       - 'tests/blob_only_service.py'
       - 'tests/blob_gateway_browse.py'
       - 'tests/blob_gateway_history.py'
       - 'tests/backup_blob_serving147.py'
+      - 'tests/backup_blob_serving169_support.py'
+      - 'tests/test_backup_blob_serving169_support.py'
       - 'tests/requirements-blob-backup.txt'
       - 'tests/schema_baseline.py'
       - 'tests/e2e.py'
@@ -117,6 +120,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Order matters: build_native_test.py clears the rootyard package, while
+          # build_native.py clears it too and must leave the final product binary.
+          # The harness derives <fixture>.build.json next to the executable, so
+          # both stay under test-results/refstore/ and reach the artifact.
+          fixture_dir="$GITHUB_WORKSPACE/test-results/refstore"
+          python3 scripts/build_native_test.py --test ref_store_format22_backup_fixture \
+            --features pando-lab,format22-fixture --no-default-features --package-debug 0 --strip-debuginfo \
+            --output "$fixture_dir/ref_store_format22_backup_fixture" \
+            > "$fixture_dir/format22-fixture-build.json"
           python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
             > test-results/refstore/standalone-build.json
           set -a
@@ -131,6 +143,7 @@ jobs:
           export ROOTYARD_BLOB_ROOT="standalone-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           export ROOTYARD_GIT="$(command -v git)"
           binary="$GITHUB_WORKSPACE/target/debug/rootyard"
+          fixture="$fixture_dir/ref_store_format22_backup_fixture"
           python3 tests/blob_only_service.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --report test-results/refstore/standalone-http.json
           python3 tests/blob_gateway_browse.py --binary "$binary" --git "$ROOTYARD_GIT" \
@@ -139,6 +152,7 @@ jobs:
             --report test-results/refstore/standalone-history.json
           python3 -m pip install -r tests/requirements-blob-backup.txt
           python3 tests/backup_blob_serving147.py --binary "$binary" --git "$ROOTYARD_GIT" \
+            --format22-fixture "$fixture" \
             --report test-results/refstore/standalone-paired-backup.json
       - name: Stop only the job-owned Garage fixture
         if: always()

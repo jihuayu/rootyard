@@ -26,7 +26,8 @@ manifest); any other nonzero exit fails the harness. The captured ledger
 digests and closure are asserted unchanged after every case, then the untouched
 clean archive restores into a fresh target with those exact digests and
 locators. The positive format22 case uses a second, API-produced source
-(source-bound Rust fixture `ref_store_format22_backup_fixture`) with non-empty
+(source-bound Rust fixture `ref_store_format22_backup_fixture`, built with
+`--features pando-lab,format22-fixture`) with non-empty
 active and released API-created roots and a producer owner that is not the
 repository tenant, then verifies and restores it into a fresh database.
 """
@@ -1115,7 +1116,7 @@ def main(argv=None):
     parser.add_argument("--report", type=Path)
     parser.add_argument("--format22-fixture",
                         help="absolute receipt of ref_store_format22_backup_fixture built by scripts/build_native_test.py "
-                             "--test ref_store_format22_backup_fixture --features pando-lab --no-default-features")
+                             "--test ref_store_format22_backup_fixture --features pando-lab,format22-fixture --no-default-features")
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args(argv)
     harness = None
