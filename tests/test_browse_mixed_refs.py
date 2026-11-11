@@ -208,14 +208,44 @@ class CaseContractTest(unittest.TestCase):
                       "release_git_option", text)
         self.assertEqual(tuple(re.search(r"MIXED_REF_CASES == \((.*?)\)", text, re.S).group(0)
                                .replace("\n", " ").split('"')[1::2]), mixed_ref_cases.MIXED_REF_CASES)
-        # The fixed inventory is byte-for-byte the pre-integration tuple.
-        head = subprocess.run(["git", "show", "89f4bb17535bba8c9df5f0514bc3cfb050579aba:tests/browse.py"],
-                              cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if head.returncode:
-            self.skipTest("pre-integration queue commit unavailable")
-        before = re.search(r"CASE_NAMES = \(.*?\n\)", head.stdout.decode(), re.S).group(0)
+        # The fixed inventory is exactly the pre-integration tuple, spelled out
+        # here so the check needs no history (a shallow CI checkout has none).
+        self.assertEqual(browse.CASE_NAMES, (
+            "setup_repos",
+            "refs_and_pagination",
+            "commits_and_pagination",
+            "tree_and_blob",
+            "compare_revisions",
+            "list_commits_deadline",
+            "compare_commits_deadline",
+            "ref_transactions_atomic_cas",
+            "idempotency_and_concurrency",
+            "access_and_fences",
+            "object_format_and_negotiation",
+            "bounded_ref_and_commit_pages",
+            "ref_scale_complete_traversal",
+            "selective_ref_prefix",
+            "protected_writes_and_ref_ack_failure",
+        ))
         now = re.search(r"CASE_NAMES = \(.*?\n\)", text, re.S).group(0)
-        self.assertEqual(now, before)
+        literal = re.search(r"CASE_NAMES = \((.*?)\n\)", text, re.S).group(1)
+        self.assertEqual(tuple(re.findall(r'"([^"]*)"', literal)), browse.CASE_NAMES)
+
+    def test_fixed_inventory_guard_has_no_skip_path(self):
+        # The fixed-inventory guard must never degrade to a skip: a shallow
+        # CI checkout has no history, so a history-backed check that skips
+        # when absent would let a changed inventory pass silently.
+        guard = inspect.getsource(CaseContractTest.test_mixin_is_the_harness_base_and_runner_imports_the_exact_ids)
+        self.assertNotIn("".join(("skip", "Test")), guard)
+        self.assertNotIn("Skip" + "Test", guard)
+        self.assertNotIn("self." + "skip", guard)
+        self.assertNotIn("expected" + "Failure", guard)
+        self.assertNotIn("".join(("git", " show")), guard)
+        self.assertNotIn("".join(("89f4bb1", "7535bba8c9df5f0514bc3cfb050579aba")), guard)
+        # No history-backed subprocess at all: the tuple below is the whole check.
+        self.assertNotIn("subprocess", guard)
+        self.assertNotIn("HEAD:", guard)
+        self.assertIn("self.assertEqual(browse.CASE_NAMES, (", guard)
 
     def test_queue_harness_still_supplies_every_primitive(self):
         needed = ("args", "env", "secrets", "bare", "work", "repo", "alice", "sql", "cli", "run",
