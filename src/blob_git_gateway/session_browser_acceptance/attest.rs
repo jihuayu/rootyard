@@ -3,17 +3,18 @@
 //! The Rust side never trusts the page's own labels for any fact the adapter
 //! observed: every upstream fact below comes from the [`Recorded`] entries the
 //! adapter captured, or from the live gate revision read through PostgreSQL.
-//! The page-only booleans are checked exactly where the page is the only
-//! observer: the synthetic fault tree answer is produced in the browser and
-//! never reaches the adapter, so the adapter records only the fault page's own
-//! real refs read around it.
+//! The page-only facts are checked where only the browser can observe them, and
+//! each is fixed: the synthetic fault tree answer is produced in the browser and
+//! never reaches the adapter, and a cookie-only Smart HTTP denial is reported
+//! with its own fixed outcome, which is always correlated with the independently
+//! captured upstream request and response.
 //!
 //! Session token strings are compared in memory only and are never formatted
 //! into a message; the same holds for the API token.
 use anyhow::{Result, anyhow, ensure};
 use serde_json::Value;
 
-use super::capture::{Recorded, Route};
+use super::capture::{DenialPath, Recorded, Route};
 
 /// The session revisions the page reported for its read chain.
 pub(super) struct Chain {
@@ -41,10 +42,12 @@ fn diagnostic_reason(summary: &Value) -> &str {
 }
 
 /// The summary's own shape: PASS, a browser version, the fault label, the exact
-/// status of every route, and the reported chain revisions, each bounded by the
-/// live gate. The fault page's reported revisions are cross-checked against its
-/// captured refs answer in [`verify`], never against the main chain. No identity
-/// or credential is part of the summary.
+/// status of every route, the cookie-only denial outcomes, and the reported
+/// chain revisions, each bounded by the live gate. The fault page's reported
+/// revisions are cross-checked against its captured refs answer in [`verify`],
+/// never against the main chain. No identity or credential is part of the
+/// summary; the denial outcomes are fixed words, a status and one bounded
+/// integer.
 pub(super) fn summary(summary: &Value, live: i64) -> Result<Chain> {
     ensure!(
         summary["result"].as_str() == Some("PASS"),
@@ -119,6 +122,51 @@ fn find(recorded: &[Recorded], route: Route, occurrence: usize, what: &'static s
         .ok_or_else(|| anyhow!("the page never requested {what}"))
 }
 
+/// The one record of an exact denial read: the captured requests of that fixed
+/// request shape, on the route it names, which must be a real upstream answer
+/// (never a forwarding failure). More than one such request is a replay and no
+/// single record speaks for the page's read.
+fn denials(recorded: &[Recorded], shape: DenialPath, route: Route) -> Result<Vec<&Recorded>> {
+    let matching: Vec<&Recorded> =
+        recorded.iter().filter(|entry| entry.denial_path == Some(shape)).collect();
+    ensure!(!matching.is_empty(), "the page never requested the {} denial", shape.name());
+    ensure!(
+        matching.iter().all(|entry| entry.route == route),
+        "the {} denial was captured on another route",
+        shape.name()
+    );
+    ensure!(
+        matching.iter().all(|entry| !entry.forwarding_failure),
+        "the {} denial was not relayed to the origin",
+        shape.name()
+    );
+    Ok(matching)
+}
+
+/// The one answer to the `shape` denial and its fixed status, cookie and
+/// challenge facts. Exactly one captured request of the shape makes the
+/// answer; any other count is another request and can never stand in for it.
+fn single_denial<'a>(
+    recorded: &'a [Recorded],
+    shape: DenialPath,
+    route: Route,
+    status: u16,
+    challenge: &'static str,
+) -> Result<&'a Recorded> {
+    let findings = denials(recorded, shape, route)?;
+    ensure!(findings.len() == 1, "the page requested the {} denial more than once", shape.name());
+    let denial = findings[0];
+    ensure!(denial.status == status, "the cookie-only {} read was not denied with {status}", shape.name());
+    ensure!(denial.has_cookie, "the {} read was not cookie-only", shape.name());
+    ensure!(!denial.has_authorization, "the {} read carried Authorization", shape.name());
+    ensure!(
+        denial.challenge == challenge,
+        "the cookie-only {} denial carried no upstream {challenge} challenge",
+        shape.name()
+    );
+    Ok(denial)
+}
+
 /// The captured request at one position, which must be the expected route.
 fn at<'a>(recorded: &'a [Recorded], index: usize, route: Route, what: &'static str) -> Result<&'a Recorded> {
     let entry = recorded.get(index).ok_or_else(|| anyhow!("the captured sequence ended before {what}"))?;
@@ -128,19 +176,27 @@ fn at<'a>(recorded: &'a [Recorded], index: usize, route: Route, what: &'static s
 
 /// The full attestation, against the live gate revision and pushed OID.
 pub(super) fn verify(recorded: &[Recorded], chain: &Chain, list: &Value, fault: &Value, live: i64) -> Result<()> {
-    // 1. Every request reached a named route, carried no Authorization and no
+    // 1. Every request reached a named route, no relayed request failed and no
     // request left the loopback origin. Origin confinement is enforced in the
     // browser itself: the Playwright context route aborts any off-origin
     // request, and the fault page's route confines on its own; either aborts
-    // the run, so an escaped request can never reach this adapter. Everything
-    // after sign-in carries the browser cookie; the three anonymous steps are
-    // exactly the sign-in redirect (an anonymous page may answer `303`), the
-    // sign-in route itself (the public page and the form that creates the
-    // session both precede the cookie), and the browser's own icon request,
-    // which Chromium may issue cookie-less.
+    // the run, so an escaped request can never reach this adapter. No request
+    // of any route carries Authorization except a request the adapter classified
+    // as one of the two exact denial reads, which step 9 then requires to carry
+    // none; every other route stays headerless in that respect. Everything
+    // after sign-in carries the browser cookie; the
+    // three anonymous steps are exactly the sign-in redirect (an anonymous page
+    // may answer `303`), the sign-in route itself (the public page and the form
+    // that creates the session both precede the cookie), and the browser's own
+    // icon request, which Chromium may issue cookie-less.
     for entry in recorded {
         ensure!(entry.route != Route::Other, "an unclassified page request reached the origin");
-        ensure!(!entry.has_authorization, "a request to {} carried Authorization", entry.route.name());
+        ensure!(!entry.forwarding_failure, "a page request to {} could not be relayed", entry.route.name());
+        ensure!(
+            !entry.has_authorization || entry.denial_path.is_some(),
+            "a request to {} carried Authorization",
+            entry.route.name()
+        );
         let anonymous = match entry.route {
             Route::WebBlob => entry.status == 303,
             Route::WebLogin | Route::Favicon => true,
@@ -229,11 +285,56 @@ pub(super) fn verify(recorded: &[Recorded], chain: &Chain, list: &Value, fault: 
     ensure!(commits_pair.revision <= live, "the commits answer is ahead of the live gate");
 
     // 9. The page's independent, cookie-only reads of the bearer-only routes
-    // are denied with the established status; no Authorization was sent.
-    for (route, expected) in [(Route::ApiRepos, 401), (Route::Git, 401)] {
-        let denial = at(recorded, find(recorded, route, 0, route.name())?, route, route.name())?;
-        ensure!(denial.has_cookie && !denial.has_authorization, "the {} read was not cookie-only", route.name());
-        ensure!(denial.status == expected, "the cookie-only {} read was not denied with {expected}", route.name());
+    // were denied by the origin itself, and each page outcome is correlated
+    // with the adapter's own record of that exact request and answer: exactly
+    // one exact `GET /api/repos` and one exact Smart HTTP `info/refs` request,
+    // each answered `401`, carrying a browser cookie, no Authorization and an
+    // upstream challenge (Bearer for the JSON API, Basic for Smart HTTP). The
+    // page cannot pass by reporting a denial of another route, a forwarding
+    // failure or an arbitrary status: the record must agree with its fixed
+    // outcome.
+    ensure!(summary["denials"].is_object(), "the page reported no cookie-only denials");
+    let denials = &summary["denials"];
+    ensure!(
+        denials["api"].as_object().is_some_and(|api| api.len() == 2) && denials["git"].as_object().is_some(),
+        "the page reported another denial shape"
+    );
+    single_denial(recorded, DenialPath::ApiRepos, Route::ApiRepos, 401, "bearer")?;
+    ensure!(
+        denials["api"]["classification"].as_str() == Some("direct_response"),
+        "the page did not report a direct response for its cookie-only API read"
+    );
+    ensure!(denials["api"]["status"].as_u64() == Some(401), "the page did not report a direct 401 for its API read");
+    ensure!(denials["api"]["abort"].is_null(), "the page reported an aborted cookie-only API read");
+
+    let git_report = &denials["git"];
+    match (git_report["classification"].as_str(), git_report["abort"].as_object()) {
+        // The page's own Fetch resolved with the actual denial, and the origin
+        // answered exactly one such request.
+        (Some("direct_response"), None) if git_report.as_object().is_some_and(|git| git.len() == 3) => {
+            single_denial(recorded, DenialPath::GitInfoRefs, Route::Git, 401, "basic")?;
+            ensure!(
+                git_report["status"].as_u64() == Some(401),
+                "the page did not report a direct 401 for its cookie-only Git read"
+            );
+        }
+        // The page's own bounded signal fired while its one request was still
+        // unanswered; only its own TimeoutError past the configured boundary is
+        // an accepted pending challenge, and the origin's one 401 with its Basic
+        // challenge is still the correlated upstream fact.
+        (Some("basic_challenge_pending"), Some(abort))
+            if git_report.as_object().is_some_and(|git| git.len() == 3) && abort.len() == 2 =>
+        {
+            single_denial(recorded, DenialPath::GitInfoRefs, Route::Git, 401, "basic")?;
+            ensure!(
+                abort["reason"].as_str() == Some("timeout_error"),
+                "the page reported no TimeoutError for its pending Git read"
+            );
+            let elapsed = abort["elapsed_ms"].as_u64().filter(|elapsed| *elapsed >= 5_000);
+            ensure!(elapsed.is_some(), "the page's Git read timed out before its own 5000 ms boundary");
+            ensure!(git_report["status"].is_null(), "the page reported a status for a pending Git read");
+        }
+        _ => return Err(anyhow!("the page reported no accepted cookie-only Git denial outcome")),
     }
 
     // 10. The fault page is a separate full navigation: its second refs read

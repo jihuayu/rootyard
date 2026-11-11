@@ -25,7 +25,13 @@ What it drives on a brand-new persistent profile in the private run root:
    tree must list both real pushes, and every captured response revision must
    be at least the configured final-push `expected_revision`, the write bound
    (`API_READ_BOUND_INVALID` for an incomplete or behind view);
-5. cookie-only fetches of `/api` and `/git` are denied;
+5. cookie-only fetches of `/api` and `/git` meet the origin's own denial: the
+   `/api/repos` fetch must resolve directly with the actual `401`, while the
+   Smart HTTP `info/refs` fetch either resolves with the actual `401` or has its
+   own `AbortSignal.timeout` fire, past the configured five-second boundary,
+   while Chromium waits on the origin's Basic challenge. Any thrown error, a
+   timeout before that boundary or another status fails the run; nothing is
+   hidden or rewritten on the way;
 6. one labelled client-side fault, only after the real chain passed: a
    re-entered repository page is answered by the page itself with a synthetic
    `200` tree carrying the real refs token and the immediately lower
@@ -47,16 +53,19 @@ SHELL = "/blob"
 LOGIN = "/login"
 FAULT_MARKER = "FAULT-INJECTION-MARKER-7f3a"
 STEP_MS = 30_000
-# The cookie-only fetch aborts itself below the step bound, so an unanswered
-# request reports the route's fetch reason instead of a step timeout.
+# The cookie-only fetches abort themselves below the step bound through their
+# own `AbortSignal.timeout`, so the browser never waits past this bound and the
+# pending Basic challenge of Smart HTTP is measured instead of hanging.
 FETCH_TIMEOUT_MS = 5_000
-# The fixed words the page-side cookie-only fetch reports for an answered
-# request: the real `401` or any other status. A request the browser itself
-# rejected is neither and fails with the route's fixed fetch reason; the test
-# adapter keeps the child's 401 but drops its Basic challenge, so a 401 is
-# observable here without an HTTP-auth challenge.
-COOKIE_ONLY_STATUS = "401"
-COOKIE_ONLY_REFUSED = "refused"
+# The only timeout the page-side cookie-only fetch reports: its own
+# `TimeoutError`, which only its own `AbortSignal.timeout` produces.
+TIMEOUT_REASON = "timeout_error"
+# The fixed classifications of one cookie-only denial. A direct record carries
+# the actual response status and no abort fact; a pending Basic challenge
+# carries no status and instead the page's own TimeoutError and its integer
+# elapsed time.
+DENIAL_DIRECT = "direct_response"
+DENIAL_PENDING = "basic_challenge_pending"
 
 # The page-side storage read returns only one of these fixed status words; a
 # Web Storage SecurityError is caught inside the page and never crosses the
@@ -76,7 +85,7 @@ STORAGE_READ_SCRIPT = f"""() => {{
     try {{
         const pairs = [read(localStorage), read(sessionStorage)];
         return {{status: '{STORAGE_STATUS_OK}', data: JSON.stringify(pairs)}};
-    }} catch (error) {{
+    }} catch (_) {{
         const denied = error && error.name === 'SecurityError';
         return {{status: denied ? '{STORAGE_STATUS_DENIED}' : 'error'}};
     }}
@@ -116,11 +125,12 @@ REASONS = frozenset(
         "REPO_PAGE_INCOMPLETE",
         "REPO_PAGE_STATUS_INVALID",
         "READ_CHAIN_INVALID",
-        "COOKIE_ONLY_DENIAL_MISSING",
         "API_COOKIE_ONLY_FETCH_FAILED",
         "API_COOKIE_ONLY_STATUS_INVALID",
+        "API_COOKIE_ONLY_TIMEOUT",
         "GIT_COOKIE_ONLY_FETCH_FAILED",
         "GIT_COOKIE_ONLY_STATUS_INVALID",
+        "GIT_COOKIE_ONLY_TIMEOUT_EARLY",
         "API_READ_BOUND_INVALID",
         "FAULT_BOUND_INVALID",
         "FAULT_NOT_APPLIED",
@@ -516,18 +526,21 @@ class Client:
                 raise Failure("API_READ_BOUND_INVALID")
         extra["reads"] = {tail: {"revision": reads[tail]["revision"]} for tail in ("refs", "tree", "commits")}
 
-        # 5. Cookie-only denial of the unchanged bearer-only routes. The Smart
-        # HTTP path is the gateway's real `/git/{owner}/{name}/info/refs` form:
-        # `name` is the configured bare repository name and the handler's
-        # `repository_name` requires the `.git` suffix, so it is kept here.
+        # 5. Cookie-only denial of the unchanged bearer-only routes, observed
+        # exactly as the origin answers them. The Smart HTTP path is the
+        # gateway's real `/git/{owner}/{name}/info/refs` form: `name` is the
+        # configured bare repository name and the handler's `repository_name`
+        # requires the `.git` suffix, so it is kept here.
         extra["denials"] = {
             "api": await self.cookie_only(page, "/api/repos", "api"),
             "git": await self.cookie_only(
                 page, f"/git/{self.owner}/{self.repo}.git/info/refs?service=git-upload-pack", "git"
             ),
         }
-        if extra["denials"] != {"api": 401, "git": 401}:
-            raise Failure("COOKIE_ONLY_DENIAL_MISSING")
+        if extra["denials"]["api"].get("classification") != DENIAL_DIRECT:
+            raise Failure("API_COOKIE_ONLY_STATUS_INVALID")
+        if extra["denials"]["git"].get("classification") not in (DENIAL_DIRECT, DENIAL_PENDING):
+            raise Failure("GIT_COOKIE_ONLY_STATUS_INVALID")
 
         # 6. The labelled client-side fault on its own page, only now that the
         # real UI chain passed; the fixed route names and statuses then close
@@ -580,41 +593,108 @@ class Client:
         }
 
     async def cookie_only(self, page, path, route):
-        """One cookie-only fetch of a bearer-only route, reduced to its status.
+        """One cookie-only fetch of a bearer-only route, classified honestly.
 
-        The page reports one fixed word per request (`401` for the real denial,
-        `refused` for any other answered status, `failed` for any request the
-        browser rejected). The bounded `evaluate` turns a step timeout into the
-        route's fixed fetch reason; a fetch the browser rejected (the bound
-        `AbortSignal` included) is that rejection, never an origin answer, so it
-        is reported as such and never as a denial. The URL is same-origin and
-        the session cookie travels with it. The capture adapter omits the
-        upstream Basic challenge from the browser-facing copy of these denials,
-        so Chromium Fetch observes the real 401 instead of starting an HTTP-auth
-        challenge that would stall under the bound. Only the fixed word crosses
-        this boundary: never the path, a request header, a cookie, the response
-        body or exception text.
+        The origin's answer reaches Chromium unchanged, its own
+        `WWW-Authenticate` included, so the page must observe what the origin
+        really answers. The page reports either an actual response status, or
+        its own `AbortSignal.timeout` firing (recognised only by that signal's
+        `TimeoutError` reason) together with an integer elapsed time measured
+        by the page; any other rejection is reported as a failed fetch. Never
+        the path, a request header, a cookie, a challenge, the response body or
+        exception text leaves the page.
+
+        The API read must resolve directly with the actual `401`. The Smart
+        HTTP read may either resolve with the actual `401`, or still be waiting
+        on the origin's Basic challenge when its own signal fires; that outcome
+        is accepted only past the configured boundary and only as a pending
+        challenge, never as a denial the page observed.
+
+        The exact request is counted on this page while the read runs, and a
+        direct or pending outcome requires exactly one attempt, so another
+        request of the same shape (for example Chromium's settled Basic
+        HTTP-auth exchange replaying a credential) can never stand in for it.
         """
-        answer = await evaluate(
-            page,
-            """async ([path, timeout]) => {
-                let response;
-                try {
-                    response = await fetch(path, {credentials: 'same-origin',
-                        headers: {Accept: 'application/json'},
-                        signal: AbortSignal.timeout(timeout)});
-                } catch (_) {
-                    return 'failed';
-                }
-                return response.status === 401 ? '401' : 'refused';
-            }""",
-            f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED",
-            [path, FETCH_TIMEOUT_MS],
-        )
-        if answer == COOKIE_ONLY_STATUS:
-            return 401
-        if answer == COOKIE_ONLY_REFUSED:
-            raise Failure(f"{route.upper()}_COOKIE_ONLY_STATUS_INVALID")
+        exact = self.origin + path
+        attempts = []
+        # Only while the page-side read itself runs is its request counted; no
+        # request of this URL before it (or after it) counts.
+        watching = {"active": True}
+
+        def count(request):
+            if watching["active"] and request.url == exact:
+                attempts.append(1)
+
+        page.on("request", count)
+        try:
+            answer = await evaluate(
+                page,
+                f"""async ([path, timeout, pending]) => {{
+                    const started = performance.now();
+                    const signal = AbortSignal.timeout(timeout);
+                    let response;
+                    try {{
+                        response = await fetch(path, {{credentials: 'same-origin',
+                            headers: {{Accept: 'application/json'}},
+                            signal}});
+                    }} catch (_) {{
+                        const reason = signal.reason;
+                        const timedOut = signal.aborted && reason !== undefined && reason !== null
+                            && reason.name === 'TimeoutError';
+                        if (pending && timedOut) {{
+                            return {{
+                                classification: '{DENIAL_PENDING}',
+                                status: null,
+                                abort: {{
+                                    reason: '{TIMEOUT_REASON}',
+                                    elapsed_ms: Math.ceil(performance.now() - started),
+                                }},
+                            }};
+                        }}
+                        return {{classification: 'fetch_failed', status: null, abort: null}};
+                    }}
+                    return {{
+                        classification: '{DENIAL_DIRECT}',
+                        status: response.status,
+                        abort: null,
+                    }};
+                }}""",
+                f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED",
+                [path, FETCH_TIMEOUT_MS, route == "git"],
+            )
+        finally:
+            watching["active"] = False
+            page.remove_listener("request", count)
+        if not isinstance(answer, dict):
+            raise Failure(f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED")
+        classification = answer.get("classification")
+        status = answer.get("status")
+        abort = answer.get("abort")
+        if classification == DENIAL_DIRECT and abort is None:
+            # The page's Fetch really resolved: only its actual status counts.
+            if isinstance(status, bool) or status != 401:
+                raise Failure(f"{route.upper()}_COOKIE_ONLY_STATUS_INVALID")
+            return {"classification": DENIAL_DIRECT, "status": status, "abort": None}
+        if classification == DENIAL_PENDING and route == "git" and status is None and isinstance(abort, dict):
+            # A challenge still pending after the page's own signal fired: the
+            # one request went out and was never answered.
+            if len(attempts) != 1:
+                raise Failure("GIT_COOKIE_ONLY_FETCH_FAILED")
+            reason = abort.get("reason")
+            elapsed = abort.get("elapsed_ms")
+            if reason != TIMEOUT_REASON:
+                raise Failure("GIT_COOKIE_ONLY_FETCH_FAILED")
+            if isinstance(elapsed, bool) or not isinstance(elapsed, int):
+                raise Failure("GIT_COOKIE_ONLY_FETCH_FAILED")
+            if elapsed < FETCH_TIMEOUT_MS:
+                raise Failure("GIT_COOKIE_ONLY_TIMEOUT_EARLY")
+            return {
+                "classification": DENIAL_PENDING,
+                "status": None,
+                "abort": {"reason": TIMEOUT_REASON, "elapsed_ms": elapsed},
+            }
+        if route == "api" and classification == DENIAL_PENDING:
+            raise Failure("API_COOKIE_ONLY_TIMEOUT")
         raise Failure(f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED")
 
     async def no_shell(self, page, reason):

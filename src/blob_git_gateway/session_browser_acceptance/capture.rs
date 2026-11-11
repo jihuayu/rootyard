@@ -3,14 +3,10 @@
 //! Every request the page issues to its own origin reaches this adapter, which
 //! records the redacted facts the Rust attestation needs and then forwards the
 //! request to the real child: method, path and query, a bounded body and the
-//! end-to-end request headers are copied; the real upstream status and the
-//! safe end-to-end response headers (`Content-Type`, CSP, `Set-Cookie`,
-//! `Location`, security and session headers) are passed back unchanged, with
-//! one documented exception: the child's `WWW-Authenticate` is omitted from the
-//! browser-facing copy of its real `401` for a cookie-only `/api/repos` or
-//! `info/refs` read ([`hide_basic_challenge`]). Chromium Fetch would otherwise
-//! start a `Basic` HTTP-auth exchange that never settles under the page's bound
-//! and hide the denial. The status, body and record stay the child's own.
+//! end-to-end request headers are copied; the child's real status, body and
+//! every end-to-end response header (`WWW-Authenticate` included, every value
+//! of it) are passed back unchanged, so Chromium observes exactly the child's
+//! own answer and any challenge behaviour is the child's, never rewritten here.
 //!
 //! The adapter is a different loopback port from the child, so the browser's
 //! `Origin` names the adapter while the child's `Host` names the child. The
@@ -21,16 +17,24 @@
 //! direction; `Host` is the one request header not copied, because the HTTP
 //! client derives it from the upstream target.
 //!
-//! Cookie values, bodies and query strings never enter a record: only presence
-//! flags, integer statuses and the presence-only fixture markers below are
-//! retained. A record exists only for a request the child answered, with exactly
-//! the status it answered: a forwarding failure is answered by the adapter and
-//! captures nothing, so the attestation can never read an adapter-made status as
-//! the child's (in particular, no `401` is synthesized here). The request token
-//! and the answered pair are separate fields: the gateway receives only the
-//! token request header, while token and revision are the answer's pair. Token
-//! strings live in a record only for in-memory equality checks and never reach
-//! a message.
+//! Cookie values, bodies, query strings, header values and the paths that are
+//! not fixed are never retained as text: only presence flags, integer statuses,
+//! fixed classifications (the route, a challenge scheme, a path shape) and the
+//! presence-only fixture markers below are. A denial record names the fixed
+//! shape of its request path ([`DenialPath`]), never the path itself.
+//!
+//! A [`Recorded`] entry exists only for a request the child answered, with
+//! exactly the status it answered. A request the adapter cannot classify or
+//! relay (an unreadable body, a client build error, no connection, an
+//! interrupted body) is answered locally and captures nothing: the local answer
+//! is never recorded as an upstream response, so the attestation can never read
+//! an adapter-made status as the child's (in particular, no `401` is
+//! synthesized here), and a forwarding failure for a denial read leaves a
+//! visible non-denial record ([`Recorded::forwarding_failure`]) instead. The
+//! request token and the answered pair are separate fields: the gateway receives
+//! only the token request header, while token and revision are the answer's
+//! pair. Token strings live in a record only for in-memory equality checks and
+//! never reach a message.
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex, PoisonError},
@@ -41,10 +45,11 @@ use axum::{
     Router,
     body::{Body, to_bytes},
     extract::{Request, State},
-    http::{HeaderName, HeaderValue, Method, StatusCode, header},
+    http::{HeaderName, HeaderValue, StatusCode, header},
     response::Response,
     routing::any,
 };
+use bytes::Bytes;
 use serde_json::Value;
 
 use crate::blob_git_gateway::repo_session::{REVISION_HEADER, SESSION_HEADER};
@@ -98,12 +103,98 @@ impl Route {
     }
 }
 
+/// A named denial read a page request may be: the fixed shape of its path and
+/// query, never the path itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DenialPath {
+    /// `GET /api/repos`.
+    ApiRepos,
+    /// `GET /git/{owner}/{name}.git/info/refs?service=git-upload-pack`.
+    GitInfoRefs,
+}
+
+impl DenialPath {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::ApiRepos => "api_repos",
+            Self::GitInfoRefs => "git_info_refs",
+        }
+    }
+
+    /// The denial shape of one exact page request, judged by method, path and
+    /// query together. Every other request on the same route is `None`.
+    fn of(fixture: &Fixture, method: &str, path: &str, query: Option<&str>) -> Option<Self> {
+        if method != "GET" {
+            return None;
+        }
+        if path == "/api/repos" {
+            return match query {
+                None | Some("") => Some(Self::ApiRepos),
+                Some(_) => None,
+            };
+        }
+        let git = fixture.git_info_refs.as_str();
+        if path == git {
+            return match query {
+                Some(git) => fixture.requests_git_info_refs(git),
+                None => None,
+            };
+        }
+        None
+    }
+}
+
+/// The challenge scheme of the first `WWW-Authenticate` value, reduced to a
+/// fixed word. Every further value is recorded only as present, never parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Challenge {
+    None,
+    Basic,
+    Bearer,
+    Other,
+}
+
+impl Challenge {
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Basic => "basic",
+            Self::Bearer => "bearer",
+            Self::Other => "other",
+        }
+    }
+
+    /// The scheme word of the first challenge value. Only the scheme is read;
+    /// parameters, realm and any later value are never recorded.
+    fn of(answer: Option<&axum::http::HeaderMap>) -> Self {
+        let Some(value) = answer.and_then(|answer| answer.get(header::WWW_AUTHENTICATE)) else {
+            return Self::None;
+        };
+        let scheme = value.to_str().map(str::trim_start).unwrap_or("").split([' ', ',']).next().unwrap_or("");
+        if scheme.eq_ignore_ascii_case("basic") {
+            Self::Basic
+        } else if scheme.eq_ignore_ascii_case("bearer") {
+            Self::Bearer
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// One page request, redacted to what the assertions need.
 pub(super) struct Recorded {
     pub route: Route,
     pub status: u16,
     pub has_cookie: bool,
     pub has_authorization: bool,
+    /// A fixed scheme word of the answer's first `WWW-Authenticate` value.
+    pub challenge: &'static str,
+    /// The exact denial read this request was, if any.
+    pub denial_path: Option<DenialPath>,
+    /// The request the adapter could not relay. Its `route` stays the route the
+    /// path names, so the attestation sees the missing denial answer, but it
+    /// carries no answer facts and is never an upstream response.
+    pub forwarding_failure: bool,
     /// The session token the request presented, if any.
     pub request_token: Option<String>,
     /// A revision the request presented. The session contract never sends it;
@@ -133,6 +224,8 @@ pub(super) struct Fixture {
     pub name: String,
     pub oid: String,
     pub file: String,
+    /// The second pushed file the HEAD tree must also name.
+    pub second_file: String,
     /// The child's origin, `http://<child address>`.
     pub upstream: String,
 }
@@ -146,6 +239,17 @@ impl Fixture {
     /// The exact path of one nested read of this repository.
     fn read_path(&self, tail: &str) -> String {
         format!("{}{tail}", self.alias_prefix())
+    }
+
+    /// The exact Smart HTTP `info/refs` path of this repository. The handler's
+    /// `repository_name` requires the `.git` suffix, so it is part of the path.
+    fn git_info_refs(&self) -> String {
+        format!("/git/{}/{}.git/info/refs", self.owner, self.name)
+    }
+
+    /// Whether one `info/refs` query is exactly `service=git-upload-pack`.
+    fn requests_git_info_refs(&self, query: &str) -> bool {
+        query == "service=git-upload-pack"
     }
 }
 
@@ -183,25 +287,64 @@ pub(super) async fn serve_adapter(capture: Capture, fixture: Fixture) -> Result<
 }
 
 /// Forward one request, then pass the child's answer back unchanged, its real
-/// status included, so a browser observes exactly what the upstream answered.
+/// status, body and every end-to-end header included, so a browser observes
+/// exactly what the upstream answered.
 async fn forward(State(adapter): State<Arc<Adapter>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let route = route_of(&adapter.fixture.alias_prefix(), parts.uri.path());
     if route == Route::Other {
         // A page request no route names is refused here and recorded as
         // `other`, never silently forwarded.
-        adapter.capture.push(record(&adapter.fixture, &parts, route, 400, None));
+        let mut captured = record(&adapter.fixture, &parts, route, 400, None);
+        captured.forwarding_failure = true;
+        adapter.capture.push(captured);
         return failure(StatusCode::BAD_REQUEST, "unclassified page request");
     }
-    match relay(&adapter, parts, body, route).await {
-        Ok(response) => response,
+    match relay(&adapter, &parts, body).await {
+        Ok(Ok((status, headers, bytes))) => {
+            let mut captured = record(&adapter.fixture, &parts, route, status.as_u16(), Some(&headers));
+            marker(&adapter.fixture, &bytes, route, &mut captured);
+            adapter.capture.push(captured);
+            answered(status, &headers, bytes)
+        }
+        Ok(Err(())) => {
+            // The child answered but its body could not be read whole: no
+            // status, header or body of that answer reaches the browser, so
+            // nothing of it may be recorded as an upstream answer either.
+            failed(&adapter, &parts, route)
+        }
         // No answer was captured for this request: a `401` is only ever the
         // child's own answer, never one built here.
-        Err(_) => failure(StatusCode::BAD_GATEWAY, "upstream unavailable"),
+        Err(()) => failed(&adapter, &parts, route),
     }
 }
 
-async fn relay(adapter: &Adapter, parts: axum::http::request::Parts, body: Body, route: Route) -> Result<Response, ()> {
+/// One request the adapter could not relay end to end. A denial read keeps a
+/// visible non-denial record, so a forwarding failure can never satisfy or
+/// silently replace the denial assertion; every other request records nothing.
+fn failed(adapter: &Adapter, parts: &axum::http::request::Parts, route: Route) -> Response {
+    if let Some(denial) = denial_of(&adapter.fixture, parts) {
+        let mut captured = record(&adapter.fixture, parts, route, StatusCode::BAD_GATEWAY.as_u16(), None);
+        captured.denial_path = Some(denial);
+        captured.forwarding_failure = true;
+        adapter.capture.push(captured);
+    }
+    failure(StatusCode::BAD_GATEWAY, "upstream unavailable")
+}
+
+/// The denial shape of one page request, or `None` for every other request.
+fn denial_of(fixture: &Fixture, parts: &axum::http::request::Parts) -> Option<DenialPath> {
+    DenialPath::of(fixture, parts.method.as_str(), parts.uri.path(), parts.uri.query())
+}
+
+/// Forward one request and return the child's own answer parts. The outer
+/// error is a local failure before any request was sent; the inner one is a
+/// sent request whose answer body could not be read whole.
+async fn relay(
+    adapter: &Adapter,
+    parts: &axum::http::request::Parts,
+    body: Body,
+) -> Result<Result<(StatusCode, axum::http::HeaderMap, Bytes), ()>, ()> {
     let body = to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| ())?;
     let upstream_origin = adapter.fixture.upstream.as_str();
     let target = format!("{upstream_origin}{}", parts.uri.path_and_query().map_or("/", |target| target.as_str()));
@@ -222,56 +365,22 @@ async fn relay(adapter: &Adapter, parts: axum::http::request::Parts, body: Body,
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let bytes = upstream.bytes().await.map_err(|_| ())?;
-    let mut captured = record(&adapter.fixture, &parts, route, status.as_u16(), Some(&headers));
-    marker(&adapter.fixture, &bytes, route, &mut captured);
-    // The record keeps the child's exact answer, the Basic challenge included;
-    // the browser-facing copy below may omit it under `basic_challenge_hidden`.
-    let basic_challenge_hidden = hide_basic_challenge(&parts, route, &captured);
-    adapter.capture.push(captured);
+    Ok(Ok((status, headers, bytes)))
+}
 
+/// The child's answer exactly as it came: its status, its body and every
+/// end-to-end header in its own order, a repeated `WWW-Authenticate` included.
+/// Only connection-scoped headers are dropped; nothing is added, replaced or
+/// omitted, and no header is rewritten here.
+fn answered(status: StatusCode, headers: &axum::http::HeaderMap, bytes: Bytes) -> Response {
     let mut answer = Response::new(Body::from(bytes));
     *answer.status_mut() = status;
     for (name, value) in headers.iter() {
-        if !is_hop_by_hop(name)
-            && !(basic_challenge_hidden && name == header::WWW_AUTHENTICATE)
-            && let Ok(value) = HeaderValue::from_bytes(value.as_bytes())
-        {
-            answer.headers_mut().append(name.clone(), value);
+        if !is_hop_by_hop(name) {
+            answer.headers_mut().append(name.clone(), value.clone());
         }
     }
-    Ok(answer)
-}
-
-/// Whether this browser-facing answer drops the child's `WWW-Authenticate`.
-///
-/// Only a response the child really answered `401` to a cookie-only (Cookie
-/// present, no Authorization) read of exactly `/api/repos` or the Smart HTTP
-/// `info/refs` route qualifies. Chromium Fetch answers such a `Basic` challenge
-/// by starting an HTTP-auth exchange that never settles under the page's bound,
-/// which would hide the real denial from the acceptance. The status, body and
-/// every other header stay the child's own; a forwarding failure never reaches
-/// here and is still a `502` with no record. The record keeps the child's
-/// challenge as forwarded; the attestation reads only status and request facts
-/// from these denials, so nothing depends on the browser-facing omission.
-fn hide_basic_challenge(request: &axum::http::request::Parts, route: Route, captured: &Recorded) -> bool {
-    let method = &request.method;
-    // A preflight names its own method and carries neither cookie nor
-    // credential; rewriting a challenge for it would misdescribe the child.
-    let preflight = request.headers.contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
-    captured.status == StatusCode::UNAUTHORIZED.as_u16()
-        && captured.has_cookie
-        && !captured.has_authorization
-        && !preflight
-        && !method.eq(&Method::OPTIONS)
-        && match route {
-            Route::ApiRepos => method.eq(&Method::GET),
-            Route::Git => {
-                method.eq(&Method::GET)
-                    && request.uri.path().ends_with("/info/refs")
-                    && request.uri.query() == Some("service=git-upload-pack")
-            }
-            _ => false,
-        }
+    answer
 }
 
 /// The redacted record of one request and, for a relayed one, its answer.
@@ -288,6 +397,9 @@ fn record(
         status,
         has_cookie: headers.contains_key(header::COOKIE),
         has_authorization: headers.contains_key(header::AUTHORIZATION),
+        challenge: Challenge::of(answer).name(),
+        denial_path: denial_of(fixture, request),
+        forwarding_failure: false,
         request_token: text(headers.get(SESSION_HEADER)),
         request_revision: text(headers.get(REVISION_HEADER)),
         response_token: answer.and_then(|answer| text(answer.get(SESSION_HEADER))),
@@ -413,7 +525,9 @@ pub(super) fn route_of(fixture_prefix: &str, path: &str) -> Route {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fixture, Route, route_of, tree_oid_is_head};
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    use super::{Challenge, DenialPath, Fixture, Route, denial_of, route_of, tree_oid_is_head};
 
     fn fixture() -> Fixture {
         Fixture {
@@ -421,8 +535,64 @@ mod tests {
             name: "repo".into(),
             oid: "0".repeat(40),
             file: "afile.txt".into(),
+            second_file: "other file.txt".into(),
             upstream: "http://127.0.0.1:1".into(),
         }
+    }
+
+    fn request(method: &str, uri: &str) -> axum::http::request::Parts {
+        axum::http::Request::builder().method(method).uri(uri).body(()).unwrap().into_parts().0
+    }
+
+    fn answer(challenges: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for challenge in challenges {
+            headers.append(header::WWW_AUTHENTICATE, HeaderValue::from_str(challenge).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn only_the_two_exact_denial_reads_classify() {
+        let fixture = fixture();
+        assert_eq!(
+            denial_of(&fixture, &request("GET", "/api/repos")),
+            Some(DenialPath::ApiRepos),
+            "the exact cookie-only API read is the API denial"
+        );
+        let git = "/git/owner/repo.git/info/refs?service=git-upload-pack";
+        assert_eq!(denial_of(&fixture, &request("GET", git)), Some(DenialPath::GitInfoRefs));
+        // Another route, repository, method, query or VCS service is no denial.
+        for uri in [
+            "/api/repos/owner/repo",
+            "/api/repos?page=2",
+            "/web/blob/api/repos",
+            "/git/other/repo.git/info/refs?service=git-upload-pack",
+            "/git/owner/repo/info/refs?service=git-upload-pack",
+            "/git/owner/repo.git/info/refs?service=git-receive-pack",
+            "/git/owner/repo.git/info/refs",
+        ] {
+            assert_eq!(denial_of(&fixture, &request("GET", uri)), None, "{uri}");
+        }
+        assert_eq!(denial_of(&fixture, &request("POST", "/api/repos")), None);
+        assert_eq!(denial_of(&fixture, &request("HEAD", git)), None);
+    }
+
+    #[test]
+    fn the_challenge_is_one_fixed_scheme_word() {
+        assert_eq!(Challenge::of(None), Challenge::None);
+        assert_eq!(Challenge::of(Some(&answer(&[]))), Challenge::None);
+        assert_eq!(Challenge::of(Some(&answer(&["Basic realm=\"Rootyard\", charset=\"UTF-8\""]))), Challenge::Basic);
+        assert_eq!(Challenge::of(Some(&answer(&["bearer realm=\"Rootyard\""]))), Challenge::Bearer);
+        // Only the first value names the scheme; later ones are never parsed.
+        assert_eq!(
+            Challenge::of(Some(&answer(&["Bearer realm=\"Rootyard\"", "Basic realm=\"Rootyard\""]))),
+            Challenge::Bearer
+        );
+        assert_eq!(Challenge::of(Some(&answer(&["Negotiate"]))), Challenge::Other);
+        let mut binary = HeaderMap::new();
+        binary.append(header::WWW_AUTHENTICATE, HeaderValue::from_bytes(b"\xff\xfe").unwrap());
+        assert_eq!(Challenge::of(Some(&binary)), Challenge::Other);
     }
 
     #[test]

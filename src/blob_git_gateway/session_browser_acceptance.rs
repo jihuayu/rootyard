@@ -41,15 +41,19 @@
 //! the signed-in shell, the JS repository list and the real repository DOM link
 //! are used, then the read chain (headerless list, refs -> tree -> commits,
 //! each presenting the previous answer's token and no revision), the cookie-only
-//! `/api` and `/git` denials, and finally one separate fault page whose
+//! `/api` and `/git` denials (a direct `401` for `/api/repos`; for Smart HTTP
+//! either a direct `401` or the page's own bounded timeout while the origin's
+//! Basic challenge is pending), and finally one separate fault page whose
 //! intercepted tree request is answered by the page itself with a synthetic
 //! `200` carrying the real refs token and the immediately lower revision.
 //!
 //! The page reaches the child only through a same-origin capture adapter that
-//! records every page request with the real upstream status and rewritten
-//! `Origin`, so [`attest`] checks the upstream facts independently of the
-//! page's own report; only the synthetic answer's page booleans are taken from
-//! the report, because that answer never reaches the adapter. Session token
+//! records every page request with the real upstream status, body and every
+//! response header passed back unchanged (its `WWW-Authenticate` included) and
+//! rewritten `Origin`, so [`attest`] checks the upstream facts independently of
+//! the page's own report and correlates each fixed page outcome with them; only
+//! the synthetic answer's page booleans and the cookie-only outcomes are taken
+//! from the report, because only the browser can observe them. Session token
 //! strings are compared in memory only and never appear in a message.
 //!
 //! Credentials reach the script only through a mode-`0600` JSON file in the
@@ -193,6 +197,7 @@ async fn browse(
         name: name.clone(),
         oid: oid.clone(),
         file: COMMIT_FILE.to_owned(),
+        second_file: SECOND_FILE.to_owned(),
         upstream: format!("http://{address}"),
     };
     let front = serve_adapter(capture.clone(), fixture).await?;
