@@ -259,7 +259,7 @@ jobs:
           export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
           export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
           export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
-          export ROOTYARD_BLOB_ROOT="format22-pg-tests-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_BLOB_ROOT="format22-169-pg-tests-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           export ROOTYARD_GIT="$(command -v git)"
           data_dir="$RUNNER_TEMP/refstore-format22-pg-data"
           rm -rf "$data_dir"

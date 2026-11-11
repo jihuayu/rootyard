@@ -130,7 +130,7 @@ fn registered(artifact: &PairArtifact) -> Result<RegisteredArtifact, ()> {
         artifact.slot,
         artifact.hold_id,
         ArtifactLocator::new(
-            artifact.tenant_id,
+            hold.storage_tenant_id,
             hold.authority_id,
             hold.generation,
             hold.attempt_id,

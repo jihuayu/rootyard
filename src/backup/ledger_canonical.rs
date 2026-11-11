@@ -31,7 +31,7 @@ pub(super) fn canonical(pair: &DeclaredPair) -> Result<(RegisteredPack, Canonica
             // A missing hold is therefore an unrebuildable set, never a panic.
             let hold = artifact.hold.as_ref().ok_or("missing artifact hold")?;
             let locator = ArtifactLocator::new(
-                artifact.tenant_id,
+                hold.storage_tenant_id,
                 hold.authority_id,
                 hold.generation,
                 hold.attempt_id,

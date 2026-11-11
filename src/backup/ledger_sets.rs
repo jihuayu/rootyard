@@ -213,7 +213,7 @@ pub(super) fn check_declared(declared: &[DeclaredPair]) -> Vec<String> {
             let at = format!("{key}:{}:{}", artifact.role, artifact.slot);
             if artifact.acquire_request_id != publication.acquire_request_id
                 || artifact.consume_request_id != publication.consume_request_id
-                || !artifact.issuer_operation
+                || (artifact.hold.is_some() && !artifact.issuer_operation)
             {
                 lines.push(format!("foreign_hold_binding:{at}"));
             }

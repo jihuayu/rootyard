@@ -742,6 +742,31 @@ class ValidatorRefusalTest(unittest.TestCase):
                           ["canonical_pair_mismatch", "hold_mismatch"],
                           ["canonical_pair_mismatch", "hold_mismatch"]])
 
+    def test_missing_and_mismatched_hold_lines_are_the_causal_two_code_summary(self):
+        # The Rust SQL-decoded shapes of both hold corruptions produce exactly
+        # canonical_pair_mismatch + hold_mismatch; a deleted hold must not add
+        # foreign_hold_binding. Both exact CLI lines are accepted.
+        for name in ("missing_hold", "mismatched_hold_locator"):
+            case = self.by_name[name]
+            self.assertEqual(required_codes(case), ["canonical_pair_mismatch", "hold_mismatch"])
+            line = summary_line(["canonical_pair_mismatch", "hold_mismatch"])
+            self.assertEqual(support.validator_refusal(line, case),
+                             "2|canonical_pair_mismatch,hold_mismatch")
+        # The exact diagnostics emitted for `valid_source` also stay causal: only
+        # the required pair plus the dependent set/root consequences are accepted.
+        exact = {
+            "missing_hold": ["canonical_pair_mismatch", "hold_mismatch", "owner_scope_mismatch",
+                             "root_pack_set_mismatch", "root_set_mismatch"],
+            "mismatched_hold_locator": ["canonical_pair_mismatch", "hold_mismatch",
+                                        "root_pack_set_mismatch", "root_set_mismatch"],
+        }
+        for name, codes in exact.items():
+            case = self.by_name[name]
+            self.assertEqual(support.validator_refusal(summary_line(codes), case),
+                             str(len(codes)) + "|" + ",".join(sorted(codes)))
+            with self.assertRaisesRegex(AssertionError, "unrelated code"):
+                support.validator_refusal(summary_line(codes + ["foreign_hold_binding"]), case)
+
     def test_multi_code_summaries_admit_only_existing_dependent_codes(self):
         for case in self.cases:
             required = required_codes(case)

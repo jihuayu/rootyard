@@ -60,3 +60,23 @@ fn a_membership_only_pair_must_be_the_canonical_a4_set() {
     relabel(&mut moved, &valid.declared[0].publication.as_ref().unwrap().digest.clone());
     assert_eq!(moved.violations(), vec![format!("canonical_pair_mismatch:{}", tag(&moved.declared[0]))]);
 }
+
+#[test]
+fn a_moved_hold_storage_tenant_without_a_resync_refuses_digest_and_hold() {
+    let mut sets = valid_source();
+    // The released root only restates the same damaged pair; drop it so the
+    // declared-set checks are the sole source of the two expected lines.
+    sets.roots.clear();
+    sets.heads.clear();
+    sets.tombstones.clear();
+    let pair = &mut sets.declared[0];
+    pair.artifacts[0].hold.as_mut().expect("the fixture holds both roles").storage_tenant_id = Uuid::from_u128(0x7f00);
+    // The publication digest is deliberately not re-synced: the canonical
+    // locator now takes its tenant from the moved hold row.
+    pair.scope = declared_violations(pair);
+    let key = tag(&sets.declared[0]);
+    assert_eq!(
+        sets.violations(),
+        vec![format!("canonical_pair_mismatch:{key}"), format!("hold_mismatch:{key}:pack:0")]
+    );
+}

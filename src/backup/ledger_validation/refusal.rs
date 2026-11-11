@@ -185,6 +185,73 @@ mod tests {
         assert!(LedgerValidationRefusal::of(&lines(&["", ""])).is_some());
     }
 
+    /// The SQL-decoded `missing_hold` and `mismatched_hold_locator` shapes keep
+    /// the refusal causal: both are canonical-pair and hold mismatches, and a
+    /// deleted hold row (no hold, request or hold slot left) must never emit
+    /// `foreign_hold_binding`.
+    #[test]
+    fn sql_decoded_hold_corruptions_keep_only_causal_summary_codes() {
+        use uuid::Uuid;
+        let valid_source = super::super::ledger_sets::ledger_sets_tests::valid_source_without;
+        let recompute = super::super::ledger_sets::declared_violations;
+        let allowed = [
+            "canonical_pair_mismatch",
+            "hold_mismatch",
+            "owner_scope_mismatch",
+            "root_set_mismatch",
+            "root_pack_set_mismatch",
+            "snapshot_set_mismatch",
+            "snapshot_membership_mismatch",
+            "serving_read_pack_mismatch",
+        ];
+        let mut missing = valid_source(&[]);
+        {
+            let pair = &mut missing.declared[0];
+            let artifact = &mut pair.artifacts[0];
+            artifact.hold = None;
+            artifact.request = None;
+            artifact.issuer_operation = false;
+            artifact.hold_slot = None;
+            pair.scope = recompute(pair);
+        }
+        let mut moved = valid_source(&[]);
+        {
+            let pair = &mut moved.declared[0];
+            pair.artifacts[0].hold.as_mut().expect("the fixture holds both roles").storage_tenant_id =
+                Uuid::from_u128(0x169);
+            pair.scope = recompute(pair);
+        }
+        for (name, sets, expected) in [
+            (
+                "missing_hold",
+                &missing,
+                &[
+                    "canonical_pair_mismatch",
+                    "hold_mismatch",
+                    "owner_scope_mismatch",
+                    "root_pack_set_mismatch",
+                    "root_set_mismatch",
+                ][..],
+            ),
+            (
+                "mismatched_hold_locator",
+                &moved,
+                &["canonical_pair_mismatch", "hold_mismatch", "root_pack_set_mismatch", "root_set_mismatch"][..],
+            ),
+        ] {
+            let violations = sets.violations();
+            let refusal = LedgerValidationRefusal::of(&violations).expect("a damaged source is refused");
+            let codes = refusal.codes();
+            assert_eq!(codes, expected, "{name}");
+            assert!(codes.contains(&"canonical_pair_mismatch"), "{name}: {codes:?}");
+            assert!(codes.contains(&"hold_mismatch"), "{name}: {codes:?}");
+            assert!(!codes.contains(&"foreign_hold_binding"), "{name}: {codes:?}");
+            assert!(!codes.contains(&OTHER_VIOLATION_CODE), "{name}: {codes:?}");
+            assert!(codes.iter().all(|code| allowed.contains(code)), "{name}: {codes:?}");
+            assert!(violations.iter().all(|line| violation_code(line) != "foreign_hold_binding"), "{name}");
+        }
+    }
+
     /// A real damaged set becomes the typed refusal through its only
     /// construction site, while any other failure (even one whose text looks
     /// like the summary) stays foreign to the type.

@@ -98,7 +98,7 @@ fn registered(artifact: &PairArtifact) -> Result<RegisteredArtifact, ()> {
         artifact.slot,
         artifact.hold_id,
         ArtifactLocator::new(
-            artifact.tenant_id,
+            hold.storage_tenant_id,
             hold.authority_id,
             hold.generation,
             hold.attempt_id,
@@ -132,7 +132,7 @@ fn raw_digest(artifacts: &[PairArtifact]) -> String {
         fields.push(a.role.as_bytes().to_vec());
         fields.push(a.slot.to_be_bytes().to_vec());
         fields.push(a.hold_id.as_bytes().to_vec());
-        fields.push(a.tenant_id.as_bytes().to_vec());
+        fields.push(hold.storage_tenant_id.as_bytes().to_vec());
         fields.push(hold.authority_id.as_bytes().to_vec());
         fields.push(hold.generation.to_be_bytes().to_vec());
         fields.push(hold.attempt_id.as_bytes().to_vec());

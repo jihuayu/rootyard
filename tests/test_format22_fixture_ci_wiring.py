@@ -395,6 +395,23 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertIn("cargo test --locked --lib --features pando-lab "
                       "backup::ledger_validation::pg_tests", runs[0])
         self.assertIn("-- --ignored --test-threads=1", runs[0])
+        pg_index = next(index for index, line in enumerate(self.lines)
+                        if "backup::ledger_validation::pg_tests" in line)
+        step = pg_index
+        while step > 0 and not self.lines[step].lstrip().startswith("- name:"):
+            step -= 1
+        step_lines = self.lines[step:pg_index]
+        blob_root = [line.strip() for line in step_lines
+                     if line.strip().startswith("export ROOTYARD_BLOB_ROOT=")]
+        self.assertEqual(
+            blob_root,
+            ['export ROOTYARD_BLOB_ROOT="format22-169-pg-tests-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"'],
+            "the pg_tests step must use the format22-169- blob root prefix required by the fixture seed",
+        )
+        self.assertTrue(blob_root[0].startswith('export ROOTYARD_BLOB_ROOT="format22-169-'))
+        seed = next(index for index in range(step, pg_index) if '"$fixture" --seed' in self.lines[index])
+        self.assertIn('--blob-root "$ROOTYARD_BLOB_ROOT"', self._continued(seed))
+        self.assertLess(seed, pg_index, "the fixture must be seeded before the pg_tests suite runs")
 
     def test_ci_discovers_the_issue169_tests_and_runs_the_native_drill(self) -> None:
         # ci.yml's full unittest discovery is what executes the static #169
