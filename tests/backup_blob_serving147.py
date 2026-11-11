@@ -10,6 +10,7 @@ Product GC stays disabled. This is fresh PG/Blob functionality, not LFS,
 workspace, interrupted-restore, physical durability or HA qualification.
 """
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -45,9 +47,184 @@ LIMITATIONS = [
     "Restore requires the same physical Blob backend identity (provider, endpoint, bucket, root, region, account) as the archive; a different backend is refused, not remapped.",
     "Original Blob objects are deleted only in this run-owned fixture to prove the archive closure; product GC stays disabled and is untouched.",
     "serve-blob holds the shared lifecycle advisory lock for its whole lifetime; offline backup/restore hold the exclusive one until publication. The legacy volume flock still only covers the native GitFS path.",
+    "The restore barrier is proven at the parked pg_restore, and every probe re-proves the exclusive key.",
     "No interrupted restore, multi-host failure, physical power-loss, throughput, or production RPO/RTO qualification is claimed.",
     "No legacy format/schema upgrade is exercised. The current binary must restore its own format22/schema147 archive; format21/schema147 stays readable as a metadata-only historical archive.",
 ]
+
+# Deterministic restore-interval gate. `src/backup/postgres.rs::command` passes
+# the caller's PATH through (and clears everything else) and `pg_command` binds
+# the child to the target `PGDATABASE`, so only this restore invocation gets a
+# private PATH prefix. Its transparent `pg_restore` wrapper parks at the real
+# process boundary, writes an atomic marker holding only its pid and
+# PGDATABASE, waits (bounded) for a run-owned release file and then execs the
+# absolute, pre-resolved pg_restore with the unchanged argv. Only that gated
+# pg_restore's environment also carries the checked-out `RECORD` file path: it
+# proves the argv the real pg_restore received. The wrapper never blocks on
+# user-controlled files (only `-f`/`-e` tests, a bounded sleep loop and a
+# bounded marker write), and its directory is removed after each case.
+RESTORE_GATE_TIMEOUT_SECONDS = 30.0
+RESTORE_GATE_POLL_SECONDS = 0.02
+RESTORE_GATE_WAIT_MS = 60000
+_WRAPPER = r"""#!/bin/sh
+# Run-owned restore gate: $1 is the absolute trusted pg_restore and the rest is
+# that invocation's argv, passed on unchanged. Only pid and PGDATABASE written.
+umask 077
+g=${0%/*}
+[ -f "$g/../marker" ] || [ -e "$g/../marker" ] && exit 70
+{
+  printf 'pid=%s\n' "$$"
+  if [ -n "${PGDATABASE+x}" ]; then printf 'database=%s\n' "$PGDATABASE"; else printf 'unset\n'; fi
+} > "$g/../marker.$$.tmp" 2>/dev/null || exit 70
+mv -f "$g/../marker.$$.tmp" "$g/../marker" 2>/dev/null || exit 70
+i=0
+while [ ! -e "$g/../released" ]; do
+  [ "$i" -lt %WAIT% ] || exit 70
+  sleep 0.01
+  i=$((i + 1))
+done
+shift
+exec env RECORD="$g/../record" "$@" || exit 70
+"""
+GATE_SQL = (
+    "SELECT (SELECT datname FROM pg_database WHERE datname=current_database()) || '|' ||"
+    " count(*) FILTER (WHERE locktype='advisory' AND classid=0 AND objid=738390103 AND objsubid=1"
+    " AND database=(SELECT oid FROM pg_database WHERE datname=current_database())"
+    " AND mode='ExclusiveLock' AND granted) FROM pg_locks"
+)
+GATE_LIFECYCLE_KEY = 738390103
+
+
+def _process_alive(pid):
+    """True only for a live, non-zombie process; an unknown state is not alive."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    try:
+        state = Path("/proc", str(pid), "stat").read_text(errors="replace")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return state[state.rindex(")") + 2:].split()[0] != "Z"
+
+
+class RestoreGate:
+    """Run-owned PATH gate that parks the restore's real `pg_restore` child.
+
+    It resolves and retains the trusted absolute pg_restore and hashes it, then
+    installs an executable shell wrapper under a private PATH prefix. Only the
+    executable and its content hash are ever reported.
+    """
+
+    def __init__(self, root, database, search_path):
+        located = shutil.which("pg_restore", path=search_path)
+        assert located, "a trusted pg_restore executable is required"
+        self.executable = Path(located).resolve(strict=True)
+        assert self.executable.is_file() and os.access(self.executable, os.X_OK), "pg_restore is not executable"
+        self.real_sha256 = self.hash()
+        self.database = database
+        self.root = Path(tempfile.mkdtemp(prefix="restore-gate-", dir=root))
+        self.root.chmod(0o700)
+        self.bin = self.root / "bin"
+        self.bin.mkdir(mode=0o700)
+        self.wrapper = self.bin / "pg_restore"
+        self.wrapper.write_text(_WRAPPER.replace("%WAIT%", str(RESTORE_GATE_WAIT_MS)))
+        self.wrapper.chmod(0o700)
+        self.marker, self.release = self.root / "marker", self.root / "released"
+        self.record, self.proof, self.probe_env = self.root / "record", {"gated_pg_restore_argv": "not-recorded"}, None
+        self.blocked = None
+
+    def hash(self):
+        return sha256_file(self.executable)
+
+    def activate(self, env):
+        """Only for this restore invocation: the private prefix goes first."""
+        # The probes never get the restore's PATH: the gated pg_restore is
+        # checked out here and serve-blob is probed with this private copy.
+        self.probe_env = {key: value for key, value in env.items() if key != "RECORD"}
+        env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
+
+    def wait_blocked(self, restore, deadline):
+        """Wait (bounded) for the wrapper marker naming this target DB."""
+        assert not self.release.exists(), "the restore gate was released before it was proven"
+        while not self.marker.exists():
+            assert restore.poll() is None, "restore exited before reaching its gated pg_restore"
+            assert time.monotonic() < deadline, "restore never reached its gated pg_restore"
+            time.sleep(RESTORE_GATE_POLL_SECONDS)
+        fields = dict(line.split("=", 1) for line in self.marker.read_text().splitlines() if "=" in line)
+        assert set(fields) <= {"pid", "database"}, "restore gate marker carries unexpected fields"
+        assert fields.get("database") == self.database, "restore gate did not wrap pg_restore of the target DB"
+        self.blocked = int(fields.get("pid", "0"))
+        assert _process_alive(self.blocked), "restore gate wrapper is not a live process"
+        self.proof = self.argv_proof()
+        return self.blocked
+
+    def held(self, restore, query):
+        """Prove the held interval: release closed, restore and wrapper live, lock granted."""
+        assert not self.release.exists(), "the restore gate released before the interval was proven"
+        assert restore.poll() is None and _process_alive(self.blocked), "restore or its parked pg_restore is gone"
+        rows = [line.split("|") for line in query(GATE_SQL).splitlines() if line]
+        assert len(rows) == 1 and len(rows[0]) == 2, "target database lock state is unreadable"
+        database, exclusive = rows[0]
+        assert database == self.database, "lock state belongs to another database"
+        assert exclusive == "1", "the exclusive lifecycle barrier is not held on the target DB"
+
+    def probe_held(self, restore, query, mode, probe):
+        """Prove the interval, run one probe inside it, then re-prove it."""
+        self.held(restore, query)
+        outcome = probe(mode)
+        self.held(restore, query)
+        return outcome
+
+    def release_gate(self):
+        """Create the run-owned release file once; a creation failure is a failure."""
+        if not self.release.exists():
+            try:
+                os.close(os.open(self.release, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600))
+            except OSError as error:
+                raise AssertionError("restore gate release could not be created: " + type(error).__name__) from None
+
+    def argv_proof(self):
+        """Read the parked real pg_restore's own record while the gate is closed.
+
+        Called right after the marker proves that pid live, so it always
+        precedes that process's own record write. The field is fixed shape
+        only: an argument count, never an argument or environment value.
+        """
+        try:
+            count = next((line[5:] for line in self.record.read_text().splitlines() if line.startswith("argc=")), "")
+        except OSError:
+            return self.proof
+        return {"gated_pg_restore_argv": count + " args"}
+
+    def finish(self, restore, timeout):
+        """Require the released real pg_restore to exit successfully."""
+        status = restore.wait(timeout=timeout)
+        assert status == 0, "paired restore from the archive failed (exit " + str(status) + ")"
+        assert self.hash() == self.real_sha256, "pg_restore changed during the restore"
+        return status
+
+    def cleanup(self):
+        """Release, let a parked wrapper finish, then remove this run's directory.
+
+        Never raises: a cleanup error cannot replace the original one, and this
+        directory lies outside every safety contract (it has no .volume-id).
+        The wrapper observes the release with its bounded poll and then execs or
+        exits; the wait below only covers that short transition.
+        """
+        with contextlib.suppress(AssertionError):
+            self.release_gate()
+        deadline = time.monotonic() + 10
+        while self.blocked is not None and _process_alive(self.blocked) and time.monotonic() < deadline:
+            time.sleep(RESTORE_GATE_POLL_SECONDS)
+        try:
+            shutil.rmtree(self.root)
+        except BaseException:
+            pass
 
 
 class Drill(BlobOnlyHarness):
@@ -283,8 +460,8 @@ class Drill(BlobOnlyHarness):
             "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=738390103"
             " AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND mode='ExclusiveLock' AND granted"))
 
-    def serving_barrier_refused(self, env, stage):
-        """Both schema modes must exit with the exact lifecycle barrier refusal.
+    def serving_barrier_refused(self, env, mode, stage):
+        """One schema mode must exit with the exact lifecycle barrier refusal.
 
         The probe runs against the barrier-held database on a run-owned loopback
         bind and a private data directory. Only the exact per-mode source message
@@ -292,19 +469,21 @@ class Drill(BlobOnlyHarness):
         a ready listener or any other exit is fail-closed ``unknown``, never a
         refusal, and the owned process group is killed and proven quiescent.
         """
-        outcomes = []
-        for mode in ("auto", "external"):
-            outcome = serving_barrier_probe(self.args.binary, env, mode, self.root / "barrier-probe",
-                                            secrets=self.secrets, label=stage + "-" + mode)
-            outcomes.append(outcome)
-            assert outcome.get("reaped") is True, stage + ": " + describe(outcome) + ": probe child was not reaped"
-            assert outcome["status"] == "refused", stage + ": " + describe(outcome)
-            assert outcome.get("expected") == BARRIER_REFUSALS[mode], stage + ": " + describe(outcome)
-            assert outcome.get("exit", 0) != 0, stage + " " + mode + ": refusal must be a non-zero exit"
-            for line in outcome.get("diagnostics", []):
-                for secret in self.secrets:
-                    for value in (secret, unquote(secret)):
-                        assert not value or value not in line, "probe diagnostic leaked a private value"
+        outcome = serving_barrier_probe(self.args.binary, env, mode, self.root / "barrier-probe",
+                                        secrets=self.secrets, label=stage + "-" + mode)
+        assert outcome.get("reaped") is True, stage + ": " + describe(outcome) + ": probe child was not reaped"
+        assert outcome["status"] == "refused", stage + ": " + describe(outcome)
+        assert outcome.get("expected") == BARRIER_REFUSALS[mode], stage + ": " + describe(outcome)
+        assert outcome.get("exit", 0) != 0, stage + " " + mode + ": refusal must be a non-zero exit"
+        for line in outcome.get("diagnostics", []):
+            for secret in self.secrets:
+                for value in (secret, unquote(secret)):
+                    assert not value or value not in line, "probe diagnostic leaked a private value"
+        return outcome
+
+    def serving_barrier_refused_all(self, env, stage):
+        """The unchanged auto/external set, each refused where no restore runs."""
+        outcomes = [self.serving_barrier_refused(env, mode, stage) for mode in ("auto", "external")]
         return outcomes
 
     def snapshot(self):
@@ -428,21 +607,48 @@ class Drill(BlobOnlyHarness):
         self.delete_originals(self.originals)
         env = self.env.copy()
         env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))
-        restore = None
+        restore, outcome = None, {}
         stdout_path = self.root / "restore.stdout.log"
         stderr_path = self.root / "restore.stderr.log"
+        target = urllib.parse.unquote(urllib.parse.urlsplit(self.target_db).path.lstrip("/"))
+        # A single lock observation only samples the restore window. Instead, the
+        # restore's own pg_restore is parked by a run-owned PATH wrapper inside
+        # the interval in which the restore holds the exclusive lifecycle key.
+        gate = RestoreGate(self.root, target, env.get("PATH", ""))
+        self.restore_gate = gate
         try:
+            gate.activate(env)
             with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                 restore = subprocess.Popen([self.args.binary, "restore", str(self.backup), "--isolated", "--trust-backup"],
                                            env=env, stdout=stdout, stderr=stderr)
-            self.wait_for_advisory_holder(self.target_db, exclusive=True)
-            self.serving_barrier_refused(env, "restore")
-            status = restore.wait(timeout=180)
-            assert status == 0, "paired restore from the archive failed (exit " + str(status) + ")"
+            gate.wait_blocked(restore, time.monotonic() + RESTORE_GATE_TIMEOUT_SECONDS)
+            query = lambda sql: self.query(self.target_db, sql)
+            served = []
+            for mode in ("auto", "external"):
+                probe = lambda mode: self.serving_barrier_refused(gate.probe_env, mode, "restore (gated at pg_restore)")
+                served.append(gate.probe_held(restore, query, mode, probe))
+            gate.release_gate()
+            gate.finish(restore, 180)
+            late = [self.serving_barrier_refused(env, mode, "restore (after gate release)")
+                    for mode in ("auto", "external")]
         finally:
+            # Release on every path without masking the original error, then
+            # bound the owned restore: if it has not finished it is killed and
+            # reaped, and the wrapper can only exit once its release is seen.
+            with contextlib.suppress(AssertionError):
+                gate.release_gate()
             if restore is not None and restore.poll() is None:
                 restore.kill()
                 restore.wait(timeout=10)
+            gate.cleanup()
+            self.restore_gate = None
+        outcome = {"restore_gate": "parked-pg_restore-exclusive-lock-proven",
+                   "pg_restore_sha256": gate.real_sha256, **gate.proof,
+                   "gated_probes": [describe(entry) for entry in served],
+                   "post_release_probes": [describe(entry) for entry in late]}
+        return self.restored_detail(stdout_path, outcome)
+
+    def restored_detail(self, stdout_path, outcome):
         restored = json.loads(stdout_path.read_text())
         assert restored["restored"] is True and restored["started_service"] is False
         assert restored["blob_artifacts"] == self.closure_rows["count"]
@@ -479,7 +685,7 @@ class Drill(BlobOnlyHarness):
                 "source_scratch_deleted": True, "post_boundary_commit_excluded": True,
                 "read_only_and_revoked_token_state_preserved": True,
                 "same_backend_identity": True, "original_blob_objects_deleted_before_restore": True,
-                "independent_blob_closure_restore": True}
+                "independent_blob_closure_restore": True, **outcome}
 
     def artifact_rows_for(self, database):
         raw = self.query(database,
