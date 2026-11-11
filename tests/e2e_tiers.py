@@ -16889,6 +16889,8 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         self.assertEqual(tier_class_methods, [255, 261, 54, 27])
         extra_f20_rule = "plus six additional F20 CI regression cases"
         for doc_txt in (infra_txt, ready_txt):
+            self.assertIn("F51", doc_txt)
+            self.assertIn("597", doc_txt)
             tier_summary_lines = [
                 line for line in doc_txt.splitlines() if f"`{tier_class_methods[0]}` Tier 1 + `{tier_class_methods[1]}` Tier 2" in line
             ]
