@@ -306,7 +306,6 @@ mod challenge_tests {
             ("GET", "/api/repos/owner/name/compare?base=HEAD&head=HEAD"),
             ("GET", "/api/repos/owner/name/operations/00000000-0000-0000-0000-000000000001"),
             ("POST", "/api/repos"),
-            ("POST", "/api/repos/owner/name/merges"),
             ("GET", "/web/blob/api/repos"),
             ("GET", "/web/blob/api/repos/owner/name"),
             ("GET", "/web/blob/api/repos/owner/name/refs"),
@@ -317,8 +316,7 @@ mod challenge_tests {
                 // `create_repo` extracts `Json<CreateRepository>` before the
                 // handler authenticates, so only this route needs a valid JSON
                 // body; every other route has no body extractor and takes the
-                // empty body. `/api/repos/{owner}/{name}/merges` has no body,
-                // form or query extractor at all.
+                // empty body.
                 let (headers, body): (Vec<(&str, &str)>, &'static [u8]) =
                     if (method, uri) == ("POST", "/api/repos") {
                         let mut headers = headers.to_vec();
@@ -331,6 +329,27 @@ mod challenge_tests {
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri} was not an unauthenticated denial");
                 assert_eq!(challenges, [BEARER], "{method} {uri} must not enter a browser Basic auth exchange");
             }
+        }
+    }
+
+    /// `unsupported_merge` (`POST /api/repos/{owner}/{name}/merges`) answers its
+    /// `501 Not Implemented` refusal before it looks at any credential, so it is
+    /// not an unauthenticated route and must not advertise a scheme challenge.
+    /// It has no body, form or query extractor, so the refusal is the same for
+    /// every rejected credential on an empty body.
+    #[tokio::test]
+    async fn unsupported_merge_refuses_without_a_challenge() {
+        let (state, _scratch) = offline_state();
+        let rejected: [&[(&str, &str)]; 3] = [
+            &[],
+            &[("authorization", "Bearer not-a-credential")],
+            &[("authorization", "Basic b3duZXI6bm90LWEtY3JlZGVudGlhbA==")],
+        ];
+        let uri = "/api/repos/owner/name/merges";
+        for headers in rejected {
+            let (status, challenges) = send(&state, "POST", uri, headers, b"").await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "POST {uri} must stay an explicit not-implemented refusal");
+            assert!(challenges.is_empty(), "POST {uri} must not challenge: it never authenticates");
         }
     }
 
