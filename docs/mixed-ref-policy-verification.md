@@ -82,11 +82,19 @@ One declared stock Git is **both** the Git client and the server's Git:
 - **Public refs** come from a **separate** authenticated `/refs` API read and
   are stored as `api_refs`.
 - The snapshot also records the operation high-water, the outbox count, the
-  admission-state map, the pending journal directory names and the repository
-  marker (`state` + `COALESCE(recovery_reason,'-')`, which both audits require
-  to be exactly `ready/-` before and after).
-- The outbox and admission counts are recorded beside the interval evidence for
-  the report only; no audit gates on them.
+  admission-state map, the per-outcome count map, the pending journal directory
+  names and the repository marker (`state` + `COALESCE(recovery_reason,'-')`,
+  which both audits require to be exactly `ready/-` before and after).
+- `outcomes` is this run-owned repository's own `git_operations` rows,
+  `outcome -> count`, read by one read-only `GROUP BY outcome` through the same
+  `self.sql` path as the other counts. It has the same text-map shape as
+  `admissions` (`no_ref_changes:1,recorded:2`), so both interval audits can
+  report it without KeyError. It is never taken from the unit snapshot
+  fixtures.
+- The outbox, admission and outcome counts are recorded beside the interval
+  evidence for the report only (`diagnostics.before`/`diagnostics.after` in
+  the API refusal audit); no audit gates on them, and they never decide
+  acceptance.
 
 The Git-refusal audit compares the physical refs before/after (requested refs
 must not move, and any other changed ref must belong to a validated CI-service
@@ -259,7 +267,7 @@ From the repository root:
 python3 -m unittest tests.test_browse_mixed_refs
 ```
 
-The suite currently has **118 tests**. It pins the exact case IDs and the
+The suite currently has **119 tests**. It pins the exact case IDs and the
 15+2 = 17 selection order, the unchanged `CASE_NAMES` (compared against a
 literal expected tuple with no history lookup, so a shallow CI checkout cannot
 skip the check; a focused test asserts the guard has no skip path), the runner's
@@ -270,7 +278,10 @@ conflict refusal) and that the transparent wrappers exec the bound declaration,
 the `--porcelain` refusal parser, rule isolation and restoration, the physical
 `for-each-ref` plus a separate, fully paginated public `/refs` walk (explicit
 limit, advancing cursors, pages bounded by their own `next_after`, bounded
-termination; proven with 201 refs across three pages), the SQL/decoder/contract
+termination; proven with 201 refs across three pages), the `ref_state`
+`outcomes` map (present with the exact source pin, parsed from this repository's
+`git_operations` rows through a read-only `GROUP BY` and reported by the API
+interval, not gated on), the SQL/decoder/contract
 types end to end (including the alternate `observed_immutable_ci_root` service
 evidence: its sentinel decodes for a service row only, `"true"`/`"false"` texts
 and the sentinel on a human row still fail, and accepted service events still

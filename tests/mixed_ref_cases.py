@@ -278,11 +278,20 @@ class MixedRefPolicyCases:
         refs.sort()
         # Counts are recorded beside the interval evidence for the report only;
         # no audit gates on them (the causal operation interval is the gate).
+        # Reuse the same SQL helper for every report-only count in the snapshot.
+        sql = self.sql
         return {"operation_highwater": operation_highwater,
                 "refs": refs,
                 "api_refs": api_refs,
-                "outbox": int(self.sql("SELECT count(*) FROM outbox_events WHERE repository_id='" + repo + "'")),
-                "admissions": dict((k, int(v)) for k, v in (item.split(":") for item in self.sql(
+                "outbox": int(sql("SELECT count(*) FROM outbox_events WHERE repository_id='" + repo + "'")),
+                # Per-outcome counts of this repository's stored operations: the
+                # same report-only text map shape as ``admissions``, from one
+                # read-only GROUP BY on the ``(repository_id, ...)`` index.
+                "outcomes": dict((k, int(v)) for k, v in (item.split(":") for item in sql(
+                    "SELECT coalesce(string_agg(outcome || ':' || n::text, ',' ORDER BY outcome), '') FROM "
+                    "(SELECT outcome, count(*) AS n FROM git_operations WHERE repository_id='" + repo
+                    + "' GROUP BY outcome) r").split(",") if item)),
+                "admissions": dict((k, int(v)) for k, v in (item.split(":") for item in sql(
                     "SELECT coalesce(string_agg(state || ':' || n::text, ',' ORDER BY state), '') FROM "
                     "(SELECT state, count(*) AS n FROM git_ref_admissions WHERE repository_id='" + repo
                     + "' GROUP BY state) r").split(",") if item)),

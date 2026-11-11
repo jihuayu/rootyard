@@ -92,6 +92,10 @@ def source(name):
     return ast.get_source_segment(CASES.read_text(), method(name))
 
 
+# A stock Git for ``ref_state`` instance tests: the pinned command, not PATH.
+MIXED_TEST_GIT = str(shutil.which("git"))
+assert MIXED_TEST_GIT, "the mixed-ref unit tests need a stock Git"
+
 # The queue harness used by every instance-level test; the runner now builds
 # exactly this class, built here without ``Harness.__init__`` (no socket/temp DB).
 FixtureHarness = browse.BrowseHarness
@@ -3074,12 +3078,102 @@ class SourceBindingTest(unittest.TestCase):
         # The snapshot carries the physical refs, the API refs, and the bounds.
         returns = [n for n in ast.walk(method("ref_state")) if isinstance(n, ast.Return)]
         keys = {k.value for k in returns[-1].value.keys if isinstance(k, ast.Constant)}
-        self.assertLessEqual({"refs", "api_refs", "journal", "state", "operation_highwater"}, keys)
+        self.assertLessEqual({"refs", "api_refs", "journal", "state", "operation_highwater",
+                              "outcomes"}, keys)
+        # ``outcomes`` is the per-outcome count map the API refusal diagnostics
+        # read: it must come from the run-owned repository's own rows through
+        # the same read-only ``self.sql`` path as the other counts, never from
+        # the unit snapshot fixtures.
+        entries = {k.value: v for k, v in zip(returns[-1].value.keys, returns[-1].value.values)}
+        outcome_sql = ast.unparse(entries["outcomes"])
+        self.assertIn("git_operations WHERE repository_id=", outcome_sql)
+        self.assertIn("GROUP BY outcome", outcome_sql)
+        self.assertIn("outcome || ':'", outcome_sql)
+        self.assertIn("ORDER BY outcome", outcome_sql)
+        self.assertIn("count(*)", outcome_sql)
+        # Only the stored operations' own columns; ``outcome`` is a real one.
+        self.assertLessEqual({"outcome", "repository_id"},
+                             RefusalAuditSqlTest.columns("git_operations"))
+        # Only the repository id is interpolated (the escaped ``repo``), and only
+        # in the WHERE clause: no second placeholder reaches the query text.
+        self.assertEqual(outcome_sql.count("+ repo +"), 1)
+        self.assertLess(outcome_sql.index("+ repo +"), outcome_sql.index("GROUP BY"))
+        self.assertNotIn("INSERT", outcome_sql.upper())
+        self.assertNotIn("UPDATE", outcome_sql.upper())
+        self.assertNotIn("DELETE", outcome_sql.upper())
+        self.assertNotIn("FOR UPDATE", outcome_sql.upper())
+        # Exactly the same callable ``self.sql`` the admissions/outbox counts
+        # use (captured once), never a fixture map or a fresh connection.
+        self.assertIn("sql = self.sql", body)
+        self.assertIn("sql(", outcome_sql)
+        self.assertNotIn("self.sql(", outcome_sql)
+        for table in ("git_ref_admissions", "outbox_events"):
+            self.assertIn(table, ast.unparse(entries[{"git_ref_admissions": "admissions",
+                                                      "outbox_events": "outbox"}[table]]))
         # The interval audits compare the actual (physical) refs, not the API view.
         helper = source_of(SQL, "audit_git_refusal_interval")
         self.assertIn('before_refs = {name: oid for name, oid in before["refs"]}', helper)
         api_helper = source_of(SQL, "audit_api_refusal_interval")
         self.assertIn('before_refs = dict(before["refs"])', api_helper)
+
+    def test_ref_state_outcomes_come_from_the_run_repository_rows(self):
+        """The API refusal diagnostics read a real per-outcome map, never KeyError."""
+        statements = []
+        probe_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, probe_dir)
+
+        def probe_ops(argv, *args, **kwargs):
+            # Only the stock ref read is faked: an empty run-owned bare repo.
+            self.assertIn("for-each-ref", argv)
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        saved = mixed_ref_cases.subprocess.run
+        mixed_ref_cases.subprocess.run = probe_ops
+        self.addCleanup(setattr, mixed_ref_cases.subprocess, "run", saved)
+
+        def sql(statement):
+            statements.append(statement)
+            if "MAX(sequence)" in statement:
+                return "0"
+            if "GROUP BY outcome" in statement:
+                return "no_ref_changes:1,recorded:2"
+            if "FROM git_ref_admissions" in statement:
+                return "ABORTED:1,COMMITTED:1"
+            if "FROM outbox_events" in statement:
+                return "1"
+            if "FROM repositories" in statement:
+                return "ready/-"
+            raise AssertionError("unexpected statement: " + statement)
+
+        harness = SimpleNamespace(
+            repo={"id": "11111111-1111-4111-8111-111111111111"},
+            bare=probe_dir, root=probe_dir,
+            _sql_literal=browse.BrowseHarness._sql_literal, sql=sql,
+            pending_journal=lambda: [], repository_marker=lambda: "ready/-",
+            native_git=lambda: {"executable": MIXED_TEST_GIT},
+            repo_api=lambda suffix="": "/api/repos/alice/demo" + suffix,
+            document=lambda path, **kwargs: {"items": [], "next_after": None})
+        state = mixed_ref_cases.MixedRefPolicyCases.ref_state(harness)
+        self.assertEqual(state["outcomes"], {"no_ref_changes": 1, "recorded": 2})
+        self.assertEqual(state["admissions"], {"ABORTED": 1, "COMMITTED": 1})
+        self.assertEqual(state["outbox"], 1)
+        self.assertEqual(state["operation_highwater"], 0)
+        # Read-only: one SELECT per count/cursor source, no writer statement.
+        outcome_statements = [s for s in statements if "GROUP BY outcome" in s]
+        self.assertEqual(len(outcome_statements), 1)  # the outcome map only
+        for statement in statements:
+            self.assertTrue(statement.lstrip().upper().startswith("SELECT"), statement)
+            for writer in ("INSERT", "UPDATE", "DELETE"):
+                self.assertNotIn(writer, statement.upper(), statement)
+            self.assertNotRegex(statement.upper(), r"\bFOR\s+(UPDATE|SHARE)\b")
+        # The API refusal interval accepts this snapshot's outcomes unchanged
+        # and reports them; the outcome map itself is not a gate.
+        before = {**state, "operation_highwater": 7}
+        final = {**state, "outcomes": {"no_ref_changes": 1, "recorded": 3}}
+        result = refusal_audit_sql.audit_api_refusal_interval(
+            before, final, "api 403", ["refs/heads/main"], lambda highwater: [],
+            lambda row: True, lambda: final)
+        self.assertEqual(result["diagnostics"]["before"]["outcomes"], {"no_ref_changes": 1, "recorded": 2})
+        self.assertEqual(result["diagnostics"]["after"]["outcomes"], {"no_ref_changes": 1, "recorded": 3})
 
     def test_public_refs_walk_follows_every_cursor_page(self):
         """More public refs than one page: the snapshot must see every one."""
