@@ -8,6 +8,7 @@ harness instead of being executed.
 """
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -73,7 +74,7 @@ def resolver_for(addresses, port=PG_PORT, family=socket.AF_INET):
 class FakeHelper:
     """Stands in for BlobOnlyHarness: isolated psql helper plus fixture redaction."""
 
-    def __init__(self, rows=("3|1|2|0",)):
+    def __init__(self, rows=("1|0|1|0",)):
         self.rows = list(rows)
         self.queries = []
         self.secrets = ["s3cr3t-endpoint-value"]
@@ -334,8 +335,9 @@ class SocketAddressTest(unittest.TestCase):
             proc.write_net("tcp6", (tcp_row(0, LOOPBACK_V6_HEX + ":CE2B", LOOPBACK_V6_HEX + ":%04X" % PG_PORT,
                                             inode=1000),))
             index = baseline.PgPortIndex(proc.pid, (["::1"], PG_PORT), proc=proc.root)
-            # The ::1 peer matches the configured ::1 endpoint: exact client address:port pair.
-            self.assertEqual(index.pairs, (("::1", 52779),))
+            # The ::1 peer matches the configured ::1 endpoint: one owned endpoint socket.
+            self.assertEqual(index.count, 1)
+            self.assertEqual(index.sockets, [("inet6", "::1", PG_PORT)])
         finally:
             proc.close()
 
@@ -395,11 +397,10 @@ class PgEndpointTest(unittest.TestCase):
 
 
 class OwnershipTest(unittest.TestCase):
-    """Only the service process's own sockets to the configured database endpoint count."""
+    """Only the service process's own ESTABLISHED sockets to the configured database endpoint count."""
 
     def owned(self, fd_links, rows, endpoint=PG_ENDPOINT):
-        return [{"address": address, "port": port} for address, port in
-                baseline.pg_pair_list(fd_links, {"tcp": baseline.parse_proc_net_tcp(table(*rows))}, endpoint)]
+        return baseline.pg_endpoint_sockets(fd_links, {"tcp": baseline.parse_proc_net_tcp(table(*rows))}, endpoint)
 
     def test_only_established_owned_sockets_to_the_configured_endpoint_count(self):
         rows = (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),
@@ -407,7 +408,7 @@ class OwnershipTest(unittest.TestCase):
                 tcp_row(2, LOOPBACK_HEX + ":CE2D", PG_HEX, inode=1002, state="06"),
                 tcp_row(3, LOOPBACK_HEX + ":CE2E", PG_HEX, inode=1003))
         self.assertEqual(self.owned(["socket:[1000]", "socket:[1001]", "socket:[1002]"], rows),
-                         [{"address": "127.0.0.1", "port": 52779}])
+                         [("inet", PG_ADDRESS, PG_PORT)])
 
     def test_sessions_the_process_does_not_own_are_ignored(self):
         rows = (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),)
@@ -418,6 +419,14 @@ class OwnershipTest(unittest.TestCase):
         rows = (tcp_row(0, LOOPBACK_HEX + ":CE2B", "0100000A:%04X" % PG_PORT, inode=1000),
                 tcp_row(1, LOOPBACK_HEX + ":CE2C", "0100007F:%04X" % (PG_PORT + 1), inode=1001))
         self.assertEqual(self.owned(["socket:[1000]", "socket:[1001]"], rows), [])
+
+    def test_repeated_endpoint_sockets_are_counted_with_multiplicity(self):
+        # Four pool/barrier sockets to one endpoint each: counted, never de-duplicated.
+        rows = tuple(tcp_row(index, LOOPBACK_HEX + ":%04X" % (41000 + index), PG_HEX, inode=1000 + index)
+                     for index in range(4))
+        owned = self.owned(["socket:[%d]" % (1000 + index) for index in range(4)], rows)
+        self.assertEqual(len(owned), 4)
+        self.assertEqual(set(owned), {("inet", PG_ADDRESS, PG_PORT)})
 
     def test_endpoint_is_required_and_validated(self):
         rows = (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),)
@@ -436,9 +445,11 @@ class OwnershipTest(unittest.TestCase):
             proc.write_net("tcp", (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),
                                    tcp_row(1, LOOPBACK_HEX + ":CE2C", PG_HEX, inode=1002)))
             index = baseline.PgPortIndex(proc.pid, PG_ENDPOINT, proc=proc.root)
-            self.assertEqual(index.pairs, (("127.0.0.1", 52779),))
+            self.assertEqual(index.count, 1)
             proc.set_links(["socket:[1002]"])
-            self.assertEqual(index.rescan(), (("127.0.0.1", 52780),))
+            self.assertEqual(index.rescan(), 1)
+            proc.set_links([])
+            self.assertEqual(index.rescan(), 0)
         finally:
             proc.close()
 
@@ -447,7 +458,7 @@ class OwnershipTest(unittest.TestCase):
         try:
             proc.write_net("tcp", (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),))
             index = baseline.PgPortIndex(proc.pid, PG_ENDPOINT, proc=proc.root)
-            self.assertEqual(index.pairs, (("127.0.0.1", 52779),))
+            self.assertEqual(index.count, 1)
             (proc.root / str(proc.pid) / "net" / "tcp").write_text("")
             with self.assertRaises(baseline.ScanFailure) as raised:
                 index.rescan()
@@ -455,6 +466,50 @@ class OwnershipTest(unittest.TestCase):
             self.assertNotIn(PG_ADDRESS, str(raised.exception))
         finally:
             proc.close()
+
+
+class CountConsistencyTest(unittest.TestCase):
+    def test_equal_nonzero_counts_pass(self):
+        self.assertEqual(baseline.count_consistency(4, 4), 4)
+        self.assertEqual(baseline.count_consistency(1, 1), 1)
+
+    def test_zero_or_unequal_counts_fail_closed(self):
+        for owned, named in ((0, 0), (4, 0), (4, 3), (3, 4), (-1, 1), (4, True), (4, "4"), (None, 1)):
+            with self.subTest(owned=owned, named=named), self.assertRaises(baseline.BaselineError):
+                baseline.count_consistency(owned, named)
+
+
+class NoServiceSessionsTest(unittest.TestCase):
+    """Pre-start gate: fixed literal SQL, four non-negative integers, zero sessions."""
+
+    def test_empty_session_check_passes_with_the_fixed_literal_sql(self):
+        helper = FakeHelper(rows=("0|0|0|0",))
+        self.assertEqual(baseline.require_no_service_sessions(helper), 0)
+        self.assertEqual(helper.queries, [baseline.PG_STAT_QUERY])
+        self.assertEqual(baseline.require_no_service_sessions(FakeHelper(rows=("0|0|0|0",))), 0)
+
+    def test_existing_sessions_are_rejected_fail_closed(self):
+        for row in ("1|0|1|0", "4|3|1|0"):
+            helper = FakeHelper(rows=(row,))
+            with self.subTest(row=row), self.assertRaises(baseline.BaselineError) as raised:
+                baseline.require_no_service_sessions(helper)
+            self.assertIn("service sessions already exist before a service start", str(raised.exception))
+            self.assertEqual(helper.queries, [baseline.PG_STAT_QUERY])
+
+    def test_malformed_or_failed_checks_raise_fixed_safe_errors(self):
+        for row in ("", "0|0|0", "0|0|0|0|0", "0|-1|0|0", "0|x|0|0", "0.0|0|0|0", None, 0,
+                    # count(*)/FILTER never return NULL; a NULL row is malformed and never read as zero.
+                    "|0|0|0",
+                    RuntimeError("connect failed to s3cr3t-endpoint-value")):
+            helper = FakeHelper(rows=(row,))
+            if row is None or isinstance(row, Exception):  # no row / helper failure is never zero
+                with self.subTest(row=row), self.assertRaises(RuntimeError):
+                    baseline.require_no_service_sessions(helper)
+                continue
+            with self.subTest(row=row), self.assertRaises(baseline.BaselineError) as raised:
+                baseline.require_no_service_sessions(helper)
+            self.assertNotIn("s3cr3t", str(raised.exception))
+            self.assertIn("four non-negative integers", str(raised.exception))
 
 
 class SamplerTest(unittest.TestCase):
@@ -465,17 +520,86 @@ class SamplerTest(unittest.TestCase):
     def ready(self, proc):
         proc.owned_connection()
 
-    def test_query_matches_exact_client_address_and_port_pairs(self):
+    def four_endpoint_sockets(self, proc):
+        """Four PID-owned ESTABLISHED sockets to the configured endpoint with local client ports."""
+        proc.write_net("tcp", tuple(tcp_row(index, LOOPBACK_HEX + ":%04X" % (41000 + index), PG_HEX,
+                                            inode=1000 + index) for index in range(4)))
+        proc.set_links(["socket:[%d]" % (1000 + index) for index in range(4)])
+
+    def test_query_selects_current_database_rows_by_source_application_names(self):
         proc = FakeProc()
-        helper = FakeHelper(rows=("3|1|2|0",))
+        helper = FakeHelper(rows=("1|0|1|0",))
         try:
             self.ready(proc)
             sampler = self.sampler(proc, helper)
             sample = sampler.scan_once()
-            self.assertEqual(sample, {"sessions": 3, "active": 1, "idle": 2, "lock": 0})
-            self.assertIn("(client_addr = '127.0.0.1'::inet AND client_port = 52779)", helper.queries[0])
-            self.assertIn("pg_stat_activity", helper.queries[0])
-            self.assertNotIn("application_name", helper.queries[0])
+            self.assertEqual(sample, {"sessions": 1, "active": 0, "idle": 1, "lock": 0})
+            query = helper.queries[0]
+            self.assertEqual(query, baseline.PG_STAT_QUERY)  # fixed literal, nothing interpolated
+            self.assertIn("FROM pg_stat_activity WHERE datname=current_database() "
+                          "AND application_name IN ('rootyard', 'rootyard-blob-barrier')", query)
+            # The NAT-sensitive client pair never enters SQL or the ownership decision.
+            for fragment in ("client_addr", "client_port", "52779", PG_ADDRESS, str(PG_PORT)):
+                self.assertNotIn(fragment, query)
+        finally:
+            proc.close()
+
+    def test_nat_rewritten_client_addresses_are_accepted_when_counts_agree(self):
+        """Docker host network -> published PG port: server client_addr/ports differ from local ones."""
+        proc = FakeProc()
+        try:
+            self.four_endpoint_sockets(proc)
+            sampler = self.sampler(proc, FakeHelper(rows=("4|2|2|1",)))
+            self.assertEqual(sampler.scan_once(), {"sessions": 4, "active": 2, "idle": 2, "lock": 1})
+            # The PID's local ports are 41000..41003; the server saw other addresses/ports entirely.
+            server_rows = (("172.18.0.1", 55110, "rootyard"), ("172.18.0.1", 55111, "rootyard"),
+                           ("172.18.0.1", 55112, "rootyard"), ("172.18.0.1", 55113, "rootyard-blob-barrier"))
+            self.assertFalse({port for _, port, _ in server_rows} & set(range(41000, 41004)))
+            self.assertTrue(all(application in baseline.SERVICE_APPLICATION_NAMES
+                                for _, _, application in server_rows))
+            self.assertNotIn("client_port", sampler.helper.queries[0])
+        finally:
+            proc.close()
+
+    def test_admin_and_psql_rows_are_not_named_and_never_counted(self):
+        proc = FakeProc()
+        try:
+            self.four_endpoint_sockets(proc)
+            # The server-side tally excludes the runner's psql helper and admin sessions by name: only
+            # the four named sessions are counted even though other rows exist on the database.
+            sampler = self.sampler(proc, FakeHelper(rows=("4|3|1|0",)))
+            self.assertEqual(sampler.scan_once()["sessions"], 4)
+            for other in ("psql", "runner", "postgres"):
+                self.assertNotIn(other, baseline.SERVICE_APPLICATION_NAMES)
+        finally:
+            proc.close()
+
+    def test_zero_named_rows_fail_even_with_owned_sockets(self):
+        proc = FakeProc()
+        try:
+            self.four_endpoint_sockets(proc)
+            sampler = self.sampler(proc, FakeHelper(rows=("0|0|0|0",)))
+            with self.assertRaises(baseline.BaselineError) as raised:
+                sampler.scan_once()
+            self.assertIn("no named PostgreSQL session", str(raised.exception))
+            self.assertTrue(sampler.errors)
+            with self.assertRaises(baseline.BaselineError):
+                sampler.scan_once()  # sticky: never silently skipped
+        finally:
+            proc.close()
+
+    def test_unequal_named_and_owned_counts_fail_closed(self):
+        proc = FakeProc()
+        try:
+            self.four_endpoint_sockets(proc)
+            # Named and owned counts that disagree (fewer named, no named, more named) fail closed.
+            for row, expected in (("3|1|2|0", "differ from the service PID"), ("0|0|0|0", "no named PostgreSQL session"),
+                                  ("2|0|2|0", "differ from the service PID")):
+                sampler = self.sampler(proc, FakeHelper(rows=(row,)))
+                with self.subTest(row=row), self.assertRaises(baseline.BaselineError) as raised:
+                    sampler.scan_once()
+                self.assertIn(expected, str(raised.exception))
+                self.assertEqual(sampler.samples, [])
         finally:
             proc.close()
 
@@ -579,6 +703,8 @@ class SamplerSummaryTest(unittest.TestCase):
         self.assertEqual(value["samples_with_connection"], 2)
         self.assertTrue(value["observed_lower_bound"])
         self.assertIsNone(value["exact_lock_wait_ms"])
+        self.assertIn("application_name IN ('rootyard', 'rootyard-blob-barrier')", value["matched_by"])
+        self.assertIn("never compared with client_addr/client_port", value["matched_by"])
         baseline.validate_summary(value)
 
     def test_zero_owned_sessions_fail(self):
@@ -1100,11 +1226,44 @@ class ReportValidationTest(unittest.TestCase):
         self.assertEqual(payload["cold_clone"]["provider_cache_state"], "unknown")
         self.assertTrue(payload["pg_ownership_samples"]["observed_lower_bound"])
         self.assertFalse(payload["pg_ownership_samples"]["restart_case_sampled"])
+        layers = payload["pg_ownership_samples"]["ownership_layers"]
+        self.assertIn("filter and count", layers["process_sockets"])
+        self.assertIn("'rootyard-blob-barrier'", layers["server_sessions"])
+        self.assertIn("never compared", layers["cross_check"])
         for key in ("opendal_get_bytes", "opendal_get_phase_ms", "exact_lock_wait_ms"):
             self.assertIsNone(payload["unmeasured"][key])
         text = json.dumps(payload)
         for forbidden in ("ROOTYARD_BLOB_ENDPOINT", "bucket", "s3://", "postgres://", PG_ADDRESS + ":"):
             self.assertNotIn(forbidden, text)
+
+    def test_report_version_scope_and_no_four_tuple_claim(self):
+        payload = report_payload()
+        self.assertEqual(baseline.REPORT_VERSION, 2)
+        self.assertEqual(payload["report_version"], 2)
+        ownership = payload["pg_ownership_samples"]
+        for field in ("limits", "limitations"):
+            self.assertEqual(payload[field], baseline.LIMITS)
+        scope = "dedicated baseline PostgreSQL database + harness isolated random schema"
+        scoped = [limit for limit in baseline.LIMITS if scope in limit]
+        self.assertEqual(len(scoped), 2)  # the ownership count and the no-four-tuple scope
+        self.assertIn(scope, ownership["scope"])
+        self.assertIn(scope, baseline.LIMITS[0])  # the single-server host limit names its database scope
+        for text in scoped + [ownership["scope"]]:
+            # Only the disclaiming "never a per-socket four-tuple" wording may mention it.
+            for match in re.finditer(r"four-tuple", text):
+                self.assertTrue(text[max(0, match.start() - 20):match.start()].endswith("never a per-socket "),
+                                text)
+        self.assertIn("no concurrent same-name Rootyard CLI/service", ownership["scope"])
+        self.assertIn("no PostgreSQL pooler or shared database", ownership["scope"])
+        self.assertIn("A pre-start check requires zero named sessions", ownership["scope"])
+        self.assertTrue(ownership["prestart_requires_zero_sessions"])
+        self.assertIs(ownership["per_socket_four_tuple_attribution"], False)
+        self.assertIs(ownership["pid_to_backend_mapping"], False)
+        self.assertIn("dedicated baseline database + isolated random schema", ownership["sql_helper"])
+        self.assertIn("dedicated baseline database + harness isolated random schema",
+                      ownership["ownership_layers"]["server_sessions"])
+        self.assertTrue(any("NAT-rewritten client address/port pairs are never compared or attributed" in limit
+                            for limit in baseline.LIMITS))
 
     def test_report_rejects_inconsistent_measurements(self):
         for index, override in ((1, {"detail": {"push": push(remote_oid="2" * 40)}}),
@@ -1161,130 +1320,6 @@ def report_payload(*, case_list=None, cold_record=None, concurrent=None, setup=N
         cold=cold_record or baseline.validate_cold(cold_fixture()))
 
 
-
-class ClientPairMatchingTest(unittest.TestCase):
-    """Client ports repeat across hosts/containers: only exact address+port pairs may match."""
-
-    def scan(self, *sockets):
-        """sockets: (family, client address hex, client port, peer, inode)."""
-        tables = {"tcp": [], "tcp6": []}
-        for family, local, port, peer, inode in sockets:
-            row = tcp_row(len(tables[family]), local + ":%04X" % port, peer, inode=inode)
-            tables[family].append(baseline.parse_proc_net_tcp(table(row))[0])
-        return tables
-
-    def pairs(self, tables, links, endpoint=PG_ENDPOINT):
-        return baseline.pg_pair_list(links, tables, endpoint)
-
-    def test_equal_ports_on_different_client_addresses_are_distinct(self):
-        # 127.0.0.1:52779 (owned) and 127.0.0.2:52779 (another host) share a port.
-        tables = self.scan(("tcp", "0100007F", 52779, PG_HEX, 1000),
-                           ("tcp", "0200007F", 52779, PG_HEX, 1001))
-        owned = self.pairs(tables, ["socket:[1000]"])
-        self.assertEqual(owned, (("127.0.0.1", 52779),))
-        predicate = baseline.pair_predicate(owned)
-        self.assertEqual(predicate, "((client_addr = '127.0.0.1'::inet AND client_port = 52779))")
-        self.assertNotIn("127.0.0.2", predicate)  # the equal port on another host never matches
-
-    def ipv6_scan(self, client, server="::"):
-        """A tcp6 table: a ``::`` listener on the PG port plus the owned client socket.
-
-        Both endpoints use real kernel encoding (``kernel_inet6``), so the peer
-        decodes to the server address/port the way Linux prints it.
-        """
-        listener = tcp_row(0, kernel_inet6("::") + ":%04X" % PG_PORT, kernel_inet6("::") + ":0000",
-                           state="0A", inode=900)
-        client = tcp_row(1, client + ":%04X" % 41000, kernel_inet6(server) + ":%04X" % PG_PORT, inode=1000)
-        return {"tcp": [], "tcp6": baseline.parse_proc_net_tcp(table(listener, client))}
-
-    def test_ipv6_and_ipv4_mapped_clients_are_canonical(self):
-        mapped = kernel_inet6("::ffff:127.0.0.1")  # as /proc/net/tcp6 prints it: 0000...0000FFFF7F000001
-        v6_server = (["::1"], PG_PORT)
-        self.assertEqual(self.pairs(self.ipv6_scan(LOOPBACK_V6_HEX, server="::1"), ["socket:[1000]"], v6_server),
-                         (("::1", 41000),))
-        self.assertEqual(self.pairs(self.ipv6_scan(mapped, server="::1"), ["socket:[1000]"], v6_server),
-                         (("127.0.0.1", 41000),))  # IPv4-mapped client is reported as IPv4
-        # A configured 127.0.0.1 server is never a ::1 (or ::fff-mapped) peer.
-        self.assertEqual(self.pairs(self.ipv6_scan(LOOPBACK_V6_HEX, server="::1"), ["socket:[1000]"],
-                                    ([PG_ADDRESS], PG_PORT)), ())
-        self.assertEqual(baseline.pair_predicate((("::1", 41000),)),
-                         "((client_addr = '::1'::inet AND client_port = 41000))")
-        # Same port, two client families: two exact pairs, never a shared-port IN list.
-        mixed = baseline.pair_predicate((("::1", 41000), ("127.0.0.1", 41000)))
-        self.assertEqual(mixed, "((client_addr = '127.0.0.1'::inet AND client_port = 41000)"
-                                " OR (client_addr = '::1'::inet AND client_port = 41000))")
-
-    def test_owned_pairs_never_match_cross_pairs(self):
-        # Exactly (A, 1) and (B, 2) are owned; pg_stat_activity rows are simulated by matching.
-        predicate = baseline.pair_predicate((("10.0.0.1", 10001), ("10.0.0.2", 10002)))
-        self.assertEqual(predicate,
-                         "((client_addr = '10.0.0.1'::inet AND client_port = 10001)"
-                         " OR (client_addr = '10.0.0.2'::inet AND client_port = 10002))")
-
-        def matches(address, port):
-            """Evaluate the generated predicate textually, as each cited pair would match."""
-            return ("(client_addr = '" + address + "'::inet AND client_port = " + str(port) + ")") in predicate
-
-        self.assertTrue(matches("10.0.0.1", 10001))    # owned
-        self.assertTrue(matches("10.0.0.2", 10002))    # owned
-        self.assertFalse(matches("10.0.0.1", 10002))   # unowned cross-pair
-        self.assertFalse(matches("10.0.0.2", 10001))   # unowned cross-pair
-        self.assertFalse(matches("10.0.0.3", 10001))   # unowned host
-        self.assertNotIn("client_port IN (", predicate)  # no per-column IN list can re-open cross-pairs
-        self.assertNotIn("client_addr IN (", predicate)
-
-    def test_repeated_pairs_are_deduplicated_and_ordered_deterministically(self):
-        pairs = [("10.0.0.2", 10002), ("10.0.0.1", 10001), ("10.0.0.2", 10002), ("10.0.0.1", 10001)]
-        expected = baseline.pair_predicate([("10.0.0.1", 10001), ("10.0.0.2", 10002)])
-        self.assertEqual(baseline.pair_predicate(pairs), expected)
-        self.assertEqual(baseline.pair_predicate(tuple(reversed(pairs))), expected)
-        self.assertEqual(baseline.pair_predicate([["10.0.0.2", 10002], ["10.0.0.1", 10001]]), expected)
-        # One occurrence per pair, ordered by address then port.
-        self.assertEqual(expected.count("10.0.0.1"), 1)
-        self.assertEqual(expected.count("10.0.0.2"), 1)
-        same_address = baseline.pair_predicate((("10.0.0.1", 20002), ("10.0.0.1", 10001)))
-        self.assertEqual(same_address, "((client_addr = '10.0.0.1'::inet AND client_port = 10001)"
-                                       " OR (client_addr = '10.0.0.1'::inet AND client_port = 20002))")
-
-    def test_generated_sql_is_credential_free(self):
-        predicate = baseline.pair_predicate((("127.0.0.1", 52779), ("::1", 41000)))
-        self.assertNotIn("@", predicate)          # no userinfo / DSN
-        self.assertNotIn("postgres://", predicate)
-        self.assertNotIn("password", predicate.lower())
-        self.assertNotIn("token", predicate.lower())
-        self.assertNotIn(";", predicate)          # exactly one statement, no stacking
-        self.assertNotIn("--", predicate)
-        clause = r"\(client_addr = '[0-9a-f.:]+'::inet AND client_port = [0-9]+\)"
-        self.assertRegex(predicate, r"^\(" + clause + " OR " + clause + r"\)$")
-
-    def test_predicate_rejects_unvalidated_input(self):
-        for pairs in (None, (), [], [("127.0.0.1",)], [("127.0.0.1", "52779")], [("127.0.0.1", 0)],
-                      [("127.0.0.1", 70000)], [("127.0.0.1", True)], [("127.0.0.1; DROP TABLE x", 52779)],
-                      [(" 127.0.0.1", 52779)], [("127.0.0.1') OR (1=1", 52779)], [(None, 52779)]):
-            with self.subTest(pairs=pairs), self.assertRaises(baseline.BaselineError):
-                baseline.pair_predicate(pairs)
-        # Canonicalisation: a non-canonical but valid literal is refused, never rewritten.
-        with self.assertRaises(baseline.BaselineError):
-            baseline.pair_predicate([("127.000.000.001", 52779)])
-        self.assertEqual(baseline.client_address("::ffff:127.0.0.1"), "127.0.0.1")
-        self.assertEqual(baseline.client_address("2001:db8::1"), "2001:db8::1")
-
-    def test_sampler_sql_carries_the_exact_pairs(self):
-        proc = FakeProc()
-        helper = FakeHelper(rows=("1|0|1|0",))
-        try:
-            proc.write_net("tcp", (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),
-                                   tcp_row(1, "0200007F:CE2B", PG_HEX, inode=1001)))
-            sampler = baseline.PgSampler(helper, proc.pid, PG_ENDPOINT, proc=proc.root)
-            self.assertEqual(sampler.scan_once(), {"sessions": 1, "active": 0, "idle": 1, "lock": 0})
-            query = helper.queries[0]
-            self.assertIn("WHERE ((client_addr = '127.0.0.1'::inet AND client_port = 52779))", query)
-            self.assertNotIn("127.0.0.2", query)
-            self.assertNotIn("application_name", query)
-        finally:
-            proc.close()
-
-
 class FakeRunHarness(FakeGitHarness):
     """End-to-end fake of the orchestration: every step recorded in wall-clock order."""
 
@@ -1302,12 +1337,18 @@ class FakeRunHarness(FakeGitHarness):
         self.env = {"ROOTYARD_BLOB_ENDPOINT": "http://127.0.0.1:1", "ROOTYARD_BLOB_SECRET_ACCESS_KEY": "fake-secret"}
         self.sql_answers = {"SELECT current_setting('port')": str(PG_PORT),
                             "SHOW server_version": "17.1"}
+        # Every pre-start session check sees an empty database unless a test injects sessions.
+        self.session_rows = ["0|0|0|0"]
+        self.start_method = self.start  # the original, un-wrapped method
 
     def note(self, event):
         self.events.append(event)
 
     def prepare(self):
         self.note("prepare")
+        # Mirrors the real setup: schema migration and account CLI steps, then the first start.
+        self.note("schema migration")
+        self.start()
 
     def create(self, name, token, object_format="sha1"):
         self.note("POST /api/repos")
@@ -1349,6 +1390,9 @@ class FakeRunHarness(FakeGitHarness):
         return baseline.run_push(self, remote, work, files)
 
     def sql(self, query):
+        if query == baseline.PG_STAT_QUERY:
+            self.note("prestart check")
+            return self.session_rows.pop(0) if len(self.session_rows) > 1 else self.session_rows[0]
         self.note("sql")
         for prefix, answer in self.sql_answers.items():
             if query.startswith(prefix):
@@ -1397,9 +1441,11 @@ class RunOrchestrationTest(unittest.TestCase):
         self.args.report = Path(tempfile.mkdtemp(prefix="blob-baseline-report-")) / "report.json"
         FakeSampler.instances = []
 
-    def run_once(self, restart_changes_pid=True):
+    def run_once(self, restart_changes_pid=True, session_rows=None):
         files = baseline.select_workload()
         harness = FakeRunHarness(files, restart_changes_pid=restart_changes_pid)
+        if session_rows is not None:
+            harness.session_rows = list(session_rows)
         profile = mock.Mock(working_tree_clean=True, build={"binary_sha256": "a" * 64,
                                                             "source_inputs_sha256": "b" * 64,
                                                             "workspace_commit": "c" * 40, "rustc": "rustc 1"},
@@ -1449,11 +1495,63 @@ class RunOrchestrationTest(unittest.TestCase):
         self.assertIsNone(restart["pg_samples"])
         sampled_pids = [sampler.pid for sampler in FakeSampler.instances if sampler.calls]
         self.assertEqual(len(sampled_pids), 4)            # every case except the restart
-        self.assertEqual(sampled_pids, [500, 500, 500, 501])
+        # prepare now runs the first start (501); the restart creates 502.
+        self.assertEqual(sampled_pids, [501, 501, 501, 502])
         self.assertTrue(all(sampler.finished for sampler in FakeSampler.instances))
         # Old-process sampling is finished strictly before the stop.
-        self.assertIn("stop 500", harness.events)
+        self.assertIn("stop 501", harness.events)
         self.assertEqual([case["service_epoch"] for case in captured["cases"]], [0, 0, 0, 1, 1])
+
+    def test_prestart_session_checks_bracket_every_start(self):
+        code, harness, report, _ = self.run_once()
+        self.assertEqual(code, 0, report.get("error"))
+        events = harness.events
+        starts = [index for index, event in enumerate(events)
+                  if event in ("start from 500", "start from 501")]
+        checks = [index for index, event in enumerate(events) if event == "prestart check"]
+        # Before setup, right after setup's migration and immediately before the first start
+        # (500), then after the SIGTERM stop (501) and immediately before the restart's start.
+        self.assertEqual(starts, [events.index("start from 500"), events.index("start from 501")])
+        self.assertEqual(len(checks), 3)
+        self.assertLess(checks[0], events.index("prepare"))
+        self.assertLess(events.index("schema migration"), checks[1])
+        self.assertEqual(checks[1] + 1, starts[0])
+        self.assertLess(events.index("stop 501"), checks[2])
+        self.assertEqual(checks[2] + 1, starts[1])
+        self.assertEqual(harness.start, harness.start_method)  # the wrapper is always restored
+
+    def test_existing_sessions_fail_before_the_first_start(self):
+        # The initial check is zero; the injected row is the next check, i.e. the one
+        # immediately before the first start, which blocks the start before it runs.
+        code, harness, report, _ = self.run_once(session_rows=["0|0|0|0", "2|1|1|0"])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("service sessions already exist before a service start: 2", report["error"])
+        self.assertEqual(harness.events, ["prestart check", "prepare", "schema migration", "prestart check"])
+        self.assertEqual(harness.start, harness.start_method)  # restored by prepare's finally
+        self.assertFalse(any(event.startswith("start from ") for event in harness.events))
+
+    def test_stale_session_after_setup_start_is_checked_before_start(self):
+        # A named session already present after setup's migration is caught right before start() runs.
+        code, harness, report, _ = self.run_once(session_rows=["0|0|0|0", "1|0|1|0", "0|0|0|0", "0|0|0|0"])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("service sessions already exist before a service start: 1", report["error"])
+        self.assertEqual(harness.start, harness.start_method)  # restored through prepare's finally
+
+    def test_session_left_after_stop_blocks_the_restart(self):
+        # The initial check and the check before the first start see zero;
+        # the check right after the stop sees two and blocks the restart's start.
+        code, harness, report, _ = self.run_once(session_rows=["0|0|0|0", "0|0|0|0", "2|1|1|0"])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("service sessions already exist before a service start: 2", report["error"])
+        events = harness.events
+        self.assertEqual([event for event in events if event.startswith("start from ")], ["start from 500"])
+        self.assertIn("stop 501", events)
+        # The gate sits between the SIGTERM stop and the restart's start.
+        self.assertEqual(events[events.index("stop 501") + 1], "prestart check")
+        self.assertNotIn("clone cold-clone", events)
 
     def test_same_pid_after_restart_fails_the_run(self):
         code, _, report, _ = self.run_once(restart_changes_pid=False)
