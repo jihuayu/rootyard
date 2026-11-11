@@ -34,7 +34,8 @@ pub(super) async fn run(script: &Path, config: &Path, log: &Path) -> Result<Valu
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(stderr));
+        .stderr(Stdio::from(stderr))
+        .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(BROWSER_SECONDS), command.output())
         .await
         .map_err(|_| anyhow!("the headless Chromium run exceeded its bound"))??;
