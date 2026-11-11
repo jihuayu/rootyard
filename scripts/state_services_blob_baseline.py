@@ -51,16 +51,25 @@ setup      schema migration, fixture accounts and serve-blob start/readiness.
 
 Every clone is issued exactly once; its working tree is then checked in place
 (HEAD, object format, exact file bytes) and ``git fsck --full --strict`` runs
-after the timer stops. For each sampled case the runner reads PostgreSQL every
+after the timer stops. Before the first serve-blob start (once before setup and
+again right after setup's schema migration and account CLI steps, checked inside
+a temporary ``harness.start`` wrapper that is restored in ``finally``) and right
+before the restart's start, the same fixed SQL must report zero named sessions;
+any existing session fails closed. For each sampled case the runner reads PostgreSQL every
 250 ms for sessions owned by the actual service process: only sockets held by
-that process (``/proc/<pid>/fd``) whose remote endpoint is the configured
-database address and port (resolved once) are used, and each such socket's
-exact client address AND port pair (never the port alone, which repeats across
-client hosts and containers) selects its ``pg_stat_activity`` row to count
-sessions, active and Lock waiters. Counts are observed lower bounds on a fixed grid, reset per
-process and never differenced across the restart; short lock waits can be
-missed and exact lock-wait milliseconds are never invented. A sampling error
-fails the run.
+that process (``/proc/<pid>/fd`` socket inodes joined with its own
+``/proc/<pid>/net/tcp{,6}``, ESTABLISHED only) whose remote endpoint is the
+configured database address and DSN port (resolved once) are counted.
+``pg_stat_activity`` rows are selected by the current test database and the two
+application names the current Rust sources set for serve-blob (``rootyard``
+pool and ``rootyard-blob-barrier``); sessions, active, idle and Lock waiters
+come from those rows only. Every sample must see that count equal (and
+nonzero) to the PID's own endpoint socket count. Client address and port are
+never compared: NAT or a Docker host port publication rewrites them between
+the host and the server. Counts are observed lower bounds on a fixed grid,
+reset per process and never differenced across the restart; short lock waits
+can be missed and exact lock-wait milliseconds are never invented. A sampling
+error fails the run.
 
 Cold means a process-local materialized view after that restart only; the
 backing object-store/provider cache state is unknown and was not observed.
@@ -100,7 +109,7 @@ import blob_only_service as serving  # noqa: E402
 import ops_provenance  # noqa: E402
 
 KIND = "rootyard/state-services-blob-baseline"
-REPORT_VERSION = 1
+REPORT_VERSION = 2
 MEASURED_PROFILE = "blob-only-serve-blob-fresh-install"
 WORKLOAD_VERSION = 1
 SAMPLE_INTERVAL_SECONDS = 0.25
@@ -119,15 +128,28 @@ WORKER_REPOSITORIES = (REPOSITORY_NAME,) * CONCURRENCY
 CASE_ORDER = ("provision", "seed_push", "concurrent_read_clones", "restart", "cold_clone")
 PUSH_REF = "refs/heads/main"
 REQUIRED_TOOLS = ("psql", "hostname")
-# Every owned session is matched by its exact client address AND port: client
-# ports repeat across client hosts/containers, so a port-only filter would
-# count unrelated sessions. Rendered by ``pair_predicate`` as an exact
-# per-pair disjunction from validated numeric IP strings and integer ports only.
+# The service sessions are identified, never by client address/port (NAT
+# rewrites both), by rows in the current test database whose application_name
+# is one of the two identities the Rust sources set: ``src/db.rs`` sets the
+# application pool to ``rootyard`` and ``src/standalone.rs`` sets the held
+# lifecycle barrier session to ``rootyard-blob-barrier``. Runner/psql helper
+# and admin connections carry neither name. The literal SQL below is fixed.
 PG_STAT_QUERY = ("SELECT count(*),"
                  "count(*) FILTER (WHERE state='active'),"
                  "count(*) FILTER (WHERE state='idle'),"
                  "count(*) FILTER (WHERE wait_event_type='Lock') "
-                 "FROM pg_stat_activity WHERE %s")
+                 "FROM pg_stat_activity WHERE datname=current_database() "
+                 "AND application_name IN ('rootyard', 'rootyard-blob-barrier')")
+# The identities ``PG_STAT_QUERY`` selects, as named by the current Rust sources.
+SERVICE_APPLICATION_NAMES = ("rootyard", "rootyard-blob-barrier")
+# Why the ownership samples mean anything: one dedicated baseline database, one
+# isolated random schema, and no other Rootyard CLI/service or pooler/shared
+# database touching named sessions. Never a per-socket four-tuple claim.
+PG_OWNERSHIP_SCOPE = ("Issue106 lane dedicated baseline PostgreSQL database + harness isolated random schema; "
+                      "requires no concurrent same-name Rootyard CLI/service on that database and no PostgreSQL "
+                      "pooler or shared database. A pre-start check requires zero named sessions and every sample "
+                      "requires the named session count to equal the service PID's endpoint socket count (nonzero), "
+                      "so an extra same-name session is rejected.")
 # The fixed seed workload: exactly MAX_PAYLOAD_BYTES of deterministic bytes.
 # Kept as an invariable map so the independent worker repositories receive
 # byte-identical copies and their commits are reproducible.
@@ -151,12 +173,17 @@ COLD_SEMANTICS = ("cold = process-local materialized view after this run's grace
                   "state is unknown and was not observed; this is not provider-cold.")
 LIMITS = [
     "One loopback HTTP origin, one PostgreSQL server and one configured OpenDAL S3 provider on one host; no HA, "
-    "multi-host, physical durability or production-latency claim.",
+    "multi-host, physical durability or production-latency claim. PostgreSQL scope: " + PG_OWNERSHIP_SCOPE,
     "The restart is a SIGTERM to this harness's own serve-blob process group; kernel/power-loss behavior is not tested.",
     "Concurrent workers are independent-repository read clones, not independent-ref pushes; the concurrent "
     "receive-pack write path is not measured.",
-    "PostgreSQL counts are 250 ms point samples of sessions owned by the service process: observed lower bounds "
-    "only; short waits can be missed and exact lock-wait milliseconds are unmeasured.",
+    "PostgreSQL counts are 250 ms point samples of current-database sessions named by the serve-blob sources "
+    "(application_name 'rootyard'/'rootyard-blob-barrier'), cross-checked against the service PID's own "
+    "ESTABLISHED sockets to the configured database endpoint: observed lower bounds only; short waits can be "
+    "missed and exact lock-wait milliseconds are unmeasured. Scope: " + PG_OWNERSHIP_SCOPE,
+    "The scope is a COUNT of named sessions and of PID-owned sockets (count equality per sample): it is never "
+    "a per-socket four-tuple or PID-to-backend mapping, and NAT-rewritten client address/port pairs are never "
+    "compared or attributed.",
     "OpenDAL GET byte/phase metrics are unmeasured: the current service exposes no such counters to this runner.",
     COLD_SEMANTICS,
     "Workload is one small deterministic repository bounded to 256 KiB plus three identical read-only "
@@ -731,55 +758,32 @@ def client_address(address):
     return str(value)
 
 
-def pg_pair_list(fd_links, tcp_tables, pg_endpoint):
-    """Sorted, de-duplicated ``((address, port), ...)`` of owned database sockets."""
+def pg_endpoint_sockets(fd_links, tcp_tables, pg_endpoint):
+    """Endpoint identities of the service PID's own ESTABLISHED sockets to the configured database.
+
+    Returns a sorted list of ``(family, remote_address, remote_port)`` with exact
+    multiplicity: only socket inodes referenced by the process's own fd links are
+    considered, only ESTABLISHED rows whose remote port is the client-configured
+    DSN port and whose remote address is one of the resolved endpoint addresses.
+    Local address/port are never used, so a rewritten NAT client address/port
+    cannot drop an owned socket.
+    """
     addresses, dsn_port = validate_pg_endpoint(pg_endpoint)
     targets = set(addresses)
     owned = parse_fd_links(fd_links)
     if not owned:
-        return ()
+        return []
     entries = [entry for entries in tcp_tables.values() for entry in entries]
-    pairs = set()
+    sockets = []
     for entry in entries:
         if entry["inode"] not in owned or entry["state"] != CONNECTION_ESTABLISHED:
             continue
         # Match the client-configured DSN destination port (host/NAT may differ from the server's listen port).
         if entry["peer_port"] == dsn_port and entry["peer_address"] in targets:
-            pairs.add((client_address(entry["local_address"]), int(entry["local_port"])))
-    return tuple(sorted(pairs))
-
-
-def pair_predicate(pairs):
-    """Exact ``(client_addr, client_port)`` disjunction, e.g.
-    ``((client_addr = 'A'::inet AND client_port = 1) OR (client_addr = 'B'::inet AND client_port = 2))``.
-
-    Only whole owned pairs can match: (A, 1) and (B, 2) never admit the
-    unowned cross-pairs (A, 2) or (B, 1), which a per-column ``IN`` list would.
-    Each address must re-validate as a canonical IP literal and each port must
-    be an integer in range, so only digits, dots, colons and SQL keywords can
-    reach the statement; nothing from the environment or a socket string is
-    interpolated unchecked. Pairs are de-duplicated and ordered
-    deterministically by address, then port.
-    """
-    need(isinstance(pairs, (list, tuple)) and pairs, "no client pairs to match")
-    owned = set()
-    for pair in pairs:
-        need(isinstance(pair, (list, tuple)) and len(pair) == 2, "client pair is malformed")
-        address, port = pair
-        need(isinstance(address, str) and address, "client address is missing")
-        try:
-            parsed = ipaddress.ip_address(address)
-        except ValueError:
-            raise BaselineError("client address is not an IP literal") from None
-        need(str(parsed) == address, "client address is not a canonical IP literal")
-        need(isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536,
-             "client port is not a valid integer port")
-        owned.add((address, port))
-    clauses = ["(client_addr = '" + address + "'::inet AND client_port = " + str(port) + ")"
-               for address, port in sorted(owned, key=lambda pair: (ipaddress.ip_address(pair[0]).version,
-                                                                    ipaddress.ip_address(pair[0]).packed,
-                                                                    pair[1]))]
-    return "(" + " OR ".join(clauses) + ")"
+            sockets.append((entry["family"], entry["peer_address"], int(entry["peer_port"])))
+    # Multiplicity is kept: every owned ESTABLISHED endpoint socket must be
+    # accounted for by exactly one named server-side session.
+    return sorted(sockets)
 
 
 def resolve_pg_endpoint(db_url, resolver=None):
@@ -787,8 +791,7 @@ def resolve_pg_endpoint(db_url, resolver=None):
 
     The hostname is resolved exactly once through ``socket.getaddrinfo`` (no
     second lookup inside ``psql``) and every result must be a supported IPv4 or
-    IPv6 TCP endpoint; anything else fails closed with an address-free message.
-    """
+    IPv6 TCP endpoint; anything else fails closed with an address-free message."""
     need(isinstance(db_url, str) and db_url, "the database URL is missing")
     parts = urllib.parse.urlsplit(db_url)
     if parts.scheme not in ("postgres", "postgresql"):
@@ -846,6 +849,22 @@ def validate_pg_endpoint(endpoint):
     return mapped, port
 
 
+def count_consistency(owned, named):
+    """The service PID's endpoint socket count versus the named current-database sessions.
+
+    Both sides are validated and the sample fails closed when the named count is
+    zero or differs from the owned socket count: a mismatch means an owned
+    socket has no server-side session of the declared identity (or the reverse),
+    so neither side alone can claim ownership.
+    """
+    for name, value in (("owned service endpoint sockets", owned), ("named service sessions", named)):
+        need(isinstance(value, int) and not isinstance(value, bool) and value >= 0, name + " count is invalid")
+    need(named > 0, "the service owns no named PostgreSQL session in the current database")
+    need(named == owned, "named service sessions (" + str(named) + ") differ from the service PID's owned "
+                         "database endpoint sockets (" + str(owned) + ")")
+    return owned
+
+
 def sample_row(sessions, active, idle, lock):
     """One validated point sample of service-owned PostgreSQL sessions."""
     for name, value in (("sessions", sessions), ("active", active), ("idle", idle), ("lock", lock)):
@@ -853,6 +872,34 @@ def sample_row(sessions, active, idle, lock):
     need(active + idle <= sessions, "active+idle exceeds sampled sessions")
     need(lock <= sessions, "lock waiters exceed sampled sessions")
     return {"sessions": sessions, "active": active, "idle": idle, "lock": lock}
+
+
+def parse_session_count(row):
+    """The named current-database session count of one ``PG_STAT_QUERY`` row.
+
+    The row must carry exactly four non-negative integer fields (the query
+    never returns NULL: ``count(*)`` and its FILTERs are 0 for an empty grid).
+    Anything else fails closed with a fixed message that never echoes the row.
+    """
+    need(isinstance(row, str), "the session check row must carry four non-negative integers")
+    text = row.strip()
+    values = text.split("|")
+    need(len(values) == 4 and all(_decimal(part.strip()) for part in values),
+         "the session check row must carry four non-negative integers")
+    return int(values[0].strip())
+
+
+def require_no_service_sessions(harness):
+    """Fail closed unless no serve-blob session exists before a service start.
+
+    Calls the fixed literal ``PG_STAT_QUERY`` through the harness's isolated
+    helper and requires the sessions column to be zero. The error is fixed
+    text: no row content is echoed.
+    """
+    row = harness.sql(PG_STAT_QUERY)
+    sessions = parse_session_count(row)
+    need(sessions == 0, "service sessions already exist before a service start: " + str(sessions))
+    return sessions
 
 
 def summarize_samples(samples, *, scans_without_connection, interval=SAMPLE_INTERVAL_SECONDS):
@@ -878,10 +925,15 @@ def summarize_samples(samples, *, scans_without_connection, interval=SAMPLE_INTE
         "exact_lock_wait_ms": None,
         "interval_seconds": interval,
         "errors": [],
-        "matched_by": "service /proc/<pid>/fd socket inodes joined with /proc/<pid>/net/tcp{,6} peers whose "
-                      "remote address:port is the configured database endpoint; pg_stat_activity is matched by "
-                      "the exact (client_addr, client_port) pair, never by client_port alone",
-        "sql_helper": "BlobOnlyHarness.sql (isolated random schema)",
+        "matched_by": "two-layer ownership: PID-owned sockets (service /proc/<pid>/fd inodes joined with "
+                      "/proc/<pid>/net/tcp{,6}, ESTABLISHED only) whose remote address and DSN port hit the "
+                      "configured database endpoint are filtered and counted only; pg_stat_activity rows in the "
+                      "current database are identified by the source-defined application_name IN "
+                      "('rootyard', 'rootyard-blob-barrier'), and every sample requires that named count to "
+                      "equal the PID's endpoint socket count (nonzero); local socket address:port is never "
+                      "compared with client_addr/client_port, which NAT rewrites",
+        "sql_helper": "BlobOnlyHarness.sql against the dedicated baseline database in the harness isolated "
+                      "random schema (no pooler, no shared database)",
         "note": "observed lower bounds; waits shorter than one sampling interval can be missed; "
                 "no exact lock-wait milliseconds are derived",
     }
@@ -892,11 +944,13 @@ class ScanFailure(BaselineError):
 
 
 class PgPortIndex:
-    """Derive the service process's own PostgreSQL client address:port pairs.
+    """Count the service process's own ESTABLISHED sockets to the configured database endpoint.
 
-    No service session is ever looked up by application name: a session counts
-    only if its exact client address and port are backed by a socket descriptor
-    the sampled process itself holds and whose peer is the configured database.
+    This side is a kernel ownership filter and count only: a socket counts only
+    if its inode is held by the sampled process and its peer is the configured
+    database endpoint. It never claims which server session a socket became;
+    that is established on the server side by application_name and cross-checked
+    by count equality.
     """
 
     def __init__(self, pid, pg_endpoint, *, proc=Path("/proc")):
@@ -904,7 +958,7 @@ class PgPortIndex:
         self.pg_endpoint = validate_pg_endpoint(pg_endpoint)
         self.pid = pid
         self.proc = Path(proc)
-        self.tcp, self.fd_links, self.pairs = self._scan()
+        self.tcp, self.fd_links, self.sockets = self._scan()
 
     def _tables(self):
         tables = {}
@@ -935,14 +989,19 @@ class PgPortIndex:
     def _scan(self):
         tables, links = self._tables(), self._fd_links()
         try:
-            pairs = pg_pair_list(links, tables, self.pg_endpoint)
+            sockets = pg_endpoint_sockets(links, tables, self.pg_endpoint)
         except ValueError as error:
             raise ScanFailure("service socket scan is malformed: " + str(error)) from None
-        return tables, links, pairs
+        return tables, links, sockets
+
+    @property
+    def count(self):
+        """Number of the process's own ESTABLISHED sockets to the configured database endpoint."""
+        return len(self.sockets)
 
     def rescan(self):
-        self.tcp, self.fd_links, self.pairs = self._scan()
-        return self.pairs
+        self.tcp, self.fd_links, self.sockets = self._scan()
+        return self.count
 
 
 class PgSampler:
@@ -960,24 +1019,27 @@ class PgSampler:
         self._thread = None
         self._failing = False
 
-    def query(self, pairs):
-        predicate = pair_predicate(pairs)
-        need(predicate is not None, "no owned client address:port pair to match")
-        return self.helper.sql(PG_STAT_QUERY % predicate)
+    def query(self):
+        """Count current-database sessions carrying a serve-blob application_name (fixed literal SQL)."""
+        return self.helper.sql(PG_STAT_QUERY)
 
     def scan_once(self):
         """One sample. Scan or SQL errors are recorded and raised: they are never skipped."""
         if self._failing:
             raise BaselineError("PostgreSQL sampler already failed: " + self.errors[0])
         try:
-            pairs = self.scanner.rescan()
-            if not pairs:
+            owned = self.scanner.rescan()
+            if not owned:
                 self.scans_without_connection += 1
                 return None
-            values = self.query(pairs).split("|")
+            values = self.query().split("|")
             need(len(values) == 4 and all(part.strip().isdigit() for part in values),
                  "sampled row has the wrong shape")
-            sample = sample_row(*[int(part) for part in values])
+            sessions, active, idle, lock = [int(part) for part in values]
+            # Cross-check kernel ownership against the server-side identity: the
+            # named current-database session count must equal, and be nonzero.
+            count_consistency(owned, sessions)
+            sample = sample_row(sessions, active, idle, lock)
         except BaselineError as error:
             message = self.helper.redact(str(error))
             self._failing = True
@@ -1330,11 +1392,34 @@ def report_payload(*, binding, blob_profile, runtime, workload, cases, setup, se
                             "provider_cache_state": "unknown", "provider_cache_observed": False,
                             "scratch_empty_before_read": True, "scratch_empty_after_read": True},
         "pg_ownership_samples": {
-            "procedure": "sessions owned by the actual serve-blob process: exact live TCP client address:port "
-                         "pairs from /proc/<pid>/fd and /proc/<pid>/net/tcp{,6} whose remote endpoint is the "
-                         "configured database address and port; pg_stat_activity is matched by each pair's "
-                         "client_addr AND client_port (never by client_port alone), read through the isolated "
-                         "psql helper",
+            "ownership_layers": {
+                "process_sockets": "kernel ownership: ESTABLISHED sockets of socket inodes held by the service "
+                                   "PID (/proc/<pid>/fd) in its own /proc/<pid>/net/tcp{,6} whose remote "
+                                   "address and DSN-configured port are the resolved database endpoint; used "
+                                   "only to filter and count the configured database endpoint",
+                "server_sessions": "server identity: pg_stat_activity rows of the current test database with "
+                                   "application_name IN ('rootyard', 'rootyard-blob-barrier'), the application "
+                                   "pool and lifecycle barrier names set by the current Rust sources; runner "
+                                   "and psql helper connections are not counted; scope: dedicated baseline "
+                                   "database + harness isolated random schema, no pooler/shared database",
+                "cross_check": "each sample requires the named session count to be nonzero and exactly equal "
+                               "to the PID's ESTABLISHED endpoint socket count; client_addr/client_port are "
+                               "never compared with local socket address:port because NAT or a published "
+                               "port rewrites them; additional same-name sessions break the equality and are "
+                               "rejected (count only, never a per-socket four-tuple or PID mapping)",
+            },
+            "procedure": "two-layer ownership per sample: filter/count the service PID's own ESTABLISHED sockets "
+                         "to the configured database endpoint from /proc/<pid>/fd and /proc/<pid>/net/tcp{,6}, "
+                         "then count current-database pg_stat_activity sessions by the source-defined "
+                         "application_name names and require zero-free count equality, read through the "
+                         "isolated psql helper; before the first start (after setup migrations/accounts) and "
+                         "before the restart's start, the same fixed SQL must return zero named sessions",
+            "scope": PG_OWNERSHIP_SCOPE,
+            "sql_helper": "BlobOnlyHarness.sql (dedicated baseline database + isolated random schema; fixed literal "
+                          "PG_STAT_QUERY, no pooler, no shared database)",
+            "prestart_requires_zero_sessions": True,
+            "per_socket_four_tuple_attribution": False,
+            "pid_to_backend_mapping": False,
             "reset_per_process": True, "differenced_across_processes": False, "exact_lock_wait_ms": None,
             "per_case": True, "observed_lower_bound": True, "restart_case_sampled": False,
             "configured_database_endpoint_reported": False,
@@ -1403,9 +1488,22 @@ def run(args, profile, blob_profile):
                           "detail": value})
             return value
 
-        # Setup starts serve-blob before any sampled case runs.
+        # Setup starts serve-blob before any sampled case runs. No serve-blob session may
+        # exist before the very first start, neither before setup nor after its
+        # schema migration and account CLI steps (checked immediately before start).
+        require_no_service_sessions(harness)
         begin = time.monotonic()
-        harness.prepare()
+        original_start = harness.start
+
+        def checked_start(*args, **kwargs):
+            require_no_service_sessions(harness)
+            return original_start(*args, **kwargs)
+
+        harness.start = checked_start
+        try:
+            harness.prepare()
+        finally:
+            harness.start = original_start
         need(harness.proc is not None and harness.proc.poll() is None, "serve-blob is not running after setup")
         setup = {"seconds": time.monotonic() - begin, "ordered_before": "provision",
                  "service_running_before_provision": True}
@@ -1445,9 +1543,11 @@ def run(args, profile, blob_profile):
         concurrent_record = sampled("concurrent_read_clones", concurrent_batch)
 
         # 4. Restart: all old-process sampling is finished before the stop; not a sampled case.
+        # The new process may only start once the stopped one left no named session.
         pid_before = harness.proc.pid
         begin = time.monotonic()
         harness.stop()
+        require_no_service_sessions(harness)
         harness.start()
         restart_seconds = time.monotonic() - begin
         need(harness.proc.pid != pid_before, "restart did not create a new service process")
