@@ -130,6 +130,7 @@ pub async fn degrade_or_recover_repo(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     let mutation = super::locks::exclusive(&state, access.repo_id).await?;
+    transitions::reject_any_pending(&tx, access.repo_id).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let repo_gen: i64 = tx
         .query_one("SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id])

@@ -3,12 +3,15 @@ use crate::{
     AppState, Error, auth, db::Identity,
     sharding::{
         faults, fencing::write_volume_marker_at, local_fence, locks,
-        models::{REPO_ROUTE_FIELDS, RepoShardRoute, VolumeFenceMarker, conflict, unix_now},
+        models::{REPO_ROUTE_FIELDS, RepoShardRoute, VolumeFenceMarker, conflict},
     },
 };
 use deadpool_postgres::Transaction;
 use serde_json::Value;
 use uuid::Uuid;
+
+mod proofs;
+use proofs::{restored_live_marker, validate_committed};
 
 pub async fn stage(
     tx: &Transaction<'_>,
@@ -89,171 +92,14 @@ async fn load_route(
     Ok((RepoShardRoute::row(&row), row.get(19)))
 }
 
-fn valid_marker_shape(marker: &VolumeFenceMarker) -> bool {
-    marker.version == 1 && marker.route_epoch > 0 && marker.fencing_token >= marker.route_epoch
-        && marker.fenced_epoch >= 0 && marker.storage_generation > 0
-}
-
-/// A promotion that rolled back leaves the source marker read-only even though PostgreSQL
-/// still names it primary. Restore it from the committed route before admitting writers.
-fn rolled_back_marker(
-    route: &RepoShardRoute,
-    repo_generation: i64,
-    marker: &VolumeFenceMarker,
-) -> Option<VolumeFenceMarker> {
-    (valid_marker_shape(marker)
-        && marker.repository_id == route.repository_id
-        && marker.read_only_degraded
-        && marker.primary_node_id == route.primary_node_id
-        && marker.fenced_node_id.as_deref() == Some(marker.primary_node_id.as_str())
-        && route.route_epoch < marker.route_epoch)
-        .then(|| {
-            VolumeFenceMarker::from_route(
-                route, repo_generation.max(route.required_generation), None, unix_now(),
-            )
-        })
-}
-
-async fn proven_source_retirement(
-    client: &tokio_postgres::Client,
-    route_if_same_epoch: Option<&str>,
-    marker: &VolumeFenceMarker,
-) -> Result<bool, Error> {
-    if marker.route_epoch <= 1 || marker.fenced_epoch != marker.route_epoch - 1 {
-        return Ok(false);
-    }
-    let replicated = client
-        .query_opt(
-            "SELECT id FROM shard_replication_operations WHERE repository_id=$1 \
-             AND source_node_id=$2 AND ($3::text IS NULL OR target_node_id=$3) \
-             AND source_route_epoch=$4 AND source_generation <= $5 AND state='completed' LIMIT 1",
-            &[&marker.repository_id, &marker.primary_node_id, &route_if_same_epoch,
-              &(marker.route_epoch - 1), &marker.storage_generation],
-        )
-        .await
-        .map_err(Error::internal)?
-        .is_some();
-    if replicated {
-        return Ok(true);
-    }
-    let promoted = client
-        .query_opt(
-            "SELECT id FROM shard_failover_operations WHERE repository_id=$1 \
-             AND old_primary_node_id=$2 AND ($3::text IS NULL OR new_primary_node_id=$3) \
-             AND new_route_epoch=$4 AND fencing_token=$5 AND storage_generation=$6 \
-             AND state='promoted' LIMIT 1",
-            &[&marker.repository_id, &marker.primary_node_id, &route_if_same_epoch,
-              &marker.route_epoch, &marker.fencing_token, &marker.storage_generation],
-        )
-        .await
-        .map_err(Error::internal)?
-        .is_some();
-    Ok(promoted)
-}
-
-async fn proven_return_to_primary(
-    client: &tokio_postgres::Client,
-    marker: &VolumeFenceMarker,
-    route: &RepoShardRoute,
-) -> Result<bool, Error> {
-    let failed_back = client
-        .query_opt(
-            "SELECT id FROM shard_failover_operations WHERE repository_id=$1 \
-             AND new_primary_node_id=$2 AND new_route_epoch > $3 AND new_route_epoch <= $4 \
-             AND state='promoted' LIMIT 1",
-            &[&marker.repository_id, &route.primary_node_id, &marker.route_epoch, &route.route_epoch],
-        )
-        .await
-        .map_err(Error::internal)?
-        .is_some();
-    if failed_back {
-        return Ok(true);
-    }
-    let replicated_back = client
-        .query_opt(
-            "SELECT id FROM shard_replication_operations WHERE repository_id=$1 \
-             AND target_node_id=$2 AND source_route_epoch >= $3 AND source_route_epoch < $4 \
-             AND state='completed' LIMIT 1",
-            &[&marker.repository_id, &route.primary_node_id, &marker.route_epoch, &route.route_epoch],
-        )
-        .await
-        .map_err(Error::internal)?
-        .is_some();
-    Ok(replicated_back)
-}
-
-async fn restored_live_marker(
-    client: &tokio_postgres::Client,
-    route: &RepoShardRoute,
-    repo_generation: i64,
-    marker: &VolumeFenceMarker,
-) -> Result<Option<VolumeFenceMarker>, Error> {
-    if !valid_marker_shape(marker) {
-        return Ok(None);
-    }
-    if let Some(restored) = rolled_back_marker(route, repo_generation, marker) {
-        return Ok(Some(restored));
-    }
-    let eff_gen = repo_generation.max(route.required_generation);
-    let returned = marker.repository_id == route.repository_id
-        && marker.read_only_degraded
-        && marker.primary_node_id == route.primary_node_id
-        && marker.fenced_node_id.as_deref() == Some(marker.primary_node_id.as_str())
-        && !route.read_only_degraded
-        && route.route_epoch > marker.route_epoch
-        && route.fencing_token >= marker.fencing_token
-        && route.fenced_epoch >= marker.fenced_epoch
-        && eff_gen >= marker.storage_generation
-        && proven_source_retirement(client, None, marker).await?
-        && proven_return_to_primary(client, marker, route).await?;
-    Ok(returned.then(|| VolumeFenceMarker::from_route(route, eff_gen, None, unix_now())))
-}
-
-async fn validate_committed(
-    client: &tokio_postgres::Client,
-    route: &RepoShardRoute,
-    repo_generation: i64,
-    marker: &VolumeFenceMarker,
-) -> Result<(), Error> {
-    if !valid_marker_shape(marker) {
-        return Err(conflict("shard marker transition has an invalid shape"));
-    }
-    if marker.repository_id != route.repository_id {
-        return Err(conflict("shard marker transition repository mismatch"));
-    }
-    let eff_gen = repo_generation.max(route.required_generation);
-    let current = route.primary_node_id == marker.primary_node_id
-        && route.read_only_degraded == marker.read_only_degraded;
-    if current {
-        return if route.route_epoch == marker.route_epoch
-            && route.fencing_token == marker.fencing_token
-            && route.fenced_epoch == marker.fenced_epoch
-            && eff_gen == marker.storage_generation
-        { Ok(()) } else {
-            Err(conflict("shard marker transition differs from committed route; writes blocked"))
-        };
-    }
-    let retired_source = marker.read_only_degraded
-        && marker.primary_node_id != route.primary_node_id
-        && marker.fenced_node_id.as_deref() == Some(marker.primary_node_id.as_str());
-    if !retired_source
-        || route.route_epoch < marker.route_epoch
-        || route.fencing_token < marker.fencing_token
-        || route.fenced_epoch < marker.fenced_epoch
-        || eff_gen < marker.storage_generation
-    {
-        return Err(conflict("shard marker transition differs from committed route; writes blocked"));
-    }
-    if route.route_epoch == marker.route_epoch {
-        if route.fencing_token != marker.fencing_token
-            || route.fenced_epoch != marker.fenced_epoch
-            || eff_gen != marker.storage_generation
-            || !proven_source_retirement(client, Some(&route.primary_node_id), marker).await?
-        {
-            return Err(conflict("shard marker transition differs from committed route; writes blocked"));
-        }
-    } else if !proven_source_retirement(client, None, marker).await? {
-        return Err(conflict("shard marker transition lacks source retirement proof; writes blocked"));
+pub async fn reject_any_pending(tx: &Transaction<'_>, repo_id: Uuid) -> Result<(), Error> {
+    let pending = tx.query_opt(
+        "SELECT id FROM shard_marker_transitions WHERE repository_id = $1 \
+         AND state = 'pending' LIMIT 1",
+        &[&repo_id],
+    ).await.map_err(Error::internal)?.is_some();
+    if pending {
+        return Err(conflict("shard marker transition pending; writes blocked until reconciliation"));
     }
     Ok(())
 }
@@ -261,13 +107,16 @@ async fn validate_committed(
 async fn complete(
     client: &tokio_postgres::Client,
     id: Uuid,
+    repository_id: Uuid,
+    volume_id: Uuid,
     marker: &VolumeFenceMarker,
 ) -> Result<(), Error> {
     let target = serde_json::to_value(marker).map_err(Error::internal)?;
     let updated = client.execute(
         "UPDATE shard_marker_transitions SET state = 'complete', target_marker = $2, \
-         completed_at = clock_timestamp() WHERE id = $1",
-        &[&id, &target],
+         completed_at = clock_timestamp() WHERE id = $1 AND repository_id = $3 \
+         AND volume_id = $4 AND state = 'pending'",
+        &[&id, &target, &repository_id, &volume_id],
     ).await.map_err(Error::internal)?;
     if updated != 1 {
         return Err(conflict("pending shard marker transition missing"));
@@ -298,16 +147,20 @@ async fn publish(
     };
     let repo_dir = state.storage.repo_path(marker.repository_id);
     write_volume_marker_at(&repo_dir, &write_marker)?;
-    complete(&client, id, &write_marker).await
+    complete(&client, id, marker.repository_id, state.storage.volume_id, &write_marker).await
 }
 
 async fn reconcile_foreign(
     state: &AppState,
     id: Uuid,
+    row_repository_id: Uuid,
     volume_id: Uuid,
     target: Value,
 ) -> Result<(), Error> {
     let marker: VolumeFenceMarker = serde_json::from_value(target).map_err(Error::internal)?;
+    if marker.repository_id != row_repository_id {
+        return Err(conflict("shard marker transition repository mismatch"));
+    }
     let registration = local_fence::registered_volume(&marker.primary_node_id)
         .map_err(|_| conflict("local volume registration is unreadable"))?;
     let Some(registration) = registration else { return Ok(()); };
@@ -317,16 +170,22 @@ async fn reconcile_foreign(
     let mutation = locks::exclusive(state, marker.repository_id).await?;
     mutation.ensure_active()?;
     let client = state.pool.get().await.map_err(Error::internal)?;
+    let (db_volume_id, db_target) = transition_row(&client, id, row_repository_id).await?;
+    if db_volume_id != volume_id
+        || db_target != serde_json::to_value(&marker).map_err(Error::internal)?
+    {
+        return Err(conflict("shard marker transition belongs to another volume or target"));
+    }
     let (route, repo_generation) = load_route(&client, marker.repository_id).await?;
     if let Some(restored) = restored_live_marker(&client, &route, repo_generation, &marker).await? {
         local_fence::write_volume_repository(&marker.primary_node_id, marker.repository_id, &restored)
             .map_err(|_| conflict("retired source marker rollback failed; writes remain blocked"))?;
-        return complete(&client, id, &restored).await;
+        return complete(&client, id, row_repository_id, volume_id, &restored).await;
     }
     validate_committed(&client, &route, repo_generation, &marker).await?;
     local_fence::retire_volume_repository(&marker.primary_node_id, marker.repository_id, &marker)
         .map_err(|_| conflict("retired source marker publication failed; writes remain blocked"))?;
-    complete(&client, id, &marker).await
+    complete(&client, id, row_repository_id, volume_id, &marker).await
 }
 
 pub async fn reject_pending(state: &AppState, repo_id: Uuid) -> Result<(), Error> {
@@ -350,12 +209,12 @@ pub async fn reject_pending(state: &AppState, repo_id: Uuid) -> Result<(), Error
 pub async fn reconcile_pending(state: &AppState) -> Result<(), Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let own_rows = client.query(
-        "SELECT id, target_marker FROM shard_marker_transitions \
+        "SELECT id, repository_id, target_marker FROM shard_marker_transitions \
          WHERE state = 'pending' AND volume_id=$1 ORDER BY created_at, id",
         &[&state.storage.volume_id],
     ).await.map_err(Error::internal)?;
     let foreign_rows = client.query(
-        "SELECT id, volume_id, target_marker FROM shard_marker_transitions \
+        "SELECT id, repository_id, volume_id, target_marker FROM shard_marker_transitions \
          WHERE state = 'pending' AND volume_id <> $1 \
          AND target_marker->>'read_only_degraded' = 'true' \
          ORDER BY created_at, id LIMIT 64",
@@ -364,18 +223,23 @@ pub async fn reconcile_pending(state: &AppState) -> Result<(), Error> {
     drop(client);
     let mut first_error: Option<Error> = None;
     for row in foreign_rows {
-        if let Err(err) = reconcile_foreign(state, row.get(0), row.get(1), row.get(2)).await
-            && first_error.is_none()
-        {
+        let result = reconcile_foreign(
+            state, row.get(0), row.get(1), row.get(2), row.get(3),
+        ).await;
+        if let Err(err) = result && first_error.is_none() {
             first_error = Some(err);
         }
     }
     for row in own_rows {
         let id: Uuid = row.get(0);
-        let target: Value = row.get(1);
+        let row_repository_id: Uuid = row.get(1);
+        let target: Value = row.get(2);
         let result: Result<(), Error> = async {
             let marker: VolumeFenceMarker =
                 serde_json::from_value(target).map_err(Error::internal)?;
+            if marker.repository_id != row_repository_id {
+                return Err(conflict("shard marker transition repository mismatch"));
+            }
             let mutation = locks::exclusive(state, marker.repository_id).await?;
             mutation.ensure_active()?;
             faults::hit(
