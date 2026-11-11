@@ -11,7 +11,7 @@ prove that a Rust executable was invoked or that production paths passed.
 **Test Suite Entrypoint**: `tests/e2e_tiers.py`
 **Infrastructure Design Document**: `TEST_INFRA.md`
 **Total Executable Tests**: `597` (`255` Tier 1 + `261` Tier 2 + `54` Tier 3 + `27` Tier 4)
-**Verification Result**: `597 passed, 0 failed, 0 errors, 0 skipped` (Linux `--reference-only`; reference-only, not native acceptance)
+**Verification Result**: `597 passed, 0 failed, 0 errors, 0 skipped` (Linux --reference-only run, exit code 0)
 
 The count above is the recorded `tests/e2e_tiers.py` result. Its cluster
 fixture runs native Git on local directories but models nodes, leases, and
@@ -38,7 +38,7 @@ native deployment or production RPO/RTO gate.
 | **Tier 4 — Real-World Scenarios** | `TestTier4RealWorldScenarios` | 25–27 scenarios | **27** | 27 | 0 | 0 | **PASS** |
 | **Total** | `tests/e2e_tiers.py` | **586–597** | **597** | **597** | **0** | **0** | **PASS** |
 
-Tier 2 has 261 rather than 255 because `F20` carries 5 standard feature tests plus six additional F20 CI regression cases (`test_t2_f20_06`..`11`), for 11 `F20` Tier 2 tests and 20 `F20` tests in total.
+Tier 2 contains 261 tests. F20 includes 5 standard feature tests plus six additional F20 CI regression cases (`test_t2_f20_06`..`11`). That gives 11 F20 Tier 2 tests and 20 F20 tests in total.
 
 ---
 
