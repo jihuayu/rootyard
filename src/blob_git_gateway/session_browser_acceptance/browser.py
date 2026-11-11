@@ -21,7 +21,10 @@ What it drives on a brand-new persistent profile in the private run root:
 4. the signed-in `/web/blob` is a direct `200` under its CSP; the page's own
    script lists the repository and the real repository DOM link is clicked,
    which must render `References`, `Files at HEAD`, `Commits` and the pushed
-   commit, with the page's own refs/tree/commits requests chained;
+   commit, with the page's own refs/tree/commits requests chained; the HEAD
+   tree must list both real pushes, and every captured response revision must
+   be at least the configured final-push `expected_revision`, the write bound
+   (`API_READ_BOUND_INVALID` for an incomplete or behind view);
 5. cookie-only fetches of `/api` and `/git` are denied;
 6. one labelled client-side fault, only after the real chain passed: a
    re-entered repository page is answered by the page itself with a synthetic
@@ -185,6 +188,7 @@ class Client:
 
     def __init__(self, config):
         self.config = config
+        self.bound = config["expected_revision"]
         self.origin = config["origin"]
         self.owner = config["username"]
         self.repo = config["repo"]
@@ -481,19 +485,28 @@ class Client:
         self.check_origin()
 
         # Real read chain: refs (unbound), tree, commits, each presenting the
-        # previous pair; the page's own status and content must prove it.
+        # previous pair; the page's own status and content must prove it. The
+        # rendered HEAD tree must carry both real pushes, and every captured
+        # response revision must meet the final committed push's revision.
         status = await self.status_has(page, "Read complete.", "READ_CHAIN_INVALID")
         content = (await page.locator("#content").text_content()) or ""
         for heading in ("References", "Files at HEAD", "Commits"):
             if heading not in content:
                 raise Failure("REPO_PAGE_INCOMPLETE")
-        if self.config["oid"][:7] not in content or self.config["file"] not in content:
+        # Both real pushes' files (exactly as the tree names them) must render.
+        first_file, second_file = self.config["file"], self.config["second_file"]
+        if first_file not in content or second_file not in content:
+            raise Failure("REPO_PAGE_INCOMPLETE")
+        if self.config["oid"][:7] not in content:
             raise Failure("REPO_PAGE_INCOMPLETE")
         if "This server did not provide a bounded session." in status:
             raise Failure("READ_CHAIN_INVALID")
         reads = await self.page_reads(page)
         if reads["complete"] is not True:
             raise Failure("READ_CHAIN_INVALID")
+        for tail in ("refs", "tree", "commits"):
+            if reads[tail]["revision"] < self.bound:
+                raise Failure("API_READ_BOUND_INVALID")
         extra["reads"] = {tail: {"revision": reads[tail]["revision"]} for tail in ("refs", "tree", "commits")}
 
         # 5. Cookie-only denial of the unchanged bearer-only routes.
