@@ -707,6 +707,20 @@ class SamplerSummaryTest(unittest.TestCase):
         self.assertIn("never compared with client_addr/client_port", value["matched_by"])
         baseline.validate_summary(value)
 
+    def test_independent_peaks_need_not_come_from_one_sample(self):
+        value = baseline.summarize_samples(self.samples([(4, 4, 0, 0), (4, 0, 4, 0)]),
+                                           scans_without_connection=0)
+        self.assertEqual(value["peak_sessions"], 4)
+        self.assertEqual(value["peak_active"], 4)
+        self.assertEqual(value["peak_idle"], 4)
+        baseline.validate_summary(value)
+
+    def test_single_peak_above_peak_sessions_is_rejected(self):
+        value = summary()
+        for key in ("peak_active", "peak_idle"):
+            with self.subTest(key=key), self.assertRaises(baseline.BaselineError):
+                baseline.validate_summary({**value, key: 3})
+
     def test_zero_owned_sessions_fail(self):
         with self.assertRaises(baseline.BaselineError):
             baseline.summarize_samples(self.samples([(0, 0, 0, 0)]), scans_without_connection=0)
