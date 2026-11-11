@@ -133,11 +133,11 @@ impl DenialPath {
                 Some(_) => None,
             };
         }
-        let git = fixture.git_info_refs.as_str();
+        let git = fixture.git_info_refs();
         if path == git {
             return match query {
-                Some(git) => fixture.requests_git_info_refs(git),
-                None => None,
+                Some(query) if fixture.requests_git_info_refs(query) => Some(Self::GitInfoRefs),
+                _ => None,
             };
         }
         None
@@ -210,8 +210,8 @@ pub(super) struct Recorded {
     pub csp: Option<String>,
     /// The list answer named the fixture repository exactly once.
     pub list_names_repository: bool,
-    /// The tree answer listed the pushed file's exact path.
-    pub tree_names_file: bool,
+    /// The tree answer listed both pushes, each at its exact configured path.
+    pub tree_names_files: bool,
     /// The commits answer listed the pushed OID.
     pub commits_names_oid: bool,
 }
@@ -410,7 +410,7 @@ fn record(
         location: answer.and_then(|answer| text(answer.get(header::LOCATION))),
         csp: answer.and_then(|answer| text(answer.get(header::CONTENT_SECURITY_POLICY))),
         list_names_repository: false,
-        tree_names_file: false,
+        tree_names_files: false,
         commits_names_oid: false,
     }
 }
@@ -452,7 +452,10 @@ fn marker(fixture: &Fixture, bytes: &[u8], route: Route, record: &mut Recorded) 
                 return;
             };
             if route == Route::WebTree {
-                record.tree_names_file = rows.iter().any(|entry| entry["path"].as_str() == Some(fixture.file.as_str()));
+                // Both real pushes must be named at their exact paths: one
+                // entry each, never one entry standing in for both.
+                let named = |file: &str| rows.iter().any(|entry| entry["path"].as_str() == Some(file));
+                record.tree_names_files = named(&fixture.file) && named(&fixture.second_file);
             } else {
                 record.commits_names_oid = rows.iter().any(|entry| entry["oid"].as_str() == Some(fixture.oid.as_str()));
             }
@@ -527,7 +530,7 @@ pub(super) fn route_of(fixture_prefix: &str, path: &str) -> Route {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{Challenge, DenialPath, Fixture, Route, denial_of, route_of, tree_oid_is_head};
+    use super::{Challenge, DenialPath, Fixture, Route, denial_of, marker, record, route_of, tree_oid_is_head};
 
     fn fixture() -> Fixture {
         Fixture {
@@ -550,6 +553,32 @@ mod tests {
             headers.append(header::WWW_AUTHENTICATE, HeaderValue::from_str(challenge).unwrap());
         }
         headers
+    }
+
+    #[test]
+    fn the_tree_names_both_pushed_files_at_their_exact_paths() {
+        let fixture = fixture();
+        let first = fixture.file.clone();
+        let second = fixture.second_file.clone();
+        // The exact production tree URL the shipped SPA issues, query included.
+        let tree = format!("{}?oid=HEAD", fixture.read_path("tree"));
+        // The real `marker()` over a tree answer naming both pushes.
+        let mark = |entries: &[(&str, &str)]| {
+            let items: Vec<serde_json::Value> =
+                entries.iter().map(|(name, path)| serde_json::json!({"name": name, "path": path})).collect();
+            let body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+            let mut recorded = record(&fixture, &request("GET", &tree), Route::WebTree, 200, None);
+            marker(&fixture, &body, Route::WebTree, &mut recorded);
+            recorded
+        };
+        let both = mark(&[(&first, &first), (&second, &second)]);
+        assert!(both.tree_names_files, "a tree naming both pushes at their exact paths");
+        assert!(both.oid_head, "the test tree request is the shipped `?oid=HEAD` read");
+        // The second push missing leaves the marker false, as does a near miss.
+        assert!(!mark(&[(&first, &first)]).tree_names_files, "the second push was never named");
+        let near = format!("prefix/{second}");
+        assert!(!mark(&[(&first, &first), (&second, &near)]).tree_names_files, "the second path was not exact");
+        assert!(!mark(&[(&first, &first), (&second, &first)]).tree_names_files, "one path cannot name two pushes");
     }
 
     #[test]

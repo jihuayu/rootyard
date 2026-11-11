@@ -16,11 +16,96 @@ use serde_json::Value;
 
 use super::capture::{DenialPath, Recorded, Route};
 
-/// The session revisions the page reported for its read chain.
+/// The session revisions the page reported for its read chain, and its fixed
+/// cookie-only denial outcomes as sanitized, typed values.
 pub(super) struct Chain {
     pub refs_revision: i64,
     pub tree_revision: i64,
     pub commits_revision: i64,
+    pub denials: Denials,
+}
+
+/// The page's classification of one cookie-only read. Only these fixed words
+/// are ever read from the report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    DirectResponse,
+    BasicChallengePending,
+}
+
+/// The page's own fixed outcome of one cookie-only Smart HTTP read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitDenial {
+    /// The page's Fetch resolved; the actual status it reported is kept.
+    Direct(u16),
+    /// The page's own `AbortSignal.timeout` fired, after `elapsed_ms`.
+    Pending { timeout_error: bool, elapsed_ms: u64 },
+}
+
+/// The page's fixed cookie-only denial outcomes: the API read, which must be a
+/// direct response, and the Smart HTTP read, which is a direct response or a
+/// pending Basic challenge. Nothing else of the report is retained here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Denials {
+    api: u16,
+    git: GitDenial,
+}
+
+/// Whether one report object has exactly these fixed keys and nothing else.
+fn exactly(value: &Value, keys: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key)))
+}
+
+fn outcome(value: &Value, what: &'static str) -> Result<Outcome> {
+    match value.as_str() {
+        Some("direct_response") => Ok(Outcome::DirectResponse),
+        Some("basic_challenge_pending") => Ok(Outcome::BasicChallengePending),
+        _ => Err(anyhow!("the page reported no fixed {what} denial classification")),
+    }
+}
+
+impl Denials {
+    /// The denial outcomes exactly as the page reported them: each object has
+    /// exactly its three fixed keys, the API read is a direct response, and the
+    /// Smart HTTP read is a direct response or the page's own timeout.
+    fn reported(denials: &Value) -> Result<Self> {
+        let shape = ["classification", "status", "abort"];
+        let api = &denials["api"];
+        ensure!(exactly(api, &shape), "the page reported another API denial shape");
+        ensure!(
+            outcome(&api["classification"], "API")? == Outcome::DirectResponse,
+            "the page reported a non-direct API denial"
+        );
+        ensure!(api["abort"].is_null(), "the page reported an abort for a direct API read");
+        let api = api["status"]
+            .as_u64()
+            .and_then(|status| u16::try_from(status).ok())
+            .ok_or_else(|| anyhow!("the page reported no API denial status"))?;
+
+        let git = &denials["git"];
+        ensure!(exactly(git, &shape), "the page reported another Git denial shape");
+        let git = match outcome(&git["classification"], "Git")? {
+            Outcome::DirectResponse => {
+                ensure!(git["abort"].is_null(), "the page reported an abort for a direct Git read");
+                let status = git["status"]
+                    .as_u64()
+                    .and_then(|status| u16::try_from(status).ok())
+                    .ok_or_else(|| anyhow!("the page reported no Git denial status"))?;
+                GitDenial::Direct(status)
+            }
+            Outcome::BasicChallengePending => {
+                ensure!(git["status"].is_null(), "the page reported a status for a pending Git read");
+                let abort = &git["abort"];
+                ensure!(exactly(abort, &["reason", "elapsed_ms"]), "the page reported another pending challenge shape");
+                let elapsed_ms = abort["elapsed_ms"].as_u64();
+                let elapsed_ms = elapsed_ms.ok_or_else(|| anyhow!("the page reported no integer elapsed time"))?;
+                GitDenial::Pending { timeout_error: abort["reason"].as_str() == Some("timeout_error"), elapsed_ms }
+            }
+        };
+        Ok(Self { api, git })
+    }
 }
 
 /// One summary revision, which must be a positive integer.
@@ -75,6 +160,7 @@ pub(super) fn summary(summary: &Value, live: i64) -> Result<Chain> {
         refs_revision: reported_revision(summary, &["reads", "refs", "revision"])?,
         tree_revision: reported_revision(summary, &["reads", "tree", "revision"])?,
         commits_revision: reported_revision(summary, &["reads", "commits", "revision"])?,
+        denials: Denials::reported(&summary["denials"])?,
     };
     ensure!(chain.tree_revision >= chain.refs_revision, "the reported chain regressed");
     ensure!(chain.commits_revision >= chain.tree_revision, "the reported commit read regressed");
@@ -127,8 +213,7 @@ fn find(recorded: &[Recorded], route: Route, occurrence: usize, what: &'static s
 /// (never a forwarding failure). More than one such request is a replay and no
 /// single record speaks for the page's read.
 fn denials(recorded: &[Recorded], shape: DenialPath, route: Route) -> Result<Vec<&Recorded>> {
-    let matching: Vec<&Recorded> =
-        recorded.iter().filter(|entry| entry.denial_path == Some(shape)).collect();
+    let matching: Vec<&Recorded> = recorded.iter().filter(|entry| entry.denial_path == Some(shape)).collect();
     ensure!(!matching.is_empty(), "the page never requested the {} denial", shape.name());
     ensure!(
         matching.iter().all(|entry| entry.route == route),
@@ -174,8 +259,16 @@ fn at<'a>(recorded: &'a [Recorded], index: usize, route: Route, what: &'static s
     Ok(entry)
 }
 
-/// The full attestation, against the live gate revision and pushed OID.
-pub(super) fn verify(recorded: &[Recorded], chain: &Chain, list: &Value, fault: &Value, live: i64) -> Result<()> {
+/// The full attestation, against the live gate revision, the pushed OID and
+/// the page's already-validated cookie-only denial outcomes.
+pub(super) fn verify(
+    recorded: &[Recorded],
+    chain: &Chain,
+    denials: &Denials,
+    list: &Value,
+    fault: &Value,
+    live: i64,
+) -> Result<()> {
     // 1. Every request reached a named route, no relayed request failed and no
     // request left the loopback origin. Origin confinement is enforced in the
     // browser itself: the Playwright context route aborts any off-origin
@@ -270,7 +363,7 @@ pub(super) fn verify(recorded: &[Recorded], chain: &Chain, list: &Value, fault: 
     ensure!(tree.status == 200, "the tree read was refused");
     refs_pair.presented_by(tree, "the tree request")?;
     ensure!(tree.oid_head, "the tree request did not ask for the pushed HEAD");
-    ensure!(tree.tree_names_file, "the tree answer did not list the pushed file");
+    ensure!(tree.tree_names_files, "the tree answer did not list both pushed files");
     let tree_pair = Pair::of(tree, "the tree answer")?;
     ensure!(tree_pair.revision >= refs_pair.revision, "the tree answer regressed below the refs revision");
 
@@ -293,48 +386,30 @@ pub(super) fn verify(recorded: &[Recorded], chain: &Chain, list: &Value, fault: 
     // page cannot pass by reporting a denial of another route, a forwarding
     // failure or an arbitrary status: the record must agree with its fixed
     // outcome.
-    ensure!(summary["denials"].is_object(), "the page reported no cookie-only denials");
-    let denials = &summary["denials"];
-    ensure!(
-        denials["api"].as_object().is_some_and(|api| api.len() == 2) && denials["git"].as_object().is_some(),
-        "the page reported another denial shape"
-    );
     single_denial(recorded, DenialPath::ApiRepos, Route::ApiRepos, 401, "bearer")?;
-    ensure!(
-        denials["api"]["classification"].as_str() == Some("direct_response"),
-        "the page did not report a direct response for its cookie-only API read"
-    );
-    ensure!(denials["api"]["status"].as_u64() == Some(401), "the page did not report a direct 401 for its API read");
-    ensure!(denials["api"]["abort"].is_null(), "the page reported an aborted cookie-only API read");
+    ensure!(denials.api == 401, "the page did not report a direct 401 for its API read");
 
-    let git_report = &denials["git"];
-    match (git_report["classification"].as_str(), git_report["abort"].as_object()) {
+    // The page's Smart HTTP outcome, correlated with the same upstream facts.
+    match denials.git {
         // The page's own Fetch resolved with the actual denial, and the origin
         // answered exactly one such request.
-        (Some("direct_response"), None) if git_report.as_object().is_some_and(|git| git.len() == 3) => {
+        GitDenial::Direct(401) => {
             single_denial(recorded, DenialPath::GitInfoRefs, Route::Git, 401, "basic")?;
-            ensure!(
-                git_report["status"].as_u64() == Some(401),
-                "the page did not report a direct 401 for its cookie-only Git read"
-            );
         }
-        // The page's own bounded signal fired while its one request was still
-        // unanswered; only its own TimeoutError past the configured boundary is
-        // an accepted pending challenge, and the origin's one 401 with its Basic
-        // challenge is still the correlated upstream fact.
-        (Some("basic_challenge_pending"), Some(abort))
-            if git_report.as_object().is_some_and(|git| git.len() == 3) && abort.len() == 2 =>
-        {
-            single_denial(recorded, DenialPath::GitInfoRefs, Route::Git, 401, "basic")?;
-            ensure!(
-                abort["reason"].as_str() == Some("timeout_error"),
-                "the page reported no TimeoutError for its pending Git read"
-            );
-            let elapsed = abort["elapsed_ms"].as_u64().filter(|elapsed| *elapsed >= 5_000);
-            ensure!(elapsed.is_some(), "the page's Git read timed out before its own 5000 ms boundary");
-            ensure!(git_report["status"].is_null(), "the page reported a status for a pending Git read");
+        // Still waiting on the origin's challenge: proven below, never here.
+        GitDenial::Pending { .. } => {}
+        // Any other status the page read is not the origin's denial.
+        GitDenial::Direct(_) => {
+            return Err(anyhow!("the page did not report a direct 401 for its cookie-only Git read"));
         }
-        _ => return Err(anyhow!("the page reported no accepted cookie-only Git denial outcome")),
+    }
+    // A pending Basic challenge is the only other accepted outcome: the page's
+    // own TimeoutError, past the configured boundary, while the origin's one 401
+    // with its Basic challenge is still the correlated upstream fact.
+    if let GitDenial::Pending { timeout_error, elapsed_ms } = denials.git {
+        ensure!(timeout_error, "the page reported no TimeoutError for its pending Git read");
+        ensure!(elapsed_ms >= 5_000, "the page's Git read timed out before its own 5000 ms boundary");
+        single_denial(recorded, DenialPath::GitInfoRefs, Route::Git, 401, "basic")?;
     }
 
     // 10. The fault page is a separate full navigation: its second refs read

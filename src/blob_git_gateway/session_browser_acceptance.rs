@@ -224,7 +224,9 @@ async fn browse(
     let summary = runner::run(&script, &config_path, &run.private_file("browser.log")?).await?;
     let recorded = capture.snapshot();
     let chain = attest::summary(&summary, live)?;
-    attest::verify(&recorded, &chain, &summary["list"], &summary["fault"], live)?;
+    // Only the already-validated denial outcomes reach the attestation, never
+    // the whole summary.
+    attest::verify(&recorded, &chain, &chain.denials, &summary["list"], &summary["fault"], live)?;
     no_credentials(&summary, token.as_str(), &oid, COMMIT_FILE, &name)
 }
 

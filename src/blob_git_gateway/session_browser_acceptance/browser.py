@@ -85,7 +85,9 @@ STORAGE_READ_SCRIPT = f"""() => {{
     try {{
         const pairs = [read(localStorage), read(sessionStorage)];
         return {{status: '{STORAGE_STATUS_OK}', data: JSON.stringify(pairs)}};
-    }} catch (_) {{
+    }} catch (error) {{
+        // Only the error's fixed class name is read; it is never returned or
+        // rendered.
         const denied = error && error.name === 'SecurityError';
         return {{status: denied ? '{STORAGE_STATUS_DENIED}' : 'error'}};
     }}
@@ -610,10 +612,13 @@ class Client:
         is accepted only past the configured boundary and only as a pending
         challenge, never as a denial the page observed.
 
-        The exact request is counted on this page while the read runs, and a
-        direct or pending outcome requires exactly one attempt, so another
-        request of the same shape (for example Chromium's settled Basic
-        HTTP-auth exchange replaying a credential) can never stand in for it.
+        Every accepted outcome is exactly one fixed record: a direct response
+        is `{classification, status, abort: null}`, a pending challenge is
+        `{classification, status: null, abort: {reason, elapsed_ms}}`, and no
+        other key is carried. A pending challenge requires exactly one attempt
+        counted on this page while the read runs, so a second request of the same
+        shape (for example Chromium's settled Basic HTTP-auth exchange replaying
+        a credential) can never stand in for it.
         """
         exact = self.origin + path
         attempts = []
@@ -668,22 +673,33 @@ class Client:
         if not isinstance(answer, dict):
             raise Failure(f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED")
         classification = answer.get("classification")
-        status = answer.get("status")
-        abort = answer.get("abort")
-        if classification == DENIAL_DIRECT and abort is None:
+        if classification == DENIAL_DIRECT:
             # The page's Fetch really resolved: only its actual status counts.
+            if set(answer) != {"classification", "status", "abort"} or answer.get("abort") is not None:
+                raise Failure(f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED")
+            status = answer.get("status")
             if isinstance(status, bool) or status != 401:
                 raise Failure(f"{route.upper()}_COOKIE_ONLY_STATUS_INVALID")
             return {"classification": DENIAL_DIRECT, "status": status, "abort": None}
-        if classification == DENIAL_PENDING and route == "git" and status is None and isinstance(abort, dict):
-            # A challenge still pending after the page's own signal fired: the
-            # one request went out and was never answered.
+        if classification == DENIAL_PENDING:
+            # Only Smart HTTP may still be waiting on a challenge, after exactly
+            # one unanswered attempt, with the page's own TimeoutError past the
+            # configured boundary.
+            if route != "git":
+                raise Failure("API_COOKIE_ONLY_TIMEOUT")
+            abort = answer.get("abort")
+            if (
+                set(answer) != {"classification", "status", "abort"}
+                or answer.get("status") is not None
+                or not isinstance(abort, dict)
+                or set(abort) != {"reason", "elapsed_ms"}
+            ):
+                raise Failure("GIT_COOKIE_ONLY_FETCH_FAILED")
             if len(attempts) != 1:
                 raise Failure("GIT_COOKIE_ONLY_FETCH_FAILED")
-            reason = abort.get("reason")
-            elapsed = abort.get("elapsed_ms")
-            if reason != TIMEOUT_REASON:
+            if abort.get("reason") != TIMEOUT_REASON:
                 raise Failure("GIT_COOKIE_ONLY_FETCH_FAILED")
+            elapsed = abort.get("elapsed_ms")
             if isinstance(elapsed, bool) or not isinstance(elapsed, int):
                 raise Failure("GIT_COOKIE_ONLY_FETCH_FAILED")
             if elapsed < FETCH_TIMEOUT_MS:
@@ -693,8 +709,6 @@ class Client:
                 "status": None,
                 "abort": {"reason": TIMEOUT_REASON, "elapsed_ms": elapsed},
             }
-        if route == "api" and classification == DENIAL_PENDING:
-            raise Failure("API_COOKIE_ONLY_TIMEOUT")
         raise Failure(f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED")
 
     async def no_shell(self, page, reason):
