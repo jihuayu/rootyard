@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import unittest
 import uuid
@@ -865,7 +866,10 @@ def directory(path, **changes):
     ``export`` creates ``blob/{repository_id}`` and
     ``blob/{repository_id}/{pack_id}`` with ``private_dir``, and
     ``filesystem::inventory`` records each as ``Entry { kind: "directory",
-    mode: 0o700 (private_dir), bytes: 0, sha256: None, target: None }``.
+    bytes: 0, sha256: None, target: None }`` with the ``mode`` of the created
+    directory: ``private_dir`` requests ``0o700``, which the process umask may
+    reduce, so ``mode`` is a non-bool integer subset of ``0o700`` (default
+    ``0o700`` here, as with the usual ``umask 022``).
     """
     return path, dict({"kind": "directory", "mode": 0o700, "bytes": 0, "sha256": None, "target": None}, **changes)
 
@@ -1232,6 +1236,73 @@ class Format22ManifestTest(unittest.TestCase):
             self.assertEqual(manifest["files"][path],
                              {"kind": "directory", "mode": 0o700, "bytes": 0, "sha256": None, "target": None})
             self.assertNotIn(path, files)
+
+    def test_blob_directory_entry_pins_every_serialized_field(self):
+        # `inventory` records a real directory as `Entry { kind: "directory",
+        # mode, bytes: 0, sha256: None, target: None }`; kind alone is not the
+        # entry. Each wrong field below keeps the path set, every kind and
+        # every byte total intact, so only the directory-field oracle can
+        # refuse it.
+        cases = (
+            ("bytes", 1, "carries non-zero bytes"),
+            ("bytes", True, "carries non-zero bytes"),
+            ("bytes", None, "carries non-zero bytes"),
+            ("sha256", "00" * 32, "carries a sha256"),
+            ("sha256", "", "carries a sha256"),
+            ("target", "blob", "carries a target"),
+            ("target", "", "carries a target"),
+        )
+        for field, value, reason in cases:
+            with self.subTest(field=field, value=value):
+                manifest, expected = positive_inputs()
+                path = support.archive_directories(manifest["blob_artifacts"])[0]
+                manifest["files"][path][field] = value
+                with self.assertRaisesRegex(AssertionError, "Blob directory at " + re.escape(path) + " " + reason):
+                    support.format22_manifest_checks(manifest, expected)
+        # A dropped field is not the serialized entry either; `Option::None`
+        # is a present JSON `null`, never an absent key.
+        for field in ("sha256", "target"):
+            with self.subTest(dropped=field):
+                manifest, expected = positive_inputs()
+                path = support.archive_directories(manifest["blob_artifacts"])[1]
+                del manifest["files"][path][field]
+                with self.assertRaisesRegex(AssertionError, "Blob directory at .* carries a " + field):
+                    support.format22_manifest_checks(manifest, expected)
+
+    def test_blob_directory_mode_must_be_a_non_bool_subset_of_0o700(self):
+        # `private_dir` asks for 0o700 and the umask may only clear bits, so a
+        # reduced mode (even 0) is a real archive, while a bool, a non-integer,
+        # a negative or any group/world/special bit is not.
+        for mode in (0o700, 0o500, 0o600, 0o400, 0o100, 0):
+            with self.subTest(mode=mode):
+                manifest, expected = positive_inputs()
+                for path in support.archive_directories(manifest["blob_artifacts"]):
+                    manifest["files"][path]["mode"] = mode
+                self.assertTrue(support.format22_manifest_checks(manifest, expected)["member_paths_exact"])
+        # A mixed inventory, as an unusually restrictive umask could leave one
+        # directory but not the other, is still a real archive.
+        manifest, expected = positive_inputs()
+        first = support.archive_directories(manifest["blob_artifacts"])[1]
+        self.assertEqual(first.count("/"), 2)
+        manifest["files"][first]["mode"] = 0o500
+        support.format22_manifest_checks(manifest, expected)
+        for mode, reason in ((True, "non-integer mode"), (False, "non-integer mode"),
+                             (float(0o700), "non-integer mode"), ("448", "non-integer mode"), (None, "non-integer mode"),
+                             (0o710, "outside"), (0o701, "outside"), (0o707, "outside"), (0o740, "outside"),
+                             (0o704, "outside"), (0o1700, "outside"), (0o777, "outside"), (0o7777, "outside"),
+                             (-1, "outside"), (-0o400, "outside")):
+            with self.subTest(mode=mode):
+                manifest, expected = positive_inputs()
+                path = support.archive_directories(manifest["blob_artifacts"])[2]
+                manifest["files"][path]["mode"] = mode
+                with self.assertRaisesRegex(AssertionError, "Blob directory at .* " + reason):
+                    support.format22_manifest_checks(manifest, expected)
+        # A directory with no `mode` at all is not the serialized `Entry`.
+        manifest, expected = positive_inputs()
+        path = support.archive_directories(manifest["blob_artifacts"])[-1]
+        del manifest["files"][path]["mode"]
+        with self.assertRaisesRegex(AssertionError, "Blob directory at .* non-integer mode"):
+            support.format22_manifest_checks(manifest, expected)
 
     def test_missing_blob_directory_is_refused(self):
         for what in ("repository", "pack"):

@@ -25,7 +25,10 @@ Three independent pieces live here:
   artifact's ``length`` and whose ``sha256`` is its digest (the per-member
   binding Rust restore applies), plus exactly the two parent ``directory``
   entries of each artifact (:func:`archive_directories`) -- no other file or
-  directory may appear.
+  directory may appear. Each directory entry pins the other serialized
+  ``Entry`` fields exactly: ``bytes == 0``, ``sha256 is None``,
+  ``target is None``, and a non-bool integer ``mode`` within ``[0, 0o700]``
+  (``private_dir`` requests ``0o700``; the umask may only clear bits).
 * :class:`CorruptionCase`/:func:`corruption_plan` and :func:`corruption_sql`/
   :func:`corruption_findings`/:func:`validator_refusal` -- the dedicated raw-SQL
   source corruption negatives. Each case is applied by one clone-local,
@@ -247,7 +250,9 @@ def format22_manifest_checks(manifest, expected):
     that artifact's serialized ``length`` and whose ``sha256`` is its digest,
     and the ``blob/`` inventory observed in ``manifest.files`` must be exactly
     those files plus the :func:`archive_directories` parent ``directory``
-    entries ``blob_closure::export`` creates. Aggregate totals alone are never
+    entries ``blob_closure::export`` creates, each also pinned to
+    ``bytes == 0``, ``sha256 is None``, ``target is None`` and a non-bool
+    integer ``mode`` within ``[0, 0o700]``. Aggregate totals alone are never
     accepted, because one member's surplus can otherwise mask another member's
     deficit.
     """
@@ -320,6 +325,15 @@ def format22_manifest_checks(manifest, expected):
     not_dirs = sorted(name for name in set(directories) & blob_paths
                       if not isinstance(files[name], dict) or files[name].get("kind") != "directory")
     need(not not_dirs, "an archive Blob parent path is not a directory entry: " + ",".join(not_dirs[:8]))
+    # A directory entry is the whole serialized Rust `Entry`, not just its kind:
+    # `filesystem::inventory` records `bytes: 0`, `sha256: None`,
+    # `target: None` for every real directory, and a `u32` mode with no group,
+    # world or special bits (a real `export` can only record `mode & 0o7777`,
+    # and `private_dir`'s requested `0o700` has no bits outside it).
+    # `private_dir` asks for `0o700`, but the process umask may remove more
+    # bits, so the exact `0o700` is never required -- only an integer subset.
+    for name in sorted(set(directories) & blob_paths):
+        _archive_directory_entry(name, files[name])
     missing = sorted((expected_files | set(directories)) - blob_paths)
     need(not missing, "the archive is missing Blob members: " + ",".join(missing[:8]))
     # Rust restore looks every artifact up by its exact archive path and binds
@@ -386,6 +400,36 @@ def archive_length(artifact):
     # so it must be a real integer or a ``slot: true`` row would pass as slot 1.
     need(type(artifact.get("slot")) is int, "an archived artifact slot is not an integer")
     return value
+
+
+DIRECTORY_MODE_MAX = 0o700
+
+
+def _archive_directory_entry(path, entry):
+    """Refuse a Blob parent entry that is not exactly a serialized directory.
+
+    Pins every field ``filesystem::inventory`` writes for a real directory:
+    ``kind: "directory"``, ``bytes: 0``, ``sha256: null``, ``target: null`` and
+    an integer (never a bool) ``mode`` that is a subset of ``0o700``. The mode
+    is bounded, not exact: ``private_dir`` requests ``0o700`` and the process
+    umask may clear further owner bits, even all of them (``0``), so a reduced
+    mode such as ``0o500`` is a real archive. Group, world and special bits
+    (any bit of ``~0o700`` within ``0o7777``) are never what ``export`` writes.
+    """
+    need(isinstance(entry, dict), "an archive Blob directory at " + path + " is not a JSON object")
+    need(entry.get("kind") == "directory", "an archive Blob directory at " + path + " changed kind")
+    need(type(entry.get("bytes")) is int and entry["bytes"] == 0,
+         "an archive Blob directory at " + path + " carries non-zero bytes")
+    need("sha256" in entry and entry["sha256"] is None,
+         "an archive Blob directory at " + path + " carries a sha256")
+    need("target" in entry and entry["target"] is None,
+         "an archive Blob directory at " + path + " carries a target")
+    mode = entry.get("mode")
+    # ``bool`` is a subclass of ``int``: ``mode: true`` must not pass as 1.
+    need(type(mode) is int, "an archive Blob directory at " + path + " has a non-integer mode")
+    need(0 <= mode <= DIRECTORY_MODE_MAX,
+         "an archive Blob directory at " + path + " has a mode outside [0, 0o700]")
+    return entry
 
 
 def _archive_bytes(entry):
