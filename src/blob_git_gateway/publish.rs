@@ -42,9 +42,9 @@ use crate::{
             CommitMode,
             pack_commit::{
                 AuthorizedCommitError, AuthorizedCommitMode, ContentDigest, PackArtifactRole, PackCommitBaseline,
-                PackCommitError, PackCommitExpectation, PackCommitPlan, PackCommitRejectCode, PackCommitRejection,
-                PackCommitScope, PackCommitTerminal, PackMembershipEntry, PackPendingToken, PackRegistrationRequest,
-                PgAuthorizedCommit, PgPackCommit, PlannedArtifact, PlannedPack, PrepareOutcome,
+                PackCommitError, PackCommitExpectation, PackCommitPlan, PackCommitRejectCode, PackCommitScope,
+                PackCommitTerminal, PackMembershipEntry, PackPendingToken, PackRegistrationRequest, PgAuthorizedCommit,
+                PgPackCommit, PlannedArtifact, PlannedPack, PrepareOutcome,
             },
         },
         tx::{begin_bounded, commit_bounded},
@@ -559,6 +559,7 @@ pub(super) fn map_authorized(error: AuthorizedCommitError) -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ref_store::core::pack_commit::PackCommitRejection;
 
     #[test]
     fn artifact_gate_refusals_only_route_same_realm_progress_to_terminalization() {
