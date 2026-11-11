@@ -459,7 +459,7 @@ class Drill(BlobOnlyHarness):
             "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=738390103"
             " AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND mode='ExclusiveLock' AND granted"))
 
-    def serving_barrier_refused(self, env, mode, stage):
+    def serving_barrier_refused_mode(self, env, mode, stage):
         """One schema mode must exit with the exact lifecycle barrier refusal.
 
         The probe runs against the barrier-held database on a run-owned loopback
@@ -480,9 +480,9 @@ class Drill(BlobOnlyHarness):
                     assert not value or value not in line, "probe diagnostic leaked a private value"
         return outcome
 
-    def serving_barrier_refused_all(self, env, stage):
+    def serving_barrier_refused(self, env, stage):
         """The unchanged auto/external set, each refused where no restore runs."""
-        outcomes = [self.serving_barrier_refused(env, mode, stage) for mode in ("auto", "external")]
+        outcomes = [self.serving_barrier_refused_mode(env, mode, stage) for mode in ("auto", "external")]
         return outcomes
 
     def snapshot(self):
@@ -624,7 +624,7 @@ class Drill(BlobOnlyHarness):
             query = lambda sql: self.query(self.target_db, sql)
             served = []
             for mode in ("auto", "external"):
-                probe = lambda mode: self.serving_barrier_refused(gate.probe_env, mode, "restore (gated at pg_restore)")
+                probe = lambda mode: self.serving_barrier_refused_mode(gate.probe_env, mode, "restore (gated at pg_restore)")
                 served.append(gate.probe_held(restore, query, mode, probe))
             # The real restore after the normal release must succeed; the
             # unheld database is no longer a refusal case and is not probed.

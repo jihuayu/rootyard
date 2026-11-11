@@ -22,6 +22,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backup_blob_barrier_probe as probe  # noqa: E402
+import backup_blob_serving147  # noqa: E402
 
 AUTO = probe.BARRIER_REFUSALS["auto"]
 EXTERNAL = probe.BARRIER_REFUSALS["external"]
@@ -666,6 +667,29 @@ class ProbeTest(unittest.TestCase):
                          "Error: could not open the lifecycle barrier session at [REDACTED]")
         self.assertEqual(probe.describe({"mode": "external", "status": "unknown", "reason": "exit 0"}),
                          "external; unknown; exit 0")
+
+    def test_the_two_argument_refusal_helper_keeps_its_auto_then_external_contract(self):
+        # The old snapshot caller keeps `serving_barrier_refused(env, stage)`:
+        # it must invoke the per-mode helper for auto, then external, with the
+        # exact env/stage and return both outcomes in that order.
+        class Drill(backup_blob_serving147.Drill):
+            def __init__(self, responses):
+                self.calls = []
+                self.responses = responses
+
+            def serving_barrier_refused_mode(self, env, mode, stage):
+                self.calls.append((env, mode, stage))
+                return self.responses[mode]
+
+        env = {"K": "v"}
+        responses = {"auto": {"mode": "auto", "status": "refused"},
+                     "external": {"mode": "external", "status": "refused"}}
+        drill = Drill(responses)
+        outcomes = drill.serving_barrier_refused(env, "offline backup")
+        self.assertEqual(drill.calls, [(env, "auto", "offline backup"), (env, "external", "offline backup")])
+        self.assertEqual(outcomes, [responses["auto"], responses["external"]])
+        self.assertIs(outcomes[0], responses["auto"])
+        self.assertIs(outcomes[1], responses["external"])
 
 
 def _reachable(bind):
