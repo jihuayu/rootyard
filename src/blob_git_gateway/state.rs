@@ -25,6 +25,7 @@ use uuid::Uuid;
 use super::{
     config::{BlobGitConfig, BlobGitConfigError, BlobGitLimits, BlobGitNativeLimits},
     error::GatewayError,
+    repo_session::SessionTokens,
 };
 use crate::blob_store::opendal::BlobStore;
 
@@ -45,6 +46,7 @@ pub struct BlobGitState {
     native_processes: Arc<Semaphore>,
     inflight: Arc<AtomicU64>,
     workspace: Arc<AtomicU64>,
+    sessions: Option<SessionTokens>,
 }
 
 impl BlobGitState {
@@ -66,11 +68,26 @@ impl BlobGitState {
             native_processes,
             inflight: Arc::new(AtomicU64::new(0)),
             workspace: Arc::new(AtomicU64::new(0)),
+            sessions: None,
         })
+    }
+
+    /// Attach the explicitly configured repository session key set (#174).
+    /// Without it, every session route and token header is answered with an
+    /// explicit `501`; nothing falls back to a generated or shared default key.
+    pub fn with_sessions(mut self, sessions: SessionTokens) -> Self {
+        self.sessions = Some(sessions);
+        self
     }
 
     pub fn pool(&self) -> &Pool {
         &self.pool
+    }
+
+    /// The configured repository session key set, if any. `None` means a
+    /// presented session header is an explicit `501`, never a guessed key.
+    pub(super) fn sessions(&self) -> Option<&SessionTokens> {
+        self.sessions.as_ref()
     }
 
     pub fn store(&self) -> &BlobStore {

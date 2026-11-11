@@ -56,6 +56,22 @@ pub(crate) struct NativeReadClosure {
     read_digest: RequestDigest,
 }
 
+#[cfg(test)]
+impl NativeReadClosure {
+    /// Test-only stand-in for a native closure (an empty lease, no local files).
+    /// Offline unit cases use it to build a materialized view without a Git
+    /// workspace; they never read bytes through it.
+    pub(in crate::ref_store::core) fn for_test(read_digest: RequestDigest) -> Self {
+        Self {
+            lease: VerificationLease::for_test(),
+            pairs: BTreeMap::new(),
+            verified_pairs: 1,
+            verified_bytes: 0,
+            read_digest,
+        }
+    }
+}
+
 impl NativeReadClosure {
     pub(crate) fn verified_pairs(&self) -> usize {
         self.verified_pairs

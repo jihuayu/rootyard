@@ -39,8 +39,8 @@ Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上
   - [issue #167](https://github.com/jihuayu/rootyard/issues/167)（本地集成修复提交 `a323f87`）并入 [PR #173](https://github.com/jihuayu/rootyard/pull/173)（head `18e4884`）：集成后保留 #167 的日志读取实现，`crates/refcas-log` 21 项单元测试加 1 项真实 SIGKILL/新进程用例通过；仍是隔离实验 crate，不是运行时。
   - [issue #168](https://github.com/jihuayu/rootyard/issues/168)（本地集成修复提交 `a72cd4e`，LunaMax 已审）：41 项 W0 测试及真实 Git 的默认小规模运行通过。
   - [issue #171](https://github.com/jihuayu/rootyard/issues/171)（本地集成修复提交 `9f161c9`，LunaMax 已审）：21 项 overlay 负向检查及实际 `cargo check --locked --lib --tests`（0 错误、0 警告）通过；Root 在私有 `TMPDIR` 下重跑组合 overlay/W0 62 项通过。
-  - [PR #172](https://github.com/jihuayu/rootyard/pull/172)（`fbe27cd`）：仅新增一致性/会话契约草案文档，未交付代码。
-- **未包含**：issue #169（配对归档 corrupt-ledger 加固）仍 OPEN，其未批准本地补丁未合并；#162–#165 及新的 #174（按 [PR #172](https://github.com/jihuayu/rootyard/pull/172) 提案实现会话读取，尚未实现）仍是 backlog（见[实施计划](implementation-plan.md)）。
+  - [PR #172](https://github.com/jihuayu/rootyard/pull/172)（`fbe27cd`）：新增一致性/会话契约草案文档；其会话读取实施由 PR #209（Refs [#174](https://github.com/jihuayu/rootyard/issues/174)）交付**单机 PostgreSQL 基础**：`ROOTYARD_SESSION_KEYRING` v2 加载器、HMAC `rs1` 帧（绑定 tenant/repository/format/history/authority-kind/authority-epoch/group-id/group-epoch/cluster-incarnation/revision）、JSON 读强制、push 提交签发、sealed serving-read proof，以及真实 HTTP/PG 验收。`rs1` 显式携带 `authority_kind` 与 `group_id`，未知 authority-kind 字节按 malformed 失败关闭。
+- **未包含**：issue #169（配对归档 corrupt-ledger 加固）仍 OPEN，其未批准本地补丁未合并；#162–#165 仍是 backlog（见[实施计划](implementation-plan.md)）。#174 仍 **OPEN**：浏览器/UI 传播、完整损坏/保留矩阵与分布式 Raft Ref-CAS 矩阵尚未完成；当前范围是会话级 read-your-writes / monotonic reads，不是全局因果一致性。
 
 ## issue #169 边界
 
@@ -52,7 +52,7 @@ Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上
 - W0/phase-metrics 的 feature-only overlay 检查改为只针对其冻结的 parent fixture（`bcd3918` manifest/lock）；当前集成 manifest 单独做显式契约验证。历史 v1/v5/v6 原始测量报告未修改。
 - `src/web.rs` 路由合成整理到原有 100 行结构上限内，全部 48 条路由与 session/Origin/CSRF 中间件保持不变；`src/token_management/mod.rs` 的过时发布声明注释已更正（父 token 发布锁已包含在当前代码）。
 
-本页不以缺失前提条件代替回归证据；集成后的二进制/PG 原生门禁以 PR #170 最终检查为准。缺陷修复 #166–#168 已有绑定各自提交的结果（见“集成状态”），集成后是否闭合以 PR #170 最终证据为准；[#169](https://github.com/jihuayu/rootyard/issues/169) 仍 OPEN，#162–#165 与 #174 仍是 backlog（见[实施计划](implementation-plan.md)）。详细构建、源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md) 与 [standalone147 证据](../../evidence/state-services/standalone147-followup/README.md)。
+本页不以缺失前提条件代替回归证据；集成后的二进制/PG 原生门禁以 PR #170 最终检查为准。缺陷修复 #166–#168 已有绑定各自提交的结果（见“集成状态”），集成后是否闭合以 PR #170 最终证据为准；[#169](https://github.com/jihuayu/rootyard/issues/169) 仍 OPEN，#162–#165 仍是 backlog（见[实施计划](implementation-plan.md)）。[#174](https://github.com/jihuayu/rootyard/issues/174) 的单机 PostgreSQL 会话下界基础已由 PR #209 实现，但 issue 仍 OPEN（UI 传播、完整损坏/保留与分布式矩阵未完成）。详细构建、源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md) 与 [standalone147 证据](../../evidence/state-services/standalone147-followup/README.md)。
 
 ## format22 配对备份与恢复的真实边界
 

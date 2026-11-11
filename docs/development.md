@@ -66,6 +66,81 @@ guards may be held across `await` points without `await_holding_lock`. Issue #75
 stays open until the same full Clippy gate passes on the integrated tree after
 the remaining concurrent work merges.
 
+## Repository session keyring (`ROOTYARD_SESSION_KEYRING`)
+
+`ROOTYARD_SESSION_KEYRING` is the only production signer for the optional
+repository session bound (`x-rootyard-session`). When it is unset, session
+headers are disabled and reads/pushes remain token-free. When it is set, the
+directory is loaded once at startup and a malformed path, manifest or key file
+is a hard startup failure: there is no generated key, no default key and no
+silent fallback to an unauthenticated gateway.
+
+Directory and file contract:
+
+- The directory is absolute, a real directory (never a symlink), owned by the
+  service euid and mode exactly `0700`.
+- `keyring.json` is a regular file, owned by the service euid, mode exactly
+  `0600`, at most 16 KiB, opened with `O_NOFOLLOW` and re-checked by device and
+  inode after opening. A replaced or symlinked file is refused.
+- Each `<key_id>.key` is a regular file with the same owner/mode/no-symlink
+  rules, exactly 32 raw random bytes. Never commit, log, copy or print key
+  material.
+- The manifest is a closed schema (`deny_unknown_fields`); an unknown field is
+  a startup error, not an ignored typo.
+
+Schema version 2:
+
+```json
+{
+  "schema": 2,
+  "current": "v2",
+  "lifetime_seconds": 300,
+  "keys": [
+    { "key_id": "v1", "id": 17 },
+    { "key_id": "v2", "id": 42 }
+  ]
+}
+```
+
+- `schema` must be `2`; a schema 1 (positional ids) manifest is refused rather
+  than reinterpreted.
+- `current` must name exactly one configured `key_id`.
+- `lifetime_seconds` is positive and capped at 15 minutes (`900`); the current
+  codec accepts `30..=900`. The lifetime is signed into every token.
+- Every key entry has a mandatory explicit `id` in `0..=255`. The id, not the
+  list position, is signed into the token; ids must be unique and must never be
+  reused for different key material. List order is irrelevant.
+
+Rotation and retirement are restart-based:
+
+1. Generate a new `<key_id>.key` and add an entry with an unused `id`; point
+   `current` at it and restart. Tokens signed by the old key keep verifying
+   while it stays listed.
+2. Retire the old entry from `keys` (keep the new `current`) and restart.
+   Tokens signed by the retired key are refused at the next request; they are
+   not accepted for "one more lifetime".
+3. Delete the retired `.key` file once no process serves with it. A retired id
+   must never be assigned to different material.
+
+Verification rules:
+
+- Session tokens are consistency lower bounds for read-your-writes and
+  monotonic reads, **never authentication credentials**. Every request still
+  performs the live token/RBAC/scope/backend authorization; a token never grants
+  permission and never replaces a pin, hold or verified Blob closure.
+- Expiry is half-open `[issued_unix, issued_unix + lifetime_seconds)`. A
+  verifier allows **zero** future-`iat` skew: `now_unix < issued_unix` is
+  rejected as expired, and so is `now_unix >= issued_unix + lifetime_seconds`.
+  Multi-process or multi-host deployments must run synchronized NTP clocks; the
+  signed lifetime is never extended to hide skew.
+- A malformed, unknown-authority, foreign-realm, group-mismatched, expired or
+  beyond-the-served-revision token fails closed. Refusals never expose another
+  repository's content or revision.
+
+```
+ROOTYARD_SESSION_KEYRING=/etc/rootyard/session-keyring rootyard serve-blob
+```
+
 ## End-to-end tests
 
 Provision a **disposable dedicated PostgreSQL database**, never a production or shared application database. The harness exercises migrations and creates test identities/repositories. It creates a random schema and drops only that schema afterward. It needs permission to create the schema. Connection URLs with existing `options` are rejected to preserve search-path isolation. Use local-only credentials and do not put real tokens into test output.
