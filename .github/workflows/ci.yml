@@ -305,6 +305,7 @@ jobs:
             --report organization_pagination=test-results/organization-pagination.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
             --report webhooks=test-results/webhooks.json \
+            --report browse=test-results/browse.json \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
@@ -330,6 +331,7 @@ jobs:
             --harness tests/web_detail_pagination.py \
             --harness tests/webhooks.py \
             --harness tests/webhook_tenant_matrix.py \
+            --harness tests/browse.py \
             --fixture postgres=postgres:17 \
             --fixture workspace_mount_mode=direct \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix \
