@@ -190,6 +190,14 @@ async fn metadata_ready(
 /// port, so the shared `auth::authenticate` answers its own `401`. Every route
 /// below decides on that credential before it touches PostgreSQL, the Blob
 /// store or native Git, so these tests need none of them.
+///
+/// Each request is shaped so that authentication, not an earlier path, query,
+/// body or content-type rejection, is what answers. Smart HTTP names the
+/// `.git` repository (`repository_name` -> `404` otherwise) and a valid service
+/// query; the RPCs carry their wire content type; `POST /api/repos` carries a
+/// syntactically valid JSON body because its `Json` extractor runs before the
+/// handler. History queries are validated before `BrowseSession::open`, so
+/// `compare` uses valid revisions.
 #[cfg(test)]
 mod challenge_tests {
     use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -208,8 +216,11 @@ mod challenge_tests {
     const BEARER: &str = "Bearer realm=\"Rootyard\"";
     const BASIC: &str = "Basic realm=\"Rootyard\", charset=\"UTF-8\"";
 
-    /// An immutable gateway state whose pool points at a closed loopback port.
-    fn offline_state() -> Arc<BlobGitState> {
+    /// An immutable gateway state whose pool points at a closed loopback port,
+    /// returned with the scratch [`tempfile::TempDir`] it was built on. The
+    /// caller must keep that guard bound for the whole test so the root
+    /// outlives every request served by the state.
+    fn offline_state() -> (Arc<BlobGitState>, tempfile::TempDir) {
         let config: tokio_postgres::Config =
             "host=127.0.0.1 port=1 user=rootyard dbname=rootyard".parse().expect("static connection string");
         let pool = deadpool_postgres::Pool::builder(Manager::new(config, tokio_postgres::NoTls))
@@ -220,14 +231,13 @@ mod challenge_tests {
         // The `cfg(test)` memory store; only its backend identity is consulted,
         // and only after the request authenticated.
         let (blob, _) = store(ResourceLimits::new(2, 2, 1 << 20).expect("test budget"));
-        // The scratch root must outlive every request served by this state.
-        let scratch = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("scratch root"));
-        Arc::new(
+        let scratch = tempfile::tempdir().expect("scratch root");
+        let state = Arc::new(
             BlobGitState::new(BlobGitConfig {
                 pool,
                 store: blob,
                 git_binary: PathBuf::from("/bin/true"),
-                scratch_root: (*scratch).path().to_path_buf(),
+                scratch_root: scratch.path().to_path_buf(),
                 max_concurrent_requests: 1,
                 max_request_bytes: 64 * 1024,
                 max_response_bytes: 64 * 1024,
@@ -236,22 +246,24 @@ mod challenge_tests {
                 native_limits: Default::default(),
             })
             .expect("gateway state"),
-        )
+        );
+        (state, scratch)
     }
 
-    /// Send one request through the real router.
+    /// Send one request through the real router with the given body bytes.
     async fn send(
         state: &Arc<BlobGitState>,
         method: &str,
         uri: &str,
         headers: &[(&str, &str)],
+        body: &'static [u8],
     ) -> (StatusCode, Vec<String>) {
         let mut request = Request::builder().method(method).uri(uri);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
         let response =
-            router(state.clone()).oneshot(request.body(Body::empty()).expect("request")).await.expect("router");
+            router(state.clone()).oneshot(request.body(Body::from(body)).expect("request")).await.expect("router");
         let challenges = response
             .headers()
             .get_all(header::WWW_AUTHENTICATE)
@@ -276,7 +288,7 @@ mod challenge_tests {
     /// `/web/blob/api` aliases answer exactly like their top-level route.
     #[tokio::test]
     async fn top_level_api_and_its_aliases_advertise_bearer() {
-        let state = offline_state();
+        let (state, _scratch) = offline_state();
         let rejected: [&[(&str, &str)]; 3] = [
             &[],
             &[("authorization", "Bearer not-a-credential")],
@@ -288,6 +300,8 @@ mod challenge_tests {
             ("GET", "/api/repos/owner/name/refs"),
             ("GET", "/api/repos/owner/name/commits"),
             ("GET", "/api/repos/owner/name/tree"),
+            // A bare `/blob` is fine: with the default `HEAD` revision and an
+            // empty path it is validated (not rejected) before authentication.
             ("GET", "/api/repos/owner/name/blob"),
             ("GET", "/api/repos/owner/name/compare?base=HEAD&head=HEAD"),
             ("GET", "/api/repos/owner/name/operations/00000000-0000-0000-0000-000000000001"),
@@ -300,7 +314,20 @@ mod challenge_tests {
         ];
         for (method, uri) in routes {
             for headers in rejected {
-                let (status, challenges) = send(&state, method, uri, headers).await;
+                // `create_repo` extracts `Json<CreateRepository>` before the
+                // handler authenticates, so only this route needs a valid JSON
+                // body; every other route has no body extractor and takes the
+                // empty body. `/api/repos/{owner}/{name}/merges` has no body,
+                // form or query extractor at all.
+                let (headers, body): (Vec<(&str, &str)>, &'static [u8]) =
+                    if (method, uri) == ("POST", "/api/repos") {
+                        let mut headers = headers.to_vec();
+                        headers.push(("content-type", "application/json"));
+                        (headers, br#"{"name":"name"}"#)
+                    } else {
+                        (headers.to_vec(), b"")
+                    };
+                let (status, challenges) = send(&state, method, uri, &headers, body).await;
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri} was not an unauthenticated denial");
                 assert_eq!(challenges, [BEARER], "{method} {uri} must not enter a browser Basic auth exchange");
             }
@@ -312,12 +339,12 @@ mod challenge_tests {
     /// both RPCs.
     #[tokio::test]
     async fn smart_http_denials_advertise_basic() {
-        let state = offline_state();
+        let (state, _scratch) = offline_state();
         let routes = [
-            ("GET", "/git/owner/name/info/refs?service=git-upload-pack"),
-            ("GET", "/git/owner/name/info/refs?service=git-receive-pack"),
-            ("POST", "/git/owner/name/git-upload-pack"),
-            ("POST", "/git/owner/name/git-receive-pack"),
+            ("GET", "/git/owner/name.git/info/refs?service=git-upload-pack"),
+            ("GET", "/git/owner/name.git/info/refs?service=git-receive-pack"),
+            ("POST", "/git/owner/name.git/git-upload-pack"),
+            ("POST", "/git/owner/name.git/git-receive-pack"),
         ];
         let rejected: [&[(&str, &str)]; 2] = [&[], &[("authorization", "Bearer not-a-credential")]];
         for (method, uri) in routes {
@@ -326,7 +353,7 @@ mod challenge_tests {
                 if method == "POST" {
                     all.push(("content-type", rpc_content_type(uri)));
                 }
-                let (status, challenges) = send(&state, method, uri, &all).await;
+                let (status, challenges) = send(&state, method, uri, &all, &[]).await;
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri} was not an unauthenticated denial");
                 assert_eq!(challenges, [BASIC], "{method} {uri} must keep the Git Basic challenge");
             }
@@ -338,13 +365,13 @@ mod challenge_tests {
     /// API answers with the authority's own failure rather than its `401`.
     #[tokio::test]
     async fn accepted_basic_and_bearer_credentials_still_pass() {
-        let state = offline_state();
+        let (state, _scratch) = offline_state();
         let token = format!("ryt_{}", "ab".repeat(32));
         let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("owner:{token}")));
         let bearer = format!("Bearer {token}");
         for uri in ["/api/repos", "/web/blob/api/repos"] {
             for credential in [basic.as_str(), bearer.as_str()] {
-                let (status, challenges) = send(&state, "GET", uri, &[("authorization", credential)]).await;
+                let (status, challenges) = send(&state, "GET", uri, &[("authorization", credential)], &[]).await;
                 assert!(challenges.is_empty(), "{uri} challenged a request that already named a scheme");
                 assert_ne!(status, StatusCode::UNAUTHORIZED, "{uri} rejected a credential syntax auth accepts");
             }
