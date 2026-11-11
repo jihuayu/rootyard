@@ -503,19 +503,22 @@ mod challenge_tests {
         let bare = GatewayError::Unauthorized.into_response();
         assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
         assert!(value(&bare).is_empty());
-        assert_eq!(value(&unauthorized.api()), [BEARER]);
-        assert_eq!(value(&unauthorized.git()), [BASIC]);
+        assert_eq!(value(&unauthorized.api()), [BEARER.to_owned()]);
+        assert_eq!(value(&unauthorized.git()), [BASIC.to_owned()]);
         // A bare `401` with no challenge gains exactly the route scheme (the
         // credential parser's refusal is the bare gateway `401`, no challenge).
-        assert_eq!(value(&with_challenge(GatewayError::Unauthorized.into_response(), Challenge::Bearer)), [BEARER]);
+        assert_eq!(
+            value(&with_challenge(GatewayError::Unauthorized.into_response(), Challenge::Bearer)),
+            [BEARER.to_owned()]
+        );
         // An existing Basic (foreign/shared sign-in) challenge is kept, not
         // rewritten or joined, and the status stays `401`.
         let existing = crate::Error::unauthorized().into_response();
         assert_eq!(existing.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(value(&existing), [BASIC]);
+        assert_eq!(value(&existing), [BASIC.to_owned()]);
         let kept = with_challenge(existing, Challenge::Bearer);
         assert_eq!(kept.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(value(&kept), [BASIC]);
+        assert_eq!(value(&kept), [BASIC.to_owned()]);
         // A non-`401` answer is never challenged either.
         let not_found = with_challenge(GatewayError::NotFound.into_response(), Challenge::Bearer);
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
