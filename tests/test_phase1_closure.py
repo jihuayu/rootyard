@@ -23,6 +23,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import schema_baseline  # noqa: E402
+from e2e_tiers import Phase1ClosureAndDocsFixture  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CI_YML = ROOT / ".github/workflows/ci.yml"
@@ -46,10 +47,29 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
 
         # Must build standard binaries and pando-lab feature binary
         self.assertIn("cargo build --locked", ci_text)
-        self.assertRegex(
-            ci_text,
-            r"python3\s+scripts/build_native\.py\s+--features\s+pando-lab\s+--bins\b",
-            "ci.yml must invoke the attested native build for all pando-lab binaries",
+        self.assertEqual(
+            Phase1ClosureAndDocsFixture.ci_build_native_batch_tokens(
+                Phase1ClosureAndDocsFixture.live_ci_run_commands(ci_text)
+            ),
+            [
+                "python3",
+                "scripts/build_native_batch.py",
+                "--all-bins",
+                "--features",
+                "pando-lab",
+                "--strip-debuginfo",
+                "--test",
+                "ref_store_snapshot_backup_fixture",
+                "--output",
+                "test-results/refstore-snapshot-fixture",
+                "--test",
+                "ref_store_holds_backup_fixture",
+                "--output",
+                "test-results/refstore-holds-fixture",
+                "--manifest-out",
+                "test-results/native-build-batch.json",
+            ],
+            "ci.yml must invoke the attested native batch build for all pando-lab binaries",
         )
         build_script = (ROOT / "scripts/build_native.py").read_text(encoding="utf-8")
         for required in (
@@ -96,9 +116,38 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
             "python3 tests/ci_mirror.py --binary target/debug/rootyard --report test-results/ci-mirror.json",
             "python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json",
             "python3 tests/workspace.py --binary target/debug/rootyard-workspace-lab --report test-results/workspace.json",
+            "python3 tests/webhooks.py --binary target/debug/rootyard --report test-results/webhooks.json",
         )
         for cmd in expected_commands:
             self.assertIn(cmd, ci_text, f"Missing CI step command in .github/workflows/ci.yml: {cmd}")
+
+        # Real-service pagination harnesses and their evidence bindings
+        pagination_commands = (
+            "python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json",
+            "python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json",
+            "python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json",
+        )
+        pagination_reports = (
+            "--report repository_pagination=test-results/repository-pagination.json",
+            "--report organization_pagination=test-results/organization-pagination.json",
+            "--report web_detail_pagination=test-results/web-detail-pagination.json",
+        )
+        pagination_harnesses = (
+            "--harness tests/repository_pagination.py",
+            "--harness tests/organization_pagination.py",
+            "--harness tests/web_detail_pagination.py",
+        )
+        for binding in pagination_commands + pagination_reports + pagination_harnesses:
+            self.assertIn(binding, ci_text, f"Missing pagination wiring in .github/workflows/ci.yml: {binding}")
+        # Webhook report and its exact matrix source are part of the native gate.
+        manifest_start = ci_text.index("python3 scripts/native_report_manifest.py --mode job")
+        manifest_step = ci_text[manifest_start:].split("\n      - name:", 1)[0]
+        for argument in (
+            "--report webhooks=test-results/webhooks.json",
+            "--harness tests/webhooks.py",
+            "--harness tests/webhook_tenant_matrix.py",
+        ):
+            self.assertIn(argument, manifest_step)
 
         # initdb requires non-root. Container jobs switch user; the qualified
         # plain-host profile executes as runner and verifies its uid at runtime.
@@ -123,6 +172,55 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
             r"python3\s+-m\s+unittest\s+discover\s+-s\s+tests\s+-p\s+['\"]test_\*\.py['\"]",
             "ci.yml must run full unittest discovery over tests/test_*.py",
         )
+
+    def test_ci_workspace_autocapture_acceptance_wiring(self) -> None:
+        text = CI_YML.read_text(encoding="utf-8")
+
+        def step_block(name: str) -> str:
+            marker = f"      - name: {name}"
+            start = text.find(marker)
+            self.assertNotEqual(start, -1, f"missing CI step {name!r}")
+            nxt = text.find("\n      - name:", start + len(marker))
+            if nxt == -1:
+                return text[start:]
+            return text[start:nxt]
+
+        acceptance = step_block("Exercise native workspace autocapture acceptance")
+        self.assertIn(
+            "python3 tests/workspace_capture_acceptance.py --binary target/debug/rootyard "
+            "--report test-results/workspace-capture.json",
+            acceptance,
+        )
+        self.assertIn("timeout-minutes: 20", acceptance)
+        self.assertIn(
+            "ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence",
+            acceptance,
+        )
+        self.assertIn("ROOTYARD_WORKSPACE_MOUNT_MODE: direct", acceptance)
+
+        manifest = step_block("Bind native regressions to the built binary and source inputs")
+        self.assertIn(
+            "--report workspace_capture=test-results/workspace-capture.json", manifest
+        )
+        self.assertIn("tests/workspace_capture_acceptance.py", manifest)
+        self.assertIn("tests/fixtures/capture_read_gate.c", manifest)
+        self.assertIn("--fixture workspace_mount_mode=direct", manifest)
+        for case in (
+            "__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix",
+            "__main__.WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture",
+            "__main__.WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive",
+            "__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision",
+            "__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing",
+        ):
+            self.assertEqual(
+                manifest.count(f"--require-case workspace_capture={case}"),
+                1,
+                case,
+            )
+
+        upload = step_block("Upload end-to-end report")
+        self.assertIn("test-results/*.json", upload)
+        self.assertIn("test-results/evidence/*.jsonl", upload)
 
     def test_all_python_scripts_referenced_in_ci_yml_exist_and_parse_cleanly(self) -> None:
         ci_text = CI_YML.read_text(encoding="utf-8")

@@ -7,14 +7,17 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import threading
+import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from forge import ForgeHarness  # noqa: E402
 from pulls import PullsHarness  # noqa: E402
 from schema_baseline import SCHEMA_VERSION_CSV, SCHEMA_VERSIONS  # noqa: E402
+from webhook_tenant_matrix import run_matrix  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +33,90 @@ def migration_040_path() -> Path:
 def compute_hmac_sha256_header(secret: str, payload_bytes: bytes) -> str:
     digest = hmac.new(secret.encode("utf-8"), payload_bytes, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
+
+
+def receiver_request_snapshot(receiver) -> list[dict]:
+    """Copy the receiver's received requests while holding its lock.
+
+    Background deliveries append to the shared list at any time, so callers must
+    read one consistent snapshot instead of indexing the live list.
+    """
+    with receiver.lock:
+        return list(receiver.requests)
+
+
+def requests_for_delivery(requests: list[dict], delivery_id: str) -> list[dict]:
+    """Records whose lower-case x-rootyard-delivery header is exactly ``delivery_id``."""
+    return [
+        req
+        for req in requests
+        if req.get("headers", {}).get("x-rootyard-delivery") == delivery_id
+    ]
+
+
+def assert_dispatch_pull_delivery(
+    summary,
+    delivery,
+    receiver_requests,
+    *,
+    webhook_id,
+    repository_id,
+    event_id,
+    expected_payload,
+    secret,
+):
+    """Require durable delivery and exact authenticated receiver evidence."""
+    assert isinstance(summary, dict), f"dispatch summary must be an object: {summary!r}"
+    delivered_count = summary.get("delivered_count")
+    assert type(delivered_count) is int and delivered_count >= 0, (
+        f"dispatch delivered_count must be a nonnegative int: {delivered_count!r}"
+    )
+    assert isinstance(delivery, dict), f"durable delivery must be an object: {delivery!r}"
+    delivery_id = delivery.get("id")
+    assert isinstance(delivery_id, str) and delivery_id, delivery
+    assert delivery.get("webhook_id") == webhook_id, delivery
+    assert delivery.get("repository_id") == repository_id, delivery
+    assert delivery.get("event_id") == event_id, delivery
+    assert delivery.get("event_type") == "pull_request", delivery
+    assert type(delivery.get("sequence")) is int and delivery["sequence"] >= 1, delivery
+    assert delivery.get("state") == "delivered", delivery
+    assert type(delivery.get("attempts")) is int and delivery["attempts"] >= 1, delivery
+    assert delivery.get("response_status") == 200, delivery
+    assert isinstance(delivery.get("delivered_at"), str) and delivery["delivered_at"], delivery
+    assert delivery.get("payload") == expected_payload, delivery
+
+    signature = delivery.get("signature_256")
+    assert isinstance(signature, str) and signature.startswith("sha256="), delivery
+    durable_headers = {
+        str(key).lower(): value
+        for key, value in delivery.get("request_headers", {}).items()
+    }
+    assert durable_headers.get("x-rootyard-event") == "pull_request", delivery
+    assert durable_headers.get("x-rootyard-delivery") == delivery_id, delivery
+    assert durable_headers.get("x-rootyard-hook-id") == webhook_id, delivery
+    assert durable_headers.get("x-rootyard-signature-256") == signature, delivery
+    assert durable_headers.get("x-rootyard-attempt") == str(delivery["attempts"]), delivery
+
+    matches = requests_for_delivery(receiver_requests, delivery_id)
+    assert len(matches) == 1, (
+        f"expected exactly one receiver request for {delivery_id}, got {len(matches)}"
+    )
+    request = matches[0]
+    request_headers = {
+        str(key).lower(): value for key, value in request.get("headers", {}).items()
+    }
+    assert request.get("signature_valid") is True, request
+    assert request.get("signature") == signature, request
+    assert request_headers.get("x-rootyard-event") == "pull_request", request
+    assert request_headers.get("x-rootyard-delivery") == delivery_id, request
+    assert request_headers.get("x-rootyard-hook-id") == webhook_id, request
+    assert request_headers.get("x-rootyard-signature-256") == signature, request
+    assert request_headers.get("x-rootyard-attempt") == str(delivery["attempts"]), request
+    assert request.get("json") == delivery["payload"], request
+    raw_body = request.get("raw_body")
+    assert isinstance(raw_body, bytes), request
+    assert compute_hmac_sha256_header(secret, raw_body) == signature, request
+    assert request.get("response_status") == 200, request
 
 
 class LocalWebhookReceiver:
@@ -120,6 +207,106 @@ class WebhooksHarness(PullsHarness):
                     str(migration_040_path()),
                 ]
             )
+
+    def json_response(self, path: str, expected, **kwargs):
+        """Send one raw request and return its status and parsed JSON body.
+
+        ``expected`` is one status or a minimal tuple of statuses the caller
+        judges further from the parsed error vocabulary. Any other status, a
+        missing Cache-Control/Content-Type header or a non-object JSON body
+        fails here, so no caller can absorb a 401, 500 or opaque conflict.
+        """
+        allowed = expected if isinstance(expected, tuple) else (expected,)
+        assert allowed, "at least one expected status is required"
+        status, body, headers = self.http(
+            path, token=kwargs.pop("token", None) or self.alice, **kwargs
+        )
+        norm_headers = {k.lower(): v for k, v in headers.items()}
+        assert status in allowed, f"{path}: expected {expected}, got {status}: {body[:200]!r}"
+        assert norm_headers.get("cache-control") == "no-store", norm_headers
+        assert "application/json" in norm_headers.get("content-type", ""), norm_headers
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None
+        assert isinstance(parsed, dict), (status, body[:200])
+        return status, parsed
+
+    def check_rows(self) -> dict:
+        """Current check-run rows for the PR head, keyed by context."""
+        return {
+            c["context"]: c
+            for c in self.document(f"{self.pr1_path}/checks", token=self.reader)["items"]
+        }
+
+    def wait_for_pull_delivery(self, event_id: str, deadline: float = 10.0) -> dict:
+        """Poll one exact pull-request delivery until its durable row is delivered."""
+        stop = time.monotonic() + deadline
+        path = f"{self.hook_path}/deliveries?event_type=pull_request"
+        last = None
+        while True:
+            page = self.document(path)
+            rows = page.get("items")
+            assert isinstance(rows, list), page
+            matches = [row for row in rows if row.get("event_id") == event_id]
+            last = matches
+            assert len(matches) <= 1, f"Expected at most one delivery for {event_id}, got {matches}"
+            if matches:
+                row = matches[0]
+                state = row.get("state")
+                if state == "delivered":
+                    return row
+                assert state in ("pending", "leased"), (
+                    f"Delivery for {event_id} entered terminal state {state!r}: {row}"
+                )
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"Delivery for {event_id} was not delivered before the "
+                    f"{deadline}s deadline: {last}"
+                )
+            time.sleep(min(0.1, remaining))
+
+    def wait_for_queued_head(self, deadline: float = 10.0) -> dict:
+        """Poll until PR #1 is exactly feat2/base and its required checks are queued.
+
+        Dispatch synchronizes pull orchestration, but the background pull-ref
+        worker runs concurrently, so the feat2 checks may not exist yet while
+        the PR head is already feat2. A present but wrong row fails at once;
+        only absent contexts sleep, up to the caller's absolute deadline, and
+        a timeout is a clear failure.
+        """
+        stop = time.monotonic() + deadline
+        last = None
+        while True:
+            pr = self.document(self.pr1_path)
+            checks = self.document(f"{self.pr1_path}/checks")
+            last = (pr, checks)
+            head_ok = pr.get("head_oid") == self.feat2_oid and pr.get("base_oid") == self.base_oid
+            rows = checks.get("items")
+            assert checks.get("head_oid") == self.feat2_oid, last
+            assert isinstance(rows, list), last
+            contexts = [row.get("context") for row in rows]
+            assert len(contexts) == len(set(contexts)), last
+            by_ctx = {row["context"]: row for row in rows}
+            queued = {}
+            for context in ("ci/test", "ci/lint"):
+                if context not in by_ctx:
+                    continue
+                row = by_ctx[context]
+                if row.get("commit_oid") != self.feat2_oid or row.get("status") != "queued":
+                    raise AssertionError(f"{context} is not queued on feat2: {row}")
+                assert row.get("conclusion") is None, row
+                queued[context] = row
+            if head_ok and len(queued) == 2:
+                return checks
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"feat2 PR head {self.feat2_oid} never had queued ci/test and ci/lint "
+                    f"before the {deadline}s deadline: {last}"
+                )
+            time.sleep(min(0.1, remaining))
 
     def signed_callback(
         self,
@@ -268,6 +455,10 @@ class WebhooksHarness(PullsHarness):
         assert updated["version"] == 2 and updated["timeout_ms"] == 4000
 
     def ping_and_hmac_sha256_signature_verification(self):
+        # The receiver is shared with the background workers: outbox push
+        # deliveries can legitimately land before, between or after this ping.
+        # Receipt is therefore correlated by the delivery id the service
+        # advertises as X-Rootyard-Delivery, never by a global request count.
         self.receiver.clear()
         ping_delivery = self.document(
             f"{self.hook_path}/ping",
@@ -275,14 +466,42 @@ class WebhooksHarness(PullsHarness):
             method="POST",
             body={"zen": "Rootyard HMAC verification test", "event_id": "ping-fixed-1"},
         )
-        assert ping_delivery["state"] == "delivered"
-        assert ping_delivery["response_status"] == 200
-        assert ping_delivery["signature_256"].startswith("sha256=")
-        assert len(self.receiver.requests) == 1
-        req = self.receiver.requests[0]
-        assert req["signature_valid"] is True
-        assert req["headers"]["x-rootyard-event"] == "ping"
-        assert req["headers"]["x-rootyard-hook-id"] == self.hook["id"]
+        assert ping_delivery["event_id"] == "ping-fixed-1", ping_delivery
+        assert ping_delivery["event_type"] == "ping", ping_delivery
+        assert ping_delivery["webhook_id"] == self.hook["id"], ping_delivery
+        assert ping_delivery["state"] == "delivered", ping_delivery
+        assert ping_delivery["response_status"] == 200, ping_delivery
+        assert ping_delivery["payload"] == {
+            "event": "ping",
+            "zen": "Rootyard HMAC verification test",
+            "hook_id": self.hook["id"],
+            "repository_id": ping_delivery["repository_id"],
+        }, ping_delivery["payload"]
+        signature = ping_delivery["signature_256"]
+        assert re.fullmatch(r"sha256=[0-9a-f]{64}", signature), signature
+
+        # One consistent snapshot under the receiver lock; only this delivery's
+        # records are scored, so other delivery ids present at any point are fine.
+        delivery_id = ping_delivery["id"]
+        snapshot = receiver_request_snapshot(self.receiver)
+        matches = requests_for_delivery(snapshot, delivery_id)
+        assert len(matches) == 1, (delivery_id, [r.get("headers") for r in snapshot])
+        req = matches[0]
+        headers = req["headers"]
+        assert req["signature_valid"] is True, headers
+        assert req["signature"] == signature, headers
+        assert headers.get("x-rootyard-event") == "ping", headers
+        assert headers.get("x-rootyard-delivery") == delivery_id, headers
+        assert headers.get("x-rootyard-hook-id") == self.hook["id"], headers
+
+        # The signed body must be this ping-fixed-1 payload, so an unrelated ping
+        # cannot satisfy the oracle. The receiver already verified the HMAC over
+        # the exact raw bytes it received, so recomputing it here never depends
+        # on how the JSON object's keys happen to be ordered.
+        assert req["json"] == ping_delivery["payload"], req["json"]
+        assert req["signature"] == compute_hmac_sha256_header(
+            self.webhook_secret, req["raw_body"]
+        ), headers
 
     def auto_pr_ci_pin_and_queued_check_orchestration(self):
         # Configure branch protection requiring ci/test and ci/lint on refs/heads/main.
@@ -314,25 +533,94 @@ class WebhooksHarness(PullsHarness):
         )
         self.pr1_path = f"{self.pullspath}/{self.pr1['number']}"
 
-        # Dispatch webhooks: scans open PRs + outbox events, creates CI pin & queued checks.
-        self.receiver.clear()
+        # Dispatch also synchronizes open PRs and sends due deliveries.
         summary = self.document(self.dispatchpath, 200, method="POST", body={})
         assert summary["orchestrated_pulls"] >= 1
-        assert summary["delivered_count"] >= 1
+        event_id = (
+            f"pull:{self.pr1['number']}:{self.pr1['version']}:{self.feat1_oid}:opened"
+        )
+        delivery = self.wait_for_pull_delivery(event_id)
 
-        # Verify CI Source Pin was created for feat1_oid.
+        # Verify the pin and queued runs belong to this exact pull orchestration job.
         pins = self.document(self.pins_path)
         pin_items = pins if isinstance(pins, list) else pins.get("items", [])
         matching_pins = [p for p in pin_items if p.get("target_oid") == self.feat1_oid]
         assert len(matching_pins) == 1, f"Expected 1 CI pin for {self.feat1_oid}, got {pin_items}"
-        assert matching_pins[0]["state"] == "pinned"
+        pin = matching_pins[0]
+        assert pin["state"] == "pinned", pin
+        assert pin["repository_id"] == self.repo["id"], pin
+        assert pin["job_id"] == delivery["payload"]["ci_job_id"], pin
+        assert pin["retention_ref"] == f"refs/rootyard-ci/jobs/{pin['job_id']}", pin
+        assert (
+            isinstance(pin["storage_generation"], int)
+            and not isinstance(pin["storage_generation"], bool)
+            and pin["storage_generation"] > 0
+        ), pin
 
-        # Verify queued check runs were automatically registered on feat1_oid.
+        expected_contexts = ["ci/test", "ci/lint"]
+        expected_payload = {
+            "event": "pull_request",
+            "action": "opened",
+            "repository_id": self.repo["id"],
+            "pull_number": self.pr1["number"],
+            "head_oid": self.feat1_oid,
+            "base_oid": self.base_oid,
+            "head_ref": "refs/heads/feature",
+            "base_ref": "refs/heads/main",
+            "ci_job_id": pin["job_id"],
+            "retention_ref": pin["retention_ref"],
+            "required_checks": expected_contexts,
+            "pull_request": self.pr1,
+            "ci_pin": {
+                "job_id": pin["job_id"],
+                "retention_ref": pin["retention_ref"],
+                "target_oid": self.feat1_oid,
+                "storage_generation": pin["storage_generation"],
+            },
+            "queued_checks": expected_contexts,
+        }
+        assert delivery["payload"] == expected_payload, delivery
+
         pr_checks = self.document(f"{self.pr1_path}/checks")["items"]
-        by_ctx = {c["context"]: c for c in pr_checks}
-        assert "ci/test" in by_ctx and "ci/lint" in by_ctx
-        assert by_ctx["ci/test"]["status"] == "queued"
-        assert by_ctx["ci/lint"]["status"] == "queued"
+        contexts = [row.get("context") for row in pr_checks]
+        assert len(contexts) == len(set(contexts)), pr_checks
+        assert set(contexts) == set(expected_contexts), pr_checks
+        for row in pr_checks:
+            assert row["repository_id"] == self.repo["id"], row
+            assert row["commit_oid"] == self.feat1_oid, row
+            assert row["status"] == "queued", row
+            assert row["conclusion"] is None, row
+
+        linkage = self.sql(
+            "SELECT count(*)::text || ':' || count(DISTINCT r.context)::text || ':' || "
+            "count(DISTINCT r.job_id)::text "
+            "FROM ci_runs r "
+            "JOIN ci_pull_sync_progress s ON s.repository_id=r.repository_id "
+            "AND s.pull_number=r.pull_number AND s.pull_version=r.pull_version "
+            "AND s.head_oid=r.head_oid AND s.base_oid=r.base_oid "
+            "AND s.storage_generation=r.storage_generation "
+            "JOIN forge_check_runs c ON c.repository_id=r.repository_id "
+            "AND c.commit_oid=r.head_oid AND c.context=r.context "
+            f"WHERE r.repository_id='{self.repo['id']}' "
+            f"AND r.job_id='{pin['job_id']}' "
+            f"AND r.pull_number={self.pr1['number']} "
+            f"AND r.pull_version={self.pr1['version']} "
+            f"AND r.head_oid='{self.feat1_oid}' AND r.base_oid='{self.base_oid}' "
+            "AND r.context IN ('ci/test','ci/lint') "
+            "AND c.status='queued' AND c.conclusion IS NULL"
+        )
+        assert linkage == "2:2:1", linkage
+
+        assert_dispatch_pull_delivery(
+            summary,
+            delivery,
+            receiver_request_snapshot(self.receiver),
+            webhook_id=self.hook["id"],
+            repository_id=self.repo["id"],
+            event_id=event_id,
+            expected_payload=expected_payload,
+            secret=self.webhook_secret,
+        )
 
     def idempotent_ci_callbacks_and_monotonic_check_runs(self):
         cb_path = f"{self.hook_path}/callback"
@@ -436,6 +724,7 @@ class WebhooksHarness(PullsHarness):
         )
 
         # Now update feature branch and PR #1 head_oid to feat2_oid: old CI on feat1_oid must NOT allow merge!
+        self.pr1_version_before_push = self.pr1["version"]
         self.git(
             "push",
             "origin",
@@ -443,28 +732,78 @@ class WebhooksHarness(PullsHarness):
             cwd=self.work,
             token=self.alice,
         )
-        self.pr1 = self.document(
-            self.pr1_path,
-            200,
-            method="PATCH",
-            body={
-                "expected_version": self.pr1["version"],
-                "head_oid": self.feat2_oid,
-            },
-        )
+        # Background reconciliation may already have advanced PR #1 from the
+        # authoritative `feature` ref (head_oid=feat2_oid, version bumped). Read
+        # the live row instead of assuming the pre-push version is still
+        # current, and only PATCH against a version just read.
+        pr_now = self.document(self.pr1_path)
+        assert pr_now["base_oid"] == self.base_oid, pr_now
+        if pr_now["head_oid"] == self.feat2_oid:
+            # Already advanced: the returned row itself must be the feat2 bump.
+            assert pr_now["version"] > self.pr1_version_before_push, pr_now
+        else:
+            # Not yet auto-advanced: the old head must still be stored, so the
+            # manual PATCH is the one legitimate single use of a just-read version.
+            assert pr_now["head_oid"] == self.pr1["head_oid"], pr_now
+            status, patched = self.json_response(
+                self.pr1_path,
+                (200, 409),
+                method="PATCH",
+                body={"expected_version": pr_now["version"], "head_oid": self.feat2_oid},
+            )
+            if status == 409:
+                # A 409 is only the legitimate background win when it is exactly
+                # the version conflict, i.e. a concurrent writer committed a
+                # version bump. Any other 409 (head_oid/base_oid mismatch,
+                # closed/merged PR, ...) fails here. The one bounded read-back
+                # must then prove the writer landed exactly feat2/base and a
+                # version past the pre-push one; a stale old-head row fails on
+                # the shared oracle below instead of being retried.
+                assert patched.get("error") == "pull request version conflict", patched
+                # Exactly one bounded read-back; it must show the feat2 bump.
+                pr_now = self.document(self.pr1_path)
+            else:
+                pr_now = patched
+        # 200 uses the real returned row; both paths must satisfy the same
+        # feat2/base/version oracle before the merge below can mean anything.
+        assert pr_now["head_oid"] == self.feat2_oid, pr_now
+        assert pr_now["base_oid"] == self.base_oid, pr_now
+        assert pr_now["version"] > self.pr1_version_before_push, pr_now
+        # Dispatch synchronizes pull orchestration (in the handler, before it
+        # answers); only after that can the feat2 head's checks be asserted.
         self.document(self.dispatchpath, 200, method="POST", body={})
+        # The feat2 checks must be queued on the final feat2 head, so the merge
+        # below is refused by the required-check policy, not any other conflict.
+        checks = self.wait_for_queued_head()
+        self.pr1 = self.document(self.pr1_path)
+        assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
+        assert checks["head_oid"] == self.feat2_oid, checks
+        # Orchestration runs concurrently with the background worker, so read the
+        # version the merge will fence on from the row as it is now.
+        self.pr1 = self.document(self.pr1_path)
 
-        # Merge at feat2_oid must fail with 409 because feat2_oid's check runs are still 'queued'.
-        self.document(
-            f"{self.pr1_path}/merge",
-            409,
-            method="POST",
-            body={
+        # Merge at feat2_oid must fail with exactly the branch-policy 409 because
+        # feat2_oid's check runs are still 'queued'. A version conflict only means
+        # the background worker advanced the row after our read: re-read the
+        # version a bounded number of times, always re-fencing on feat2_oid, and
+        # fail on any other status or error.
+        for _ in range(5):
+            merge_body = {
                 "expected_version": self.pr1["version"],
                 "expected_head_oid": self.feat2_oid,
                 "expected_base_oid": self.base_oid,
-            },
-        )
+            }
+            _, merge = self.json_response(
+                f"{self.pr1_path}/merge", 409, method="POST", body=merge_body
+            )
+            if merge.get("error") == "required check runs have not succeeded":
+                break
+            assert merge.get("error") == "pull request version conflict", merge
+            self.pr1 = self.document(self.pr1_path)
+            assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
+        else:
+            raise AssertionError(f"merge never reached the check-run oracle: {merge}")
+        assert self.pr1["head_oid"] == self.feat2_oid, self.pr1
 
     def outbox_push_and_pull_request_event_dispatch(self):
         deliveries = self.document(f"{self.hook_path}/deliveries")["items"]
@@ -780,6 +1119,9 @@ class WebhooksHarness(PullsHarness):
         self.document("/api/repos/alice/other/webhooks", 404, token=carol)
         self.document(org_hooks, 404, token=carol)
 
+    def tenant_role_matrix(self):
+        return run_matrix(self)
+
     def access_and_boundaries(self):
         # Non-owner (bob) receives 404 Not Found; read-only token receives 403 Forbidden on mutations.
         self.document(self.webhookspath, 404, token=self.bob)
@@ -819,6 +1161,7 @@ def main():
             "exponential_backoff_retry_and_dead_letter",
             "webhook_loopback_default_deny_and_operator_opt_in",
             "collaborator_team_and_organization_tenant_scope",
+            "tenant_role_matrix",
             "access_and_boundaries",
         ):
             harness.case(name, getattr(harness, name))

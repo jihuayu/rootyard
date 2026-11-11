@@ -191,6 +191,9 @@ async fn run_hydration(key: &HydrationKey, deadline: Instant) -> FlightOutcome {
         Err(error) => {
             // Keep only the bounded typed cause; never flatten error Display
             // or its transport source into text stored on the shared flight.
+            if error.downcast_ref::<RemoteStoreError>().is_some() {
+                super::remote_metrics::counters().record_remote_failure();
+            }
             let remote = error.downcast::<RemoteStoreError>().ok();
             FlightOutcome::Failed(Arc::new(FlightFailure { remote }))
         }
@@ -269,7 +272,9 @@ pub(super) fn schedule_repair(
     let Ok(permit) = REPAIR_SLOTS.try_acquire() else {
         return;
     };
+    let backlog = super::remote_metrics::counters().begin_repair();
     tokio::spawn(async move {
+        let _backlog = backlog;
         let _permit = permit;
         let result = async {
             let Some(store) = remote_store(&data_root)? else {
@@ -285,6 +290,9 @@ pub(super) fn schedule_repair(
         }
         .await;
         if let Err(error) = result {
+            if error.downcast_ref::<RemoteStoreError>().is_some() {
+                super::remote_metrics::counters().record_remote_failure();
+            }
             // Observable but intentionally non-fatal: local verified bytes and
             // the paired backup remain authoritative until a later repair.
             // Fixed text only; never format the error or its source chain.

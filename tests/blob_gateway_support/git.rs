@@ -103,9 +103,14 @@ impl Git {
 
 /// Percent-free credentials: the production token is `ryt_` plus hex and the
 /// fixture username is lowercase ASCII, so URL encoding is unnecessary.
+///
+/// The path is the serving gateway's real Smart HTTP route (`/git/...`, see
+/// `blob_git_gateway::router` and the API `clone_path`), which also requires
+/// the `.git` suffix on the repository name.
 pub fn clone_url(address: std::net::SocketAddr, owner: &str, name: &str, username: &str, token: &str) -> String {
     // Smart HTTP route of the directly mounted `blob_git_gateway::router`
-    // (no prefix proxy), so the path is `/git/{owner}/{name}/...`.
+    // (no prefix proxy), so the path is `/git/{owner}/{name}/...`; the clone
+    // URL names the same route and keeps the required `.git` suffix.
     format!("http://{username}:{token}@{address}/git/{owner}/{name}.git")
 }
 

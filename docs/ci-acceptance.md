@@ -3,7 +3,7 @@
 Two layers cover the native acceptance suites. Neither layer replaces the
 specialised cgroup VM gate in `.github/workflows/native-kernel-acceptance.yml`.
 
-## Layer 1 — every push and pull request (`.github/workflows/ci.yml`)
+## Layer 1 — every pull request and every push to `main` (`.github/workflows/ci.yml`)
 
 The verify job runs on a plain `ubuntu-22.04` host, not in the former
 `rust:1-trixie` container. That is the same host profile on which the manual
@@ -41,24 +41,140 @@ network namespaces with a mounted tmpfs. Nothing is skipped and no global
 subreaper, sysctl or AppArmor policy is changed.
 
 Cheap but real native security, tenancy and concurrency regressions run against
-the binary built once by `scripts/build_native.py --features pando-lab --bins`:
+a single `scripts/build_native_batch.py` invocation that builds `target/debug/rootyard`
+together with the feature-enabled Cargo metadata bins and both selected RefStore
+fixture integration-test executables, recording the batch in
+`test-results/native-build-batch.json`; the fixture outputs are written to
+`test-results/refstore-snapshot-fixture` and `test-results/refstore-holds-fixture`:
 
 | Suite | What it proves | Evidence |
 | --- | --- | --- |
 | `tests/web_sessions.py` | Session exchange, CSRF binding, expiry and parent-token revocation over the real Rust service and PostgreSQL 17 | `test-results/web-sessions.json` |
 | `tests/ci_webhook_regressions.py` | 201-event batching, concurrent claim fencing, verified TLS delivery and untrusted-CA rejection (no `--report`; the stdout log is the evidence) | `test-results/ci-webhook-regressions.log` |
 | `tests/webhook_worker_recovery.py` | Background worker recovery across SIGKILL at the enqueue and ack boundaries, lease overlap and backoff/dead-letter, with no manual dispatch | `test-results/webhook-worker-recovery.json` |
+| `tests/repository_pagination.py` | Real API/PostgreSQL traversal of 1,001 repositories with keyset ordering, actor scope and mutations | `test-results/repository-pagination.json` |
+| `tests/organization_pagination.py` | Real API/PostgreSQL traversal of 101 members and 101 teams with authorization, cursor scope and mutation resume | `test-results/organization-pagination.json` |
+| `tests/web_detail_pagination.py` | Real web Issue comments and PR reviews across the 100-row page boundary (105 rows seeded plus the 106th written through real HTTP/Git), including cursor/actor/revocation checks | `test-results/web-detail-pagination.json` |
 
 A final step, `scripts/native_report_manifest.py --mode job`, fails the job
 unless every report was produced by the exact binary whose SHA-256 appears in
 `target/debug/rootyard.build.json`, every declared case passed, the
 `ci_webhook_regressions` log is non-empty and contains each expected phase
 marker, and the receipt's commit and compiled source-input digest were recorded.
+The manifest also binds the `repository-pagination.json`,
+`organization-pagination.json` and `web-detail-pagination.json` reports and
+their harness sources to that same build receipt, so none of the three can be
+produced by a different binary. These three harnesses are real functional
+regressions over real API, PostgreSQL, HTTP and Git state, not scalability
+benchmarks.
 The manifest (`test-results/native-pr-gate.json`) also stores harness SHA-256
 digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
 `git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
 the native tool provenance file. Injecting any of those defects turns the pull
 request red instead of leaving the regression to manual re-verification.
+The `e2e-report` artifact includes `target/debug/rootyard.build.json` and
+`test-results/native-build-batch.json`, so downloaded job manifests can be
+checked against the build receipt and batch manifest.
+
+## 专项与完整 candidate 分层 (specialised suites vs. the complete gate)
+
+The existing GitHub Actions workflow layering and required checks are unchanged.
+The grouped acceptance runner described at the end of this section is optional
+and does not alter any CI required status. It does not replace the full required
+gate, the candidate-release workflow or the qualified Linux kernel/cgroup
+workflow. Choosing a layer:
+
+| Situation | What runs |
+| --- | --- |
+| Opening or updating any pull request | `CI` → `verify`, `container`; Pando → `isolated-lab`; Redis → `redis-contract`; plus `native` / `log-storage` automatically when their `pull_request.paths` match. This is the **full required gate** and is never skipped by default. |
+| Working on one affected area before the PR is ready | Dispatch the affected specialised workflow on the branch: `refstore-protocol-acceptance.yml`, `refcas-log.yml`, `native-kernel-acceptance.yml` (cgroup VM profile), `candidate-release-acceptance.yml` (Chromium + Garage candidate), or `pando-lab.yml` / `redis-contract.yml` (now also dispatachable). Dispatch is additive; it does not change the PR's required result. |
+| Merging to `main` | The `push` on `main` re-runs every full-gate workflow on the merged commit (the PR head is a different commit), so the complete gate is re-verified after merge. |
+
+Trigger policy: full-gate workflows (`ci.yml`, `pando-lab.yml`, `redis-contract.yml`) run
+`pull_request` on every PR head and `push` only for `main`. An unfiltered `push` duplicated the
+whole gate for each feature-branch head (before/after evidence and the limits of what has been
+observed are in `docs/acceptance/ci-trigger-dedup-20261110.md`). Do not add `paths:` filters to
+those workflows: a required check that is filtered out stays "expected" forever on a PR. The
+path-filtered suites above intentionally have none of their jobs as `main` required checks;
+their `workflow_dispatch` makes them available at any time.
+
+## Optional local grouped runner (`scripts/run_native_acceptance.py`)
+
+Operator-side scheduling evidence only. It is a Linux-only coordinator that
+executes existing suite commands from a JSON plan; it is not a CI job and it
+proves nothing about kernel or cgroup behaviour.
+
+* Every `full` suite must depend, directly or transitively, on a `smoke` suite,
+  and a failed, timed-out, cancelled or blocked dependency blocks its dependants
+  (`blocked` is never a pass). This does not mean all smoke work finishes before
+  any full job starts: every eligible suite may run concurrently, in plan order
+  subject to dependencies, `max_workers` and resource locks.
+* Each suite declares resource keys (`exclusive`, or `shared` with a harness
+  isolation declaration). Stateful `global`/`kernel`/`lifecycle` keys need their
+  own named isolation entry to be shared; `database: owned_schema` supports
+  sharing non-stateful keys; exclusive use needs no declaration. Per-suite
+  `timeout_seconds` (at most 86400) and the optional `total_timeout_seconds`
+  request cancellation only: they are not wall-clock guarantees, because locks
+  stay held until owned descendants are proven quiescent. If that state is
+  unknown, the runner and its locks may stay alive indefinitely with no final
+  pass or report.
+* The runner only executes each suite's `argv` and coordinates flocked resource
+  keys; it never provisions or drops PostgreSQL or Garage. Service and resource
+  setup and cleanup belong to each suite's existing harness.
+* Keep credentials out of plans and pass them through the private runner
+  environment. Validation rejects URI-like values under sensitive top-level
+  environment keys but does not reject every possible secret string.
+* Suite summaries are redacted output, except the supervisor pre-spawn refusal,
+  which uses a fixed summary. The self-test marks the run/report failed if a
+  known sensitive value remains in the rendered report text. It is detection,
+  not prevention: on a detected leak the runner writes and prints the same
+  minimal hashed failure payload (kind, version, run id, hashed self-test
+  matches, `gate: failed`) instead of the full report; if that file cannot be
+  written, it prints no report. Raw per-suite logs
+  (`<run-dir>/logs/<suite_id>.log`) are mode `0600` but may contain secrets;
+  keep them private.
+* The runner requires a readable Linux `/proc` and working pidfds and refuses
+  to spawn anything when either is unsupported.
+* `--dry-run` validates host support and paths but starts no child and creates no
+  run or report directory. A real run creates the run directory and the report
+  parent. The lock directory must already exist and be operator-created; lock,
+  run, log and report paths must resolve outside `--verify-host` (the plan file
+  itself need not be).
+
+A minimal no-secret plan:
+
+```json
+{"version": 1,
+ "suites": [{"id": "smoke-web-sessions", "phase": "smoke",
+             "argv": ["python3", "tests/web_sessions.py", "--binary",
+                      "target/debug/rootyard", "--report", "{run_dir}/smoke.json"],
+             "depends_on": [],
+             "resources": {"instance:pg17": "shared"},
+             "timeout_seconds": 600,
+             "isolation": {"database": "owned_schema"}}]}
+```
+
+Build, validate and run (placeholders; create only the lock directory and export
+any credentials in the runner process environment before the run; the runner
+creates `/outside/path/runs/run-1` and `report.json`):
+
+```sh
+python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo --bins
+mkdir -p /outside/path/locks
+python3 scripts/run_native_acceptance.py --plan /outside/path/plan.json \
+  --lock-dir /outside/path/locks --log-dir /outside/path/runs/run-1 \
+  --report /outside/path/runs/run-1/report.json --run-id run-1 --dry-run
+python3 scripts/run_native_acceptance.py --plan /outside/path/plan.json \
+  --lock-dir /outside/path/locks --log-dir /outside/path/runs/run-1 \
+  --report /outside/path/runs/run-1/report.json --run-id run-1
+```
+
+`--exclude SUITE` (repeatable) drops an unreferenced suite after the original
+plan has been validated; if any included suite depends on an excluded suite, or
+if exclusion would leave no suites, the runner rejects the invocation with a
+bounded preflight error before spawning suites or acquiring resource locks.
+`--verify-host` names the checkout root used to refuse in-checkout lock, run,
+log and report paths (default: the repository root).
 
 ## Layer 2 — candidate release gate (`.github/workflows/candidate-release-acceptance.yml`)
 
@@ -143,10 +259,21 @@ scripts/install_ci_native_tools.sh preflight --prefix "$RUNNER_TEMP/rootyard-ci-
 Then run the per-pull-request regressions exactly as CI does after building once:
 
 ```sh
-python3 scripts/build_native.py --features pando-lab --bins
+python3 scripts/build_native_batch.py \
+  --all-bins \
+  --features pando-lab \
+  --strip-debuginfo \
+  --test ref_store_snapshot_backup_fixture \
+  --output test-results/refstore-snapshot-fixture \
+  --test ref_store_holds_backup_fixture \
+  --output test-results/refstore-holds-fixture \
+  --manifest-out test-results/native-build-batch.json
 python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
 python3 tests/ci_webhook_regressions.py --binary target/debug/rootyard | tee test-results/ci-webhook-regressions.log
 python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
+python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json
+python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json
+python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json
 ```
 
 The native host profile in this change was validated locally only: workflow
