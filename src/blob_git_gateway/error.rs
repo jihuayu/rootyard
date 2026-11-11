@@ -236,16 +236,21 @@ mod tests {
         let values = |response: &Response| -> Vec<_> {
             response.headers().get_all(header::WWW_AUTHENTICATE).iter().cloned().collect()
         };
-        // A handler refusal that already carries another authority's challenge
-        // is returned exactly as rendered: nothing is replaced or appended.
-        let mut existing = GatewayError::Unauthorized.into_response();
-        existing
-            .headers_mut()
-            .append(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer realm=\"Rootyard\""));
-        let expected = values(&existing);
-        for rendered in
-            [with_challenge(existing.clone(), Challenge::Basic), with_challenge(existing, Challenge::Bearer)]
-        {
+        // A fresh handler refusal carrying another authority's challenge, as
+        // rendered; `Response<Body>` is not cloneable, so each assertion builds
+        // its own fixture.
+        let existing = || {
+            let mut existing = GatewayError::Unauthorized.into_response();
+            existing
+                .headers_mut()
+                .append(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer realm=\"Rootyard\""));
+            existing
+        };
+        for challenge in [Challenge::Basic, Challenge::Bearer] {
+            let before = existing();
+            let expected = values(&before);
+            assert_eq!(expected.len(), 1, "precondition: one existing challenge");
+            let rendered = with_challenge(before, challenge);
             assert_eq!(rendered.status(), StatusCode::UNAUTHORIZED);
             assert_eq!(values(&rendered), expected, "an existing challenge is preserved and never joined");
         }

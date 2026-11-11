@@ -329,11 +329,8 @@ pub async fn middleware(
         // enforces Origin), instead of letting them skip Origin/CSRF. Bearer
         // remains an explicit, non-ambient API credential.
         if path != "/web/login" && basic_authorization(&headers) {
-            return Error(
-                StatusCode::FORBIDDEN,
-                "browser mutations require a session cookie and CSRF token",
-            )
-            .into_response();
+            return Error(StatusCode::FORBIDDEN, "browser mutations require a session cookie and CSRF token")
+                .into_response();
         }
         if path == "/web/logout" {
             if session_mode && !browser_origin(&headers) {
@@ -440,10 +437,7 @@ pub async fn login(
     let token_id = Uuid::new_v4();
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let parent = client
-        .query_opt(
-            "SELECT kind, is_restricted FROM tokens WHERE id=$1 AND user_id=$2",
-            &[&actor.token_id, &actor.id],
-        )
+        .query_opt("SELECT kind, is_restricted FROM tokens WHERE id=$1 AND user_id=$2", &[&actor.token_id, &actor.id])
         .await
         .map_err(Error::internal)?;
     let Some(parent) = parent else {
@@ -454,18 +448,13 @@ pub async fn login(
     if restricted {
         // Restricted API tokens cannot mint a browser child until a parent
         // binding exists: a child must never become an unrestricted proxy.
-        let mut response = render_login(
-            &target,
-            Some("Restricted API tokens cannot open a browser session yet."),
-        );
+        let mut response = render_login(&target, Some("Restricted API tokens cannot open a browser session yet."));
         *response.status_mut() = StatusCode::FORBIDDEN;
         return Ok(response);
     }
     if kind != "api" {
-        let mut response = render_login(
-            &target,
-            Some("API token sign-in is required; browser sessions cannot sign in again."),
-        );
+        let mut response =
+            render_login(&target, Some("API token sign-in is required; browser sessions cannot sign in again."));
         *response.status_mut() = StatusCode::UNAUTHORIZED;
         return Ok(response);
     }
@@ -547,6 +536,11 @@ mod tests {
         response.headers().get_all(header::WWW_AUTHENTICATE).iter().map(|v| v.to_str().unwrap()).collect()
     }
 
+    /// A fresh fixture for one assertion: `Response<Body>` is not cloneable.
+    fn page_refusal() -> Response {
+        Error::unauthorized().into_response()
+    }
+
     /// Only the exact alias namespace and its descendants are API reads.
     #[test]
     fn only_the_blob_api_alias_namespace_is_scoped() {
@@ -585,10 +579,9 @@ mod tests {
     /// API `Bearer` challenge.
     #[test]
     fn an_alias_unauthorized_advertises_exactly_the_bearer_challenge() {
-        let page = Error::unauthorized().into_response();
-        assert_eq!(challenges(&page), [PAGE_CHALLENGE], "precondition: the shared refusal is Basic");
+        assert_eq!(challenges(&page_refusal()), [PAGE_CHALLENGE], "precondition: the shared refusal is Basic");
         for path in ["/web/blob/api/repos", "/web/blob/api/repos/owner/name/refs"] {
-            let response = session_challenge(page.clone(), path);
+            let response = session_challenge(page_refusal(), path);
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert_eq!(challenges(&response), [API_CHALLENGE], "{path}");
         }
@@ -597,9 +590,8 @@ mod tests {
     /// Every other route keeps the existing page `Basic` challenge.
     #[test]
     fn page_login_and_other_routes_keep_the_basic_challenge() {
-        let page = Error::unauthorized().into_response();
         for path in ["/web/login", "/web/logout", "/web/blob", "/web/blob/repos/o/n", "/web/repos", "/git/o/n.git"] {
-            let response = session_challenge(page.clone(), path);
+            let response = session_challenge(page_refusal(), path);
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert_eq!(challenges(&response), [PAGE_CHALLENGE], "{path}");
         }
@@ -609,8 +601,8 @@ mod tests {
     #[test]
     fn a_non_unauthorized_answer_is_unchanged() {
         for status in [StatusCode::OK, StatusCode::FORBIDDEN, StatusCode::NOT_FOUND, StatusCode::SERVICE_UNAVAILABLE] {
-            let original = (status, "body").into_response();
             for path in ["/web/blob/api/repos", "/web/blob/api/repos/owner/name", "/web/login", "/web/repos"] {
+                let original = (status, "body").into_response();
                 let response = session_challenge(original.clone(), path);
                 assert_eq!(response.status(), status, "{path}");
                 assert_eq!(response.headers(), original.headers(), "{path}");
@@ -623,19 +615,24 @@ mod tests {
     #[test]
     fn the_challenge_rewrite_preserves_status_body_and_other_headers() {
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let original = Error::unauthorized().into_response();
-        let mut original = {
-            let (mut parts, _) = original.into_parts();
+        // The fixture is not cloneable, so the challenger and one untouched
+        // twin are built separately from the same header set.
+        let fixture = || -> Response {
+            let mut parts =
+                (StatusCode::UNAUTHORIZED, [("x-fixture", "cookie-and-header-holder")]).into_response().into_parts().0;
+            parts.headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static(PAGE_CHALLENGE));
             parts.headers.insert(header::SET_COOKIE, HeaderValue::from_static("rootyard_session=; Max-Age=0"));
             parts.headers.append(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             parts.headers.append(header::CACHE_CONTROL, HeaderValue::from_static("private"));
             Response::from_parts(parts, Body::from(r#"{"error":"valid credentials required"}"#))
         };
-        let response = session_challenge(original.clone(), "/web/blob/api/repos/owner/name");
+        let original = fixture();
+        let response = session_challenge(fixture(), "/web/blob/api/repos/owner/name");
         assert_eq!(challenges(&original), [PAGE_CHALLENGE]);
         assert_eq!(challenges(&response), [API_CHALLENGE]);
-        original.headers_mut().remove(header::WWW_AUTHENTICATE);
+        let (mut response, mut original) = (response, original);
         response.headers_mut().remove(header::WWW_AUTHENTICATE);
+        original.headers_mut().remove(header::WWW_AUTHENTICATE);
         assert_eq!(response.status(), original.status());
         assert_eq!(response.headers(), original.headers());
         let read = |response: Response| {
@@ -665,10 +662,10 @@ mod tests {
     }
 
     /// `validate_session` refuses a secret whose embedded parent id does not
-    /// decode before it ever touches the pool (`session_parent`). The session
-    /// middleware hands that error to `session_challenge`, so an alias read
-    /// answers an exactly-Bearer `401` without a live database; page paths keep
-    /// Basic.
+    /// decode before it ever touches the pool (`session_parent`). Its refusal is
+    /// the shared page `Basic` `401`, and `session_challenge` maps that exact
+    /// answer to Bearer on an alias read while page paths keep Basic. No HTTP
+    /// request here represents a stale or revoked database session.
     #[tokio::test]
     async fn a_validate_session_rejection_is_bearer_challenged_on_alias_reads() {
         let (state, _scratch) = offline_metadata();
@@ -677,12 +674,25 @@ mod tests {
         let Err(rejected) = validate_session(&state, &secret, None).await else {
             panic!("a session without a decodable parent id must not validate");
         };
-        let response = session_challenge(*rejected.clone(), "/web/blob/api/repos");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // Owned status/challenge snapshots; the response itself is not cloned.
+        let (status, challenge) = owned_snapshot(*rejected);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(challenge.as_deref(), Some(PAGE_CHALLENGE), "precondition: validate_session renders Basic");
+        let response = session_challenge(Error::unauthorized().into_response(), "/web/blob/api/repos");
+        assert_eq!(response.status(), status);
         assert_eq!(challenges(&response), [API_CHALLENGE]);
-        let page = (*rejected).into_response();
-        let response = session_challenge(page, "/web/blob");
+        // The same page refusal on a page path keeps Basic.
+        let response = session_challenge(Error::unauthorized().into_response(), "/web/blob");
+        assert_eq!(response.status(), status);
         assert_eq!(challenges(&response), [PAGE_CHALLENGE]);
+    }
+
+    /// Owned status and first challenge of one response, taken before the
+    /// response itself is moved into the code under test.
+    fn owned_snapshot(response: Response) -> (StatusCode, Option<String>) {
+        let (parts, _body) = response.into_parts();
+        let challenge = parts.headers.get(header::WWW_AUTHENTICATE).map(|value| value.to_str().unwrap().to_owned());
+        (parts.status, challenge)
     }
 
     fn offline_metadata() -> (MetadataState, tempfile::TempDir) {

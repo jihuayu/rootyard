@@ -38,7 +38,7 @@ mod inline;
 use axum::{
     Form, Router,
     extract::{Path, Query, Request, State, rejection::PathRejection},
-    http::{HeaderMap, Uri, header},
+    http::{HeaderMap, HeaderValue, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
