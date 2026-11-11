@@ -106,9 +106,10 @@ class MixedRefPolicyCases:
         """Declared Git with an explicit per-command header (never clone-only)."""
         probe = self.native_git_probe()
         assert probe["declared"], "Git I/O needs the declared, verified executable"
+        # Only this command's own copy gets the client; ``self.env`` is the
+        # server's environment and must keep describing the live process.
         env = self.env.copy()
-        env["ROOTYARD_GIT"] = probe["executable"]  # the server looks Git up via ROOTYARD_GIT
-        self.env["ROOTYARD_GIT"] = probe["executable"]
+        env["ROOTYARD_GIT"] = probe["executable"]
         auth = base64.b64encode((token["username"] + ":" + token["token"]).encode()).decode()
         try:
             completed = self.run([probe["executable"], "-c", "http.extraHeader=Authorization: Basic " + auth,
@@ -121,29 +122,43 @@ class MixedRefPolicyCases:
                                              + completed.stderr.decode(errors="replace")[-4000:]))
         return completed
 
+    def started_server_git(self):
+        """The Git the live server process was started with, or fail closed.
+
+        ``self.server_git`` is captured at each successful ``start()``; it is
+        never read back from ``self.env``, which helpers may rewrite.
+        """
+        started = getattr(self, "server_git", None)
+        assert isinstance(started, dict) and started.get("path") is not None, (
+            "the live server's start-time Git is unknown; restart it before the mixed proof: "
+            + repr(started))
+        assert started["path"] == self.git_binding["declared"], (
+            "the live server did not start on the declared Git: "
+            + repr({"started": started["path"], "declared": self.git_binding["declared"]}))
+        return started["path"]
+
     def push_with(self, *refspecs):
-        """Authenticated push: the executed client is the server's probed Git.
+        """Authenticated push: the executed client is the server's started Git.
 
         ``CompletedProcess`` has no ``executable``; its ``args[0]`` is the argv
-        entry subprocess launched for this exact call, checked against the
-        probed path and the server's ``ROOTYARD_GIT`` binding.
+        entry subprocess launched for this exact call.  It is checked against
+        the probed client and the Git captured when the live server process
+        started, never against an environment a helper may have mutated.
         """
+        server_git = self.started_server_git()
         completed = self.git_as(self.alice, "push", "--porcelain", "origin", *refspecs)
         probe = self.native_git_probe()
-        launched = completed.args[0]
-        bound = os.environ.get("ROOTYARD_GIT")
-        assert str(Path(launched).resolve()) == probe["executable"] == str(
-            Path(self.env["ROOTYARD_GIT"]).resolve()), (
-            "the push client is not the probed Git the server was bound to: "
-            + repr({"launched": launched, "probed": probe["executable"], "ROOTYARD_GIT": bound}))
-        assert bound is None or str(Path(bound).resolve()) == probe["executable"], (
-            "server ROOTYARD_GIT differs from the push client: " + repr(bound))
+        launched = str(Path(completed.args[0]).resolve())
+        assert launched == probe["executable"] == server_git, (
+            "the push client is not the probed Git the server started with: "
+            + repr({"launched": launched, "probed": probe["executable"], "server_git": server_git}))
         runner = Path(self.env["ROOTYARD_DATA_DIR"]) / "managed-hooks" / ".runner"
         observed = self._sha256(runner) if runner.is_file() else None
         self.git_evidence = {"client": probe["executable"], "client_sha256": probe["sha256"],
                              "client_version": probe["version"], "declared": probe["declared"],
                              "push_actor": "alice", "push_header": "http.extraHeader (per push)",
-                             "server_git": self.env.get("ROOTYARD_GIT"),
+                             "server_git": server_git,
+                             "server_configured": getattr(self, "server_git", {}).get("configured"),
                              "managed_hook_runner_sha256": observed,
                              "notes": probe["notes"]}
         return completed, probe
@@ -462,6 +477,8 @@ class MixedRefPolicyCases:
         assert dict(before["refs"]).get(main) == self.third, before["refs"]
         listed = dict(before["api_refs"])
         assert listed.get(main) == self.third, "the API must advertise the refused base"
+        # The server-start Git is proven before any mixed write is attempted.
+        self.started_server_git()
         refused = self.push_as_owner("--atomic", "+" + self.first + ":" + main,
                                      self.feature_oid + ":" + topic)
         assert refused.returncode != 0, "non-fast-forward main was accepted"

@@ -17,6 +17,10 @@ import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness  # noqa: E402
+
+# The ``Harness.start`` that launches the server process; bound at import so a
+# test can substitute the launch without touching the production capture.
+harness_start = Harness.start
 from browse_ref_scale import verify_ref_scale  # noqa: E402
 from mixed_ref_cases import MIXED_REF_CASES, MixedRefPolicyCases, release_git_option  # noqa: E402
 
@@ -69,8 +73,48 @@ class BrowseHarness(MixedRefPolicyCases, Harness):
         # the mixed cases' ``native_git()`` resolves; the PATH Git is only the
         # fixed inventory's fallback when nothing is declared.
         self.git_binding = self._bind_declared_git(args)
-        self.wrapper_git = self.git_binding["env"] or shutil.which("git") or "git"
+        # Instrumentation wrappers exec the bound Git when declared.  PATH is
+        # only a fallback for fixed-inventory runs without a declaration.
+        self.wrapper_git = self.git_binding["declared"] or shutil.which("git") or "git"
+        self.server_git = None  # process-start Git of the live server; see start()
         self._native_git_probe = None  # one probe per run; see native_git_probe()
+
+    def start(self):
+        """Start the server and capture the Git its live process actually runs.
+
+        ``server_git`` is the process-start fact: it is read from the environment
+        handed to ``Popen`` and frozen for the life of this process.  No later
+        helper (such as the mixed cases' ``git_as``) may rewrite it.
+        """
+        harness_start(self)
+        configured = self.env.get("ROOTYARD_GIT")
+        self.server_git = {"configured": configured,
+                           "path": str(Path(configured).resolve()) if configured else None}
+        return self
+
+    def restore_declared_git(self):
+        """Make the live server run the bound Git before the mixed proof.
+
+        The fixed cases leave an instrumentation wrapper in ``ROOTYARD_GIT``
+        (the fault wrapper, for instance) after their last restart.  The causal
+        mixed proof needs a server that was started on the declared executable,
+        so the bound value is restored and the server restarted when its live
+        process started under anything else.  An already-bound server is left
+        untouched.
+        """
+        declared = self.git_binding["declared"]
+        if declared is None:
+            raise RunnerError("--mixed-refs needs a declared Git; the server's Git is unknown")
+        if self.server_git is not None and self.server_git["path"] == declared:
+            return {"restarted": False, "server_git": dict(self.server_git)}
+        previous = dict(self.server_git) if self.server_git is not None else None
+        self.stop()
+        self.env["ROOTYARD_GIT"] = declared
+        self.start()
+        assert self.server_git["path"] == declared and self.env["ROOTYARD_GIT"] == declared, (
+            "server restart did not bind the declared Git: "
+            + repr({"started": self.server_git, "env": self.env.get("ROOTYARD_GIT")}))
+        return {"restarted": True, "previous": previous, "server_git": dict(self.server_git)}
 
     def _bind_declared_git(self, args):
         """Bind one stock Git as client AND server before any server start.
@@ -1377,6 +1421,8 @@ def execute(args, harness_type):
                 + repr(executed)
             )
         if args.mixed_refs:
+            # Remove the fixed-suite instrumentation before the causal proof.
+            harness.git_handoff = harness.restore_declared_git()
             for name in MIXED_REF_CASES:
                 harness.case(name, getattr(harness, name))
         completed = [item["name"] for item in harness.results]
@@ -1414,6 +1460,7 @@ def execute(args, harness_type):
             mixed_ref_results={item["name"]: item["status"] for item in harness.results
                                if item["name"] in MIXED_REF_CASES} if args.mixed_refs else {},
             git=harness.git_binding,
+            git_handoff=getattr(harness, "git_handoff", None),
             git_evidence=getattr(harness, "git_evidence", None),
             cases_run=len(harness.results),
             cases_passed=sum(1 for item in harness.results if item["status"] == "passed"),

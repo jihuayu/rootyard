@@ -253,7 +253,12 @@ class CaseContractTest(unittest.TestCase):
         self.assertIn("if executed != list(CASE_NAMES):", runner)
         self.assertLess(runner.index("if executed != list(CASE_NAMES):"),
                         runner.index("for name in MIXED_REF_CASES:"))
-        self.assertIn("if args.mixed_refs:\n            for name in MIXED_REF_CASES:", runner)
+        handoff = runner.index("harness.git_handoff = harness.restore_declared_git()")
+        self.assertIn("if args.mixed_refs:\n            # Remove the fixed-suite instrumentation",
+                      runner)
+        self.assertLess(handoff, runner.index("for name in MIXED_REF_CASES:"))
+        self.assertLess(runner.index("if executed != list(CASE_NAMES):"), handoff)
+        self.assertIn("git_handoff=getattr(harness, \"git_handoff\", None)", source_of(BROWSE, "execute"))
         self.assertIn("if completed != selected:", runner)
         # A bare --mixed-refs is rejected before any harness is built.
         self.assertIn('if args.mixed_refs and not (args.git or os.environ.get("ROOTYARD_GIT")):', runner)
@@ -581,6 +586,7 @@ class MixedRefWiringTest(unittest.TestCase):
         harness.work = str(Path(__file__).resolve().parent)
         harness.base_db, harness.db = "postgres://probe/admin", "postgres://probe/run"
         harness.register_token({"username": "alice", "token": "s3cr3t-token"})
+        original_env = dict(harness.env)
         saved = dict(mixed_ref_cases.os.environ)
         with tempfile.TemporaryDirectory() as root:
             marker = Path(root) / "argv"
@@ -605,8 +611,23 @@ class MixedRefWiringTest(unittest.TestCase):
         expected = "http.extraHeader=Authorization: Basic " + base64.b64encode(b"alice:s3cr3t-token").decode()
         self.assertEqual(argv[:2], ["-c", expected])
         self.assertEqual(argv[-3:], ["push", "origin", "a:b"])
-        self.assertEqual(harness.env["ROOTYARD_GIT"], str(wrapper))
         self.assertNotIn("s3cr3t-token", harness.redact(" ".join(argv)))
+        # The credential copy is per command: the server env is never rewritten
+        # (a mutation here used to make the live server look bound to the client).
+        self.assertEqual(harness.env, original_env, "git_as must not mutate the server env")
+
+
+class _FakeProcess:
+    """Minimal live ``Popen`` stand-in for ``Harness.start`` readiness checks."""
+
+    pid = 4242
+    terminated = False
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
 
 
 class BrowseIntegrationTest(unittest.TestCase):
@@ -620,6 +641,7 @@ class BrowseIntegrationTest(unittest.TestCase):
         saved = {key: os.environ.get(key) for key in ("ROOTYARD_GIT", "ROOTYARD_TEST_DATABASE_URL")}
         self.addCleanup(self._restore_env, saved)
         os.environ.pop("ROOTYARD_GIT", None)
+        self.real_launch = browse.harness_start
 
     @staticmethod
     def _restore_env(saved):
@@ -642,6 +664,28 @@ class BrowseIntegrationTest(unittest.TestCase):
         # What the server child actually receives at start time.
         harness.runtime_env = dict(harness.env)
         harness.run = self.run_for(harness)
+        # Real ``Harness.start`` spawns a server; intercept only that process
+        # launch. ``BrowseHarness.start`` itself still runs and captures.
+        # ``Harness.start`` is the process launcher: record the env instead of
+        # spawning.  ``BrowseHarness.start``'s capture still computes the fact
+        # from ``self.env`` exactly as production does.
+        harness.starts = []
+        real_launch = browse.harness_start
+        self.addCleanup(setattr, browse, "harness_start", real_launch)
+        self.real_launch = real_launch
+
+        def launch(target):
+            harness.starts.append(dict(target.env))
+            target.proc = _FakeProcess()
+        browse.harness_start = launch
+        saved_stop = harness.stop
+
+        def stop(hard=False):
+            if isinstance(harness.proc, _FakeProcess):
+                harness.proc.terminated = True   # the real stop() only signals
+                harness.proc = None
+            return saved_stop(hard=hard)
+        harness.stop = stop
         self.addCleanup(shutil.rmtree, harness.root, True)
         return harness
 
@@ -734,6 +778,109 @@ class BrowseIntegrationTest(unittest.TestCase):
         # The native client resolves the same executable as the wrappers.
         self.assertEqual(Path(harness.native_git()["executable"]), sh)
 
+    def test_server_start_git_is_captured_and_immutable(self):
+        git = str(Path(self.GIT).resolve())
+        harness = self.harness(git=git, mixed_refs=True)
+        self.assertIsNone(harness.server_git, "no server has started yet")
+        harness.start()
+        self.assertEqual(harness.server_git, {"configured": git, "path": git})
+        captured = dict(harness.server_git)
+        harness.native_git_probe = lambda: {"executable": git, "declared": True, "notes": [],
+                                            "version": "9.9", "minor": (9, 9), "sha256": "0" * 64}
+        wrapper = harness.root / "some-wrapper"
+        harness.env["ROOTYARD_GIT"] = str(wrapper)
+        seen = []
+        saved_environ = dict(mixed_ref_cases.os.environ)
+
+        def run(argv, cwd=None, check=True, data=None, env=None):
+            seen.append(dict(env or {}))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"", args=argv)
+        harness.run = run
+        try:
+            mixed_ref_cases.os.environ.clear()
+            mixed_ref_cases.os.environ.update(harness.env)
+            # A real ``git_as`` call runs the probed Git; it must not touch the
+            # server env.
+            import tempfile as _tempfile
+            with _tempfile.TemporaryDirectory() as scratch:
+                harness.work = scratch
+                done = harness.git_as({"username": "alice", "token": "x"}, "ls-remote", "origin")
+        finally:
+            mixed_ref_cases.os.environ.clear()
+            mixed_ref_cases.os.environ.update(saved_environ)
+        self.assertEqual(done.returncode, 0)
+        # git_as handed its own copy the client, and the live server env and the
+        # process-start fact are both unchanged by it.
+        self.assertEqual(seen[0]["ROOTYARD_GIT"], git)
+        self.assertEqual(harness.server_git, captured)
+        self.assertEqual(harness.env["ROOTYARD_GIT"], str(wrapper))
+
+    def test_push_evidence_reports_the_started_server_git(self):
+        git = str(Path(self.GIT).resolve())
+        harness = self.harness(git=git, mixed_refs=True)
+        harness.start()
+        harness.alice = {"username": "alice", "token": "test-only"}
+        harness.native_git_probe = lambda: {
+            "executable": git, "declared": True, "notes": [], "version": "2.47.3",
+            "minor": (2, 47), "sha256": "0" * 64}
+
+        def simulated_client(*args, **kwargs):
+            # Simulate a post-start helper changing its mutable env view. The
+            # captured process-start identity must remain the proof source.
+            harness.env["ROOTYARD_GIT"] = str(harness.root / "mutated-after-start")
+            return SimpleNamespace(args=[git, "push"])
+
+        harness.git_as = simulated_client
+        with tempfile.TemporaryDirectory() as root:
+            harness.env["ROOTYARD_DATA_DIR"] = root
+            harness.push_with("main")
+        bound = harness.started_server_git()
+        self.assertEqual(bound, git)
+        self.assertEqual(harness.git_evidence["server_git"], git)
+        self.assertEqual(harness.git_evidence["server_configured"], git)
+        self.assertNotEqual(harness.env["ROOTYARD_GIT"], git)
+
+    def test_mixed_proof_rejects_a_server_not_started_on_the_declared_git(self):
+        git = str(Path(self.GIT).resolve())
+        harness = self.harness(git=git, mixed_refs=True)
+        harness.env["ROOTYARD_GIT"] = str(harness.root / "git-fault-wrapper")
+        harness.start()
+        called = []
+        harness.git_as = lambda *args, **kwargs: called.append(args)
+        with self.assertRaises(AssertionError) as caught:
+            harness.push_with("main")
+        self.assertIn("did not start on the declared Git", str(caught.exception))
+        self.assertEqual(called, [], "a mismatched live server must be rejected before the push")
+        # An unknown start state fails closed too.
+        fresh = self.harness(git=git, mixed_refs=True)
+        with self.assertRaisesRegex(AssertionError, "start-time Git is unknown"):
+            fresh.started_server_git()
+
+    def test_handoff_restarts_only_when_the_server_is_not_bound(self):
+        git = str(Path(self.GIT).resolve())
+        harness = self.harness(git=git)
+        harness.start()
+        # Already bound: no restart, no env change.
+        starts = len(harness.starts)
+        result = harness.restore_declared_git()
+        self.assertEqual(result["restarted"], False)
+        self.assertEqual(len(harness.starts), starts)
+        self.assertEqual(harness.env["ROOTYARD_GIT"], git)
+        # The fault wrapper a fixed case leaves behind: restarted on the binding.
+        harness.stop()
+        wrapper = harness.root / "git-fault-wrapper"
+        harness.env["ROOTYARD_GIT"] = str(wrapper)
+        harness.start()
+        self.assertEqual(harness.server_git["path"], str(wrapper.resolve()))
+        starts = len(harness.starts)
+        result = harness.restore_declared_git()
+        self.assertEqual(result["restarted"], True)
+        self.assertEqual(result["previous"]["path"], str(wrapper.resolve()))
+        self.assertEqual(len(harness.starts), starts + 1)
+        self.assertEqual(harness.starts[-1]["ROOTYARD_GIT"], git)
+        self.assertEqual(harness.server_git, {"configured": git, "path": git})
+        self.assertEqual(harness.started_server_git(), git)
+
     def test_explicit_git_is_bound_before_any_start(self):
         harness = self.harness(git=self.GIT, mixed_refs=True)
         self.assertEqual(harness.runtime_env["ROOTYARD_GIT"], self.GIT)
@@ -741,14 +888,19 @@ class BrowseIntegrationTest(unittest.TestCase):
         self.assertIsNone(harness.proc, "construction must not start the server")
         init = inspect.getsource(browse.BrowseHarness.__init__)
         self.assertLess(init.index("_bind_declared_git"), init.index("_native_git_probe"))
-        # wrapper_git is derived from the validated binding, never from the env.
+        # wrapper_git comes from the validated binding; PATH is only the
+        # fallback when no Git was declared.
         self.assertLess(init.index("_bind_declared_git"), init.index("self.wrapper_git ="))
-        self.assertIn('self.wrapper_git = self.git_binding["env"] or shutil.which("git") or "git"', init)
-        self.assertNotIn("self.wrapper_git = os.environ", init)
+        self.assertIn('self.wrapper_git = self.git_binding["declared"] or shutil.which("git") or "git"',
+                      init)
+        self.assertIn("self.server_git = None", init)
         self.assertIn("super().__init__(args)", init)
-        self.assertNotIn("start", browse.BrowseHarness.__dict__)
+        self.assertIn("start", browse.BrowseHarness.__dict__)
+        launch = inspect.getsource(browse.BrowseHarness.start)
+        self.assertLess(launch.index("harness_start(self)"), launch.index("self.server_git ="))
+        self.assertIn('self.env.get("ROOTYARD_GIT")', launch)
         # Every server start (Harness.start) therefore sees the bound value.
-        self.assertIn("env=self.env", inspect.getsource(harness.start))
+        self.assertIn("env=self.env", inspect.getsource(self.real_launch))
 
     def test_conflicting_git_declarations_are_rejected(self):
         # Two real, distinct executables: validation passes and the
@@ -831,12 +983,18 @@ class BrowseIntegrationTest(unittest.TestCase):
             raise AttributeError(name)
 
         def __init__(self, args):
-            self.args, self.results, self.calls = args, [], []
+            self.args, self.results, self.calls, self.events = args, [], [], []
             self.git_binding = {"declared": args.git, "mixed_refs": args.mixed_refs}
             self.git_evidence = None
+            self.git_handoff = None
+
+        def restore_declared_git(self):
+            self.events.append("handoff")
+            return {"restarted": True, "server_git": {"path": self.args.git}}
 
         def case(self, name, fn):
             self.calls.append(name)
+            self.events.append(name)
             self.results.append({"name": name, "status": "passed", "seconds": 0.0, "detail": {}})
 
         def redact(self, value):
@@ -877,7 +1035,10 @@ class BrowseIntegrationTest(unittest.TestCase):
         self.assertEqual(set(report["mixed_ref_results"].values()), {"passed"})
         self.assertEqual([item["name"] for item in report["cases"]], expected)
         self.assertEqual(created[0].calls, expected)
+        self.assertEqual(created[0].events,
+                         list(browse.CASE_NAMES) + ["handoff"] + list(mixed_ref_cases.MIXED_REF_CASES))
         self.assertEqual(report["git"]["declared"], self.GIT)
+        self.assertEqual(report["git_handoff"], {"restarted": True, "server_git": {"path": self.GIT}})
 
     def test_runner_without_opt_in_is_the_fixed_inventory_only(self):
         code, report, created, err = self.run_execute([])
@@ -888,6 +1049,7 @@ class BrowseIntegrationTest(unittest.TestCase):
         self.assertEqual(report["mixed_ref_results"], {})
         self.assertEqual(report["fixed_cases"], list(browse.CASE_NAMES))
         self.assertEqual(created[0].calls, list(browse.CASE_NAMES))
+        self.assertEqual(created[0].events, list(browse.CASE_NAMES))
 
     def test_runner_rejects_mixed_refs_without_a_declared_git(self):
         os.environ.pop("ROOTYARD_GIT", None)
@@ -926,6 +1088,8 @@ class BrowseIntegrationTest(unittest.TestCase):
         # The harness ran every selected case except the skipped one.
         self.assertEqual(built[0].calls,
                          [name for name in browse.selected_cases(True) if name != mixed_last])
+        self.assertEqual(built[0].events,
+                         list(browse.CASE_NAMES) + ["handoff", mixed_ref_cases.MIXED_REF_CASES[0]])
 
 
 class RefusalAuditSqlTest(unittest.TestCase):

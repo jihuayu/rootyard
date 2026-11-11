@@ -42,21 +42,35 @@ One declared stock Git is **both** the Git client and the server's Git:
   **resolve to the same file**; otherwise construction is refused. A conflict
   names both resolved paths.
 - `_bind_declared_git()` runs in `BrowseHarness.__init__`, so the resolved value
-  is written to the server environment **before any start** and is restored on
-  every `stop()`/`start()` restart.
-- The transparent Git wrappers (the deadline wrapper and the `cat-file` counter
-  wrapper) exec that same **bound** executable. The PATH Git is only the fixed
-  inventory's fallback when nothing is declared.
+  is written to the server environment **before any start**.
+- Each successful `BrowseHarness.start()` records `server_git`: the Git the live
+  server process actually started with, frozen for that process. Helpers never
+  rewrite it, and `git_as()` gives the client only its own per-command copy of
+  the environment, so a mixed command can never make the live server *look*
+  bound to a Git it did not start on.
+- Instrumentation wrappers (the deadline wrapper, the `cat-file` counter and
+  the `git-fault-wrapper`) exec the bound declared Git when one is configured;
+  PATH Git is only the fixed-inventory fallback when no declaration exists.
+  The fault wrapper is left in `ROOTYARD_GIT` by its last restart. Before the
+  first mixed case, `execute()` calls `restore_declared_git()`, which restores
+  the bound Git and restarts the server **only if** the live process started
+  under something else. The mixed proof therefore always starts on the declared
+  binary.
 - Mixed Git writes (atomic pairs, the protected-only refusal, the `features`
   push behind the pull, the unprotected control and `ls-remote`) run through one
   helper that executes the declared executable with its own per-call
   `-c http.extraHeader=Authorization: Basic <alice>` credential; no credential
-  from clone persists to a later push.
+  from clone persists to a later push. `push_with()` refuses the proof when the
+  executed client, the probed client and the captured server-start Git are not
+  the same declared executable.
 - The report records `selected_cases`, `fixed_cases`, `fixed_case_count`,
   `mixed_ref_cases`, `mixed_ref_results`, plus `git` (the binding: declared path,
-  environment value, `mixed_refs`) and `git_evidence` (client path, SHA-256,
-  version, whether declared, push actor/header, server Git and the managed hook
-  runner digest). `case_count` is the selected count.
+  environment value, `mixed_refs`), `git_handoff` (whether the pre-mixed restart
+  happened and what the previous process started on) and `git_evidence`
+  (client path, SHA-256, version, whether declared, push actor/header,
+  `server_git` — the **captured server-start identity**, not the current
+  environment — plus the managed hook runner digest). `case_count` is the
+  selected count.
 
 ## Ref reads: public API and physical refs
 
@@ -194,7 +208,7 @@ From the repository root:
 python3 -m unittest tests.test_browse_mixed_refs
 ```
 
-The suite currently has **83 tests**. It pins the exact case IDs and the
+The suite currently has **87 tests**. It pins the exact case IDs and the
 15+2 = 17 selection order, the unchanged `CASE_NAMES`, the runner's
 fixed-inventory assertion before the opt-in loop and the selected-case
 completion check, the CI opt-in arguments and report fields, the pre-start Git
