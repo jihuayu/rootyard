@@ -1269,10 +1269,27 @@ class Format22ManifestTest(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "Blob directory at .* carries a " + field):
                     support.format22_manifest_checks(manifest, expected)
 
+    def test_blob_directory_entry_refuses_every_unknown_field(self):
+        # `backup::Entry` is `#[serde(deny_unknown_fields)]`, so a directory
+        # entry has exactly `kind`, `mode`, `bytes`, `sha256` and `target`; an
+        # extra key is a manifest Rust would refuse to load, not a directory.
+        for key, value in (("length", 0), ("path", "blob"), ("size", 0), ("Kind", "directory"),
+                           ("mode ", 0o700), ("", None), ("target_base64", None)):
+            with self.subTest(unknown=key):
+                manifest, expected = positive_inputs()
+                path = support.archive_directories(manifest["blob_artifacts"])[0]
+                manifest["files"][path][key] = value
+                with self.assertRaisesRegex(
+                        AssertionError,
+                        "Blob directory at " + re.escape(path) + " carries an unknown field " + re.escape(key)):
+                    support.format22_manifest_checks(manifest, expected)
+
     def test_blob_directory_mode_must_be_a_non_bool_subset_of_0o700(self):
         # `private_dir` asks for 0o700 and the umask may only clear bits, so a
-        # reduced mode (even 0) is a real archive, while a bool, a non-integer,
-        # a negative or any group/world/special bit is not.
+        # bitwise-subset reduced mode (even 0) is a real archive, while a bool,
+        # a non-integer, a negative or any group/world/special bit is not --
+        # including numerically smaller modes such as 0o640 that carry group
+        # bits.
         for mode in (0o700, 0o500, 0o600, 0o400, 0o100, 0):
             with self.subTest(mode=mode):
                 manifest, expected = positive_inputs()
@@ -1290,6 +1307,8 @@ class Format22ManifestTest(unittest.TestCase):
                              (float(0o700), "non-integer mode"), ("448", "non-integer mode"), (None, "non-integer mode"),
                              (0o710, "outside"), (0o701, "outside"), (0o707, "outside"), (0o740, "outside"),
                              (0o704, "outside"), (0o1700, "outside"), (0o777, "outside"), (0o7777, "outside"),
+                             # Numerically below 0o700 but carrying group bits, so not a bitwise subset.
+                             (0o640, "subset"), (0o660, "subset"), (0o670, "subset"), (0o440, "subset"),
                              (-1, "outside"), (-0o400, "outside")):
             with self.subTest(mode=mode):
                 manifest, expected = positive_inputs()

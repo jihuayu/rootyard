@@ -327,9 +327,10 @@ def format22_manifest_checks(manifest, expected):
     need(not not_dirs, "an archive Blob parent path is not a directory entry: " + ",".join(not_dirs[:8]))
     # A directory entry is the whole serialized Rust `Entry`, not just its kind:
     # `filesystem::inventory` records `bytes: 0`, `sha256: None`,
-    # `target: None` for every real directory, and a `u32` mode with no group,
-    # world or special bits (a real `export` can only record `mode & 0o7777`,
-    # and `private_dir`'s requested `0o700` has no bits outside it).
+    # `target: None` for every real directory, exactly the five serialized
+    # `Entry` keys (`Entry` denies unknown fields), and a `u32` mode with no
+    # group, world or special bits (a real `export` can only record `mode &
+    # 0o7777`, and `private_dir`'s requested `0o700` has no bits outside it).
     # `private_dir` asks for `0o700`, but the process umask may remove more
     # bits, so the exact `0o700` is never required -- only an integer subset.
     for name in sorted(set(directories) & blob_paths):
@@ -402,6 +403,10 @@ def archive_length(artifact):
     return value
 
 
+# `backup::Entry` is `#[serde(deny_unknown_fields)]` and its exact serialized
+# keys are these five; `Entry::kind` is an open `String`, so a directory is
+# told apart from a file or symlink only by the value checked below.
+DIRECTORY_ENTRY_KEYS = frozenset({"kind", "mode", "bytes", "sha256", "target"})
 DIRECTORY_MODE_MAX = 0o700
 
 
@@ -414,10 +419,17 @@ def _archive_directory_entry(path, entry):
     is bounded, not exact: ``private_dir`` requests ``0o700`` and the process
     umask may clear further owner bits, even all of them (``0``), so a reduced
     mode such as ``0o500`` is a real archive. Group, world and special bits
-    (any bit of ``~0o700`` within ``0o7777``) are never what ``export`` writes.
+    (any bit of ``~0o700``) are never what ``export`` writes, and because
+    ``private_dir`` never sets them a numerically smaller mode such as
+    ``0o640`` is not a subset and is refused too.
     """
     need(isinstance(entry, dict), "an archive Blob directory at " + path + " is not a JSON object")
     need(entry.get("kind") == "directory", "an archive Blob directory at " + path + " changed kind")
+    # `Entry` denies unknown fields, so a serialized archive entry has exactly
+    # its five keys: an extra key is a manifest Rust would refuse to load.
+    unknown = sorted(key for key in entry if key not in DIRECTORY_ENTRY_KEYS)
+    if unknown:
+        raise AssertionError("an archive Blob directory at " + path + " carries an unknown field " + unknown[0])
     need(type(entry.get("bytes")) is int and entry["bytes"] == 0,
          "an archive Blob directory at " + path + " carries non-zero bytes")
     need("sha256" in entry and entry["sha256"] is None,
@@ -427,8 +439,8 @@ def _archive_directory_entry(path, entry):
     mode = entry.get("mode")
     # ``bool`` is a subclass of ``int``: ``mode: true`` must not pass as 1.
     need(type(mode) is int, "an archive Blob directory at " + path + " has a non-integer mode")
-    need(0 <= mode <= DIRECTORY_MODE_MAX,
-         "an archive Blob directory at " + path + " has a mode outside [0, 0o700]")
+    need(mode >= 0 and (mode & ~DIRECTORY_MODE_MAX) == 0,
+         "an archive Blob directory at " + path + " has a mode outside the 0o700 subset")
     return entry
 
 
