@@ -154,6 +154,55 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
             "ci.yml must run full unittest discovery over tests/test_*.py",
         )
 
+    def test_ci_workspace_autocapture_acceptance_wiring(self) -> None:
+        text = CI_YML.read_text(encoding="utf-8")
+
+        def step_block(name: str) -> str:
+            marker = f"      - name: {name}"
+            start = text.find(marker)
+            self.assertNotEqual(start, -1, f"missing CI step {name!r}")
+            nxt = text.find("\n      - name:", start + len(marker))
+            if nxt == -1:
+                return text[start:]
+            return text[start:nxt]
+
+        acceptance = step_block("Exercise native workspace autocapture acceptance")
+        self.assertIn(
+            "python3 tests/workspace_capture_acceptance.py --binary target/debug/rootyard "
+            "--report test-results/workspace-capture.json",
+            acceptance,
+        )
+        self.assertIn("timeout-minutes: 20", acceptance)
+        self.assertIn(
+            "ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence",
+            acceptance,
+        )
+        self.assertIn("ROOTYARD_WORKSPACE_MOUNT_MODE: direct", acceptance)
+
+        manifest = step_block("Bind native regressions to the built binary and source inputs")
+        self.assertIn(
+            "--report workspace_capture=test-results/workspace-capture.json", manifest
+        )
+        self.assertIn("tests/workspace_capture_acceptance.py", manifest)
+        self.assertIn("tests/fixtures/capture_read_gate.c", manifest)
+        self.assertIn("--fixture workspace_mount_mode=direct", manifest)
+        for case in (
+            "__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix",
+            "__main__.WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture",
+            "__main__.WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive",
+            "__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision",
+            "__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing",
+        ):
+            self.assertEqual(
+                manifest.count(f"--require-case workspace_capture={case}"),
+                1,
+                case,
+            )
+
+        upload = step_block("Upload end-to-end report")
+        self.assertIn("test-results/*.json", upload)
+        self.assertIn("test-results/evidence/*.jsonl", upload)
+
     def test_all_python_scripts_referenced_in_ci_yml_exist_and_parse_cleanly(self) -> None:
         ci_text = CI_YML.read_text(encoding="utf-8")
         referenced = set(re.findall(r"\b(?:tests|scripts)/[a-zA-Z0-9_]+\.py\b", ci_text))
