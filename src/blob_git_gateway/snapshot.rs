@@ -150,7 +150,7 @@ pub(super) async fn build_view(
     view: &RefView,
     deadline: tokio::time::Instant,
 ) -> Result<ComputedView, GatewayError> {
-    let sealed = build_view_with(state, view, deadline, Materializer::Unsealed).await?;
+    let sealed = build_view_with(state, view, deadline, Materializer::Unsealed).await.map_err(post_capture_error)?;
     Ok(ComputedView { read: None, ..sealed })
 }
 
@@ -161,7 +161,7 @@ pub(super) async fn build_sealed_view(
     view: &RefView,
     deadline: tokio::time::Instant,
 ) -> Result<ComputedView, GatewayError> {
-    build_view_with(state, view, deadline, Materializer::Sealed).await
+    build_view_with(state, view, deadline, Materializer::Sealed).await.map_err(post_capture_error)
 }
 
 /// Which materializer produces the copied bytes. Only [`Materializer::Sealed`]
@@ -260,7 +260,7 @@ async fn build_into(
         .map(|reference| (reference.name().to_owned(), reference.oid_hex().to_owned()))
         .collect::<Vec<_>>();
     if materialized_refs != view.refs {
-        return Err(GatewayError::Conflict("materialized ref set differs from the sealed snapshot"));
+        return Err(GatewayError::Internal("materialized ref set differs from the sealed snapshot"));
     }
     let pack_dir = git.repo().join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir)
@@ -394,14 +394,24 @@ pub(super) fn ref_error(error: RefStoreError) -> GatewayError {
     error.into()
 }
 
-/// Post-capture pack snapshot materialization never answers `400`: an
-/// `Unsupported` refusal here means the registered bytes could not be verified
-/// (missing/unreadable/corrupted Blob artifact or unusable materialization
-/// metadata), which is a server-side failure. The ref-view capture above keeps
-/// [`ref_error`] so genuine repository-provisioning refusals stay `400`.
+/// Post-capture pack snapshot materialization never answers a `4xx`: a
+/// `RepositoryNotFound`, `MetadataGateVersionMismatch`, `Unsupported`,
+/// `BadRequest` or any other client-shaped refusal here means verified bytes or
+/// metadata could not be reproduced, which is a server-side failure. Genuine
+/// `5xx` outcomes ([`GatewayError::Unavailable`], [`GatewayError::Timeout`],
+/// [`GatewayError::OutcomeUnknown`], [`GatewayError::Internal`]) are preserved.
 pub(super) fn materialize_error(error: RefStoreError) -> GatewayError {
-    match GatewayError::from(error) {
-        GatewayError::Unsupported(_) => GatewayError::Internal("verified pack snapshot could not be materialized"),
-        other => other,
+    post_capture_error(error.into())
+}
+
+/// No view is built before [`load_ref_view`] captured the authoritative refs,
+/// so a client verdict from that point would blame the client for server-side
+/// bytes or a ref set it did not supply. Collapse every `4xx` into the same
+/// opaque `500`; preserve real `5xx` outcomes.
+fn post_capture_error(error: GatewayError) -> GatewayError {
+    if error.status().is_server_error() {
+        error
+    } else {
+        GatewayError::Internal("verified pack snapshot could not be materialized")
     }
 }

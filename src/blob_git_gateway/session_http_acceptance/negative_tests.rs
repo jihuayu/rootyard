@@ -12,8 +12,8 @@ use super::{
     },
     support::{
         BOUNDED_LIFETIME, COMMIT_FILE, Gateway, PUSHED_REF, add_read_collaborator, contains, delete_registered_pack,
-        ensure_no_disclosure, flip_mac, json_read, keyring_tokens, live_realm, looks_like_refs, open_store, raw_get,
-        remove_collaborator, serving, status_succeeds, test_tokens, unique_name, unix_now,
+        ensure_no_disclosure, flip_mac, is_denial, json_read, keyring_tokens, live_realm, looks_like_refs, open_store,
+        raw_get, remove_collaborator, serving, status_succeeds, test_tokens, unique_name, unix_now,
     },
 };
 
@@ -189,10 +189,32 @@ async fn revoked_collaborator_session_is_refused_before_token_scoring() -> Resul
         let baseline =
             raw_get(&client, &format!("{}/refs", gateway.base(&owner.username, &name)), &stranger.token, None).await?;
         ensure!(!status_succeeds(denied.status), "a revoked collaborator's token still read the repository");
+        ensure!(
+            is_denial(baseline.status),
+            "unauthorized stranger baseline must be an auth denial, got {}",
+            baseline.status
+        );
+        ensure!(is_denial(denied.status), "revoked collaborator refusal must be an auth denial, got {}", denied.status);
         ensure!(denied.status == baseline.status, "revocation answered differently from an unauthorized stranger");
         ensure!(denied.body == baseline.body, "revocation body differed from an unauthorized stranger");
         ensure!(denied.session.token.is_none(), "a refused revoked read emitted a session");
         ensure!(!looks_like_refs(&denied.body), "a revoked-collaborator refusal looked like a refs answer");
+
+        // Token scoring must not run before authorization: a malformed session
+        // header would be a 400 token-parse/HMAC refusal if it did, but the
+        // revoked collaborator must receive the same denial as the stranger.
+        let tampered = raw_get(
+            &client,
+            &format!("{}/refs", gateway.base(&owner.username, &name)),
+            &collaborator.token,
+            Some("ry_sess_v1.malformed-after-revocation"),
+        )
+        .await?;
+        ensure!(is_denial(tampered.status), "a malformed session after revocation was not an auth denial");
+        ensure!(tampered.status == baseline.status, "a malformed session changed the denial status");
+        ensure!(tampered.body == baseline.body, "a malformed session changed the denial body");
+        ensure!(tampered.session.token.is_none(), "a malformed-session denial emitted a session");
+        ensure!(tampered.session.revision.is_none(), "a malformed-session denial emitted a revision");
         ensure_no_disclosure(&denied.body, &[oid.as_str(), PUSHED_REF], "revoked-collaborator refusal")?;
         Ok(())
     }
@@ -216,6 +238,7 @@ async fn missing_registered_pack_fails_closed_without_a_session() -> Result<()> 
         let denied = raw_get(&client, &url, &owner.token, Some(&token)).await?;
         ensure!((500..600).contains(&denied.status), "a missing registered pack did not fail closed with a 5xx status");
         ensure!(denied.session.token.is_none(), "a missing-pack failure emitted a session header");
+        ensure!(denied.session.revision.is_none(), "a missing-pack failure emitted a session revision");
         ensure!(!looks_like_refs(&denied.body), "a missing-pack failure looked like a successful read");
         ensure_no_disclosure(&denied.body, &[oid.as_str(), PUSHED_REF], "missing-pack refusal")?;
 
@@ -224,6 +247,9 @@ async fn missing_registered_pack_fails_closed_without_a_session() -> Result<()> 
         let token_free = raw_get(&client, &url, &owner.token, None).await?;
         ensure!((500..600).contains(&token_free.status), "a token-free corrupt read did not fail closed");
         ensure!(token_free.session.token.is_none(), "a token-free corrupt read emitted a session");
+        ensure!(token_free.session.revision.is_none(), "a token-free corrupt read emitted a session revision");
+        ensure!(!looks_like_refs(&token_free.body), "a token-free missing-pack refusal looked like a refs answer");
+        ensure_no_disclosure(&token_free.body, &[oid.as_str(), PUSHED_REF], "token-free missing-pack refusal")?;
         Ok(())
     }
     .await;

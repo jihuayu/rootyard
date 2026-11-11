@@ -218,15 +218,37 @@ mod tests {
             )
             .await;
         }
-        // The ref-view capture keeps the explicit 400 for an unprovisioned or
-        // `metadata_only` repository; the post-capture boundary still fails
-        // closed with 500 if such a refusal ever reached it.
-        let unprovisioned = "repository is not provisioned for core serving";
-        assert_eq!(GatewayError::from(RefStoreError::Unsupported(unprovisioned)).status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            snapshot::materialize_error(RefStoreError::Unsupported(unprovisioned)).status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+        // The ref-view capture keeps the explicit 400 for an uninitialized core
+        // gate (the production literal in `serving_read_sql.rs`); the
+        // post-capture boundary still fails closed with 500 if such a refusal
+        // ever reached it.
+        let uninitialized = "repository has no initialized core gate";
+        assert_eq!(GatewayError::from(RefStoreError::Unsupported(uninitialized)).status(), StatusCode::BAD_REQUEST);
+        assert_opaque_server_error(
+            snapshot::materialize_error(RefStoreError::Unsupported(uninitialized)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"verified pack snapshot could not be materialized"}"#,
+        )
+        .await;
+
+        // A post-capture lookup can still observe either durable refusal.
+        // Neither may leak as a 404/409 after the refs were already sealed.
+        let missing = RefStoreError::RepositoryNotFound;
+        assert_eq!(GatewayError::from(missing.clone()).status(), StatusCode::NOT_FOUND);
+        assert_opaque_server_error(
+            snapshot::materialize_error(missing),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"verified pack snapshot could not be materialized"}"#,
+        )
+        .await;
+        let moved = RefStoreError::MetadataGateVersionMismatch;
+        assert_eq!(GatewayError::from(moved.clone()).status(), StatusCode::CONFLICT);
+        assert_opaque_server_error(
+            snapshot::materialize_error(moved),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"verified pack snapshot could not be materialized"}"#,
+        )
+        .await;
     }
 
     #[tokio::test]
