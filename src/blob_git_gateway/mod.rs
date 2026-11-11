@@ -203,12 +203,12 @@ mod challenge_tests {
     use std::{path::PathBuf, sync::Arc, time::Duration};
 
     use axum::{
+        ServiceExt,
         body::Body,
         http::{HeaderValue, Request, StatusCode, header},
     };
     use base64::Engine;
     use deadpool_postgres::{Manager, Runtime};
-    use tower::ServiceExt;
 
     use super::{BlobGitConfig, BlobGitState, GatewayError, router};
     use crate::blob_store::{budget::ResourceLimits, test_support::store};
