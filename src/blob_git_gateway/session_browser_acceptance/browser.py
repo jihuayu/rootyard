@@ -135,7 +135,7 @@ REASONS = frozenset(
         "GIT_COOKIE_ONLY_TIMEOUT_EARLY",
         "API_READ_BOUND_INVALID",
         "FAULT_BOUND_INVALID",
-        "FAULT_NAVIGATION_EXCEEDED",
+        "FAULT_NAVIGATION_FAILED",
         "FAULT_NOT_APPLIED",
         "FAULT_TARGET_MISMATCH",
         "FAULT_ROUTE_NOT_DISPATCHED",
@@ -835,7 +835,7 @@ class Client:
             facts["fulfilled"] = True
 
         await fault_page.route("**/*", fault)
-        await self.goto(fault_page, self.web + self.scope, "FAULT_NAVIGATION_EXCEEDED")
+        await self.goto(fault_page, self.web + self.scope, "FAULT_NAVIGATION_FAILED")
         # The tree request alone produces the generic refusal; refs may already
         # have rendered before it.
         await self.fault_status(fault_page, facts)
