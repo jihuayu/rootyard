@@ -5,10 +5,9 @@
 //! literals so a transport error can never echo a credential or a client pack.
 //!
 //! A `401` carries no challenge on its own. The challenge names the credential
-//! scheme of the route that refused, so it is applied explicitly by each
-//! protocol boundary ([`Challenge::Bearer`] for the relayed JSON/API answers,
-//! [`Challenge::Basic`] for Smart HTTP); rendering an error alone never
-//! advertises either.
+//! scheme of the route that refused, so it is rendered explicitly by each
+//! handler ([`Challenge::Bearer`] for every JSON/API answer, [`Challenge::Basic`]
+//! for Smart HTTP); rendering an error alone never advertises either.
 use axum::{
     Json,
     http::{StatusCode, header},
@@ -93,23 +92,36 @@ impl Challenge {
     }
 }
 
+/// Give `response` the `challenge` of its protocol when, and only when, it is a
+/// `401` that advertises no scheme yet.
+///
+/// The refusal comes from a gateway handler that renders no challenge, so a
+/// bare `401` is this route's own denial. A `401` that already names a scheme
+/// belongs to another authority (for example the shared sign-in helper) and is
+/// never rewritten or joined. Status, body and every other header are the
+/// response's own.
+fn with_challenge(mut response: Response, challenge: Challenge) -> Response {
+    if response.status() == StatusCode::UNAUTHORIZED && !response.headers().contains_key(header::WWW_AUTHENTICATE) {
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static(challenge.value()));
+    }
+    response
+}
+
+/// Render one handler failure with the challenge its protocol advertises.
+fn challenged(error: GatewayError, challenge: Challenge) -> Response {
+    with_challenge(error.into_response(), challenge)
+}
+
 impl GatewayError {
-    /// The unchanged `401` answer, now advertising `challenge` instead of
-    /// assuming Basic. Only an unauthorized error is challenged; every other
-    /// refusal is returned exactly as [`GatewayError::into_response`] renders it.
-    ///
-    /// The handlers themselves render every refusal; this is the explicit
-    /// vocabulary their route-level protocol boundaries test against.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn challenged(self, challenge: Challenge) -> Response {
-        let unauthorized = self.status() == StatusCode::UNAUTHORIZED;
-        let mut response = self.into_response();
-        if unauthorized {
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static(challenge.value()));
-        }
-        response
+    /// The JSON/API refusal of every `/api` handler and `/web/blob/api` alias.
+    pub(super) fn api(self) -> Response {
+        challenged(self, Challenge::Bearer)
+    }
+
+    /// The Smart HTTP refusal of `info/refs`, `git-upload-pack` and
+    /// `git-receive-pack`.
+    pub(super) fn git(self) -> Response {
+        challenged(self, Challenge::Basic)
     }
 }
 
@@ -191,8 +203,8 @@ mod tests {
         response.headers().get(header::WWW_AUTHENTICATE).map(|value| value.to_str().expect("challenge is text"))
     }
 
-    /// Rendering an unauthorized error by itself no longer guesses a scheme;
-    /// the protocol boundary that owns the route applies exactly one.
+    /// Rendering an unauthorized error by itself never guesses a scheme; the
+    /// handler of the route applies exactly one (`api` / `git`).
     #[test]
     fn an_unauthorized_error_alone_carries_no_challenge() {
         let response = GatewayError::Unauthorized.into_response();
@@ -201,14 +213,14 @@ mod tests {
     }
 
     #[test]
-    fn each_protocol_boundary_applies_its_own_challenge_scheme() {
-        let api = GatewayError::Unauthorized.challenged(Challenge::Bearer);
+    fn each_protocol_renders_its_own_challenge_scheme() {
+        let api = GatewayError::Unauthorized.api();
         assert_eq!(
             challenge(&api),
             Some("Bearer realm=\"Rootyard\""),
             "the JSON/API 401 must never start a browser Basic auth prompt"
         );
-        let smart = GatewayError::Unauthorized.challenged(Challenge::Basic);
+        let smart = GatewayError::Unauthorized.git();
         assert_eq!(
             challenge(&smart),
             Some("Basic realm=\"Rootyard\", charset=\"UTF-8\""),
@@ -216,13 +228,39 @@ mod tests {
         );
     }
 
+    /// A `401` that already names a scheme is another authority's answer (for
+    /// example the shared sign-in refusal): its challenge, every repeated value
+    /// and their order included, is kept exactly; nothing is rewritten or joined.
+    #[test]
+    fn an_existing_challenge_is_never_rewritten_or_joined() {
+        let values = |response: &Response| -> Vec<_> {
+            response.headers().get_all(header::WWW_AUTHENTICATE).iter().cloned().collect()
+        };
+        // A handler refusal that already carries another authority's challenge
+        // is returned exactly as rendered: nothing is replaced or appended.
+        let mut existing = GatewayError::Unauthorized.into_response();
+        existing
+            .headers_mut()
+            .append(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer realm=\"Rootyard\""));
+        let expected = values(&existing);
+        for rendered in
+            [with_challenge(existing.clone(), Challenge::Basic), with_challenge(existing, Challenge::Bearer)]
+        {
+            assert_eq!(rendered.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(values(&rendered), expected, "an existing challenge is preserved and never joined");
+        }
+        // The shared sign-in refusal keeps its own Basic challenge.
+        let sign_in = crate::Error::unauthorized().into_response();
+        assert_eq!(challenge(&sign_in), Some("Basic realm=\"Rootyard\", charset=\"UTF-8\""));
+    }
+
     /// The challenge changes the header only: status, content type and the
     /// fixed refusal text are the same on both protocols.
     #[test]
     fn the_challenge_does_not_change_status_or_body() {
         let plain = GatewayError::Unauthorized.into_response();
-        let api = GatewayError::Unauthorized.challenged(Challenge::Bearer);
-        let smart = GatewayError::Unauthorized.challenged(Challenge::Basic);
+        let api = GatewayError::Unauthorized.api();
+        let smart = GatewayError::Unauthorized.git();
         assert_eq!(api.status(), plain.status());
         assert_eq!(smart.status(), plain.status());
         let content_type = plain.headers().get(header::CONTENT_TYPE);
@@ -247,8 +285,7 @@ mod tests {
             GatewayError::BadRequest("invalid request"),
             GatewayError::Internal("Gateway request was refused"),
         ] {
-            for challenge in [Challenge::Bearer, Challenge::Basic] {
-                let response = error.challenged(challenge);
+            for response in [error.api(), error.git()] {
                 assert_eq!(response.status(), error.status());
                 assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
                 assert_eq!(response.headers().get(header::WWW_AUTHENTICATE), None);

@@ -23,6 +23,13 @@
 //! The ordinary `/api` and Smart HTTP routes keep their bearer-only behaviour
 //! and are neither merged, wrapped nor changed here. No mutation, push or
 //! content-write route exists in the browser subtree.
+//!
+//! The 401 challenge of a relayed read is not decided in this module: every
+//! JSON handler the aliases call renders an unauthorized answer with
+//! [`GatewayError::api`] (`Bearer realm="Rootyard"`), so the alias and the
+//! top-level `/api` route answer one identical refusal and a cookie-only
+//! browser `fetch` resolves promptly instead of entering a Basic auth exchange.
+//! A refusal already challenged by another authority passes through untouched.
 use std::sync::Arc;
 
 #[path = "browser_ui/assets.rs"]
@@ -31,14 +38,14 @@ mod inline;
 use axum::{
     Form, Router,
     extract::{Path, Query, Request, State, rejection::PathRejection},
-    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+    http::{HeaderMap, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::Value;
 
-use super::{api, browse, error::{Challenge, GatewayError}, history, state::BlobGitState};
+use super::{api, browse, error::GatewayError, history, state::BlobGitState};
 use crate::{
     application::MetadataState,
     browse::models::{BlobByOidQuery, BlobQuery, CommitsQuery, CompareQuery, RefsQuery, TreeByOidQuery, TreeQuery},
@@ -69,8 +76,7 @@ pub(super) fn router() -> Router<Arc<BlobGitState>> {
         .route("/repos/{owner}/{name}/blob", get(alias_blob))
         .route("/repos/{owner}/{name}/blob/{oid}", get(alias_blob_by_oid))
         .route("/repos/{owner}/{name}/compare", get(alias_compare))
-        .layer(middleware::from_fn(normalize_session_headers))
-        .layer(middleware::from_fn(api_challenge));
+        .layer(middleware::from_fn(normalize_session_headers));
     Router::new()
         .route("/login", get(login_page).post(login))
         .route("/logout", post(logout))
@@ -79,35 +85,6 @@ pub(super) fn router() -> Router<Arc<BlobGitState>> {
         .route("/blob/", get(spa_shell))
         .route("/blob/repos/{owner}/{name}", get(spa_shell))
         .nest("/blob/api", aliases)
-        .layer(middleware::from_fn(api_challenge))
-}
-
-/// The relayed JSON/API challenge boundary.
-///
-/// These routes authenticate with a Bearer API credential, so an unauthorized
-/// answer must advertise that scheme ([`Challenge::Bearer`]) and never Basic: a
-/// same-origin browser `fetch` of a `Basic` `401` starts an HTTP-auth exchange
-/// that does not settle under the page's bound, hiding the real denial. Only the
-/// `WWW-Authenticate` header of an error the handler itself produced is set; a
-/// successful answer, its status/body and every other header are untouched, and
-/// an in-band answer (the shared sign-in `Error`, the session middleware's
-/// redirect) passes through unchanged. The Smart HTTP `/git` boundary keeps its
-/// own Basic challenge and is never wrapped by this one.
-async fn api_challenge(request: Request, next: Next) -> Response {
-    let response = next.run(request).await;
-    challenge_api_response(response)
-}
-
-/// Apply [`Challenge::Bearer`] to one JSON/API answer. Only a `401` without any
-/// challenge is the handler's own `GatewayError` refusal; a `401` that already
-/// names a scheme stays the other authority's answer.
-fn challenge_api_response(mut response: Response) -> Response {
-    if response.status() == StatusCode::UNAUTHORIZED && !response.headers().contains_key(header::WWW_AUTHENTICATE) {
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static(Challenge::Bearer.value()));
-    }
-    response
 }
 
 /// Translate the already-validated HttpOnly browser session cookie into the
@@ -115,8 +92,10 @@ fn challenge_api_response(mut response: Response) -> Response {
 ///
 /// Only cookie-to-header normalisation is applied and only here. A request that
 /// already carries any `Authorization` value is left untouched (the shared
-/// normaliser's rule) and no other header is rewritten. The public `/api` and
-/// Smart HTTP routes are outside this subtree and stay bearer-only.
+/// normaliser's rule) and no other header is rewritten, and no response header
+/// is touched: the relayed handler renders the `401` challenge itself. The
+/// public `/api` and Smart HTTP routes are outside this subtree and stay
+/// bearer-only.
 async fn normalize_session_headers(request: Request, next: Next) -> Response {
     let (mut parts, body) = request.into_parts();
     parts.headers = normalize_web_headers(&parts.headers);
@@ -213,7 +192,7 @@ async fn list_repos(
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
     let query: api::ListQuery = optional_query(&uri)?;
-    api::list_repos(State(state), Query(query), uri, headers).await
+    Ok(api::list_repos(State(state), Query(query), uri, headers).await)
 }
 
 async fn get_repo(
@@ -222,7 +201,7 @@ async fn get_repo(
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
-    api::get_repo(State(state), Path((owner, name)), headers).await
+    Ok(api::get_repo(State(state), Path((owner, name)), headers).await)
 }
 
 /// The bound a browser presented, also guarding the cookie-only list read.
@@ -293,7 +272,7 @@ async fn alias_refs(
     let presented = presented_bound(&headers).cloned();
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: RefsQuery = optional_query(&uri)?;
-    let answer = history::refs(State(state), Path((owner, name)), Query(query), headers).await;
+    let answer = Ok(history::refs(State(state), Path((owner, name)), Query(query), headers).await);
     admit_bound(answer, presented.as_ref()).await
 }
 
@@ -306,7 +285,7 @@ async fn alias_commits(
     let presented = presented_bound(&headers).cloned();
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: CommitsQuery = optional_query(&uri)?;
-    let answer = history::commits(State(state), Path((owner, name)), Query(query), headers).await;
+    let answer = Ok(history::commits(State(state), Path((owner, name)), Query(query), headers).await);
     admit_bound(answer, presented.as_ref()).await
 }
 
@@ -321,7 +300,7 @@ async fn alias_compare(
     // `base` and `head` are required; a missing pair is the same generic input
     // refusal the handler gives for an invalid revision.
     let query: CompareQuery = optional_query(&uri)?;
-    let answer = history::compare(State(state), Path((owner, name)), Query(query), headers).await;
+    let answer = Ok(history::compare(State(state), Path((owner, name)), Query(query), headers).await);
     admit_bound(answer, presented.as_ref()).await
 }
 
@@ -334,7 +313,7 @@ async fn alias_tree(
     let presented = presented_bound(&headers).cloned();
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: TreeQuery = optional_query(&uri)?;
-    let answer = browse::tree(State(state), Path((owner, name)), Query(query), headers).await;
+    let answer = Ok(browse::tree(State(state), Path((owner, name)), Query(query), headers).await);
     admit_bound(answer, presented.as_ref()).await
 }
 
@@ -347,7 +326,7 @@ async fn alias_tree_by_oid(
     let presented = presented_bound(&headers).cloned();
     let Path((owner, name, oid)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: TreeByOidQuery = optional_query(&uri)?;
-    let answer = browse::tree_by_oid(State(state), Path((owner, name, oid)), Query(query), headers).await;
+    let answer = Ok(browse::tree_by_oid(State(state), Path((owner, name, oid)), Query(query), headers).await);
     admit_bound(answer, presented.as_ref()).await
 }
 
@@ -360,7 +339,7 @@ async fn alias_blob(
     let presented = presented_bound(&headers).cloned();
     let Path((owner, name)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: BlobQuery = optional_query(&uri)?;
-    let answer = browse::blob(State(state), Path((owner, name)), Query(query), headers).await;
+    let answer = Ok(browse::blob(State(state), Path((owner, name)), Query(query), headers).await);
     admit_bound(answer, presented.as_ref()).await
 }
 
@@ -373,7 +352,7 @@ async fn alias_blob_by_oid(
     let presented = presented_bound(&headers).cloned();
     let Path((owner, name, oid)) = path.map_err(|_| GatewayError::NotFound)?;
     let query: BlobByOidQuery = optional_query(&uri)?;
-    let answer = browse::blob_by_oid(State(state), Path((owner, name, oid)), Query(query), headers).await;
+    let answer = Ok(browse::blob_by_oid(State(state), Path((owner, name, oid)), Query(query), headers).await);
     admit_bound(answer, presented.as_ref()).await
 }
 
@@ -618,98 +597,40 @@ mod tests {
         assert_eq!(shell.matches("GatewayError::Unauthorized").count(), 0, "no failure may collapse into a 401");
     }
 
-    fn www_authenticate(response: &Response) -> Option<&str> {
-        response.headers().get(header::WWW_AUTHENTICATE).map(|value| value.to_str().expect("text"))
-    }
-
-    /// The real API handlers render a bare `401`; the boundary answers it with a
-    /// Bearer challenge, never the Basic one a browser `fetch` would enter.
-    /// `create_repo` authenticates before it reads its body or touches state, so
-    /// it is the concrete relayed refusal; the source check pins that order.
+    /// Every relayed alias is the unchanged JSON handler the top-level `/api`
+    /// route registers, so both routes render the same `Bearer` challenge; the
+    /// alias router itself rewrites no header and no answer.
     #[test]
-    fn a_relayed_api_unauthorized_answer_advertises_bearer() {
-        let handler = challenge_api_response(GatewayError::Unauthorized.into_response());
-        assert_eq!(handler.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            www_authenticate(&handler),
-            Some("Bearer realm=\"Rootyard\""),
-            "the relayed API answer never starts a browser Basic auth prompt"
-        );
-
-        let source = include_str!("api.rs");
-        let create = body_of(source, "pub(super) async fn create_repo(", "async fn list_repos(", "create_repo");
-        let authenticate = create.find("authenticate(").expect("create_repo authenticates");
-        let state = create.find("state.").expect("create_repo uses its state");
-        assert!(authenticate < state, "the unauthorized answer is reached before any state work");
-        assert!(create.contains("authenticate(&state, &headers).await?"), "the bare gateway 401 is the body checked");
-        let refusal = GatewayError::Unauthorized.into_response();
-        assert_eq!(www_authenticate(&refusal), None, "the handler itself renders no challenge");
-    }
-
-    /// The boundary changes only the challenge: status, every other header and
-    /// every non-`401` answer are the handler's own.
-    #[test]
-    fn the_relayed_api_challenge_changes_no_other_answer() {
-        for error in [
-            GatewayError::Forbidden("write permission required"),
-            GatewayError::NotFound,
-            GatewayError::BadRequest("invalid request"),
-            GatewayError::Timeout,
-        ] {
-            let plain = error.into_response();
-            let relayed = challenge_api_response(error.into_response());
-            assert_eq!(relayed.status(), plain.status());
-            assert_eq!(www_authenticate(&relayed), None);
-            for (name, expected) in plain.headers() {
-                assert_eq!(relayed.headers().get(name), Some(expected), "{name} changed");
-            }
-            assert_eq!(relayed.headers().len(), plain.headers().len());
-        }
-        let plain = GatewayError::Unauthorized.into_response();
-        let relayed = challenge_api_response(GatewayError::Unauthorized.into_response());
-        assert_eq!(relayed.status(), plain.status());
-        assert_eq!(
-            relayed.headers().get(header::CACHE_CONTROL),
-            plain.headers().get(header::CACHE_CONTROL),
-            "the refusal body headers are the unchanged gateway ones"
-        );
-        assert_eq!(relayed.headers().len(), plain.headers().len() + 1);
-    }
-
-    /// A `401` that already names a scheme belongs to another authority (the
-    /// shared sign-in handler or the session middleware redirect): the boundary
-    /// neither rewrites nor adds a challenge to it.
-    #[test]
-    fn the_relayed_api_boundary_keeps_an_existing_answer() {
-        let sign_in = crate::Error::unauthorized().into_response();
-        assert_eq!(sign_in.status(), StatusCode::UNAUTHORIZED);
-        let passed = challenge_api_response(sign_in);
-        assert_eq!(www_authenticate(&passed), Some("Basic realm=\"Rootyard\", charset=\"UTF-8\""));
-
-        let mut challenged = GatewayError::Unauthorized.into_response();
-        challenged
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Negotiate"));
-        let passed = challenge_api_response(challenged);
-        assert_eq!(www_authenticate(&passed), Some("Negotiate"));
-    }
-
-    /// The boundary covers the relayed API (the alias subtree and the nest that
-    /// mounts it); the sign-in pages and the SPA shell are registered apart from
-    /// it, and Smart HTTP is outside this router and keeps its own challenge.
-    #[test]
-    fn only_the_relayed_api_subtree_advertises_bearer() {
+    fn every_alias_relays_a_challenged_json_handler() {
+        let relaying = [
+            ("/repos", get(list_repos)),
+            ("/repos/{owner}/{name}", get(get_repo)),
+            ("/repos/{owner}/{name}/refs", get(alias_refs)),
+            ("/repos/{owner}/{name}/commits", get(alias_commits)),
+            ("/repos/{owner}/{name}/tree", get(alias_tree)),
+            ("/repos/{owner}/{name}/tree/{oid}", get(alias_tree_by_oid)),
+            ("/repos/{owner}/{name}/blob", get(alias_blob)),
+            ("/repos/{owner}/{name}/blob/{oid}", get(alias_blob_by_oid)),
+            ("/repos/{owner}/{name}/compare", get(alias_compare)),
+        ];
+        let api = body_of(include_str!("mod.rs"), ".route(\"/api/repos\"", ".route(\"/git/", "the /api routes");
         let source = include_str!("browser_ui.rs");
-        let aliases = body_of(source, "let aliases = Router::new()", "\n    Router::new()", "the alias router");
-        assert!(aliases.contains(".layer(middleware::from_fn(api_challenge))"));
-        // The end marker is the doc comment of [`challenge_api_response`], which
-        // follows the router; keep the router ahead of it.
-        let pages = body_of(source, "\n    Router::new()\n        .route(\"/login\"", "\n/// Apply ", "the Web router");
-        let nest = pages.find(".nest(\"/blob/api\", aliases)").expect("the aliases are nested below /blob/api");
-        assert!(pages[nest..].contains(".layer(middleware::from_fn(api_challenge))"), "the boundary wraps the nest");
-        for in_band in ["/login\", get(login_page)", "/logout\", post(logout)", "/blob\", get(spa_shell)"] {
-            assert!(pages[..nest].contains(in_band), "{in_band} is registered outside the API boundary");
+        for (route, _) in relaying {
+            assert!(api.contains(&format!(".route(\"/api{route}\"")), "the top-level route api{route} is registered");
+            assert!(
+                source.contains(&format!(".route(\"{route}\", ")),
+                "the alias {route} is registered below /web/blob/api"
+            );
         }
+        for (_, handler) in [("api", "api::list_repos"), ("history", "history::refs"), ("browse", "browse::tree")] {
+            assert!(source.contains(&format!("{handler}(")), "{handler} is relayed, not reimplemented");
+        }
+        let router = body_of(source, "pub(super) fn router()", "/// Translate the already-validated", "the Web router");
+        assert_eq!(
+            router.matches(".layer(").count(),
+            1,
+            "only the cookie translation is layered: the challenge belongs to the relayed handler"
+        );
     }
 
     /// The source text of one item: from `from` up to the next `to` marker.

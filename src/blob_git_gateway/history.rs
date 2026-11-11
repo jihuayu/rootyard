@@ -43,6 +43,10 @@
 //! (`413`), never clipped answers presented as complete.
 //! Responses use the legacy browse JSON models with additive `format`,
 //! `hash_algorithm` and `oid_hex_len` fields so SHA-1 vs SHA-256 is explicit.
+//!
+//! Each public handler is the entry point of a top-level `/api` route (and of
+//! its `/web/blob/api` alias) and renders its failure with
+//! `GatewayError::api`, so an unauthorized read advertises `Bearer` on both.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -69,6 +73,15 @@ const MAX_COMPARE_DIFF: u64 = 2 * 1024 * 1024;
 const MAX_COMPARE_COMMITS: usize = 100;
 
 pub(super) async fn refs(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String)>,
+    query: Query<models::RefsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    refs_authorized(state, path, query, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn refs_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<models::RefsQuery>,
@@ -121,6 +134,15 @@ pub(super) async fn refs(
 }
 
 pub(super) async fn commits(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String)>,
+    query: Query<models::CommitsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    commits_authorized(state, path, query, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn commits_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<models::CommitsQuery>,
@@ -167,6 +189,14 @@ pub(super) async fn commits(
 }
 
 pub(super) async fn commit(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    commit_authorized(state, path, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn commit_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, name, oid)): Path<(String, String, String)>,
     headers: HeaderMap,
@@ -193,6 +223,15 @@ pub(super) async fn commit(
 }
 
 pub(super) async fn compare(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String)>,
+    query: Query<CompareQuery>,
+    headers: HeaderMap,
+) -> Response {
+    compare_authorized(state, path, query, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn compare_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<CompareQuery>,

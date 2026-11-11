@@ -20,6 +20,13 @@
 //! Local bare Git exists only as a per-request computed view. Durable refs live
 //! in the core and durable bytes in Blob, so the RAII deletion of a compute view
 //! can never lose an already acknowledged ref or byte.
+//!
+//! An unauthenticated request is answered per protocol (#174): every `/api`
+//! JSON route and its `/web/blob/api` alias advertises `Bearer realm="Rootyard"`,
+//! while the three Smart HTTP `/git` endpoints keep the Git
+//! `Basic realm="Rootyard", charset="UTF-8"` challenge. The challenge is
+//! rendered once by the route's own handler (`GatewayError::api` / `GatewayError::git`), so
+//! the two routes that share a handler can never disagree.
 mod api;
 mod browse;
 mod browser_ui;
@@ -70,7 +77,9 @@ pub use state::BlobGitState;
 /// It is merged once here and never wraps `/api` or `/git`, so those keep their
 /// bearer-only behaviour unchanged. Cookie authentication is added only for the
 /// GET-only `/web/blob/api/...` reads, where the validated session cookie is
-/// translated into the `Authorization` header the gateway handlers read.
+/// translated into the `Authorization` header the gateway handlers read; an
+/// unauthorized answer of those aliases is the same challenged JSON refusal the
+/// top-level `/api` route renders.
 fn web_router(state: Arc<BlobGitState>) -> Router<Arc<BlobGitState>> {
     Router::new()
         .nest("/web", browser_ui::router())
@@ -171,4 +180,197 @@ async fn metadata_ready(
     })
     .await
     .map_err(|_| GatewayError::Timeout)?
+}
+
+/// Route-boundary tests for the `401` challenge (#174).
+///
+/// These drive the real `router()` through `tower`'s `oneshot`, so each request
+/// goes through the same route binding, middleware and handler as production.
+/// Only authentication differs: the pool points at a never-listening loopback
+/// port, so the shared `auth::authenticate` answers its own `401`. Every route
+/// below decides on that credential before it touches PostgreSQL, the Blob
+/// store or native Git, so these tests need none of them.
+#[cfg(test)]
+mod challenge_tests {
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+
+    use axum::{
+        body::Body,
+        http::{HeaderValue, Request, StatusCode, header},
+    };
+    use base64::Engine;
+    use deadpool_postgres::{Manager, Runtime};
+    use tower::ServiceExt;
+
+    use super::{BlobGitConfig, BlobGitState, GatewayError, router};
+    use crate::blob_store::{budget::ResourceLimits, test_support::store};
+
+    const BEARER: &str = "Bearer realm=\"Rootyard\"";
+    const BASIC: &str = "Basic realm=\"Rootyard\", charset=\"UTF-8\"";
+
+    /// An immutable gateway state whose pool points at a closed loopback port.
+    fn offline_state() -> Arc<BlobGitState> {
+        let config: tokio_postgres::Config =
+            "host=127.0.0.1 port=1 user=rootyard dbname=rootyard".parse().expect("static connection string");
+        let pool = deadpool_postgres::Pool::builder(Manager::new(config, tokio_postgres::NoTls))
+            .runtime(Runtime::Tokio1)
+            .max_size(1)
+            .build()
+            .expect("offline pool");
+        // The `cfg(test)` memory store; only its backend identity is consulted,
+        // and only after the request authenticated.
+        let (blob, _) = store(ResourceLimits::new(2, 2, 1 << 20).expect("test budget"));
+        // The scratch root must outlive every request served by this state.
+        let scratch = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("scratch root"));
+        Arc::new(
+            BlobGitState::new(BlobGitConfig {
+                pool,
+                store: blob,
+                git_binary: PathBuf::from("/bin/true"),
+                scratch_root: (*scratch).path().to_path_buf(),
+                max_concurrent_requests: 1,
+                max_request_bytes: 64 * 1024,
+                max_response_bytes: 64 * 1024,
+                max_inflight_bytes: 64 * 1024,
+                operation_deadline: Duration::from_secs(30),
+                native_limits: Default::default(),
+            })
+            .expect("gateway state"),
+        )
+    }
+
+    /// Send one request through the real router.
+    async fn send(
+        state: &Arc<BlobGitState>,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Vec<String>) {
+        let mut request = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response =
+            router(state.clone()).oneshot(request.body(Body::empty()).expect("request")).await.expect("router");
+        let challenges = response
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|value| value.to_str().expect("challenge is text").to_owned())
+            .collect();
+        (response.status(), challenges)
+    }
+
+    /// The wire `Content-Type` of one Smart HTTP RPC request.
+    fn rpc_content_type(uri: &str) -> &'static str {
+        if uri.ends_with("/git-upload-pack") {
+            "application/x-git-upload-pack-request"
+        } else {
+            "application/x-git-receive-pack-request"
+        }
+    }
+
+    /// Every JSON/API route, with or without a rejected credential, answers its
+    /// unauthenticated denial with the Bearer challenge, never the Basic one a
+    /// same-origin browser `fetch` would turn into a hanging auth exchange. The
+    /// `/web/blob/api` aliases answer exactly like their top-level route.
+    #[tokio::test]
+    async fn top_level_api_and_its_aliases_advertise_bearer() {
+        let state = offline_state();
+        let rejected: [&[(&str, &str)]; 3] = [
+            &[],
+            &[("authorization", "Bearer not-a-credential")],
+            &[("authorization", "Basic b3duZXI6bm90LWEtY3JlZGVudGlhbA==")],
+        ];
+        let routes = [
+            ("GET", "/api/repos"),
+            ("GET", "/api/repos/owner/name"),
+            ("GET", "/api/repos/owner/name/refs"),
+            ("GET", "/api/repos/owner/name/commits"),
+            ("GET", "/api/repos/owner/name/tree"),
+            ("GET", "/api/repos/owner/name/blob"),
+            ("GET", "/api/repos/owner/name/compare?base=HEAD&head=HEAD"),
+            ("GET", "/api/repos/owner/name/operations/00000000-0000-0000-0000-000000000001"),
+            ("POST", "/api/repos"),
+            ("POST", "/api/repos/owner/name/merges"),
+            ("GET", "/web/blob/api/repos"),
+            ("GET", "/web/blob/api/repos/owner/name"),
+            ("GET", "/web/blob/api/repos/owner/name/refs"),
+            ("GET", "/web/blob/api/repos/owner/name/tree"),
+        ];
+        for (method, uri) in routes {
+            for headers in rejected {
+                let (status, challenges) = send(&state, method, uri, headers).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri} was not an unauthenticated denial");
+                assert_eq!(challenges, [BEARER], "{method} {uri} must not enter a browser Basic auth exchange");
+            }
+        }
+    }
+
+    /// All three Smart HTTP endpoints (as registered in [`router`]) keep the
+    /// current Git Basic challenge on an unauthenticated advertisement and on
+    /// both RPCs.
+    #[tokio::test]
+    async fn smart_http_denials_advertise_basic() {
+        let state = offline_state();
+        let routes = [
+            ("GET", "/git/owner/name/info/refs?service=git-upload-pack"),
+            ("GET", "/git/owner/name/info/refs?service=git-receive-pack"),
+            ("POST", "/git/owner/name/git-upload-pack"),
+            ("POST", "/git/owner/name/git-receive-pack"),
+        ];
+        let rejected: [&[(&str, &str)]; 2] = [&[], &[("authorization", "Bearer not-a-credential")]];
+        for (method, uri) in routes {
+            for headers in rejected {
+                let mut all = headers.to_vec();
+                if method == "POST" {
+                    all.push(("content-type", rpc_content_type(uri)));
+                }
+                let (status, challenges) = send(&state, method, uri, &all).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri} was not an unauthenticated denial");
+                assert_eq!(challenges, [BASIC], "{method} {uri} must keep the Git Basic challenge");
+            }
+        }
+    }
+
+    /// Credential acceptance is not narrowed: a well-formed Basic or Bearer
+    /// credential passes the shared parser and reaches the authority, so the
+    /// API answers with the authority's own failure rather than its `401`.
+    #[tokio::test]
+    async fn accepted_basic_and_bearer_credentials_still_pass() {
+        let state = offline_state();
+        let token = format!("ryt_{}", "ab".repeat(32));
+        let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("owner:{token}")));
+        let bearer = format!("Bearer {token}");
+        for uri in ["/api/repos", "/web/blob/api/repos"] {
+            for credential in [basic.as_str(), bearer.as_str()] {
+                let (status, challenges) = send(&state, "GET", uri, &[("authorization", credential)]).await;
+                assert!(challenges.is_empty(), "{uri} challenged a request that already named a scheme");
+                assert_ne!(status, StatusCode::UNAUTHORIZED, "{uri} rejected a credential syntax auth accepts");
+            }
+        }
+    }
+
+    /// The shared `Error` mapping keeps the route protocol as the challenge
+    /// owner, and a refusal already challenged elsewhere is left untouched.
+    #[test]
+    fn shared_mappings_use_the_route_challenge() {
+        let unauthorized: GatewayError = crate::Error::unauthorized().into();
+        assert_eq!(unauthorized, GatewayError::Unauthorized);
+        let value = |response: axum::response::Response| -> Vec<String> {
+            response
+                .headers()
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .map(|value| value.to_str().expect("challenge is text").to_owned())
+                .collect()
+        };
+        assert_eq!(value(unauthorized.api()), [BEARER]);
+        assert_eq!(value(unauthorized.git()), [BASIC]);
+        // A refusal already challenged elsewhere is never rewritten or joined.
+        let mut sign_in = GatewayError::Unauthorized.into_response();
+        sign_in.headers_mut().append(header::WWW_AUTHENTICATE, HeaderValue::from_static("Negotiate"));
+        assert_eq!(value(sign_in.git()), ["Negotiate"]);
+        assert_eq!(value(GatewayError::Unauthorized.into_response()), []);
+    }
 }
