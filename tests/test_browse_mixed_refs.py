@@ -38,10 +38,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import browse  # noqa: E402
 import browse_ref_scale  # noqa: E402
 import mixed_ref_cases  # noqa: E402
+import mixed_ref_support  # noqa: E402
 import refusal_audit_sql  # noqa: E402
 
 BROWSE = Path(__file__).with_name("browse.py")
 CASES = Path(__file__).with_name("mixed_ref_cases.py")
+SUPPORT = Path(__file__).with_name("mixed_ref_support.py")
 SQL = Path(__file__).with_name("refusal_audit_sql.py")
 KLASS = "MixedRefPolicyCases"
 # Command words that move the checked-out fixture.  ``git`` is named explicitly
@@ -82,14 +84,26 @@ def assert_no_forked_state(test, body):
     test.assertNotIn("prune", body)
 
 
-def method(name, path=CASES):
-    tree = ast.parse(path.read_text())
-    klass = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == KLASS)
-    return next(n for n in klass.body if isinstance(n, ast.FunctionDef) and n.name == name)
+def method(name, path=None):
+    for candidate in ([path] if path is not None else [CASES, SUPPORT]):
+        tree = ast.parse(candidate.read_text())
+        for klass in (n for n in tree.body
+                      if isinstance(n, ast.ClassDef) and n.name in (KLASS, "MixedRefSupport")):
+            found = next((n for n in klass.body
+                          if isinstance(n, ast.FunctionDef) and n.name == name), None)
+            if found is not None:
+                return found
+    raise LookupError("no mixed-ref method " + name)
 
 
 def source(name):
-    return ast.get_source_segment(CASES.read_text(), method(name))
+    for path in (CASES, SUPPORT):
+        try:
+            node = method(name, path)
+        except LookupError:
+            continue
+        return ast.get_source_segment(path.read_text(), node)
+    raise LookupError("no mixed-ref method " + name)
 
 
 # A stock Git for ``ref_state`` instance tests: the pinned command, not PATH.
@@ -194,9 +208,9 @@ class CaseContractTest(unittest.TestCase):
                 self.assertEqual(name, "mixed_protected_unprotected_ref_transaction", name)
 
     def test_fixed_inventory_is_untouched(self):
-        self.assertEqual(len(browse.CASE_NAMES), 15)
+        self.assertEqual(len(browse.CASE_NAMES), 17)
         self.assertEqual(browse.CASE_NAMES[12], "ref_scale_complete_traversal")
-        self.assertEqual(browse.CASE_NAMES[-1], "protected_writes_and_ref_ack_failure")
+        self.assertEqual(browse.CASE_NAMES[-1], "ref_transaction_crash_recovery")
         self.assertEqual(browse.CASE_NAMES.count("ref_scale_complete_traversal"), 1)
         for deadline in ("list_commits_deadline", "compare_commits_deadline"):
             self.assertIn(deadline, browse.CASE_NAMES)
@@ -230,6 +244,8 @@ class CaseContractTest(unittest.TestCase):
             "ref_scale_complete_traversal",
             "selective_ref_prefix",
             "protected_writes_and_ref_ack_failure",
+            "ref_transaction_settlement_recovery",
+            "ref_transaction_crash_recovery",
         ))
         now = re.search(r"CASE_NAMES = \(.*?\n\)", text, re.S).group(0)
         literal = re.search(r"CASE_NAMES = \((.*?)\n\)", text, re.S).group(1)
@@ -267,15 +283,15 @@ class CaseContractTest(unittest.TestCase):
     def test_selection_is_the_fixed_inventory_then_the_two_mixed_cases(self):
         fixed, mixed = list(browse.CASE_NAMES), list(mixed_ref_cases.MIXED_REF_CASES)
         deadlines = ("list_commits_deadline", "compare_commits_deadline")
-        self.assertEqual(len(fixed), 15)
-        # 14 main cases (the deadline cases are part of them) + the one scale case.
-        self.assertEqual((len(fixed) - 1, fixed.count("ref_scale_complete_traversal")), (14, 1))
+        self.assertEqual(len(fixed), 17)
+        # 16 main cases (the deadline cases are part of them) + the one scale case.
+        self.assertEqual((len(fixed) - 1, fixed.count("ref_scale_complete_traversal")), (16, 1))
         for deadline in deadlines:
             self.assertEqual(fixed.count(deadline), 1)
         self.assertEqual(sum(name.endswith("_deadline") for name in fixed), 2)
         self.assertEqual(browse.selected_cases(False), fixed)
         selected = browse.selected_cases(True)
-        self.assertEqual(len(selected), 17)
+        self.assertEqual(len(selected), 19)
         self.assertEqual(selected[-2:], [
             "mixed_protected_unprotected_atomic_push",
             "mixed_protected_unprotected_ref_transaction"])
@@ -332,10 +348,11 @@ class CaseContractTest(unittest.TestCase):
 
     def test_ci_browse_step_runs_the_seventeen_case_mode(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        command = ('run: python3 tests/browse.py --binary target/debug/rootyard '
-                   '--report test-results/browse.json --mixed-refs --git "$(command -v git)"')
+        command = ('run: python3 tests/browse.py --mixed-refs --git "$(command -v git)" '
+                   '--binary target/debug/rootyard --report test-results/browse.json')
         self.assertEqual(workflow.count(command), 1)
-        self.assertEqual(workflow.count("tests/browse.py"), 1, "only the Browse step may change")
+        self.assertEqual(workflow.count("tests/browse.py"), 2,
+                         "the Browse step and its native manifest harness may reference it")
         # Other suites keep their exact commands.
         for untouched in ("python3 tests/pulls.py --binary target/debug/rootyard --report test-results/pulls.json",
                           "python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json"):
@@ -349,7 +366,8 @@ class CaseContractTest(unittest.TestCase):
     def test_module_stays_modular(self):
         # Refusal audit SQL/verdict live in refusal_audit_sql.py.  The module
         # also carries the shared public-refs cursor walk used by ``ref_state``.
-        self.assertLessEqual(len(CASES.read_text().splitlines()), 700)
+        self.assertLess(len(CASES.read_text().splitlines()), 500)
+        self.assertLess(len(SUPPORT.read_text().splitlines()), 500)
         self.assertEqual(CASES.read_text().count("def operations_after_query"), 0)
 
     def test_reference_events_shape(self):
@@ -365,6 +383,70 @@ class MixedRefWiringTest(unittest.TestCase):
         self.assertTrue(hasattr(mixed_ref_cases.MixedRefPolicyCases.isolated_rules, "__wrapped__"))
         harness = object.__new__(FixtureHarness)
         self.assertIsInstance(harness.isolated_rules(), contextlib.AbstractContextManager)
+
+    def test_support_resolves_the_refusal_audit_helpers(self):
+        """The support module owns the audit calls, so it must bind their names."""
+        self.assertIs(mixed_ref_support.audit_git_refusal_interval,
+                      refusal_audit_sql.audit_git_refusal_interval)
+        self.assertIs(mixed_ref_support.audit_api_refusal_interval,
+                      refusal_audit_sql.audit_api_refusal_interval)
+
+    def test_ensure_repo_ready_clears_only_the_prior_unknown_fence(self):
+        """A ready repo is untouched; the crash-recovery fence uses the real CLI."""
+        calls = []
+
+        def harness_for(state):
+            harness = object.__new__(FixtureHarness)
+            harness.args = SimpleNamespace(binary="/opt/rootyard")
+            harness.repo = {"id": "11111111-1111-4111-8111-111111111111"}
+            harness.state = state
+
+            def repo_state():
+                return harness.state
+
+            def stop():
+                calls.append(("stop",))
+
+            def start():
+                calls.append(("start",))
+                harness.state = "ready/-"
+
+            def run(argv, check=True, **kwargs):
+                calls.append(tuple(argv))
+                if argv[1] == "inspect-recovery":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({
+                        "storage_generation": 7, "fingerprint": "a" * 64}).encode(), stderr=b"")
+                return SimpleNamespace(returncode=0, stdout=b"{}", stderr=b"")
+
+            harness.repo_state, harness.stop, harness.start, harness.run = (
+                repo_state, stop, start, run)
+            return harness
+
+        ready = harness_for("ready/-")
+        ready.ensure_repo_ready()
+        self.assertEqual(calls, [], "a ready repository must not be restarted or inspected")
+
+        calls.clear()
+        recovering = harness_for("recovering/push_outcome_unknown")
+        recovering.ensure_repo_ready()
+        self.assertEqual(recovering.repo_state(), "ready/-")
+        self.assertEqual(calls, [
+            ("stop",),
+            ("/opt/rootyard", "inspect-recovery", recovering.repo["id"]),
+            ("/opt/rootyard", "resolve-unknown", recovering.repo["id"],
+             "--expected-generation", "7", "--fingerprint", "a" * 64,
+             "--acknowledge-audit-gap",
+             "Browse harness cleared prior crash-recovery case fence before mixed-ref cases."),
+            ("start",),
+        ])
+
+        # Both mixed cases clear the inherited fence before entering rule isolation.
+        for name in ("mixed_protected_unprotected_atomic_push",
+                     "mixed_protected_unprotected_ref_transaction"):
+            body = source(name)
+            self.assertLess(body.index("self.ensure_repo_ready()"),
+                            body.index("with self.isolated_rules():"))
+        self.assertNotIn("ensure_repo_ready", source("isolated_rules"))
 
     def test_rules_are_isolated_and_restored(self):
         both = source("mixed_protected_unprotected_atomic_push") + source(
@@ -513,6 +595,29 @@ class MixedRefWiringTest(unittest.TestCase):
         self.assertEqual(native.count("assert_one_aborted_refusal("), 1)
         self.assertEqual(policy.count("assert_one_aborted_refusal("), 2)
 
+    def test_causal_rule_matrix_isolates_each_protected_tip_flag(self):
+        self.assertEqual(mixed_ref_cases.MixedRefPolicyCases.CAUSAL_RULES, (
+            ("ff_only", True, False),
+            ("force_only", False, True),
+            ("delete_ff", True, False),
+            ("delete_force", False, True),
+        ))
+        atomic = source("causal_atomic_refusals")
+        transaction = source("causal_transaction_refusals")
+        for body in (atomic, transaction):
+            self.assertIn("required_approvals=0, required_checks=[]", body)
+            self.assertIn("prevent_deletion=False", body)
+            self.assertIn("require_fast_forward=fast_forward", body)
+            self.assertIn("prevent_force_push=force_push", body)
+        self.assertIn('self.push_as_owner("--atomic", "--force"', atomic)
+        self.assertIn('self.ref_oids(protected, sibling)', atomic)
+        self.assertIn('"old_oid": old, "new_oid": ZERO_OID', transaction)
+        self.assertIn('"old_oid": ZERO_OID, "new_oid": self.feature_oid', transaction)
+        self.assertIn("causal_atomic_refusals(main)", source(
+            "mixed_protected_unprotected_atomic_push"))
+        self.assertIn("causal_transaction_refusals(transact, refused)", source(
+            "mixed_protected_unprotected_ref_transaction"))
+
     def test_pull_is_recorded_but_the_direct_push_is_still_denied(self):
         self.assertIn("head_oid", [n.id for n in ast.walk(method("open_pull_for_main")) if isinstance(n, ast.Name)])
         bodies = dict_literals(method("open_pull_for_main"))
@@ -554,7 +659,9 @@ class MixedRefWiringTest(unittest.TestCase):
         self.assertIn("audit_git_refusal_interval", native)
         self.assertNotIn("git_refusal_audit", native)
         transactions = (ROOT / "src/browse/transactions.rs").read_text()
-        self.assertLess(transactions.index('"reference old_oid mismatch"'),
+        ref_transaction = (ROOT / "src/browse/ref_transaction.rs").read_text()
+        self.assertIn('"reference old_oid mismatch"', ref_transaction)
+        self.assertLess(transactions.index("validate_applied_updates("),
                         transactions.index("crate::browse::policy::validate("))
         policy = (ROOT / "src/browse/policy.rs").read_text()
         self.assertIn('Error(StatusCode::FORBIDDEN, "protected branch policy denied"', policy)
@@ -787,7 +894,7 @@ class BrowseRefScaleGitContractTest(unittest.TestCase):
 
 
 class BrowseIntegrationTest(unittest.TestCase):
-    """The wired runner: one harness, 17 selected IDs, one bound Git."""
+    """The wired runner: one harness, 19 selected IDs, one bound Git."""
 
     GIT = str(Path(shutil.which("git")).resolve()) if shutil.which("git") else None
 
@@ -870,16 +977,16 @@ class BrowseIntegrationTest(unittest.TestCase):
         # from the mixin, and __init__ never assigns an instance string.
         self.assertNotIn("native_git", browse.BrowseHarness.__dict__)
         self.assertNotIn("native_git", browse.BrowseHarness.__init__.__code__.co_names)
-        self.assertIn("native_git", mixed_ref_cases.MixedRefPolicyCases.__dict__)
+        self.assertIn("native_git", mixed_ref_cases.MixedRefPolicyCases.__mro__[1].__dict__)
         initializer = next(n for n in self.browse_class().body
                            if isinstance(n, ast.FunctionDef) and n.name == "__init__")
         assigned = {t.attr for n in ast.walk(initializer) if isinstance(n, ast.Assign)
                     for t in n.targets if isinstance(t, ast.Attribute)}
         self.assertIn("wrapper_git", assigned)
         self.assertNotIn("native_git", assigned, "an instance string would shadow the method")
-        # The rename touches exactly the wrapper field and its four use sites.
+        # The wrapper field is the only string spelling; every use site execs it.
         text = BROWSE.read_text()
-        self.assertEqual(text.count("self.wrapper_git"), 4)
+        self.assertEqual(text.count("self.wrapper_git"), 6)
         self.assertIsNone(re.search(r"self\.native_git\b", text))
         probe = ast.unparse(next(n for n in self.browse_class().body
                                  if isinstance(n, ast.FunctionDef) and n.name == "native_git_probe"))
@@ -1183,8 +1290,8 @@ class BrowseIntegrationTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         expected = list(browse.CASE_NAMES) + list(mixed_ref_cases.MIXED_REF_CASES)
         self.assertEqual(report["selected_cases"], expected)
-        self.assertEqual(report["case_count"], 17)
-        self.assertEqual(report["fixed_case_count"], 15)
+        self.assertEqual(report["case_count"], 19)
+        self.assertEqual(report["fixed_case_count"], 17)
         self.assertEqual(report["fixed_cases"], list(browse.CASE_NAMES))
         self.assertEqual(report["mixed_ref_cases"], list(mixed_ref_cases.MIXED_REF_CASES))
         self.assertEqual(list(report["mixed_ref_results"]), list(mixed_ref_cases.MIXED_REF_CASES))
@@ -1200,7 +1307,7 @@ class BrowseIntegrationTest(unittest.TestCase):
         code, report, created, err = self.run_execute([])
         self.assertEqual(code, 0, err)
         self.assertEqual(report["selected_cases"], list(browse.CASE_NAMES))
-        self.assertEqual(report["case_count"], 15)
+        self.assertEqual(report["case_count"], 17)
         self.assertEqual(report["mixed_ref_cases"], [])
         self.assertEqual(report["mixed_ref_results"], {})
         self.assertEqual(report["fixed_cases"], list(browse.CASE_NAMES))
@@ -1347,26 +1454,27 @@ class RefusalAuditSqlTest(unittest.TestCase):
 
     def test_schema_pins_the_evidence_json_types(self):
         """All four evidence values are Rust bools serialized as JSON booleans."""
-        evidence = (ROOT / "src/reliability.rs").read_text()
-        # The receive-pack evidence object serializes each key from a value that
-        # is a Rust bool: changing any of these to a string needs review here.
-        self.assertIn('"finished":finished', evidence)
-        self.assertIn('"interrupted":interrupted', evidence)
-        self.assertIn('"storage_generation_matches":operation.storage_generation==generation', evidence)
-        self.assertIn('"ungranted_without_hooks":ungranted_without_hooks', evidence)
+        evidence = (ROOT / "src/journal/record.rs").read_text()
+        # The shared ref-transaction evidence object serializes each key from a
+        # Rust bool: changing any of these to a string needs review here.
+        self.assertIn('"finished": finished', evidence)
+        self.assertIn('"interrupted": interrupted', evidence)
+        self.assertIn('"storage_generation_matches": operation.storage_generation == generation', evidence)
+        self.assertIn('"ungranted_without_hooks": ungranted_without_hooks', evidence)
         self.assertIn("let ungranted_without_hooks = no_parent_publication_possible(", evidence)
         self.assertRegex(evidence, r"fn no_parent_publication_possible\([^)]*\) -> bool")
         self.assertIn("pub fn is_interrupted(op: &Operation) -> Result<bool>",
-                      (ROOT / "src/journal.rs").read_text())
+                      (ROOT / "src/journal/state.rs").read_text())
         self.assertIn("pub fn is_finished(op: &Operation) -> Result<bool>",
-                      (ROOT / "src/journal.rs").read_text())
-        # ``reference_events`` is serialized directly from ``journal::events``,
-        # a ``Vec<HookEvent>``: it is always a JSON array in stored evidence.
-        self.assertIn('"reference_events":raw', evidence)
-        self.assertIn("journal::events(&operation)", evidence)
+                      (ROOT / "src/journal/state.rs").read_text())
+        # ``reference_events`` is a typed ``Vec<HookEvent>`` parameter, always
+        # a JSON array in stored evidence; live settlement reads the journal.
+        self.assertIn('"reference_events": reference_events', evidence)
+        self.assertIn("reference_events: &[HookEvent]", evidence)
+        self.assertIn("journal::events(&operation)", (ROOT / "src/reliability.rs").read_text())
         journal = (ROOT / "src/journal.rs").read_text()
-        self.assertRegex(journal, r"pub fn events\(op: &Operation\) -> Result<Vec<HookEvent>>")
-        hook = (ROOT / "src/journal/core.rs").read_text()
+        self.assertIn("pub use record::{events, receipts, ref_transaction_evidence, requests};", journal)
+        hook = (ROOT / "src/journal/operation.rs").read_text()
         self.assertRegex(hook, r"pub struct HookEvent \{\s+pub ordinal: i64,\s+pub phase: HookPhase,\s+"
                                r"pub changes: Vec<RefChange>,")
         self.assertRegex(hook, r"pub struct RefChange \{\s+pub ref_name: String,\s+pub old_oid: String,\s+"
@@ -3256,6 +3364,8 @@ class SourceBindingTest(unittest.TestCase):
         body = ast.unparse(method("ref_oids"))
         self.assertIn("\'--git-dir=\' + str(self.bare)", body)
         self.assertIn("\'rev-parse\', \'--verify\', \'-q\'", body)
+        self.assertIn("self.native_git_probe()['executable']", body)
+        self.assertNotIn("self.git(", body)
 
 
 class GitResolutionTest(unittest.TestCase):

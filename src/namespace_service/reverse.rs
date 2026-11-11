@@ -293,7 +293,7 @@ pub async fn create(
     let mut pin_headers = headers.clone();
     let proposal_id = Uuid::new_v4();
     pin_headers
-        .insert("idempotency-key", HeaderValue::from_str(&format!("pin-{}", Uuid::new_v4())).map_err(Error::internal)?);
+        .insert("idempotency-key", HeaderValue::from_str(&format!("pin-{proposal_id}")).map_err(Error::internal)?);
     let pinned = transactions::create_proposal_pin(
         state.clone(),
         mount.owner.clone(),

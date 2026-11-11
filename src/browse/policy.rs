@@ -25,7 +25,14 @@ pub async fn validate<C: GenericClient + Sync>(
         let deleting = change.new_oid.bytes().all(|b| b == b'0');
         let creating = change.old_oid.bytes().all(|b| b == b'0');
         if deleting {
-            if row.get::<_, bool>("prevent_deletion") { return Err(denied()); }
+            // A deletion that any protection flag forbids closes the
+            // delete-then-recreate rewind vector: a force-push or
+            // fast-forward-only rule also protects the current tip.
+            if row.get::<_, bool>("prevent_deletion")
+                || row.get::<_, bool>("require_fast_forward")
+                || row.get::<_, bool>("prevent_force_push") {
+                return Err(denied());
+            }
             continue;
         }
         // Approvals are tied to an authenticated PR merge. A direct push has

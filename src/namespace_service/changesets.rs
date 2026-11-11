@@ -2,7 +2,7 @@ use super::handlers;
 use crate::{
     AppState, Error, auth,
     browse::{
-        models::{RefTransactionRequest, RefUpdateInput},
+        ref_transaction::{RefTransactionRequest, RefUpdateInput},
         transactions,
     },
     members::models::Role,

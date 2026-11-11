@@ -1,7 +1,7 @@
 //! HTTP handlers for Branch Protection Rules and merge policy evaluation.
 use crate::{
     AppState, Error,
-    auth::{self, finish_tx as finish, idempotency_key},
+    auth::{self, finish_tx as finish, idempotency_key}, db::Identity,
     members::{audit, models::Role, rbac},
     pulls::models::{
         BranchRule, BranchRuleInput, Page, RULE_FIELDS, context_valid, creation_replay, json,
@@ -31,25 +31,27 @@ pub struct PolicyEvaluation {
     pub reason: Option<&'static str>,
 }
 
-async fn policy_ref_guard(state: &AppState, owner: &str, name: &str, branch_ref:&str)
+async fn policy_ref_guard(state: &AppState, actor: &Identity, owner: &str, name: &str, branch: &str)
     -> Result<crate::storage::ref_publication::PublicationGuard, Error> {
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let row = client.query_opt(
-        "SELECT r.id,r.storage_generation FROM repositories r JOIN namespaces u ON u.id=r.owner_id WHERE u.slug=$1 AND r.name=$2",
-        &[&owner,&name],
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let access = auth::authorize_repo_with_role(&tx, actor, owner, name,
+        Role::Maintain, crate::token_scopes::RepoAction::PullsWrite).await?;
+    let row = tx.query_opt(
+        "SELECT storage_generation FROM repositories WHERE id=$1",
+        &[&access.repo_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    let repo_id: Uuid = row.get(0);
-    let generation: i64 = row.get(1);
+    let generation: i64 = row.get(0);
+    drop(tx);
     drop(client);
-    crate::storage::ref_publication::acquire(&state.pool,repo_id,generation,
-        &[branch_ref.to_owned()],tokio::time::Instant::now()+state.config.git_timeout).await
+    crate::storage::ref_publication::acquire(&state.pool,access.repo_id,generation,
+        &[branch.to_owned()],tokio::time::Instant::now()+state.config.git_timeout).await
 }
 
 async fn has_self_approval_col(tx: &Transaction<'_>) -> Result<bool, Error> {
     let sql = "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='forge_branch_rules' AND column_name='prevent_self_approval')";
     Ok(tx.query_one(sql, &[]).await.map_err(Error::internal)?.get(0))
 }
-
 pub async fn is_self_approval_disallowed(
     tx: &Transaction<'_>,
     tenant_id: Uuid,
@@ -128,7 +130,8 @@ async fn upsert_branch_rule_inner(
     }
 
     let key = idempotency_key(&headers)?;
-    let publication = policy_ref_guard(&state, &owner, &name, &branch_ref).await?;
+    // Authorize before waiting for a publication window to avoid stalling pushes.
+    let publication = policy_ref_guard(&state, &actor, &owner, &name, &branch_ref).await?;
     let _policy_guard = publication.enter_window(&state.storage,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
@@ -321,7 +324,8 @@ pub async fn delete_branch_rule(
 ) -> Result<Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let branch_ref = normalize_branch_ref(&branch)?;
-    let publication = policy_ref_guard(&state, &owner, &name, &branch_ref).await?;
+    // Authorize before waiting for a publication window to avoid stalling pushes.
+    let publication = policy_ref_guard(&state, &actor, &owner, &name, &branch_ref).await?;
     let _policy_guard = publication.enter_window(&state.storage,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
@@ -398,8 +402,7 @@ pub async fn evaluate_branch_policy(
 
     let required_approvals: i64 = rule_row.get("required_approvals");
     let checks_val: Value = rule_row.get("required_checks");
-    let required_checks: Vec<String> =
-        serde_json::from_value(checks_val).map_err(Error::internal)?;
+    let required_checks: Vec<String> = serde_json::from_value(checks_val).map_err(Error::internal)?;
     let require_fast_forward: bool = rule_row.get("require_fast_forward");
 
     let latest_verdict = tx
@@ -452,25 +455,21 @@ pub async fn evaluate_branch_policy(
         approval_count
     };
 
-    let current_approvals = if latest_verdict.as_deref() == Some("changes_requested") {
-        0
-    } else {
-        effective_approvals
-    };
+    let changes_requested = latest_verdict.as_deref() == Some("changes_requested");
+    let current_approvals = if changes_requested { 0 } else { effective_approvals };
 
     let mut missing_or_failed_checks = Vec::new();
     for ctx in &required_checks {
-        let passed = crate::webhooks::trust::trusted_check_passed(
+        if !crate::webhooks::trust::trusted_check_passed(
             &**tx, repository_id, head_oid, ctx, candidate_base.as_deref(),
-        ).await?;
-        if !passed {
+        ).await? {
             missing_or_failed_checks.push(ctx.clone());
         }
     }
 
     let mut allowed = true;
     let mut reason = None;
-    if latest_verdict.as_deref() == Some("changes_requested") && required_approvals > 0 {
+    if changes_requested && required_approvals > 0 {
         allowed = false;
         reason = Some("changes requested on pull request");
     } else if current_approvals < required_approvals {

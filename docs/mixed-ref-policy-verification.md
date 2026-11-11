@@ -1,37 +1,50 @@
 # Mixed protected/unprotected multi-ref refusal in `tests/browse.py` (#18)
 
-Status: harness code, offline oracles and the CI opt-in are in place. This is a
-verification specification, **not native evidence**. Everything below
-describes what the code asserts. A native conclusion requires a report bound to
-the exact candidate and binary that shows both mixed case IDs `passed` (see
-"Native evidence" at the end).
+Status: harness code, offline oracles and the CI execution/manifest binding are
+in place. This is a verification specification, **not native evidence**.
+Everything below describes what the code asserts. A native conclusion requires
+a report bound to the exact candidate and binary that shows both mixed case IDs
+`passed` and a `source_head` equal to the built commit (see "Native evidence" at
+the end).
 
 ## Wiring
 
 The cases live in `tests/mixed_ref_cases.py` (`MixedRefPolicyCases`), mixed into
 `BrowseHarness` in `tests/browse.py`. They are **opt-in via `--mixed-refs`**:
 
-- The fixed inventory `CASE_NAMES` has **15 IDs**: 14 main IDs plus exactly one
-  `ref_scale_complete_traversal`. The two deadline cases (`list_commits_deadline`,
-  `compare_commits_deadline`) are part of the 14 main IDs. The tuple stays
-  byte-for-byte unchanged and is still pinned by
+- The fixed inventory `CASE_NAMES` has **17 IDs**: 12 original contracts, the two
+  deadline cases (`list_commits_deadline`, `compare_commits_deadline`), exactly
+  one `ref_scale_complete_traversal`, and the two Issue #14 recovery cases
+  (`ref_transaction_settlement_recovery`, `ref_transaction_crash_recovery`).
+  The tuple is pinned by
   `tests/test_browse_git_read_steps.py::test_browse_contract_is_unchanged`.
 - The two mixed IDs are **not** in `CASE_NAMES`:
   `mixed_protected_unprotected_atomic_push` and
   `mixed_protected_unprotected_ref_transaction`. A module-level assertion in
-  `tests/browse.py` pins `len(CASE_NAMES) == 15` and the exact mixed tuple.
+  `tests/browse.py` pins `len(CASE_NAMES) == 17` and the exact mixed tuple.
 - `selected_cases(mixed_refs)` is the fixed inventory followed, only under
-  `--mixed-refs`, by the two mixed IDs: the combined run selects **17** IDs with
+  `--mixed-refs`, by the two mixed IDs: the combined run selects **19** IDs with
   the two exact mixed names last.
 - `execute()` runs the fixed inventory and keeps its original
   `executed != list(CASE_NAMES)` assertion before the opt-in loop, then runs the
   mixed cases and asserts `completed == selected`. The runner fails if any
   selected case was not executed. `--mixed-refs` without a declared Git is
-  refused before the harness is built.
-- CI's Browse step only gains the opt-in arguments:
-  `--mixed-refs --git "$(command -v git)"`, so the Rust server and the Git
-  client are source-bound to the same executable. The step keeps its name and
-  every other workflow command is unchanged.
+  refused before the harness is built. The report records `source_head` (the
+  executing checkout's `HEAD`) in addition to the selected/fixed case records.
+- CI **executes** the mixed mode in the `native` job:
+  `python3 tests/browse.py --mixed-refs --git "$(command -v git)" --binary
+  target/debug/rootyard --report test-results/browse.json`. The declared
+  executable is the runner's pinned stock Git and is used by both the Rust
+  server and the Git client.
+- The same `native` job's `scripts/native_report_manifest.py --mode job` step
+  binds `--report browse=test-results/browse.json`, the Browse runtime and
+  imported helper harnesses (`tests/browse.py`, `tests/browse_ref_scale.py`,
+  `tests/mixed_ref_cases.py`, `tests/mixed_ref_support.py`,
+  `tests/refusal_audit_sql.py`), and requires all
+  four fixed Browse cases plus both mixed case IDs to be present and passing.
+  The manifest additionally requires the Browse report's `source_head` to be
+  present and exactly equal to the build receipt's workspace commit; a missing
+  or foreign head fails the gate.
 
 ## Trusted Git
 
@@ -63,8 +76,8 @@ One declared stock Git is **both** the Git client and the server's Git:
   from clone persists to a later push. `push_with()` refuses the proof when the
   executed client, the probed client and the captured server-start Git are not
   the same declared executable.
-- The report records `selected_cases`, `fixed_cases`, `fixed_case_count`,
-  `mixed_ref_cases`, `mixed_ref_results`, plus `git` (the binding: declared path,
+- The report records `source_head`, `selected_cases`, `fixed_cases`,
+  `fixed_case_count`, `mixed_ref_cases`, `mixed_ref_results`, plus `git` (the binding: declared path,
   environment value, `mixed_refs`), `git_handoff` (whether the pre-mixed restart
   happened and what the previous process started on) and `git_evidence`
   (client path, SHA-256, version, whether declared, push actor/header,
@@ -172,6 +185,16 @@ groups and keeps the native group's audit as the policy group's independent
 `git_refusal` evidence; the policy group separately records the protected-only
 push and its audit.
 
+4. **Causal one-flag matrix.** With `required_approvals=0` and
+   `required_checks=[]`, only one protected-tip flag varies at a time:
+   `require_fast_forward=True` alone and `prevent_force_push=True` alone must
+   each refuse a mixed non-fast-forward `git push --atomic --force`; and
+   `prevent_deletion=False` with either flag set must refuse deleting a
+   non-HEAD protected branch in a mixed push. Every refusal is audited with the
+   same one-row interval evidence, the protected ref keeps its old OID and the
+   unprotected sibling branch is not created. This closes the
+   delete-then-recreate rewind vector.
+
 ## Case 2: `mixed_protected_unprotected_ref_transaction`
 
 `main` and `main`/`mixed-tx-topic`, through the **API**
@@ -204,6 +227,16 @@ to API refusals; adding it there would be false. After a worker pass, no refused
 update is projected (`repository_ref_projection`), and the final physical refs
 equal the post-control baseline.
 
+6. **Causal one-flag matrix.** The same matrix runs through
+   `POST /ref-transactions` with `required_approvals=0`,
+   `required_checks=[]` and one flag at a time: `require_fast_forward=True`
+   alone and `prevent_force_push=True` alone each refuse a mixed
+   non-fast-forward transaction; and `prevent_deletion=False` with either flag
+   set refuses deleting a non-HEAD protected branch alongside an unprotected
+   sibling update. Every transaction is a `403 protected branch policy denied`
+   with zero user operations, the protected ref unchanged and the sibling
+   unmoved.
+
 ## Refusal oracles
 
 - `refusal_audit_sql.refusal_audit_verdict()`: an exact settled
@@ -220,10 +253,12 @@ equal the post-control baseline.
   The SQL projects all four evidence keys with `->` (never `->>`) and an absent
   key becomes the JSON sentinel `EVIDENCE_MISSING_BOOL` (`"missing"`), so the
   stored booleans survive end to end; the Rust serialization of the four keys is
-  pinned so a change in `src/reliability.rs` needs deliberate review.
+  pinned in the shared `src/journal/record.rs` evidence builder so a change
+  needs deliberate review.
 - There are two stored service evidence shapes, and the interval deliberately
   reads every service and human row:
-  - the receive-pack shape of `src/reliability.rs` (human rows too) stores
+  - the receive-pack shape built by `src/journal/record.rs` for live
+    ref-transaction settlement and `src/reliability.rs` (human rows too) stores
     `finished`, `interrupted`, `reference_events`,
     `storage_generation_matches` and `ungranted_without_hooks`;
   - the alternate `kind=observed_immutable_ci_root` `ci_pin` shape, written by
@@ -267,10 +302,10 @@ From the repository root:
 python3 -m unittest tests.test_browse_mixed_refs
 ```
 
-The suite currently has **119 tests**. It pins the exact case IDs and the
-15+2 = 17 selection order, the unchanged `CASE_NAMES` (compared against a
-literal expected tuple with no history lookup, so a shallow CI checkout cannot
-skip the check; a focused test asserts the guard has no skip path), the runner's
+The suite pins the exact case IDs and the 17+2 = 19 selection order, the
+`CASE_NAMES` inventory (compared against a literal expected tuple with no
+history lookup, so a shallow CI checkout cannot skip the check; a focused test
+asserts the guard has no skip path), the runner's
 fixed-inventory assertion before the opt-in loop and the selected-case
 completion check, the CI opt-in arguments and report fields, the pre-start Git
 binding (absolute executable, agreement of declarations, inherited-only,
@@ -301,11 +336,15 @@ and never claim it passed.
 A native run is performed later:
 
 ```bash
-python3 tests/browse.py --binary <attested-binary> --report <unique>.json \
-  --mixed-refs --git /usr/bin/git
+python3 tests/browse.py --mixed-refs --git /usr/bin/git \
+  --binary <attested-binary> --report <unique>.json
 ```
 
-Only a report bound to the exact candidate and binary that shows
-`mixed_ref_results` with **both** mixed IDs `passed` (and a passing
-`selected_cases` of 17) supports the conclusion that the native proof holds.
-The report, not this specification, is the evidence for that conclusion.
+In CI this is `--git "$(command -v git)"`, the same pinned stock Git whose
+version is recorded as the `git` fixture. Only a report bound to the exact
+candidate and binary that shows `mixed_ref_results` with **both** mixed IDs
+`passed`, a passing `selected_cases` of **19**, and a `source_head` equal to the
+build receipt's workspace commit supports the conclusion that the native proof
+holds. `scripts/native_report_manifest.py` enforces that Browse `source_head`
+binding. The report, not this specification, is the evidence for that
+conclusion.
