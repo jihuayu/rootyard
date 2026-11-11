@@ -1321,6 +1321,35 @@ class ReportValidationTest(unittest.TestCase):
             with self.subTest(marker=marker), self.assertRaises(baseline.BaselineError):
                 baseline.validate_no_secrets({**payload, "note": marker}, [])
 
+    def test_blob_selectors_stay_safe_while_connection_values_are_sensitive(self):
+        selectors = {"ROOTYARD_BLOB_DRIVER": "opendal", "ROOTYARD_BLOB_SERVICE": "s3"}
+        protected = {
+            "ROOTYARD_BLOB_ENDPOINT": "http://127.0.0.1:1",
+            "OBJECT_STORE_ENDPOINT": "http://127.0.0.1:1",
+            "ROOTYARD_BLOB_BUCKET": "fake-bucket-x1",
+            "ROOTYARD_BLOB_ROOT": "issue106/root-x1",
+            "ROOTYARD_BLOB_ACCESS_KEY_ID": "fake-access-id-x1",
+            "ROOTYARD_BLOB_SECRET_ACCESS_KEY": "fake-secret-key-x1",
+            "ROOTYARD_BLOB_SESSION_TOKEN": "fake-session-token-x1",
+            "ROOTYARD_TEST_DATABASE_URL": "postgres://u:pw@127.0.0.1:1/db",
+        }
+        env = {**selectors, **protected}
+        found = baseline.sensitive_values(env)
+        for name, value in protected.items():
+            with self.subTest(protected=name):
+                self.assertIn(value, found)
+        for name, value in selectors.items():
+            with self.subTest(selector=name):
+                self.assertNotIn(value, found)
+        # A misdeclared selector value is not assumed benign.
+        self.assertIn("not-opendal", baseline.sensitive_values({**env, "ROOTYARD_BLOB_DRIVER": "not-opendal"}))
+        self.assertIn("not-s3", baseline.sensitive_values({**env, "ROOTYARD_BLOB_SERVICE": "not-s3"}))
+        payload = {"blob_profile": dict(selectors)}
+        self.assertTrue(baseline.validate_no_secrets(payload, found))
+        for name, value in protected.items():
+            with self.subTest(rejected=name), self.assertRaises(baseline.BaselineError):
+                baseline.validate_no_secrets({**payload, "case": {"output": value}}, found)
+
     def test_report_labels_and_bounds(self):
         payload = report_payload()
         self.assertEqual(payload["status"], "passed")

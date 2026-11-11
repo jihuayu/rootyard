@@ -166,7 +166,12 @@ WORKLOAD_PAYLOAD = "payload.bin"
 INPUT_FILES = ("tests/blob_only_service.py", "tests/e2e.py", "tests/native_evidence.py",
                "tests/ops_provenance.py", "tests/owned_fuse_cleanup.py", "scripts/build_native.py")
 # Names whose values must never reach a report (checked before writing, not trusted).
-SENSITIVE_PATTERN = re.compile(r"BLOB|DATABASE|DSN|PASS|SECRET|TOKEN|KEY|CREDENTIAL", re.IGNORECASE)
+SENSITIVE_PATTERN = re.compile(r"DATABASE|DSN|PASS|SECRET|TOKEN|KEY|CREDENTIAL|ENDPOINT|BUCKET|ROOT|"
+                               r"OBJECT_STORE|BLOB_(?:SERVICE|DRIVER)", re.IGNORECASE)
+# Benign Blob selectors: classified here and at ``blob_profile`` with ``service``/``driver``
+# pinned, so their values are not private even though their names mention Blob.
+BLOB_SELECTOR_NAMES = ("ROOTYARD_BLOB_DRIVER", "ROOTYARD_BLOB_SERVICE")
+BLOB_SELECTORS = {"ROOTYARD_BLOB_DRIVER": "opendal", "ROOTYARD_BLOB_SERVICE": "s3"}
 CONNECTION_ESTABLISHED = "01"
 LISTEN = "0A"
 WILDCARD = ("0.0.0.0", "::")
@@ -1431,7 +1436,9 @@ def validate_service_admission(admission):
 
 def sensitive_values(env):
     """Values a report must never contain: credentials and connection/endpoint material."""
-    values = [value for name, value in env.items() if value and SENSITIVE_PATTERN.search(name)]
+    values = [value for name, value in env.items()
+              if value and SENSITIVE_PATTERN.search(name)
+              and not (name in BLOB_SELECTOR_NAMES and value == BLOB_SELECTORS[name])]
     values.extend(serving.sensitive_values(env))
     return sorted({value for value in values if isinstance(value, str)})
 
