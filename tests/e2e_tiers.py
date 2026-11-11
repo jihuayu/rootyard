@@ -16882,9 +16882,22 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
     def test_t1_f41_05_test_infra_and_test_ready_docs_align_with_42_feature_486_test_inventory(self) -> None:
         infra_txt = (ROOT / "TEST_INFRA.md").read_text(encoding="utf-8")
         ready_txt = (ROOT / "TEST_READY.md").read_text(encoding="utf-8")
+        tier_class_methods = [
+            len(unittest.TestLoader().getTestCaseNames(cls))
+            for cls in (TestTier1FeatureCoverage, TestTier2BoundaryAndCornerCases, TestTier3CrossFeatureCombinations, TestTier4RealWorldScenarios)
+        ]
+        self.assertEqual(tier_class_methods, [255, 261, 54, 27])
+        extra_f20_rule = "plus six additional F20 CI regression cases"
         for doc_txt in (infra_txt, ready_txt):
-            self.assertIn("F51", doc_txt)
-            self.assertIn("591", doc_txt)
+            tier_summary_lines = [
+                line for line in doc_txt.splitlines() if f"`{tier_class_methods[0]}` Tier 1 + `{tier_class_methods[1]}` Tier 2" in line
+            ]
+            self.assertTrue(tier_summary_lines, msg="missing current tier split line")
+            for line in tier_summary_lines:
+                self.assertIn(f"`{tier_class_methods[2]}` Tier 3 + `{tier_class_methods[3]}` Tier 4", line)
+            self.assertIn("`255` Tier 1 + `261` Tier 2", doc_txt)
+            self.assertIn("`54` Tier 3 + `27` Tier 4", doc_txt)
+            self.assertIn(extra_f20_rule, doc_txt)
 
     # =========================================================================
     # Feature F42: Part 3 — Cross-Track Schema 060, 11-Domain Router Non-Collision, Anti-Monolith Caps & Paired Backup (5 Tests)
