@@ -1,0 +1,1317 @@
+#!/usr/bin/env python3
+"""Fast unit tests for scripts/state_services_blob_baseline.py.
+
+Only pure helpers and in-memory fakes run here: no PostgreSQL, S3 profile,
+credentials, network, native service or cargo build is required. ``/proc`` is
+synthesized in a temporary directory and Git operations are counted on a fake
+harness instead of being executed.
+"""
+import json
+import os
+import socket
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
+import state_services_blob_baseline as baseline  # noqa: E402
+
+OID = "1" * 40
+# A batch window starts at the first barrier release, up to a few microseconds
+# before the earliest clone timer starts (worker hand-off into measured_clone).
+WINDOW_START_SLACK = 0.005
+PG_PORT = 54329
+PG_ADDRESS = "127.0.0.1"
+PG_ENDPOINT = ([PG_ADDRESS], PG_PORT)
+PG_HEX = "0100007F:%04X" % PG_PORT     # 127.0.0.1:54329 as Linux prints it (host-order u32)
+LOOPBACK_HEX = "0100007F"              # 127.0.0.1
+LOOPBACK_V6_HEX = "00000000000000000000000001000000"  # ::1 exactly as /proc/net/tcp6 prints it
+TCP_HEADER = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  "
+              "timeout inode")
+
+
+def kernel_inet6(text):
+    """Encode an IPv6 address exactly as Linux prints it in /proc/net/tcp6 (host-order u32 words)."""
+    import ipaddress
+    packed = ipaddress.IPv6Address(text).packed
+    return "".join(packed[index:index + 4][::-1].hex() for index in range(0, 16, 4)).upper()
+
+
+def tcp_row(index, local, peer, state="01", inode=1000):
+    return ("%4d: %s %s %s 00000000:00000000 00:00000000 00000000   501        0 %d 1 "
+            "0000000000000000 20 4 30 10 -1" % (index, local, peer, state, inode))
+
+
+def table(*rows):
+    return "\n".join((TCP_HEADER,) + rows) + "\n"
+
+
+def resolver_raising(error):
+    def resolve(*args):
+        raise error
+    return resolve
+
+
+def resolver_for(addresses, port=PG_PORT, family=socket.AF_INET):
+    """A getaddrinfo stand-in that records calls and never touches the network."""
+    calls = []
+
+    def resolve(host, service, *flags):
+        calls.append((host, service) + flags)
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, port)) for address in addresses]
+
+    resolve.calls = calls
+    return resolve
+
+
+class FakeHelper:
+    """Stands in for BlobOnlyHarness: isolated psql helper plus fixture redaction."""
+
+    def __init__(self, rows=("3|1|2|0",)):
+        self.rows = list(rows)
+        self.queries = []
+        self.secrets = ["s3cr3t-endpoint-value"]
+
+    def redact(self, value):
+        text = str(value)
+        for secret in self.secrets:
+            text = text.replace(secret, "[REDACTED]")
+        return text
+
+    def sql(self, query):
+        self.queries.append(query)
+        value = self.rows.pop(0) if len(self.rows) > 1 else self.rows[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+class FakeProc:
+    """A temporary /proc subtree with one process's fd links and network tables."""
+
+    def __init__(self, pid=4242):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.pid = pid
+        (self.root / str(pid) / "fd").mkdir(parents=True)
+        (self.root / str(pid) / "net").mkdir(parents=True)
+        for name in ("tcp", "tcp6"):
+            (self.root / str(pid) / "net" / name).write_text(table())
+        self.set_links(["socket:[1000]"])
+
+    def write_net(self, name, rows):
+        (self.root / str(self.pid) / "net" / name).write_text(table(*rows))
+
+    def set_links(self, links):
+        fd = self.root / str(self.pid) / "fd"
+        for entry in fd.iterdir():
+            entry.unlink()
+        for index, link in enumerate(links):
+            (fd / str(10 + index)).symlink_to(link)
+
+    def owned_connection(self, **row):
+        settings = {"local": LOOPBACK_HEX + ":CE2B", "peer": PG_HEX, "inode": 1000}
+        settings.update(row)
+        self.write_net("tcp", (tcp_row(0, settings["local"], settings["peer"],
+                                       state=settings.get("state", "01"), inode=settings["inode"]),))
+
+    def close(self):
+        self.directory.cleanup()
+
+
+class FakeProcess:
+    def __init__(self, pid):
+        self.pid = pid
+
+    def poll(self):
+        return None
+
+
+class FakeGitHarness(FakeHelper):
+    """A fake BlobOnlyHarness: in-memory files, counted clones, injectable clock."""
+
+    def __init__(self, files, pid=500, object_format="sha1"):
+        super().__init__()
+        self.files = files
+        self.proc = FakeProcess(pid)
+        self.ready = False
+        self.clones = []            # (remote, destination name, token) per git clone
+        self.fsck = []              # destinations whose local fsck ran
+        self.root = Path(tempfile.mkdtemp(prefix="blob-baseline-fake-"))
+        self.base = "http://fixture.invalid"
+        self.reader = {"username": "alice", "token": "reader-token-value"}
+        self.alice = {"username": "alice", "token": "writer-token-value"}
+        self.object_format_name = object_format
+        self.delay = 0.02               # wall-clock mode: clone duration
+        self.verification_delay = 0.0   # wall-clock mode: optional verification delay
+        self.clone_failures = {}        # per instance: destination name -> exception
+        self.clock = None               # set by patch_clock: the batch's deterministic clock
+
+    def _write_tree(self, destination):
+        destination = Path(destination)
+        for name, data in self.files.items():
+            (destination / name).parent.mkdir(parents=True, exist_ok=True)
+            (destination / name).write_bytes(data)
+        (destination / ".git").mkdir(exist_ok=True)
+        return destination
+
+    def clone(self, remote, destination, token=None):
+        import time
+        self.clones.append((remote, Path(destination).name, token))
+        try:
+            time.sleep(self.delay)
+            failure = self.clone_failures.get(Path(destination).name)
+            if failure is not None:
+                raise failure
+        finally:
+            pass
+        return self._write_tree(destination)
+
+    def verify_tick(self):
+        """Wall-clock mode only: optional local-check delay."""
+        import time
+        if self.verification_delay:
+            time.sleep(self.verification_delay)
+
+    def object_format(self, work):
+        self.verify_tick()
+        return self.object_format_name
+
+    def git(self, *args, cwd=None, token=None, check=True, **kwargs):
+        self.verify_tick()
+        if "fsck" in args:
+            self.fsck.append(Path(cwd).name)
+        return mock.Mock(stdout=OID.encode() + b"\n", stderr=b"", returncode=0)
+
+    def patch_clock(self, test):
+        """A deterministic clock shared by the clone timers and the aggregate window.
+
+        It advances only while a clone runs (exactly ``delay`` per clone), so
+        each worker's clone timer and the aggregate are exact, independent of
+        host sleep jitter or scheduling. Verification never advances it; that a
+        window excludes verification is proven on real wall time instead.
+        """
+        clock = {"t": 0.0}
+
+        def now():
+            return clock["t"]
+
+        def virtual_clone(remote, destination, token=None):
+            self.clones.append((remote, Path(destination).name, token))
+            clock["t"] += self.delay
+            failure = self.clone_failures.get(Path(destination).name)
+            if failure is not None:
+                raise failure
+            return self._write_tree(destination)
+
+        patcher = mock.patch.object(self, "clone", side_effect=virtual_clone)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+        self.clone_clock = now  # every worker's clone timer uses this clock
+        test.addCleanup(lambda: setattr(self, "clone_clock", None))
+        return now
+
+    def cleanup(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+def summary(**overrides):
+    value = baseline.summarize_samples([baseline.sample_row(2, 1, 1, 0)], scans_without_connection=0)
+    value.update(overrides)
+    return value
+
+
+def push(**overrides):
+    value = {"returncode": 0, "stdout": "*\trefs/heads/main:refs/heads/main\t[new branch]\n",
+             "oid": OID, "expected_oid": OID, "remote_oid": OID, "push_wall_seconds": 0.42,
+             "ls_remote_seconds": 0.01, "payload_bytes": 262144}
+    value.update(overrides)
+    return value
+
+
+def worker(index, **overrides):
+    value = {"label": "worker-" + str(index + 1), "kind": "read_clone", "repository": baseline.REPOSITORY_NAME,
+             "destination": "concurrent-worker-" + str(index + 1), "seconds": 0.4,
+             "verification_seconds": 0.05, "head_oid": OID, "expected_oid": OID,
+             "files_verified": True, "fsck": True}
+    value.update(overrides)
+    return value
+
+
+def restart(epoch=1, **overrides):
+    value = {"name": "restart", "status": "passed", "seconds": 1.5, "service_epoch": epoch, "sampled": False,
+             "pg_samples": None, "skip_reason": "infrastructure case: the process is replaced",
+             "from_epoch": epoch - 1, "old_pid": 500, "new_pid": 501, "samples_stopped_before_stop": True,
+             "detail": {}}
+    value.update(overrides)
+    return value
+
+
+def case_fixture(epochs=(0, 0, 0, 1, 1)):
+    values = []
+    for name, epoch in zip(baseline.CASE_ORDER, epochs):
+        if name == "restart":
+            values.append({key: value for key, value in restart(epoch).items() if key in (
+                "name", "status", "seconds", "service_epoch", "sampled", "pg_samples", "skip_reason",
+                "from_epoch", "old_pid", "new_pid", "samples_stopped_before_stop")})
+            continue
+        detail = {"push": push()} if name == "seed_push" else {}
+        values.append({"name": name, "status": "passed", "seconds": 0.25, "service_epoch": epoch,
+                       "sampled": True, "pg_samples": summary(), "detail": detail})
+    return values
+
+
+def cold_fixture(**overrides):
+    value = {"seconds": 0.3, "service_restarted": True, "scratch_empty_before": True,
+             "scratch_empty_after": True, "head_oid": OID, "expected_oid": OID, "files_verified": True,
+             "fsck": True, "verification_seconds": None, "samples_across_restart": False}
+    value.update(overrides)
+    return value
+
+
+def workload():
+    files = baseline.select_workload()
+    return {**baseline.describe_workload(files), "version": baseline.WORKLOAD_VERSION, "mode": baseline.READ_MODE,
+            "concurrency": baseline.CONCURRENCY, "repositories_provisioned_via": "POST /api/repos",
+            "fingerprint_sha256": baseline.workload_fingerprint(files)}
+
+
+BINDING = {"attested": True, "inputs_unchanged": True, "binary_sha256": "a" * 64,
+           "source_inputs_sha256": "b" * 64, "build_receipt_sha256": "c" * 64, "runner_sha256": "d" * 64,
+           "harness_sha256": "e" * 64, "trusted_git_sha256": "f" * 64, "workspace_commit": "0" * 40,
+           "rustc": "rustc 1", "inputs": {"runner": "d" * 64, "tests/blob_only_service.py": "e" * 64}}
+RUNTIME = {"git_version": "git version 2", "psql_version": "psql (17)", "postgres_server_version": "17.1",
+           "python": "3.12.0", "kernel": "6.1.0", "machine": "x86_64", "architecture": "x86_64",
+           "cpu": "test", "hostname": "fixture", "logical_cpus": 4, "mem_total_kb": 1024, "procfs": True}
+
+
+class SocketAddressTest(unittest.TestCase):
+    """Decoding follows Linux's host-order printing, using addresses a kernel actually produced."""
+
+    def test_decodes_inet_and_kernel_tcp6_rows(self):
+        self.assertEqual(baseline.decode_socket_address("0100007F:CE2B"), ("inet", "127.0.0.1", 52779))
+        # Observed on the Linux runner image: ::1 is printed host-order per u32 word.
+        self.assertEqual(baseline.decode_socket_address(LOOPBACK_V6_HEX + ":CE2B"), ("inet6", "::1", 52779))
+        self.assertEqual(baseline.decode_socket_address("00000000000000000000000000000000:0016"),
+                         ("inet6", "::", 22))
+        self.assertEqual(baseline.decode_socket_address("B80D0120000000000000000000000000:1F90"),
+                         ("inet6", "2001:db8::", 8080))
+        self.assertEqual(baseline.decode_socket_address("00000000000000000000000000000001:0016"),
+                         ("inet6", "::100:0", 22))
+
+    def test_rejects_malformed_endpoints(self):
+        for value in ("", "0100007F", "0100007F:CE2", "zz00007F:0016", "0100007F:CE2B:00", None, 7):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                baseline.decode_socket_address(value)
+
+    def test_rejects_table_without_header_or_bad_rows(self):
+        with self.assertRaises(ValueError):
+            baseline.parse_proc_net_tcp("")
+        with self.assertRaises(ValueError):
+            baseline.parse_proc_net_tcp("  sl local_address\n 0: bad row\n")
+        with self.assertRaises(ValueError):  # queue without "tx:rx"
+            baseline.parse_proc_net_tcp(table(tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX)
+                                              .replace(" 00000000:00000000 ", " 00000000 ")))
+        with self.assertRaises(ValueError):  # non-hex socket state
+            baseline.parse_proc_net_tcp(table(tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, state="qq")))
+
+    def test_tcp6_fixture_decodes_the_observed_loopback_peer(self):
+        proc = FakeProc()
+        try:
+            proc.write_net("tcp6", (tcp_row(0, LOOPBACK_V6_HEX + ":CE2B", LOOPBACK_V6_HEX + ":%04X" % PG_PORT,
+                                            inode=1000),))
+            index = baseline.PgPortIndex(proc.pid, (["::1"], PG_PORT), proc=proc.root)
+            # The ::1 peer matches the configured ::1 endpoint: exact client address:port pair.
+            self.assertEqual(index.pairs, (("::1", 52779),))
+        finally:
+            proc.close()
+
+
+class EndpointResolutionTest(unittest.TestCase):
+    def test_resolves_once_and_maps_ipv6(self):
+        resolver = resolver_for(["::ffff:127.0.0.1", "127.0.0.1"], family=socket.AF_INET6)
+        endpoint = baseline.resolve_pg_endpoint("postgresql://u:pw@db.internal:54329/svc", resolver=resolver)
+        self.assertEqual(endpoint, (["127.0.0.1"], 54329))
+        self.assertEqual(len(resolver.calls), 1)  # resolved once, never again inside psql
+        self.assertEqual(len(baseline.resolve_pg_endpoint(
+            "postgres://u:pw@localhost/db", resolver=resolver_for(["::1"], port=5432))[0]), 1)
+        self.assertEqual(baseline.resolve_pg_endpoint("postgres://u@h/db", resolver=resolver_for(["127.0.0.1"],
+                                                                                                 port=5432)),
+                         (["127.0.0.1"], 5432))
+
+    def test_unsupported_endpoints_fail_without_echoing_them(self):
+        cases = [("postgresql://u:pw@/var/run/postgresql", resolver_for(["127.0.0.1"])),
+                 ("postgresql://u:pw@socket-host/db", resolver_for(["127.0.0.1"], family=socket.AF_UNIX)),
+                 ("postgresql://u:pw@udp-host/db", resolver_for(["127.0.0.1"], family=socket.AF_INET)),
+                 ("postgresql://u:pw@broken-host.internal/db", resolver_raising(RuntimeError("cannot resolve"))),
+                 ("postgresql://u:pw@empty-host.internal/db", resolver_for([])),
+                 ("postgresql://u:pw@text-host.internal/db", resolver_for(["not-an-address"]))]
+        for url, resolve in cases:
+            with self.subTest(url=url), self.assertRaises(baseline.ScanFailure) as raised:
+                baseline.resolve_pg_endpoint(url, resolver=resolve)
+            self.assertNotIn("internal", str(raised.exception))
+            self.assertNotIn("pw", str(raised.exception))
+
+    def test_unix_socket_dsn_is_rejected_with_a_clear_reason(self):
+        with self.assertRaises(baseline.ScanFailure) as raised:
+            baseline.resolve_pg_endpoint("postgresql:///svc", resolver=resolver_for(["127.0.0.1"]))
+        self.assertIn("TCP host", str(raised.exception))
+
+
+class OwnershipTest(unittest.TestCase):
+    """Only the service process's own sockets to the configured database endpoint count."""
+
+    def owned(self, fd_links, rows, endpoint=PG_ENDPOINT):
+        return [{"address": address, "port": port} for address, port in
+                baseline.pg_pair_list(fd_links, {"tcp": baseline.parse_proc_net_tcp(table(*rows))}, endpoint)]
+
+    def test_only_established_owned_sockets_to_the_configured_endpoint_count(self):
+        rows = (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),
+                tcp_row(1, LOOPBACK_HEX + ":CE2C", LOOPBACK_HEX + ":0050", inode=1001),
+                tcp_row(2, LOOPBACK_HEX + ":CE2D", PG_HEX, inode=1002, state="06"),
+                tcp_row(3, LOOPBACK_HEX + ":CE2E", PG_HEX, inode=1003))
+        self.assertEqual(self.owned(["socket:[1000]", "socket:[1001]", "socket:[1002]"], rows),
+                         [{"address": "127.0.0.1", "port": 52779}])
+
+    def test_sessions_the_process_does_not_own_are_ignored(self):
+        rows = (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),)
+        self.assertEqual(self.owned(["socket:[2000]", "pipe:[3]", "anon_inode:[eventfd]"], rows), [])
+        self.assertEqual(self.owned([], rows), [])
+
+    def test_another_server_on_the_same_port_is_not_the_configured_database(self):
+        rows = (tcp_row(0, LOOPBACK_HEX + ":CE2B", "0100000A:%04X" % PG_PORT, inode=1000),
+                tcp_row(1, LOOPBACK_HEX + ":CE2C", "0100007F:%04X" % (PG_PORT + 1), inode=1001))
+        self.assertEqual(self.owned(["socket:[1000]", "socket:[1001]"], rows), [])
+
+    def test_endpoint_is_required_and_validated(self):
+        rows = (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),)
+        for endpoint in ((), ([], PG_PORT), (["127.0.0.1"], 0), (["127.0.0.1"], "54329"), ("127.0.0.1", PG_PORT)):
+            with self.subTest(endpoint=endpoint), self.assertRaises(baseline.BaselineError):
+                self.owned(["socket:[1000]"], rows, endpoint)
+
+    def test_invalid_socket_links_raise(self):
+        for link in ("socket:[abc]", "socket:12]", "socket:[12"):
+            with self.subTest(link=link), self.assertRaises(ValueError):
+                baseline.parse_fd_links([link])
+
+    def test_index_reads_only_this_process_proc_subtree(self):
+        proc = FakeProc()
+        try:
+            proc.write_net("tcp", (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),
+                                   tcp_row(1, LOOPBACK_HEX + ":CE2C", PG_HEX, inode=1002)))
+            index = baseline.PgPortIndex(proc.pid, PG_ENDPOINT, proc=proc.root)
+            self.assertEqual(index.pairs, (("127.0.0.1", 52779),))
+            proc.set_links(["socket:[1002]"])
+            self.assertEqual(index.rescan(), (("127.0.0.1", 52780),))
+        finally:
+            proc.close()
+
+    def test_scan_never_reports_the_endpoint(self):
+        proc = FakeProc()
+        try:
+            proc.write_net("tcp", (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),))
+            index = baseline.PgPortIndex(proc.pid, PG_ENDPOINT, proc=proc.root)
+            self.assertEqual(index.pairs, (("127.0.0.1", 52779),))
+            (proc.root / str(proc.pid) / "net" / "tcp").write_text("")
+            with self.assertRaises(baseline.ScanFailure) as raised:
+                index.rescan()
+            self.assertNotIn(str(PG_PORT), str(raised.exception))
+            self.assertNotIn(PG_ADDRESS, str(raised.exception))
+        finally:
+            proc.close()
+
+
+class SamplerTest(unittest.TestCase):
+    def sampler(self, proc, helper, interval=0.25, endpoint=PG_ENDPOINT):
+        sampler = baseline.PgSampler(helper, proc.pid, endpoint, proc=proc.root, interval=interval)
+        return sampler
+
+    def ready(self, proc):
+        proc.owned_connection()
+
+    def test_query_matches_exact_client_address_and_port_pairs(self):
+        proc = FakeProc()
+        helper = FakeHelper(rows=("3|1|2|0",))
+        try:
+            self.ready(proc)
+            sampler = self.sampler(proc, helper)
+            sample = sampler.scan_once()
+            self.assertEqual(sample, {"sessions": 3, "active": 1, "idle": 2, "lock": 0})
+            self.assertIn("(client_addr = '127.0.0.1'::inet AND client_port = 52779)", helper.queries[0])
+            self.assertIn("pg_stat_activity", helper.queries[0])
+            self.assertNotIn("application_name", helper.queries[0])
+        finally:
+            proc.close()
+
+    def test_interval_below_bound_is_rejected(self):
+        proc = FakeProc()
+        try:
+            with self.assertRaises(baseline.BaselineError):
+                self.sampler(proc, FakeHelper(), interval=0.1)
+        finally:
+            proc.close()
+
+    def test_scan_without_owned_connection_is_counted_not_sampled(self):
+        proc = FakeProc()
+        try:
+            proc.write_net("tcp", (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=9999),))
+            sampler = self.sampler(proc, FakeHelper())
+            self.assertIsNone(sampler.scan_once())
+            self.assertEqual(sampler.scans_without_connection, 1)
+            self.assertEqual(sampler.samples, [])
+        finally:
+            proc.close()
+
+    def test_begin_and_end_require_an_owned_service_session(self):
+        proc = FakeProc()
+        try:
+            self.ready(proc)
+            sampler = self.sampler(proc, FakeHelper())
+
+            class IdleThread:
+                def __init__(self, **_):
+                    pass
+
+                def start(self):
+                    return None
+
+                def join(self, timeout=None):
+                    return None
+
+                def is_alive(self):
+                    return False
+
+            with mock.patch.object(baseline.threading, "Thread", IdleThread):
+                sampler.start(timeout=0.05)
+            self.assertEqual(sampler.finish()["samples"], 2)
+        finally:
+            proc.close()
+
+    def test_missing_connection_at_boundary_fails_the_run(self):
+        proc = FakeProc()
+        try:
+            self.ready(proc)
+            sampler = self.sampler(proc, FakeHelper())
+            sampler.scan_once()
+            proc.set_links(["socket:[9999]"])
+            with self.assertRaises(baseline.BaselineError):
+                sampler.finish()
+        finally:
+            proc.close()
+
+    def test_sql_error_is_visible_redacted_and_fails(self):
+        proc = FakeProc()
+        helper = FakeHelper(rows=(RuntimeError("could not connect to s3cr3t-endpoint-value"),))
+        try:
+            self.ready(proc)
+            sampler = self.sampler(proc, helper)
+            with self.assertRaises(baseline.BaselineError) as raised:
+                sampler.scan_once()
+            self.assertNotIn("s3cr3t-endpoint-value", str(raised.exception))
+            self.assertIn("[REDACTED]", str(raised.exception))
+            self.assertTrue(sampler.errors)
+            with self.assertRaises(baseline.BaselineError):
+                sampler.scan_once()  # sticky failure: later samples are never silently skipped
+        finally:
+            proc.close()
+
+    def test_malformed_query_row_fails(self):
+        proc = FakeProc()
+        try:
+            self.ready(proc)
+            for row in ("3|1|2", "3|x|2|0", "1|2|2|0", "2|1|1|3"):
+                sampler = self.sampler(proc, FakeHelper(rows=(row,)))
+                with self.subTest(row=row), self.assertRaises(baseline.BaselineError):
+                    sampler.scan_once()
+        finally:
+            proc.close()
+
+    def test_missing_kernel_procfs_fails_closed(self):
+        with self.assertRaises(baseline.ScanFailure):
+            baseline.PgPortIndex(4242, PG_ENDPOINT, proc=Path(tempfile.gettempdir()) / "absent-proc-for-test")
+
+
+class SamplerSummaryTest(unittest.TestCase):
+    def samples(self, values):
+        return [baseline.sample_row(*value) for value in values]
+
+    def test_lower_bound_summary(self):
+        value = baseline.summarize_samples(self.samples([(0, 0, 0, 0), (3, 1, 2, 1), (4, 0, 3, 2)]),
+                                           scans_without_connection=1)
+        self.assertEqual(value["peak_sessions"], 4)
+        self.assertEqual(value["peak_lock_waiters"], 2)
+        self.assertEqual(value["samples_with_connection"], 2)
+        self.assertTrue(value["observed_lower_bound"])
+        self.assertIsNone(value["exact_lock_wait_ms"])
+        baseline.validate_summary(value)
+
+    def test_zero_owned_sessions_fail(self):
+        with self.assertRaises(baseline.BaselineError):
+            baseline.summarize_samples(self.samples([(0, 0, 0, 0)]), scans_without_connection=0)
+
+    def test_summary_marks_are_required(self):
+        value = summary()
+        for key, replacement in (("observed_lower_bound", False), ("exact_lock_wait_ms", 12.5),
+                                 ("interval_seconds", 0.01), ("errors", ["boom"]), ("peak_lock_waiters", 99)):
+            with self.subTest(key=key), self.assertRaises(baseline.BaselineError):
+                baseline.validate_summary({**value, key: replacement})
+
+    def test_unbounded_interval_is_rejected(self):
+        with self.assertRaises(baseline.BaselineError):
+            baseline.summarize_samples(self.samples([(1, 0, 1, 0)]), scans_without_connection=0, interval=0.05)
+
+    def test_sample_row_rejects_inconsistent_counts(self):
+        for value in ((-1, 0, 0, 0), (1, 2, 0, 0), (1, 0, 0, 2), ("3", 0, 0, 0), (True, 0, 0, 0)):
+            with self.subTest(value=value), self.assertRaises(baseline.BaselineError):
+                baseline.sample_row(*value)
+
+
+class WorkloadTest(unittest.TestCase):
+    def test_deterministic_bounded_workload(self):
+        first, second = baseline.select_workload(), baseline.select_workload()
+        self.assertEqual(first, second)
+        self.assertEqual(sum(len(data) for data in first.values()), baseline.MAX_PAYLOAD_BYTES)
+        self.assertEqual(baseline.workload_fingerprint(first), baseline.workload_fingerprint(second))
+
+    def test_workload_declaration(self):
+        declared = workload()
+        self.assertEqual(baseline.validate_workload(declared)["total_bytes"], baseline.MAX_PAYLOAD_BYTES)
+        self.assertEqual(baseline.READ_MODE, "single_repository_independent_read_clones")
+        for field, value in (("total_bytes", baseline.MAX_PAYLOAD_BYTES + 1), ("concurrency", 8),
+                             ("mode", "independent_repository_read_clones"),
+                             ("mode", "independent_ref_pushes"),
+                             ("repositories_provisioned_via", "SQL"), ("version", 2),
+                             ("fingerprint_sha256", "short")):
+            with self.subTest(field=field, value=value), self.assertRaises(baseline.BaselineError):
+                baseline.validate_workload({**declared, field: value})
+        for files in ([{"path": "/etc/passwd", "bytes": 1}], [{"path": "../escape", "bytes": 1}],
+                      [{"path": "a//b", "bytes": 1}], [{"path": "a", "bytes": -1}],
+                      [{"path": "a", "bytes": 1}, {"path": "a", "bytes": 1}],
+                      [{"path": "big", "bytes": baseline.MAX_PAYLOAD_BYTES + 1}], []):
+            with self.subTest(files=files), self.assertRaises(baseline.BaselineError):
+                baseline.validate_workload({**declared, "files": files})
+
+
+class PushTest(unittest.TestCase):
+    def test_validated_summaries_are_not_measurements(self):
+        # A report must be assembled from the measured push, never from its summary.
+        measured = baseline.validate_push_summary(push())
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_push_result(measured)  # summary without its raw push evidence
+        raw_measurement = {**push(), **measured}    # exactly what run_push returns
+        self.assertIsNone(baseline.validate_push_result(raw_measurement))
+
+    def test_push_wall_time_is_preserved_and_kept_apart_from_ls_remote(self):
+        result = baseline.validate_push_summary(push(push_wall_seconds=0.375, ls_remote_seconds=0.02))
+        self.assertEqual(result["push_wall_seconds"], 0.375)
+        self.assertEqual(result["ls_remote_seconds"], 0.02)
+        self.assertEqual(result["payload_bytes"], 262144)
+        self.assertNotIn("seconds", result)  # never folded into the setup or case duration
+
+    def test_push_requires_a_measured_duration(self):
+        for override in ({"push_wall_seconds": None}, {"push_wall_seconds": -1}, {"push_wall_seconds": "1"},
+                         {"push_wall_seconds": float("nan")}):
+            with self.subTest(override=override), self.assertRaises(baseline.BaselineError):
+                baseline.validate_push_summary(push(**override))
+
+    def test_push_content_rules(self):
+        for override in ({"returncode": 1}, {"stdout": "!\trefs/heads/main:refs/heads/main\t[rejected]\n"},
+                         {"stdout": ""}, {"remote_oid": "2" * 40}, {"oid": "short"}, {"expected_oid": "2" * 40},
+                         {"ls_remote_seconds": -1}, {"payload_bytes": -1}):
+            with self.subTest(override=override), self.assertRaises(baseline.BaselineError):
+                baseline.validate_push_summary(push(**override))
+
+    def test_report_carries_the_measured_push_duration(self):
+        payload = report_payload()
+        self.assertEqual(payload["seed_push"]["push_wall_seconds"], 0.42)
+        self.assertEqual(payload["seed_push"]["ls_remote_seconds"], 0.01)
+
+
+class SingleCloneTest(unittest.TestCase):
+    """Each read issues exactly one git clone; verification never clones again."""
+
+    def setUp(self):
+        self.files = baseline.select_workload()
+        self.harness = FakeGitHarness(self.files)
+        self.seed = {"remote": "http://fixture.invalid/git/alice/blob-baseline.git", "oid": OID,
+                     "files": self.files}
+
+    def tearDown(self):
+        self.harness.cleanup()
+
+    def test_worker_clones_once_per_destination(self):
+        self.harness.patch_clock(self)
+        records = [baseline.measured_clone(self.harness, self.seed["remote"],
+                                           self.harness.root / ("concurrent-worker-" + str(index + 1)),
+                                           self.seed["oid"], self.seed["files"], self.harness.reader,
+                                           "read_clone", "worker-" + str(index + 1),
+                                           repository=baseline.REPOSITORY_NAME)
+                   for index in range(4)]
+        self.assertEqual(len(self.harness.clones), 4)
+        self.assertEqual(sorted(name for _, name, _ in self.harness.clones),
+                         ["concurrent-worker-1", "concurrent-worker-2", "concurrent-worker-3",
+                          "concurrent-worker-4"])
+        self.assertTrue(all(remote == self.seed["remote"] for remote, _, _ in self.harness.clones))
+        self.assertTrue(all(token is self.harness.reader for _, _, token in self.harness.clones))
+        for index, record in enumerate(records):
+            self.assertEqual(record["label"], "worker-" + str(index + 1))
+            self.assertEqual(record["destination"], "concurrent-worker-" + str(index + 1))
+            self.assertEqual(record["head_oid"], OID)
+            self.assertEqual(len(self.harness.clones), len(self.harness.fsck))  # one clone, one fsck
+            self.assertIn("OID/file/fsck checks", record["timed_scope"])
+
+    def test_concurrent_batch_clones_once_per_worker(self):
+        # Real wall time, the normal FakeGitHarness.clone: each clone really sleeps.
+        self.harness.delay = 0.15
+        started = time.monotonic()
+        workers, aggregate_seconds, record = baseline.run_concurrent_reads(self.harness, self.seed)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(self.harness.clones), baseline.CONCURRENCY)
+        self.assertEqual(len(workers), baseline.CONCURRENCY)
+        self.assertGreater(aggregate_seconds, 0)
+        self.assertEqual(len(record["workers"]), baseline.CONCURRENCY)
+        self.assertEqual(len({worker["destination"] for worker in record["workers"]}), baseline.CONCURRENCY)
+        self.assertFalse(record["includes_local_verification"])
+        self.assertIn("never compared or summed", record["verification_scope"])
+        self.assertFalse(record["concurrent_write_pushes"])
+        # Every clone took at least `delay`, and the four really overlapped: the
+        # aggregate is far below their sum (serial clones would take the sum).
+        for worker_record in workers:
+            self.assertGreaterEqual(worker_record["seconds"], self.harness.delay)
+        self.assertLess(aggregate_seconds, sum(record["worker_seconds"]) * 0.75)
+        self.assertGreaterEqual(aggregate_seconds, self.harness.delay)  # real sleeping happened
+        self.assertGreaterEqual(elapsed, aggregate_seconds)
+
+    def test_delayed_verification_cannot_extend_aggregate_seconds(self):
+        """Real wall time: slow local checks run only after the aggregate window closes."""
+        self.harness.delay = 0.02
+        self.harness.verification_delay = 0.1   # four workers => ~0.4 s of local checks
+        started = time.monotonic()
+        workers, aggregate_seconds, record = baseline.run_concurrent_reads(self.harness, self.seed)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(self.harness.clones), baseline.CONCURRENCY)
+        # Verification did happen, for every worker, but never inside the window.
+        self.assertEqual(len(self.harness.fsck), baseline.CONCURRENCY)
+        self.assertGreater(elapsed - aggregate_seconds, baseline.CONCURRENCY * self.harness.verification_delay * 0.5)
+        self.assertLess(aggregate_seconds, self.harness.verification_delay)
+        self.assertFalse(record["includes_local_verification"])
+        self.assertIn("first git clone call start", record["aggregate_definition"])
+        for worker_record in workers:
+            self.assertGreaterEqual(worker_record["verification_seconds"], self.harness.verification_delay)
+
+    def test_aggregate_is_exact_against_a_deterministic_clone_clock(self):
+        self.harness.delay = 0.05
+        self.harness.verification_delay = 0.25
+        self.harness.patch_clock(self)
+        workers, aggregate_seconds, record = baseline.run_concurrent_reads(self.harness, self.seed)
+        # Clone timers and the aggregate come from the same timed clone calls only:
+        # every recorded duration is nonzero clone time, well below one verification
+        # tick (0.25 s), which never enters the clock or the window.
+        for worker_record in workers:
+            self.assertGreater(worker_record["seconds"], 0)
+            self.assertLess(worker_record["seconds"], self.harness.verification_delay)
+        self.assertGreater(aggregate_seconds, 0)
+        self.assertLess(aggregate_seconds, self.harness.verification_delay)
+        self.assertFalse(record["includes_local_verification"])
+        self.assertIn("verification runs only after the window closes", record["aggregate_definition"])
+
+    def test_failed_clone_settles_and_raises_promptly(self):
+        self.harness.delay = 0.02
+        # One worker's clone fails; peers must not hang and nothing may verify.
+        self.harness.clone_failures = {"concurrent-worker-2": RuntimeError("clone transport failed")}
+        outcome = {}
+
+        def batch():
+            try:
+                outcome["result"] = baseline.run_concurrent_reads(self.harness, self.seed)
+            except BaseException as error:
+                outcome["error"] = error
+
+        thread = threading.Thread(target=batch, daemon=True)
+        started = time.monotonic()
+        thread.start()
+        thread.join(10)
+        self.assertFalse(thread.is_alive(), "a failed clone left the batch blocked")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertNotIn("result", outcome)  # no partial batch is ever measured
+        error = outcome["error"]
+        self.assertIsInstance(error, baseline.BaselineError)
+        self.assertIn("concurrent read batch failed (worker 2)", str(error))
+        self.assertIn("clone transport failed", str(error))
+        self.assertEqual(len(self.harness.clones), baseline.CONCURRENCY)  # every clone call settled
+        self.assertEqual(self.harness.fsck, [])                         # nothing verified
+
+    def test_cold_clone_is_single_and_follows_a_restart(self):
+        self.harness.patch_clock(self)
+        self.harness.scratch = self.harness.root / "scratch"
+        self.harness.scratch.mkdir(mode=0o700)
+        record = baseline.run_cold_clone(self.harness, self.seed, restarted=True)
+        self.assertEqual(len(self.harness.clones), 1)
+        self.assertEqual(self.harness.clones[0][1], "cold-clone")
+        self.assertTrue(record["scratch_empty_before"] and record["scratch_empty_after"])
+        self.assertEqual(record["head_oid"], OID)
+        self.assertEqual(list(self.harness.scratch.iterdir()), [])
+        with self.assertRaises(baseline.BaselineError):
+            baseline.run_cold_clone(self.harness, self.seed, restarted=False)
+        self.assertEqual(len(self.harness.clones), 1)
+
+    def test_wrong_bytes_fail_verification_without_a_second_clone(self):
+        self.harness.patch_clock(self)
+        # The clone's bytes differ from the content the seed push is supposed to contain.
+        self.seed["files"] = dict(self.files, **{"README.txt": b"tampered\n"})
+        with self.assertRaises(baseline.BaselineError):
+            baseline.measured_clone(self.harness, self.seed["remote"], self.harness.root / "wrong-bytes",
+                                    self.seed["oid"], self.seed["files"], self.harness.reader, "read_clone",
+                                    "worker-1", repository=baseline.REPOSITORY_NAME)
+        self.assertEqual(len(self.harness.clones), 1)
+
+    def test_wrong_object_format_fails_verification(self):
+        self.harness.patch_clock(self)
+        self.harness.object_format_name = "sha256"  # the clone produced a different object format
+        with self.assertRaises(baseline.BaselineError):
+            baseline.measured_clone(self.harness, self.seed["remote"], self.harness.root / "wrong-format",
+                                    self.seed["oid"], self.seed["files"], self.harness.reader, "read_clone",
+                                    "worker-1", repository=baseline.REPOSITORY_NAME)
+        self.assertEqual(len(self.harness.clones), 1)
+
+    def test_worker_validates_single_seed_repository_and_destination(self):
+        value = baseline.validate_worker("worker-1", worker(0), OID)
+        self.assertEqual(value["seconds"], 0.4)
+        self.assertEqual(value["verification_seconds"], 0.05)
+        for override in ({"label": "worker-2"}, {"kind": "cold_clone"},
+                         {"repository": "blob-reader-2"}, {"expected_oid": "2" * 40},
+                         {"head_oid": "2" * 40}, {"files_verified": False}, {"fsck": False}):
+            with self.subTest(override=override), self.assertRaises(baseline.BaselineError):
+                baseline.validate_worker("worker-1", worker(0, **override), OID)
+
+    def test_aggregate_rejects_shared_destinations_and_reports_clone_only_scope(self):
+        workers = [worker(index) for index in range(baseline.CONCURRENCY)]
+        record = baseline.aggregate_wall(workers, 0.9, OID)
+        self.assertEqual(record["mode"], baseline.READ_MODE)
+        self.assertFalse(record["includes_local_verification"])
+        self.assertEqual(record["concurrency_window_ratio"], 2.25)
+        shared = [workers[0], worker(1, destination="concurrent-worker-1")] + workers[2:]
+        with self.assertRaises(baseline.BaselineError):
+            baseline.aggregate_wall(shared, 0.9, OID)
+        with self.assertRaises(baseline.BaselineError):
+            baseline.aggregate_wall(workers, 0.1, OID)  # shorter than a worker
+        with self.assertRaises(baseline.BaselineError):
+            baseline.aggregate_wall(workers[:3], 1.0, OID)
+
+
+class SetupAndRestartTest(unittest.TestCase):
+    def test_cases_require_setup_then_sampled_provisioning(self):
+        payload = report_payload()
+        self.assertEqual(payload["setup"]["ordered_before"], "provision")
+        self.assertTrue(payload["setup"]["service_running_before_provision"])
+        self.assertEqual(payload["cases"][0]["name"], "provision")
+        self.assertTrue(payload["cases"][0]["sampled"])
+        self.assertIsNotNone(payload["cases"][0]["pg_samples"])
+        with self.assertRaises(baseline.BaselineError):
+            report_payload(setup={"seconds": 1.0, "ordered_before": "after"})
+
+    def test_restart_is_unsampled_and_advances_exactly_one_epoch(self):
+        validated = baseline.validate_cases(case_fixture(), [0, 0, 0, 1, 1])
+        self.assertFalse(validated[baseline.CASE_ORDER.index("restart")]["sampled"])
+        self.assertIsNone(validated[baseline.CASE_ORDER.index("restart")]["pg_samples"])
+        broken = case_fixture()
+        broken[3]["pg_samples"] = summary()  # samples across the stop would merge two PIDs
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_cases(broken, [0, 0, 0, 1, 1])
+
+    def test_epoch_and_pid_rules(self):
+        for epochs in ([2, 2, 2, 1, 1],       # epochs not monotone
+                       [0, 0, 0, 2, 2],       # restart skipped an epoch
+                       [0, 2, 2, 1, 1],       # restart merged two processes
+                       [0, 1, 1, 2, 2],       # epochs advanced before the restart
+                       [0, 0, 0, 1, 2]):      # cold clone outside the restarted epoch
+            with self.subTest(epochs=epochs), self.assertRaises(baseline.BaselineError):
+                baseline.validate_cases(case_fixture(), epochs)
+        same_pid = case_fixture()
+        same_pid[3]["new_pid"] = same_pid[3]["old_pid"]
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_cases(same_pid, [0, 0, 0, 1, 1])
+        not_finished = case_fixture()
+        not_finished[3]["samples_stopped_before_stop"] = False
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_cases(not_finished, [0, 0, 0, 1, 1])
+        unsampled_case = case_fixture()
+        unsampled_case[1]["sampled"] = False
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_cases(unsampled_case, [0, 0, 0, 1, 1])
+
+    def test_cold_clone_never_spans_the_restart(self):
+        record = baseline.validate_cold(cold_fixture())
+        self.assertEqual(record["samples_across_restart"], False)
+        self.assertFalse(record["includes_local_verification"])
+        self.assertIsNone(record["verification_seconds"])
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_cold(cold_fixture(samples_across_restart=True))
+
+
+class ReportValidationTest(unittest.TestCase):
+    def test_cold_rules(self):
+        self.assertEqual(baseline.validate_cold(cold_fixture())["head_oid"], OID)
+        for override in ({"service_restarted": False}, {"scratch_empty_before": False},
+                         {"scratch_empty_after": False}, {"files_verified": False}, {"fsck": False},
+                         {"head_oid": "2" * 40}, {"expected_oid": ""}, {"seconds": -1}):
+            with self.subTest(override=override), self.assertRaises(baseline.BaselineError):
+                baseline.validate_cold(cold_fixture(**override))
+
+    def test_runtime_facts_must_be_complete(self):
+        self.assertEqual(baseline.validate_runtime(RUNTIME)["hostname"], "fixture")
+        for key, value in (("hostname", ""), ("logical_cpus", None), ("mem_total_kb", 0), ("procfs", False),
+                           ("kernel", "a\nb")):
+            with self.subTest(key=key), self.assertRaises(baseline.BaselineError):
+                baseline.validate_runtime({**RUNTIME, key: value})
+
+    def test_binding_requires_attested_receipt_and_inputs(self):
+        self.assertIs(baseline.validate_binding(BINDING), BINDING)
+        for key, value in (("attested", False), ("inputs_unchanged", False), ("harness_sha256", "0"),
+                           ("workspace_commit", ""), ("rustc", None)):
+            with self.subTest(key=key), self.assertRaises(baseline.BaselineError):
+                baseline.validate_binding({**BINDING, key: value})
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_binding({**BINDING, "inputs": {"runner": "d" * 64}})
+
+    def test_secret_scan_refuses_credentials(self):
+        sensitive = ["s3cr3t-endpoint-value", "long-access-key-id-0001", "postgres://user:pw@h/db"]
+        payload = {"blob_profile": {"driver": "opendal", "service": "s3"}, "cases": []}
+        self.assertTrue(baseline.validate_no_secrets(payload, sensitive))
+        for leaked in sensitive:
+            with self.subTest(leaked=leaked), self.assertRaises(baseline.BaselineError):
+                baseline.validate_no_secrets({**payload, "note": leaked}, sensitive)
+        for marker in ("https://user:pw@example.invalid", "password=hunter2", "Secret_Access_Key: x",
+                       "Authorization: Bearer x"):
+            with self.subTest(marker=marker), self.assertRaises(baseline.BaselineError):
+                baseline.validate_no_secrets({**payload, "note": marker}, [])
+
+    def test_report_labels_and_bounds(self):
+        payload = report_payload()
+        self.assertEqual(payload["status"], "passed")
+        self.assertFalse(payload["issue"]["issue_complete"])
+        self.assertFalse(payload["issue"]["budgets_frozen"])
+        self.assertFalse(payload["legacy_pando_profile_used"])
+        self.assertEqual(payload["concurrent"]["worker_seconds"], [0.4] * baseline.CONCURRENCY)
+        self.assertTrue(payload["concurrent"]["identical_commit_oid_by_construction"])
+        self.assertEqual(payload["cold_clone"]["provider_cache_state"], "unknown")
+        self.assertTrue(payload["pg_ownership_samples"]["observed_lower_bound"])
+        self.assertFalse(payload["pg_ownership_samples"]["restart_case_sampled"])
+        for key in ("opendal_get_bytes", "opendal_get_phase_ms", "exact_lock_wait_ms"):
+            self.assertIsNone(payload["unmeasured"][key])
+        text = json.dumps(payload)
+        for forbidden in ("ROOTYARD_BLOB_ENDPOINT", "bucket", "s3://", "postgres://", PG_ADDRESS + ":"):
+            self.assertNotIn(forbidden, text)
+
+    def test_report_rejects_inconsistent_measurements(self):
+        for index, override in ((1, {"detail": {"push": push(remote_oid="2" * 40)}}),
+                                (1, {"detail": {"push": push(push_wall_seconds=None)}}),
+                                (1, {"detail": {"push": push(push_wall_seconds=0.9)}}),
+                                (4, {"detail": {}})):
+            broken = case_fixture()
+            broken[index].update(override)
+            if index == 4:
+                # A completed run whose cold case lost its scratch/restart evidence.
+                expected_report_error({"cold_record": cold_fixture(scratch_empty_before=False)},
+                                      "a validation rule")
+                continue
+            with self.subTest(index=index, override=override):
+                expected_report_error({"case_list": broken}, "a validation rule")
+        # The cold clone read another repository state than the measured seed push.
+        expected_report_error({"cold_record": cold_fixture(expected_oid="2" * 40, head_oid="2" * 40)},
+                              "a validation rule")
+        mismatched = [worker(index, expected_oid="2" * 40) for index in range(baseline.CONCURRENCY)]
+        expected_report_error({"concurrent": mismatched_concurrent(mismatched)}, "a validation rule")
+
+    def test_report_writer_is_atomic_and_never_raises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "nested" / "report.json"
+            self.assertEqual(baseline.safe_write_report(destination, {"b": 1, "a": [1, 2]}), "")
+            self.assertEqual(json.loads(destination.read_text()), {"a": [1, 2], "b": 1})
+            self.assertFalse(destination.with_suffix(".json.tmp").exists())
+            self.assertEqual(baseline.safe_write_report("", {"x": 1}), "")
+
+
+def mismatched_concurrent(workers):
+    return {"workers": workers, "aggregate_seconds": 1.0, "worker_oid": OID}
+
+
+def expected_report_error(case, categories):
+    """The report must be refused by a *validation* rule, not by a stray exception."""
+    try:
+        report_payload(**case)
+    except baseline.BaselineError:
+        return
+    except (KeyError, TypeError) as error:
+        raise AssertionError("report refused by " + type(error).__name__ + ", expected " + categories) from None
+    raise AssertionError("report accepted " + repr(case))
+
+
+def report_payload(*, case_list=None, cold_record=None, concurrent=None, setup=None):
+    return baseline.report_payload(
+        binding=BINDING, blob_profile={"driver": "opendal", "service": "s3", "root_configured": True},
+        runtime=RUNTIME, workload=workload(), cases=case_list if case_list is not None else case_fixture(),
+        setup=setup or {"seconds": 2.0, "ordered_before": "provision", "service_running_before_provision": True},
+        seeding={"push": push(), "object_format": "sha1"},
+        concurrent=concurrent or {"workers": [worker(index) for index in range(baseline.CONCURRENCY)],
+                                  "aggregate_seconds": 1.0, "worker_oid": OID},
+        cold=cold_record or baseline.validate_cold(cold_fixture()))
+
+
+
+class ClientPairMatchingTest(unittest.TestCase):
+    """Client ports repeat across hosts/containers: only exact address+port pairs may match."""
+
+    def scan(self, *sockets):
+        """sockets: (family, client address hex, client port, peer, inode)."""
+        tables = {"tcp": [], "tcp6": []}
+        for family, local, port, peer, inode in sockets:
+            row = tcp_row(len(tables[family]), local + ":%04X" % port, peer, inode=inode)
+            tables[family].append(baseline.parse_proc_net_tcp(table(row))[0])
+        return tables
+
+    def pairs(self, tables, links, endpoint=PG_ENDPOINT):
+        return baseline.pg_pair_list(links, tables, endpoint)
+
+    def test_equal_ports_on_different_client_addresses_are_distinct(self):
+        # 127.0.0.1:52779 (owned) and 127.0.0.2:52779 (another host) share a port.
+        tables = self.scan(("tcp", "0100007F", 52779, PG_HEX, 1000),
+                           ("tcp", "0200007F", 52779, PG_HEX, 1001))
+        owned = self.pairs(tables, ["socket:[1000]"])
+        self.assertEqual(owned, (("127.0.0.1", 52779),))
+        predicate = baseline.pair_predicate(owned)
+        self.assertEqual(predicate, "((client_addr = '127.0.0.1'::inet AND client_port = 52779))")
+        self.assertNotIn("127.0.0.2", predicate)  # the equal port on another host never matches
+
+    def ipv6_scan(self, client, server="::"):
+        """A tcp6 table: a ``::`` listener on the PG port plus the owned client socket.
+
+        Both endpoints use real kernel encoding (``kernel_inet6``), so the peer
+        decodes to the server address/port the way Linux prints it.
+        """
+        listener = tcp_row(0, kernel_inet6("::") + ":%04X" % PG_PORT, kernel_inet6("::") + ":0000",
+                           state="0A", inode=900)
+        client = tcp_row(1, client + ":%04X" % 41000, kernel_inet6(server) + ":%04X" % PG_PORT, inode=1000)
+        return {"tcp": [], "tcp6": baseline.parse_proc_net_tcp(table(listener, client))}
+
+    def test_ipv6_and_ipv4_mapped_clients_are_canonical(self):
+        mapped = kernel_inet6("::ffff:127.0.0.1")  # as /proc/net/tcp6 prints it: 0000...0000FFFF7F000001
+        v6_server = (["::1"], PG_PORT)
+        self.assertEqual(self.pairs(self.ipv6_scan(LOOPBACK_V6_HEX, server="::1"), ["socket:[1000]"], v6_server),
+                         (("::1", 41000),))
+        self.assertEqual(self.pairs(self.ipv6_scan(mapped, server="::1"), ["socket:[1000]"], v6_server),
+                         (("127.0.0.1", 41000),))  # IPv4-mapped client is reported as IPv4
+        # A configured 127.0.0.1 server is never a ::1 (or ::fff-mapped) peer.
+        self.assertEqual(self.pairs(self.ipv6_scan(LOOPBACK_V6_HEX, server="::1"), ["socket:[1000]"],
+                                    ([PG_ADDRESS], PG_PORT)), ())
+        self.assertEqual(baseline.pair_predicate((("::1", 41000),)),
+                         "((client_addr = '::1'::inet AND client_port = 41000))")
+        # Same port, two client families: two exact pairs, never a shared-port IN list.
+        mixed = baseline.pair_predicate((("::1", 41000), ("127.0.0.1", 41000)))
+        self.assertEqual(mixed, "((client_addr = '127.0.0.1'::inet AND client_port = 41000)"
+                                " OR (client_addr = '::1'::inet AND client_port = 41000))")
+
+    def test_owned_pairs_never_match_cross_pairs(self):
+        # Exactly (A, 1) and (B, 2) are owned; pg_stat_activity rows are simulated by matching.
+        predicate = baseline.pair_predicate((("10.0.0.1", 10001), ("10.0.0.2", 10002)))
+        self.assertEqual(predicate,
+                         "((client_addr = '10.0.0.1'::inet AND client_port = 10001)"
+                         " OR (client_addr = '10.0.0.2'::inet AND client_port = 10002))")
+
+        def matches(address, port):
+            """Evaluate the generated predicate textually, as each cited pair would match."""
+            return ("(client_addr = '" + address + "'::inet AND client_port = " + str(port) + ")") in predicate
+
+        self.assertTrue(matches("10.0.0.1", 10001))    # owned
+        self.assertTrue(matches("10.0.0.2", 10002))    # owned
+        self.assertFalse(matches("10.0.0.1", 10002))   # unowned cross-pair
+        self.assertFalse(matches("10.0.0.2", 10001))   # unowned cross-pair
+        self.assertFalse(matches("10.0.0.3", 10001))   # unowned host
+        self.assertNotIn("client_port IN (", predicate)  # no per-column IN list can re-open cross-pairs
+        self.assertNotIn("client_addr IN (", predicate)
+
+    def test_repeated_pairs_are_deduplicated_and_ordered_deterministically(self):
+        pairs = [("10.0.0.2", 10002), ("10.0.0.1", 10001), ("10.0.0.2", 10002), ("10.0.0.1", 10001)]
+        expected = baseline.pair_predicate([("10.0.0.1", 10001), ("10.0.0.2", 10002)])
+        self.assertEqual(baseline.pair_predicate(pairs), expected)
+        self.assertEqual(baseline.pair_predicate(tuple(reversed(pairs))), expected)
+        self.assertEqual(baseline.pair_predicate([["10.0.0.2", 10002], ["10.0.0.1", 10001]]), expected)
+        # One occurrence per pair, ordered by address then port.
+        self.assertEqual(expected.count("10.0.0.1"), 1)
+        self.assertEqual(expected.count("10.0.0.2"), 1)
+        same_address = baseline.pair_predicate((("10.0.0.1", 20002), ("10.0.0.1", 10001)))
+        self.assertEqual(same_address, "((client_addr = '10.0.0.1'::inet AND client_port = 10001)"
+                                       " OR (client_addr = '10.0.0.1'::inet AND client_port = 20002))")
+
+    def test_generated_sql_is_credential_free(self):
+        predicate = baseline.pair_predicate((("127.0.0.1", 52779), ("::1", 41000)))
+        self.assertNotIn("@", predicate)          # no userinfo / DSN
+        self.assertNotIn("postgres://", predicate)
+        self.assertNotIn("password", predicate.lower())
+        self.assertNotIn("token", predicate.lower())
+        self.assertNotIn(";", predicate)          # exactly one statement, no stacking
+        self.assertNotIn("--", predicate)
+        clause = r"\(client_addr = '[0-9a-f.:]+'::inet AND client_port = [0-9]+\)"
+        self.assertRegex(predicate, r"^\(" + clause + " OR " + clause + r"\)$")
+
+    def test_predicate_rejects_unvalidated_input(self):
+        for pairs in (None, (), [], [("127.0.0.1",)], [("127.0.0.1", "52779")], [("127.0.0.1", 0)],
+                      [("127.0.0.1", 70000)], [("127.0.0.1", True)], [("127.0.0.1; DROP TABLE x", 52779)],
+                      [(" 127.0.0.1", 52779)], [("127.0.0.1') OR (1=1", 52779)], [(None, 52779)]):
+            with self.subTest(pairs=pairs), self.assertRaises(baseline.BaselineError):
+                baseline.pair_predicate(pairs)
+        # Canonicalisation: a non-canonical but valid literal is refused, never rewritten.
+        with self.assertRaises(baseline.BaselineError):
+            baseline.pair_predicate([("127.000.000.001", 52779)])
+        self.assertEqual(baseline.client_address("::ffff:127.0.0.1"), "127.0.0.1")
+        self.assertEqual(baseline.client_address("2001:db8::1"), "2001:db8::1")
+
+    def test_sampler_sql_carries_the_exact_pairs(self):
+        proc = FakeProc()
+        helper = FakeHelper(rows=("1|0|1|0",))
+        try:
+            proc.write_net("tcp", (tcp_row(0, LOOPBACK_HEX + ":CE2B", PG_HEX, inode=1000),
+                                   tcp_row(1, "0200007F:CE2B", PG_HEX, inode=1001)))
+            sampler = baseline.PgSampler(helper, proc.pid, PG_ENDPOINT, proc=proc.root)
+            self.assertEqual(sampler.scan_once(), {"sessions": 1, "active": 0, "idle": 1, "lock": 0})
+            query = helper.queries[0]
+            self.assertIn("WHERE ((client_addr = '127.0.0.1'::inet AND client_port = 52779))", query)
+            self.assertNotIn("127.0.0.2", query)
+            self.assertNotIn("application_name", query)
+        finally:
+            proc.close()
+
+
+class FakeRunHarness(FakeGitHarness):
+    """End-to-end fake of the orchestration: every step recorded in wall-clock order."""
+
+    URL = "postgresql://www-data:super-secret@database.fixture.invalid:54329/service"
+
+    def __init__(self, files, restart_changes_pid=True):
+        super().__init__(files)
+        self.events = []
+        self.db = self.URL
+        self.schema = "rootyard_e2e_fixture0123456789abcdef"
+        self.scratch = self.root / "scratch"
+        self.restart_changes_pid = restart_changes_pid
+        self.captured = None
+        # Only names/values the runner may inspect; no real profile is ever read.
+        self.env = {"ROOTYARD_BLOB_ENDPOINT": "http://127.0.0.1:1", "ROOTYARD_BLOB_SECRET_ACCESS_KEY": "fake-secret"}
+        self.sql_answers = {"SELECT current_setting('port')": str(PG_PORT),
+                            "SHOW server_version": "17.1"}
+
+    def note(self, event):
+        self.events.append(event)
+
+    def prepare(self):
+        self.note("prepare")
+
+    def create(self, name, token, object_format="sha1"):
+        self.note("POST /api/repos")
+        return {"id": "fixture", "owner": "alice", "name": name,
+                "clone_path": "/git/alice/" + name + ".git"}, 201  # (repo, POST status)
+
+    def db_repo(self, repo_id):
+        self.note("db binding")
+        return "pg_refstore|1|sha1"
+
+    def clone(self, remote, destination, token=None):
+        self.note("clone " + Path(destination).name)
+        return super().clone(remote, destination, token)
+
+    def configure(self, work):
+        pass
+
+    def commit_files(self, work, message, files):
+        self.note("commit")
+        for name, data in files.items():
+            (Path(work) / name).parent.mkdir(parents=True, exist_ok=True)
+            (Path(work) / name).write_bytes(data)
+        return OID
+
+    def git(self, *args, cwd=None, token=None, check=True, **kwargs):
+        if "push" in args:
+            self.note("git push")
+            return mock.Mock(stdout=b"*\trefs/heads/main:refs/heads/main\t[new branch]\n",
+                             stderr=b"", returncode=0)
+        return super().git(*args, cwd=cwd, token=token, check=check, **kwargs)
+
+    def remote_refs(self, remote, token=None):
+        self.note("ls-remote")
+        return {"refs/heads/main": OID}
+
+    def run_push(self, remote, work, files):
+        """Run the real push measurement against this fake git, then keep its summary."""
+        self.note("measure push")
+        return baseline.run_push(self, remote, work, files)
+
+    def sql(self, query):
+        self.note("sql")
+        for prefix, answer in self.sql_answers.items():
+            if query.startswith(prefix):
+                return answer
+        return super().sql(query)
+
+    def stop(self):
+        self.note("stop " + str(self.proc.pid))
+
+    def start(self):
+        self.note("start from " + str(self.proc.pid))
+        next_pid = (self.proc.pid + 1) if (self.restart_changes_pid or self.proc.pid != 500) else self.proc.pid
+        self.proc = FakeProcess(next_pid)
+        self.scratch.mkdir(mode=0o700, exist_ok=True)
+
+    def run(self, argv, **kwargs):
+        return mock.Mock(stdout=(argv[-1] if isinstance(argv[-1], str) else "tool").encode(), returncode=0)
+
+
+class FakeSampler:
+    """Stands in for PgSampler and mirrors the real sweep's end-of-case validation."""
+
+    instances = []
+
+    def __init__(self, helper, pid, endpoint, **kwargs):
+        self.helper, self.pid, self.endpoint = helper, pid, endpoint
+        self.finished = False
+        self.calls = []
+        FakeSampler.instances.append(self)
+
+    def start(self, timeout=None):
+        self.calls.append(baseline.sample_row(1, 0, 1, 0))
+        return self.calls[-1]
+
+    def finish(self):
+        self.finished = True
+        self.calls.append(baseline.sample_row(1, 0, 1, 0))
+        return baseline.summarize_samples(self.calls, scans_without_connection=0)
+
+
+class RunOrchestrationTest(unittest.TestCase):
+    """The run itself: setup before sampling, restart without cross-PID samples."""
+
+    def setUp(self):
+        self.args = mock.Mock(binary="/fixture/rootyard", keep=False)
+        self.args.report = Path(tempfile.mkdtemp(prefix="blob-baseline-report-")) / "report.json"
+        FakeSampler.instances = []
+
+    def run_once(self, restart_changes_pid=True):
+        files = baseline.select_workload()
+        harness = FakeRunHarness(files, restart_changes_pid=restart_changes_pid)
+        profile = mock.Mock(working_tree_clean=True, build={"binary_sha256": "a" * 64,
+                                                            "source_inputs_sha256": "b" * 64,
+                                                            "workspace_commit": "c" * 40, "rustc": "rustc 1"},
+                            receipt_sha256="d" * 64, harness_sha256="e" * 64, git_sha256="f" * 64)
+        def capture(*args, **kwargs):
+            # Record the run's own case records, then build the report normally.
+            harness.captured = {"cases": kwargs["cases"], "setup": kwargs["setup"], "seeding": kwargs["seeding"]}
+            return real_report_payload(*args, **kwargs)
+
+        real_report_payload = baseline.report_payload
+        patches = (mock.patch.object(baseline, "report_payload", side_effect=capture),
+                   mock.patch.object(baseline, "binding_record", return_value=BINDING),
+                   mock.patch.object(baseline.serving, "BlobOnlyHarness", return_value=harness),
+                   mock.patch.object(baseline, "resolve_pg_endpoint",
+                                     return_value=([PG_ADDRESS], PG_PORT)),
+                   mock.patch.object(baseline, "PgSampler", FakeSampler),
+                   mock.patch.object(baseline, "runtime_facts", return_value=RUNTIME),
+                   mock.patch.object(baseline, "sensitive_values", return_value=[]))
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(harness.cleanup)
+        code = baseline.run(self.args, profile, {"driver": "opendal", "service": "s3"})
+        return code, harness, json.loads(self.args.report.read_text()), harness.captured or {}
+
+    def test_setup_precedes_every_sampled_case(self):
+        code, harness, report, captured = self.run_once()
+        self.assertEqual(code, 0, report.get("error"))
+        self.assertEqual(report["status"], "passed")
+        events = harness.events
+        self.assertLess(events.index("prepare"), events.index("POST /api/repos"))
+        self.assertLess(events.index("prepare"), events.index("clone blob-baseline-work"))
+        names = [case["name"] for case in report["cases"]]
+        self.assertEqual(names, list(baseline.CASE_ORDER))
+        self.assertGreater(report["setup"]["seconds"], 0)
+        self.assertTrue(report["cases"][0]["sampled"])
+        self.assertIsNotNone(report["cases"][0]["pg_samples"])
+        self.assertEqual(report["seed_push"]["push_wall_seconds"] > 0, True)
+        self.assertNotIn("super-secret", json.dumps(report))
+        self.assertNotIn("database.fixture.internal", json.dumps(report))
+
+    def test_restart_is_never_sampled_and_samples_follow_the_pid(self):
+        code, harness, report, captured = self.run_once()
+        self.assertEqual(code, 0, report.get("error"))
+        restart = captured["cases"][baseline.CASE_ORDER.index("restart")]
+        self.assertFalse(restart["sampled"])
+        self.assertIsNone(restart["pg_samples"])
+        sampled_pids = [sampler.pid for sampler in FakeSampler.instances if sampler.calls]
+        self.assertEqual(len(sampled_pids), 4)            # every case except the restart
+        self.assertEqual(sampled_pids, [500, 500, 500, 501])
+        self.assertTrue(all(sampler.finished for sampler in FakeSampler.instances))
+        # Old-process sampling is finished strictly before the stop.
+        self.assertIn("stop 500", harness.events)
+        self.assertEqual([case["service_epoch"] for case in captured["cases"]], [0, 0, 0, 1, 1])
+
+    def test_same_pid_after_restart_fails_the_run(self):
+        code, _, report, _ = self.run_once(restart_changes_pid=False)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("new service process", report["error"])
+
+
+class FixtureReuseTest(unittest.TestCase):
+    def test_runner_reuses_the_real_blob_only_fixture(self):
+        self.assertIs(baseline.serving.BlobOnlyHarness.__mro__[1], baseline.serving.Harness)
+        for name in ("NativeProfile", "check_blob_profile", "BlobOnlyHarness", "ProfileError"):
+            self.assertTrue(hasattr(baseline.serving, name), name)
+        run_source = Path(baseline.__file__).read_text()
+        for reused in ("serving.BlobOnlyHarness(", "serving.NativeProfile(", "serving.check_blob_profile("):
+            self.assertIn(reused, run_source)
+        for forbidden in ("delete_objects", "ROOTYARD_BLOB_DELETE=", "s3://", "exact_clone("):
+            self.assertNotIn(forbidden, run_source)
+        self.assertEqual(run_source.count('need(binding_record(profile)["inputs"] == binding["inputs"]'), 1)
+        run_body = run_source[run_source.index("def run(args, profile, blob_profile):"):]
+        self.assertEqual(run_body.count("binding = binding_record(profile)"), 1)  # attested once, re-checked once
+
+    def test_cli_contract(self):
+        parser_source = Path(baseline.__file__).read_text()
+        for flag in ('"--binary", required=True', '"--git"', '"--report", required=True', '"--keep"'):
+            self.assertIn(flag, parser_source)
+
+    def test_main_fails_closed_before_any_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with mock.patch.object(baseline.serving, "NativeProfile",
+                                   side_effect=baseline.serving.ProfileError("no receipt")):
+                self.assertEqual(baseline.main(["--binary", "/bin/sh", "--report", str(report)]), 2)
+            written = json.loads(report.read_text())
+            self.assertTrue(written["preflight_failed"])
+            self.assertEqual(written["status"], "failed")
+            self.assertEqual(written["error"], "no receipt")
+            self.assertEqual(written["cases"], [])
+
+    def test_main_fails_closed_without_procfs(self):
+        real_is_dir = Path.is_dir
+
+        def is_dir(path):
+            return False if str(path) == "/proc/self/fd" else real_is_dir(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with mock.patch.object(baseline.serving, "NativeProfile", return_value=mock.Mock()), \
+                    mock.patch.object(baseline.serving, "check_blob_profile", return_value={}), \
+                    mock.patch.dict(os.environ, {"ROOTYARD_TEST_DATABASE_URL": "postgres://unused"}), \
+                    mock.patch.object(Path, "is_dir", is_dir):
+                self.assertEqual(baseline.main(["--binary", "/bin/sh", "--report", str(report)]), 2)
+            self.assertIn("procfs", json.loads(report.read_text())["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
