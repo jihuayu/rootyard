@@ -747,7 +747,7 @@ class Client:
         # ``routes`` registered ``context.on("page", self.listen)``, so creating
         # the page already attached its response/request capture exactly once;
         # a second ``self.listen(page)`` would duplicate both.
-        page = await context.new_page()
+        fault_page = await context.new_page()
         facts = {"intercepted": 0, "commits": 0, "failed": False}
 
         def observe_request(request):
@@ -758,7 +758,7 @@ class Client:
                 if path == self.alias + "/commits":
                     facts["commits"] += 1
 
-        page.on("request", observe_request)
+        fault_page.on("request", observe_request)
 
         async def fault(route, request):
             # This handler confines on its own: a request that left the origin
@@ -771,10 +771,12 @@ class Client:
             if request.url != target:
                 await route.continue_()
                 return
-            pairs = (self.read_pairs.get(id(page)) or {}).get("refs") or []
-            refs = pairs[0] if pairs else {}
-            token = refs.get("token") if isinstance(refs, dict) else None
-            revision = refs.get("revision") if isinstance(refs, dict) else None
+            # The injected answer is built from this fault page's own first refs
+            # pair, exactly one.
+            pairs = (self.read_pairs.get(id(fault_page)) or {}).get("refs") or []
+            refs = pairs[0] if len(pairs) == 1 and isinstance(pairs[0], dict) else {}
+            token = refs.get("token")
+            revision = refs.get("revision")
             presented = request.headers.get(TOKEN)
             if (
                 facts["intercepted"]
@@ -791,29 +793,38 @@ class Client:
                 facts["failed"] = True
                 await route.abort()
                 return
+            # The exact request is now counted, so an unanswered read can never
+            # be mistaken for a missing injection.
             facts["intercepted"] += 1
             facts["uses_token"] = True
             facts["no_revision"] = True
-            fault_revision = revision
-            await route.fulfill(
-                status=200,
-                headers={
-                    "content-type": "application/json",
-                    "cache-control": "no-store",
-                    "x-rootyard-client-fault": "1",
-                    TOKEN: token,
-                    REVISION: str(revision - 1),
-                },
-                body=json.dumps(synthetic),
-            )
+            # Only after the synthetic answer really reached the page is the
+            # refusal the page's own.
+            try:
+                await route.fulfill(
+                    status=200,
+                    headers={
+                        "content-type": "application/json",
+                        "cache-control": "no-store",
+                        "x-rootyard-client-fault": "1",
+                        TOKEN: token,
+                        REVISION: str(revision - 1),
+                    },
+                    body=json.dumps(synthetic),
+                )
+            except Exception:
+                facts["failed"] = True
+                return
+            facts["revision"] = revision
+            facts["fulfilled"] = True
 
-        await page.route("**/*", fault)
-        await self.goto(page, self.web + self.scope, "FAULT_NOT_APPLIED")
+        await fault_page.route("**/*", fault)
+        await self.goto(fault_page, self.web + self.scope, "FAULT_NOT_APPLIED")
         # The tree request alone produces the generic refusal; refs may already
         # have rendered before it.
-        await self.fault_status(page)
-        status = (await page.locator("#status").text_content()) or ""
-        content = (await page.locator("#content").text_content()) or ""
+        await self.fault_status(fault_page, facts)
+        status = (await fault_page.locator("#status").text_content()) or ""
+        content = (await fault_page.locator("#content").text_content()) or ""
         self.check_origin()
         if facts["failed"]:
             raise Failure("FAULT_BOUND_INVALID")
@@ -825,11 +836,11 @@ class Client:
         marker_absent = FAULT_MARKER not in content
         tree_absent = "Files at HEAD" not in content and self.config["file"] not in content
         commits_absent = "Commits" not in content
-        await self.no_credentials(page)
+        await self.no_credentials(fault_page)
         return {
             "mode": "client_fault_injection",
-            "refs_revision": fault_revision,
-            "synthetic_revision": fault_revision - 1,
+            "refs_revision": facts["revision"],
+            "synthetic_revision": facts["revision"] - 1,
             "started": facts["intercepted"] == 1,
             "fault_uses_refs_token": facts.get("uses_token") is True,
             "fault_request_revision_absent": facts.get("no_revision") is True,
@@ -840,7 +851,16 @@ class Client:
             "commits_not_requested": facts["commits"] == 0,
         }
 
-    async def fault_status(self, page):
+    async def fault_status(self, page, facts):
+        """Wait, within the fixed bound, for the page's own rendered refusal.
+
+        A wait that ends without one is classified by what the injection itself
+        established, with fixed reasons only: no exact request was intercepted
+        (`FAULT_NOT_APPLIED`), the request was seen but its facts or the route
+        operation failed (`FAULT_BOUND_INVALID`), or a valid synthetic answer
+        was really fulfilled and the page still rendered no refusal
+        (`FAULT_REFUSAL_MISSING`).
+        """
         try:
             await page.wait_for_function(
                 "() => { const node = document.querySelector('#status');"
@@ -849,6 +869,12 @@ class Client:
             )
             return (await page.locator("#status").text_content()) or ""
         except Exception:
+            if facts.get("failed"):
+                raise Failure("FAULT_BOUND_INVALID") from None
+            if facts.get("intercepted") != 1:
+                raise Failure("FAULT_NOT_APPLIED") from None
+            if facts.get("fulfilled") is not True:
+                raise Failure("FAULT_BOUND_INVALID") from None
             raise Failure("FAULT_REFUSAL_MISSING") from None
 
 
