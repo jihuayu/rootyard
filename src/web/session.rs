@@ -25,6 +25,16 @@ const SESSION_LIFETIME_SECONDS: i64 = 12 * 60 * 60;
 const SESSION_PREFIX: &str = "ryt_";
 const PARENT_HEX_LEN: usize = 32;
 
+/// The exact read-alias namespace of the Blob gateway browser UI: the index
+/// `GET /web/blob/api/repos` and every read below it.
+const BLOB_API_ALIAS: &str = "/web/blob/api/repos";
+
+/// The credential scheme one web-session refusal advertises.
+const PAGE_CHALLENGE: &str = "Basic realm=\"Rootyard\", charset=\"UTF-8\"";
+/// The JSON/API challenge of the Blob gateway aliases, identical to
+/// [`crate::blob_git_gateway::Challenge::Bearer`].
+const API_CHALLENGE: &str = "Bearer realm=\"Rootyard\"";
+
 fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(header::COOKIE)?.to_str().ok()?.split(';').find_map(|part| {
         let (key, value) = part.trim().split_once('=')?;
@@ -93,6 +103,35 @@ fn authorization_credential(headers: &HeaderMap) -> Option<String> {
         return pair.split_once(':').map(|(_, token)| token.to_owned());
     }
     None
+}
+
+/// True only for the Blob gateway read aliases: exactly `/web/blob/api/repos`
+/// and its descendants in whole path segments. Every other `/web` path (the
+/// login/logout pages, the `/web/blob` page navigation, sibling `/web/*` pages)
+/// and every `/git/*` path keeps the page challenge.
+fn is_blob_api_alias(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(BLOB_API_ALIAS) else { return false };
+    rest.is_empty() || rest.starts_with('/')
+}
+
+/// Choose the challenge of a `401` the session middleware itself answers.
+///
+/// The API alias namespace advertises the JSON/API `Bearer` scheme, so a
+/// cookie-only browser `fetch` that resolves promptly itself (no network
+/// delay) can never start the Basic HTTP-auth exchange Chromium would
+/// otherwise leave pending. Every other path keeps the page `Basic` challenge.
+///
+/// Only a `401` is looked at. Its status, body and every other header (cookies,
+/// repeated values included) are the response's own; an answer that names no
+/// challenge at all is left exactly as rendered.
+fn session_challenge(mut response: Response, path: &str) -> Response {
+    if response.status() == StatusCode::UNAUTHORIZED
+        && response.headers().get(header::WWW_AUTHENTICATE).is_some_and(|value| value == PAGE_CHALLENGE)
+    {
+        let challenge = if is_blob_api_alias(path) { API_CHALLENGE } else { PAGE_CHALLENGE };
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static(challenge));
+    }
+    response
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -280,7 +319,7 @@ pub async fn middleware(
 
     let auth_mode = match web_auth_mode(&state, &headers, session.as_deref()).await {
         Ok(mode) => mode,
-        Err(response) => return *response,
+        Err(response) => return session_challenge(*response, &path),
     };
     let session_mode = matches!(auth_mode, WebAuthMode::CookieOnly | WebAuthMode::BrowserSession);
 
@@ -315,14 +354,18 @@ pub async fn middleware(
                 return Error(StatusCode::FORBIDDEN, "CSRF token required").into_response();
             };
             if let Err(response) = validate_session(&state, secret, Some(csrf)).await {
-                return *response;
+                return session_challenge(*response, &path);
             }
         }
     } else if session_mode
         && let Some(secret) = session.as_deref()
         && let Err(response) = validate_session(&state, secret, None).await
     {
-        return if is_navigation { login_redirect(&path, query.as_deref(), &headers) } else { *response };
+        return if is_navigation {
+            login_redirect(&path, query.as_deref(), &headers)
+        } else {
+            session_challenge(*response, &path)
+        };
     }
 
     let response = auth::web_scope(next.run(request)).await;
@@ -489,3 +532,184 @@ pub async fn logout(State(state): State<MetadataState>, headers: HeaderMap) -> R
 #[path = "session_assets.rs"]
 mod assets;
 pub use assets::app_js;
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::{Body, to_bytes},
+        http::header,
+        response::{IntoResponse, Response},
+    };
+
+    use super::*;
+
+    fn challenges(response: &Response) -> Vec<&str> {
+        response.headers().get_all(header::WWW_AUTHENTICATE).iter().map(|v| v.to_str().unwrap()).collect()
+    }
+
+    /// Only the exact alias namespace and its descendants are API reads.
+    #[test]
+    fn only_the_blob_api_alias_namespace_is_scoped() {
+        for path in [
+            "/web/blob/api/repos",
+            "/web/blob/api/repos/",
+            "/web/blob/api/repos/owner/name",
+            "/web/blob/api/repos/owner/name/refs",
+            "/web/blob/api/repos/owner/name/tree/abc",
+        ] {
+            assert!(is_blob_api_alias(path), "{path} is a Blob API read alias");
+        }
+        for path in [
+            "/web/login",
+            "/web/logout",
+            "/web/blob",
+            "/web/blob/",
+            "/web/blob/repos/owner/name",
+            "/web/app.js",
+            "/web/repos",
+            "/web/settings/tokens",
+            "/web/blob/api/repository",
+            "/web/blob/api/repositories",
+            "/web/blob/api/reposx",
+            "/web/blob/api",
+            "/web/blob/api/",
+            "/git/owner/name.git/info/refs",
+            "/api/repos",
+            "",
+        ] {
+            assert!(!is_blob_api_alias(path), "{path} is not a Blob API read alias");
+        }
+    }
+
+    /// A `Basic`-challenged session `401` on an alias read becomes exactly the
+    /// API `Bearer` challenge.
+    #[test]
+    fn an_alias_unauthorized_advertises_exactly_the_bearer_challenge() {
+        let page = Error::unauthorized().into_response();
+        assert_eq!(challenges(&page), [PAGE_CHALLENGE], "precondition: the shared refusal is Basic");
+        for path in ["/web/blob/api/repos", "/web/blob/api/repos/owner/name/refs"] {
+            let response = session_challenge(page.clone(), path);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(challenges(&response), [API_CHALLENGE], "{path}");
+        }
+    }
+
+    /// Every other route keeps the existing page `Basic` challenge.
+    #[test]
+    fn page_login_and_other_routes_keep_the_basic_challenge() {
+        let page = Error::unauthorized().into_response();
+        for path in ["/web/login", "/web/logout", "/web/blob", "/web/blob/repos/o/n", "/web/repos", "/git/o/n.git"] {
+            let response = session_challenge(page.clone(), path);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(challenges(&response), [PAGE_CHALLENGE], "{path}");
+        }
+    }
+
+    /// A non-`401` answer is never touched, on the alias or elsewhere.
+    #[test]
+    fn a_non_unauthorized_answer_is_unchanged() {
+        for status in [StatusCode::OK, StatusCode::FORBIDDEN, StatusCode::NOT_FOUND, StatusCode::SERVICE_UNAVAILABLE] {
+            let original = (status, "body").into_response();
+            for path in ["/web/blob/api/repos", "/web/blob/api/repos/owner/name", "/web/login", "/web/repos"] {
+                let response = session_challenge(original.clone(), path);
+                assert_eq!(response.status(), status, "{path}");
+                assert_eq!(response.headers(), original.headers(), "{path}");
+            }
+        }
+    }
+
+    /// The challenge is the only field that can change: status, body, cookies
+    /// and every other header (repeated values included) stay the response's.
+    #[test]
+    fn the_challenge_rewrite_preserves_status_body_and_other_headers() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let original = Error::unauthorized().into_response();
+        let mut original = {
+            let (mut parts, _) = original.into_parts();
+            parts.headers.insert(header::SET_COOKIE, HeaderValue::from_static("rootyard_session=; Max-Age=0"));
+            parts.headers.append(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            parts.headers.append(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+            Response::from_parts(parts, Body::from(r#"{"error":"valid credentials required"}"#))
+        };
+        let response = session_challenge(original.clone(), "/web/blob/api/repos/owner/name");
+        assert_eq!(challenges(&original), [PAGE_CHALLENGE]);
+        assert_eq!(challenges(&response), [API_CHALLENGE]);
+        original.headers_mut().remove(header::WWW_AUTHENTICATE);
+        response.headers_mut().remove(header::WWW_AUTHENTICATE);
+        assert_eq!(response.status(), original.status());
+        assert_eq!(response.headers(), original.headers());
+        let read = |response: Response| {
+            runtime.block_on(async move {
+                let (parts, body) = response.into_parts();
+                (parts.status, to_bytes(body, usize::MAX).await.unwrap())
+            })
+        };
+        assert_eq!(read(response), read(original));
+    }
+
+    /// A `401` that names no challenge, or another authority's scheme, is not
+    /// the session middleware's page refusal and is passed through untouched.
+    #[test]
+    fn an_unauthorized_without_the_page_challenge_is_passed_through() {
+        let bare = Response::builder().status(StatusCode::UNAUTHORIZED).body(Body::empty()).unwrap();
+        let foreign = Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::WWW_AUTHENTICATE, "Negotiate")
+            .body(Body::empty())
+            .unwrap();
+        for response in [bare.into_response(), foreign] {
+            let existing = challenges(&response);
+            let after = session_challenge(response, "/web/blob/api/repos");
+            assert_eq!(challenges(&after), existing);
+        }
+    }
+
+    /// `validate_session` refuses a secret whose embedded parent id does not
+    /// decode before it ever touches the pool (`session_parent`). The session
+    /// middleware hands that error to `session_challenge`, so an alias read
+    /// answers an exactly-Bearer `401` without a live database; page paths keep
+    /// Basic.
+    #[tokio::test]
+    async fn a_validate_session_rejection_is_bearer_challenged_on_alias_reads() {
+        let (state, _scratch) = offline_metadata();
+        let secret = format!("{SESSION_PREFIX}{}", "zz".repeat(32));
+        assert_eq!(session_parent(&secret), None);
+        let Err(rejected) = validate_session(&state, &secret, None).await else {
+            panic!("a session without a decodable parent id must not validate");
+        };
+        let response = session_challenge(*rejected.clone(), "/web/blob/api/repos");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(challenges(&response), [API_CHALLENGE]);
+        let page = (*rejected).into_response();
+        let response = session_challenge(page, "/web/blob");
+        assert_eq!(challenges(&response), [PAGE_CHALLENGE]);
+    }
+
+    fn offline_metadata() -> (MetadataState, tempfile::TempDir) {
+        let config: tokio_postgres::Config =
+            "host=127.0.0.1 port=1 user=rootyard dbname=rootyard".parse().expect("static connection string");
+        let pool = deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(config, tokio_postgres::NoTls))
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .max_size(1)
+            .build()
+            .expect("offline pool");
+        (MetadataState { pool }, tempfile::tempdir().expect("scratch"))
+    }
+
+    /// The real middleware source must route both of its session short
+    /// circuits through `session_challenge` and leave the navigation redirect
+    /// decision in place; this pins the wiring the offline tests cannot reach.
+    #[test]
+    fn both_session_short_circuits_use_the_challenge_helper() {
+        let source = include_str!("session.rs");
+        let middleware = source
+            .split_once("pub async fn middleware(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the middleware body");
+        assert!(middleware.contains("Err(response) => return session_challenge(*response, &path)"));
+        assert_eq!(middleware.matches("session_challenge(*response, &path)").count(), 2);
+        assert!(middleware.contains("login_redirect(&path, query.as_deref(), &headers)"));
+        assert!(!middleware.contains("WWW_AUTHENTICATE"), "the middleware never writes the header itself");
+    }
+}

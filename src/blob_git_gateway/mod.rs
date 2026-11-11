@@ -332,6 +332,49 @@ mod challenge_tests {
         }
     }
 
+    /// A stale/revoked/expired browser cookie that the outer session middleware
+    /// rejects before the alias handler runs keeps the API `Bearer` challenge
+    /// on `/web/blob/api/repos...` (never the page Basic one a cookie-only
+    /// Chromium fetch would turn into a pending auth prompt), while every other
+    /// route keeps the session middleware's Basic challenge.
+    ///
+    /// The secret is malformed (`session_parent` cannot decode it), so
+    /// `validate_session` answers its `401` offline. A non-navigation request
+    /// (no `text/html` Accept, no navigate mode) is answered with that refusal
+    /// instead of the shared login redirect on every path, so this exercises
+    /// the middleware short circuit itself, before any handler or database.
+    #[tokio::test]
+    async fn a_rejected_browser_cookie_keeps_each_route_scheme() {
+        let (state, _scratch) = offline_state();
+        let cookie = format!("rootyard_session=ryt_{}", "zz".repeat(32));
+        for uri in ["/web/blob/api/repos", "/web/blob/api/repos/owner/name", "/web/blob/api/repos/owner/name/refs"] {
+            let (status, challenges) = send(&state, "GET", uri, &[("cookie", cookie.as_str())], &[]).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "GET {uri} was not the session refusal");
+            assert_eq!(challenges, [BEARER], "GET {uri} must settle the cookie-only browser fetch without Basic");
+        }
+        for uri in ["/web/login", "/web/logout", "/web/blob", "/web/blob/repos/owner/name", "/web/app.js"] {
+            let (status, challenges) = send(&state, "GET", uri, &[("cookie", cookie.as_str())], &[]).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "GET {uri} was not the session refusal");
+            assert_eq!(challenges, [BASIC], "GET {uri} keeps the page Basic challenge");
+        }
+        // Smart HTTP never sees the session middleware: Git Basic negotiation
+        // is unchanged, and a browser cookie is not a Git credential here.
+        let (status, challenges) =
+            send(&state, "GET", "/git/owner/name.git/info/refs?service=git-upload-pack", &[("cookie", &cookie)], &[])
+                .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(challenges, [BASIC]);
+        // An explicit API credential still wins over the stale cookie: the
+        // credential parser accepts it and the authority (offline here) answers
+        // without any challenge.
+        let bearer = format!("Bearer ryt_{}", "ab".repeat(32));
+        let (status, challenges) =
+            send(&state, "GET", "/web/blob/api/repos", &[("cookie", cookie.as_str()), ("authorization", &bearer)], &[])
+                .await;
+        assert!(challenges.is_empty(), "an accepted credential was challenged");
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
+
     /// `unsupported_merge` (`POST /api/repos/{owner}/{name}/merges`) answers its
     /// `501 Not Implemented` refusal before it looks at any credential, so it is
     /// not an unauthenticated route and must not advertise a scheme challenge.
