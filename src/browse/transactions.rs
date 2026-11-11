@@ -3,7 +3,10 @@ use crate::{
     AppState, Error, auth,
     browse::{
         git_read, idempotency,
-        ref_transaction::{RefTransactionRequest, RefTransactionResponse, build_update_ref_stdin_payload},
+        ref_transaction::{
+            AppliedRefUpdate, RefTransactionRequest, RefTransactionResponse, prepare_stdin_file,
+            validate_applied_updates,
+        },
     },
     db::{self, Identity}, events, journal,
     members::models::RepoAccess, reliability, storage,
@@ -14,15 +17,22 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use std::{
-    collections::HashMap,
-    fs::OpenOptions,
-    io::{Seek, SeekFrom, Write},
-    os::unix::fs::OpenOptionsExt,
-    process::Stdio,
-    sync::Arc,
-};
+use std::{process::Stdio, sync::Arc};
 use uuid::Uuid;
+
+pub fn build_update_ref_stdin_payload(updates: &[AppliedRefUpdate]) -> Vec<u8> {
+    crate::browse::ref_transaction::build_update_ref_stdin_payload(updates)
+}
+
+async fn record_creation(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: Uuid,
+    repo: Uuid,
+    key: Option<&str>,
+    response: &serde_json::Value,
+) -> Result<(), Error> {
+    idempotency::record(tx, tenant, repo, key, response).await
+}
 
 pub async fn execute_ref_transaction(
     State(state): State<Arc<AppState>>,
@@ -207,47 +217,15 @@ async fn execute_ref_transaction_inner(
     let repo_format = crate::browse::object_format::detect_repo_object_format(&state, repo_id).await?;
     let zero_oid = repo_format.zero_oid();
     let (head, current_refs) = git_read::read_head_and_refs(&state, repo_id).await?;
-    let refs_map: HashMap<&str, &str> = current_refs
-        .iter()
-        .map(|r| (r.name.as_str(), r.oid.as_str()))
-        .collect();
-
-    for u in &normalized_updates {
-        if !crate::browse::object_format::valid_oid_for_format(&u.old_oid, repo_format)
-            || !crate::browse::object_format::valid_oid_for_format(&u.new_oid, repo_format)
-        {
-            return Err(Error(
-                StatusCode::CONFLICT,
-                "ref transaction object format does not match repository",
-            ));
-        }
-        let actual_old = refs_map.get(u.ref_name.as_str()).copied().unwrap_or(zero_oid);
-        if actual_old != u.old_oid {
-            return Err(Error(StatusCode::CONFLICT, "reference old_oid mismatch"));
-        }
-        if u.new_oid == zero_oid {
-            if head.target.as_deref() == Some(u.ref_name.as_str()) {
-                return Err(Error(
-                    StatusCode::CONFLICT,
-                    "cannot delete current HEAD branch",
-                ));
-            }
-        } else {
-            let kind = git_read::object_type(&state, repo_id, &u.new_oid).await?;
-            let Some(kind_str) = kind else {
-                return Err(Error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "target object does not exist",
-                ));
-            };
-            if u.ref_name.starts_with("refs/heads/") && kind_str != "commit" {
-                return Err(Error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "branch reference target must be a commit",
-                ));
-            }
-        }
-    }
+    validate_applied_updates(
+        &state,
+        repo_id,
+        repo_format,
+        &current_refs,
+        &head,
+        &normalized_updates,
+    )
+    .await?;
 
     let requested: Vec<journal::RefChange> = normalized_updates.iter().map(|u| journal::RefChange {
         ref_name: u.ref_name.clone(), old_oid: u.old_oid.clone(), new_oid: u.new_oid.clone(),
@@ -261,23 +239,8 @@ async fn execute_ref_transaction_inner(
 
     let journal_root = state.storage.root.join("journal");
     journal::mkdir(&journal_root).map_err(Error::internal)?;
-    let stdin_path = journal_root.join(format!(".tmp-stdin-{}", Uuid::new_v4()));
-    let mut stdin_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&stdin_path)
-        .map_err(Error::internal)?;
-    let _ = std::fs::remove_file(&stdin_path);
     let stdin_payload = build_update_ref_stdin_payload(&normalized_updates);
-    stdin_file
-        .write_all(&stdin_payload)
-        .map_err(Error::internal)?;
-    stdin_file
-        .seek(SeekFrom::Start(0))
-        .map_err(Error::internal)?;
+    let stdin_file = prepare_stdin_file(&journal_root, &stdin_payload)?;
 
     let idempotency = idem_key.as_deref().map(|key| {
         let (key_sha256, request_sha256) = idempotency::fingerprint(key, &request_json);
@@ -452,7 +415,7 @@ async fn execute_ref_transaction_inner(
         return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction settlement interrupted"));
     }
     if let Err(error) =
-        idempotency::record(&tx, tenant_id, repo_id, idem_key.as_deref(), &response_value).await
+        record_creation(&tx, tenant_id, repo_id, idem_key.as_deref(), &response_value).await
     {
         let _ = tx.rollback().await;
         let _ = reliability::reconcile(&state, repo_id, current_generation, false).await;

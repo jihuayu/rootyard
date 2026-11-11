@@ -1,11 +1,22 @@
 //! Native ref-transaction request models and wire-format construction.
-use crate::Error;
+use crate::{
+    AppState, Error,
+    browse::{
+        git_read,
+        models::{HeadInfo, RefItem, is_zero_oid, valid_oid, valid_public_ref},
+        object_format::{ObjectFormat, valid_oid_for_format},
+    },
+};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
+    io::{Seek, SeekFrom, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+};
 use uuid::Uuid;
-
-use super::models::{is_zero_oid, valid_oid, valid_public_ref};
 
 pub const MAX_REF_UPDATES: usize = 128;
 
@@ -141,6 +152,58 @@ impl RefTransactionRequest {
     }
 }
 
+pub async fn validate_applied_updates(
+    state: &AppState,
+    repo_id: Uuid,
+    object_format: ObjectFormat,
+    refs: &[RefItem],
+    head: &HeadInfo,
+    updates: &[AppliedRefUpdate],
+) -> Result<(), Error> {
+    let zero_oid = object_format.zero_oid();
+    let refs_map: HashMap<&str, &str> = refs
+        .iter()
+        .map(|r| (r.name.as_str(), r.oid.as_str()))
+        .collect();
+    for u in updates {
+        if !valid_oid_for_format(&u.old_oid, object_format)
+            || !valid_oid_for_format(&u.new_oid, object_format)
+        {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "ref transaction object format does not match repository",
+            ));
+        }
+        let actual_old = refs_map.get(u.ref_name.as_str()).copied().unwrap_or(zero_oid);
+        if actual_old != u.old_oid {
+            return Err(Error(StatusCode::CONFLICT, "reference old_oid mismatch"));
+        }
+        if u.new_oid == zero_oid {
+            if head.target.as_deref() == Some(u.ref_name.as_str()) {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "cannot delete current HEAD branch",
+                ));
+            }
+        } else {
+            let kind = git_read::object_type(state, repo_id, &u.new_oid).await?;
+            let Some(kind_str) = kind else {
+                return Err(Error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "target object does not exist",
+                ));
+            };
+            if u.ref_name.starts_with("refs/heads/") && kind_str != "commit" {
+                return Err(Error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "branch reference target must be a commit",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn build_update_ref_stdin_payload(updates: &[AppliedRefUpdate]) -> Vec<u8> {
     let mut sorted = updates.to_vec();
     sorted.sort_by(|a, b| a.ref_name.cmp(&b.ref_name));
@@ -157,4 +220,20 @@ pub fn build_update_ref_stdin_payload(updates: &[AppliedRefUpdate]) -> Vec<u8> {
     }
     buf.extend_from_slice(b"prepare\0commit\0");
     buf
+}
+
+pub fn prepare_stdin_file(journal_root: &Path, payload: &[u8]) -> Result<File, Error> {
+    let stdin_path = journal_root.join(format!(".tmp-stdin-{}", Uuid::new_v4()));
+    let mut stdin_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&stdin_path)
+        .map_err(Error::internal)?;
+    let _ = std::fs::remove_file(&stdin_path);
+    stdin_file.write_all(payload).map_err(Error::internal)?;
+    stdin_file.seek(SeekFrom::Start(0)).map_err(Error::internal)?;
+    Ok(stdin_file)
 }
