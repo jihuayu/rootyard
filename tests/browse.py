@@ -999,9 +999,10 @@ class BrowseHarness(Harness):
     def ref_transaction_settlement_recovery(self):
         """Exercise every Issue #14 boundary around the native CAS and SQL commit.
 
-        (a) a revoked writer is rejected by the pre-CAS re-check: refs stay
-            untouched, the claim and journal are released, and the same key can
-            be retried successfully once the writer is authorized again;
+        (a) a writer whose credential expires during the pre-CAS pause is
+            rejected by the re-check: refs stay untouched, the claim and
+            journal are released, and the same key can be retried successfully
+            once the writer is authorized again;
         (b) the outbox set was written inside the settlement transaction but
             that transaction had not committed: a process death rolls both
             back, so no operation/event is durable while the Git receipt and
@@ -1038,8 +1039,11 @@ class BrowseHarness(Harness):
                 + self.repo["id"] + "'"
             )
 
-        # (a) Failure before native publication, with a real token revocation.
-        revoked = self.account("create-token", "alice")
+        # (a) Failure before native publication: the credential expires while
+        # the request waits immediately before the native CAS. Revoking the
+        # token row cannot be used here because the request holds its FOR SHARE
+        # lock, which is exactly what makes revocation wait for settlement.
+        expiring = self.account("create-token", "alice")
         before_ref = "refs/heads/boundary-before-publication"
         before_payload = {"updates": [{"ref_name": before_ref, "old_oid": ZERO_OID,
                                        "new_oid": self.feature_oid}]}
@@ -1048,16 +1052,19 @@ class BrowseHarness(Harness):
         self.env[pause_env] = "3000"
         self.start()
         try:
+            self.sql("UPDATE tokens SET expires_at=clock_timestamp()+interval '2 seconds' "
+                     "WHERE id='" + self._sql_literal(expiring["token_id"]) + "'")
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(
-                    self.http, endpoint, token=revoked, method="POST",
+                    self.http, endpoint, token=expiring, method="POST",
                     body=before_payload,
                     extra_headers={"Idempotency-Key": before_key},
                 )
-                time.sleep(0.4)
-                self.cli("revoke-token", revoked["token_id"])
+                time.sleep(2.5)
                 status, body, _ = future.result(timeout=20)
             assert status == 401, (status, body[:200])
+            assert self.sql("SELECT expires_at <= clock_timestamp() FROM tokens WHERE id='"
+                            + self._sql_literal(expiring["token_id"]) + "'") == "t"
             assert self.git("--git-dir=" + str(self.bare), "show-ref", "--verify",
                             before_ref, check=False).returncode != 0
             assert self.ref_operations(before_ref) == []
@@ -1205,7 +1212,7 @@ class BrowseHarness(Harness):
         assert len(self.ref_operations(commit_ref)) == 1
         assert outbox_count(commit_ref) == 1
         return {
-            "pre_cas_revocation_released_claim": True,
+            "pre_cas_expiry_released_claim": True,
             "post_publish_rollback_created_no_settlement": True,
             "post_receipt_settlement_recovered": True,
             "post_commit_retirement_recovered": True,
