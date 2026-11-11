@@ -285,6 +285,9 @@ jobs:
         run: python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
       - name: Exercise sharded control-plane placement, lease/epoch fencing, and explicit refusal of unmeasured failover, rebalance and DR
         run: python3 tests/sharding.py --binary target/debug/rootyard --report test-results/sharding.json
+      - name: Exercise shard marker transition crash/rollback and restart reconciliation
+        timeout-minutes: 20
+        run: python3 tests/cluster_migration_phases_native.py --binary target/debug/rootyard --transitions-only --report test-results/shard-marker-transitions.json
       - name: Exercise labelled simulation-only 1/2/4-node sharding benchmark metadata receipts
         run: python3 tests/benchmark_tiers.py --binary target/debug/rootyard --report test-results/benchmark-tiers.json
       - name: Exercise explicitly labeled 4-tier reference models
@@ -305,6 +308,20 @@ jobs:
             --report organization_pagination=test-results/organization-pagination.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
             --report webhooks=test-results/webhooks.json \
+            --report shard_marker_transitions=test-results/shard-marker-transitions.json \
+            --require-case shard_marker_transitions=takeover-after-source-marker \
+            --require-case shard_marker_transitions=fence-audit-rollback \
+            --require-case shard_marker_transitions=fence-transition-before-commit \
+            --require-case shard_marker_transitions=fence-cutover-after-commit \
+            --require-case shard_marker_transitions=unfence-audit-rollback \
+            --require-case shard_marker_transitions=unfence-transition-before-commit \
+            --require-case shard_marker_transitions=unfence-cutover-after-commit \
+            --require-case shard_marker_transitions=degrade-audit-rollback \
+            --require-case shard_marker_transitions=degrade-transition-before-commit \
+            --require-case shard_marker_transitions=degrade-cutover-after-commit \
+            --require-case shard_marker_transitions=recover-audit-rollback \
+            --require-case shard_marker_transitions=recover-transition-before-commit \
+            --require-case shard_marker_transitions=recover-cutover-after-commit \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
@@ -314,7 +331,6 @@ jobs:
             --harness tests/metrics.py \
             --harness tests/webhook_worker_recovery.py \
             --harness tests/webhook_fairness.py \
-            --harness tests/webhooks.py \
             --harness tests/pulls.py \
             --harness tests/forge.py \
             --harness tests/e2e.py \
@@ -329,6 +345,7 @@ jobs:
             --harness tests/organization_pagination.py \
             --harness tests/web_detail_pagination.py \
             --harness tests/webhooks.py \
+            --harness tests/cluster_migration_phases_native.py \
             --harness tests/webhook_tenant_matrix.py \
             --fixture postgres=postgres:17 \
             --fixture workspace_mount_mode=direct \

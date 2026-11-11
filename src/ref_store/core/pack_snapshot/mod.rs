@@ -4,6 +4,20 @@
 //! [`MaterializedPackRead`] is an opaque owned local view; it grants no new
 //! serving or write authority and claims no physical Blob-byte backup.
 //!
+//! # Session proof (#174)
+//!
+//! [`PgPackSnapshotMaterializer::materialize_serving_read_sealed`] returns the
+//! view together with an internal [`VerifiedReadViewProof`] (non-empty
+//! captures only). `snapshot::build_sealed_view` uses it for every JSON read and
+//! keeps the [`MaterializedServingRead`] in the gateway's computed view only
+//! after the copy and `verify_refs` succeeded; `browse::finalize` then requires
+//! the fresh authorized lookup, the proof and the capture's own anchor to carry
+//! the identical cluster authority incarnation (unconditionally, with or without
+//! a session key set) before it may issue a session from that proof. A checked
+//! empty capture has no proof and never issues a token, but its anchor is still
+//! fenced. Git Smart HTTP still materializes through the unsealed
+//! [`PgPackSnapshotMaterializer::materialize_serving_read`].
+//!
 //! Serving-read addition (#107/#114/#144): [`PgServingReads`] is a separate,
 //! bounded **transient** read-pin family (migration 146). One GET captures the
 //! current refs/HEAD/registered membership under the same strict `pg_refstore`
@@ -13,7 +27,9 @@
 //! repository A5a quota is unchanged. [`ServingReadCapture`] is opaque and
 //! either a checked empty-repository observation or a real [`PackReadSnapshot`]
 //! with [`ReadSnapshotSourceKind::ServingTransient`]; the materializer routes
-//! that source kind to the migration-146 T2 recheck.
+//! that source kind to the migration-146 T2 recheck. Both shapes also keep the
+//! cluster authority incarnation the capture locked first (see
+//! `serving_read`), and T2 refuses when it moved.
 //!
 //! A5a: atomic, durable, complete **registered pack membership** snapshot plus a
 //! durable pin and permanent historical receipts (#107 foundation).
@@ -54,6 +70,7 @@ mod query;
 mod read_snapshot;
 mod receipt;
 mod request;
+mod serving_proof;
 mod serving_read;
 mod serving_read_request;
 mod serving_read_sql;
@@ -69,11 +86,15 @@ pub use contract::{
     TENANT_MAX_PACK_LOGICAL_BYTES, TENANT_MAX_PACK_PINS, TENANT_MAX_PACK_RECEIPTS, TENANT_MAX_PACK_REFS,
     TENANT_MAX_PACK_SNAPSHOTS, TENANT_PACK_FACTOR,
 };
+pub(crate) use materialize::MaterializedServingRead;
 pub use materialize::{MaterializedPackRead, PgPackSnapshotMaterializer};
 pub use pg::PgPackSnapshot;
 pub use read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
 pub use receipt::{PackPinReceipt, PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceipt};
 pub use request::{CreatePackSnapshotRequest, PackSnapshotExpectation, PackSnapshotReceiptQuery, PackSnapshotRef};
+pub(crate) use serving_proof::ProvenScope;
+#[cfg(test)]
+pub(crate) use serving_proof::probe_a5a;
 pub use serving_read::{PgServingReads, ServingReadCapture};
 pub use serving_read_request::{
     MAX_EXPIRED_SERVING_READ_RECLAIM, MAX_SERVING_READ_LEASE_SECONDS, MIN_SERVING_READ_LEASE_SECONDS,

@@ -133,6 +133,13 @@ impl ReadAuthorization {
     /// back before it returns, so no PostgreSQL client is held while the caller
     /// materializes Blob/Git data afterwards.
     pub(super) async fn revalidate(&self, deadline: Instant) -> Result<(), GatewayError> {
+        self.revalidate_serving(deadline).await.map(|_| ())
+    }
+
+    /// [`Self::revalidate`] that also returns the fresh authorized lookup, so a
+    /// caller can fence the cluster authority incarnation that lookup just read
+    /// (session issuance) and nothing else.
+    pub(super) async fn revalidate_serving(&self, deadline: Instant) -> Result<ServingRepository, GatewayError> {
         let serving = lookup(
             self.state.pool(),
             &self.actor,
@@ -144,7 +151,8 @@ impl ReadAuthorization {
         )
         .await
         .map_err(authority_error)?;
-        self.ensure_same_realm(&serving)
+        self.ensure_same_realm(&serving)?;
+        Ok(serving)
     }
 
     /// Compare a fresh serving lookup with the captured realm without doing

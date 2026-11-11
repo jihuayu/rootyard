@@ -140,12 +140,9 @@ pub fn pool_for(url: &str, schema: &str, max: usize) -> Result<Pool> {
 /// clean-up hook: a supervisor that terminates the process on a deadline would
 /// skip it anyway. Instead, every launch claims a fresh random schema and a
 /// fresh random remote prefix, so a killed run can never be reused, and the
-/// clean-up the suite does perform is reported through [`Db::teardown`],
-/// `db::delete_owned_prefix` and [`finish`].
+/// clean-up the suite does perform is reported through [`Db::teardown`].
 struct RunEnvironment {
     schema: String,
-    root: String,
-    previous_root: Option<std::ffi::OsString>,
 }
 
 impl RunEnvironment {
@@ -156,25 +153,14 @@ impl RunEnvironment {
         let pinned = with_search_path(&url, &schema)?;
         let root = format!("blob-gateway-suite/{}", Uuid::new_v4().simple());
         ensure!(!root.starts_with('/') && root.split('/').all(|part| !part.is_empty()), "fixture prefix is relative");
-        let previous_root = std::env::var_os(ROOT_ENV);
         // SAFETY: every read of these variables in this test binary goes through
         // this module's `OnceLock`, i.e. strictly after this single write, and
-        // `finish` only runs after the suite's only service process exited.
+        // the run-owned prefix is only read while this environment is pinned.
         unsafe {
             std::env::set_var("ROOTYARD_TEST_DATABASE_URL", &pinned);
             std::env::set_var(ROOT_ENV, &root);
         }
-        Ok(Self { schema, root, previous_root })
-    }
-
-    fn restore(&self) {
-        unsafe {
-            match &self.previous_root {
-                Some(value) => std::env::set_var(ROOT_ENV, value),
-                None => std::env::remove_var(ROOT_ENV),
-            }
-            std::env::remove_var("ROOTYARD_TEST_DATABASE_URL");
-        }
+        Ok(Self { schema })
     }
 }
 
@@ -189,30 +175,10 @@ pub fn prepare() -> Result<&'static str> {
     Ok(&environment.schema)
 }
 
-/// The remote object prefix this run owns.
-#[allow(dead_code)] // Blob-prefix clean-up lands with the storage fixture.
-pub fn owned_root() -> Result<&'static str> {
-    prepare()?;
-    Ok(RUN.get().map(|environment| environment.root.as_str()).expect("run environment was just prepared"))
-}
-
-/// Put the operator's environment back after the suite's service stopped and
-/// its schema and Blob prefix were deleted. Only this test process changes.
-#[allow(dead_code)] // Called when the storage fixture lands.
-pub fn finish() {
-    if let Some(environment) = RUN.get() {
-        environment.restore();
-    }
-}
-
 pub struct Db {
     admin: Pool,
     pub pool: Pool,
-    schema: String,
-    /// The pinned run URL (schema selector included); the launched service gets
-    /// exactly this value as `DATABASE_URL`.
-    #[allow(dead_code)] // Consumed by the service fixture.
-    url: String,
+    pub(super) schema: String,
 }
 
 impl Db {
@@ -244,18 +210,7 @@ impl Db {
             .get(0);
         ensure!(installed, "db::migrate did not install migration 144 and the core gate/pack tables");
         drop(client);
-        Ok(Self { admin, pool, schema, url })
-    }
-
-    /// The run database URL, already selecting [`Db::schema`]; this is what the
-    /// launched service receives as `DATABASE_URL`.
-    pub fn database_url(&self) -> &str {
-        &self.url
-    }
-
-    /// The run-owned schema installed by `db::migrate`.
-    pub fn schema(&self) -> &str {
-        &self.schema
+        Ok(Self { admin, pool, schema })
     }
 
     pub async fn teardown(&self) -> Result<()> {

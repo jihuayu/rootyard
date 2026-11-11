@@ -130,9 +130,40 @@ fn child_guard_refusal(error: &tokio_postgres::Error) -> Option<String> {
     (database.code().code() == "P0001").then(|| database.message().to_owned())
 }
 
+/// Names the production Blob profile's root prefix to this case alone, so a
+/// parallel case (for example `ref_store_serving_proof`) can never observe a
+/// different physical backend than the repository it provisioned against. The
+/// guard restores the previous value (and the parent copy on fork) on exit; this
+/// binary hashes into that prefix and downloads nothing from it.
+struct BlobRootIsolation(Option<std::ffi::OsString>);
+
+impl BlobRootIsolation {
+    fn new() -> Self {
+        let previous = std::env::var_os("ROOTYARD_BLOB_ROOT");
+        // SAFETY: the identity this case provisions, captures and materializes
+        // is built from the same value; every other case in this binary has its
+        // own guard or names its identity explicitly.
+        unsafe { std::env::set_var("ROOTYARD_BLOB_ROOT", format!("fixture-{}", Uuid::new_v4().simple())) };
+        Self(previous)
+    }
+}
+
+impl Drop for BlobRootIsolation {
+    fn drop(&mut self) {
+        // SAFETY: as above; the restore runs on every exit path.
+        unsafe {
+            match &self.0 {
+                Some(value) => std::env::set_var("ROOTYARD_BLOB_ROOT", value),
+                None => std::env::remove_var("ROOTYARD_BLOB_ROOT"),
+            }
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the production Blob profile"]
 async fn empty_repository_cycles_are_bounded_and_never_touch_the_retained_quota() -> Result<()> {
+    let _blob_root = BlobRootIsolation::new();
     let fixture = Fixture::new().await?;
     ensure_migration_146(&fixture).await?;
     let owner = actor(&fixture.pool, false).await?;
