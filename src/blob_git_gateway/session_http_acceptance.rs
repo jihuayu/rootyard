@@ -48,6 +48,10 @@
 //! URL, Git stderr, a token, the key, the database URL nor Blob secrets are
 //! ever printed.
 
+// The shared fixture tree is compiled whole by `tests/blob_git_gateway.rs`; this
+// harness drives only its session/HTTP subset, so the remaining helpers are
+// legitimately unused in the library test binary.
+#[allow(dead_code)]
 #[path = "../../tests/blob_gateway_support/mod.rs"]
 mod support;
 

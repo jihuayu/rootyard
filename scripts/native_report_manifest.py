@@ -35,6 +35,7 @@ REQUIRED_RECEIPT_FIELDS = ("binary_sha256", "source_inputs_sha256", "workspace_c
 JOB_KIND = "rootyard/native-acceptance-job-manifest"
 RELEASE_KIND = "rootyard/candidate-release-gate"
 FAILURE_KIND = "rootyard/native-acceptance-failure"
+BATCH_KIND = "rootyard/native-build-batch"
 SECRET_ENVIRONMENT = (
     "ROOTYARD_OBJECT_STORE_SECRET_KEY",
     "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
@@ -100,6 +101,18 @@ def pairs(values, flag):
     return result
 
 
+def required_cases(values):
+    result = {}
+    for value in values or []:
+        report, separator, case_name = value.partition("=")
+        require(
+            separator and report and case_name,
+            f"--require-case expects REPORT=CASE_NAME, got {value!r}",
+        )
+        result.setdefault(report, []).append(case_name)
+    return result
+
+
 def secret_values():
     return [value for value in (os.environ.get(name) for name in SECRET_ENVIRONMENT) if value and len(value) >= 8]
 
@@ -135,8 +148,245 @@ def load_receipt(path, binary_override):
     return receipt, file, binary
 
 
+def verify_batch_receipt(receipt, receipt_file, binary):
+    if not isinstance(receipt, dict) or "batch" not in receipt:
+        return None
+    batch = receipt["batch"]
+    require(isinstance(batch, dict), "batch receipt must be an object")
+    require(
+        batch.get("kind") == BATCH_KIND,
+        "batch receipt has an invalid kind",
+    )
+    batch_version = batch.get("receipt_version")
+    require(
+        isinstance(batch_version, int)
+        and not isinstance(batch_version, bool)
+        and batch_version > 0,
+        "batch receipt has an invalid receipt_version",
+    )
+    require(batch.get("binary") == binary.name, "batch receipt has an invalid binary")
+    require(
+        not receipt.get("implicit_build"),
+        "receipts produced by implicit builds cannot be accepted",
+    )
+    manifest_value = batch.get("manifest")
+    require(
+        isinstance(manifest_value, str) and manifest_value,
+        "batch receipt manifest must be a nonempty path string",
+    )
+    manifest_path = Path(manifest_value)
+    require(manifest_path.is_absolute(), "batch receipt manifest path must be absolute")
+    require(
+        manifest_path.exists() and manifest_path.is_file(),
+        "batch receipt manifest must be a regular file",
+    )
+    require(
+        manifest_path.is_symlink() is False,
+        "batch receipt manifest must not be a symlink",
+    )
+    targets = batch.get("targets")
+    require(
+        isinstance(targets, list) and targets,
+        "batch receipt targets must be a nonempty list",
+    )
+    require(
+        all(isinstance(target, str) and target for target in targets),
+        "batch receipt targets must be nonempty strings",
+    )
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ManifestError("batch receipt manifest is not valid JSON") from error
+    require(isinstance(manifest, dict), "batch receipt manifest must be an object")
+    require(
+        manifest.get("kind") == BATCH_KIND,
+        "batch receipt manifest has an invalid kind",
+    )
+    require(
+        manifest.get("status") == "passed",
+        "batch receipt manifest must have passed status",
+    )
+    manifest_version = manifest.get("manifest_version")
+    require(
+        isinstance(manifest_version, int)
+        and not isinstance(manifest_version, bool)
+        and manifest_version == batch_version,
+        "batch receipt manifest version does not match the batch receipt",
+    )
+
+    for field, receipt_value in (
+        ("source_commit", receipt.get("workspace_commit")),
+        ("source_inputs_sha256", receipt.get("source_inputs_sha256")),
+        ("toolchain", receipt.get("toolchain")),
+        ("architecture", receipt.get("architecture")),
+        ("target_directory", receipt.get("target_dir")),
+    ):
+        require(
+            manifest.get(field) == receipt_value,
+            "batch receipt manifest does not match the receipt",
+        )
+
+    manifest_build = manifest.get("build")
+    require(
+        isinstance(manifest_build, dict),
+        "batch receipt manifest build must be an object",
+    )
+    require(
+        manifest_build.get("command") == receipt.get("command"),
+        "batch receipt manifest does not match the receipt",
+    )
+
+    bound_inputs = manifest.get("bound_inputs")
+    require(
+        isinstance(bound_inputs, dict),
+        "batch receipt manifest bound_inputs must be an object",
+    )
+    receipt_bound_inputs = receipt.get("bound_inputs")
+    require(
+        isinstance(receipt_bound_inputs, dict),
+        "batch receipt bound_inputs must be an object",
+    )
+    bound_digest = bound_inputs.get("digest")
+    require(
+        isinstance(bound_digest, str) and bound_digest,
+        "batch receipt manifest bound_inputs digest must be a nonempty string",
+    )
+    require(
+        bound_digest == batch.get("bound_inputs_sha256"),
+        "batch receipt manifest bound_inputs digest does not match the batch receipt",
+    )
+    require(
+        bound_digest == receipt_bound_inputs.get("digest"),
+        "batch receipt manifest bound_inputs digest does not match the receipt",
+    )
+
+    clean = manifest.get("clean")
+    require(
+        isinstance(clean, dict),
+        "batch receipt manifest clean must be an object",
+    )
+    require(
+        isinstance(clean.get("commands"), int)
+        and not isinstance(clean.get("commands"), bool)
+        and clean.get("commands") == 1,
+        "batch receipt manifest clean.commands must be exactly 1",
+    )
+    require(
+        isinstance(manifest_build.get("commands"), int)
+        and not isinstance(manifest_build.get("commands"), bool)
+        and manifest_build.get("commands") == 1,
+        "batch receipt manifest build.commands must be exactly 1",
+    )
+
+    fresh_false_artifacts = manifest_build.get("fresh_false_artifacts")
+    require(
+        isinstance(fresh_false_artifacts, list) and len(fresh_false_artifacts) > 0,
+        "fresh_false_artifacts must be a non-empty list",
+    )
+    require(
+        all(isinstance(item, dict) for item in fresh_false_artifacts),
+        "fresh_false_artifacts items must be dicts",
+    )
+    require(
+        all(item.get("kind") in ("lib", "bin") for item in fresh_false_artifacts),
+        "fresh_false_artifacts kind must be lib or bin",
+    )
+    require(
+        all(
+            isinstance(item.get("target"), str) and item.get("target") != ""
+            for item in fresh_false_artifacts
+        ),
+        "fresh_false_artifacts target must be a non-empty string",
+    )
+    require(
+        all(item.get("fresh") is False for item in fresh_false_artifacts),
+        "fresh_false_artifacts fresh must be exactly False",
+    )
+    typed_targets = [(item.get("kind"), item.get("target")) for item in fresh_false_artifacts]
+    require(
+        len(typed_targets) == len(set(typed_targets)),
+        "Duplicate (kind, target) pair detected in fresh_false_artifacts",
+    )
+    require(
+        targets == [target for kind, target in typed_targets],
+        "targets must match typed_targets order",
+    )
+
+    artifacts = manifest.get("artifacts")
+    require(
+        isinstance(artifacts, list) and artifacts,
+        "batch receipt manifest artifacts must be a nonempty list",
+    )
+    require(
+        all(isinstance(artifact, dict) for artifact in artifacts),
+        "batch receipt manifest artifacts must be objects",
+    )
+
+    target_dir_value = receipt.get("target_dir")
+    require(
+        isinstance(target_dir_value, str)
+        and bool(target_dir_value)
+        and Path(target_dir_value).is_absolute(),
+        "receipt.target_dir must be a nonempty absolute path",
+    )
+    target_dir = Path(target_dir_value)
+    expected_binary = target_dir / "debug" / batch["binary"]
+    expected_receipt = target_dir / "debug" / f'{batch["binary"]}.build.json'
+
+    def resolves_to(entry_value, expected):
+        if not isinstance(entry_value, str) or not entry_value:
+            return False
+        try:
+            if not Path(entry_value).is_absolute():
+                return False
+            return Path(entry_value).resolve() == expected.resolve()
+        except (OSError, ValueError, RuntimeError):
+            return False
+
+    matched = [
+        artifact
+        for artifact in artifacts
+        if resolves_to(artifact.get("artifact"), expected_binary)
+        and resolves_to(artifact.get("receipt"), expected_receipt)
+    ]
+    require(
+        len(matched) == 1,
+        "batch receipt manifest must contain exactly one entry for the binary and receipt",
+    )
+    entry = matched[0]
+    require(entry.get("kind") == "bin", "batch receipt binary entry has an invalid kind")
+    require(
+        entry.get("fresh") is False,
+        "batch receipt binary entry must not be fresh",
+    )
+    require(
+        entry.get("implicit") is False,
+        "batch receipt binary entry must not be implicit",
+    )
+    require(
+        entry.get("target") in targets,
+        "batch receipt binary entry target is not listed in the batch targets",
+    )
+    require(
+        ("bin", entry.get("target")) in typed_targets,
+        "bin entry target must be in typed_targets",
+    )
+    require(
+        entry.get("sha256") == receipt.get("binary_sha256"),
+        "batch receipt binary digest does not match the receipt",
+    )
+
+    return {
+        "file": str(manifest_path.resolve()),
+        "sha256": digest(manifest_path),
+        "target": entry["target"],
+    }
+
+
 def job_manifest(args):
     receipt, receipt_file, binary = load_receipt(args.build_receipt, args.binary)
+    batch_manifest = verify_batch_receipt(receipt, receipt_file, binary)
     commit = args.expect_commit or receipt["workspace_commit"]
     require(
         commit == receipt["workspace_commit"],
@@ -147,6 +397,12 @@ def job_manifest(args):
 
     reports = pairs(args.report, "--report")
     require(reports, "at least one --report is required; a gate cannot pass without executed evidence")
+    case_requirements = required_cases(args.require_case)
+    missing_reports = [name for name in case_requirements if name not in reports]
+    require(
+        not missing_reports,
+        f"--require-case names report(s) not supplied by --report: {', '.join(repr(name) for name in missing_reports)}",
+    )
     report_records = {}
     for name, path in reports.items():
         text = read_text(path, f"report {name}")
@@ -166,6 +422,16 @@ def job_manifest(args):
         for case in cases:
             require(isinstance(case, dict), f"report {name}: malformed case record")
             require(case.get("status") == "passed", f"report {name}: case {case.get('name')!r} is not passed")
+        executed_names = set()
+        for case in cases:
+            case_name = case.get("name")
+            if isinstance(case_name, str):
+                executed_names.add(case_name)
+        for required_name in case_requirements.get(name, []):
+            require(
+                required_name in executed_names,
+                f"report {name}: required case {required_name!r} is absent",
+            )
         require(not data.get("failure_traceback"), f"report {name}: records a failure traceback")
         head = data.get("source_head")
         require(head in (None, commit), f"report {name}: produced from commit {head}, expected {commit}")
@@ -215,7 +481,12 @@ def job_manifest(args):
         "source_inputs_sha256": receipt["source_inputs_sha256"],
         "binary_sha256": receipt["binary_sha256"],
         "binary": str(binary),
-        "build_receipt": {"file": str(receipt_file), "sha256": digest(receipt_file), "rustc": receipt["rustc"]},
+        "build_receipt": {
+            "file": str(receipt_file),
+            "sha256": digest(receipt_file),
+            "rustc": receipt["rustc"],
+            **({"batch_manifest": batch_manifest} if batch_manifest is not None else {}),
+        },
         "build_command": receipt["command"],
         "harnesses": harnesses,
         "fixtures": fixtures,
@@ -268,6 +539,320 @@ def release_manifest(args):
                     f"{label}: downloaded file does not match the manifest sha256",
                 )
                 verified[f"{kind}:{record_name}"] = {"file": downloaded.name, "sha256": actual}
+        build_receipt = data.get("build_receipt")
+        require(isinstance(build_receipt, dict), f"job manifest {name}: build_receipt must be an object")
+        label = f"job manifest {name}: build receipt"
+        downloaded_receipt = artifact_file(artifact_dir, build_receipt, label)
+        receipt_sha256 = digest(downloaded_receipt)
+        require(
+            receipt_sha256 == build_receipt.get("sha256"),
+            f"{label}: downloaded file does not match the manifest sha256",
+        )
+        try:
+            receipt = json.loads(downloaded_receipt.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ManifestError(f"{label}: not valid JSON: {error}")
+        require(isinstance(receipt, dict), f"{label}: not a JSON object")
+        require(
+            receipt.get("workspace_commit") == data.get("source_commit"),
+            f"{label}: workspace_commit does not match the job source commit",
+        )
+        require(
+            receipt.get("source_inputs_sha256") == data.get("source_inputs_sha256"),
+            f"{label}: source_inputs_sha256 does not match the job source input digest",
+        )
+        require(
+            receipt.get("binary_sha256") == data.get("binary_sha256"),
+            f"{label}: binary_sha256 does not match the job binary digest",
+        )
+        require(
+            isinstance(build_receipt.get("rustc"), str) and build_receipt.get("rustc"),
+            f"{label}: build receipt rustc must be a nonempty string",
+        )
+        require(
+            receipt.get("rustc") == build_receipt.get("rustc"),
+            f"{label}: rustc does not match the job build receipt",
+        )
+        verified["build:receipt"] = {"file": downloaded_receipt.name, "sha256": receipt_sha256}
+
+        batch = receipt.get("batch")
+        if "batch" not in receipt:
+            require(
+                "batch_manifest" not in build_receipt,
+                f"job manifest {name}: standalone build receipt must not carry a batch manifest",
+            )
+        else:
+            require(isinstance(batch, dict), f"{label}: batch must be an object")
+            require(
+                batch.get("kind") == BATCH_KIND,
+                f"{label}: batch has an invalid kind {batch.get('kind')!r}",
+            )
+            batch_version = batch.get("receipt_version")
+            require(
+                isinstance(batch_version, int)
+                and not isinstance(batch_version, bool)
+                and batch_version > 0,
+                f"{label}: batch receipt_version must be a positive integer",
+            )
+            binary_name = batch.get("binary")
+            require(
+                isinstance(binary_name, str) and binary_name,
+                f"{label}: batch binary must be a nonempty string",
+            )
+            require(
+                isinstance(data.get("binary"), str) and data.get("binary"),
+                f"job manifest {name}: binary must be a nonempty path",
+            )
+            require(
+                Path(data["binary"]).name == binary_name,
+                f"job manifest {name}: binary {data['binary']!r} does not name batch binary {binary_name!r}",
+            )
+            require(
+                receipt.get("binary_sha256") == data.get("binary_sha256"),
+                f"{label}: receipt binary_sha256 does not match the job binary digest",
+            )
+            batch_targets = batch.get("targets")
+            require(
+                isinstance(batch_targets, list) and batch_targets,
+                f"{label}: batch targets must be a nonempty list",
+            )
+            require(
+                all(isinstance(target, str) and target for target in batch_targets),
+                f"{label}: batch targets must be nonempty strings",
+            )
+            receipt_bound = receipt.get("bound_inputs")
+            require(
+                isinstance(receipt_bound, dict),
+                f"{label}: bound_inputs must be an object",
+            )
+            batch_bound = batch.get("bound_inputs_sha256")
+            require(
+                isinstance(batch_bound, str) and batch_bound,
+                f"{label}: batch bound_inputs_sha256 must be a nonempty string",
+            )
+            require(
+                isinstance(receipt_bound.get("digest"), str) and receipt_bound.get("digest"),
+                f"{label}: bound_inputs digest must be a nonempty string",
+            )
+            require(
+                receipt_bound.get("digest") == batch_bound,
+                f"{label}: bound_inputs digest does not match batch bound_inputs_sha256",
+            )
+
+            batch_manifest = build_receipt.get("batch_manifest")
+            require(
+                isinstance(batch_manifest, dict),
+                f"job manifest {name}: batch build receipt requires a build_receipt.batch_manifest object",
+            )
+            require(
+                batch_manifest.get("target") == binary_name,
+                f"job manifest {name}: build_receipt.batch_manifest target {batch_manifest.get('target')!r} "
+                f"does not match batch binary {binary_name!r}",
+            )
+            recorded_manifest = batch_manifest.get("file")
+            require(
+                isinstance(recorded_manifest, str) and recorded_manifest,
+                f"job manifest {name}: build_receipt.batch_manifest file must be a nonempty path",
+            )
+            require(
+                Path(recorded_manifest).is_absolute(),
+                f"job manifest {name}: build_receipt.batch_manifest file must be absolute",
+            )
+            receipt_manifest = batch.get("manifest")
+            require(
+                isinstance(receipt_manifest, str) and receipt_manifest and Path(receipt_manifest).is_absolute(),
+                f"{label}: batch manifest must be a nonempty absolute path",
+            )
+            try:
+                manifest_paths_match = Path(recorded_manifest).resolve() == Path(receipt_manifest).resolve()
+            except (OSError, ValueError):
+                manifest_paths_match = False
+            require(
+                manifest_paths_match,
+                f"job manifest {name}: build_receipt.batch_manifest file does not match the receipt batch manifest",
+            )
+            require(
+                isinstance(batch_manifest.get("sha256"), str) and batch_manifest.get("sha256"),
+                f"job manifest {name}: build_receipt.batch_manifest sha256 is required",
+            )
+            manifest_label = f"job manifest {name}: batch manifest"
+            downloaded_manifest = artifact_file(artifact_dir, batch_manifest, manifest_label)
+            manifest_sha256 = digest(downloaded_manifest)
+            require(
+                manifest_sha256 == batch_manifest.get("sha256"),
+                f"{manifest_label}: downloaded file does not match the manifest sha256",
+            )
+            try:
+                manifest = json.loads(downloaded_manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise ManifestError(f"{manifest_label}: not valid JSON: {error}")
+            require(isinstance(manifest, dict), f"{manifest_label}: not a JSON object")
+
+            require(
+                manifest.get("kind") == BATCH_KIND,
+                f"{manifest_label}: invalid kind {manifest.get('kind')!r}",
+            )
+            require(
+                manifest.get("status") == "passed",
+                f"{manifest_label}: status must be 'passed'",
+            )
+            manifest_version = manifest.get("manifest_version")
+            require(
+                isinstance(manifest_version, int)
+                and not isinstance(manifest_version, bool)
+                and manifest_version == batch_version,
+                f"{manifest_label}: manifest_version must equal batch receipt_version",
+            )
+            for manifest_field, receipt_field in (
+                ("source_commit", "workspace_commit"),
+                ("source_inputs_sha256", "source_inputs_sha256"),
+                ("toolchain", "toolchain"),
+                ("architecture", "architecture"),
+                ("target_directory", "target_dir"),
+            ):
+                require(
+                    manifest.get(manifest_field) == receipt.get(receipt_field),
+                    f"{manifest_label}: {manifest_field} does not match receipt {receipt_field}",
+                )
+            manifest_build = manifest.get("build")
+            require(isinstance(manifest_build, dict), f"{manifest_label}: build must be an object")
+            require(
+                manifest_build.get("command") == receipt.get("command"),
+                f"{manifest_label}: build.command does not match the receipt command",
+            )
+            manifest_bound = manifest.get("bound_inputs")
+            require(isinstance(manifest_bound, dict), f"{manifest_label}: bound_inputs must be an object")
+            manifest_bound_digest = manifest_bound.get("digest")
+            require(
+                isinstance(manifest_bound_digest, str) and manifest_bound_digest,
+                f"{manifest_label}: bound_inputs digest must be a nonempty string",
+            )
+            require(
+                manifest_bound_digest == receipt_bound.get("digest"),
+                f"{manifest_label}: bound_inputs digest does not match the receipt",
+            )
+            manifest_clean = manifest.get("clean")
+            require(isinstance(manifest_clean, dict), f"{manifest_label}: clean must be an object")
+            require(
+                isinstance(manifest_clean.get("commands"), int)
+                and not isinstance(manifest_clean.get("commands"), bool)
+                and manifest_clean.get("commands") == 1,
+                f"{manifest_label}: clean.commands must be exactly 1",
+            )
+            require(
+                isinstance(manifest_build.get("commands"), int)
+                and not isinstance(manifest_build.get("commands"), bool)
+                and manifest_build.get("commands") == 1,
+                f"{manifest_label}: build.commands must be exactly 1",
+            )
+
+            fresh_false_artifacts = manifest_build.get("fresh_false_artifacts")
+            require(
+                isinstance(fresh_false_artifacts, list) and fresh_false_artifacts,
+                f"{manifest_label}: build.fresh_false_artifacts must be a nonempty list",
+            )
+            require(
+                all(isinstance(item, dict) for item in fresh_false_artifacts),
+                f"{manifest_label}: build.fresh_false_artifacts entries must be objects",
+            )
+            require(
+                all(item.get("kind") in ("lib", "bin") for item in fresh_false_artifacts),
+                f"{manifest_label}: build.fresh_false_artifacts kind must be 'lib' or 'bin'",
+            )
+            require(
+                all(
+                    isinstance(item.get("target"), str) and item.get("target")
+                    for item in fresh_false_artifacts
+                ),
+                f"{manifest_label}: build.fresh_false_artifacts target must be a nonempty string",
+            )
+            require(
+                all(item.get("fresh") is False for item in fresh_false_artifacts),
+                f"{manifest_label}: build.fresh_false_artifacts fresh must be exactly false",
+            )
+            typed_targets = [(item.get("kind"), item.get("target")) for item in fresh_false_artifacts]
+            require(
+                len(typed_targets) == len(set(typed_targets)),
+                f"{manifest_label}: duplicate (kind, target) pair in build.fresh_false_artifacts",
+            )
+            require(
+                batch_targets == [target for kind, target in typed_targets],
+                f"{manifest_label}: batch targets {batch_targets!r} do not match "
+                f"fresh_false_artifacts targets {[target for kind, target in typed_targets]!r}",
+            )
+            require(
+                ("bin", binary_name) in typed_targets,
+                f"{manifest_label}: no fresh-false (bin, {binary_name}) target recorded",
+            )
+
+            target_dir = receipt.get("target_dir")
+            require(
+                isinstance(target_dir, str) and target_dir and Path(target_dir).is_absolute(),
+                f"{label}: target_dir must be a nonempty absolute path",
+            )
+            expect_binary = Path(target_dir) / "debug" / binary_name
+            expect_receipt = Path(target_dir) / "debug" / f"{binary_name}.build.json"
+            try:
+                expected_binary_path = expect_binary.resolve()
+                expected_receipt_path = expect_receipt.resolve()
+            except (OSError, ValueError) as error:
+                raise ManifestError(f"{label}: cannot resolve the original batch artifact paths: {error}")
+
+            def original_path_matches(value):
+                if not isinstance(value, str) or not value:
+                    return False
+                path = Path(value)
+                if not path.is_absolute():
+                    return False
+                try:
+                    return Path(value).resolve()
+                except (OSError, ValueError):
+                    return None
+
+            artifacts = manifest.get("artifacts")
+            require(
+                isinstance(artifacts, list) and artifacts,
+                f"{manifest_label}: artifacts must be a nonempty list",
+            )
+            require(
+                all(isinstance(artifact, dict) for artifact in artifacts),
+                f"{manifest_label}: artifacts entries must be objects",
+            )
+            matched = [
+                artifact
+                for artifact in artifacts
+                if original_path_matches(artifact.get("artifact")) == expected_binary_path
+                and original_path_matches(artifact.get("receipt")) == expected_receipt_path
+            ]
+            require(
+                len(matched) == 1,
+                f"{manifest_label}: expected exactly one artifacts entry for {expect_binary} and {expect_receipt}, "
+                f"got {len(matched)}",
+            )
+            entry = matched[0]
+            require(
+                entry.get("kind") == "bin",
+                f"{manifest_label}: binary artifacts entry kind must be 'bin'",
+            )
+            require(
+                entry.get("target") == binary_name,
+                f"{manifest_label}: binary artifacts entry target {entry.get('target')!r} "
+                f"does not match binary {binary_name!r}",
+            )
+            require(
+                entry.get("fresh") is False,
+                f"{manifest_label}: binary artifacts entry fresh must be exactly false",
+            )
+            require(
+                entry.get("implicit") is False,
+                f"{manifest_label}: binary artifacts entry implicit must be exactly false",
+            )
+            require(
+                entry.get("sha256") == receipt.get("binary_sha256"),
+                f"{manifest_label}: binary artifacts entry sha256 does not match the receipt binary_sha256",
+            )
+
+            verified["build:batch_manifest"] = {"file": downloaded_manifest.name, "sha256": manifest_sha256}
         for report_name, record in reports.items():
             require(report_name not in all_reports, f"report {report_name!r} is claimed by two jobs")
             all_reports[report_name] = {**record, "job": name, "downloaded_sha256": verified[f"report:{report_name}"]["sha256"]}
@@ -353,6 +938,7 @@ def main():
     parser.add_argument("--build-receipt")
     parser.add_argument("--binary")
     parser.add_argument("--report", action="append", default=[])
+    parser.add_argument("--require-case", action="append", default=[])
     parser.add_argument("--log", action="append", default=[])
     parser.add_argument("--log-marker", action="append", default=[])
     parser.add_argument("--harness", action="append", default=[])

@@ -16,6 +16,11 @@ import urllib.parse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness  # noqa: E402
 import schema_baseline  # noqa: E402
+from lfs_remote_contract import (  # noqa: E402
+    cleanup_run_tenant_lfs_prefix,
+    configure_metrics_listener,
+    run_remote_outage_contract,
+)
 
 LFS_MIME = "application/vnd.git-lfs+json"
 
@@ -546,11 +551,31 @@ def main():
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--remote-read-contract", action="store_true")
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
         parser.error("ROOTYARD_TEST_DATABASE_URL is required")
+    remote_read_contract = args.remote_read_contract
+    if remote_read_contract:
+        required_remote_vars = (
+            "ROOTYARD_OBJECT_STORE_ENDPOINT",
+            "ROOTYARD_OBJECT_STORE_BUCKET",
+            "ROOTYARD_OBJECT_STORE_REGION",
+            "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+            "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+        )
+        missing_remote_vars = [
+            name for name in required_remote_vars if not os.environ.get(name)
+        ]
+        if missing_remote_vars:
+            parser.error(
+                "--remote-read-contract requires nonempty environment variables: "
+                + ", ".join(missing_remote_vars)
+            )
     harness = LfsHarness(args)
+    if remote_read_contract:
+        configure_metrics_listener(harness)
     success = False
     try:
         for name in (
@@ -566,10 +591,38 @@ def main():
             "paired_backup_and_restore",
         ):
             harness.case(name, getattr(harness, name))
+            if name == "setup_lfs" and remote_read_contract:
+                harness.case(
+                    "remote_read_contract",
+                    lambda: run_remote_outage_contract(harness),
+                )
         success = True
     except Exception as error:
         print(harness.redact(error), file=sys.stderr)
     finally:
+        if (
+            os.environ.get("ROOTYARD_OBJECT_STORE_ENDPOINT")
+            and getattr(harness, "repo", None)
+        ):
+            try:
+                deleted = cleanup_run_tenant_lfs_prefix(harness)
+            except Exception:
+                harness.results.append(
+                    dict(
+                        name="garage_lfs_cleanup",
+                        status="failed",
+                        error="garage_lfs_cleanup failed",
+                    )
+                )
+                success = False
+            else:
+                harness.results.append(
+                    dict(
+                        name="garage_lfs_cleanup",
+                        status="passed",
+                        deleted=int((deleted or {}).get("deleted", 0)),
+                    )
+                )
         try:
             harness.cleanup()
         except Exception as error:

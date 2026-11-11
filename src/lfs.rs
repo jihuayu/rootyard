@@ -4,6 +4,7 @@ mod hydration;
 pub mod locks;
 pub mod models;
 pub mod publication;
+pub(crate) mod remote_metrics;
 pub mod storage;
 mod upload;
 mod verification;

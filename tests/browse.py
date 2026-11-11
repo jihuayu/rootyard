@@ -17,6 +17,7 @@ import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness  # noqa: E402
+from browse_ref_scale import verify_ref_scale  # noqa: E402
 
 ZERO_OID = "0" * 40
 
@@ -38,6 +39,7 @@ CASE_NAMES = (
     "access_and_fences",
     "object_format_and_negotiation",
     "bounded_ref_and_commit_pages",
+    "ref_scale_complete_traversal",
     "selective_ref_prefix",
     "protected_writes_and_ref_ack_failure",
 )
@@ -627,6 +629,9 @@ class BrowseHarness(Harness):
             after = len(count_path.read_text().splitlines())
             assert after - before == 2, (size, after - before)
         packed.write_text("# pack-refs with: peeled fully-peeled sorted\n" + "\n".join(existing) + "\n")
+
+    def ref_scale_complete_traversal(self):
+        return verify_ref_scale(self)
 
     def selective_ref_prefix(self):
         # A literal prefix narrower than a whole namespace must count the page

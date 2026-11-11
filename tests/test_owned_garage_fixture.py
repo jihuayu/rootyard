@@ -376,13 +376,17 @@ class ColdCacheImageTest(FixtureGuardTest):
 
     def test_layout_mutation_waits_for_read_only_rpc_ready(self):
         # node id is readable immediately, but the RPC handshake fails twice
-        # first: no layout mutation may be issued before a status succeeds.
+        # first: no layout mutation may be issued before a status succeeds. The
+        # 10s budget leaves room for the two failed attempts, the 1s pauses
+        # between them and the successful third attempt even on a loaded CI
+        # runner; the short-budget tests below still pin the absolute failure
+        # bound, so this does not weaken the startup safety contract.
         directory = self.root / "cold"
         process, _ = self.bound_start(
             directory,
             env={
                 "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
-                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "3",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "10",
                 "STUB_STATUS_FAILS": "2",
             },
         )
