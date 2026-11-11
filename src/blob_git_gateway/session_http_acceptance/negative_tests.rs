@@ -31,9 +31,18 @@ async fn pushed(db: &Db, label: &str) -> Result<(Gateway, Actor, String, String)
 }
 
 /// One valid, unexpired session token obtained through a real HTTP read.
-async fn issued_token(gateway: &Gateway, client: &reqwest::Client, owner: &Actor, name: &str) -> Result<String> {
-    let answer =
-        json_read(client, &format!("{}/refs", gateway.base(&owner.username, name)), &owner.token, None).await?;
+///
+/// `actor` authenticates and is issued the token; `repo_owner` is the personal
+/// namespace the repository actually lives in, which may be another actor (a
+/// repository collaborator).
+async fn issued_token(
+    gateway: &Gateway,
+    client: &reqwest::Client,
+    actor: &Actor,
+    repo_owner: &str,
+    name: &str,
+) -> Result<String> {
+    let answer = json_read(client, &format!("{}/refs", gateway.base(repo_owner, name)), &actor.token, None).await?;
     Ok(answer.session.admit()?.token)
 }
 
@@ -44,7 +53,7 @@ async fn cross_repository_session_replay_is_refused() -> Result<()> {
     let outcome = async {
         let (gateway, owner, name_a, oid_a) = pushed(&db, "replay-repo").await?;
         let client = reqwest::Client::new();
-        let token = issued_token(&gateway, &client, &owner, &name_a).await?;
+        let token = issued_token(&gateway, &client, &owner, &owner.username, &name_a).await?;
 
         // A second repository of the same tenant exists and is authorized for
         // the same owner, so only the signed repository binding can refuse it.
@@ -72,7 +81,7 @@ async fn cross_tenant_session_replay_is_refused() -> Result<()> {
     let outcome = async {
         let (gateway, owner_a, name_a, oid_a) = pushed(&db, "replay-tenant-a").await?;
         let client = reqwest::Client::new();
-        let token = issued_token(&gateway, &client, &owner_a, &name_a).await?;
+        let token = issued_token(&gateway, &client, &owner_a, &owner_a.username, &name_a).await?;
 
         // Tenant B's authorized owner creates and authorizes its own repository.
         let owner_b = actor::owner(&db.pool).await?;
@@ -138,7 +147,7 @@ async fn tampered_session_token_is_refused_over_http() -> Result<()> {
     let outcome = async {
         let (gateway, owner, name, oid) = pushed(&db, "forged-token").await?;
         let client = reqwest::Client::new();
-        let token = issued_token(&gateway, &client, &owner, &name).await?;
+        let token = issued_token(&gateway, &client, &owner, &owner.username, &name).await?;
         let forged = flip_mac(&token)?;
         let denied =
             raw_get(&client, &format!("{}/refs", gateway.base(&owner.username, &name)), &owner.token, Some(&forged))
@@ -164,7 +173,7 @@ async fn revoked_collaborator_session_is_refused_before_token_scoring() -> Resul
         add_read_collaborator(&db, repo.gate.repository_id(), repo.gate.tenant_id(), collaborator.identity.id).await?;
 
         let client = reqwest::Client::new();
-        let token = issued_token(&gateway, &client, &collaborator, &name).await?;
+        let token = issued_token(&gateway, &client, &collaborator, &owner.username, &name).await?;
         remove_collaborator(&db, repo.gate.repository_id(), collaborator.identity.id).await?;
 
         // The token is still authentic and unexpired, but the live repository
@@ -198,7 +207,7 @@ async fn missing_registered_pack_fails_closed_without_a_session() -> Result<()> 
     let outcome = async {
         let (gateway, owner, name, oid) = pushed(&db, "missing-pack").await?;
         let client = reqwest::Client::new();
-        let token = issued_token(&gateway, &client, &owner, &name).await?;
+        let token = issued_token(&gateway, &client, &owner, &owner.username, &name).await?;
 
         // The token is valid, the refs are durable, but the acknowledged pack
         // bytes are gone from the shared Blob store.

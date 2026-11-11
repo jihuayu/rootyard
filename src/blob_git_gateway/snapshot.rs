@@ -227,21 +227,22 @@ async fn build_into(
         write_refs(git.repo(), &view.refs, &view.head_ref)?;
         return Ok(None);
     };
-    let materializer =
-        PgPackSnapshotMaterializer::new(state.store().clone(), state.git_binary().to_path_buf()).map_err(ref_error)?;
+    let materializer = PgPackSnapshotMaterializer::new(state.store().clone(), state.git_binary().to_path_buf())
+        .map_err(materialize_error)?;
     // The sealed read owns its view, so it stays a local until the final
     // return; every copy below borrows that same owned view.
     let sealed = match mode {
-        Materializer::Sealed => {
-            materializer.materialize_serving_read_sealed(state.pool(), handle, deadline).await.map_err(ref_error)?
-        }
+        Materializer::Sealed => materializer
+            .materialize_serving_read_sealed(state.pool(), handle, deadline)
+            .await
+            .map_err(materialize_error)?,
         Materializer::Unsealed => None,
     };
     // Smart HTTP materializes an owned unsealed view in its own local; the
     // sealed path never builds one, so no proof is ever cloned or invented.
     let unsealed = match mode {
         Materializer::Unsealed => {
-            materializer.materialize_serving_read(state.pool(), handle, deadline).await.map_err(ref_error)?
+            materializer.materialize_serving_read(state.pool(), handle, deadline).await.map_err(materialize_error)?
         }
         Materializer::Sealed => None,
     };
@@ -266,8 +267,8 @@ async fn build_into(
         .map_err(|_| GatewayError::Internal("could not create the temporary pack directory"))?;
     for pack in read.packs() {
         let pack_id = pack.pack_id();
-        let pack_bytes = read.pack_bytes(pack_id, deadline).await.map_err(ref_error)?;
-        let idx_bytes = read.idx_bytes(pack_id, deadline).await.map_err(ref_error)?;
+        let pack_bytes = read.pack_bytes(pack_id, deadline).await.map_err(materialize_error)?;
+        let idx_bytes = read.idx_bytes(pack_id, deadline).await.map_err(materialize_error)?;
         // The membership UUID is not a Git pack filename. The materializer
         // already verified these exact bytes and the pack/index checksum pair;
         // use their object-format-sized pack checksum as Git's canonical stem.
@@ -391,4 +392,16 @@ pub(super) async fn capture_baseline(
 
 pub(super) fn ref_error(error: RefStoreError) -> GatewayError {
     error.into()
+}
+
+/// Post-capture pack snapshot materialization never answers `400`: an
+/// `Unsupported` refusal here means the registered bytes could not be verified
+/// (missing/unreadable/corrupted Blob artifact or unusable materialization
+/// metadata), which is a server-side failure. The ref-view capture above keeps
+/// [`ref_error`] so genuine repository-provisioning refusals stay `400`.
+pub(super) fn materialize_error(error: RefStoreError) -> GatewayError {
+    match GatewayError::from(error) {
+        GatewayError::Unsupported(_) => GatewayError::Internal("verified pack snapshot could not be materialized"),
+        other => other,
+    }
 }

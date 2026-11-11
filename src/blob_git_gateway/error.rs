@@ -102,6 +102,19 @@ impl From<crate::ref_store::RefStoreError> for GatewayError {
         match error {
             Ref::Timeout => Self::Timeout,
             Ref::RepositoryNotFound => Self::NotFound,
+            // Post-capture pack materialization refusals are never a client
+            // verdict. A missing/unreadable/corrupted registered artifact is a
+            // transient 503, and unusable materialization metadata is an opaque
+            // 500. An unprovisioned/`metadata_only` repository keeps the
+            // explicit `400 Unsupported` below.
+            Ref::Unsupported("native materialized read verification is unavailable")
+            | Ref::Unsupported("materialized read PostgreSQL pool is unavailable") => {
+                Self::Unavailable("verified pack snapshot is unavailable")
+            }
+            Ref::Unsupported("materialized read metadata is not valid")
+            | Ref::Unsupported("unknown materialized pack id") => {
+                Self::Internal("verified pack snapshot could not be materialized")
+            }
             Ref::Unsupported(reason) => Self::Unsupported(reason),
             // A durable pending row is an unknown outcome. The client must query
             // the same operation id; it must never be reported as a ref result.
@@ -131,8 +144,100 @@ impl From<crate::ref_store::core::pack_commit::PackCommitError> for GatewayError
             Pack::Invalid(_) => Self::BadRequest("publication plan is invalid"),
             Pack::Capacity { .. } => Self::TooLarge,
             Pack::Rejected(_) => Self::Conflict("publication was rejected by the core ledger"),
-            Pack::ProofUnavailable(_) => Self::Unsupported("native pack verification is unavailable"),
+            // A registered artifact that cannot be re-verified is a transient
+            // server-side failure, never a client bad request.
+            Pack::ProofUnavailable(_) => Self::Unavailable("native pack verification is unavailable"),
             Pack::CommitUnknown { .. } => Self::OutcomeUnknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::to_bytes,
+        http::{HeaderMap, StatusCode, header},
+        response::IntoResponse,
+    };
+
+    use super::GatewayError;
+    use crate::{blob_git_gateway::snapshot, ref_store::RefStoreError};
+
+    async fn render(error: GatewayError) -> (StatusCode, HeaderMap, String) {
+        let response = error.into_response();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), 8 * 1024).await.expect("gateway body");
+        (status, headers, String::from_utf8(body.to_vec()).expect("gateway body is UTF-8"))
+    }
+
+    async fn assert_opaque_server_error(error: GatewayError, expected: StatusCode, expected_body: &str) {
+        let (status, headers, body) = render(error).await;
+        assert_eq!(status, expected);
+        assert!(status.is_server_error(), "a failed materialization must never be a client verdict");
+        assert_eq!(body, expected_body);
+        assert_eq!(headers.get(header::CACHE_CONTROL).and_then(|value| value.to_str().ok()), Some("no-store"));
+        assert!(headers.get("x-rootyard-session").is_none(), "a refused materialization must not issue a session");
+        assert!(!body.contains("s3://") && !body.contains("secret-key"), "provider details leaked: {body}");
+    }
+
+    #[tokio::test]
+    async fn missing_or_unreadable_pack_proof_is_an_opaque_service_unavailable() {
+        for reason in
+            ["native materialized read verification is unavailable", "materialized read PostgreSQL pool is unavailable"]
+        {
+            let direct = GatewayError::from(RefStoreError::Unsupported(reason));
+            assert_eq!(direct.status(), StatusCode::SERVICE_UNAVAILABLE, "{reason}");
+            let boundary = snapshot::materialize_error(RefStoreError::Unsupported(reason));
+            assert_eq!(boundary.status(), StatusCode::SERVICE_UNAVAILABLE, "{reason}");
+            assert_opaque_server_error(
+                boundary,
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"verified pack snapshot is unavailable"}"#,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn post_capture_materializer_refusals_are_never_bad_requests() {
+        for reason in [
+            "materialized read metadata is not valid",
+            "unknown materialized pack id",
+            "materialized view exceeds its workspace bound",
+            "native materialized read verification is unavailable",
+        ] {
+            let mapped = snapshot::materialize_error(RefStoreError::Unsupported(reason));
+            assert!(mapped.status().is_server_error(), "{reason} mapped to {}", mapped.status());
+        }
+        for reason in ["materialized read metadata is not valid", "unknown materialized pack id"] {
+            assert_opaque_server_error(
+                snapshot::materialize_error(RefStoreError::Unsupported(reason)),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"verified pack snapshot could not be materialized"}"#,
+            )
+            .await;
+        }
+        // The ref-view capture keeps the explicit 400 for an unprovisioned or
+        // `metadata_only` repository; the post-capture boundary still fails
+        // closed with 500 if such a refusal ever reached it.
+        let unprovisioned = "repository is not provisioned for core serving";
+        assert_eq!(GatewayError::from(RefStoreError::Unsupported(unprovisioned)).status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            snapshot::materialize_error(RefStoreError::Unsupported(unprovisioned)).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn database_errors_do_not_leak_provider_details() {
+        let error = RefStoreError::Database("s3://bucket/secret-key".into());
+        assert_opaque_server_error(
+            snapshot::materialize_error(error.clone()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"metadata operation was refused"}"#,
+        )
+        .await;
+        assert_eq!(GatewayError::from(error).status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
