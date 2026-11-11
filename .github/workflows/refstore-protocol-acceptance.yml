@@ -13,6 +13,8 @@ on:
       - 'tests/ref_store_*.rs'
       - 'tests/retention_roots_support/**'
       - 'tests/decision_subset_support/**'
+      - 'tests/blob_git_gateway.rs'
+      - 'tests/blob_gateway_support/**'
       - 'tests/blob_only_service.py'
       - 'tests/blob_gateway_browse.py'
       - 'tests/blob_gateway_history.py'
@@ -140,6 +142,202 @@ jobs:
           python3 -m pip install -r tests/requirements-blob-backup.txt
           python3 tests/backup_blob_serving147.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --report test-results/refstore/standalone-paired-backup.json
+      - name: 'Run the #126 native receive-pack acceptance on the external test and serving binaries'
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          set -euo pipefail
+          pair="$RUNNER_TEMP/refstore-126-pair"
+          mkdir -p "$pair" test-results/refstore/blob_git_gateway
+          git_status="$(git status --porcelain --untracked-files=normal)"
+          if [ -n "$git_status" ]; then
+            echo "worktree check failed: the worktree is not clean before building the #126 test pair" >&2
+            exit 1
+          fi
+          test_binary="$pair/blob-git-gateway"
+          serving_binary="$pair/rootyard"
+          # Both builders run to completion before anything consumes their outputs; receipts stay external.
+          python3 scripts/build_native_test.py --test blob_git_gateway --features pando-lab \
+            --no-default-features --package-debug 0 --strip-debuginfo --output "$test_binary"
+          python3 scripts/build_native.py --features pando-lab --no-default-features \
+            --package-debug 0 --strip-debuginfo
+          cp target/debug/rootyard "$serving_binary"
+          cp target/debug/rootyard.build.json "$pair/rootyard.build.json"
+          test_receipt="$test_binary.build.json"
+          serving_receipt="$pair/rootyard.build.json"
+          [ -x "$test_binary" ] && [ -f "$test_receipt" ]
+          [ -x "$serving_binary" ] && [ -f "$serving_receipt" ]
+          git_status="$(git status --porcelain --untracked-files=normal)"
+          if [ -n "$git_status" ]; then
+            echo "worktree check failed: the worktree is not clean after both #126 builders completed" >&2
+            exit 1
+          fi
+          python3 - "$test_receipt" "$serving_receipt" "$test_binary" "$serving_binary" tests/blob_git_gateway.rs <<'PY'
+          import hashlib, json, pathlib, subprocess, sys
+
+          test_receipt_path, serving_receipt_path, test_binary, serving_binary, test_source = sys.argv[1:]
+          test_receipt = json.loads(pathlib.Path(test_receipt_path).read_text())
+          serving_receipt = json.loads(pathlib.Path(serving_receipt_path).read_text())
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+
+          def check(condition, message):
+              if not condition:
+                  raise SystemExit('build receipt verification failed: ' + message)
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with open(path, 'rb') as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def receipts_of(receipt, label):
+              if not isinstance(receipt, dict):
+                  raise SystemExit('build receipt verification failed: ' + label + ' receipt is not an object')
+              entries = receipt.get('fresh_false_artifacts')
+              check(isinstance(entries, list) and entries,
+                    label + ' receipt has no fresh_false_artifacts entries')
+              for index, entry in enumerate(entries):
+                  check(isinstance(entry, dict) and entry.get('fresh') is False,
+                        label + ' fresh_false_artifacts[' + str(index) + '] is not fresh=false')
+                  yield entry
+
+          check(test_receipt.get('workspace_commit') == head, 'test receipt workspace_commit differs from HEAD')
+          check(serving_receipt.get('workspace_commit') == head, 'product receipt workspace_commit differs from HEAD')
+          check(isinstance(test_receipt.get('source_inputs_sha256'), str)
+                and test_receipt.get('source_inputs_sha256') == serving_receipt.get('source_inputs_sha256'),
+                'test and product receipts disagree on source_inputs_sha256')
+          check(test_receipt.get('fresh') is False, 'test receipt fresh is not false')
+          check(test_receipt.get('kind') == 'rust-integration-test', 'test receipt kind is not rust-integration-test')
+          check(test_receipt.get('relocated_artifact') is True, 'test receipt does not describe a relocated artifact')
+          check(test_receipt.get('package_rebuilt') is True, 'test receipt does not record a package rebuild')
+          check(test_receipt.get('integration_test_source_sha256') == sha256(test_source),
+                'test receipt source SHA does not match tests/blob_git_gateway.rs')
+          check(test_receipt.get('binary_sha256') == sha256(test_binary),
+                'relocated test executable SHA-256 does not match its receipt')
+          check(serving_receipt.get('binary_sha256') == sha256(serving_binary),
+                'copied rootyard executable SHA-256 does not match its receipt')
+
+          closure_paths = subprocess.check_output(
+              ['git', 'ls-files', '-z', '--', 'tests/blob_git_gateway.rs', 'tests/blob_gateway_support'],
+              text=True).split('\0')
+          closure_files = sorted(path for path in closure_paths if path)
+          check(test_source in closure_files,
+                'tracked test source closure does not include ' + test_source)
+          check(len(closure_files) == len(set(closure_files)),
+                'tracked test source closure lists duplicate paths')
+          check(all(pathlib.Path(path).is_file() for path in closure_files),
+                'tracked test source closure lists files that do not exist')
+          closure_digest = hashlib.sha256()
+          for path in closure_files:
+              file_sha = sha256(path)
+              closure_digest.update(b'tests/blob-git-gateway-closure\0')
+              closure_digest.update(path.encode('utf-8') + b'\0')
+              closure_digest.update(file_sha.encode('ascii') + b'\n')
+
+          test_artifacts = list(receipts_of(test_receipt, 'test'))
+          selected = [entry for entry in test_artifacts
+                      if entry.get('target') == 'blob_git_gateway' and entry.get('kind') == 'test']
+          check(len(selected) == 1, 'test receipt does not name exactly one blob_git_gateway/test artifact')
+          check(len(test_artifacts) == 1, 'test receipt names extra fresh artifacts')
+          serving_artifacts = list(receipts_of(serving_receipt, 'product'))
+          binaries = [entry for entry in serving_artifacts
+                      if entry.get('target') == 'rootyard' and entry.get('kind') == 'bin']
+          check(len(binaries) == 1, 'product receipt does not name exactly one rootyard/bin artifact')
+
+          manifest = {
+              'version': 1, 'issue': 126, 'test': 'blob_git_gateway',
+              'workspace_commit': head,
+              'source_inputs_sha256': test_receipt['source_inputs_sha256'],
+              'test_source_closure': {'sha256': closure_digest.hexdigest(), 'files': closure_files},
+              'test_executable': {'name': 'blob-git-gateway', 'sha256': sha256(test_binary)},
+              'serving_executable': {'name': 'rootyard', 'sha256': sha256(serving_binary)},
+              'test_receipt': {'fresh': test_receipt['fresh'],
+                               'fresh_false_artifacts': test_artifacts},
+              'serving_receipt': {'fresh_false_artifacts': serving_artifacts},
+          }
+          pathlib.Path('test-results/refstore/blob_git_gateway/build-pair.json').write_text(
+              json.dumps(manifest, indent=2) + '\n')
+          PY
+          # Pair verification passed; copy the raw receipts (kept in $pair) into the uploaded evidence directory.
+          cp "$test_receipt" test-results/refstore/blob_git_gateway/blob-git-gateway.build.json
+          cp "$serving_receipt" test-results/refstore/blob_git_gateway/rootyard.build.json
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="blob-git-gateway-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_TEST_GIT="$(command -v git)"
+          export ROOTYARD_SERVING_BINARY="$serving_binary"
+          export CARGO_BIN_EXE_ROOTYARD="$GITHUB_WORKSPACE/target/debug/rootyard"
+          report_dir=test-results/refstore/blob_git_gateway
+          "$test_binary" --ignored --list > "$report_dir/ignored-inventory.txt" 2>&1
+          python3 - "$report_dir/ignored-inventory.txt" <<'PY'
+          import pathlib, re, sys
+
+          listing = pathlib.Path(sys.argv[1]).read_text()
+          names = re.findall(r'^([A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*): test$', listing, re.MULTILINE)
+          expected = [
+              'atomic_push_with_rewritten_old_oid_rejects_both_refs_and_leaves_gate_unchanged',
+              'concurrent_same_tip_pushes_get_parsed_ng_stale_info',
+              'lost_receive_pack_ack_after_commit_resolves_committed_via_operation_get',
+              'smart_http_push_then_reclone_without_compute_views_has_exact_oid',
+          ]
+          if not names:
+              raise SystemExit('ignored inventory check failed: no ignored tests were listed')
+          if len(names) != len(set(names)):
+              raise SystemExit('ignored inventory check failed: duplicate test names')
+          if sorted(names) != sorted(expected):
+              raise SystemExit('ignored inventory check failed: unexpected ' + repr(sorted(names)) +
+                               '; expected exactly ' + repr(sorted(expected)))
+          pathlib.Path(sys.argv[1]).with_name('ignored-inventory.json').write_text(
+              __import__('json').dumps({'ok': True, 'ignored_tests': expected}, indent=2) + '\n')
+          PY
+          status=0
+          "$test_binary" --ignored --test-threads=1 \
+            --skip smart_http_push_then_reclone_without_compute_views_has_exact_oid \
+            > "$report_dir/native.log" 2>&1 || status=$?
+          python3 - "$report_dir/native.log" "$status" <<'PY'
+          import json, pathlib, re, sys
+
+          log = pathlib.Path(sys.argv[1]).read_text()
+          status = sys.argv[2]
+          if status != '0':
+              raise SystemExit('native log check failed: test executable exit status ' + status)
+          targets = [
+              'atomic_push_with_rewritten_old_oid_rejects_both_refs_and_leaves_gate_unchanged',
+              'concurrent_same_tip_pushes_get_parsed_ng_stale_info',
+              'lost_receive_pack_ack_after_commit_resolves_committed_via_operation_get',
+          ]
+          rows = re.findall(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;',
+                            log, re.MULTILINE)
+          if rows != [('ok', '3', '0', '0')]:
+              raise SystemExit('native log check failed: expected exactly one "test result: ok. 3 passed; 0 failed; 0 ignored" row, got ' + repr(rows))
+          ok_names = re.findall(r'^test ([A-Za-z0-9_]+) \.\.\. ok$', log, re.MULTILINE)
+          for name in targets:
+              count = ok_names.count(name)
+              if count != 1 or re.search(r'^test ' + re.escape(name) + r' \.\.\. (?!ok$)', log, re.MULTILINE):
+                  raise SystemExit('native log check failed: target ' + name + ' was not reported "ok" exactly once')
+          extra = sorted(set(ok_names) - set(targets))
+          if extra:
+              raise SystemExit('native log check failed: unexpected completed tests ' + repr(extra))
+          failures = re.findall(r'^test ([A-Za-z0-9_]+) \.\.\. (FAILED|ignored)$', log, re.MULTILINE)
+          if failures:
+              raise SystemExit('native log check failed: target failures/ignored ' + repr(failures))
+          pathlib.Path(sys.argv[1]).with_name('acceptance.json').write_text(json.dumps({
+              'version': 1, 'issue': 126, 'suite': 'blob_git_gateway',
+              'accepted': True,
+              'tests': {name: 'ok' for name in targets},
+              'skipped': ['smart_http_push_then_reclone_without_compute_views_has_exact_oid'],
+              'result': {'state': 'ok', 'passed': 3, 'failed': 0, 'ignored': 0},
+          }, indent=2) + '\n')
+          PY
+          [ "$status" -eq 0 ]
       - name: Stop only the job-owned Garage fixture
         if: always()
         run: |
