@@ -123,15 +123,25 @@ Every push is authenticated with Alice's own owner grant (`create-user`); a
    witness: exactly one new operation, settled, `no_ref_changes`, with an
    `ABORTED` admission whose actor/token/repository match Alice's grant and
    whose `ref_names` are exactly the two pushed refs. The audit also requires:
-   - the folded evidence contract: `finished` and `storage_generation_matches`
-     are JSON booleans; `interrupted` and `ungranted_without_hooks` are
-     text `"true"`/`"false"`; no `post_receive` receipt;
+   - the folded evidence contract: all four values (`finished`,
+     `storage_generation_matches`, `interrupted`, `ungranted_without_hooks`)
+     are JSON booleans as `src/reliability.rs` stores them; the first two must
+     be exactly `true` for a valid refusal, the last two accept either boolean,
+     and an interrupted operation requires `ungranted_without_hooks true`; no
+     `post_receive` receipt;
    - no outbox event or outbox ref for the operation;
    - journal directories empty before and after, and every journal entry (if
      any appears) linked to an exact interval row; the marker `ready/-`;
    - no ref outside a validated CI-service operation (`ci-scheduler`,
      `observed_immutable_ci_root`, one `refs/rootyard-ci/jobs/<id>` outbox
-     event) may change during the interval, and the requested refs must not;
+     event) may change during the interval, and the requested refs must not.
+     A service event whitelists one **exact transition**, not a ref name: the
+     physical before/after OIDs must equal that event's `old_oid`/`new_oid`
+     (an absent side normalized to the zero OID of the event's format, so a
+     create is zero -> new), or the change is an out-of-band overwrite and
+     fails. An unchanged ref need not materialize an event, and two validated
+     service events naming the same ref in one interval are ambiguous and fail
+     closed;
    - the public `api_refs` view unchanged.
    This witness is what "+1 settled operation" means: one settled operation,
    exactly audited, never a global counter comparison.
@@ -178,8 +188,10 @@ The API refuses inside its handler, before it journals anything, so every API
 refusal must preserve the **full interval evidence with zero user operations**:
 no user (human-principal) operation row appears in the interval, the final read
 is classified like every other read, and only source-validated CI-service
-operations may change refs; journal, marker and the public `api_refs` view are
-unchanged. The Git "+1 settled operation" rule is **deliberately not applied**
+operations may change refs, with the same source-bound OID match (and the
+same duplicate-event refusal) as the Git interval. The journal, marker and the
+public `api_refs` view are unchanged. The Git "+1 settled operation" rule is
+**deliberately not applied**
 to API refusals; adding it there would be false. After a worker pass, no refused
 update is projected (`repository_ref_projection`), and the final physical refs
 equal the post-control baseline.
@@ -191,12 +203,23 @@ equal the post-control baseline.
   any unsettled row never do; every single defect fails, including a wrong
   principal combination, admission state/settlement/identity, a non-exact
   `ref_names` set, any outbox event, a non-null receipt, wrong evidence types
-  (a text `"true"` for a boolean field fails), a missing or non-empty journal,
-  and any `reference_events` entry recording a change.
+  (a text `"true"`/`"false"` or an integer for a boolean field fails), a missing
+  or non-empty journal,
+  and any `reference_events` entry recording a change. `reference_events` must
+  be the stored array: a missing, null, string or object value fails, and every
+  entry must be a journal event whose `changes` list is empty.
 - The interval decoder accepts only the complete `jsonb_build_object` key set,
-  with booleans for `finished`/`storage_generation_matches` and text for
-  `interrupted`/`ungranted_without_hooks`. The SQL projects the two booleans
-  with `->` so the JSON keeps them as booleans end to end.
+  requiring a JSON boolean for all four evidence keys (a string, an integer,
+  null or a missing key -- which surfaces as the JSON sentinel
+  `EVIDENCE_MISSING_BOOL` -- is rejected). The SQL projects all four with `->`
+  so the stored booleans survive end to end; the Rust serialization of the four
+  keys is pinned so a change in `src/reliability.rs` needs deliberate review.
+- `reference_events` keeps a missing key as a non-array sentinel (never `[]`),
+  and the decoder requires a source-shaped array matching `journal::events()`:
+  each entry is exactly `ordinal` (positive, contiguous and ordered from 1),
+  `phase` (one of the serialized `HookPhase` names) and `changes` (a list of
+  `ref_name`/`old_oid`/`new_oid` strings). The key is serialized directly from
+  a `Vec<HookEvent>` and that source shape is pinned.
 - Every SQL value passes through `BrowseHarness._sql_literal`; identifiers are
   UUID-validated.
 
@@ -208,16 +231,25 @@ From the repository root:
 python3 -m unittest tests.test_browse_mixed_refs
 ```
 
-The suite currently has **87 tests**. It pins the exact case IDs and the
-15+2 = 17 selection order, the unchanged `CASE_NAMES`, the runner's
+The suite currently has **108 tests**. It pins the exact case IDs and the
+15+2 = 17 selection order, the unchanged `CASE_NAMES` (compared against a
+literal expected tuple with no history lookup, so a shallow CI checkout cannot
+skip the check; a focused test asserts the guard has no skip path), the runner's
 fixed-inventory assertion before the opt-in loop and the selected-case
 completion check, the CI opt-in arguments and report fields, the pre-start Git
 binding (absolute executable, agreement of declarations, inherited-only,
 conflict refusal) and that the transparent wrappers exec the bound declaration,
 the `--porcelain` refusal parser, rule isolation and restoration, the physical
-`for-each-ref` plus separate public `/refs` reads, the SQL/decoder/contract
+`for-each-ref` plus a separate, fully paginated public `/refs` walk (explicit
+limit, advancing cursors, pages bounded by their own `next_after`, bounded
+termination; proven with 201 refs across three pages), the SQL/decoder/contract
 types end to end, the final API read being classified (a human row only on the
-final read fails the audit), and the `refusal_audit_verdict` truth table.
+final read fails the audit), the API interval's stable read (rows are read and
+classified, the refs are captured, then the rows are re-read: a settled service
+create for an operation absent from the pre-snapshot read forces a second
+snapshot that follows it, and the reported `changed_refs` include the job ref;
+the reviewed pre-fix loops on the same interleaving accepted the stale
+snapshot), and the `refusal_audit_verdict` truth table.
 
 These tests are **not native evidence**. They cannot stand in for a native run
 and never claim it passed.
