@@ -119,6 +119,13 @@ class BrowseHarness(Harness):
             + self._sql_literal(requested_json) + "'::jsonb"
         ))
 
+    def operation_summary(self, operation_id):
+        """Return `GET /operations` evidence summary for one durable operation."""
+        for operation in self.document(self.repo_api("/operations")):
+            if operation["id"] == operation_id:
+                return operation["evidence_summary"]
+        raise AssertionError("operation not visible: " + str(operation_id))
+
     def repository_diagnostics(self):
         """Current schema and repository row facts for an unexpected response."""
         repo = getattr(self, "repo", {}) or {}
@@ -895,6 +902,7 @@ class BrowseHarness(Harness):
         )
         wrapper.chmod(0o700)
         self.stop()
+        prior_git = self.env.get("ROOTYARD_GIT")
         self.env["ROOTYARD_GIT"] = str(wrapper)
         self.start()
         try:
@@ -902,8 +910,10 @@ class BrowseHarness(Harness):
             server_pid = self.proc.pid
             pid_file.write_text(str(server_pid) + "\n")
             try:
-                status, body, _ = self.http(self.repo_api("/ref-transactions"),
-                                            token=self.alice, method="POST", body=payload)
+                status, body, _ = self.http(
+                    self.repo_api("/ref-transactions"), token=self.alice, method="POST",
+                    body=payload,
+                    extra_headers={"Idempotency-Key": "crash-recovery-key"})
             except (OSError, urllib.error.URLError) as error:
                 # Only a connection-level disconnect is expected; any HTTP
                 # response is handled by the `else` branch and is a failure.
@@ -940,6 +950,10 @@ class BrowseHarness(Harness):
             # never to the whole process group. In failure cleanup, inherited
             # Harness.stop() may signal this harness-created service process
             # group if it is still live; that is owned teardown, not the fault.
+            if prior_git is None:
+                self.env.pop("ROOTYARD_GIT", None)
+            else:
+                self.env["ROOTYARD_GIT"] = prior_git
             self.stop()
         assert done.is_file(), "fault wrapper did not complete before restart"
         assert exited is not None, "killed service PID was still running"
@@ -955,7 +969,8 @@ class BrowseHarness(Harness):
 
         assert self.git("--git-dir=" + str(self.bare), "rev-parse", "--verify", ref).stdout.decode().strip() == self.feature_oid
         rows = json.loads(self.sql(
-            "SELECT coalesce(json_agg(json_build_object('outcome',o.outcome,'evidence',o.evidence)),"
+            "SELECT coalesce(json_agg(json_build_object('id',o.id,'outcome',o.outcome,"
+            "'evidence',o.evidence)),"
             "'[]'::json)::text FROM git_operations o WHERE o.repository_id='"
             + repo_id + "' AND o.evidence->'requested' @> '"
             + self._sql_literal(requested_json) + "'::jsonb"
@@ -964,6 +979,10 @@ class BrowseHarness(Harness):
         operation = rows[0]
         details = operation["evidence"]
         assert operation["outcome"] == "unknown", operation["outcome"]
+        assert details.get("kind") == "ref_transaction", details.get("kind")
+        assert len(details["idempotency_key_sha256"]) == 64
+        assert len(details["idempotency_request_sha256"]) == 64
+        assert self.operation_summary(operation["id"])["kind"] == "ref_transaction"
         assert details.get("finished") is True, "operation must be finished"
         assert details.get("interrupted") is True, "operation must be interrupted"
         assert details.get("requested") == [
@@ -985,6 +1004,14 @@ class BrowseHarness(Harness):
                          "new_oid": self.feature_oid}]})
         assert self.git("--git-dir=" + str(self.bare), "show-ref", "--verify", next_ref,
                         check=False).returncode != 0
+        # The SIGKILLed request carried a key; the durable unknown fence rejects
+        # both the original and a conflicting payload with 409 rather than 200.
+        self.document(self.repo_api("/ref-transactions"), 409, method="POST", body=payload,
+                      extra_headers={"Idempotency-Key": "crash-recovery-key"})
+        self.document(self.repo_api("/ref-transactions"), 409, method="POST", body={
+            "updates": [{"ref_name": ref, "old_oid": ZERO_OID,
+                         "new_oid": self.first}]},
+            extra_headers={"Idempotency-Key": "crash-recovery-key"})
         return {
             "service_pid": server_pid,
             "wrapper_pid": wrapper_pid,
@@ -1049,19 +1076,30 @@ class BrowseHarness(Harness):
                                        "new_oid": self.feature_oid}]}
         before_key = "boundary-before-publication"
         self.stop()
-        self.env[pause_env] = "3000"
+        self.env[pause_env] = "4000"
         self.start()
         try:
-            self.sql("UPDATE tokens SET expires_at=clock_timestamp()+interval '2 seconds' "
+            self.sql("UPDATE tokens SET expires_at=clock_timestamp()+interval '3 seconds' "
                      "WHERE id='" + self._sql_literal(expiring["token_id"]) + "'")
+            started = time.monotonic()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(
                     self.http, endpoint, token=expiring, method="POST",
                     body=before_payload,
                     extra_headers={"Idempotency-Key": before_key},
                 )
-                time.sleep(2.5)
+                journal_deadline = time.monotonic() + 10
+                while time.monotonic() < journal_deadline:
+                    if len(self.pending_journal_entries()) == 1:
+                        break
+                    time.sleep(0.02)
+                # Observing the intent proves outer authenticate, preflight
+                # write-access, role authorization, token verification and
+                # begin_ref_transaction all succeeded before the pause; the
+                # eventual 401 therefore proves the pre-CAS recheck fired.
+                assert len(self.pending_journal_entries()) == 1
                 status, body, _ = future.result(timeout=20)
+            assert time.monotonic() - started >= 3.8
             assert status == 401, (status, body[:200])
             assert self.sql("SELECT expires_at <= clock_timestamp() FROM tokens WHERE id='"
                             + self._sql_literal(expiring["token_id"]) + "'") == "t"
@@ -1089,6 +1127,80 @@ class BrowseHarness(Harness):
         assert self.pending_journal_entries() == []
         assert self.document(endpoint, 200, method="POST", body=before_payload,
                              extra_headers={"Idempotency-Key": before_key}) == retried
+        assert self.operation_summary(retried["operation_id"])["kind"] == "ref_transaction"
+
+        # (a2) A setup failure after the durable intent exists but before the
+        # native CAS must finish and retire the intent, roll the claim back and
+        # leave no lock-waiting state for the immediate same-server retry.
+        precas_ref = "refs/heads/boundary-cleanup-before-cas"
+        precas_payload = {"updates": [{"ref_name": precas_ref, "old_oid": ZERO_OID,
+                                       "new_oid": self.feature_oid}]}
+        precas_key = "boundary-cleanup-before-cas"
+        precas_file = self.root / "browse-precas-failpoint"
+        self.stop()
+        precas_file.write_text("before_cas\n")
+        self.env[failpoint_env] = "file:" + str(precas_file)
+        self.start()
+        try:
+            self.document(endpoint, 503, method="POST", body=precas_payload,
+                          extra_headers={"Idempotency-Key": precas_key})
+            assert self.git("--git-dir=" + str(self.bare), "show-ref", "--verify",
+                            precas_ref, check=False).returncode != 0
+            assert self.ref_operations(precas_ref) == []
+            assert outbox_count(precas_ref) == 0
+            assert self.pending_journal_entries() == []
+            assert claim_row(precas_key) == ""
+            assert ready() == "ready|"
+            # Unlink only the failpoint file: the same live server must accept
+            # the immediate retry without a 500 lock-timeout loop.
+            precas_file.unlink()
+            precas_replay = self.document(endpoint, 200, method="POST", body=precas_payload,
+                                          extra_headers={"Idempotency-Key": precas_key})
+        finally:
+            self.env.pop(failpoint_env, None)
+            precas_file.unlink(missing_ok=True)
+            self.stop()
+            self.start()
+        assert self.git("--git-dir=" + str(self.bare), "rev-parse",
+                        precas_ref).stdout.decode().strip() == self.feature_oid
+        precas_ops = self.ref_operations(precas_ref)
+        assert len(precas_ops) == 1 and precas_ops[0]["outcome"] == "recorded", precas_ops
+        assert precas_ops[0]["id"] == precas_replay["operation_id"]
+        assert self.operation_summary(precas_replay["operation_id"])["kind"] == "ref_transaction"
+
+        # (a3) A post-CAS journal left by after_receipt is reconciled by the
+        # next request's `before_gitfs_push`, which now runs before the
+        # settlement transaction takes `FOR SHARE`; the key then replays 200.
+        live_ref = "refs/heads/boundary-live-reconcile"
+        live_payload = {"updates": [{"ref_name": live_ref, "old_oid": ZERO_OID,
+                                     "new_oid": self.feature_oid}]}
+        live_key = "boundary-live-reconcile"
+        live_file = self.root / "browse-live-reconcile-failpoint"
+        self.stop()
+        live_file.write_text("after_receipt\n")
+        self.env[failpoint_env] = "file:" + str(live_file)
+        self.start()
+        try:
+            self.document(endpoint, 503, method="POST", body=live_payload,
+                          extra_headers={"Idempotency-Key": live_key})
+            assert self.git("--git-dir=" + str(self.bare), "rev-parse",
+                            live_ref).stdout.decode().strip() == self.feature_oid
+            assert self.ref_operations(live_ref) == []
+            assert len(self.pending_journal_entries()) == 1
+            live_file.unlink()
+            live_replay = self.document(endpoint, 200, method="POST", body=live_payload,
+                                        extra_headers={"Idempotency-Key": live_key})
+            assert self.pending_journal_entries() == []
+            live_ops = self.ref_operations(live_ref)
+            assert len(live_ops) == 1 and live_ops[0]["outcome"] == "recorded", live_ops
+            assert live_ops[0]["id"] == live_replay["operation_id"]
+            assert outbox_count(live_ref) == 1
+            assert self.operation_summary(live_replay["operation_id"])["kind"] == "ref_transaction"
+        finally:
+            self.env.pop(failpoint_env, None)
+            live_file.unlink(missing_ok=True)
+            self.stop()
+            self.start()
 
         # (b) The outbox insert succeeded inside the settlement transaction,
         # but the transaction died before finalizing the claim or committing.
@@ -1120,12 +1232,23 @@ class BrowseHarness(Harness):
         publish_ops = self.ref_operations(publish_ref)
         assert len(publish_ops) == 1 and publish_ops[0]["outcome"] == "recorded", publish_ops
         assert outbox_count(publish_ref) == 1
+        assert self.operation_summary(publish_ops[0]["id"])["kind"] == "ref_transaction"
+        # The rolled-back claim is still absent, so replay_terminal itself must
+        # reject a conflicting payload using the journal fingerprint.
+        self.document(endpoint, 409, method="POST", body={
+            "updates": [{"ref_name": publish_ref, "old_oid": ZERO_OID,
+                         "new_oid": self.first}]},
+            extra_headers={"Idempotency-Key": publish_key})
         publish_replay = self.document(endpoint, 200, method="POST", body=publish_payload,
                                        extra_headers={"Idempotency-Key": publish_key})
         assert publish_replay["operation_id"] == publish_ops[0]["id"]
         assert publish_replay["updates"] == publish_payload["updates"]
         assert self.document(endpoint, 200, method="POST", body=publish_payload,
                              extra_headers={"Idempotency-Key": publish_key}) == publish_replay
+        self.document(endpoint, 409, method="POST", body={
+            "updates": [{"ref_name": publish_ref, "old_oid": ZERO_OID,
+                         "new_oid": self.first}]},
+            extra_headers={"Idempotency-Key": publish_key})
         assert len(self.ref_operations(publish_ref)) == 1
         assert outbox_count(publish_ref) == 1
         assert self.pending_journal_entries() == []
@@ -1164,12 +1287,21 @@ class BrowseHarness(Harness):
         ], evidence
         assert len(evidence["idempotency_key_sha256"]) == 64
         assert len(evidence["idempotency_request_sha256"]) == 64
+        assert self.operation_summary(receipt_ops[0]["id"])["kind"] == "ref_transaction"
+        self.document(endpoint, 409, method="POST", body={
+            "updates": [{"ref_name": receipt_ref, "old_oid": ZERO_OID,
+                         "new_oid": self.first}]},
+            extra_headers={"Idempotency-Key": receipt_key})
         receipt_replay = self.document(endpoint, 200, method="POST", body=receipt_payload,
                                        extra_headers={"Idempotency-Key": receipt_key})
         assert receipt_replay["operation_id"] == receipt_ops[0]["id"]
         assert receipt_replay["updates"] == receipt_payload["updates"]
         assert self.document(endpoint, 200, method="POST", body=receipt_payload,
                              extra_headers={"Idempotency-Key": receipt_key}) == receipt_replay
+        self.document(endpoint, 409, method="POST", body={
+            "updates": [{"ref_name": receipt_ref, "old_oid": ZERO_OID,
+                         "new_oid": self.first}]},
+            extra_headers={"Idempotency-Key": receipt_key})
         assert len(self.ref_operations(receipt_ref)) == 1
         assert outbox_count(receipt_ref) == 1
         assert self.pending_journal_entries() == []
@@ -1203,12 +1335,21 @@ class BrowseHarness(Harness):
         assert self.ref_operations(commit_ref) == committed_ops
         assert outbox_count(commit_ref) == 1
         assert ready() == "ready|"
+        assert self.operation_summary(committed_ops[0]["id"])["kind"] == "ref_transaction"
+        self.document(endpoint, 409, method="POST", body={
+            "updates": [{"ref_name": commit_ref, "old_oid": ZERO_OID,
+                         "new_oid": self.first}]},
+            extra_headers={"Idempotency-Key": commit_key})
         commit_replay = self.document(endpoint, 200, method="POST", body=commit_payload,
                                       extra_headers={"Idempotency-Key": commit_key})
         assert commit_replay["operation_id"] == committed_ops[0]["id"]
         assert commit_replay["updates"] == commit_payload["updates"]
         assert self.document(endpoint, 200, method="POST", body=commit_payload,
                              extra_headers={"Idempotency-Key": commit_key}) == commit_replay
+        self.document(endpoint, 409, method="POST", body={
+            "updates": [{"ref_name": commit_ref, "old_oid": ZERO_OID,
+                         "new_oid": self.first}]},
+            extra_headers={"Idempotency-Key": commit_key})
         assert len(self.ref_operations(commit_ref)) == 1
         assert outbox_count(commit_ref) == 1
         return {
@@ -1489,6 +1630,7 @@ class BrowseHarness(Harness):
         # 7. Reliability & Outbox integration
         ops = self.document(self.repo_api("/operations"))
         assert any(o["id"] == res["operation_id"] and o["outcome"] == "recorded" for o in ops)
+        assert self.operation_summary(res["operation_id"])["kind"] == "ref_transaction"
         self.cli("worker-once")
         projected = self.sql(
             f"SELECT oid FROM repository_ref_projection WHERE repository_id='{self.repo['id']}' AND ref_name='refs/tags/v2.0' AND NOT deleted"
@@ -1781,10 +1923,21 @@ def main():
             if binary_path.is_file()
             else None
         )
-        source_head = subprocess.run(
+        source_head_proc = subprocess.run(
             ["git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "HEAD"],
-            stdout=subprocess.PIPE, check=True,
-        ).stdout.decode().strip()
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        source_head = (
+            source_head_proc.stdout.decode().strip()
+            if source_head_proc.returncode == 0
+            else None
+        )
+        if source_head is None:
+            harness.results.append(dict(
+                name="source_head", status="failed",
+                error="git rev-parse HEAD failed; report is not head-bound",
+            ))
+            success = False
         report = dict(
             passed=success,
             source_head=source_head,

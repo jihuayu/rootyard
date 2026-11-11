@@ -24,7 +24,7 @@ pub(crate) fn fingerprint(key: &str, request: &Value) -> (String, String) {
     let key = digest(b"rootyard-ref-idempotency-key-v1\0", key.as_bytes());
     let request = digest(
         b"rootyard-ref-idempotency-request-v1\0",
-        &serde_json::to_vec(request).unwrap_or_default(),
+        &serde_json::to_vec(request).expect("in-memory Value serializes"),
     );
     (key, request)
 }
@@ -101,7 +101,7 @@ pub(crate) async fn replay_terminal(
         .query(
             "SELECT id,storage_generation,sequence,outcome,evidence FROM git_operations \
              WHERE repository_id=$1 AND evidence->>'idempotency_key_sha256'=$2 \
-             ORDER BY storage_generation DESC,sequence DESC LIMIT 8",
+             ORDER BY storage_generation DESC,sequence DESC",
             &[&repo, &key_sha256],
         )
         .await

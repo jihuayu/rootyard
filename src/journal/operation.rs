@@ -8,6 +8,14 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+/// Native operation class persisted with the intent. `None` is the receive-pack
+/// default and must stay unencoded so `/operations` keeps its legacy fallback.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    RefTransaction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Operation {
@@ -21,6 +29,8 @@ pub struct Operation {
     pub service_principal_id: Option<Uuid>,
     pub sequence: i64,
     pub storage_generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<OperationKind>,
     #[serde(default)]
     pub requires_parent_publication: bool,
     /// Admitted shard route epoch. Zero denotes a pre-admission legacy journal.
@@ -32,7 +42,8 @@ pub struct Operation {
     /// Internal, absent-to-target proposal pin. Never supplied by Git clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) proposal_pin: Option<crate::namespace_service::ProposalIntent>,
-    /// Present only for HTTP ref transactions carrying an Idempotency-Key.
+    /// Present for ref transactions (HTTP or proposal pin) carrying an
+    /// `Idempotency-Key`. Never present on CI maintenance operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency: Option<super::IdempotencyIntent>,
     #[serde(skip)]
@@ -93,7 +104,10 @@ pub(super) fn load(path: &Path) -> Result<Operation> {
         let valid =
             |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
         ensure!(valid(&intent.key_sha256) && valid(&intent.request_sha256), "invalid idempotency intent");
-        ensure!(op.ci_pin.is_none() && op.proposal_pin.is_none(), "idempotency intent on maintenance operation");
+        ensure!(op.ci_pin.is_none(), "idempotency intent on maintenance operation");
+    }
+    if op.kind == Some(OperationKind::RefTransaction) {
+        ensure!(!op.requires_parent_publication && op.ci_pin.is_none(), "invalid ref_transaction operation metadata");
     }
     ensure!(
         path.file_name().and_then(|s| s.to_str()) == Some(op_name(&op).as_str()),

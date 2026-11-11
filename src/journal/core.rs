@@ -113,6 +113,7 @@ pub fn begin(
         Uuid::new_v4(),
         0,
         None,
+        None,
     )?
     .0)
 }
@@ -143,6 +144,7 @@ pub fn begin_ref_transaction(
         Uuid::new_v4(),
         0,
         idempotency,
+        Some(OperationKind::RefTransaction),
     )?
     .0)
 }
@@ -188,6 +190,7 @@ pub fn begin_active_with(
         writer_id,
         shard_epoch,
         None,
+        None,
     )?;
     Ok((op, guard.context("missing active admission lock")?))
 }
@@ -212,6 +215,7 @@ pub(crate) fn begin_ci(
         false,
         Uuid::new_v4(),
         0,
+        None,
         None,
     )?
     .0)
@@ -239,6 +243,7 @@ pub(crate) fn begin_ci_service(
         Uuid::new_v4(),
         0,
         None,
+        None,
     )?
     .0)
 }
@@ -251,6 +256,7 @@ pub(crate) fn begin_proposal(
     token_id: Uuid,
     storage_generation: i64,
     intent: crate::namespace_service::ProposalIntent,
+    idempotency: Option<super::IdempotencyIntent>,
 ) -> Result<Operation> {
     intent.validate()?;
     ensure!(intent.repository_id == repository_id, "proposal pin repository mismatch");
@@ -267,7 +273,8 @@ pub(crate) fn begin_proposal(
         false,
         Uuid::new_v4(),
         0,
-        None,
+        idempotency,
+        Some(OperationKind::RefTransaction),
     )
     .map(|(op, _)| op)
 }
@@ -287,6 +294,7 @@ fn begin_inner(
     writer_id: Uuid,
     shard_epoch: i64,
     idempotency: Option<super::IdempotencyIntent>,
+    kind: Option<OperationKind>,
 ) -> Result<(Operation, Option<ActiveGuard>)> {
     safe_path(data_root)?;
     ensure!(storage_generation > 0 && !actor_name.is_empty() && actor_name.len() <= 4096, "invalid operation metadata");
@@ -321,6 +329,7 @@ fn begin_inner(
         service_principal_id,
         sequence,
         storage_generation,
+        kind,
         requires_parent_publication: active,
         shard_epoch,
         ci_pin,

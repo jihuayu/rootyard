@@ -26,7 +26,7 @@ pub use core::{begin, begin_active, begin_active_with, begin_ref_transaction, pe
 pub use hooks::{
     record_ref_transaction_intent, record_ref_transaction_receipt, run_hook, run_post_receive, run_pre_receive,
 };
-pub use operation::{ActiveGuard, HookEvent, HookPhase, Operation, RefChange};
+pub use operation::{ActiveGuard, HookEvent, HookPhase, Operation, OperationKind, RefChange};
 pub use record::{events, receipts, ref_transaction_evidence, requests};
 pub(crate) use record::{no_parent_publication_possible, valid_ref};
 pub use state::{

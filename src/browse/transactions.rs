@@ -92,7 +92,7 @@ async fn execute_ref_transaction_inner(
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
-    let mut repo = db::Repository::from_row(&repo_row);
+    let repo = db::Repository::from_row(&repo_row);
     crate::pando_gateway::transition::admit_write(&state.pool, repo.id, &repo.storage_backend).await?;
 
     // Fail an unauthorized caller before acquiring durable publication and
@@ -136,6 +136,17 @@ async fn execute_ref_transaction_inner(
         tokio::time::Instant::now() + state.config.git_timeout,
     )
     .await?;
+    // Reconcile before opening the settlement transaction: reconciliation may
+    // update `repositories` under its own lock, and doing that here avoids
+    // waiting on this request's `FOR SHARE` row lock.
+    if repo.state != "ready" {
+        return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
+    }
+    if let Some(expected_gen) = input.storage_generation
+        && expected_gen != repo.storage_generation {
+            return Err(Error(StatusCode::CONFLICT, "storage generation mismatch"));
+        }
+    reliability::before_gitfs_push(&state, &repo).await?;
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
@@ -149,7 +160,6 @@ async fn execute_ref_transaction_inner(
         .await
         .map_err(Error::internal)?
         .get(0);
-
     let request_json = serde_json::json!({
         "operation": "ref_transaction",
         "storage_generation": input.storage_generation,
@@ -180,21 +190,6 @@ async fn execute_ref_transaction_inner(
         && expected_gen != current_generation {
             return Err(Error(StatusCode::CONFLICT, "storage generation mismatch"));
         }
-    repo.storage_generation = current_generation;
-    reliability::before_gitfs_push(&state, &repo).await?;
-
-    // `before_gitfs_push` reconciles any pending journal from an interrupted
-    // request under this repository's write lock. That reconciliation may
-    // have just settled the operation for this exact key, so re-read the
-    // terminal journal fingerprint before creating a second intent.
-    if let Some(ref key) = idem_key
-        && let Some(saved_response) =
-            idempotency::replay_terminal(&tx, tenant_id, repo_id, key, &request_json).await?
-    {
-        auth::finish_tx(tx, &actor, true).await?;
-        return Ok((StatusCode::OK, [(header::CACHE_CONTROL, "no-store")], Json(saved_response)).into_response());
-    }
-
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     let quota = state.config.max_repo_bytes;
     let check_path = repo_path.clone();
@@ -284,39 +279,50 @@ async fn execute_ref_transaction_inner(
         .seek(SeekFrom::Start(0))
         .map_err(Error::internal)?;
 
+    let idempotency = idem_key.as_deref().map(|key| {
+        let (key_sha256, request_sha256) = idempotency::fingerprint(key, &request_json);
+        journal::IdempotencyIntent { key_sha256, request_sha256 }
+    });
     let operation = if let Some(proposal_id)=proposal_pin {
         let intent=crate::namespace_service::ProposalIntent{
             proposal_id,repository_id:repo_id,target_oid:requested[0].new_oid.clone(),
         };
         journal::begin_proposal(&state.storage.root,repo_id,actor.id,
-            actor.username.clone(),actor.token_id,current_generation,intent)
+            actor.username.clone(),actor.token_id,current_generation,intent,idempotency)
     } else {
-        let idempotency = idem_key.as_deref().map(|key| {
-            let (key_sha256, request_sha256) = idempotency::fingerprint(key, &request_json);
-            journal::IdempotencyIntent { key_sha256, request_sha256 }
-        });
         journal::begin_ref_transaction(&state.storage.root,repo_id,actor.id,
             actor.username.clone(),actor.token_id,current_generation,idempotency)
     }.map_err(Error::internal)?;
-    journal::record_ref_transaction_intent(&operation, &requested).map_err(Error::internal)?;
 
-    // Test-only rendezvous for revoking a token while this request is still
-    // before native publication. It is an inert no-op unless explicitly set.
-    if let Some(millis) = test_pause_before_cas() {
-        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
-    }
-    // Re-check the caller's token and effective role BEFORE the native CAS.
-    // A revoked writer must abort the intent while refs are still untouched.
-    if let Err(error) = auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repo_id,
-        auth::web_scope_enabled(), crate::token_scopes::RepoAction::ContentsWrite).await {
-        journal::finish(&operation).map_err(Error::internal)?;
-        let rollback = tx.rollback().await.map_err(Error::internal);
-        journal::retire(&operation).map_err(Error::internal)?;
-        rollback?;
-        return Err(error);
-    }
-
-    let mut cmd = git_read::git_cmd(&state, repo_id)?;
+    // Any setup failure after the durable intent exists but before the native
+    // CAS is provably ref-free: finish and retire the journal, then roll the
+    // claim back so a retry cannot wedge on this request's own lock.
+    let pre_cas = async {
+        journal::record_ref_transaction_intent(&operation, &requested).map_err(Error::internal)?;
+        // Test-only rendezvous for revoking a token while this request is still
+        // before native publication. It is an inert no-op unless explicitly set.
+        if let Some(millis) = test_pause_before_cas() {
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+        }
+        // Re-check the caller's token and effective role BEFORE the native CAS.
+        // A revoked writer must abort the intent while refs are still untouched.
+        auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repo_id,
+            auth::web_scope_enabled(), crate::token_scopes::RepoAction::ContentsWrite).await?;
+        if test_failpoint("before_cas") {
+            return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction aborted before CAS"));
+        }
+        git_read::git_cmd(&state, repo_id)
+    }.await;
+    let mut cmd = match pre_cas {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            let _ = journal::finish(&operation);
+            let rollback = tx.rollback().await.map_err(Error::internal);
+            journal::retire(&operation).map_err(Error::internal)?;
+            rollback?;
+            return Err(error);
+        }
+    };
     cmd.args(["update-ref", "--stdin", "-z", "--no-deref"]);
     if let Err(err) = crate::git_http::collect_git_output_input(
         cmd,
@@ -361,9 +367,15 @@ async fn execute_ref_transaction_inner(
             return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction outcome requires recovery"));
         }
     }
-    journal::record_ref_transaction_receipt(&operation, &requested).map_err(Error::internal)?;
-    journal::finish(&operation).map_err(Error::internal)?;
-
+    if let Err(error) = journal::record_ref_transaction_receipt(&operation, &requested)
+        .and_then(|()| journal::finish(&operation))
+        .map_err(Error::internal)
+    {
+        // The intent is now provably post-CAS; never retire it unsettled.
+        let _ = tx.rollback().await;
+        let _ = reliability::reconcile(&state, repo_id, current_generation, false).await;
+        return Err(error);
+    }
     let event_inputs: Vec<events::RefEventInput> = normalized_updates
         .iter()
         .enumerate()
@@ -468,11 +480,19 @@ async fn execute_ref_transaction_inner(
         .into_response())
 }
 
+/// Native-boundary rendezvous. Inert unless the process environment explicitly
+/// sets `ROOTYARD_TEST_REF_TRANSACTION_PAUSE_BEFORE_CAS_MS`; production never does.
 fn test_pause_before_cas() -> Option<u64> {
     let value = std::env::var("ROOTYARD_TEST_REF_TRANSACTION_PAUSE_BEFORE_CAS_MS").ok()?;
     value.parse().ok().map(|millis: u64| millis.min(10_000))
 }
 
+/// Native-boundary crash hook. Inert unless explicitly armed by a native
+/// boundary test through `ROOTYARD_TEST_REF_TRANSACTION_FAILPOINT`, either as
+/// this exact name or as `file:<path>` whose trimmed content names it.
 fn test_failpoint(name: &str) -> bool {
-    std::env::var("ROOTYARD_TEST_REF_TRANSACTION_FAILPOINT").ok().as_deref() == Some(name)
+    let Ok(value) = std::env::var("ROOTYARD_TEST_REF_TRANSACTION_FAILPOINT") else { return false };
+    value == name || value.strip_prefix("file:").is_some_and(|path| {
+        std::fs::read_to_string(path).is_ok_and(|contents| contents.trim() == name)
+    })
 }

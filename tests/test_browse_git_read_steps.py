@@ -524,10 +524,38 @@ class GitReadStepsSourceTest(unittest.TestCase):
 
     def test_browse_line_caps_cover_every_direct_submodule(self):
         facade = (ROOT / "src" / "browse.rs").read_text()
+        journal_facade = (ROOT / "src" / "journal.rs").read_text()
         self.assertLess(len(facade.splitlines()), 100)
+        self.assertLess(len(journal_facade.splitlines()), 100)
         for path in sorted((ROOT / "src" / "browse").glob("*.rs")):
             lines = len(path.read_text().splitlines())
             self.assertLess(lines, 500, f"{path} exceeds the 500-line Browse submodule cap ({lines})")
+        for path in sorted((ROOT / "src" / "journal").glob("*.rs")):
+            lines = len(path.read_text().splitlines())
+            self.assertLess(lines, 500, f"{path} exceeds the 500-line Journal submodule cap ({lines})")
+
+    def test_issue14_canonical_kind_ordering_and_facade_governance(self):
+        record = (ROOT / "src" / "journal" / "record.rs").read_text()
+        self.assertIn('evidence["kind"] = serde_json::json!("ref_transaction");', record)
+        tx = (ROOT / "src" / "browse" / "transactions.rs").read_text()
+        self.assertLess(tx.index("reliability::before_gitfs_push("), tx.index("client.transaction()"))
+        self.assertIn("current_generation,intent,idempotency)", tx)
+        self.assertIn('test_failpoint("before_cas")', tx)
+        self.assertIn('strip_prefix("file:")', tx)
+        self.assertIn("journal::retire(&operation)", tx)
+        browse = (TESTS / "browse.py").read_text()
+        self.assertIn('self.operation_summary(operation["id"])["kind"]', browse)
+        self.assertIn('self.operation_summary(retried["operation_id"])["kind"]', browse)
+        self.assertIn('"Idempotency-Key": "crash-recovery-key"', browse)
+        # Facades stay thin: no module declaration files, inline SQL or direct
+        # child processes; all implementation lives in bounded submodules.
+        self.assertFalse((ROOT / "src" / "browse" / "mod.rs").exists())
+        self.assertFalse((ROOT / "src" / "journal" / "mod.rs").exists())
+        for facade in (ROOT / "src" / "browse.rs", ROOT / "src" / "journal.rs"):
+            text = facade.read_text()
+            self.assertNotIn("Command::new", text)
+            for sql in ("SELECT ", "INSERT ", "UPDATE ", "DELETE "):
+                self.assertNotIn(sql, text)
 
     def test_issue14_pre_cas_recheck_and_atomic_settlement_order(self):
         tx = (ROOT / "src" / "browse" / "transactions.rs").read_text()

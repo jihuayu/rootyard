@@ -181,6 +181,9 @@ pub fn ref_transaction_evidence(
         "repeated_receipt_refs": repeated,
         "ungranted_without_hooks": ungranted_without_hooks,
     });
+    if operation.kind == Some(super::OperationKind::RefTransaction) {
+        evidence["kind"] = serde_json::json!("ref_transaction");
+    }
     if let Some(intent) = &operation.idempotency {
         evidence["idempotency_key_sha256"] = serde_json::json!(intent.key_sha256);
         evidence["idempotency_request_sha256"] = serde_json::json!(intent.request_sha256);
