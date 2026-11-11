@@ -1051,10 +1051,9 @@ class Drill(BlobOnlyHarness):
         verify = subprocess.run([self.args.binary, "backup-verify", str(path)], env=self.format22_env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
         assert verify.returncode == 0, "format22 backup-verify refused: " + self.redact(verify.stderr[-2000:])
-        migrate = subprocess.run([self.args.binary, "migrate"], env=dict(self.format22_env,
-                                 DATABASE_URL=self.format22_target), stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.PIPE, timeout=120)
-        assert migrate.returncode == 0, "format22 target migrate failed: " + self.redact(migrate.stderr[-2000:])
+        # The target is a fresh TEMPLATE template0 database with no data
+        # directory yet: restore.rs requires that empty-target barrier, so no
+        # migrate (which would create catalog objects) runs here.
         restore_env = dict(self.format22_env, DATABASE_URL=self.format22_target,
                            ROOTYARD_DATA_DIR=str(self.root / "format22-restored-data"),
                            ROOTYARD_SCRATCH_DIR=str(self.root / "format22-scratch"))
