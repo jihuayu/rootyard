@@ -691,6 +691,47 @@ class ProbeTest(unittest.TestCase):
         self.assertIs(outcomes[0], responses["auto"])
         self.assertIs(outcomes[1], responses["external"])
 
+    def test_restore_gate_wrapper_keeps_the_pg_restore_symlink_basename_and_argv(self):
+        # pg_restore is a symlink to a multicall stand-in with another basename:
+        # resolving the symlink would make the stand-in refuse its own argv[0].
+        multicall = r"""#!/bin/sh
+case ${0##*/} in
+pg_restore) ;;
+*) exit 64 ;;
+esac
+for arg in "$@"; do printf '%s\0' "$arg"; done > "$PG_RESTORE_ARGV_RECORD"
+"""
+        stand_in = Path(self.stand_in(multicall))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "pg_restore").symlink_to(stand_in)
+        search_path = str(bin_dir)
+        database = "rootyard_restore_gate_unit"
+        argv = ["database=rootyard gate unit", "label='single' and \"double\"", "", "--no-owner"]
+        self.owned.mkdir(exist_ok=True)
+        record = self.owned / "argv"
+        gate, restore = None, None
+        try:
+            gate = backup_blob_serving147.restore_gate(str(self.owned), database, search_path)
+            self.assertEqual(gate.executable, bin_dir / "pg_restore")
+            env = dict(os.environ, PGDATABASE=database, PG_RESTORE_ARGV_RECORD=str(record))
+            restore = subprocess.Popen([str(gate.wrapper), *argv], env=env)
+            gate.wait_blocked(restore, time.monotonic() + backup_blob_serving147.RESTORE_GATE_TIMEOUT_SECONDS)
+            self.assertIn("database=" + database, gate.marker.read_text().splitlines())
+            gate.release_gate()
+            restore.communicate(timeout=backup_blob_serving147.RESTORE_GATE_TIMEOUT_SECONDS)
+        finally:
+            if gate is not None and not gate.release.exists():
+                gate.release_gate()
+            if restore is not None and restore.poll() is None:
+                restore.kill()
+                restore.wait(timeout=10)
+            if gate is not None:
+                gate.cleanup()
+        self.assertEqual(restore.returncode, 0, "released pg_restore did not exit successfully")
+        self.assertEqual(record.read_bytes().split(b"\0")[:-1], [item.encode() for item in argv])
+        self.assertFalse(gate.root.exists(), "restore gate directory was not cleaned")
+
 
 def _reachable(bind):
     try:
