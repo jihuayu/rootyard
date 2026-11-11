@@ -52,7 +52,9 @@ STEP_MS = 30_000
 FETCH_TIMEOUT_MS = 5_000
 # The fixed words the page-side cookie-only fetch reports for an answered
 # request: the real `401` or any other status. A request the browser itself
-# rejected is neither and fails with the route's fixed fetch reason.
+# rejected is neither and fails with the route's fixed fetch reason; the test
+# adapter keeps the child's 401 but drops its Basic challenge, so a 401 is
+# observable here without an HTTP-auth challenge.
 COOKIE_ONLY_STATUS = "401"
 COOKIE_ONLY_REFUSED = "refused"
 
@@ -515,13 +517,14 @@ class Client:
         extra["reads"] = {tail: {"revision": reads[tail]["revision"]} for tail in ("refs", "tree", "commits")}
 
         # 5. Cookie-only denial of the unchanged bearer-only routes. The Smart
-        # HTTP path is the gateway's `/git/{owner}/{name}/info/refs` exactly:
-        # `{name}` is the bare repository name, so `.git` suffixes, a doubled
-        # name and a trailing slash must never route here.
-        name = self.repo.removesuffix(".git")
+        # HTTP path is the gateway's real `/git/{owner}/{name}/info/refs` form:
+        # `name` is the configured bare repository name and the handler's
+        # `repository_name` requires the `.git` suffix, so it is kept here.
         extra["denials"] = {
             "api": await self.cookie_only(page, "/api/repos", "api"),
-            "git": await self.cookie_only(page, f"/git/{self.owner}/{name}/info/refs?service=git-upload-pack", "git"),
+            "git": await self.cookie_only(
+                page, f"/git/{self.owner}/{self.repo}.git/info/refs?service=git-upload-pack", "git"
+            ),
         }
         if extra["denials"] != {"api": 401, "git": 401}:
             raise Failure("COOKIE_ONLY_DENIAL_MISSING")
@@ -584,18 +587,20 @@ class Client:
         browser rejected). The bounded `evaluate` turns a step timeout into the
         route's fixed fetch reason; a fetch the browser rejected (the bound
         `AbortSignal` included) is that rejection, never an origin answer, so it
-        is reported as such and never as a denial. CORS mode is kept: the URL
-        stays same-origin with the session cookie, and a redirect the request
-        could follow off the origin arrives unreadable instead of as an opaque
-        rejection. Only the fixed word crosses this boundary: never the path,
-        a request header, a cookie, the response body or exception text.
+        is reported as such and never as a denial. The URL is same-origin and
+        the session cookie travels with it. The capture adapter omits the
+        upstream Basic challenge from the browser-facing copy of these denials,
+        so Chromium Fetch observes the real 401 instead of starting an HTTP-auth
+        challenge that would stall under the bound. Only the fixed word crosses
+        this boundary: never the path, a request header, a cookie, the response
+        body or exception text.
         """
         answer = await evaluate(
             page,
             """async ([path, timeout]) => {
                 let response;
                 try {
-                    response = await fetch(path, {mode: 'cors', credentials: 'same-origin',
+                    response = await fetch(path, {credentials: 'same-origin',
                         headers: {Accept: 'application/json'},
                         signal: AbortSignal.timeout(timeout)});
                 } catch (_) {

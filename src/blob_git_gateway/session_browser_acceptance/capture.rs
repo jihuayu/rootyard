@@ -5,7 +5,12 @@
 //! request to the real child: method, path and query, a bounded body and the
 //! end-to-end request headers are copied; the real upstream status and the
 //! safe end-to-end response headers (`Content-Type`, CSP, `Set-Cookie`,
-//! `Location`, security and session headers) are passed back unchanged.
+//! `Location`, security and session headers) are passed back unchanged, with
+//! one documented exception: the child's `WWW-Authenticate` is omitted from the
+//! browser-facing copy of its real `401` for a cookie-only `/api/repos` or
+//! `info/refs` read ([`hide_basic_challenge`]). Chromium Fetch would otherwise
+//! start a `Basic` HTTP-auth exchange that never settles under the page's bound
+//! and hide the denial. The status, body and record stay the child's own.
 //!
 //! The adapter is a different loopback port from the child, so the browser's
 //! `Origin` names the adapter while the child's `Host` names the child. The
@@ -36,7 +41,7 @@ use axum::{
     Router,
     body::{Body, to_bytes},
     extract::{Request, State},
-    http::{HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header},
     response::Response,
     routing::any,
 };
@@ -219,18 +224,54 @@ async fn relay(adapter: &Adapter, parts: axum::http::request::Parts, body: Body,
     let bytes = upstream.bytes().await.map_err(|_| ())?;
     let mut captured = record(&adapter.fixture, &parts, route, status.as_u16(), Some(&headers));
     marker(&adapter.fixture, &bytes, route, &mut captured);
+    // The record keeps the child's exact answer, the Basic challenge included;
+    // the browser-facing copy below may omit it under `basic_challenge_hidden`.
+    let basic_challenge_hidden = hide_basic_challenge(&parts, route, &captured);
     adapter.capture.push(captured);
 
     let mut answer = Response::new(Body::from(bytes));
     *answer.status_mut() = status;
     for (name, value) in headers.iter() {
         if !is_hop_by_hop(name)
+            && !(basic_challenge_hidden && name == header::WWW_AUTHENTICATE)
             && let Ok(value) = HeaderValue::from_bytes(value.as_bytes())
         {
             answer.headers_mut().append(name.clone(), value);
         }
     }
     Ok(answer)
+}
+
+/// Whether this browser-facing answer drops the child's `WWW-Authenticate`.
+///
+/// Only a response the child really answered `401` to a cookie-only (Cookie
+/// present, no Authorization) read of exactly `/api/repos` or the Smart HTTP
+/// `info/refs` route qualifies. Chromium Fetch answers such a `Basic` challenge
+/// by starting an HTTP-auth exchange that never settles under the page's bound,
+/// which would hide the real denial from the acceptance. The status, body and
+/// every other header stay the child's own; a forwarding failure never reaches
+/// here and is still a `502` with no record. The record keeps the child's
+/// challenge as forwarded; the attestation reads only status and request facts
+/// from these denials, so nothing depends on the browser-facing omission.
+fn hide_basic_challenge(request: &axum::http::request::Parts, route: Route, captured: &Recorded) -> bool {
+    let method = &request.method;
+    // A preflight names its own method and carries neither cookie nor
+    // credential; rewriting a challenge for it would misdescribe the child.
+    let preflight = request.headers.contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
+    captured.status == StatusCode::UNAUTHORIZED.as_u16()
+        && captured.has_cookie
+        && !captured.has_authorization
+        && !preflight
+        && !method.eq(&Method::OPTIONS)
+        && match route {
+            Route::ApiRepos => method.eq(&Method::GET),
+            Route::Git => {
+                method.eq(&Method::GET)
+                    && request.uri.path().ends_with("/info/refs")
+                    && request.uri.query() == Some("service=git-upload-pack")
+            }
+            _ => false,
+        }
 }
 
 /// The redacted record of one request and, for a relayed one, its answer.
