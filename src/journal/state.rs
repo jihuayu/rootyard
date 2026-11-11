@@ -1,6 +1,7 @@
 //! Terminal markers, canonical operator evidence, and crash-safe retirement.
 use super::Operation;
-use super::core::{atomic, exists, op_name, read, sync_dir, validate};
+use super::core::{atomic, exists, read, sync_dir};
+use super::operation::{op_name, validate};
 use super::record::{events, receipts, requests};
 use anyhow::{Context, Result, ensure};
 use std::fs;

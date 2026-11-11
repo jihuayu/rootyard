@@ -12,21 +12,21 @@ const MAX_REFS: usize = 4096;
 mod core;
 #[path = "journal/hooks.rs"]
 mod hooks;
+#[path = "journal/operation.rs"]
+mod operation;
 #[path = "journal/record.rs"]
 mod record;
 #[path = "journal/state.rs"]
 mod state;
 
-pub use core::{
-    ActiveGuard, HookEvent, HookPhase, Operation, RefChange, begin, begin_active, begin_active_with,
-    begin_ref_transaction, pending, sequence,
-};
 pub(crate) use core::{
     atomic, begin_ci, begin_ci_service, begin_proposal, ensure_sequence_at_least, exists, mkdir, read, safe_path,
 };
+pub use core::{begin, begin_active, begin_active_with, begin_ref_transaction, pending, sequence};
 pub use hooks::{
     record_ref_transaction_intent, record_ref_transaction_receipt, run_hook, run_post_receive, run_pre_receive,
 };
+pub use operation::{ActiveGuard, HookEvent, HookPhase, Operation, RefChange};
 pub use record::{events, receipts, ref_transaction_evidence, requests};
 pub(crate) use record::{no_parent_publication_possible, valid_ref};
 pub use state::{

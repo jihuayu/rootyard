@@ -58,12 +58,12 @@ fn canonical_ref_transaction_evidence_binds_idempotency_fingerprint() {
     let requested = requests(&op).unwrap();
     let receipt = receipts(&op).unwrap();
     let live = ref_transaction_evidence(&op, 1, true, false, &raw, requested.as_deref(), receipt.as_deref());
-    let loaded = super::core::load(&op.path).unwrap();
+    let loaded = super::operation::load(&op.path).unwrap();
     let reconciled = ref_transaction_evidence(&loaded, 1, true, false, &raw, requested.as_deref(), receipt.as_deref());
     assert_eq!(live, reconciled);
     assert_eq!(live["idempotency_key_sha256"], "a".repeat(64));
     assert_eq!(live["idempotency_request_sha256"], "b".repeat(64));
-    assert_eq!(super::core::load(&op.path).unwrap().idempotency, op.idempotency);
+    assert_eq!(super::operation::load(&op.path).unwrap().idempotency, op.idempotency);
 }
 
 #[test]

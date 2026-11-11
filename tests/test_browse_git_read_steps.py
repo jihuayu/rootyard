@@ -567,8 +567,8 @@ class GitReadStepsSourceTest(unittest.TestCase):
         self.assertIn("pub fn ref_transaction_evidence(", record)
         self.assertIn("ref_transaction_evidence", journal)
         self.assertLess(len(journal.splitlines()), 100)
-        core = (ROOT / "src" / "journal" / "core.rs").read_text()
-        self.assertRegex(core, r"#\[serde\(deny_unknown_fields\)\]\s*pub struct Operation")
+        operation = (ROOT / "src" / "journal" / "operation.rs").read_text()
+        self.assertRegex(operation, r"#\[serde\(deny_unknown_fields\)\]\s*pub struct Operation")
 
     def test_issue14_failure_boundaries_fail_closed_and_reported(self):
         browse = (TESTS / "browse.py").read_text()
@@ -605,8 +605,9 @@ class GitReadStepsSourceTest(unittest.TestCase):
                 ref_transaction,
                 r"#\[serde\(deny_unknown_fields\)\]\s*pub struct " + name + r"\b",
             )
-        core = (ROOT / "src" / "journal" / "core.rs").read_text()
-        self.assertRegex(core, r"#\[serde\(deny_unknown_fields\)\]\s*pub struct Operation\b")
+        operation = (ROOT / "src" / "journal" / "operation.rs").read_text()
+        self.assertRegex(operation, r"#\[serde\(deny_unknown_fields\)\]\s*pub struct Operation\b")
+        self.assertLess(len((ROOT / "src" / "journal" / "core.rs").read_text().splitlines()), 500)
         journal = (ROOT / "src" / "journal.rs").read_text()
         self.assertRegex(journal, r"#\[serde\(deny_unknown_fields\)\]\s*pub struct IdempotencyIntent\b")
 

@@ -1,5 +1,6 @@
 //! Native Git hook recording and the server-side ref-transaction evidence API.
-use super::core::{atomic, exists, load, validate};
+use super::core::{atomic, exists};
+use super::operation::{load, validate};
 use super::record::{events_with_size, parse, validate_request};
 use super::state::is_finished;
 use super::{HookEvent, HookPhase, MAX_BYTES, MAX_ENTRIES, MAX_EVENT_BYTES, MAX_RECORD_BYTES, Operation, RefChange};

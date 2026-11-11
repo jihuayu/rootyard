@@ -1,5 +1,6 @@
 //! Parsing, request/receipt evidence, and the canonical settlement shape.
-use super::core::{entries, exists, read, validate};
+use super::core::{entries, exists, read};
+use super::operation::validate;
 use super::{HookEvent, MAX_BYTES, MAX_EVENT_BYTES, MAX_REFS, Operation, RefChange};
 use anyhow::{Context, Result, ensure};
 use std::collections::HashSet;
