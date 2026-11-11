@@ -40,9 +40,12 @@ setup      schema migration, fixture accounts and serve-blob start/readiness.
                      ``git push`` alone and ``ls_remote_seconds`` the separate
                      ``ls-remote`` acknowledgement.
 3. concurrent_read_clones
-                     four concurrent read-only clones of that single seed
-                     repository into four distinct destinations; per-worker and
-                     aggregate wall times cover ``git clone`` only.
+                     two concurrent read-only clones of that single seed
+                     repository into two distinct destinations; per-worker and
+                     aggregate wall times cover ``git clone`` only. The report
+                     records the effective service admission settings (read
+                     only, never overridden) and checks that the configured
+                     capacity covers these two concurrent clones.
 4. restart           graceful stop/start of this harness's own process group.
                      Not a sampled case: sampling is finished for the old PID
                      before the stop and the new epoch begins at cold_clone.
@@ -109,7 +112,7 @@ import blob_only_service as serving  # noqa: E402
 import ops_provenance  # noqa: E402
 
 KIND = "rootyard/state-services-blob-baseline"
-REPORT_VERSION = 2
+REPORT_VERSION = 3
 MEASURED_PROFILE = "blob-only-serve-blob-fresh-install"
 WORKLOAD_VERSION = 1
 SAMPLE_INTERVAL_SECONDS = 0.25
@@ -120,7 +123,7 @@ AGGREGATE_SLACK_SECONDS = 0.005
 # last-returning clone, whose timer starts microseconds after the release).
 AGGREGATE_SLACK_RATIO = 0.25
 MAX_PAYLOAD_BYTES = 256 * 1024
-CONCURRENCY = 4
+CONCURRENCY = 2
 READ_MODE = "single_repository_independent_read_clones"
 REPOSITORY_NAME = "blob-baseline"
 # One measured seed repository; every concurrent worker clones it into its own destination.
@@ -175,8 +178,8 @@ LIMITS = [
     "One loopback HTTP origin, one PostgreSQL server and one configured OpenDAL S3 provider on one host; no HA, "
     "multi-host, physical durability or production-latency claim. PostgreSQL scope: " + PG_OWNERSHIP_SCOPE,
     "The restart is a SIGTERM to this harness's own serve-blob process group; kernel/power-loss behavior is not tested.",
-    "Concurrent workers are independent-repository read clones, not independent-ref pushes; the concurrent "
-    "receive-pack write path is not measured.",
+    "The concurrent case times " + str(CONCURRENCY) + " independent read-clone destinations from the same "
+    "single seeded repository; receive-pack writes are not measured.",
     "PostgreSQL counts are 250 ms point samples of current-database sessions named by the serve-blob sources "
     "(application_name 'rootyard'/'rootyard-blob-barrier'), cross-checked against the service PID's own "
     "ESTABLISHED sockets to the configured database endpoint: observed lower bounds only; short waits can be "
@@ -1180,7 +1183,7 @@ def run_read_worker(harness, index, seed, clock=time.monotonic):
 
 
 def run_concurrent_reads(harness, seed):
-    """Four concurrent clones in two phases: (records, clone-only aggregate, report).
+    """Two concurrent clones in two phases: (records, clone-only aggregate, report).
 
     Phase 1 runs one timed ``git clone`` per worker and nothing else; phase 2
     starts only after every clone call has returned, and verifies each cloned
@@ -1316,6 +1319,115 @@ def fixture_input_hashes(root=ROOT):
     return hashes
 
 
+# --- service admission (configured, never overridden) ---------------------------
+MAX_CONCURRENT_GIT_SETTING = ("ROOTYARD_MAX_CONCURRENT_GIT", 8, 1, 256)
+MAX_REQUEST_BYTES_SETTING = ("ROOTYARD_MAX_REQUEST_BYTES", 128 << 20, 64 << 10, 4 << 30)
+MAX_INFLIGHT_BYTES_SETTING = ("ROOTYARD_MAX_INFLIGHT_BYTES", 256 << 20, 64 << 10, 16 << 30)
+DEFAULT_SOURCE = "src/standalone/config.rs default"
+OVERRIDE_SOURCE = "environment_override"
+UPLOAD_PACK_RESERVATION_SOURCE = ("one full ROOTYARD_MAX_REQUEST_BYTES admission lease per upload-pack body "
+                                 "before spooling (src/blob_git_gateway/smart_http.rs)")
+# Why the admission capacity is a derived configuration fact, not a measurement.
+ADMISSION_SCOPE = ("configured admission only: the values are read, never overridden or widened; this is neither "
+                   "a measured throughput nor a frozen performance budget")
+
+_ASCII_DECIMAL = re.compile(r"[0-9]+")
+
+
+def _admission_number(env, setting):
+    """One configured admission number and its source; invalid values are never echoed."""
+    name, default, low, high = setting
+    if not isinstance(env, dict):
+        raise BaselineError("service admission environment is missing")
+    if name not in env:
+        return default, DEFAULT_SOURCE
+    raw = env[name]
+    need(isinstance(raw, str) and _ASCII_DECIMAL.fullmatch(raw) is not None,
+         name + " must be an ASCII decimal integer")
+    value = int(raw)
+    need(low <= value <= high, name + " is outside its supported range")
+    return value, OVERRIDE_SOURCE
+
+
+def service_admission_facts(env):
+    """Effective admission settings of the configured service plus the derived clone capacity.
+
+    Only ``ROOTYARD_MAX_CONCURRENT_GIT``, ``ROOTYARD_MAX_REQUEST_BYTES`` and
+    ``ROOTYARD_MAX_INFLIGHT_BYTES`` are read, with the defaults and ranges of the
+    current ``src/standalone/config.rs``; ``env`` is never written or overridden.
+    Each upload-pack body reserves one full ``max_request_bytes`` admission lease
+    before it is spooled, so the number of concurrent clones the configured
+    admission covers is bounded by both the concurrent-Git limit and the
+    inflight byte budget. Fails closed unless that capacity covers
+    ``CONCURRENCY``. This describes configured admission, never measured
+    throughput or a frozen budget.
+    """
+    max_git, git_source = _admission_number(env, MAX_CONCURRENT_GIT_SETTING)
+    request, request_source = _admission_number(env, MAX_REQUEST_BYTES_SETTING)
+    inflight, inflight_source = _admission_number(env, MAX_INFLIGHT_BYTES_SETTING)
+    need(inflight >= request, "ROOTYARD_MAX_INFLIGHT_BYTES must be at least ROOTYARD_MAX_REQUEST_BYTES")
+    byte_capacity = inflight // request
+    effective = min(max_git, byte_capacity)
+    need(effective >= CONCURRENCY,
+         "configured service admission covers fewer than " + str(CONCURRENCY) + " concurrent upload-pack bodies")
+    return validate_service_admission({
+        "settings": {
+            "max_concurrent_git": {"value": max_git, "source": git_source, "range": [1, 256]},
+            "max_request_bytes": {"value": request, "source": request_source, "range": [64 << 10, 4 << 30]},
+            "max_inflight_bytes": {"value": inflight, "source": inflight_source, "range": [64 << 10, 16 << 30]},
+        },
+        "upload_pack_reservation_bytes": request,
+        "upload_pack_reservation_source": UPLOAD_PACK_RESERVATION_SOURCE,
+        "byte_budget_capacity": byte_capacity,
+        "effective_upload_pack_capacity": effective,
+        "capacity_covers_measured_concurrency": True,
+        "measured_clone_concurrency": CONCURRENCY,
+        "scope": ADMISSION_SCOPE,
+        "explanation": "smart_http reserves max_request_bytes per upload-pack body before spooling it; "
+                       "byte_budget_capacity = max_inflight_bytes // max_request_bytes and effective capacity "
+                       "= min(max_concurrent_git, byte_budget_capacity); measured concurrency must fit",
+    })
+
+
+def validate_service_admission(admission):
+    """Re-check admission facts (recomputing the derived capacity) before they enter a report."""
+    need(isinstance(admission, dict), "service admission facts are missing")
+    settings = admission.get("settings")
+    need(isinstance(settings, dict), "service admission settings are missing")
+    values = {}
+    for key, setting in (("max_concurrent_git", MAX_CONCURRENT_GIT_SETTING),
+                         ("max_request_bytes", MAX_REQUEST_BYTES_SETTING),
+                         ("max_inflight_bytes", MAX_INFLIGHT_BYTES_SETTING)):
+        entry = settings.get(key)
+        need(isinstance(entry, dict), "service admission setting is missing: " + key)
+        value, source = entry.get("value"), entry.get("source")
+        need(isinstance(value, int) and not isinstance(value, bool)
+             and (source == DEFAULT_SOURCE and value == setting[1] or
+                  source == OVERRIDE_SOURCE and setting[2] <= value <= setting[3]),
+             "service admission setting is invalid: " + key)
+        need(entry.get("range") == [setting[2], setting[3]], "service admission range changed: " + key)
+        values[key] = value
+    need(values["max_inflight_bytes"] >= values["max_request_bytes"],
+         "ROOTYARD_MAX_INFLIGHT_BYTES must be at least ROOTYARD_MAX_REQUEST_BYTES")
+    byte_capacity = values["max_inflight_bytes"] // values["max_request_bytes"]
+    effective = min(values["max_concurrent_git"], byte_capacity)
+    need(effective >= CONCURRENCY,
+         "configured service admission covers fewer than " + str(CONCURRENCY) + " concurrent upload-pack bodies")
+    need(admission.get("upload_pack_reservation_bytes") == values["max_request_bytes"],
+         "upload-pack reservation does not equal max_request_bytes")
+    need(admission.get("upload_pack_reservation_source") == UPLOAD_PACK_RESERVATION_SOURCE,
+         "upload-pack reservation source is missing")
+    need(admission.get("byte_budget_capacity") == byte_capacity, "byte-budget capacity was not derived")
+    need(admission.get("effective_upload_pack_capacity") == effective, "effective capacity was not derived")
+    need(admission.get("measured_clone_concurrency") == CONCURRENCY, "measured clone concurrency changed")
+    need(admission.get("capacity_covers_measured_concurrency") is True,
+         "configured capacity does not cover the measured clone concurrency")
+    need(admission.get("scope") == ADMISSION_SCOPE, "service admission scope changed")
+    need(isinstance(admission.get("explanation"), str) and "before spooling" in admission["explanation"],
+         "service admission explanation is missing")
+    return json.loads(json.dumps(admission))
+
+
 def sensitive_values(env):
     """Values a report must never contain: credentials and connection/endpoint material."""
     values = [value for name, value in env.items() if value and SENSITIVE_PATTERN.search(name)]
@@ -1332,10 +1444,12 @@ UNMEASURED = {
 }
 
 
-def report_payload(*, binding, blob_profile, runtime, workload, cases, setup, seeding, concurrent, cold):
+def report_payload(*, binding, blob_profile, runtime, workload, cases, setup, seeding, concurrent, cold,
+                   service_admission):
     """Assemble the redaction-safe baseline report from measured pieces only."""
     validate_binding(binding)
     facts = validate_workload(workload)
+    admission = validate_service_admission(service_admission)
     epochs = [case.get("service_epoch") for case in cases]
     validated = validate_cases(cases, epochs)
     cold_record = validate_cold(cold)
@@ -1387,6 +1501,7 @@ def report_payload(*, binding, blob_profile, runtime, workload, cases, setup, se
                    "service_epoch": case["service_epoch"], "sampled": case["name"] != "restart",
                    "pg_samples": case.get("pg_samples")} for case in validated],
         "concurrent": concurrent_record,
+        "service_admission": admission,
         "cold_clone": cold_record,
         "cache_semantics": {"cold": COLD_SEMANTICS, "cold_scope": "process_local_materialized_view_only",
                             "provider_cache_state": "unknown", "provider_cache_observed": False,
@@ -1452,6 +1567,8 @@ def run(args, profile, blob_profile):
         # Attest once, before any fixture exists; re-verified after the run.
         binding = binding_record(profile)
         harness = serving.BlobOnlyHarness(args, profile, blob_profile)
+        # Effective admission settings of this profile, read once and never overridden.
+        admission_facts = service_admission_facts(harness.env)
         workload = {**describe_workload(files), "version": WORKLOAD_VERSION,
                     "mode": READ_MODE, "concurrency": CONCURRENCY,
                     "repositories_provisioned_via": "POST /api/repos",
@@ -1532,7 +1649,7 @@ def run(args, profile, blob_profile):
 
         seeding = sampled("seed_push", seeding_case)
 
-        # 3. Four concurrent independent read-only clones of that single seed repository.
+        # 3. Two concurrent read-clone destinations from the same single seed repository.
         def concurrent_batch():
             # Keep the raw worker records and the measured window: the report re-validates them.
             workers, aggregate_seconds, aggregate = run_concurrent_reads(harness, seed)
@@ -1569,7 +1686,7 @@ def run(args, profile, blob_profile):
         payload = report_payload(binding=binding, blob_profile=blob_profile, runtime=runtime, workload=workload,
                                  cases=cases, setup=setup, seeding=seeding,
                                  concurrent=concurrent_batch.raw,
-                                 cold=cold_record)
+                                 cold=cold_record, service_admission=admission_facts)
         validate_no_secrets(payload, sensitive_values(harness.env))
         report.update(payload)
     except BaseException as error:
