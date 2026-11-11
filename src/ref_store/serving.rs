@@ -40,7 +40,6 @@
 use crate::{
     Error, auth,
     db::{self, Identity, Repository},
-    members::models::Role,
     organizations,
     ref_store::{
         CoreGate,
@@ -51,13 +50,18 @@ use crate::{
         },
         pg::bound,
     },
-    token_scopes::RepoAction,
 };
 use axum::http::StatusCode;
 use deadpool_postgres::{Pool, Transaction};
 use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
+
+mod authority;
+
+pub(crate) use authority::AuthorityKind;
+pub use authority::lookup;
+pub(crate) use authority::lookup_in_tx;
 
 /// Default branch a freshly provisioned core gate starts on.
 const DEFAULT_HEAD_REF: &str = "refs/heads/main";
@@ -98,6 +102,10 @@ impl std::fmt::Debug for ProvisionReceipt {
 pub struct ServingRepository {
     pub repository: Repository,
     pub gate: CoreGate,
+    /// The non-nil `public.cluster_authority.incarnation` this lookup read in
+    /// its own bounded transaction after authorization. A later serving read
+    /// capture must prove the identical value before it may materialize.
+    pub cluster_incarnation: Uuid,
 }
 
 impl std::fmt::Debug for ServingRepository {
@@ -106,6 +114,7 @@ impl std::fmt::Debug for ServingRepository {
             .debug_struct("ServingRepository")
             .field("repository_id", &self.repository.id)
             .field("revision", &self.gate.revision())
+            .field("cluster_incarnation", &self.cluster_incarnation)
             .finish()
     }
 }
@@ -462,72 +471,6 @@ async fn provision_in_tx(
     Ok((repository_id, created))
 }
 
-/// Resolve one already served `pg_refstore` repository after current
-/// authorization.
-///
-/// `writable` selects the required role/scope (`write` vs `read`) and refuses a
-/// read-only token. Authorization runs first (token, RBAC, token scope,
-/// repository `ready`); only then is the durable binding, the live gate and the
-/// concrete Blob backend identity checked, so an unauthorized caller cannot
-/// probe serving state.
-pub async fn lookup(
-    pool: &Pool,
-    actor: &Identity,
-    owner: &str,
-    name: &str,
-    writable: bool,
-    backend: &crate::blob_store::BlobBackendIdentity,
-    deadline: Instant,
-) -> Result<ServingRepository, Error> {
-    if !db::valid_name(owner) || !db::valid_name(name) {
-        return Err(Error::not_found());
-    }
-    if writable {
-        auth::writable(actor)?;
-    }
-    let mut client = acquire(pool, deadline).await?;
-    let tx = begin_owned(&mut client, deadline).await?;
-    let result = lookup_in_tx(&tx, actor, owner, name, writable, backend, deadline).await;
-    let _ = tx.rollback().await;
-    result
-}
-
-pub(crate) async fn lookup_in_tx(
-    tx: &Transaction<'_>,
-    actor: &Identity,
-    owner: &str,
-    name: &str,
-    writable: bool,
-    backend: &crate::blob_store::BlobBackendIdentity,
-    deadline: Instant,
-) -> Result<ServingRepository, Error> {
-    bound(tx, deadline).await.map_err(map_refstore)?;
-    let (min_role, action) =
-        if writable { (Role::Write, RepoAction::ContentsWrite) } else { (Role::Read, RepoAction::ContentsRead) };
-    let access = auth::authorize_repo_with_role(tx, actor, owner, name, min_role, action).await?;
-    // The tenant identity is the owner namespace resolved by that
-    // authorization, never the actor id.
-    let scope =
-        LockedScope::lock(tx, access.repo_id, false).await.map_err(map_refstore)?.ok_or_else(Error::not_found)?;
-    let binding = scope.require_serving(access.owner_id, backend.as_hex()).map_err(map_scope_refusal)?;
-    let gate = PgRefStoreCore
-        .read_gate_in_tx(tx, access.repo_id, false)
-        .await
-        .map_err(map_refstore)?
-        .ok_or_else(Error::not_found)?;
-    // Durable binding realm must equal the live gate realm; a gate that moved
-    // under another realm is a durable inconsistency, never a request verdict.
-    scope.require_binding_matches_gate(&gate).map_err(|refusal| Error::internal(refusal.reason()))?;
-    if gate.tenant_id() != access.owner_id
-        || gate.object_format() != binding.object_format()
-        || gate.repository_id() != access.repo_id
-    {
-        return Err(Error::internal("durable gate/binding realm mismatch"));
-    }
-    let repository = read_repository_in_tx(tx, access.repo_id).await?;
-    Ok(ServingRepository { repository, gate })
-}
-
 async fn read_repository(pool: &Pool, repository_id: Uuid, deadline: Instant) -> Result<Repository, Error> {
     let client = acquire(pool, deadline).await?;
     let row = tokio::time::timeout_at(
@@ -538,15 +481,6 @@ async fn read_repository(pool: &Pool, repository_id: Uuid, deadline: Instant) ->
     .map_err(|_| deadline_error())?
     .map_err(Error::internal)?
     .ok_or_else(Error::not_found)?;
-    Ok(Repository::from_row(&row))
-}
-
-async fn read_repository_in_tx(tx: &Transaction<'_>, repository_id: Uuid) -> Result<Repository, Error> {
-    let row = tx
-        .query_opt(&format!("{} WHERE r.id=$1", db::REPO_SELECT), &[&repository_id])
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
     Ok(Repository::from_row(&row))
 }
 

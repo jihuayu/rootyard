@@ -21,10 +21,11 @@ use tokio::{
     time::timeout,
 };
 
-// `blob_gateway_support` is both the crate root (as `mod
-// blob_gateway_support`) and `crate::proxy`'s parent, so `wire` outside `super`
-// is ambiguous there; name it through its defining module instead.
-use crate::blob_gateway_support::wire::{self, Bounds};
+// `wire` is the support root's own module. Name it two levels up so this file
+// compiles both under the integration test's crate-root `mod
+// blob_gateway_support` and under the library harness, which includes the same
+// `mod.rs` as `session_http_acceptance::support`.
+use super::super::wire::{self, Bounds};
 
 use super::{Limits, Proxy, loopback};
 

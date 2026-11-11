@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    UploadIntent,
+    BlobBackendIdentity, BlobLocator, UploadIntent,
     budget::{ResourceContext, ResourceLimits},
     config::BlobProfile,
     opendal::BlobStore,
@@ -34,6 +34,22 @@ pub(crate) fn store(limits: ResourceLimits) -> (BlobStore, Arc<ResourceContext>)
     let resources = Arc::new(ResourceContext::new(limits));
     let store = BlobStore::open_memory(BlobProfile::memory_profile(limits), Arc::clone(&resources));
     (store, resources)
+}
+
+/// Two distinct real `cfg(test)` memory-store identities from one shared
+/// private budget. Callers that need a stable identity per test compare the
+/// returned values instead of opening a new store per call.
+pub(crate) fn distinct_backend_identities() -> (BlobBackendIdentity, BlobBackendIdentity) {
+    let limits = ResourceLimits::new(2, 2, 1 << 20).expect("test budget");
+    let (first, _) = store(limits);
+    let (second, _) = store(limits);
+    (first.backend_identity().clone(), second.backend_identity().clone())
+}
+
+/// The stable synthetic identity named `name`. Two calls with one name are
+/// equal; different names are distinct. Not a real store and not a secret.
+pub(crate) fn blob_backend_identity(name: &str) -> BlobBackendIdentity {
+    BlobBackendIdentity::named_test_identity(name)
 }
 
 pub(crate) fn payload(len: usize) -> Vec<u8> {
@@ -55,4 +71,19 @@ pub(crate) fn write_source(dir: &Path, bytes: &[u8]) -> PathBuf {
     let path = dir.join("source");
     std::fs::write(&path, bytes).expect("test source write");
     path
+}
+
+/// Delete exactly one already-published object by its read-only locator.
+///
+/// Test-only: the production `BlobStore::delete` remains disabled. The fixture
+/// uses this to prove that a token issued before the bytes disappeared cannot
+/// make a serving read succeed.
+pub(crate) async fn delete_exact(store: &BlobStore, locator: &BlobLocator) -> anyhow::Result<()> {
+    let path = store.object_path(locator);
+    store
+        .operator()
+        .delete(&path)
+        .await
+        .map_err(|error| anyhow::anyhow!("fixture Blob delete failed ({})", error.kind()))?;
+    Ok(())
 }

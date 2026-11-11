@@ -36,14 +36,10 @@
 //! uses `std::time::Instant`. The single effective deadline is converted with
 //! `into_std()` at that boundary, so both halves observe the same absolute
 //! instant and the budget is never restarted.
-use super::super::pack_commit::{
-    self, CapturedRef, NativeReadClosure, NativeReadEngine, NativeReadRequest, PackArtifactRole, PackCommitError,
-    RegisteredPack,
-};
-use super::super::snapshot_contract::MetadataSnapshotScope;
+use super::super::pack_commit::{self, NativeReadClosure, NativeReadEngine, NativeReadRequest, PackCommitError};
 use super::contract as pack_contract;
 use super::pg::PgPackSnapshot;
-use super::read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
+use super::read_snapshot::PackReadSnapshot;
 use super::request::PackSnapshotRef;
 use super::serving_read::{RegisteredServingRead, ServingReadCapture, revalidate_serving_capture};
 use crate::blob_store::opendal::BlobStore;
@@ -52,7 +48,6 @@ use crate::ref_store::core::snapshot_sql;
 use crate::ref_store::pg;
 use crate::ref_store::tx::begin_bounded;
 use deadpool_postgres::Pool;
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
@@ -244,13 +239,9 @@ impl PgPackSnapshotMaterializer {
             return Ok(None);
         }
         let deadline = effective_deadline(deadline)?;
-        let (snapshot, binding) = capture.registered_parts()?;
+        let (snapshot, binding, capture_incarnation) = capture.registered_parts()?;
         let registered = RegisteredServingRead { snapshot, binding };
-        if registered.snapshot.source_kind() != ReadSnapshotSourceKind::ServingTransient
-            || registered.snapshot.pack_mode() != pack_contract::PACK_MODE_VERIFIED
-            || !registered.snapshot.complete_registered_pack_membership()
-            || registered.snapshot.pack_count() <= 0
-        {
+        if registered.snapshot.complete_transient_pack_read().is_none() {
             return Err(RefStoreError::Unsupported(
                 "serving read materialization requires a transient complete pack-verified capture",
             ));
@@ -284,7 +275,39 @@ impl PgPackSnapshotMaterializer {
         {
             return Err(RefStoreError::Unsupported("materialized view exceeds its workspace bound"));
         }
-        self.revalidate_serving(pool, &registered, native, deadline).await.map(Some)
+        match self.revalidate_serving(pool, &registered, capture_incarnation, native, deadline).await? {
+            Some(view) => Ok(Some(view)),
+            None => Err(RefStoreError::Database("serving read transaction cleanup left no view".into())),
+        }
+    }
+
+    /// The proof-producing form of [`Self::materialize_serving_read`] (#174).
+    ///
+    /// Exactly the same download, verification, native `fsck` and fresh T2
+    /// recheck, but the returned value keeps the verified native view and the
+    /// sealed [`serving_proof::VerifiedReadViewProof`] alive together. The proof is built by
+    /// [`serving_proof::VerifiedReadView::of_materialized`], which accepts nothing but the
+    /// T2-completed [`MaterializedPackRead`] itself and reads the proof's
+    /// cluster incarnation back from that view's private, T2-sealed anchor (the
+    /// value T2 re-read `FOR SHARE` and compared with the capture). A restore
+    /// rotation between capture and T2 makes T2 refuse, so no view and no proof
+    /// exist; no caller can pass an incarnation in. A checked empty capture still
+    /// returns `Ok(None)`: no bytes, no proof (its anchor is kept only in the
+    /// opaque capture). The JSON read gateway keeps this value in its computed
+    /// view and issues a session only from it, after encoding and the final
+    /// authorization fence: the fresh lookup, the proof and the capture anchor
+    /// must all carry the same cluster authority incarnation (see
+    /// `browse::finalize` and `read_session::verify_capture_anchor`).
+    pub(crate) async fn materialize_serving_read_sealed(
+        &self,
+        pool: &Pool,
+        capture: &ServingReadCapture,
+        deadline: Instant,
+    ) -> Result<Option<MaterializedServingRead>, RefStoreError> {
+        let Some(view) = self.materialize_serving_read(pool, capture, deadline).await? else {
+            return Ok(None);
+        };
+        serving_materialization(view, capture).map(Some)
     }
 
     /// T2 for the transient serving read source kind.
@@ -296,15 +319,22 @@ impl PgPackSnapshotMaterializer {
         &self,
         pool: &Pool,
         registered: &RegisteredServingRead,
+        capture_incarnation: Uuid,
         native: NativeReadClosure,
         deadline: Instant,
-    ) -> Result<MaterializedPackRead, RefStoreError> {
+    ) -> Result<Option<MaterializedPackRead>, RefStoreError> {
         let mut client = pooled_client(pool, deadline).await?;
         let tx = begin_bounded(&mut client, deadline).await?;
         let result = async {
             let fresh = pg::before_deadline(
                 deadline,
-                revalidate_serving_capture(&tx, registered, self.store_identity.as_hex(), deadline),
+                revalidate_serving_capture(
+                    &tx,
+                    registered,
+                    capture_incarnation,
+                    self.store_identity.as_hex(),
+                    deadline,
+                ),
             )
             .await?;
             if fresh != registered.snapshot || fresh.materialization_digest() != registered.binding {
@@ -326,10 +356,10 @@ impl PgPackSnapshotMaterializer {
             Ok(fresh)
         }
         .await;
-        let sealed = result.map(|fresh| {
-            let read_digest = native.read_digest_hex();
-            MaterializedPackRead { snapshot: fresh, native, read_digest }
-        });
+        // The view — and only this transient serving T2 path — keeps the anchor
+        // T2 just re-read `FOR SHARE` and compared with the capture. The proof
+        // factory later reads it back from here; no call site supplies it.
+        let sealed = result.map(|fresh| Some(MaterializedPackRead::sealed(fresh, native, Some(capture_incarnation))));
         let cleanup = match tokio::time::timeout_at(deadline, tx.rollback()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(RefStoreError::Database("serving read transaction cleanup failed".into())),
@@ -409,8 +439,10 @@ impl PgPackSnapshotMaterializer {
                     "materialized native closure binding differs from the revalidated read",
                 ));
             }
-            let read_digest = native.read_digest_hex();
-            Ok(MaterializedPackRead { snapshot: fresh, native, read_digest })
+            // Legacy/history materialization takes no cluster authority row
+            // lock, so it can never carry a serving anchor: its view is
+            // unanchored and can never become a serving proof.
+            Ok(MaterializedPackRead::sealed(fresh, native, None))
         });
         // Bounded cleanup under the SAME absolute deadline. The sealed value is
         // returned only when cleanup succeeded; a timeout or a failed rollback
@@ -425,146 +457,6 @@ impl PgPackSnapshotMaterializer {
             (Err(error), _) => Err(error),
             (Ok(_dropped), Err(error)) => Err(error),
         }
-    }
-}
-
-/// Opaque owned materialized read view. Not `Clone`, not `Serialize`, no public
-/// constructor and no write/publish/serving capability.
-pub struct MaterializedPackRead {
-    snapshot: PackReadSnapshot,
-    native: NativeReadClosure,
-    read_digest: String,
-}
-
-impl MaterializedPackRead {
-    pub fn snapshot_id(&self) -> Uuid {
-        self.snapshot.snapshot_id()
-    }
-    pub fn pin_id(&self) -> Uuid {
-        self.snapshot.pin_id()
-    }
-    pub fn pin_generation(&self) -> i64 {
-        self.snapshot.pin_generation()
-    }
-    pub fn scope(&self) -> &MetadataSnapshotScope {
-        self.snapshot.scope()
-    }
-    pub fn repository_id(&self) -> Uuid {
-        self.snapshot.repository_id()
-    }
-    pub fn tenant_id(&self) -> Uuid {
-        self.snapshot.tenant_id()
-    }
-    pub fn owner_id(&self) -> Uuid {
-        self.snapshot.owner_id()
-    }
-    pub fn gate_revision(&self) -> i64 {
-        self.snapshot.gate_revision()
-    }
-    pub fn gate_digest_hex(&self) -> &str {
-        self.snapshot.gate_digest_hex()
-    }
-    pub fn pack_mode(&self) -> &'static str {
-        self.snapshot.pack_mode()
-    }
-    pub fn head_ref(&self) -> &str {
-        self.snapshot.head_ref()
-    }
-    pub fn head_oid_hex(&self) -> Option<&str> {
-        self.snapshot.head_oid_hex()
-    }
-    pub fn refs(&self) -> &[CapturedRef] {
-        self.snapshot.refs()
-    }
-    pub fn ref_count(&self) -> i64 {
-        self.snapshot.ref_count()
-    }
-    pub fn packs(&self) -> &[RegisteredPack] {
-        self.snapshot.packs()
-    }
-    pub fn pack_count(&self) -> i64 {
-        self.snapshot.pack_count()
-    }
-    pub fn membership_digest_hex(&self) -> &str {
-        self.snapshot.membership_digest_hex()
-    }
-    pub fn snapshot_digest_hex(&self) -> &str {
-        self.snapshot.snapshot_digest_hex()
-    }
-    /// Complete A5b binding: full scope, expiry, pin/generation, refs+HEAD,
-    /// membership and full pack identity digests. Never the incomplete A5a
-    /// read digest alone.
-    pub fn read_digest_hex(&self) -> &str {
-        &self.read_digest
-    }
-    pub fn logical_bytes(&self) -> i64 {
-        self.snapshot.logical_bytes()
-    }
-    pub fn expires_at_unix_micros(&self) -> i64 {
-        self.snapshot.expires_at_unix_micros()
-    }
-    pub fn expires_at(&self) -> Result<std::time::SystemTime, RefStoreError> {
-        self.snapshot.expires_at()
-    }
-    pub fn verified_pairs(&self) -> usize {
-        self.native.verified_pairs()
-    }
-    pub fn verified_bytes(&self) -> u64 {
-        self.native.verified_bytes()
-    }
-    pub const fn complete_registered_pack_membership(&self) -> bool {
-        true
-    }
-    pub const fn complete_git_read_snapshot(&self) -> bool {
-        true
-    }
-    pub const fn packs_complete(&self) -> bool {
-        true
-    }
-
-    /// Read one exact verified local pack copy. This never re-opens the Blob
-    /// backend and never exposes the private workspace path.
-    pub async fn pack_bytes(&self, pack_id: Uuid, deadline: Instant) -> Result<Vec<u8>, RefStoreError> {
-        self.read_local(pack_id, PackArtifactRole::Pack, deadline).await
-    }
-
-    /// Read one exact verified local index copy.
-    pub async fn idx_bytes(&self, pack_id: Uuid, deadline: Instant) -> Result<Vec<u8>, RefStoreError> {
-        self.read_local(pack_id, PackArtifactRole::Idx, deadline).await
-    }
-
-    async fn read_local(
-        &self,
-        pack_id: Uuid,
-        role: PackArtifactRole,
-        deadline: Instant,
-    ) -> Result<Vec<u8>, RefStoreError> {
-        if deadline <= Instant::now() {
-            return Err(RefStoreError::Timeout);
-        }
-        let pack = self
-            .snapshot
-            .packs()
-            .iter()
-            .find(|pack| pack.pack_id() == pack_id)
-            .ok_or(RefStoreError::Unsupported("unknown materialized pack id"))?;
-        let artifact = pack.artifact(role);
-        // The private workspace path is never exposed: the native closure selects
-        // the exact verified copy and runs the read in one owned blocking task
-        // that holds the workspace/view lease until the read actually exits, so a
-        // timeout/cancel can never reclaim the workspace under a live read.
-        let bytes = self
-            .native
-            .read_artifact(pack_id, role, artifact.verified_length(), deadline.into_std())
-            .await
-            .map_err(map_native_error)?;
-        if bytes.len() as u64 != artifact.verified_length() {
-            return Err(RefStoreError::Database("verified local materialized copy changed its length".into()));
-        }
-        if hex::encode(Sha256::digest(&bytes)) != artifact.verified_sha256().as_str() {
-            return Err(RefStoreError::Database("verified local materialized copy changed its digest".into()));
-        }
-        Ok(bytes)
     }
 }
 
@@ -593,3 +485,14 @@ fn map_native_error(error: PackCommitError) -> RefStoreError {
         PackCommitError::CommitUnknown { .. } => RefStoreError::Unsupported("materialized read never commits"),
     }
 }
+
+mod serving;
+
+pub use serving::MaterializedPackRead;
+pub(crate) use serving::MaterializedServingRead;
+pub(super) use serving::serving_materialization;
+#[cfg(test)]
+pub(super) use serving::test_materialized_view;
+
+#[cfg(test)]
+mod serving_tests;

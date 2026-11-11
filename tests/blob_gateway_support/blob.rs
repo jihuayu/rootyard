@@ -5,7 +5,7 @@
 //! `ROOTYARD_BLOB_ROOT` is a remote object *prefix*, not a local directory:
 //! `validate_root` rejects absolute paths, and the S3 driver hands the value
 //! straight to the bucket as `root`. The fixture therefore never guesses or
-//! fabricates a prefix; [`db::owned_root`] pins exactly one random relative
+//! fabricates a prefix; [`db_run::owned_root`] pins exactly one random relative
 //! prefix for the run, the launched service receives that same value, and the
 //! store opened here resolves to the same physical objects. A description of
 //! the opened profile never contains credentials, secrets, a session token or
@@ -13,7 +13,7 @@
 use anyhow::{Result, anyhow, ensure};
 use rootyard::blob_store::{BlobProvider, config::BlobProfile, opendal::BlobStore};
 
-use super::db;
+use super::db_run;
 
 /// Open the real store both the test process and the service use.
 pub fn open_store() -> Result<BlobStore> {
@@ -26,7 +26,7 @@ pub fn open_store() -> Result<BlobStore> {
 
 /// The run-owned relative prefix, or the reason it cannot be used.
 pub fn root() -> Result<&'static str> {
-    let root = db::owned_root()?;
+    let root = db_run::owned_root()?;
     validate(root)
 }
 

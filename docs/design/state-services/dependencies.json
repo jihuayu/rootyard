@@ -135,6 +135,10 @@
       "pando-lab": {
         "value": []
       },
+      "format22-fixture": {
+        "value": [],
+        "note": "Build-only gate for the issue #169 format22 source fixture; selects no dependency and is never enabled by the all-targets gates."
+      },
       "blob-azblob": {
         "value": [
           "opendal/services-azblob"
@@ -805,7 +809,7 @@
     "lock_sha256": "fcd88cd99ce590cfa401180bc45bbafa4099193abe552c562a4cca81d84c4186",
     "lock_sha256_note": "Exact reviewed SHA-256 of the committed integrated Cargo.lock (Root-owned). Pins the whole reviewed dependency graph; the frozen (name,version,source,checksum) identity comparison below remains as corroboration.",
     "target_dependencies_policy": "No [target.*.dependencies/dev-dependencies/build-dependencies] entries are declared or accepted by the integrated contract; any target-specific dependency is rejected as unreviewed until one is explicitly recorded here.",
-    "manifest_sha256": "b330229dffa6bd4c74aacda2d869d206b321444f5d8101431ce21d6e28fcbc51",
+    "manifest_sha256": "dd56fb61a43f361a613dba0132577e09b3d3756e588337eb4e92b622d5c3cd54",
     "manifest_sha256_note": "Exact reviewed SHA-256 of the committed integrated Cargo.toml (Root-owned). The exact-bytes pin is the primary integrated approval: features, target tables, versions and dependency edges cannot change without the pin and this record changing together, which requires explicit PR review. The semantic checks below remain as readable corroboration."
   },
   "open_items_before_add": [

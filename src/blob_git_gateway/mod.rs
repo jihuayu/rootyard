@@ -31,13 +31,18 @@ mod operation;
 mod process_guard;
 mod protocol;
 mod publish;
+mod read_session;
 mod receive;
+pub(crate) mod repo_session;
 mod resource;
 mod serving;
 mod session;
 mod smart_http;
 mod snapshot;
 mod state;
+
+#[cfg(test)]
+mod session_http_acceptance;
 
 use std::sync::Arc;
 
@@ -48,6 +53,7 @@ use axum::{
 
 pub use config::{BlobGitConfig, BlobGitConfigError, BlobGitLimits, BlobGitNativeLimits};
 pub use error::GatewayError;
+pub use repo_session::SessionTokens;
 pub use state::BlobGitState;
 
 /// Mount the Blob Git gateway. The caller owns the listener and the real Blob

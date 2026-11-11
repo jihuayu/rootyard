@@ -16,6 +16,10 @@ on:
       - 'tests/decision_subset_support/**'
       - 'tests/blob_git_gateway.rs'
       - 'tests/blob_gateway_support/**'
+      - 'tests/serving_proof_support/**'
+      - 'tests/serving_reads_support/**'
+      - 'tests/serving_support/**'
+      - 'tests/fixtures/**'
       - 'tests/blob_only_service.py'
       - 'tests/blob_gateway_browse.py'
       - 'tests/blob_gateway_history.py'
@@ -57,6 +61,8 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 12
     env:
       ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_protocol
+      SESSION174_DATABASE_ADMIN_URL: postgresql://rootyard@127.0.0.1:55432/postgres
+      SESSION174_DATABASE_PREFIX: session174_foundation
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -119,6 +125,35 @@ jobs:
               'ignored': 0, 'external_blob_backup': False, 'serving_cutover': False,
           }, indent=2) + '\n')
           PY
+      - name: "Create the run-owned #174 foundation database"
+        id: session174_db
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          case "$SESSION174_DATABASE_PREFIX" in *[!a-z0-9_]*) echo "unsafe database prefix" >&2; exit 1 ;; esac
+          database="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}_a${GITHUB_RUN_ATTEMPT}"
+          if [ "${#database}" -gt 63 ]; then echo "database name exceeds 63 bytes" >&2; exit 1; fi
+          connected="$(psql "$SESSION174_DATABASE_ADMIN_URL" -X -t -A -v ON_ERROR_STOP=1 -c 'SELECT current_database()')"
+          if [ "$connected" != "postgres" ]; then echo "admin URL must connect to the postgres bootstrap database" >&2; exit 1; fi
+          # psql does not interpolate :'variables' inside -c; the SQL must arrive on stdin.
+          preexisting="$(psql "$SESSION174_DATABASE_ADMIN_URL" -X -t -A -v ON_ERROR_STOP=1 -v database="$database" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          if [ "$preexisting" != "0" ]; then echo "owned database name already exists; refusing to adopt or overwrite it" >&2; exit 1; fi
+          # Record the name before CREATE so the always() cleanup can drop a partial creation.
+          echo "database=$database" >> "$GITHUB_OUTPUT"
+          psql "$SESSION174_DATABASE_ADMIN_URL" -X -v ON_ERROR_STOP=1 -v database="$database" >/dev/null <<'SQL'
+          SELECT format('CREATE DATABASE %I', :'database') \gexec
+          SQL
+          created="$(psql "$SESSION174_DATABASE_ADMIN_URL" -X -t -A -v ON_ERROR_STOP=1 -v database="$database" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          if [ "$created" != "1" ]; then echo "owned database was not created exactly once" >&2; exit 1; fi
       - name: Build and exercise the minimal Blob standalone service
         timeout-minutes: 20
         shell: bash
@@ -148,6 +183,22 @@ jobs:
           export ROOTYARD_GIT="$(command -v git)"
           binary="$GITHUB_WORKSPACE/target/debug/rootyard"
           fixture="$fixture_dir/ref_store_format22_backup_fixture"
+          # tests/blob_only_service.py -> e2e.Harness.setup() migrates only a random search_path
+          # schema, so the job-owned service database needs the production public migration first.
+          # The DSN is passed only through the environment and never echoed.
+          if ! env DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL" "$binary" migrate \
+              > test-results/refstore/standalone-migrate.log 2>&1; then
+            # The raw log stays in test-results/ and is collected by the artifact upload;
+            # never print it here because diagnostics can include the DSN/credentials.
+            echo "standalone Blob gate: production CLI migrate failed on the job-owned database" >&2
+            exit 1
+          fi
+          authority="$(psql "$ROOTYARD_TEST_DATABASE_URL" -X -t -A -v ON_ERROR_STOP=1 -c \
+            "SELECT to_regclass('public.cluster_authority') IS NOT NULL")"
+          if [ "$authority" != "t" ]; then
+            echo "standalone Blob gate: public.cluster_authority is absent from the job-owned database" >&2
+            exit 1
+          fi
           python3 tests/blob_only_service.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --report test-results/refstore/standalone-http.json
           python3 tests/blob_gateway_browse.py --binary "$binary" --git "$ROOTYARD_GIT" \
@@ -463,6 +514,399 @@ jobs:
             --harness scripts/native_report_manifest.py \
             --fixture postgres=postgres:17 \
             --fixture garage="Garage v2.1.0 sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78e93ee8da7cf6a"
+      - name: "Exercise the #174 HTTP foundation cases against the owned database and Blob fixture"
+        timeout-minutes: 15
+        shell: bash
+        env:
+          SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}
+        run: |
+          set -euo pipefail
+          if [ ! -s "$RUNNER_TEMP/refstore-object-store.env" ]; then echo "missing object-store env" >&2; exit 1; fi
+          evidence="$RUNNER_TEMP/session174-foundation"
+          mkdir -p "$evidence" test-results/refstore/session174-foundation
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="session174-foundation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_TEST_GIT="$(command -v git)"
+          export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$SESSION174_DATABASE"
+          export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
+          lib="$evidence/session174-lib-tests"
+          cli="$evidence/rootyard-cli"
+          # Keep builder stdout off the atomically written <output>.build.json receipt path;
+          # the canonical receipt is copied from that path below.
+          python3 scripts/build_native_test.py --lib --no-default-features --package-debug 0 --strip-debuginfo \
+            --output "$lib" > "$evidence/session174-lib-tests.stdout.log"
+          python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
+            > "$evidence/standalone-build.json"
+          cp --preserve=mode "$GITHUB_WORKSPACE/target/debug/rootyard" "$cli"
+          chmod 755 "$cli" "$lib"
+          if ! python3 - "$lib" "$cli" <<'PY' 2>&1 | tee "$evidence/preflight.log"
+          # The owned database name arrives only through DATABASE_URL; it is never printed.
+          import hashlib, json, os, pathlib, re, subprocess, sys
+          lib, cli = sys.argv[1:3]
+          workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          evidence = pathlib.Path(lib).parent
+          hex64 = re.compile(r'^[0-9a-f]{64}$')
+          names = [
+              'blob_git_gateway::session_http_acceptance::push_token_bounds_repeated_http_reads',
+              'blob_git_gateway::session_http_acceptance::negative_tests::cross_repository_session_replay_is_refused',
+              'blob_git_gateway::session_http_acceptance::negative_tests::cross_tenant_session_replay_is_refused',
+              'blob_git_gateway::session_http_acceptance::negative_tests::expired_session_token_is_refused_over_http',
+              'blob_git_gateway::session_http_acceptance::negative_tests::tampered_session_token_is_refused_over_http',
+              'blob_git_gateway::session_http_acceptance::negative_tests::revoked_collaborator_session_is_refused_before_token_scoring',
+              'blob_git_gateway::session_http_acceptance::negative_tests::missing_registered_pack_fails_closed_without_a_session',
+              'blob_git_gateway::session_http_acceptance::negative_tests::keyring_loaded_gateway_issues_and_validates_sessions',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materialization',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::corrupting_a_registered_pack_after_capture_refuses_the_sealed_materialization',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_returns_none_for_a_checked_empty_capture',
+          ]
+          # Exact argv recorded by the builder invocations above, as emitted by the
+          # current scripts/build_native_test.py --lib and scripts/build_native.py.
+          EXPECTED_LIB_COMMAND = [
+              'cargo',
+              '--config', 'profile.dev.package.rootyard.debug=0',
+              '--config', 'profile.test.package.rootyard.debug=0',
+              '--config', 'profile.dev.package.rootyard.strip="debuginfo"',
+              '--config', 'profile.test.package.rootyard.strip="debuginfo"',
+              'test', '--locked', '--no-default-features', '--lib', '--no-run',
+              '--message-format=json-render-diagnostics',
+          ]
+          EXPECTED_CLI_COMMAND = [
+              'cargo', 'build', '--locked', '--no-default-features',
+              '--config', 'profile.dev.package.rootyard.debug=0',
+              '--bin', 'rootyard',
+              '--config', 'profile.dev.package.rootyard.strip="debuginfo"',
+              '--message-format=json-render-diagnostics',
+          ]
+
+
+          def fail(message):
+              raise SystemExit('session174 preflight: ' + message)
+
+
+          def load(path):
+              try:
+                  return json.loads(pathlib.Path(path).read_text())
+              except (OSError, ValueError) as error:
+                  fail('unreadable receipt ' + repr(str(path)) + ': ' + type(error).__name__)
+
+
+          def sha(path):
+              path = pathlib.Path(path)
+              if not path.is_file():
+                  fail('missing file ' + repr(str(path)))
+              digest = hashlib.sha256()
+              with path.open('rb') as source:
+                  for chunk in iter(lambda: source.read(1 << 20), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def require_command(command, expected, label):
+              '''Require the receipt command to equal the expected argv exactly.'''
+              if not isinstance(command, list) or any(not isinstance(item, str) for item in command):
+                  fail(label + ' receipt command is not a list of strings')
+              if command != expected:
+                  fail(label + ' receipt command is ' + repr(command) + ', expected exactly ' + repr(expected))
+
+
+          test_receipt = load(pathlib.Path(lib).with_suffix('.build.json'))
+          cli_receipt = load(workspace / 'target' / 'debug' / 'rootyard.build.json')
+          (evidence / 'rootyard-cli.build.json').write_text(json.dumps(cli_receipt, indent=2) + '\n')
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=workspace, text=True).strip()
+          if not re.fullmatch(r'[0-9a-f]{40}', head):
+              fail('HEAD is not a lowercase 40-hex commit')
+          if test_receipt.get('kind') != 'rust-library-test':
+              fail('lib receipt kind is not rust-library-test')
+          if test_receipt.get('relocated_artifact') is not True or test_receipt.get('fresh') is not False:
+              fail('lib receipt is not a relocated Fresh=false artifact')
+          if test_receipt.get('workspace_commit') != head or cli_receipt.get('workspace_commit') != head:
+              fail('a receipt does not bind the current HEAD')
+          source = test_receipt.get('source_inputs_sha256')
+          if not isinstance(source, str) or not hex64.fullmatch(source):
+              fail('source_inputs_sha256 is not lowercase 64-hex')
+          if cli_receipt.get('source_inputs_sha256') != source:
+              fail('lib and CLI receipts bind different source_inputs_sha256')
+          if not test_receipt.get('rustc') or test_receipt.get('rustc') != cli_receipt.get('rustc'):
+              fail('lib and CLI receipts bind different rustc')
+          if test_receipt.get('package_rebuilt') is not True or cli_receipt.get('package_rebuilt') is not True:
+              fail('a receipt does not record a rebuilt rootyard package')
+          support = test_receipt.get('lib_test_support_inputs_sha256')
+          if not isinstance(support, str) or not hex64.fullmatch(support):
+              fail('lib receipt lacks a lowercase 64-hex lib_test_support_inputs_sha256')
+          if 'lib_test_support_inputs_sha256' in cli_receipt:
+              fail('CLI receipt unexpectedly carries a test-support digest')
+          # Lib receipt: exact build_native_test.py --lib argv (cargo test --locked
+          # --no-default-features --lib --no-run with the package debug/strip configs).
+          require_command(test_receipt.get('command'), EXPECTED_LIB_COMMAND, 'lib')
+          # CLI receipt (build_native.py version 1, no kind, no support digest): exact argv.
+          if cli_receipt.get('version') != 1:
+              fail('CLI receipt is not a version 1 build_native.py receipt')
+          require_command(cli_receipt.get('command'), EXPECTED_CLI_COMMAND, 'CLI')
+          if sha(lib) != test_receipt.get('binary_sha256'):
+              fail('relocated libtest binary does not match its receipt')
+          if sha(cli) != cli_receipt.get('binary_sha256'):
+              fail('relocated CLI does not match the CLI receipt')
+          test_artifacts = test_receipt.get('fresh_false_artifacts')
+          if not isinstance(test_artifacts, list) or len(test_artifacts) != 1:
+              fail('lib receipt lacks exactly one Fresh=false rootyard lib-test artifact')
+          test_artifact = test_artifacts[0]
+          if test_artifact.get('kind') != 'lib-test' or test_artifact.get('target') != 'rootyard' \
+                  or test_artifact.get('fresh') is not False:
+              fail('lib receipt lacks exactly one Fresh=false rootyard lib-test artifact')
+          profile = test_artifact.get('profile')
+          if not isinstance(profile, dict) or profile.get('test') is not True or profile.get('debuginfo') != 0:
+              fail('lib-test artifact profile is not the debug=0 test harness')
+          if cli_receipt.get('target_dir') is None:
+              fail('CLI receipt is not the build_native.py receipt')
+          cli_artifacts = cli_receipt.get('fresh_false_artifacts')
+          if not isinstance(cli_artifacts, list) or sorted(item.get('kind') for item in cli_artifacts) != ['bin', 'lib'] \
+                  or any(item.get('target') != 'rootyard' or item.get('fresh') is not False for item in cli_artifacts):
+              fail('CLI receipt lacks exactly the Fresh=false rootyard lib and bin artifacts')
+          cli_bin = next(item for item in cli_artifacts if item.get('kind') == 'bin')
+          executable = cli_bin.get('executable') or ''
+          if pathlib.Path(executable).resolve() != (workspace / 'target' / 'debug' / 'rootyard').resolve():
+              fail('CLI bin artifact is not the workspace target binary')
+          target_dir = pathlib.Path(cli_receipt.get('target_dir') or '').resolve()
+          for path in (lib, cli):
+              if target_dir == pathlib.Path(path).resolve() or target_dir in pathlib.Path(path).resolve().parents:
+                  fail('receipt or executable would live only inside CARGO_TARGET_DIR')
+          listing = subprocess.run([lib, '--list', '--ignored'], text=True, capture_output=True, env=os.environ)
+          if listing.returncode != 0:
+              fail('libtest could not list ignored cases (status ' + str(listing.returncode) + ')')
+          listed = {line.split(': ', 1)[0] for line in listing.stdout.splitlines() if line.endswith(': test')}
+          missing = [name for name in names if name not in listed]
+          if missing:
+              fail('libtest binary does not contain ' + ', '.join(missing))
+          migrated = subprocess.run([cli, 'migrate'], text=True, capture_output=True, env=os.environ)
+          if migrated.returncode != 0:
+              fail('production CLI migrate failed with status ' + str(migrated.returncode))
+          checked = subprocess.run(
+              ['psql', os.environ['DATABASE_URL'], '-X', '-t', '-A', '-v', 'ON_ERROR_STOP=1', '-c',
+               "SELECT to_regclass('public.cluster_authority') IS NOT NULL"],
+              text=True, capture_output=True)
+          if checked.returncode != 0 or checked.stdout.strip() != 't':
+              fail('public.cluster_authority is absent from the owned database public schema')
+          (evidence / 'preflight.json').write_text(json.dumps({
+              'passed': True, 'head': head, 'source_inputs_sha256': source,
+              'lib_test_support_inputs_sha256': support, 'rustc': test_receipt['rustc'],
+              'feature_set': ['no-default-features'],
+              'lib_command': test_receipt['command'], 'cli_command': cli_receipt['command'],
+              'lib_binary_sha256': test_receipt['binary_sha256'],
+              'cli_binary_sha256': cli_receipt['binary_sha256'],
+              'cluster_authority': 'public.cluster_authority', 'required_names': names,
+          }, indent=2) + '\n')
+          print('session174 preflight: receipts bound, CLI migrated, public.cluster_authority present')
+          PY
+          then
+            echo "session174 preflight failed" >&2
+            exit 1
+          fi
+          # Run every case; capture the pipeline status so evidence is saved before failing.
+          if python3 - "$lib" "$evidence" <<'PY' 2>&1 | tee "$evidence/cases.log"
+          import json, os, pathlib, re, subprocess, sys
+          lib, evidence = sys.argv[1], pathlib.Path(sys.argv[2])
+          secret_env = ('ROOTYARD_OBJECT_STORE_ACCESS_KEY', 'ROOTYARD_OBJECT_STORE_SECRET_KEY',
+                        'ROOTYARD_BLOB_ACCESS_KEY_ID', 'ROOTYARD_BLOB_SECRET_ACCESS_KEY')
+          secrets = sorted({os.environ.get(key) or '' for key in secret_env}, key=len, reverse=True)
+          secrets = [value for value in secrets if len(value) >= 4]
+          names = [
+              'blob_git_gateway::session_http_acceptance::push_token_bounds_repeated_http_reads',
+              'blob_git_gateway::session_http_acceptance::negative_tests::cross_repository_session_replay_is_refused',
+              'blob_git_gateway::session_http_acceptance::negative_tests::cross_tenant_session_replay_is_refused',
+              'blob_git_gateway::session_http_acceptance::negative_tests::expired_session_token_is_refused_over_http',
+              'blob_git_gateway::session_http_acceptance::negative_tests::tampered_session_token_is_refused_over_http',
+              'blob_git_gateway::session_http_acceptance::negative_tests::revoked_collaborator_session_is_refused_before_token_scoring',
+              'blob_git_gateway::session_http_acceptance::negative_tests::missing_registered_pack_fails_closed_without_a_session',
+              'blob_git_gateway::session_http_acceptance::negative_tests::keyring_loaded_gateway_issues_and_validates_sessions',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materialization',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::corrupting_a_registered_pack_after_capture_refuses_the_sealed_materialization',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
+              'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_returns_none_for_a_checked_empty_capture',
+          ]
+          summary = re.compile(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; '
+                               r'(\d+) measured; (\d+) filtered out; finished in ([0-9.]+)s$', re.M)
+
+          def sanitize(text):
+              '''Never persist URL-like lines; mask the actual S3 access/secret values.'''
+              kept = []
+              for line in text.splitlines():
+                  if '://' in line:
+                      kept.append('[line withheld: connection string]')
+                      continue
+                  for value in secrets:
+                      line = line.replace(value, '[redacted]')
+                  kept.append(line)
+              return '\n'.join(kept) + ('\n' if kept else '')
+
+          def save(path, text):
+              path.write_text(sanitize(text))
+
+          results = []
+          for index, name in enumerate(names, 1):
+              log = evidence / ('case-' + str(index) + '.log')
+              record = {'index': index, 'name': name, 'log': log.name, 'exit_code': None, 'errors': []}
+              passed_count = failed_count = ignored_count = 0
+              try:
+                  command = [lib, '--ignored', '--exact', name, '--test-threads=1']
+                  process = subprocess.run(command, text=True, capture_output=True)
+                  combined = process.stdout + process.stderr
+                  record['exit_code'] = process.returncode
+                  save(log, '$ libtest --ignored --exact ' + name + ' --test-threads=1\n'
+                       + '$ exit ' + str(process.returncode) + '\n--- stdout ---\n'
+                       + process.stdout + '--- stderr ---\n' + process.stderr)
+                  # Only this unsanitized in-memory output is parsed for the libtest summary.
+                  rows = summary.findall(combined)
+                  record['summaries'] = len(rows)
+                  if process.returncode != 0:
+                      record['errors'].append('exit ' + str(process.returncode))
+                  if len(rows) != 1:
+                      record['errors'].append(str(len(rows)) + ' libtest summaries, expected exactly 1')
+                  else:
+                      state, passed, failed, ignored, measured, filtered, elapsed = rows[0]
+                      record['summary'] = rows[0]
+                      record['elapsed_seconds'] = float(elapsed)
+                      passed_count, failed_count, ignored_count = int(passed), int(failed), int(ignored)
+                      if (state, passed, failed, ignored, measured) != ('ok', '1', '0', '0', '0'):
+                          record['errors'].append('summary is not 1 passed, 0 failed, 0 ignored')
+                  ran = [line[5:-len(' ... ok')] for line in process.stdout.splitlines()
+                         if line.startswith('test ') and line.endswith(' ... ok')]
+                  record['case_lines'] = ran
+                  if ran != [name]:
+                      record['errors'].append('did not run exactly the required case line')
+              except (OSError, subprocess.SubprocessError) as error:
+                  record['exit_code'] = None
+                  record['errors'].append('runner error ' + type(error).__name__)
+                  save(log, '$ libtest --ignored --exact ' + name + ' --test-threads=1\n'
+                       + '$ runner error ' + type(error).__name__ + '\n')
+              # Missing/multiple summaries, ignored or zero-run cases and exit failures are failures.
+              record['passed'] = 0 if record['errors'] else passed_count
+              record['failed'] = 1 if record['errors'] else max(failed_count, 1 if passed_count == 0 else 0)
+              record['ignored'] = ignored_count
+              record['result'] = 'passed' if not record['errors'] else 'failed'
+              results.append(record)
+              print('case ' + str(index) + ': ' + record['result'] + ' ' + name)
+              for error in record['errors']:
+                  print('  failure: ' + error)
+          required = [(index, name) for index, name in enumerate(names, 1)]
+          complete = len(results) == len(required) and all(
+              (record['index'], record['name']) == (index, name) for record, (index, name) in zip(results, required))
+          passed_total = sum(item['passed'] for item in results)
+          failed_total = sum(item['failed'] for item in results)
+          ignored_total = sum(item['ignored'] for item in results)
+          aggregate = {'suite': 'session174-http-foundation', 'required_cases': names,
+                       'cases_required': len(names), 'cases_recorded': len(results),
+                       'cases_run': len(results), 'records_complete': complete,
+                       'passed': passed_total, 'failed': failed_total, 'ignored': ignored_total,
+                       'summary': (str(passed_total) + ' passed, ' + str(failed_total) + ' failed, '
+                                   + str(ignored_total) + ' ignored'),
+                       'cases': results}
+          complete = complete and all(item['result'] == 'passed' for item in results)
+          expected_total = len(names)
+          ok = (complete and (passed_total, failed_total, ignored_total) == (expected_total, 0, 0)
+                and all(item['exit_code'] == 0 for item in results))
+          aggregate['ok'] = ok
+          aggregate['summary'] = (str(expected_total) + ' passed, 0 failed, 0 ignored' if ok
+                                  else aggregate['summary'])
+          save(evidence / 'session174-foundation.json', json.dumps(aggregate, indent=2) + '\n')
+          print('session174 cases: ' + aggregate['summary']
+                + (' (ok)' if ok else ' (FAILED; report written with ' + str(len(results)) + ' case records)'))
+          sys.exit(0 if ok else 1)
+          PY
+          then
+            status=0
+          else
+            status=$?
+          fi
+          cp "$evidence/preflight.json" "$evidence/preflight.log" \
+            "$evidence/session174-lib-tests.build.json" "$evidence/session174-lib-tests.stdout.log" \
+            "$evidence/rootyard-cli.build.json" "$evidence/standalone-build.json" \
+            "$evidence/cases.log" "$evidence/session174-foundation.json" \
+            test-results/refstore/session174-foundation/ 2>/dev/null || true
+          # Every required case writes its own case-N.log; copy all of them.
+          for log in "$evidence"/case-*.log; do
+            if [ -f "$log" ]; then cp "$log" test-results/refstore/session174-foundation/; fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "session174 cases failed (status $status)" >&2
+            exit "$status"
+          fi
+      - name: "Drop only the run-owned #174 foundation database"
+        if: always()
+        timeout-minutes: 5
+        shell: bash
+        env:
+          SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}
+          # Never inherit a search_path or other server option from the job environment.
+          PGOPTIONS: ''
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/session174-foundation"
+          mkdir -p "$evidence" test-results/refstore/session174-foundation
+          copy_log() {
+            [ -f "$evidence/database-cleanup.log" ] || return 0
+            cp "$evidence/database-cleanup.log" test-results/refstore/session174-foundation/
+          }
+          trap copy_log EXIT
+          if [ -z "${SESSION174_DATABASE:-}" ]; then
+            echo "owned database was not created; nothing to drop" > "$evidence/database-cleanup.log"
+            exit 0
+          fi
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}_a${GITHUB_RUN_ATTEMPT}"
+          if [ "$SESSION174_DATABASE" != "$expected" ]; then echo "refusing to drop a database not owned by this run" >&2; exit 1; fi
+          case "$SESSION174_DATABASE" in ''|*[!a-z0-9_]*|postgres|rootyard_protocol|template*)
+            echo "refusing to drop a shared or unsafe database" >&2
+            exit 1
+            ;;
+          esac
+          # Written before psql so the collected evidence exists even if cleanup fails mid-way.
+          printf 'owned database %s\n' "$SESSION174_DATABASE" > "$evidence/database-cleanup.log"
+          {
+            psql "$SESSION174_DATABASE_ADMIN_URL" -X -t -A -v ON_ERROR_STOP=1 -v database="$SESSION174_DATABASE" <<'SQL'
+          SELECT 'owned_before=' || count(*) FROM pg_database WHERE datname = :'database';
+          SELECT format('DROP DATABASE IF EXISTS %I', :'database') \gexec
+          SELECT 'owned_after=' || count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+            echo "owned database dropped; shared databases untouched"
+          } >> "$evidence/database-cleanup.log" 2>&1
+          cat "$evidence/database-cleanup.log"
+          remaining="$(psql "$SESSION174_DATABASE_ADMIN_URL" -X -t -A -v ON_ERROR_STOP=1 -v database="$SESSION174_DATABASE" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          if [ "$remaining" != "0" ]; then echo "owned database still exists after cleanup" >&2; exit 1; fi
+      - name: "Collect #174 acceptance evidence"
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/session174-foundation"
+          upload=test-results/refstore/session174-foundation
+          if [ ! -d "$evidence" ]; then
+            echo "no session174 acceptance evidence was produced"
+            exit 0
+          fi
+          mkdir -p "$upload"
+          for name in preflight.json preflight.log session174-lib-tests.build.json \
+                      session174-lib-tests.stdout.log rootyard-cli.build.json standalone-build.json \
+                      cases.log session174-foundation.json database-cleanup.log; do
+            [ -f "$evidence/$name" ] && cp "$evidence/$name" "$upload/"
+          done
+          # One case-N.log per required case; never a fixed case-1..case-4 list.
+          for log in "$evidence"/case-*.log; do
+            if [ -f "$log" ]; then cp "$log" "$upload/"; fi
+          done
+          ls -la "$upload"
       - name: Stop only the job-owned Garage fixture
         if: always()
         run: |

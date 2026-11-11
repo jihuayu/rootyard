@@ -2,36 +2,38 @@
 //!
 //! No local repository is authoritative. Each request captures the current refs,
 //! materializes their protected pack closure and discards its computed view.
+//!
+//! Every JSON read (this module and [`super::history`]) ends in [`finalize`]:
+//! the body is fully encoded and size-checked first, then the live
+//! authorization is re-run once and its cluster authority incarnation must
+//! equal the capture's own anchor — unconditionally, with or without a key set.
+//! Only after that fence — from the sealed [`MaterializedServingRead`] retained
+//! with the view by [`snapshot::build_sealed_view`] — is a session token
+//! issued, and only if the proof's realm matches that same fresh lookup. A
+//! checked empty capture has no proof, so it never issues, but its anchor is
+//! still fenced; a failed fence drops the encoded body with its slot/byte
+//! leases and returns the generic retryable refusal.
 use std::sync::Arc;
 
 use axum::{
-    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, header},
+    http::HeaderMap,
     response::Response,
 };
 use base64::Engine;
-use bytes::Bytes;
-use serde::Serialize;
 use tokio::time::Instant;
 
-use super::{
-    error::GatewayError,
-    native,
-    serving::lookup,
-    session::{ReadAuthorization, authenticate, authority_error, read_authorization},
-    snapshot::{self, ComputedView},
-    state::{BlobGitState, ByteLease},
-};
-use crate::{
-    browse::models::{
-        self, BlobByOidQuery, BlobQuery, BlobResponse, TreeByOidQuery, TreeEntry, TreeQuery, TreeResponse,
-    },
-    ref_store::GitObjectFormat,
+use super::{error::GatewayError, native, snapshot::ComputedView, state::BlobGitState};
+use crate::browse::models::{
+    self, BlobByOidQuery, BlobQuery, BlobResponse, TreeByOidQuery, TreeEntry, TreeQuery, TreeResponse,
 };
 
 const MAX_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
+
+mod session;
+
+pub(super) use session::{BrowseSession, finalize};
 
 pub(super) async fn tree(
     State(state): State<Arc<BlobGitState>>,
@@ -76,89 +78,6 @@ pub(super) async fn blob_by_oid(
     read_blob(state, owner, name, BlobQuery { oid: Some(oid), path: query.path }, headers).await
 }
 
-/// One authorized, captured and materialized read view shared by every browse
-/// and history handler.
-///
-/// The pipeline is fixed and mirrored from [`read_tree`]: authenticate the
-/// current token, take the gateway slot and byte lease (released with the
-/// response body), resolve the repository through the shared serving
-/// authority, capture the RefStore ref view, build its computed view, then
-/// require the captured realm to still match. `finish` runs the second
-/// authorization revalidation right before the response is encoded.
-pub(super) struct BrowseSession {
-    pub state: Arc<BlobGitState>,
-    pub view: ComputedView,
-    pub slot: tokio::sync::OwnedSemaphorePermit,
-    pub lease: ByteLease,
-    pub deadline: tokio::time::Instant,
-    /// Captured-output ceiling for this request: the same reserved memory
-    /// budget, split so retained native output, the decoded/serialized copies
-    /// and the encoded response body all fit inside it together.
-    budget: u64,
-    authorization: ReadAuthorization,
-    /// Captured non-zero refs (`refs/*` names and stored object ids).
-    pub refs: Vec<(String, String)>,
-    pub head_ref: String,
-    pub head_oid: Option<String>,
-    pub format: GitObjectFormat,
-    pub repository_id: uuid::Uuid,
-    pub storage_generation: i64,
-}
-
-impl BrowseSession {
-    pub(super) async fn open(
-        state: Arc<BlobGitState>,
-        headers: HeaderMap,
-        owner: String,
-        name: String,
-    ) -> Result<Self, GatewayError> {
-        let actor = authenticate(&state, &headers).await?;
-        let deadline = state.deadline();
-        let slot = state.slot().await?;
-        let memory = memory_budget(&state);
-        let lease = state.reserve_bytes(memory)?;
-        let serving = lookup(state.pool(), &actor, &owner, &name, false, state.store().backend_identity(), deadline)
-            .await
-            .map_err(authority_error)?;
-        let authorization = read_authorization(state.clone(), &actor, &serving);
-        let refs = snapshot::load_ref_view(&state, &serving, deadline).await?;
-        let view = snapshot::build_view(&state, &refs, deadline).await?;
-        authorization.revalidate(deadline).await?;
-        Ok(Self {
-            refs: refs.refs.clone(),
-            head_ref: refs.head_ref.clone(),
-            head_oid: refs.head_oid.clone(),
-            format: refs.format,
-            repository_id: serving.gate.repository_id(),
-            storage_generation: serving.repository.storage_generation,
-            authorization,
-            state,
-            view,
-            slot,
-            lease,
-            deadline,
-            budget: memory / 12,
-        })
-    }
-
-    /// Per-request captured-output ceiling (never zero: the reservation above
-    /// already requires a valid `max_inflight_bytes`, and the gateway's fixed
-    /// bounds keep `memory >= 64 KiB`).
-    pub(super) fn budget(&self) -> u64 {
-        self.budget
-    }
-
-    /// Revalidate the complete read authority against the captured realm
-    /// immediately before the response is encoded.
-    pub(super) async fn finish(&self) -> Result<(), GatewayError> {
-        self.authorization.revalidate(self.deadline).await
-    }
-
-    pub(super) fn format_name(&self) -> &'static str {
-        self.format.as_str()
-    }
-}
-
 /// Quietly resolved peeled object (`rev-parse --verify --quiet <expr>`), where
 /// exit 1 is the only "no such name" verdict and every other failure is a
 /// broken native read.
@@ -186,36 +105,33 @@ async fn read_tree(
 ) -> Result<Response, GatewayError> {
     let path = models::normalize_rel_path(query.path.as_deref()).map_err(bad_input)?;
     let limit = models::validate_limit(query.limit).map_err(bad_input)?;
-    let after = validate_tree_after(query.after.as_deref())?;
-    let spec = query.oid.as_deref().unwrap_or("HEAD");
-    validate_spec(spec)?;
-    let actor = authenticate(&state, &headers).await?;
-    let deadline = state.deadline();
-    let slot = state.slot().await?;
-    let memory = memory_budget(&state);
-    let lease = state.reserve_bytes(memory)?;
-    let serving = lookup(state.pool(), &actor, &owner, &name, false, state.store().backend_identity(), deadline)
-        .await
-        .map_err(authority_error)?;
-    let authorization = read_authorization(state.clone(), &actor, &serving);
-    let refs = snapshot::load_ref_view(&state, &serving, deadline).await?;
-    let spec = captured_revision(&refs, spec)?;
-    let view = snapshot::build_view(&state, &refs, deadline).await?;
-    authorization.revalidate(deadline).await?;
-    let root_oid = root_oid(&state, &view, &spec, memory, deadline).await?;
+    let after = validate_tree_after(query.after.as_deref())?.map(str::to_owned);
+    let spec = query.oid.as_deref().unwrap_or("HEAD").to_owned();
+    validate_spec(&spec)?;
+    let session = BrowseSession::open(state, headers, owner, name).await?;
+    let spec = captured_revision(&session.refs, &spec)?;
+    let deadline = session.deadline;
+    let memory = memory_budget(&session.state);
+    let root_oid = root_oid(&session.state, &session.view, &spec, memory, deadline).await?;
     let expression = if path.is_empty() { format!("{root_oid}^{{tree}}") } else { format!("{root_oid}:{path}") };
-    let tree_oid = resolve(&state, &view, &expression, deadline).await?;
-    require_type(&state, &view, &tree_oid, "tree", deadline).await?;
-    let raw =
-        run(&state, &view, &["ls-tree", "-z", "-l", &tree_oid], (memory / 8).min(MAX_CAPTURE_BYTES), deadline).await?;
-    let mut entries = parse_tree(&raw, &path, after, limit)?;
+    let tree_oid = resolve(&session.state, &session.view, &expression, deadline).await?;
+    require_type(&session.state, &session.view, &tree_oid, "tree", deadline).await?;
+    let raw = run(
+        &session.state,
+        &session.view,
+        &["ls-tree", "-z", "-l", &tree_oid],
+        (memory / 8).min(MAX_CAPTURE_BYTES),
+        deadline,
+    )
+    .await?;
+    let mut entries = parse_tree(&raw, &path, after.as_deref(), limit)?;
     let more = entries.len() > limit;
     entries.truncate(limit);
     let next_after = if more { entries.last().map(|entry| entry.name.clone()) } else { None };
     let result = TreeResponse { oid: root_oid, tree_oid, path, items: entries, next_after };
-    // This includes empty trees, just as the Blob handler includes empty files.
-    authorization.revalidate(deadline).await?;
-    json_response(&state, &result, slot, lease)
+    // This includes empty trees, just as the Blob handler includes empty files:
+    // the session ends in the same final fence and issuance path either way.
+    finalize(session, &result).await
 }
 
 async fn read_blob(
@@ -226,44 +142,38 @@ async fn read_blob(
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
     let path = models::normalize_rel_path(query.path.as_deref()).map_err(bad_input)?;
-    let spec = query.oid.as_deref().unwrap_or("HEAD");
-    validate_spec(spec)?;
-    if path.is_empty() && !models::valid_non_zero_oid(spec) {
+    let spec = query.oid.as_deref().unwrap_or("HEAD").to_owned();
+    validate_spec(&spec)?;
+    if path.is_empty() && !models::valid_non_zero_oid(&spec) {
         return Err(GatewayError::BadRequest("a file path or full blob object identifier is required"));
     }
-    let actor = authenticate(&state, &headers).await?;
-    let deadline = state.deadline();
-    let slot = state.slot().await?;
-    let memory = memory_budget(&state);
-    let lease = state.reserve_bytes(memory)?;
-    let serving = lookup(state.pool(), &actor, &owner, &name, false, state.store().backend_identity(), deadline)
-        .await
-        .map_err(authority_error)?;
-    let authorization = read_authorization(state.clone(), &actor, &serving);
-    let refs = snapshot::load_ref_view(&state, &serving, deadline).await?;
-    let spec = captured_revision(&refs, spec)?;
-    let view = snapshot::build_view(&state, &refs, deadline).await?;
-    authorization.revalidate(deadline).await?;
+    let session = BrowseSession::open(state, headers, owner, name).await?;
+    let spec = captured_revision(&session.refs, &spec)?;
+    let deadline = session.deadline;
+    let memory = memory_budget(&session.state);
     let oid = if path.is_empty() {
-        reachable(&state, &view, &spec, memory, deadline).await?;
-        resolve(&state, &view, &spec, deadline).await?
+        reachable(&session.state, &session.view, &spec, memory, deadline).await?;
+        resolve(&session.state, &session.view, &spec, deadline).await?
     } else {
-        let root = root_oid(&state, &view, &spec, memory, deadline).await?;
-        resolve(&state, &view, &format!("{root}:{path}"), deadline).await?
+        let root = root_oid(&session.state, &session.view, &spec, memory, deadline).await?;
+        resolve(&session.state, &session.view, &format!("{root}:{path}"), deadline).await?
     };
-    require_type(&state, &view, &oid, "blob", deadline).await?;
-    let raw_size = run(&state, &view, &["cat-file", "-s", &oid], 64, deadline).await?;
+    require_type(&session.state, &session.view, &oid, "blob", deadline).await?;
+    let raw_size = run(&session.state, &session.view, &["cat-file", "-s", &oid], 64, deadline).await?;
     let size = std::str::from_utf8(&raw_size)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .ok_or(GatewayError::Internal("native blob size is invalid"))?;
     // Twelve times the payload covers base64, optional text and worst-case
     // JSON escaping together with their live input/output buffers.
-    let max_blob = MAX_CAPTURE_BYTES.min(memory / 12).min(state.limits().max_response_bytes / 8);
+    let max_blob = MAX_CAPTURE_BYTES
+        .min(memory / 12)
+        .min(session.state.limits().max_response_bytes / 8)
+        .min(session.budget() / 12);
     if size > max_blob {
         return Err(GatewayError::TooLarge);
     }
-    let raw = run(&state, &view, &["cat-file", "blob", &oid], max_blob, deadline).await?;
+    let raw = run(&session.state, &session.view, &["cat-file", "blob", &oid], max_blob, deadline).await?;
     if raw.len() as u64 != size {
         return Err(GatewayError::Internal("native blob length differs from its object size"));
     }
@@ -271,8 +181,7 @@ async fn read_blob(
     let content = if is_binary { None } else { std::str::from_utf8(&raw).ok().map(str::to_owned) };
     let content_base64 = base64::engine::general_purpose::STANDARD.encode(&raw);
     let result = BlobResponse { oid, size, is_binary, content, content_base64 };
-    authorization.revalidate(deadline).await?;
-    json_response(&state, &result, slot, lease)
+    finalize(session, &result).await
 }
 
 fn bad_input(_: crate::Error) -> GatewayError {
@@ -302,13 +211,15 @@ fn memory_budget(state: &BlobGitState) -> u64 {
     MAX_MEMORY_BYTES.min(state.limits().max_inflight_bytes)
 }
 
-fn captured_revision(refs: &snapshot::RefView, spec: &str) -> Result<String, GatewayError> {
+/// Resolve a short revision against the captured ref pairs (`refs/*` name and
+/// stored object id), never against Git's own name resolution.
+fn captured_revision(refs: &[(String, String)], spec: &str) -> Result<String, GatewayError> {
     if models::valid_non_zero_oid(spec) || spec == "HEAD" {
         return Ok(spec.to_owned());
     }
     // A short revision denotes a captured branch/tag, never Git's object-id
     // abbreviation or another native revision fallback.
-    let mut found = refs.refs.iter().filter(|(name, _)| {
+    let mut found = refs.iter().filter(|(name, _)| {
         name == spec || name.strip_prefix("refs/heads/") == Some(spec) || name.strip_prefix("refs/tags/") == Some(spec)
     });
     let Some((name, _)) = found.next() else {
@@ -450,38 +361,6 @@ fn parse_tree(raw: &[u8], path: &str, after: Option<&str>, limit: usize) -> Resu
             size,
         })
         .collect())
-}
-
-pub(super) fn json_response<T: Serialize>(
-    state: &BlobGitState,
-    value: &T,
-    slot: tokio::sync::OwnedSemaphorePermit,
-    lease: ByteLease,
-) -> Result<Response, GatewayError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|_| GatewayError::Internal("repository browse response could not be encoded"))?;
-    json_response_bytes(state, bytes, slot, lease)
-}
-
-pub(super) fn json_response_bytes(
-    state: &BlobGitState,
-    bytes: Vec<u8>,
-    slot: tokio::sync::OwnedSemaphorePermit,
-    lease: ByteLease,
-) -> Result<Response, GatewayError> {
-    if bytes.len() as u64 > state.limits().max_response_bytes {
-        return Err(GatewayError::TooLarge);
-    }
-    // Keep the bounded response's capacity charged until its body is consumed
-    // or discarded, even after the request future has returned.
-    let stream =
-        futures_util::stream::unfold((Some(Bytes::from(bytes)), slot, lease), |(bytes, slot, lease)| async move {
-            bytes.map(|bytes| (Ok::<_, std::convert::Infallible>(bytes), (None, slot, lease)))
-        });
-    let mut response = Response::new(Body::from_stream(stream));
-    response.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-    response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
-    Ok(response)
 }
 
 #[cfg(test)]

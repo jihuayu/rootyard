@@ -1,6 +1,6 @@
 # Pando 一致性契约与交付边界
 
-状态：**设计提案，未实现或验收**。本文为 [全新安装实施计划](implementation-plan.md) 补充面向客户端的可观察保证；历史实现和单机测试不是分布式资格。Pando 在这里指目标 Blob-only Git 后端：单机使用 PostgreSQL RefStore，分布式使用 Raft Ref-CAS；两者使用 Blob 保存内容。本地 Git 仓库是可丢的计算视图。GitFS 及旧 Pando 不作为部署模式；本提案不新增旧数据导入、跨模式在线迁移或旧备份升级。
+状态：**部分实现（standalone PostgreSQL 会话下界基础已实现并验收；整体设计与分布式/UI 部分未完成）**。本文为 [全新安装实施计划](implementation-plan.md) 补充面向客户端的可观察保证；历史实现和单机测试不是分布式资格。Pando 在这里指目标 Blob-only Git 后端：单机使用 PostgreSQL RefStore，分布式使用 Raft Ref-CAS；两者使用 Blob 保存内容。本地 Git 仓库是可丢的计算视图。GitFS 及旧 Pando 不作为部署模式；本提案不新增旧数据导入、跨模式在线迁移或旧备份升级。
 
 ## 权威与提交
 
@@ -23,7 +23,7 @@
 
 ## 会话令牌
 
-第一阶段目标是 **read-your-writes 与 monotonic reads**，不是完整跨服务因果一致性。令牌是服务端认证、有大小和有效期上限的不透明下界，至少绑定版本、部署/history incarnation、租户与仓库、authority 类型及 epoch、group/epoch（适用时）和仓库 revision；具体编码、签名轮换及上限由实现确定。写入和读取返回服务端证明的实际版本；不能信任调用者自报的位点。令牌不是授权凭据，也不能固定 pack 布局或替代 pin/hold。
+第一阶段目标是 **read-your-writes 与 monotonic reads**，不是完整跨服务因果一致性。令牌是服务端认证、有大小和有效期上限的不透明下界，至少绑定版本、部署/history incarnation、租户与仓库、authority 类型及 epoch、group/epoch（适用时）和仓库 revision；具体编码、签名轮换及上限由实现确定。当前 `rs1` 实现显式签名 authority kind（`1 = pg_refstore`，`2 = raft_refstore`）、`group_id`（standalone PostgreSQL 为 `0`）及 `group_epoch`，未知 authority-kind 字节按 malformed 失败关闭；密钥、轮换与部署契约见 [Repository session keyring](../development.md#repository-session-keyring-rootyard_session_keyring)。写入和读取返回服务端证明的实际版本；不能信任调用者自报的位点。令牌不是授权凭据，也不能固定 pack 布局或替代 pin/hold。
 
 只有在相同 history 与可验证的同一权威序列中，revision 才能比较。Raft term 不是业务版本；不同 group 的裸日志 index 不可互相比较。恢复建立新 incarnation；旧令牌默认拒绝并要求重新同步，不能因新数字更大就承诺旧历史存在。全新安装路线不提供 PG↔Raft 在线切换；将来若另立迁移方案，必须先定义可验证的历史衔接，不能靠递增数字推断。
 
