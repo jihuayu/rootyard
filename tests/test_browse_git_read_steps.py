@@ -235,6 +235,11 @@ BROWSE_DEADLINE_CASES = (
     "list_commits_deadline",
     "compare_commits_deadline",
 )
+# The only permitted scale case: the Issue #8 native ref-scale acceptance that
+# walks the complete large-refset cursor traversal.
+BROWSE_SCALE_CASES = (
+    "ref_scale_complete_traversal",
+)
 
 class GitReadStepsSourceTest(unittest.TestCase):
     """Static contract of the focused production fix."""
@@ -476,12 +481,15 @@ class GitReadStepsSourceTest(unittest.TestCase):
         names = re.findall(r'"([^"]+)"', cases)
         # Order is runtime order, so the new cases may interleave; what is pinned
         # is that the inventory is exactly the original contracts plus the two
-        # deadline cases, with no duplicate, dropped or unrelated entry.
+        # deadline cases and the one scale case, with no duplicate, dropped or
+        # unrelated entry.
         self.assertEqual(len(names), len(set(names)))
         self.assertEqual(sorted(names),
-                         sorted(ORIGINAL_BROWSE_CASES + BROWSE_DEADLINE_CASES))
+                         sorted(ORIGINAL_BROWSE_CASES + BROWSE_DEADLINE_CASES
+                                + BROWSE_SCALE_CASES))
         self.assertEqual(len(ORIGINAL_BROWSE_CASES), 12)
         self.assertEqual(len(BROWSE_DEADLINE_CASES), 2)
+        self.assertEqual(len(BROWSE_SCALE_CASES), 1)
         # Every listed case is still dispatched to its own implementation and the
         # suite fails when the executed inventory differs from `CASE_NAMES`.
         self.assertIn("for name in CASE_NAMES:\n            harness.case(name, getattr(harness, name))",
