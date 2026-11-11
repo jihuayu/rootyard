@@ -42,9 +42,9 @@ use crate::{
             CommitMode,
             pack_commit::{
                 AuthorizedCommitError, AuthorizedCommitMode, ContentDigest, PackArtifactRole, PackCommitBaseline,
-                PackCommitExpectation, PackCommitPlan, PackCommitScope, PackCommitTerminal, PackMembershipEntry,
-                PackPendingToken, PackRegistrationRequest, PgAuthorizedCommit, PgPackCommit, PlannedArtifact,
-                PlannedPack, PrepareOutcome,
+                PackCommitError, PackCommitExpectation, PackCommitPlan, PackCommitRejectCode, PackCommitRejection,
+                PackCommitScope, PackCommitTerminal, PackMembershipEntry, PackPendingToken, PackRegistrationRequest,
+                PgAuthorizedCommit, PgPackCommit, PlannedArtifact, PlannedPack, PrepareOutcome,
             },
         },
         tx::{begin_bounded, commit_bounded},
@@ -63,6 +63,10 @@ use super::{
 
 const HOLD_NAMESPACE: &str = "gateway-pack";
 const ISSUER_LANE: &str = "blob-git-receive";
+
+/// The one fixed 409 refusal for a durable cancellation tombstone, shared with
+/// `RefStoreError::Cancelled`. It carries no operation id or provider detail.
+const DURABLY_CANCELLED: GatewayError = GatewayError::Conflict("operation is durably cancelled");
 
 /// One staged `.pack` + `.idx` pair with its verified content digest.
 pub(super) struct Pair {
@@ -451,15 +455,17 @@ async fn publish_pair(
     Ok(())
 }
 
-/// These two A3 refusals are produced only after matching the live immutable
-/// scope and observing its gate proof move. Other scope/ledger/provider errors
-/// are not a stale-base result; unknown durability must not enter the refusal
-/// transaction. Its sealed-token check independently proves revision progress.
+/// These A3 refusals are produced only after matching the live immutable
+/// scope and observing its gate proof move, or after the ledger proved the
+/// durable operation is cancelled. Other scope/ledger/provider errors are not a
+/// stale-base result; unknown durability must not enter the refusal transaction.
+/// Its sealed-token check independently proves revision progress.
 fn map_acquire(error: ArtifactHoldError) -> GatewayError {
     match error {
         ArtifactHoldError::ScopeMismatch("expected core gate proof") => {
             GatewayError::Conflict("repository gate changed before artifact admission")
         }
+        ArtifactHoldError::OperationCancelled { .. } => DURABLY_CANCELLED,
         _ => GatewayError::Internal("artifact hold acquisition was refused"),
     }
 }
@@ -469,6 +475,7 @@ fn map_protected_upload(error: ProtectedUploadError) -> GatewayError {
         ProtectedUploadError::Consume(ArtifactHoldError::ScopeMismatch("current core gate moved before consume")) => {
             GatewayError::Conflict("repository gate changed before artifact consumption")
         }
+        ProtectedUploadError::Consume(ArtifactHoldError::OperationCancelled { .. }) => DURABLY_CANCELLED,
         _ => GatewayError::Internal("protected Blob upload was refused"),
     }
 }
@@ -495,7 +502,11 @@ async fn decide(
     Ok(receipt.terminal)
 }
 
-fn authorized(state: &BlobGitState) -> Result<PgAuthorizedCommit, GatewayError> {
+/// The authorized A4 facade over this gateway's one opened Blob store and
+/// trusted Git binary. It grants nothing by itself: every stage re-reads live
+/// authorization and the coordinating transaction (`cancel`) re-checks the live
+/// token, RBAC and decision/terminal state inside the same short transaction.
+pub(super) fn authorized(state: &BlobGitState) -> Result<PgAuthorizedCommit, GatewayError> {
     PgAuthorizedCommit::new(state.store().clone(), state.git_binary().to_path_buf())
         .map_err(|_| GatewayError::Unsupported("authorized publication adapter is unavailable"))
 }
@@ -514,13 +525,22 @@ fn to_std(deadline: Instant) -> Result<StdInstant, GatewayError> {
 /// report-status. Refusals below stay typed HTTP errors with the operation
 /// header so a client can query the same operation id instead of seeing a false
 /// `ng`/`ok`.
-fn map_authorized(error: AuthorizedCommitError) -> GatewayError {
+pub(super) fn map_authorized(error: AuthorizedCommitError) -> GatewayError {
     if error.is_unknown() {
         return GatewayError::OutcomeUnknown;
     }
     match error {
         AuthorizedCommitError::Timeout => GatewayError::Timeout,
+        // A durable cancellation tombstone is a definite no-effect refusal.
+        AuthorizedCommitError::Terminal("cancelled") => DURABLY_CANCELLED,
         AuthorizedCommitError::Contended(_) => GatewayError::Unavailable("publication dependency is contended; retry"),
+        // Only the typed cancellation code is a tombstone; every other pack
+        // refusal keeps its existing `PackCommitError` mapping.
+        AuthorizedCommitError::Pack(PackCommitError::Rejected(rejection))
+            if rejection.code == PackCommitRejectCode::Cancelled =>
+        {
+            DURABLY_CANCELLED
+        }
         AuthorizedCommitError::Pack(error) => error.into(),
         AuthorizedCommitError::Denied(_) => GatewayError::Forbidden("publication is not authorized"),
         // The decision/operation is already terminal; resolve it by querying the
@@ -578,5 +598,69 @@ mod tests {
         ));
         assert!(matches!(map_protected_upload(ProtectedUploadError::Checkout), GatewayError::Internal(_)));
         assert!(matches!(map_protected_upload(ProtectedUploadError::ForeignBackend), GatewayError::Internal(_)));
+    }
+
+    fn rejected(code: PackCommitRejectCode) -> AuthorizedCommitError {
+        AuthorizedCommitError::Pack(PackCommitError::Rejected(PackCommitRejection::new(
+            code,
+            "cancellation tombstone won",
+        )))
+    }
+
+    #[test]
+    fn durable_cancellation_keeps_the_fixed_conflict_refusal() {
+        let operation_id = Uuid::new_v4();
+        let cases = [
+            ("A3 acquire", map_acquire(ArtifactHoldError::OperationCancelled { operation_id })),
+            (
+                "A3 protected consume",
+                map_protected_upload(ProtectedUploadError::Consume(ArtifactHoldError::OperationCancelled {
+                    operation_id,
+                })),
+            ),
+            ("A4 terminal", map_authorized(AuthorizedCommitError::Terminal("cancelled"))),
+            ("A4 rejected", map_authorized(rejected(PackCommitRejectCode::Cancelled))),
+        ];
+        for (label, error) in cases {
+            assert_eq!(error, DURABLY_CANCELLED, "{label}");
+            assert_eq!(error, GatewayError::Conflict("operation is durably cancelled"), "{label}");
+        }
+    }
+
+    #[test]
+    fn non_cancel_unknown_and_terminal_refusals_stay_unchanged() {
+        let unknown = AuthorizedCommitError::Pack(PackCommitError::CommitUnknown {
+            repository_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4(),
+        });
+        assert!(map_authorized(unknown).eq(&GatewayError::OutcomeUnknown));
+        assert!(map_authorized(AuthorizedCommitError::Terminal("committed")).eq(&GatewayError::OutcomeUnknown));
+        assert!(map_authorized(AuthorizedCommitError::Terminal("rejected")).eq(&GatewayError::OutcomeUnknown));
+        let other_terminal = map_authorized(rejected(PackCommitRejectCode::DecisionRejected));
+        assert_eq!(other_terminal, GatewayError::Conflict("publication was rejected by the core ledger"));
+        for code in [
+            PackCommitRejectCode::PendingMissing,
+            PackCommitRejectCode::OldOidMismatch,
+            PackCommitRejectCode::LedgerIntegrity,
+            PackCommitRejectCode::NoRefApplied,
+        ] {
+            assert_eq!(
+                map_authorized(rejected(code)),
+                GatewayError::Conflict("publication was rejected by the core ledger"),
+                "{}",
+                code.as_str()
+            );
+        }
+        // Other hold refusals are not cancellations and keep their fail-closed 500.
+        assert!(matches!(
+            map_acquire(ArtifactHoldError::OperationNotPending { operation_id: Uuid::new_v4() }),
+            GatewayError::Internal("artifact hold acquisition was refused")
+        ));
+        assert!(matches!(
+            map_protected_upload(ProtectedUploadError::Consume(ArtifactHoldError::OperationNotPending {
+                operation_id: Uuid::new_v4()
+            })),
+            GatewayError::Internal("protected Blob upload was refused")
+        ));
     }
 }
