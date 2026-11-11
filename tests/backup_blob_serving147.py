@@ -65,7 +65,9 @@ LIMITATIONS = [
 # bounded marker write), and its directory is removed after each case.
 RESTORE_GATE_TIMEOUT_SECONDS = 30.0
 RESTORE_GATE_POLL_SECONDS = 0.02
-RESTORE_GATE_WAIT_MS = 60000
+# The wrapper sleeps 0.01s (10ms) per poll, so 6000 polls is a nominal
+# 60-second wait bound before it gives up with exit 70.
+RESTORE_GATE_WAIT_POLLS = 6000
 RESTORE_FINISH_TIMEOUT_SECONDS = 180
 _WRAPPER_TEMPLATE = r"""#!/bin/sh
 # Run-owned restore gate for the one trusted absolute pg_restore; its own
@@ -135,7 +137,7 @@ class RestoreGate:
         self.bin = self.root / "bin"
         self.bin.mkdir(mode=0o700)
         self.wrapper = self.bin / "pg_restore"
-        self.wrapper.write_text(_WRAPPER_TEMPLATE.replace("@@WAIT@@", str(RESTORE_GATE_WAIT_MS))
+        self.wrapper.write_text(_WRAPPER_TEMPLATE.replace("@@WAIT@@", str(RESTORE_GATE_WAIT_POLLS))
                                 .replace("@@PG_RESTORE@@", shlex.quote(str(self.executable))))
         self.wrapper.chmod(0o700)
         self.marker, self.release = self.root / "marker", self.root / "released"
