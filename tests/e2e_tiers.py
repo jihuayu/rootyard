@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Rootyard native suite dispatcher and explicit reference models (F1-F51).
 
-With --reference-only, executes 591 historical reference-model tests across 4 tiers:
+With --reference-only, executes 597 active reference-model tests across 4 tiers
+(591 existing historical tests plus six additional Tier 2 F20 CI regression tests):
 - Tier 1 (`TestTier1FeatureCoverage`): 255 tests (5 per feature F1-F51)
-- Tier 2 (`TestTier2BoundaryAndCornerCases`): 255 tests (5 per feature F1-F51)
+- Tier 2 (`TestTier2BoundaryAndCornerCases`): 261 tests (5 per feature F1-F51, plus six
+  additional F20 CI regression tests: 11 total for F20)
 - Tier 3 (`TestTier3CrossFeatureCombinations`): 54 cross-feature integration tests
 - Tier 4 (`TestTier4RealWorldScenarios`): 27 multi-step real-world scenarios (S1-S27)
 
@@ -7466,7 +7468,7 @@ class SchemaBoundaryIntegrationFixture:
         simulated_skip_or_placeholder: bool = False,
         simulated_unmapped_tier3_or_tier4: Optional[str] = None,
     ) -> dict[str, Any]:
-        """F41: Verifies 4-tier E2E harness completeness across all 51 features (F1-F51) and 591 tests."""
+        """F41: Verifies 4-tier E2E harness completeness across all 51 features (F1-F51) and 597 tests."""
         if simulated_missing_feature is not None:
             raise AssertionError(f"Missing feature {simulated_missing_feature} in FEATURE_CATALOG")
         if simulated_insufficient_tier_tests is not None:
@@ -7491,9 +7493,9 @@ class SchemaBoundaryIntegrationFixture:
         t3_methods = [m for m in sorted(dir(TestTier3CrossFeatureCombinations)) if m.startswith("test_")]
         t4_methods = [m for m in sorted(dir(TestTier4RealWorldScenarios)) if m.startswith("test_")]
 
-        if len(t1_methods) != 255 or len(t2_methods) != 255 or len(t3_methods) != 54 or len(t4_methods) != 27:
+        if len(t1_methods) != 255 or len(t2_methods) != 261 or len(t3_methods) != 54 or len(t4_methods) != 27:
             raise AssertionError(
-                f"Expected (255, 255, 54, 27) tests across Tiers 1-4, got "
+                f"Expected (255, 261, 54, 27) tests across Tiers 1-4, got "
                 f"({len(t1_methods)}, {len(t2_methods)}, {len(t3_methods)}, {len(t4_methods)})"
             )
 
@@ -7505,7 +7507,8 @@ class SchemaBoundaryIntegrationFixture:
             prefixes = FEATURE_TO_TIER3_AND_TIER4[fid]
             c3 = sum(1 for m in t3_methods if tag in m or any(m.startswith(p) for p in prefixes))
             c4 = sum(1 for m in t4_methods if any(m.startswith(p) for p in prefixes))
-            if c1 != 5 or c2 != 5 or c3 < 2 or c4 < 2:
+            expected_c2 = 11 if fid == "F20" else 5
+            if c1 != 5 or c2 != expected_c2 or c3 < 2 or c4 < 2:
                 raise AssertionError(f"Feature {fid} tier counts invalid: T1={c1}, T2={c2}, T3={c3}, T4={c4}")
             suite_f = build_suite("all", feature=fid)
             total_f = suite_f.countTestCases()
@@ -7514,8 +7517,8 @@ class SchemaBoundaryIntegrationFixture:
             per_feature_counts[fid] = {"t1": c1, "t2": c2, "t3": c3, "t4": c4, "total": total_f}
 
         total_all = build_suite("all").countTestCases()
-        if total_all != 591:
-            raise AssertionError(f"Total suite count {total_all} != 591")
+        if total_all != 597:
+            raise AssertionError(f"Total suite count {total_all} != 597")
 
         return {
             "feature_count": len(expected_fids),
@@ -7701,6 +7704,255 @@ class Phase1ClosureAndDocsFixture:
             return []
 
     @staticmethod
+    def live_ci_run_commands(text: str) -> list[list[str]]:
+        """Tokenize shell commands declared under YAML run keys (inline and block scalars)."""
+        commands: list[list[str]] = []
+        lines = text.splitlines()
+        block_header = re.compile(r"^([|>])(?:([+-])([1-9])?|([1-9])([+-])?)?(?:[ \t]+#.*)?$")
+
+        def indent_of(line: str) -> int:
+            return len(line) - len(line.lstrip(" "))
+
+        def is_skippable(line: str) -> bool:
+            stripped = line.strip()
+            return not stripped or stripped.startswith("#")
+
+        def block_style(value: str) -> str | None:
+            match = block_header.match(value)
+            return match.group(1) if match else None
+
+        def collect_block(start: int, key_indent: int) -> tuple[list[str], int]:
+            body: list[str] = []
+            index = start
+            while index < len(lines):
+                line = lines[index]
+                if line.strip() and indent_of(line) <= key_indent:
+                    break
+                body.append(line)
+                index += 1
+            content = [line for line in body if line.strip()]
+            if content:
+                common = min(indent_of(line) for line in content)
+                body = [line[common:] if line.strip() else "" for line in body]
+            return body, index
+
+        def split_key_value(stripped: str) -> tuple[str, str]:
+            if ":" not in stripped:
+                return stripped, ""
+            key, value = stripped.split(":", 1)
+            return key.strip(), value.strip()
+
+        def is_job_key(stripped: str) -> bool:
+            if not stripped or stripped.startswith("-"):
+                return False
+            key, value = split_key_value(stripped)
+            if not key or value:
+                return False
+            return re.fullmatch(r"[A-Za-z0-9_.\-]+", key) is not None
+
+        def tokenize(script: str) -> list[list[str]]:
+            try:
+                lexer = shlex.shlex(script, posix=True, punctuation_chars=";&|")
+                lexer.whitespace_split = True
+                lexer.commenters = "#"
+                tokens = list(lexer)
+            except ValueError:
+                return []
+            if current_job_name == "verify" and (
+                "eval" in tokens
+                or any(
+                    tokens[i] in {"bash", "sh"} and tokens[i + 1] == "-c"
+                    for i in range(len(tokens) - 1)
+                )
+            ):
+                # Dynamic shell evaluation cannot be audited statically.
+                tokens.append("scripts/build_native_batch.py")
+            return [tokens] if tokens else []
+
+        def run_value_commands(value: str, start: int, key_indent: int) -> tuple[list[list[str]], int]:
+            style = block_style(value)
+            if style is None:
+                if not value:
+                    return [], start
+                return tokenize(value), start
+            body, next_index = collect_block(start, key_indent)
+            if style == ">":
+                paragraphs: list[list[str]] = []
+                current_paragraph: list[str] = []
+                for line in body:
+                    if line.strip():
+                        current_paragraph.append(line.strip())
+                    elif current_paragraph:
+                        paragraphs.append(current_paragraph)
+                        current_paragraph = []
+                if current_paragraph:
+                    paragraphs.append(current_paragraph)
+                script = "\n".join(" ".join(paragraph) for paragraph in paragraphs)
+            else:
+                joined: list[str] = []
+                pending = ""
+                for line in body:
+                    current = line.rstrip()
+                    if pending:
+                        current = pending + current
+                        pending = ""
+                    if current.endswith("\\"):
+                        pending = current[:-1]
+                        continue
+                    joined.append(current)
+                if pending:
+                    joined.append(pending)
+                script = "\n".join(joined)
+            return tokenize(script), next_index
+
+        steps_indent: int | None = None
+        step_indent: int | None = None
+        in_root_jobs = False
+        in_job = False
+        current_job_name: str | None = None
+        index = 0
+        while index < len(lines):
+            raw = lines[index]
+            if is_skippable(raw):
+                index += 1
+                continue
+            indent = indent_of(raw)
+            stripped = raw.strip()
+            if indent == 0:
+                root_key, root_value = split_key_value(stripped)
+                in_root_jobs = root_key == "jobs" and not root_value
+                in_job = False
+                current_job_name = None
+                steps_indent = None
+                step_indent = None
+                if block_style(root_value) is not None:
+                    _, index = collect_block(index + 1, 0)
+                    in_root_jobs = False
+                    continue
+                index += 1
+                continue
+            if not in_root_jobs:
+                if block_style(split_key_value(stripped)[1]) is not None:
+                    _, index = collect_block(index + 1, indent)
+                    continue
+                index += 1
+                continue
+            if indent == 2:
+                key, value = split_key_value(stripped)
+                in_job = is_job_key(stripped) and not value
+                current_job_name = key if in_job else None
+                steps_indent = None
+                step_indent = None
+                if not in_job:
+                    if block_style(value) is not None:
+                        _, index = collect_block(index + 1, indent)
+                        continue
+                    index += 1
+                    continue
+                index += 1
+                continue
+            if not in_job:
+                index += 1
+                continue
+            if steps_indent is None:
+                key, value = split_key_value(stripped)
+                if key == "steps" and indent == 4 and not value:
+                    steps_indent = indent
+                    step_indent = None
+                    index += 1
+                    continue
+                if block_style(value) is not None:
+                    _, index = collect_block(index + 1, indent)
+                    continue
+                index += 1
+                continue
+            if indent <= steps_indent:
+                steps_indent = None
+                step_indent = None
+                continue
+            if step_indent is None:
+                if stripped.startswith("-"):
+                    step_indent = indent
+                else:
+                    index += 1
+                    continue
+            if indent < step_indent:
+                steps_indent = None
+                step_indent = None
+                continue
+            if stripped != "-" and not stripped.startswith("- "):
+                index += 1
+                continue
+            item_indent = indent
+            item = "" if stripped == "-" else stripped[2:].strip()
+            key, value = split_key_value(item)
+            if key == "run":
+                found, index = run_value_commands(value, index + 1, item_indent)
+                commands.extend(found)
+                continue
+            property_indent = item_indent + 2
+            if block_style(value) is not None:
+                _, index = collect_block(index + 1, item_indent)
+                continue
+            index += 1
+            while index < len(lines):
+                line = lines[index]
+                if is_skippable(line):
+                    index += 1
+                    continue
+                line_indent = indent_of(line)
+                if line_indent <= item_indent:
+                    break
+                if line_indent != property_indent:
+                    index += 1
+                    continue
+                property_key, property_value = split_key_value(line.strip())
+                if property_key == "run":
+                    found, index = run_value_commands(property_value, index + 1, line_indent)
+                    commands.extend(found)
+                    continue
+                if block_style(property_value) is not None:
+                    _, index = collect_block(index + 1, line_indent)
+                else:
+                    index += 1
+        return commands
+
+    @staticmethod
+    def ci_build_native_batch_tokens(commands: list[list[str]]) -> list[str]:
+        """Return the single native batch build command from CI run commands."""
+        prefix = ["python3", "scripts/build_native_batch.py"]
+        references = [
+            tokens
+            for tokens in commands
+            if any("build_native_batch.py" in token for token in tokens)
+        ]
+        matches = [tokens for tokens in references if tokens[:2] == prefix]
+        expected = [
+            "python3", "scripts/build_native_batch.py", "--all-bins",
+            "--features", "pando-lab", "--strip-debuginfo",
+            "--test", "ref_store_snapshot_backup_fixture",
+            "--output", "test-results/refstore-snapshot-fixture",
+            "--test", "ref_store_holds_backup_fixture",
+            "--output", "test-results/refstore-holds-fixture",
+            "--manifest-out", "test-results/native-build-batch.json",
+        ]
+        if len(references) != 1:
+            raise AssertionError(
+                f"CI workflow must contain exactly one scripts/build_native_batch.py command, "
+                f"found {len(references)} references"
+            )
+        if len(matches) != 1:
+            raise AssertionError(
+                "CI workflow has a suspicious build_native_batch.py reference that does not start with "
+                f"'python3 scripts/build_native_batch.py': {references[0]}"
+            )
+        if matches[0] != expected:
+            raise AssertionError(
+                "CI workflow scripts/build_native_batch.py command must match the native batch build contract"
+            )
+        return matches[0]
+
+    @staticmethod
     def pando_runs_behind_nonroot_guard(text: str) -> bool:
         """True when the live Pando invocation is protected by a same-run-block non-root guard."""
         pando_tokens = [
@@ -7758,21 +8010,7 @@ class Phase1ClosureAndDocsFixture:
             raise AssertionError("CI workflow missing cargo clippy with --features pando-lab")
         if not re.search(r"cargo\s+test\s+[^\n]*--features\s+pando-lab", text):
             raise AssertionError("CI workflow missing cargo test with --features pando-lab")
-        native_tokens = None
-        for line in text.splitlines():
-            tokens = cls.live_ci_command_tokens(line)
-            if tokens[:2] == ["python3", "scripts/build_native.py"]:
-                native_tokens = tokens
-                break
-        if native_tokens is None:
-            raise AssertionError("CI workflow missing scripts/build_native.py native build")
-        native_args = native_tokens[2:]
-        has_feature = any(
-            native_args[i] == "--features" and native_args[i + 1] == "pando-lab"
-            for i in range(len(native_args) - 1)
-        )
-        if not has_feature or "--bins" not in native_args:
-            raise AssertionError("CI workflow build_native.py must build --bins with --features pando-lab")
+        cls.ci_build_native_batch_tokens(cls.live_ci_run_commands(text))
         if not re.search(r"python3\s+tests/e2e_tiers\.py\s+--reference-only\s+--tier\s+all\s+--report\b", text):
             raise AssertionError("CI workflow must invoke tests/e2e_tiers.py with explicit --reference-only --tier all --report")
         if "Verify schema-008 catalog" in text:
@@ -15070,13 +15308,19 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertRegex(ci_text, r"cargo\s+clippy\s+(?:--locked\s+)?--all-targets\s+--features\s+pando-lab\s+--\s+-D\s+warnings")
         self.assertRegex(ci_text, r"cargo\s+test\s+--locked\s+(?:--all-targets\s+)?--features\s+pando-lab")
-        live_commands = [
-            Phase1ClosureAndDocsFixture.live_ci_command_tokens(line)
-            for line in ci_text.splitlines()
-        ]
-        self.assertIn(
-            ["python3", "scripts/build_native.py", "--features", "pando-lab", "--bins", "--strip-debuginfo"],
-            live_commands,
+        self.assertEqual(
+            Phase1ClosureAndDocsFixture.ci_build_native_batch_tokens(
+                Phase1ClosureAndDocsFixture.live_ci_run_commands(ci_text)
+            ),
+            [
+                "python3", "scripts/build_native_batch.py",
+                "--all-bins", "--features", "pando-lab", "--strip-debuginfo",
+                "--test", "ref_store_snapshot_backup_fixture",
+                "--output", "test-results/refstore-snapshot-fixture",
+                "--test", "ref_store_holds_backup_fixture",
+                "--output", "test-results/refstore-holds-fixture",
+                "--manifest-out", "test-results/native-build-batch.json",
+            ],
         )
 
     def test_t1_f20_03_ci_workflow_verifies_schema_030_catalog_and_design_docs_gates(self) -> None:
@@ -16617,17 +16861,17 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         info = SchemaBoundaryIntegrationFixture.verify_tier3_e2e_suite_completeness()
         for fid, counts in info["per_feature_counts"].items():
             self.assertEqual(counts["t1"], 5, msg=fid)
-            self.assertEqual(counts["t2"], 5, msg=fid)
+            self.assertEqual(counts["t2"], 11 if fid == "F20" else 5, msg=fid)
             self.assertGreaterEqual(counts["t3"], 2, msg=fid)
             self.assertGreaterEqual(counts["t4"], 2, msg=fid)
             self.assertGreaterEqual(counts["total"], 14, msg=fid)
 
     def test_t1_f41_03_build_suite_tier_counts_match_210_210_44_22_and_486_total(self) -> None:
         self.assertEqual(build_suite("1").countTestCases(), 255)
-        self.assertEqual(build_suite("2").countTestCases(), 255)
+        self.assertEqual(build_suite("2").countTestCases(), 261)
         self.assertEqual(build_suite("3").countTestCases(), 54)
         self.assertEqual(build_suite("4").countTestCases(), 27)
-        self.assertEqual(build_suite("all").countTestCases(), 591)
+        self.assertEqual(build_suite("all").countTestCases(), 597)
 
     def test_t1_f41_04_feature_filter_cli_selector_resolves_tier1_tier2_tier3_and_tier4_tests_for_all_new_features(self) -> None:
         for idx in range(32, 52):
@@ -16638,9 +16882,24 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
     def test_t1_f41_05_test_infra_and_test_ready_docs_align_with_42_feature_486_test_inventory(self) -> None:
         infra_txt = (ROOT / "TEST_INFRA.md").read_text(encoding="utf-8")
         ready_txt = (ROOT / "TEST_READY.md").read_text(encoding="utf-8")
+        tier_class_methods = [
+            len(unittest.TestLoader().getTestCaseNames(cls))
+            for cls in (TestTier1FeatureCoverage, TestTier2BoundaryAndCornerCases, TestTier3CrossFeatureCombinations, TestTier4RealWorldScenarios)
+        ]
+        self.assertEqual(tier_class_methods, [255, 261, 54, 27])
+        extra_f20_rule = "plus six additional F20 CI regression cases"
         for doc_txt in (infra_txt, ready_txt):
             self.assertIn("F51", doc_txt)
-            self.assertIn("591", doc_txt)
+            self.assertIn("597", doc_txt)
+            tier_summary_lines = [
+                line for line in doc_txt.splitlines() if f"`{tier_class_methods[0]}` Tier 1 + `{tier_class_methods[1]}` Tier 2" in line
+            ]
+            self.assertTrue(tier_summary_lines, msg="missing current tier split line")
+            for line in tier_summary_lines:
+                self.assertIn(f"`{tier_class_methods[2]}` Tier 3 + `{tier_class_methods[3]}` Tier 4", line)
+            self.assertIn("`255` Tier 1 + `261` Tier 2", doc_txt)
+            self.assertIn("`54` Tier 3 + `27` Tier 4", doc_txt)
+            self.assertIn(extra_f20_rule, doc_txt)
 
     # =========================================================================
     # Feature F42: Part 3 — Cross-Track Schema 060, 11-Domain Router Non-Collision, Anti-Monolith Caps & Paired Backup (5 Tests)
@@ -17187,7 +17446,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
 
 
 class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
-    """Tier 2: Boundary & Corner Cases (255 tests = 5 per feature F1-F51)."""
+    """Tier 2: Boundary & Corner Cases (261 tests = 5 per feature F1-F51, plus six additional F20 CI contract cases)."""
 
 
     # =========================================================================
@@ -18209,7 +18468,7 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
                 self.assertIn(parent_tbl, {"users", "repositories", "forge_pulls"})
 
     # =========================================================================
-    # Feature F20: Phase 1 Closure — CI Pipeline Wiring — Boundary & Corner Cases (5 Tests)
+    # Feature F20: Phase 1 Closure — CI Pipeline Wiring — Boundary & Corner Cases (11 Tests)
     # =========================================================================
     def test_t2_f20_01_ci_validator_rejects_missing_postgresql_17_or_pg_share(self) -> None:
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -18219,34 +18478,165 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
             Phase1ClosureAndDocsFixture.validate_ci_workflow(ci_text.replace("PG_SHARE=/usr/share/postgresql/17", "PG_SHARE=/tmp"))
 
     def test_t2_f20_02_ci_validator_rejects_missing_pando_lab_feature_flags(self) -> None:
-        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        workflow_path = ROOT / ".github/workflows/ci.yml"
+        ci_text = workflow_path.read_text(encoding="utf-8")
+
+        def batch_tokens(workflow: str) -> list[str]:
+            commands = Phase1ClosureAndDocsFixture.live_ci_run_commands(workflow)
+            return Phase1ClosureAndDocsFixture.ci_build_native_batch_tokens(commands)
+
         no_clippy_feat = re.sub(r"cargo\s+clippy[^\n]*", "cargo clippy --all-targets -- -D warnings", ci_text)
         with self.assertRaisesRegex(AssertionError, "cargo clippy"):
             Phase1ClosureAndDocsFixture.validate_ci_workflow(no_clippy_feat)
-        no_build_feat = re.sub(
-            r"python3\s+scripts/build_native\.py[^\n]*",
-            "python3 scripts/build_native.py --bins",
-            ci_text,
+
+        step_name = "Build native bins and RefStore fixtures in one batch"
+        run_header = "        run: |"
+        expected_tokens: list[str] = [
+            "python3",
+            "scripts/build_native_batch.py",
+            "--all-bins",
+            "--features",
+            "pando-lab",
+            "--strip-debuginfo",
+            "--test",
+            "ref_store_snapshot_backup_fixture",
+            "--output",
+            "test-results/refstore-snapshot-fixture",
+            "--test",
+            "ref_store_holds_backup_fixture",
+            "--output",
+            "test-results/refstore-holds-fixture",
+            "--manifest-out",
+            "test-results/native-build-batch.json",
+        ]
+        exact_command = " ".join(expected_tokens)
+
+        def with_script(script: str) -> str:
+            lines = ci_text.split("\n")
+            step_idx = -1
+            for idx, line in enumerate(lines):
+                if line.strip() == f"- name: {step_name}":
+                    step_idx = idx
+                    break
+            assert step_idx >= 0, f"CI workflow is missing step: {step_name}"
+            run_idx = lines.index(run_header, step_idx)
+            verify_header = "      - name: Verify design documentation integrity"
+            end_idx = lines.index(verify_header, run_idx)
+            body_lines = [f"          {body}" for body in script.split("\n")]
+            return "\n".join([*lines[: run_idx + 1], *body_lines, *lines[end_idx:]])
+
+        def assert_rejected(mutated_text: str) -> None:
+            self.assertNotEqual(mutated_text, ci_text)
+            with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+                Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated_text)
+
+        self.assertEqual(batch_tokens(ci_text), expected_tokens)
+        self.assertEqual(batch_tokens(with_script(exact_command)), expected_tokens)
+
+        false_command_forms = (
+            f"# {exact_command}",
+            f"echo noop # {exact_command}",
+            f"echo {exact_command}",
+            f"printf '%s\\n' \"{exact_command}\"",
+            f"bash -c '{exact_command}'",
         )
-        with self.assertRaisesRegex(AssertionError, "build_native"):
-            Phase1ClosureAndDocsFixture.validate_ci_workflow(no_build_feat)
-        commented_build = re.sub(
-            r"^(\s*-\s*run:\s*)(python3\s+scripts/build_native\.py[^\n]*)$",
-            r"# \1\2",
-            ci_text,
-            count=1,
-            flags=re.MULTILINE,
+        for false_body in false_command_forms:
+            with self.subTest(false_command=false_body):
+                assert_rejected(with_script(false_body))
+
+        verify_header = "      - name: Verify design documentation integrity"
+        compound_text = with_script(
+            exact_command
+            + "\necho done && python3 scripts/build_native_batch.py --all-bins --features pando-lib"
         )
-        self.assertNotEqual(commented_build, ci_text)
-        with self.assertRaisesRegex(AssertionError, "build_native"):
-            Phase1ClosureAndDocsFixture.validate_ci_workflow(commented_build)
-        inline_comment_build = ci_text.replace(
-            "python3 scripts/build_native.py --features pando-lab --bins",
-            "python3 scripts/build_native.py --bins # --features pando-lab",
+        assert_rejected(compound_text)
+
+        fake_env_step = (
+            "      - name: Build native batch with environment\n"
+            "        env:\n"
+            f'          RUN: "{exact_command}"\n'
+            "        run: echo environment only\n"
         )
-        self.assertNotEqual(inline_comment_build, ci_text)
-        with self.assertRaisesRegex(AssertionError, "build_native"):
-            Phase1ClosureAndDocsFixture.validate_ci_workflow(inline_comment_build)
+        fake_env_text = ci_text.replace(verify_header, fake_env_step + verify_header, 1)
+        if batch_tokens(fake_env_text) != expected_tokens:
+            raise AssertionError("env-only exact command changed batch tokens")
+        Phase1ClosureAndDocsFixture.validate_ci_workflow(fake_env_text)
+
+        folded_wrong_step = [
+            "      - name: Build native bins with the wrong feature",
+            "        run: >",
+            "          python3 scripts/build_native_batch.py",
+            "          --all-bins --features pando-lib",
+        ]
+        folded_wrong_text = "\n".join(
+            [ci_text[: ci_text.index(verify_header)], *folded_wrong_step, ci_text[ci_text.index(verify_header) :]]
+        )
+        assert_rejected(folded_wrong_text)
+
+        duplicate_step = [
+            "      - name: Build native bins and RefStore fixtures in one batch",
+            "        run: |",
+            f"          {exact_command}",
+        ]
+        duplicate_text = "\n".join(
+            [ci_text[: ci_text.index(verify_header)], *duplicate_step, ci_text[ci_text.index(verify_header) :]]
+        )
+        assert_rejected(duplicate_text)
+
+        def pair_start(token: str, target_value: str, start: int = 0) -> int:
+            for idx in range(start, len(expected_tokens) - 1):
+                if expected_tokens[idx] == token and expected_tokens[idx + 1] == target_value:
+                    return idx
+            raise AssertionError(f"expected token pair not found: {token} {target_value}")
+
+        pair_cases: tuple[tuple[str, str], ...] = (
+            ("--features", "pando-lab"),
+            ("--test", "ref_store_snapshot_backup_fixture"),
+            ("--output", "test-results/refstore-snapshot-fixture"),
+            ("--test", "ref_store_holds_backup_fixture"),
+            ("--output", "test-results/refstore-holds-fixture"),
+        )
+        mutations: list[tuple[str, list[str]]] = [
+            ("--all-bins", [tok for tok in expected_tokens if tok != "--all-bins"]),
+            ("--strip-debuginfo", [tok for tok in expected_tokens if tok != "--strip-debuginfo"]),
+        ]
+        diff_start = 0
+        for flag, value in pair_cases:
+            idx = pair_start(flag, value, diff_start)
+            diff_start = idx + 2
+            mutations.append((f"{flag} {value} remove flag", [tok for k, tok in enumerate(expected_tokens) if k != idx]))
+            mutations.append((f"{flag} {value} remove value", [tok for k, tok in enumerate(expected_tokens) if k != idx + 1]))
+            mutations.append(
+                (
+                    f"{flag} {value} corrupt value",
+                    [f"{value}-typo" if k == idx + 1 else tok for k, tok in enumerate(expected_tokens)],
+                )
+            )
+            mutations.append((f"{flag} {value} duplicate pair", [*expected_tokens[: idx + 2], flag, value, *expected_tokens[idx + 2 :]]))
+        mutations.append(("--all-bins corrupt", [f"{tok}x" if tok == "--all-bins" else tok for tok in expected_tokens]))
+        mutations.append(("--all-bins duplicate", [*expected_tokens[:2], "--all-bins", *expected_tokens[2:]]))
+        mutations.append(("--strip-debuginfo corrupt", [f"{tok}x" if tok == "--strip-debuginfo" else tok for tok in expected_tokens]))
+        mutations.append(("--strip-debuginfo duplicate", [*expected_tokens[:3], "--strip-debuginfo", *expected_tokens[3:]]))
+
+        manifest_flag = "--manifest-out"
+        manifest_value = "test-results/native-build-batch.json"
+        manifest_idx = expected_tokens.index(manifest_flag)
+        manifest_cases: list[tuple[str, list[str]]] = [
+            ("manifest flag removed", [tok for tok in expected_tokens if tok != manifest_flag]),
+            ("manifest path removed", [tok for k, tok in enumerate(expected_tokens) if k != manifest_idx + 1]),
+            ("manifest bad flag", ["--manifest" if tok == manifest_flag else tok for tok in expected_tokens]),
+            ("manifest wrong path", [f"{manifest_value}.bak" if tok == manifest_value else tok for tok in expected_tokens]),
+            ("manifest pair duplicate", [*expected_tokens, manifest_flag, manifest_value]),
+            ("manifest path only", [*expected_tokens, manifest_value]),
+        ]
+        mutations.extend(manifest_cases)
+
+        for label, tokens in mutations:
+            with self.subTest(mutation=label):
+                mutated_tokens: list[str] = list(tokens)
+                mutated_workflow = with_script(" ".join(mutated_tokens))
+                self.assertNotEqual(mutated_tokens, expected_tokens)
+                assert_rejected(mutated_workflow)
 
     def test_t2_f20_03_ci_validator_rejects_stale_schema_008_or_missing_design_docs_gate(self) -> None:
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -18303,6 +18693,119 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         with self.assertRaisesRegex(AssertionError, "non-existent Python script"):
             Phase1ClosureAndDocsFixture.validate_ci_workflow(ci_text + "\n      - run: python3 tests/nonexistent_ghost_suite.py\n")
+
+    def test_t2_f20_06_ci_validator_rejects_nested_env_steps_spoof(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        expected_tokens = Phase1ClosureAndDocsFixture.ci_build_native_batch_tokens(
+            Phase1ClosureAndDocsFixture.live_ci_run_commands(ci_text)
+        )
+        exact_command = " ".join(expected_tokens)
+
+        step_anchor = "      - name: Build native bins and RefStore fixtures in one batch\n"
+        step_index = ci_text.index(step_anchor)
+        run_header = "        run: |\n"
+        run_index = ci_text.index(run_header, step_index)
+        next_anchor = "      - name: Verify design documentation integrity\n"
+        next_index = ci_text.index(next_anchor, run_index)
+
+        mutated = (
+            ci_text[:run_index]
+            + "        run: echo no native build\n"
+            + ci_text[next_index:]
+        )
+
+        verify_index = mutated.index("  verify:\n")
+        verify_steps = "    steps:\n"
+        steps_index = mutated.index(verify_steps, verify_index)
+        spoof_env = "    env:\n      steps: |\n        - run: " + exact_command + "\n"
+        mutated = mutated[:steps_index] + spoof_env + mutated[steps_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_07_ci_validator_rejects_folded_native_batch_step(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        next_anchor = "      - name: Verify design documentation integrity\n"
+        anchor_index = ci_text.index(next_anchor)
+        folded_step = (
+            "      - name: Folded native batch with header comment\n"
+            "        run: > # folded scalar comment\n"
+            "          python3 scripts/build_native_batch.py\n"
+            "          --all-bins --features pando-lib\n"
+        )
+        mutated = ci_text[:anchor_index] + folded_step + ci_text[anchor_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_08_ci_validator_rejects_failure_masked_native_batch_step(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        exact_command = " ".join(
+            Phase1ClosureAndDocsFixture.ci_build_native_batch_tokens(
+                Phase1ClosureAndDocsFixture.live_ci_run_commands(ci_text)
+            )
+        )
+        step_anchor = "      - name: Build native bins and RefStore fixtures in one batch\n"
+        step_index = ci_text.index(step_anchor)
+        run_header = "        run: |\n"
+        run_index = ci_text.index(run_header, step_index)
+        next_anchor = "      - name: Verify design documentation integrity\n"
+        next_index = ci_text.index(next_anchor, run_index)
+        masked_run = run_header + f"          {exact_command} || true\n"
+        mutated = ci_text[:run_index] + masked_run + ci_text[next_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_09_ci_validator_rejects_wrong_first_steps_item(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        verify_index = ci_text.index("  verify:\n")
+        steps_index = ci_text.index("    steps:\n", verify_index)
+        insert_index = steps_index + len("    steps:\n")
+        wrong_step = (
+            "      - name: Wrong first native batch\n"
+            "        run: python3 scripts/build_native_batch.py --all-bins --features pando-lib\n"
+        )
+        mutated = ci_text[:insert_index] + wrong_step + ci_text[insert_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_10_ci_validator_rejects_bare_dash_first_batch_step(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        verify_index = ci_text.index("  verify:\n")
+        steps_index = ci_text.index("    steps:\n", verify_index)
+        insert_index = steps_index + len("    steps:\n")
+        wrong_step = (
+            "      -\n"
+            "        name: Wrong first native batch under bare dash\n"
+            "        run: python3 scripts/build_native_batch.py --all-bins --features pando-lib\n"
+        )
+        mutated = ci_text[:insert_index] + wrong_step + ci_text[insert_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_11_ci_validator_rejects_dynamic_shell_batch_eval(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        anchor = "      - name: Build native bins and RefStore fixtures in one batch\n"
+        insert_index = ci_text.index(anchor)
+        dynamic_step = (
+            "      - name: Dynamic shell command in verify job\n"
+            "        env:\n"
+            "          RUN: \"python3 scripts/build_native_batch.py --all-bins --features pando-lib\"\n"
+            "        run: bash -c \"$RUN\"\n"
+        )
+        mutated = ci_text[:insert_index] + dynamic_step + ci_text[insert_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
 
     # =========================================================================
     # Feature F21: Phase 1 Closure — Implementation Status & Docs Sync — Boundary & Corner Cases (5 Tests)
@@ -20686,7 +21189,7 @@ class TestTier3CrossFeatureCombinations(BaseRootyardTestCase):
         e2e = SchemaBoundaryIntegrationFixture.verify_tier3_e2e_suite_completeness()
         self.assertEqual(p1["tables_050_count"], 30)
         self.assertEqual(p3["expected_060_table_count"], 34)
-        self.assertEqual(e2e["total_count"], 591)
+        self.assertEqual(e2e["total_count"], 597)
 
     def test_t3_44_f32_f37_f38_f41_f42_full_42_feature_486_test_matrix_and_paired_backup_34_table_contract(self) -> None:
         wfx = WorkspaceManifestIgnoreViewFixture(self.tmp_path / "t3_44_vfs")
@@ -21565,7 +22068,7 @@ class TestTier4RealWorldScenarios(BaseRootyardTestCase):
         self.assertTrue(pando.object_store_verify()["valid"])
 
     def test_t4_22_scenario_phase2_part1_and_part3_full_42_feature_486_test_convergence_and_schema_060_gate(self) -> None:
-        """S22: Phase 2 Part 1 (050 Closure) & Part 3 (51-Feature 591-Test Suite + Schema 060 + 11-Domain Governance) Gate (F30, F31, F32, F41, F42)."""
+        """S22: Phase 2 Part 1 (050 Closure) & Part 3 (51-Feature 597-Test Suite + Schema 060 + 11-Domain Governance) Gate (F30, F31, F32, F41, F42)."""
         p1_info = SchemaBoundaryIntegrationFixture.verify_part1_schema_050_closure()
         p3_info = SchemaBoundaryIntegrationFixture.verify_part3_convergence_and_tier3_governance()
         e2e_info = SchemaBoundaryIntegrationFixture.verify_tier3_e2e_suite_completeness()
@@ -21574,7 +22077,7 @@ class TestTier4RealWorldScenarios(BaseRootyardTestCase):
         self.assertEqual(p1_info["tables_050_count"], 30)
         self.assertEqual(p3_info["expected_060_table_count"], 34)
         self.assertEqual(e2e_info["feature_count"], 51)
-        self.assertEqual(e2e_info["total_count"], 591)
+        self.assertEqual(e2e_info["total_count"], 597)
         self.assertGreaterEqual(ci_info["suites_verified"], 11)
 
     def test_t4_23_scenario_view_lab_multi_repo_namespace_3way_changeset_recovery_and_signed_history_projection(self) -> None:
@@ -21715,7 +22218,7 @@ class TestTier4RealWorldScenarios(BaseRootyardTestCase):
             self.assertFalse(rec["index_lock_exists"], msg=win)
 
     def test_t4_27_scenario_tier5_full_51_feature_591_test_five_track_convergence_gate(self) -> None:
-        """S27: Tier 5 Full 51-Feature 591-Test Five-Track Convergence Gate Across View-Lab, SHA-256, Sharding & Overlay/WAL (F43, F44, F45, F46, F47, F48, F49, F50, F51)."""
+        """S27: Tier 5 Full 51-Feature 597-Test Five-Track Convergence Gate Across View-Lab, SHA-256, Sharding & Overlay/WAL (F43, F44, F45, F46, F47, F48, F49, F50, F51)."""
         mod_info = Tier5ViewLabHistoryAndSignatureFixture.verify_view_lab_modularity()
         self.assertLess(mod_info["root_lines"], 120)
 
@@ -21744,7 +22247,7 @@ class TestTier4RealWorldScenarios(BaseRootyardTestCase):
 
         e2e_info = SchemaBoundaryIntegrationFixture.verify_tier3_e2e_suite_completeness()
         self.assertEqual(e2e_info["feature_count"], 51)
-        self.assertEqual(e2e_info["total_count"], 591)
+        self.assertEqual(e2e_info["total_count"], 597)
 
 
 FEATURE_CATALOG: dict[str, dict[str, Any]] = {
@@ -21788,7 +22291,7 @@ FEATURE_CATALOG: dict[str, dict[str, Any]] = {
     "F38": {"id": "F38", "track": "M15 (Track 3 Sparse VFS)", "name": "Workspace-Lab Copy-on-Write Dirty File Tracking, Ignore-Aware Status & Clean Blob Eviction"},
     "F39": {"id": "F39", "track": "M16 (Track 4 Sharding)", "name": "Multi-Node Repository Sharding Catalog, Deterministic Bucket Placement & Routing"},
     "F40": {"id": "F40", "track": "M16 (Track 4 Fencing)", "name": "Epoch Storage Write Fencing, Automated Node Failover & Read-Only Degradation Drills"},
-    "F41": {"id": "F41", "track": "M12.5 (Track 5 E2E Harness)", "name": "4-Tier E2E Test Harness Expansion & Per-Feature Filter Verification (591 Tests)"},
+    "F41": {"id": "F41", "track": "M12.5 (Track 5 E2E Harness)", "name": "4-Tier E2E Test Harness Expansion & Per-Feature Filter Verification (597 Tests)"},
     "F42": {"id": "F42", "track": "M17 (Part 3 Integration)", "name": "Cross-Track Schema 060, 11-Domain Router Non-Collision, Anti-Monolith Caps & Paired Backup"},
     "F43": {"id": "F43", "track": "Tier 5 Track 1 (view_lab)", "name": "View-Lab Anti-Monolith Split, Namespace Pins & 3-Way Changeset Failpoint Recovery"},
     "F44": {"id": "F44", "track": "Tier 5 Track 1 (view_lab)", "name": "Long-Term History Projection Strategies (deterministic_history vs task_snapshot)"},

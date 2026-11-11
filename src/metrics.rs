@@ -95,6 +95,8 @@ pub fn router(
 // expired included; the two oldest-expiry subqueries only consider rows whose
 // expiry is already past, so an unexpired session is never the "oldest expired"
 // sample, an empty set reports zero and the database clock is authoritative.
+// The webhook age likewise joins deliveries to their hook and measures only an
+// For active hooks it includes pending rows, retry-delayed failures, and all leased rows, including expired leases awaiting reclaim.
 const SNAPSHOT_SQL: &str = r#"
 SELECT
  (SELECT count(*) FROM repositories WHERE state='provisioning'),
@@ -106,6 +108,9 @@ SELECT
  (SELECT count(*) FROM event_deliveries WHERE state='leased'),
  (SELECT COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(e.created_at))),0),0)::double precision
     FROM event_deliveries d JOIN outbox_events e ON e.event_id=d.event_id WHERE d.state<>'delivered'),
+ (SELECT COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(d.created_at))),0),0)::double precision
+    FROM forge_webhook_deliveries d JOIN forge_webhooks h ON h.id=d.webhook_id
+    WHERE h.active AND d.state IN ('pending','failed','leased')),
  (SELECT count(*) FROM repositories WHERE state='provisioning' AND next_retry_at<=statement_timestamp()),
  (SELECT COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(created_at))),0),0)::double precision
     FROM repositories WHERE state='provisioning'),
@@ -125,6 +130,7 @@ struct Snapshot {
     pending: i64,
     leased: i64,
     delivery_age: f64,
+    webhook_delivery_age: f64,
     provisioning_due: i64,
     provisioning_age: f64,
     browser_sessions: i64,
@@ -153,12 +159,13 @@ async fn snapshot(
         pending: row.try_get(4)?,
         leased: row.try_get(5)?,
         delivery_age: row.try_get(6)?,
-        provisioning_due: row.try_get(7)?,
-        provisioning_age: row.try_get(8)?,
-        browser_sessions: row.try_get(9)?,
-        browser_tokens: row.try_get(10)?,
-        expired_session_age: row.try_get(11)?,
-        expired_token_age: row.try_get(12)?,
+        webhook_delivery_age: row.try_get(7)?,
+        provisioning_due: row.try_get(8)?,
+        provisioning_age: row.try_get(9)?,
+        browser_sessions: row.try_get(10)?,
+        browser_tokens: row.try_get(11)?,
+        expired_session_age: row.try_get(12)?,
+        expired_token_age: row.try_get(13)?,
     };
     let workers = metrics_workers::query(&transaction, config).await?;
     transaction.commit().await?;
@@ -263,6 +270,19 @@ fn render(
         counters.received.load(Ordering::Relaxed),
         counters.sent.load(Ordering::Relaxed)
     );
+    let remote_metrics = crate::lfs::remote_metrics::counters().snapshot();
+    counter(
+        &mut output,
+        "rootyard_lfs_remote_failures_total",
+        "Typed LFS remote-store operation failures.",
+        remote_metrics.remote_failures_total,
+    );
+    gauge(
+        &mut output,
+        "rootyard_lfs_remote_repair_backlog",
+        "Admitted LFS repair jobs holding a bounded repair permit; not a durable queue.",
+        remote_metrics.repair_backlog,
+    );
     // The GC counters describe this process's own bounded loop. They stay
     // exported on a failed SQL snapshot because they never assert database
     // health, and they are read from the GC module's single counter set.
@@ -308,6 +328,12 @@ fn render(
             "rootyard_event_delivery_oldest_age_seconds",
             "Age of oldest undelivered event including retry delays and expired leases.",
             s.delivery_age,
+        );
+        gauge(
+            &mut output,
+            "rootyard_webhook_delivery_oldest_age_seconds",
+            "Database-clock age since creation of the oldest outstanding webhook delivery on an active hook in pending, failed or leased state. Includes retry-delayed failures and every row still in leased state, even an expired lease awaiting reclaim; delivered, dead_letter and inactive hooks are excluded, and an empty set reports 0.",
+            s.webhook_delivery_age,
         );
         gauge(
             &mut output,
@@ -396,6 +422,7 @@ mod tests {
         assert!(!text.contains("rootyard_operations_unresolved"));
         assert!(!text.contains("rootyard_browser_"));
         assert!(!text.contains("rootyard_expired_browser_"));
+        assert!(!text.contains("rootyard_webhook_"));
         assert!(!text.contains("rootyard_workspace_"));
         assert!(!text.contains("rootyard_storage_maintenance"));
         // Process-local GC counters survive the failed snapshot unchanged.
@@ -420,6 +447,7 @@ mod tests {
         assert!(text.contains("rootyard_git_transfer_bytes_total{direction=\"sent\"} 17\n"));
         assert!(text.contains("rootyard_git_transfers_total{outcome=\"success\"} 1\n"));
         assert!(text.contains("rootyard_git_transfers_total{outcome=\"failure\"} 1\n"));
+        assert!(text.contains("rootyard_webhook_delivery_oldest_age_seconds 0\n"));
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (name, value) = line.split_once(' ').unwrap();
             assert!(name.starts_with("rootyard_"));
@@ -462,8 +490,10 @@ mod tests {
         crate::baseline_metrics::render(&mut baseline);
         assert_eq!(
             text.lines().filter(|l| !l.starts_with('#')).count(),
-            91 + baseline.lines().filter(|l| !l.starts_with('#')).count()
+            94 + baseline.lines().filter(|l| !l.starts_with('#')).count()
         );
+        assert!(text.contains("rootyard_lfs_remote_failures_total "));
+        assert!(text.contains("rootyard_lfs_remote_repair_backlog "));
     }
 
     #[test]
