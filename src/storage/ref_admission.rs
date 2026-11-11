@@ -804,6 +804,7 @@ mod tests {
                 shard_epoch: admission.shard_epoch,
                 ci_pin: None,
                 proposal_pin: None,
+                idempotency: None,
                 path: std::path::PathBuf::new(),
             },
         )

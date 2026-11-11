@@ -153,6 +153,7 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
             "--harness tests/browse.py",
             "--harness tests/browse_ref_scale.py",
             "--require-case browse=protected_writes_and_ref_ack_failure",
+            "--require-case browse=ref_transaction_settlement_recovery",
             "--require-case browse=ref_transaction_crash_recovery",
             "--require-case browse=ref_scale_complete_traversal",
         ):

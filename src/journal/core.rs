@@ -1,7 +1,15 @@
 //! Durable operation identity, admission, and filesystem records.
 use super::*;
+use anyhow::{Context, Result, ensure};
+use fs2::FileExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Operation {
     pub id: Uuid,
     pub repository_id: Uuid,
@@ -24,6 +32,9 @@ pub struct Operation {
     /// Internal, absent-to-target proposal pin. Never supplied by Git clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) proposal_pin: Option<crate::namespace_service::ProposalIntent>,
+    /// Present only for HTTP ref transactions carrying an Idempotency-Key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<super::IdempotencyIntent>,
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -159,6 +170,12 @@ pub(super) fn load(path: &Path) -> Result<Operation> {
         "invalid operation sequence, generation or shard epoch"
     );
     ensure!(!op.actor_name.is_empty() && op.actor_name.len() <= 4096, "invalid actor name");
+    if let Some(intent) = &op.idempotency {
+        let valid =
+            |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+        ensure!(valid(&intent.key_sha256) && valid(&intent.request_sha256), "invalid idempotency intent");
+        ensure!(op.ci_pin.is_none() && op.proposal_pin.is_none(), "idempotency intent on maintenance operation");
+    }
     ensure!(
         path.file_name().and_then(|s| s.to_str()) == Some(op_name(&op).as_str()),
         "operation path identity mismatch"
@@ -226,6 +243,37 @@ pub fn begin(
         false,
         Uuid::new_v4(),
         0,
+        None,
+    )?
+    .0)
+}
+
+/// Admit a server-side exact-ref transaction carrying optional idempotency
+/// fingerprints. The fingerprints are persisted with the intent so recovery
+/// can replay the committed response after a settlement crash.
+pub fn begin_ref_transaction(
+    data_root: &Path,
+    repository_id: Uuid,
+    actor_id: Uuid,
+    actor_name: String,
+    token_id: Uuid,
+    storage_generation: i64,
+    idempotency: Option<super::IdempotencyIntent>,
+) -> Result<Operation> {
+    Ok(begin_inner(
+        data_root,
+        repository_id,
+        actor_id,
+        actor_name,
+        token_id,
+        storage_generation,
+        None,
+        None,
+        None,
+        false,
+        Uuid::new_v4(),
+        0,
+        idempotency,
     )?
     .0)
 }
@@ -270,6 +318,7 @@ pub fn begin_active_with(
         true,
         writer_id,
         shard_epoch,
+        None,
     )?;
     Ok((op, guard.context("missing active admission lock")?))
 }
@@ -294,6 +343,7 @@ pub(crate) fn begin_ci(
         false,
         Uuid::new_v4(),
         0,
+        None,
     )?
     .0)
 }
@@ -319,6 +369,7 @@ pub(crate) fn begin_ci_service(
         false,
         Uuid::new_v4(),
         0,
+        None,
     )?
     .0)
 }
@@ -347,6 +398,7 @@ pub(crate) fn begin_proposal(
         false,
         Uuid::new_v4(),
         0,
+        None,
     )
     .map(|(op, _)| op)
 }
@@ -365,6 +417,7 @@ fn begin_inner(
     active: bool,
     writer_id: Uuid,
     shard_epoch: i64,
+    idempotency: Option<super::IdempotencyIntent>,
 ) -> Result<(Operation, Option<ActiveGuard>)> {
     safe_path(data_root)?;
     ensure!(storage_generation > 0 && !actor_name.is_empty() && actor_name.len() <= 4096, "invalid operation metadata");
@@ -403,6 +456,7 @@ fn begin_inner(
         shard_epoch,
         ci_pin,
         proposal_pin,
+        idempotency,
         path: PathBuf::new(),
     };
     op.path = repo.join(op_name(&op));

@@ -340,6 +340,7 @@ jobs:
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing \
             --require-case browse=protected_writes_and_ref_ack_failure \
+            --require-case browse=ref_transaction_settlement_recovery \
             --require-case browse=ref_transaction_crash_recovery \
             --require-case browse=ref_scale_complete_traversal \
             --fixture rust="$(rustc -V)" \

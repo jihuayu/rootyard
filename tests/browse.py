@@ -10,6 +10,7 @@ import os
 import shlex
 import shutil
 import signal
+import subprocess
 from pathlib import Path
 import sys
 import time
@@ -44,6 +45,7 @@ CASE_NAMES = (
     "ref_scale_complete_traversal",
     "selective_ref_prefix",
     "protected_writes_and_ref_ack_failure",
+    "ref_transaction_settlement_recovery",
     "ref_transaction_crash_recovery",
 )
 
@@ -95,6 +97,27 @@ class BrowseHarness(Harness):
     @staticmethod
     def _sql_literal(value):
         return str(value).replace("'", "''")
+
+    def pending_journal_entries(self):
+        """Visible, non-retired operation directories for the fixture repo."""
+        repo_dir = self.root / "data" / "journal" / self.repo["id"]
+        if not repo_dir.is_dir():
+            return []
+        return sorted(
+            path.name for path in repo_dir.iterdir()
+            if path.is_dir() and not path.name.startswith((".tmp-", ".retired-"))
+        )
+
+    def ref_operations(self, ref):
+        requested = [{"ref_name": ref, "old_oid": ZERO_OID, "new_oid": self.feature_oid}]
+        requested_json = json.dumps(requested, separators=(",", ":"))
+        return json.loads(self.sql(
+            "SELECT coalesce(json_agg(json_build_object('id',id::text,'outcome',outcome,"
+            "'evidence',evidence)),'[]'::json)::text FROM git_operations "
+            "WHERE repository_id='" + self._sql_literal(self.repo["id"])
+            + "' AND evidence->'requested' @> '"
+            + self._sql_literal(requested_json) + "'::jsonb"
+        ))
 
     def repository_diagnostics(self):
         """Current schema and repository row facts for an unexpected response."""
@@ -860,7 +883,8 @@ class BrowseHarness(Harness):
             'if [ "$matched" = 1 ] && [ "$rc" = 0 ] && [ -f '
             + shlex.quote(str(arm)) + " ]; then\n"
             "  rm -f \"$stdin_file\"\n"
-            "  kill -KILL \"$(cat " + shlex.quote(str(pid_file)) + ")\"\n"
+            "  kill -KILL \"$(cat " + shlex.quote(str(pid_file)) + ")\" || { rm -f "
+            + shlex.quote(str(done)) + "; exit 125; }\n"
             "  printf done > " + shlex.quote(str(done)) + "\n"
             "  exit 1\n"
             "fi\n"
@@ -919,6 +943,7 @@ class BrowseHarness(Harness):
             self.stop()
         assert done.is_file(), "fault wrapper did not complete before restart"
         assert exited is not None, "killed service PID was still running"
+        assert exited == -signal.SIGKILL, "fault must terminate the service with SIGKILL, got " + str(exited)
         wrapper_pid = int(wrapper_pid_file.read_text().strip())
         git_pid = int(git_pid_file.read_text().strip())
         pids = {"service_pid": server_pid, "wrapper_pid": wrapper_pid,
@@ -969,6 +994,222 @@ class BrowseHarness(Harness):
             "outcome": operation["outcome"],
             "repository_state": state,
             "recovery_reason": reason,
+        }
+
+    def ref_transaction_settlement_recovery(self):
+        """Exercise every Issue #14 boundary around the native CAS and SQL commit.
+
+        (a) a revoked writer is rejected by the pre-CAS re-check: refs stay
+            untouched, the claim and journal are released, and the same key can
+            be retried successfully once the writer is authorized again;
+        (b) the outbox set was written inside the settlement transaction but
+            that transaction had not committed: a process death rolls both
+            back, so no operation/event is durable while the Git receipt and
+            journal remain;
+        (c) a durable Git receipt exists but the PostgreSQL settlement is
+            interrupted: restart reconciliation publishes the recorded
+            operation/outbox exactly once, retires the journal, and the same
+            Idempotency-Key replays instead of running a second CAS;
+        (d) settlement commits but retirement does not: the reconciler replays
+            the identical canonical evidence, retires the journal instead of
+            wedging on "terminal operation evidence mismatch", and the key
+            still replays the committed response.
+        """
+        endpoint = self.repo_api("/ref-transactions")
+        pause_env = "ROOTYARD_TEST_REF_TRANSACTION_PAUSE_BEFORE_CAS_MS"
+        failpoint_env = "ROOTYARD_TEST_REF_TRANSACTION_FAILPOINT"
+
+        def outbox_count(ref):
+            return int(self.sql(
+                "SELECT count(*) FROM outbox_events WHERE repository_id='" + self.repo["id"]
+                + "' AND ref_name='" + ref + "'"
+            ))
+
+        def claim_row(key):
+            return self.sql(
+                "SELECT coalesce(response::text,'') FROM forge_creation_requests "
+                "WHERE repository_id='" + self.repo["id"] + "' AND idempotency_key='"
+                + self._sql_literal(key) + "'"
+            )
+
+        def ready():
+            return self.sql(
+                "SELECT state || '|' || coalesce(recovery_reason,'') FROM repositories WHERE id='"
+                + self.repo["id"] + "'"
+            )
+
+        # (a) Failure before native publication, with a real token revocation.
+        revoked = self.account("create-token", "alice")
+        before_ref = "refs/heads/boundary-before-publication"
+        before_payload = {"updates": [{"ref_name": before_ref, "old_oid": ZERO_OID,
+                                       "new_oid": self.feature_oid}]}
+        before_key = "boundary-before-publication"
+        self.stop()
+        self.env[pause_env] = "3000"
+        self.start()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    self.http, endpoint, token=revoked, method="POST",
+                    body=before_payload,
+                    extra_headers={"Idempotency-Key": before_key},
+                )
+                time.sleep(0.4)
+                self.cli("revoke-token", revoked["token_id"])
+                status, body, _ = future.result(timeout=20)
+            assert status == 401, (status, body[:200])
+            assert self.git("--git-dir=" + str(self.bare), "show-ref", "--verify",
+                            before_ref, check=False).returncode != 0
+            assert self.ref_operations(before_ref) == []
+            assert outbox_count(before_ref) == 0
+            assert self.pending_journal_entries() == []
+            assert claim_row(before_key) == ""
+            assert ready() == "ready|"
+        finally:
+            self.env.pop(pause_env, None)
+            self.stop()
+            self.start()
+
+        # The claim rolled back with the aborted intent, so the same key and
+        # exact request are now admissible and publish exactly once.
+        retried = self.document(endpoint, 200, method="POST", body=before_payload,
+                                extra_headers={"Idempotency-Key": before_key})
+        assert self.git("--git-dir=" + str(self.bare), "rev-parse",
+                        before_ref).stdout.decode().strip() == self.feature_oid
+        before_ops = self.ref_operations(before_ref)
+        assert len(before_ops) == 1 and before_ops[0]["outcome"] == "recorded", before_ops
+        assert outbox_count(before_ref) == 1
+        assert self.pending_journal_entries() == []
+        assert self.document(endpoint, 200, method="POST", body=before_payload,
+                             extra_headers={"Idempotency-Key": before_key}) == retried
+
+        # (b) The outbox insert succeeded inside the settlement transaction,
+        # but the transaction died before finalizing the claim or committing.
+        # The rollback proves publication and settlement are one atomic unit:
+        # no operation or event is visible until the commit.
+        publish_ref = "refs/heads/boundary-after-publish"
+        publish_payload = {"updates": [{"ref_name": publish_ref, "old_oid": ZERO_OID,
+                                        "new_oid": self.feature_oid}]}
+        publish_key = "boundary-after-publish"
+        self.stop()
+        self.env[failpoint_env] = "after_publish"
+        self.start()
+        try:
+            self.document(endpoint, 503, method="POST", body=publish_payload,
+                          extra_headers={"Idempotency-Key": publish_key})
+            assert self.git("--git-dir=" + str(self.bare), "rev-parse",
+                            publish_ref).stdout.decode().strip() == self.feature_oid
+            assert self.ref_operations(publish_ref) == []
+            assert outbox_count(publish_ref) == 0
+            assert claim_row(publish_key) == ""
+            assert len(self.pending_journal_entries()) == 1
+            assert ready() == "ready|"
+        finally:
+            self.env.pop(failpoint_env, None)
+            self.stop()
+            self.start()
+
+        assert self.pending_journal_entries() == []
+        publish_ops = self.ref_operations(publish_ref)
+        assert len(publish_ops) == 1 and publish_ops[0]["outcome"] == "recorded", publish_ops
+        assert outbox_count(publish_ref) == 1
+        publish_replay = self.document(endpoint, 200, method="POST", body=publish_payload,
+                                       extra_headers={"Idempotency-Key": publish_key})
+        assert publish_replay["operation_id"] == publish_ops[0]["id"]
+        assert publish_replay["updates"] == publish_payload["updates"]
+        assert self.document(endpoint, 200, method="POST", body=publish_payload,
+                             extra_headers={"Idempotency-Key": publish_key}) == publish_replay
+        assert len(self.ref_operations(publish_ref)) == 1
+        assert outbox_count(publish_ref) == 1
+        assert self.pending_journal_entries() == []
+
+        # (c) Git receipt is durable, SQL settlement is not. The claim rolls
+        # back with the transaction; startup reconciliation publishes once.
+        receipt_ref = "refs/heads/boundary-after-receipt"
+        receipt_payload = {"updates": [{"ref_name": receipt_ref, "old_oid": ZERO_OID,
+                                        "new_oid": self.feature_oid}]}
+        receipt_key = "boundary-after-receipt"
+        self.stop()
+        self.env[failpoint_env] = "after_receipt"
+        self.start()
+        try:
+            self.document(endpoint, 503, method="POST", body=receipt_payload,
+                          extra_headers={"Idempotency-Key": receipt_key})
+            assert self.git("--git-dir=" + str(self.bare), "rev-parse",
+                            receipt_ref).stdout.decode().strip() == self.feature_oid
+            assert self.ref_operations(receipt_ref) == []
+            assert outbox_count(receipt_ref) == 0
+            assert claim_row(receipt_key) == ""
+            assert len(self.pending_journal_entries()) == 1
+            assert ready() == "ready|"
+        finally:
+            self.env.pop(failpoint_env, None)
+            self.stop()
+            self.start()
+
+        assert self.pending_journal_entries() == []
+        receipt_ops = self.ref_operations(receipt_ref)
+        assert len(receipt_ops) == 1 and receipt_ops[0]["outcome"] == "recorded", receipt_ops
+        assert outbox_count(receipt_ref) == 1
+        evidence = receipt_ops[0]["evidence"]
+        assert evidence["requested"] == [
+            {"ref_name": receipt_ref, "old_oid": ZERO_OID, "new_oid": self.feature_oid}
+        ], evidence
+        assert len(evidence["idempotency_key_sha256"]) == 64
+        assert len(evidence["idempotency_request_sha256"]) == 64
+        receipt_replay = self.document(endpoint, 200, method="POST", body=receipt_payload,
+                                       extra_headers={"Idempotency-Key": receipt_key})
+        assert receipt_replay["operation_id"] == receipt_ops[0]["id"]
+        assert receipt_replay["updates"] == receipt_payload["updates"]
+        assert self.document(endpoint, 200, method="POST", body=receipt_payload,
+                             extra_headers={"Idempotency-Key": receipt_key}) == receipt_replay
+        assert len(self.ref_operations(receipt_ref)) == 1
+        assert outbox_count(receipt_ref) == 1
+        assert self.pending_journal_entries() == []
+
+        # (d) The settlement transaction committed, but journal retirement did
+        # not. Reconciliation must reproduce the exact evidence and retire.
+        commit_ref = "refs/heads/boundary-after-commit"
+        commit_payload = {"updates": [{"ref_name": commit_ref, "old_oid": ZERO_OID,
+                                       "new_oid": self.feature_oid}]}
+        commit_key = "boundary-after-commit"
+        self.stop()
+        self.env[failpoint_env] = "after_commit"
+        self.start()
+        try:
+            self.document(endpoint, 503, method="POST", body=commit_payload,
+                          extra_headers={"Idempotency-Key": commit_key})
+            assert self.git("--git-dir=" + str(self.bare), "rev-parse",
+                            commit_ref).stdout.decode().strip() == self.feature_oid
+            committed_ops = self.ref_operations(commit_ref)
+            assert len(committed_ops) == 1 and committed_ops[0]["outcome"] == "recorded", committed_ops
+            assert outbox_count(commit_ref) == 1
+            assert claim_row(commit_key) != ""
+            assert len(self.pending_journal_entries()) == 1
+            assert ready() == "ready|"
+        finally:
+            self.env.pop(failpoint_env, None)
+            self.stop()
+            self.start()
+
+        assert self.pending_journal_entries() == []
+        assert self.ref_operations(commit_ref) == committed_ops
+        assert outbox_count(commit_ref) == 1
+        assert ready() == "ready|"
+        commit_replay = self.document(endpoint, 200, method="POST", body=commit_payload,
+                                      extra_headers={"Idempotency-Key": commit_key})
+        assert commit_replay["operation_id"] == committed_ops[0]["id"]
+        assert commit_replay["updates"] == commit_payload["updates"]
+        assert self.document(endpoint, 200, method="POST", body=commit_payload,
+                             extra_headers={"Idempotency-Key": commit_key}) == commit_replay
+        assert len(self.ref_operations(commit_ref)) == 1
+        assert outbox_count(commit_ref) == 1
+        return {
+            "pre_cas_revocation_released_claim": True,
+            "post_publish_rollback_created_no_settlement": True,
+            "post_receipt_settlement_recovered": True,
+            "post_commit_retirement_recovered": True,
+            "journal_entries": self.pending_journal_entries(),
         }
 
     def commits_and_pagination(self):
@@ -1370,6 +1611,28 @@ class BrowseHarness(Harness):
                 }
             ],
         }
+        denied_ref = "refs/heads/denied"
+        denied_json = json.dumps(
+            [{"ref_name": denied_ref, "old_oid": ZERO_OID, "new_oid": self.third}],
+            separators=(",", ":"),
+        )
+
+        def denied_side_effects():
+            return (
+                int(self.sql(
+                    "SELECT count(*) FROM git_operations WHERE repository_id='"
+                    + self._sql_literal(self.repo["id"]) + "' AND evidence->'requested' @> '"
+                    + self._sql_literal(denied_json) + "'::jsonb"
+                )),
+                int(self.sql(
+                    "SELECT count(*) FROM outbox_events WHERE repository_id='"
+                    + self._sql_literal(self.repo["id"]) + "' AND ref_name='"
+                    + self._sql_literal(denied_ref) + "'"
+                )),
+                self.pending_journal_entries(),
+            )
+
+        before_denied = denied_side_effects()
         self.expect(self.repo_api("/ref-transactions"), 401, method="POST", body=tx_body)
         self.document(
             self.repo_api("/ref-transactions"),
@@ -1378,6 +1641,11 @@ class BrowseHarness(Harness):
             method="POST",
             body=tx_body,
         )
+        # A caller without write access must fail before durable publication,
+        # admission, journal reservation or outbox projection.
+        assert denied_side_effects() == before_denied, denied_side_effects()
+        assert self.git("--git-dir=" + str(self.bare), "show-ref", "--verify",
+                        denied_ref, check=False).returncode != 0
         self.document(
             self.repo_api("/ref-transactions"),
             404,
@@ -1506,8 +1774,13 @@ def main():
             if binary_path.is_file()
             else None
         )
+        source_head = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE, check=True,
+        ).stdout.decode().strip()
         report = dict(
             passed=success,
+            source_head=source_head,
             case_count=len(CASE_NAMES),
             cases_run=len(harness.results),
             cases_passed=sum(1 for item in harness.results if item["status"] == "passed"),
