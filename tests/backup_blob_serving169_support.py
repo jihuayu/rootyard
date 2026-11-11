@@ -17,11 +17,15 @@ Three independent pieces live here:
   byte length is ``length`` (:func:`archive_length`), never the A4 /
   ``artifact_holds`` column name ``content_length`` that the SQL evidence and
   the artifact-set digest below do use. Each registration's pack and idx rows
-  share one repository, one generated pack id and one repository tenant
-  (:data:`REGISTRATION_IDENTITY`), and every artifact's exact
-  :func:`archive_path` must be one regular ``file`` entry whose ``bytes`` is
-  that artifact's ``length`` and whose ``sha256`` is its digest -- the same
-  per-member binding Rust restore applies.
+  must share one repository, one generated pack id and one repository tenant
+  (:data:`REGISTRATION_IDENTITY`), so a registration scope is only ever built
+  after both its rows agree on all three. The ``blob/`` inventory must be
+  exactly what ``blob_closure::export`` writes: every artifact's exact
+  :func:`archive_path` as one regular ``file`` entry whose ``bytes`` is that
+  artifact's ``length`` and whose ``sha256`` is its digest (the per-member
+  binding Rust restore applies), plus exactly the two parent ``directory``
+  entries of each artifact (:func:`archive_directories`) -- no other file or
+  directory may appear.
 * :class:`CorruptionCase`/:func:`corruption_plan` and :func:`corruption_sql`/
   :func:`corruption_findings`/:func:`validator_refusal` -- the dedicated raw-SQL
   source corruption negatives. Each case is applied by one clone-local,
@@ -227,17 +231,25 @@ def format22_manifest_checks(manifest, expected):
     with at least one active and one released root), ``repos``
     (``[{id, owner_id, tenant_id}]``), ``producer`` (the owner of every root
     capture) and ``serving_read`` (the validated ``markers["serving_read"]``
-    entry of :func:`native_marker_checks`). An optional ``registration_scopes``
-    (``{registration_id: (repository_id, pack_id)}``, read from the source's
-    own publications) independently pins each registration's identity; without
-    it the artifact rows themselves are the only identity source. ``manifest``
-    is the parsed archive manifest.
+    entry of :func:`native_marker_checks`). ``manifest`` is the parsed archive
+    manifest.
+
+    The pair identity is always enforced from the archive rows themselves: the
+    pack and idx rows of one registration must agree on ``repository_id``,
+    ``pack_id`` and ``tenant_id``, and only then is that registration's one
+    scope formed. An optional ``registration_scopes`` (``{registration_id:
+    (repository_id, pack_id)}``, read from the source's own publications) is a
+    separate, additional check of that scope; without it the rows are still
+    checked for agreement with each other.
 
     The byte proof follows Rust restore exactly: each artifact's
     :func:`archive_path` must be one regular ``file`` entry whose ``bytes`` is
-    that artifact's serialized ``length`` and whose ``sha256`` is its digest.
-    Aggregate totals alone are never accepted, because one member's surplus can
-    otherwise mask another member's deficit.
+    that artifact's serialized ``length`` and whose ``sha256`` is its digest,
+    and the ``blob/`` inventory observed in ``manifest.files`` must be exactly
+    those files plus the :func:`archive_directories` parent ``directory``
+    entries ``blob_closure::export`` creates. Aggregate totals alone are never
+    accepted, because one member's surplus can otherwise mask another member's
+    deficit.
     """
     need(manifest.get("format") == 22 == expected["format"], "archive is not format22")
     schema_versions = expected_schema_versions(expected["schema_versions"], expected["schema_baseline"], 147)
@@ -269,32 +281,49 @@ def format22_manifest_checks(manifest, expected):
     # Real A4 pack/idx artifacts share registration, repository, pack and tenant
     # identity (one repository, one generated pack id, one repository tenant per
     # registration); only hold/request ids, digests and lengths are per artifact.
-    # One scope per registration collapses only when both its roles agree, and a
-    # second registration can never hold the same repository/pack pair as its
-    # own archive path would then collide.
-    scopes = {str(entry["registration_id"]): (str(entry.get("repository_id")), str(entry.get("pack_id")))
-              for entry in artifacts}
+    # Each scope is built only after both rows of its pair agreed on all three,
+    # so a per-row dict comprehension can never collapse a drift; a second
+    # registration can never hold the same repository/pack pair as its own
+    # archive path would then collide.
+    ordered = [str(value) for value in expected["registered_packs"]]
+    scopes = {registration: tuple(_registration_scope(artifacts, registration, field)
+                                  for field in REGISTRATION_IDENTITY)
+              for registration in ordered}
     need(len(scopes) == len(artifacts) // len(PAIR_ROLES)
-         and set(scopes) == {str(value) for value in expected["registered_packs"]},
-         "a registration's pack and idx artifacts disagree on their repository or pack identity")
-    _expected_registration_scopes(artifacts, expected, scopes)
+         and {str(entry["registration_id"]) for entry in artifacts} == set(scopes),
+         "the archived artifacts are not exactly one pack+idx pair per registered pack")
+    _expected_registration_scopes(expected, scopes)
     invalid = [str(entry.get("hold_id")) for entry in artifacts
                if not isinstance(entry.get("hold_id"), str) or not UUID_HEX.match(entry["hold_id"])]
     need(not invalid, "an archived artifact has no hold id")
     files = manifest.get("files")
     need(isinstance(files, dict), "the archive carries no file entry map")
-    blob_files = [name for name, entry in files.items()
-                  if isinstance(entry, dict) and name.startswith("blob/") and entry.get("kind") == "file"]
-    need(len(blob_files) == len(artifacts), "archived blob members differ from the closure")
-    need(sum(_archive_bytes(files[name]) for name in blob_files) == closure.get("bytes") > 0,
-         "archived blob bytes differ from the closure")
-    # Format22 writes `blob_closure.bytes` as the sum of the wired `length`
-    # fields, so the archive's own byte totals must agree with them.
-    need(sum(lengths) == closure.get("bytes") > 0, "archived artifact lengths differ from the closure bytes")
-    # Rust restore looks every artifact up by its exact archive path and binds
-    # that member to the artifact's own length and digest.
+    # `blob_closure::entries` inventories the whole `blob/` tree, so the
+    # archive's `files` map carries the artifact files *and* the two parent
+    # directories `export` creates for each of them (filesystem::inventory
+    # records a real directory with kind `directory`). The observed `blob/`
+    # paths must therefore equal exactly those files plus those directories.
     paths = _archive_paths(artifacts)
     need(len(set(paths)) == len(artifacts), "archived artifacts do not have distinct archive paths")
+    directories = archive_directories(artifacts)
+    blob_paths = {name for name, entry in files.items() if name.startswith("blob/")}
+    expected_files = set(paths)
+    extra_files = sorted(name for name in blob_paths - expected_files - set(directories)
+                         if not isinstance(files[name], dict) or files[name].get("kind") != "directory")
+    extra_dirs = sorted(name for name in blob_paths - expected_files - set(directories)
+                        if isinstance(files[name], dict) and files[name].get("kind") == "directory")
+    need(not extra_files, "the archive carries extra Blob members: " + ",".join(extra_files[:8]))
+    need(not extra_dirs, "the archive carries extra Blob directories: " + ",".join(extra_dirs[:8]))
+    # A parent path announced as a file (or any non-directory kind), or a
+    # parent that is absent from the inventory entirely, is not what `export`
+    # writes.
+    not_dirs = sorted(name for name in set(directories) & blob_paths
+                      if not isinstance(files[name], dict) or files[name].get("kind") != "directory")
+    need(not not_dirs, "an archive Blob parent path is not a directory entry: " + ",".join(not_dirs[:8]))
+    missing = sorted((expected_files | set(directories)) - blob_paths)
+    need(not missing, "the archive is missing Blob members: " + ",".join(missing[:8]))
+    # Rust restore looks every artifact up by its exact archive path and binds
+    # that member to the artifact's own length and digest.
     for entry, path, length in zip(artifacts, paths, lengths):
         need(path in files, "the archive is missing the Blob member at an artifact's archive path")
         member = files[path]
@@ -303,9 +332,14 @@ def format22_manifest_checks(manifest, expected):
         need(_archive_bytes(member) == length, "an archived Blob member length differs from its artifact length")
         need(member.get("sha256") == str(entry["sha256"]),
              "an archived Blob member digest differs from its artifact digest")
-    extra = sorted(name for name, entry in files.items() if name.startswith("blob/")
-                   and not (isinstance(entry, dict) and name in set(paths)))
-    need(not extra, "the archive carries extra Blob members")
+    blob_files = [name for name, entry in files.items()
+                  if isinstance(entry, dict) and name.startswith("blob/") and entry.get("kind") == "file"]
+    need(len(blob_files) == len(artifacts), "archived blob members differ from the closure")
+    need(sum(_archive_bytes(files[name]) for name in blob_files) == closure.get("bytes") > 0,
+         "archived blob bytes differ from the closure")
+    # Format22 writes `blob_closure.bytes` as the sum of the wired `length`
+    # fields, so the archive's own byte totals must agree with them.
+    need(sum(lengths) == closure.get("bytes") > 0, "archived artifact lengths differ from the closure bytes")
     # RefStore carry: every registered-set and roots ledger must travel too.
     carry = manifest.get("refstore") or {}
     for table in _CARRY_TABLES:
@@ -382,8 +416,39 @@ def _archive_paths(artifacts):
     return [archive_path(entry) for entry in artifacts]
 
 
+def archive_directories(artifacts):
+    """The exact parent ``directory`` paths ``blob_closure::export`` creates.
+
+    For every artifact ``export`` creates ``blob/{repository_id}`` and
+    ``blob/{repository_id}/{pack_id}`` before writing the artifact's file, and
+    ``entries()`` inventories the whole ``blob`` tree, so each real directory
+    is recorded with ``Entry.kind == "directory"``. The ``blob`` root itself is
+    created by ``private_dir`` but inventoried as the root, never a member. The
+    result is sorted and unique, exactly the directory set of one archive.
+    """
+    directories = set()
+    for artifact in artifacts:
+        repository_id = _uuid_in_path(artifact, "repository_id")
+        pack_id = _uuid_in_path(artifact, "pack_id")
+        directories.add("blob/" + repository_id)
+        directories.add("blob/" + repository_id + "/" + pack_id)
+    return sorted(directories)
+
+
+def _uuid_in_path(artifact, field):
+    need(isinstance(artifact, dict) and isinstance(artifact.get(field), str) and UUID_HEX.match(artifact[field]),
+         "an archived artifact " + field + " is not a valid uuid")
+    return artifact[field]
+
+
 def _registration_scope(artifacts, registration, field):
-    """The one uuid ``field`` value both rows of ``registration``'s pair carry."""
+    """The one uuid ``field`` value both rows of ``registration``'s pair carry.
+
+    Called for every field of :data:`REGISTRATION_IDENTITY` before a scope is
+    built, so a missing, padded or drifted ``repository_id``, ``pack_id`` or
+    ``tenant_id`` is refused on its own name whether or not the caller supplied
+    an independent ``registration_scopes`` expectation.
+    """
     need(field in REGISTRATION_IDENTITY, "artifact identity field is not part of the pair identity")
     members = [entry for entry in artifacts if str(entry["registration_id"]) == str(registration)]
     need(len(members) == len(PAIR_ROLES), "a registration is not exactly one pack(slot 0) + idx(slot 1)")
@@ -393,7 +458,7 @@ def _registration_scope(artifacts, registration, field):
     return str(members[0][field])
 
 
-def _expected_registration_scopes(artifacts, expected, scopes):
+def _expected_registration_scopes(expected, scopes):
     """Cross-registration identity: one repository set, tenant, unique packs.
 
     Each archived pair is one registration of one repository, so every
@@ -402,20 +467,32 @@ def _expected_registration_scopes(artifacts, expected, scopes):
     never share a pack id (their archive paths would then collide too).
     """
     bindings = {str(repo["id"]): str(repo.get("owner_id")) for repo in expected["repos"]}
+    # ``called`` is keyed in REGISTRATION_IDENTITY order (repository, pack,
+    # tenant), and only ever built from a scope whose pair already agreed.
     called = {str(registration): tuple(scopes[str(registration)]) for registration in expected["registered_packs"]}
-    need(all(repository in bindings for repository, _ in called.values()),
+    need(all(len(scope) == len(REGISTRATION_IDENTITY) for scope in called.values()),
+         "an archived registration scope is incomplete")
+    pairs = {registration: (scope[0], scope[1]) for registration, scope in called.items()}
+    need(all(repository in bindings for repository, _ in pairs.values()),
          "an archived artifact names a repository the API did not create")
-    for registration, (repository_id, _) in called.items():
-        need(_registration_scope(artifacts, registration, "tenant_id") == bindings[repository_id],
+    for registration, (repository_id, _, tenant_id) in called.items():
+        need(tenant_id == bindings[repository_id],
              "an archived artifact tenant is not the tenant of its repository")
-    need(len({pack_id for _, pack_id in called.values()}) == len(called),
+    need(len({pack_id for _, pack_id in pairs.values()}) == len(called),
          "two registrations share a pack id")
-    scopes = expected.get("registration_scopes")
-    if scopes is not None:
-        need(isinstance(scopes, dict), "the expected registration scopes are not a mapping")
-        need({str(registration): (str(repository_id), str(pack_id))
-              for registration, (repository_id, pack_id) in scopes.items()} == called,
-             "the archived registration scopes differ from the source publications")
+    # The optional independent source scopes are an additional check of the
+    # same (repository_id, pack_id) pair; they never replace the pair agreement
+    # _registration_scope already proved row by row.
+    source = expected.get("registration_scopes")
+    if source is not None:
+        need(isinstance(source, dict), "the expected registration scopes are not a mapping")
+        parsed = {}
+        for registration, scope in source.items():
+            need(isinstance(scope, (tuple, list)) and len(scope) == 2,
+                 "an expected registration scope is not a (repository_id, pack_id) pair")
+            parsed[str(registration)] = (_uuid(scope[0], "expected repository id"),
+                                         _uuid(scope[1], "expected pack id"))
+        need(parsed == pairs, "the archived registration scopes differ from the source publications")
     return called
 
 

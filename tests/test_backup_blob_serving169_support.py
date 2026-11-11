@@ -859,6 +859,24 @@ def member(artifact, **changes):
          "target": None}, **changes)
 
 
+def directory(path, **changes):
+    """The real ``manifest.files`` entry of one archived Blob directory.
+
+    ``export`` creates ``blob/{repository_id}`` and
+    ``blob/{repository_id}/{pack_id}`` with ``private_dir``, and
+    ``filesystem::inventory`` records each as ``Entry { kind: "directory",
+    mode: 0o700 (private_dir), bytes: 0, sha256: None, target: None }``.
+    """
+    return path, dict({"kind": "directory", "mode": 0o700, "bytes": 0, "sha256": None, "target": None}, **changes)
+
+
+def blob_inventory(artifacts):
+    """The exact ``blob/`` entries ``blob_closure::entries`` records."""
+    entries = dict(member(row) for row in artifacts)
+    entries.update(directory(path) for path in support.archive_directories(artifacts))
+    return entries
+
+
 def positive_inputs(producer=None):
     tenant = str(uuid.uuid4())
     producer = producer or str(uuid.uuid4())
@@ -894,7 +912,10 @@ def positive_inputs(producer=None):
                 "blob_closure": {"artifacts": len(artifacts), "bytes": sum(row["length"] for row in artifacts),
                                  "provider": "s3", "backend_identity": "ab" * 32},
                 "blob_artifacts": artifacts, "refstore": carry,
-                "files": {path: entry for path, entry in (member(row) for row in artifacts)}}
+                # `entries()` inventories the whole `blob/` tree: the artifact
+                # files plus the two parent directories of each artifact, with
+                # the same `Entry.kind` values the Rust inventory records.
+                "files": blob_inventory(artifacts)}
     return manifest, expected
 
 
@@ -997,6 +1018,60 @@ class Format22ManifestTest(unittest.TestCase):
                                             + "|API did not create|scopes differ"):
                     support.format22_manifest_checks(manifest, expected)
 
+    def test_pair_identity_drift_is_refused_without_registration_scopes(self):
+        # The optional independent source scopes never carry the pair check:
+        # each pair must share `repository_id`, `pack_id` and `tenant_id` on its
+        # own, so a drift is refused on its exact field name even when
+        # `registration_scopes` is absent.
+        for field in support.REGISTRATION_IDENTITY:
+            for scopes in ("absent", "kept"):
+                with self.subTest(field=field, scopes=scopes):
+                    manifest, expected = positive_inputs()
+                    drifted = manifest["blob_artifacts"][1]
+                    source = expected["registration_scopes"][drifted["registration_id"]]
+                    if scopes == "absent":
+                        del expected["registration_scopes"]
+                    else:
+                        # The source scope still names the un-drifted pair, so the
+                        # pair check must refuse first, on its own field name.
+                        self.assertEqual(source, (drifted["repository_id"], drifted["pack_id"]))
+                    drifted[field] = str(uuid.uuid4())
+                    manifest["files"] = blob_inventory(manifest["blob_artifacts"])
+                    with self.assertRaisesRegex(AssertionError, "disagree on their " + field):
+                        support.format22_manifest_checks(manifest, expected)
+        # A missing or non-uuid identity is a drift too, not a silent empty scope.
+        for value in (None, "", str(uuid.uuid4()).upper(), str(uuid.uuid4()).replace("-", "")):
+            with self.subTest(value=value):
+                manifest, expected = positive_inputs()
+                del expected["registration_scopes"]
+                manifest["blob_artifacts"][3]["pack_id"] = value
+                with self.assertRaisesRegex(AssertionError, "disagree on their pack_id"):
+                    support.format22_manifest_checks(manifest, expected)
+
+    def test_an_agreed_pair_builds_one_scope_without_source_scopes(self):
+        # Without `registration_scopes` an agreed pair still yields one
+        # (repository_id, pack_id, tenant_id) scope, checked against the
+        # API-created repositories, and the optional comparison is skipped.
+        manifest, expected = positive_inputs()
+        del expected["registration_scopes"]
+        detail = support.format22_manifest_checks(manifest, expected)
+        self.assertTrue(detail["pair_identity_shared"])
+        for registration in expected["registered_packs"]:
+            pair = [row for row in manifest["blob_artifacts"] if row["registration_id"] == registration]
+            self.assertEqual(tuple(support._registration_scope(manifest["blob_artifacts"], registration, field)
+                                   for field in support.REGISTRATION_IDENTITY),
+                             (pair[0]["repository_id"], pair[0]["pack_id"], pair[0]["tenant_id"]))
+
+    def test_malformed_source_scopes_are_refused(self):
+        for value in ({"x": ("y",)}, "not-a-mapping",
+                      {str(uuid.uuid4()): ("not-a-uuid", str(uuid.uuid4()))}):
+            with self.subTest(value=value):
+                manifest, expected = positive_inputs()
+                expected["registration_scopes"] = value
+                with self.assertRaisesRegex(AssertionError, "expected registration scopes are not a mapping"
+                                            + "|not a \\(repository_id, pack_id\\) pair|expected repository id is not a uuid"):
+                    support.format22_manifest_checks(manifest, expected)
+
     def test_two_registrations_may_not_share_a_pack_id(self):
         manifest, expected = positive_inputs()
         second_pack, second_idx = manifest["blob_artifacts"][2:]
@@ -1011,12 +1086,27 @@ class Format22ManifestTest(unittest.TestCase):
 
     def test_artifact_repository_and_tenant_must_be_api_created_and_its_tenant(self):
         # A wrong but internally consistent identity is caught against the
-        # expected repositories/tenants, not against byte totals.
+        # expected repositories/tenants, not against byte totals. Only the
+        # artifact rows move: the archive's frozen `blob/` inventory still
+        # names the API repository, so the file and parent-directory checks
+        # (which run earlier) cannot mask the identity result.
         manifest, expected = positive_inputs()
-        for row in manifest["blob_artifacts"][:2]:
-            row["repository_id"] = str(uuid.uuid4())
+        foreign = str(uuid.uuid4())
+        for row in manifest["blob_artifacts"]:
+            row["repository_id"] = foreign
         with self.assertRaisesRegex(AssertionError, "API did not create"):
             support.format22_manifest_checks(manifest, expected)
+        # One row of a pair naming a foreign repository is first and always a
+        # pair-identity drift, even when `registration_scopes` is absent.
+        for scopes in ("kept", "removed"):
+            with self.subTest(scopes):
+                manifest, expected = positive_inputs()
+                manifest["blob_artifacts"][0]["repository_id"] = str(uuid.uuid4())
+                manifest["files"] = blob_inventory(manifest["blob_artifacts"])
+                if scopes == "removed":
+                    del expected["registration_scopes"]
+                with self.assertRaisesRegex(AssertionError, "disagree on their repository_id"):
+                    support.format22_manifest_checks(manifest, expected)
         manifest, expected = positive_inputs()
         wrong = str(uuid.uuid4())
         for row in manifest["blob_artifacts"]:
@@ -1026,11 +1116,9 @@ class Format22ManifestTest(unittest.TestCase):
         # A repository the API created, but not the one the source publishes
         # these registrations under: only the source scopes can catch it.
         manifest, expected = positive_inputs()
-        manifest["files"] = {}
         for row in manifest["blob_artifacts"]:
             row["repository_id"] = expected["repos"][1]["id"]
-            path, entry = member(row)
-            manifest["files"][path] = entry
+        manifest["files"] = blob_inventory(manifest["blob_artifacts"])
         with self.assertRaisesRegex(AssertionError, "scopes differ from the source publications"):
             support.format22_manifest_checks(manifest, expected)
         # Without the independent source scopes the self-consistent rows stand
@@ -1088,8 +1176,10 @@ class Format22ManifestTest(unittest.TestCase):
         # An internally positive but inconsistent length must not pass: the
         # closure byte total is derived from these very fields.
         manifest, expected = positive_inputs()
+        # Restore binds each member to its own artifact length, so the
+        # aggregate inconsistency behind it is never reached.
         manifest["blob_artifacts"][0]["length"] += 1
-        with self.assertRaisesRegex(AssertionError, "lengths differ from the closure bytes"):
+        with self.assertRaisesRegex(AssertionError, "member length differs from its artifact length"):
             support.format22_manifest_checks(manifest, expected)
         # The aggregate is only ever counted over real regular-file members, so
         # a total that still closes cannot hide a member without a byte count.
@@ -1105,7 +1195,9 @@ class Format22ManifestTest(unittest.TestCase):
 
     def test_member_paths_are_the_rust_archive_path_not_the_hold_id(self):
         manifest, expected = positive_inputs()
-        self.assertEqual(set(manifest["files"]), {support.archive_path(row) for row in manifest["blob_artifacts"]})
+        self.assertEqual(set(manifest["files"]),
+                         {support.archive_path(row) for row in manifest["blob_artifacts"]}
+                         | set(support.archive_directories(manifest["blob_artifacts"])))
         for row in manifest["blob_artifacts"]:
             self.assertEqual(support.archive_path(row), "blob/%s/%s/%s.%s"
                              % (row["repository_id"], row["pack_id"], row["role"], row["role"]))
@@ -1115,44 +1207,119 @@ class Format22ManifestTest(unittest.TestCase):
         manifest, expected = positive_inputs()
         manifest["files"] = {"blob/" + row["hold_id"]: entry for row, (_, entry) in
                              zip(manifest["blob_artifacts"], [member(row) for row in manifest["blob_artifacts"]])}
-        with self.assertRaisesRegex(AssertionError, "archive path"):
+        with self.assertRaisesRegex(AssertionError, "Blob members"):
             support.format22_manifest_checks(manifest, expected)
         # Moving exactly one member to its hold-id name is a missing member.
         manifest, expected = positive_inputs()
         row = manifest["blob_artifacts"][0]
         manifest["files"]["blob/" + row["hold_id"]] = manifest["files"].pop(support.archive_path(row))
-        with self.assertRaisesRegex(AssertionError, "missing the Blob member at an artifact's archive path"):
+        with self.assertRaisesRegex(AssertionError, "extra Blob members: blob/" + row["hold_id"] + "$"):
+            support.format22_manifest_checks(manifest, expected)
+
+    def test_blob_inventory_is_exactly_the_artifact_files_and_their_directories(self):
+        # `blob_closure::export` creates `blob/{repository_id}` and
+        # `blob/{repository_id}/{pack_id}` and `entries()` inventories the whole
+        # `blob/` tree, so the real archive's `files` map carries those two
+        # `directory` entries per artifact next to the artifact files.
+        manifest, expected = positive_inputs()
+        self.assertTrue(support.format22_manifest_checks(manifest, expected)["member_paths_exact"])
+        artifacts = manifest["blob_artifacts"]
+        files = [support.archive_path(row) for row in artifacts]
+        directories = sorted({"/".join(path.split("/")[:2]) for path in files}
+                             | {path.rsplit("/", 1)[0] for path in files})
+        self.assertEqual(support.archive_directories(artifacts), directories)
+        for path in directories:
+            self.assertEqual(manifest["files"][path],
+                             {"kind": "directory", "mode": 0o700, "bytes": 0, "sha256": None, "target": None})
+            self.assertNotIn(path, files)
+
+    def test_missing_blob_directory_is_refused(self):
+        for what in ("repository", "pack"):
+            with self.subTest(what):
+                manifest, expected = positive_inputs()
+                path = support.archive_directories(manifest["blob_artifacts"])[0 if what == "repository" else 1]
+                self.assertEqual(path.count("/"), 1 if what == "repository" else 2)
+                del manifest["files"][path]
+                with self.assertRaisesRegex(AssertionError, "missing Blob members: " + path):
+                    support.format22_manifest_checks(manifest, expected)
+
+    def test_extra_blob_directory_is_refused(self):
+        manifest, expected = positive_inputs()
+        pack_path = support.archive_path(manifest["blob_artifacts"][0]).rsplit("/", 1)[0]
+        extra = pack_path + "/" + str(uuid.uuid4())
+        manifest["files"].update([directory(extra)])
+        # The extra directory carries no bytes, so every aggregate still closes.
+        self.assertEqual(sum(entry["bytes"] for name, entry in manifest["files"].items() if name.startswith("blob/")),
+                         manifest["blob_closure"]["bytes"])
+        with self.assertRaisesRegex(AssertionError, "extra Blob directories: " + extra):
+            support.format22_manifest_checks(manifest, expected)
+        # A sibling repository directory that no artifact's archive path parents.
+        manifest, expected = positive_inputs()
+        extra = "blob/" + str(uuid.uuid4())
+        manifest["files"].update([directory(extra)])
+        with self.assertRaisesRegex(AssertionError, "extra Blob directories: " + extra):
+            support.format22_manifest_checks(manifest, expected)
+        # The real `blob/` root is a file-map entry in the manifest, but
+        # `inventory` starts below it and `export` never records it as a member.
+        manifest, expected = positive_inputs()
+        manifest["files"].update([directory("blob/")])
+        with self.assertRaisesRegex(AssertionError, "extra Blob directories"):
+            support.format22_manifest_checks(manifest, expected)
+
+    def test_blob_artifact_paths_and_parents_must_be_regular_files_and_directories(self):
+        # A required parent announced as a file (the old file-only model) is
+        # not what `export` writes.
+        manifest, expected = positive_inputs()
+        path = support.archive_directories(manifest["blob_artifacts"])[0]
+        manifest["files"][path]["kind"] = "file"
+        with self.assertRaisesRegex(AssertionError, "parent path is not a directory entry: " + path):
+            support.format22_manifest_checks(manifest, expected)
+        # An artifact path announced as a directory is never a regular file.
+        for kind in ("directory", "dir", "symlink"):
+            with self.subTest(kind):
+                manifest, expected = positive_inputs()
+                row = manifest["blob_artifacts"][2]
+                manifest["files"][support.archive_path(row)]["kind"] = kind
+                with self.assertRaisesRegex(AssertionError,
+                                            "member at an artifact's archive path is not a regular file"):
+                    support.format22_manifest_checks(manifest, expected)
+        # Moving a member under its hold id leaves both its archive path and its
+        # parent directories missing; the file itself is an extra member.
+        manifest, expected = positive_inputs()
+        row = manifest["blob_artifacts"][0]
+        manifest["files"]["blob/" + row["hold_id"]] = manifest["files"].pop(support.archive_path(row))
+        with self.assertRaisesRegex(AssertionError, "extra Blob members: blob/" + row["hold_id"] + "$"):
             support.format22_manifest_checks(manifest, expected)
 
     def test_extra_or_missing_blob_members_are_refused_beyond_their_totals(self):
         manifest, expected = positive_inputs()
         del manifest["files"][support.archive_path(manifest["blob_artifacts"][3])]
-        with self.assertRaisesRegex(AssertionError, "blob members differ from the closure"):
+        with self.assertRaisesRegex(AssertionError, "missing Blob members: blob/"):
             support.format22_manifest_checks(manifest, expected)
         # A regular file under a plausible Blob tree that no artifact names.
         manifest, expected = positive_inputs()
         row = manifest["blob_artifacts"][0]
-        manifest["files"]["blob/" + row["repository_id"] + "/" + str(uuid.uuid4()) + "/pack.pack"] = \
-            member(row)[1]
-        with self.assertRaisesRegex(AssertionError, "blob members differ from the closure"):
+        stray = "blob/" + row["repository_id"] + "/" + str(uuid.uuid4()) + "/pack.pack"
+        manifest["files"][stray] = member(row)[1]
+        with self.assertRaisesRegex(AssertionError, "extra Blob members: " + stray + "$"):
             support.format22_manifest_checks(manifest, expected)
         manifest, expected = positive_inputs()
         manifest["files"]["blob/" + row["hold_id"]] = member(row)[1]
-        with self.assertRaisesRegex(AssertionError, "blob members differ from the closure"):
+        with self.assertRaisesRegex(AssertionError, "extra Blob members: blob/" + row["hold_id"] + "$"):
             support.format22_manifest_checks(manifest, expected)
         # A Blob entry that is not a regular file is never a member.
         manifest, expected = positive_inputs()
         row = manifest["blob_artifacts"][2]
         manifest["files"][support.archive_path(row)]["kind"] = "dir"
-        with self.assertRaisesRegex(AssertionError, "blob members differ from the closure"):
+        with self.assertRaisesRegex(AssertionError, "member at an artifact's archive path is not a regular file"):
             support.format22_manifest_checks(manifest, expected)
         manifest, expected = positive_inputs()
         idx = [art for art in manifest["blob_artifacts"] if art["role"] == "idx"][0]
-        directory = support.archive_path(idx)
+        member_path = support.archive_path(idx)
         # Drop the whole registration from the closure but keep its two archive
-        # paths as `dir` entries: every count and total still agrees.
-        manifest["files"][directory]["kind"] = "dir"
-        manifest["files"][directory.replace("/idx.idx", "/pack.pack")]["kind"] = "dir"
+        # paths and its parent directories: every count and total still agrees.
+        manifest["files"][member_path]["kind"] = "dir"
+        manifest["files"][member_path.replace("/idx.idx", "/pack.pack")]["kind"] = "dir"
         pair = [art for art in manifest["blob_artifacts"] if art["registration_id"] != idx["registration_id"]]
         manifest["blob_artifacts"] = pair
         manifest["blob_closure"]["artifacts"] = len(pair)
@@ -1161,6 +1328,13 @@ class Format22ManifestTest(unittest.TestCase):
         expected["registered_packs"].remove(idx["registration_id"])
         expected["registration_scopes"].pop(idx["registration_id"])
         with self.assertRaisesRegex(AssertionError, "extra Blob members"):
+            support.format22_manifest_checks(manifest, expected)
+        # A stranded directory that no artifact's archive path parents is an
+        # extra directory even when every file is exactly right.
+        manifest, expected = positive_inputs()
+        pack_path = support.archive_path(manifest["blob_artifacts"][0]).rsplit("/", 1)[0]
+        manifest["files"].update([directory(pack_path + "/" + str(uuid.uuid4()))])
+        with self.assertRaisesRegex(AssertionError, "extra Blob directories"):
             support.format22_manifest_checks(manifest, expected)
 
     def test_compensating_member_lengths_cannot_pass_the_aggregate_totals(self):
@@ -1184,7 +1358,7 @@ class Format22ManifestTest(unittest.TestCase):
         manifest["blob_artifacts"][0]["length"] += 1
         self.assertEqual(sum(files[support.archive_path(row)]["bytes"] for row in manifest["blob_artifacts"]),
                          manifest["blob_closure"]["bytes"])
-        with self.assertRaisesRegex(AssertionError, "lengths differ from the closure bytes"):
+        with self.assertRaisesRegex(AssertionError, "member length differs from its artifact length"):
             support.format22_manifest_checks(manifest, expected)
         # A member carrying another artifact's real byte count is refused too.
         manifest, expected = positive_inputs()
