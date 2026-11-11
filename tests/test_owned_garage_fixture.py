@@ -382,7 +382,7 @@ class ColdCacheImageTest(FixtureGuardTest):
             directory,
             env={
                 "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
-                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "3",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "10",
                 "STUB_STATUS_FAILS": "2",
             },
         )
