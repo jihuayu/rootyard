@@ -1578,7 +1578,7 @@ class RefusalAuditSqlTest(unittest.TestCase):
         self.assertFalse(hasattr(refusal_audit_sql, "EVIDENCE_TEXT_KEYS"))
         # The same key tuples the decoder and verdict enforce.
         decoder = source_of(SQL, "decode_operation_interval")
-        self.assertIn("*EVIDENCE_BOOL_KEYS", decoder)
+        self.assertIn("for name in EVIDENCE_BOOL_KEYS:", decoder)
         self.assertNotIn("_STR_KEYS", decoder, "no evidence text-key path may remain")
         self.assertNotIn("jsonb_each", sql)
         self.assertIn("o.evidence->'post_receive' IS NULL", sql)
@@ -2603,6 +2603,307 @@ class ServiceRefTransitionTest(unittest.TestCase):
         # The legacy name array must still describe exactly these events.
         with self.assertRaises(ValueError):
             decode([self.event()], names=["refs/rootyard-ci/jobs/other"])
+
+
+class ServiceEvidenceSchemaDecodeTest(unittest.TestCase):
+    """The alternate ``observed_immutable_ci_root`` service evidence schema.
+
+    ``src/reliability.rs`` and ``src/webhooks/delivery.rs`` persist service
+    operations with ``finished``/``interrupted``/``reference_events``/``retained``
+    and without the receive-pack-only ``storage_generation_matches`` /
+    ``ungranted_without_hooks``.  The interval query deliberately reads every
+    service and human row, so the decoder accepts exactly the SQL missing
+    sentinel for those two keys on a service row; the human row keeps all four
+    real booleans, and no service row is accepted without ``service_release_valid``.
+    """
+
+    HUMAN = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    SERVICE = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    JOB_REF = "refs/rootyard-ci/jobs/11111111-1111-4111-8111-111111111111"
+    OLD, NEW = "c" * 40, "d" * 40
+
+    @property
+    def projection_sql(self):
+        return refusal_audit_sql.operations_after_query(
+            "11111111-1111-4111-8111-111111111111", 7,
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333", str)
+
+    @classmethod
+    def projection_values(cls):
+        sql = refusal_audit_sql.operations_after_query(
+            "11111111-1111-4111-8111-111111111111", 7,
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333", str)
+        return dict(re.findall(r"'([a-z_]+)', (.*?)(?=, '[a-z_]+', |\)::text)", sql))
+
+    def test_only_the_two_omitted_service_keys_may_decode_as_the_sentinel(self):
+        """The allowance is derived from the two stored service schemas only."""
+        values = self.projection_values()
+        self.assertEqual(refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS,
+                         ("storage_generation_matches", "ungranted_without_hooks"))
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            self.assertIn("o.evidence->'" + key + "'", values[key], key)
+            self.assertNotIn("o.evidence->>'" + key + "'", values[key], key)
+        decoder = source_of(SQL, "decode_operation_interval")
+        self.assertIn("name in SERVICE_EVIDENCE_OMITTED_KEYS", decoder)
+        self.assertIn("is_service", decoder)
+        # The settled retained variant in ``src/reliability.rs`` has the same
+        # four-key shape as the source in ``src/webhooks/delivery.rs``.
+        reliability = (ROOT / "src/reliability.rs").read_text()
+        retained = next(line for line in reliability.splitlines()
+                        if '"retained":!changes.is_empty()' in line)
+        for key in ("finished", "interrupted", "reference_events", "retained"):
+            self.assertIn('"%s"' % key, retained, key)
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            self.assertNotIn('"%s"' % key, retained, key)
+        # An alternate recovery record has a different, unaccepted shape.
+        pending = next(line for line in reliability.splitlines()
+                       if '"kind":if operation.service_principal_id.is_some()' in line)
+        for key in ("finished", "storage_generation_matches"):
+            self.assertIn('"%s"' % key, pending, key)
+        for key in ("interrupted", "reference_events", "ungranted_without_hooks", "retained"):
+            self.assertNotIn('"%s"' % key, pending, key)
+        # ``src/webhooks/delivery.rs`` writes the four-key alternate schema.
+        delivery = (ROOT / "src/webhooks/delivery.rs").read_text()
+        delivery_object = re.search(
+            r'json!\(\{\s*"version": 1, "kind": "observed_immutable_ci_root", "intent": intent,'
+            r'.*?\}\)', delivery, re.S)
+        self.assertIsNotNone(delivery_object)
+        delivered = delivery_object.group(0)
+        for key in ("finished", "interrupted", "reference_events", "retained"):
+            self.assertIn('"%s"' % key, delivered, key)
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            self.assertNotIn('"%s"' % key, delivered, key)
+        # Both accepted retained schemas carry ``finished`` and ``interrupted``
+        # from the four receive-pack keys. The allowance is exactly the two
+        # receive-pack-only keys they omit; ``reference_events`` remains a
+        # stored array on both sources.
+        self.assertEqual(
+            [key for key in refusal_audit_sql.EVIDENCE_KEYS if '"%s"' % key in delivered],
+            ["finished", "interrupted"])
+        self.assertEqual(
+            [key for key in refusal_audit_sql.EVIDENCE_KEYS if '"%s"' % key in retained],
+            ["finished", "interrupted"])
+        # The separate recovery record is not the accepted retained schema; it
+        # carries storage-generation evidence but no receipt/outbox proof.
+        self.assertEqual(
+            [key for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS
+             if '"%s"' % key in retained], [])
+        self.assertEqual(
+            [key for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS
+             if '"%s"' % key in pending],
+            ["storage_generation_matches"])
+        self.assertEqual(
+            refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS,
+            tuple(key for key in refusal_audit_sql.EVIDENCE_KEYS
+                  if key not in ("finished", "interrupted", "reference_events")))
+        self.assertEqual(refusal_audit_sql.SERVICE_EVIDENCE_ALLOWED_VALUES,
+                         (True, False, "missing"))
+
+    def row(self, principal="human", **changes):
+        row = {"operation_id": self.HUMAN, "sequence": 8, "outcome": "no_ref_changes",
+               "settled": True, "actor_and_token_match": True, "human_principal": True,
+               "service_principal": False, "evidence_no_receipt": True,
+               "reference_events": [], "admission_present": True,
+               "admission_state": "ABORTED", "admission_settled": True,
+               "admission_identity_matches": True,
+               "admission_ref_names": ["refs/heads/main"], "outbox_count": 0,
+               "outbox_ref_names": [], "outbox_events": []}
+        if principal == "human":
+            row.update(finished=True, interrupted=False, storage_generation_matches=True,
+                       ungranted_without_hooks=False)
+        else:
+            # The settled, retained CI service shape: no receive-pack admission
+            # or post-receive receipt, one linked job-ref event, and the two
+            # receive-pack-only keys projected as the SQL missing sentinel.
+            row.update(operation_id=self.SERVICE, sequence=9, outcome="recorded",
+                       actor_and_token_match=False, human_principal=False, service_principal=True,
+                       evidence_no_receipt=True, admission_present=False, admission_state=None,
+                       admission_settled=False, admission_identity_matches=False,
+                       admission_ref_names=[], outbox_count=1, finished=True,
+                       interrupted=False, storage_generation_matches="missing",
+                       ungranted_without_hooks="missing",
+                       outbox_ref_names=[self.JOB_REF],
+                       # The delivery create: zero -> new for an absent ref.
+                       outbox_events=[{"ref_name": self.JOB_REF, "old_oid": "0" * 40,
+                                       "new_oid": self.NEW}])
+        row.update(changes)
+        return row
+
+    def test_human_row_missing_either_schema_boolean_fails_at_decode(self):
+        decode = refusal_audit_sql.decode_operation_interval
+        # The sentinel for either key on a human row is not a JSON boolean.
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, r"invalid operations interval: " + key):
+                    decode(json.dumps([self.human(**{key: "missing"})]), 7)
+        # The SQL projection of an omitted key is the same sentinel (``->`` plus
+        # ``COALESCE``); the decoder rejects it and never reads absence as false.
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            self.assertIn("'" + key + "', (COALESCE(o.evidence->'" + key + "', "
+                          + refusal_audit_sql.EVIDENCE_MISSING_BOOL + "))", self.projection_sql)
+        # Every other evidence key needs a real bool on a human row, too.
+        for key in refusal_audit_sql.EVIDENCE_BOOL_KEYS:
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, r"invalid operations interval: " + key):
+                    decode(json.dumps([self.human(**{key: "missing"})]), 7)
+
+    @classmethod
+    def human(cls, **changes):
+        return ServiceEvidenceSchemaDecodeTest.row(cls(), "human", **changes)
+
+    def test_human_service_flag_forgery_never_unlocks_the_sentinel(self):
+        decode = refusal_audit_sql.decode_operation_interval
+        for flags in ({"human_principal": True, "service_principal": True,
+                       "actor_and_token_match": False},
+                      {"human_principal": False, "service_principal": True,
+                       "actor_and_token_match": True},
+                      {"human_principal": False, "service_principal": False,
+                       "actor_and_token_match": False},
+                      {"human_principal": True, "service_principal": False,
+                       "actor_and_token_match": False}):
+            with self.subTest(flags=flags):
+                row = self.human(storage_generation_matches="missing",
+                                 ungranted_without_hooks="missing", **flags)
+                with self.assertRaisesRegex(ValueError, "storage_generation_matches"):
+                    decode(json.dumps([row]), 7)
+
+    def test_service_row_with_the_expected_sentinel_decodes_for_source_validation(self):
+        raw = json.dumps([self.row("service")])
+        rows = refusal_audit_sql.decode_operation_interval(raw, 7)
+        self.assertEqual(rows[0]["storage_generation_matches"], "missing")
+        self.assertEqual(rows[0]["ungranted_without_hooks"], "missing")
+        self.assertIs(rows[0]["finished"], True)
+        self.assertIs(rows[0]["interrupted"], False)
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            self.assertIn(rows[0][key], refusal_audit_sql.SERVICE_EVIDENCE_ALLOWED_VALUES, key)
+        # ``src/reliability.rs`` writes verified service rows as
+        # ``recorded``/``settled``, the only shape the source query accepts.
+        self.assertEqual((rows[0]["outcome"], rows[0]["settled"], rows[0]["evidence_no_receipt"]),
+                         ("recorded", True, True))
+        # Decoding is not acceptance: the human refusal contract still refuses
+        # the sentinel, so no service row can be folded as a refusal receipt.
+        folded = refusal_audit_sql.fold_operation_evidence(
+            {"label": "service", "operation_id": self.SERVICE}, rows)
+        with self.assertRaisesRegex(AssertionError,
+                                    "storage_generation_matches.*ungranted_without_hooks|"
+                                    "ungranted_without_hooks"):
+            refusal_audit_sql.assert_evidence_contract("service", folded)
+
+    def test_unverified_recovery_service_row_without_events_fails_decode(self):
+        """The alternate recovery record is never treated as retained evidence."""
+        row = self.row("service", outcome="unknown", settled=False,
+                       storage_generation_matches=True, ungranted_without_hooks="missing")
+        row["reference_events"] = "missing"
+        row["outbox_count"] = 0
+        row["outbox_ref_names"] = []
+        row["outbox_events"] = []
+        self.assertIn("'reference_events', (COALESCE(o.evidence->'reference_events', "
+                      + refusal_audit_sql.EVIDENCE_MISSING_ARRAY + "))", self.projection_sql)
+        with self.assertRaisesRegex(ValueError, "invalid operations interval"):
+            refusal_audit_sql.decode_operation_interval(json.dumps([row]), 7)
+
+    def test_service_text_booleans_remain_rejected(self):
+        decode = refusal_audit_sql.decode_operation_interval
+        # The legacy text projection of the two omitted keys is not a bool.
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            for bad in ("true", "false"):
+                with self.subTest(key=key, value=bad):
+                    with self.assertRaisesRegex(ValueError,
+                                                r"invalid operations interval: " + key):
+                        decode(json.dumps([self.row("service", **{key: bad})]), 7)
+        # The two keys the alternate schema keeps are always real booleans,
+        # both in their stored form and in the obsolete text form.
+        for key in ("finished", "interrupted"):
+            for bad in ("true", "false"):
+                with self.subTest(key=key, value=bad):
+                    with self.assertRaisesRegex(ValueError,
+                                                r"invalid operations interval: " + key):
+                        decode(json.dumps([self.row("service", **{key: bad})]), 7)
+
+    def test_service_sentinel_is_only_the_exact_missing_string(self):
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            for bad in ("", "MISSING", "missing ", 0, 1, None, [], {}, True):
+                if isinstance(bad, bool):
+                    # A real boolean is the stored form and always decodes.
+                    self.assertIs(
+                        refusal_audit_sql.decode_operation_interval(
+                            json.dumps([self.row("service", **{key: bad})]), 7)[0][key], bad)
+                    continue
+                with self.subTest(key=key, value=bad):
+                    with self.assertRaisesRegex(ValueError,
+                                                r"invalid operations interval: " + key):
+                        refusal_audit_sql.decode_operation_interval(
+                            json.dumps([self.row("service", **{key: bad})]), 7)
+
+    def test_service_events_still_pass_the_source_bound_validator(self):
+        """A decoded service row is accepted only if ``service_release_valid`` holds."""
+        rows = refusal_audit_sql.decode_operation_interval(json.dumps([self.row("service")]), 7)
+        service_row = rows[0]
+        snapshot = {"operation_highwater": 7, "refs": [], "api_refs": [("refs/heads/main", "a")],
+                    "journal": [], "state": "ready/-", "outcomes": {}, "admissions": {},
+                    "outbox": 0}
+
+        def run(valid):
+            validated = []
+
+            def service_release_valid(row):
+                # The audit re-classifies the stable read: validated each time.
+                self.assertEqual(row["operation_id"], self.SERVICE)
+                validated.append(row["operation_id"])
+                return valid
+
+            def ref_state():
+                return dict(snapshot, operation_highwater=service_row["sequence"],
+                            refs=[(self.JOB_REF, self.NEW)])
+            result = refusal_audit_sql.audit_api_refusal_interval(
+                snapshot, snapshot, "api 403", ["refs/heads/main"],
+                lambda highwater: rows, service_release_valid, ref_state)
+            return result, validated
+
+        result, validated = run(True)
+        # Decoded for validation and validated on every read, never bypassed.
+        self.assertGreaterEqual(len(validated), 1)
+        self.assertEqual(set(validated), {self.SERVICE})
+        self.assertEqual(result["service_operations"],
+                         [{"operation_id": self.SERVICE, "sequence": 9, "outbox_ref": self.JOB_REF}])
+        with self.assertRaisesRegex(AssertionError, "not source-validated"):
+            run(False)
+        # An exception from the owning source-proof query is never a pass.
+        def broken(row):
+            raise AssertionError("service row not settled under the exact source query")
+        with self.assertRaisesRegex(AssertionError, "not settled under the exact source query"):
+            refusal_audit_sql.audit_api_refusal_interval(
+                snapshot, snapshot, "api 403", ["refs/heads/main"], lambda highwater: rows,
+                broken, lambda: dict(snapshot, operation_highwater=9))
+        # The Git interval classifies through the same validator.
+        git_human = self.human()
+        git_rows = [git_human, service_row]
+        calls = []
+
+        def git_service_valid(row):
+            calls.append(row["operation_id"])
+            return False
+        with self.assertRaisesRegex(AssertionError, "not a valid"):
+            refusal_audit_sql.audit_git_refusal_interval(
+                snapshot, "git refusal", ["refs/heads/main"],
+                lambda highwater: git_rows, git_service_valid, lambda: [],
+                lambda: dict(snapshot, operation_highwater=9, refs=[(self.JOB_REF, self.NEW)]))
+        self.assertEqual(calls, [self.SERVICE])
+
+    def test_human_refusal_path_never_accepts_a_missing_sentinel(self):
+        human = self.human()
+        rows = [self.row("service", storage_generation_matches="missing",
+                         ungranted_without_hooks="missing")]
+        rows = refusal_audit_sql.decode_operation_interval(json.dumps(rows), 7)
+        folded = refusal_audit_sql.fold_operation_evidence(
+            {"label": "t", "operation_id": self.HUMAN},
+            [dict(human, operation_id=self.HUMAN)] + rows)
+        self.assertEqual(folded, refusal_audit_sql.assert_evidence_contract("t", folded))
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            with self.subTest(key=key):
+                self.assertIs(folded[key], human[key])
 
 
 class NativeRefusalAccountingTest(unittest.TestCase):

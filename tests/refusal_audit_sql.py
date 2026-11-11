@@ -27,6 +27,20 @@ EVIDENCE_BOOL_KEYS = ("finished", "storage_generation_matches", "interrupted",
 EVIDENCE_REQUIRED_TRUE_KEYS = ("finished", "storage_generation_matches")
 EVIDENCE_KEYS = EVIDENCE_BOOL_KEYS
 
+# The legitimate alternate ``ci_pin`` service operation schema
+# (``kind=observed_immutable_ci_root``), as ``src/reliability.rs`` and
+# ``src/webhooks/delivery.rs`` write it: ``finished``, ``interrupted``,
+# ``reference_events`` and ``retained`` are stored, but the receive-pack-only
+# ``storage_generation_matches`` and ``ungranted_without_hooks`` are not.
+# These keys therefore surface as ``EVIDENCE_MISSING_BOOL`` on such a row.
+# Only a service-principal row may carry the sentinel; the human refusal row
+# still needs the four real booleans, and every service row is accepted only
+# after ``service_release_valid`` (the source-bound exact query) holds.
+SERVICE_EVIDENCE_OMITTED_KEYS = ("storage_generation_matches", "ungranted_without_hooks")
+# What such a row may carry for those two keys: a stored boolean or the one
+# explicit sentinel (``json.loads`` gives ``"missing"`` for ``EVIDENCE_MISSING_BOOL``).
+SERVICE_EVIDENCE_ALLOWED_VALUES = (True, False, "missing")
+
 # A missing boolean key stays absent as the JSON string ``"missing"``, which the
 # decoder and contract both reject: absence is never mistaken for ``false``.
 EVIDENCE_MISSING_BOOL = "'\"missing\"'::jsonb"
@@ -430,7 +444,16 @@ def refusal_audit_verdict(row, journal, refs):
 
 
 def decode_operation_interval(raw, highwater):
-    """Decode `operations_after_query` -At JSON text and enforce the decoder contract."""
+    """Decode `operations_after_query` -At JSON text and enforce the decoder contract.
+
+    The four evidence keys are JSON booleans on every human row.  A
+    service-principal row written with the alternate ``observed_immutable_ci_root``
+    schema may instead project the explicit ``EVIDENCE_MISSING_BOOL`` sentinel
+    (``"missing"``) for ``SERVICE_EVIDENCE_OMITTED_KEYS``; that decodes so the
+    row can be source-validated, and only ``service_release_valid`` then decides
+    whether its event is accepted.  Arbitrary strings, integers, nulls and the
+    sentinel on any principal combination fail here.
+    """
     _ERR = "invalid operations interval"
 
     _KEY = (
@@ -458,18 +481,34 @@ def decode_operation_interval(raw, highwater):
     )
     _ALLOWED = frozenset(_KEY)
 
-    # Every evidence key is a stored JSON boolean; there is no text-key path.
+    # Every row boolean is a stored JSON boolean; there is no text-key path.
     _BOOL_KEYS = (
         "settled",
         "actor_and_token_match",
         "human_principal",
         "service_principal",
         "evidence_no_receipt",
-        *EVIDENCE_BOOL_KEYS,
         "admission_present",
         "admission_settled",
         "admission_identity_matches",
     )
+
+    # The exact principal flags of a human refusal row and of a row written by
+    # the CI service principal.  A mixed combination matches neither (as in
+    # ``audit_git_refusal_interval``'s classifier) and so never unlocks the
+    # sentinel; ``classify`` still refuses such a row.
+    _HUMAN_FLAGS = {
+        "human_principal": True,
+        "service_principal": False,
+        "actor_and_token_match": True,
+    }
+    _SERVICE_FLAGS = {
+        "human_principal": False,
+        "service_principal": True,
+        "actor_and_token_match": False,
+    }
+    # The exact SQL sentinel ``EVIDENCE_MISSING_BOOL`` decodes to.
+    _MISSING = "missing"
 
     # The serialized ``HookPhase`` names (``src/journal/core.rs``).
     _HOOK_PHASES = ("Preparing", "Prepared", "Committed", "Aborted")
@@ -563,6 +602,35 @@ def decode_operation_interval(raw, highwater):
                 # Name the offending key: every failure here is "invalid
                 # operations interval", so the field must be identifiable.
                 raise ValueError("{}: {} is not a JSON boolean".format(_ERR, name))
+
+        # A human refusal row must carry all four evidence booleans as stored.
+        # Only a service row may carry the explicit SQL missing sentinel, and
+        # only for the keys the alternate ci_pin schema omits; any other string,
+        # an integer, null or another principal combination fails.  A service
+        # row is decoded for its later source validation and is never accepted
+        # on this decoder alone: ``service_release_valid`` gates every one.
+        def not_boolean(name):
+            # Name the offending key: every failure here is "invalid
+            # operations interval", so the field must be identifiable.
+            return ValueError("{}: {} is not a JSON boolean".format(_ERR, name))
+
+        is_service = {name: row[name] for name in _SERVICE_FLAGS} == _SERVICE_FLAGS
+        is_human = {name: row[name] for name in _HUMAN_FLAGS} == _HUMAN_FLAGS
+        for name in EVIDENCE_BOOL_KEYS:
+            if not isinstance(row[name], (bool, str)):
+                raise not_boolean(name)
+        for name in EVIDENCE_BOOL_KEYS:
+            value = row[name]
+            if isinstance(value, bool):
+                continue
+            if (
+                is_service
+                and not is_human
+                and name in SERVICE_EVIDENCE_OMITTED_KEYS
+                and value == _MISSING
+            ):
+                continue
+            raise not_boolean(name)
 
         _check_reference_events(row["reference_events"])
 

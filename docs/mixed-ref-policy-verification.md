@@ -123,12 +123,12 @@ Every push is authenticated with Alice's own owner grant (`create-user`); a
    witness: exactly one new operation, settled, `no_ref_changes`, with an
    `ABORTED` admission whose actor/token/repository match Alice's grant and
    whose `ref_names` are exactly the two pushed refs. The audit also requires:
-   - the folded evidence contract: all four values (`finished`,
-     `storage_generation_matches`, `interrupted`, `ungranted_without_hooks`)
-     are JSON booleans as `src/reliability.rs` stores them; the first two must
-     be exactly `true` for a valid refusal, the last two accept either boolean,
-     and an interrupted operation requires `ungranted_without_hooks true`; no
-     `post_receive` receipt;
+   - the folded evidence contract on the human refusal row: all four values
+     (`finished`, `storage_generation_matches`, `interrupted`,
+     `ungranted_without_hooks`) are JSON booleans as the human `git_operations`
+     row stores them; the first two must be exactly `true` for a valid refusal,
+     the last two accept either boolean, and an interrupted operation requires
+     `ungranted_without_hooks true`; no `post_receive` receipt;
    - no outbox event or outbox ref for the operation;
    - journal directories empty before and after, and every journal entry (if
      any appears) linked to an exact interval row; the marker `ready/-`;
@@ -208,12 +208,40 @@ equal the post-control baseline.
   and any `reference_events` entry recording a change. `reference_events` must
   be the stored array: a missing, null, string or object value fails, and every
   entry must be a journal event whose `changes` list is empty.
-- The interval decoder accepts only the complete `jsonb_build_object` key set,
-  requiring a JSON boolean for all four evidence keys (a string, an integer,
-  null or a missing key -- which surfaces as the JSON sentinel
-  `EVIDENCE_MISSING_BOOL` -- is rejected). The SQL projects all four with `->`
-  so the stored booleans survive end to end; the Rust serialization of the four
-  keys is pinned so a change in `src/reliability.rs` needs deliberate review.
+- The interval decoder accepts only the complete `jsonb_build_object` key set.
+  The SQL projects all four evidence keys with `->` (never `->>`) and an absent
+  key becomes the JSON sentinel `EVIDENCE_MISSING_BOOL` (`"missing"`), so the
+  stored booleans survive end to end; the Rust serialization of the four keys is
+  pinned so a change in `src/reliability.rs` needs deliberate review.
+- There are two stored service evidence shapes, and the interval deliberately
+  reads every service and human row:
+  - the receive-pack shape of `src/reliability.rs` (human rows too) stores
+    `finished`, `interrupted`, `reference_events`,
+    `storage_generation_matches` and `ungranted_without_hooks`;
+  - the alternate `kind=observed_immutable_ci_root` `ci_pin` shape, written by
+    `src/reliability.rs` and `src/webhooks/delivery.rs`, stores `finished`,
+    `interrupted`, `reference_events` and `retained`, but **not**
+  `storage_generation_matches` or `ungranted_without_hooks`; those two keys
+  project as the sentinel on such a row. A separate recovery record in
+  `src/reliability.rs` may store only `finished` and
+  `storage_generation_matches`; it lacks the required `reference_events` array
+  and this audit rejects it during decoding. Such a row is never accepted as
+  service evidence; a settled service row must have the exact retained evidence
+  and outbox event required by the source query.
+
+  The four receive-pack keys therefore do not exist on every operation row.
+  The decoder still requires a JSON boolean for every evidence key on a human
+  row, and on a service row for `finished`, `interrupted` and the
+  `reference_events` array. Only a row carrying exactly the service-principal
+  flags (`human_principal` false, `service_principal` true, no actor/token
+  match) may present the sentinel, and only for `storage_generation_matches` and
+  `ungranted_without_hooks`. Any other string (`"true"`/`"false"`), an integer,
+  null, or the sentinel on any other principal combination fails. Decoding a
+  service row is not acceptance: `service_release_valid` (the exact
+  source-bound query of `service_release_valid_query`) still gates every
+  settled service event in both interval audits, and the human receipt is
+  folded from the human row only, so the sentinel never reaches
+  `assert_evidence_contract` or the verdict.
 - `reference_events` keeps a missing key as a non-array sentinel (never `[]`),
   and the decoder requires a source-shaped array matching `journal::events()`:
   each entry is exactly `ordinal` (positive, contiguous and ordered from 1),
@@ -231,7 +259,7 @@ From the repository root:
 python3 -m unittest tests.test_browse_mixed_refs
 ```
 
-The suite currently has **108 tests**. It pins the exact case IDs and the
+The suite currently has **118 tests**. It pins the exact case IDs and the
 15+2 = 17 selection order, the unchanged `CASE_NAMES` (compared against a
 literal expected tuple with no history lookup, so a shallow CI checkout cannot
 skip the check; a focused test asserts the guard has no skip path), the runner's
@@ -243,7 +271,10 @@ the `--porcelain` refusal parser, rule isolation and restoration, the physical
 `for-each-ref` plus a separate, fully paginated public `/refs` walk (explicit
 limit, advancing cursors, pages bounded by their own `next_after`, bounded
 termination; proven with 201 refs across three pages), the SQL/decoder/contract
-types end to end, the final API read being classified (a human row only on the
+types end to end (including the alternate `observed_immutable_ci_root` service
+evidence: its sentinel decodes for a service row only, `"true"`/`"false"` texts
+and the sentinel on a human row still fail, and accepted service events still
+pass `service_release_valid`), the final API read being classified (a human row only on the
 final read fails the audit), the API interval's stable read (rows are read and
 classified, the refs are captured, then the rows are re-read: a settled service
 create for an operation absent from the pre-snapshot read forces a second
