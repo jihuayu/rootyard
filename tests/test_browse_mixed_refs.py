@@ -110,6 +110,10 @@ def source(name):
 MIXED_TEST_GIT = str(shutil.which("git"))
 assert MIXED_TEST_GIT, "the mixed-ref unit tests need a stock Git"
 
+# Captured before any test runs: the process-global lookup that the Git unit
+# suites temporarily replace must be restored to this exact object and result.
+ORIGINAL_SHUTIL_WHICH = shutil.which
+
 # The queue harness used by every instance-level test; the runner now builds
 # exactly this class, built here without ``Harness.__init__`` (no socket/temp DB).
 FixtureHarness = browse.BrowseHarness
@@ -3373,15 +3377,26 @@ class GitResolutionTest(unittest.TestCase):
         harness = object.__new__(FixtureHarness)
         harness.args = SimpleNamespace(git=args_git)
         harness.env = dict(env)
-        saved = dict(mixed_ref_cases.os.environ)
+        saved_environ = dict(mixed_ref_cases.os.environ)
+        # ``mixed_ref_cases.shutil`` and ``mixed_ref_support.shutil`` normally
+        # name the same stdlib module as ``shutil`` here, but save each exact
+        # attribute so restoring never depends on that identity.
+        saved_which = shutil.which
+        saved_case_which = mixed_ref_cases.shutil.which
+        saved_support_which = mixed_ref_support.shutil.which
         try:
             mixed_ref_cases.os.environ.clear()
             mixed_ref_cases.os.environ.update(env)
             mixed_ref_cases.shutil.which = lambda name: path_git
             return harness.native_git()
         finally:
+            # Unconditional: a failed resolution must not leave every later
+            # test module resolving any executable through this lambda.
+            mixed_ref_cases.shutil.which = saved_case_which
+            mixed_ref_support.shutil.which = saved_support_which
+            shutil.which = saved_which
             mixed_ref_cases.os.environ.clear()
-            mixed_ref_cases.os.environ.update(saved)
+            mixed_ref_cases.os.environ.update(saved_environ)
 
     def test_declared_git_wins_over_path(self):
         real = str(Path(sys.executable).resolve())
@@ -3408,6 +3423,85 @@ class GitResolutionTest(unittest.TestCase):
         resolved = self.run_resolve(None, {}, real)
         self.assertEqual(resolved["executable"], real)
         self.assertFalse(resolved["declared"])
+
+
+class GitBindingTest(unittest.TestCase):
+    """Regression: Git resolution and binding tests leave process globals intact.
+
+    The binding cases on this branch live on ``BrowseIntegrationTest``; this
+    class keeps their global-state contract next to ``GitResolutionTest``.
+    Both suites run here from a clean snapshot, because ``run_resolve`` used
+    to replace the process-wide ``shutil.which`` with a lambda returning
+    ``sys.executable`` for every lookup.
+    """
+
+    @staticmethod
+    def snapshot():
+        return {
+            "which": shutil.which,
+            "case_which": mixed_ref_cases.shutil.which,
+            "support_which": mixed_ref_support.shutil.which,
+            "git": shutil.which("git"),
+            "python": shutil.which("python3"),
+            "environ": dict(os.environ),
+        }
+
+    @staticmethod
+    def restore(snapshot):
+        shutil.which = snapshot["which"]
+        mixed_ref_cases.shutil.which = snapshot["case_which"]
+        mixed_ref_support.shutil.which = snapshot["support_which"]
+        os.environ.clear()
+        os.environ.update(snapshot["environ"])
+
+    def assert_restored(self, snapshot):
+        # Identity catches even a callable with the same result; the two
+        # lookups catch the old lambda, which returned one path for every name.
+        self.assertIs(shutil.which, snapshot["which"])
+        self.assertIs(mixed_ref_cases.shutil.which, snapshot["case_which"])
+        self.assertIs(mixed_ref_support.shutil.which, snapshot["support_which"])
+        self.assertEqual(shutil.which("git"), snapshot["git"])
+        self.assertEqual(shutil.which("python3"), snapshot["python"])
+        self.assertEqual(os.environ.get("ROOTYARD_GIT"),
+                         snapshot["environ"].get("ROOTYARD_GIT"))
+        self.assertEqual(dict(os.environ), snapshot["environ"])
+
+    def run_suite(self, suite):
+        result = unittest.TestResult()
+        suite.run(result)
+        problems = [problem for _test, problem in result.failures + result.errors]
+        self.assertTrue(result.wasSuccessful(),
+                        "nested Git tests failed:\n" + "\n".join(problems))
+        self.assertEqual(result.skipped, [])
+
+    def test_git_resolution_and_binding_restore_process_globals(self):
+        before = self.snapshot()
+        # The module-level capture catches a leak that happened before this
+        # regression test was reached, not just one caused by the suites below.
+        self.assertIs(before["which"], ORIGINAL_SHUTIL_WHICH)
+        self.assertEqual(before["git"], MIXED_TEST_GIT)
+        try:
+            self.run_suite(unittest.defaultTestLoader.loadTestsFromTestCase(
+                GitResolutionTest))
+            self.run_suite(unittest.TestSuite([
+                BrowseIntegrationTest("test_wrapper_git_is_the_bound_declaration_not_path_git"),
+                BrowseIntegrationTest("test_conflicting_git_declarations_are_rejected"),
+                BrowseIntegrationTest("test_mixed_refs_requires_a_declared_git"),
+            ]))
+            self.assert_restored(before)
+        finally:
+            # The regression itself must never poison later test modules.
+            self.restore(before)
+
+    def test_failed_resolution_still_restores_process_globals(self):
+        before = self.snapshot()
+        missing = str(Path(__file__).with_name("git-does-not-exist-for-regression"))
+        try:
+            with self.assertRaisesRegex(AssertionError, "not an executable file"):
+                GitResolutionTest().run_resolve(missing, {}, "/usr/bin/false-git")
+            self.assert_restored(before)
+        finally:
+            self.restore(before)
 
 
 def dict_literals(node):
