@@ -602,10 +602,13 @@ mod tests {
     fn a_non_unauthorized_answer_is_unchanged() {
         for status in [StatusCode::OK, StatusCode::FORBIDDEN, StatusCode::NOT_FOUND, StatusCode::SERVICE_UNAVAILABLE] {
             for path in ["/web/blob/api/repos", "/web/blob/api/repos/owner/name", "/web/login", "/web/repos"] {
-                let original = (status, "body").into_response();
-                let response = session_challenge(original.clone(), path);
+                // `Response<Body>` is not cloneable: the input is one fresh
+                // fixture and the expectation is an owned header snapshot taken
+                // from a distinct one.
+                let expected: HeaderMap = (status, "body").into_response().headers().clone();
+                let response = session_challenge((status, "body").into_response(), path);
                 assert_eq!(response.status(), status, "{path}");
-                assert_eq!(response.headers(), original.headers(), "{path}");
+                assert_eq!(response.headers(), &expected, "{path}");
             }
         }
     }
@@ -655,9 +658,12 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         for response in [bare.into_response(), foreign] {
-            let existing = challenges(&response);
+            // Owned snapshot before the response itself is moved.
+            let existing: Vec<String> =
+                challenges(&response).into_iter().map(|challenge| challenge.to_owned()).collect();
             let after = session_challenge(response, "/web/blob/api/repos");
-            assert_eq!(challenges(&after), existing);
+            let after: Vec<&str> = challenges(&after);
+            assert_eq!(after, existing.iter().map(String::as_str).collect::<Vec<_>>());
         }
     }
 

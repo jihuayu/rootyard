@@ -100,7 +100,7 @@ impl Challenge {
 /// belongs to another authority (for example the shared sign-in helper) and is
 /// never rewritten or joined. Status, body and every other header are the
 /// response's own.
-fn with_challenge(mut response: Response, challenge: Challenge) -> Response {
+pub(super) fn with_challenge(mut response: Response, challenge: Challenge) -> Response {
     if response.status() == StatusCode::UNAUTHORIZED && !response.headers().contains_key(header::WWW_AUTHENTICATE) {
         response.headers_mut().insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static(challenge.value()));
     }

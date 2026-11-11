@@ -207,13 +207,17 @@ mod challenge_tests {
     use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
     use axum::{
-        ServiceExt,
-        http::{HeaderValue, StatusCode, header},
+        http::{StatusCode, header},
+        response::IntoResponse,
     };
     use base64::Engine;
     use deadpool_postgres::{Manager, Runtime};
 
-    use super::{BlobGitConfig, BlobGitState, GatewayError, router};
+    use super::{
+        BlobGitConfig, BlobGitState, GatewayError,
+        error::{Challenge, with_challenge},
+        router,
+    };
     use crate::blob_store::{budget::ResourceLimits, test_support::store};
 
     const BEARER: &str = "Bearer realm=\"Rootyard\"";
@@ -315,10 +319,13 @@ mod challenge_tests {
         }
     }
 
-    /// Every JSON/API route, with or without a rejected credential, answers its
-    /// unauthenticated denial with the Bearer challenge, never the Basic one a
-    /// same-origin browser `fetch` would turn into a hanging auth exchange. The
-    /// `/web/blob/api` aliases answer exactly like their top-level route.
+    /// Every Blob JSON/API route below, with or without a rejected credential,
+    /// answers its unauthenticated denial with the Bearer challenge, never the
+    /// Basic one a same-origin browser `fetch` would turn into a hanging auth
+    /// exchange. The `/web/blob/api` aliases answer exactly like their top-level
+    /// route. The table names only the Blob API: the shared `/api/tokens` and
+    /// `/api/sessions` token routes and the `/web/blob/repos...` page routes are
+    /// outside this table and do not all advertise Bearer.
     #[tokio::test]
     async fn top_level_api_and_its_aliases_advertise_bearer() {
         let (state, _scratch) = offline_state();
@@ -340,19 +347,13 @@ mod challenge_tests {
             ("GET", "/api/repos/owner/name/compare?base=HEAD&head=HEAD"),
             ("GET", "/api/repos/owner/name/operations/00000000-0000-0000-0000-000000000001"),
             ("POST", "/api/repos"),
-            // The shared token routes merged into the same router.
-            ("GET", "/api/tokens"),
-            ("GET", "/api/sessions"),
+            // The Blob API aliases are the `/web/blob/api/...` names registered
+            // in the `/web/blob` tree, never the `/web/blob/repos...` pages.
             ("GET", "/web/blob/api/repos"),
             ("GET", "/web/blob/api/repos/owner/name"),
             ("GET", "/web/blob/api/repos/owner/name/refs"),
             ("GET", "/web/blob/api/repos/owner/name/tree"),
             ("GET", "/web/blob/api/repos/owner/name/blob?path=README.md"),
-            // The Blob API aliases are same-path names of the `/web/blob` tree,
-            // registered at `/web/blob/api/...` only.
-            ("GET", "/web/blob/repos"),
-            ("GET", "/web/blob/repos/owner/name"),
-            ("GET", "/web/blob/repos/owner/name/refs"),
         ];
         for (method, uri) in routes {
             for headers in rejected {
@@ -378,13 +379,14 @@ mod challenge_tests {
     /// lowercase-hex `ryt_` value) is treated as no cookie. Anonymous browser
     /// reads of the alias and of the page subtree therefore answer exactly as
     /// they do without the cookie: the alias read is the gateway's Bearer `401`,
-    /// while the pages render their own status (`/web/blob/api/repos` is JSON,
-    /// `GET /web/login` renders the sign-in form). This is not a stale or
-    /// revoked database session; that path needs the order-bound acceptance
-    /// suite, and the middleware's exact Basic -> Bearer mapping is covered by
-    /// `session_challenge` and its wiring test in `web::session`.
+    /// `GET /web/login` renders the sign-in form, and Smart HTTP keeps its Git
+    /// Basic challenge. This is not a stale, expired or revoked database
+    /// session: those are valid session secrets whose rejection needs the
+    /// order-bound acceptance suite. The middleware's exact Basic -> Bearer
+    /// mapping is covered by `session_challenge` and its wiring test in
+    /// `web::session`.
     #[tokio::test]
-    async fn a_non_session_cookie_is_ignored_like_no_cookie() {
+    async fn non_session_cookie_is_ignored_like_no_cookie() {
         let (state, _scratch) = offline_state();
         let gateway = Gateway::start(&state).await;
         let cookie = format!("rootyard_session=ryt_{}", "zz".repeat(32));
@@ -455,12 +457,15 @@ mod challenge_tests {
     }
 
     /// Credential parsing is not narrowed: a syntactically well-formed Basic or
-    /// Bearer credential passes the shared parser and is challenged by the
-    /// gateway's own handler with the route scheme. The offline pool cannot
-    /// check the credential, so the shared authority fails closed: nothing is
-    /// ever accepted here, and no silent success can hide behind it.
+    /// Bearer credential (`ryt_` plus 64 hex characters) passes the shared
+    /// parser, so authentication moves past it to the authority. The pool
+    /// points at a closed loopback port, so that authority cannot be reached:
+    /// authentication fails closed with the shared internal-server refusal,
+    /// which is not a `401` and carries no `WWW-Authenticate` challenge. This
+    /// shows only that the request reached the (offline) authority; it says
+    /// nothing about whether any PostgreSQL token or session would accept it.
     #[tokio::test]
-    async fn syntax_accepted_credentials_still_reach_the_authority() {
+    async fn syntax_accepted_credentials_reach_the_offline_authority() {
         let (state, _scratch) = offline_state();
         let gateway = Gateway::start(&state).await;
         let token = format!("ryt_{}", "ab".repeat(32));
@@ -469,19 +474,23 @@ mod challenge_tests {
         for uri in ["/api/repos", "/web/blob/api/repos"] {
             for credential in [basic.as_str(), bearer.as_str()] {
                 let (status, challenges) = gateway.send("GET", uri, &[("authorization", credential)], &[]).await;
-                assert_eq!(challenges, [BEARER], "{uri} must render its own handler's challenge");
-                assert_ne!(status, StatusCode::OK, "{uri} accepted a credential the offline authority cannot verify");
+                assert_ne!(status, StatusCode::UNAUTHORIZED, "GET {uri} rejected the syntactically valid credential");
+                assert!(challenges.is_empty(), "GET {uri} must not challenge a syntax-accepted credential");
+                assert_ne!(status, StatusCode::OK, "GET {uri} cannot succeed while the authority is offline");
             }
         }
     }
 
     /// The shared `Error` mapping keeps the route protocol as the challenge
-    /// owner, and a refusal already challenged elsewhere is left untouched.
+    /// owner: the same `401` renders Bearer on the JSON/API path and Basic on
+    /// Smart HTTP. [`with_challenge`] only fills a bare `401`, so a refusal that
+    /// already names a scheme (for example the shared sign-in helper's Basic
+    /// challenge) is kept as is and never rewritten or joined.
     #[test]
     fn shared_mappings_use_the_route_challenge() {
         let unauthorized: GatewayError = crate::Error::unauthorized().into();
         assert_eq!(unauthorized, GatewayError::Unauthorized);
-        let value = |response: axum::response::Response| -> Vec<String> {
+        let value = |response: &axum::response::Response| -> Vec<String> {
             response
                 .headers()
                 .get_all(header::WWW_AUTHENTICATE)
@@ -489,12 +498,27 @@ mod challenge_tests {
                 .map(|value| value.to_str().expect("challenge is text").to_owned())
                 .collect()
         };
-        assert_eq!(value(unauthorized.api()), [BEARER]);
-        assert_eq!(value(unauthorized.git()), [BASIC]);
-        // A refusal already challenged elsewhere is never rewritten or joined.
-        let mut sign_in = GatewayError::Unauthorized.into_response();
-        sign_in.headers_mut().append(header::WWW_AUTHENTICATE, HeaderValue::from_static("Negotiate"));
-        assert_eq!(value(sign_in.git()), ["Negotiate"]);
-        assert_eq!(value(GatewayError::Unauthorized.into_response()), []);
+        // A gateway refusal renders no challenge of its own; the route's
+        // mapping adds exactly its scheme.
+        let bare = GatewayError::Unauthorized.into_response();
+        assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
+        assert!(value(&bare).is_empty());
+        assert_eq!(value(&unauthorized.api()), [BEARER]);
+        assert_eq!(value(&unauthorized.git()), [BASIC]);
+        // A bare `401` with no challenge gains exactly the route scheme (the
+        // credential parser's refusal is the bare gateway `401`, no challenge).
+        assert_eq!(value(&with_challenge(GatewayError::Unauthorized.into_response(), Challenge::Bearer)), [BEARER]);
+        // An existing Basic (foreign/shared sign-in) challenge is kept, not
+        // rewritten or joined, and the status stays `401`.
+        let existing = crate::Error::unauthorized().into_response();
+        assert_eq!(existing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(value(&existing), [BASIC]);
+        let kept = with_challenge(existing, Challenge::Bearer);
+        assert_eq!(kept.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(value(&kept), [BASIC]);
+        // A non-`401` answer is never challenged either.
+        let not_found = with_challenge(GatewayError::NotFound.into_response(), Challenge::Bearer);
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        assert!(value(&not_found).is_empty());
     }
 }
