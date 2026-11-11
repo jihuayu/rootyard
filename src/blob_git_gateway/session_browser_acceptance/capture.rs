@@ -18,10 +18,14 @@
 //!
 //! Cookie values, bodies and query strings never enter a record: only presence
 //! flags, integer statuses and the presence-only fixture markers below are
-//! retained. The request token and the answered pair are separate fields: the
-//! gateway receives only the token request header, while token and revision
-//! are the answer's pair. Token strings live in a record only for in-memory
-//! equality checks and never reach a message.
+//! retained. A record exists only for a request the child answered, with exactly
+//! the status it answered: a forwarding failure is answered by the adapter and
+//! captures nothing, so the attestation can never read an adapter-made status as
+//! the child's (in particular, no `401` is synthesized here). The request token
+//! and the answered pair are separate fields: the gateway receives only the
+//! token request header, while token and revision are the answer's pair. Token
+//! strings live in a record only for in-memory equality checks and never reach
+//! a message.
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex, PoisonError},
@@ -186,6 +190,8 @@ async fn forward(State(adapter): State<Arc<Adapter>>, request: Request) -> Respo
     }
     match relay(&adapter, parts, body, route).await {
         Ok(response) => response,
+        // No answer was captured for this request: a `401` is only ever the
+        // child's own answer, never one built here.
         Err(_) => failure(StatusCode::BAD_GATEWAY, "upstream unavailable"),
     }
 }

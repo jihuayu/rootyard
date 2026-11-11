@@ -50,6 +50,11 @@ STEP_MS = 30_000
 # The cookie-only fetch aborts itself below the step bound, so an unanswered
 # request reports the route's fetch reason instead of a step timeout.
 FETCH_TIMEOUT_MS = 5_000
+# The fixed words the page-side cookie-only fetch reports for an answered
+# request: the real `401` or any other status. A request the browser itself
+# rejected is neither and fails with the route's fixed fetch reason.
+COOKIE_ONLY_STATUS = "401"
+COOKIE_ONLY_REFUSED = "refused"
 
 # The page-side storage read returns only one of these fixed status words; a
 # Web Storage SecurityError is caught inside the page and never crosses the
@@ -509,12 +514,14 @@ class Client:
                 raise Failure("API_READ_BOUND_INVALID")
         extra["reads"] = {tail: {"revision": reads[tail]["revision"]} for tail in ("refs", "tree", "commits")}
 
-        # 5. Cookie-only denial of the unchanged bearer-only routes.
+        # 5. Cookie-only denial of the unchanged bearer-only routes. The Smart
+        # HTTP path is the gateway's `/git/{owner}/{name}/info/refs` exactly:
+        # `{name}` is the bare repository name, so `.git` suffixes, a doubled
+        # name and a trailing slash must never route here.
+        name = self.repo.removesuffix(".git")
         extra["denials"] = {
             "api": await self.cookie_only(page, "/api/repos", "api"),
-            "git": await self.cookie_only(
-                page, f"/git/{self.owner}/{self.repo}.git/info/refs?service=git-upload-pack", "git"
-            ),
+            "git": await self.cookie_only(page, f"/git/{self.owner}/{name}/info/refs?service=git-upload-pack", "git"),
         }
         if extra["denials"] != {"api": 401, "git": 401}:
             raise Failure("COOKIE_ONLY_DENIAL_MISSING")
@@ -572,29 +579,38 @@ class Client:
     async def cookie_only(self, page, path, route):
         """One cookie-only fetch of a bearer-only route, reduced to its status.
 
-        The bounded `evaluate` turns an in-page fetch rejection or a step
-        timeout into the route's fixed fetch reason; a resolved fetch whose
-        status is not the required `401` is the route's fixed status failure.
-        The fetch carries an `AbortSignal` shorter than the step, so an
-        unanswered request fails here rather than at the step bound.
-        Neither the path, the request headers, the cookies, the response body
-        nor any exception text crosses this boundary: only the integer status
-        of a `401` is returned.
+        The page reports one fixed word per request (`401` for the real denial,
+        `refused` for any other answered status, `failed` for any request the
+        browser rejected). The bounded `evaluate` turns a step timeout into the
+        route's fixed fetch reason; a fetch the browser rejected (the bound
+        `AbortSignal` included) is that rejection, never an origin answer, so it
+        is reported as such and never as a denial. CORS mode is kept: the URL
+        stays same-origin with the session cookie, and a redirect the request
+        could follow off the origin arrives unreadable instead of as an opaque
+        rejection. Only the fixed word crosses this boundary: never the path,
+        a request header, a cookie, the response body or exception text.
         """
-        status = await evaluate(
+        answer = await evaluate(
             page,
             """async ([path, timeout]) => {
-                const response = await fetch(path, {credentials: 'same-origin',
-                    headers: {Accept: 'application/json'},
-                    signal: AbortSignal.timeout(timeout)});
-                return response.status;
+                let response;
+                try {
+                    response = await fetch(path, {mode: 'cors', credentials: 'same-origin',
+                        headers: {Accept: 'application/json'},
+                        signal: AbortSignal.timeout(timeout)});
+                } catch (_) {
+                    return 'failed';
+                }
+                return response.status === 401 ? '401' : 'refused';
             }""",
             f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED",
             [path, FETCH_TIMEOUT_MS],
         )
-        if isinstance(status, bool) or not isinstance(status, int) or status != 401:
+        if answer == COOKIE_ONLY_STATUS:
+            return 401
+        if answer == COOKIE_ONLY_REFUSED:
             raise Failure(f"{route.upper()}_COOKIE_ONLY_STATUS_INVALID")
-        return status
+        raise Failure(f"{route.upper()}_COOKIE_ONLY_FETCH_FAILED")
 
     async def no_shell(self, page, reason):
         scripts = await evaluate(page, "() => Array.from(document.scripts).map((node) => node.src)", reason)
