@@ -128,7 +128,7 @@ class RestoreGate:
     def __init__(self, root, database, search_path):
         located = shutil.which("pg_restore", path=search_path)
         assert located, "a trusted pg_restore executable is required"
-        self.executable = Path(located).resolve(strict=True)
+        self.executable = Path(os.path.abspath(located))
         assert self.executable.is_file() and os.access(self.executable, os.X_OK), "pg_restore is not executable"
         self.real_sha256 = self.hash()
         self.database = database
