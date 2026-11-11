@@ -295,9 +295,14 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertLess(self._anchor("mkdir -p test-results/refstore"), run_index)
 
     def test_drill_receives_fixture_receipt_adjacent_to_executable(self) -> None:
-        self.assertEqual(len(re.findall(r'^\s+binary="\$GITHUB_WORKSPACE/target/debug/rootyard"$',
-                                        self.text, re.MULTILINE)), 1)
-        _, drill = self._find_command("tests/backup_blob_serving147.py")
+        # Later native steps also build their own product binary; only the
+        # assignment in the paired-drill step (before the drill command) belongs
+        # to this contract.
+        drill_index, drill = self._find_command("tests/backup_blob_serving147.py")
+        binary_lines = [index for index, line in enumerate(self.lines)
+                        if line.strip() == 'binary="$GITHUB_WORKSPACE/target/debug/rootyard"']
+        self.assertEqual(len([index for index in binary_lines if index < drill_index]), 1,
+                         "the paired drill needs exactly one product binary assignment before it")
         self.assertEqual(len(re.findall(
             r'^\s+fixture="\$fixture_dir/' + FIXTURE + r'"$', self.text, re.MULTILINE)), 1)
         self.assertIn('--format22-fixture "$fixture"', drill)
@@ -343,12 +348,56 @@ class WorkflowWiringTest(unittest.TestCase):
     def test_drill_callback_and_zero_skip_contract_is_intact(self) -> None:
         harness = (ROOT / "tests" / "backup_blob_serving147.py").read_text(encoding="utf-8")
         cases = re.search(r'^CASES = \((.*?)^\)', harness, re.MULTILINE | re.DOTALL).group(1)
-        names = re.findall(r'"([a-z0-9_]+)"', cases)
-        self.assertEqual(len(names), 12, names)
-        self.assertEqual(names[-1], "format22_active_released_roots_distinct_producer_roundtrip")
+        names = tuple(re.findall(r'"([a-z0-9_]+)"', cases))
+        # Pin the complete issue-#169 set, not only its count: a removed
+        # negative would otherwise still satisfy a length assertion.
+        expected = (
+            "real_http_sha1_sha256_source_without_persistent_bare",
+            "offline_volume_and_postgres_snapshot_barriers",
+            "incomplete_and_damaged_archives_rejected_before_sql",
+            "existing_database_and_directory_targets_refused",
+            "missing_pack",
+            "missing_idx",
+            "missing_all_artifacts",
+            "wrong_artifact_set_digest",
+            "post_backup_acknowledged_write_excluded",
+            "fresh_database_restore_clone_refs_content_fsck",
+            "restored_exact_receive_replay_without_second_effect",
+            "format22_active_released_roots_distinct_producer_roundtrip",
+        )
+        self.assertEqual(names, expected)
+        # Every corruption callback the harness advertises is one of the cases,
+        # and the four issue-#169 negatives are exactly the advertised set.
+        callbacks = re.search(r'^CORRUPTION_CALLBACKS = \{(.*?)^\}', harness, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(callbacks)
+        advertised = tuple(re.findall(r'^\s+"([a-z0-9_]+)":\s*"([a-z0-9_]+)",?$', callbacks.group(1),
+                                      re.MULTILINE))
+        self.assertEqual(tuple(name for name, _ in advertised),
+                         ("missing_pack", "missing_idx", "missing_all_artifacts", "wrong_artifact_set_digest"))
+        self.assertEqual(tuple(callback for _, callback in advertised),
+                         ("corrupt_source_missing_pack_refused_before_publication",
+                          "corrupt_source_missing_idx_refused_before_publication",
+                          "corrupt_source_missing_all_artifacts_refused_before_publication",
+                          "corrupt_source_wrong_artifact_set_digest_refused_before_publication"))
         self.assertIn('"skips": 0', harness)
         # The drill's own help keeps naming the same two-feature profile.
         self.assertIn(f"--features {FIXTURE_FEATURES} --no-default-features", harness)
+
+    def test_ci_discovers_the_issue169_tests_and_runs_the_native_drill(self) -> None:
+        # ci.yml's full unittest discovery is what executes the static #169
+        # contracts (this module and the digest/corruption plan tests).
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", ci)
+        self.assertTrue((ROOT / "tests" / "test_backup_blob_serving169_support.py").is_file())
+        # The native drill (all four PG corruption negatives plus the format22
+        # positive) is a command in the RefStore acceptance workflow, fed the
+        # source-bound fixture receipt.
+        drill_index, drill = self._find_command("tests/backup_blob_serving147.py")
+        self.assertIn('--binary "$binary"', drill)
+        self.assertIn('--format22-fixture "$fixture"', drill)
+        self.assertLess(drill_index, len(self.lines))
+        self.assertFalse(self._index("tests/backup_blob_serving147.py", drill_index + 1, command=True) >= 0,
+                         "the paired drill must run exactly once per workflow")
 
 
 if __name__ == "__main__":

@@ -61,9 +61,9 @@
 - [#153](https://github.com/jihuayu/rootyard/issues/153)：[State/D] PG 切点+Raft index+Blob closure 配对备份与全新 incarnation 恢复。
 - [#151](https://github.com/jihuayu/rootyard/issues/151)：[State/D] 全局 PG artifact hold 与 Ref-CAS pin/root 的可恢复保留桥。
 
-## 新发布的后继任务与修复 backlog（#166–#168 缺陷修复已并入 PR #170 集成；集成后 CI 以 PR #170 最终检查为准）
+## 新发布的后继任务与修复 backlog（#166–#168 缺陷修复已并入 PR #170 集成；#169 候选实现待 PR CI/合并）
 
-维护者另行发布了下列 issue。未实现的后继 backlog（#162–#165、#169、#174）**尚未实现**、没有任何验收结果；#166–#168 已有绑定各自提交的组件修复与测试，最终集成 CI 与 issue 关闭以 PR #170 为准。两者都不改变上面任务的完成状态，不构成分布式/HA/GC 能力声明。标题取自 GitHub；合并与验收完成后才可据实更新。范围摘要与技术前置见[实施计划](implementation-plan.md)的“新增任务与修复 backlog”一节。
+维护者另行发布了下列 issue。未实现的后继 backlog（#162–#165、#174）**尚未实现**、没有任何验收结果；#166–#168 已有绑定各自提交的组件修复与测试，最终集成 CI 与 issue 关闭以 PR #170 为准；#169 的候选实现已进入 `codex/backup169-candidate-20261110`，但尚未合并，不能据此称为已交付。两者都不改变上面任务的完成状态，不构成分布式/HA/GC 能力声明。标题取自 GitHub；合并与验收完成后才可据实更新。范围摘要与技术前置见[实施计划](implementation-plan.md)的“新增任务与修复 backlog”一节。
 
 | issue | 标题 | 类型 |
 | --- | --- | --- |
@@ -74,7 +74,7 @@
 | [#166](https://github.com/jihuayu/rootyard/issues/166) | [CI] 修复 genuine schema007 备份恢复回归，恢复完整合并门禁 | 缺陷修复 |
 | [#167](https://github.com/jihuayu/rootyard/issues/167) | [Raft/P2] 持久日志范围读取检测内部缺口并失败关闭 | 实验 crate 缺陷（待复现） |
 | [#168](https://github.com/jihuayu/rootyard/issues/168) | [P2] W0 baseline runner 落实运行因子、临时空间与全程绝对期限 | 工具缺陷 |
-| [#169](https://github.com/jihuayu/rootyard/issues/169) | [Backup/P2] 配对归档逐项验证注册 pack 的完整 artifact 集合与摘要 | 备份缺陷（待原生验证） |
+| [#169](https://github.com/jihuayu/rootyard/issues/169) | [Backup/P2] 配对归档逐项验证注册 pack 的完整 artifact 集合与摘要 | 备份缺陷；候选修复（待 PR CI 与合并） |
 | [#170](https://github.com/jihuayu/rootyard/issues/170) | Integrate the pending Forge and Blob/RefStore PR stack with reviewed recovery fixes | 集成 PR |
 | [#171](https://github.com/jihuayu/rootyard/issues/171) | [Integration] 分离历史 W0 冻结快照与当前架构，修复合并后的验证契约 | 合并契约修复 |
 | [#172](https://github.com/jihuayu/rootyard/pull/172) / [#174](https://github.com/jihuayu/rootyard/issues/174) | Pando 一致性与会话读取契约（提案）/ 对应会话读取实施 | 文档提案；实施 backlog（未实现） |

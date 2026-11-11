@@ -59,6 +59,14 @@ pub fn absent_store() -> Result<BlobStore> {
     opened
 }
 
+/// The three independent identities of a production plan: the authenticated
+/// issuer, its lane and the publication producer.
+pub struct Producer<'a> {
+    pub issuer_id: Uuid,
+    pub lane: &'a str,
+    pub producer: Uuid,
+}
+
 pub struct World {
     pub db: Db,
     pub store: BlobStore,
@@ -128,24 +136,22 @@ impl World {
         lane: &str,
     ) -> Result<(PackCommitPlan, PackPendingToken)> {
         let producer = self.verified.tenant;
-        self.plan_as_producer(refs, sequence, mode, head, issuer_id, lane, producer).await
+        self.plan_as_producer(refs, sequence, mode, head, Producer { issuer_id, lane, producer }).await
     }
 
     /// Same original plan with the production producer semantics: the scope's
     /// `tenant_id` is the repository tenant, while `owner_id` is the independent
     /// publication producer (a real, maybe non-tenant, API user), and the issuer
     /// is the exact authenticated actor.
-    #[allow(clippy::too_many_arguments)]
     pub async fn plan_as_producer(
         &self,
         refs: Vec<RefUpdate>,
         sequence: i64,
         mode: CommitMode,
         head: HeadUpdate,
-        issuer_id: Uuid,
-        lane: &str,
-        producer: Uuid,
+        actor: Producer<'_>,
     ) -> Result<(PackCommitPlan, PackPendingToken)> {
+        let Producer { issuer_id, lane, producer } = actor;
         let gate = &self.verified.gate;
         let mut client = self.db.pool.get().await?;
         let baseline =
@@ -219,7 +225,10 @@ impl World {
         lane: &str,
         producer: Uuid,
     ) -> Result<PackCommitPlan> {
-        Ok(self.plan_as_producer(refs, sequence, CommitMode::AcceptedSubset, head, issuer_id, lane, producer).await?.0)
+        Ok(self
+            .plan_as_producer(refs, sequence, CommitMode::AcceptedSubset, head, Producer { issuer_id, lane, producer })
+            .await?
+            .0)
     }
 
     /// Drive the full staged facade and return the exact-op receipt. A final

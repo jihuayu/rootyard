@@ -6,7 +6,7 @@
 //! only if (a) the T1 transaction cleanup succeeded, (b) every registered pack/idx was downloaded and verified,
 //! (c) the synthetic non-branch root refs and HEAD attested exactly, and (d) the native closure carries exactly
 //! the canonical binding digest computed from the sealed metadata.
-use super::candidate::{RootCandidate, source_read_digest};
+use super::candidate::{RootCandidate, SealRequest, source_read_digest};
 use super::capture::{BindingParts, binding_digest};
 use super::error::RootError;
 use super::request::PrepareRootRequest;
@@ -117,15 +117,17 @@ impl PgRetentionRoots {
         drop(native);
 
         let candidate = RootCandidate::seal(
-            *request.scope(),
-            reference,
-            request.root_id(),
-            request.operation_id(),
-            operation_digest,
-            request.selector().kind(),
-            oids,
+            SealRequest {
+                scope: *request.scope(),
+                reference,
+                root_id: request.root_id(),
+                operation_id: request.operation_id(),
+                operation_digest,
+                selector_kind: request.selector().kind(),
+                oids,
+                packs: sealed.packs().to_vec(),
+            },
             &sealed,
-            sealed.packs().to_vec(),
         )?;
         if candidate.binding_digest() != binding {
             return Err(RootError::RootDigestConflict("sealed candidate binding differs from the native binding"));
