@@ -120,7 +120,7 @@ jobs:
           rows = re.findall(r'test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;', log)
           assert len(rows) == 4, rows
           assert all(state == 'ok' and failed == ignored == '0' for state, _, failed, ignored in rows), rows
-          assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 11, 12, 20], rows
+          assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 11, 12, 23], rows
           pathlib.Path('test-results/refstore/native.json').write_text(json.dumps({
               'passed': True, 'suite_counts': [int(row[1]) for row in rows],
               'ignored': 0, 'external_blob_backup': False, 'serving_cutover': False,

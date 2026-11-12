@@ -46,15 +46,15 @@ Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上
 
 配对归档当前仅在受支持的 API 产生的静止配对流程上有资格。PR #161 本身没有完整的 ledger corruption guard；LunaMax 独立审查确认，由 API 创建并在静止状态固定的 root pack 能原子地从已登记的永久 artifact 派生，手工或特权直接改 DB 造成的损坏（root 到 A4 的等价性）未被 PR #161 语义验证。因此 #169 仍保持 OPEN，只有在候选实现合并并完成 PR CI/原生验收后才可关闭；本页不把候选分支的本地结果当作已合并能力。
 
-### issue #169 候选实现（`codex/backup169-candidate-20261110`，未合并）
+### issue #169 候选实现（[PR #214](https://github.com/jihuayu/rootyard/pull/214) / `codex/backup169-candidate-20261110`，未合并）
 
 候选分支已实现并测试以下边界，但尚未合并到 `main`，也不改变 PR #170 的集成记录：
 
 - **声明集合枚举**：`src/backup/ledger_validation.rs`（SQL 在 `ledger_validation/sql.rs`，摘要词表/typed refusal 在 `ledger_validation/refusal.rs`）在调用方已有的 `REPEATABLE READ` 导出快照事务（恢复时为恢复后的数据库）和**同一个绝对 deadline** 上读取；不新建连接、不 `BEGIN`、不取第二个快照。`membership`、A5 `snapshot_packs`、活动/已释放 `root_packs`、`serving_read_packs` 分别从各自的声明表枚举，artifact 侧使用 LEFT JOIN，所以缺失的 pack/idx 行变成 NULL 而不是让结果静默缩小。
 - **逐项证明**：每个应归档 registration 必须恰好有 `pack`(slot 0) 与 `idx`(slot 1) 两个角色、合法 slot/locator、与同一 publication 的 acquire/consume request、durable hold 和 consume receipt 绑定，且 producer 与 tenant 两种身份分别核对；`artifact_set_digest` 从实际 artifact 行重算。A5 snapshot 与 retained root descriptor 逐项对照同一 canonical A4 集合；retained capture 还由 core 自己的 `retention_root` validator 在同一事务/期限上重新证明。任何缺件、额外/非法角色、错误摘要或身份/摘要不匹配都会形成有界、固定词表的 typed refusal，并在创建目标目录、`COMPLETE` 或 manifest 之前失败。
-- **负向测试**：`tests/backup_blob_serving147.py` 的四个 corruption case（缺 `.pack`、缺 `.idx`、缺全部 artifact、错误 `artifact_set_digest`）在一次性 `pg_dump` clone 中构造，只在一个 `SET LOCAL session_replication_role = replica` 事务内改动目标行，先证明恰好该行/字段变化，再删除 clone；备份只允许以该 case 的精确 source-ledger validator violation 拒绝，且目标路径、`COMPLETE`、manifest 均不存在，干净归档随后在全新数据库恢复且摘要/locator 不变。
+- **负向测试**：`tests/backup_blob_serving147.py` 的六个 corruption case（缺 `.pack`、缺 `.idx`、缺全部 artifact、错误 `artifact_set_digest`、缺 durable hold、错误 hold locator）在一次性 `pg_dump` clone 中构造，只在一个 `SET LOCAL session_replication_role = replica` 事务内改动目标行，先证明恰好该行/字段变化，再删除 clone；备份只允许以该 case 的精确 source-ledger validator violation 拒绝，且目标路径、`COMPLETE`、manifest 均不存在，干净归档随后在全新数据库恢复且摘要/locator 不变；此外 `src/backup/ledger_validation/pg_tests.rs` 对已种源数据库做 8 项隔离 `REPEATABLE READ` 事务回归。
 - **正向测试**：同一 drill 的第二份 API 产生源（`tests/ref_store_format22_backup_fixture.rs`，`pando-lab,format22-fixture`）带非空的活动与已释放 API-created roots，producer owner 与 repository tenant 不同；drill 验证 format22 manifest 的完整 artifact 集合、字节证明/摘要、root 生命周期和 serving-read 记录，并恢复到全新数据库。
-- **CI 状态**：记录时该分支在 GitHub Actions 上没有运行记录（按 branch 与这两个候选 SHA 查询均为 0），因此没有可引用的失败日志；合并前必须由 PR 触发 `RefStore protocol native acceptance` 的 fixture 构建与 paired drill。候选分支的本地门禁结果记录在对应 delivery 记录/PR 中；未运行的 native 场景不得称为通过。
+- **CI 状态**：PR #214 前序提交 `c840dec` 在 GitHub Actions 通过 `CI / verify`、`CI / container`、`Pando synthetic lab`、`Redis contract` 四项远端检查，`RefStore protocol native acceptance / native` 因 `ref_store_decision_subset` 增至 23 项而旧工作流仍断言 `[8, 11, 12, 20]` 在四套件计数步骤中止（后续 fixture 与 paired drill 步骤尚未在远端跑完）。当前分支已合并 `origin/main`（`3f21678`，含 PR #211/#213）、修正套件计数断言为 `[8, 11, 12, 23]` 并通过本地 PG/Garage 原生验证（四套件 8+11+12+23=54 项零失败零忽略及 8 项已种源 `pg_tests`）；合并与 issue 关闭仍以 PR #214 远端完整检查通过为准。
 
 #171 的修复随 PR #170 整合，最终 CI 状态以 PR 为准；它只处理合并后的契约缺陷，未新增或声称任何分布式、HA、GC 或容量能力：
 

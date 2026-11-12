@@ -54,9 +54,9 @@
 | [#157](https://github.com/jihuayu/rootyard/issues/157) | [State/D] 真实 3 主机故障矩阵、ACK 完整性、RPO/RTO 与容量成本 | [#155](https://github.com/jihuayu/rootyard/issues/155), [#156](https://github.com/jihuayu/rootyard/issues/156), [#153](https://github.com/jihuayu/rootyard/issues/153), [#42](https://github.com/jihuayu/rootyard/issues/42), [#151](https://github.com/jihuayu/rootyard/issues/151) |
 | [#123](https://github.com/jihuayu/rootyard/issues/123) | [State/Release] 汇总单机与分布式新架构资格及发布闸门 | [#154](https://github.com/jihuayu/rootyard/issues/154), [#157](https://github.com/jihuayu/rootyard/issues/157) |
 
-## 新增任务与修复 backlog（#166–#168 见下方集成说明；#169 有候选实现待合并；#162–#165 未实现；#174 单机基础已实现但仍 OPEN）
+## 新增任务与修复 backlog（#166–#168 见下方集成说明；#169 候选实现 PR #214 待 CI/合并；#162–#165 未实现；#174 单机基础已实现但仍 OPEN）
 
-下列 issue 是维护者另行发布的后续任务和缺陷修复单。此处登记的是 GitHub 上的确切标题、范围摘要与技术前置；未实现的后继 backlog（#162–#165）**没有实现、没有验收结果**，不计入任何已完成阶段；#169 的候选实现已加入 `codex/backup169-candidate-20261110`，待 PR CI 与合并，仍不具备已合并能力；#166–#168 已有绑定各自提交的组件修复与测试，最终集成 CI 与 issue 关闭以 PR #170 为准。[#174](https://github.com/jihuayu/rootyard/issues/174) 已由 PR #209 交付单机 PostgreSQL 会话下界基础（keyring v2、`rs1` HMAC 帧含 authority kind/group id、JSON 读强制、push 签发、sealed proof、真实 HTTP/PG 验收），但 issue 仍 **OPEN**：浏览器/UI 传播、完整损坏/保留矩阵与分布式 Raft Ref-CAS 矩阵未完成。两者都不表示分布式、HA、GC 等新能力已交付。标题与正文以 GitHub 为准，issue 正文更新后须同步本表和 [任务映射](issue-map.md)。
+下列 issue 是维护者另行发布的后续任务和缺陷修复单。此处登记的是 GitHub 上的确切标题、范围摘要与技术前置；未实现的后继 backlog（#162–#165）**没有实现、没有验收结果**，不计入任何已完成阶段；#169 的 PR #214 候选实现已合并 `origin/main`（`3f21678`，含 PR #211/#213）并通过本地原生门禁（四个 test crate 共 8+11+12+23=54 项，零失败、零忽略），但仍待 PR CI 与合并，尚不具备已合并能力；#166–#168 已有绑定各自提交的组件修复与测试，最终集成 CI 与 issue 关闭以 PR #170 为准。[#174](https://github.com/jihuayu/rootyard/issues/174) 已由 PR #209 交付单机 PostgreSQL 会话下界基础（keyring v2、`rs1` HMAC 帧含 authority kind/group id、JSON 读强制、push 签发、sealed proof、真实 HTTP/PG 验收），但 issue 仍 **OPEN**：浏览器/UI 传播、完整损坏/保留矩阵与分布式 Raft Ref-CAS 矩阵未完成。两者都不表示分布式、HA、GC 等新能力已交付。标题与正文以 GitHub 为准，issue 正文更新后须同步本表和 [任务映射](issue-map.md)。
 
 | 任务 | 范围 | 技术前置 |
 | --- | --- | --- |
@@ -67,7 +67,7 @@
 | [#166](https://github.com/jihuayu/rootyard/issues/166) | [CI] 修复 genuine schema007 备份恢复回归，恢复完整合并门禁（format4/schema007 真实归档恢复失败；不得删除或放宽原断言，旧路径在 #148 前不得静默回归） | 不新增架构前置；与 [#120](https://github.com/jihuayu/rootyard/issues/120)/[#148](https://github.com/jihuayu/rootyard/issues/148) 边界相关 |
 | [#167](https://github.com/jihuayu/rootyard/issues/167) | [Raft/P2] 持久日志范围读取检测内部缺口并失败关闭（`crates/refcas-log` read_range 连续性；待复现的审查发现，不先称为已验证回归） | PR #160 的实验 crate；不替代 [#149](https://github.com/jihuayu/rootyard/issues/149) |
 | [#168](https://github.com/jihuayu/rootyard/issues/168) | [P2] W0 baseline runner 落实运行因子、临时空间与全程绝对期限（workload 准入、贯穿 Git/PG 子进程的绝对 deadline、实际临时空间执行） | 不新增架构前置；关联 [#164](https://github.com/jihuayu/rootyard/issues/164) |
-| [#169](https://github.com/jihuayu/rootyard/issues/169) | [Backup/P2] 配对归档逐项验证注册 pack 的完整 artifact 集合与摘要（pack+idx 角色、slot/locator/proof/hold 绑定、artifact_set_digest；缺件/错摘要拒绝归档） | [#120](https://github.com/jihuayu/rootyard/issues/120)；候选实现已加入 `codex/backup169-candidate-20261110`，待 PR CI 与合并；不扩大已验收范围 |
+| [#169](https://github.com/jihuayu/rootyard/issues/169) | [Backup/P2] 配对归档逐项验证注册 pack 的完整 artifact 集合与摘要（pack+idx 角色、slot/locator/proof/hold 绑定、artifact_set_digest；缺件/错摘要拒绝归档） | [#120](https://github.com/jihuayu/rootyard/issues/120)；候选实现 PR #214（`codex/backup169-candidate-20261110`）待 PR CI 与合并；不扩大已验收范围 |
 | [#170](https://github.com/jihuayu/rootyard/issues/170) | Integrate the pending Forge and Blob/RefStore PR stack with reviewed recovery fixes | 合并 #89–#161 的候选栈（PR，不是新能力） |
 | [#171](https://github.com/jihuayu/rootyard/issues/171) | [Integration] 分离历史 W0 冻结快照与当前架构，修复合并后的验证契约 | #170；合并契约修复，不宣称新架构任务全部交付 |
 | [#172](https://github.com/jihuayu/rootyard/pull/172) / [#174](https://github.com/jihuayu/rootyard/issues/174) | Pando 一致性与会话读取契约（提案）；单机 PostgreSQL 会话下界基础已由 PR #209 实现，issue 仍 OPEN | 文档提案；UI 传播、完整损坏/保留与分布式 Ref-CAS 矩阵另立后续 |

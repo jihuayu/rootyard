@@ -25,6 +25,7 @@ consuming tools.
 """
 from __future__ import annotations
 
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -40,6 +41,167 @@ RESULT_DIR = "test-results/refstore"
 # The absolute directory the workflow builder writes into, inside the checkout.
 FIXTURE_DIR = f"$GITHUB_WORKSPACE/{RESULT_DIR}"
 FIXTURE_OUTPUT = f"$fixture_dir/{FIXTURE}"
+
+PROTOCOL_STEP = "Exercise roots, decisions, accepted subset and pack-read regressions"
+PROTOCOL_SUITES = (
+    "ref_store_packs",
+    "ref_store_retention_roots",
+    "ref_store_materialized_reads",
+    "ref_store_decision_subset",
+)
+# Counts verified by running every binary with `--ignored --test-threads=1`.
+PROTOCOL_COUNTS = {
+    "ref_store_packs": 8,
+    "ref_store_retention_roots": 11,
+    "ref_store_materialized_reads": 12,
+    "ref_store_decision_subset": 23,
+}
+
+_TEST_ATTRIBUTE = re.compile(
+    r"^[ \t]*#\s*\[\s*(?:tokio\s*::\s*)?test(?:\s*\([^\]\n]*\))?\s*\]",
+    re.MULTILINE,
+)
+_TEST_BLOCK = re.compile(
+    r"(?:^[ \t]*#\s*\[[^\]\n]*\][ \t]*\r?\n)+",
+    re.MULTILINE,
+)
+_IGNORE_ATTRIBUTE = re.compile(
+    r"^[ \t]*#\s*\[\s*ignore(?:\s*=|\s*\(|\s*\])",
+    re.MULTILINE,
+)
+_PATH_MODULE = re.compile(
+    r'#[ \t]*\[[ \t]*path[ \t]*=[ \t]*"([^"]+)"[ \t]*\][ \t\r\n]*'
+    r"(?:(?:#\s*\[[^\]\n]*\][ \t\r\n]*)*)"
+    r"(?:pub(?:\([^)]*\))?[ \t]+)?mod[ \t]+([A-Za-z_]\w*)[ \t]*;"
+)
+_OUT_OF_LINE_MODULE = re.compile(
+    r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?mod[ \t]+([A-Za-z_]\w*)[ \t]*;",
+    re.MULTILINE,
+)
+_RAW_STRING = re.compile(r'(?:br|rb|r)(#*)"')
+_CHAR_LITERAL = re.compile(r"(?:b)?'(?:\\[^'\n]|[^'\\\n])'")
+
+
+def _strip_rust_comments(text: str) -> str:
+    """Remove Rust line/block comments while preserving attributes and strings.
+
+    Commented-out ``#[test]`` attributes must not inflate the static count, and
+    char literals such as ``'"'`` must not open fake string literals, while
+    offsets and newlines are kept so module declarations stay discoverable.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        raw = _RAW_STRING.match(text, index)
+        char_lit = _CHAR_LITERAL.match(text, index)
+        if raw and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_")):
+            closing = '"' + raw.group(1)
+            end = text.find(closing, raw.end())
+            if end < 0:
+                out.append(text[index:])
+                break
+            end += len(closing)
+            out.append(text[index:end])
+            index = end
+        elif char_lit and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_")):
+            out.append(char_lit.group(0))
+            index = char_lit.end()
+        elif text.startswith("//", index):
+            end = text.find("\n", index)
+            end = len(text) if end < 0 else end
+            out.append(" " * (end - index))
+            index = end
+        elif text.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < len(text) and depth:
+                if text.startswith("/*", index):
+                    depth += 1
+                    out.append("  ")
+                    index += 2
+                elif text.startswith("*/", index):
+                    depth -= 1
+                    out.append("  ")
+                    index += 2
+                else:
+                    out.append("\n" if text[index] == "\n" else " ")
+                    index += 1
+        elif char == '"':
+            out.append(char)
+            index += 1
+            while index < len(text):
+                out.append(text[index])
+                if text[index] == "\\" and index + 1 < len(text):
+                    index += 1
+                    out.append(text[index])
+                elif text[index] == '"':
+                    index += 1
+                    break
+                index += 1
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def _module_path(current: Path, name: str, explicit: str | None, is_root: bool) -> Path:
+    """Resolve ``mod name;`` using ``#[path]`` or Rust's directory rules."""
+    if explicit is not None:
+        candidate = (current.parent / explicit).resolve()
+        if not candidate.is_file():
+            raise AssertionError(f"{current}: #[path = {explicit!r}] does not resolve")
+        return candidate
+    module_dir = current.parent if is_root or current.name == "mod.rs" else current.parent / current.stem
+    candidates = (module_dir / f"{name}.rs", module_dir / name / "mod.rs")
+    matches = [candidate for candidate in candidates if candidate.is_file()]
+    if len(matches) != 1:
+        raise AssertionError(f"{current}: mod {name}; resolves to {matches}")
+    return matches[0].resolve()
+
+
+def _protocol_suite_counts() -> dict[str, int]:
+    """Count ``#[ignore]``-gated test attributes through every out-of-line module."""
+    counts: dict[str, int] = {}
+    for suite in PROTOCOL_SUITES:
+        root = ROOT / "tests" / f"{suite}.rs"
+        pending = [(root, True)]
+        visited: set[Path] = set()
+        total = 0
+        while pending:
+            current, is_root = pending.pop()
+            current = current.resolve()
+            if current in visited:
+                continue
+            visited.add(current)
+            source = _strip_rust_comments(current.read_text(encoding="utf-8"))
+            attr_total = len(_TEST_ATTRIBUTE.findall(source))
+            ignored_blocks = 0
+            for block_match in _TEST_BLOCK.finditer(source):
+                block = block_match.group(0)
+                test_attrs = _TEST_ATTRIBUTE.findall(block)
+                if not test_attrs:
+                    continue
+                if len(test_attrs) != 1 or not _IGNORE_ATTRIBUTE.search(block):
+                    raise AssertionError(
+                        f"{current}: test attribute block is missing #[ignore] or stacks multiple #[test] attributes:\n{block}"
+                    )
+                ignored_blocks += 1
+            if ignored_blocks != attr_total:
+                raise AssertionError(
+                    f"{current}: matched {attr_total} test attributes vs {ignored_blocks} #[ignore] blocks"
+                )
+            total += attr_total
+            explicit_spans = []
+            for match in _PATH_MODULE.finditer(source):
+                explicit_spans.append(match.span())
+                pending.append((_module_path(current, match.group(2), match.group(1), is_root), False))
+            for match in _OUT_OF_LINE_MODULE.finditer(source):
+                if any(start <= match.start() < end for start, end in explicit_spans):
+                    continue
+                pending.append((_module_path(current, match.group(1), None, is_root), False))
+        counts[suite] = total
+    return counts
 
 
 def _feature_names() -> dict[str, str]:
@@ -419,7 +581,7 @@ class WorkflowWiringTest(unittest.TestCase):
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", ci)
         self.assertTrue((ROOT / "tests" / "test_backup_blob_serving169_support.py").is_file())
-        # The native drill (all four PG corruption negatives plus the format22
+        # The native drill (all six PG corruption negatives plus the format22
         # positive) is a command in the RefStore acceptance workflow, fed the
         # source-bound fixture receipt.
         drill_index, drill = self._find_command("tests/backup_blob_serving147.py")
@@ -428,6 +590,47 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertLess(drill_index, len(self.lines))
         self.assertFalse(self._index("tests/backup_blob_serving147.py", drill_index + 1, command=True) >= 0,
                          "the paired drill must run exactly once per workflow")
+
+
+class ProtocolSuiteCountTest(unittest.TestCase):
+    def _step(self, name: str) -> str:
+        lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+        starts = [index for index, line in enumerate(lines) if line.strip() == f"- name: {name}"]
+        self.assertEqual(len(starts), 1, f"workflow has {len(starts)} steps named `{name}`")
+        start = starts[0]
+        end = next((index for index in range(start + 1, len(lines))
+                    if re.match(r"^      - ", lines[index])), len(lines))
+        return "\n".join(lines[start:end])
+
+    def test_protocol_suite_counts_match_test_crates(self) -> None:
+        # The workflow runs this exact set through `cargo test -- --ignored`;
+        # every runtime row must therefore match the static per-crate count.
+        counts = _protocol_suite_counts()
+        self.assertEqual(counts, PROTOCOL_COUNTS)
+
+        step = self._step(PROTOCOL_STEP)
+        for suite in PROTOCOL_SUITES:
+            self.assertIn(f"--test {suite}", step)
+        self.assertIn("-- --ignored --test-threads=1", step)
+
+        assertion = re.search(
+            r"assert sorted\(int\(passed\) for _, passed, _, _ in rows\) == (\[[^\]]*\]), rows",
+            step,
+        )
+        self.assertIsNotNone(assertion, "the step has no sorted suite-count assertion")
+        asserted = ast.literal_eval(assertion.group(1))
+        self.assertEqual(asserted, sorted(counts.values()))
+        self.assertEqual(asserted, [8, 11, 12, 23])
+
+    def test_strip_rust_comments_handles_comments_and_char_literals(self) -> None:
+        sample = (
+            'const Q: char = \'"\';\n'
+            "// #[test]\n"
+            "/* nested /* block */ \n#[tokio::test]\n*/\n"
+            '#[tokio::test]\n#[ignore = "real"]\nasync fn real_case() {}\n'
+        )
+        stripped = _strip_rust_comments(sample)
+        self.assertEqual(len(_TEST_ATTRIBUTE.findall(stripped)), 1)
 
 
 if __name__ == "__main__":
