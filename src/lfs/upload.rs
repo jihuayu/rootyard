@@ -1,5 +1,5 @@
 //! Streaming Git LFS upload and admission diagnostics.
-use super::handlers::{lfs_json, sanitize_headers};
+use super::handlers::{lfs_json, reauthorize_repo, sanitize_headers};
 use crate::{
     AppState, Error, auth,
     lfs::{models, storage},
@@ -96,7 +96,7 @@ async fn upload_inner(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Error> {
-    let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+    let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
@@ -175,7 +175,7 @@ async fn upload_inner(
     let already_ready = {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        auth::authorize_repo_with_role(
+        let reauth = auth::authorize_repo_with_role(
             &tx,
             &actor,
             &owner,
@@ -184,6 +184,9 @@ async fn upload_inner(
             crate::token_scopes::RepoAction::ContentsWrite,
         )
         .await?;
+        if reauth.repo_id != repo_id || reauth.owner_id != tenant_id {
+            return Err(Error(StatusCode::CONFLICT, "repository identity changed"));
+        }
         let row = tx
             .query_opt(
                 "SELECT size, state FROM lfs_objects WHERE tenant_id=$1 AND repository_id=$2 AND oid=$3",
@@ -206,6 +209,18 @@ async fn upload_inner(
             .await
             .map_err(Error::internal)?
     {
+        reauthorize_repo(
+            &state,
+            &actor,
+            &owner,
+            name,
+            repo_id,
+            tenant_id,
+            auth::Role::Write,
+            crate::token_scopes::RepoAction::ContentsWrite,
+            true,
+        )
+        .await?;
         storage::schedule_remote_repair(
             state.storage.root.clone(),
             repo_id,
@@ -227,12 +242,12 @@ async fn upload_inner(
     )
     .await
     .map_err(|_| Error::timeout())??;
-    storage::publish_remote(&state, repo_id, tenant_id, &oid, expected_size).await?;
+    storage::publish_remote(&state, repo_id, tenant_id, &oid, expected_size, deadline).await?;
 
     let finalize_res: Result<(), Error> = async {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let _ = auth::authorize_repo_with_role(
+        let reauth = auth::authorize_repo_with_role(
             &tx,
             &actor,
             &owner,
@@ -241,6 +256,9 @@ async fn upload_inner(
             crate::token_scopes::RepoAction::ContentsWrite,
         )
         .await?;
+        if reauth.repo_id != repo_id || reauth.owner_id != tenant_id {
+            return Err(Error(StatusCode::CONFLICT, "repository identity changed"));
+        }
         let updated = tx
             .execute(
                 "UPDATE lfs_objects SET state = 'ready', updated_at = clock_timestamp() WHERE tenant_id = $1 AND repository_id = $2 AND oid = $3 AND size = $4",

@@ -18,6 +18,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, sync::Arc};
+use uuid::Uuid;
 
 /// Deduplicates multiple byte-for-byte identical `Authorization` headers while leaving
 /// distinct conflicting `Authorization` headers untouched so `auth::authenticate` rejects them.
@@ -59,6 +60,28 @@ pub(super) fn obj_error(oid: String, size: i64, code: u16, msg: &str) -> BatchOb
     }
 }
 
+pub(super) async fn reauthorize_repo(
+    state: &AppState,
+    actor: &crate::db::Identity,
+    owner: &str,
+    name: &str,
+    expected_repo_id: Uuid,
+    expected_tenant_id: Uuid,
+    min_role: auth::Role,
+    action: crate::token_scopes::RepoAction,
+    write: bool,
+) -> Result<(), Error> {
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let reauth = auth::authorize_repo_with_role(&tx, actor, owner, name, min_role, action).await?;
+    if reauth.repo_id != expected_repo_id || reauth.owner_id != expected_tenant_id {
+        return Err(Error(StatusCode::CONFLICT, "repository identity changed"));
+    }
+    auth::finish_tx(tx, actor, write).await?;
+    drop(client);
+    Ok(())
+}
+
 fn build_base_url(headers: &HeaderMap) -> String {
     let scheme = headers
         .get("x-forwarded-proto")
@@ -82,7 +105,7 @@ pub async fn batch(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
-    let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+    let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let name = models::normalize_repo_name(&repo_raw)?;
@@ -143,7 +166,7 @@ pub async fn verify_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
-    let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+    let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
@@ -199,6 +222,18 @@ pub async fn verify_object(
     )
     .await
     .map_err(Error::internal)?;
+    reauthorize_repo(
+        &state,
+        &actor,
+        &owner,
+        name,
+        repo_id,
+        tenant_id,
+        auth::Role::Write,
+        crate::token_scopes::RepoAction::ContentsWrite,
+        true,
+    )
+    .await?;
     if !verified {
         return Ok(lfs_error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object integrity verification failed"));
     }
@@ -230,6 +265,7 @@ async fn download_inner(
     size_param: Option<i64>,
     headers: HeaderMap,
 ) -> Result<Response, Error> {
+    let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let name = models::normalize_repo_name(&repo_raw)?;
@@ -270,7 +306,8 @@ async fn download_inner(
         (repo_id, tenant_id, db_size as u64)
     };
 
-    let stream_body = storage::open_verified_download_stream(&state, repo_id, tenant_id, &oid, expected_size).await?;
+    let stream_body =
+        storage::open_verified_download_stream_until(&state, repo_id, tenant_id, &oid, expected_size, deadline).await?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")

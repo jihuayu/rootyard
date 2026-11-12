@@ -60,7 +60,10 @@ requests, while cache-empty existing-local waves coalesce onto one digest pass
 across concurrent readers (`tests/lfs_read_amplification.py`,
 `tests/lfs_process_metrics.py`). `Batch`, `verify`, and `upload` pre-checks
 commit their short read transactions and release database pool connections
-before running local disk verification or remote hydration. Warm reads do not construct an object-store client, issue a remote HEAD/GET, or
+before running local disk verification or remote hydration, then re-authorize
+against PostgreSQL before returning `200 OK` or scheduling deduplicated remote
+repairs (and roll back to run `ensure_readable` in at most three passes if a
+row transitions concurrently to `ready` before `Batch` upload reservation). Warm reads do not construct an object-store client, issue a remote HEAD/GET, or
 perform a synchronous remote repair; an unreachable or misconfigured endpoint
 cannot turn a verified local download into a 5xx (issue #71). A cold miss
 (`local file absent, corrupt, truncated, replaced, or symlinked`) is explicit:
