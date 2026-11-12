@@ -214,6 +214,14 @@ capture age, on due backlog growth and expired running leases, and on
 `rootyard_postgres_up == 0` / scrape failure. Treat terminal-failure history as
 an investigation input, not a permanent fault or retryable-backlog alert.
 
+For the complete operator troubleshooting runbook, executable PromQL alert
+expressions, and structured `jq` stderr correlation rules across expected `4xx`
+policy rejections, transient PostgreSQL/S3 dependency failures, and internal
+consistency / worker backlog anomalies, see
+[observability-alerts.md](observability-alerts.md) alongside
+[observability-errors.md](observability-errors.md) and
+[worker-diagnostics.md](worker-diagnostics.md).
+
 ## Opt-in state-services baseline series
 
 Building with `--features state-baseline-metrics` (default OFF, no dependency)
@@ -299,3 +307,21 @@ positive `busy`/`waiting` gauges and full capacity recovery after unlock.
 ```
 ROOTYARD_TEST_DATABASE_URL=postgresql://... python3 tests/pool_metrics.py --binary target/debug/rootyard --report pool-metrics-report.json
 ```
+
+[tests/test_observability_backlog.py](../tests/test_observability_backlog.py)
+runs an end-to-end native regression over the built `rootyard` binary, isolated
+PostgreSQL schemas, and gated loopback S3/webhook endpoints: it verifies claimed
+`storage_lifecycle` `execute` `attempt`/`generation` correlation, redacted
+`scope:"worker"` fault events across `webhooks_background`, `workspace_capture`,
+`workspace_remote_gc`, and `durable_dispatch`, live `/metrics` discovery of
+unresolved operations, overdue outbox/webhook deliveries, workspace capture lag /
+unsampled baselines / expired leases, storage maintenance due queues / expired
+running leases / overdue scans, LFS remote failure and in-flight repair-backlog
+series, and fail-closed HTTP 503 exposition under a 4-second PostgreSQL
+`statement_timeout` lock. Its synthetic SQL triggers and loopback stubs do not
+claim production throughput or multi-host outage SLAs.
+[tests/test_observability_runbook.py](../tests/test_observability_runbook.py)
+binds every metric name, label set, and structured error field in
+[observability-alerts.md](observability-alerts.md),
+[observability-errors.md](observability-errors.md), and
+[worker-diagnostics.md](worker-diagnostics.md) to the Rust source.
