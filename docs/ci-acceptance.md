@@ -52,19 +52,26 @@ fixture integration-test executables, recording the batch in
 | `tests/web_sessions.py` | Session exchange, CSRF binding, expiry and parent-token revocation over the real Rust service and PostgreSQL 17 | `test-results/web-sessions.json` |
 | `tests/ci_webhook_regressions.py` | 201-event batching, concurrent claim fencing, verified TLS delivery and untrusted-CA rejection (no `--report`; the stdout log is the evidence) | `test-results/ci-webhook-regressions.log` |
 | `tests/webhook_worker_recovery.py` | Background worker recovery across SIGKILL at the enqueue and ack boundaries, lease overlap and backoff/dead-letter, with no manual dispatch | `test-results/webhook-worker-recovery.json` |
+| `tests/webhook_pagination.py` | Webhook delivery sequence allocation, concurrent barriers and cursor pagination over PostgreSQL 17 | `test-results/webhook-pagination.json` |
+| `tests/webhook_pr_sync.py` | No-hook, paused-hook and deleted-hook Pull Request ref reconciliation across page boundaries | `test-results/webhook-pr-sync.json` |
 | `tests/repository_pagination.py` | Real API/PostgreSQL traversal of 1,001 repositories with keyset ordering, actor scope and mutations | `test-results/repository-pagination.json` |
 | `tests/organization_pagination.py` | Real API/PostgreSQL traversal of 101 members and 101 teams with authorization, cursor scope and mutation resume | `test-results/organization-pagination.json` |
 | `tests/web_detail_pagination.py` | Real web Issue comments and PR reviews across the 100-row page boundary (105 rows seeded plus the 106th written through real HTTP/Git), including cursor/actor/revocation checks | `test-results/web-detail-pagination.json` |
+| `tests/web_repository_pagination.py` | Browser repository-discovery keyset pagination, actor/membership binding and restricted/anonymous scope checks | `test-results/web-repository-pagination.json` |
+| `tests/worker_diagnostics.py` | Source-bound structured worker-operation diagnostics isolation under real PostgreSQL `statement_timeout` | `test-results/worker-diagnostics.json` |
 
 A final step, `scripts/native_report_manifest.py --mode job`, fails the job
 unless every report was produced by the exact binary whose SHA-256 appears in
 `target/debug/rootyard.build.json`, every declared case passed, the
 `ci_webhook_regressions` log is non-empty and contains each expected phase
 marker, and the receipt's commit and compiled source-input digest were recorded.
-The manifest also binds the `repository-pagination.json`,
-`organization-pagination.json` and `web-detail-pagination.json` reports and
-their harness sources to that same build receipt, so none of the three can be
-produced by a different binary. These three harnesses are real functional
+The manifest also binds the pagination, webhook reconciliation and worker
+diagnostics reports (`repository-pagination.json`,
+`organization-pagination.json`, `web-detail-pagination.json`,
+`web-repository-pagination.json`, `webhook-pagination.json`,
+`webhook-pr-sync.json`, `worker-diagnostics.json`) together with the other
+verify-job reports and their harness sources to that same build receipt, so none
+can be produced by a different binary. These harnesses are real functional
 regressions over real API, PostgreSQL, HTTP and Git state, not scalability
 benchmarks.
 The manifest (`test-results/native-pr-gate.json`) also stores harness SHA-256
@@ -72,8 +79,9 @@ digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
 `git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
 the native tool provenance file. Injecting any of those defects turns the pull
 request red instead of leaving the regression to manual re-verification.
-The `e2e-report` artifact includes `target/debug/rootyard.build.json` and
-`test-results/native-build-batch.json`, so downloaded job manifests can be
+The `e2e-report` artifact includes `target/debug/rootyard.build.json`,
+`test-results/native-build-batch.json` and both `test-results/evidence/*.jsonl`
+and `test-results/*-evidence/*.jsonl`, so downloaded job manifests can be
 checked against the build receipt and batch manifest.
 
 ## 专项与完整 candidate 分层 (specialised suites vs. the complete gate)
@@ -184,11 +192,16 @@ and every job asserts `git rev-parse HEAD` equals it before building.
 
 * `browser-native` runs `tests/browser_ui.py` against the real system Chromium
   at `/usr/bin/chromium` with a fixed Playwright client (`playwright==1.49.0`).
-  No downloaded Playwright browser is substituted for the system package. The
-  manifest records the version reported by `importlib.metadata` and the actual
-  `/usr/bin/chromium --version` and PostgreSQL server/client versions; the
-  `rust:1-trixie` container tag and apt packages are mutable inputs, not
-  immutable pins.
+  No downloaded Playwright browser is substituted for the system package.
+  Because container steps run as UID 0 against the host-runner bind mount at
+  `$GITHUB_WORKSPACE` (`/__w/...`), a setup step sets container-scoped
+  `ROOTYARD_TEST_EVIDENCE_DIR` and exports `GIT_CONFIG_COUNT`/`safe.directory`
+  into `$GITHUB_ENV` so Git commands succeed even inside harnesses that pass
+  `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`. The manifest
+  requires `browser_ui=chromium_browser_workflow` and records the version
+  reported by `importlib.metadata` plus the actual `/usr/bin/chromium --version`
+  and PostgreSQL server/client versions; the `rust:1-trixie` container tag and
+  apt packages are mutable inputs, not immutable pins.
 * `object-store-native` starts an ephemeral, job-owned Garage container pinned
   by tag and digest (`dxflrs/garage:v2.1.0@sha256:4c9b34c1...`) and runs:
   * `tests/lfs_hydration_concurrency.py` — concurrent cold hydration through the
@@ -198,11 +211,17 @@ and every job asserts `git rev-parse HEAD` equals it before building.
     retention with **no** object-store endpoint configured. The step clears and
     asserts `ROOTYARD_OBJECT_STORE_ENDPOINT`/`_BUCKET` empty, so it cannot
     accidentally inherit the Garage fixture.
-  Git LFS 3.6.1 is downloaded and its tarball SHA-256 is compared with the
-  official release `sha256sums.txt`; the release tarball's real
-  `git-lfs-3.6.1/git-lfs` layout is stripped before install. If the checksum
-  asset is unavailable or ambiguous the step fails rather than installing an
-  unverified binary. The installed `git-lfs/<version>` output is asserted.
+  Git LFS 3.6.1 is downloaded by `scripts/install_git_lfs.sh` and its tarball
+  SHA-256 is verified against both the official release `sha256sums.asc`
+  cleartext-signed manifest (parsed strictly inside the PGP signed message body,
+  rejecting unsigned tail entries or truncated framing) and the workflow's
+  pinned `--expected-sha256`
+  (`2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76`); the
+  release tarball's real `git-lfs-3.6.1/git-lfs` layout is stripped before
+  install. If the checksum asset is unavailable, malformed, unsigned-tailed or
+  ambiguous the step fails rather than installing an unverified binary. The
+  installed `git-lfs/<version>` output and `$RUNNER_TEMP/bin/git-lfs` precedence
+  on `PATH` are asserted.
 * `release-gate` downloads both job manifests and runs
   `scripts/native_report_manifest.py --mode release`. It requires the two jobs to
   share the dispatched commit and one compiled source-input digest, re-verifies
@@ -211,8 +230,8 @@ and every job asserts `git rev-parse HEAD` equals it before building.
   symlinked or traversing artifact names fail closed), requires the
   `browser_ui`, `lfs_hydration`, `lfs_remote` and `lfs_retention` reports, and
   requires the exact `garage_version=2.1.0`, the exact Garage image digest,
-  `git_lfs_version=3.6.1`, `playwright_version=1.49.0` and a Chromium version in
-  the fixture record. The Garage image's own version output is
+  `git_lfs_version=3.6.1`, the exact `git_lfs_tarball_sha256`,
+  `playwright_version=1.49.0` and a Chromium version in the fixture record. The Garage image's own version output is
   `garage v2.1.0 [features: ...]`; the helper matches exactly 2.1.0 plus an
   optional feature tail and obtains the node id from the first line of
   `garage node id` (64 hex `@address`), never by grepping 16-hex `status` ids. Its output is `candidate-release-gate.json`.
@@ -241,9 +260,12 @@ refuses a non-loopback or non-HTTP endpoint, probes the endpoint until it
 answers with an S3 XML body (a stub web page fails), and writes the credential
 to a `0600` environment file in a `0700` directory outside the checkout. The
 cleanup step removes that file and the owned fixture; the file is never
-uploaded and values are never printed. The object-store manifest step sources
-the private file in its own shell so the credential scanner sees this job's
-generated keys; an actions-step environment is not inherited across steps.
+uploaded and values are never printed. The object-store manifest step (`if: always()`)
+sources the private file in its own shell when present so the credential scanner
+sees this job's generated keys (an actions-step environment is not inherited
+across steps), or passes `--fixture "object_store_env="` when an earlier step
+failed before fixture startup so `scripts/native_report_manifest.py` still writes
+a `rootyard/native-acceptance-failure` manifest while failing closed.
 
 ## Reproduction and current status
 
@@ -271,9 +293,13 @@ python3 scripts/build_native_batch.py \
 python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
 python3 tests/ci_webhook_regressions.py --binary target/debug/rootyard | tee test-results/ci-webhook-regressions.log
 python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
+python3 tests/webhook_pagination.py --binary target/debug/rootyard --report test-results/webhook-pagination.json
+python3 tests/webhook_pr_sync.py --binary target/debug/rootyard --report test-results/webhook-pr-sync.json
 python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json
 python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json
 python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json
+python3 tests/web_repository_pagination.py --binary target/debug/rootyard --report test-results/web-repository-pagination.json
+python3 tests/worker_diagnostics.py --binary target/debug/rootyard --report test-results/worker-diagnostics.json
 ```
 
 The native host profile in this change was validated locally only: workflow
@@ -287,27 +313,30 @@ digests are recorded in the provenance artifact rather than fabricated in
 advance.
 
 Candidate jobs require Docker with the pinned Garage image, `/usr/bin/chromium`
-and a Playwright client. The coordinator verifies them against an owned fixture;
-the workflow was **not executed on GitHub by this change**, so no green
-candidate-release run or release certification is claimed here. The recorded
-state is: workflow/script YAML and bash syntax validated, the owned-fixture
-cleanup guards covered by `tests/test_owned_garage_fixture.py`, the Git LFS
-archive layout/checksum path covered by `tests/test_install_git_lfs.py`, and the
-manifest contract covered by `tests/test_native_report_manifest.py`. Those are
-local unit/syntax checks only; no Docker fixture, no real Git LFS download and
-no GitHub Actions run was executed.
+and a Playwright client. Dispatch run `43249639303` on `3f21678` exposed the
+container `safe.directory` / `$GITHUB_WORKSPACE` boundary, the official
+`sha256sums.asc` asset name and early-failure `OBJECT_STORE_ENV_FILE` manifest
+handling addressed on this branch; a green `candidate-release-acceptance.yml`
+run on GitHub Actions is still pending before any candidate-release pass or `#76`
+closure is claimed. Locally, workflow/script YAML and bash syntax were
+validated, the owned-fixture cleanup and startup-budget guards are covered by
+`tests/test_owned_garage_fixture.py`, the Git LFS `sha256sums.asc` and pinned
+digest checks are covered by `tests/test_install_git_lfs.py`, and the manifest
+contract is covered by `tests/test_native_report_manifest.py`.
 
 ## Limits
 
 * All candidate suites are single-host loopback runs; timings are functional,
   not scalability evidence.
 * Chromium and Playwright cannot prove cross-browser behaviour.
-* The Git LFS release tarball is pinned by version URL and verified against the
-  official release `sha256sums.txt` at run time. No expected digest was
-  fabricated or hard-coded in this change; the current environment had no
-  network access to fetch and confirm the official 3.6.1 checksum entry. The
-  step fails closed if the official checksum asset is missing, ambiguous or
-  does not match.
+* The Git LFS 3.6.1 release tarball (`git-lfs-linux-amd64-v3.6.1.tar.gz`) is
+  verified against both the official release `sha256sums.asc` manifest entry
+  (parsed strictly inside the PGP signed message body; `gpg` cryptographic
+  signature verification is not performed) and the pinned SHA-256 digest
+  `2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76`
+  (`--expected-sha256` and `release-gate` `--require-fixture-exact`). The step
+  fails closed if the official checksum asset is missing, malformed,
+  unsigned-tailed, ambiguous or does not match.
 * Kernel sandbox/cgroup acceptance remains in
   `.github/workflows/native-kernel-acceptance.yml`; Docker-backed Garage tests do
   not exercise it. No Vault dependency is introduced.

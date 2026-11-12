@@ -268,6 +268,12 @@ jobs:
       - name: Exercise webhook fairness
         timeout-minutes: 20
         run: python3 tests/webhook_fairness.py --binary target/debug/rootyard --report test-results/webhook-fairness.json
+      - name: Exercise webhook delivery sequence allocation and cursor pagination
+        timeout-minutes: 5
+        run: python3 tests/webhook_pagination.py --binary target/debug/rootyard --report test-results/webhook-pagination.json
+      - name: Exercise no-hook Pull Request ref reconciliation
+        timeout-minutes: 10
+        run: python3 tests/webhook_pr_sync.py --binary target/debug/rootyard --report test-results/webhook-pr-sync.json
       - name: Exercise repository collaborators, teams, 5-role RBAC, and audit log
         run: python3 tests/members.py --binary target/debug/rootyard --report test-results/members.json
       - name: Exercise organization and member pagination against real PostgreSQL
@@ -278,11 +284,17 @@ jobs:
       - name: Exercise web detail pagination against real PostgreSQL
         timeout-minutes: 10
         run: python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json
+      - name: Exercise browser repository-discovery pagination against real PostgreSQL
+        timeout-minutes: 5
+        run: python3 tests/web_repository_pagination.py --binary target/debug/rootyard --report test-results/web-repository-pagination.json
       - name: Exercise real browser sessions, CSRF, expiry and revocation
         timeout-minutes: 10
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
         run: python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
+      - name: Exercise structured worker-operation diagnostics isolation
+        timeout-minutes: 5
+        run: python3 tests/worker_diagnostics.py --binary target/debug/rootyard --report test-results/worker-diagnostics.json
       - name: Exercise sharded control-plane placement, lease/epoch fencing, and explicit refusal of unmeasured failover, rebalance and DR
         run: python3 tests/sharding.py --binary target/debug/rootyard --report test-results/sharding.json
       - name: Exercise shard marker transition crash/rollback and restart reconciliation
@@ -302,11 +314,15 @@ jobs:
             --report metrics=test-results/metrics.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
             --report webhook_fairness=test-results/webhook-fairness.json \
+            --report webhook_pagination=test-results/webhook-pagination.json \
+            --report webhook_pr_sync=test-results/webhook-pr-sync.json \
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
             --report workspace_capture=test-results/workspace-capture.json \
             --report repository_pagination=test-results/repository-pagination.json \
             --report organization_pagination=test-results/organization-pagination.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
+            --report web_repository_pagination=test-results/web-repository-pagination.json \
+            --report worker_diagnostics=test-results/worker-diagnostics.json \
             --report webhooks=test-results/webhooks.json \
             --report browse=test-results/browse.json \
             --report shard_marker_transitions=test-results/shard-marker-transitions.json \
@@ -345,7 +361,11 @@ jobs:
             --harness tests/repository_pagination.py \
             --harness tests/organization_pagination.py \
             --harness tests/web_detail_pagination.py \
+            --harness tests/web_repository_pagination.py \
+            --harness tests/worker_diagnostics.py \
             --harness tests/webhooks.py \
+            --harness tests/webhook_pagination.py \
+            --harness tests/webhook_pr_sync.py \
             --harness tests/cluster_migration_phases_native.py \
             --harness tests/webhook_tenant_matrix.py \
             --harness tests/browse.py \
@@ -382,6 +402,7 @@ jobs:
             target/debug/rootyard.build.json
             test-results/ci-webhook-regressions.log
             test-results/evidence/*.jsonl
+            test-results/*-evidence/*.jsonl
             test-results/ci-native-tools/provenance.json
           if-no-files-found: ignore
 

@@ -31,6 +31,7 @@ env:
   GARAGE_IMAGE_DIGEST: sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a
   PLAYWRIGHT_VERSION: "1.49.0"
   GIT_LFS_VERSION: "3.6.1"
+  GIT_LFS_TARBALL_SHA256: "2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76"
 
 concurrency:
   group: candidate-release-${{ github.run_id }}
@@ -54,15 +55,40 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U rootyard -d rootyard_candidate"
           --health-interval 5s --health-timeout 5s --health-retries 12
+    defaults:
+      run:
+        shell: bash
     env:
       ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard:rootyard-ci-only@postgres:5432/rootyard_candidate
-      ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/candidate/browser/evidence
       ROOTYARD_SOURCE_COMMIT: ${{ github.sha }}
     steps:
       - name: Checkout the dispatched candidate commit without persisted credentials
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Configure container workspace environment and Git safe directory
+        run: |
+          set -euo pipefail
+          test -d "$GITHUB_WORKSPACE/.git"
+          workspace=$(cd "$GITHUB_WORKSPACE" && pwd -P)
+          # Inside a container job, ${{ github.workspace }} in job-level env evaluates
+          # to the host runner path (/home/runner/work/...) rather than the mounted
+          # container workspace ($GITHUB_WORKSPACE = /__w/...), and the bind-mounted
+          # checkout is owned by the host runner UID while container steps run as UID 0.
+          # Export GIT_CONFIG_COUNT/KEY_*/VALUE_* so safe.directory survives harnesses
+          # that set GIT_CONFIG_NOSYSTEM=1 and GIT_CONFIG_GLOBAL=/dev/null.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if [ "$workspace" != "$GITHUB_WORKSPACE" ]; then
+            git config --global --add safe.directory "$workspace"
+          fi
+          {
+            echo "ROOTYARD_TEST_EVIDENCE_DIR=$workspace/test-results/candidate/browser/evidence"
+            echo "GIT_CONFIG_COUNT=2"
+            echo "GIT_CONFIG_KEY_0=safe.directory"
+            echo "GIT_CONFIG_VALUE_0=$GITHUB_WORKSPACE"
+            echo "GIT_CONFIG_KEY_1=safe.directory"
+            echo "GIT_CONFIG_VALUE_1=$workspace"
+          } >>"$GITHUB_ENV"
       - name: Install pinned Rust 1.99.1 gate tools
         run: |
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -73,10 +99,13 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates chromium git openssl postgresql-17 postgresql-client-17 \
-            python3 python3-venv
+            ca-certificates chromium fonts-liberation g++ gcc git libc6-dev \
+            libssl-dev make openssl pkg-config postgresql-17 postgresql-client-17 \
+            python3 python3-venv zlib1g-dev
+          echo "/usr/lib/postgresql/17/bin" >>"$GITHUB_PATH"
           test -x /usr/bin/chromium
           /usr/bin/chromium --version
+          git --version
       - name: Install pinned Playwright client against the system Chromium
         timeout-minutes: 10
         run: |
@@ -91,7 +120,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
           mkdir -p test-results/candidate/browser
-          python3 scripts/build_native.py --features pando-lab
+          python3 scripts/build_native.py --features pando-lab --package-debug 0 --strip-debuginfo
           test "$(target/debug/rootyard --rootyard-hook-self-check)" = rootyard-hook-v1
           cp target/debug/rootyard.build.json test-results/candidate/browser/rootyard.build.json
       - name: Exercise real Chromium sign-in, Issue/PR workflow and session revocation
@@ -105,19 +134,28 @@ jobs:
       - name: Bind the browser report to the built binary
         if: always()
         run: |
+          set -euo pipefail
+          playwright_version=$(test-results/tools/playwright-venv/bin/python -c 'import importlib.metadata; print(importlib.metadata.version("playwright"))' 2>/dev/null || true)
+          chromium_version=$(/usr/bin/chromium --version 2>/dev/null || true)
+          postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version' 2>/dev/null || true)
+          postgres_client_version=$(psql --version 2>/dev/null || true)
+          rust_version=$(rustc -V 2>/dev/null || true)
           python3 scripts/native_report_manifest.py --mode job \
             --manifest-out test-results/candidate/browser/native-job-manifest.json \
             --build-receipt test-results/candidate/browser/rootyard.build.json \
             --binary target/debug/rootyard \
             --report browser_ui=test-results/candidate/browser/browser-ui.json \
+            --require-case browser_ui=chromium_browser_workflow \
             --log browser_ui=test-results/candidate/browser/browser-ui.log \
             --harness tests/browser_ui.py \
             --harness tests/web_sessions.py \
-            --fixture "playwright_version=$(test-results/tools/playwright-venv/bin/python -c 'import importlib.metadata; print(importlib.metadata.version("playwright"))')" \
-            --fixture "chromium_version=$(/usr/bin/chromium --version)" \
-            --fixture "postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version')" \
-            --fixture "postgres_client_version=$(psql --version)" \
-            --fixture "rust=$(rustc -V)"
+            --harness tests/e2e.py \
+            --harness tests/native_evidence.py \
+            --fixture "playwright_version=$playwright_version" \
+            --fixture "chromium_version=$chromium_version" \
+            --fixture "postgres_server_version=$postgres_server_version" \
+            --fixture "postgres_client_version=$postgres_client_version" \
+            --fixture "rust=$rust_version"
       - name: Upload browser candidate evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -161,7 +199,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ca-certificates curl gcc git gnupg libc6-dev openssl python3 util-linux
+            ca-certificates curl g++ gcc git gnupg libc6-dev libssl-dev make \
+            openssl pkg-config python3 util-linux zlib1g-dev
           sudo install -d -m 0755 /etc/apt/keyrings
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
@@ -183,6 +222,7 @@ jobs:
             --version "$GIT_LFS_VERSION" \
             --destination "$RUNNER_TEMP/bin" \
             --work "$RUNNER_TEMP/git-lfs" \
+            --expected-sha256 "$GIT_LFS_TARBALL_SHA256" \
             --sha-output "$RUNNER_TEMP/git-lfs-tarball.sha256"
           echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
           PATH="$RUNNER_TEMP/bin:$PATH" git lfs version | tee "$RUNNER_TEMP/git-lfs-version.txt"
@@ -196,10 +236,11 @@ jobs:
         timeout-minutes: 25
         run: |
           set -euo pipefail
+          test "$(command -v git-lfs)" = "$RUNNER_TEMP/bin/git-lfs"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
           mkdir -p test-results/candidate/object-store
-          python3 scripts/build_native.py --features pando-lab
+          python3 scripts/build_native.py --features pando-lab --package-debug 0 --strip-debuginfo
           test "$(target/debug/rootyard --rootyard-hook-self-check)" = rootyard-hook-v1
           cp target/debug/rootyard.build.json test-results/candidate/object-store/rootyard.build.json
       - name: Start the job-owned Garage 2.1 S3 fixture
@@ -258,22 +299,29 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          test -s "${OBJECT_STORE_ENV_FILE:?}"
-          # Source the private fixture file in THIS shell: the credential scanner
-          # needs the keys generated by this job, and env does not persist across
-          # actions steps. Nothing is echoed or uploaded.
-          set -a
-          . "$OBJECT_STORE_ENV_FILE"
-          set +a
+          extra_args=()
+          if [ -n "${OBJECT_STORE_ENV_FILE:-}" ] && [ -s "$OBJECT_STORE_ENV_FILE" ]; then
+            # Source the private fixture file in THIS shell: the credential scanner
+            # needs the keys generated by this job, and env does not persist across
+            # actions steps. Nothing is echoed or uploaded.
+            set -a
+            . "$OBJECT_STORE_ENV_FILE"
+            set +a
+          else
+            extra_args+=(--fixture "object_store_env=")
+          fi
           garage_json="$RUNNER_TEMP/owned-garage/fixture/garage-image.json"
-          garage_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$garage_json")
-          garage_version_line=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version_line"])' "$garage_json")
-          garage_image=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"])' "$garage_json")
-          garage_image_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_id"])' "$garage_json")
-          garage_image_digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_digest"])' "$garage_json")
-          git_lfs_version=$(sed -n 's#^git-lfs/\([0-9][0-9.]*\).*#\1#p' "$RUNNER_TEMP/git-lfs-version.txt")
-          git_lfs_sha256=$(cat "$RUNNER_TEMP/git-lfs-tarball.sha256")
-          postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version')
+          garage_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$garage_json" 2>/dev/null || true)
+          garage_version_line=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version_line"])' "$garage_json" 2>/dev/null || true)
+          garage_image=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"])' "$garage_json" 2>/dev/null || true)
+          garage_image_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_id"])' "$garage_json" 2>/dev/null || true)
+          garage_image_digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_digest"])' "$garage_json" 2>/dev/null || true)
+          git_lfs_version=$(sed -n 's#^git-lfs/\([0-9][0-9.]*\).*#\1#p' "$RUNNER_TEMP/git-lfs-version.txt" 2>/dev/null || true)
+          git_lfs_output=$(cat "$RUNNER_TEMP/git-lfs-version.txt" 2>/dev/null || true)
+          git_lfs_sha256=$(cat "$RUNNER_TEMP/git-lfs-tarball.sha256" 2>/dev/null || true)
+          postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version' 2>/dev/null || true)
+          postgres_client_version=$(psql --version 2>/dev/null || true)
+          rust_version=$(rustc -V 2>/dev/null || true)
           python3 scripts/native_report_manifest.py --mode job \
             --manifest-out test-results/candidate/object-store/native-job-manifest.json \
             --build-receipt test-results/candidate/object-store/rootyard.build.json \
@@ -287,17 +335,24 @@ jobs:
             --harness tests/lfs_hydration_concurrency.py \
             --harness tests/lfs_remote.py \
             --harness tests/lfs_retention_acceptance.py \
+            --harness tests/lfs.py \
+            --harness tests/e2e.py \
+            --harness tests/native_evidence.py \
+            --harness scripts/install_git_lfs.sh \
+            --harness scripts/owned_garage_fixture.sh \
+            --harness scripts/owned_object_store_env.py \
             --fixture "garage_version=$garage_version" \
             --fixture "garage_version_output=$garage_version_line" \
             --fixture "garage_image=$garage_image" \
             --fixture "garage_image_id=$garage_image_id" \
             --fixture "garage_image_digest=$garage_image_digest" \
             --fixture "git_lfs_version=$git_lfs_version" \
-            --fixture "git_lfs_output=$(cat "$RUNNER_TEMP/git-lfs-version.txt")" \
+            --fixture "git_lfs_output=$git_lfs_output" \
             --fixture "git_lfs_tarball_sha256=$git_lfs_sha256" \
             --fixture "postgres_server_version=$postgres_server_version" \
-            --fixture "postgres_client_version=$(psql --version)" \
-            --fixture "rust=$(rustc -V)"
+            --fixture "postgres_client_version=$postgres_client_version" \
+            --fixture "rust=$rust_version" \
+            "${extra_args[@]}"
       - name: Remove the owned fixture and private environment file
         if: always()
         run: |
@@ -361,6 +416,7 @@ jobs:
             --require-fixture-exact garage_version=2.1.0 \
             --require-fixture-exact garage_image_digest=sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a \
             --require-fixture-exact git_lfs_version=3.6.1 \
+            --require-fixture-exact "git_lfs_tarball_sha256=$GIT_LFS_TARBALL_SHA256" \
             --require-fixture-exact playwright_version=1.49.0 \
             --require-fixture chromium_version=Chromium
       - name: Upload candidate release gate manifest
