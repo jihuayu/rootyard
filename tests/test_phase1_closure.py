@@ -111,7 +111,8 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         expected_commands = (
             "python3 tests/pulls.py --binary target/debug/rootyard --report test-results/pulls.json",
             "python3 tests/backup_pulls.py --binary target/debug/rootyard --report test-results/backup-pulls.json",
-            "python3 tests/browse.py --binary target/debug/rootyard --report test-results/browse.json",
+            'python3 tests/browse.py --mixed-refs --git "$(command -v git)" '
+            "--binary target/debug/rootyard --report test-results/browse.json",
             "python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json",
             "python3 tests/ci_mirror.py --binary target/debug/rootyard --report test-results/ci-mirror.json",
             "python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json",
@@ -152,10 +153,15 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
             "--report browse=test-results/browse.json",
             "--harness tests/browse.py",
             "--harness tests/browse_ref_scale.py",
+            "--harness tests/mixed_ref_cases.py",
+            "--harness tests/mixed_ref_support.py",
+            "--harness tests/refusal_audit_sql.py",
             "--require-case browse=protected_writes_and_ref_ack_failure",
             "--require-case browse=ref_transaction_settlement_recovery",
             "--require-case browse=ref_transaction_crash_recovery",
             "--require-case browse=ref_scale_complete_traversal",
+            "--require-case browse=mixed_protected_unprotected_atomic_push",
+            "--require-case browse=mixed_protected_unprotected_ref_transaction",
         ):
             self.assertIn(argument, manifest_step)
         # One Browse report and harness entry; the scale helper is the only

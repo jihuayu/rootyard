@@ -228,6 +228,25 @@ class TestJobManifest(unittest.TestCase):
         self.assertEqual(sorted(manifest["reports"]), ["web_sessions"])
         self.assertEqual(manifest["logs"]["webhook_regressions"]["bytes"], len(self.fixture.log().read_bytes()))
 
+    def test_accepts_browse_report_bound_to_the_source_head(self):
+        report = self.fixture.report(name="browse", source_head=self.fixture.commit)
+        manifest = json.loads(self.fixture.job(reports={"browse": report}).read_text())
+        self.assertEqual(manifest["status"], "passed")
+        self.assertEqual(manifest["reports"]["browse"]["case_names"], ["workflow"])
+
+    def test_rejects_browse_report_without_a_source_head(self):
+        report = self.fixture.report(name="browse")
+        self.fixture.job(reports={"browse": report}, expect=1)
+        self.assertIn("source_head is required", self.fixture.last_process.stderr)
+        failed = json.loads((self.fixture.root / "manifests/job.json").read_text())
+        self.assertEqual(failed["status"], "failed")
+
+    def test_rejects_browse_report_from_another_source_head(self):
+        report = self.fixture.report(name="browse", source_head="d" * 40)
+        self.fixture.job(reports={"browse": report}, expect=1)
+        self.assertIn("source_head is required", self.fixture.last_process.stderr)
+        self.assertIn("d" * 40, self.fixture.last_process.stderr)
+
     def test_accepts_and_records_batch_manifest_provenance(self):
         batch_path = self.fixture.enable_batch_receipt()
         job = json.loads(self.fixture.job().read_text(encoding="utf-8"))

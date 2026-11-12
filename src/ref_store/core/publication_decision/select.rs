@@ -67,6 +67,19 @@ fn rule_for<'a>(policy: &'a RepoPolicyFacts, name: &str) -> Option<&'a BranchRul
     policy.rules.iter().find(|rule| rule.branch_ref == name)
 }
 
+/// The protected-tip flags that also forbid deleting the branch. Deleting and
+/// recreating the tip would bypass them, so only a rule with every protection
+/// disabled may delete.
+fn deletion_reject_code(rule: &BranchRuleFacts) -> Option<DecisionRejectCode> {
+    if rule.prevent_deletion {
+        Some(DecisionRejectCode::ProtectedBranch)
+    } else if rule.require_fast_forward || rule.prevent_force_push {
+        Some(DecisionRejectCode::ForcePushDenied)
+    } else {
+        None
+    }
+}
+
 fn deny(
     name: &crate::ref_store::core::types::RefName,
     code: DecisionRejectCode,
@@ -126,8 +139,8 @@ fn evaluate(
         return Ok(None);
     };
     if deleting {
-        if rule.prevent_deletion {
-            return Ok(Some(DecisionRejectCode::ProtectedBranch));
+        if let Some(code) = deletion_reject_code(rule) {
+            return Ok(Some(code));
         }
         return Ok(None);
     }
@@ -288,4 +301,31 @@ pub(super) fn policy_verdicts(input: &SelectionInput<'_>) -> Result<SelectionOut
         }
     }
     Ok(SelectionOutcome { policy })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(prevent_deletion: bool, require_fast_forward: bool, prevent_force_push: bool) -> BranchRuleFacts {
+        BranchRuleFacts {
+            branch_ref: "refs/heads/main".into(),
+            required_approvals: 0,
+            required_checks: Vec::new(),
+            require_fast_forward,
+            prevent_deletion,
+            prevent_force_push,
+            prevent_self_approval: false,
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn deletion_is_denied_by_every_protected_tip_flag() {
+        assert_eq!(deletion_reject_code(&rule(true, false, false)), Some(DecisionRejectCode::ProtectedBranch));
+        assert_eq!(deletion_reject_code(&rule(false, true, false)), Some(DecisionRejectCode::ForcePushDenied));
+        assert_eq!(deletion_reject_code(&rule(false, false, true)), Some(DecisionRejectCode::ForcePushDenied));
+        assert_eq!(deletion_reject_code(&rule(false, true, true)), Some(DecisionRejectCode::ForcePushDenied));
+        assert_eq!(deletion_reject_code(&rule(false, false, false)), None);
+    }
 }
