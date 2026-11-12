@@ -1,4 +1,6 @@
 //! Persistent, repository-authorized native workspaces.
+#[path = "workspaces/blocking.rs"]
+mod blocking;
 #[path = "workspaces/capture.rs"]
 pub mod capture;
 #[path = "workspaces/checkpoints.rs"]

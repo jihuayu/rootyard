@@ -6,14 +6,11 @@
 //! 3. a short `FOR UPDATE` transaction that revalidates host, lease epoch and
 //!    revision, then commits the fingerprint, revision bump and event together.
 //!
-//! API mutations retain the established synchronous `record_current` baseline:
-//! it runs inside their existing workspace-lock transaction so their revision
-//! and capture baseline are never split across commits. A pending-marker scheme
-//! that recorded the baseline after the API commit was rejected: it could adopt
-//! a racing native edit as the API baseline, or replay the API write as a
-//! spurious external capture when the deferred baseline failed. Removing the
-//! remaining API-side hash is a follow-up; the long background scan is already
-//! off-thread and out of the transaction.
+//! API mutations (`create`, `restore`, `files::put`, `files::git`) compute
+//! their post-write baseline off-thread on the bounded workspace I/O bulkhead
+//! outside any PostgreSQL transaction, then persist the pre-computed
+//! fingerprint atomically with the workspace revision in their short commit
+//! transaction while fencing concurrent background scans via [`super::blocking`].
 use super::{scan, service};
 use crate::{
     AppState, Error,
@@ -54,16 +51,13 @@ fn scan_is_current(expected_revision: i64, expected_epoch: i64, revision: i64, e
     revision == expected_revision && epoch == expected_epoch
 }
 
-/// API mutations record the exact post-write fingerprint in their transaction.
-/// This preserves the original revision/event contract: a subsequent scan must
-/// not report the API write as an external edit, and it must still detect a
-/// genuinely later native edit.
-pub async fn record_current(tx: &deadpool_postgres::Transaction<'_>, state: &AppState, id: Uuid) -> Result<(), Error> {
-    record_current_at(tx, id, &service::workspace_repo(state, id)).await
-}
-
-pub async fn record_current_at(tx: &deadpool_postgres::Transaction<'_>, id: Uuid, path: &Path) -> Result<(), Error> {
-    let value = fingerprint(path)?;
+/// Persist a pre-computed post-mutation fingerprint inside the caller's short
+/// commit transaction without performing any filesystem I/O while locks are held.
+pub(super) async fn record_fingerprint(
+    tx: &deadpool_postgres::Transaction<'_>,
+    id: Uuid,
+    value: &str,
+) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO workspace_capture_state(workspace_id,fingerprint) VALUES($1,$2) \
          ON CONFLICT(workspace_id) DO UPDATE SET fingerprint=$2,scanned_at=clock_timestamp()",
@@ -107,6 +101,9 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
     if !super::mounts::mounted(id) {
         return Ok(false);
     }
+    let Some(scan_token) = super::blocking::begin_scan(id) else {
+        return Ok(false);
+    };
     let Some((expected_revision, expected_epoch)) = eligible(state, id).await? else {
         return Ok(false);
     };
@@ -156,9 +153,9 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
     };
     let revision: i64 = row.get(0);
     let epoch: i64 = row.get(1);
-    // A stale scan must never overwrite a newer API edit, checkpoint or lease
-    // handoff. Discarding the result is safe: the next round scans current bytes.
-    if !scan_is_current(expected_revision, expected_epoch, revision, epoch) {
+    // A stale scan or any scan overlapping an in-process API mutation must
+    // never overwrite a newer API edit, checkpoint or lease handoff.
+    if !scan_is_current(expected_revision, expected_epoch, revision, epoch) || !scan_token.is_unchanged() {
         return Ok(false);
     }
     let previous = tx

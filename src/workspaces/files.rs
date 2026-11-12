@@ -9,21 +9,25 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use deadpool_postgres::Transaction;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
+    io::{Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
+const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+
 fn safe_path(raw: &str) -> Result<PathBuf, Error> {
     Ok(PathBuf::from(crate::browse::models::normalize_rel_path(Some(raw))?))
 }
+
 fn safe_file(repo: &FsPath, raw: &str) -> Result<PathBuf, Error> {
     let rel = safe_path(raw)?;
     if rel.as_os_str().is_empty() {
@@ -41,22 +45,79 @@ fn safe_file(repo: &FsPath, raw: &str) -> Result<PathBuf, Error> {
     }
     Ok(path)
 }
-fn atomic_put(path: &FsPath, bytes: &[u8]) -> Result<(), Error> {
+
+fn read_working_bounded(repo: &FsPath, raw: &str) -> Result<Vec<u8>, Error> {
+    let path = safe_file(repo, raw)?;
+    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound { Error::not_found() } else { Error::internal(error) }
+    })?;
+    let meta = file.metadata().map_err(Error::internal)?;
+    if !meta.is_file() {
+        return Err(Error::bad_request());
+    }
+    if meta.len() > MAX_FILE_BYTES as u64 {
+        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "file too large"));
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(Error::internal)?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "file too large"));
+    }
+    Ok(bytes)
+}
+
+fn atomic_put(path: &FsPath, bytes: &[u8], mode: u32) -> Result<(), Error> {
     let parent = path.parent().ok_or_else(Error::bad_request)?;
     fs::create_dir_all(parent).map_err(Error::internal)?;
     let tmp = parent.join(format!(".rootyard-{}", Uuid::new_v4()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(mode & 0o777)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)
         .map_err(Error::internal)?;
     file.write_all(bytes).map_err(Error::internal)?;
+    file.set_permissions(fs::Permissions::from_mode(mode & 0o777)).map_err(Error::internal)?;
     file.sync_all().map_err(Error::internal)?;
     drop(file);
     fs::rename(&tmp, path).map_err(Error::internal)?;
     File::open(parent).and_then(|d| d.sync_all()).map_err(Error::internal)?;
+    Ok(())
+}
+
+async fn check_idempotency(tx: &Transaction<'_>, id: Uuid, key: &str, hash: &str) -> Result<Option<Value>, Error> {
+    let Some(row) = tx
+        .query_opt(
+            "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
+            &[&id, &key],
+        )
+        .await
+        .map_err(Error::internal)?
+    else {
+        return Ok(None);
+    };
+    if row.get::<_, String>(0) != hash {
+        return Err(service::conflict());
+    }
+    if row.get::<_, String>(1) == "committed" {
+        return Ok(Some(row.get(2)));
+    }
+    Err(service::conflict())
+}
+
+async fn check_lease_live(tx: &Transaction<'_>, id: Uuid, volume_id: Uuid, lease_epoch: i64) -> Result<(), Error> {
+    let lease_ok: bool = tx
+        .query_one(
+            "SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1",
+            &[&id, &volume_id, &lease_epoch],
+        )
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    if !lease_ok {
+        return Err(service::conflict());
+    }
     Ok(())
 }
 
@@ -72,16 +133,14 @@ pub async fn get(
     let rel = safe_path(&query.path)?;
     let raw = match query.view.as_deref().unwrap_or("working") {
         "working" => {
-            let path = safe_file(&repo, &query.path)?;
-            fs::read(path).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound { Error::not_found() } else { Error::internal(error) }
-            })?
+            let path_arg = query.path.clone();
+            super::blocking::run(move || read_working_bounded(&repo, &path_arg)).await?
         }
-        "head" => service::git(&state, &repo, &["show", &format!("HEAD:{}", rel.display())], 4 * 1024 * 1024).await?,
-        "index" => service::git(&state, &repo, &["show", &format!(":{}", rel.display())], 4 * 1024 * 1024).await?,
+        "head" => service::git(&state, &repo, &["show", &format!("HEAD:{}", rel.display())], MAX_FILE_BYTES).await?,
+        "index" => service::git(&state, &repo, &["show", &format!(":{}", rel.display())], MAX_FILE_BYTES).await?,
         _ => return Err(Error::bad_request()),
     };
-    if raw.len() > 4 * 1024 * 1024 {
+    if raw.len() > MAX_FILE_BYTES {
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "file too large"));
     }
     let client = state.pool.get().await.map_err(Error::internal)?;
@@ -91,9 +150,16 @@ pub async fn get(
         .map_err(Error::internal)?
         .map(|r| r.get(0))
         .unwrap_or(0);
-    Ok(Json(
-        json!({"path":query.path,"view":query.view.unwrap_or_else(||"working".into()),"content_base64":STANDARD.encode(&raw),"sha256":hex::encode(Sha256::digest(&raw)),"entry_version":version,"workspace_revision":ws.revision,"captured":false,"durability":"live_local"}),
-    ))
+    Ok(Json(json!({
+        "path": query.path,
+        "view": query.view.unwrap_or_else(|| "working".into()),
+        "content_base64": STANDARD.encode(&raw),
+        "sha256": hex::encode(Sha256::digest(&raw)),
+        "entry_version": version,
+        "workspace_revision": ws.revision,
+        "captured": false,
+        "durability": "live_local"
+    })))
 }
 
 pub async fn put(
@@ -107,14 +173,38 @@ pub async fn put(
         return Err(Error::bad_request());
     }
     let bytes = STANDARD.decode(&input.content_base64).map_err(|_| Error::bad_request())?;
-    if bytes.len() > 4 * 1024 * 1024 {
+    if bytes.len() > MAX_FILE_BYTES {
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "file too large"));
     }
+    let permit = super::blocking::try_put_slot()?;
+    let job = PutJob { raw_path: query.path, bytes, input };
+    let response = super::git::spawn_job(put_mutation(state, headers, id, job, permit));
+    match response.await {
+        Ok(result) => result.map(Json),
+        Err(_) => Err(Error::internal("owned workspace write job ended without a result")),
+    }
+}
+
+struct PutJob {
+    raw_path: String,
+    bytes: Vec<u8>,
+    input: FilePut,
+}
+
+async fn put_mutation(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    id: Uuid,
+    job: PutJob,
+    permit: OwnedSemaphorePermit,
+) -> Result<Value, Error> {
+    let _permit = permit;
+    let PutJob { raw_path, bytes, input } = job;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     let hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&(
-            &query.path,
+            &raw_path,
             &input.content_base64,
             input.expected_entry_version,
             input.expected_workspace_revision,
@@ -122,39 +212,93 @@ pub async fn put(
         ))
         .map_err(Error::internal)?,
     ));
+    let _mutation = super::blocking::lock_mutation(id, super::blocking::io_timeout()).await?;
+
+    // Phase 1: short pre-check transaction without holding DB locks across disk work.
+    {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let ws =
+            service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
+        if let Some(replayed) = check_idempotency(&tx, id, &key, &hash).await? {
+            tx.commit().await.map_err(Error::internal)?;
+            return Ok(replayed);
+        }
+        check_lease_live(&tx, id, state.storage.volume_id, input.lease_epoch).await?;
+        if ws.revision != input.expected_workspace_revision {
+            return Err(service::conflict());
+        }
+        let prior: i64 = tx
+            .query_opt(
+                "SELECT entry_version FROM workspace_entries WHERE workspace_id=$1 AND path=$2",
+                &[&id, &raw_path],
+            )
+            .await
+            .map_err(Error::internal)?
+            .map(|r| r.get(0))
+            .unwrap_or(0);
+        if prior != input.expected_entry_version {
+            return Err(service::conflict());
+        }
+        tx.commit().await.map_err(Error::internal)?;
+    }
+
+    // Phase 2: bounded off-thread atomic file write and post-write baseline fingerprint.
+    let repo = service::workspace_repo(&state, id);
+    let path_arg = raw_path.clone();
+    let direct_mode = !super::mounts::enabled();
+    let (digest, scanned) = super::blocking::run(move || {
+        let path = safe_file(&repo, &path_arg)?;
+        let backup = if direct_mode && path.exists() {
+            let meta = fs::symlink_metadata(&path).map_err(Error::internal)?;
+            if meta.is_file() && meta.len() <= crate::workspace_lab::core::MAX_BYTES {
+                Some((fs::read(&path).map_err(Error::internal)?, meta.permissions().mode() & 0o777))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let existed = direct_mode && path.exists();
+        atomic_put(&path, &bytes, 0o600)?;
+        let scanned = match super::capture::fingerprint(&repo) {
+            Ok(fp) => fp,
+            Err(error) => {
+                if direct_mode {
+                    match backup {
+                        Some((old_bytes, old_mode)) => {
+                            let _ = atomic_put(&path, &old_bytes, old_mode);
+                        }
+                        None if !existed => {
+                            let _ = fs::remove_file(&path);
+                        }
+                        None => {}
+                    }
+                }
+                return Err(error);
+            }
+        };
+        Ok((hex::encode(Sha256::digest(&bytes)), scanned))
+    })
+    .await?;
+
+    // Phase 3: short FOR UPDATE commit transaction with zero filesystem I/O.
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let ws = service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
-    if let Some(row) = tx
-        .query_opt(
-            "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
-            &[&id, &key],
-        )
-        .await
-        .map_err(Error::internal)?
-    {
-        let old: String = row.get(0);
-        if old != hash {
-            return Err(service::conflict());
-        }
-        if row.get::<_, String>(1) == "committed" {
-            return Ok(Json(row.get(2)));
-        }
-        return Err(service::conflict());
+    if let Some(replayed) = check_idempotency(&tx, id, &key, &hash).await? {
+        tx.commit().await.map_err(Error::internal)?;
+        return Ok(replayed);
     }
-    let lease_ok: bool = tx
-        .query_one(
-            "SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1",
-            &[&id, &state.storage.volume_id, &input.lease_epoch],
-        )
-        .await
-        .map_err(Error::internal)?
-        .get(0);
-    if !lease_ok || ws.revision != input.expected_workspace_revision {
+    check_lease_live(&tx, id, state.storage.volume_id, input.lease_epoch).await?;
+    if ws.revision != input.expected_workspace_revision {
         return Err(service::conflict());
     }
     let prior: i64 = tx
-        .query_opt("SELECT entry_version FROM workspace_entries WHERE workspace_id=$1 AND path=$2", &[&id, &query.path])
+        .query_opt(
+            "SELECT entry_version FROM workspace_entries WHERE workspace_id=$1 AND path=$2 FOR UPDATE",
+            &[&id, &raw_path],
+        )
         .await
         .map_err(Error::internal)?
         .map(|r| r.get(0))
@@ -162,13 +306,22 @@ pub async fn put(
     if prior != input.expected_entry_version {
         return Err(service::conflict());
     }
-    let path = safe_file(&service::workspace_repo(&state, id), &query.path)?;
-    atomic_put(&path, &bytes)?;
-    let digest = hex::encode(Sha256::digest(&bytes));
     let version = prior + 1;
-    tx.execute("INSERT INTO workspace_entries(workspace_id,path,entry_version,digest) VALUES($1,$2,$3,$4) ON CONFLICT(workspace_id,path) DO UPDATE SET entry_version=$3,digest=$4,deleted=false", &[&id,&query.path,&version,&digest]).await.map_err(Error::internal)?;
+    tx.execute(
+        "INSERT INTO workspace_entries(workspace_id,path,entry_version,digest) VALUES($1,$2,$3,$4) \
+         ON CONFLICT(workspace_id,path) DO UPDATE SET entry_version=$3,digest=$4,deleted=false",
+        &[&id, &raw_path, &version, &digest],
+    )
+    .await
+    .map_err(Error::internal)?;
     let revision = ws.revision + 1;
-    let result = json!({"path":query.path,"entry_version":version,"workspace_revision":revision,"sha256":digest,"lease_epoch":input.lease_epoch});
+    let result = json!({
+        "path": raw_path,
+        "entry_version": version,
+        "workspace_revision": revision,
+        "sha256": digest,
+        "lease_epoch": input.lease_epoch
+    });
     tx.execute(
         "UPDATE workspaces SET revision=$2,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1",
         &[&id, &revision],
@@ -181,40 +334,32 @@ pub async fn put(
     )
     .await
     .map_err(Error::internal)?;
-    tx.execute("INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) VALUES($1,$2,$3,$4,'file_put','committed',$5)", &[&Uuid::new_v4(),&id,&key,&hash,&result]).await.map_err(Error::internal)?;
-    super::capture::record_current(&tx, &state, id).await?;
+    tx.execute(
+        "INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) \
+         VALUES($1,$2,$3,$4,'file_put','committed',$5)",
+        &[&Uuid::new_v4(), &id, &key, &hash, &result],
+    )
+    .await
+    .map_err(Error::internal)?;
+    super::capture::record_fingerprint(&tx, id, &scanned).await?;
     tx.commit().await.map_err(Error::internal)?;
-    Ok(Json(result))
+    Ok(result)
 }
 
-/// `POST /api/workspaces/{id}/git`: reserve capacity, then hand the *entire*
-/// mutation to an owned job. A caller disconnect drops only the response
-/// future; the job keeps its permit, row lock and child process until the
-/// bounded Git deadline and commit finish. The client response is then unknown
-/// and must be retried with the same `Idempotency-Key`, which replays the
-/// committed result instead of repeating the mutation.
 pub async fn git(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
     Json(input): Json<GitAction>,
 ) -> Result<Json<Value>, Error> {
-    // Taken before the job is spawned and before any DB transaction or row
-    // lock, so a full Git capacity is a retryable 503 without side effects.
     let permit = super::git::try_slot(&state)?;
     let response = super::git::spawn_job(git_mutation(state, headers, id, input, permit));
     match response.await {
         Ok(result) => result.map(Json),
-        // The sender disappears only on panic or an aborted job; never report
-        // the mutation as failed, because Git may already have changed the index.
         Err(_) => Err(Error::internal("owned workspace Git job ended without a result")),
     }
 }
 
-/// Owned workspace Git mutation. Authentication, the DB client and transaction,
-/// the row lock, lease checks, the child process and the fingerprint/event/
-/// idempotency commit all happen here so none of them can be cancelled
-/// half-way by a disconnected client future.
 async fn git_mutation(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -235,46 +380,39 @@ async fn git_mutation(
         ))
         .map_err(Error::internal)?,
     ));
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
-    if let Some(row) = tx
-        .query_opt(
-            "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
-            &[&id, &key],
-        )
-        .await
-        .map_err(Error::internal)?
+    let _mutation = super::blocking::lock_mutation(id, state.config.git_timeout).await?;
+
+    // Phase 1: short pre-check transaction without holding DB locks across Git or FS work.
     {
-        if row.get::<_, String>(0) != request_hash {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let ws =
+            service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
+        if let Some(replayed) = check_idempotency(&tx, id, &key, &request_hash).await? {
+            tx.commit().await.map_err(Error::internal)?;
+            return Ok(replayed);
+        }
+        check_lease_live(&tx, id, state.storage.volume_id, input.lease_epoch).await?;
+        if ws.revision != input.expected_workspace_revision || ws.git_generation != input.expected_git_generation {
             return Err(service::conflict());
         }
-        if row.get::<_, String>(1) == "committed" {
-            return Ok(row.get(2));
-        }
-        return Err(service::conflict());
+        tx.commit().await.map_err(Error::internal)?;
     }
-    let lease_ok: bool = tx
-        .query_one(
-            "SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1",
-            &[&id, &state.storage.volume_id, &input.lease_epoch],
-        )
-        .await
-        .map_err(Error::internal)?
-        .get(0);
-    if !lease_ok
-        || ws.revision != input.expected_workspace_revision
-        || ws.git_generation != input.expected_git_generation
-    {
-        return Err(service::conflict());
-    }
+
     let paths = input.paths.unwrap_or_default();
     if paths.len() > 128 {
         return Err(Error::bad_request());
     }
-    for path in &paths {
-        safe_file(&service::workspace_repo(&state, id), path)?;
-    }
+    let repo = service::workspace_repo(&state, id);
+    let repo_check = repo.clone();
+    let paths_check = paths.clone();
+    super::blocking::run(move || {
+        for path in &paths_check {
+            safe_file(&repo_check, path)?;
+        }
+        Ok(())
+    })
+    .await?;
     let mut args: Vec<&str> = match input.action.as_str() {
         "add" if !paths.is_empty() => vec!["add", "--"],
         "reset" if !paths.is_empty() => vec!["reset", "HEAD", "--"],
@@ -282,20 +420,50 @@ async fn git_mutation(
     };
     args.extend(paths.iter().map(String::as_str));
     let output =
-        super::git::run_in_job(&service::workspace_repo(&state, id), &args, 64 * 1024, state.config.git_timeout)
-            .await?;
+        super::git::run_in_job_with_git(&state.config.git, &repo, &args, 64 * 1024, state.config.git_timeout).await?;
+    let repo_fp = repo.clone();
+    let scanned = super::blocking::run(move || super::capture::fingerprint(&repo_fp)).await?;
+
+    // Phase 3: short FOR UPDATE commit transaction with zero filesystem or Git work.
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let ws = service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
+    if let Some(replayed) = check_idempotency(&tx, id, &key, &request_hash).await? {
+        tx.commit().await.map_err(Error::internal)?;
+        return Ok(replayed);
+    }
+    check_lease_live(&tx, id, state.storage.volume_id, input.lease_epoch).await?;
+    if ws.revision != input.expected_workspace_revision || ws.git_generation != input.expected_git_generation {
+        return Err(service::conflict());
+    }
     let revision = ws.revision + 1;
     let generation = ws.git_generation + 1;
-    let result = json!({"action":input.action,"workspace_revision":revision,"git_generation":generation,"output_base64":STANDARD.encode(output)});
-    tx.execute("UPDATE workspaces SET revision=$2,git_generation=$3,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1", &[&id,&revision,&generation]).await.map_err(Error::internal)?;
+    let result = json!({
+        "action": input.action,
+        "workspace_revision": revision,
+        "git_generation": generation,
+        "output_base64": STANDARD.encode(output)
+    });
+    tx.execute(
+        "UPDATE workspaces SET revision=$2,git_generation=$3,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1",
+        &[&id, &revision, &generation],
+    )
+    .await
+    .map_err(Error::internal)?;
     tx.execute(
         "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'git',$3)",
         &[&id, &revision, &result],
     )
     .await
     .map_err(Error::internal)?;
-    tx.execute("INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) VALUES($1,$2,$3,$4,'git','committed',$5)", &[&Uuid::new_v4(),&id,&key,&request_hash,&result]).await.map_err(Error::internal)?;
-    super::capture::record_current(&tx, &state, id).await?;
+    tx.execute(
+        "INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) \
+         VALUES($1,$2,$3,$4,'git','committed',$5)",
+        &[&Uuid::new_v4(), &id, &key, &request_hash, &result],
+    )
+    .await
+    .map_err(Error::internal)?;
+    super::capture::record_fingerprint(&tx, id, &scanned).await?;
     tx.commit().await.map_err(Error::internal)?;
     Ok(result)
 }
