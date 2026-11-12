@@ -434,7 +434,13 @@ def job_manifest(args):
             )
         require(not data.get("failure_traceback"), f"report {name}: records a failure traceback")
         head = data.get("source_head")
-        require(head in (None, commit), f"report {name}: produced from commit {head}, expected {commit}")
+        if name == "browse":
+            require(
+                head == commit,
+                f"report {name}: source_head is required and must equal commit {commit}, got {head!r}",
+            )
+        else:
+            require(head in (None, commit), f"report {name}: produced from commit {head}, expected {commit}")
         report_records[name] = {
             "file": str(path),
             "sha256": digest(path),

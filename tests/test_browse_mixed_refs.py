@@ -1,0 +1,3522 @@
+#!/usr/bin/env python3
+"""Focused #18 oracle for the mixed protected/unprotected atomic push cases.
+
+Offline only: no binary, PostgreSQL, Git or Cargo is executed here. These pin
+the exact native case IDs, the pure ``--porcelain`` refusal parser, the wiring
+that keeps the native cases isolated in policy state, keeps the native-CAS and
+policy proofs separately attributable, makes the ref-transaction case prove a
+real stale CAS, uses one declared Git client as both client and server, and
+binds the refusal SQL to the real schema and evidence contract. They cannot
+replace the native run and never claim it passed.
+
+The queue runner (``tests/browse.py``) is deliberately not changed in this
+phase: every contract the #18 cases need from it is asserted here where the
+Phase 2 integration must satisfy it.
+"""
+import argparse
+import ast
+import base64
+import contextlib
+import json
+import io
+import inspect
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+import urllib.parse
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import browse  # noqa: E402
+import browse_ref_scale  # noqa: E402
+import mixed_ref_cases  # noqa: E402
+import mixed_ref_support  # noqa: E402
+import refusal_audit_sql  # noqa: E402
+
+BROWSE = Path(__file__).with_name("browse.py")
+CASES = Path(__file__).with_name("mixed_ref_cases.py")
+SUPPORT = Path(__file__).with_name("mixed_ref_support.py")
+SQL = Path(__file__).with_name("refusal_audit_sql.py")
+KLASS = "MixedRefPolicyCases"
+# Command words that move the checked-out fixture.  ``git`` is named explicitly
+# so a case cannot bypass the declared client; ``commit-tree`` is the one
+# allowed exception: it writes an object and moves no branch.
+MUTATING = {"git", "push", "rebase", "merge", "reset", "commit", "add", "checkout", "switch"}
+ALLOWED = {"commit-tree"}
+
+
+def git_commands(name):
+    """The command word of every ``git``/``git_as`` call in one case method.
+
+    ``git_as`` takes a token first, so its command is the constant directly
+    after it; ``git`` takes the command as its first positional argument.
+    """
+    for call in ast.walk(method(name)):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and call.func.attr in ("git", "git_as")):
+            continue
+        args = list(call.args[1:] if call.func.attr == "git_as" else call.args)
+        if args and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str):
+            yield args[0].value
+
+
+def assert_not_mutating_git(test, name):
+    """No Git command word of a case moves the checked-out fixture."""
+    # The ref-transaction case is API-only and deliberately runs no Git at all.
+    commands = list(git_commands(name))
+    for word in commands:
+        if word in MUTATING:
+            test.fail(name + " runs a mutating Git command: " + word)
+    test.assertLessEqual([word for word in commands if word in ALLOWED], ["commit-tree"], name)
+
+
+def assert_no_forked_state(test, body):
+    """The API case never forces or prunes: no second history proves a stale CAS."""
+    test.assertNotIn("--force", body)
+    test.assertNotIn("prune", body)
+
+
+def method(name, path=None):
+    for candidate in ([path] if path is not None else [CASES, SUPPORT]):
+        tree = ast.parse(candidate.read_text())
+        for klass in (n for n in tree.body
+                      if isinstance(n, ast.ClassDef) and n.name in (KLASS, "MixedRefSupport")):
+            found = next((n for n in klass.body
+                          if isinstance(n, ast.FunctionDef) and n.name == name), None)
+            if found is not None:
+                return found
+    raise LookupError("no mixed-ref method " + name)
+
+
+def source(name):
+    for path in (CASES, SUPPORT):
+        try:
+            node = method(name, path)
+        except LookupError:
+            continue
+        return ast.get_source_segment(path.read_text(), node)
+    raise LookupError("no mixed-ref method " + name)
+
+
+# A stock Git for ``ref_state`` instance tests: the pinned command, not PATH.
+MIXED_TEST_GIT = str(shutil.which("git"))
+assert MIXED_TEST_GIT, "the mixed-ref unit tests need a stock Git"
+
+# Captured before any test runs: the process-global lookup that the Git unit
+# suites temporarily replace must be restored to this exact object and result.
+ORIGINAL_SHUTIL_WHICH = shutil.which
+
+# The queue harness used by every instance-level test; the runner now builds
+# exactly this class, built here without ``Harness.__init__`` (no socket/temp DB).
+FixtureHarness = browse.BrowseHarness
+
+
+def completed(stdout, returncode=1, stderr=""):
+    return SimpleNamespace(returncode=returncode, stdout=stdout.encode(), stderr=stderr.encode())
+
+
+def source_of(path, name):
+    text = Path(path).read_text()
+    node = next(n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(text, node)
+
+
+class PushRefusalParserTest(unittest.TestCase):
+    def rejects(self, out, *refs):
+        return mixed_ref_cases.MixedRefPolicyCases.assert_push_refusals(completed(out), *refs)
+
+    def test_both_refs_rejected_by_server_is_evidence(self):
+        out = ("To http://127.0.0.1:1/git/alice/demo.git\n"
+               "!\trefs/heads/main:refs/heads/main\t[remote rejected] (non-fast-forward)\n"
+               "!\trefs/heads/mixed-topic:refs/heads/mixed-topic\t[remote rejected] (atomic push failure)\n"
+               "Done\n")
+        detail = self.rejects(out, "refs/heads/main", "refs/heads/mixed-topic")
+        self.assertEqual(set(detail["refs"]), {"refs/heads/main", "refs/heads/mixed-topic"})
+        self.assertTrue(detail["refs"]["refs/heads/mixed-topic"]["summary"].startswith("[remote rejected]"))
+
+    def test_local_rejection_is_not_server_evidence(self):
+        # A ``+`` force refspec would bypass the client's own check; a bare one
+        # is refused locally before the server ever sees it.
+        out = ("!\trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)\n"
+               "!\trefs/heads/mixed-topic:refs/heads/mixed-topic\t[rejected] (atomic push failed)\n")
+        with self.assertRaisesRegex(AssertionError, "not server-refused"):
+            self.rejects(out, "refs/heads/main", "refs/heads/mixed-topic")
+
+    def test_one_local_rejection_spoils_the_pair(self):
+        out = ("!\trefs/heads/main:refs/heads/main\t[remote rejected] (non-fast-forward)\n"
+               "!\trefs/heads/mixed-topic:refs/heads/mixed-topic\t[rejected] (atomic push failed)\n")
+        with self.assertRaisesRegex(AssertionError, "refs/heads/mixed-topic was not server-refused"):
+            self.rejects(out, "refs/heads/main", "refs/heads/mixed-topic")
+
+    def test_bang_without_remote_summary_is_not_evidence(self):
+        with self.assertRaisesRegex(AssertionError, "not server-refused"):
+            self.rejects("!\trefs/heads/main:refs/heads/main\t[nothing to push]\n", "refs/heads/main")
+
+    def test_local_up_to_date_noop_is_not_evidence(self):
+        out = ("=\trefs/heads/main:refs/heads/main\t[up to date]\n"
+               "!\trefs/heads/mixed-topic:refs/heads/mixed-topic\t[remote rejected]\n")
+        with self.assertRaisesRegex(AssertionError, "local no-op"):
+            self.rejects(out, "refs/heads/main", "refs/heads/mixed-topic")
+
+    def test_other_output_is_kept_in_the_evidence(self):
+        out = ("To http://127.0.0.1:1/git/alice/demo.git\n"
+               "error: failed to push some refs\n"
+               "!\trefs/heads/release:refs/heads/release\t[remote rejected] (deletion of the current branch prohibited)\n")
+        detail = self.rejects(out, "refs/heads/release")
+        self.assertEqual(detail["other_output"], ["To http://127.0.0.1:1/git/alice/demo.git",
+                                                  "error: failed to push some refs"])
+
+    def test_missing_status_line_is_not_evidence(self):
+        out = "!\trefs/heads/main:refs/heads/main\t[remote rejected]\n"
+        with self.assertRaisesRegex(AssertionError, "was not server-refused"):
+            self.rejects(out, "refs/heads/main", "refs/heads/mixed-topic")
+
+    def test_flags_do_not_leak_into_the_status(self):
+        blank = "\trefs/heads/mixed-topic:refs/heads/mixed-topic\t[remote rejected] (denied)\n"
+        with self.assertRaisesRegex(AssertionError, "local no-op|not refused per ref"):
+            self.rejects(blank, "refs/heads/mixed-topic")
+        star = "*\trefs/heads/main:refs/main\t[new tag]\n"
+        with self.assertRaisesRegex(AssertionError, "local no-op|not refused per ref"):
+            self.rejects(star, "refs/main")
+
+    def test_successful_push_fails_the_helper(self):
+        out = ("*\trefs/heads/main:refs/heads/main\t[new branch]\n"
+               " \trefs/heads/mixed-topic:refs/heads/mixed-topic\tdone\n")
+        with self.assertRaisesRegex(AssertionError, "not refused|not server-refused"):
+            self.rejects(out, "refs/heads/main")
+
+
+class CaseContractTest(unittest.TestCase):
+    """The exact native IDs, kept an explicit opt-in beyond the fixed inventory."""
+
+    def test_exact_case_ids(self):
+        self.assertIsInstance(mixed_ref_cases.MIXED_REF_CASES, tuple)
+        self.assertEqual(mixed_ref_cases.MIXED_REF_CASES, (
+            "mixed_protected_unprotected_atomic_push",
+            "mixed_protected_unprotected_ref_transaction"))
+        for name in mixed_ref_cases.MIXED_REF_CASES:
+            self.assertTrue(callable(getattr(mixed_ref_cases.MixedRefPolicyCases, name, None)), name)
+        # No renamed, near-miss or additional case method exists.
+        klass = next(n for n in ast.parse(CASES.read_text()).body if isinstance(n, ast.ClassDef) and n.name == KLASS)
+        defined = {n.name for n in klass.body if isinstance(n, ast.FunctionDef)}
+        for name in defined:
+            if name.startswith("mixed_") and name != "mixed_protected_unprotected_atomic_push":
+                self.assertEqual(name, "mixed_protected_unprotected_ref_transaction", name)
+
+    def test_fixed_inventory_is_untouched(self):
+        self.assertEqual(len(browse.CASE_NAMES), 17)
+        self.assertEqual(browse.CASE_NAMES[12], "ref_scale_complete_traversal")
+        self.assertEqual(browse.CASE_NAMES[-1], "ref_transaction_crash_recovery")
+        self.assertEqual(browse.CASE_NAMES.count("ref_scale_complete_traversal"), 1)
+        for deadline in ("list_commits_deadline", "compare_commits_deadline"):
+            self.assertIn(deadline, browse.CASE_NAMES)
+        for name in mixed_ref_cases.MIXED_REF_CASES:
+            self.assertNotIn(name, browse.CASE_NAMES)
+
+    def test_mixin_is_the_harness_base_and_runner_imports_the_exact_ids(self):
+        self.assertTrue(issubclass(browse.BrowseHarness, mixed_ref_cases.MixedRefPolicyCases))
+        self.assertIsInstance(object.__new__(browse.BrowseHarness), mixed_ref_cases.MixedRefPolicyCases)
+        text = BROWSE.read_text()
+        # The runner imports the exact IDs from the case module, never a copy.
+        self.assertIn("from mixed_ref_cases import MIXED_REF_CASES, MixedRefPolicyCases, "
+                      "release_git_option", text)
+        self.assertEqual(tuple(re.search(r"MIXED_REF_CASES == \((.*?)\)", text, re.S).group(0)
+                               .replace("\n", " ").split('"')[1::2]), mixed_ref_cases.MIXED_REF_CASES)
+        # The fixed inventory is exactly the pre-integration tuple, spelled out
+        # here so the check needs no history (a shallow CI checkout has none).
+        self.assertEqual(browse.CASE_NAMES, (
+            "setup_repos",
+            "refs_and_pagination",
+            "commits_and_pagination",
+            "tree_and_blob",
+            "compare_revisions",
+            "list_commits_deadline",
+            "compare_commits_deadline",
+            "ref_transactions_atomic_cas",
+            "idempotency_and_concurrency",
+            "access_and_fences",
+            "object_format_and_negotiation",
+            "bounded_ref_and_commit_pages",
+            "ref_scale_complete_traversal",
+            "selective_ref_prefix",
+            "protected_writes_and_ref_ack_failure",
+            "ref_transaction_settlement_recovery",
+            "ref_transaction_crash_recovery",
+        ))
+        now = re.search(r"CASE_NAMES = \(.*?\n\)", text, re.S).group(0)
+        literal = re.search(r"CASE_NAMES = \((.*?)\n\)", text, re.S).group(1)
+        self.assertEqual(tuple(re.findall(r'"([^"]*)"', literal)), browse.CASE_NAMES)
+
+    def test_fixed_inventory_guard_has_no_skip_path(self):
+        # The fixed-inventory guard must never degrade to a skip: a shallow
+        # CI checkout has no history, so a history-backed check that skips
+        # when absent would let a changed inventory pass silently.
+        guard = inspect.getsource(CaseContractTest.test_mixin_is_the_harness_base_and_runner_imports_the_exact_ids)
+        self.assertNotIn("".join(("skip", "Test")), guard)
+        self.assertNotIn("Skip" + "Test", guard)
+        self.assertNotIn("self." + "skip", guard)
+        self.assertNotIn("expected" + "Failure", guard)
+        self.assertNotIn("".join(("git", " show")), guard)
+        self.assertNotIn("".join(("89f4bb1", "7535bba8c9df5f0514bc3cfb050579aba")), guard)
+        # No history-backed subprocess at all: the tuple below is the whole check.
+        self.assertNotIn("subprocess", guard)
+        self.assertNotIn("HEAD:", guard)
+        self.assertIn("self.assertEqual(browse.CASE_NAMES, (", guard)
+
+    def test_queue_harness_still_supplies_every_primitive(self):
+        needed = ("args", "env", "secrets", "bare", "work", "repo", "alice", "sql", "cli", "run",
+                  "http", "document", "http_failure_detail", "redact", "_sql_literal", "git", "repo_api",
+                  "first", "second", "third", "feature_oid")
+        text = BROWSE.read_text() + (ROOT / "tests/e2e.py").read_text()
+        for name in needed:
+            self.assertIn(name, text, name)
+        bare = [line.strip() for line in text.splitlines() if line.strip().startswith("self.bare =")]
+        self.assertEqual(bare, ['self.bare = self.root / "data" / "repos" / (repo["id"] + ".git")'])
+        # The API refs share the shape the case reads (``name``/``oid``).
+        self.assertIn('assert names == ["refs/heads/feature", "refs/heads/main", "refs/tags/v1.0"], names',
+                      text)
+
+    def test_selection_is_the_fixed_inventory_then_the_two_mixed_cases(self):
+        fixed, mixed = list(browse.CASE_NAMES), list(mixed_ref_cases.MIXED_REF_CASES)
+        deadlines = ("list_commits_deadline", "compare_commits_deadline")
+        self.assertEqual(len(fixed), 17)
+        # 16 main cases (the deadline cases are part of them) + the one scale case.
+        self.assertEqual((len(fixed) - 1, fixed.count("ref_scale_complete_traversal")), (16, 1))
+        for deadline in deadlines:
+            self.assertEqual(fixed.count(deadline), 1)
+        self.assertEqual(sum(name.endswith("_deadline") for name in fixed), 2)
+        self.assertEqual(browse.selected_cases(False), fixed)
+        selected = browse.selected_cases(True)
+        self.assertEqual(len(selected), 19)
+        self.assertEqual(selected[-2:], [
+            "mixed_protected_unprotected_atomic_push",
+            "mixed_protected_unprotected_ref_transaction"])
+        self.assertEqual(selected[:-2], fixed)
+        self.assertEqual(set(selected) - set(fixed), set(mixed))
+        self.assertNotIn(True, [name in fixed for name in mixed])
+
+    def test_runner_keeps_the_fixed_assertion_before_the_opt_in(self):
+        runner = source_of(BROWSE, "execute")
+        # The original fixed-inventory assertion is kept, byte for byte, first.
+        self.assertIn("for name in CASE_NAMES:\n            harness.case(name, getattr(harness, name))", runner)
+        self.assertIn("if executed != list(CASE_NAMES):", runner)
+        self.assertLess(runner.index("if executed != list(CASE_NAMES):"),
+                        runner.index("for name in MIXED_REF_CASES:"))
+        handoff = runner.index("harness.git_handoff = harness.restore_declared_git()")
+        self.assertIn("if args.mixed_refs:\n            # Remove the fixed-suite instrumentation",
+                      runner)
+        self.assertLess(handoff, runner.index("for name in MIXED_REF_CASES:"))
+        self.assertLess(runner.index("if executed != list(CASE_NAMES):"), handoff)
+        self.assertIn("git_handoff=getattr(harness, \"git_handoff\", None)", source_of(BROWSE, "execute"))
+        self.assertIn("if completed != selected:", runner)
+        # A bare --mixed-refs is rejected before any harness is built.
+        self.assertIn('if args.mixed_refs and not (args.git or os.environ.get("ROOTYARD_GIT")):', runner)
+        self.assertLess(runner.index("if args.mixed_refs and not (args.git"),
+                        runner.index("harness = harness_type(args)"))
+        self.assertIn('raise RunnerError("--mixed-refs requires a declared --git', runner)
+        # --mixed-refs and the trusted Git option, in that order, after base args.
+        parser_source = source_of(BROWSE, "build_parser")
+        self.assertLess(parser_source.index('"--keep"'), parser_source.index('"--mixed-refs"'))
+        self.assertLess(parser_source.index('"--mixed-refs"'), parser_source.index("release_git_option(parser)"))
+        self.assertIn("release_git_option(parser)", parser_source)
+        self.assertEqual(parser_source.count("return parser"), 1)
+        self.assertIn("parse_args()", source_of(BROWSE, "main"))
+        self.assertIn("execute(args, BrowseHarness)", source_of(BROWSE, "main"))
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--keep", action="store_true")
+        parser.add_argument("--mixed-refs", action="store_true")
+        mixed_ref_cases.release_git_option(parser)
+        opts = parser.parse_args(["--mixed-refs", "--git", "/usr/bin/git"])
+        self.assertTrue(opts.mixed_refs)
+        self.assertEqual(opts.git, "/usr/bin/git")
+        self.assertFalse(parser.parse_args([]).mixed_refs)
+        self.assertIsNone(parser.parse_args([]).git)
+
+    def test_report_carries_the_fixed_record_and_the_two_results(self):
+        runner = source_of(BROWSE, "execute")
+        for field in ("case_count=len(selected)", "fixed_case_count=len(CASE_NAMES)",
+                      "fixed_cases=list(CASE_NAMES)", "selected_cases=selected",
+                      "mixed_ref_cases=list(MIXED_REF_CASES) if args.mixed_refs else []",
+                      'mixed_ref_results={item["name"]: item["status"] for item in harness.results',
+                      "git=harness.git_binding", 'git_evidence=getattr(harness, "git_evidence", None)'):
+            self.assertIn(field, runner, field)
+        self.assertIn("cases=harness.results", runner)
+
+    def test_ci_browse_step_runs_the_seventeen_case_mode(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        command = ('run: python3 tests/browse.py --mixed-refs --git "$(command -v git)" '
+                   '--binary target/debug/rootyard --report test-results/browse.json')
+        self.assertEqual(workflow.count(command), 1)
+        self.assertEqual(workflow.count("tests/browse.py"), 2,
+                         "the Browse step and its native manifest harness may reference it")
+        # Other suites keep their exact commands.
+        for untouched in ("python3 tests/pulls.py --binary target/debug/rootyard --report test-results/pulls.json",
+                          "python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json"):
+            self.assertIn("run: " + untouched, workflow)
+        if shutil.which("git"):
+            # The shell substitution yields an absolute path accepted by --git.
+            parsed = argparse.ArgumentParser()
+            mixed_ref_cases.release_git_option(parsed)
+            self.assertTrue(Path(parsed.parse_args(["--git", shutil.which("git")]).git).is_absolute())
+
+    def test_module_stays_modular(self):
+        # Refusal audit SQL/verdict live in refusal_audit_sql.py.  The module
+        # also carries the shared public-refs cursor walk used by ``ref_state``.
+        self.assertLess(len(CASES.read_text().splitlines()), 500)
+        self.assertLess(len(SUPPORT.read_text().splitlines()), 500)
+        self.assertEqual(CASES.read_text().count("def operations_after_query"), 0)
+
+    def test_reference_events_shape(self):
+        real = [{"ordinal": 1, "phase": "Aborted", "changes": []},
+                {"ordinal": 2, "phase": "Aborted", "changes": []}]
+        self.assertEqual(mixed_ref_cases.reference_events(real), real)
+        self.assertEqual(mixed_ref_cases.reference_events({"changes": []}), [{"changes": []}])
+        self.assertEqual(mixed_ref_cases.reference_events(None), [])
+
+class MixedRefWiringTest(unittest.TestCase):
+    def test_isolated_rules_is_a_context_manager(self):
+        # A bare generator here fails every native case at the first `with`.
+        self.assertTrue(hasattr(mixed_ref_cases.MixedRefPolicyCases.isolated_rules, "__wrapped__"))
+        harness = object.__new__(FixtureHarness)
+        self.assertIsInstance(harness.isolated_rules(), contextlib.AbstractContextManager)
+
+    def test_support_resolves_the_refusal_audit_helpers(self):
+        """The support module owns the audit calls, so it must bind their names."""
+        self.assertIs(mixed_ref_support.audit_git_refusal_interval,
+                      refusal_audit_sql.audit_git_refusal_interval)
+        self.assertIs(mixed_ref_support.audit_api_refusal_interval,
+                      refusal_audit_sql.audit_api_refusal_interval)
+
+    def test_ensure_repo_ready_clears_only_the_prior_unknown_fence(self):
+        """A ready repo is untouched; the crash-recovery fence uses the real CLI."""
+        calls = []
+
+        def harness_for(state):
+            harness = object.__new__(FixtureHarness)
+            harness.args = SimpleNamespace(binary="/opt/rootyard")
+            harness.repo = {"id": "11111111-1111-4111-8111-111111111111"}
+            harness.state = state
+
+            def repo_state():
+                return harness.state
+
+            def stop():
+                calls.append(("stop",))
+
+            def start():
+                calls.append(("start",))
+                harness.state = "ready/-"
+
+            def run(argv, check=True, **kwargs):
+                calls.append(tuple(argv))
+                if argv[1] == "inspect-recovery":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({
+                        "storage_generation": 7, "fingerprint": "a" * 64}).encode(), stderr=b"")
+                return SimpleNamespace(returncode=0, stdout=b"{}", stderr=b"")
+
+            harness.repo_state, harness.stop, harness.start, harness.run = (
+                repo_state, stop, start, run)
+            return harness
+
+        ready = harness_for("ready/-")
+        ready.ensure_repo_ready()
+        self.assertEqual(calls, [], "a ready repository must not be restarted or inspected")
+
+        calls.clear()
+        recovering = harness_for("recovering/push_outcome_unknown")
+        recovering.ensure_repo_ready()
+        self.assertEqual(recovering.repo_state(), "ready/-")
+        self.assertEqual(calls, [
+            ("stop",),
+            ("/opt/rootyard", "inspect-recovery", recovering.repo["id"]),
+            ("/opt/rootyard", "resolve-unknown", recovering.repo["id"],
+             "--expected-generation", "7", "--fingerprint", "a" * 64,
+             "--acknowledge-audit-gap",
+             "Browse harness cleared prior crash-recovery case fence before mixed-ref cases."),
+            ("start",),
+        ])
+
+        # Both mixed cases clear the inherited fence before entering rule isolation.
+        for name in ("mixed_protected_unprotected_atomic_push",
+                     "mixed_protected_unprotected_ref_transaction"):
+            body = source(name)
+            self.assertLess(body.index("self.ensure_repo_ready()"),
+                            body.index("with self.isolated_rules():"))
+        self.assertNotIn("ensure_repo_ready", source("isolated_rules"))
+
+    def test_rules_are_isolated_and_restored(self):
+        both = source("mixed_protected_unprotected_atomic_push") + source(
+            "mixed_protected_unprotected_ref_transaction")
+        self.assertEqual(both.count("with self.isolated_rules():"), 2)
+        body = ast.unparse(method("isolated_rules"))
+        self.assertIn("original = policy()", body)
+        self.assertIn("method='DELETE'", body)
+        self.assertIn("self._restore_rules(repo, original, policy)", body)
+        restore = ast.unparse(method("_restore_rules"))
+        self.assertIn("for ref in self.rules(repo)", restore)
+        self.assertIn("assert remaining == {}", restore)
+        self.assertIn("for ref, item in original.items()", restore)
+        self.assertIn("assert policy() == original", restore)
+        # No case may assume the global rule inventory of an earlier case.
+        self.assertNotIn('refs == {"refs/heads/main"}', CASES.read_text())
+        # No docstring may claim the API refuses every update of a rule.
+        for text in (CASES.read_text(), BROWSE.read_text()):
+            self.assertNotIn("refuses every update", text)
+        # A restore delete treats an already-deleted rule (404) as deleted, and
+        # nothing else as success.
+        self.assertIn("if status not in (200, 404):", restore)
+
+    def fake_rules(self):
+        """A fake rule API with ``src/pulls/rules.rs`` upsert/delete semantics.
+
+        GET lists stored rows; a PUT for an absent branch with
+        ``expected_version`` is a 409; an existing branch only updates when the
+        body names its current version (then bumps it). DELETE hard-deletes and
+        returns 200 (``{"deleted": true}``), exactly as the handler does.
+        """
+        rules, log = {}, []
+
+        def document(self, path, code=200, token=None, **kwargs):
+            method, body = kwargs.get("method", "GET"), kwargs.get("body")
+            ref = path.split("/branch-rules/", 1)[1] if "/branch-rules/" in path else None
+            log.append((method, ref, dict(body) if body else None))
+            current = rules.get(ref)
+            if method == "GET":
+                return {"items": list(rules.values())}
+            if method == "DELETE":
+                del rules[ref]
+                return {"deleted": True}
+            if current is None:
+                assert "expected_version" not in body, 409
+                rules[ref] = {"branch_ref": ref, "version": 1}
+            else:
+                assert body.get("expected_version") == current["version"], 409
+                current["version"] += 1
+            rules[ref].update({k: body[k] for k in self.RULE_FIELDS if k in body})
+            return dict(rules[ref])
+
+        def http(self, path, token=None, method="GET"):
+            ref = path.split("/branch-rules/", 1)[1]
+            status = 200 if method == "DELETE" and ref in rules else 404
+            if status == 200:
+                del rules[ref]
+            return status, json.dumps({"deleted": status == 200}).encode(), {}
+
+        harness = object.__new__(FixtureHarness)
+        harness.document, harness.http = document.__get__(harness), http.__get__(harness)
+        harness.http_failure_detail = lambda path, expected, status, body, headers, token, note=None: (
+            "Delete failed: " + path + " -> " + str(status))
+        harness.local_repo, harness.pulled = "demo", False
+        harness.alice = {"username": "alice", "token": "secret"}
+        rules["refs/heads/main"] = {"branch_ref": "refs/heads/main", "required_approvals": 2,
+                                    "required_checks": ["ci/required"], "require_fast_forward": True,
+                                    "prevent_deletion": True, "prevent_force_push": True,
+                                    "prevent_self_approval": False, "version": 3}
+        return harness, rules, log
+
+    def test_update_carries_the_real_version_insert_omits_it(self):
+        harness, rules, log = self.fake_rules()
+        # Insert: no rule row, so no expected_version.
+        self.assertEqual(harness.put_rule("refs/heads/topic")["version"], 1)
+        self.assertIsNone(log[-1][2].get("expected_version"))
+        # Update of an existing rule: the real row version, not a guess.
+        self.assertEqual(harness.policy_rule("refs/heads/main")["required_approvals"], 1)
+        self.assertEqual(log[-1][2]["expected_version"], 3)
+        self.assertEqual(harness.put_rule("refs/heads/topic", required_approvals=2)["version"], 2)
+        self.assertEqual(log[-1][2]["expected_version"], 1)
+        # Isolation deletes every rule (a real API DELETE) and restores policy.
+        policy = lambda: {ref: harness.rule_view(item) for ref, item in rules.items()}
+        original = policy()
+        self.assertEqual(sorted(original), ["refs/heads/main", "refs/heads/topic"])
+        log.clear()
+        with harness.isolated_rules():
+            self.assertEqual(policy(), {})
+            harness.put_rule("refs/heads/case")
+        self.assertEqual(policy(), original)
+        # Every original is recreated as a new row: no old version is sent.
+        restores = [body for method, ref, body in log if method == "PUT" and ref in original]
+        self.assertEqual(sorted({body["branch_ref"] for body in restores}),
+                         ["refs/heads/main", "refs/heads/topic"])
+        for body in restores:
+            self.assertEqual(set(body) & {"expected_version", "version"}, set(), body)
+
+    def test_restore_failure_keeps_the_case_exception_as_context(self):
+        """A failing restore step must not hide what the case actually failed on."""
+        harness, rules, log = self.fake_rules()
+        saved_get = harness.document
+
+        def document(self, path, code=200, token=None, **kwargs):
+            if kwargs.get("method", "GET") == "GET" and any(
+                    entry[0] == "PUT" for entry in log):  # a restore PUT follows
+                raise AssertionError("expected (200, 201), got 409: branch rule version conflict")
+            return saved_get(path, code, token, **kwargs)
+
+        harness.document = document.__get__(harness)
+        with self.assertRaises(AssertionError) as caught:
+            with harness.isolated_rules():
+                raise ArithmeticError("the real case failure")
+        self.assertIn("version conflict", str(caught.exception))
+        self.assertIsInstance(caught.exception.__context__, ArithmeticError, "cause was masked")
+        self.assertEqual(caught.exception.__context__.args, ("the real case failure",))
+
+    def test_native_group_has_no_policy_and_policy_group_only_policy(self):
+        body = source("mixed_protected_unprotected_atomic_push")
+        # One rule-free context for both groups; each group then owns its rules.
+        self.assertLess(body.index("self.native_group(main, topic)"),
+                        body.index("self.policy_group(main, topic, native[\"audit\"])"))
+        native = source("native_group")
+        # Group 1 creates no rule and relaxes no flag: the refusal is stock Git.
+        self.assertIn("self.assert_rule_state({})", native)
+        for forbidden in ("put_rule", "policy_rule", "rule_body", "require_fast_forward"):
+            self.assertNotIn(forbidden, native, forbidden)
+        self.assertNotIn("--unset", native)
+        self.assertIn("self.push_as_owner(\"--atomic\"", native)
+        # Policy group: approvals only; the fast-forward commit sits on the tip.
+        policy = source("policy_group")
+        self.assertIn("require_fast_forward=False, prevent_force_push=False", policy)
+        self.assertIn("self.policy_rule(main, require_fast_forward=False, prevent_force_push=False", policy)
+        self.assertIn("policy_oid = self.commit_over(base, ", policy)
+        self.assertIn("base = self.advertised_oid(main)", policy)
+        self.assertIn("assert base == self.third, base", policy)
+        # No ancestry check may run against an unpushed local commit.
+        joined = CASES.read_text()
+        self.assertNotIn("rev-list", joined)
+        self.assertNotIn("merge-base", joined)
+        self.assertIn('"ls-remote", self.remote, ref', source("advertised_oid"))
+        self.assertIn("self.open_pull_for_main(policy_oid)", policy)
+        self.assertIn("policy_oid + \":\" + main", policy)
+        self.assertIn('"native_group"', body)
+        self.assertIn('"policy_group"', body)
+        # Every refusal re-reads the real state: two atomic pairs and the half.
+        self.assertEqual(native.count("assert_one_aborted_refusal("), 1)
+        self.assertEqual(policy.count("assert_one_aborted_refusal("), 2)
+
+    def test_causal_rule_matrix_isolates_each_protected_tip_flag(self):
+        self.assertEqual(mixed_ref_cases.MixedRefPolicyCases.CAUSAL_RULES, (
+            ("ff_only", True, False),
+            ("force_only", False, True),
+            ("delete_ff", True, False),
+            ("delete_force", False, True),
+        ))
+        atomic = source("causal_atomic_refusals")
+        transaction = source("causal_transaction_refusals")
+        for body in (atomic, transaction):
+            self.assertIn("required_approvals=0, required_checks=[]", body)
+            self.assertIn("prevent_deletion=False", body)
+            self.assertIn("require_fast_forward=fast_forward", body)
+            self.assertIn("prevent_force_push=force_push", body)
+        self.assertIn('self.push_as_owner("--atomic", "--force"', atomic)
+        self.assertIn('self.ref_oids(protected, sibling)', atomic)
+        self.assertIn('"old_oid": old, "new_oid": ZERO_OID', transaction)
+        self.assertIn('"old_oid": ZERO_OID, "new_oid": self.feature_oid', transaction)
+        self.assertIn("causal_atomic_refusals(main)", source(
+            "mixed_protected_unprotected_atomic_push"))
+        self.assertIn("causal_transaction_refusals(transact, refused)", source(
+            "mixed_protected_unprotected_ref_transaction"))
+
+    def test_pull_is_recorded_but_the_direct_push_is_still_denied(self):
+        self.assertIn("head_oid", [n.id for n in ast.walk(method("open_pull_for_main")) if isinstance(n, ast.Name)])
+        bodies = dict_literals(method("open_pull_for_main"))
+        self.assertTrue(any(item.get("head_ref") == "features" and item.get("base_ref") == "main"
+                            for item in bodies), bodies)
+        # The pull is listed as evidence of what does NOT authorize a direct
+        # write; only the PR-merge binding could satisfy an approval rule.
+        policy = source("policy_group")
+        self.assertIn('"pull_alone_authorizes": False', policy)
+        self.assertIn('"git_refusal": native_refusal', policy)
+        # The production decision really says a pull identity does not authorize.
+        self.assertIn("A direct push has\n        // no pull-request identity",
+                      (ROOT / "src/browse/policy.rs").read_text())
+
+    def test_ref_transaction_refuses_mixed_first_then_protected_alone(self):
+        body = source("mixed_protected_unprotected_ref_transaction")
+        markers = ["Seed with no rule", "policy_mixed = refused", "Control:",
+                   "base = self.ref_state()", "alone = refused", "409 stale"]
+        pos = -1
+        for marker in markers:
+            nxt = body.index(marker, pos + 1)
+            self.assertGreater(nxt, pos, marker)
+            pos = nxt
+        for text in [
+            'refused("403 mixed", 403, "protected branch policy denied"',
+            '"ref_name": main, "old_oid": self.third, "new_oid": self.feature_oid',
+            '"ref_name": topic, "old_oid": self.second, "new_oid": self.feature_oid',
+            'refused("403 protected alone", 403',
+            'refused("409 stale", 409, "reference old_oid mismatch"',
+            'self.assert_api_refusal(before, self.ref_state(), label, [update["ref_name"] for update in updates])',
+            "api_operations_delta",
+            '"api_operations_delta": 0',
+        ]:
+            self.assertIn(text, body)
+        self.assertNotIn("merge-base", body)
+        api = source("assert_api_refusal")
+        self.assertNotIn("git_refusal_audit", api)
+        native = source("assert_one_aborted_refusal")
+        self.assertIn("audit_git_refusal_interval", native)
+        self.assertNotIn("git_refusal_audit", native)
+        transactions = (ROOT / "src/browse/transactions.rs").read_text()
+        ref_transaction = (ROOT / "src/browse/ref_transaction.rs").read_text()
+        self.assertIn('"reference old_oid mismatch"', ref_transaction)
+        self.assertLess(transactions.index("validate_applied_updates("),
+                        transactions.index("crate::browse::policy::validate("))
+        policy = (ROOT / "src/browse/policy.rs").read_text()
+        self.assertIn('Error(StatusCode::FORBIDDEN, "protected branch policy denied"', policy)
+
+    def test_topic_seed_uses_a_context_without_the_topic_rule(self):
+        body = source("mixed_protected_unprotected_ref_transaction")
+        seed = body[body.index("Seed with no rule"):body.index("One rule set")]
+        self.assertIn("self.assert_rule_state({})", seed)
+        self.assertNotIn("self.put_rule(", seed)
+        self.assertLess(body.index("One rule set"), body.index("Control:"))
+        self.assertLess(body.index("self.put_rule(topic, required_approvals=0)"), body.index("Control:"))
+        assert_not_mutating_git(self, "mixed_protected_unprotected_ref_transaction")
+        self.assertIn("refs/heads/mixed-tx-topic", body)
+        assert_no_forked_state(self, body)
+
+    def test_git_client_is_declared_and_shared_with_the_server(self):
+        env_keys = {n.args[0].value for n in ast.walk(method("native_git"))
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "get" and n.args and isinstance(n.args[0], ast.Constant)}
+        self.assertIn("ROOTYARD_GIT", env_keys)
+        args = {n.attr for n in ast.walk(method("native_git")) if isinstance(n, ast.Attribute)}
+        self.assertIn("args", args)
+        messages = {n.value for n in ast.walk(method("native_git")) if isinstance(n, ast.Constant)
+                    and isinstance(n.value, str) and "disagree" in n.value}
+        self.assertTrue(messages, "a disagreeing --git/ROOTYARD_GIT must fail loudly")
+        # Every push (and any Git I/O of these cases) runs the declared
+        # executable with its own alice Authorization header, never a PATH git
+        # and never a clone-time-only credential.
+        for name in ("git_as", "push_with", "push_as_owner"):
+            self.assertNotIn("self.git(", source(name), name)
+        self.assertNotIn("self.run(", source("push_with"))
+        self.assertIn('"http.extraHeader=Authorization: Basic "', source("git_as"))
+        self.assertIn("probe[\"executable\"]", source("git_as"))
+        self.assertIn("self.git_as(self.alice", source("push_with"))
+        git_argv = ast.unparse(method("git_as"))
+        self.assertIn("cwd=cwd or self.work", git_argv)
+
+    def test_push_really_carries_the_token(self):
+        # Real subprocess behaviour: the per-push header reaches Git (a wrapper
+        # records argv), and the raw credential never reaches a diagnostic.
+        harness = object.__new__(FixtureHarness)
+        harness.args = SimpleNamespace(git="/usr/bin/git", mixed_refs=True)
+        harness.git_binding = {"declared": "/usr/bin/git", "env": None, "mixed_refs": True}
+        harness.env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                           GIT_TERMINAL_PROMPT="0")
+        harness.secrets = []
+        harness.work = str(Path(__file__).resolve().parent)
+        harness.base_db, harness.db = "postgres://probe/admin", "postgres://probe/run"
+        harness.register_token({"username": "alice", "token": "s3cr3t-token"})
+        original_env = dict(harness.env)
+        saved = dict(mixed_ref_cases.os.environ)
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / "argv"
+            wrapper = Path(root) / "git"
+            wrapper.write_text("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.47.3'; exit 0; fi\n"
+                               "printf '%s\\n' \"$@\" > " + str(marker) + "\nexit 3\n")
+            wrapper.chmod(0o755)
+            harness.native_git = lambda: {"executable": str(wrapper), "declared": True, "notes": []}
+            harness.native_git_probe = lambda: {
+                "executable": str(wrapper), "declared": True, "notes": [],
+                "version": "2.47.3", "minor": (2, 47), "sha256": "0" * 64}
+            try:
+                mixed_ref_cases.os.environ.clear()
+                mixed_ref_cases.os.environ.update(harness.env)
+                done = harness.git_as({"username": "alice", "token": "s3cr3t-token"},
+                                      "push", "origin", "a:b")
+            finally:
+                mixed_ref_cases.os.environ.clear()
+                mixed_ref_cases.os.environ.update(saved)
+            argv = marker.read_text().splitlines()
+        self.assertEqual(done.returncode, 3)
+        expected = "http.extraHeader=Authorization: Basic " + base64.b64encode(b"alice:s3cr3t-token").decode()
+        self.assertEqual(argv[:2], ["-c", expected])
+        self.assertEqual(argv[-3:], ["push", "origin", "a:b"])
+        self.assertNotIn("s3cr3t-token", harness.redact(" ".join(argv)))
+        # The credential copy is per command: the server env is never rewritten
+        # (a mutation here used to make the live server look bound to the client).
+        self.assertEqual(harness.env, original_env, "git_as must not mutate the server env")
+
+
+class _FakeProcess:
+    """Minimal live ``Popen`` stand-in for ``Harness.start`` readiness checks."""
+
+    pid = 4242
+    terminated = False
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class BrowseRefScaleGitContractTest(unittest.TestCase):
+    """The fixed ref-scale case runs the bound executable string.
+
+    ``verify_ref_scale`` is the fixed inventory's case 13; it runs before the
+    mixed proof, so it must find the executable in ``wrapper_git`` and never
+    treat the callable ``native_git()`` resolver as an argv entry.
+    """
+
+    GIT = str(Path(shutil.which("git")).resolve()) if shutil.which("git") else None
+
+    def setUp(self):
+        if self.GIT is None:
+            self.skipTest("no stock git on PATH")
+        self.root = Path(tempfile.mkdtemp(prefix="ref-scale-contract-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.bare = self.root / "bare.git"
+        self.bare.mkdir()
+        subprocess.run([self.GIT, "init", "--quiet", "--bare", str(self.bare)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # A real commit ref: the scan counts what Git actually reports.
+        git_dir = ["--git-dir", str(self.bare)]
+        tree = subprocess.run([self.GIT, *git_dir, "mktree"], input=b"", check=True,
+                              stdout=subprocess.PIPE).stdout.decode().strip()
+        identity = dict(os.environ, GIT_AUTHOR_NAME="ref-scale", GIT_AUTHOR_EMAIL="scale@example.invalid",
+                        GIT_COMMITTER_NAME="ref-scale", GIT_COMMITTER_EMAIL="scale@example.invalid",
+                        GIT_AUTHOR_DATE="2000-01-01T00:00:00Z",
+                        GIT_COMMITTER_DATE="2000-01-01T00:00:00Z")
+        commit = subprocess.run([self.GIT, *git_dir, "commit-tree", tree, "-m", "ref-scale"],
+                                check=True, stdout=subprocess.PIPE,
+                                env=identity).stdout.decode().strip()
+        self.harness = SimpleNamespace(
+            bare=self.bare, root=self.root, third=commit,
+            env={"ROOTYARD_GIT": self.GIT}, wrapper_git=self.GIT, native_git=self.bound_resolver,
+            alice={"username": "alice", "token": "test-only"})
+        (self.bare / "packed-refs").write_text(
+            "# pack-refs with: peeled fully-peeled sorted\n" + commit + " refs/heads/main\n")
+        self.scans, self.wrappers = [], []
+        saved = {name: getattr(browse_ref_scale, name) for name in ("_native_scan", "_walk",
+                                                                    "_install_wrapper")}
+        self.addCleanup(lambda: [setattr(browse_ref_scale, name, value) for name, value in saved.items()])
+        real_native_scan, real_wrapper = browse_ref_scale._native_scan, browse_ref_scale._install_wrapper
+        real_walk = browse_ref_scale._walk
+
+        def native_scan(git, bare):
+            self.scans.append(git)
+            return real_native_scan(git, bare)
+
+        def install_wrapper(harness, log):
+            wrapper = real_wrapper(harness, log)
+            self.wrappers.append(wrapper.read_text())
+            return wrapper
+        browse_ref_scale._native_scan = native_scan
+        browse_ref_scale._install_wrapper = install_wrapper
+        # The HTTP walk proves the same ref set, so it is answered offline.
+        # Keep the real ``_walk``: it pages through ``harness.http`` below, and
+        # it is the phase that asserts the wrapper really ran ``for-each-ref``.
+        # The HTTP pages come from the same packed fixture, parsed by the real
+        # ``_read_records``; no Browse service is contacted.
+        self.harness.repo_api = lambda suffix="": suffix
+        self.harness.http = self.serve_refs_page
+
+    def bound_resolver(self):
+        """The real contract: ``native_git`` is the callable mixed resolver."""
+        return {"executable": self.GIT, "declared": True, "notes": []}
+
+    def serve_refs_page(self, path, token=None):
+        """Answer ``/refs?limit=..&after=..`` from the packed fixture's refs/tags.
+
+        Every refs page makes the service run ``for-each-ref`` through its
+        ``ROOTYARD_GIT`` wrapper, so that wrapper start is recorded here.
+        """
+        log = self.root / "browse-ref-scale-for-each-ref.log"
+        with open(log, "a") as handle:
+            handle.write("start\n")
+        query = urllib.parse.parse_qs(path.split("?", 1)[1])
+        limit = int(query.get("limit", ["100"])[0])
+        after = query.get("after", [None])[0]
+        # The public view is ordered by name: heads first, then the tags.
+        names = sorted(name for name, _oid in browse_ref_scale._read_records(
+            self.bare / "packed-refs") if name.startswith(("refs/heads/", "refs/tags/")))
+        remaining = [name for name in names if after is None or name > after]
+        page = remaining[:limit]
+        body = {"items": [{"name": name} for name in page],
+                "next_after": page[-1] if len(remaining) > limit else None}
+        return 200, json.dumps(body).encode(), {}
+
+    def test_scale_runs_the_bound_executable_string(self):
+        harness = SimpleNamespace(**vars(self.harness))
+        harness.git = lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        harness.stop = lambda: None
+        harness.start = lambda: None   # each restart: the scale case owns the service
+        # The RSS measurement guard needs Linux /proc; this test proves the
+        # executable handoff, so the probe is answered as present.
+        saved_probe = browse_ref_scale._read_peak_kib
+        self.addCleanup(setattr, browse_ref_scale, "_read_peak_kib", saved_probe)
+        browse_ref_scale._read_peak_kib = lambda pid: 1
+        result = browse_ref_scale.verify_ref_scale(harness)
+        # Every native scan and the installed wrapper carry the bound string.
+        self.assertEqual(len(self.scans), 2)
+        self.assertEqual(self.scans, [self.GIT, self.GIT])
+        self.assertEqual(len(self.wrappers), 1)
+        self.assertIn("exec " + shlex.quote(self.GIT) + ' "$@"', self.wrappers[0])
+        # The resolver is a method: it can never be an argv entry.
+        self.assertTrue(callable(harness.native_git))
+        for value in self.scans + [self.wrappers[0]]:
+            self.assertNotIn("native_git", str(value))
+            self.assertNotIn("bound_resolver", str(value))
+        # The scan is ``refs/tags`` only, so it counts exactly the fixture tags.
+        self.assertEqual(result["native_fallback"]["small"]["records"],
+                         browse_ref_scale.SMALL_TAG_COUNT)
+        self.assertEqual(result["fixture"]["baseline_refs"], 1)
+        # Each service page ran for-each-ref through the installed wrapper, and
+        # the wrapper execs the bound executable string.
+        self.assertGreater(result["for_each_ref_process_starts"]["walk"], 0)
+        self.assertGreater(result["for_each_ref_process_starts"]["small"], 0)
+        # Cleanup restarted the service once more; never through a callable.
+        self.assertEqual(self.scans, [self.GIT, self.GIT])
+        self.assertIn("exec " + shlex.quote(self.GIT) + ' "$@"', self.wrappers[0])
+
+    def test_scale_helper_never_treats_the_resolver_as_an_argv_string(self):
+        method = SimpleNamespace(wrapper_git=self.GIT, native_git=self.bound_resolver)
+        self.assertEqual(browse_ref_scale._bound_git(method), self.GIT)
+        # Without the bound string the helper fails closed instead of handing
+        # a callable (or its repr) to ``Path``/``Popen``.
+        callable_only = SimpleNamespace(native_git=self.bound_resolver)
+        with self.assertRaisesRegex(AssertionError, "executable string"):
+            browse_ref_scale._bound_git(callable_only)
+        with self.assertRaisesRegex(AssertionError, "executable string"):
+            browse_ref_scale._bound_git(SimpleNamespace(wrapper_git=None))
+        scale = (ROOT / "tests/browse_ref_scale.py").read_text()
+        self.assertIsNone(re.search(r"harness\.native_git\b", scale),
+                          "the scale helper must not use the resolver as a string")
+        # The three runtime handoffs that need the executable string.
+        self.assertEqual(scale.count("    native = Path(_bound_git(harness))"), 1)
+        self.assertEqual(scale.count("        located = shutil.which(_bound_git(harness))"), 1)
+        self.assertEqual(scale.count("    git = _bound_git(harness)\n"), 1)
+
+
+class BrowseIntegrationTest(unittest.TestCase):
+    """The wired runner: one harness, 19 selected IDs, one bound Git."""
+
+    GIT = str(Path(shutil.which("git")).resolve()) if shutil.which("git") else None
+
+    def setUp(self):
+        if self.GIT is None:
+            self.skipTest("no stock git on PATH")
+        saved = {key: os.environ.get(key) for key in ("ROOTYARD_GIT", "ROOTYARD_TEST_DATABASE_URL")}
+        self.addCleanup(self._restore_env, saved)
+        os.environ.pop("ROOTYARD_GIT", None)
+        self.real_launch = browse.harness_start
+
+    @staticmethod
+    def _restore_env(saved):
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def harness(self, **options):
+        """A real ``BrowseHarness.__init__``; it starts no server.
+
+        ``Harness.__init__`` only reads the database URL, picks a loopback port
+        and creates a temporary root, which the cleanup removes.
+        """
+        os.environ["ROOTYARD_TEST_DATABASE_URL"] = "postgres://probe/run"
+        parsed = dict(binary="/opt/rootyard", git=None, mixed_refs=False)
+        parsed.update(options)
+        harness = browse.BrowseHarness(SimpleNamespace(**parsed))
+        # What the server child actually receives at start time.
+        harness.runtime_env = dict(harness.env)
+        harness.run = self.run_for(harness)
+        # Real ``Harness.start`` spawns a server; intercept only that process
+        # launch. ``BrowseHarness.start`` itself still runs and captures.
+        # ``Harness.start`` is the process launcher: record the env instead of
+        # spawning.  ``BrowseHarness.start``'s capture still computes the fact
+        # from ``self.env`` exactly as production does.
+        harness.starts = []
+        real_launch = browse.harness_start
+        self.addCleanup(setattr, browse, "harness_start", real_launch)
+        self.real_launch = real_launch
+
+        def launch(target):
+            harness.starts.append(dict(target.env))
+            target.proc = _FakeProcess()
+        browse.harness_start = launch
+        saved_stop = harness.stop
+
+        def stop(hard=False):
+            if isinstance(harness.proc, _FakeProcess):
+                harness.proc.terminated = True   # the real stop() only signals
+                harness.proc = None
+            return saved_stop(hard=hard)
+        harness.stop = stop
+        self.addCleanup(shutil.rmtree, harness.root, True)
+        return harness
+
+    @staticmethod
+    def run_for(harness):
+        """``Harness.run`` with the timeout widened; it executes, never starts."""
+        def run(argv, cwd=None, check=True, data=None, env=None):
+            done = subprocess.run(argv, cwd=cwd, env=harness.env if env is None else env, input=data,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            if check and done.returncode:
+                raise AssertionError("command failed: " + done.stderr.decode(errors="replace")[-600:])
+            return done
+        return run
+
+    @staticmethod
+    def browse_class():
+        return next(n for n in ast.parse(BROWSE.read_text()).body
+                    if isinstance(n, ast.ClassDef) and n.name == "BrowseHarness")
+
+    def test_native_git_is_the_callable_resolver_not_the_wrapper_string(self):
+        harness = self.harness()
+        self.assertTrue(callable(harness.native_git))
+        self.assertEqual(harness.native_git()["executable"], self.GIT)
+        self.assertIsInstance(harness.wrapper_git, str)
+        # No class-level string shadows the resolver either: it comes only
+        # from the mixin, and __init__ never assigns an instance string.
+        self.assertNotIn("native_git", browse.BrowseHarness.__dict__)
+        self.assertNotIn("native_git", browse.BrowseHarness.__init__.__code__.co_names)
+        self.assertIn("native_git", mixed_ref_cases.MixedRefPolicyCases.__mro__[1].__dict__)
+        initializer = next(n for n in self.browse_class().body
+                           if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+        assigned = {t.attr for n in ast.walk(initializer) if isinstance(n, ast.Assign)
+                    for t in n.targets if isinstance(t, ast.Attribute)}
+        self.assertIn("wrapper_git", assigned)
+        self.assertNotIn("native_git", assigned, "an instance string would shadow the method")
+        # The wrapper field is the only string spelling; every use site execs it.
+        text = BROWSE.read_text()
+        self.assertEqual(text.count("self.wrapper_git"), 6)
+        self.assertIsNone(re.search(r"self\.native_git\b", text))
+        probe = ast.unparse(next(n for n in self.browse_class().body
+                                 if isinstance(n, ast.FunctionDef) and n.name == "native_git_probe"))
+        self.assertIn("self._native_git_probe", probe)
+        self.assertIn("super().native_git_probe()", probe)
+
+    def test_wrapper_git_is_the_bound_declaration_not_path_git(self):
+        """An explicit ``--git`` elsewhere on disk is what the wrappers exec."""
+        self.assertNotEqual(Path(shutil.which("git")).resolve(), Path(shutil.which("sh")).resolve())
+        other = str(Path(shutil.which("sh")).resolve())
+        # Fixed inventory only: no --mixed-refs, so no Git probe is needed.
+        harness = self.harness(git=other)
+        self.assertEqual(harness.git_binding["declared"], other)
+        self.assertEqual(harness.runtime_env["ROOTYARD_GIT"], other)
+        self.assertEqual(harness.wrapper_git, other)
+        self.assertNotEqual(harness.wrapper_git, shutil.which("git"))
+        # Bind the executable of a declared PATH Git: it is the same file.
+        via_path = self.harness(git=shutil.which("git"))
+        self.assertEqual(Path(via_path.wrapper_git), Path(self.GIT))
+        self.assertEqual(Path(via_path.native_git()["executable"]), Path(via_path.wrapper_git))
+        # An inherited-only declaration binds the wrapper the same way.
+        os.environ["ROOTYARD_GIT"] = other
+        inherited = self.harness()
+        self.assertEqual(inherited.runtime_env["ROOTYARD_GIT"], other)
+        self.assertEqual(inherited.wrapper_git, other)
+        os.environ.pop("ROOTYARD_GIT")
+        fixed_only = self.harness()
+        self.assertIsNone(fixed_only.git_binding["declared"])
+        self.assertNotIn("ROOTYARD_GIT", fixed_only.runtime_env)
+        self.assertEqual(fixed_only.wrapper_git, shutil.which("git"))
+
+    def test_both_transparent_wrappers_execute_the_bound_declaration(self):
+        """The wrappers really run the bound executable, not the PATH Git."""
+        sh = Path(shutil.which("sh")).resolve()
+        # ``/bin/sh`` does not speak Git, so any fallback to PATH Git would
+        # either fail (``--version``) or run Git; the evidence must be sh.
+        harness = self.harness(git=str(sh))
+        self.assertEqual(harness.wrapper_git, str(sh))
+        script = harness._deadline_wrapper_script(harness.wrapper_git, harness.root / "arm",
+                                                  harness.root / "log")
+        self.assertIn("exec " + shlex.quote(str(sh)) + ' "$@"', script)
+        for case, size in (("deadline", None), ("cat-file", 1)):
+            with self.subTest(wrapper=case):
+                path = harness.root / ("wrapper-" + case)
+                path.write_text(script if size is None else
+                                "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then :; fi\n"
+                                "done\nexec " + shlex.quote(harness.wrapper_git) + " \"$@\"\n")
+                path.chmod(0o700)
+                # Never ``git --version``: an unarmed/wrapper-transparent call.
+                done = harness.run([str(path)], check=False)
+                self.assertEqual(done.returncode, 0, done.stderr[:300])
+        # The native client resolves the same executable as the wrappers.
+        self.assertEqual(Path(harness.native_git()["executable"]), sh)
+
+    def test_server_start_git_is_captured_and_immutable(self):
+        git = str(Path(self.GIT).resolve())
+        harness = self.harness(git=git, mixed_refs=True)
+        self.assertIsNone(harness.server_git, "no server has started yet")
+        harness.start()
+        self.assertEqual(harness.server_git, {"configured": git, "path": git})
+        captured = dict(harness.server_git)
+        harness.native_git_probe = lambda: {"executable": git, "declared": True, "notes": [],
+                                            "version": "9.9", "minor": (9, 9), "sha256": "0" * 64}
+        wrapper = harness.root / "some-wrapper"
+        harness.env["ROOTYARD_GIT"] = str(wrapper)
+        seen = []
+        saved_environ = dict(mixed_ref_cases.os.environ)
+
+        def run(argv, cwd=None, check=True, data=None, env=None):
+            seen.append(dict(env or {}))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"", args=argv)
+        harness.run = run
+        try:
+            mixed_ref_cases.os.environ.clear()
+            mixed_ref_cases.os.environ.update(harness.env)
+            # A real ``git_as`` call runs the probed Git; it must not touch the
+            # server env.
+            import tempfile as _tempfile
+            with _tempfile.TemporaryDirectory() as scratch:
+                harness.work = scratch
+                done = harness.git_as({"username": "alice", "token": "x"}, "ls-remote", "origin")
+        finally:
+            mixed_ref_cases.os.environ.clear()
+            mixed_ref_cases.os.environ.update(saved_environ)
+        self.assertEqual(done.returncode, 0)
+        # git_as handed its own copy the client, and the live server env and the
+        # process-start fact are both unchanged by it.
+        self.assertEqual(seen[0]["ROOTYARD_GIT"], git)
+        self.assertEqual(harness.server_git, captured)
+        self.assertEqual(harness.env["ROOTYARD_GIT"], str(wrapper))
+
+    def test_push_evidence_reports_the_started_server_git(self):
+        git = str(Path(self.GIT).resolve())
+        harness = self.harness(git=git, mixed_refs=True)
+        harness.start()
+        harness.alice = {"username": "alice", "token": "test-only"}
+        harness.native_git_probe = lambda: {
+            "executable": git, "declared": True, "notes": [], "version": "2.47.3",
+            "minor": (2, 47), "sha256": "0" * 64}
+
+        def simulated_client(*args, **kwargs):
+            # Simulate a post-start helper changing its mutable env view. The
+            # captured process-start identity must remain the proof source.
+            harness.env["ROOTYARD_GIT"] = str(harness.root / "mutated-after-start")
+            return SimpleNamespace(args=[git, "push"])
+
+        harness.git_as = simulated_client
+        with tempfile.TemporaryDirectory() as root:
+            harness.env["ROOTYARD_DATA_DIR"] = root
+            harness.push_with("main")
+        bound = harness.started_server_git()
+        self.assertEqual(bound, git)
+        self.assertEqual(harness.git_evidence["server_git"], git)
+        self.assertEqual(harness.git_evidence["server_configured"], git)
+        self.assertNotEqual(harness.env["ROOTYARD_GIT"], git)
+
+    def test_mixed_proof_rejects_a_server_not_started_on_the_declared_git(self):
+        git = str(Path(self.GIT).resolve())
+        harness = self.harness(git=git, mixed_refs=True)
+        harness.env["ROOTYARD_GIT"] = str(harness.root / "git-fault-wrapper")
+        harness.start()
+        called = []
+        harness.git_as = lambda *args, **kwargs: called.append(args)
+        with self.assertRaises(AssertionError) as caught:
+            harness.push_with("main")
+        self.assertIn("did not start on the declared Git", str(caught.exception))
+        self.assertEqual(called, [], "a mismatched live server must be rejected before the push")
+        # An unknown start state fails closed too.
+        fresh = self.harness(git=git, mixed_refs=True)
+        with self.assertRaisesRegex(AssertionError, "start-time Git is unknown"):
+            fresh.started_server_git()
+
+    def test_handoff_restarts_only_when_the_server_is_not_bound(self):
+        git = str(Path(self.GIT).resolve())
+        harness = self.harness(git=git)
+        harness.start()
+        # Already bound: no restart, no env change.
+        starts = len(harness.starts)
+        result = harness.restore_declared_git()
+        self.assertEqual(result["restarted"], False)
+        self.assertEqual(len(harness.starts), starts)
+        self.assertEqual(harness.env["ROOTYARD_GIT"], git)
+        # The fault wrapper a fixed case leaves behind: restarted on the binding.
+        harness.stop()
+        wrapper = harness.root / "git-fault-wrapper"
+        harness.env["ROOTYARD_GIT"] = str(wrapper)
+        harness.start()
+        self.assertEqual(harness.server_git["path"], str(wrapper.resolve()))
+        starts = len(harness.starts)
+        result = harness.restore_declared_git()
+        self.assertEqual(result["restarted"], True)
+        self.assertEqual(result["previous"]["path"], str(wrapper.resolve()))
+        self.assertEqual(len(harness.starts), starts + 1)
+        self.assertEqual(harness.starts[-1]["ROOTYARD_GIT"], git)
+        self.assertEqual(harness.server_git, {"configured": git, "path": git})
+        self.assertEqual(harness.started_server_git(), git)
+
+    def test_explicit_git_is_bound_before_any_start(self):
+        harness = self.harness(git=self.GIT, mixed_refs=True)
+        self.assertEqual(harness.runtime_env["ROOTYARD_GIT"], self.GIT)
+        self.assertEqual(harness.git_binding, {"declared": self.GIT, "env": self.GIT, "mixed_refs": True})
+        self.assertIsNone(harness.proc, "construction must not start the server")
+        init = inspect.getsource(browse.BrowseHarness.__init__)
+        self.assertLess(init.index("_bind_declared_git"), init.index("_native_git_probe"))
+        # wrapper_git comes from the validated binding; PATH is only the
+        # fallback when no Git was declared.
+        self.assertLess(init.index("_bind_declared_git"), init.index("self.wrapper_git ="))
+        self.assertIn('self.wrapper_git = self.git_binding["declared"] or shutil.which("git") or "git"',
+                      init)
+        self.assertIn("self.server_git = None", init)
+        self.assertIn("super().__init__(args)", init)
+        self.assertIn("start", browse.BrowseHarness.__dict__)
+        launch = inspect.getsource(browse.BrowseHarness.start)
+        self.assertLess(launch.index("harness_start(self)"), launch.index("self.server_git ="))
+        self.assertIn('self.env.get("ROOTYARD_GIT")', launch)
+        # Every server start (Harness.start) therefore sees the bound value.
+        self.assertIn("env=self.env", inspect.getsource(self.real_launch))
+
+    def test_conflicting_git_declarations_are_rejected(self):
+        # Two real, distinct executables: validation passes and the
+        # resolve-and-compare check is what refuses the pair.
+        other = shutil.which("sh") or shutil.which("sh", path="/bin")
+        self.assertTrue(other)
+        self.assertNotEqual(Path(other).resolve(), Path(self.GIT).resolve())
+        os.environ["ROOTYARD_GIT"] = other
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(git=self.GIT)
+        self.assertIn("disagree", str(caught.exception))
+        self.assertIn(str(Path(other).resolve()), str(caught.exception))
+        self.assertIn(self.GIT, str(caught.exception))
+        # A distinct absolute spelling of the same file is accepted once both
+        # sides resolve.  ``Path(a) / "." / b`` and ``a + "/.//" + b`` normalize
+        # to ``a/b``, so the fixture concatenates without building a Path.
+        resolved = Path(self.GIT).resolve()
+        spelling = str(resolved.parent) + "/.//" + resolved.name
+        self.assertNotEqual(spelling, self.GIT)
+        self.assertIn("/.//", spelling)
+        self.assertEqual(Path(spelling).resolve(), resolved)
+        os.environ["ROOTYARD_GIT"] = spelling
+        agreeing = self.harness(git=self.GIT)
+        self.assertEqual(agreeing.runtime_env["ROOTYARD_GIT"], self.GIT)
+        self.assertEqual(agreeing.git_binding["declared"], self.GIT)
+
+    def test_mixed_refs_requires_a_declared_git(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(mixed_refs=True)
+        self.assertIn("--mixed-refs requires a declared --git", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(git="git", mixed_refs=True)
+        self.assertIn("absolute", str(caught.exception))
+        # An inherited ROOTYARD_GIT alone satisfies the requirement without
+        # --git, is validated, and is bound to that binary before any start.
+        os.environ["ROOTYARD_GIT"] = self.GIT
+        inherited_only = self.harness(mixed_refs=True)
+        self.assertEqual(inherited_only.git_binding, {"declared": self.GIT, "env": self.GIT,
+                                                      "mixed_refs": True})
+        self.assertEqual(inherited_only.runtime_env["ROOTYARD_GIT"], self.GIT)
+        self.assertIsNone(inherited_only.proc, "binding must precede any server start")
+        # An inherited declaration gets the same absolute/executable validation.
+        os.environ["ROOTYARD_GIT"] = "git"
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(mixed_refs=True)
+        self.assertIn("ROOTYARD_GIT must be an absolute path", str(caught.exception))
+        os.environ["ROOTYARD_GIT"] = str(Path(self.GIT).parent / "git-not-declared-here")
+        with self.assertRaises(SystemExit) as caught:
+            self.harness(mixed_refs=True)
+        self.assertIn("ROOTYARD_GIT is not an executable file", str(caught.exception))
+        # The fixed inventory alone needs no declaration and adds none.
+        os.environ.pop("ROOTYARD_GIT")
+        fixed_only = self.harness()
+        self.assertIsNone(fixed_only.git_binding["declared"])
+        self.assertNotIn("ROOTYARD_GIT", fixed_only.runtime_env)
+
+    def test_wrapper_behavior_unchanged_and_restores_the_bound_git(self):
+        harness = self.harness(git=self.GIT, mixed_refs=True)
+        script = harness._deadline_wrapper_script(harness.wrapper_git, harness.root / "arm", harness.root / "log")
+        self.assertIn("exec " + shlex.quote(harness.wrapper_git) + ' "$@"', script)
+        service = ast.unparse(self.browse_class())
+        body = service[service.index("def _deadline_git_service"):service.index("def _deadline_git_events")]
+        self.assertIn("bound_git = self.env.get('ROOTYARD_GIT', self.git_binding['env'])", body)
+        self.assertIn("self.env['ROOTYARD_GIT'] = bound_git", body)
+        # ROOTYARD_GIT is no longer snapped from the inherited env and restored.
+        self.assertNotIn("'ROOTYARD_GIT', 'ROOTYARD_GIT_TIMEOUT_SECONDS'", body)
+        self.assertIn("if bound_git is None:\n                self.env.pop('ROOTYARD_GIT', None)",
+                      body + "\n")
+
+    class FakeHarness:
+        """Records the cases ``execute`` runs, exactly as ``Harness.case`` does."""
+
+        def __getattr__(self, name):
+            if name in browse.CASE_NAMES or name in browse.MIXED_REF_CASES:
+                calls = self.calls  # bound to the instance at access time
+
+                def case():
+                    calls.append(name)
+                return case
+            raise AttributeError(name)
+
+        def __init__(self, args):
+            self.args, self.results, self.calls, self.events = args, [], [], []
+            self.git_binding = {"declared": args.git, "mixed_refs": args.mixed_refs}
+            self.git_evidence = None
+            self.git_handoff = None
+
+        def restore_declared_git(self):
+            self.events.append("handoff")
+            return {"restarted": True, "server_git": {"path": self.args.git}}
+
+        def case(self, name, fn):
+            self.calls.append(name)
+            self.events.append(name)
+            self.results.append({"name": name, "status": "passed", "seconds": 0.0, "detail": {}})
+
+        def redact(self, value):
+            return str(value)
+
+        def cleanup(self):
+            pass
+
+    def run_execute(self, argv, harness_type=None):
+        """Parse real argv and run ``execute`` against a fake harness."""
+        report = Path(tempfile.mkdtemp()) / "browse.json"
+        self.addCleanup(shutil.rmtree, report.parent, True)
+        # Real builtin defaults: FakeHarness must not leak into the namespace.
+        argv = ["--report", str(report), "--binary", sys.executable, *argv]
+        args = browse.build_parser().parse_args(argv)
+        args.binary = str(Path(args.binary).resolve())
+        built = []
+
+        def build(value):
+            harness = (harness_type or self.FakeHarness)(value)
+            built.append(harness)
+            return harness
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = browse.execute(args, build)
+        return code, (json.loads(report.read_text()) if report.is_file() else None), built, err.getvalue()
+
+    def test_runner_selects_executes_and_reports_seventeen(self):
+        code, report, created, err = self.run_execute(["--mixed-refs", "--git", self.GIT])
+        self.assertEqual(code, 0, err)
+        expected = list(browse.CASE_NAMES) + list(mixed_ref_cases.MIXED_REF_CASES)
+        self.assertEqual(report["selected_cases"], expected)
+        self.assertEqual(report["case_count"], 19)
+        self.assertEqual(report["fixed_case_count"], 17)
+        self.assertEqual(report["fixed_cases"], list(browse.CASE_NAMES))
+        self.assertEqual(report["mixed_ref_cases"], list(mixed_ref_cases.MIXED_REF_CASES))
+        self.assertEqual(list(report["mixed_ref_results"]), list(mixed_ref_cases.MIXED_REF_CASES))
+        self.assertEqual(set(report["mixed_ref_results"].values()), {"passed"})
+        self.assertEqual([item["name"] for item in report["cases"]], expected)
+        self.assertEqual(created[0].calls, expected)
+        self.assertEqual(created[0].events,
+                         list(browse.CASE_NAMES) + ["handoff"] + list(mixed_ref_cases.MIXED_REF_CASES))
+        self.assertEqual(report["git"]["declared"], self.GIT)
+        self.assertEqual(report["git_handoff"], {"restarted": True, "server_git": {"path": self.GIT}})
+
+    def test_runner_without_opt_in_is_the_fixed_inventory_only(self):
+        code, report, created, err = self.run_execute([])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["selected_cases"], list(browse.CASE_NAMES))
+        self.assertEqual(report["case_count"], 17)
+        self.assertEqual(report["mixed_ref_cases"], [])
+        self.assertEqual(report["mixed_ref_results"], {})
+        self.assertEqual(report["fixed_cases"], list(browse.CASE_NAMES))
+        self.assertEqual(created[0].calls, list(browse.CASE_NAMES))
+        self.assertEqual(created[0].events, list(browse.CASE_NAMES))
+
+    def test_runner_rejects_mixed_refs_without_a_declared_git(self):
+        os.environ.pop("ROOTYARD_GIT", None)
+        with self.assertRaises(SystemExit) as caught:
+            self.run_execute(["--mixed-refs"])
+        self.assertIn("--mixed-refs requires a declared --git", str(caught.exception))
+
+    def test_runner_fails_when_a_selected_case_is_not_executed(self):
+        """A skipped case fails the assertion that owns it, in both modes."""
+        fixed_last, mixed_last = browse.CASE_NAMES[-1], mixed_ref_cases.MIXED_REF_CASES[-1]
+        base_case = self.FakeHarness.case  # captured from the base, not the subclass
+
+        def skipping(skip):
+            def case(harness, name, fn):
+                if name != skip:
+                    base_case(harness, name, fn)
+            return type("SkippingHarness", (self.FakeHarness,), {"case": case})
+
+        # Fixed mode: the fixed-inventory assertion owns the skip.
+        code, report, built, err = self.run_execute([], skipping(fixed_last))
+        self.assertEqual(code, 1, err)
+        self.assertIn("native case inventory mismatch", err)
+        self.assertEqual([item["name"] for item in report["cases"]], list(browse.CASE_NAMES[:-1]))
+        self.assertFalse(report["passed"])
+        # Opt-in mode: the fixed suite is intact, so the skip falls through the
+        # fixed assertion and is caught by the selected-case completion check.
+        code, report, built, err = self.run_execute(["--mixed-refs", "--git", self.GIT],
+                                                    skipping(mixed_last))
+        self.assertEqual(code, 1, err)
+        self.assertIn("selected cases were not all executed", err)
+        self.assertEqual([item["name"] for item in report["cases"]],
+                         list(browse.CASE_NAMES) + [mixed_ref_cases.MIXED_REF_CASES[0]])
+        self.assertEqual(report["selected_cases"], list(browse.CASE_NAMES) + list(
+            mixed_ref_cases.MIXED_REF_CASES))
+        self.assertFalse(report["passed"])
+        # The harness ran every selected case except the skipped one.
+        self.assertEqual(built[0].calls,
+                         [name for name in browse.selected_cases(True) if name != mixed_last])
+        self.assertEqual(built[0].events,
+                         list(browse.CASE_NAMES) + ["handoff", mixed_ref_cases.MIXED_REF_CASES[0]])
+
+
+class RefusalAuditSqlTest(unittest.TestCase):
+    """The active interval SQL names only real tables/columns, types included."""
+
+    REPO = "11111111-1111-4111-8111-111111111111"
+    ACTOR = "22222222-2222-4222-8222-222222222222"
+    TOKEN = "33333333-3333-4333-8333-333333333333"
+
+    def interval_sql(self):
+        """The real ``operations_after_query()`` text the interval reader runs."""
+        return refusal_audit_sql.operations_after_query(
+            self.REPO, 7, self.ACTOR, self.TOKEN, self.escape)
+
+    def escape(self, value):
+        """``BrowseHarness._sql_literal``: escape only, no delimiters added."""
+        return browse.BrowseHarness._sql_literal(value)
+
+    def test_operation_highwater_query_validates_uuid_and_quotes_once(self):
+        uuid_value = "0f8fad5b-d9cb-469f-a165-70867728950e"
+        expected = (
+            "SELECT COALESCE(MAX(sequence), 0)::text FROM git_operations "
+            "WHERE repository_id = '%s'::uuid" % uuid_value
+        )
+
+        calls = []
+
+        def counting_escape(value):
+            calls.append(value)
+            return value
+
+        sql = refusal_audit_sql.operation_highwater_query(uuid_value, counting_escape)
+
+        self.assertEqual(sql, expected)
+        self.assertEqual(sql.count(uuid_value), 1)
+        self.assertEqual(calls, [uuid_value])
+
+        for bad in (
+            "",
+            "not-a-uuid",
+            uuid_value.upper(),
+            uuid_value + "'",
+            "%s' OR '1'='1" % uuid_value,
+            "'; DROP TABLE git_operations; --",
+        ):
+            with self.subTest(value=bad):
+                calls.clear()
+                with self.assertRaises(ValueError) as ctx:
+                    refusal_audit_sql.operation_highwater_query(bad, counting_escape)
+                if bad:
+                    self.assertNotIn(bad, str(ctx.exception))
+                self.assertEqual(calls, [])
+
+    def test_operations_after_query_sql_shape(self):
+        repo = "11111111-1111-4111-8111-111111111111"
+        actor = "22222222-2222-4222-8222-222222222222"
+        token = "33333333-3333-4333-8333-333333333333"
+        seen = []
+
+        def escape(value):
+            seen.append(value)
+            return "ESC[" + value + "]"
+
+        sql = refusal_audit_sql.operations_after_query(repo, 7, actor, token, escape)
+        self.assertIsInstance(sql, str)
+        self.assertIn("WHERE o.repository_id = 'ESC[%s]'::uuid AND o.sequence > 7" % repo, sql)
+        self.assertEqual(sql.count("jsonb_agg(jsonb_build_object("), 2)
+        self.assertIn("ORDER BY o.sequence, o.id", sql)
+        join = "LEFT JOIN git_ref_admissions a ON a.writer_id = o.id AND a.repository_id = o.repository_id"
+        self.assertIn(join, sql)
+        keys = ["operation_id", "sequence", "outcome", "settled", "actor_and_token_match",
+                "human_principal", "service_principal", "admission_present", "admission_state",
+                "admission_settled", "admission_identity_matches", "admission_ref_names",
+                "outbox_count", "outbox_ref_names", "finished", "evidence_no_receipt", "interrupted",
+                "storage_generation_matches", "ungranted_without_hooks", "reference_events"]
+        for key in keys:
+            self.assertIn("'%s'" % key, sql)
+        # All four stored booleans stay booleans: ``->`` keeps the JSONB value.
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            expected = "(COALESCE(o.evidence->'" + key + "', " + refusal_audit_sql.EVIDENCE_MISSING_BOOL + "))"
+            self.assertIn(expected, sql, key)
+            self.assertNotIn("o.evidence->>'" + key + "'", sql, key)
+        self.assertIn("o.evidence->'reference_events'", sql)
+        self.assertIn("o.evidence->'post_receive' IS NULL", sql)
+        self.assertIn("o.evidence->'post_receive' = 'null'::jsonb", sql)
+        self.assertIn("o.actor_id = 'ESC[%s]'::uuid" % actor, sql)
+        self.assertIn("o.token_id = 'ESC[%s]'::uuid" % token, sql)
+        self.assertNotIn("LIMIT", sql)
+        self.assertNotIn("MAX(", sql)
+        self.assertEqual(seen, [repo, actor, token])
+        for bad_sequence in (True, "7", -1):
+            with self.assertRaises(ValueError):
+                refusal_audit_sql.operations_after_query(repo, bad_sequence, actor, token, escape)
+        seen.clear()
+        with self.assertRaises(ValueError):
+            refusal_audit_sql.operations_after_query(
+                "11111111-1111-4111-8111-11111111111' OR 1=1 --", 7, actor, token, escape)
+        self.assertEqual(seen, [])
+
+    def test_schema_pins_the_evidence_json_types(self):
+        """All four evidence values are Rust bools serialized as JSON booleans."""
+        evidence = (ROOT / "src/journal/record.rs").read_text()
+        # The shared ref-transaction evidence object serializes each key from a
+        # Rust bool: changing any of these to a string needs review here.
+        self.assertIn('"finished": finished', evidence)
+        self.assertIn('"interrupted": interrupted', evidence)
+        self.assertIn('"storage_generation_matches": operation.storage_generation == generation', evidence)
+        self.assertIn('"ungranted_without_hooks": ungranted_without_hooks', evidence)
+        self.assertIn("let ungranted_without_hooks = no_parent_publication_possible(", evidence)
+        self.assertRegex(evidence, r"fn no_parent_publication_possible\([^)]*\) -> bool")
+        self.assertIn("pub fn is_interrupted(op: &Operation) -> Result<bool>",
+                      (ROOT / "src/journal/state.rs").read_text())
+        self.assertIn("pub fn is_finished(op: &Operation) -> Result<bool>",
+                      (ROOT / "src/journal/state.rs").read_text())
+        # ``reference_events`` is a typed ``Vec<HookEvent>`` parameter, always
+        # a JSON array in stored evidence; live settlement reads the journal.
+        self.assertIn('"reference_events": reference_events', evidence)
+        self.assertIn("reference_events: &[HookEvent]", evidence)
+        self.assertIn("journal::events(&operation)", (ROOT / "src/reliability.rs").read_text())
+        journal = (ROOT / "src/journal.rs").read_text()
+        self.assertIn("pub use record::{events, receipts, ref_transaction_evidence, requests};", journal)
+        hook = (ROOT / "src/journal/operation.rs").read_text()
+        self.assertRegex(hook, r"pub struct HookEvent \{\s+pub ordinal: i64,\s+pub phase: HookPhase,\s+"
+                               r"pub changes: Vec<RefChange>,")
+        self.assertRegex(hook, r"pub struct RefChange \{\s+pub ref_name: String,\s+pub old_oid: String,\s+"
+                               r"pub new_oid: String,")
+        self.assertIn("pub enum HookPhase {\n    Preparing,\n    Prepared,\n    Committed,\n    Aborted,",
+                      hook)
+        self.assertEqual(refusal_audit_sql.EVIDENCE_KEYS,
+                         ("finished", "storage_generation_matches", "interrupted",
+                          "ungranted_without_hooks"))
+
+    def test_release_valid_query_binds_source_evidence_and_outbox(self):
+        operation_id = "44444444-4444-4444-8444-444444444444"
+        repo_id = "11111111-1111-4111-8111-111111111111"
+        seen = []
+
+        def escape(value):
+            seen.append(value)
+            return f"ESC[{value}]"
+
+        sql = refusal_audit_sql.service_release_valid_query(operation_id, repo_id, escape)
+        self.assertIsInstance(sql, str)
+        self.assertEqual(seen, [operation_id, repo_id])
+        self.assertIn(f"o.id = 'ESC[{operation_id}]'::uuid", sql)
+        self.assertIn(f"o.repository_id = 'ESC[{repo_id}]'::uuid", sql)
+        self.assertTrue(sql.lstrip().startswith("SELECT COALESCE(EXISTS ("))
+        self.assertTrue(sql.endswith("), false)::text"))
+        for clause in (
+            "o.outcome = 'recorded'",
+            "o.settled_at IS NOT NULL",
+            "o.actor_id IS NULL",
+            "o.token_id IS NULL",
+            "o.service_principal_id IS NOT NULL",
+            "o.actor_name = 'ci-scheduler'",
+            "r.state = 'ready'",
+            "r.storage_generation = o.storage_generation",
+            "jsonb_typeof(o.evidence) = 'object'",
+            "(SELECT count(*) FROM jsonb_object_keys(o.evidence)) = 7",
+            "NOT (o.evidence ? 'action')",
+            "o.evidence -> 'version' = '1'::jsonb",
+            "o.evidence ->> 'kind' = 'observed_immutable_ci_root'",
+            "jsonb_typeof(o.evidence -> 'finished') = 'boolean'",
+            "o.evidence -> 'finished' = 'true'::jsonb",
+            "jsonb_typeof(o.evidence -> 'interrupted') = 'boolean'",
+            "o.evidence -> 'interrupted' = 'false'::jsonb",
+            "jsonb_typeof(o.evidence -> 'reference_events') = 'array'",
+            "o.evidence -> 'reference_events' = '[]'::jsonb",
+            "jsonb_typeof(o.evidence -> 'retained') = 'boolean'",
+            "o.evidence -> 'retained' = 'true'::jsonb",
+            "jsonb_typeof(o.evidence -> 'intent') = 'object'",
+            "(SELECT count(*) FROM jsonb_object_keys(o.evidence -> 'intent')) = 8",
+            "o.evidence -> 'intent' -> 'version' = '1'::jsonb",
+            "jsonb_typeof(o.evidence -> 'intent' -> 'job_id') = 'string'",
+            "~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'",
+            "jsonb_typeof(o.evidence -> 'intent' -> 'owner_id') = 'string'",
+            "o.evidence -> 'intent' ->> 'owner_id' = r.owner_id::text",
+            "jsonb_typeof(o.evidence -> 'intent' -> 'repository_id') = 'string'",
+            "o.evidence -> 'intent' ->> 'repository_id' = o.repository_id::text",
+            "jsonb_typeof(o.evidence -> 'intent' -> 'storage_generation') = 'number'",
+            "o.evidence -> 'intent' -> 'storage_generation' = to_jsonb(o.storage_generation)",
+            "jsonb_typeof(o.evidence -> 'intent' -> 'object_format') = 'string'",
+            "o.evidence -> 'intent' ->> 'object_format' IN ('sha1', 'sha256')",
+            "jsonb_typeof(o.evidence -> 'intent' -> 'target_oid') = 'string'",
+            "~ '^[0-9a-f]{40}$'",
+            "~ '^[0-9a-f]{64}$'",
+            "AND (o.evidence -> 'intent' ->> 'target_oid') ~ '[1-9a-f]'",
+            "jsonb_typeof(o.evidence -> 'intent' -> 'retention_ref') = 'string'",
+            "o.evidence -> 'intent' ->> 'retention_ref' = 'refs/rootyard-ci/jobs/' || (o.evidence -> 'intent' ->> 'job_id')",
+            "p.id = o.service_principal_id",
+            "p.repository_id = o.repository_id",
+            "p.kind = 'ci-pin'",
+            "p.active",
+            "NOT EXISTS (SELECT 1 FROM git_ref_admissions a WHERE a.writer_id = o.id)",
+            "(SELECT count(*) FROM outbox_events e WHERE e.operation_id = o.id) = 1",
+        ):
+            self.assertIn(clause, sql, clause)
+        outbox_where = (
+            "SELECT 1 FROM outbox_events e\n"
+            "          WHERE e.operation_id = o.id\n"
+            "            AND e.repository_id = o.repository_id\n"
+            "            AND e.storage_generation = o.storage_generation\n"
+            "            AND e.operation_sequence = o.sequence\n"
+            "            AND e.ref_name = o.evidence -> 'intent' ->> 'retention_ref'\n"
+            "            AND e.new_oid = o.evidence -> 'intent' ->> 'target_oid'\n"
+            "            AND e.old_oid IS DISTINCT FROM o.evidence -> 'intent' ->> 'target_oid'\n"
+            "            AND (\n"
+            "                (o.evidence -> 'intent' ->> 'object_format' = 'sha1'\n"
+            "                 AND e.old_oid ~ '^[0-9a-f]{40}$')\n"
+            "                OR\n"
+            "                (o.evidence -> 'intent' ->> 'object_format' = 'sha256'\n"
+            "                 AND e.old_oid ~ '^[0-9a-f]{64}$')\n"
+            "            )"
+        )
+        self.assertIn(outbox_where, sql)
+        for forbidden in ("{{", "}}", "hex_to_int", "jsonb_object_keys(o.evidence) AS k",
+                          "jsonb_object_keys(o.evidence -> 'intent') AS k", "array_agg", "AS k",
+                          "'action' = 'released'", "o.evidence ->> 'action'", "repeat('0'",
+                          "e.old_oid = o.evidence -> 'intent' ->> 'target_oid'", "WHERE e.old_oid",
+                          "e.new_oid = repeat('0'", "e.operation_id <> o.id",
+                          "e.operation_id IS DISTINCT FROM o.id",
+                          "(SELECT count(*) FROM outbox_events e) = 1",
+                          "FROM outbox_events e\n          WHERE e.repository_id = o.repository_id",
+                          "') LIKE 'refs/rootyard-ci/jobs/'", "LIMIT", "COPY", "--"):
+            self.assertNotIn(forbidden, sql, forbidden)
+        self.assertEqual(seen, [operation_id, repo_id])
+        calls = []
+
+        def spy(value):
+            calls.append(value)
+            return "ESC"
+
+        self.assertEqual(calls, [])
+        for bad_op, bad_repo in ((("not-a-uuid"), repo_id), (operation_id, "not-a-uuid"),
+                                 (None, repo_id), (operation_id, None)):
+            with self.assertRaises(ValueError):
+                refusal_audit_sql.service_release_valid_query(bad_op, bad_repo, spy)
+        self.assertEqual(calls, [])
+
+    def test_interval_reader_binds_actual_actor_and_token_not_account_role(self):
+        source_text = source("operation_rows_since")
+        self.assertIn('self.alice["user_id"]', source_text)
+        self.assertIn('self.alice["token_id"]', source_text)
+        self.assertNotIn('self.alice["id"]', source_text)
+        self.assertNotIn('self.alice["username"]', source_text)
+        self.assertNotIn('self.alice["token"]', source_text)
+        self.assertNotIn("users", source_text.lower())
+        self.assertNotIn("string_agg", source_text.lower())
+        self.assertNotIn("role", source_text.lower())
+        self.assertIn('self.repo["id"]', source_text)
+        self.assertIn("self._sql_literal", source_text)
+        self.assertIn("decode_operation_interval(self.sql(query), highwater)", source_text)
+
+    @staticmethod
+    def columns(table):
+        """Columns a table has after every migration, index-keyed."""
+        schema = "\n".join(path.read_text() for path in sorted((ROOT / "migrations").glob("*.sql")))
+        block = re.search(r"CREATE TABLE (?:IF NOT EXISTS )?" + table + r" \((.*?)\n\);", schema, re.S)
+        assert block is not None, "table " + table + " is not in the migrations"
+        columns = set(re.findall(r"^\s+(\w+) ", block.group(1), re.M))
+        for added in re.findall(r"ALTER TABLE " + table + r" ADD COLUMN (?:IF NOT EXISTS )?(\w+)", schema):
+            columns.add(added)
+        return columns
+
+    def test_interval_query_uses_only_schema_tables_and_columns(self):
+        sql = self.interval_sql()
+        schema = "\n".join(path.read_text() for path in sorted((ROOT / "migrations").glob("*.sql")))
+        created = set(re.findall(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)", schema))
+        # Every alias is bound to exactly the schema table the query names;
+        # ``FROM|JOIN <table> <alias>`` yields ``{table: alias}``, so turn it
+        # into ``{alias: table}`` rather than inverting the lookup.
+        declared = re.findall(r"\b(?:FROM|JOIN)\s+(\w+)\s+([a-z])\b", sql)
+        bound = {alias: table for table, alias in declared}
+        self.assertEqual(bound, {"o": "git_operations", "a": "git_ref_admissions",
+                                 "e": "outbox_events"})
+        self.assertLessEqual(set(bound.values()), created)
+        # Each alias.column is a real column of that alias's table, after the
+        # migrations' ALTER TABLE additions (``service_principal_id``).
+        referenced = {}
+        for alias, table in bound.items():
+            used = set(re.findall(r"(?<!\w)" + alias + r"\.(\w+)", sql))
+            if used:
+                referenced[alias] = len(used)
+            known = self.columns(table)
+            self.assertEqual(used - known, set(), (alias, table, sorted(known)[:5]))
+        # Measured column usage: operations (9), admissions (7) and the outbox
+        # rows the name and event-object aggregations order, filter and project
+        # with their recorded old/new OIDs (5).
+        self.assertEqual(referenced, {"o": 9, "a": 7, "e": 5})
+        self.assertEqual(set(re.findall(r"(?<!\w)o\.(\w+)", sql)),
+                         {"id", "sequence", "outcome", "settled_at", "repository_id", "actor_id",
+                          "token_id", "service_principal_id", "evidence"})
+        self.assertEqual(set(re.findall(r"(?<!\w)a\.(\w+)", sql)),
+                         {"writer_id", "repository_id", "state", "settled_at", "actor_id",
+                          "token_id", "ref_names"})
+        self.assertEqual(set(re.findall(r"(?<!\w)e\.(\w+)", sql)),
+                         {"operation_id", "transaction_sequence", "ref_name", "old_oid", "new_oid"})
+        for column in ("actor_id", "token_id", "repository_id", "sequence", "evidence",
+                       "settled_at", "service_principal_id"):
+            self.assertIn(column, self.columns("git_operations"), column)
+        for column in ("writer_id", "state", "settled_at", "ref_names", "actor_id",
+                       "token_id", "repository_id"):
+            self.assertIn(column, self.columns("git_ref_admissions"), column)
+        # The joined admission really stores a sorted ``ref_names TEXT[]``.
+        self.assertIn("ref_names", self.columns("git_ref_admissions"))
+        self.assertIn("ref_names TEXT[] NOT NULL", (ROOT / "migrations/126_ref_admissions.sql").read_text())
+
+    def test_reference_events_projection_keeps_absence_visible(self):
+        sql = self.interval_sql()
+        # ``src/reliability.rs`` always serializes a ``Vec``; a missing key must
+        # therefore surface as the non-array sentinel, never as ``[]``.
+        self.assertIn("'reference_events', (COALESCE(o.evidence->'reference_events', "
+                      + refusal_audit_sql.EVIDENCE_MISSING_ARRAY + "))", sql)
+        self.assertNotIn("o.evidence->'reference_events', '[]'::jsonb", sql)
+        self.assertEqual(refusal_audit_sql.EVIDENCE_MISSING_ARRAY,
+                         refusal_audit_sql.EVIDENCE_MISSING_BOOL)
+        self.assertNotIn("o.evidence->>'reference_events'", sql)
+        # The decoder enforces the array contract, not an opaque passthrough.
+        decoder = source_of(SQL, "decode_operation_interval")
+        self.assertIn('_check_reference_events(row["reference_events"])', decoder)
+
+    def test_interval_query_projection_types_match_storage(self):
+        sql = self.interval_sql()
+        # All four evidence fields are stored JSON booleans: ``->`` (never
+        # ``->>``) and an absent key is a JSON string the decoder rejects.
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            self.assertIn("'" + key + "', (COALESCE(o.evidence->'" + key + "', "
+                          + refusal_audit_sql.EVIDENCE_MISSING_BOOL + "))", sql, key)
+            self.assertNotIn("o.evidence->>'" + key + "'", sql, key)
+        self.assertEqual(refusal_audit_sql.EVIDENCE_KEYS,
+                         ("finished", "storage_generation_matches", "interrupted",
+                          "ungranted_without_hooks"))
+        self.assertEqual(refusal_audit_sql.EVIDENCE_REQUIRED_TRUE_KEYS,
+                         ("finished", "storage_generation_matches"))
+        self.assertFalse(hasattr(refusal_audit_sql, "EVIDENCE_TEXT_KEYS"))
+        # The same key tuples the decoder and verdict enforce.
+        decoder = source_of(SQL, "decode_operation_interval")
+        self.assertIn("for name in EVIDENCE_BOOL_KEYS:", decoder)
+        self.assertNotIn("_STR_KEYS", decoder, "no evidence text-key path may remain")
+        self.assertNotIn("jsonb_each", sql)
+        self.assertIn("o.evidence->'post_receive' IS NULL", sql)
+        self.assertIn("o.evidence->'post_receive' = 'null'::jsonb", sql)
+
+    def test_interval_query_is_one_statement_without_global_limits(self):
+        sql = self.interval_sql()
+        self.assertTrue(sql.startswith("SELECT COALESCE(jsonb_agg(jsonb_build_object("))
+        # One row aggregation plus one exact event-object aggregation.
+        self.assertEqual(sql.count("jsonb_agg(jsonb_build_object("), 2)
+        self.assertIn("'outbox_events'", sql)
+        self.assertIn("ORDER BY o.sequence, o.id", sql)
+        self.assertIn("WHERE o.repository_id = '" + self.REPO + "'::uuid AND o.sequence > 7", sql)
+        self.assertNotIn("MAX(", sql)
+        self.assertNotIn("LIMIT", sql)
+        self.assertNotIn("COPY", sql.upper())
+
+    def test_operation_tables_used_by_the_interval_reader_exist(self):
+        schema = "\n".join(path.read_text() for path in sorted((ROOT / "migrations").glob("*.sql")))
+        for table in ("git_operations", "git_ref_admissions", "outbox_events", "repository_ref_projection"):
+            self.assertIn("CREATE TABLE IF NOT EXISTS " + table + " (", schema, table)
+        # ``service_principal_id`` that the release query binds is real.
+        self.assertIn("ALTER TABLE git_operations ADD COLUMN service_principal_id UUID",
+                      (ROOT / "migrations/109_ci_integration_jobs.sql").read_text())
+
+    def test_evidence_keys_are_jsonb_booleans_not_text(self):
+        sql = self.interval_sql()
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            self.assertIn("'" + key + "', (COALESCE(o.evidence->'" + key + "', "
+                          + refusal_audit_sql.EVIDENCE_MISSING_BOOL + "))", sql, key)
+            # The obsolete text projection is gone for every evidence key.
+            self.assertIsNone(re.search(r"o\.evidence->>'" + key + "'", sql), key)
+        self.assertNotIn("jsonb_each", sql)
+        self.assertIn("o.evidence->'post_receive' = 'null'::jsonb", sql)
+
+    def test_interval_decoder_enforces_complete_json_contract(self):
+        decode = refusal_audit_sql.decode_operation_interval
+
+        def row(operation_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sequence=8):
+            return {"operation_id": operation_id, "sequence": sequence,
+                    "outcome": "no_ref_changes", "settled": True, "finished": True,
+                    "actor_and_token_match": True, "human_principal": True, "service_principal": False,
+                    "evidence_no_receipt": True, "interrupted": False, "storage_generation_matches": True,
+                    "ungranted_without_hooks": False, "reference_events": [], "admission_present": True,
+                    "admission_state": "ABORTED", "admission_settled": True, "admission_identity_matches": True,
+                    "admission_ref_names": ["refs/heads/main"], "outbox_count": 0,
+                    "outbox_ref_names": [], "outbox_events": []}
+
+        def reject(rows):
+            with self.assertRaises(ValueError):
+                decode(json.dumps(rows), 7)
+
+        base = row()
+        self.assertEqual(decode(json.dumps([]), 7), [])
+        self.assertEqual(decode(json.dumps([base]), 7), [base])
+        with self.assertRaises(ValueError):
+            decode("{", 7)
+        with self.assertRaises(ValueError):
+            decode(json.dumps({}), 7)
+        missing = row()
+        del missing["outcome"]
+        reject([missing])
+        extra = row()
+        extra["actor_id"] = "actor"
+        reject([extra])
+        invalid_uuid = row()
+        invalid_uuid["operation_id"] = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+        reject([invalid_uuid])
+        at_highwater = row()
+        at_highwater["sequence"] = 7
+        reject([at_highwater])
+        boolean_sequence = row()
+        boolean_sequence["sequence"] = True
+        reject([boolean_sequence])
+        integer_settled = row()
+        integer_settled["settled"] = 1
+        reject([integer_settled])
+        # All four evidence keys are JSON booleans: text, ints and null fail.
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            for bad in ("true", "false", 1, 0, None):
+                wrong = row()
+                wrong[key] = bad
+                reject([wrong])
+            for good in (True, False):
+                acceptable = row()
+                acceptable[key] = good
+                self.assertEqual(decode(json.dumps([acceptable]), 7)[0][key], good)
+            missing_bool = row()
+            del missing_bool[key]
+            reject([missing_bool])
+        boolean_outbox_count = row()
+        boolean_outbox_count["outbox_count"] = True
+        reject([boolean_outbox_count])
+        integer_ref = row()
+        integer_ref["admission_ref_names"] = ["refs/heads/main", 1]
+        reject([integer_ref])
+        earlier = row(operation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", sequence=9)
+        later = row(operation_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc", sequence=8)
+        reject([earlier, later])
+        reject([base, dict(base, sequence=9)])
+
+    def test_operation_rows_since_decodes_interval_and_escapes_ids(self):
+        repo_uuid = "11111111-1111-4111-8111-111111111111"
+        actor_uuid = "22222222-2222-4222-8222-222222222222"
+        token_uuid = "33333333-3333-4333-8333-333333333333"
+        escaped = []
+        queries = []
+
+        def escape(value):
+            escaped.append(value)
+            return "E[" + value + "]"
+
+        def sql(query):
+            queries.append(query)
+            return "[]"
+
+        fake = SimpleNamespace(
+            repo={"id": repo_uuid},
+            alice={"user_id": actor_uuid, "token_id": token_uuid},
+            _sql_literal=escape,
+            sql=sql,
+        )
+        result = mixed_ref_cases.MixedRefPolicyCases.operation_rows_since(fake, 7)
+        self.assertEqual(result, [])
+        self.assertEqual(escaped, [repo_uuid, actor_uuid, token_uuid])
+        self.assertEqual(len(queries), 1)
+        query = queries[0]
+        self.assertIn("E[" + repo_uuid + "]", query)
+        self.assertIn("E[" + actor_uuid + "]", query)
+        self.assertIn("E[" + token_uuid + "]", query)
+        self.assertIn("o.sequence > 7", query)
+        self.assertEqual(query.count("jsonb_agg(jsonb_build_object("), 2)   # rows + events
+        self.assertIn("'outbox_events'", query)
+        self.assertNotIn("COPY", query.upper())
+
+    def test_service_release_valid_escapes_ids_and_requires_literal_true(self):
+        repo_uuid = "11111111-1111-4111-8111-111111111111"
+        operation_uuid = "44444444-4444-4444-8444-444444444444"
+        for raw_result, expected in (
+            ("true" + chr(10), True),
+            ("false" + chr(10), False),
+            ("TRUE" + chr(10), False),
+        ):
+            escaped = []
+            queries = []
+
+            def escape(value, escaped=escaped):
+                escaped.append(value)
+                return "E[" + value + "]"
+
+            def sql(query, responses=[], raw=raw_result):
+                responses.append(raw)
+                queries.append(query)
+                return raw
+
+            fake = SimpleNamespace(repo={"id": repo_uuid}, _sql_literal=escape, sql=sql)
+            result = mixed_ref_cases.MixedRefPolicyCases.service_release_valid(
+                fake, {"operation_id": operation_uuid})
+            self.assertIs(result, expected)
+            self.assertEqual(escaped, [operation_uuid, repo_uuid])
+            self.assertEqual(len(queries), 1)
+            self.assertIn("E[" + operation_uuid + "]", queries[0])
+            self.assertIn("E[" + repo_uuid + "]", queries[0])
+
+
+class RefusalOracleTest(unittest.TestCase):
+    """Directed truth table for ``refusal_audit_sql.refusal_audit_verdict``."""
+
+    def row(self, **changes):
+        row = {"settled": True, "outcome": "no_ref_changes",
+               "actor_and_token_match": True, "human_principal": True, "service_principal": False,
+               "evidence_no_receipt": True, "finished": True, "interrupted": False,
+               "storage_generation_matches": True, "ungranted_without_hooks": False,
+               "reference_events": [],
+               "admission_present": True, "admission_state": "ABORTED", "admission_settled": True,
+               "admission_identity_matches": True,
+               "admission_ref_names": ["refs/heads/main", "refs/heads/mixed-topic"],
+               "outbox_count": 0, "outbox_ref_names": [], "outbox_events": []}
+        row.update(changes)
+        return row
+
+    def verdict(self, row, journal=None):
+        journal = [] if journal is None else journal
+        return refusal_audit_sql.refusal_audit_verdict(
+            self.row(**row), journal, self.row()["admission_ref_names"])
+
+    def test_exact_settled_no_ref_changes_passes(self):
+        self.assertEqual(self.verdict({}), {"status": "settled", "problems": []})
+        # ``reference_events`` is a stored array; every event records no change.
+        self.assertEqual(self.verdict({"reference_events": [
+            {"ordinal": 1, "phase": "Aborted", "changes": []},
+            {"ordinal": 2, "phase": "Prepared", "changes": []}]}, [])["problems"], [])
+
+    def test_unknown_recorded_or_unsettled_is_never_a_pass(self):
+        unsettled = self.verdict({"settled": False, "outcome": "unknown"})
+        self.assertEqual(unsettled["status"], "pending", unsettled)
+        self.assertEqual(unsettled["problems"], [], unsettled)
+        for outcome in ("unknown", "recorded"):
+            settled = self.verdict({"settled": True, "outcome": outcome})
+            self.assertEqual(settled["status"], "settled", settled)
+            self.assertIn("outcome", settled["problems"], settled)
+        wrong_type = self.verdict({"settled": "true"})
+        self.assertEqual(wrong_type["status"], "settled", wrong_type)
+        self.assertIn("settled", wrong_type["problems"], wrong_type)
+
+    def test_every_single_defect_fails(self):
+        base = self.row()
+        defects = (
+            {"actor_and_token_match": False},
+            {"human_principal": False},
+            {"service_principal": True},
+            {"admission_present": False},
+            {"admission_state": "COMMITTED"},
+            {"admission_settled": False},
+            {"admission_identity_matches": False},
+            {"admission_ref_names": list(reversed(base["admission_ref_names"]))},
+            {"outbox_count": True},
+            {"outbox_count": 1},
+            {"outbox_ref_names": ["refs/heads/main"]},
+            {"evidence_no_receipt": False},
+            {"finished": False},
+            {"finished": "true"},
+            {"finished": 1},
+            {"storage_generation_matches": False},
+            {"storage_generation_matches": "true"},
+            {"interrupted": "maybe"},
+            {"ungranted_without_hooks": "maybe"},
+            {"interrupted": "true"},                     # text is not a bool
+            {"ungranted_without_hooks": "false"},
+            {"interrupted": 1},
+            # Boolean ordering rule: interrupted True requires ungranted True.
+            {"interrupted": True, "ungranted_without_hooks": False},
+            {"interrupted": True},                       # and presence is required
+            {"reference_events": None},
+        )
+        for changes in defects:
+            verdict = self.verdict(changes)
+            self.assertEqual(verdict["status"], "settled", (changes, verdict))
+            self.assertTrue(verdict["problems"], (changes, verdict))
+        verdict = self.verdict({}, journal=["op-id"])
+        self.assertEqual(verdict["status"], "settled", verdict)
+        self.assertTrue(verdict["problems"], verdict)
+        audit = refusal_audit_sql.refusal_audit_verdict(None, [], ["refs/heads/main"])
+        self.assertTrue(audit["problems"], audit)
+        for key in ("actor_and_token_match", "admission_state", "outbox_count", "reference_events",
+                    "finished", "storage_generation_matches"):
+            row = self.row()
+            del row[key]
+            result = refusal_audit_sql.refusal_audit_verdict(row, [], base["admission_ref_names"])
+            self.assertTrue(result["problems"], (key, result))
+
+    def test_recorded_ref_change_is_a_defect(self):
+        for evidence in (
+            [{"changes": [{"ref_name": "refs/heads/main"}]}],
+            [{"ordinal": 1, "phase": "Committed",
+              "changes": [{"ref_name": "refs/heads/main", "old_oid": "a", "new_oid": "b"}]}],
+            [{"changes": []}, {"changes": [{"ref_name": "refs/heads/main"}]}],
+            ["not a dict"],
+            [{"ordinal": 1, "phase": "Aborted"}],          # no changes list is not []
+        ):
+            problems = self.verdict({"reference_events": evidence})["problems"]
+            self.assertIn("reference_event_changes", problems, evidence)
+
+    def test_reference_events_must_be_a_stored_array(self):
+        """Only the stored ``Vec`` array passes; absence and other shapes fail."""
+        for bad in (None, "missing", {"ordinal": 1, "phase": "Aborted", "changes": []},
+                    "[]", 0, True):
+            with self.subTest(reference_events=bad):
+                self.assertIn("reference_events", self.verdict({"reference_events": bad})["problems"])
+        row = self.row()
+        del row["reference_events"]                        # an omitted key
+        self.assertIn("reference_events",
+                      refusal_audit_sql.refusal_audit_verdict(
+                          row, [], row["admission_ref_names"])["problems"])
+
+    def test_requested_is_validation_not_a_grant(self):
+        for ref in ("refs/heads/main", "refs/heads/other"):
+            row = {"reference_events": [{"changes": [], "requested": [ref]}]}
+            self.assertEqual(self.verdict(row)["problems"], [], ref)
+        source_text = CASES.read_text()
+        self.assertNotIn("no_requested_window", source_text)
+        self.assertNotIn("jsonb_each", source_text)
+
+    def test_filesystem_pending_journal_is_checked_separately_from_reference_events(self):
+        # The stored events record no change, so only the journal can fail.
+        self.assertEqual(self.verdict({"reference_events": []})["problems"], [])
+        result = self.verdict({"reference_events": [
+            {"ordinal": 1, "phase": "Aborted", "changes": []}]},
+            journal=["operation-directory"])
+        self.assertEqual(result["status"], "settled")
+        self.assertIn("journal", result["problems"])
+
+
+class EvidenceContractTest(unittest.TestCase):
+    """``assert_evidence_contract`` and ``fold_operation_evidence`` pin the storage."""
+
+    def evidence(self, **changes):
+        evidence = {"finished": True, "storage_generation_matches": True,
+                    "interrupted": False, "ungranted_without_hooks": False}
+        evidence.update(changes)
+        return evidence
+
+    def test_accepts_the_real_packet_line_evidence(self):
+        self.assertEqual(refusal_audit_sql.assert_evidence_contract("t", self.evidence()),
+                         self.evidence())
+        # Both recorded flags accept either boolean.
+        self.assertIs(refusal_audit_sql.assert_evidence_contract(
+            "t", self.evidence(interrupted=True, ungranted_without_hooks=True))["interrupted"], True)
+        self.assertIs(refusal_audit_sql.assert_evidence_contract(
+            "t", self.evidence(interrupted=True, ungranted_without_hooks=False))["interrupted"], True)
+
+    def test_rejects_each_defect(self):
+        for changes in ({"finished": "true"}, {"finished": 1}, {"finished": None},
+                        {"storage_generation_matches": None}, {"interrupted": "true"},
+                        {"interrupted": "false"}, {"interrupted": 1}, {"interrupted": None},
+                        {"ungranted_without_hooks": "missing"}, {"ungranted_without_hooks": 0},
+                        # The proof keys must be exactly true, even as booleans.
+                        {"finished": False}, {"storage_generation_matches": False}):
+            with self.subTest(changes=changes), self.assertRaises(AssertionError):
+                refusal_audit_sql.assert_evidence_contract("t", self.evidence(**changes))
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            evidence = self.evidence()
+            del evidence[key]
+            with self.subTest(missing=key), self.assertRaises(AssertionError):
+                refusal_audit_sql.assert_evidence_contract("t", evidence)
+        for value in (None, [], "true"):
+            with self.subTest(value=value), self.assertRaises(AssertionError):
+                refusal_audit_sql.assert_evidence_contract("t", value)
+
+    def test_folds_only_the_named_operation(self):
+        rows = [{"operation_id": "a", **self.evidence()}, {"operation_id": "b", **self.evidence()}]
+        folded = refusal_audit_sql.fold_operation_evidence({"label": "t", "operation_id": "b"}, rows)
+        self.assertEqual(folded, self.evidence())
+        for audit, rows in (({"label": "t", "operation_id": "c"}, rows),
+                            ({"label": "t", "operation_id": "a"}, rows[:1] * 2),
+                            ({"label": "t", "operation_id": "a"}, [])):
+            with self.subTest(audit=audit, rows=rows), self.assertRaises(AssertionError):
+                refusal_audit_sql.fold_operation_evidence(audit, rows)
+
+    def test_both_interval_audits_require_the_contract(self):
+        git_interval = source_of(SQL, "audit_git_refusal_interval")
+        self.assertIn("assert_evidence_contract(label, fold_operation_evidence(", git_interval)
+        self.assertIn('"evidence": evidence', git_interval)
+        self.assertIn('if before.get("api_refs") != after.get("api_refs")', git_interval)
+        api_interval = source_of(SQL, "audit_api_refusal_interval")
+        self.assertIn('"user_operation_count": len(', api_interval)
+        self.assertNotIn('"user_operation_count": 0', api_interval)
+
+
+class OperationsIntervalTypeRegressionTest(unittest.TestCase):
+    """End to end: projected SQL -> decoder -> fold -> contract, typed as stored."""
+
+    REPO = "11111111-1111-4111-8111-111111111111"
+    ACTOR = "22222222-2222-4222-8222-222222222222"
+    TOKEN = "33333333-3333-4333-8333-333333333333"
+    OPERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    @staticmethod
+    def projection_values():
+        sql = refusal_audit_sql.operations_after_query(
+            OperationsIntervalTypeRegressionTest.REPO, 7,
+            OperationsIntervalTypeRegressionTest.ACTOR,
+            OperationsIntervalTypeRegressionTest.TOKEN, str)
+        # Every jsonb_build_object value, in projection order: "<key>", <expr>.
+        pairs = re.findall(r"'([a-z_]+)', (.*?)(?=, '[a-z_]+', |\)::text)", sql)
+        return dict(pairs)
+
+    def projected(self):
+        """A representative row with the runtime types the SQL projection emits.
+
+        ``->`` yields the stored JSON value; all four evidence keys are stored
+        booleans (``src/reliability.rs`` serializes Rust ``bool``).  A missing
+        key becomes the JSON string ``EVIDENCE_MISSING_BOOL``, which the
+        decoder rejects; it is never mapped to ``False``.
+        """
+        values = self.projection_values()
+        emitted = {}
+        for key, expression in values.items():
+            projected = [name for name in refusal_audit_sql.EVIDENCE_KEYS
+                         if "o.evidence->'" + name + "'" in expression]
+            if projected:
+                # A representative aborted refusal: the two proof facts hold,
+                # the two recorded flags are false -- all as stored booleans.
+                emitted[key] = key in refusal_audit_sql.EVIDENCE_REQUIRED_TRUE_KEYS
+        return emitted
+
+    def test_sql_projects_booleans_with_the_json_operator(self):
+        values = self.projection_values()
+        self.assertEqual(refusal_audit_sql.EVIDENCE_KEYS,
+                         ("finished", "storage_generation_matches", "interrupted",
+                          "ungranted_without_hooks"))
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            self.assertIn("o.evidence->'" + key + "'", values[key], key)
+            self.assertNotIn("o.evidence->>'" + key + "'", values[key], key)
+            self.assertIn(refusal_audit_sql.EVIDENCE_MISSING_BOOL, values[key], key)
+        self.assertEqual(sorted(self.projected()), sorted(refusal_audit_sql.EVIDENCE_KEYS))
+        self.assertEqual({type(v) for v in self.projected().values()}, {bool})
+        # The SQL text has no text projection of any evidence key left.
+        sql = refusal_audit_sql.operations_after_query(
+            self.REPO, 7, self.ACTOR, self.TOKEN, str)
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            self.assertNotIn("o.evidence->>'" + key + "'", sql, key)
+
+    def row(self, **changes):
+        row = {"operation_id": self.OPERATION, "sequence": 8, "outcome": "no_ref_changes",
+               "settled": True, "actor_and_token_match": True, "human_principal": True,
+               "service_principal": False, "evidence_no_receipt": True,
+               "reference_events": [{"ordinal": 1, "phase": "Aborted", "changes": []}],
+               "admission_present": True, "admission_state": "ABORTED", "admission_settled": True,
+               "admission_identity_matches": True,
+               "admission_ref_names": ["refs/heads/main", "refs/heads/mixed-topic"],
+               "outbox_count": 0, "outbox_ref_names": [], "outbox_events": []}
+        row.update(self.projected())
+        row.update(changes)
+        return row
+
+    def run_pipeline(self, **changes):
+        """The real chain: -At JSON text -> decode -> fold -> contract."""
+        raw = json.dumps([self.row(**changes)])
+        self.assertIsInstance(raw, str)
+        rows = refusal_audit_sql.decode_operation_interval(raw, 7)
+        folded = refusal_audit_sql.fold_operation_evidence(
+            {"label": "interval", "operation_id": self.OPERATION}, rows)
+        return rows, folded, refusal_audit_sql.assert_evidence_contract("interval", folded)
+
+    def test_representative_row_passes_the_whole_chain(self):
+        rows, folded, contract = self.run_pipeline()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(folded, self.projected())
+        self.assertEqual(contract, folded)
+        self.assertIs(folded["finished"], True)
+        self.assertIs(folded["storage_generation_matches"], True)
+        self.assertIs(folded["interrupted"], False)
+        self.assertIs(folded["ungranted_without_hooks"], False)
+        # The verdict consumes the same decoded row without a type problem.
+        self.assertEqual(refusal_audit_sql.refusal_audit_verdict(rows[0], [], rows[0]["admission_ref_names"]),
+                         {"status": "settled", "problems": []})
+
+    def test_non_bool_value_is_rejected_and_names_its_key(self):
+        """Every bool key stays strict, and a failure says which key failed."""
+        # The unmodified row still decodes; only the bad value is rejected.
+        self.assertEqual(refusal_audit_sql.decode_operation_interval(
+            json.dumps([self.row()]), 7), [self.row()])
+        for bad in ("true", "false", 1, 0, None, [True]):
+            with self.subTest(key="interrupted", value=bad):
+                with self.assertRaisesRegex(
+                        ValueError,
+                        r"\binvalid operations interval: interrupted\b"):
+                    refusal_audit_sql.decode_operation_interval(
+                        json.dumps([self.row(interrupted=bad)]), 7)
+        with self.assertRaisesRegex(ValueError,
+                                    r"\binvalid operations interval: service_principal\b"):
+            refusal_audit_sql.decode_operation_interval(
+                json.dumps([self.row(service_principal="false")]), 7)
+
+    def test_either_booleans_text_form_breaks_the_chain(self):
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            with self.subTest(key=key):
+                # The SQL projection really emits a JSON value, not text.
+                self.assertIn(refusal_audit_sql.EVIDENCE_MISSING_BOOL, self.projection_values()[key])
+                # A string in either previously stringified field fails too.
+                with self.assertRaises(ValueError):
+                    refusal_audit_sql.decode_operation_interval(
+                        json.dumps([self.row(**{key: "true"})]), 7)
+
+    def test_text_at_the_contract_and_verdict_stages_is_rejected(self):
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            with self.subTest(key=key):
+                folded = dict(self.projected(), **{key: "true"})
+                with self.assertRaises(AssertionError):
+                    refusal_audit_sql.assert_evidence_contract("interval", folded)
+                verdict = refusal_audit_sql.refusal_audit_verdict(
+                    self.row(**{key: "true"}), [], self.row()["admission_ref_names"])
+                self.assertIn(key, verdict["problems"], verdict)
+                # "false" as text fails at every stage too: it is not a bool.
+                with self.assertRaises(ValueError):
+                    refusal_audit_sql.decode_operation_interval(
+                        json.dumps([self.row(**{key: "false"})]), 7)
+                with self.assertRaises(AssertionError):
+                    refusal_audit_sql.assert_evidence_contract(
+                        "interval", dict(self.projected(), **{key: "false"}))
+                self.assertIn(key, refusal_audit_sql.refusal_audit_verdict(
+                    self.row(**{key: "false"}), [], self.row()["admission_ref_names"])["problems"])
+
+    def test_reference_events_array_contract_end_to_end(self):
+        """Only a stored array of exact journal events survives the chain."""
+        real = [{"ordinal": 1, "phase": "Prepared", "changes": []},
+                {"ordinal": 2, "phase": "Aborted", "changes": []}]
+        rows = refusal_audit_sql.decode_operation_interval(
+            json.dumps([self.row(reference_events=real)]), 7)
+        self.assertEqual(rows[0]["reference_events"], real)
+        self.assertEqual(refusal_audit_sql.refusal_audit_verdict(
+            rows[0], [], rows[0]["admission_ref_names"])["problems"], [])
+        # A recorded change decodes (it is a real RefChange); the verdict refuses it.
+        changed = [{"ref_name": "refs/heads/main", "old_oid": "a" * 40, "new_oid": "b" * 40}]
+        decoded = refusal_audit_sql.decode_operation_interval(json.dumps([self.row(
+            reference_events=[{"ordinal": 1, "phase": "Committed", "changes": changed}])]), 7)
+        self.assertIn("reference_event_changes", refusal_audit_sql.refusal_audit_verdict(
+            decoded[0], [], decoded[0]["admission_ref_names"])["problems"])
+        # Missing, null, string, object and malformed entries fail the decoder.
+        for bad in ("missing", None, "[]", {}, 0, True,
+                    [{"ordinal": "1", "phase": "Aborted", "changes": []}],
+                    [{"ordinal": 1, "phase": "Aborting", "changes": []}],
+                    [{"ordinal": 1, "phase": "Aborted"}],
+                    [{"ordinal": 1, "phase": "Aborted", "changes": [], "extra": 1}],
+                    [{"ordinal": 1, "phase": "Aborted", "changes": {}}],
+                    [{"ordinal": 1, "phase": "Aborted",
+                      "changes": [{"ref_name": "refs/heads/main", "old_oid": "a" * 40}]}],
+                    [{"ordinal": 1, "phase": "Aborted",
+                      "changes": [{"ref_name": 1, "old_oid": "a" * 40, "new_oid": "b" * 40}]}],
+                    ["event"]):
+            with self.subTest(reference_events=bad):
+                with self.assertRaises(ValueError):
+                    refusal_audit_sql.decode_operation_interval(
+                        json.dumps([self.row(reference_events=bad)]), 7)
+        omitted = self.row()
+        del omitted["reference_events"]
+        with self.assertRaises(ValueError):
+            refusal_audit_sql.decode_operation_interval(json.dumps([omitted]), 7)
+
+    def test_reference_event_ordinals_are_positive_contiguous_and_ordered(self):
+        """``src/journal.rs`` keeps 1..N; impossible ordinals fail the decoder."""
+        def event(ordinal):
+            return {"ordinal": ordinal, "phase": "Aborted", "changes": []}
+
+        for bad in ([event(0)],                     # zero ordinal
+                    [event(-1)],                    # negative ordinal
+                    [event(1), event(1)],           # duplicate
+                    [event(2)],                     # gap from one
+                    [event(1), event(3)],           # gap in the middle
+                    [event(2), event(1)],           # out of order
+                    [event(1), {"ordinal": True, "phase": "Aborted", "changes": []}],
+                    ):
+            with self.subTest(ordinals=[entry["ordinal"] for entry in bad]):
+                with self.assertRaises(ValueError):
+                    refusal_audit_sql.decode_operation_interval(
+                        json.dumps([self.row(reference_events=bad)]), 7)
+        for good in ([], [event(1)], [event(1), event(2), event(3)]):
+            with self.subTest(ordinals=[entry["ordinal"] for entry in good]):
+                rows = refusal_audit_sql.decode_operation_interval(
+                    json.dumps([self.row(reference_events=good)]), 7)
+                self.assertEqual(rows[0]["reference_events"], good)
+
+    def test_folded_bool_is_the_only_bool_family(self):
+        _, folded, _ = self.run_pipeline()
+        self.assertEqual({key for key in folded if isinstance(folded[key], bool)},
+                         set(refusal_audit_sql.EVIDENCE_KEYS))
+        self.assertEqual({key for key in folded if isinstance(folded[key], str)}, set())
+
+    def test_either_boolean_is_accepted_for_the_recorded_flags(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                rows, folded, contract = self.run_pipeline()
+                row = dict(rows[0], interrupted=value, ungranted_without_hooks=value)
+                rows = refusal_audit_sql.decode_operation_interval(json.dumps([row]), 7)
+                folded = refusal_audit_sql.fold_operation_evidence(
+                    {"label": "interval", "operation_id": self.OPERATION}, rows)
+                self.assertIs(refusal_audit_sql.assert_evidence_contract("interval", folded)
+                              ["interrupted"], value)
+                # The ordering rule reads booleans; with both flags equal the
+                # verdict is clean either way.
+                verdict = refusal_audit_sql.refusal_audit_verdict(
+                    rows[0], [], rows[0]["admission_ref_names"])
+                self.assertEqual(verdict["problems"], [])
+
+    def test_boolean_ordering_rule_requires_ungranted_when_interrupted(self):
+        """``interrupted is True`` demands ``ungranted_without_hooks is True``."""
+        clean = refusal_audit_sql.refusal_audit_verdict(
+            self.row(interrupted=True, ungranted_without_hooks=True), [],
+            self.row()["admission_ref_names"])
+        self.assertEqual(clean["problems"], [])
+        broken = refusal_audit_sql.refusal_audit_verdict(
+            self.row(interrupted=True, ungranted_without_hooks=False), [],
+            self.row()["admission_ref_names"])
+        self.assertEqual(broken["problems"], ["interrupted_ungranted_order"])
+        # Not interrupted: the other flag is free.
+        for ungranted in (True, False):
+            verdict = refusal_audit_sql.refusal_audit_verdict(
+                self.row(interrupted=False, ungranted_without_hooks=ungranted), [],
+                self.row()["admission_ref_names"])
+            self.assertEqual(verdict["problems"], [], ungranted)
+
+    def test_finished_must_be_exactly_true(self):
+        for key in refusal_audit_sql.EVIDENCE_REQUIRED_TRUE_KEYS:
+            with self.subTest(key=key):
+                # Decodable (it is a bool) but not a valid refusal proof.
+                rows = refusal_audit_sql.decode_operation_interval(
+                    json.dumps([self.row(**{key: False})]), 7)
+                folded = refusal_audit_sql.fold_operation_evidence(
+                    {"label": "interval", "operation_id": self.OPERATION}, rows)
+                with self.assertRaisesRegex(AssertionError, key):
+                    refusal_audit_sql.assert_evidence_contract("interval", folded)
+                verdict = refusal_audit_sql.refusal_audit_verdict(
+                    rows[0], [], rows[0]["admission_ref_names"])
+                self.assertIn(key, verdict["problems"], verdict)
+
+
+class FinalApiReadRegressionTest(unittest.TestCase):
+    """The rows read once the refs are final are part of the proof call."""
+
+    JOB_REF = "refs/rootyard-ci/jobs/11111111-1111-4111-8111-111111111111"
+    OPERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    @staticmethod
+    def snapshot(**changes):
+        snapshot = {"operation_highwater": 7, "refs": [("refs/heads/main", "a")], "journal": [],
+                    "state": "ready/-", "outcomes": {}, "admissions": {}, "outbox": 0,
+                    "api_refs": [("refs/heads/main", "a")]}
+        snapshot.update(changes)
+        return snapshot
+
+    @classmethod
+    def human(cls, settled=False):
+        return {"operation_id": cls.OPERATION, "sequence": 8, "human_principal": True,
+                "service_principal": False, "actor_and_token_match": True, "settled": settled,
+                "outbox_ref_names": [], "outbox_events": []}
+
+    JOB_OLD, JOB_NEW = "c" * 40, "d" * 40
+
+    @classmethod
+    def service(cls, settled=True, old_oid=None, new_oid=None, sequence=9,
+                operation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"):
+        """One CI service row linking its exact job outbox event."""
+        event = {"ref_name": cls.JOB_REF, "old_oid": old_oid or cls.JOB_OLD,
+                 "new_oid": new_oid or cls.JOB_NEW}
+        return {"operation_id": operation_id, "sequence": sequence,
+                "human_principal": False, "service_principal": True, "actor_and_token_match": False,
+                "settled": settled, "outbox_ref_names": [cls.JOB_REF], "outbox_events": [event]}
+
+    # -- interval snapshot race: a service row settled after the ref read -----
+    STALE_LOOP_PRE = """
+    while True:
+        _, pending_service_rows, _ = classify(operation_rows_since(highwater))
+        if pending_service_rows:
+            wait(time.monotonic())
+            continue
+        final_after = ref_state()
+        final_rows = operation_rows_since(highwater)
+        settled_service_rows, pending_service_rows, allowed_service_events = classify(final_rows)
+        if pending_service_rows:
+            wait(time.monotonic())
+            continue
+        break
+    """
+
+    STALE_LOOP_CURRENT = """
+    while True:
+        _, pending_service_rows, _ = classify(operation_rows_since(highwater))
+        final_after = ref_state()
+        sed_rows = operation_rows_since(highwater)
+        if pending_service_rows:
+            wait(time.monotonic())
+            continue
+        settled_service_rows, pending_service_rows, allowed_service_events = classify(sed_rows)
+        if pending_service_rows:
+            wait(time.monotonic())
+            continue
+        break
+    """
+
+    def test_human_row_only_on_the_final_read_fails_the_audit(self):
+        reads, refs = [], []
+
+        def operation_rows_since(before_highwater):
+            reads.append(before_highwater)
+            return [self.human()] if refs else []
+
+        def ref_state():
+            refs.append(True)
+            return self.snapshot(operation_highwater=9)
+        validated = []
+        with self.assertRaisesRegex(AssertionError, "human operation row"):
+            refusal_audit_sql.audit_api_refusal_interval(
+                self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"],
+                operation_rows_since, lambda row: validated.append(row) or True, ref_state)
+        # The pre-snapshot read was empty; the human row was only seen by the
+        # post-snapshot re-read and was never accepted.
+        self.assertEqual(reads, [7, 7])
+        self.assertEqual(validated, [])
+
+    def test_user_count_comes_from_the_classified_final_rows(self):
+        # The settled row is visible only after the first snapshot (which is
+        # taken before it, highwater 7); one re-snapshot follows it, and the
+        # proof rows come from that second read.
+        reads, refs = [], []
+
+        def operation_rows_since(before_highwater):
+            reads.append(before_highwater)
+            return [self.creation()] if refs else []
+
+        def ref_state():
+            refs.append(True)
+            return self.snapshot(operation_highwater=7) if len(refs) == 1 \
+                else self.late_snapshot(with_before_main=True)
+        result = refusal_audit_sql.audit_api_refusal_interval(
+            self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"],
+            operation_rows_since, lambda row: True, ref_state)
+        # Pre-read (empty), snapshot 7, reread (row), fresh snapshot 8, reread.
+        self.assertEqual(reads, [7, 7, 7, 7])
+        self.assertEqual(len(refs), 2)
+        self.assertEqual(result["user_operation_count"], 0)
+        self.assertEqual([op["operation_id"] for op in result["service_operations"]],
+                         [self.creation()["operation_id"]])
+
+    def test_pending_service_row_still_settles_before_the_final_proof(self):
+        reads, snapshots = [], []
+        # One operation, sequence 8, one zero -> new event: pending first, then
+        # the same row settled.  The pending snapshot stops at highwater 7 (no
+        # job ref); the settled snapshot is highwater 8 with main + job ref.
+        pending = self.creation(settled=False)
+        settled = self.creation()
+        # The first pass only sees the pending row and cannot reach the
+        # snapshot; once settled, the snapshot taken is still the highwater-7
+        # one, so the audit re-snapshots and proves against highwater 8.
+        snapshots_iter = iter([self.snapshot(operation_highwater=7,
+                                             refs=[("refs/heads/main", "a")]),
+                               self.late_snapshot(with_before_main=True)])
+
+        def rows_since(highwater):
+            reads.append(highwater)
+            # The first read sees the row pending; from the reread on, the
+            # same operation is settled in place.
+            return [pending if len(reads) == 1 else settled]
+
+        def ref_state():
+            snapshots.append(len(reads))
+            return next(snapshots_iter)
+        result = refusal_audit_sql.audit_api_refusal_interval(
+            self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"], rows_since,
+            lambda row: True, ref_state)
+        self.assertEqual(result["user_operation_count"], 0)
+        # The pending row made the audit wait and repeat the pass.  Pending
+        # read (wait); settled pass: pre-read, snapshot at 7, reread (sequence
+        # 8 > 7, stale); fresh snapshot at 8; final reread, then the settled
+        # row is reported.  Never accepted while unsettled.
+        self.assertEqual(reads, [7, 7, 7, 7, 7])
+        self.assertEqual(snapshots, [2, 4])
+        self.assertEqual(result["service_operations"],
+                         [{"operation_id": settled["operation_id"], "sequence": 8,
+                           "outbox_ref": self.JOB_REF}])
+        self.assertEqual(result["changed_refs"], [self.JOB_REF])
+        self.assertEqual(result["diagnostics"]["final_highwater"], 8)
+
+    def test_unvalidated_service_row_on_the_final_read_still_fails(self):
+        reads, refs = [], []
+
+        def operation_rows_since(before_highwater):
+            reads.append(before_highwater)
+            return [self.creation()] if refs else []
+
+        def ref_state():
+            refs.append(True)
+            return self.late_snapshot(with_before_main=True)
+        with self.assertRaisesRegex(AssertionError, "not source-validated"):
+            refusal_audit_sql.audit_api_refusal_interval(
+                self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"],
+                operation_rows_since, lambda row: False, ref_state)
+        self.assertEqual(reads, [7, 7])
+
+    # -- interval snapshot race: a service row settled after the ref read -----
+    def late_snapshot(self, with_before_main):
+        """The refs once the settled service create (sequence 8) is durable."""
+        refs = [(self.JOB_REF, self.JOB_NEW)]
+        if with_before_main:
+            refs.insert(0, ("refs/heads/main", "a"))
+        return self.snapshot(operation_highwater=8, refs=refs)
+
+    @classmethod
+    def creation(cls, settled=True):
+        """The creation event: zero -> new for an absent job ref."""
+        return cls.service(sequence=8, old_oid="0" * 40, new_oid=cls.JOB_NEW, settled=settled)
+
+    @staticmethod
+    def stale_loop(loop, highwater, classify, operation_rows_since, ref_state):
+        """Run one reviewed pre-fix loop verbatim against this test's fakes."""
+        namespace = {}
+        exec(compile(textwrap.dedent(
+            "def stale_loop(highwater, classify, operation_rows_since, ref_state, wait):"
+            + loop), "<pre-fix final api read>", "exec"),
+             {"time": refusal_audit_sql.time}, namespace)
+        namespace["stale_loop"](highwater, classify, operation_rows_since, ref_state,
+                                lambda _moment: None)
+
+    @classmethod
+    def stale_classify(cls, rows):
+        """The pre-fix loops' permissive service classification."""
+        return None, [row for row in rows if not row["settled"]], []
+
+    def test_late_settled_service_row_forces_a_new_ref_snapshot(self):
+        # One deterministic interleaving: the pre-read before the first
+        # snapshot returns no rows; the read after that snapshot returns the
+        # settled sequence-8 service create (zero -> d...d); every later read
+        # returns that same row.  The first snapshot keeps only
+        # refs/heads/main at operation_highwater 7; the second also has the
+        # job ref at d...d with operation_highwater 8.
+        late = self.creation()
+        pre_snapshot = self.snapshot(operation_highwater=7, refs=[("refs/heads/main", "a")])
+        fresh_snapshot = self.late_snapshot(with_before_main=True)
+
+        # Pre-fix loops, verbatim, on the same interleaving: the pending check
+        # reads first, the refs are read, and only then does the reread gain
+        # the operation.  The stale highwater-7 snapshot is accepted with the
+        # settled zero -> d...d event, and the unchanged refs pass the
+        # transition check.  That is the bug.
+        for name, loop in (("first", self.STALE_LOOP_PRE), ("current", self.STALE_LOOP_CURRENT)):
+            with self.subTest(pre_fix_loop=name):
+                reads = []
+
+                def stale_rows(before_highwater):
+                    reads.append(before_highwater)
+                    return [] if len(reads) == 1 else [late]
+
+                def stale_refs():
+                    self.assertEqual(len(reads), 1)
+                    return pre_snapshot
+                self.stale_loop(loop, 7, self.stale_classify, stale_rows, stale_refs)
+                self.assertEqual(pre_snapshot["refs"], [("refs/heads/main", "a")])
+                self.assertEqual(pre_snapshot["operation_highwater"], 7)
+                refusal_audit_sql.check_service_ref_transitions(
+                    "stale", dict(pre_snapshot["refs"]), dict(pre_snapshot["refs"]),
+                    refusal_audit_sql.service_allow_map("stale", [late["outbox_events"][0]]),
+                    ["refs/heads/main"])
+
+        # The real audit, same interleaving: pre-read (empty), snapshot at
+        # highwater 7, reread (row), next pre-read (same row), fresh snapshot
+        # at highwater 8, reread (row) -- then the row is reported.
+        reads, snapshots = [], []
+
+        def audited_rows(before_highwater):
+            reads.append(before_highwater)
+            return [] if len(reads) == 1 else [late]
+
+        def audited_refs():
+            snapshots.append(len(reads))
+            return pre_snapshot if len(snapshots) == 1 else fresh_snapshot
+
+        result = refusal_audit_sql.audit_api_refusal_interval(
+            self.snapshot(), self.snapshot(), "api 403", ["refs/heads/main"],
+            audited_rows, lambda row: True, audited_refs)
+        self.assertEqual(reads, [7, 7, 7, 7])
+        self.assertEqual(snapshots, [1, 3])
+        self.assertEqual(result["user_operation_count"], 0)
+        self.assertEqual(result["service_operations"],
+                         [{"operation_id": late["operation_id"], "sequence": 8,
+                           "outbox_ref": self.JOB_REF}])
+        self.assertEqual(result["changed_refs"], [self.JOB_REF])
+        self.assertEqual(result["diagnostics"]["final_highwater"], 8)
+
+
+class ServiceRefTransitionTest(unittest.TestCase):
+    """A service event whitelists one exact ref transition, never a ref name."""
+
+    JOB_REF = "refs/rootyard-ci/jobs/11111111-1111-4111-8111-111111111111"
+    OLD, NEW, OTHER = "c" * 40, "d" * 40, "e" * 40
+    SNAPSHOT = {"journal": [], "state": "ready/-", "outcomes": {}, "admissions": {}, "outbox": 0,
+                "operation_highwater": 7, "api_refs": [("refs/heads/main", "a")]}
+
+    def event(self, old=None, new=None):
+        return {"ref_name": self.JOB_REF, "old_oid": old or self.OLD, "new_oid": new or self.NEW}
+
+    def snapshot(self, refs, highwater=None):
+        snapshot = dict(self.SNAPSHOT, refs=refs)
+        if highwater is not None:
+            snapshot["operation_highwater"] = highwater
+        return snapshot
+
+    # -- Git refusal interval -------------------------------------------------
+    def git_rows(self, events):
+        return [{"operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "sequence": 8,
+                 "outcome": "no_ref_changes", "settled": True, "finished": True,
+                 "actor_and_token_match": True, "human_principal": True, "service_principal": False,
+                 "evidence_no_receipt": True, "interrupted": False, "storage_generation_matches": True,
+                 "ungranted_without_hooks": False, "reference_events": [],
+                 "admission_present": True, "admission_state": "ABORTED", "admission_settled": True,
+                 "admission_identity_matches": True, "admission_ref_names": ["refs/heads/main"],
+                 "outbox_count": 0, "outbox_ref_names": [], "outbox_events": []},
+                {"operation_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "sequence": 9,
+                 "human_principal": False, "service_principal": True, "actor_and_token_match": False,
+                 "settled": True, "outbox_ref_names": [events[0]["ref_name"]] if events else [],
+                 "outbox_events": events}]
+
+    def run_git(self, events, before_refs, after_refs):
+        def ref_state():
+            # Every interval read observes the same settled post-refusal state.
+            return self.snapshot(after_refs)
+        return refusal_audit_sql.audit_git_refusal_interval(
+            self.snapshot(before_refs), "git refusal", ["refs/heads/main"],
+            lambda highwater: self.git_rows(events), lambda row: True, lambda: [],
+            ref_state)
+
+    # -- API refusal interval -------------------------------------------------
+    def run_api(self, events, before_refs, after_refs):
+        row = {"operation_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "sequence": 9,
+               "human_principal": False, "service_principal": True, "actor_and_token_match": False,
+               "settled": True, "outbox_ref_names": [event["ref_name"] for event in events],
+               "outbox_events": events}
+        return refusal_audit_sql.audit_api_refusal_interval(
+            self.snapshot(before_refs), self.snapshot(before_refs), "api 403", ["refs/heads/main"],
+            lambda highwater: [row], lambda row: True,
+            lambda: self.snapshot(after_refs, highwater=row["sequence"]))
+
+    def test_exact_service_transition_is_allowed_in_both_audits(self):
+        before = [("refs/heads/main", "a"), (self.JOB_REF, self.OLD)]
+        after = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        for name, run in (("git", self.run_git), ("api", self.run_api)):
+            with self.subTest(audit=name):
+                result = run([self.event()], before, after)
+                self.assertEqual(result["service_ref_names"], [self.JOB_REF])
+                if name == "api":
+                    self.assertEqual(result["changed_refs"], [self.JOB_REF])
+
+    def test_absent_ref_materializing_at_the_event_target_is_allowed(self):
+        # The real CI path: the service operation *creates* the job ref, so its
+        # event is zero -> target and the absent physical side is the zero OID.
+        event = self.event(old="0" * 40, new=self.NEW)
+        before = [("refs/heads/main", "a")]
+        after = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        for name, run in (("git", self.run_git), ("api", self.run_api)):
+            with self.subTest(audit=name):
+                run([event], before, after)
+
+    def test_out_of_band_overwrite_of_the_same_ref_is_rejected_in_both_audits(self):
+        # The ref name is the validated one, but the physical move is not the
+        # event's old -> new transition: an unrelated overwrite must fail.
+        for event, before, after in (
+            (self.event(), [("refs/heads/main", "a"), (self.JOB_REF, self.OLD)],
+             [("refs/heads/main", "a"), (self.JOB_REF, self.OTHER)]),
+            # A creation event whose physical target is a different OID.
+            (self.event(old="0" * 40, new=self.NEW), [("refs/heads/main", "a")],
+             [("refs/heads/main", "a"), (self.JOB_REF, self.OTHER)]),
+        ):
+            for name, run in (("git", self.run_git), ("api", self.run_api)):
+                with self.subTest(audit=name, event=event):
+                    with self.assertRaisesRegex(AssertionError, "moved out of band|without a validated"):
+                        run([event], before, after)
+
+    def test_unchanged_ref_is_not_forced_to_materialize_an_event(self):
+        # A recorded event whose target was already in place: nothing moved, so
+        # the audit neither requires nor rejects the ref on that account.
+        before = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        for name, run in (("git", self.run_git), ("api", self.run_api)):
+            with self.subTest(audit=name):
+                run([self.event()], before, before)
+
+    def test_absent_event_old_must_be_the_zero_oid_of_its_format(self):
+        # An event claiming a non-zero old OID for a ref that did not exist is
+        # a source/observed disagreement, not a legal creation.
+        before = [("refs/heads/main", "a")]
+        after = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        for name, run in (("git", self.run_git), ("api", self.run_api)):
+            with self.subTest(audit=name):
+                with self.assertRaisesRegex(AssertionError, "moved out of band"):
+                    run([self.event()], before, after)
+
+    def test_duplicate_service_events_for_one_ref_are_ambiguous(self):
+        # Same ref name, two validated events: which move it must match cannot
+        # be decided, so both audits fail closed.
+        before = [("refs/heads/main", "a"), (self.JOB_REF, self.OLD)]
+        after = [("refs/heads/main", "a"), (self.JOB_REF, self.NEW)]
+        first = self.event()
+        second = {"ref_name": self.JOB_REF, "old_oid": self.OLD, "new_oid": self.OTHER}
+        # Two settled service rows: each links its own job event, but both name
+        # the same ref, so the physical move cannot be attributed to one.
+        duplicate_rows = self.git_rows([first])
+        duplicate_rows.append(dict(duplicate_rows[1],
+                                   operation_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                                   sequence=10, outbox_ref_names=[self.JOB_REF],
+                                   outbox_events=[second]))
+        with self.assertRaisesRegex(AssertionError, "duplicate validated service outbox events"):
+            refusal_audit_sql.audit_git_refusal_interval(
+                self.snapshot(before), "duplicate", ["refs/heads/main"],
+                lambda highwater: duplicate_rows, lambda row: True, lambda: [],
+                lambda: self.snapshot(after))
+        with self.assertRaisesRegex(AssertionError, "duplicate validated service outbox events"):
+            refusal_audit_sql.audit_api_refusal_interval(
+                self.snapshot(before), self.snapshot(before), "duplicate api", ["refs/heads/main"],
+                lambda highwater: duplicate_rows[1:], lambda row: True, lambda: self.snapshot(after))
+        # The shared allow-map helper stays the last-line guard.
+        with self.assertRaisesRegex(AssertionError, "duplicate validated service outbox events"):
+            refusal_audit_sql.service_allow_map("t", [first, second])
+
+    def test_human_refusal_must_have_no_outbox_event_objects(self):
+        row = {"settled": True, "outcome": "no_ref_changes", "actor_and_token_match": True,
+               "human_principal": True, "service_principal": False, "evidence_no_receipt": True,
+               "finished": True, "interrupted": False, "storage_generation_matches": True,
+               "ungranted_without_hooks": False, "reference_events": [], "admission_present": True,
+               "admission_state": "ABORTED", "admission_settled": True,
+               "admission_identity_matches": True, "admission_ref_names": ["refs/heads/main"],
+               "outbox_count": 0, "outbox_ref_names": []}
+        for bad in ([],):
+            self.assertEqual(refusal_audit_sql.refusal_audit_verdict(
+                dict(row, outbox_events=bad), [], ["refs/heads/main"])["problems"], [])
+        for bad in ([self.event()], None, "[]"):
+            self.assertIn("outbox_events", refusal_audit_sql.refusal_audit_verdict(
+                dict(row, outbox_events=bad), [], ["refs/heads/main"])["problems"], bad)
+
+    def test_decoder_requires_exact_event_objects(self):
+        base = {"operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "sequence": 8,
+                "outcome": "no_ref_changes", "settled": True, "finished": True,
+                "actor_and_token_match": True, "human_principal": True, "service_principal": False,
+                "evidence_no_receipt": True, "interrupted": False, "storage_generation_matches": True,
+                "ungranted_without_hooks": False, "reference_events": [], "admission_present": True,
+                "admission_state": "ABORTED", "admission_settled": True,
+                "admission_identity_matches": True, "admission_ref_names": ["refs/heads/main"],
+                "outbox_count": 0}
+
+        def decode(events, names=None):
+            derived = ([event["ref_name"] for event in events
+                        if isinstance(event, dict) and "ref_name" in event]
+                       if names is None and isinstance(events, list) else
+                       ([] if names is None else names))
+            row = dict(base, outbox_events=events, outbox_ref_names=derived)
+            return refusal_audit_sql.decode_operation_interval(json.dumps([row]), 7)
+        self.assertEqual(decode([self.event()])[0]["outbox_events"], [self.event()])
+        for bad in ({}, "event", None, [{"ref_name": self.JOB_REF, "old_oid": self.OLD}],
+                    [dict(self.event(), extra=1)], [self.event(new=self.OLD.upper())],
+                    [self.event(new=self.NEW[:-1])], [self.event(old="f" * 64)],
+                    [dict(self.event(), new_oid="g" * 40)]):
+            with self.subTest(outbox_events=bad):
+                with self.assertRaises(ValueError):
+                    decode(bad)
+        # The legacy name array must still describe exactly these events.
+        with self.assertRaises(ValueError):
+            decode([self.event()], names=["refs/rootyard-ci/jobs/other"])
+
+
+class ServiceEvidenceSchemaDecodeTest(unittest.TestCase):
+    """The alternate ``observed_immutable_ci_root`` service evidence schema.
+
+    ``src/reliability.rs`` and ``src/webhooks/delivery.rs`` persist service
+    operations with ``finished``/``interrupted``/``reference_events``/``retained``
+    and without the receive-pack-only ``storage_generation_matches`` /
+    ``ungranted_without_hooks``.  The interval query deliberately reads every
+    service and human row, so the decoder accepts exactly the SQL missing
+    sentinel for those two keys on a service row; the human row keeps all four
+    real booleans, and no service row is accepted without ``service_release_valid``.
+    """
+
+    HUMAN = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    SERVICE = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    JOB_REF = "refs/rootyard-ci/jobs/11111111-1111-4111-8111-111111111111"
+    OLD, NEW = "c" * 40, "d" * 40
+
+    @property
+    def projection_sql(self):
+        return refusal_audit_sql.operations_after_query(
+            "11111111-1111-4111-8111-111111111111", 7,
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333", str)
+
+    @classmethod
+    def projection_values(cls):
+        sql = refusal_audit_sql.operations_after_query(
+            "11111111-1111-4111-8111-111111111111", 7,
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333", str)
+        return dict(re.findall(r"'([a-z_]+)', (.*?)(?=, '[a-z_]+', |\)::text)", sql))
+
+    def test_only_the_two_omitted_service_keys_may_decode_as_the_sentinel(self):
+        """The allowance is derived from the two stored service schemas only."""
+        values = self.projection_values()
+        self.assertEqual(refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS,
+                         ("storage_generation_matches", "ungranted_without_hooks"))
+        for key in refusal_audit_sql.EVIDENCE_KEYS:
+            self.assertIn("o.evidence->'" + key + "'", values[key], key)
+            self.assertNotIn("o.evidence->>'" + key + "'", values[key], key)
+        decoder = source_of(SQL, "decode_operation_interval")
+        self.assertIn("name in SERVICE_EVIDENCE_OMITTED_KEYS", decoder)
+        self.assertIn("is_service", decoder)
+        # The settled retained variant in ``src/reliability.rs`` has the same
+        # four-key shape as the source in ``src/webhooks/delivery.rs``.
+        reliability = (ROOT / "src/reliability.rs").read_text()
+        retained = next(line for line in reliability.splitlines()
+                        if '"retained":!changes.is_empty()' in line)
+        for key in ("finished", "interrupted", "reference_events", "retained"):
+            self.assertIn('"%s"' % key, retained, key)
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            self.assertNotIn('"%s"' % key, retained, key)
+        # An alternate recovery record has a different, unaccepted shape.
+        pending = next(line for line in reliability.splitlines()
+                       if '"kind":if operation.service_principal_id.is_some()' in line)
+        for key in ("finished", "storage_generation_matches"):
+            self.assertIn('"%s"' % key, pending, key)
+        for key in ("interrupted", "reference_events", "ungranted_without_hooks", "retained"):
+            self.assertNotIn('"%s"' % key, pending, key)
+        # ``src/webhooks/delivery.rs`` writes the four-key alternate schema.
+        delivery = (ROOT / "src/webhooks/delivery.rs").read_text()
+        delivery_object = re.search(
+            r'json!\(\{\s*"version": 1, "kind": "observed_immutable_ci_root", "intent": intent,'
+            r'.*?\}\)', delivery, re.S)
+        self.assertIsNotNone(delivery_object)
+        delivered = delivery_object.group(0)
+        for key in ("finished", "interrupted", "reference_events", "retained"):
+            self.assertIn('"%s"' % key, delivered, key)
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            self.assertNotIn('"%s"' % key, delivered, key)
+        # Both accepted retained schemas carry ``finished`` and ``interrupted``
+        # from the four receive-pack keys. The allowance is exactly the two
+        # receive-pack-only keys they omit; ``reference_events`` remains a
+        # stored array on both sources.
+        self.assertEqual(
+            [key for key in refusal_audit_sql.EVIDENCE_KEYS if '"%s"' % key in delivered],
+            ["finished", "interrupted"])
+        self.assertEqual(
+            [key for key in refusal_audit_sql.EVIDENCE_KEYS if '"%s"' % key in retained],
+            ["finished", "interrupted"])
+        # The separate recovery record is not the accepted retained schema; it
+        # carries storage-generation evidence but no receipt/outbox proof.
+        self.assertEqual(
+            [key for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS
+             if '"%s"' % key in retained], [])
+        self.assertEqual(
+            [key for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS
+             if '"%s"' % key in pending],
+            ["storage_generation_matches"])
+        self.assertEqual(
+            refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS,
+            tuple(key for key in refusal_audit_sql.EVIDENCE_KEYS
+                  if key not in ("finished", "interrupted", "reference_events")))
+        self.assertEqual(refusal_audit_sql.SERVICE_EVIDENCE_ALLOWED_VALUES,
+                         (True, False, "missing"))
+
+    def row(self, principal="human", **changes):
+        row = {"operation_id": self.HUMAN, "sequence": 8, "outcome": "no_ref_changes",
+               "settled": True, "actor_and_token_match": True, "human_principal": True,
+               "service_principal": False, "evidence_no_receipt": True,
+               "reference_events": [], "admission_present": True,
+               "admission_state": "ABORTED", "admission_settled": True,
+               "admission_identity_matches": True,
+               "admission_ref_names": ["refs/heads/main"], "outbox_count": 0,
+               "outbox_ref_names": [], "outbox_events": []}
+        if principal == "human":
+            row.update(finished=True, interrupted=False, storage_generation_matches=True,
+                       ungranted_without_hooks=False)
+        else:
+            # The settled, retained CI service shape: no receive-pack admission
+            # or post-receive receipt, one linked job-ref event, and the two
+            # receive-pack-only keys projected as the SQL missing sentinel.
+            row.update(operation_id=self.SERVICE, sequence=9, outcome="recorded",
+                       actor_and_token_match=False, human_principal=False, service_principal=True,
+                       evidence_no_receipt=True, admission_present=False, admission_state=None,
+                       admission_settled=False, admission_identity_matches=False,
+                       admission_ref_names=[], outbox_count=1, finished=True,
+                       interrupted=False, storage_generation_matches="missing",
+                       ungranted_without_hooks="missing",
+                       outbox_ref_names=[self.JOB_REF],
+                       # The delivery create: zero -> new for an absent ref.
+                       outbox_events=[{"ref_name": self.JOB_REF, "old_oid": "0" * 40,
+                                       "new_oid": self.NEW}])
+        row.update(changes)
+        return row
+
+    def test_human_row_missing_either_schema_boolean_fails_at_decode(self):
+        decode = refusal_audit_sql.decode_operation_interval
+        # The sentinel for either key on a human row is not a JSON boolean.
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, r"invalid operations interval: " + key):
+                    decode(json.dumps([self.human(**{key: "missing"})]), 7)
+        # The SQL projection of an omitted key is the same sentinel (``->`` plus
+        # ``COALESCE``); the decoder rejects it and never reads absence as false.
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            self.assertIn("'" + key + "', (COALESCE(o.evidence->'" + key + "', "
+                          + refusal_audit_sql.EVIDENCE_MISSING_BOOL + "))", self.projection_sql)
+        # Every other evidence key needs a real bool on a human row, too.
+        for key in refusal_audit_sql.EVIDENCE_BOOL_KEYS:
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, r"invalid operations interval: " + key):
+                    decode(json.dumps([self.human(**{key: "missing"})]), 7)
+
+    @classmethod
+    def human(cls, **changes):
+        return ServiceEvidenceSchemaDecodeTest.row(cls(), "human", **changes)
+
+    def test_human_service_flag_forgery_never_unlocks_the_sentinel(self):
+        decode = refusal_audit_sql.decode_operation_interval
+        for flags in ({"human_principal": True, "service_principal": True,
+                       "actor_and_token_match": False},
+                      {"human_principal": False, "service_principal": True,
+                       "actor_and_token_match": True},
+                      {"human_principal": False, "service_principal": False,
+                       "actor_and_token_match": False},
+                      {"human_principal": True, "service_principal": False,
+                       "actor_and_token_match": False}):
+            with self.subTest(flags=flags):
+                row = self.human(storage_generation_matches="missing",
+                                 ungranted_without_hooks="missing", **flags)
+                with self.assertRaisesRegex(ValueError, "storage_generation_matches"):
+                    decode(json.dumps([row]), 7)
+
+    def test_service_row_with_the_expected_sentinel_decodes_for_source_validation(self):
+        raw = json.dumps([self.row("service")])
+        rows = refusal_audit_sql.decode_operation_interval(raw, 7)
+        self.assertEqual(rows[0]["storage_generation_matches"], "missing")
+        self.assertEqual(rows[0]["ungranted_without_hooks"], "missing")
+        self.assertIs(rows[0]["finished"], True)
+        self.assertIs(rows[0]["interrupted"], False)
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            self.assertIn(rows[0][key], refusal_audit_sql.SERVICE_EVIDENCE_ALLOWED_VALUES, key)
+        # ``src/reliability.rs`` writes verified service rows as
+        # ``recorded``/``settled``, the only shape the source query accepts.
+        self.assertEqual((rows[0]["outcome"], rows[0]["settled"], rows[0]["evidence_no_receipt"]),
+                         ("recorded", True, True))
+        # Decoding is not acceptance: the human refusal contract still refuses
+        # the sentinel, so no service row can be folded as a refusal receipt.
+        folded = refusal_audit_sql.fold_operation_evidence(
+            {"label": "service", "operation_id": self.SERVICE}, rows)
+        with self.assertRaisesRegex(AssertionError,
+                                    "storage_generation_matches.*ungranted_without_hooks|"
+                                    "ungranted_without_hooks"):
+            refusal_audit_sql.assert_evidence_contract("service", folded)
+
+    def test_unverified_recovery_service_row_without_events_fails_decode(self):
+        """The alternate recovery record is never treated as retained evidence."""
+        row = self.row("service", outcome="unknown", settled=False,
+                       storage_generation_matches=True, ungranted_without_hooks="missing")
+        row["reference_events"] = "missing"
+        row["outbox_count"] = 0
+        row["outbox_ref_names"] = []
+        row["outbox_events"] = []
+        self.assertIn("'reference_events', (COALESCE(o.evidence->'reference_events', "
+                      + refusal_audit_sql.EVIDENCE_MISSING_ARRAY + "))", self.projection_sql)
+        with self.assertRaisesRegex(ValueError, "invalid operations interval"):
+            refusal_audit_sql.decode_operation_interval(json.dumps([row]), 7)
+
+    def test_service_text_booleans_remain_rejected(self):
+        decode = refusal_audit_sql.decode_operation_interval
+        # The legacy text projection of the two omitted keys is not a bool.
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            for bad in ("true", "false"):
+                with self.subTest(key=key, value=bad):
+                    with self.assertRaisesRegex(ValueError,
+                                                r"invalid operations interval: " + key):
+                        decode(json.dumps([self.row("service", **{key: bad})]), 7)
+        # The two keys the alternate schema keeps are always real booleans,
+        # both in their stored form and in the obsolete text form.
+        for key in ("finished", "interrupted"):
+            for bad in ("true", "false"):
+                with self.subTest(key=key, value=bad):
+                    with self.assertRaisesRegex(ValueError,
+                                                r"invalid operations interval: " + key):
+                        decode(json.dumps([self.row("service", **{key: bad})]), 7)
+
+    def test_service_sentinel_is_only_the_exact_missing_string(self):
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            for bad in ("", "MISSING", "missing ", 0, 1, None, [], {}, True):
+                if isinstance(bad, bool):
+                    # A real boolean is the stored form and always decodes.
+                    self.assertIs(
+                        refusal_audit_sql.decode_operation_interval(
+                            json.dumps([self.row("service", **{key: bad})]), 7)[0][key], bad)
+                    continue
+                with self.subTest(key=key, value=bad):
+                    with self.assertRaisesRegex(ValueError,
+                                                r"invalid operations interval: " + key):
+                        refusal_audit_sql.decode_operation_interval(
+                            json.dumps([self.row("service", **{key: bad})]), 7)
+
+    def test_service_events_still_pass_the_source_bound_validator(self):
+        """A decoded service row is accepted only if ``service_release_valid`` holds."""
+        rows = refusal_audit_sql.decode_operation_interval(json.dumps([self.row("service")]), 7)
+        service_row = rows[0]
+        snapshot = {"operation_highwater": 7, "refs": [], "api_refs": [("refs/heads/main", "a")],
+                    "journal": [], "state": "ready/-", "outcomes": {}, "admissions": {},
+                    "outbox": 0}
+
+        def run(valid):
+            validated = []
+
+            def service_release_valid(row):
+                # The audit re-classifies the stable read: validated each time.
+                self.assertEqual(row["operation_id"], self.SERVICE)
+                validated.append(row["operation_id"])
+                return valid
+
+            def ref_state():
+                return dict(snapshot, operation_highwater=service_row["sequence"],
+                            refs=[(self.JOB_REF, self.NEW)])
+            result = refusal_audit_sql.audit_api_refusal_interval(
+                snapshot, snapshot, "api 403", ["refs/heads/main"],
+                lambda highwater: rows, service_release_valid, ref_state)
+            return result, validated
+
+        result, validated = run(True)
+        # Decoded for validation and validated on every read, never bypassed.
+        self.assertGreaterEqual(len(validated), 1)
+        self.assertEqual(set(validated), {self.SERVICE})
+        self.assertEqual(result["service_operations"],
+                         [{"operation_id": self.SERVICE, "sequence": 9, "outbox_ref": self.JOB_REF}])
+        with self.assertRaisesRegex(AssertionError, "not source-validated"):
+            run(False)
+        # An exception from the owning source-proof query is never a pass.
+        def broken(row):
+            raise AssertionError("service row not settled under the exact source query")
+        with self.assertRaisesRegex(AssertionError, "not settled under the exact source query"):
+            refusal_audit_sql.audit_api_refusal_interval(
+                snapshot, snapshot, "api 403", ["refs/heads/main"], lambda highwater: rows,
+                broken, lambda: dict(snapshot, operation_highwater=9))
+        # The Git interval classifies through the same validator.
+        git_human = self.human()
+        git_rows = [git_human, service_row]
+        calls = []
+
+        def git_service_valid(row):
+            calls.append(row["operation_id"])
+            return False
+        with self.assertRaisesRegex(AssertionError, "not a valid"):
+            refusal_audit_sql.audit_git_refusal_interval(
+                snapshot, "git refusal", ["refs/heads/main"],
+                lambda highwater: git_rows, git_service_valid, lambda: [],
+                lambda: dict(snapshot, operation_highwater=9, refs=[(self.JOB_REF, self.NEW)]))
+        self.assertEqual(calls, [self.SERVICE])
+
+    def test_human_refusal_path_never_accepts_a_missing_sentinel(self):
+        human = self.human()
+        rows = [self.row("service", storage_generation_matches="missing",
+                         ungranted_without_hooks="missing")]
+        rows = refusal_audit_sql.decode_operation_interval(json.dumps(rows), 7)
+        folded = refusal_audit_sql.fold_operation_evidence(
+            {"label": "t", "operation_id": self.HUMAN},
+            [dict(human, operation_id=self.HUMAN)] + rows)
+        self.assertEqual(folded, refusal_audit_sql.assert_evidence_contract("t", folded))
+        for key in refusal_audit_sql.SERVICE_EVIDENCE_OMITTED_KEYS:
+            with self.subTest(key=key):
+                self.assertIs(folded[key], human[key])
+
+
+class NativeRefusalAccountingTest(unittest.TestCase):
+    def test_native_refusal_uses_highwater_interval_and_validated_service_exception(self):
+        native = source("assert_one_aborted_refusal")
+        compile(native, "assert_one_aborted_refusal", "exec")
+        self.assertIn("audit_git_refusal_interval", native)
+        helper = source_of(SQL, "audit_git_refusal_interval")
+        compile(helper, "<audit_git_refusal_interval>", "exec")
+        for needle in (
+            'before["operation_highwater"]',
+            "operation_rows_since(highwater)",
+            "service_release_valid(row)",
+            'refusal_audit_verdict(human, after["journal"], requested_refs)',
+            '"ready/-"',
+            "refs/rootyard-ci/jobs/",
+            "service_ref_names",
+        ):
+            self.assertIn(needle, helper)
+        counter_pattern = re.compile(
+            r'(?:before|after)\[\s*"(?:outcomes|admissions|outbox)"\s*\]'
+            r'\s*(?:==|!=|<=|>=|<|>)'
+            r'|(?:==|!=|<=|>=|<|>)\s*'
+            r'(?:before|after)\[\s*"(?:outcomes|admissions|outbox)"\s*\]'
+        )
+        self.assertIsNone(counter_pattern.search(helper),
+                          "refusal interval audit must not gate on global counters")
+        api = source("assert_api_refusal")
+        self.assertNotIn("git_refusal_audit", api)
+
+    def test_api_interval_allows_valid_ci_release_and_ignores_global_count_deltas(self):
+        job_ref = "refs/rootyard-ci/jobs/11111111-1111-4111-8111-111111111111"
+        operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        old_oid, new_oid = "c" * 40, "d" * 40
+        service_row = {"operation_id": operation_id, "sequence": 8, "human_principal": False,
+                       "service_principal": True, "actor_and_token_match": False, "settled": True,
+                       "outbox_ref_names": [job_ref],
+                       "outbox_events": [{"ref_name": job_ref, "old_oid": old_oid,
+                                          "new_oid": new_oid}]}
+        before = {"operation_highwater": 7, "refs": [("refs/heads/main", "a"), (job_ref, old_oid)],
+                  "journal": [], "state": "ready/-", "outcomes": {"recorded": 1}, "admissions": {},
+                  "outbox": 1, "api_refs": [("refs/heads/main", "a")]}
+        final = {"operation_highwater": 8, "refs": [("refs/heads/main", "a"), (job_ref, new_oid)],
+                 "journal": [], "state": "ready/-", "outcomes": {"recorded": 2},
+                 "admissions": {"ABORTED": 1}, "outbox": 2, "api_refs": [("refs/heads/main", "a")]}
+        highwaters = []
+        validated = []
+        state_calls = []
+
+        def rows_since(highwater):
+            highwaters.append(highwater)
+            return [service_row]
+
+        def service_valid(row):
+            validated.append(row["operation_id"])
+            return True
+
+        def get_state():
+            state_calls.append("state")
+            return final
+
+        result = refusal_audit_sql.audit_api_refusal_interval(
+            before, before, "api 403", ["refs/heads/main"], rows_since, service_valid, get_state)
+        self.assertEqual(result["user_operation_count"], 0)
+        self.assertEqual(result["changed_refs"], [job_ref])
+        self.assertEqual(len(result["service_operations"]), 1)
+        self.assertDictEqual(result["service_operations"][0],
+                             {"operation_id": operation_id, "sequence": 8, "outbox_ref": job_ref})
+        self.assertTrue(highwaters)
+        for highwater in highwaters:
+            self.assertEqual(highwater, 7)
+        self.assertIn(operation_id, validated)
+        self.assertTrue(state_calls)
+
+    def test_api_interval_rejects_unsettled_human_and_unknown_rows_immediately(self):
+        rows = [
+            {"operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "sequence": 8,
+             "human_principal": True, "service_principal": False, "actor_and_token_match": True,
+             "settled": False, "outbox_ref_names": []},
+            {"operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "sequence": 8,
+             "human_principal": False, "service_principal": False, "actor_and_token_match": False,
+             "settled": False, "outbox_ref_names": []},
+        ]
+        for row in rows:
+            with self.subTest(row=row):
+                before = {"operation_highwater": 7, "refs": [("refs/heads/main", "a")], "journal": [],
+                          "state": "ready/-", "outcomes": {}, "admissions": {}, "outbox": 0}
+                after = dict(before)
+                calls, valid_calls, ref_state_calls = [], [], []
+
+                def operation_rows_since(highwater):
+                    calls.append(highwater)
+                    return [dict(row)]
+
+                def service_release_valid(candidate):
+                    valid_calls.append(candidate)
+                    return True
+
+                def ref_state():
+                    ref_state_calls.append(True)
+                    return after
+
+                with self.assertRaises(AssertionError):
+                    refusal_audit_sql.audit_api_refusal_interval(
+                        before, after, "api 403", ["refs/heads/main"], operation_rows_since,
+                        service_release_valid, ref_state)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(valid_calls, [])
+                self.assertEqual(ref_state_calls, [])
+
+    def test_api_interval_rejects_unaccounted_repository_ref_change(self):
+        before = {"operation_highwater": 7, "refs": [("refs/heads/main", "a"), ("refs/heads/other", "x")],
+                  "journal": [], "state": "ready/-", "outcomes": {}, "admissions": {}, "outbox": 0,
+                  "api_refs": [("refs/heads/main", "a")]}
+        final = {**before, "refs": [("refs/heads/main", "a"), ("refs/heads/other", "y")]}
+
+        def rows_since(highwater):
+            return []
+
+        def service_valid(row):
+            raise AssertionError("service validation must not run for an empty interval")
+
+        def get_state():
+            return final
+
+        with self.assertRaises(AssertionError):
+            refusal_audit_sql.audit_api_refusal_interval(
+                before, before, "api 403", ["refs/heads/main"], rows_since, service_valid, get_state)
+
+    def test_api_interval_rejects_a_public_view_change(self):
+        before = {"operation_highwater": 7, "refs": [("refs/heads/main", "a")], "journal": [],
+                  "state": "ready/-", "outcomes": {}, "admissions": {}, "outbox": 0,
+                  "api_refs": [("refs/heads/main", "a")]}
+        final = {**before, "api_refs": [("refs/heads/main", "z")]}
+        with self.assertRaisesRegex(AssertionError, "api_refs differ"):
+            refusal_audit_sql.audit_api_refusal_interval(
+                before, final, "api 403", ["refs/heads/main"], lambda highwater: [],
+                lambda row: True, lambda: final)
+
+    def test_native_group_uses_the_real_server_denial(self):
+        native = source("native_group")
+        self.assertIn('"config", "--get", "receive.denyNonFastForwards"', native)
+        self.assertIn('.strip() == "true"', native)
+        self.assertIn('"+" + self.first + ":" + main', native)
+        self.assertIn('"--atomic"', native)
+        for forbidden in ("put_rule", "policy_rule", "rule_body", "require_fast_forward"):
+            self.assertNotIn(forbidden, native, forbidden)
+        self.assertIn('listed.get(main) == self.third', native)
+
+
+class SourceBindingTest(unittest.TestCase):
+    """Physical refs only from the run-owned bare repo via stock for-each-ref."""
+
+    def test_ref_state_reads_the_bare_repository_with_stock_for_each_ref(self):
+        body = ast.unparse(method("ref_state"))
+        self.assertIn("'--git-dir=' + str(self.bare)", body)
+        self.assertIn("for-each-ref", body)
+        self.assertIn("%(refname)%00%(objectname)", body)
+        self.assertIn("self.native_git()[\'executable\']", body)
+        # Never through the PATH wrapper and never through a Git config.
+        self.assertNotIn("self.git(", body)
+        self.assertNotIn("self.git_as(", body)
+        # The public view is a separate, fully paginated API read: the cursor
+        # walk helper, never a single page that could stop at the limit.
+        self.assertIn("public_refs(self, self.repo_api(''))", body)
+        self.assertNotIn("self.document(self.repo_api('/refs'))", body)
+        self.assertLess(body.index("api_refs"), body.index("subprocess.run("))
+        # The snapshot carries the physical refs, the API refs, and the bounds.
+        returns = [n for n in ast.walk(method("ref_state")) if isinstance(n, ast.Return)]
+        keys = {k.value for k in returns[-1].value.keys if isinstance(k, ast.Constant)}
+        self.assertLessEqual({"refs", "api_refs", "journal", "state", "operation_highwater",
+                              "outcomes"}, keys)
+        # ``outcomes`` is the per-outcome count map the API refusal diagnostics
+        # read: it must come from the run-owned repository's own rows through
+        # the same read-only ``self.sql`` path as the other counts, never from
+        # the unit snapshot fixtures.
+        entries = {k.value: v for k, v in zip(returns[-1].value.keys, returns[-1].value.values)}
+        outcome_sql = ast.unparse(entries["outcomes"])
+        self.assertIn("git_operations WHERE repository_id=", outcome_sql)
+        self.assertIn("GROUP BY outcome", outcome_sql)
+        self.assertIn("outcome || ':'", outcome_sql)
+        self.assertIn("ORDER BY outcome", outcome_sql)
+        self.assertIn("count(*)", outcome_sql)
+        # Only the stored operations' own columns; ``outcome`` is a real one.
+        self.assertLessEqual({"outcome", "repository_id"},
+                             RefusalAuditSqlTest.columns("git_operations"))
+        # Only the repository id is interpolated (the escaped ``repo``), and only
+        # in the WHERE clause: no second placeholder reaches the query text.
+        self.assertEqual(outcome_sql.count("+ repo +"), 1)
+        self.assertLess(outcome_sql.index("+ repo +"), outcome_sql.index("GROUP BY"))
+        self.assertNotIn("INSERT", outcome_sql.upper())
+        self.assertNotIn("UPDATE", outcome_sql.upper())
+        self.assertNotIn("DELETE", outcome_sql.upper())
+        self.assertNotIn("FOR UPDATE", outcome_sql.upper())
+        # Exactly the same callable ``self.sql`` the admissions/outbox counts
+        # use (captured once), never a fixture map or a fresh connection.
+        self.assertIn("sql = self.sql", body)
+        self.assertIn("sql(", outcome_sql)
+        self.assertNotIn("self.sql(", outcome_sql)
+        for table in ("git_ref_admissions", "outbox_events"):
+            self.assertIn(table, ast.unparse(entries[{"git_ref_admissions": "admissions",
+                                                      "outbox_events": "outbox"}[table]]))
+        # The interval audits compare the actual (physical) refs, not the API view.
+        helper = source_of(SQL, "audit_git_refusal_interval")
+        self.assertIn('before_refs = {name: oid for name, oid in before["refs"]}', helper)
+        api_helper = source_of(SQL, "audit_api_refusal_interval")
+        self.assertIn('before_refs = dict(before["refs"])', api_helper)
+
+    def test_ref_state_outcomes_come_from_the_run_repository_rows(self):
+        """The API refusal diagnostics read a real per-outcome map, never KeyError."""
+        statements = []
+        probe_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, probe_dir)
+
+        def probe_ops(argv, *args, **kwargs):
+            # Only the stock ref read is faked: an empty run-owned bare repo.
+            self.assertIn("for-each-ref", argv)
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        saved = mixed_ref_cases.subprocess.run
+        mixed_ref_cases.subprocess.run = probe_ops
+        self.addCleanup(setattr, mixed_ref_cases.subprocess, "run", saved)
+
+        def sql(statement):
+            statements.append(statement)
+            if "MAX(sequence)" in statement:
+                return "0"
+            if "GROUP BY outcome" in statement:
+                return "no_ref_changes:1,recorded:2"
+            if "FROM git_ref_admissions" in statement:
+                return "ABORTED:1,COMMITTED:1"
+            if "FROM outbox_events" in statement:
+                return "1"
+            if "FROM repositories" in statement:
+                return "ready/-"
+            raise AssertionError("unexpected statement: " + statement)
+
+        harness = SimpleNamespace(
+            repo={"id": "11111111-1111-4111-8111-111111111111"},
+            bare=probe_dir, root=probe_dir,
+            _sql_literal=browse.BrowseHarness._sql_literal, sql=sql,
+            pending_journal=lambda: [], repository_marker=lambda: "ready/-",
+            native_git=lambda: {"executable": MIXED_TEST_GIT},
+            repo_api=lambda suffix="": "/api/repos/alice/demo" + suffix,
+            document=lambda path, **kwargs: {"items": [], "next_after": None})
+        state = mixed_ref_cases.MixedRefPolicyCases.ref_state(harness)
+        self.assertEqual(state["outcomes"], {"no_ref_changes": 1, "recorded": 2})
+        self.assertEqual(state["admissions"], {"ABORTED": 1, "COMMITTED": 1})
+        self.assertEqual(state["outbox"], 1)
+        self.assertEqual(state["operation_highwater"], 0)
+        # Read-only: one SELECT per count/cursor source, no writer statement.
+        outcome_statements = [s for s in statements if "GROUP BY outcome" in s]
+        self.assertEqual(len(outcome_statements), 1)  # the outcome map only
+        for statement in statements:
+            self.assertTrue(statement.lstrip().upper().startswith("SELECT"), statement)
+            for writer in ("INSERT", "UPDATE", "DELETE"):
+                self.assertNotIn(writer, statement.upper(), statement)
+            self.assertNotRegex(statement.upper(), r"\bFOR\s+(UPDATE|SHARE)\b")
+        # The API refusal interval accepts this snapshot's outcomes unchanged
+        # and reports them; the outcome map itself is not a gate.
+        before = {**state, "operation_highwater": 7}
+        final = {**state, "outcomes": {"no_ref_changes": 1, "recorded": 3}}
+        result = refusal_audit_sql.audit_api_refusal_interval(
+            before, final, "api 403", ["refs/heads/main"], lambda highwater: [],
+            lambda row: True, lambda: final)
+        self.assertEqual(result["diagnostics"]["before"]["outcomes"], {"no_ref_changes": 1, "recorded": 2})
+        self.assertEqual(result["diagnostics"]["after"]["outcomes"], {"no_ref_changes": 1, "recorded": 3})
+
+    def test_public_refs_walk_follows_every_cursor_page(self):
+        """More public refs than one page: the snapshot must see every one."""
+        names = ["refs/heads/main"] + ["refs/tags/tag-%04d" % index for index in range(200)]
+        self.assertEqual(len(names), 201)              # limit=100 -> three pages
+        oid = "a" * 40
+        harness = SimpleNamespace(requests=[], last_cursor=None)
+
+        def document(path, code=200, token=None, **kwargs):
+            self.assertTrue(path.startswith("/api/repos/alice/demo/refs?"), path)
+            query = urllib.parse.parse_qs(path.split("?", 1)[1])
+            limit = int(query["limit"][0])
+            self.assertEqual(limit, mixed_ref_cases.PUBLIC_REFS_PAGE_LIMIT)
+            self.assertLessEqual(limit, 100, "the supported page size is 100")
+            after = query.get("after", [None])[0]
+            harness.requests.append((limit, after))
+            remaining = [name for name in names if after is None or name > after]
+            page = remaining[:limit]
+            return {"items": [{"name": name, "oid": oid} for name in page],
+                    "next_after": page[-1] if len(remaining) > limit else None}
+        harness.document = document
+        refs = mixed_ref_cases.public_refs(harness, "/api/repos/alice/demo")
+        # Every ref is present, and the walk made exactly the cursor requests
+        # for them: limit only, then one cursor per completed page.
+        self.assertEqual(sorted(refs), [(name, oid) for name in names])
+        self.assertEqual(harness.requests,
+                         [(100, None), (100, names[99]), (100, names[199])])
+        self.assertEqual(len(harness.requests), 3)
+        # A single default-limit read would have truncated at 50.
+        self.assertGreater(len(refs), 50)
+
+    @staticmethod
+    def refs_page(items, next_after):
+        """A fake ``/refs`` server returning the same page for every cursor."""
+        return SimpleNamespace(document=lambda path, code=200, token=None, **kwargs: {
+            "items": [{"name": name, "oid": "a" * 40} for name in items],
+            "next_after": next_after})
+
+    def test_public_refs_walk_rejects_stalled_or_non_terminating_cursors(self):
+        # A cursor that does not advance must fail rather than loop or truncate.
+        with self.assertRaisesRegex(AssertionError, "did not advance"):
+            mixed_ref_cases.public_refs(
+                self.refs_page(["refs/heads/main"], "refs/heads/main"), "/r")
+        # A single page whose last ref runs past its own cursor would be skipped
+        # by that cursor, so the full public set is unknown: fail closed.
+        with self.assertRaisesRegex(AssertionError, "not bounded by its own next_after"):
+            mixed_ref_cases.public_refs(
+                self.refs_page(["refs/tags/a", "refs/tags/z"], "refs/tags/m"), "/r")
+        # A page whose cursor sits before its last ref is just as unbounded.
+        with self.assertRaisesRegex(AssertionError, "not bounded by its own next_after"):
+            mixed_ref_cases.public_refs(
+                self.refs_page(["refs/tags/m", "refs/tags/a"], "refs/tags/m"), "/r")
+        # An empty page with a cursor cannot make progress either.
+        with self.assertRaisesRegex(AssertionError, "not bounded by its own next_after"):
+            mixed_ref_cases.public_refs(self.refs_page([], "refs/tags/m"), "/r")
+        # A page without an items list is not evidence of an empty repository.
+        with self.assertRaisesRegex(AssertionError, "items list"):
+            mixed_ref_cases.public_refs(SimpleNamespace(document=lambda *a, **k: {}), "/r")
+        # A page with a non-string cursor is not a page at all.
+        with self.assertRaisesRegex(AssertionError, "did not advance"):
+            mixed_ref_cases.public_refs(
+                SimpleNamespace(document=lambda *a, **k: {
+                    "items": [], "next_after": 5}), "/r")
+        # An unbounded server is refused instead of walking forever.
+        saved = mixed_ref_cases.PUBLIC_REFS_MAX_PAGES
+        page_number = iter(range(100_000))
+
+        def endless(path, code=200, token=None, **kwargs):
+            number = next(page_number)
+            return {"items": [{"name": "refs/tags/x%07d" % number, "oid": "a" * 40}],
+                    "next_after": "refs/tags/x%07d" % number}
+        mixed_ref_cases.PUBLIC_REFS_MAX_PAGES = 3
+        try:
+            with self.assertRaisesRegex(AssertionError, "did not terminate"):
+                mixed_ref_cases.public_refs(SimpleNamespace(document=endless), "/r")
+        finally:
+            mixed_ref_cases.PUBLIC_REFS_MAX_PAGES = saved
+
+    def test_ref_oids_uses_rev_parse_on_the_bare_repository(self):
+        body = ast.unparse(method("ref_oids"))
+        self.assertIn("\'--git-dir=\' + str(self.bare)", body)
+        self.assertIn("\'rev-parse\', \'--verify\', \'-q\'", body)
+        self.assertIn("self.native_git_probe()['executable']", body)
+        self.assertNotIn("self.git(", body)
+
+
+class GitResolutionTest(unittest.TestCase):
+    def run_resolve(self, args_git, env, path_git):
+        harness = object.__new__(FixtureHarness)
+        harness.args = SimpleNamespace(git=args_git)
+        harness.env = dict(env)
+        saved_environ = dict(mixed_ref_cases.os.environ)
+        # ``mixed_ref_cases.shutil`` and ``mixed_ref_support.shutil`` normally
+        # name the same stdlib module as ``shutil`` here, but save each exact
+        # attribute so restoring never depends on that identity.
+        saved_which = shutil.which
+        saved_case_which = mixed_ref_cases.shutil.which
+        saved_support_which = mixed_ref_support.shutil.which
+        try:
+            mixed_ref_cases.os.environ.clear()
+            mixed_ref_cases.os.environ.update(env)
+            mixed_ref_cases.shutil.which = lambda name: path_git
+            return harness.native_git()
+        finally:
+            # Unconditional: a failed resolution must not leave every later
+            # test module resolving any executable through this lambda.
+            mixed_ref_cases.shutil.which = saved_case_which
+            mixed_ref_support.shutil.which = saved_support_which
+            shutil.which = saved_which
+            mixed_ref_cases.os.environ.clear()
+            mixed_ref_cases.os.environ.update(saved_environ)
+
+    def test_declared_git_wins_over_path(self):
+        real = str(Path(sys.executable).resolve())
+        resolved = self.run_resolve(real, {"ROOTYARD_GIT": real}, "/usr/bin/false-git")
+        self.assertEqual(resolved["executable"], real)
+        self.assertTrue(resolved["declared"])
+
+    def test_disagreeing_declarations_fail(self):
+        harness = object.__new__(FixtureHarness)
+        harness.args = SimpleNamespace(git="/opt/a/git")
+        harness.env = {}
+        saved = dict(mixed_ref_cases.os.environ)
+        try:
+            mixed_ref_cases.os.environ.clear()
+            mixed_ref_cases.os.environ.update({"ROOTYARD_GIT": "/opt/b/git"})
+            with self.assertRaisesRegex(AssertionError, "disagree"):
+                harness.native_git()
+        finally:
+            mixed_ref_cases.os.environ.clear()
+            mixed_ref_cases.os.environ.update(saved)
+
+    def test_implicit_path_is_recorded_as_implicit(self):
+        real = str(Path(sys.executable).resolve())
+        resolved = self.run_resolve(None, {}, real)
+        self.assertEqual(resolved["executable"], real)
+        self.assertFalse(resolved["declared"])
+
+
+class GitBindingTest(unittest.TestCase):
+    """Regression: Git resolution and binding tests leave process globals intact.
+
+    The binding cases on this branch live on ``BrowseIntegrationTest``; this
+    class keeps their global-state contract next to ``GitResolutionTest``.
+    Both suites run here from a clean snapshot, because ``run_resolve`` used
+    to replace the process-wide ``shutil.which`` with a lambda returning
+    ``sys.executable`` for every lookup.
+    """
+
+    @staticmethod
+    def snapshot():
+        return {
+            "which": shutil.which,
+            "case_which": mixed_ref_cases.shutil.which,
+            "support_which": mixed_ref_support.shutil.which,
+            "git": shutil.which("git"),
+            "python": shutil.which("python3"),
+            "environ": dict(os.environ),
+        }
+
+    @staticmethod
+    def restore(snapshot):
+        shutil.which = snapshot["which"]
+        mixed_ref_cases.shutil.which = snapshot["case_which"]
+        mixed_ref_support.shutil.which = snapshot["support_which"]
+        os.environ.clear()
+        os.environ.update(snapshot["environ"])
+
+    def assert_restored(self, snapshot):
+        # Identity catches even a callable with the same result; the two
+        # lookups catch the old lambda, which returned one path for every name.
+        self.assertIs(shutil.which, snapshot["which"])
+        self.assertIs(mixed_ref_cases.shutil.which, snapshot["case_which"])
+        self.assertIs(mixed_ref_support.shutil.which, snapshot["support_which"])
+        self.assertEqual(shutil.which("git"), snapshot["git"])
+        self.assertEqual(shutil.which("python3"), snapshot["python"])
+        self.assertEqual(os.environ.get("ROOTYARD_GIT"),
+                         snapshot["environ"].get("ROOTYARD_GIT"))
+        self.assertEqual(dict(os.environ), snapshot["environ"])
+
+    def run_suite(self, suite):
+        result = unittest.TestResult()
+        suite.run(result)
+        problems = [problem for _test, problem in result.failures + result.errors]
+        self.assertTrue(result.wasSuccessful(),
+                        "nested Git tests failed:\n" + "\n".join(problems))
+        self.assertEqual(result.skipped, [])
+
+    def test_git_resolution_and_binding_restore_process_globals(self):
+        before = self.snapshot()
+        # The module-level capture catches a leak that happened before this
+        # regression test was reached, not just one caused by the suites below.
+        self.assertIs(before["which"], ORIGINAL_SHUTIL_WHICH)
+        self.assertEqual(before["git"], MIXED_TEST_GIT)
+        try:
+            self.run_suite(unittest.defaultTestLoader.loadTestsFromTestCase(
+                GitResolutionTest))
+            self.run_suite(unittest.TestSuite([
+                BrowseIntegrationTest("test_wrapper_git_is_the_bound_declaration_not_path_git"),
+                BrowseIntegrationTest("test_conflicting_git_declarations_are_rejected"),
+                BrowseIntegrationTest("test_mixed_refs_requires_a_declared_git"),
+            ]))
+            self.assert_restored(before)
+        finally:
+            # The regression itself must never poison later test modules.
+            self.restore(before)
+
+    def test_failed_resolution_still_restores_process_globals(self):
+        before = self.snapshot()
+        missing = str(Path(__file__).with_name("git-does-not-exist-for-regression"))
+        try:
+            with self.assertRaisesRegex(AssertionError, "not an executable file"):
+                GitResolutionTest().run_resolve(missing, {}, "/usr/bin/false-git")
+            self.assert_restored(before)
+        finally:
+            self.restore(before)
+
+
+def dict_literals(node):
+    """Every dict literal in ``node`` with constant keys/values, as plain dicts."""
+    found = []
+    for literal in ast.walk(node):
+        if isinstance(literal, ast.Dict):
+            item = {}
+            for key, value in zip(literal.keys, literal.values):
+                if isinstance(key, ast.Constant) and isinstance(value, ast.Constant):
+                    item[key.value] = value.value
+            if item:
+                found.append(item)
+    return found
+
+
+if __name__ == "__main__":
+    unittest.main()

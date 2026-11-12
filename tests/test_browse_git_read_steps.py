@@ -229,8 +229,8 @@ ORIGINAL_BROWSE_CASES = (
     "selective_ref_prefix",
     "protected_writes_and_ref_ack_failure",
 )
-# The only permitted additions: one deadline case per read path whose read,
-# exit and group quiescence now share a single deadline.
+# Deadline cases only: one such case per read path whose read, exit and
+# group quiescence now share a single deadline; fault cases are held separately.
 BROWSE_DEADLINE_CASES = (
     "list_commits_deadline",
     "compare_commits_deadline",
@@ -239,6 +239,13 @@ BROWSE_DEADLINE_CASES = (
 # walks the complete large-refset cursor traversal.
 BROWSE_SCALE_CASES = (
     "ref_scale_complete_traversal",
+)
+# Fault cases: a real SIGKILL between a successful native ref CAS and its
+# acknowledgement, plus the pre-publication / post-receipt / post-commit
+# settlement-recovery boundaries from Issue #14.
+BROWSE_FAULT_CASES = (
+    "ref_transaction_crash_recovery",
+    "ref_transaction_settlement_recovery",
 )
 
 class GitReadStepsSourceTest(unittest.TestCase):
@@ -474,28 +481,37 @@ class GitReadStepsSourceTest(unittest.TestCase):
         browse = (TESTS / "browse.py").read_text()
         # The inventory is parsed from the source rather than counted as a raw
         # number: every original contract case stays named and ordered, and the
-        # two deadline cases are asserted as the only additions. A count alone
-        # would accept either adding unrelated cases or dropping, say,
+        # two deadline cases, the single scale case and the single SIGKILL fault
+        # case are asserted as the only additions. A count alone would accept
+        # either adding unrelated cases or dropping, say,
         # `idempotency_and_concurrency` to keep the unit passing.
         cases = re.search(r"CASE_NAMES = \((.*?)\n\)", browse, re.S).group(1)
         names = re.findall(r'"([^"]+)"', cases)
         # Order is runtime order, so the new cases may interleave; what is pinned
         # is that the inventory is exactly the original contracts plus the two
-        # deadline cases and the one scale case, with no duplicate, dropped or
-        # unrelated entry.
+        # deadline cases, the one scale case and the one fault case, with no
+        # duplicate, dropped or unrelated entry.
         self.assertEqual(len(names), len(set(names)))
         self.assertEqual(sorted(names),
                          sorted(ORIGINAL_BROWSE_CASES + BROWSE_DEADLINE_CASES
-                                + BROWSE_SCALE_CASES))
+                                + BROWSE_SCALE_CASES + BROWSE_FAULT_CASES))
         self.assertEqual(len(ORIGINAL_BROWSE_CASES), 12)
         self.assertEqual(len(BROWSE_DEADLINE_CASES), 2)
         self.assertEqual(len(BROWSE_SCALE_CASES), 1)
+        self.assertEqual(BROWSE_FAULT_CASES,
+                         ("ref_transaction_crash_recovery",
+                          "ref_transaction_settlement_recovery"))
+        self.assertEqual(len(names), 17)
         # Every listed case is still dispatched to its own implementation and the
         # suite fails when the executed inventory differs from `CASE_NAMES`.
         self.assertIn("for name in CASE_NAMES:\n            harness.case(name, getattr(harness, name))",
                       browse)
         self.assertIn("if executed != list(CASE_NAMES):", browse)
         self.assertIn('"selective_ref_prefix",', browse)
+        self.assertIn('"ref_transaction_settlement_recovery",', browse)
+        self.assertIn('refs/heads/boundary-before-publication', browse)
+        self.assertIn('refs/heads/boundary-after-receipt', browse)
+        self.assertIn('refs/heads/boundary-after-commit', browse)
         self.assertIn('"kind": "symbolic",', browse)
         self.assertIn('"target": "refs/heads/main",', browse)
         self.assertIn('"oid": self.third,', browse)
@@ -505,6 +521,123 @@ class GitReadStepsSourceTest(unittest.TestCase):
         self.assertIn("authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, "
                       "crate::token_scopes::RepoAction::ContentsRead)", handlers)
         self.assertNotIn("StatusCode::NOT_FOUND", handlers)
+
+    def test_browse_line_caps_cover_every_direct_submodule(self):
+        facade = (ROOT / "src" / "browse.rs").read_text()
+        journal_facade = (ROOT / "src" / "journal.rs").read_text()
+        self.assertLess(len(facade.splitlines()), 100)
+        self.assertLess(len(journal_facade.splitlines()), 100)
+        for path in sorted((ROOT / "src" / "browse").glob("*.rs")):
+            lines = len(path.read_text().splitlines())
+            self.assertLess(lines, 500, f"{path} exceeds the 500-line Browse submodule cap ({lines})")
+        for path in sorted((ROOT / "src" / "journal").glob("*.rs")):
+            lines = len(path.read_text().splitlines())
+            self.assertLess(lines, 500, f"{path} exceeds the 500-line Journal submodule cap ({lines})")
+
+    def test_issue14_canonical_kind_ordering_and_facade_governance(self):
+        record = (ROOT / "src" / "journal" / "record.rs").read_text()
+        self.assertIn('evidence["kind"] = serde_json::json!("ref_transaction");', record)
+        tx = (ROOT / "src" / "browse" / "transactions.rs").read_text()
+        self.assertLess(tx.index("reliability::before_gitfs_push("), tx.index("client.transaction()"))
+        self.assertIn("current_generation,intent,idempotency)", tx)
+        self.assertIn('test_failpoint("before_cas")', tx)
+        self.assertIn('strip_prefix("file:")', tx)
+        self.assertIn("journal::retire(&operation)", tx)
+        browse = (TESTS / "browse.py").read_text()
+        self.assertIn('self.operation_summary(operation["id"])["kind"]', browse)
+        self.assertIn('self.operation_summary(retried["operation_id"])["kind"]', browse)
+        self.assertIn('"Idempotency-Key": "crash-recovery-key"', browse)
+        # Facades stay thin: no module declaration files, inline SQL or direct
+        # child processes; all implementation lives in bounded submodules.
+        self.assertFalse((ROOT / "src" / "browse" / "mod.rs").exists())
+        self.assertFalse((ROOT / "src" / "journal" / "mod.rs").exists())
+        for facade in (ROOT / "src" / "browse.rs", ROOT / "src" / "journal.rs"):
+            text = facade.read_text()
+            self.assertNotIn("Command::new", text)
+            for sql in ("SELECT ", "INSERT ", "UPDATE ", "DELETE "):
+                self.assertNotIn(sql, text)
+
+    def test_issue14_pre_cas_recheck_and_atomic_settlement_order(self):
+        tx = (ROOT / "src" / "browse" / "transactions.rs").read_text()
+        # A preflight write-access check rejects an unauthorized caller before
+        # durable publication/admission/journal state. The transaction-scoped
+        # re-check then runs immediately before the native CAS, and its failure
+        # retires the intent before any child can publish refs.
+        rechecks = [match.start() for match in re.finditer(
+            r"auth::verify_repo_write_access", tx)]
+        publication = tx.index("storage::ref_publication::acquire")
+        cas = tx.index('cmd.args(["update-ref"')
+        retires = [match.start() for match in re.finditer(r"journal::retire\(&operation\)", tx)]
+        self.assertEqual(len(rechecks), 2)
+        self.assertLess(rechecks[0], publication)
+        self.assertLess(rechecks[-1], cas)
+        self.assertGreaterEqual(len(retires), 2)
+        self.assertLess(retires[0], cas)
+        # Operation, outbox and the Idempotency-Key response share one
+        # transaction; retirement happens only after its commit.
+        publish = tx.index("events::publish_in_tx(")
+        record = tx.index("idempotency::record(")
+        commit = tx.index("tx.commit().await")
+        self.assertLess(publish, commit)
+        self.assertLess(record, commit)
+        self.assertGreater(retires[-1], commit)
+        self.assertNotIn("events::publish(", tx)
+        # A rolled-back claim is recovered from the journal fingerprint rather
+        # than re-running update-ref against already-published refs.
+        for required in ("idempotency::replay_terminal(", "idempotency::claim(",
+                         "journal::ref_transaction_evidence(",
+                         "journal::begin_ref_transaction("):
+            self.assertIn(required, tx)
+        reliability = (ROOT / "src" / "reliability.rs").read_text()
+        self.assertIn("journal::ref_transaction_evidence(", reliability)
+        journal = (ROOT / "src" / "journal.rs").read_text()
+        record = (ROOT / "src" / "journal" / "record.rs").read_text()
+        self.assertIn("pub fn ref_transaction_evidence(", record)
+        self.assertIn("ref_transaction_evidence", journal)
+        self.assertLess(len(journal.splitlines()), 100)
+        operation = (ROOT / "src" / "journal" / "operation.rs").read_text()
+        self.assertRegex(operation, r"#\[serde\(deny_unknown_fields\)\]\s*pub struct Operation")
+
+    def test_issue14_failure_boundaries_fail_closed_and_reported(self):
+        browse = (TESTS / "browse.py").read_text()
+        tx = (ROOT / "src" / "browse" / "transactions.rs").read_text()
+        # Test failpoints are env-gated and inert unless explicitly armed.
+        self.assertIn("ROOTYARD_TEST_REF_TRANSACTION_PAUSE_BEFORE_CAS_MS", tx)
+        self.assertIn("ROOTYARD_TEST_REF_TRANSACTION_FAILPOINT", tx)
+        self.assertIn('test_failpoint("after_receipt")', tx)
+        self.assertIn('test_failpoint("after_publish")', tx)
+        self.assertIn('test_failpoint("after_commit")', tx)
+        # The SIGKILL wrapper fails closed and the harness verifies the signal.
+        self.assertIn('kill -KILL \\"$(cat ', browse)
+        self.assertIn('|| { rm -f ', browse)
+        self.assertIn('; exit 125; }', browse)
+        self.assertIn("exited == -signal.SIGKILL", browse)
+        # The report names the executing source revision, exactly like the
+        # other native JSON reports.
+        self.assertIn("source_head=source_head", browse)
+        self.assertIn('"git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "HEAD"',
+                      browse)
+        # All three Issue #14 boundaries are executed and inspect durable state.
+        for required in ("ref_transaction_settlement_recovery",
+                         "pending_journal_entries", "boundary-before-publication",
+                         "boundary-after-publish", "boundary-after-receipt",
+                         "boundary-after-commit", "idempotency_key_sha256",
+                         "idempotency_request_sha256"):
+            self.assertIn(required, browse)
+
+    def test_issue14_new_deserialize_structs_deny_unknown_fields(self):
+        ref_transaction = (ROOT / "src" / "browse" / "ref_transaction.rs").read_text()
+        for name in ("RefTransactionRequest", "RefUpdateInput",
+                     "AppliedRefUpdate", "RefTransactionResponse"):
+            self.assertRegex(
+                ref_transaction,
+                r"#\[serde\(deny_unknown_fields\)\]\s*pub struct " + name + r"\b",
+            )
+        operation = (ROOT / "src" / "journal" / "operation.rs").read_text()
+        self.assertRegex(operation, r"#\[serde\(deny_unknown_fields\)\]\s*pub struct Operation\b")
+        self.assertLess(len((ROOT / "src" / "journal" / "core.rs").read_text().splitlines()), 500)
+        journal = (ROOT / "src" / "journal.rs").read_text()
+        self.assertRegex(journal, r"#\[serde\(deny_unknown_fields\)\]\s*pub struct IdempotencyIntent\b")
 
 
 class RealGitFixtureTest(unittest.TestCase):

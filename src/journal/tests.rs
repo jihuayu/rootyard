@@ -1,4 +1,126 @@
+use super::hooks::{record, record_receipt, record_request};
+use super::record::{events_with_size, parse};
 use super::*;
+use std::fs;
+use std::io::Write;
+use uuid::Uuid;
+
+#[test]
+fn operation_rejects_unknown_json_fields_but_round_trips_known_ones() {
+    let (_root, op) = setup();
+    let bytes = read(&op.path.join("operation.json")).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(serde_json::from_value::<Operation>(value.clone()).is_ok());
+    value["unexpected_field"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<Operation>(value).is_err());
+}
+
+#[test]
+fn canonical_ref_transaction_evidence_matches_journal_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let op =
+        begin_ref_transaction(root.path(), Uuid::new_v4(), Uuid::new_v4(), "actor".into(), Uuid::new_v4(), 1, None)
+            .unwrap();
+    let changes =
+        vec![RefChange { ref_name: "refs/heads/main".into(), old_oid: "0".repeat(40), new_oid: "a".repeat(40) }];
+    record_ref_transaction_intent(&op, &changes).unwrap();
+    record_ref_transaction_receipt(&op, &changes).unwrap();
+    finish(&op).unwrap();
+    let live = ref_transaction_evidence(
+        &op,
+        1,
+        is_finished(&op).unwrap(),
+        is_interrupted(&op).unwrap(),
+        &events(&op).unwrap(),
+        requests(&op).unwrap().as_deref(),
+        receipts(&op).unwrap().as_deref(),
+    );
+    // Reconciliation reloads the operation from disk and re-reads all markers
+    // and hook records instead of reusing the in-memory admission.
+    let loaded = super::operation::load(&op.path).unwrap();
+    let reconciled = ref_transaction_evidence(
+        &loaded,
+        1,
+        is_finished(&loaded).unwrap(),
+        is_interrupted(&loaded).unwrap(),
+        &events(&loaded).unwrap(),
+        requests(&loaded).unwrap().as_deref(),
+        receipts(&loaded).unwrap().as_deref(),
+    );
+    assert_eq!(live, reconciled);
+    assert_eq!(live["kind"], "ref_transaction");
+    assert_eq!(live["requested"], serde_json::json!(changes));
+    assert_eq!(live["post_receive"], serde_json::json!(changes));
+    assert_eq!(live["reference_events"], serde_json::json!(events(&loaded).unwrap()));
+    assert_eq!(live["storage_generation_matches"], true);
+    // receive-pack journals (`begin`) omit `kind` so `/operations` keeps its
+    // `COALESCE(evidence->>'kind','receive_pack')` fallback.
+    let (_receive_root, receive) = setup();
+    let receive_evidence = ref_transaction_evidence(&receive, 1, false, false, &[], None, None);
+    assert!(receive_evidence.get("kind").is_none());
+}
+
+#[test]
+fn canonical_ref_transaction_evidence_binds_idempotency_fingerprint() {
+    let root = tempfile::tempdir().unwrap();
+    let op = begin_ref_transaction(
+        root.path(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "actor".into(),
+        Uuid::new_v4(),
+        1,
+        Some(IdempotencyIntent { key_sha256: "a".repeat(64), request_sha256: "b".repeat(64) }),
+    )
+    .unwrap();
+    let changes =
+        vec![RefChange { ref_name: "refs/heads/main".into(), old_oid: "0".repeat(40), new_oid: "a".repeat(40) }];
+    record_ref_transaction_intent(&op, &changes).unwrap();
+    record_ref_transaction_receipt(&op, &changes).unwrap();
+    finish(&op).unwrap();
+    let raw = events(&op).unwrap();
+    let requested = requests(&op).unwrap();
+    let receipt = receipts(&op).unwrap();
+    let live = ref_transaction_evidence(&op, 1, true, false, &raw, requested.as_deref(), receipt.as_deref());
+    let loaded = super::operation::load(&op.path).unwrap();
+    let reconciled = ref_transaction_evidence(&loaded, 1, true, false, &raw, requested.as_deref(), receipt.as_deref());
+    assert_eq!(live, reconciled);
+    assert_eq!(live["kind"], "ref_transaction");
+    assert_eq!(live["idempotency_key_sha256"], "a".repeat(64));
+    assert_eq!(live["idempotency_request_sha256"], "b".repeat(64));
+    assert_eq!(super::operation::load(&op.path).unwrap().idempotency, op.idempotency);
+}
+
+#[test]
+fn proposal_pin_round_trips_idempotency_fingerprint_and_kind() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = Uuid::new_v4();
+    let intent = crate::namespace_service::ProposalIntent {
+        proposal_id: Uuid::new_v4(),
+        repository_id: repo,
+        target_oid: "a".repeat(40),
+    };
+    let fingerprint = IdempotencyIntent { key_sha256: "c".repeat(64), request_sha256: "d".repeat(64) };
+    let op = begin_proposal(
+        root.path(),
+        repo,
+        Uuid::new_v4(),
+        "actor".into(),
+        Uuid::new_v4(),
+        1,
+        intent,
+        Some(fingerprint.clone()),
+    )
+    .unwrap();
+    let loaded = super::operation::load(&op.path).unwrap();
+    assert_eq!(loaded.kind, Some(OperationKind::RefTransaction));
+    assert_eq!(loaded.idempotency, Some(fingerprint));
+    assert_eq!(loaded.proposal_pin, op.proposal_pin);
+    let evidence = ref_transaction_evidence(&loaded, 1, false, false, &[], None, None);
+    assert_eq!(evidence["kind"], "ref_transaction");
+    assert_eq!(evidence["idempotency_key_sha256"], "c".repeat(64));
+    assert_eq!(evidence["idempotency_request_sha256"], "d".repeat(64));
+}
 
 #[test]
 fn ref_transaction_intent_precedes_receipt_and_accepts_sha256() {

@@ -1,9 +1,11 @@
 //! Track 2A: read-only repository browsing and atomic multi-ref CAS transactions.
 pub mod git_read;
 pub mod handlers;
+pub mod idempotency;
 pub mod models;
 pub mod object_format;
 pub mod policy;
+pub mod ref_transaction;
 pub mod transactions;
 
 use crate::AppState;

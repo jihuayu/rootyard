@@ -2,7 +2,7 @@
 //! capability negotiation, and dual-hash compatibility matrix drills.
 use crate::{
     AppState, Error, auth, db::Identity,
-    browse::{git_read, handlers, models::{RefTransactionRequest, RefUpdateInput}},
+    browse::{git_read, handlers, ref_transaction::{RefTransactionRequest, RefUpdateInput}},
     journal,
     lfs::models::{LFS_HASH_ALGO, verify_lfs_pointer_compatibility},
 };
