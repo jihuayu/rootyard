@@ -1,12 +1,8 @@
 # Operations: supported external PostgreSQL HA with Patroni, etcd and HAProxy
 
-Status: reference profile implemented and exercised natively on one Linux
-host by `tests/cluster_patroni_native.py`. It is a supported *external* HA
-stack (Patroni + etcd + HAProxy), not a custom in-process consensus protocol,
-and it is not certified for production on the local virtual machine used for
-the acceptance run (no hardware watchdog, one physical host).
+Status: single-host external PostgreSQL HA reference profile implemented and exercised natively on one Linux host by `tests/cluster_patroni_native.py`. It is an *external* PostgreSQL HA reference stack (Patroni + etcd + HAProxy) for the legacy GitFS/PostgreSQL topology, not a custom in-process consensus protocol, not distributed Raft Ref-CAS, and **not certified for multi-host production** (one physical host, no hardware watchdog, no cross-host storage fencing, no GitFS volume replication). For the active codebase operational and backup contracts (`schema 147`, `format 21` / `format 22`), see [operations.md](operations.md) and [backup-restore.md](backup-restore.md).
 
-Round-3 acceptance (current result, still bounded): the composed round-3 source `1061a8e` with HA harness `300c6c9` passed this profile natively on one host — automatic Patroni promotion after killing the whole old leader, unchanged Rootyard PID, 0 measured acknowledged-commit loss on promotion, 2-of-3 etcd quorum loss with all PostgreSQL roles refusing writes, and an offline format-8/schema-132 restore. Numbers and the failed-attempt ledger: [`evidence/round3/ha43-patroni-300c6c9/`](../evidence/round3/ha43-patroni-300c6c9/README.md); summary: [`acceptance/round3-ha43.md`](acceptance/round3-ha43.md). Issues #43/#44 remain **OPEN**: single physical host only, no cross-host fencing, hardware watchdog arming, power-loss or HAProxy HA.
+Historical round-3 acceptance (bounded single-host snapshot): composed round-3 source `1061a8e` with HA harness `300c6c9` passed this profile natively on one host — automatic Patroni promotion after killing the whole old leader, unchanged Rootyard PID, 0 measured acknowledged-commit loss on promotion, 2-of-3 etcd quorum loss with all PostgreSQL roles refusing writes, and an offline `format 8` / `schema 132` restore (historical round-3 archive format; current binaries emit `format 21` / `format 22` on `schema 147`). Numbers and failed-attempt ledger: [`evidence/round3/ha43-patroni-300c6c9/`](../evidence/round3/ha43-patroni-300c6c9/README.md); summary: [`acceptance/round3-ha43.md`](acceptance/round3-ha43.md). Legacy issues `43`/`44` were superseded in [design/issue-map.md](design/issue-map.md) by `#153`/`#155`/`#157`, which remain **OPEN** (no multi-host physical fencing, hardware watchdog qualification, power-loss qualification, or HAProxy HA is claimed).
 
 ## Roles and components
 
@@ -152,9 +148,7 @@ cross-host fencing.
 After the failover and quorum-loss drills the test stops the application
 writer, takes a real `rootyard backup --offline` closure through the stable
 endpoint, verifies it with `backup-verify`, and records the archive format and
-schema from the verified `manifest.json` (the certified local binary currently
-produces format 7/schema 131; newer composed binaries must report their own
-observed values). It then
+schema dynamically from the verified `manifest.json` (current binaries on `schema 147` produce `format 21` for GitFS/Pando sources or `format 22` for `pg_refstore` sources; historical round-2/round-3 runs recorded `format 7` / `schema 131` and `format 8` / `schema 132`). It then
 restores it with `rootyard restore --isolated --trust-backup` into a *fresh*
 PostgreSQL 17 cluster and a *new* private data directory. No Rootyard ingress
 exists for the restored authority until these offline checks pass:
@@ -179,15 +173,7 @@ exists for the restored authority until these offline checks pass:
 
 ### Backup format/schema compatibility (including Pando)
 
-The acceptance derives format and schema from the verified manifest instead of
-hardcoding them. The round-2 certified binary produced format 7/schema 131 (historical snapshot; round 3 has since exercised format 8/schema 132 — see the acceptance pointer above).
-A composed binary that produces Pando schema132/backup format8 must be recorded
-honestly from its own verified manifest and must pass the same gates: untouched
-`backup-verify`, exact ref/OID-map equality, pre-boundary ACK survival, absence
-of the post-boundary OID, retained delegation/revocation/worker checks, and the
-same trusted binary for backup and restore. These gates are never weakened to
-admit a newer format, and this worker does not claim a schema132/format8 pass
-until the composed binary is actually exercised.
+The acceptance harness derives format and schema from the verified manifest instead of hardcoding them. Historical round-2 runs exercised `format 7` / `schema 131` and round-3 (`1061a8e`) exercised `format 8` / `schema 132` (see the acceptance pointer above); a rerun on a newer binary must report its own observed manifest values (for example `format 21` / `schema 147` on GitFS/Pando) and pass the same gates: untouched `backup-verify`, exact ref/OID-map equality, pre-boundary ACK survival, absence of the post-boundary OID, retained delegation/revocation/worker checks, and the same trusted binary for backup and restore. No rerun on `schema 147` is claimed by this historical record.
 
 Cutover is a deliberate operator action: the reference profile never starts
 the restored deployment beside the old writer automatically.
