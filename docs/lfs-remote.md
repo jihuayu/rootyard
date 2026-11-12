@@ -36,25 +36,31 @@ inode or start a duplicate full-file pass. This coalescing is local-only and is
 not cold hydration: an absent or inadmissible local file still takes the
 explicit hydration path.
 
-The process-wide eight-slot verification limiter
+The process-wide eight-slot FIFO verification limiter
 (`MAX_CONCURRENT_VERIFICATIONS = 8` in `src/lfs/verification_limiter.rs`) is
 shared across both asynchronous HTTP Batch/verify/download entry points
 (`verify_local` and `open_verified_file`) and synchronous `verify_path_blocking`
 callers (CI checkout dependency scans, mirror preparation, paired backup LFS
 inventory, and concurrent publication race fallback). Asynchronous callers wait
-for a slot up to their request deadline before `tokio::task::spawn_blocking`, so
-excess HTTP requests never occupy blocking-pool threads while queued, and then
-move the owned permit into the blocking closure; synchronous callers wait on
-the same eight-slot pool via deadline-bounded condition variable waits. Every
-caller acquires its slot before registering in the singleflight table, so a
-`FlightLeader` never waits for a second slot while singleflight followers hold
-permits.
+in the shared FIFO ticket queue up to their request deadline before
+`tokio::task::spawn_blocking`, so excess HTTP requests never occupy
+blocking-pool threads while queued, and then move the owned permit into the
+blocking closure; synchronous callers wait on the same eight-slot FIFO queue via
+deadline-bounded condition variable waits. Every caller acquires its slot before
+registering in the singleflight table, so a `FlightLeader` never waits for a
+second slot while singleflight followers hold permits, and if a short-deadline
+leader times out first, a surviving follower with remaining deadline budget
+takes over on its already-open descriptor.
 
 Warm verified reads are local-only: steady-state `Batch -> GET` waves achieve
-`rchar / served_bytes == 1.0` with `0` remote object-store requests, while
-cache-empty existing-local waves coalesce onto one digest pass across concurrent
-readers (`tests/lfs_read_amplification.py`, `tests/lfs_process_metrics.py`).
-Warm reads do not construct an object-store client, issue a remote HEAD/GET, or
+`rchar / served_bytes ≈ 1.0` (one object read pass per served download, bounded
+`< 2.0` in `tests/lfs_read_amplification.py`, since `/proc/<pid>/io` `rchar`
+includes small HTTP and PostgreSQL socket reads) with `0` remote object-store
+requests, while cache-empty existing-local waves coalesce onto one digest pass
+across concurrent readers (`tests/lfs_read_amplification.py`,
+`tests/lfs_process_metrics.py`). `Batch`, `verify`, and `upload` pre-checks
+commit their short read transactions and release database pool connections
+before running local disk verification or remote hydration. Warm reads do not construct an object-store client, issue a remote HEAD/GET, or
 perform a synchronous remote repair; an unreachable or misconfigured endpoint
 cannot turn a verified local download into a 5xx (issue #71). A cold miss
 (`local file absent, corrupt, truncated, replaced, or symlinked`) is explicit:

@@ -6,10 +6,8 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
-static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
-    TEST_SERIAL.lock().await
+    super::test_serial().await
 }
 
 fn fixture(payload: &[u8]) -> (PathBuf, PathBuf, String) {

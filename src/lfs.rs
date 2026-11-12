@@ -1,5 +1,6 @@
 //! Track 2B: Git LFS Batch API and verified streaming object transfers.
 pub mod handlers;
+mod handlers_batch;
 mod hydration;
 pub mod locks;
 pub mod models;

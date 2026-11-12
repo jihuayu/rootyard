@@ -30,6 +30,9 @@ static REPAIR_SLOTS: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_REPAIRS));
 static FLIGHTS: LazyLock<Mutex<HashMap<HydrationKey, FlightEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+static HYDRATION_FOLLOWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct HydrationKey {
     data_root: PathBuf,
@@ -48,6 +51,10 @@ struct FlightEntry {
 enum FlightOutcome {
     Published,
     Missing,
+    /// The initiator's own short deadline expired before hydration completed.
+    /// Surviving followers with remaining deadline budget re-enter `FLIGHTS`
+    /// instead of inheriting the initiator's caller-specific timeout.
+    InitiatorTimedOut(Arc<FlightFailure>),
     /// Carries the typed failure across the shared single-flight result without
     /// formatting it. Waiters reconstruct a source chain so the central
     /// classifier can downcast to the finite remote-store error.
@@ -61,6 +68,7 @@ impl std::fmt::Debug for FlightOutcome {
         formatter.write_str(match self {
             Self::Published => "Published",
             Self::Missing => "Missing",
+            Self::InitiatorTimedOut(_) => "InitiatorTimedOut",
             Self::Failed(_) => "Failed",
         })
     }
@@ -94,6 +102,42 @@ impl std::error::Error for SharedFlightError {
     }
 }
 
+#[derive(Debug)]
+struct HydrationSlotTimeout;
+
+impl std::fmt::Display for HydrationSlotTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LFS hydration concurrency wait timed out")
+    }
+}
+
+impl std::error::Error for HydrationSlotTimeout {}
+
+struct HydrationFlightGuard {
+    key: HydrationKey,
+    id: Uuid,
+    removed: bool,
+}
+
+impl HydrationFlightGuard {
+    fn remove_now(&mut self) {
+        if self.removed {
+            return;
+        }
+        let mut flights = FLIGHTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if flights.get(&self.key).is_some_and(|entry| entry.id == self.id) {
+            flights.remove(&self.key);
+        }
+        self.removed = true;
+    }
+}
+
+impl Drop for HydrationFlightGuard {
+    fn drop(&mut self) {
+        self.remove_now();
+    }
+}
+
 pub(super) fn remote_store(data_root: &Path) -> Result<Option<RemoteObjectStore>> {
     if std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_none() {
         return Ok(None);
@@ -117,14 +161,45 @@ pub(super) async fn ensure_readable(
     if verification::verify_local(path, data_root.to_path_buf(), repo_id, oid.to_owned(), size, deadline).await? {
         return Ok(true);
     }
-    if remote_store(data_root)?.is_none() {
+    let Some(store) = remote_store(data_root)? else {
         return Ok(false);
+    };
+    ensure_readable_cold(data_root, repo_id, tenant_id, oid, size, deadline, Arc::new(store)).await
+}
+
+#[cfg(test)]
+async fn ensure_readable_with_store(
+    data_root: &Path,
+    repo_id: Uuid,
+    tenant_id: Uuid,
+    oid: &str,
+    size: u64,
+    deadline: Instant,
+    store: Arc<RemoteObjectStore>,
+) -> Result<bool> {
+    let path = object_path(data_root, repo_id, oid)?;
+    if verification::verify_local(path, data_root.to_path_buf(), repo_id, oid.to_owned(), size, deadline).await? {
+        return Ok(true);
     }
-    let outcome = hydrate_coalesced(data_root, repo_id, tenant_id, oid, size, deadline).await?;
+    ensure_readable_cold(data_root, repo_id, tenant_id, oid, size, deadline, store).await
+}
+
+async fn ensure_readable_cold(
+    data_root: &Path,
+    repo_id: Uuid,
+    tenant_id: Uuid,
+    oid: &str,
+    size: u64,
+    deadline: Instant,
+    store: Arc<RemoteObjectStore>,
+) -> Result<bool> {
+    let outcome = hydrate_coalesced(data_root, repo_id, tenant_id, oid, size, deadline, store).await?;
     match outcome {
         FlightOutcome::Published => Ok(true),
         FlightOutcome::Missing => Ok(false),
-        FlightOutcome::Failed(failure) => Err(anyhow::Error::new(SharedFlightError(failure))),
+        FlightOutcome::InitiatorTimedOut(failure) | FlightOutcome::Failed(failure) => {
+            Err(anyhow::Error::new(SharedFlightError(failure)))
+        }
     }
 }
 
@@ -135,29 +210,51 @@ async fn hydrate_coalesced(
     oid: &str,
     size: u64,
     deadline: Instant,
+    store: Arc<RemoteObjectStore>,
 ) -> Result<FlightOutcome> {
     let key = HydrationKey { data_root: data_root.to_path_buf(), repo_id, tenant_id, oid: oid.to_owned(), size };
-    let receiver = {
-        let mut flights = FLIGHTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = flights.get(&key) {
-            entry.receiver.clone()
-        } else {
-            let (sender, receiver) = watch::channel(None);
-            let id = Uuid::new_v4();
-            flights.insert(key.clone(), FlightEntry { id, receiver: receiver.clone() });
-            let key_for_task = key.clone();
-            tokio::spawn(async move {
-                let outcome = run_hydration(&key_for_task, deadline).await;
-                let _ = sender.send(Some(outcome.clone()));
-                let mut flights = FLIGHTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if flights.get(&key_for_task).is_some_and(|entry| entry.id == id) {
-                    flights.remove(&key_for_task);
+    loop {
+        ensure!(Instant::now() < deadline, "LFS hydration wait timed out");
+        let receiver = {
+            let mut flights = FLIGHTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = flights.get(&key) {
+                #[cfg(test)]
+                HYDRATION_FOLLOWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                entry.receiver.clone()
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                let id = Uuid::new_v4();
+                flights.insert(key.clone(), FlightEntry { id, receiver: receiver.clone() });
+                let key_for_task = key.clone();
+                let store_for_task = store.clone();
+                let initiator_deadline = deadline;
+                tokio::spawn(async move {
+                    let mut guard = HydrationFlightGuard { key: key_for_task, id, removed: false };
+                    let outcome = run_hydration(&store_for_task, &guard.key, initiator_deadline).await;
+                    // Remove the flight entry before waking followers so a surviving
+                    // follower retrying after `InitiatorTimedOut` or a newly arriving
+                    // caller can never re-attach to the completed flight.
+                    guard.remove_now();
+                    let _ = sender.send(Some(outcome));
+                });
+                receiver
+            }
+        };
+        match wait_for_flight(receiver, deadline).await? {
+            FlightOutcome::InitiatorTimedOut(failure) => {
+                if Instant::now() >= deadline {
+                    return Ok(FlightOutcome::InitiatorTimedOut(failure));
                 }
-            });
-            receiver
+                let path = object_path(data_root, repo_id, oid)?;
+                if verification::verify_local(path, data_root.to_path_buf(), repo_id, oid.to_owned(), size, deadline)
+                    .await?
+                {
+                    return Ok(FlightOutcome::Published);
+                }
+            }
+            outcome => return Ok(outcome),
         }
-    };
-    wait_for_flight(receiver, deadline).await
+    }
 }
 
 async fn wait_for_flight(
@@ -178,15 +275,23 @@ async fn wait_for_flight(
     .map_err(|_| anyhow::anyhow!("LFS hydration wait timed out"))?
 }
 
-async fn run_hydration(key: &HydrationKey, deadline: Instant) -> FlightOutcome {
-    let result = async {
-        let Some(store) = remote_store(&key.data_root)? else {
-            bail!("LFS object store is not configured");
-        };
-        hydrate(&store, key, deadline).await
+fn is_initiator_timeout(error: &anyhow::Error, deadline: Instant) -> bool {
+    if Instant::now() < deadline {
+        return false;
     }
-    .await;
-    match result {
+    if error.downcast_ref::<HydrationSlotTimeout>().is_some()
+        || error.downcast_ref::<tokio::time::error::Elapsed>().is_some()
+    {
+        return true;
+    }
+    if let Some(remote) = error.downcast_ref::<RemoteStoreError>() {
+        return remote.http_status().is_none() && remote.to_string().ends_with(" timed out");
+    }
+    false
+}
+
+async fn run_hydration(store: &RemoteObjectStore, key: &HydrationKey, deadline: Instant) -> FlightOutcome {
+    match hydrate(store, key, deadline).await {
         Ok(outcome) => outcome,
         Err(error) => {
             // Keep only the bounded typed cause; never flatten error Display
@@ -194,8 +299,10 @@ async fn run_hydration(key: &HydrationKey, deadline: Instant) -> FlightOutcome {
             if error.downcast_ref::<RemoteStoreError>().is_some() {
                 super::remote_metrics::counters().record_remote_failure();
             }
+            let timed_out = is_initiator_timeout(&error, deadline);
             let remote = error.downcast::<RemoteStoreError>().ok();
-            FlightOutcome::Failed(Arc::new(FlightFailure { remote }))
+            let failure = Arc::new(FlightFailure { remote });
+            if timed_out { FlightOutcome::InitiatorTimedOut(failure) } else { FlightOutcome::Failed(failure) }
         }
     }
 }
@@ -203,7 +310,7 @@ async fn run_hydration(key: &HydrationKey, deadline: Instant) -> FlightOutcome {
 async fn hydrate(store: &RemoteObjectStore, key: &HydrationKey, deadline: Instant) -> Result<FlightOutcome> {
     let permit = tokio::time::timeout_at(deadline, HYDRATION_SLOTS.acquire())
         .await
-        .map_err(|_| anyhow::anyhow!("LFS hydration concurrency wait timed out"))?
+        .map_err(|_| anyhow::Error::new(HydrationSlotTimeout))?
         .context("LFS hydration limiter closed")?;
 
     let object_key = ObjectKey::new(key.tenant_id, "lfs", &key.oid)?;
@@ -301,3 +408,17 @@ pub(super) fn schedule_repair(
         }
     });
 }
+
+#[cfg(test)]
+fn active_hydration_flights() -> usize {
+    FLIGHTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
+}
+
+#[cfg(test)]
+fn hydration_follower_count() -> usize {
+    HYDRATION_FOLLOWERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+#[path = "hydration_tests.rs"]
+mod tests;

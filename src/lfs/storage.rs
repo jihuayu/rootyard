@@ -137,7 +137,7 @@ pub fn verify_object_integrity(data_root: &Path, repo_id: Uuid, oid: &str, expec
         repo_id,
         oid,
         expected_size,
-        StdInstant::now() + Duration::from_secs(24 * 60 * 60),
+        StdInstant::now() + Duration::from_secs(300),
     )
 }
 

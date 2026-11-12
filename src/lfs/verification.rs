@@ -167,94 +167,134 @@ fn admit(path: &Path, data_root: &Path, repo_id: Uuid, oid: &str, promised_size:
 #[cfg(test)]
 static HASHED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn hash_until(file: &mut File, expected_oid: &str, expected_size: u64, deadline: Instant) -> Result<bool> {
+#[cfg(test)]
+pub(super) fn hashed_bytes() -> u64 {
+    HASHED_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(super) async fn test_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_SERIAL.lock().await
+}
+
+enum HashOutcome {
+    Matched,
+    Mismatch,
+    LeaderTimedOut,
+}
+
+fn hash_until(file: &mut File, expected_oid: &str, expected_size: u64, deadline: Instant) -> Result<HashOutcome> {
+    if Instant::now() >= deadline {
+        return Ok(HashOutcome::LeaderTimedOut);
+    }
     file.seek(SeekFrom::Start(0))?;
-    hash_gate_enter();
+    if !hash_gate_enter(deadline) {
+        return Ok(HashOutcome::LeaderTimedOut);
+    }
     let mut hasher = Sha256::new();
     let mut total = 0u64;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        ensure!(Instant::now() < deadline, "LFS integrity verification timed out");
+        if Instant::now() >= deadline {
+            return Ok(HashOutcome::LeaderTimedOut);
+        }
         let read = file.read(&mut buf)?;
         if read == 0 {
             break;
         }
         total = total.saturating_add(read as u64);
         if total > expected_size {
-            return Ok(false);
+            return Ok(HashOutcome::Mismatch);
         }
         hasher.update(&buf[..read]);
         #[cfg(test)]
         HASHED_BYTES.fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
     }
     if total != expected_size {
-        return Ok(false);
+        return Ok(HashOutcome::Mismatch);
     }
-    Ok(hex::encode(hasher.finalize()) == expected_oid)
+    if hex::encode(hasher.finalize()) == expected_oid {
+        Ok(HashOutcome::Matched)
+    } else {
+        Ok(HashOutcome::Mismatch)
+    }
 }
 
 /// Hashes the admitted descriptor unless the exact file identity is already
 /// cached. Concurrent callers that admitted the same identity share one digest
-/// pass; followers wait with their own request deadline. Re-validates the
-/// identity after hashing so a concurrent in-place change is never admitted
-/// into the cache.
+/// pass; followers wait with their own request deadline and take over if a
+/// short-deadline leader expires first. Re-validates the identity after hashing
+/// so a concurrent in-place change is never admitted into the cache.
 fn verify_admitted(
     admitted: &mut AdmittedFile,
     expected_oid: &str,
     expected_size: u64,
     deadline: Instant,
 ) -> Result<bool> {
-    if cache().is_fresh(&admitted.identity, Instant::now()) {
-        return Ok(true);
-    }
     let identity = admitted.identity.clone();
-    let leader = match register_flight(&identity) {
-        FlightRegistration::Leader(leader) => leader,
-        FlightRegistration::Follower(flight) => {
-            return match flight.wait(deadline)? {
-                FlightResult::Verified => Ok(true),
-                FlightResult::Mismatch => Ok(false),
-                FlightResult::Failed(message) => Err(anyhow::anyhow!(message)),
-            };
+    loop {
+        if cache().is_fresh(&identity, Instant::now()) {
+            return Ok(true);
         }
-    };
-    // A previous flight may have completed between the cache miss above and
-    // the flight map lock. Re-check before spending a second hash pass.
-    if cache().is_fresh(&identity, Instant::now()) {
-        leader.complete(FlightResult::Verified);
-        return Ok(true);
-    }
-    let result = (|| -> Result<bool> {
-        let matches = hash_until(&mut admitted.file, expected_oid, expected_size, deadline)?;
-        let after = FileIdentity::new(
-            &identity.data_root,
-            identity.repo_id,
-            &identity.oid,
-            identity.promised_size,
-            &admitted.file.metadata()?,
-        );
-        if after != identity {
-            // The file changed while it was read; never cache this observation.
-            return Ok(false);
-        }
-        if matches {
-            cache().insert(after, Instant::now());
-        }
-        Ok(matches)
-    })();
-    match result {
-        Ok(true) => {
+        ensure!(Instant::now() < deadline, "LFS integrity verification timed out");
+        let leader = match register_flight(&identity) {
+            FlightRegistration::Leader(leader) => leader,
+            FlightRegistration::Follower(flight) => match flight.wait(deadline)? {
+                FlightResult::Verified => return Ok(true),
+                FlightResult::Mismatch => return Ok(false),
+                FlightResult::Failed(message) => return Err(anyhow::anyhow!(message)),
+                FlightResult::LeaderTimedOut => {
+                    ensure!(Instant::now() < deadline, "LFS integrity verification timed out");
+                    continue;
+                }
+            },
+        };
+        // A previous flight may have completed between the cache miss above and
+        // the flight map lock. Re-check before spending a second hash pass.
+        if cache().is_fresh(&identity, Instant::now()) {
             leader.complete(FlightResult::Verified);
-            Ok(true)
+            return Ok(true);
         }
-        Ok(false) => {
-            leader.complete(FlightResult::Mismatch);
-            Ok(false)
-        }
-        Err(error) => {
-            leader.complete(FlightResult::Failed(format!("{error:#}")));
-            Err(error)
-        }
+        let result = (|| -> Result<HashOutcome> {
+            let outcome = hash_until(&mut admitted.file, expected_oid, expected_size, deadline)?;
+            if !matches!(outcome, HashOutcome::Matched) {
+                return Ok(outcome);
+            }
+            let after = FileIdentity::new(
+                &identity.data_root,
+                identity.repo_id,
+                &identity.oid,
+                identity.promised_size,
+                &admitted.file.metadata()?,
+            );
+            if after != identity {
+                // The file changed while it was read; never cache this observation.
+                return Ok(HashOutcome::Mismatch);
+            }
+            cache().insert(after, Instant::now());
+            Ok(HashOutcome::Matched)
+        })();
+        return match result {
+            Ok(HashOutcome::Matched) => {
+                leader.complete(FlightResult::Verified);
+                Ok(true)
+            }
+            Ok(HashOutcome::Mismatch) => {
+                leader.complete(FlightResult::Mismatch);
+                Ok(false)
+            }
+            Ok(HashOutcome::LeaderTimedOut) => {
+                leader.complete(FlightResult::LeaderTimedOut);
+                Err(anyhow::anyhow!("LFS integrity verification timed out"))
+            }
+            Err(error) => {
+                leader.complete(FlightResult::Failed(format!("{error:#}")));
+                Err(error)
+            }
+        };
     }
 }
 
