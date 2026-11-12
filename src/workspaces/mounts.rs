@@ -223,6 +223,7 @@ pub async fn prewarm(
         .await
         .map_err(Error::internal)?
         .get(0);
+    drop(client);
     if !live {
         return Err(super::service::conflict());
     }
@@ -269,6 +270,7 @@ pub async fn ensure_from_database(state: &Arc<AppState>, id: Uuid) -> Result<(),
         )
         .await
         .map_err(Error::internal)?;
+    drop(client);
     ensure_async(state, id, row.get(0), row.get(1)).await
 }
 
@@ -289,6 +291,7 @@ pub async fn reconcile_startup(state: &Arc<AppState>) -> Result<(), Error> {
         )
         .await
         .map_err(Error::internal)?;
+    drop(client);
     for row in rows {
         ensure_async(state, row.get(0), row.get(1), row.get(2)).await?;
     }

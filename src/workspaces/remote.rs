@@ -108,6 +108,7 @@ pub(super) async fn load_manifest(
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    drop(client);
     if row.get::<_, String>(0) != "committed" {
         return Err(service::conflict());
     }
@@ -169,16 +170,18 @@ pub async fn publish(
     headers: HeaderMap,
     Path(cp): Path<Uuid>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let row = client
-        .query_opt(
-            "SELECT c.workspace_id,c.repository_id,c.state,c.lease_epoch,c.captured_revision,c.manifest_digest,c.manifest_size,r.owner_id \
-             FROM workspace_checkpoints c JOIN repositories r ON r.id=c.repository_id WHERE c.id=$1",
-            &[&cp],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
+    let row = {
+        let client = state.pool.get().await.map_err(Error::internal)?;
+        client
+            .query_opt(
+                "SELECT c.workspace_id,c.repository_id,c.state,c.lease_epoch,c.captured_revision,c.manifest_digest,c.manifest_size,r.owner_id \
+                 FROM workspace_checkpoints c JOIN repositories r ON r.id=c.repository_id WHERE c.id=$1",
+                &[&cp],
+            )
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(Error::not_found)?
+    };
     let ws_id: Uuid = row.get(0);
     let repo_id: Uuid = row.get(1);
     let status: String = row.get(2);
@@ -207,15 +210,17 @@ pub async fn publish(
     if status != "local_complete" || ws.host_id != state.storage.volume_id || ws.lease_epoch != epoch {
         return Err(service::conflict());
     }
-    let valid_lease: bool = client
-        .query_one("SELECT lease_until>clock_timestamp() FROM workspaces WHERE id=$1", &[&ws_id])
-        .await
-        .map_err(Error::internal)?
-        .get(0);
+    let valid_lease: bool = {
+        let client = state.pool.get().await.map_err(Error::internal)?;
+        client
+            .query_one("SELECT lease_until>clock_timestamp() FROM workspaces WHERE id=$1", &[&ws_id])
+            .await
+            .map_err(Error::internal)?
+            .get(0)
+    };
     if !valid_lease {
         return Err(service::conflict());
     }
-    drop(client);
 
     let store = remote_store(&state)?;
     let root = service::checkpoint_repo(&state, cp);
@@ -317,6 +322,7 @@ pub async fn publish(
         }
     }
     tx.commit().await.map_err(Error::internal)?;
+    drop(client);
     if std::env::var("ROOTYARD_WORKSPACE_REMOTE_KILL_AFTER_COMMIT").as_deref() == Ok("1") {
         std::process::exit(78);
     }

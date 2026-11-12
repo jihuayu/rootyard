@@ -1,24 +1,13 @@
 //! Bounded off-thread execution and in-memory per-workspace mutation fencing.
 //!
-//! Foreground workspace routes must never execute full-tree walks, SHA-256
-//! inventories, checkpoint copies, sparse file staging or FUSE control RPCs on
-//! Tokio async worker threads, and must never spawn unbounded OS blocking
-//! threads when storage slows down. This module provides two isolated bulkheads
-//! plus an in-memory per-workspace mutation coordinator:
-//!
-//! * **Data I/O bulkhead** ([`run`]): gates `tokio::task::spawn_blocking` behind
-//!   a bounded [`Semaphore`] (`ROOTYARD_WORKSPACE_IO_CONCURRENCY`, default 8).
-//!   The [`OwnedSemaphorePermit`] travels inside the blocking closure, so a
-//!   timed-out or disconnected caller never releases capacity before the kernel
-//!   syscall actually returns.
-//! * **Control bulkhead** ([`run_control`], [`spawn_observe`]): separate
-//!   bounded [`Semaphore`] so FUSE mount, freeze and lease-observation RPCs
-//!   stay responsive even when all Data I/O permits are saturated.
-//! * **Per-workspace mutation coordinator** ([`lock_mutation`], [`begin_scan`]):
-//!   serializes in-place API mutations (`files::put`, `files::git`) per
-//!   workspace in memory without holding PostgreSQL transactions or row locks
-//!   across filesystem or Git execution, and fences overlapping background
-//!   capture scans via a refcounted monotonic generation counter.
+//! * **Data I/O bulkhead** ([`run`]): gates `spawn_blocking` behind a bounded
+//!   [`Semaphore`] (`ROOTYARD_WORKSPACE_IO_CONCURRENCY`, default 8) with the
+//!   permit retained inside the OS closure until syscalls return.
+//! * **Control bulkhead** ([`run_control`], [`spawn_observe`]): isolated
+//!   [`Semaphore`] so FUSE mount/freeze/observe RPCs stay responsive.
+//! * **Mutation coordinator** ([`lock_mutation`], [`begin_scan`]): serializes
+//!   per-workspace mutations in memory, drains in-flight `ScanToken`s before
+//!   admitting foreground mutations, and fences overlapping background scans.
 use crate::{Error, observability::worker};
 use axum::http::StatusCode;
 use std::{
@@ -169,9 +158,30 @@ where
 
 struct MutationEntry {
     mutex: Arc<tokio::sync::Mutex<()>>,
+    notify: Arc<tokio::sync::Notify>,
     refs: usize,
     active: bool,
+    waiters: usize,
+    active_scans: usize,
     generation: u64,
+}
+
+impl MutationEntry {
+    fn new() -> Self {
+        Self {
+            mutex: Arc::new(tokio::sync::Mutex::new(())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            refs: 0,
+            active: false,
+            waiters: 0,
+            active_scans: 0,
+            generation: 0,
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.refs == 0 && !self.active && self.waiters == 0 && self.active_scans == 0
+    }
 }
 
 fn mutations() -> &'static Mutex<HashMap<Uuid, MutationEntry>> {
@@ -179,32 +189,31 @@ fn mutations() -> &'static Mutex<HashMap<Uuid, MutationEntry>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn release_ref(id: Uuid, end_mutation: bool) {
-    let mut map = lock(mutations());
-    let remove = if let Some(entry) = map.get_mut(&id) {
-        if end_mutation {
-            entry.active = false;
-            entry.generation = entry.generation.wrapping_add(1);
-        }
-        entry.refs = entry.refs.saturating_sub(1);
-        entry.refs == 0 && !entry.active
-    } else {
-        false
-    };
-    if remove {
-        map.remove(&id);
-    }
-}
-
-struct RefDecrement {
+struct WaiterGuard {
     id: Uuid,
-    armed: bool,
+    waiting: bool,
+    ref_armed: bool,
 }
 
-impl Drop for RefDecrement {
+impl Drop for WaiterGuard {
     fn drop(&mut self) {
-        if self.armed {
-            release_ref(self.id, false);
+        if !self.waiting && !self.ref_armed {
+            return;
+        }
+        let mut map = lock(mutations());
+        let remove = if let Some(entry) = map.get_mut(&self.id) {
+            if self.waiting {
+                entry.waiters = entry.waiters.saturating_sub(1);
+            }
+            if self.ref_armed {
+                entry.refs = entry.refs.saturating_sub(1);
+            }
+            entry.is_idle()
+        } else {
+            false
+        };
+        if remove {
+            map.remove(&self.id);
         }
     }
 }
@@ -217,33 +226,66 @@ pub(super) struct MutationGuard {
     _owned: OwnedMutexGuard<()>,
 }
 
+impl MutationGuard {
+    /// Hold `active_scans > 0` across a foreground `mounts::with_frozen` call so
+    /// even a timed-out `blocking::run` caller cannot allow another freeze or
+    /// scan on `id` until `mounts::with_frozen` actually exits.
+    pub(super) fn freeze_guard(&self) -> ScanToken {
+        let mut map = lock(mutations());
+        let entry = map.get_mut(&self.id).expect("workspace mutation entry retained by active guard");
+        entry.refs += 1;
+        entry.active_scans += 1;
+        let generation = entry.generation;
+        ScanToken { slot: Arc::new(ScanSlot { id: self.id, generation }) }
+    }
+}
+
 impl Drop for MutationGuard {
     fn drop(&mut self) {
-        release_ref(self.id, true);
+        let mut map = lock(mutations());
+        let remove = if let Some(entry) = map.get_mut(&self.id) {
+            entry.active = false;
+            entry.generation = entry.generation.wrapping_add(1);
+            entry.refs = entry.refs.saturating_sub(1);
+            entry.is_idle()
+        } else {
+            false
+        };
+        if remove {
+            map.remove(&self.id);
+        }
     }
 }
 
 pub(super) async fn lock_mutation(id: Uuid, timeout: Duration) -> Result<MutationGuard, Error> {
-    let mutex = {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let (mutex, notify) = {
         let mut map = lock(mutations());
-        let entry = map.entry(id).or_insert_with(|| MutationEntry {
-            mutex: Arc::new(tokio::sync::Mutex::new(())),
-            refs: 0,
-            active: false,
-            generation: 0,
-        });
+        let entry = map.entry(id).or_insert_with(MutationEntry::new);
         entry.refs += 1;
-        entry.mutex.clone()
+        entry.waiters += 1;
+        (entry.mutex.clone(), entry.notify.clone())
     };
-    let mut ref_guard = RefDecrement { id, armed: true };
-    let owned = tokio::time::timeout(timeout, mutex.lock_owned()).await.map_err(|_| Error::timeout())?;
-    {
-        let mut map = lock(mutations());
-        let entry = map.get_mut(&id).expect("workspace mutation entry retained by refcount");
-        entry.active = true;
-        entry.generation = entry.generation.wrapping_add(1);
+    let mut waiter = WaiterGuard { id, waiting: true, ref_armed: true };
+    let owned = tokio::time::timeout_at(deadline, mutex.lock_owned()).await.map_err(|_| Error::timeout())?;
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let mut map = lock(mutations());
+            let entry = map.get_mut(&id).expect("workspace mutation entry retained by refcount");
+            if entry.active_scans == 0 {
+                entry.waiters = entry.waiters.saturating_sub(1);
+                waiter.waiting = false;
+                entry.active = true;
+                entry.generation = entry.generation.wrapping_add(1);
+                waiter.ref_armed = false;
+                break;
+            }
+        }
+        tokio::time::timeout_at(deadline, notified).await.map_err(|_| Error::timeout())?;
     }
-    ref_guard.armed = false;
     Ok(MutationGuard { id, _owned: owned })
 }
 
@@ -279,47 +321,65 @@ impl Drop for DirCleanupGuard {
     }
 }
 
-/// Observation token held by `capture::reconcile_one` while scanning `id`.
-pub(super) struct ScanToken {
+struct ScanSlot {
     id: Uuid,
     generation: u64,
 }
 
+impl Drop for ScanSlot {
+    fn drop(&mut self) {
+        let notify = {
+            let mut map = lock(mutations());
+            let mut wake = None;
+            let remove = if let Some(entry) = map.get_mut(&self.id) {
+                entry.active_scans = entry.active_scans.saturating_sub(1);
+                entry.refs = entry.refs.saturating_sub(1);
+                if entry.active_scans == 0 {
+                    wake = Some(entry.notify.clone());
+                }
+                entry.is_idle()
+            } else {
+                false
+            };
+            if remove {
+                map.remove(&self.id);
+            }
+            wake
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+}
+
+/// Refcounted observation token held by `capture::reconcile_one` (and cloned
+/// into the `scan::frozen` OS worker closure so `active_scans > 0` holds until
+/// `mounts::with_frozen` actually exits).
+#[derive(Clone)]
+pub(super) struct ScanToken {
+    slot: Arc<ScanSlot>,
+}
+
 impl ScanToken {
-    /// Returns `true` iff no in-process API mutation is active or ran on `id`
-    /// since this scan token was acquired.
     pub(super) fn is_unchanged(&self) -> bool {
         let map = lock(mutations());
-        map.get(&self.id).is_some_and(|entry| !entry.active && entry.generation == self.generation)
+        map.get(&self.slot.id).is_some_and(|entry| !entry.active && entry.generation == self.slot.generation)
     }
 }
 
-impl Drop for ScanToken {
-    fn drop(&mut self) {
-        release_ref(self.id, false);
-    }
-}
-
-/// Acquire a scan observation token if no in-process API mutation currently
-/// owns `id`. Returns `None` while a mutation is active so background capture
-/// skips `id` and retries on the next fair round.
 pub(super) fn begin_scan(id: Uuid) -> Option<ScanToken> {
     let mut map = lock(mutations());
-    let entry = map.entry(id).or_insert_with(|| MutationEntry {
-        mutex: Arc::new(tokio::sync::Mutex::new(())),
-        refs: 0,
-        active: false,
-        generation: 0,
-    });
-    if entry.active {
-        if entry.refs == 0 {
+    let entry = map.entry(id).or_insert_with(MutationEntry::new);
+    if entry.active || entry.waiters > 0 || entry.active_scans > 0 {
+        if entry.is_idle() {
             map.remove(&id);
         }
         return None;
     }
     entry.refs += 1;
+    entry.active_scans += 1;
     let generation = entry.generation;
-    Some(ScanToken { id, generation })
+    Some(ScanToken { slot: Arc::new(ScanSlot { id, generation }) })
 }
 
 #[cfg(test)]
@@ -358,7 +418,6 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        // Both caller futures time out, but the OS closures still hold both permits.
         for handle in handles {
             assert_eq!(handle.await.unwrap().unwrap_err().0, StatusCode::GATEWAY_TIMEOUT);
         }
@@ -390,19 +449,34 @@ mod tests {
         assert!(run(|| Ok(worker::current())).await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn mutation_guard_invalidates_overlapping_scan_and_prunes_idle_entry() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lock_mutation_drains_inflight_scans_blocks_new_scans_and_cleans_up_on_timeout() {
         let id = Uuid::new_v4();
         let scan = begin_scan(id).expect("idle workspace allows scan");
+        let worker_clone = scan.clone();
         assert!(scan.is_unchanged());
 
-        let guard = lock_mutation(id, Duration::from_secs(1)).await.expect("mutation lock");
-        assert!(begin_scan(id).is_none(), "active mutation blocks new scan");
-        assert!(!scan.is_unchanged(), "active mutation invalidates in-flight scan");
+        // Wedged scan causes lock_mutation to time out cleanly without leaking waiters.
+        let timed_out = lock_mutation(id, Duration::from_millis(40)).await;
+        assert_eq!(timed_out.err().map(|e| e.0), Some(StatusCode::GATEWAY_TIMEOUT));
 
-        drop(guard);
-        assert!(!scan.is_unchanged(), "completed mutation still invalidates overlapping scan");
+        // Healthy in-flight scan finishes unimpeded while queued waiter blocks new scans.
+        let waiter_task = tokio::spawn(async move { lock_mutation(id, Duration::from_secs(2)).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while lock(mutations()).get(&id).map_or(0, |e| e.waiters) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(begin_scan(id).is_none(), "queued foreground mutation must block new background scans");
+        assert!(scan.is_unchanged(), "in-flight scan remains valid until it completes");
+
         drop(scan);
+        assert!(!waiter_task.is_finished(), "cloned worker token still holds active_scans > 0");
+        drop(worker_clone);
+
+        let guard = waiter_task.await.unwrap().expect("mutation acquired once scan drains");
+        assert!(begin_scan(id).is_none());
+        drop(guard);
         assert!(!lock(mutations()).contains_key(&id), "idle entry must be pruned");
     }
 }

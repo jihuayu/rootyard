@@ -95,6 +95,18 @@ async fn eligible(state: &AppState, id: Uuid) -> Result<Option<(i64, i64)>, Erro
     Ok(row.map(|row| (row.get(0), row.get(1))))
 }
 
+fn scan_workspace_fingerprint(repo: &Path, stable_gate: bool) -> Result<String, Error> {
+    let before = fingerprint(repo)?;
+    if stable_gate {
+        return Ok(before);
+    }
+    let after = fingerprint(repo)?;
+    if before != after {
+        return Err(service::conflict());
+    }
+    Ok(after)
+}
+
 pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
     if !super::mounts::mounted(id) {
         return Ok(false);
@@ -102,44 +114,13 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
     let Some(scan_token) = super::blocking::begin_scan(id) else {
         return Ok(false);
     };
-    reconcile_inner(state, id, Some(scan_token)).await
-}
-
-/// Reconcile native worktree/index edits when the caller already owns the
-/// per-workspace [`super::blocking::MutationGuard`] (e.g., `checkpoints::create`).
-pub(super) async fn reconcile_locked(
-    state: &AppState,
-    id: Uuid,
-    _guard: &super::blocking::MutationGuard,
-) -> Result<bool, Error> {
-    if !super::mounts::mounted(id) {
-        return Ok(false);
-    }
-    reconcile_inner(state, id, None).await
-}
-
-async fn reconcile_inner(
-    state: &AppState,
-    id: Uuid,
-    scan_token: Option<super::blocking::ScanToken>,
-) -> Result<bool, Error> {
     let Some((expected_revision, expected_epoch)) = eligible(state, id).await? else {
         return Ok(false);
     };
     let repo = service::workspace_repo(state, id);
-    // The FUSE gate gives a stable snapshot for one pass. Direct mode keeps the
-    // second pass to detect an editor write racing an unfenced scan.
     let stable_gate = super::mounts::enabled();
-    let scanned = match scan::frozen(id, scan::timeout(), move || {
-        let before = fingerprint(&repo)?;
-        if stable_gate {
-            return Ok(before);
-        }
-        let after = fingerprint(&repo)?;
-        if before != after {
-            return Err(service::conflict());
-        }
-        Ok(after)
+    let scanned = match scan::frozen_with_token(id, scan::timeout(), Some(scan_token.clone()), move || {
+        scan_workspace_fingerprint(&repo, stable_gate)
     })
     .await
     {
@@ -148,15 +129,51 @@ async fn reconcile_inner(
         // eligible on the next round.
         Err(scan::ScanFailure::Busy) => return Ok(false),
         // A worker that never returned is reported here, in the async reconcile
-        // scope, with the fixed `timeout` label and no source text. The blocking
-        // thread has no caller left to report to, and turning the timeout into
-        // an error would observe the same scan twice.
+        // scope, with the fixed `timeout` label and no source text.
         Err(scan::ScanFailure::Timeout) => {
             observability::observe_timeout();
             return Ok(false);
         }
         Err(scan::ScanFailure::Failed(error)) => return Err(error),
     };
+    commit_reconciled(state, id, expected_revision, expected_epoch, Some(&scan_token), &scanned).await
+}
+
+/// Reconcile native worktree/index edits on the foreground Data I/O bulkhead
+/// when the caller already owns [`super::blocking::MutationGuard`]
+/// (`checkpoints::create`), propagating `503`/`504` errors instead of skipping.
+pub(super) async fn reconcile_locked(
+    state: &AppState,
+    id: Uuid,
+    guard: &super::blocking::MutationGuard,
+) -> Result<bool, Error> {
+    if !super::mounts::mounted(id) {
+        return Err(Error::internal("workspace FUSE mount missing"));
+    }
+    let Some((expected_revision, expected_epoch)) = eligible(state, id).await? else {
+        return Ok(false);
+    };
+    let repo = service::workspace_repo(state, id);
+    let stable_gate = super::mounts::enabled();
+    let freeze_guard = guard.freeze_guard();
+    let scanned = super::blocking::run(move || {
+        let _freeze = freeze_guard;
+        let out = super::mounts::with_frozen(id, || scan_workspace_fingerprint(&repo, stable_gate));
+        drop(_freeze);
+        out
+    })
+    .await?;
+    commit_reconciled(state, id, expected_revision, expected_epoch, None, &scanned).await
+}
+
+async fn commit_reconciled(
+    state: &AppState,
+    id: Uuid,
+    expected_revision: i64,
+    expected_epoch: i64,
+    scan_token: Option<&super::blocking::ScanToken>,
+    scanned: &str,
+) -> Result<bool, Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let row = tx
@@ -173,7 +190,7 @@ async fn reconcile_inner(
     let revision: i64 = row.get(0);
     let epoch: i64 = row.get(1);
     if !scan_is_current(expected_revision, expected_epoch, revision, epoch)
-        || scan_token.as_ref().is_some_and(|token| !token.is_unchanged())
+        || scan_token.is_some_and(|token| !token.is_unchanged())
     {
         return Ok(false);
     }
@@ -181,7 +198,7 @@ async fn reconcile_inner(
         .query_opt("SELECT fingerprint FROM workspace_capture_state WHERE workspace_id=$1 FOR UPDATE", &[&id])
         .await
         .map_err(Error::internal)?;
-    let changed = capture_changes(previous.as_ref().map(|row| row.get::<_, String>(0)).as_deref(), &scanned);
+    let changed = capture_changes(previous.as_ref().map(|row| row.get::<_, String>(0)).as_deref(), scanned);
     tx.execute(
         "INSERT INTO workspace_capture_state(workspace_id,fingerprint) VALUES($1,$2) \
          ON CONFLICT(workspace_id) DO UPDATE SET fingerprint=$2,scanned_at=clock_timestamp()",

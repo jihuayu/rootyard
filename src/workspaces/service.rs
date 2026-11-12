@@ -94,6 +94,7 @@ pub async fn authorized(
         return Err(Error::not_found());
     }
     tx.commit().await.map_err(Error::internal)?;
+    drop(client);
     if !super::mounts::mounted(id) {
         return Err(Error::internal("workspace FUSE mount missing"));
     }
@@ -160,7 +161,6 @@ pub async fn lease(
     Json(input): Json<LeaseRequest>,
 ) -> Result<Json<Workspace>, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    let _mutation = super::blocking::lock_mutation(id, state.config.git_timeout).await?;
 
     // Phase 1: short read pre-check without holding a row lock across S3 or disk work.
     let takeover = {
@@ -204,6 +204,7 @@ pub async fn lease(
         tx.commit().await.map_err(Error::internal)?;
         plan
     };
+    let _mutation = super::blocking::lock_mutation(id, super::blocking::io_timeout()).await?;
 
     // Phase 2: materialize cross-host takeover or check local repo off-thread with no DB TX held.
     // Newly materialized lower/sidecar paths remain armed until disarmed right before COMMIT.
@@ -350,6 +351,7 @@ pub async fn create(
         .await?;
         if let Some(saved) = lookup_existing_creation(&tx, actor.id, &key, &digest, false).await? {
             tx.commit().await.map_err(Error::internal)?;
+            drop(client);
             super::mounts::ensure_from_database(&state, saved.id).await?;
             return Ok((StatusCode::OK, Json(saved)));
         }

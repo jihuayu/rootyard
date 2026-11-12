@@ -94,8 +94,10 @@ pub async fn create(
     let dest = service::checkpoint_repo(&state, cp);
     let stable_gate = super::mounts::enabled();
     let state_copy = state.clone();
+    let freeze_guard = mutation.freeze_guard();
     let (before, published) = super::blocking::run(move || {
-        super::mounts::with_frozen(id, || {
+        let _freeze = freeze_guard;
+        let out = super::mounts::with_frozen(id, || {
             let before_raw = super::snapshot::Raw::load(&source)?
                 .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
             let before = before_raw.digest().to_owned();
@@ -120,7 +122,9 @@ pub async fn create(
                 }
             }
             Ok((before, published))
-        })
+        });
+        drop(_freeze);
+        out
     })
     .await?;
 
@@ -272,6 +276,7 @@ async fn restore_inner(
             && let Some(saved) = service::lookup_existing_creation(&tx, actor.id, key, &digest, false).await?
         {
             tx.commit().await.map_err(Error::internal)?;
+            drop(client);
             super::mounts::ensure_from_database(&state, saved.id).await?;
             return Ok((StatusCode::OK, Json(saved)));
         }
@@ -409,6 +414,7 @@ pub async fn fork(
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    drop(client);
     if row.get::<_, Uuid>(0) != ws.id {
         return Err(Error::not_found());
     }

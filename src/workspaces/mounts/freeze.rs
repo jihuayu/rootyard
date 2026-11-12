@@ -77,6 +77,7 @@ pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
         )
         .await
         .map_err(Error::internal)?;
+    drop(client);
     let leases: HashMap<Uuid, (i64, i64)> = rows.iter().map(|r| (r.get(0), (r.get(1), r.get(2)))).collect();
     super::super::blocking::run_control(move || {
         for (id, gate, marker) in in_process {

@@ -116,6 +116,7 @@ pub async fn get(
         .map_err(Error::internal)?
         .map(|r| r.get(0))
         .unwrap_or(0);
+    drop(client);
     Ok(Json(json!({
         "path": query.path,
         "view": query.view.unwrap_or_else(|| "working".into()),
@@ -166,6 +167,7 @@ async fn put_mutation(
 ) -> Result<Value, Error> {
     let _permit = permit;
     let PutJob { raw_path, bytes, input } = job;
+    service::authorized(&state, &headers, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     let hash = hex::encode(Sha256::digest(
@@ -329,6 +331,7 @@ async fn git_mutation(
     permit: OwnedSemaphorePermit,
 ) -> Result<Value, Error> {
     let _permit = permit;
+    service::authorized(&state, &headers, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     let request_hash = hex::encode(Sha256::digest(

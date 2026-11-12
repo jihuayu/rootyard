@@ -110,7 +110,21 @@ impl Drop for InflightGuard {
 /// the pool thread so `Error::internal` inside the closure is attributed to the
 /// real worker and phase instead of a detached scope. Only that operation scope
 /// is carried: an HTTP request scope is never captured.
+#[cfg(test)]
 pub(super) async fn frozen<T, F>(id: Uuid, timeout: Duration, work: F) -> Result<T, ScanFailure>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+{
+    frozen_with_token(id, timeout, None, work).await
+}
+
+pub(super) async fn frozen_with_token<T, F>(
+    id: Uuid,
+    timeout: Duration,
+    token: Option<super::blocking::ScanToken>,
+    work: F,
+) -> Result<T, ScanFailure>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, Error> + Send + 'static,
@@ -126,7 +140,9 @@ where
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let job: Job = Box::new(move || {
         let _guard = guard;
+        let _token = token;
         let outcome = worker::blocking(operation, move || super::mounts::with_frozen(id, work));
+        drop(_token);
         let _ = sender.send(outcome);
     });
     let pool = pool()?;

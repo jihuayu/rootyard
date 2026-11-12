@@ -44,43 +44,55 @@ pub async fn abandon(
     headers: HeaderMap,
     Path(cp): Path<Uuid>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let row = tx
-        .query_opt("SELECT workspace_id,state FROM workspace_checkpoints WHERE id=$1", &[&cp])
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    let workspace_id: Uuid = row.get(0);
-    let status: String = row.get(1);
+    let workspace_id: Uuid = {
+        let client = state.pool.get().await.map_err(Error::internal)?;
+        client
+            .query_opt("SELECT workspace_id FROM workspace_checkpoints WHERE id=$1", &[&cp])
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(Error::not_found)?
+            .get(0)
+    };
     service::authorized(&state, &headers, workspace_id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite)
         .await?;
-    if status == "committed" {
-        return Err(Error(StatusCode::CONFLICT, "committed checkpoint is a retention root"));
-    }
-    if status != "failed" {
-        let changed = tx
-            .execute(
-                "UPDATE workspace_checkpoints SET state='failed' WHERE id=$1 AND state='local_complete' AND NOT EXISTS (SELECT 1 FROM workspaces WHERE parent_checkpoint_id=$1)",
-                &[&cp],
+    {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let status: String = tx
+            .query_opt("SELECT state FROM workspace_checkpoints WHERE id=$1 FOR UPDATE", &[&cp])
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(Error::not_found)?
+            .get(0);
+        if status == "committed" {
+            return Err(Error(StatusCode::CONFLICT, "committed checkpoint is a retention root"));
+        }
+        if status != "failed" {
+            let changed = tx
+                .execute(
+                    "UPDATE workspace_checkpoints SET state='failed' WHERE id=$1 AND state='local_complete' AND NOT EXISTS (SELECT 1 FROM workspaces WHERE parent_checkpoint_id=$1)",
+                    &[&cp],
+                )
+                .await
+                .map_err(Error::internal)?;
+            if changed != 1 {
+                return Err(service::conflict());
+            }
+            tx.execute(
+                "UPDATE workspaces SET last_checkpoint_id=NULL WHERE id=$1 AND last_checkpoint_id=$2",
+                &[&workspace_id, &cp],
             )
             .await
             .map_err(Error::internal)?;
-        if changed != 1 {
-            return Err(service::conflict());
         }
-        tx.execute(
-            "UPDATE workspaces SET last_checkpoint_id=NULL WHERE id=$1 AND last_checkpoint_id=$2",
-            &[&workspace_id, &cp],
-        )
-        .await
-        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
     }
-    tx.commit().await.map_err(Error::internal)?;
     // A transport failure leaves the staging rows as the retryable tombstone.
     let removed = collect_once(&state).await.unwrap_or(0);
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let pending = cleanup_pending_objects(&client, cp).await?;
+    let pending = {
+        let client = state.pool.get().await.map_err(Error::internal)?;
+        cleanup_pending_objects(&client, cp).await?
+    };
     Ok((
         StatusCode::OK,
         Json(json!({
