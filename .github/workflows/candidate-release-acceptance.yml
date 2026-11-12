@@ -151,10 +151,12 @@ jobs:
             --harness tests/web_sessions.py \
             --harness tests/e2e.py \
             --harness tests/native_evidence.py \
+            --harness tests/owned_fuse_cleanup.py \
+            --harness scripts/build_native.py \
             --fixture "playwright_version=$playwright_version" \
             --fixture "chromium_version=$chromium_version" \
-            --fixture "postgres_server_version=$postgres_server_version" \
-            --fixture "postgres_client_version=$postgres_client_version" \
+            --fixture "browser_postgres_server_version=$postgres_server_version" \
+            --fixture "browser_postgres_client_version=$postgres_client_version" \
             --fixture "rust=$rust_version"
       - name: Upload browser candidate evidence
         if: always()
@@ -336,8 +338,12 @@ jobs:
             --harness tests/lfs_remote.py \
             --harness tests/lfs_retention_acceptance.py \
             --harness tests/lfs.py \
+            --harness tests/lfs_remote_contract.py \
+            --harness tests/schema_baseline.py \
             --harness tests/e2e.py \
             --harness tests/native_evidence.py \
+            --harness tests/owned_fuse_cleanup.py \
+            --harness scripts/build_native.py \
             --harness scripts/install_git_lfs.sh \
             --harness scripts/owned_garage_fixture.sh \
             --harness scripts/owned_object_store_env.py \
@@ -349,8 +355,8 @@ jobs:
             --fixture "git_lfs_version=$git_lfs_version" \
             --fixture "git_lfs_output=$git_lfs_output" \
             --fixture "git_lfs_tarball_sha256=$git_lfs_sha256" \
-            --fixture "postgres_server_version=$postgres_server_version" \
-            --fixture "postgres_client_version=$postgres_client_version" \
+            --fixture "object_store_postgres_server_version=$postgres_server_version" \
+            --fixture "object_store_postgres_client_version=$postgres_client_version" \
             --fixture "rust=$rust_version" \
             "${extra_args[@]}"
       - name: Remove the owned fixture and private environment file

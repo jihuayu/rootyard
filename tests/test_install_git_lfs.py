@@ -202,6 +202,59 @@ class InstallGitLfsTest(unittest.TestCase):
         self.assertIn("exactly one entry", process.stderr)
         self.assertFalse((self.destination / "git-lfs").exists())
 
+    def test_rejects_unsigned_sha256sums_asc_without_pgp_framing(self):
+        self.checksums = self.work / "sha256sums.asc"
+        self.write_checksums(f"{self.digest} *git-lfs-linux-amd64-v3.6.1.tar.gz\n")
+        self.run_helper(1)
+        self.assertFalse((self.destination / "git-lfs").exists())
+
+    def test_rejects_unsigned_default_downloaded_sha256sums_asc(self):
+        release_dir = self.root / "unsigned-release"
+        release_dir.mkdir()
+        (release_dir / "git-lfs-linux-amd64-v3.6.1.tar.gz").write_bytes(self.archive.read_bytes())
+        (release_dir / "sha256sums.asc").write_text(
+            f"{self.digest} *git-lfs-linux-amd64-v3.6.1.tar.gz\n"
+        )
+        fresh_work = self.root / "unsigned-work"
+        process = subprocess.run(
+            [
+                str(SCRIPT),
+                "--version",
+                "3.6.1",
+                "--destination",
+                str(self.destination),
+                "--work",
+                str(fresh_work),
+                "--base-url",
+                release_dir.as_uri(),
+                "--expected-sha256",
+                self.digest,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(1, process.returncode, f"stdout: {process.stdout}\nstderr: {process.stderr}")
+        self.assertFalse((self.destination / "git-lfs").exists())
+
+    def test_rejects_symlink_binary_inside_archive(self):
+        target = self.root / "real-target"
+        target.write_text("#!/usr/bin/env bash\necho 'git-lfs/3.6.1 (symlink)'\n")
+        target.chmod(0o755)
+        symlink_dir = self.root / "symlink-src/git-lfs-3.6.1"
+        symlink_dir.mkdir(parents=True)
+        (symlink_dir / "git-lfs").symlink_to(target)
+        symlink_archive = self.work / "git-lfs-linux-amd64-v3.6.1.tar.gz"
+        symlink_archive.unlink()
+        with tarfile.open(symlink_archive, "w:gz") as tar:
+            tar.add(symlink_dir, arcname="git-lfs-3.6.1", recursive=True)
+        self.archive = symlink_archive
+        self.digest = hashlib.sha256(symlink_archive.read_bytes()).hexdigest()
+        self.write_checksums(f"{self.digest}  git-lfs-linux-amd64-v3.6.1.tar.gz\n")
+        process = self.run_helper(1)
+        self.assertIn("regular top-level git-lfs binary", process.stderr)
+        self.assertFalse((self.destination / "git-lfs").exists())
+
 
 class CandidateAndPrWorkflowWiringTest(unittest.TestCase):
     PINNED_LFS_SHA256 = "2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76"
@@ -218,6 +271,93 @@ class CandidateAndPrWorkflowWiringTest(unittest.TestCase):
         self.assertNotIn('test -s "${OBJECT_STORE_ENV_FILE:?}"', text)
         self.assertIn('extra_args+=(--fixture "object_store_env=")', text)
         self.assertIn("--require-case browser_ui=chromium_browser_workflow", text)
+        self.assertIn('--fixture "browser_postgres_server_version=$postgres_server_version"', text)
+        self.assertIn('--fixture "browser_postgres_client_version=$postgres_client_version"', text)
+        self.assertIn('--fixture "object_store_postgres_server_version=$postgres_server_version"', text)
+        self.assertIn('--fixture "object_store_postgres_client_version=$postgres_client_version"', text)
+        self.assertNotIn('--fixture "postgres_server_version=', text)
+        self.assertNotIn('--fixture "postgres_client_version=', text)
+        self.assertEqual(2, text.count("--harness tests/owned_fuse_cleanup.py"))
+        self.assertEqual(2, text.count("--harness scripts/build_native.py"))
+
+    def test_release_manifest_accepts_debian_and_ubuntu_pgdg_psql_versions_across_jobs(self):
+        from tests.test_native_report_manifest import ManifestFixture
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ManifestFixture(tmp)
+            browser_report = fixture.report("browser_ui")
+            browser_manifest = fixture.job(
+                "browser.json",
+                reports={"browser_ui": browser_report},
+                extra=(
+                    "--fixture",
+                    "browser_postgres_server_version=17.11 (Debian 17.11-1.pgdg120+1)",
+                    "--fixture",
+                    "browser_postgres_client_version=psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)",
+                    "--fixture",
+                    "rust=rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+                    "--fixture",
+                    "playwright_version=1.49.0",
+                    "--fixture",
+                    "chromium_version=Chromium 131.0",
+                ),
+            )
+            store_manifest = fixture.job(
+                "object-store.json",
+                reports={
+                    "lfs_hydration": fixture.report("lfs_hydration"),
+                    "lfs_remote": fixture.report("lfs_remote"),
+                    "lfs_retention": fixture.report("lfs_retention"),
+                },
+                extra=(
+                    "--fixture",
+                    "object_store_postgres_server_version=17.11 (Debian 17.11-1.pgdg120+1)",
+                    "--fixture",
+                    "object_store_postgres_client_version=psql (PostgreSQL) 17.11 (Ubuntu 17.11-1.pgdg24.04+2)",
+                    "--fixture",
+                    "rust=rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+                    "--fixture",
+                    "garage_version=2.1.0",
+                    "--fixture",
+                    "git_lfs_version=3.6.1",
+                ),
+            )
+            browser_dir = fixture.artifact_directory("browser", browser_manifest)
+            store_dir = fixture.artifact_directory("object-store", store_manifest)
+            gate_out = fixture.root / "candidate-release-gate.json"
+            fixture.run(
+                "--mode",
+                "release",
+                "--manifest-out",
+                gate_out,
+                "--expect-commit",
+                fixture.commit,
+                "--artifact-dir",
+                f"browser={browser_dir}",
+                "--artifact-dir",
+                f"object-store={store_dir}",
+                "--job-manifest",
+                f"browser={browser_manifest}",
+                "--job-manifest",
+                f"object-store={store_manifest}",
+                "--require-report",
+                "browser_ui",
+                "--require-report",
+                "lfs_hydration",
+                "--require-report",
+                "lfs_remote",
+                "--require-report",
+                "lfs_retention",
+                "--require-fixture-exact",
+                "garage_version=2.1.0",
+                "--require-fixture-exact",
+                "git_lfs_version=3.6.1",
+                "--require-fixture-exact",
+                "playwright_version=1.49.0",
+                "--require-fixture",
+                "chromium_version=Chromium",
+                expect=0,
+            )
 
     def test_ci_workflow_runs_and_binds_recent_native_regressions(self):
         text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -230,9 +370,11 @@ class CandidateAndPrWorkflowWiringTest(unittest.TestCase):
             self.assertIn(f"python3 {harness} --binary target/debug/rootyard --report {report_path}", text)
             self.assertIn(f"--report {report_key}={report_path}", text)
             self.assertIn(f"--harness {harness}", text)
+        self.assertIn("--harness scripts/build_native.py", text)
         self.assertIn("test-results/*-evidence/*.jsonl", text)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 

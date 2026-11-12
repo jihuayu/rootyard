@@ -62,19 +62,32 @@ archive_name="git-lfs-linux-amd64-v${version}.tar.gz"
 base_url="${base_url:-https://github.com/git-lfs/git-lfs/releases/download/v${version}}"
 if [ -z "$archive" ]; then
   archive="$work/$archive_name"
-  curl -fsSL --retry 3 -o "$archive" "$base_url/$archive_name" \
+  curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 --max-filesize 104857600 \
+    -o "$archive" "$base_url/$archive_name" \
     || fail "cannot download the official $archive_name"
 fi
 [ -f "$archive" ] || fail "archive is missing: $archive"
+require_pgp=0
 if [ -z "$checksums" ]; then
+  if [ -z "$checksums_url" ]; then
+    require_pgp=1
+  fi
   checksums="$work/sha256sums.asc"
   checksums_url="${checksums_url:-$base_url/sha256sums.asc}"
-  curl -fsSL --retry 3 -o "$checksums" "$checksums_url" \
+  case "$checksums_url" in
+    *.asc | *.asc\?* | *.asc#*) require_pgp=1 ;;
+  esac
+  curl -fsSL --retry 3 --connect-timeout 15 --max-time 30 --max-filesize 1048576 \
+    -o "$checksums" "$checksums_url" \
     || fail "cannot download the official checksums asset $checksums_url"
+else
+  case "$checksums" in
+    *.asc) require_pgp=1 ;;
+  esac
 fi
 [ -f "$checksums" ] || fail "checksums file is missing: $checksums"
 
-expected=$(awk -v name="$archive_name" '
+expected=$(awk -v name="$archive_name" -v require_pgp="$require_pgp" '
   {
     sub(/\r$/, "")
   }
@@ -131,6 +144,9 @@ expected=$(awk -v name="$archive_name" '
     }
   }
   END {
+    if (require_pgp && !pgp_mode) {
+      exit 6
+    }
     if (pgp_mode && (!saw_body || !saw_sig || !saw_end_sig || in_sig)) {
       exit 4
     }
@@ -155,7 +171,8 @@ rm -rf -- "$extract"
 mkdir -p -- "$extract"
 tar -xzf "$archive" -C "$extract" --strip-components=1 \
   || fail "$archive_name does not contain the expected top-level directory"
-[ -f "$extract/git-lfs" ] || fail "$archive_name did not yield a top-level git-lfs binary after stripping"
+{ [ ! -L "$extract/git-lfs" ] && [ -f "$extract/git-lfs" ]; } \
+  || fail "$archive_name did not yield a regular top-level git-lfs binary after stripping"
 install -m 0755 "$extract/git-lfs" "$destination/git-lfs"
 "$destination/git-lfs" version | grep -F "git-lfs/${version}" \
   || fail "installed git-lfs does not report git-lfs/${version}"

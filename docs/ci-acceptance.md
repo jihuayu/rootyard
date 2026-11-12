@@ -200,8 +200,13 @@ and every job asserts `git rev-parse HEAD` equals it before building.
   `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`. The manifest
   requires `browser_ui=chromium_browser_workflow` and records the version
   reported by `importlib.metadata` plus the actual `/usr/bin/chromium --version`
-  and PostgreSQL server/client versions; the `rust:1-trixie` container tag and
-  apt packages are mutable inputs, not immutable pins.
+  and job-scoped PostgreSQL server/client versions
+  (`browser_postgres_server_version` / `browser_postgres_client_version`,
+  namespaced away from `object-store-native`'s
+  `object_store_postgres_server_version` / `object_store_postgres_client_version`
+  so Debian container vs. Ubuntu PGDG client strings do not collide in
+  `release-gate`, while `rust` stays shared); the `rust:1-trixie` container tag
+  and apt packages are mutable inputs, not immutable pins.
 * `object-store-native` starts an ephemeral, job-owned Garage container pinned
   by tag and digest (`dxflrs/garage:v2.1.0@sha256:4c9b34c1...`) and runs:
   * `tests/lfs_hydration_concurrency.py` — concurrent cold hydration through the
@@ -211,17 +216,19 @@ and every job asserts `git rev-parse HEAD` equals it before building.
     retention with **no** object-store endpoint configured. The step clears and
     asserts `ROOTYARD_OBJECT_STORE_ENDPOINT`/`_BUCKET` empty, so it cannot
     accidentally inherit the Garage fixture.
-  Git LFS 3.6.1 is downloaded by `scripts/install_git_lfs.sh` and its tarball
-  SHA-256 is verified against both the official release `sha256sums.asc`
-  cleartext-signed manifest (parsed strictly inside the PGP signed message body,
-  rejecting unsigned tail entries or truncated framing) and the workflow's
-  pinned `--expected-sha256`
+  Git LFS 3.6.1 is downloaded by `scripts/install_git_lfs.sh` with bounded
+  `curl` timeouts/size caps and its tarball SHA-256 is verified against both the
+  official release `sha256sums.asc` cleartext-signed manifest (requiring PGP
+  signed-message framing on `.asc` / default checksum assets and parsing
+  strictly inside the PGP signed message body, rejecting unsigned files,
+  unsigned tail entries or truncated framing) and the workflow's pinned
+  `--expected-sha256`
   (`2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76`); the
-  release tarball's real `git-lfs-3.6.1/git-lfs` layout is stripped before
-  install. If the checksum asset is unavailable, malformed, unsigned-tailed or
-  ambiguous the step fails rather than installing an unverified binary. The
-  installed `git-lfs/<version>` output and `$RUNNER_TEMP/bin/git-lfs` precedence
-  on `PATH` are asserted.
+  release tarball's real `git-lfs-3.6.1/git-lfs` layout is stripped and verified
+  to be a regular non-symlink file before install. If the checksum asset is
+  unavailable, unsigned, malformed, unsigned-tailed or ambiguous the step fails
+  rather than installing an unverified binary. The installed `git-lfs/<version>`
+  output and `$RUNNER_TEMP/bin/git-lfs` precedence on `PATH` are asserted.
 * `release-gate` downloads both job manifests and runs
   `scripts/native_report_manifest.py --mode release`. It requires the two jobs to
   share the dispatched commit and one compiled source-input digest, re-verifies

@@ -373,6 +373,7 @@ jobs:
             --harness tests/mixed_ref_cases.py \
             --harness tests/mixed_ref_support.py \
             --harness tests/refusal_audit_sql.py \
+            --harness scripts/build_native.py \
             --fixture postgres=postgres:17 \
             --fixture workspace_mount_mode=direct \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix \
