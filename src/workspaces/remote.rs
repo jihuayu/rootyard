@@ -24,6 +24,7 @@ use std::{
         ffi::OsStringExt,
         fs::{OpenOptionsExt, PermissionsExt, symlink},
     },
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -40,6 +41,7 @@ pub(super) struct RemoteEntry {
     pub sha256: String,
     pub target_base64: Option<String>,
 }
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RemoteManifest {
@@ -56,8 +58,6 @@ pub(super) fn remote_store(state: &AppState) -> Result<RemoteObjectStore, Error>
 }
 
 /// Object store built from the process environment and a storage root only.
-/// The independent FUSE helper uses this instead of an `AppState`, so the child
-/// never needs PostgreSQL or the service configuration.
 pub(super) fn store_at(root: &std::path::Path) -> Result<RemoteObjectStore, Error> {
     let store =
         RemoteObjectStore::from_env(root.join("workspace-service/local-object-cache")).map_err(Error::internal)?;
@@ -66,21 +66,33 @@ pub(super) fn store_at(root: &std::path::Path) -> Result<RemoteObjectStore, Erro
     }
     Ok(store)
 }
+
 pub(super) fn key(tenant: Uuid, digest: &str) -> Result<ObjectKey, Error> {
     ObjectKey::new(tenant, "workspace", digest).map_err(|_| Error::bad_request())
 }
+
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(120)
 }
+
 fn bounded_manifest(raw: &[u8]) -> Result<RemoteManifest, Error> {
     if raw.len() > 16 * 1024 * 1024 {
         return Err(Error::bad_request());
     }
     serde_json::from_slice(raw).map_err(|_| Error::bad_request())
 }
+
 fn report(cp: Uuid, manifest: &str, size: i64, revision: i64) -> Value {
-    json!({"checkpoint_id":cp,"state":"COMMITTED","durability":"remote_verified","manifest_sha256":manifest,"manifest_size":size,"captured_revision":revision})
+    json!({
+        "checkpoint_id": cp,
+        "state": "COMMITTED",
+        "durability": "remote_verified",
+        "manifest_sha256": manifest,
+        "manifest_size": size,
+        "captured_revision": revision
+    })
 }
+
 pub(super) async fn load_manifest(
     state: &AppState,
     cp: Uuid,
@@ -96,6 +108,7 @@ pub(super) async fn load_manifest(
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    drop(client);
     if row.get::<_, String>(0) != "committed" {
         return Err(service::conflict());
     }
@@ -106,16 +119,34 @@ pub(super) async fn load_manifest(
     }
     let store = remote_store(state)?;
     let stage = state.storage.root.join("workspace-service/staging");
-    fs::create_dir_all(&stage).map_err(Error::internal)?;
+    let stage_dir = stage.clone();
+    super::blocking::run(move || {
+        fs::create_dir_all(&stage_dir).map_err(Error::internal)?;
+        Ok(())
+    })
+    .await?;
     let path = stage.join(format!("lazy-manifest-{cp}-{}", Uuid::new_v4()));
-    let result = store.get_to_file(&key(tenant, &digest)?, &path, size as u64, deadline()).await;
-    if let Err(error) = result {
-        let _ = fs::remove_file(&path);
+    let temp_guard = super::cleanup::FileCleanupGuard::new(path.clone());
+    if let Err(error) = store.get_to_file(&key(tenant, &digest)?, &path, size as u64, deadline()).await {
+        temp_guard.cleanup().await;
         return Err(Error::internal(error));
     }
-    let raw = fs::read(&path).map_err(Error::internal)?;
-    let _ = fs::remove_file(&path);
-    let manifest = bounded_manifest(&raw)?;
+    let manifest = match super::blocking::run(move || {
+        let raw = fs::read(&path).map_err(Error::internal);
+        let _ = fs::remove_file(&path);
+        bounded_manifest(&raw?)
+    })
+    .await
+    {
+        Ok(m) => {
+            temp_guard.keep();
+            m
+        }
+        Err(err) => {
+            temp_guard.cleanup().await;
+            return Err(err);
+        }
+    };
     if manifest.schema != 1
         || manifest.checkpoint_id != cp
         || manifest.repository_id != repo
@@ -125,11 +156,18 @@ pub(super) async fn load_manifest(
     }
     Ok(manifest)
 }
+
 async fn stage_key(state: &AppState, cp: Uuid, tenant: Uuid, digest: &str, size: u64, kind: &str) -> Result<(), Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     super::remote_gc::lock_key(&tx, tenant, digest).await?;
-    tx.execute("INSERT INTO workspace_remote_staging_objects(checkpoint_id,tenant_id,digest,size,kind) VALUES($1,$2,$3,$4,$5) ON CONFLICT(checkpoint_id,digest) DO NOTHING", &[&cp,&tenant,&digest,&(size as i64),&kind]).await.map_err(Error::internal)?;
+    tx.execute(
+        "INSERT INTO workspace_remote_staging_objects(checkpoint_id,tenant_id,digest,size,kind) VALUES($1,$2,$3,$4,$5) \
+         ON CONFLICT(checkpoint_id,digest) DO NOTHING",
+        &[&cp, &tenant, &digest, &(size as i64), &kind],
+    )
+    .await
+    .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     Ok(())
 }
@@ -139,8 +177,18 @@ pub async fn publish(
     headers: HeaderMap,
     Path(cp): Path<Uuid>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let row=client.query_opt("SELECT c.workspace_id,c.repository_id,c.state,c.lease_epoch,c.captured_revision,c.manifest_digest,c.manifest_size,r.owner_id FROM workspace_checkpoints c JOIN repositories r ON r.id=c.repository_id WHERE c.id=$1", &[&cp]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let row = {
+        let client = state.pool.get().await.map_err(Error::internal)?;
+        client
+            .query_opt(
+                "SELECT c.workspace_id,c.repository_id,c.state,c.lease_epoch,c.captured_revision,c.manifest_digest,c.manifest_size,r.owner_id \
+                 FROM workspace_checkpoints c JOIN repositories r ON r.id=c.repository_id WHERE c.id=$1",
+                &[&cp],
+            )
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(Error::not_found)?
+    };
     let ws_id: Uuid = row.get(0);
     let repo_id: Uuid = row.get(1);
     let status: String = row.get(2);
@@ -169,25 +217,42 @@ pub async fn publish(
     if status != "local_complete" || ws.host_id != state.storage.volume_id || ws.lease_epoch != epoch {
         return Err(service::conflict());
     }
-    let valid_lease: bool = client
-        .query_one("SELECT lease_until>clock_timestamp() FROM workspaces WHERE id=$1", &[&ws_id])
-        .await
-        .map_err(Error::internal)?
-        .get(0);
+    let valid_lease: bool = {
+        let client = state.pool.get().await.map_err(Error::internal)?;
+        client
+            .query_one("SELECT lease_until>clock_timestamp() FROM workspaces WHERE id=$1", &[&ws_id])
+            .await
+            .map_err(Error::internal)?
+            .get(0)
+    };
     if !valid_lease {
         return Err(service::conflict());
     }
+
     let store = remote_store(&state)?;
     let root = service::checkpoint_repo(&state, cp);
-    let entries = core::inventory(&root).map_err(Error::internal)?;
-    let mut remote_entries = Vec::with_capacity(entries.len());
+    let root_inv = root.clone();
+    let scanned_items = super::blocking::run(move || {
+        let entries = core::inventory(&root_inv).map_err(Error::internal)?;
+        let mut prepared = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let rel = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
+            let file = root_inv.join(rel);
+            let target = if entry.kind == "symlink" {
+                Some(STANDARD.encode(fs::read_link(&file).map_err(Error::internal)?.into_os_string().into_vec()))
+            } else {
+                None
+            };
+            prepared.push((entry, file, target));
+        }
+        Ok(prepared)
+    })
+    .await?;
+
+    let mut remote_entries = Vec::with_capacity(scanned_items.len());
     let mut uploaded = 0usize;
-    for entry in entries {
-        let rel = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
-        let file = root.join(rel);
-        let target = if entry.kind == "symlink" {
-            Some(STANDARD.encode(fs::read_link(&file).map_err(Error::internal)?.into_os_string().into_vec()))
-        } else {
+    for (entry, file, target) in scanned_items {
+        if entry.kind != "symlink" {
             stage_key(&state, cp, tenant, &entry.sha256, entry.size, "file").await?;
             store
                 .put_file(&key(tenant, &entry.sha256)?, &file, entry.size, deadline())
@@ -199,8 +264,7 @@ pub async fn publish(
             {
                 std::process::exit(77);
             }
-            None
-        };
+        }
         remote_entries.push(RemoteEntry {
             path_base64: entry.path_base64,
             kind: entry.kind,
@@ -220,22 +284,36 @@ pub async fn publish(
     };
     let raw = serde_json::to_vec(&manifest).map_err(Error::internal)?;
     bounded_manifest(&raw)?;
+    let raw_len = raw.len();
     let digest = hex::encode(Sha256::digest(&raw));
-    stage_key(&state, cp, tenant, &digest, raw.len() as u64, "manifest").await?;
+    stage_key(&state, cp, tenant, &digest, raw_len as u64, "manifest").await?;
     let stage = state.storage.root.join("workspace-service/staging");
-    fs::create_dir_all(&stage).map_err(Error::internal)?;
-    let file = stage.join(format!("manifest-{cp}-{}", Uuid::new_v4()));
-    let mut output =
-        OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file).map_err(Error::internal)?;
-    output.write_all(&raw).map_err(Error::internal)?;
-    output.sync_all().map_err(Error::internal)?;
-    drop(output);
-    let upload = store.put_file(&key(tenant, &digest)?, &file, raw.len() as u64, deadline()).await;
-    let _ = fs::remove_file(&file);
+    let file = super::blocking::run(move || {
+        fs::create_dir_all(&stage).map_err(Error::internal)?;
+        let file = stage.join(format!("manifest-{cp}-{}", Uuid::new_v4()));
+        let mut output =
+            OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file).map_err(Error::internal)?;
+        output.write_all(&raw).map_err(Error::internal)?;
+        output.sync_all().map_err(Error::internal)?;
+        Ok(file)
+    })
+    .await?;
+    let temp_guard = super::cleanup::FileCleanupGuard::new(file.clone());
+    let upload = store.put_file(&key(tenant, &digest)?, &file, raw_len as u64, deadline()).await;
+    temp_guard.cleanup().await;
     upload.map_err(Error::internal)?;
+
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let changed=tx.execute("UPDATE workspace_checkpoints c SET state='committed',manifest_digest=$2,manifest_size=$3,committed_at=clock_timestamp() FROM workspaces w WHERE c.id=$1 AND c.workspace_id=w.id AND c.state='local_complete' AND c.lease_epoch=w.lease_epoch AND w.host_id=$4 AND w.lease_until>clock_timestamp()", &[&cp,&digest,&(raw.len() as i64),&state.storage.volume_id]).await.map_err(Error::internal)?;
+    let changed = tx
+        .execute(
+            "UPDATE workspace_checkpoints c SET state='committed',manifest_digest=$2,manifest_size=$3,committed_at=clock_timestamp() \
+             FROM workspaces w WHERE c.id=$1 AND c.workspace_id=w.id AND c.state='local_complete' \
+             AND c.lease_epoch=w.lease_epoch AND w.host_id=$4 AND w.lease_until>clock_timestamp()",
+            &[&cp, &digest, &(raw_len as i64), &state.storage.volume_id],
+        )
+        .await
+        .map_err(Error::internal)?;
     if changed != 1 {
         let row = tx
             .query_opt("SELECT state,manifest_digest,manifest_size FROM workspace_checkpoints WHERE id=$1", &[&cp])
@@ -247,56 +325,25 @@ pub async fn publish(
         }
     }
     tx.commit().await.map_err(Error::internal)?;
+    drop(client);
     if std::env::var("ROOTYARD_WORKSPACE_REMOTE_KILL_AFTER_COMMIT").as_deref() == Ok("1") {
         std::process::exit(78);
     }
-    Ok((StatusCode::OK, Json(report(cp, &digest, raw.len() as i64, captured))))
+    Ok((StatusCode::OK, Json(report(cp, &digest, raw_len as i64, captured))))
 }
 
 pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) -> Result<(), Error> {
     let final_path = service::checkpoint_repo(state, cp);
-    if final_path.is_dir() {
+    let check_path = final_path.clone();
+    if super::blocking::run(move || Ok(check_path.is_dir())).await? {
         return Ok(());
     }
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let row = client
-        .query_opt(
-            "SELECT state,manifest_digest,manifest_size FROM workspace_checkpoints WHERE id=$1 AND repository_id=$2",
-            &[&cp, &repo],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    if row.get::<_, String>(0) != "committed" {
-        return Err(service::conflict());
-    }
-    let digest: String = row.get::<_, Option<String>>(1).ok_or_else(|| Error::internal("missing remote metadata"))?;
-    let size: i64 = row.get::<_, Option<i64>>(2).ok_or_else(|| Error::internal("missing remote metadata"))?;
-    if !(1..=16 * 1024 * 1024).contains(&size) {
-        return Err(Error::internal("invalid remote manifest size"));
-    }
+    let manifest = load_manifest(state, cp, repo, tenant).await?;
     let store = remote_store(state)?;
-    let stage = state.storage.root.join("workspace-service/staging").join(format!("restore-{cp}-{}", Uuid::new_v4()));
-    fs::create_dir_all(&stage).map_err(Error::internal)?;
-    let manifest_path = stage.join("manifest.json");
-    store
-        .get_to_file(&key(tenant, &digest)?, &manifest_path, size as u64, deadline())
-        .await
-        .map_err(Error::internal)?;
-    let raw = fs::read(&manifest_path).map_err(Error::internal)?;
-    let manifest = bounded_manifest(&raw)?;
-    if manifest.schema != 1
-        || manifest.checkpoint_id != cp
-        || manifest.repository_id != repo
-        || manifest.tenant_id != tenant
-    {
-        return Err(Error::bad_request());
-    }
-    let root = stage.join("repo");
-    fs::create_dir(&root).map_err(Error::internal)?;
     let mut paths = BTreeSet::new();
     let mut symlinks = BTreeSet::new();
     let mut total = 0u64;
+    let mut downloads = Vec::new();
     for entry in &manifest.entries {
         let path = core::decode_path(&entry.path_base64).map_err(|_| Error::bad_request())?;
         if !paths.insert(path.clone()) || entry.mode > 0o777 || entry.size > core::MAX_BYTES {
@@ -306,11 +353,13 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
         if total > core::MAX_BYTES {
             return Err(Error::bad_request());
         }
-        key(tenant, &entry.sha256)?;
+        let obj_key = key(tenant, &entry.sha256)?;
         if entry.kind == "symlink" {
             symlinks.insert(path);
         } else if entry.kind != "file" || entry.target_base64.is_some() {
             return Err(Error::bad_request());
+        } else {
+            downloads.push((path, obj_key, entry.size));
         }
     }
     for path in &paths {
@@ -318,46 +367,94 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
             return Err(Error::bad_request());
         }
     }
-    let mut expected = Vec::new();
-    for entry in manifest.entries {
-        let rel = core::decode_path(&entry.path_base64).map_err(|_| Error::bad_request())?;
-        let to = root.join(&rel);
-        let parent = to.parent().ok_or_else(Error::bad_request)?;
-        fs::create_dir_all(parent).map_err(Error::internal)?;
-        if entry.kind == "file" {
-            store
-                .get_to_file(&key(tenant, &entry.sha256)?, &to, entry.size, deadline())
-                .await
-                .map_err(Error::internal)?;
-            fs::set_permissions(&to, fs::Permissions::from_mode(entry.mode)).map_err(Error::internal)?;
-        } else {
-            let target = STANDARD
-                .decode(entry.target_base64.as_deref().ok_or_else(Error::bad_request)?)
-                .map_err(|_| Error::bad_request())?;
-            if target.len() as u64 != entry.size || hex::encode(Sha256::digest(&target)) != entry.sha256 {
-                return Err(Error::bad_request());
-            }
-            symlink(OsString::from_vec(target), &to).map_err(Error::internal)?;
+
+    let stage = state.storage.root.join("workspace-service/staging").join(format!("restore-{cp}-{}", Uuid::new_v4()));
+    let stage_guard = super::blocking::DirCleanupGuard::new(stage.clone());
+    let root = stage.join("repo");
+    let root_init = root.clone();
+    let stage_init = stage.clone();
+    let rels: Vec<PathBuf> = downloads.iter().map(|(rel, _, _)| rel.clone()).collect();
+    if let Err(err) = super::blocking::run(move || {
+        fs::create_dir_all(&stage_init).map_err(Error::internal)?;
+        fs::create_dir(&root_init).map_err(Error::internal)?;
+        for rel in rels {
+            let parent = root_init.join(&rel).parent().ok_or_else(Error::bad_request)?.to_path_buf();
+            fs::create_dir_all(parent).map_err(Error::internal)?;
         }
-        expected.push(core::Entry {
-            path_base64: entry.path_base64,
-            kind: entry.kind,
-            mode: entry.mode,
-            size: entry.size,
-            sha256: entry.sha256,
-        });
+        Ok(())
+    })
+    .await
+    {
+        stage_guard.cleanup().await;
+        return Err(err);
     }
-    let actual = core::inventory(&root).map_err(Error::internal)?;
-    if actual != expected {
-        return Err(Error::internal("remote checkpoint inventory mismatch"));
+
+    let download_outcome: Result<(), Error> = async {
+        for (rel, obj_key, size) in &downloads {
+            let to = root.join(rel);
+            store.get_to_file(obj_key, &to, *size, deadline()).await.map_err(Error::internal)?;
+        }
+        Ok(())
     }
-    core::sync_tree(&root).map_err(Error::internal)?;
-    if let Some(parent) = final_path.parent() {
-        fs::create_dir_all(parent).map_err(Error::internal)?;
+    .await;
+    if let Err(err) = download_outcome {
+        stage_guard.cleanup().await;
+        return Err(err);
     }
-    if fs::rename(&root, &final_path).is_err() && !final_path.is_dir() {
-        return Err(Error::internal("checkpoint restore publication failed"));
+
+    let entries = manifest.entries;
+    let finalize = super::blocking::run(move || {
+        let outcome = (|| -> Result<(), Error> {
+            let mut expected = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let rel = core::decode_path(&entry.path_base64).map_err(|_| Error::bad_request())?;
+                let to = root.join(&rel);
+                let parent = to.parent().ok_or_else(Error::bad_request)?;
+                fs::create_dir_all(parent).map_err(Error::internal)?;
+                if entry.kind == "file" {
+                    fs::set_permissions(&to, fs::Permissions::from_mode(entry.mode)).map_err(Error::internal)?;
+                } else {
+                    let target = STANDARD
+                        .decode(entry.target_base64.as_deref().ok_or_else(Error::bad_request)?)
+                        .map_err(|_| Error::bad_request())?;
+                    if target.len() as u64 != entry.size || hex::encode(Sha256::digest(&target)) != entry.sha256 {
+                        return Err(Error::bad_request());
+                    }
+                    symlink(OsString::from_vec(target), &to).map_err(Error::internal)?;
+                }
+                expected.push(core::Entry {
+                    path_base64: entry.path_base64,
+                    kind: entry.kind,
+                    mode: entry.mode,
+                    size: entry.size,
+                    sha256: entry.sha256,
+                });
+            }
+            let actual = core::inventory(&root).map_err(Error::internal)?;
+            if actual != expected {
+                return Err(Error::internal("remote checkpoint inventory mismatch"));
+            }
+            core::sync_tree(&root).map_err(Error::internal)?;
+            if let Some(parent) = final_path.parent() {
+                fs::create_dir_all(parent).map_err(Error::internal)?;
+            }
+            if fs::rename(&root, &final_path).is_err() && !final_path.is_dir() {
+                return Err(Error::internal("checkpoint restore publication failed"));
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(&stage);
+        outcome
+    })
+    .await;
+    match finalize {
+        Ok(()) => {
+            stage_guard.keep();
+            Ok(())
+        }
+        Err(err) => {
+            stage_guard.cleanup().await;
+            Err(err)
+        }
     }
-    let _ = fs::remove_dir_all(stage);
-    Ok(())
 }

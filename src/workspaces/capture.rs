@@ -6,14 +6,11 @@
 //! 3. a short `FOR UPDATE` transaction that revalidates host, lease epoch and
 //!    revision, then commits the fingerprint, revision bump and event together.
 //!
-//! API mutations retain the established synchronous `record_current` baseline:
-//! it runs inside their existing workspace-lock transaction so their revision
-//! and capture baseline are never split across commits. A pending-marker scheme
-//! that recorded the baseline after the API commit was rejected: it could adopt
-//! a racing native edit as the API baseline, or replay the API write as a
-//! spurious external capture when the deferred baseline failed. Removing the
-//! remaining API-side hash is a follow-up; the long background scan is already
-//! off-thread and out of the transaction.
+//! API mutations (`create`, `restore`, `files::put`, `files::git`) compute
+//! their post-write baseline off-thread on the bounded workspace I/O bulkhead
+//! outside any PostgreSQL transaction, then persist the pre-computed
+//! fingerprint atomically with the workspace revision in their short commit
+//! transaction while fencing concurrent background scans via [`super::blocking`].
 use super::{scan, service};
 use crate::{
     AppState, Error,
@@ -54,16 +51,13 @@ fn scan_is_current(expected_revision: i64, expected_epoch: i64, revision: i64, e
     revision == expected_revision && epoch == expected_epoch
 }
 
-/// API mutations record the exact post-write fingerprint in their transaction.
-/// This preserves the original revision/event contract: a subsequent scan must
-/// not report the API write as an external edit, and it must still detect a
-/// genuinely later native edit.
-pub async fn record_current(tx: &deadpool_postgres::Transaction<'_>, state: &AppState, id: Uuid) -> Result<(), Error> {
-    record_current_at(tx, id, &service::workspace_repo(state, id)).await
-}
-
-pub async fn record_current_at(tx: &deadpool_postgres::Transaction<'_>, id: Uuid, path: &Path) -> Result<(), Error> {
-    let value = fingerprint(path)?;
+/// Persist a pre-computed post-mutation fingerprint inside the caller's short
+/// commit transaction without performing any filesystem I/O while locks are held.
+pub(super) async fn record_fingerprint(
+    tx: &deadpool_postgres::Transaction<'_>,
+    id: Uuid,
+    value: &str,
+) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO workspace_capture_state(workspace_id,fingerprint) VALUES($1,$2) \
          ON CONFLICT(workspace_id) DO UPDATE SET fingerprint=$2,scanned_at=clock_timestamp()",
@@ -101,29 +95,32 @@ async fn eligible(state: &AppState, id: Uuid) -> Result<Option<(i64, i64)>, Erro
     Ok(row.map(|row| (row.get(0), row.get(1))))
 }
 
+fn scan_workspace_fingerprint(repo: &Path, stable_gate: bool) -> Result<String, Error> {
+    let before = fingerprint(repo)?;
+    if stable_gate {
+        return Ok(before);
+    }
+    let after = fingerprint(repo)?;
+    if before != after {
+        return Err(service::conflict());
+    }
+    Ok(after)
+}
+
 pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
-    // In FUSE mode the mutation gate only exists while the workspace is
-    // mounted; without it no stable snapshot can be taken.
     if !super::mounts::mounted(id) {
         return Ok(false);
     }
+    let Some(scan_token) = super::blocking::begin_scan(id) else {
+        return Ok(false);
+    };
     let Some((expected_revision, expected_epoch)) = eligible(state, id).await? else {
         return Ok(false);
     };
     let repo = service::workspace_repo(state, id);
-    // The FUSE gate gives a stable snapshot for one pass. Direct mode keeps the
-    // second pass to detect an editor write racing an unfenced scan.
     let stable_gate = super::mounts::enabled();
-    let scanned = match scan::frozen(id, scan::timeout(), move || {
-        let before = fingerprint(&repo)?;
-        if stable_gate {
-            return Ok(before);
-        }
-        let after = fingerprint(&repo)?;
-        if before != after {
-            return Err(service::conflict());
-        }
-        Ok(after)
+    let scanned = match scan::frozen_with_token(id, scan::timeout(), Some(scan_token.clone()), move || {
+        scan_workspace_fingerprint(&repo, stable_gate)
     })
     .await
     {
@@ -132,15 +129,50 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
         // eligible on the next round.
         Err(scan::ScanFailure::Busy) => return Ok(false),
         // A worker that never returned is reported here, in the async reconcile
-        // scope, with the fixed `timeout` label and no source text. The blocking
-        // thread has no caller left to report to, and turning the timeout into
-        // an error would observe the same scan twice.
+        // scope, with the fixed `timeout` label and no source text.
         Err(scan::ScanFailure::Timeout) => {
             observability::observe_timeout();
             return Ok(false);
         }
         Err(scan::ScanFailure::Failed(error)) => return Err(error),
     };
+    commit_reconciled(state, id, expected_revision, expected_epoch, Some(&scan_token), &scanned).await
+}
+
+/// Reconcile native worktree/index edits on the foreground Data I/O bulkhead
+/// when the caller already owns [`super::blocking::MutationGuard`]
+/// (`checkpoints::create`), propagating `503`/`504` errors instead of skipping.
+pub(super) async fn reconcile_locked(
+    state: &AppState,
+    id: Uuid,
+    guard: &super::blocking::MutationGuard,
+) -> Result<bool, Error> {
+    if !super::mounts::mounted(id) {
+        return Err(Error::internal("workspace FUSE mount missing"));
+    }
+    let Some((expected_revision, expected_epoch)) = eligible(state, id).await? else {
+        return Ok(false);
+    };
+    let repo = service::workspace_repo(state, id);
+    let stable_gate = super::mounts::enabled();
+    let scanned = super::blocking::run_mutating(guard, move |abandoned, _fence| {
+        if abandoned.is_abandoned() {
+            return Err(Error::timeout());
+        }
+        super::mounts::with_frozen(id, || scan_workspace_fingerprint(&repo, stable_gate))
+    })
+    .await?;
+    commit_reconciled(state, id, expected_revision, expected_epoch, None, &scanned).await
+}
+
+async fn commit_reconciled(
+    state: &AppState,
+    id: Uuid,
+    expected_revision: i64,
+    expected_epoch: i64,
+    scan_token: Option<&super::blocking::ScanToken>,
+    scanned: &str,
+) -> Result<bool, Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let row = tx
@@ -156,16 +188,16 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
     };
     let revision: i64 = row.get(0);
     let epoch: i64 = row.get(1);
-    // A stale scan must never overwrite a newer API edit, checkpoint or lease
-    // handoff. Discarding the result is safe: the next round scans current bytes.
-    if !scan_is_current(expected_revision, expected_epoch, revision, epoch) {
+    if !scan_is_current(expected_revision, expected_epoch, revision, epoch)
+        || scan_token.is_some_and(|token| !token.is_unchanged())
+    {
         return Ok(false);
     }
     let previous = tx
         .query_opt("SELECT fingerprint FROM workspace_capture_state WHERE workspace_id=$1 FOR UPDATE", &[&id])
         .await
         .map_err(Error::internal)?;
-    let changed = capture_changes(previous.as_ref().map(|row| row.get::<_, String>(0)).as_deref(), &scanned);
+    let changed = capture_changes(previous.as_ref().map(|row| row.get::<_, String>(0)).as_deref(), scanned);
     tx.execute(
         "INSERT INTO workspace_capture_state(workspace_id,fingerprint) VALUES($1,$2) \
          ON CONFLICT(workspace_id) DO UPDATE SET fingerprint=$2,scanned_at=clock_timestamp()",

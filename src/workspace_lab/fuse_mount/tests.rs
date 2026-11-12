@@ -127,3 +127,59 @@ fn owned_unmount_requires_the_captured_mount_id() {
     assert!(!owns_current_mount(37, Some(38)), "a newer mount at the path is not owned");
     assert!(!owns_current_mount(37, None), "an already unmounted path needs no unmount");
 }
+
+#[test]
+fn direct_upper_whiteout_rollback_keeps_overlay_reads_and_subsequent_unlinks_consistent() {
+    let root = tempfile::tempdir().unwrap();
+    let lower = root.path().join("lower");
+    let upper = root.path().join("upper");
+    fs::create_dir_all(&lower).unwrap();
+    fs::write(lower.join("a.txt"), b"from-lower-a").unwrap();
+    fs::write(lower.join("b.txt"), b"from-lower-b").unwrap();
+
+    let gate = MutationGate::new_with_lease(1, i64::MAX).unwrap();
+    let mut overlay = Overlay::new_with_gate(lower, upper.clone(), gate.clone()).unwrap();
+
+    // 1. Unlink lower file `a.txt` through Overlay; snapshot `.rootyard-whiteouts.json`.
+    overlay.op_unlink(1, OsStr::new("a.txt")).unwrap();
+    assert_eq!(overlay.op_lookup(1, OsStr::new("a.txt")).unwrap_err().raw_os_error(), Some(libc::ENOENT));
+    let whiteout_path = upper.join(".rootyard-whiteouts.json");
+    let prior_whiteouts = fs::read(&whiteout_path).unwrap();
+    assert_eq!(serde_json::from_slice::<Vec<String>>(&prior_whiteouts).unwrap(), vec!["a.txt"]);
+
+    // 2. Write over `a.txt` via atomic temp create + write + rename (clearing `a.txt` whiteout).
+    let tmp = overlay.op_create(1, OsStr::new(".tmp-put"), 0o600).unwrap();
+    overlay.op_write(tmp.ino, 0, b"rejected-put-a").unwrap();
+    overlay.op_rename(1, OsStr::new(".tmp-put"), 1, OsStr::new("a.txt"), 0).unwrap();
+    let a_attr = overlay.op_lookup(1, OsStr::new("a.txt")).unwrap();
+    assert_eq!(a_attr.size, 14);
+    assert!(serde_json::from_slice::<Vec<String>>(&fs::read(&whiteout_path).unwrap()).unwrap().is_empty());
+
+    // 3. Fence FUSE and simulate direct upper-layer rollback restoring `.rootyard-whiteouts.json`.
+    gate.fence();
+    fs::remove_file(upper.join("a.txt")).unwrap();
+    let rollback_tmp = upper.join(".rollback-whiteouts");
+    fs::write(&rollback_tmp, &prior_whiteouts).unwrap();
+    fs::rename(&rollback_tmp, &whiteout_path).unwrap();
+
+    // 4. Ungated Overlay reads/lookups/readdir must see ENOENT, never resurrecting `lower/a.txt`.
+    assert_eq!(overlay.op_lookup(1, OsStr::new("a.txt")).unwrap_err().raw_os_error(), Some(libc::ENOENT));
+    assert_eq!(overlay.op_getattr(a_attr.ino).unwrap_err().raw_os_error(), Some(libc::ENOENT));
+    assert_eq!(overlay.read_plan(a_attr.ino).err().and_then(|e| e.raw_os_error()), Some(libc::ENOENT));
+    let listed: Vec<String> = overlay
+        .op_readdir(1)
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, n)| n.to_string_lossy().into_owned())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(listed, vec!["b.txt"]);
+
+    // 5. Same-host lease handoff + unrelated unlink of `b.txt` must preserve `a.txt` whiteout on disk.
+    gate.handoff(2, i64::MAX).unwrap();
+    overlay.op_unlink(1, OsStr::new("b.txt")).unwrap();
+    assert_eq!(overlay.op_lookup(1, OsStr::new("a.txt")).unwrap_err().raw_os_error(), Some(libc::ENOENT));
+    assert_eq!(overlay.op_lookup(1, OsStr::new("b.txt")).unwrap_err().raw_os_error(), Some(libc::ENOENT));
+    let saved: Vec<String> = serde_json::from_slice(&fs::read(&whiteout_path).unwrap()).unwrap();
+    assert_eq!(saved, vec!["a.txt", "b.txt"]);
+}
