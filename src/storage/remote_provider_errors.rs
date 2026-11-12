@@ -15,24 +15,31 @@
 //! `opendal::Error` whose private source is a [`HttpFailure`] carrying only the
 //! numeric status, the finite [`RemoteOp`] and the bounded SDK classification.
 //!
-//! Successful responses pass through untouched, so an HTTP 200 carrying an
-//! embedded provider error is still parsed by the SDK and reported with no
-//! HTTP status. Attribution is per request: a retry that ends in a transport
-//! failure, or a later 200 decode failure, can never report status from an
-//! earlier 503. Concurrent multipart requests each carry their own marker.
-//! No URL, path, query value, header, credential or body is stored, logged or
-//! formatted. Error classification walks only the bounded `std::error::Error`
-//! source chain and private marker types; it never parses source text.
+//! Successful response heads pass through untouched, so an HTTP 200 carrying an
+//! embedded provider error document is still parsed by the SDK and reported
+//! with no HTTP status, while any mid-body or truncation failure after a 2xx
+//! head is stripped of provider URLs and marked permanent so OpenDAL's
+//! `RetryReader` never silently restarts a partially-streamed request.
+//! Attribution is per request: a retry that ends in a transport failure, or a
+//! later 200 decode failure, can never report status from an earlier 503.
+//! Concurrent multipart requests each carry their own marker. No URL, path,
+//! query value, header, credential or body is stored, logged or formatted.
+//! Error classification walks only the bounded `std::error::Error` source chain
+//! and private marker types; it never parses source text.
 
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::{Future, IntoFuture};
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::task::{Context, Poll};
 
 // `http` is not a direct dependency of this crate (the root owns `Cargo.toml`)
 // and `axum` re-exports the same `http` 1.x crate that `opendal-core` uses, so
 // these are the exact request/response types of the `HttpFetch` trait.
 use axum::http::{Method, Request, Response, Uri};
 use bytes::{Bytes, BytesMut};
+use futures_util::Stream;
 use opendal::raw::oio::Read as _;
 use opendal::raw::{HttpBody, HttpClient, HttpFetch};
 use opendal::{Buffer, ErrorKind, Result as SdkResult};
@@ -50,6 +57,7 @@ const MAX_CAUSE_DEPTH: usize = 8;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const HTTP_FAILURE_MESSAGE: &str = "remote object store request failed";
 const TRANSPORT_FAILURE_MESSAGE: &str = "remote object store transport failed";
+const STREAM_FAILURE_MESSAGE: &str = "remote object store stream failed";
 
 /// Private marker attached to the exact failing HTTP response. It holds only
 /// finite values: a numeric status, an operation label and the bounded SDK
@@ -233,8 +241,82 @@ fn request_stage(method: &Method, uri: &Uri) -> RemoteOp {
     RemoteOp::Put
 }
 
-/// Exact-request HTTP wrapper: successful responses pass through, every
-/// observed non-2xx response is classified by the upstream S3 parser.
+type BodyReadFuture = Pin<Box<dyn Future<Output = (HttpBody, SdkResult<Buffer>)> + Send>>;
+
+enum BodyStreamState {
+    Idle(HttpBody),
+    Reading(BodyReadFuture),
+    Done,
+}
+
+/// Stream wrapper over a 2xx [`HttpBody`] that delegates chunk reads and
+/// `Content-Length` EOF checks to `HttpBody::read`, then strips temporary
+/// retryability and URL-bearing provider context from any mid-body error.
+struct NonRetryingBodyStream {
+    state: Mutex<BodyStreamState>,
+}
+
+impl NonRetryingBodyStream {
+    fn new(body: HttpBody) -> Self {
+        Self { state: Mutex::new(BodyStreamState::Idle(body)) }
+    }
+}
+
+/// Convert a post-2xx body read failure into a permanent, source-free SDK
+/// error. Once 2xx response headers have been accepted, OpenDAL's
+/// `RetryReader` must not silently issue a ranged second `GET`, and no
+/// `reqwest` or `HttpBody` message/context (which may carry the request URL)
+/// may survive.
+fn stream_body_failure(error: opendal::Error) -> opendal::Error {
+    let kind = error.kind();
+    drop(error);
+    opendal::Error::new(kind, STREAM_FAILURE_MESSAGE).set_persistent()
+}
+
+impl Stream for NonRetryingBodyStream {
+    type Item = SdkResult<Buffer>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let state = self.get_mut().state.get_mut().expect("unpoisoned exclusive stream state");
+        loop {
+            match std::mem::replace(state, BodyStreamState::Done) {
+                BodyStreamState::Idle(mut body) => {
+                    *state = BodyStreamState::Reading(Box::pin(async move {
+                        let chunk = body.read().await;
+                        (body, chunk)
+                    }));
+                }
+                BodyStreamState::Reading(mut future) => match future.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        *state = BodyStreamState::Reading(future);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready((body, Ok(chunk))) if chunk.is_empty() => {
+                        drop(body);
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready((body, Ok(chunk))) => {
+                        *state = BodyStreamState::Idle(body);
+                        return Poll::Ready(Some(Ok(chunk)));
+                    }
+                    Poll::Ready((body, Err(error))) => {
+                        drop(body);
+                        return Poll::Ready(Some(Err(stream_body_failure(error))));
+                    }
+                },
+                BodyStreamState::Done => return Poll::Ready(None),
+            }
+        }
+    }
+}
+
+fn non_retrying_success_body(body: HttpBody) -> HttpBody {
+    HttpBody::new(NonRetryingBodyStream::new(body), None)
+}
+
+/// Exact-request HTTP wrapper: successful response heads pass through with
+/// non-retrying body classification, and every observed non-2xx response is
+/// classified by the upstream S3 parser.
 struct StatusAttributingFetch {
     inner: HttpClient,
 }
@@ -247,7 +329,7 @@ impl HttpFetch for StatusAttributingFetch {
             Err(error) => return Err(network_failure(error, op)),
         };
         if response.status().is_success() {
-            return Ok(response);
+            return Ok(response.map(non_retrying_success_body));
         }
 
         let status = response.status().as_u16();
@@ -383,235 +465,5 @@ fn sdk_kind(kind: ErrorKind) -> RemoteSdkKind {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn classify(error: opendal::Error) -> RemoteStoreError {
-        RemoteFailure::classify(error, RemoteOp::Put).into_error()
-    }
-
-    fn classify_failure(error: opendal::Error) -> RemoteFailure {
-        RemoteFailure::classify(error, RemoteOp::Put)
-    }
-
-    fn upstream_parse(status: u16, body: &str) -> opendal::Error {
-        let mut response = Response::new(Buffer::from(body.as_bytes().to_vec()));
-        *response.status_mut() = axum::http::StatusCode::from_u16(status).expect("test status");
-        parsed_http_failure(parse_error_response(response), status, RemoteOp::Get)
-    }
-
-    #[test]
-    fn no_such_bucket_404_is_config_invalid() {
-        let failure = classify_failure(upstream_parse(
-            404,
-            r#"<Error><Code>NoSuchBucket</Code><Message>no such bucket</Message><Resource>/private/bucket</Resource><RequestId>x</RequestId></Error>"#,
-        ));
-        assert_eq!(failure.kind, ErrorKind::ConfigInvalid);
-        assert!(!failure.is_not_found());
-        let error = failure.into_error();
-        assert_eq!(error.http_status(), Some(404));
-        assert_eq!(error.op(), RemoteOp::Get);
-    }
-
-    #[test]
-    fn request_timeout_400_stays_retryable() {
-        let failure = classify_failure(upstream_parse(
-            400,
-            r#"<Error><Code>RequestTimeout</Code><Message>request timed out</Message></Error>"#,
-        ));
-        assert_eq!(failure.kind, ErrorKind::Unexpected);
-        assert!(!failure.is_conflict());
-        let error = failure.into_error();
-        assert_eq!(error.http_status(), Some(400));
-    }
-
-    #[test]
-    fn operation_aborted_409_is_unexpected_not_conditional() {
-        let failure = classify_failure(upstream_parse(
-            409,
-            r#"<Error><Code>OperationAborted</Code><Message>conflicting operation</Message></Error>"#,
-        ));
-        assert_eq!(failure.kind, ErrorKind::Unexpected);
-        assert!(!failure.is_conflict());
-        let error = failure.into_error();
-        assert_eq!(error.http_status(), Some(409));
-    }
-
-    #[test]
-    fn normal_412_remains_permanent_condition_not_match() {
-        let failure = classify_failure(upstream_parse(
-            412,
-            r#"<Error><Code>PreconditionFailed</Code><Message>precondition failed</Message></Error>"#,
-        ));
-        assert_eq!(failure.kind, ErrorKind::ConditionNotMatch);
-        assert!(failure.is_conflict());
-        let error = failure.into_error();
-        assert_eq!(error.http_status(), Some(412));
-    }
-
-    #[test]
-    fn exact_failed_response_keeps_status_and_request_stage() {
-        let part = classify(upstream_parse(503, "<Error><Code>InternalError</Code></Error>"));
-        assert_eq!(part.http_status(), Some(503));
-        assert_eq!(part.op(), RemoteOp::Get);
-    }
-
-    #[tokio::test]
-    async fn oversized_and_unreadable_error_bodies_preserve_status_defaults() {
-        let oversized = HttpBody::new(
-            futures_util::stream::iter([
-                Ok(Buffer::from(vec![b'x'; MAX_ERROR_BODY_BYTES])),
-                Ok(Buffer::from(vec![b'y'; 1])),
-            ]),
-            None,
-        );
-        assert!(collect_error_body(oversized).await.is_none());
-        let unreadable = HttpBody::new(
-            futures_util::stream::iter([Err(opendal::Error::new(
-                ErrorKind::Unexpected,
-                "private provider body error",
-            ))]),
-            None,
-        );
-        assert!(collect_error_body(unreadable).await.is_none());
-        let retry = unparsed_http_failure(503, RemoteOp::MultipartComplete);
-        assert!(retry.is_temporary());
-        let typed = classify(retry);
-        assert_eq!(typed.http_status(), Some(503));
-        assert_eq!(typed.op(), RemoteOp::MultipartComplete);
-        let conflict = classify_failure(unparsed_http_failure(412, RemoteOp::MultipartComplete));
-        assert!(conflict.is_conflict());
-        assert_eq!(conflict.into_error().http_status(), Some(412));
-        let missing = classify_failure(unparsed_http_failure(404, RemoteOp::Get));
-        assert!(missing.is_not_found());
-    }
-
-    #[test]
-    fn transport_marker_is_finite_and_carries_the_exact_request_stage() {
-        let error = network_failure(
-            opendal::Error::new(ErrorKind::Unexpected, "connection reset at https://example.invalid/private")
-                .with_context("url", "https://user:secret@example.invalid/private/object?token=secret"),
-            RemoteOp::MultipartPart,
-        );
-        let failure = classify_failure(error);
-        assert_eq!(failure.kind, ErrorKind::Unexpected);
-        let typed = failure.into_error();
-        assert_eq!(typed.http_status(), None);
-        assert_eq!(typed.op(), RemoteOp::MultipartPart);
-        let display = typed.to_string();
-        let debug = format!("{typed:?}");
-        assert!(display.contains("transport failed"));
-        for rendered in [display, debug] {
-            assert!(!rendered.contains("://"));
-            assert!(!rendered.contains("secret"));
-            assert!(!rendered.contains("/private"));
-            assert!(!rendered.contains("token"));
-        }
-    }
-
-    #[test]
-    fn a_prior_503_is_not_reused_for_a_later_transport_failure() {
-        let stale = classify(upstream_parse(503, "<Error><Code>InternalError</Code></Error>"));
-        assert_eq!(stale.http_status(), Some(503));
-
-        let transport = network_failure(opendal::Error::new(ErrorKind::Unexpected, "connection reset"), RemoteOp::Put);
-        let later = classify(transport);
-        assert_eq!(later.http_status(), None);
-        assert_eq!(later.op(), RemoteOp::Put);
-        assert!(later.to_string().contains("transport failed"));
-    }
-
-    #[test]
-    fn a_prior_503_is_not_reused_for_a_200_embedded_provider_error() {
-        let stale = classify(upstream_parse(503, "<Error><Code>InternalError</Code></Error>"));
-        assert_eq!(stale.http_status(), Some(503));
-
-        // The SDK parsed an error document carried by HTTP 200: no source and
-        // no numeric response status are available.
-        let embedded = classify(opendal::Error::new(ErrorKind::Unexpected, "provider error document"));
-        assert_eq!(embedded.http_status(), None);
-        assert!(embedded.to_string().contains("provider kind other"));
-    }
-
-    #[test]
-    fn concurrent_requests_keep_their_own_status_and_stage() {
-        let complete = classify(upstream_parse(429, "<Error><Code>SlowDown</Code></Error>"));
-        let part = classify(upstream_parse(403, "<Error><Code>AccessDenied</Code></Error>"));
-        assert_eq!((complete.http_status(), complete.op()), (Some(429), RemoteOp::Get));
-        assert_eq!((part.http_status(), part.op()), (Some(403), RemoteOp::Get));
-    }
-
-    #[test]
-    fn initial_body_get_failure_keeps_the_exact_http_tag() {
-        let error = std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            upstream_parse(503, "<Error><Code>InternalError</Code></Error>"),
-        );
-        let typed = classify_io_error(RemoteOp::Get, error);
-        assert_eq!(typed.http_status(), Some(503));
-        assert_eq!(typed.op(), RemoteOp::Get);
-    }
-
-    #[test]
-    fn mid_body_failure_after_200_has_no_http_status_and_no_unsafe_source() {
-        let inner = opendal::Error::new(ErrorKind::Unexpected, "read body")
-            .set_source(std::io::Error::other("connection reset at https://example.invalid/private"));
-        let error = std::io::Error::new(std::io::ErrorKind::Interrupted, inner);
-        let typed = classify_io_error(RemoteOp::Get, error);
-        assert_eq!(typed.http_status(), None);
-        assert!(typed.to_string().contains("provider kind stream"));
-        assert!(!typed.to_string().contains("://"));
-        assert!(!format!("{typed:?}").contains("://"));
-    }
-
-    #[test]
-    fn dropped_sdk_source_uses_a_bounded_unknown_kind() {
-        let typed = classify(opendal::Error::new(ErrorKind::Unexpected, "no source"));
-        assert_eq!(typed.http_status(), None);
-        assert!(typed.to_string().contains("provider kind other"));
-    }
-
-    #[test]
-    fn request_stage_uses_method_and_fixed_query_keys_only() {
-        let uri = |raw: &'static str| raw.parse::<Uri>().expect("test uri");
-        assert_eq!(request_stage(&Method::GET, &uri("https://example.invalid/secret/path")), RemoteOp::Get);
-        assert_eq!(request_stage(&Method::HEAD, &uri("https://example.invalid/secret/path")), RemoteOp::Head);
-        assert_eq!(request_stage(&Method::DELETE, &uri("https://example.invalid/secret/path")), RemoteOp::Delete);
-        assert_eq!(
-            request_stage(&Method::DELETE, &uri("https://example.invalid/secret/path?uploadId=private-value")),
-            RemoteOp::MultipartAbort
-        );
-        assert_eq!(
-            request_stage(&Method::POST, &uri("https://example.invalid/secret/path?uploads")),
-            RemoteOp::MultipartInitiate
-        );
-        assert_eq!(
-            request_stage(&Method::POST, &uri("https://example.invalid/secret/path?uploadId=private-value")),
-            RemoteOp::MultipartComplete
-        );
-        assert_eq!(
-            request_stage(
-                &Method::PUT,
-                &uri("https://example.invalid/secret/path?partNumber=1&uploadId=private-value")
-            ),
-            RemoteOp::MultipartPart
-        );
-        assert_eq!(request_stage(&Method::PUT, &uri("https://example.invalid/secret/path")), RemoteOp::Put);
-    }
-
-    #[test]
-    fn safe_diagnostics_never_format_a_source_url_or_path() {
-        let source = opendal::Error::new(ErrorKind::Unexpected, "request failed")
-            .with_context("url", "https://user:secret@example.invalid/private/object?token=secret")
-            .set_source(std::io::Error::other("connection reset at https://example.invalid/private/object"));
-        let typed = classify(source);
-        let display = typed.to_string();
-        let debug = format!("{typed:?}");
-        for rendered in [display, debug] {
-            assert!(!rendered.contains("://"));
-            assert!(!rendered.contains("secret"));
-            assert!(!rendered.contains("/private/object"));
-            assert!(!rendered.contains("token"));
-        }
-    }
-}
+#[path = "remote_provider_errors_tests.rs"]
+mod tests;

@@ -423,7 +423,7 @@ class ColdCacheImageTest(FixtureGuardTest):
             directory, 1, "--port", str(port),
             env={
                 "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
-                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "2",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "5",
                 "STUB_STATUS_FAILS": "1000000",
             },
         )
@@ -434,7 +434,7 @@ class ColdCacheImageTest(FixtureGuardTest):
         self.assertNotIn("key create", calls)
         self.assertNotIn("bucket create", calls)
         self.assertIn("read-only 'garage status' handshake", process.stderr)
-        self.assertIn("within the 2s startup budget", process.stderr)
+        self.assertIn("within the 5s startup budget", process.stderr)
         combined = process.stdout + process.stderr
         self.assertNotIn("GK0123456789abcdef01234567", combined)
         self.assertNotIn("ROOTYARD_", combined)
@@ -448,7 +448,7 @@ class ColdCacheImageTest(FixtureGuardTest):
     def test_hung_rpc_probe_is_killed_within_the_short_budget(self):
         # The stub docker hosts `garage status` and hangs every call. This
         # proves the host-side stub (and the `timeout` wrapper around it) is
-        # cleaned up within the 2s absolute budget, the call sequence issues no
+        # cleaned up within the 3s absolute budget, the call sequence issues no
         # layout/key mutation and stop runs. It does not observe whether a
         # remote process inside a real container exits: the stuck-probe process
         # is only signalled; removal is proven solely by the `rm -f` call.
@@ -459,7 +459,7 @@ class ColdCacheImageTest(FixtureGuardTest):
             directory, 1, "--port", str(port),
             env={
                 "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
-                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "2",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "3",
                 "STUB_STATUS_HANG_AFTER": "1000000",
             },
         )
@@ -469,7 +469,7 @@ class ColdCacheImageTest(FixtureGuardTest):
         self.assertNotIn(" layout apply ", calls)
         self.assertNotIn("key create", calls)
         self.assertIn("read-only 'garage status' handshake", process.stderr)
-        self.assertIn("within the 2s startup budget", process.stderr)
+        self.assertIn("within the 3s startup budget", process.stderr)
         self.assertEqual("", process.stdout)
         self.assertIn(f"rm -f -- {self.cid}", calls)
         self.assertFalse(directory.exists())

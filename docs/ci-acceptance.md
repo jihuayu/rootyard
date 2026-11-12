@@ -52,19 +52,26 @@ fixture integration-test executables, recording the batch in
 | `tests/web_sessions.py` | Session exchange, CSRF binding, expiry and parent-token revocation over the real Rust service and PostgreSQL 17 | `test-results/web-sessions.json` |
 | `tests/ci_webhook_regressions.py` | 201-event batching, concurrent claim fencing, verified TLS delivery and untrusted-CA rejection (no `--report`; the stdout log is the evidence) | `test-results/ci-webhook-regressions.log` |
 | `tests/webhook_worker_recovery.py` | Background worker recovery across SIGKILL at the enqueue and ack boundaries, lease overlap and backoff/dead-letter, with no manual dispatch | `test-results/webhook-worker-recovery.json` |
+| `tests/webhook_pagination.py` | Webhook delivery sequence allocation, concurrent barriers and cursor pagination over PostgreSQL 17 | `test-results/webhook-pagination.json` |
+| `tests/webhook_pr_sync.py` | No-hook, paused-hook and deleted-hook Pull Request ref reconciliation across page boundaries | `test-results/webhook-pr-sync.json` |
 | `tests/repository_pagination.py` | Real API/PostgreSQL traversal of 1,001 repositories with keyset ordering, actor scope and mutations | `test-results/repository-pagination.json` |
 | `tests/organization_pagination.py` | Real API/PostgreSQL traversal of 101 members and 101 teams with authorization, cursor scope and mutation resume | `test-results/organization-pagination.json` |
 | `tests/web_detail_pagination.py` | Real web Issue comments and PR reviews across the 100-row page boundary (105 rows seeded plus the 106th written through real HTTP/Git), including cursor/actor/revocation checks | `test-results/web-detail-pagination.json` |
+| `tests/web_repository_pagination.py` | Browser repository-discovery keyset pagination, actor/membership binding and restricted/anonymous scope checks | `test-results/web-repository-pagination.json` |
+| `tests/worker_diagnostics.py` | Source-bound structured worker-operation diagnostics isolation under real PostgreSQL `statement_timeout` | `test-results/worker-diagnostics.json` |
 
 A final step, `scripts/native_report_manifest.py --mode job`, fails the job
 unless every report was produced by the exact binary whose SHA-256 appears in
 `target/debug/rootyard.build.json`, every declared case passed, the
 `ci_webhook_regressions` log is non-empty and contains each expected phase
 marker, and the receipt's commit and compiled source-input digest were recorded.
-The manifest also binds the `repository-pagination.json`,
-`organization-pagination.json` and `web-detail-pagination.json` reports and
-their harness sources to that same build receipt, so none of the three can be
-produced by a different binary. These three harnesses are real functional
+The manifest also binds the pagination, webhook reconciliation and worker
+diagnostics reports (`repository-pagination.json`,
+`organization-pagination.json`, `web-detail-pagination.json`,
+`web-repository-pagination.json`, `webhook-pagination.json`,
+`webhook-pr-sync.json`, `worker-diagnostics.json`) together with the other
+verify-job reports and their harness sources to that same build receipt, so none
+can be produced by a different binary. These harnesses are real functional
 regressions over real API, PostgreSQL, HTTP and Git state, not scalability
 benchmarks.
 The manifest (`test-results/native-pr-gate.json`) also stores harness SHA-256
@@ -72,8 +79,9 @@ digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
 `git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
 the native tool provenance file. Injecting any of those defects turns the pull
 request red instead of leaving the regression to manual re-verification.
-The `e2e-report` artifact includes `target/debug/rootyard.build.json` and
-`test-results/native-build-batch.json`, so downloaded job manifests can be
+The `e2e-report` artifact includes `target/debug/rootyard.build.json`,
+`test-results/native-build-batch.json` and both `test-results/evidence/*.jsonl`
+and `test-results/*-evidence/*.jsonl`, so downloaded job manifests can be
 checked against the build receipt and batch manifest.
 
 ## 专项与完整 candidate 分层 (specialised suites vs. the complete gate)
@@ -184,25 +192,45 @@ and every job asserts `git rev-parse HEAD` equals it before building.
 
 * `browser-native` runs `tests/browser_ui.py` against the real system Chromium
   at `/usr/bin/chromium` with a fixed Playwright client (`playwright==1.49.0`).
-  No downloaded Playwright browser is substituted for the system package. The
-  manifest records the version reported by `importlib.metadata` and the actual
-  `/usr/bin/chromium --version` and PostgreSQL server/client versions; the
-  `rust:1-trixie` container tag and apt packages are mutable inputs, not
-  immutable pins.
+  No downloaded Playwright browser is substituted for the system package.
+  Because container steps run as UID 0 against the host-runner bind mount at
+  `$GITHUB_WORKSPACE` (`/__w/...`), a setup step sets container-scoped
+  `ROOTYARD_TEST_EVIDENCE_DIR` and exports `GIT_CONFIG_COUNT`/`safe.directory`
+  into `$GITHUB_ENV` so Git commands succeed even inside harnesses that pass
+  `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`. The manifest
+  requires `browser_ui=chromium_browser_workflow` and records the version
+  reported by `importlib.metadata` plus the actual `/usr/bin/chromium --version`
+  and job-scoped PostgreSQL server/client versions
+  (`browser_postgres_server_version` / `browser_postgres_client_version`,
+  namespaced away from `object-store-native`'s
+  `object_store_postgres_server_version` / `object_store_postgres_client_version`
+  so Debian container vs. Ubuntu PGDG client strings do not collide in
+  `release-gate`, while `rust` stays shared); the `rust:1-trixie` container tag
+  and apt packages are mutable inputs, not immutable pins.
 * `object-store-native` starts an ephemeral, job-owned Garage container pinned
   by tag and digest (`dxflrs/garage:v2.1.0@sha256:4c9b34c1...`) and runs:
   * `tests/lfs_hydration_concurrency.py` — concurrent cold hydration through the
     real S3 backend;
   * `tests/lfs_remote.py` — second-node recovery after source-volume loss;
   * `tests/lfs_retention_acceptance.py` — publication and committed-object
-    retention with **no** object-store endpoint configured. The step clears and
-    asserts `ROOTYARD_OBJECT_STORE_ENDPOINT`/`_BUCKET` empty, so it cannot
-    accidentally inherit the Garage fixture.
-  Git LFS 3.6.1 is downloaded and its tarball SHA-256 is compared with the
-  official release `sha256sums.txt`; the release tarball's real
-  `git-lfs-3.6.1/git-lfs` layout is stripped before install. If the checksum
-  asset is unavailable or ambiguous the step fails rather than installing an
-  unverified binary. The installed `git-lfs/<version>` output is asserted.
+    retention with **no** object-store endpoint configured. The step unsets all
+    `ROOTYARD_OBJECT_STORE_*` variables in shell (never exporting `""` via step
+    `env:`) and asserts `ROOTYARD_OBJECT_STORE_ENDPOINT`/`_BUCKET` are unset, so
+    it cannot accidentally inherit the Garage fixture or trigger empty-endpoint
+    parsing.
+  Git LFS 3.6.1 is downloaded by `scripts/install_git_lfs.sh` with bounded
+  `curl` timeouts/size caps and its tarball SHA-256 is verified against both the
+  official release `sha256sums.asc` cleartext-signed manifest (requiring PGP
+  signed-message framing on `.asc` / default checksum assets and parsing
+  strictly inside the PGP signed message body, rejecting unsigned files,
+  unsigned tail entries or truncated framing) and the workflow's pinned
+  `--expected-sha256`
+  (`2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76`); the
+  release tarball's real `git-lfs-3.6.1/git-lfs` layout is stripped and verified
+  to be a regular non-symlink file before install. If the checksum asset is
+  unavailable, unsigned, malformed, unsigned-tailed or ambiguous the step fails
+  rather than installing an unverified binary. The installed `git-lfs/<version>`
+  output and `$RUNNER_TEMP/bin/git-lfs` precedence on `PATH` are asserted.
 * `release-gate` downloads both job manifests and runs
   `scripts/native_report_manifest.py --mode release`. It requires the two jobs to
   share the dispatched commit and one compiled source-input digest, re-verifies
@@ -211,8 +239,8 @@ and every job asserts `git rev-parse HEAD` equals it before building.
   symlinked or traversing artifact names fail closed), requires the
   `browser_ui`, `lfs_hydration`, `lfs_remote` and `lfs_retention` reports, and
   requires the exact `garage_version=2.1.0`, the exact Garage image digest,
-  `git_lfs_version=3.6.1`, `playwright_version=1.49.0` and a Chromium version in
-  the fixture record. The Garage image's own version output is
+  `git_lfs_version=3.6.1`, the exact `git_lfs_tarball_sha256`,
+  `playwright_version=1.49.0` and a Chromium version in the fixture record. The Garage image's own version output is
   `garage v2.1.0 [features: ...]`; the helper matches exactly 2.1.0 plus an
   optional feature tail and obtains the node id from the first line of
   `garage node id` (64 hex `@address`), never by grepping 16-hex `status` ids. Its output is `candidate-release-gate.json`.
@@ -241,9 +269,12 @@ refuses a non-loopback or non-HTTP endpoint, probes the endpoint until it
 answers with an S3 XML body (a stub web page fails), and writes the credential
 to a `0600` environment file in a `0700` directory outside the checkout. The
 cleanup step removes that file and the owned fixture; the file is never
-uploaded and values are never printed. The object-store manifest step sources
-the private file in its own shell so the credential scanner sees this job's
-generated keys; an actions-step environment is not inherited across steps.
+uploaded and values are never printed. The object-store manifest step (`if: always()`)
+sources the private file in its own shell when present so the credential scanner
+sees this job's generated keys (an actions-step environment is not inherited
+across steps), or passes `--fixture "object_store_env="` when an earlier step
+failed before fixture startup so `scripts/native_report_manifest.py` still writes
+a `rootyard/native-acceptance-failure` manifest while failing closed.
 
 ## Reproduction and current status
 
@@ -271,9 +302,13 @@ python3 scripts/build_native_batch.py \
 python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
 python3 tests/ci_webhook_regressions.py --binary target/debug/rootyard | tee test-results/ci-webhook-regressions.log
 python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
+python3 tests/webhook_pagination.py --binary target/debug/rootyard --report test-results/webhook-pagination.json
+python3 tests/webhook_pr_sync.py --binary target/debug/rootyard --report test-results/webhook-pr-sync.json
 python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json
 python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json
 python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json
+python3 tests/web_repository_pagination.py --binary target/debug/rootyard --report test-results/web-repository-pagination.json
+python3 tests/worker_diagnostics.py --binary target/debug/rootyard --report test-results/worker-diagnostics.json
 ```
 
 The native host profile in this change was validated locally only: workflow
@@ -287,27 +322,93 @@ digests are recorded in the provenance artifact rather than fabricated in
 advance.
 
 Candidate jobs require Docker with the pinned Garage image, `/usr/bin/chromium`
-and a Playwright client. The coordinator verifies them against an owned fixture;
-the workflow was **not executed on GitHub by this change**, so no green
-candidate-release run or release certification is claimed here. The recorded
-state is: workflow/script YAML and bash syntax validated, the owned-fixture
-cleanup guards covered by `tests/test_owned_garage_fixture.py`, the Git LFS
-archive layout/checksum path covered by `tests/test_install_git_lfs.py`, and the
-manifest contract covered by `tests/test_native_report_manifest.py`. Those are
-local unit/syntax checks only; no Docker fixture, no real Git LFS download and
-no GitHub Actions run was executed.
+and a Playwright client. Earlier hosted dispatches exposed the container
+`safe.directory` / `$GITHUB_WORKSPACE` boundary, official `sha256sums.asc` asset
+name and early-failure `OBJECT_STORE_ENV_FILE` manifest handling (run
+`43249639303` on `3f21678`), OpenDAL `RetryLayer` re-issuing a ranged `GET` on
+truncated 2xx S3 bodies plus Debian vs. Ubuntu `psql` fixture-key collisions
+(run `43292515525` on `027784e`), and step-level YAML `env: KEY: ""` exporting
+empty strings instead of unsetting `ROOTYARD_OBJECT_STORE_*` before
+`tests/lfs_retention_acceptance.py` (run `43303142078` on `66c31a6`). Locally,
+the owned-fixture cleanup and startup-budget guards are covered by
+`tests/test_owned_garage_fixture.py`, the Git LFS `sha256sums.asc` and pinned
+digest checks plus retention `unset` wiring by `tests/test_install_git_lfs.py`,
+and the manifest contract by `tests/test_native_report_manifest.py`.
+
+Hosted `candidate-release-acceptance.yml` run `43306664983`
+(`https://github.com/jihuayu/rootyard/actions/runs/43306664983`,
+`workflow_dispatch` on `codex/ci76-candidate-gate-20261112`, candidate commit
+`a76f6f19b333081b24e06b3f5483d1e4c1a83bf7`, shared `source_inputs_sha256`
+`aca2c480eca111f2acc3ea141e935c23d5680d0dd839a3f7cb425b780c0dc470`,
+`rustc 1.99.1 (58cf8f9c3 2026-10-13)`) passed all 3/3 jobs:
+
+* `browser-native` (job `131491660347`, `success`): container-built `rootyard`
+  SHA-256 `5641446cec9f922f3c1b1f684a0dd4dd477ca141abb6457a81205eb2d68a9171`
+  (`rootyard.build.json` SHA-256
+  `ecb256f9e0762726ac8103caed0e40fffe29ad11f0c1182e4a45f611e2b4b2bc`,
+  `native-job-manifest.json` SHA-256
+  `c7ffd5d453e930f6ca283274d793f04eba0bcd2226eee84fa2ba7eb74ab27119`);
+  fixtures `chromium_version=Chromium 156.0.8078.79 built on Debian GNU/Linux 13 (trixie)`,
+  `playwright_version=1.49.0`,
+  `browser_postgres_server_version=17.11 (Debian 17.11-1.pgdg13+2)`,
+  `browser_postgres_client_version=psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)`;
+  `browser_ui` (`browser-ui.json`, SHA-256
+  `2993cc6d1305dcb8e7d322713183beb4368f9860e01efdab28baf68ed3b376a4`) passed
+  `chromium_browser_workflow` (`6.5513s`) against `/usr/bin/chromium`.
+* `object-store-native` (job `131491659861`, `success`): host-built `rootyard`
+  SHA-256 `2aeb51c56ad3bfed0d56dd8ed9876471db871c1ce744ed2c53dd5507adbdcc76`
+  (`rootyard.build.json` SHA-256
+  `abdb633847824a3b0ba264992ac39ffeb66671f514b4b37766974d00c677d847`,
+  `native-job-manifest.json` SHA-256
+  `cd889e139984b47ceb86dc99cb70bec70f0b51f1f25b8b159966d21fc1de1c1a`);
+  fixtures `garage_version=2.1.0`
+  (`dxflrs/garage:v2.1.0@sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a`,
+  image id `sha256:246f9db8485da30929ce4d25e87016ae432bac009a26d206667aaaf59906fe6c`),
+  `git_lfs_version=3.6.1`
+  (`git-lfs/3.6.1 (GitHub; linux amd64; go 1.23.3; git ea47a34b)`),
+  `git_lfs_tarball_sha256=2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76`,
+  `object_store_postgres_server_version=17.11 (Debian 17.11-1.pgdg13+2)`,
+  `object_store_postgres_client_version=psql (PostgreSQL) 17.12 (Ubuntu 17.12-1.pgdg24.04+1)`;
+  passed `lfs_hydration` (`lfs-hydration.json`, SHA-256
+  `c1ac04984727631aa1431693b4a77547686494606dd90fbba8906b6408e3c62f`,
+  `concurrent_cold_hydration`, `16.4449s` — shared singleflight `backend_gets=1` /
+  `backend_heads=1`, 502 retry, truncated 2xx body `backend_gets_for_shared_flight=1`
+  with `partial_final_published=false` and `staging_leftovers=0`, cancellation
+  recovery), `lfs_remote` (`lfs-remote.json`, SHA-256
+  `9ff78b352866af42f25b40173438a2d50d4416d899ddc850a01152fb2bc27f11`,
+  `stock_lfs_second_node_recovery`, `5.4776s`), and `lfs_retention`
+  (`lfs-retention.json`, SHA-256
+  `7380a6cbc4b72491aac15f532dcea45715d270e3820c8fb5edd658f0f704185e`,
+  `valid_and_compatible_publication` `4.6544s`,
+  `committed_bytes_survive_failures` `0.1889s`,
+  `gitfs_maintenance_during_pointer_publication` `4.7284s` with all
+  `ROOTYARD_OBJECT_STORE_*` variables unset).
+* `release-gate` (job `131493914554`, `success`): `candidate-release-gate.json`
+  (`status: "passed"`, SHA-256
+  `7579f03d7c51ef7f49e807a6e1e0e32d78edf843c77bc1cf8af4b4b0aa55c8ed`) verified
+  identical `source_commit` and `source_inputs_sha256` across both build
+  environments, re-verified all 15 harness digests against the checkout, and
+  re-hashed every downloaded report, log and build receipt against its job
+  manifest.
+
+Recording run `43306664983` in this file produces a documentation-only follow-up
+commit on top of the exact verified code tree `a76f6f1`
+(`a76f6f19b333081b24e06b3f5483d1e4c1a83bf7`); no workflow, script, harness or
+Rust source changed after `a76f6f1`.
 
 ## Limits
 
 * All candidate suites are single-host loopback runs; timings are functional,
   not scalability evidence.
 * Chromium and Playwright cannot prove cross-browser behaviour.
-* The Git LFS release tarball is pinned by version URL and verified against the
-  official release `sha256sums.txt` at run time. No expected digest was
-  fabricated or hard-coded in this change; the current environment had no
-  network access to fetch and confirm the official 3.6.1 checksum entry. The
-  step fails closed if the official checksum asset is missing, ambiguous or
-  does not match.
+* The Git LFS 3.6.1 release tarball (`git-lfs-linux-amd64-v3.6.1.tar.gz`) is
+  verified against both the official release `sha256sums.asc` manifest entry
+  (parsed strictly inside the PGP signed message body; `gpg` cryptographic
+  signature verification is not performed) and the pinned SHA-256 digest
+  `2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76`
+  (`--expected-sha256` and `release-gate` `--require-fixture-exact`). The step
+  fails closed if the official checksum asset is missing, malformed,
+  unsigned-tailed, ambiguous or does not match.
 * Kernel sandbox/cgroup acceptance remains in
   `.github/workflows/native-kernel-acceptance.yml`; Docker-backed Garage tests do
   not exercise it. No Vault dependency is introduced.
