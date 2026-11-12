@@ -46,13 +46,19 @@ impl LazyPublished {
     pub(super) fn keep(mut self) {
         self.kept = true;
     }
+
+    pub(super) async fn cleanup(mut self) {
+        if self.created && !self.kept {
+            self.kept = true;
+            super::cleanup::cleanup_paths_async(Some(self.dest.clone()), Some(self.sidecar.clone()), true).await;
+        }
+    }
 }
 
 impl Drop for LazyPublished {
     fn drop(&mut self) {
         if self.created && !self.kept {
-            let _ = fs::remove_dir_all(&self.dest);
-            let _ = fs::remove_file(&self.sidecar);
+            super::cleanup::cleanup_paths_on_drop(Some(self.dest.clone()), Some(self.sidecar.clone()), true);
         }
     }
 }

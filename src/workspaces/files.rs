@@ -1,3 +1,7 @@
+#[path = "files_rollback.rs"]
+mod rollback;
+
+use self::rollback::{GitRollback, PutRollback, atomic_put, safe_file, safe_path};
 use super::{
     models::{FilePut, FileQuery, GitAction},
     service,
@@ -13,9 +17,9 @@ use deadpool_postgres::Transaction;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    fs::OpenOptions,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
@@ -24,26 +28,8 @@ use uuid::Uuid;
 
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 
-fn safe_path(raw: &str) -> Result<PathBuf, Error> {
-    Ok(PathBuf::from(crate::browse::models::normalize_rel_path(Some(raw))?))
-}
-
-fn safe_file(repo: &FsPath, raw: &str) -> Result<PathBuf, Error> {
-    let rel = safe_path(raw)?;
-    if rel.as_os_str().is_empty() {
-        return Err(Error::bad_request());
-    }
-    let path = repo.join(rel);
-    let mut cur = repo.to_path_buf();
-    for seg in path.strip_prefix(repo).map_err(Error::internal)?.components() {
-        cur.push(seg);
-        if let Ok(meta) = fs::symlink_metadata(&cur)
-            && meta.file_type().is_symlink()
-        {
-            return Err(Error::bad_request());
-        }
-    }
-    Ok(path)
+fn upper_fallback_root(state: &AppState, id: Uuid) -> Option<PathBuf> {
+    super::mounts::enabled().then(|| state.storage.root.join("workspace-service/uppers").join(id.to_string()))
 }
 
 fn read_working_bounded(repo: &FsPath, raw: &str) -> Result<Vec<u8>, Error> {
@@ -64,26 +50,6 @@ fn read_working_bounded(repo: &FsPath, raw: &str) -> Result<Vec<u8>, Error> {
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "file too large"));
     }
     Ok(bytes)
-}
-
-fn atomic_put(path: &FsPath, bytes: &[u8], mode: u32) -> Result<(), Error> {
-    let parent = path.parent().ok_or_else(Error::bad_request)?;
-    fs::create_dir_all(parent).map_err(Error::internal)?;
-    let tmp = parent.join(format!(".rootyard-{}", Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode & 0o777)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&tmp)
-        .map_err(Error::internal)?;
-    file.write_all(bytes).map_err(Error::internal)?;
-    file.set_permissions(fs::Permissions::from_mode(mode & 0o777)).map_err(Error::internal)?;
-    file.sync_all().map_err(Error::internal)?;
-    drop(file);
-    fs::rename(&tmp, path).map_err(Error::internal)?;
-    File::open(parent).and_then(|d| d.sync_all()).map_err(Error::internal)?;
-    Ok(())
 }
 
 async fn check_idempotency(tx: &Transaction<'_>, id: Uuid, key: &str, hash: &str) -> Result<Option<Value>, Error> {
@@ -243,107 +209,102 @@ async fn put_mutation(
         tx.commit().await.map_err(Error::internal)?;
     }
 
-    // Phase 2: bounded off-thread atomic file write and post-write baseline fingerprint.
+    // Phase 2: capture rollback state (direct + FUSE), write atomically, and compute baseline.
     let repo = service::workspace_repo(&state, id);
+    let upper_root = upper_fallback_root(&state, id);
     let path_arg = raw_path.clone();
-    let direct_mode = !super::mounts::enabled();
-    let (digest, scanned) = super::blocking::run(move || {
-        let path = safe_file(&repo, &path_arg)?;
-        let backup = if direct_mode && path.exists() {
-            let meta = fs::symlink_metadata(&path).map_err(Error::internal)?;
-            if meta.is_file() && meta.len() <= crate::workspace_lab::core::MAX_BYTES {
-                Some((fs::read(&path).map_err(Error::internal)?, meta.permissions().mode() & 0o777))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let existed = direct_mode && path.exists();
-        atomic_put(&path, &bytes, 0o600)?;
+    let (digest, scanned, mut put_rb) = super::blocking::run(move || {
+        let mut rb = PutRollback::capture(&repo, &path_arg, upper_root)?;
+        let target = rb.target().to_path_buf();
+        if let Err(error) = atomic_put(&target, &bytes, 0o600) {
+            rb.restore_now();
+            return Err(error);
+        }
         let scanned = match super::capture::fingerprint(&repo) {
             Ok(fp) => fp,
             Err(error) => {
-                if direct_mode {
-                    match backup {
-                        Some((old_bytes, old_mode)) => {
-                            let _ = atomic_put(&path, &old_bytes, old_mode);
-                        }
-                        None if !existed => {
-                            let _ = fs::remove_file(&path);
-                        }
-                        None => {}
-                    }
-                }
+                rb.restore_now();
                 return Err(error);
             }
         };
-        Ok((hex::encode(Sha256::digest(&bytes)), scanned))
+        Ok((hex::encode(Sha256::digest(&bytes)), scanned, rb))
     })
     .await?;
 
-    // Phase 3: short FOR UPDATE commit transaction with zero filesystem I/O.
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
-    if let Some(replayed) = check_idempotency(&tx, id, &key, &hash).await? {
-        tx.commit().await.map_err(Error::internal)?;
-        return Ok(replayed);
-    }
-    check_lease_live(&tx, id, state.storage.volume_id, input.lease_epoch).await?;
-    if ws.revision != input.expected_workspace_revision {
-        return Err(service::conflict());
-    }
-    let prior: i64 = tx
-        .query_opt(
-            "SELECT entry_version FROM workspace_entries WHERE workspace_id=$1 AND path=$2 FOR UPDATE",
-            &[&id, &raw_path],
+    // Phase 3: short FOR UPDATE commit transaction; roll back disk if rejected before COMMIT.
+    let mut commit_sent = false;
+    let outcome: Result<Value, Error> = async {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let ws =
+            service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
+        if let Some(replayed) = check_idempotency(&tx, id, &key, &hash).await? {
+            tx.commit().await.map_err(Error::internal)?;
+            return Ok(replayed);
+        }
+        check_lease_live(&tx, id, state.storage.volume_id, input.lease_epoch).await?;
+        if ws.revision != input.expected_workspace_revision {
+            return Err(service::conflict());
+        }
+        let prior: i64 = tx
+            .query_opt(
+                "SELECT entry_version FROM workspace_entries WHERE workspace_id=$1 AND path=$2 FOR UPDATE",
+                &[&id, &raw_path],
+            )
+            .await
+            .map_err(Error::internal)?
+            .map(|r| r.get(0))
+            .unwrap_or(0);
+        if prior != input.expected_entry_version {
+            return Err(service::conflict());
+        }
+        let version = prior + 1;
+        tx.execute(
+            "INSERT INTO workspace_entries(workspace_id,path,entry_version,digest) VALUES($1,$2,$3,$4) \
+             ON CONFLICT(workspace_id,path) DO UPDATE SET entry_version=$3,digest=$4,deleted=false",
+            &[&id, &raw_path, &version, &digest],
         )
         .await
-        .map_err(Error::internal)?
-        .map(|r| r.get(0))
-        .unwrap_or(0);
-    if prior != input.expected_entry_version {
-        return Err(service::conflict());
+        .map_err(Error::internal)?;
+        let revision = ws.revision + 1;
+        let result = json!({
+            "path": raw_path,
+            "entry_version": version,
+            "workspace_revision": revision,
+            "sha256": digest,
+            "lease_epoch": input.lease_epoch
+        });
+        tx.execute(
+            "UPDATE workspaces SET revision=$2,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1",
+            &[&id, &revision],
+        )
+        .await
+        .map_err(Error::internal)?;
+        tx.execute(
+            "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'file_put',$3)",
+            &[&id, &revision, &result],
+        )
+        .await
+        .map_err(Error::internal)?;
+        tx.execute(
+            "INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) \
+             VALUES($1,$2,$3,$4,'file_put','committed',$5)",
+            &[&Uuid::new_v4(), &id, &key, &hash, &result],
+        )
+        .await
+        .map_err(Error::internal)?;
+        super::capture::record_fingerprint(&tx, id, &scanned).await?;
+        commit_sent = true;
+        put_rb.disarm();
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(result)
     }
-    let version = prior + 1;
-    tx.execute(
-        "INSERT INTO workspace_entries(workspace_id,path,entry_version,digest) VALUES($1,$2,$3,$4) \
-         ON CONFLICT(workspace_id,path) DO UPDATE SET entry_version=$3,digest=$4,deleted=false",
-        &[&id, &raw_path, &version, &digest],
-    )
-    .await
-    .map_err(Error::internal)?;
-    let revision = ws.revision + 1;
-    let result = json!({
-        "path": raw_path,
-        "entry_version": version,
-        "workspace_revision": revision,
-        "sha256": digest,
-        "lease_epoch": input.lease_epoch
-    });
-    tx.execute(
-        "UPDATE workspaces SET revision=$2,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1",
-        &[&id, &revision],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'file_put',$3)",
-        &[&id, &revision, &result],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) \
-         VALUES($1,$2,$3,$4,'file_put','committed',$5)",
-        &[&Uuid::new_v4(), &id, &key, &hash, &result],
-    )
-    .await
-    .map_err(Error::internal)?;
-    super::capture::record_fingerprint(&tx, id, &scanned).await?;
-    tx.commit().await.map_err(Error::internal)?;
-    Ok(result)
+    .await;
+
+    if !commit_sent {
+        put_rb.rollback().await;
+    }
+    outcome
 }
 
 pub async fn git(
@@ -403,67 +364,91 @@ async fn git_mutation(
     if paths.len() > 128 {
         return Err(Error::bad_request());
     }
-    let repo = service::workspace_repo(&state, id);
-    let repo_check = repo.clone();
-    let paths_check = paths.clone();
-    super::blocking::run(move || {
-        for path in &paths_check {
-            safe_file(&repo_check, path)?;
-        }
-        Ok(())
-    })
-    .await?;
     let mut args: Vec<&str> = match input.action.as_str() {
         "add" if !paths.is_empty() => vec!["add", "--"],
         "reset" if !paths.is_empty() => vec!["reset", "HEAD", "--"],
         _ => return Err(Error::bad_request()),
     };
     args.extend(paths.iter().map(String::as_str));
-    let output =
-        super::git::run_in_job_with_git(&state.config.git, &repo, &args, 64 * 1024, state.config.git_timeout).await?;
-    let repo_fp = repo.clone();
-    let scanned = super::blocking::run(move || super::capture::fingerprint(&repo_fp)).await?;
 
-    // Phase 3: short FOR UPDATE commit transaction with zero filesystem or Git work.
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
-    if let Some(replayed) = check_idempotency(&tx, id, &key, &request_hash).await? {
+    // Phase 2: snapshot .git/index and .git/objects, run Git, and compute baseline.
+    let repo = service::workspace_repo(&state, id);
+    let upper_root = upper_fallback_root(&state, id);
+    let repo_cap = repo.clone();
+    let paths_cap = paths.clone();
+    let mut git_rb = super::blocking::run(move || GitRollback::capture(&repo_cap, &paths_cap, upper_root)).await?;
+
+    let output =
+        match super::git::run_in_job_with_git(&state.config.git, &repo, &args, 64 * 1024, state.config.git_timeout)
+            .await
+        {
+            Ok(out) => out,
+            Err(error) => {
+                git_rb.rollback().await;
+                return Err(error);
+            }
+        };
+    let repo_fp = repo.clone();
+    let scanned = match super::blocking::run(move || super::capture::fingerprint(&repo_fp)).await {
+        Ok(fp) => fp,
+        Err(error) => {
+            git_rb.rollback().await;
+            return Err(error);
+        }
+    };
+
+    // Phase 3: short FOR UPDATE commit transaction; roll back .git state if rejected before COMMIT.
+    let mut commit_sent = false;
+    let outcome: Result<Value, Error> = async {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let ws =
+            service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
+        if let Some(replayed) = check_idempotency(&tx, id, &key, &request_hash).await? {
+            tx.commit().await.map_err(Error::internal)?;
+            return Ok(replayed);
+        }
+        check_lease_live(&tx, id, state.storage.volume_id, input.lease_epoch).await?;
+        if ws.revision != input.expected_workspace_revision || ws.git_generation != input.expected_git_generation {
+            return Err(service::conflict());
+        }
+        let revision = ws.revision + 1;
+        let generation = ws.git_generation + 1;
+        let result = json!({
+            "action": input.action,
+            "workspace_revision": revision,
+            "git_generation": generation,
+            "output_base64": STANDARD.encode(output)
+        });
+        tx.execute(
+            "UPDATE workspaces SET revision=$2,git_generation=$3,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1",
+            &[&id, &revision, &generation],
+        )
+        .await
+        .map_err(Error::internal)?;
+        tx.execute(
+            "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'git',$3)",
+            &[&id, &revision, &result],
+        )
+        .await
+        .map_err(Error::internal)?;
+        tx.execute(
+            "INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) \
+             VALUES($1,$2,$3,$4,'git','committed',$5)",
+            &[&Uuid::new_v4(), &id, &key, &request_hash, &result],
+        )
+        .await
+        .map_err(Error::internal)?;
+        super::capture::record_fingerprint(&tx, id, &scanned).await?;
+        commit_sent = true;
+        git_rb.disarm();
         tx.commit().await.map_err(Error::internal)?;
-        return Ok(replayed);
+        Ok(result)
     }
-    check_lease_live(&tx, id, state.storage.volume_id, input.lease_epoch).await?;
-    if ws.revision != input.expected_workspace_revision || ws.git_generation != input.expected_git_generation {
-        return Err(service::conflict());
+    .await;
+
+    if !commit_sent {
+        git_rb.rollback().await;
     }
-    let revision = ws.revision + 1;
-    let generation = ws.git_generation + 1;
-    let result = json!({
-        "action": input.action,
-        "workspace_revision": revision,
-        "git_generation": generation,
-        "output_base64": STANDARD.encode(output)
-    });
-    tx.execute(
-        "UPDATE workspaces SET revision=$2,git_generation=$3,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1",
-        &[&id, &revision, &generation],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'git',$3)",
-        &[&id, &revision, &result],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) \
-         VALUES($1,$2,$3,$4,'git','committed',$5)",
-        &[&Uuid::new_v4(), &id, &key, &request_hash, &result],
-    )
-    .await
-    .map_err(Error::internal)?;
-    super::capture::record_fingerprint(&tx, id, &scanned).await?;
-    tx.commit().await.map_err(Error::internal)?;
-    Ok(result)
+    outcome
 }

@@ -5,6 +5,8 @@ mod blocking;
 pub mod capture;
 #[path = "workspaces/checkpoints.rs"]
 mod checkpoints;
+#[path = "workspaces/cleanup.rs"]
+mod cleanup;
 #[path = "workspaces/events.rs"]
 mod events;
 #[path = "workspaces/files.rs"]

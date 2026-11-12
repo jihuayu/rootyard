@@ -37,7 +37,8 @@ pub async fn create(
     Json(input): Json<CheckpointRequest>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
     service::authorized(&state, &headers, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
-    super::capture::reconcile_one(&state, id).await?;
+    let mutation = super::blocking::lock_mutation(id, super::blocking::io_timeout()).await?;
+    super::capture::reconcile_locked(&state, id, &mutation).await?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     let hash =
@@ -123,93 +124,107 @@ pub async fn create(
     })
     .await?;
 
-    // Phase 3: short FOR UPDATE commit transaction revalidating lease, revision, and baseline.
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
-    if let Some(row) = tx
-        .query_opt(
-            "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
-            &[&id, &key],
-        )
-        .await
-        .map_err(Error::internal)?
-    {
-        if row.get::<_, String>(0) != hash {
+    // Phase 3: short FOR UPDATE commit transaction; clean up checkpoint tree on pre-COMMIT exit.
+    let mut published_opt = Some(published);
+    let phase3: Result<(StatusCode, Value), Error> = async {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let ws =
+            service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
+        if let Some(row) = tx
+            .query_opt(
+                "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
+                &[&id, &key],
+            )
+            .await
+            .map_err(Error::internal)?
+        {
+            if row.get::<_, String>(0) != hash {
+                return Err(service::conflict());
+            }
+            if row.get::<_, String>(1) == "committed" {
+                let replayed: Value = row.get(2);
+                tx.commit().await.map_err(Error::internal)?;
+                return Ok((StatusCode::OK, replayed));
+            }
             return Err(service::conflict());
         }
-        if row.get::<_, String>(1) == "committed" {
-            let replayed: Value = row.get(2);
-            tx.commit().await.map_err(Error::internal)?;
-            return Ok((StatusCode::OK, Json(replayed)));
+        let lease_ok: bool = tx
+            .query_one(
+                "SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1",
+                &[&id, &state.storage.volume_id, &input.lease_epoch],
+            )
+            .await
+            .map_err(Error::internal)?
+            .get(0);
+        if !lease_ok || ws.revision != input.expected_workspace_revision {
+            return Err(service::conflict());
         }
-        return Err(service::conflict());
-    }
-    let lease_ok: bool = tx
-        .query_one(
-            "SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1",
-            &[&id, &state.storage.volume_id, &input.lease_epoch],
+        let current_fp = tx
+            .query_opt("SELECT fingerprint FROM workspace_capture_state WHERE workspace_id=$1 FOR UPDATE", &[&id])
+            .await
+            .map_err(Error::internal)?
+            .map(|row| row.get::<_, String>(0));
+        match current_fp {
+            Some(ref fp) if fp != &before => return Err(service::conflict()),
+            Some(_) => {}
+            None => super::capture::record_fingerprint(&tx, id, &before).await?,
+        }
+        let revision = ws.revision + 1;
+        let result = json!({
+            "checkpoint_id": cp,
+            "workspace_id": id,
+            "captured_revision": ws.revision,
+            "workspace_revision": revision,
+            "state": "local_complete",
+            "durability": "local_filesystem_only",
+            "excluded_native_state": "none"
+        });
+        let base_oid: Option<String> = tx
+            .query_opt("SELECT base_oid FROM workspaces WHERE id=$1", &[&id])
+            .await
+            .map_err(Error::internal)?
+            .and_then(|row| row.get(0));
+        tx.execute(
+            "INSERT INTO workspace_checkpoints(id,workspace_id,repository_id,captured_revision,lease_epoch,state,excluded_summary,base_oid) \
+             VALUES($1,$2,$3,$4,$5,'local_complete',$6,$7)",
+            &[&cp, &id, &ws.repository_id, &ws.revision, &ws.lease_epoch, &json!({"native_entries": "included"}), &base_oid],
         )
         .await
-        .map_err(Error::internal)?
-        .get(0);
-    if !lease_ok || ws.revision != input.expected_workspace_revision {
-        return Err(service::conflict());
-    }
-    let current_fp = tx
-        .query_opt("SELECT fingerprint FROM workspace_capture_state WHERE workspace_id=$1 FOR UPDATE", &[&id])
+        .map_err(Error::internal)?;
+        tx.execute(
+            "UPDATE workspaces SET revision=$2,last_checkpoint_id=$3,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1",
+            &[&id, &revision, &cp],
+        )
         .await
-        .map_err(Error::internal)?
-        .map(|row| row.get::<_, String>(0));
-    match current_fp {
-        Some(ref fp) if fp != &before => return Err(service::conflict()),
-        Some(_) => {}
-        None => super::capture::record_fingerprint(&tx, id, &before).await?,
-    }
-    let revision = ws.revision + 1;
-    let result = json!({
-        "checkpoint_id": cp,
-        "workspace_id": id,
-        "captured_revision": ws.revision,
-        "workspace_revision": revision,
-        "state": "local_complete",
-        "durability": "local_filesystem_only",
-        "excluded_native_state": "none"
-    });
-    let base_oid: Option<String> = tx
-        .query_opt("SELECT base_oid FROM workspaces WHERE id=$1", &[&id])
+        .map_err(Error::internal)?;
+        tx.execute(
+            "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'checkpoint',$3)",
+            &[&id, &revision, &result],
+        )
         .await
-        .map_err(Error::internal)?
-        .and_then(|row| row.get(0));
-    tx.execute(
-        "INSERT INTO workspace_checkpoints(id,workspace_id,repository_id,captured_revision,lease_epoch,state,excluded_summary,base_oid) \
-         VALUES($1,$2,$3,$4,$5,'local_complete',$6,$7)",
-        &[&cp, &id, &ws.repository_id, &ws.revision, &ws.lease_epoch, &json!({"native_entries": "included"}), &base_oid],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "UPDATE workspaces SET revision=$2,last_checkpoint_id=$3,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1",
-        &[&id, &revision, &cp],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'checkpoint',$3)",
-        &[&id, &revision, &result],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) \
-         VALUES($1,$2,$3,$4,'checkpoint','committed',$5)",
-        &[&Uuid::new_v4(), &id, &key, &hash, &result],
-    )
-    .await
-    .map_err(Error::internal)?;
-    published.keep();
-    tx.commit().await.map_err(Error::internal)?;
-    Ok((StatusCode::CREATED, Json(result)))
+        .map_err(Error::internal)?;
+        tx.execute(
+            "INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) \
+             VALUES($1,$2,$3,$4,'checkpoint','committed',$5)",
+            &[&Uuid::new_v4(), &id, &key, &hash, &result],
+        )
+        .await
+        .map_err(Error::internal)?;
+        if let Some(guard) = published_opt.take() {
+            guard.keep();
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        Ok((StatusCode::CREATED, result))
+    }
+    .await;
+
+    if let Some(guard) = published_opt.take() {
+        guard.cleanup().await;
+    }
+    drop(mutation);
+    let (status, result) = phase3?;
+    Ok((status, Json(result)))
 }
 
 async fn restore_inner(
@@ -254,25 +269,10 @@ async fn restore_inner(
             return Err(Error::not_found());
         }
         if let Some(ref key) = key
-            && let Some(old) = tx
-                .query_opt(
-                    "SELECT request_sha256,workspace_id FROM workspace_creations WHERE actor_id=$1 AND idempotency_key=$2",
-                    &[&actor.id, key],
-                )
-                .await
-                .map_err(Error::internal)?
+            && let Some(saved) = service::lookup_existing_creation(&tx, actor.id, key, &digest, false).await?
         {
-            if old.get::<_, String>(0) != digest {
-                return Err(service::conflict());
-            }
-            let existing: Uuid = old.get(1);
-            let row = tx
-                .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&existing])
-                .await
-                .map_err(Error::internal)?;
-            let saved = Workspace::from_row(&row);
             tx.commit().await.map_err(Error::internal)?;
-            super::mounts::ensure_from_database(&state, existing).await?;
+            super::mounts::ensure_from_database(&state, saved.id).await?;
             return Ok((StatusCode::OK, Json(saved)));
         }
         let cp_state: String = row.get("checkpoint_state");
@@ -282,11 +282,18 @@ async fn restore_inner(
 
     // Phase 2: materialize lower tree and compute initial fingerprint off-thread with zero DB locks held.
     let id = Uuid::new_v4();
+    let _mutation = super::blocking::lock_mutation(id, super::blocking::io_timeout()).await?;
     let lower = super::mounts::lower_path(&state, id);
-    let (lazy_guard, published, initial_fingerprint) = if super::mounts::enabled() && cp_state == "committed" {
+    let (mut lazy_guard, mut published, initial_fingerprint) = if super::mounts::enabled() && cp_state == "committed" {
         let lazy_pub = super::lazy::prepare(&state, id, cp, parent.repository_id, owner_id).await?;
         let lower_fp = lower.clone();
-        let fp = super::blocking::run(move || super::capture::fingerprint(&lower_fp)).await?;
+        let fp = match super::blocking::run(move || super::capture::fingerprint(&lower_fp)).await {
+            Ok(fp) => fp,
+            Err(error) => {
+                lazy_pub.cleanup().await;
+                return Err(error);
+            }
+        };
         (Some(lazy_pub), None, fp)
     } else {
         super::remote::ensure_local(&state, cp, parent.repository_id, owner_id).await?;
@@ -302,86 +309,81 @@ async fn restore_inner(
     };
 
     // Phase 3: short commit transaction locking the checkpoint row against concurrent abandon.
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let check_row = tx
-        .query_opt(
-            "SELECT w.creator_id,w.repository_id,w.owner_slug,w.repository_name,c.base_oid \
-             FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id \
-             WHERE c.id=$1 AND c.state IN ('local_complete','committed') FOR SHARE OF c",
-            &[&cp],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(service::conflict)?;
-    let owner_slug: String = check_row.get(2);
-    let repo_name: String = check_row.get(3);
-    let access = auth::authorize_repo_with_role(
-        &tx,
-        &actor,
-        &owner_slug,
-        &repo_name,
-        Role::Write,
-        crate::token_scopes::RepoAction::WorkspacesWrite,
-    )
-    .await?;
-    if check_row.get::<_, Uuid>(0) != actor.id || access.repo_id != check_row.get::<_, Uuid>(1) {
-        return Err(Error::not_found());
-    }
-    if let Some(ref key) = key {
-        service::creation_lock(&tx, actor.id, key).await?;
-        if let Some(old) = tx
+    let phase3: Result<(StatusCode, Workspace), Error> = async {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let check_row = tx
             .query_opt(
-                "SELECT request_sha256,workspace_id FROM workspace_creations WHERE actor_id=$1 AND idempotency_key=$2 FOR UPDATE",
-                &[&actor.id, key],
+                "SELECT w.creator_id,w.repository_id,w.owner_slug,w.repository_name,c.base_oid \
+                 FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id \
+                 WHERE c.id=$1 AND c.state IN ('local_complete','committed') FOR SHARE OF c",
+                &[&cp],
             )
             .await
             .map_err(Error::internal)?
-        {
-            if old.get::<_, String>(0) != digest {
-                return Err(service::conflict());
-            }
-            let existing: Uuid = old.get(1);
-            let row = tx
-                .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&existing])
-                .await
-                .map_err(Error::internal)?;
-            let saved = Workspace::from_row(&row);
-            tx.commit().await.map_err(Error::internal)?;
-            super::mounts::ensure_from_database(&state, existing).await?;
-            return Ok((StatusCode::OK, Json(saved)));
+            .ok_or_else(service::conflict)?;
+        let owner_slug: String = check_row.get(2);
+        let repo_name: String = check_row.get(3);
+        let access = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &owner_slug,
+            &repo_name,
+            Role::Write,
+            crate::token_scopes::RepoAction::WorkspacesWrite,
+        )
+        .await?;
+        if check_row.get::<_, Uuid>(0) != actor.id || access.repo_id != check_row.get::<_, Uuid>(1) {
+            return Err(Error::not_found());
         }
-    }
-    let base_oid: Option<String> = check_row.get(4);
-    tx.execute(
-        "INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,parent_checkpoint_id,state,host_id,lease_until,base_oid) \
-         VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp()+interval '5 minutes',$9)",
-        &[&id, &parent.repository_id, &owner_slug, &repo_name, &agent, &actor.id, &cp, &state.storage.volume_id, &base_oid],
-    )
-    .await
-    .map_err(Error::internal)?;
-    if let Some(ref key) = key {
+        if let Some(ref key) = key {
+            service::creation_lock(&tx, actor.id, key).await?;
+            if let Some(saved) = service::lookup_existing_creation(&tx, actor.id, key, &digest, true).await? {
+                tx.commit().await.map_err(Error::internal)?;
+                return Ok((StatusCode::OK, saved));
+            }
+        }
+        let base_oid: Option<String> = check_row.get(4);
         tx.execute(
-            "INSERT INTO workspace_creations(actor_id,idempotency_key,request_sha256,workspace_id) VALUES($1,$2,$3,$4)",
-            &[&actor.id, key, &digest, &id],
+            "INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,parent_checkpoint_id,state,host_id,lease_until,base_oid) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp()+interval '5 minutes',$9)",
+            &[&id, &parent.repository_id, &owner_slug, &repo_name, &agent, &actor.id, &cp, &state.storage.volume_id, &base_oid],
         )
         .await
         .map_err(Error::internal)?;
+        if let Some(ref key) = key {
+            tx.execute(
+                "INSERT INTO workspace_creations(actor_id,idempotency_key,request_sha256,workspace_id) VALUES($1,$2,$3,$4)",
+                &[&actor.id, key, &digest, &id],
+            )
+            .await
+            .map_err(Error::internal)?;
+        }
+        super::capture::record_fingerprint(&tx, id, &initial_fingerprint).await?;
+        let row = tx
+            .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id])
+            .await
+            .map_err(Error::internal)?;
+        if let Some(guard) = lazy_guard.take() {
+            guard.keep();
+        }
+        if let Some(guard) = published.take() {
+            guard.keep();
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        Ok((StatusCode::CREATED, Workspace::from_row(&row)))
     }
-    super::capture::record_fingerprint(&tx, id, &initial_fingerprint).await?;
-    let row = tx
-        .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id])
-        .await
-        .map_err(Error::internal)?;
-    if let Some(lazy_guard) = lazy_guard {
-        lazy_guard.keep();
+    .await;
+
+    if let Some(guard) = lazy_guard.take() {
+        guard.cleanup().await;
     }
-    if let Some(published) = published {
-        published.keep();
+    if let Some(guard) = published.take() {
+        guard.cleanup().await;
     }
-    tx.commit().await.map_err(Error::internal)?;
-    super::mounts::ensure_from_database(&state, id).await?;
-    Ok((StatusCode::CREATED, Json(Workspace::from_row(&row))))
+    let (status, saved) = phase3?;
+    super::mounts::ensure_from_database(&state, saved.id).await?;
+    Ok((status, Json(saved)))
 }
 
 pub async fn restore(

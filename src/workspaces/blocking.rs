@@ -23,7 +23,6 @@ use crate::{Error, observability::worker};
 use axum::http::StatusCode;
 use std::{
     collections::HashMap,
-    fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard, OnceLock},
@@ -263,12 +262,19 @@ impl DirCleanupGuard {
     pub(super) fn keep(mut self) {
         self.kept = true;
     }
+
+    pub(super) async fn cleanup(mut self) {
+        if !self.kept {
+            self.kept = true;
+            super::cleanup::cleanup_paths_async(Some(self.path.clone()), None, false).await;
+        }
+    }
 }
 
 impl Drop for DirCleanupGuard {
     fn drop(&mut self) {
         if !self.kept {
-            let _ = fs::remove_dir_all(&self.path);
+            super::cleanup::cleanup_paths_on_drop(Some(self.path.clone()), None, false);
         }
     }
 }

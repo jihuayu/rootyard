@@ -48,6 +48,13 @@ impl Published {
     pub(in crate::workspaces) fn keep(mut self) {
         self.kept = true;
     }
+
+    pub(in crate::workspaces) async fn cleanup(mut self) {
+        if !self.kept {
+            self.kept = true;
+            super::super::cleanup::cleanup_paths_async(Some(self.dest.clone()), None, true).await;
+        }
+    }
 }
 
 impl Drop for Published {
@@ -55,10 +62,7 @@ impl Drop for Published {
         if self.kept {
             return;
         }
-        let _ = fs::remove_dir_all(&self.dest);
-        if let Some(parent) = self.dest.parent() {
-            let _ = File::open(parent).and_then(|directory| directory.sync_all());
-        }
+        super::super::cleanup::cleanup_paths_on_drop(Some(self.dest.clone()), None, true);
     }
 }
 

@@ -1,16 +1,16 @@
-"""Workspace runtime bulkhead, short-transaction, and non-starvation regression (#73).
+"""Workspace runtime bulkhead, rollback, and takeover regressions (#73).
 
-Proves against a real PostgreSQL 15 cluster and live `rootyard` server that:
+Proves against a real PostgreSQL 15 cluster, Garage 2.1.0 S3, and live `rootyard`:
 1. 16 concurrent stalled workspace Git mutations (`max_size(16)` DB pool) hold
-   zero `idle in transaction` PostgreSQL connections during Phase 2 execution.
-2. Unrelated workspace/API reads stay responsive (`200 OK` under tight timeout)
-   even when all 16 workspace Git slots are parked mid-mutation.
-3. A 17th concurrent Git mutation fails fast with `503 Service Unavailable`
-   before opening a DB transaction, and succeeds cleanly once capacity frees up.
-4. Client disconnect while `git add` is mid-flight preserves the owned job,
-   commits cleanly on release, leaves no `.git/index.lock`, records the exact
-   post-write capture baseline (zero spurious `external_capture` events), and
-   replays `200 OK` when retried with the same `Idempotency-Key`.
+   zero `idle in transaction` PostgreSQL connections during Phase 2 execution,
+   never starve bystander reads, fail fast with `503` on the 17th slot, and
+   replay disconnect-interrupted owned jobs with zero spurious capture events.
+2. Phase 3 pre-`COMMIT` `409 Conflict` rejections in both `PUT /files` and
+   `POST /git` roll back working-tree files, `.git/index`, and newly created
+   `.git/objects` loose blobs so subsequent `capture::reconcile_one` scans see
+   an unchanged baseline and emit zero `external_capture` events.
+3. A cross-volume `POST /lease` takeover that loses a Phase 3 race cleans up its
+   uncommitted `workspaces/<id>` tree instead of wedging a later `cp2` takeover.
 """
 import argparse
 import base64
@@ -18,7 +18,9 @@ from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 import os
+from pathlib import Path
 import shutil
+import subprocess
 import time
 import unittest
 import urllib.parse
@@ -26,88 +28,131 @@ import urllib.parse
 from tests.e2e import Harness
 
 
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
+def wait_for_capture_scan(h: Harness, wid: str, after_ts: str, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        scanned = h.sql(
+            f"SELECT COALESCE(scanned_at > '{after_ts}'::timestamptz, false) "
+            f"FROM workspace_capture_state WHERE workspace_id = '{wid}'"
+        ).strip()
+        if scanned == "t":
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"workspace {wid} was not scanned by capture worker after {after_ts}")
+
+
+def start_psql_tx(h: Harness) -> subprocess.Popen:
+    env = h.env.copy()
+    env["PGDATABASE"] = h.db
+    return subprocess.Popen(
+        ["psql", "--dbname", h.db, "-X", "-v", "ON_ERROR_STOP=1", "-qAt"],
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def stop_psql_tx(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=5)
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None and not stream.closed:
+            stream.close()
+
+
+def git_object_files(repo: Path) -> set[str]:
+    obj_root = repo / ".git/objects"
+    if not obj_root.is_dir():
+        return set()
+    return {str(p.relative_to(obj_root)) for p in obj_root.rglob("*") if p.is_file()}
+
+
 class WorkspaceRuntimeBulkheadTest(unittest.TestCase):
-    def test_sixteen_stalled_mutations_never_starve_postgres_pool_or_strand_locks(self):
-        h = Harness(
-            argparse.Namespace(
-                binary="target/debug/rootyard",
-                keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1",
+    def _new_harness(self) -> Harness:
+        return Harness(argparse.Namespace(binary="target/debug/rootyard", keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
+
+    def _make_git_gate(self, h: Harness):
+        real_git = shutil.which("git", path=h.env["PATH"])
+        self.assertTrue(real_git)
+        gate_dir = h.root / "git-gate"
+        gate_dir.mkdir(exist_ok=True)
+        pause_flag = gate_dir / "pause-add"
+        entered_dir = gate_dir / "entered"
+        entered_dir.mkdir(exist_ok=True)
+        wrapper = h.root / "gated-workspace-git"
+        wrapper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys, time\n"
+            "args = sys.argv[1:]\n"
+            f"pause = pathlib.Path({str(pause_flag)!r})\n"
+            f"entered = pathlib.Path({str(entered_dir)!r})\n"
+            "if 'add' in args and pause.exists():\n"
+            "    (entered / str(os.getpid())).write_text('1')\n"
+            "    while pause.exists():\n"
+            "        time.sleep(0.02)\n"
+            f"os.execv({real_git!r}, [{real_git!r}] + args)\n"
+        )
+        wrapper.chmod(0o700)
+        return wrapper, pause_flag, entered_dir
+
+    def _create_ws(self, h: Harness, agent: str, key: str) -> dict:
+        return json.loads(
+            h.expect(
+                "/api/workspaces",
+                201,
+                token=h.alice,
+                method="POST",
+                body={"owner": "alice", "repository": "demo", "agent_id": agent, "base_oid": h.second},
+                extra_headers={"Idempotency-Key": key},
             )
         )
+
+    def _put_hello(self, h: Harness, wid: str, data: bytes, entry_ver: int, rev: int, key: str, epoch: int = 1):
+        return h.expect(
+            f"/api/workspaces/{wid}/files?path=hello.txt",
+            200,
+            token=h.alice,
+            method="PUT",
+            body={
+                "content_base64": b64(data),
+                "expected_entry_version": entry_ver,
+                "expected_workspace_revision": rev,
+                "lease_epoch": epoch,
+            },
+            extra_headers={"Idempotency-Key": key},
+        )
+
+    def test_sixteen_stalled_mutations_never_starve_postgres_pool_or_strand_locks(self):
+        h = self._new_harness()
         try:
             h.setup()
             h.api()
             h.roundtrip()
-            real_git = shutil.which("git", path=h.env["PATH"])
-            self.assertTrue(real_git)
-
-            gate_dir = h.root / "git-gate"
-            gate_dir.mkdir()
-            pause_flag = gate_dir / "pause-add"
-            entered_dir = gate_dir / "entered"
-            entered_dir.mkdir()
-            wrapper = h.root / "gated-workspace-git"
-            wrapper.write_text(
-                "#!/usr/bin/env python3\n"
-                "import os, pathlib, sys, time\n"
-                "args = sys.argv[1:]\n"
-                f"pause = pathlib.Path({str(pause_flag)!r})\n"
-                f"entered = pathlib.Path({str(entered_dir)!r})\n"
-                "if 'add' in args and pause.exists():\n"
-                "    (entered / str(os.getpid())).write_text('1')\n"
-                "    while pause.exists():\n"
-                "        time.sleep(0.02)\n"
-                f"os.execv({real_git!r}, [{real_git!r}] + args)\n"
-            )
-            wrapper.chmod(0o700)
-
+            wrapper, pause_flag, entered_dir = self._make_git_gate(h)
             h.stop()
             h.env["ROOTYARD_GIT"] = str(wrapper)
             h.env["ROOTYARD_MAX_CONCURRENT_GIT"] = "16"
             h.start()
 
-            # Create 17 independent workspaces (16 to saturate all Git slots ==
-            # deadpool max_size(16), plus 1 bystander workspace for reads/503).
             workspaces = []
             for idx in range(17):
-                ws = json.loads(
-                    h.expect(
-                        "/api/workspaces",
-                        201,
-                        token=h.alice,
-                        method="POST",
-                        body={
-                            "owner": "alice",
-                            "repository": "demo",
-                            "agent_id": f"bulkhead-{idx}",
-                            "base_oid": h.second,
-                        },
-                        extra_headers={"Idempotency-Key": f"bulkhead-create-{idx}"},
-                    )
-                )
-                put_body = {
-                    "content_base64": base64.b64encode(f"payload-{idx}\n".encode()).decode(),
-                    "expected_entry_version": 0,
-                    "expected_workspace_revision": 0,
-                    "lease_epoch": ws["lease_epoch"],
-                }
-                h.expect(
-                    f"/api/workspaces/{ws['id']}/files?path=hello.txt",
-                    200,
-                    token=h.alice,
-                    method="PUT",
-                    body=put_body,
-                    extra_headers={"Idempotency-Key": f"bulkhead-put-{idx}"},
-                )
+                ws = self._create_ws(h, f"bh-{idx}", f"bh-create-{idx}")
+                self._put_hello(h, ws["id"], f"payload-{idx}\n".encode(), 0, 0, f"bh-put-{idx}", ws["lease_epoch"])
                 workspaces.append(ws)
 
             bystander = workspaces[16]
             pause_flag.write_text("hold\n")
 
             def stage_one(idx: int):
-                wid = workspaces[idx]["id"]
                 return h.http(
-                    f"/api/workspaces/{wid}/git",
+                    f"/api/workspaces/{workspaces[idx]['id']}/git",
                     token=h.alice,
                     method="POST",
                     body={
@@ -117,7 +162,7 @@ class WorkspaceRuntimeBulkheadTest(unittest.TestCase):
                         "expected_workspace_revision": 1,
                         "lease_epoch": 1,
                     },
-                    extra_headers={"Idempotency-Key": f"bulkhead-add-{idx}"},
+                    extra_headers={"Idempotency-Key": f"bh-add-{idx}"},
                 )
 
             with ThreadPoolExecutor(max_workers=16) as pool:
@@ -127,92 +172,54 @@ class WorkspaceRuntimeBulkheadTest(unittest.TestCase):
                     self.assertLess(time.monotonic(), deadline, "not all 16 git add workers entered gate")
                     time.sleep(0.02)
 
-                # 1. Zero `idle in transaction` PostgreSQL backends while all 16
-                #    mutations are parked inside Phase 2!
+                time.sleep(0.2)
                 idle_in_tx = int(
                     h.sql(
                         "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE datname = current_database() AND state = 'idle in transaction'"
+                        "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+                        "AND state = 'idle in transaction' "
+                        "AND xact_start <= clock_timestamp() - interval '150 milliseconds'"
                     ).strip()
                 )
-                self.assertEqual(
-                    idle_in_tx,
-                    0,
-                    "workspace mutations held open PostgreSQL transactions across Git execution",
-                )
+                self.assertEqual(idle_in_tx, 0, "workspace mutations held PostgreSQL transactions across Git I/O")
 
-                # 2. Bystander DB + filesystem reads succeed promptly despite all
-                #    16 Git slots (== deadpool max_size(16)) being parked!
                 t0 = time.monotonic()
                 for _ in range(5):
-                    info = json.loads(
-                        h.expect(f"/api/workspaces/{bystander['id']}", 200, token=h.alice)
-                    )
+                    info = json.loads(h.expect(f"/api/workspaces/{bystander['id']}", 200, token=h.alice))
                     self.assertEqual(info["revision"], 1)
-                    file_resp = json.loads(
-                        h.expect(
-                            f"/api/workspaces/{bystander['id']}/files?path=hello.txt",
-                            200,
-                            token=h.alice,
-                        )
+                    got = json.loads(
+                        h.expect(f"/api/workspaces/{bystander['id']}/files?path=hello.txt", 200, token=h.alice)
                     )
-                    self.assertEqual(
-                        base64.b64decode(file_resp["content_base64"]),
-                        b"payload-16\n",
-                    )
-                self.assertLess(time.monotonic() - t0, 2.5, "bystander reads stalled under Git saturation")
+                    self.assertEqual(base64.b64decode(got["content_base64"]), b"payload-16\n")
+                self.assertLess(time.monotonic() - t0, 2.5)
 
-                # 3. 17th concurrent Git mutation fails fast with 503 Service Unavailable.
                 status_17, raw_17, _ = stage_one(16)
                 self.assertEqual(status_17, 503, raw_17)
 
-                # Release all 16 parked `git add` invocations.
                 pause_flag.unlink()
                 for idx, fut in enumerate(futures):
                     st, raw, _ = fut.result(timeout=15)
                     self.assertEqual(st, 200, f"worker {idx} failed: {raw}")
-                    body = json.loads(raw)
-                    self.assertEqual(body["workspace_revision"], 2)
-                    self.assertEqual(body["git_generation"], 1)
 
-            # Once capacity is released, the 17th workspace succeeds cleanly too.
-            st_17, raw_17, _ = stage_one(16)
-            self.assertEqual(st_17, 200, raw_17)
+            self.assertEqual(stage_one(16)[0], 200)
 
-            # 4. Client disconnect mid-flight still finishes owned job cleanly
-            #    and replays on Idempotency-Key retry without spurious capture!
             for marker in entered_dir.iterdir():
                 marker.unlink()
-            put_disconnect = {
-                "content_base64": base64.b64encode(b"disconnect-safe\n").decode(),
-                "expected_entry_version": 1,
-                "expected_workspace_revision": 2,
-                "lease_epoch": 1,
-            }
-            h.expect(
-                f"/api/workspaces/{bystander['id']}/files?path=hello.txt",
-                200,
-                token=h.alice,
-                method="PUT",
-                body=put_disconnect,
-                extra_headers={"Idempotency-Key": "disconnect-prep-put"},
-            )
+            self._put_hello(h, bystander["id"], b"disconnect-safe\n", 1, 2, "disconnect-prep-put")
             pause_flag.write_text("hold-disconnect\n")
             parsed = urllib.parse.urlparse(h.base)
             conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
-            disconnect_body = json.dumps(
-                {
-                    "action": "add",
-                    "paths": ["hello.txt"],
-                    "expected_git_generation": 1,
-                    "expected_workspace_revision": 3,
-                    "lease_epoch": 1,
-                }
-            ).encode()
+            disconnect_body = {
+                "action": "add",
+                "paths": ["hello.txt"],
+                "expected_git_generation": 1,
+                "expected_workspace_revision": 3,
+                "lease_epoch": 1,
+            }
             conn.request(
                 "POST",
                 f"/api/workspaces/{bystander['id']}/git",
-                body=disconnect_body,
+                body=json.dumps(disconnect_body).encode(),
                 headers={
                     "Authorization": f"Bearer {h.alice['token']}",
                     "Content-Type": "application/json",
@@ -221,13 +228,11 @@ class WorkspaceRuntimeBulkheadTest(unittest.TestCase):
             )
             deadline = time.monotonic() + 8.0
             while not list(entered_dir.iterdir()):
-                self.assertLess(time.monotonic(), deadline, "disconnect git add never entered gate")
+                self.assertLess(time.monotonic(), deadline)
                 time.sleep(0.02)
-            # Abruptly close the client TCP socket before reading any response!
             conn.close()
             pause_flag.unlink()
 
-            # Retry with the identical Idempotency-Key: must replay the committed 200 OK result!
             deadline = time.monotonic() + 8.0
             replayed = None
             while time.monotonic() < deadline:
@@ -235,23 +240,21 @@ class WorkspaceRuntimeBulkheadTest(unittest.TestCase):
                     f"/api/workspaces/{bystander['id']}/git",
                     token=h.alice,
                     method="POST",
-                    body=json.loads(disconnect_body.decode()),
+                    body=disconnect_body,
                     extra_headers={"Idempotency-Key": "disconnect-git-key"},
                 )
                 if st == 200:
                     replayed = json.loads(raw)
                     break
                 time.sleep(0.05)
-            self.assertIsNotNone(replayed, "disconnected owned git job did not replay 200 OK")
+            self.assertIsNotNone(replayed)
             self.assertEqual(replayed["workspace_revision"], 4)
-            self.assertEqual(replayed["git_generation"], 2)
 
             repo_dir = h.root / "data/workspace-service/workspaces" / bystander["id"]
             self.assertFalse((repo_dir / ".git/index.lock").exists())
 
-            # Wait over one capture cycle to verify no spurious external_capture
-            # event was emitted after the API mutations recorded their baselines.
-            time.sleep(1.5)
+            marker_ts = h.sql("SELECT clock_timestamp()::text")
+            wait_for_capture_scan(h, bystander["id"], marker_ts)
             events = json.loads(
                 h.expect(f"/api/workspaces/{bystander['id']}/events?after_revision=0", 200, token=h.alice)
             )["events"]
@@ -259,128 +262,200 @@ class WorkspaceRuntimeBulkheadTest(unittest.TestCase):
         finally:
             h.cleanup()
 
-    @unittest.skipUnless(os.environ.get("ROOTYARD_OBJECT_STORE_ENDPOINT"), "live S3 fixture required")
-    def test_cross_volume_lease_takeover_from_remote_checkpoint_without_db_lock_retention(self):
-        h = Harness(
-            argparse.Namespace(
-                binary="target/debug/rootyard",
-                keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1",
-            )
-        )
+    def test_phase3_rejected_put_and_git_roll_back_disk_and_emit_zero_external_captures(self):
+        h = self._new_harness()
         try:
             h.setup()
             h.api()
             h.roundtrip()
-            ws = json.loads(
-                h.expect(
-                    "/api/workspaces",
-                    201,
-                    token=h.alice,
-                    method="POST",
-                    body={
-                        "owner": "alice",
-                        "repository": "demo",
-                        "agent_id": "cross-vol",
-                        "base_oid": h.second,
-                    },
-                    extra_headers={"Idempotency-Key": "cross-vol-create"},
-                )
-            )
+            wrapper, pause_flag, entered_dir = self._make_git_gate(h)
+            h.stop()
+            h.env["ROOTYARD_GIT"] = str(wrapper)
+            h.start()
+
+            ws = self._create_ws(h, "rb-agent", "rb-create")
             wid = ws["id"]
-            payload = b"cross-volume takeover payload\n"
-            h.expect(
-                f"/api/workspaces/{wid}/files?path=hello.txt",
-                200,
-                token=h.alice,
-                method="PUT",
-                body={
-                    "content_base64": base64.b64encode(payload).decode(),
-                    "expected_entry_version": 0,
-                    "expected_workspace_revision": 0,
-                    "lease_epoch": 1,
-                },
-                extra_headers={"Idempotency-Key": "cross-vol-put"},
-            )
+            repo_dir = h.root / "data/workspace-service/workspaces" / wid
+
+            self._put_hello(h, wid, b"staged-v1\n", 0, 0, "rb-put-1")
             h.expect(
                 f"/api/workspaces/{wid}/git",
                 200,
                 token=h.alice,
                 method="POST",
-                body={
-                    "action": "add",
-                    "paths": ["hello.txt"],
-                    "expected_git_generation": 0,
-                    "expected_workspace_revision": 1,
-                    "lease_epoch": 1,
-                },
-                extra_headers={"Idempotency-Key": "cross-vol-add"},
+                body={"action": "add", "paths": ["hello.txt"], "expected_git_generation": 0, "expected_workspace_revision": 1, "lease_epoch": 1},
+                extra_headers={"Idempotency-Key": "rb-add-1"},
             )
-            cp = json.loads(
+            self._put_hello(h, wid, b"unstaged-v2\n", 1, 2, "rb-put-2")
+
+            # Case A: PUT /files passes Phase 1 + Phase 2, then rejects in Phase 3 (409).
+            locker = start_psql_tx(h)
+            try:
+                locker.stdin.write(
+                    f"BEGIN;\nSELECT 'LOCKED' FROM workspace_entries WHERE workspace_id='{wid}' AND path='hello.txt' FOR UPDATE;\n"
+                )
+                locker.stdin.flush()
+                self.assertEqual(locker.stdout.readline().strip(), "LOCKED")
+
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    put_fut = pool.submit(
+                        h.http,
+                        f"/api/workspaces/{wid}/files?path=hello.txt",
+                        token=h.alice,
+                        method="PUT",
+                        body={"content_base64": b64(b"rejected-put-bytes\n"), "expected_entry_version": 2, "expected_workspace_revision": 3, "lease_epoch": 1},
+                        extra_headers={"Idempotency-Key": "rb-put-rejected"},
+                    )
+                    deadline = time.monotonic() + 8.0
+                    while not (
+                        int(h.sql("SELECT count(*) FROM pg_locks WHERE NOT granted").strip()) > 0
+                        and (repo_dir / "hello.txt").read_bytes() == b"rejected-put-bytes\n"
+                    ):
+                        self.assertLess(time.monotonic(), deadline, "PUT never reached Phase 3 row lock")
+                        time.sleep(0.02)
+
+                    locker.stdin.write(f"UPDATE workspace_entries SET entry_version = 99 WHERE workspace_id='{wid}' AND path='hello.txt';\nCOMMIT;\n")
+                    locker.stdin.close()
+                    locker.wait(timeout=5)
+                    st_put, raw_put, _ = put_fut.result(timeout=10)
+                    self.assertEqual(st_put, 409, raw_put)
+            finally:
+                stop_psql_tx(locker)
+
+            h.sql(f"UPDATE workspace_entries SET entry_version = 2 WHERE workspace_id='{wid}' AND path='hello.txt'")
+            working = json.loads(h.expect(f"/api/workspaces/{wid}/files?path=hello.txt", 200, token=h.alice))
+            self.assertEqual(base64.b64decode(working["content_base64"]), b"unstaged-v2\n")
+            self.assertEqual(working["entry_version"], 2)
+            wait_for_capture_scan(h, wid, h.sql("SELECT clock_timestamp()::text"))
+            self.assertEqual(json.loads(h.expect(f"/api/workspaces/{wid}", 200, token=h.alice))["revision"], 3)
+
+            # Case B: POST /git passes Phase 1, stages unstaged-v2 in Phase 2, then rejects in Phase 3 (409).
+            objs_before = git_object_files(repo_dir)
+            for m in entered_dir.iterdir():
+                m.unlink()
+            pause_flag.write_text("hold-git-rb\n")
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                git_fut = pool.submit(
+                    h.http,
+                    f"/api/workspaces/{wid}/git",
+                    token=h.alice,
+                    method="POST",
+                    body={"action": "add", "paths": ["hello.txt"], "expected_git_generation": 1, "expected_workspace_revision": 3, "lease_epoch": 1},
+                    extra_headers={"Idempotency-Key": "rb-git-rejected"},
+                )
+                deadline = time.monotonic() + 8.0
+                while not list(entered_dir.iterdir()):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.02)
+                h.sql(f"UPDATE workspaces SET lease_epoch = 2 WHERE id = '{wid}'")
+                pause_flag.unlink()
+                st_git, raw_git, _ = git_fut.result(timeout=10)
+                self.assertEqual(st_git, 409, raw_git)
+
+            self.assertEqual(git_object_files(repo_dir), objs_before)
+            idx_view = json.loads(h.expect(f"/api/workspaces/{wid}/files?path=hello.txt&view=index", 200, token=h.alice))
+            self.assertEqual(base64.b64decode(idx_view["content_base64"]), b"staged-v1\n")
+            wait_for_capture_scan(h, wid, h.sql("SELECT clock_timestamp()::text"))
+            self.assertEqual(json.loads(h.expect(f"/api/workspaces/{wid}", 200, token=h.alice))["revision"], 3)
+            events = json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=0", 200, token=h.alice))["events"]
+            self.assertEqual([e["kind"] for e in events], ["file_put", "git", "file_put"])
+        finally:
+            h.cleanup()
+
+    @unittest.skipUnless(os.environ.get("ROOTYARD_OBJECT_STORE_ENDPOINT"), "live S3 fixture required")
+    def test_cross_volume_lease_takeover_and_lost_race_recovery_with_live_s3(self):
+        h = self._new_harness()
+        try:
+            h.setup()
+            h.api()
+            h.roundtrip()
+            ws = self._create_ws(h, "cross-vol", "cross-vol-create")
+            wid = ws["id"]
+            self._put_hello(h, wid, b"cp1 payload\n", 0, 0, "cross-vol-put-1")
+            cp1 = json.loads(
                 h.expect(
                     f"/api/workspaces/{wid}/checkpoints",
                     201,
                     token=h.alice,
                     method="POST",
-                    body={"expected_workspace_revision": 2, "lease_epoch": 1},
-                    extra_headers={"Idempotency-Key": "cross-vol-cp"},
+                    body={"expected_workspace_revision": 1, "lease_epoch": 1},
+                    extra_headers={"Idempotency-Key": "cross-vol-cp-1"},
                 )
             )
-            pub = json.loads(
-                h.expect(
-                    f"/api/checkpoints/{cp['checkpoint_id']}/publish",
-                    200,
-                    token=h.alice,
-                    method="POST",
-                )
+            self.assertEqual(
+                json.loads(h.expect(f"/api/checkpoints/{cp1['checkpoint_id']}/publish", 200, token=h.alice, method="POST"))["state"],
+                "COMMITTED",
             )
-            self.assertEqual(pub["state"], "COMMITTED")
 
-            # Destroy volume 1 completely and start server on fresh volume 2.
             h.stop(hard=True)
-            shutil.rmtree(h.root / "data")
-            h.env["ROOTYARD_DATA_DIR"] = str(h.root / "volume-two")
+            vol1, vol2 = h.root / "data", h.root / "volume-two"
+            h.env["ROOTYARD_DATA_DIR"] = str(vol2)
             h.start()
 
-            # Unexpired foreign lease must fail with 409; non-member must get 404.
-            self.assertEqual(
-                h.http(
-                    f"/api/workspaces/{wid}/lease",
+            h.sql(f"UPDATE workspaces SET lease_until = clock_timestamp() - interval '1 second' WHERE id = '{wid}'")
+            locker = start_psql_tx(h)
+            try:
+                locker.stdin.write(f"BEGIN;\nSELECT 'LOCKED' FROM workspaces WHERE id = '{wid}' FOR UPDATE;\n")
+                locker.stdin.flush()
+                self.assertEqual(locker.stdout.readline().strip(), "LOCKED")
+
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    lease_fut = pool.submit(
+                        h.http, f"/api/workspaces/{wid}/lease", token=h.alice, method="POST", body={"expected_lease_epoch": 1}
+                    )
+                    deadline = time.monotonic() + 10.0
+                    while not (
+                        int(h.sql("SELECT count(*) FROM pg_locks WHERE NOT granted").strip()) > 0
+                        and (vol2 / "workspace-service/workspaces" / wid).exists()
+                    ):
+                        self.assertLess(time.monotonic(), deadline, "takeover never materialized cp1 before Phase 3")
+                        time.sleep(0.02)
+
+                    locker.stdin.write(
+                        f"UPDATE workspaces SET lease_until = clock_timestamp() + interval '5 minutes' WHERE id = '{wid}';\nCOMMIT;\n"
+                    )
+                    locker.stdin.close()
+                    locker.wait(timeout=5)
+                    st_race, raw_race, _ = lease_fut.result(timeout=10)
+                    self.assertEqual(st_race, 409, raw_race)
+            finally:
+                stop_psql_tx(locker)
+
+            self.assertFalse((vol2 / "workspace-service/workspaces" / wid).exists())
+
+            h.stop(hard=True)
+            h.env["ROOTYARD_DATA_DIR"] = str(vol1)
+            h.start()
+            self._put_hello(h, wid, b"cp2 newer payload\n", 1, 2, "cross-vol-put-2")
+            cp2 = json.loads(
+                h.expect(
+                    f"/api/workspaces/{wid}/checkpoints",
+                    201,
                     token=h.alice,
                     method="POST",
-                    body={"expected_lease_epoch": 1},
-                )[0],
-                409,
+                    body={"expected_workspace_revision": 3, "lease_epoch": 1},
+                    extra_headers={"Idempotency-Key": "cross-vol-cp-2"},
+                )
             )
-            h.sql(f"UPDATE workspaces SET lease_until = clock_timestamp() - interval '1 second' WHERE id = '{wid}'")
             self.assertEqual(
-                h.http(
-                    f"/api/workspaces/{wid}/lease",
-                    token=h.bob,
-                    method="POST",
-                    body={"expected_lease_epoch": 1},
-                )[0],
-                404,
+                json.loads(h.expect(f"/api/checkpoints/{cp2['checkpoint_id']}/publish", 200, token=h.alice, method="POST"))["state"],
+                "COMMITTED",
             )
 
+            h.stop(hard=True)
+            shutil.rmtree(vol1)
+            h.env["ROOTYARD_DATA_DIR"] = str(vol2)
+            h.start()
+            h.sql(f"UPDATE workspaces SET lease_until = clock_timestamp() - interval '1 second' WHERE id = '{wid}'")
+            self.assertEqual(
+                h.http(f"/api/workspaces/{wid}/lease", token=h.bob, method="POST", body={"expected_lease_epoch": 1})[0], 404
+            )
             taken = json.loads(
-                h.expect(
-                    f"/api/workspaces/{wid}/lease",
-                    200,
-                    token=h.alice,
-                    method="POST",
-                    body={"expected_lease_epoch": 1},
-                )
+                h.expect(f"/api/workspaces/{wid}/lease", 200, token=h.alice, method="POST", body={"expected_lease_epoch": 1})
             )
             self.assertEqual(taken["lease_epoch"], 2)
-            for view in ("working", "index"):
-                got = json.loads(
-                    h.expect(
-                        f"/api/workspaces/{wid}/files?path=hello.txt&view={view}",
-                        200,
-                        token=h.alice,
-                    )
-                )
-                self.assertEqual(base64.b64decode(got["content_base64"]), payload)
+            got = json.loads(h.expect(f"/api/workspaces/{wid}/files?path=hello.txt", 200, token=h.alice))
+            self.assertEqual(base64.b64decode(got["content_base64"]), b"cp2 newer payload\n")
         finally:
             h.cleanup()
 

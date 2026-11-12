@@ -1,5 +1,9 @@
+#[path = "lease_takeover.rs"]
+mod takeover;
+
+use self::takeover::{TakeoverGuards, prepare_takeover, verify_takeover_checkpoint};
 use super::models::{CreateWorkspace, LeaseRequest, WS_COLUMNS, Workspace};
-use crate::{AppState, Error, auth, members::models::Role, storage::read_leases, workspace_lab::core};
+use crate::{AppState, Error, auth, members::models::Role, storage::read_leases};
 use axum::{
     Json,
     extract::{Path, State},
@@ -43,7 +47,7 @@ pub(crate) async fn creation_lock(
     Ok(())
 }
 
-async fn lookup_existing_creation(
+pub(super) async fn lookup_existing_creation(
     tx: &deadpool_postgres::Transaction<'_>,
     actor_id: Uuid,
     key: &str,
@@ -66,22 +70,6 @@ async fn lookup_existing_creation(
         .await
         .map_err(Error::internal)?;
     Ok(Some(Workspace::from_row(&row)))
-}
-
-async fn verify_takeover_checkpoint(tx: &deadpool_postgres::Transaction<'_>, ws: &Workspace) -> Result<Uuid, Error> {
-    let cp = ws.last_checkpoint_id.ok_or_else(conflict)?;
-    let cp_row = tx
-        .query_opt(
-            "SELECT state,captured_revision FROM workspace_checkpoints WHERE id=$1 AND workspace_id=$2",
-            &[&cp, &ws.id],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(conflict)?;
-    if cp_row.get::<_, String>(0) != "committed" || ws.revision != cp_row.get::<_, i64>(1) + 1 {
-        return Err(conflict());
-    }
-    Ok(cp)
 }
 
 pub async fn git(state: &AppState, repo: &FsPath, args: &[&str], limit: usize) -> Result<Vec<u8>, Error> {
@@ -172,6 +160,7 @@ pub async fn lease(
     Json(input): Json<LeaseRequest>,
 ) -> Result<Json<Workspace>, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
+    let _mutation = super::blocking::lock_mutation(id, state.config.git_timeout).await?;
 
     // Phase 1: short read pre-check without holding a row lock across S3 or disk work.
     let takeover = {
@@ -217,104 +206,92 @@ pub async fn lease(
     };
 
     // Phase 2: materialize cross-host takeover or check local repo off-thread with no DB TX held.
-    if let Some((cp, repository_id, tenant)) = takeover {
-        if super::mounts::enabled() {
-            super::lazy::prepare(&state, id, cp, repository_id, tenant).await?.keep();
-        } else {
-            super::remote::ensure_local(&state, cp, repository_id, tenant).await?;
-            let state_copy = state.clone();
-            super::blocking::run(move || materialize_takeover(&state_copy, id, cp)).await?;
-        }
+    // Newly materialized lower/sidecar paths remain armed until disarmed right before COMMIT.
+    let mut takeover_guards = if let Some((cp, repository_id, tenant)) = takeover {
+        prepare_takeover(&state, id, cp, repository_id, tenant).await?
     } else {
         let lower = super::mounts::lower_path(&state, id);
         if !super::blocking::run(move || Ok(lower.join(".git").is_dir())).await? {
             return Err(conflict());
         }
-    }
-
-    // Phase 3: short FOR UPDATE commit transaction revalidating lease_epoch, expiry, and checkpoint.
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws =
-        locked_inner(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite, false).await?;
-    if ws.lease_epoch != input.expected_lease_epoch {
-        return Err(conflict());
-    }
-    if ws.host_id != state.storage.volume_id {
-        let expired: bool = tx
-            .query_one("SELECT lease_until<=clock_timestamp() FROM workspaces WHERE id=$1", &[&id])
-            .await
-            .map_err(Error::internal)?
-            .get(0);
-        if !expired {
-            return Err(conflict());
-        }
-        verify_takeover_checkpoint(&tx, &ws).await?;
-    }
-    let same_host = ws.host_id == state.storage.volume_id;
-    let commit_started = Arc::new(AtomicBool::new(false));
-    let commit = async {
-        let active: bool = tx
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM sandbox_jobs WHERE workspace_id=$1 AND state IN ('queued','running'))",
-                &[&id],
-            )
-            .await
-            .map_err(Error::internal)?
-            .get(0);
-        if active {
-            return Err(conflict());
-        }
-        let row = tx
-            .query_opt(
-                &format!(
-                    "UPDATE workspaces SET host_id=$2,lease_epoch=lease_epoch+1,lease_until=clock_timestamp()+interval '5 minutes' \
-                     WHERE id=$1 AND lease_epoch=$3 AND (host_id=$2 OR lease_until<=clock_timestamp()) \
-                     RETURNING {WS_COLUMNS},EXTRACT(EPOCH FROM lease_until)::bigint AS lease_deadline"
-                ),
-                &[&id, &state.storage.volume_id, &input.expected_lease_epoch],
-            )
-            .await
-            .map_err(Error::internal)?
-            .ok_or_else(conflict)?;
-        let deadline: i64 = row.get("lease_deadline");
-        commit_started.store(true, Ordering::Release);
-        tx.commit().await.map_err(Error::internal)?;
-        Ok((Workspace::from_row(&row), deadline))
+        TakeoverGuards::default()
     };
-    let (saved, deadline) = if same_host {
-        super::mounts::with_frozen_async(id, commit_started.clone(), commit).await?
-    } else {
-        commit.await?
+
+    // Phase 3: short FOR UPDATE commit transaction; clean up uncommitted takeover on pre-COMMIT failure.
+    let commit_started = Arc::new(AtomicBool::new(false));
+    let phase3: Result<(Workspace, i64), Error> = async {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let ws =
+            locked_inner(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite, false).await?;
+        if ws.lease_epoch != input.expected_lease_epoch {
+            return Err(conflict());
+        }
+        if ws.host_id != state.storage.volume_id {
+            let expired: bool = tx
+                .query_one("SELECT lease_until<=clock_timestamp() FROM workspaces WHERE id=$1", &[&id])
+                .await
+                .map_err(Error::internal)?
+                .get(0);
+            if !expired {
+                return Err(conflict());
+            }
+            let cp = verify_takeover_checkpoint(&tx, &ws).await?;
+            if takeover.map(|(planned_cp, _, _)| planned_cp) != Some(cp) {
+                return Err(conflict());
+            }
+        }
+        let same_host = ws.host_id == state.storage.volume_id;
+        let commit_flag = commit_started.clone();
+        let commit = async {
+            let active: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM sandbox_jobs WHERE workspace_id=$1 AND state IN ('queued','running'))",
+                    &[&id],
+                )
+                .await
+                .map_err(Error::internal)?
+                .get(0);
+            if active {
+                return Err(conflict());
+            }
+            let row = tx
+                .query_opt(
+                    &format!(
+                        "UPDATE workspaces SET host_id=$2,lease_epoch=lease_epoch+1,lease_until=clock_timestamp()+interval '5 minutes' \
+                         WHERE id=$1 AND lease_epoch=$3 AND (host_id=$2 OR lease_until<=clock_timestamp()) \
+                         RETURNING {WS_COLUMNS},EXTRACT(EPOCH FROM lease_until)::bigint AS lease_deadline"
+                    ),
+                    &[&id, &state.storage.volume_id, &input.expected_lease_epoch],
+                )
+                .await
+                .map_err(Error::internal)?
+                .ok_or_else(conflict)?;
+            let deadline: i64 = row.get("lease_deadline");
+            takeover_guards.keep();
+            commit_flag.store(true, Ordering::Release);
+            tx.commit().await.map_err(Error::internal)?;
+            Ok((Workspace::from_row(&row), deadline))
+        };
+        if same_host {
+            super::mounts::with_frozen_async(id, commit_started.clone(), commit).await
+        } else {
+            commit.await
+        }
+    }
+    .await;
+
+    let (saved, deadline) = match phase3 {
+        Ok(pair) => pair,
+        Err(error) => {
+            if !commit_started.load(Ordering::Acquire) {
+                takeover_guards.cleanup().await;
+            }
+            return Err(error);
+        }
     };
     super::mounts::ensure_async(&state, id, saved.lease_epoch, deadline).await?;
     Ok(Json(saved))
-}
-
-fn materialize_takeover(state: &AppState, id: Uuid, cp: Uuid) -> Result<(), Error> {
-    let source = checkpoint_repo(state, cp);
-    let destination = super::mounts::lower_path(state, id);
-    if destination.exists() {
-        if core::inventory(&destination).map_err(Error::internal)?
-            != core::inventory(&source).map_err(Error::internal)?
-        {
-            return Err(conflict());
-        }
-        return Ok(());
-    }
-    let parent = destination.parent().ok_or_else(Error::bad_request)?;
-    fs::create_dir_all(parent).map_err(Error::internal)?;
-    let stage = parent.join(format!(".transfer-{}", Uuid::new_v4()));
-    let copied = (|| {
-        core::copy_all(&source, &stage).map_err(Error::internal)?;
-        core::sync_tree(&stage).map_err(Error::internal)?;
-        fs::rename(&stage, &destination).map_err(Error::internal)?;
-        fs::File::open(parent).and_then(|f| f.sync_all()).map_err(Error::internal)
-    })();
-    if copied.is_err() {
-        let _ = fs::remove_dir_all(&stage);
-    }
-    copied
 }
 
 pub async fn fence_restored(pool: &deadpool_postgres::Pool) -> Result<(), Error> {
@@ -383,6 +360,7 @@ pub async fn create(
     // Phase 2: clone under bounded Git slot + source read lease, then compute
     // initial fingerprint on the bounded blocking pool with zero DB locks held.
     let id = Uuid::new_v4();
+    let _mutation = super::blocking::lock_mutation(id, state.config.git_timeout).await?;
     let dest = super::mounts::lower_path(&state, id);
     let dest_parent = dest.clone();
     super::blocking::run(move || {
@@ -392,104 +370,115 @@ pub async fn create(
         Ok(())
     })
     .await?;
-    let cleanup = super::blocking::DirCleanupGuard::new(dest.clone());
-    {
-        let _clone_slot = super::git::try_slot(&state)?;
-        let source_lease =
-            read_leases::shared(&state.pool, repo.repo_id, tokio::time::Instant::now() + state.config.git_timeout)
-                .await?;
-        let _local = tokio::time::timeout(state.config.git_timeout, state.storage.read_snapshot_lock(repo.repo_id))
-            .await
-            .map_err(|_| Error::timeout())?;
-        source_lease.ensure_active()?;
+    let mut cleanup = Some(super::blocking::DirCleanupGuard::new(dest.clone()));
+    let phase2_and_3: Result<(StatusCode, Workspace), Error> = async {
         {
-            let mut client = state.pool.get().await.map_err(Error::internal)?;
-            let tx = client.transaction().await.map_err(Error::internal)?;
-            let refreshed = auth::authorize_repo_with_role(
-                &tx,
-                &actor,
-                &input.owner,
-                &input.repository,
-                Role::Write,
-                crate::token_scopes::RepoAction::WorkspacesWrite,
-            )
-            .await?;
-            if refreshed.repo_id != repo.repo_id {
-                return Err(Error::not_found());
+            let _clone_slot = super::git::try_slot(&state)?;
+            let source_lease =
+                read_leases::shared(&state.pool, repo.repo_id, tokio::time::Instant::now() + state.config.git_timeout)
+                    .await?;
+            let _local = tokio::time::timeout(state.config.git_timeout, state.storage.read_snapshot_lock(repo.repo_id))
+                .await
+                .map_err(|_| Error::timeout())?;
+            source_lease.ensure_active()?;
+            {
+                let mut client = state.pool.get().await.map_err(Error::internal)?;
+                let tx = client.transaction().await.map_err(Error::internal)?;
+                let refreshed = auth::authorize_repo_with_role(
+                    &tx,
+                    &actor,
+                    &input.owner,
+                    &input.repository,
+                    Role::Write,
+                    crate::token_scopes::RepoAction::WorkspacesWrite,
+                )
+                .await?;
+                if refreshed.repo_id != repo.repo_id {
+                    return Err(Error::not_found());
+                }
+                tx.commit().await.map_err(Error::internal)?;
             }
-            tx.commit().await.map_err(Error::internal)?;
+            let repo_id = repo.repo_id;
+            let state_verify = state.clone();
+            let source =
+                super::blocking::run(move || state_verify.storage.verify_path(repo_id).map_err(Error::internal))
+                    .await?;
+            let mut clone = state.storage.git(&state.config);
+            clone
+                .args(["-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks", "--"])
+                .arg(&source)
+                .arg(&dest);
+            source_lease
+                .guard(crate::git_http::collect_git_output(clone, 4096, state.config.git_timeout))
+                .await?
+                .map_err(Error::internal)?;
+            source_lease.ensure_active()?;
         }
-        let repo_id = repo.repo_id;
-        let state_verify = state.clone();
-        let source =
-            super::blocking::run(move || state_verify.storage.verify_path(repo_id).map_err(Error::internal)).await?;
-        let mut clone = state.storage.git(&state.config);
-        clone
-            .args(["-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks", "--"])
-            .arg(&source)
-            .arg(&dest);
-        source_lease
-            .guard(crate::git_http::collect_git_output(clone, 4096, state.config.git_timeout))
-            .await?
-            .map_err(Error::internal)?;
-        source_lease.ensure_active()?;
-    }
 
-    let head = String::from_utf8(git(&state, &dest, &["rev-parse", "HEAD"], 4096).await.unwrap_or_default())
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| crate::browse::models::valid_non_zero_oid(value));
-    if let Some(base) = &input.base_oid
-        && head.as_deref() != Some(base.as_str())
-    {
-        return Err(conflict());
-    }
-    let base_oid = input.base_oid.clone().or(head);
-    let dest_fp = dest.clone();
-    let initial_fingerprint = super::blocking::run(move || super::capture::fingerprint(&dest_fp)).await?;
+        let head = String::from_utf8(git(&state, &dest, &["rev-parse", "HEAD"], 4096).await.unwrap_or_default())
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| crate::browse::models::valid_non_zero_oid(value));
+        if let Some(base) = &input.base_oid
+            && head.as_deref() != Some(base.as_str())
+        {
+            return Err(conflict());
+        }
+        let base_oid = input.base_oid.clone().or(head);
+        let dest_fp = dest.clone();
+        let initial_fingerprint = super::blocking::run(move || super::capture::fingerprint(&dest_fp)).await?;
 
-    // Phase 3: short commit transaction with zero filesystem or Git work.
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let refreshed = auth::authorize_repo_with_role(
-        &tx,
-        &actor,
-        &input.owner,
-        &input.repository,
-        Role::Write,
-        crate::token_scopes::RepoAction::WorkspacesWrite,
-    )
-    .await?;
-    if refreshed.repo_id != repo.repo_id {
-        return Err(Error::not_found());
-    }
-    creation_lock(&tx, actor.id, &key).await?;
-    if let Some(saved) = lookup_existing_creation(&tx, actor.id, &key, &digest, true).await? {
-        tx.commit().await.map_err(Error::internal)?;
-        super::mounts::ensure_from_database(&state, saved.id).await?;
-        return Ok((StatusCode::OK, Json(saved)));
-    }
-    let host_id = state.storage.volume_id;
-    tx.execute(
-        "INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,state,host_id,lease_until,base_oid) \
-         VALUES($1,$2,$3,$4,$5,$6,'ready',$7,clock_timestamp()+interval '5 minutes',$8)",
-        &[&id, &repo.repo_id, &input.owner, &input.repository, &input.agent_id, &actor.id, &host_id, &base_oid],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "INSERT INTO workspace_creations(actor_id,idempotency_key,request_sha256,workspace_id) VALUES($1,$2,$3,$4)",
-        &[&actor.id, &key, &digest, &id],
-    )
-    .await
-    .map_err(Error::internal)?;
-    super::capture::record_fingerprint(&tx, id, &initial_fingerprint).await?;
-    let row = tx
-        .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id])
+        // Phase 3: short commit transaction with zero filesystem or Git work.
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let refreshed = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &input.owner,
+            &input.repository,
+            Role::Write,
+            crate::token_scopes::RepoAction::WorkspacesWrite,
+        )
+        .await?;
+        if refreshed.repo_id != repo.repo_id {
+            return Err(Error::not_found());
+        }
+        creation_lock(&tx, actor.id, &key).await?;
+        if let Some(saved) = lookup_existing_creation(&tx, actor.id, &key, &digest, true).await? {
+            tx.commit().await.map_err(Error::internal)?;
+            return Ok((StatusCode::OK, saved));
+        }
+        let host_id = state.storage.volume_id;
+        tx.execute(
+            "INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,state,host_id,lease_until,base_oid) \
+             VALUES($1,$2,$3,$4,$5,$6,'ready',$7,clock_timestamp()+interval '5 minutes',$8)",
+            &[&id, &repo.repo_id, &input.owner, &input.repository, &input.agent_id, &actor.id, &host_id, &base_oid],
+        )
         .await
         .map_err(Error::internal)?;
-    cleanup.keep();
-    tx.commit().await.map_err(Error::internal)?;
-    super::mounts::ensure_from_database(&state, id).await?;
-    Ok((StatusCode::CREATED, Json(Workspace::from_row(&row))))
+        tx.execute(
+            "INSERT INTO workspace_creations(actor_id,idempotency_key,request_sha256,workspace_id) VALUES($1,$2,$3,$4)",
+            &[&actor.id, &key, &digest, &id],
+        )
+        .await
+        .map_err(Error::internal)?;
+        super::capture::record_fingerprint(&tx, id, &initial_fingerprint).await?;
+        let row = tx
+            .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id])
+            .await
+            .map_err(Error::internal)?;
+        if let Some(guard) = cleanup.take() {
+            guard.keep();
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        Ok((StatusCode::CREATED, Workspace::from_row(&row)))
+    }
+    .await;
+
+    if let Some(guard) = cleanup.take() {
+        guard.cleanup().await;
+    }
+    let (status, saved) = phase2_and_3?;
+    super::mounts::ensure_from_database(&state, saved.id).await?;
+    Ok((status, Json(saved)))
 }

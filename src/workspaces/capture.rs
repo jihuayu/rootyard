@@ -96,14 +96,33 @@ async fn eligible(state: &AppState, id: Uuid) -> Result<Option<(i64, i64)>, Erro
 }
 
 pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
-    // In FUSE mode the mutation gate only exists while the workspace is
-    // mounted; without it no stable snapshot can be taken.
     if !super::mounts::mounted(id) {
         return Ok(false);
     }
     let Some(scan_token) = super::blocking::begin_scan(id) else {
         return Ok(false);
     };
+    reconcile_inner(state, id, Some(scan_token)).await
+}
+
+/// Reconcile native worktree/index edits when the caller already owns the
+/// per-workspace [`super::blocking::MutationGuard`] (e.g., `checkpoints::create`).
+pub(super) async fn reconcile_locked(
+    state: &AppState,
+    id: Uuid,
+    _guard: &super::blocking::MutationGuard,
+) -> Result<bool, Error> {
+    if !super::mounts::mounted(id) {
+        return Ok(false);
+    }
+    reconcile_inner(state, id, None).await
+}
+
+async fn reconcile_inner(
+    state: &AppState,
+    id: Uuid,
+    scan_token: Option<super::blocking::ScanToken>,
+) -> Result<bool, Error> {
     let Some((expected_revision, expected_epoch)) = eligible(state, id).await? else {
         return Ok(false);
     };
@@ -153,9 +172,9 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
     };
     let revision: i64 = row.get(0);
     let epoch: i64 = row.get(1);
-    // A stale scan or any scan overlapping an in-process API mutation must
-    // never overwrite a newer API edit, checkpoint or lease handoff.
-    if !scan_is_current(expected_revision, expected_epoch, revision, epoch) || !scan_token.is_unchanged() {
+    if !scan_is_current(expected_revision, expected_epoch, revision, epoch)
+        || scan_token.as_ref().is_some_and(|token| !token.is_unchanged())
+    {
         return Ok(false);
     }
     let previous = tx
