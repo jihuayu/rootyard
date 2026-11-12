@@ -40,21 +40,17 @@ Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上
   - [issue #168](https://github.com/jihuayu/rootyard/issues/168)（本地集成修复提交 `a72cd4e`，LunaMax 已审）：41 项 W0 测试及真实 Git 的默认小规模运行通过。
   - [issue #171](https://github.com/jihuayu/rootyard/issues/171)（本地集成修复提交 `9f161c9`，LunaMax 已审）：21 项 overlay 负向检查及实际 `cargo check --locked --lib --tests`（0 错误、0 警告）通过；Root 在私有 `TMPDIR` 下重跑组合 overlay/W0 62 项通过。
   - [PR #172](https://github.com/jihuayu/rootyard/pull/172)（`fbe27cd`）：新增一致性/会话契约草案文档；其会话读取实施由 PR #209（Refs [#174](https://github.com/jihuayu/rootyard/issues/174)）交付**单机 PostgreSQL 基础**：`ROOTYARD_SESSION_KEYRING` v2 加载器、HMAC `rs1` 帧（绑定 tenant/repository/format/history/authority-kind/authority-epoch/group-id/group-epoch/cluster-incarnation/revision）、JSON 读强制、push 提交签发、sealed serving-read proof，以及真实 HTTP/PG 验收。`rs1` 显式携带 `authority_kind` 与 `group_id`，未知 authority-kind 字节按 malformed 失败关闭。
-- **未包含**：issue #169（配对归档 corrupt-ledger 加固）不在 PR #170 中，仍 OPEN；其候选实现见下方“issue #169 候选实现”。#162–#165 仍是 backlog（见[实施计划](implementation-plan.md)）。#174 仍 **OPEN**：浏览器/UI 传播、完整损坏/保留矩阵与分布式 Raft Ref-CAS 矩阵尚未完成；当前范围是会话级 read-your-writes / monotonic reads，不是全局因果一致性。
+- **未包含**：issue #169（配对归档 corrupt-ledger 加固）当时不在 PR #170 中，后续由 [PR #214](https://github.com/jihuayu/rootyard/pull/214) 实现（见下节“issue #169 实现与边界”）。#162–#165 仍是未实现 backlog（见[实施计划](implementation-plan.md)）。#174 仍 **OPEN**：浏览器/UI 传播、完整损坏/保留矩阵与分布式 Raft Ref-CAS 矩阵尚未完成；当前范围是会话级 read-your-writes / monotonic reads，不是全局因果一致性。
 
-## issue #169 边界
+## issue #169 实现与边界（[PR #214](https://github.com/jihuayu/rootyard/pull/214)）
 
-配对归档当前仅在受支持的 API 产生的静止配对流程上有资格。PR #161 本身没有完整的 ledger corruption guard；LunaMax 独立审查确认，由 API 创建并在静止状态固定的 root pack 能原子地从已登记的永久 artifact 派生，手工或特权直接改 DB 造成的损坏（root 到 A4 的等价性）未被 PR #161 语义验证。因此 #169 仍保持 OPEN，只有在候选实现合并并完成 PR CI/原生验收后才可关闭；本页不把候选分支的本地结果当作已合并能力。
+PR #161 初版没有完整的源账本损坏防护（手工或特权直接改 DB 造成的 root/snapshot/serving-read 到 A4 等价性破坏未被逐项校验）。[PR #214](https://github.com/jihuayu/rootyard/pull/214) 为 `format 22` 配对归档补齐源账本与物理 Blob 闭包逐项验证器，严格保持下列能力与边界（不改变 PR #170 的历史集成记录）：
 
-### issue #169 候选实现（[PR #214](https://github.com/jihuayu/rootyard/pull/214) / `codex/backup169-candidate-20261110`，未合并）
-
-候选分支已实现并测试以下边界，但尚未合并到 `main`，也不改变 PR #170 的集成记录：
-
-- **声明集合枚举**：`src/backup/ledger_validation.rs`（SQL 在 `ledger_validation/sql.rs`，摘要词表/typed refusal 在 `ledger_validation/refusal.rs`）在调用方已有的 `REPEATABLE READ` 导出快照事务（恢复时为恢复后的数据库）和**同一个绝对 deadline** 上读取；不新建连接、不 `BEGIN`、不取第二个快照。`membership`、A5 `snapshot_packs`、活动/已释放 `root_packs`、`serving_read_packs` 分别从各自的声明表枚举，artifact 侧使用 LEFT JOIN，所以缺失的 pack/idx 行变成 NULL 而不是让结果静默缩小。
+- **声明集合枚举**：`src/backup/ledger_validation.rs`（SQL 在 `ledger_validation/sql.rs`，摘要词表/typed refusal 在 `ledger_validation/refusal.rs`）在调用方已有的 `REPEATABLE READ` 导出快照事务（恢复时为恢复后的数据库）和**同一个绝对 deadline** 上读取；不新建连接、不 `BEGIN`、不取第二个快照。`membership`、A5 `snapshot_packs`、活动/已释放 `root_packs`、`serving_read_packs` 分别从各自的声明表枚举，artifact 侧使用 LEFT JOIN，并对缺失仓库行或非 `pg_refstore` 仓库名下仍残留的 snapshot/root/serving-read 声明通过 `$1::uuid[]` 回查（不在 `declared` 子句中内连接过滤），避免缺失行或被篡改的 `storage_backend` 让结果静默缩小。
 - **逐项证明**：每个应归档 registration 必须恰好有 `pack`(slot 0) 与 `idx`(slot 1) 两个角色、合法 slot/locator、与同一 publication 的 acquire/consume request、durable hold 和 consume receipt 绑定，且 producer 与 tenant 两种身份分别核对；`artifact_set_digest` 从实际 artifact 行重算。A5 snapshot 与 retained root descriptor 逐项对照同一 canonical A4 集合；retained capture 还由 core 自己的 `retention_root` validator 在同一事务/期限上重新证明。任何缺件、额外/非法角色、错误摘要或身份/摘要不匹配都会形成有界、固定词表的 typed refusal，并在创建目标目录、`COMPLETE` 或 manifest 之前失败。
-- **负向测试**：`tests/backup_blob_serving147.py` 的六个 corruption case（缺 `.pack`、缺 `.idx`、缺全部 artifact、错误 `artifact_set_digest`、缺 durable hold、错误 hold locator）在一次性 `pg_dump` clone 中构造，只在一个 `SET LOCAL session_replication_role = replica` 事务内改动目标行，先证明恰好该行/字段变化，再删除 clone；备份只允许以该 case 的精确 source-ledger validator violation 拒绝，且目标路径、`COMPLETE`、manifest 均不存在，干净归档随后在全新数据库恢复且摘要/locator 不变；此外 `src/backup/ledger_validation/pg_tests.rs` 对已种源数据库做 8 项隔离 `REPEATABLE READ` 事务回归。
+- **负向测试**：`tests/backup_blob_serving147.py` 的六个 corruption case（缺 `.pack`、缺 `.idx`、缺全部 artifact、错误 `artifact_set_digest`、缺 durable hold、错误 hold locator）在一次性 `pg_dump` clone 中构造，只在一个 `SET LOCAL session_replication_role = replica` 事务内改动目标行，先证明恰好该行/字段变化，再删除 clone；备份只允许以该 case 的精确 source-ledger validator violation 拒绝，且目标路径、`COMPLETE`、manifest 均不存在，干净归档随后在全新数据库恢复且摘要/locator 不变；此外 `src/backup/ledger_validation/pg_tests.rs` 对已种源数据库做 10 项隔离 `REPEATABLE READ` 事务回归（含非 `pg_refstore`/缺失仓库、悬挂 `registration_id` 及孤立 `serving_read_packs` 的 `undeclared` 回查路径）。
 - **正向测试**：同一 drill 的第二份 API 产生源（`tests/ref_store_format22_backup_fixture.rs`，`pando-lab,format22-fixture`）带非空的活动与已释放 API-created roots，producer owner 与 repository tenant 不同；drill 验证 format22 manifest 的完整 artifact 集合、字节证明/摘要、root 生命周期和 serving-read 记录，并恢复到全新数据库。
-- **CI 状态**：PR #214 前序提交 `c840dec` 在 GitHub Actions 通过 `CI / verify`、`CI / container`、`Pando synthetic lab`、`Redis contract` 四项远端检查，`RefStore protocol native acceptance / native` 因 `ref_store_decision_subset` 增至 23 项而旧工作流仍断言 `[8, 11, 12, 20]` 在四套件计数步骤中止（后续 fixture 与 paired drill 步骤尚未在远端跑完）。当前分支已合并 `origin/main`（`3f21678`，含 PR #211/#213）、修正套件计数断言为 `[8, 11, 12, 23]` 并通过本地 PG/Garage 原生验证（四套件 8+11+12+23=54 项零失败零忽略及 8 项已种源 `pg_tests`）；合并与 issue 关闭仍以 PR #214 远端完整检查通过为准。
+- **非扩权范围边界**：本实现仅覆盖**同一物理 Blob 后端**上的 `pg_refstore` pack/idx 闭包（`membership`、`snapshot_packs`、`root_packs`、`serving_read_packs`）；物理 Blob GC 仍保持关闭；不声称单机全量切换（[#147](https://github.com/jihuayu/rootyard/issues/147)/[#120](https://github.com/jihuayu/rootyard/issues/120) 全内容/默认入口切换未完成）、分布式 Raft Ref-CAS、HA 或跨后端重传恢复。
 
 #171 的修复随 PR #170 整合，最终 CI 状态以 PR 为准；它只处理合并后的契约缺陷，未新增或声称任何分布式、HA、GC 或容量能力：
 
@@ -62,7 +58,7 @@ Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上
 - W0/phase-metrics 的 feature-only overlay 检查改为只针对其冻结的 parent fixture（`bcd3918` manifest/lock）；当前集成 manifest 单独做显式契约验证。历史 v1/v5/v6 原始测量报告未修改。
 - `src/web.rs` 路由合成整理到原有 100 行结构上限内，全部 48 条路由与 session/Origin/CSRF 中间件保持不变；`src/token_management/mod.rs` 的过时发布声明注释已更正（父 token 发布锁已包含在当前代码）。
 
-本页不以缺失前提条件代替回归证据；集成后的二进制/PG 原生门禁以 PR #170 最终检查为准。缺陷修复 #166–#168 已有绑定各自提交的结果（见“集成状态”），集成后是否闭合以 PR #170 最终证据为准；[#169](https://github.com/jihuayu/rootyard/issues/169) 仍 OPEN，其候选实现见本节，合并与 CI 通过前不改变该状态；#162–#165 仍是 backlog（见[实施计划](implementation-plan.md)）。[#174](https://github.com/jihuayu/rootyard/issues/174) 的单机 PostgreSQL 会话下界基础已由 PR #209 实现，但 issue 仍 OPEN（UI 传播、完整损坏/保留与分布式矩阵未完成）。详细构建、源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md) 与 [standalone147 证据](../../evidence/state-services/standalone147-followup/README.md)。
+本页不以缺失前提条件代替回归证据；集成后的二进制/PG 原生门禁以 PR #170 最终检查为准。缺陷修复 #166–#168 已有绑定各自提交的结果（见“集成状态”），集成后是否闭合以 PR #170 最终证据为准；[#169](https://github.com/jihuayu/rootyard/issues/169) 已由 [PR #214](https://github.com/jihuayu/rootyard/pull/214) 实现同物理 Blob 后端上的 `format 22` 源账本与 `pg_refstore` pack/idx 闭包逐项校验（边界见本节，物理 GC 仍关闭，不扩大到 `#147`/`#120` 全量切换、跨后端重传、HA 或分布式 Ref-CAS）；#162–#165 仍是未实现 backlog（见[实施计划](implementation-plan.md)）。[#174](https://github.com/jihuayu/rootyard/issues/174) 的单机 PostgreSQL 会话下界基础已由 PR #209 实现，但 issue 仍 OPEN（UI 传播、完整损坏/保留与分布式矩阵未完成）。详细构建、源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md) 与 [standalone147 证据](../../evidence/state-services/standalone147-followup/README.md)。
 
 ## format22 配对备份与恢复的真实边界
 

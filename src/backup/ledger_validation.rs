@@ -70,8 +70,7 @@ pub(super) async fn validate_source(
     sets.tombstones = decode_tombstones(rows(client, TOMBSTONES, &[], deadline).await?);
     let missing = super::ledger_sets::undeclared(&sets.declared, &sets.snapshots, &sets.roots, &sets.serving_reads);
     if !missing.is_empty() {
-        let ids = missing.iter().map(|id| id as &(dyn tokio_postgres::types::ToSql + Sync)).collect::<Vec<_>>();
-        let orphans = decode_declared(&rows(client, &declared_query(true), &ids, deadline).await?)?;
+        let orphans = decode_declared(&rows(client, &declared_query(true), &[&missing], deadline).await?)?;
         sets.declared.extend(orphans.into_iter().filter(|pair| missing.contains(&pair.registration_id)));
     }
     let mut violations = sets.violations();

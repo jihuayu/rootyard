@@ -17,7 +17,7 @@
 ///
 /// Each set row carries its own artifact-set digest and joined revision, so a
 /// partial or re-pointed row is a mismatch instead of being averaged away.
-pub(in crate::backup) const DECLARED_SETS: &str = "WITH scoped AS (
+const SCOPED_SETS: &str = "WITH scoped AS (
            SELECT 'membership'::text source,p.repository_id,p.pack_id,p.registration_id,p.artifact_set_digest,
                   p.joined_revision
              FROM public.ref_store_core_pack_memberships p
@@ -32,11 +32,9 @@ pub(in crate::backup) const DECLARED_SETS: &str = "WITH scoped AS (
            SELECT 'serving_read_packs',s.repository_id,p.pack_id,p.registration_id,p.artifact_set_digest,
                   p.joined_revision
              FROM public.ref_store_core_serving_read_packs p
-             JOIN public.ref_store_core_serving_reads s ON s.pin_id=p.pin_id),
-         declared AS (
-           SELECT s.* FROM scoped s
-             JOIN public.repositories r ON r.id=s.repository_id AND r.storage_backend='pg_refstore'),
-         sets AS (
+             JOIN public.ref_store_core_serving_reads s ON s.pin_id=p.pin_id)";
+
+const PUBLISHED_SETS: &str = "sets AS (
            SELECT d.repository_id,d.pack_id,d.registration_id,
                   array_agg(DISTINCT d.source ORDER BY d.source) declared_by,
                   array_agg(DISTINCT d.source||'='||d.artifact_set_digest||'@'||d.joined_revision ORDER BY d.source||'='||d.artifact_set_digest||'@'||d.joined_revision)
@@ -57,8 +55,17 @@ pub(in crate::backup) const DECLARED_SETS: &str = "WITH scoped AS (
              FROM sets s
              LEFT JOIN public.ref_store_core_pack_publications g
                ON g.registration_id=s.registration_id AND g.repository_id=s.repository_id AND g.pack_id=s.pack_id
-             LEFT JOIN public.repositories r ON r.id=s.repository_id
+             LEFT JOIN public.repositories r ON r.id=s.repository_id AND r.storage_backend='pg_refstore'
              LEFT JOIN public.ref_store_core_gates ge ON ge.repository_id=s.repository_id)";
+
+fn declared_sets_cte(restrict: bool) -> String {
+    let declared = if restrict {
+        "SELECT s.* FROM scoped s WHERE s.registration_id=ANY($1::uuid[])"
+    } else {
+        "SELECT s.* FROM scoped s JOIN public.repositories r ON r.id=s.repository_id AND r.storage_backend='pg_refstore'"
+    };
+    format!("{SCOPED_SETS},\n         declared AS ({declared}),\n         {PUBLISHED_SETS}")
+}
 
 /// The header-only declared rows (no artifact join) for
 /// [`super::ledger::inventory`]: [`DECLARED_COLUMNS`] (0..19) plus the artifact
@@ -66,8 +73,9 @@ pub(in crate::backup) const DECLARED_SETS: &str = "WITH scoped AS (
 /// `None` and never reads 21.., so this deliberately is *not* a mirror of
 /// [`ARTIFACT_COLUMNS`]: only the "no artifact" sentinel is supplied.
 pub(in crate::backup) fn declared_sql() -> String {
+    let ctes = declared_sets_cte(false);
     format!(
-        "{DECLARED_SETS}
+        "{ctes}
          SELECT {DECLARED_COLUMNS},{ARTIFACT_SENTINEL}
            FROM published p
           ORDER BY p.repository_id,p.pack_id,p.registration_id"
@@ -124,20 +132,15 @@ pub(in crate::backup) const ARTIFACT_COLUMNS: &str =
 pub(in crate::backup) const ARTIFACT_SENTINEL: &str = "NULL::text AS role";
 
 /// Every declared registration with its publication, artifacts, durable hold
-/// and consume receipt, optionally restricted to `ids` (a `uuid[]` parameter).
+/// and consume receipt, optionally restricted to `$1::uuid[]` without filtering
+/// `declared` by `public.repositories` so orphan/non-`pg_refstore` declarations
+/// remain visible to the step-7 lookup.
 pub(in crate::backup) fn declared_query(restrict: bool) -> String {
-    let (wanted, join) = if restrict {
-        (
-            ", wanted AS (SELECT unnest($1::uuid[]) registration_id)",
-            " JOIN wanted w ON w.registration_id=p.registration_id",
-        )
-    } else {
-        ("", "")
-    };
+    let ctes = declared_sets_cte(restrict);
     format!(
-        "{DECLARED_SETS}{wanted}
+        "{ctes}
          SELECT {DECLARED_COLUMNS},{ARTIFACT_COLUMNS}
-           FROM published p{join}
+           FROM published p
            LEFT JOIN public.ref_store_core_pack_artifacts a ON a.registration_id=p.registration_id
            LEFT JOIN public.artifact_holds h ON h.hold_id=a.hold_id AND h.request_id=a.acquire_request_id
            LEFT JOIN public.artifact_hold_requests q ON q.request_id=h.request_id
@@ -201,3 +204,26 @@ pub(in crate::backup) const REALM: &str =
        LEFT JOIN public.ref_store_core_gates g ON g.repository_id=r.id
       WHERE r.storage_backend='pg_refstore'
       ORDER BY r.id";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restricted_declared_query_skips_repository_inner_join_and_keeps_pg_refstore_left_join() {
+        let regular = declared_query(false);
+        assert!(regular.contains(
+            "declared AS (SELECT s.* FROM scoped s JOIN public.repositories r ON r.id=s.repository_id AND r.storage_backend='pg_refstore')"
+        ));
+        assert!(!regular.contains("$1::uuid[]"));
+
+        let restricted = declared_query(true);
+        assert!(restricted.contains("declared AS (SELECT s.* FROM scoped s WHERE s.registration_id=ANY($1::uuid[]))"));
+        assert!(!restricted.contains("FROM scoped s JOIN public.repositories"));
+        assert!(
+            restricted.contains(
+                "LEFT JOIN public.repositories r ON r.id=s.repository_id AND r.storage_backend='pg_refstore'"
+            )
+        );
+    }
+}

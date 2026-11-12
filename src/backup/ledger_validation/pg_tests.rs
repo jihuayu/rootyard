@@ -289,3 +289,203 @@ async fn repointed_hold_request_id_is_refused_without_panicking() -> Result<()> 
     )
     .await
 }
+
+/// Step-7 `undeclared` fallback when `declared_query(false)` cannot see a
+/// repository's packs because `repositories.storage_backend != 'pg_refstore'`
+/// (`missing.len() >= 2`) or the `public.repositories` row is absent
+/// (`missing.len() == 1`). Both must bind `$1::uuid[]` cleanly, recover the
+/// `scoped` rows via `declared_query(true)` and return a typed
+/// `LedgerValidationRefusal` rather than a SQL parameter/read error.
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL seeded by ref_store_format22_backup_fixture"]
+async fn non_pg_refstore_and_missing_repository_undeclared_packs_are_refused() -> Result<()> {
+    // 1. Multi-item `missing.len() >= 2`: flip every `pg_refstore` repository to `gitfs`.
+    {
+        let mut client = connect().await?;
+        let tx = repeatable_read(&mut client).await?;
+        tx.query_one("SELECT pg_advisory_xact_lock(16900169)", &[]).await?;
+        tx.batch_execute("SET LOCAL session_replication_role = replica").await?;
+        let undeclared_count: i64 = tx
+            .query_one(
+                "SELECT count(DISTINCT registration_id) FROM (
+                   SELECT p.registration_id FROM public.ref_store_core_snapshot_packs p
+                     JOIN public.ref_store_core_snapshots s ON s.snapshot_id=p.snapshot_id
+                    WHERE s.pack_mode='pack_verified'
+                   UNION SELECT registration_id FROM public.ref_store_core_root_packs
+                   UNION SELECT p.registration_id FROM public.ref_store_core_serving_read_packs p
+                     JOIN public.ref_store_core_serving_reads s ON s.pin_id=p.pin_id
+                 ) u",
+                &[],
+            )
+            .await?
+            .get(0);
+        ensure!(
+            undeclared_count >= 2,
+            "expected >= 2 declared snapshot/root/serving registrations, got {undeclared_count}"
+        );
+        let changed = tx
+            .execute("UPDATE public.repositories SET storage_backend='gitfs' WHERE storage_backend='pg_refstore'", &[])
+            .await?;
+        ensure!(changed >= 1, "expected at least one pg_refstore repository");
+        let outcome = validate_source(&tx, deadline()).await;
+        tx.rollback().await?;
+        let error = outcome.expect_err("non-pg_refstore repository owning RefStore packs must be refused");
+        let refusal = error.downcast::<LedgerValidationRefusal>().map_err(|error| {
+            error.context("validator did not return typed refusal for non-pg_refstore undeclared packs")
+        })?;
+        ensure!(
+            refusal.codes().contains(&"publication_binding_mismatch"),
+            "expected publication_binding_mismatch, got {:?} ({})",
+            refusal.codes(),
+            refusal.diagnostic()
+        );
+    }
+
+    // 2. Single-item `missing.len() == 1` present in `scoped`: isolate one snapshot
+    // registration on its repository and delete that repository row.
+    {
+        let mut client = connect().await?;
+        let tx = repeatable_read(&mut client).await?;
+        tx.query_one("SELECT pg_advisory_xact_lock(16900169)", &[]).await?;
+        tx.batch_execute("SET LOCAL session_replication_role = replica").await?;
+        let row = tx
+            .query_one(
+                "SELECT s.repository_id,p.registration_id
+                   FROM public.ref_store_core_snapshots s
+                   JOIN public.ref_store_core_snapshot_packs p ON p.snapshot_id=s.snapshot_id
+                   JOIN public.repositories r ON r.id=s.repository_id AND r.storage_backend='pg_refstore'
+                  WHERE s.pack_mode='pack_verified'
+                  ORDER BY s.repository_id,p.registration_id LIMIT 1",
+                &[],
+            )
+            .await?;
+        let repo_id: Uuid = row.get(0);
+        let reg_id: Uuid = row.get(1);
+        tx.execute(
+            "DELETE FROM public.ref_store_core_snapshot_packs WHERE repository_id=$1 AND registration_id<>$2",
+            &[&repo_id, &reg_id],
+        )
+        .await?;
+        for table in [
+            "ref_store_core_root_packs",
+            "ref_store_core_root_refs",
+            "ref_store_core_root_oids",
+            "ref_store_core_roots",
+            "ref_store_core_root_heads",
+            "ref_store_core_root_tombstones",
+        ] {
+            tx.execute(&format!("DELETE FROM public.{table} WHERE repository_id=$1"), &[&repo_id]).await?;
+        }
+        for child in [
+            "ref_store_core_serving_read_packs",
+            "ref_store_core_serving_read_artifacts",
+            "ref_store_core_serving_read_refs",
+        ] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM public.{child} c USING public.ref_store_core_serving_reads s
+                      WHERE c.pin_id=s.pin_id AND s.repository_id=$1"
+                ),
+                &[&repo_id],
+            )
+            .await?;
+        }
+        tx.execute("DELETE FROM public.ref_store_core_serving_reads WHERE repository_id=$1", &[&repo_id]).await?;
+        let deleted = tx.execute("DELETE FROM public.repositories WHERE id=$1", &[&repo_id]).await?;
+        ensure!(deleted == 1, "expected to delete exactly one repository row");
+        let outcome = validate_source(&tx, deadline()).await;
+        tx.rollback().await?;
+        let error = outcome.expect_err("deleted repository row owning a snapshot pack must be refused");
+        let refusal = error
+            .downcast::<LedgerValidationRefusal>()
+            .map_err(|error| error.context("validator did not return typed refusal for missing repository row"))?;
+        ensure!(
+            refusal.codes().contains(&"publication_binding_mismatch"),
+            "expected publication_binding_mismatch, got {:?} ({})",
+            refusal.codes(),
+            refusal.diagnostic()
+        );
+    }
+    Ok(())
+}
+
+/// Step-7 `undeclared` fallback when `missing` contains 1 or >= 2 registration
+/// ids absent from `scoped` altogether, plus an orphan `serving_read_packs`
+/// child row whose `ref_store_core_serving_reads` header was deleted.
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL seeded by ref_store_format22_backup_fixture"]
+async fn repointed_undeclared_registrations_and_orphan_serving_read_packs_are_refused() -> Result<()> {
+    let registration = registered_pack().await?;
+    // 1. Single unknown registration_id (`missing.len() == 1`, 0 rows in `scoped`).
+    assert_refused(
+        "UPDATE public.ref_store_core_snapshot_packs SET registration_id=gen_random_uuid()
+          WHERE ctid=(SELECT ctid FROM public.ref_store_core_snapshot_packs WHERE registration_id=$1 LIMIT 1)",
+        registration,
+        "unregistered_publication",
+    )
+    .await?;
+
+    // 2. Multiple unknown registration_ids (`missing.len() >= 2`, 0 rows in `scoped`).
+    {
+        let mut client = connect().await?;
+        let tx = repeatable_read(&mut client).await?;
+        tx.query_one("SELECT pg_advisory_xact_lock(16900169)", &[]).await?;
+        tx.batch_execute("SET LOCAL session_replication_role = replica").await?;
+        let c1 = tx
+            .execute(
+                "UPDATE public.ref_store_core_snapshot_packs SET registration_id=gen_random_uuid()
+                  WHERE ctid=(SELECT ctid FROM public.ref_store_core_snapshot_packs LIMIT 1)",
+                &[],
+            )
+            .await?;
+        let c2 = tx
+            .execute(
+                "UPDATE public.ref_store_core_serving_read_packs SET registration_id=gen_random_uuid()
+                  WHERE ctid=(SELECT ctid FROM public.ref_store_core_serving_read_packs LIMIT 1)",
+                &[],
+            )
+            .await?;
+        ensure!(c1 == 1 && c2 == 1, "expected to re-point one snapshot pack and one serving-read pack");
+        let outcome = validate_source(&tx, deadline()).await;
+        tx.rollback().await?;
+        let error = outcome.expect_err("re-pointed undeclared registrations must be refused");
+        let refusal = error
+            .downcast::<LedgerValidationRefusal>()
+            .map_err(|error| error.context("validator did not return typed refusal for >= 2 unknown registrations"))?;
+        ensure!(
+            refusal.codes().contains(&"unregistered_publication"),
+            "expected unregistered_publication, got {:?} ({})",
+            refusal.codes(),
+            refusal.diagnostic()
+        );
+    }
+
+    // 3. Orphan `serving_read_packs` row whose `pin_id` has no header in `ref_store_core_serving_reads`.
+    {
+        let mut client = connect().await?;
+        let tx = repeatable_read(&mut client).await?;
+        tx.query_one("SELECT pg_advisory_xact_lock(16900169)", &[]).await?;
+        tx.batch_execute("SET LOCAL session_replication_role = replica").await?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM public.ref_store_core_serving_reads
+                  WHERE pin_id IN (SELECT pin_id FROM public.ref_store_core_serving_read_packs)",
+                &[],
+            )
+            .await?;
+        ensure!(deleted >= 1, "expected at least one serving read header with pack rows");
+        let outcome = validate_source(&tx, deadline()).await;
+        tx.rollback().await?;
+        let error = outcome.expect_err("orphan serving_read_packs row must be refused");
+        let refusal = error
+            .downcast::<LedgerValidationRefusal>()
+            .map_err(|error| error.context("validator did not return typed refusal for orphan serving_read_packs"))?;
+        ensure!(
+            refusal.codes().contains(&"serving_read_orphan"),
+            "expected serving_read_orphan, got {:?} ({})",
+            refusal.codes(),
+            refusal.diagnostic()
+        );
+    }
+    Ok(())
+}
