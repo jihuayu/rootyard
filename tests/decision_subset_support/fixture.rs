@@ -59,6 +59,14 @@ pub fn absent_store() -> Result<BlobStore> {
     opened
 }
 
+/// The three independent identities of a production plan: the authenticated
+/// issuer, its lane and the publication producer.
+pub struct Producer<'a> {
+    pub issuer_id: Uuid,
+    pub lane: &'a str,
+    pub producer: Uuid,
+}
+
 pub struct World {
     pub db: Db,
     pub store: BlobStore,
@@ -127,6 +135,23 @@ impl World {
         issuer_id: Uuid,
         lane: &str,
     ) -> Result<(PackCommitPlan, PackPendingToken)> {
+        let producer = self.verified.tenant;
+        self.plan_as_producer(refs, sequence, mode, head, Producer { issuer_id, lane, producer }).await
+    }
+
+    /// Same original plan with the production producer semantics: the scope's
+    /// `tenant_id` is the repository tenant, while `owner_id` is the independent
+    /// publication producer (a real, maybe non-tenant, API user), and the issuer
+    /// is the exact authenticated actor.
+    pub async fn plan_as_producer(
+        &self,
+        refs: Vec<RefUpdate>,
+        sequence: i64,
+        mode: CommitMode,
+        head: HeadUpdate,
+        actor: Producer<'_>,
+    ) -> Result<(PackCommitPlan, PackPendingToken)> {
+        let Producer { issuer_id, lane, producer } = actor;
         let gate = &self.verified.gate;
         let mut client = self.db.pool.get().await?;
         let baseline =
@@ -140,7 +165,7 @@ impl World {
         let scope = PackCommitScope::new(
             self.verified.repo,
             self.verified.tenant,
-            self.verified.tenant,
+            producer,
             gate.object_format(),
             gate.history_incarnation(),
             gate.authority_epoch(),
@@ -190,6 +215,22 @@ impl World {
         Ok(self.plan_as(refs, sequence, CommitMode::AcceptedSubset, head, issuer_id, lane).await?.0)
     }
 
+    /// `plan_with_head_as` with a non-tenant publication producer.
+    pub async fn plan_with_head_as_producer(
+        &self,
+        refs: Vec<RefUpdate>,
+        sequence: i64,
+        head: HeadUpdate,
+        issuer_id: Uuid,
+        lane: &str,
+        producer: Uuid,
+    ) -> Result<PackCommitPlan> {
+        Ok(self
+            .plan_as_producer(refs, sequence, CommitMode::AcceptedSubset, head, Producer { issuer_id, lane, producer })
+            .await?
+            .0)
+    }
+
     /// Drive the full staged facade and return the exact-op receipt. A final
     /// authorization/policy drift is an `Ok` receipt with a rejected terminal;
     /// native/whole-operation failures stay `Err`.
@@ -232,14 +273,22 @@ pub async fn select(
     prepared: PreparedPublication,
     actor: &Actor,
 ) -> Result<AuthorizedSelection> {
+    select_as(adapter, pool, prepared, &actor.identity).await
+}
+
+/// `select` as an exact authenticated identity (the production facade itself refuses any
+/// issuer/actor mismatch; this exists to exercise that refusal with a real second session).
+pub async fn select_as(
+    adapter: &PgAuthorizedCommit,
+    pool: &Pool,
+    prepared: PreparedPublication,
+    actor: &rootyard::db::Identity,
+) -> Result<AuthorizedSelection> {
     let mode = match prepared.commit_mode() {
         CommitMode::Atomic => AuthorizedCommitMode::Atomic,
         CommitMode::AcceptedSubset => AuthorizedCommitMode::AcceptedSubset,
     };
-    adapter
-        .select(pool, prepared, &actor.identity, mode, deadline())
-        .await
-        .map_err(|error| anyhow!("select refused: {error:?}"))
+    adapter.select(pool, prepared, actor, mode, deadline()).await.map_err(|error| anyhow!("select refused: {error:?}"))
 }
 
 pub async fn verify(

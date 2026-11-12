@@ -6,11 +6,13 @@
 //! only if (a) the T1 transaction cleanup succeeded, (b) every registered pack/idx was downloaded and verified,
 //! (c) the synthetic non-branch root refs and HEAD attested exactly, and (d) the native closure carries exactly
 //! the canonical binding digest computed from the sealed metadata.
-use super::candidate::{RootCandidate, source_read_digest};
-use super::capture::{BindingParts, binding_digest};
+use super::candidate::{RootCandidate, SealRequest, source_read_digest};
+use super::capture::{self, BindingParts, binding_digest};
 use super::error::RootError;
 use super::request::PrepareRootRequest;
 use super::selector::{native_refs, resolve_oids};
+use super::sql_read;
+use super::{RootPurpose, RootRef, RootSelectorKind};
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::contract::RefStoreError;
 use crate::ref_store::core::pack_commit::{NativeReadEngine, NativeReadRequest, PackCommitError};
@@ -20,6 +22,8 @@ use crate::ref_store::tx::begin_bounded;
 use deadpool_postgres::Pool;
 use std::path::PathBuf;
 use tokio::time::{Instant, timeout_at};
+use tokio_postgres::GenericClient;
+use uuid::Uuid;
 
 /// Frozen roots adapter. Construction validates the absolute trusted Git binary once; it grants no capability.
 pub struct PgRetentionRoots {
@@ -117,15 +121,17 @@ impl PgRetentionRoots {
         drop(native);
 
         let candidate = RootCandidate::seal(
-            *request.scope(),
-            reference,
-            request.root_id(),
-            request.operation_id(),
-            operation_digest,
-            request.selector().kind(),
-            oids,
+            SealRequest {
+                scope: *request.scope(),
+                reference,
+                root_id: request.root_id(),
+                operation_id: request.operation_id(),
+                operation_digest,
+                selector_kind: request.selector().kind(),
+                oids,
+                packs: sealed.packs().to_vec(),
+            },
             &sealed,
-            sealed.packs().to_vec(),
         )?;
         if candidate.binding_digest() != binding {
             return Err(RootError::RootDigestConflict("sealed candidate binding differs from the native binding"));
@@ -215,4 +221,104 @@ async fn capture_t1(
 /// Map the private native refusal without promoting Git text, argv, a path, a locator or provider text.
 fn map_native_error(error: PackCommitError) -> RootError {
     RootError::from(error)
+}
+
+/// Re-proven metadata of one retained capture, as the core itself stores it.
+///
+/// It holds only values the public [`RootRecord`] already exposes; the core's row structs stay private.
+/// The capture is addressed by its key, so it carries no repository/root id of its own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedCapture {
+    tenant_id: Uuid,
+    owner_id: Uuid,
+    purpose: RootPurpose,
+    business_intent_digest: String,
+    register_digest: String,
+    head_ref: String,
+    head_oid: Option<String>,
+    selector_kind: RootSelectorKind,
+    oids: Vec<String>,
+    refs_digest: String,
+    pack_set_digest: String,
+    native_binding_digest: String,
+}
+
+impl ValidatedCapture {
+    fn of(capture: capture::RawCapture) -> Result<Self, RootError> {
+        let binding = capture.binding_digest()?;
+        let header = capture.header;
+        let header_register = header.register_digest.clone();
+        if header_register != capture::register_digest(binding, header.root_id, header.purpose.as_str()).as_hex() {
+            return Err(RootError::RootDigestConflict("retained root register digest disagrees with its binding"));
+        }
+        Ok(Self {
+            tenant_id: header.tenant_id,
+            owner_id: header.owner_id,
+            purpose: header.purpose,
+            business_intent_digest: header.business_intent_digest,
+            register_digest: header_register,
+            head_ref: header.head_ref,
+            head_oid: header.head_oid,
+            selector_kind: header.selector_kind,
+            oids: capture.oids,
+            refs_digest: header.refs_digest,
+            pack_set_digest: header.pack_set_digest,
+            native_binding_digest: header.native_binding_digest,
+        })
+    }
+
+    pub(crate) fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+    /// The producer/requester; it may differ from the tenant.
+    pub(crate) fn owner_id(&self) -> Uuid {
+        self.owner_id
+    }
+    pub(crate) fn purpose(&self) -> RootPurpose {
+        self.purpose
+    }
+    pub(crate) fn business_intent_digest_hex(&self) -> &str {
+        &self.business_intent_digest
+    }
+    /// Recomputed by [`capture::register_digest`] from the binding; `register` stores the same value.
+    pub(crate) fn register_digest_hex(&self) -> &str {
+        &self.register_digest
+    }
+    pub(crate) fn head_ref(&self) -> &str {
+        &self.head_ref
+    }
+    pub(crate) fn head_oid_hex(&self) -> Option<&str> {
+        self.head_oid.as_deref()
+    }
+    pub(crate) fn selector_kind(&self) -> RootSelectorKind {
+        self.selector_kind
+    }
+    /// The exact selector oids, already required to equal `resolve_oids` of the stored kind.
+    pub(crate) fn root_oids(&self) -> &[String] {
+        &self.oids
+    }
+    pub(crate) fn refs_digest_hex(&self) -> &str {
+        &self.refs_digest
+    }
+    pub(crate) fn pack_set_digest_hex(&self) -> &str {
+        &self.pack_set_digest
+    }
+    pub(crate) fn native_binding_digest_hex(&self) -> &str {
+        &self.native_binding_digest
+    }
+}
+
+/// Read one retained capture and re-prove it with the real core algorithm (`RawCapture::binding_digest`:
+/// selector shape/order/format, snapshot selector equality, native refs and the binding-domain digest, then
+/// the register digest) on the caller's own transaction. Data only: no lock, no source pin, no gate, no new
+/// transaction or connection; the caller owns its absolute deadline. `None` if no such capture exists.
+pub(crate) async fn validate_capture(
+    client: &(impl GenericClient + Sync),
+    repository_id: Uuid,
+    root_id: Uuid,
+    generation: i64,
+) -> Result<Option<ValidatedCapture>, RootError> {
+    let root = RootRef::new(repository_id, root_id, generation)?;
+    let capture = sql_read::read_capture(client, root).await?;
+    capture.map(ValidatedCapture::of).transpose()
 }

@@ -77,3 +77,5 @@ pub use usage::{
     TENANT_MAX_RECEIPTS, TENANT_MAX_ROOT_OID_REFS, TENANT_MAX_ROOTS,
 };
 pub use view::RootReadView;
+
+pub(crate) use self::pg::{ValidatedCapture, validate_capture};

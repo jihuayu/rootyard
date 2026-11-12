@@ -46,6 +46,23 @@ pub struct Db {
     pub pool: Pool,
     url: String,
     schema: String,
+    /// Only the random schema created by `setup` belongs to this fixture.
+    /// `setup_public` binds an existing run-owned database and must never drop
+    /// its `public` schema; the caller drops that whole database instead.
+    owns_schema: bool,
+}
+
+impl Db {
+    /// The actual connection URL this fixture opened (never a credential of the
+    /// process: it is the caller-supplied `ROOTYARD_TEST_DATABASE_URL`).
+    pub fn database_url(&self) -> String {
+        self.url.clone()
+    }
+
+    /// The random schema every pool of this fixture is bound to.
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
 }
 
 impl Db {
@@ -77,7 +94,62 @@ impl Db {
             .get(0);
         ensure!(installed, "db::migrate did not install migration 144 or its real roots tables");
         drop(client);
-        Ok(Self { admin, pool, url, schema })
+        Ok(Self { admin, pool, url, schema, owns_schema: true })
+    }
+
+    /// Bind the *existing* run-owned database's `public` schema instead of
+    /// creating a random fixture schema.
+    ///
+    /// The format22 paired drill creates a fresh run-owned database, migrates
+    /// it in `public` with the product migrator, and then runs this seed helper.
+    /// The product backup source validator reads explicit `public.*` tables, so
+    /// a random `search_path` schema would hide every seeded row. This mode
+    /// therefore migrates and verifies `public` only. It never creates or owns a
+    /// schema; `teardown` never drops `public`, and the harness drops the whole
+    /// dedicated database.
+    pub async fn setup_public() -> Result<Self> {
+        let url = database_url();
+        let admin = db::pool(&url)?;
+        let schema = "public".to_owned();
+        let pool = pool_for(&url, &schema, 16, None)?;
+        db::migrate(&pool).await?;
+        let client = pool.get().await?;
+        let active: Option<String> = client.query_one("SELECT current_schema()", &[]).await?.get(0);
+        ensure!(
+            active.as_deref() == Some(schema.as_str()),
+            "the run-owned database's public schema is not the fixture search_path"
+        );
+        let installed: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=147)
+                    AND to_regclass('public.ref_store_core_protocol_repos') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_root_heads') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_roots') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_root_refs') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_root_oids') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_root_packs') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_root_tombstones') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_root_receipts') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_root_repo_usage') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_root_tenant_usage') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_pack_snapshot_history') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_serving_reads') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_serving_read_refs') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_serving_read_packs') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_serving_read_artifacts') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_serving_read_repo_usage') IS NOT NULL
+                    AND to_regclass('public.ref_store_core_serving_read_tenant_usage') IS NOT NULL
+                    AND to_regclass('public.ref_store_serving_operations') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .get(0);
+        ensure!(
+            installed,
+            "the run-owned database's public schema lacks migration 147, its roots tables or its serving-read tables"
+        );
+        drop(client);
+        Ok(Self { admin, pool, url, schema, owns_schema: false })
     }
 
     pub fn new_pool(&self, max: usize) -> Result<Pool> {
@@ -85,6 +157,13 @@ impl Db {
     }
 
     pub async fn teardown(&self) -> Result<()> {
+        if !self.owns_schema {
+            ensure!(self.schema == "public", "the fixture is bound to a schema it does not own");
+            // The whole dedicated run-owned database is dropped by the harness;
+            // this fixture only ever owns the random schema `setup` created.
+            return Ok(());
+        }
+        ensure!(self.schema != "public", "refusing to drop the run-owned database's public schema");
         self.admin.get().await?.batch_execute(&format!("DROP SCHEMA {} CASCADE", self.schema)).await?;
         Ok(())
     }

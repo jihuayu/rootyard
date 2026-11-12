@@ -34,6 +34,25 @@ PROBE_ENV = {"DATABASE_URL": DSN, "ROOTYARD_BLOB_SECRET_ACCESS_KEY": SECRET,
              "ROOTYARD_BLOB_ENDPOINT": ENDPOINT, "PATH": os.environ.get("PATH", "")}
 SECRETS = [SECRET, DSN, "pg-password-value", ENDPOINT]
 
+def assert_not_live(testcase, pid):
+    """The owned process is gone or an unreaped zombie, never running.
+
+    A container PID 1 that does not reap orphans leaves a killed child as a
+    zombie visible to `kill(pid, 0)`; the probe's own quiescence census already
+    excludes zombies, so the test must not confuse a dead process with a live
+    one on such hosts.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return
+    stat_path = Path("/proc", str(pid), "stat")
+    if not stat_path.exists():
+        testcase.fail("process " + str(pid) + " still answers kill(0) without a /proc state")
+    state = stat_path.read_text(errors="replace")
+    testcase.assertEqual(state[state.rindex(")") + 2:].split()[0], "Z",
+                         "owned process " + str(pid) + " is still running")
+
 
 def write_executable(path, body):
     path.write_text("#!/bin/sh\n" + body)
@@ -325,8 +344,7 @@ class ProbeTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(outcome["status"], "unknown", outcome)
         self.assertTrue(outcome["reaped"])
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int(pidfile.read_text()), 0)
+        assert_not_live(self, int(pidfile.read_text()))
 
     @unittest.skipUnless(LINUX, "process-group quiescence proof is Linux /proc only")
     def test_a_leader_that_exits_leaving_an_owned_child_is_killed_and_proven(self):
@@ -342,8 +360,7 @@ class ProbeTest(unittest.TestCase):
         deadline = time.monotonic() + 5
         while not pidfile.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int(pidfile.read_text()), 0)
+        assert_not_live(self, int(pidfile.read_text()))
 
     def test_non_linux_legacy_fallback_kills_and_reaps_without_waitid_or_census(self):
         with self.assertRaises(NotImplementedError):
@@ -474,8 +491,7 @@ class ProbeTest(unittest.TestCase):
             except ProcessLookupError:
                 break
             time.sleep(0.02)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(pid, 0)
+        assert_not_live(self, pid)
         self.assertNotIn(pid, probe._group_members(pid))
         leftovers = [entry for entry in self.owned.iterdir() if entry.name.startswith("probe-")]
         self.assertEqual(leftovers, [])

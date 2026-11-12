@@ -91,20 +91,28 @@ pub(super) fn source_read_digest(
     )
 }
 
+/// Every caller-supplied identity of one sealed root candidate.
+///
+/// Grouping the request keeps `seal` a two-argument boundary: the adapter
+/// supplies the immutable request parts and the already-read source snapshot,
+/// and `seal` re-validates them together instead of accepting a long positional
+/// list whose order could silently drift.
+pub(super) struct SealRequest {
+    pub scope: RootsScope,
+    pub reference: PackSnapshotRef,
+    pub root_id: Uuid,
+    pub operation_id: Uuid,
+    pub operation_digest: RequestDigest,
+    pub selector_kind: RootSelectorKind,
+    pub oids: Vec<String>,
+    pub packs: Vec<RegisteredPack>,
+}
+
 impl RootCandidate {
     /// Seal one candidate. Only the adapter may call this, and only after the native closure succeeded.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn seal(
-        scope: RootsScope,
-        reference: PackSnapshotRef,
-        root_id: Uuid,
-        operation_id: Uuid,
-        operation_digest: RequestDigest,
-        selector_kind: RootSelectorKind,
-        oids: Vec<String>,
-        snapshot: &PackReadSnapshot,
-        packs: Vec<RegisteredPack>,
-    ) -> Result<Self, RootError> {
+    pub(super) fn seal(request: SealRequest, snapshot: &PackReadSnapshot) -> Result<Self, RootError> {
+        let SealRequest { scope, reference, root_id, operation_id, operation_digest, selector_kind, oids, packs } =
+            request;
         if root_id.is_nil() || operation_id.is_nil() || root_id == operation_id {
             return Err(RootError::Store(RefStoreError::InvalidIdentity(
                 "root candidate ids must be non-nil and distinct".into(),
@@ -188,10 +196,7 @@ impl RootCandidate {
             packs: &packs,
             membership_digest: snapshot.membership_digest_hex(),
         });
-        let register_digest = RequestDigest::of(
-            REGISTER_DIGEST_DOMAIN,
-            &[binding.as_bytes(), root_id.as_bytes(), b"generation-1", scope.purpose().as_str().as_bytes()],
-        );
+        let register_digest = super::capture::register_digest(binding, root_id, scope.purpose().as_str());
         Ok(Self {
             scope,
             reference,
