@@ -298,6 +298,18 @@ class ReadAmplificationHarness(LfsHarness):
             os.chmod(final, 0o600)
             self.lfs_get(get_path, token=self.reader, code=200)
 
+            symlink_target = self._repo_dir() / "symlink-target"
+            symlink_target.write_bytes(payload)
+            os.chmod(symlink_target, 0o600)
+            final.unlink()
+            os.symlink(symlink_target, final)
+            self.lfs_get(get_path, token=self.reader, code=(422, 500, 503))
+            final.unlink()
+            symlink_target.unlink()
+            final.write_bytes(payload)
+            os.chmod(final, 0o600)
+            self.lfs_get(get_path, token=self.reader, code=200)
+
             final.unlink()
             self.lfs_get(get_path, token=self.reader, code=(422, 500, 503))
             assert not final.exists()
@@ -379,7 +391,7 @@ class ReadAmplificationHarness(LfsHarness):
                     "read_amplification_ratio": round(offline_delta / size, 4),
                     "remote_requests": {k: 0 for k in ("HEAD", "GET", "PUT")},
                 },
-                "local_failure_modes": ["corrupt", "truncated", "replaced", "missing"],
+                "local_failure_modes": ["corrupt", "truncated", "replaced", "symlink", "missing"],
                 "concurrent_cold_reads": {
                     "readers": CONCURRENT_READERS,
                     "backend_gets": cold_counts["GET"],

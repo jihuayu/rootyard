@@ -8,6 +8,7 @@ pub(crate) mod remote_metrics;
 pub mod storage;
 mod upload;
 mod verification;
+mod verification_limiter;
 pub const MIGRATION_020_SQL: &str = include_str!("lfs/020_lfs_objects.sql");
 
 mod routes;
