@@ -12,6 +12,7 @@ on:
       - 'migrations/**'
       - 'tests/ref_store_*.rs'
       - 'tests/retention_roots_support/**'
+      - 'tests/format22_support/**'
       - 'tests/decision_subset_support/**'
       - 'tests/blob_git_gateway.rs'
       - 'tests/blob_gateway_support/**'
@@ -23,6 +24,8 @@ on:
       - 'tests/blob_gateway_browse.py'
       - 'tests/blob_gateway_history.py'
       - 'tests/backup_blob_serving147.py'
+      - 'tests/backup_blob_serving169_support.py'
+      - 'tests/test_backup_blob_serving169_support.py'
       - 'tests/requirements-blob-backup.txt'
       - 'tests/schema_baseline.py'
       - 'tests/e2e.py'
@@ -60,6 +63,7 @@ jobs:
       ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_protocol
       SESSION174_DATABASE_ADMIN_URL: postgresql://rootyard@127.0.0.1:55432/postgres
       SESSION174_DATABASE_PREFIX: session174_foundation
+      FORMAT22_DATABASE_PREFIX: format22_ledger
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -116,7 +120,7 @@ jobs:
           rows = re.findall(r'test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;', log)
           assert len(rows) == 4, rows
           assert all(state == 'ok' and failed == ignored == '0' for state, _, failed, ignored in rows), rows
-          assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 11, 12, 20], rows
+          assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 11, 12, 23], rows
           pathlib.Path('test-results/refstore/native.json').write_text(json.dumps({
               'passed': True, 'suite_counts': [int(row[1]) for row in rows],
               'ignored': 0, 'external_blob_backup': False, 'serving_cutover': False,
@@ -156,6 +160,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Order matters: build_native_test.py clears the rootyard package, while
+          # build_native.py clears it too and must leave the final product binary.
+          # The harness derives <fixture>.build.json next to the executable, so
+          # both stay under test-results/refstore/ and reach the artifact.
+          fixture_dir="$GITHUB_WORKSPACE/test-results/refstore"
+          python3 scripts/build_native_test.py --test ref_store_format22_backup_fixture \
+            --features pando-lab,format22-fixture --no-default-features --package-debug 0 --strip-debuginfo \
+            --output "$fixture_dir/ref_store_format22_backup_fixture" \
+            > "$fixture_dir/format22-fixture-build.json"
           python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
             > test-results/refstore/standalone-build.json
           set -a
@@ -170,6 +183,7 @@ jobs:
           export ROOTYARD_BLOB_ROOT="standalone-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           export ROOTYARD_GIT="$(command -v git)"
           binary="$GITHUB_WORKSPACE/target/debug/rootyard"
+          fixture="$fixture_dir/ref_store_format22_backup_fixture"
           # tests/blob_only_service.py -> e2e.Harness.setup() migrates only a random search_path
           # schema, so the job-owned service database needs the production public migration first.
           # The DSN is passed only through the environment and never echoed.
@@ -194,7 +208,70 @@ jobs:
             --report test-results/refstore/standalone-history.json
           python3 -m pip install -r tests/requirements-blob-backup.txt
           python3 tests/backup_blob_serving147.py --binary "$binary" --git "$ROOTYARD_GIT" \
+            --format22-fixture "$fixture" \
             --report test-results/refstore/standalone-paired-backup.json
+      - name: "Run the seeded format22 ledger-validation PostgreSQL tests"
+        id: format22_pg_tests
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          case "$FORMAT22_DATABASE_PREFIX" in *[!a-z0-9_]*) echo "unsafe format22 database prefix" >&2; exit 1 ;; esac
+          database="${FORMAT22_DATABASE_PREFIX}_r${GITHUB_RUN_ID}_a${GITHUB_RUN_ATTEMPT}"
+          if [ "${#database}" -gt 63 ]; then echo "database name exceeds 63 bytes" >&2; exit 1; fi
+          # Record the name before CREATE so the always() cleanup can drop a partial creation.
+          echo "database=$database" >> "$GITHUB_OUTPUT"
+          connected="$(psql "$SESSION174_DATABASE_ADMIN_URL" -X -t -A -v ON_ERROR_STOP=1 -c 'SELECT current_database()')"
+          if [ "$connected" != "postgres" ]; then echo "admin URL must connect to the postgres bootstrap database" >&2; exit 1; fi
+          preexisting="$(psql "$SESSION174_DATABASE_ADMIN_URL" -X -t -A -v ON_ERROR_STOP=1 -v database="$database" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          if [ "$preexisting" != "0" ]; then echo "owned format22 database name already exists; refusing to adopt it" >&2; exit 1; fi
+          psql "$SESSION174_DATABASE_ADMIN_URL" -X -v ON_ERROR_STOP=1 -v database="$database" >/dev/null <<'SQL'
+          SELECT format('CREATE DATABASE %I', :'database') \gexec
+          SQL
+          created="$(psql "$SESSION174_DATABASE_ADMIN_URL" -X -t -A -v ON_ERROR_STOP=1 -v database="$database" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          if [ "$created" != "1" ]; then echo "owned format22 database was not created exactly once" >&2; exit 1; fi
+          # The DSN is passed only through the environment and never echoed.
+          export ROOTYARD_TEST_DATABASE_URL="${ROOTYARD_TEST_DATABASE_URL%/*}/$database"
+          export DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL"
+          fixture="$GITHUB_WORKSPACE/test-results/refstore/ref_store_format22_backup_fixture"
+          binary="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/rootyard"
+          test -x "$fixture" && test -x "$binary"
+          evidence="test-results/refstore/format22-pg-tests"
+          mkdir -p "$evidence"
+          if ! "$binary" migrate > "$evidence/migrate.log" 2>&1; then
+            echo "format22 pg_tests: production CLI migrate failed on the owned database" >&2
+            exit 1
+          fi
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="format22-169-pg-tests-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_GIT="$(command -v git)"
+          data_dir="$RUNNER_TEMP/refstore-format22-pg-data"
+          rm -rf "$data_dir"
+          mkdir -p "$data_dir"
+          seed="$GITHUB_WORKSPACE/$evidence/seed.json"
+          if ! "$fixture" --seed "$seed" --data-dir "$data_dir" --git "$ROOTYARD_GIT" \
+              --blob-root "$ROOTYARD_BLOB_ROOT" > "$evidence/seed.log" 2>&1; then
+            echo "format22 pg_tests: source fixture seed failed" >&2
+            exit 1
+          fi
+          cargo test --locked --lib --features pando-lab backup::ledger_validation::pg_tests \
+            -- --ignored --test-threads=1 2>&1 | tee "$evidence/pg-tests.log"
       - name: 'Run the #126 native receive-pack acceptance on the external test and serving binaries'
         timeout-minutes: 25
         shell: bash
@@ -871,6 +948,37 @@ jobs:
           SQL
           )"
           if [ "$remaining" != "0" ]; then echo "owned database still exists after cleanup" >&2; exit 1; fi
+      - name: "Drop only the run-owned format22 ledger-validation database"
+        if: always()
+        timeout-minutes: 5
+        shell: bash
+        env:
+          FORMAT22_DATABASE: ${{ steps.format22_pg_tests.outputs.database }}
+          # Never inherit a search_path or other server option from the job environment.
+          PGOPTIONS: ''
+        run: |
+          set -euo pipefail
+          if [ -z "${FORMAT22_DATABASE:-}" ]; then
+            echo "owned format22 database was not created; nothing to drop"
+            exit 0
+          fi
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          expected="${FORMAT22_DATABASE_PREFIX}_r${GITHUB_RUN_ID}_a${GITHUB_RUN_ATTEMPT}"
+          if [ "$FORMAT22_DATABASE" != "$expected" ]; then echo "refusing to drop a database not owned by this run" >&2; exit 1; fi
+          case "$FORMAT22_DATABASE" in ''|*[!a-z0-9_]*|postgres|rootyard_protocol|template*)
+            echo "refusing to drop a shared or unsafe database" >&2
+            exit 1
+            ;;
+          esac
+          psql "$SESSION174_DATABASE_ADMIN_URL" -X -v ON_ERROR_STOP=1 -v database="$FORMAT22_DATABASE" >/dev/null <<'SQL'
+          SELECT format('DROP DATABASE IF EXISTS %I', :'database') \gexec
+          SQL
+          remaining="$(psql "$SESSION174_DATABASE_ADMIN_URL" -X -t -A -v ON_ERROR_STOP=1 -v database="$FORMAT22_DATABASE" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          if [ "$remaining" != "0" ]; then echo "owned format22 database still exists after cleanup" >&2; exit 1; fi
       - name: "Collect #174 acceptance evidence"
         if: always()
         shell: bash

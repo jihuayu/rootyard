@@ -1,0 +1,1486 @@
+#!/usr/bin/env python3
+"""Issue #169 fixture support for the format22 paired backup drill.
+
+Static/offline module: it imports only the standard library, so every plan can
+be unit-tested without a binary, PostgreSQL, S3 or boto3 (the harness imports
+boto3 lazily only when it actually reads objects).
+
+Three independent pieces live here:
+
+* :func:`format22_manifest_checks` -- the positive expectations for one
+  format22 paired archive built from API-created ``pg_refstore`` repositories
+  with a non-empty active + released retained-root set, a producer owner
+  distinct from the repository tenant, and one nonempty transient serving read
+  owned by a third real requester. It reads only the public manifest
+  surface (repositories, pack closure, files, refstore carry, blob artifacts).
+  ``blob_artifacts`` are the serialized ``ledger::Artifact`` wire rows: their
+  byte length is ``length`` (:func:`archive_length`), never the A4 /
+  ``artifact_holds`` column name ``content_length`` that the SQL evidence and
+  the artifact-set digest below do use. Each registration's pack and idx rows
+  must share one repository, one generated pack id and one repository tenant
+  (:data:`REGISTRATION_IDENTITY`), so a registration scope is only ever built
+  after both its rows agree on all three. The ``blob/`` inventory must be
+  exactly what ``blob_closure::export`` writes: every artifact's exact
+  :func:`archive_path` as one regular ``file`` entry whose ``bytes`` is that
+  artifact's ``length`` and whose ``sha256`` is its digest (the per-member
+  binding Rust restore applies), plus exactly the two parent ``directory``
+  entries of each artifact (:func:`archive_directories`) -- no other file or
+  directory may appear. Each directory entry pins the other serialized
+  ``Entry`` fields exactly: ``bytes == 0``, ``sha256 is None``,
+  ``target is None``, and a non-bool integer ``mode`` within ``[0, 0o700]``
+  (``private_dir`` requests ``0o700``; the umask may only clear bits).
+* :class:`CorruptionCase`/:func:`corruption_plan` and :func:`corruption_sql`/
+  :func:`corruption_findings`/:func:`validator_refusal` -- the dedicated raw-SQL
+  source corruption negatives. Each case is applied by one clone-local,
+  explicitly privileged transaction inside its own throw-away ``pg_dump`` clone
+  of the API-produced base source, the clone must prove exactly the intended
+  row changed (exact changed row count), and the backup may refuse only with
+  the typed one-line source-ledger summary: a positive count of the case's two
+  required codes plus only existing dependent codes. The product's violation
+  IDs are intentionally not part of the CLI summary.
+* :class:`NativeFixtureRequest` + :func:`native_fixture_argv` and
+  :func:`native_marker_checks` -- the contract of the source-bound Rust helper
+  (``tests/ref_store_format22_backup_fixture.rs``) that creates the real
+  PostgreSQL/Blob repository, packs, snapshots and roots through production
+  APIs, and the checks the Python drill applies to the helper's seed marker.
+
+The artifact-set digest (``core-pack-artifact-set-v2``) is rebuilt here with the
+same canonical field encoding as ``ArtifactSetDigest::of`` so the "wrong digest"
+negative case changes exactly the stored digest column and nothing else. The
+canonical locator identity is not stored by A4 (migration 142) and its
+``tenant_id`` column is the repository tenant, so the clone target evidence joins
+every artifact to its immutable migration-141 ``artifact_holds`` row by
+``hold_id`` and the rebuild takes the locator tenant/authority/attempt from
+that hold only.
+"""
+import hashlib
+import json
+from pathlib import Path
+import re
+import types
+import uuid
+
+ARTIFACT_SET_DOMAIN = "core-pack-artifact-set-v2"
+ROOT_STATES = ("active", "released")
+# Roles a registration must carry exactly once each, in the canonical slots.
+PAIR_ROLES = (("pack", 0), ("idx", 1))
+# Identity both artifacts of one A4 registration share. Real pack/idx rows are
+# committed under one publication, so they carry the same repository, generated
+# pack id and repository tenant; only hold/request ids, digests and lengths differ.
+REGISTRATION_IDENTITY = ("repository_id", "pack_id", "tenant_id")
+TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+UUID_HEX = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+TARGET_LITERAL = re.compile(r"^'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'::uuid$")
+MARKER_KIND = "rootyard/format22-backup-fixture-seed"
+CORRUPTION_CASES = ("missing_pack", "missing_idx", "missing_all_artifacts", "wrong_artifact_set_digest",
+                    "missing_hold", "mismatched_hold_locator")
+# The declared-set sources of ledger_validation::DECLARED_SETS.
+DECLARED_SOURCES = ("membership", "snapshot_packs", "root_packs", "serving_read_packs")
+
+
+def need(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+
+def parse_columns(value):
+    """Stable jsonb columns of one artifact set row."""
+    if isinstance(value, str):
+        value = json.loads(value)
+    need(isinstance(value, dict), "artifact set columns are not a JSON object")
+    return value
+
+
+def _field(name, length=None):
+    """Length-prefixed canonical field (``length`` is recomputed/verified, so a
+    caller can never mismatch the prefix with the payload)."""
+    payload = name.encode() if isinstance(name, str) else bytes(name)
+    if length is not None:
+        need(length == len(payload), "canonical field length mismatch")
+    return len(payload).to_bytes(8, "big") + payload
+
+
+def _int(value, width=8):
+    """Big-endian unsigned integer of exactly ``width`` bytes.
+
+    The default mirrors Rust ``u64/i64::to_be_bytes()`` (8 bytes), never a
+    ``bits`` count: callers pass an explicit slot width of 4.
+    """
+    return int(value).to_bytes(width, "big", signed=False)
+
+
+# ``PackArtifactRole`` declaration order in Rust: Pack then Idx.
+_ROLE_RANK = {"pack": 0, "idx": 1}
+
+
+def _role_rank(value):
+    need(value in _ROLE_RANK, "stored pack artifact role is not recognized")
+    return _ROLE_RANK[value]
+
+
+def artifact_set_digest(columns):
+    """Exact rebuild of ``ArtifactSetDigest::of`` over stored jsonb columns.
+
+    ``columns`` is either one artifact row or a list of them; each row carries
+    ``role``, ``slot``, ``hold_id``, ``tenant_id``, ``authority_id``,
+    ``authority_generation``, ``attempt_id``, ``namespace``, ``sha256``,
+    ``content_length``, ``provider``, ``backend_identity``. These are the real
+    A4 / ``artifact_holds`` SQL column names, not the archive's ``length`` wire
+    field. Artifacts are
+    sorted on their canonical ``RegisteredArtifact`` derivation, which is
+    equivariant under the row order, so a stable sort reproduces the Rust sort.
+    The leading field is ``PackArtifactRole``'s declaration order (pack before
+    idx), not the role string.
+    """
+    rows = columns if isinstance(columns, list) else [columns]
+    keyed = []
+    for row in rows:
+        row = parse_columns(row)
+        canonical = (
+            _role_rank(row["role"]), int(row["slot"]), str(row["hold_id"]), str(row["tenant_id"]),
+            str(row["authority_id"]), int(row["authority_generation"]), str(row["attempt_id"]),
+            str(row["namespace"]), str(row["sha256"]), int(row["content_length"]), str(row["provider"]),
+            str(row["backend_identity"]),
+        )
+        keyed.append((canonical, row))
+    keyed.sort(key=lambda item: item[0])
+    # Raw payload bytes only: ``RequestDigest::of`` length-prefixes each field
+    # exactly once in the final loop, so a field must never be pre-prefixed.
+    fields = [_int(len(keyed))]
+    for _, row in keyed:
+        sha256 = str(row["sha256"]).encode()
+        content_length = _int(row["content_length"])
+        fields.extend((
+            str(row["role"]).encode(), _int(row["slot"], 4),
+            bytes.fromhex(str(row["hold_id"]).replace("-", "")),
+            bytes.fromhex(str(row["tenant_id"]).replace("-", "")),
+            bytes.fromhex(str(row["authority_id"]).replace("-", "")),
+            _int(row["authority_generation"]),
+            bytes.fromhex(str(row["attempt_id"]).replace("-", "")),
+            str(row["namespace"]).encode(),
+            sha256,
+            content_length,
+            str(row["provider"]).encode(),
+            str(row["backend_identity"]).encode(),
+            # verified_sha256 == locator sha256, verified_length == length.
+            sha256,
+            content_length,
+        ))
+    digest = hashlib.sha256()
+    digest.update(b"rootyard-ref-store-request-v1\0")
+    digest.update(_field(ARTIFACT_SET_DOMAIN))
+    for field in fields:
+        digest.update(_field(field))
+    return digest.hexdigest()
+
+
+def q(value):
+    """Single-quoted SQL literal (fixture values are generated identifiers)."""
+    text = str(value)
+    need("'" not in text and "\x00" not in text, "SQL literal refused")
+    return "'" + text + "'"
+
+
+def uuid_array(values):
+    return "ARRAY[" + ",".join(q(value) + "::uuid" for value in values) + "]::uuid[]" if values else "'{}'::uuid[]"
+
+
+def text_array(values):
+    return "ARRAY[" + ",".join(q(value) for value in values) + "]::text[]" if values else "'{}'::text[]"
+
+
+# ---------------------------------------------------------------------------
+# Positive format22 manifest expectations
+# ---------------------------------------------------------------------------
+_CARRY_TABLES = (
+    "ref_store_core_pack_publications", "ref_store_core_pack_artifacts", "ref_store_core_pack_memberships",
+    "ref_store_core_root_heads", "ref_store_core_roots", "ref_store_core_root_packs", "ref_store_core_root_refs",
+    "ref_store_core_root_receipts", "ref_store_core_root_oids", "ref_store_core_root_tombstones",
+    "ref_store_core_snapshot_packs", "ref_store_core_pins",
+    # Migration-146 transient serving reads: the header and all three of its
+    # children of the one nonempty `serving_read` marker.
+    "ref_store_core_serving_reads", "ref_store_core_serving_read_refs",
+    "ref_store_core_serving_read_packs", "ref_store_core_serving_read_artifacts",
+)
+
+
+def expected_schema_versions(schema_versions, baseline, current):
+    """The independent ordered migration vector a format22 manifest must carry.
+
+    Format22 returns every migration the source applied (``crate::db::SCHEMA_VERSIONS``),
+    not only its maximum, so the oracle is the caller's baseline list (never the
+    manifest under test): a strictly ascending unique projection of the complete
+    migration baseline that ends at the supported current version.
+    """
+    versions = [int(version) for version in schema_versions]
+    complete = sorted({int(version) for version in baseline})
+    need(complete and complete[-1] == int(current),
+         "schema baseline does not end at the supported current version")
+    need(versions and versions == sorted(set(versions)), "schema baseline is not an ascending unique vector")
+    need(versions[-1] == int(current), "schema baseline does not end at the supported current version")
+    need(complete == versions,
+         "schema baseline is not the complete migration vector up to the supported current version")
+    return versions
+
+
+def format22_manifest_checks(manifest, expected):
+    """Return a detail dict or raise AssertionError for a non-format22 archive.
+
+    ``expected`` carries the API-created identities: ``format`` (22),
+    ``schema_versions`` (the complete independent full ordered migration vector,
+    e.g. ``schema_baseline.SCHEMA_VERSIONS``), ``schema_baseline`` (the same
+    baseline, used to prove ``schema_versions`` is complete, not truncated),
+    ``registered_packs`` (registrations the source holds),
+    ``artifacts`` (pack + idx rows), ``roots`` (``[{root_id, state, owner_id}]``
+    with at least one active and one released root), ``repos``
+    (``[{id, owner_id, tenant_id}]``), ``producer`` (the owner of every root
+    capture) and ``serving_read`` (the validated ``markers["serving_read"]``
+    entry of :func:`native_marker_checks`). ``manifest`` is the parsed archive
+    manifest.
+
+    The pair identity is always enforced from the archive rows themselves: the
+    pack and idx rows of one registration must agree on ``repository_id``,
+    ``pack_id`` and ``tenant_id``, and only then is that registration's one
+    scope formed. An optional ``registration_scopes`` (``{registration_id:
+    (repository_id, pack_id)}``, read from the source's own publications) is a
+    separate, additional check of that scope; without it the rows are still
+    checked for agreement with each other.
+
+    The byte proof follows Rust restore exactly: each artifact's
+    :func:`archive_path` must be one regular ``file`` entry whose ``bytes`` is
+    that artifact's serialized ``length`` and whose ``sha256`` is its digest,
+    and the ``blob/`` inventory observed in ``manifest.files`` must be exactly
+    those files plus the :func:`archive_directories` parent ``directory``
+    entries ``blob_closure::export`` creates, each also pinned to
+    ``bytes == 0``, ``sha256 is None``, ``target is None`` and a non-bool
+    integer ``mode`` within ``[0, 0o700]``. Aggregate totals alone are never
+    accepted, because one member's surplus can otherwise mask another member's
+    deficit.
+    """
+    need(manifest.get("format") == 22 == expected["format"], "archive is not format22")
+    schema_versions = expected_schema_versions(expected["schema_versions"], expected["schema_baseline"], 147)
+    need(manifest.get("schema_versions") == schema_versions, "unexpected schema versions")
+    repos = manifest.get("repositories") or []
+    need(len(repos) == len(expected["repos"]), "manifest repository count differs from the API-created set")
+    need({str(repo["id"]) for repo in repos} == {str(repo["id"]) for repo in expected["repos"]},
+         "manifest repositories are not exactly the API-created repositories")
+    need(all(repo.get("backend") == "pg_refstore" for repo in repos), "a manifest repository is not pg_refstore")
+    closure = manifest.get("blob_closure") or {}
+    artifacts = manifest.get("blob_artifacts") or []
+    need(closure.get("artifacts") == expected["artifacts"] == len(artifacts),
+         "closure artifact count differs from the registered pack + idx rows")
+    registrations = {str(entry["registration_id"]) for entry in artifacts}
+    need(registrations == {str(value) for value in expected["registered_packs"]},
+         "closure does not carry exactly one pack+idx pair per registered pack")
+    for registration in expected["registered_packs"]:
+        roles = sorted((str(entry["role"]), int(entry["slot"])) for entry in artifacts
+                       if str(entry["registration_id"]) == str(registration))
+        need(roles == sorted(PAIR_ROLES), "a registration is not exactly one pack(slot 0) + idx(slot 1)")
+    need(len({str(entry["hold_id"]) for entry in artifacts}) == len(artifacts), "artifact hold ids are not unique")
+    lengths = [archive_length(entry) for entry in artifacts]
+    need(all(HEX64.match(str(entry["sha256"])) and length > 0 for entry, length in zip(artifacts, lengths)),
+         "an archived artifact has no positive byte proof")
+    need(all(str(entry["provider"]) == closure.get("provider") for entry in artifacts),
+         "an archived artifact names another provider")
+    need(all(str(entry["backend_identity"]) == closure.get("backend_identity") for entry in artifacts),
+         "an archived artifact names another backend identity")
+    # Real A4 pack/idx artifacts share registration, repository, pack and tenant
+    # identity (one repository, one generated pack id, one repository tenant per
+    # registration); only hold/request ids, digests and lengths are per artifact.
+    # Each scope is built only after both rows of its pair agreed on all three,
+    # so a per-row dict comprehension can never collapse a drift; a second
+    # registration can never hold the same repository/pack pair as its own
+    # archive path would then collide.
+    ordered = [str(value) for value in expected["registered_packs"]]
+    scopes = {registration: tuple(_registration_scope(artifacts, registration, field)
+                                  for field in REGISTRATION_IDENTITY)
+              for registration in ordered}
+    need(len(scopes) == len(artifacts) // len(PAIR_ROLES)
+         and {str(entry["registration_id"]) for entry in artifacts} == set(scopes),
+         "the archived artifacts are not exactly one pack+idx pair per registered pack")
+    _expected_registration_scopes(expected, scopes)
+    invalid = [str(entry.get("hold_id")) for entry in artifacts
+               if not isinstance(entry.get("hold_id"), str) or not UUID_HEX.match(entry["hold_id"])]
+    need(not invalid, "an archived artifact has no hold id")
+    files = manifest.get("files")
+    need(isinstance(files, dict), "the archive carries no file entry map")
+    # `blob_closure::entries` inventories the whole `blob/` tree, so the
+    # archive's `files` map carries the artifact files *and* the two parent
+    # directories `export` creates for each of them (filesystem::inventory
+    # records a real directory with kind `directory`). The observed `blob/`
+    # paths must therefore equal exactly those files plus those directories.
+    paths = _archive_paths(artifacts)
+    need(len(set(paths)) == len(artifacts), "archived artifacts do not have distinct archive paths")
+    directories = archive_directories(artifacts)
+    blob_paths = {name for name, entry in files.items() if name.startswith("blob/")}
+    expected_files = set(paths)
+    extra_files = sorted(name for name in blob_paths - expected_files - set(directories)
+                         if not isinstance(files[name], dict) or files[name].get("kind") != "directory")
+    extra_dirs = sorted(name for name in blob_paths - expected_files - set(directories)
+                        if isinstance(files[name], dict) and files[name].get("kind") == "directory")
+    need(not extra_files, "the archive carries extra Blob members: " + ",".join(extra_files[:8]))
+    need(not extra_dirs, "the archive carries extra Blob directories: " + ",".join(extra_dirs[:8]))
+    # A parent path announced as a file (or any non-directory kind), or a
+    # parent that is absent from the inventory entirely, is not what `export`
+    # writes.
+    not_dirs = sorted(name for name in set(directories) & blob_paths
+                      if not isinstance(files[name], dict) or files[name].get("kind") != "directory")
+    need(not not_dirs, "an archive Blob parent path is not a directory entry: " + ",".join(not_dirs[:8]))
+    # A directory entry is the whole serialized Rust `Entry`, not just its kind:
+    # `filesystem::inventory` records `bytes: 0`, `sha256: None`,
+    # `target: None` for every real directory, exactly the five serialized
+    # `Entry` keys (`Entry` denies unknown fields), and a `u32` mode with no
+    # group, world or special bits (a real `export` can only record `mode &
+    # 0o7777`, and `private_dir`'s requested `0o700` has no bits outside it).
+    # `private_dir` asks for `0o700`, but the process umask may remove more
+    # bits, so the exact `0o700` is never required -- only an integer subset.
+    for name in sorted(set(directories) & blob_paths):
+        _archive_directory_entry(name, files[name])
+    missing = sorted((expected_files | set(directories)) - blob_paths)
+    need(not missing, "the archive is missing Blob members: " + ",".join(missing[:8]))
+    # Rust restore looks every artifact up by its exact archive path and binds
+    # that member to the artifact's own length and digest.
+    for entry, path, length in zip(artifacts, paths, lengths):
+        need(path in files, "the archive is missing the Blob member at an artifact's archive path")
+        member = files[path]
+        need(isinstance(member, dict) and member.get("kind") == "file",
+             "the archive Blob member at an artifact's archive path is not a regular file")
+        need(_archive_bytes(member) == length, "an archived Blob member length differs from its artifact length")
+        need(member.get("sha256") == str(entry["sha256"]),
+             "an archived Blob member digest differs from its artifact digest")
+    blob_files = [name for name, entry in files.items()
+                  if isinstance(entry, dict) and name.startswith("blob/") and entry.get("kind") == "file"]
+    need(len(blob_files) == len(artifacts), "archived blob members differ from the closure")
+    need(sum(_archive_bytes(files[name]) for name in blob_files) == closure.get("bytes") > 0,
+         "archived blob bytes differ from the closure")
+    # Format22 writes `blob_closure.bytes` as the sum of the wired `length`
+    # fields, so the archive's own byte totals must agree with them.
+    need(sum(lengths) == closure.get("bytes") > 0, "archived artifact lengths differ from the closure bytes")
+    # RefStore carry: every registered-set and roots ledger must travel too.
+    carry = manifest.get("refstore") or {}
+    for table in _CARRY_TABLES:
+        need(int(carry.get(table, {}).get("rows", 0)) > 0, "archive carry is missing " + table)
+    # Positive roots: non-empty active AND released API-created roots.
+    states = [str(root["state"]) for root in expected["roots"]]
+    for state in ROOT_STATES:
+        need(states.count(state) >= 1, "positive format22 archive needs a non-empty " + state + " root set")
+    need(len({str(root["root_id"]) for root in expected["roots"]}) == len(expected["roots"]),
+         "root ids are not unique")
+    # Producer owner (root owner_id / pack hold owner_id) is never the tenant.
+    tenants = {str(repo["owner_id"]) for repo in expected["repos"]}
+    need(str(expected["producer"]) not in tenants, "the root producer equals a repository tenant")
+    need(all(str(root.get("owner_id")) == str(expected["producer"]) for root in expected["roots"]),
+         "root captures disagree on their producer owner")
+    serving_read = _archive_serving_read(expected.get("serving_read"), expected["repos"], tenants,
+                                         expected["registered_packs"], expected["producer"])
+    return {"format": 22, "repositories": len(repos), "closure_artifacts": len(artifacts),
+            "closure_bytes": closure.get("bytes"), "blob_members": len(blob_files),
+            "registrations": len(registrations), "roots": {state: states.count(state) for state in ROOT_STATES},
+            "producer_distinct_from_tenant": True, "carry_tables": len(carry),
+            "pair_identity_shared": True, "member_paths_exact": True,
+            "serving_read": {key: serving_read[key] for key in ("pin_id", "repository_id", "tenant_id", "owner_id",
+                                                                "pack_count")}}
+
+
+def archive_length(artifact):
+    """The positive wire length of one ``manifest.blob_artifacts`` entry.
+
+    Format22 stores ``Vec<ledger::Artifact>`` and Rust serializes its unrenamed
+    ``length: u64`` field as ``length``, so the archive never carries the A4 /
+    ``artifact_holds`` column name ``content_length``. A missing, wrongly named
+    or non-integer field is refused as an explicit assertion, never as a raw
+    ``KeyError`` or ``ValueError``; no alias is accepted.
+    """
+    need(isinstance(artifact, dict), "an archived artifact entry is not a JSON object")
+    need("length" in artifact, "an archived artifact entry carries no length field")
+    for alias in ("content_length", "verified_length", "locator_length"):
+        need(alias not in artifact, "an archived artifact entry carries the non-archive field " + alias)
+    value = artifact["length"]
+    need(isinstance(value, int) and not isinstance(value, bool) and value > 0,
+         "an archived artifact length is not a positive integer")
+    # ``slot`` is the other member of the archive path: ``True == 1`` in Python,
+    # so it must be a real integer or a ``slot: true`` row would pass as slot 1.
+    need(type(artifact.get("slot")) is int, "an archived artifact slot is not an integer")
+    return value
+
+
+# `backup::Entry` is `#[serde(deny_unknown_fields)]` and its exact serialized
+# keys are these five; `Entry::kind` is an open `String`, so a directory is
+# told apart from a file or symlink only by the value checked below.
+DIRECTORY_ENTRY_KEYS = frozenset({"kind", "mode", "bytes", "sha256", "target"})
+DIRECTORY_MODE_MAX = 0o700
+
+
+def _archive_directory_entry(path, entry):
+    """Refuse a Blob parent entry that is not exactly a serialized directory.
+
+    Pins every field ``filesystem::inventory`` writes for a real directory:
+    ``kind: "directory"``, ``bytes: 0``, ``sha256: null``, ``target: null`` and
+    an integer (never a bool) ``mode`` that is a subset of ``0o700``. The mode
+    is bounded, not exact: ``private_dir`` requests ``0o700`` and the process
+    umask may clear further owner bits, even all of them (``0``), so a reduced
+    mode such as ``0o500`` is a real archive. Group, world and special bits
+    (any bit of ``~0o700``) are never what ``export`` writes, and because
+    ``private_dir`` never sets them a numerically smaller mode such as
+    ``0o640`` is not a subset and is refused too.
+    """
+    need(isinstance(entry, dict), "an archive Blob directory at " + path + " is not a JSON object")
+    need(entry.get("kind") == "directory", "an archive Blob directory at " + path + " changed kind")
+    # `Entry` denies unknown fields, so a serialized archive entry has exactly
+    # its five keys: an extra key is a manifest Rust would refuse to load.
+    unknown = sorted(key for key in entry if key not in DIRECTORY_ENTRY_KEYS)
+    if unknown:
+        raise AssertionError("an archive Blob directory at " + path + " carries an unknown field " + unknown[0])
+    need(type(entry.get("bytes")) is int and entry["bytes"] == 0,
+         "an archive Blob directory at " + path + " carries non-zero bytes")
+    need("sha256" in entry and entry["sha256"] is None,
+         "an archive Blob directory at " + path + " carries a sha256")
+    need("target" in entry and entry["target"] is None,
+         "an archive Blob directory at " + path + " carries a target")
+    mode = entry.get("mode")
+    # ``bool`` is a subclass of ``int``: ``mode: true`` must not pass as 1.
+    need(type(mode) is int, "an archive Blob directory at " + path + " has a non-integer mode")
+    need(mode >= 0 and (mode & ~DIRECTORY_MODE_MAX) == 0,
+         "an archive Blob directory at " + path + " has a mode outside the 0o700 subset")
+    return entry
+
+
+def _archive_bytes(entry):
+    """The positive wire byte count of one ``manifest.files`` member."""
+    need(isinstance(entry, dict) and isinstance(entry.get("bytes"), int) and not isinstance(entry.get("bytes"), bool),
+         "an archived Blob member carries no integer byte count")
+    return entry["bytes"]
+
+
+def archive_path(artifact):
+    """The exact archive-relative path of one wire artifact, as Rust computes it.
+
+    Mirrors ``ledger::Artifact::archive_path`` -- ``blob/{repository_id}/
+    {pack_id}/{role}.{role}`` with the ids in their dashed lowercase uuid form --
+    instead of guessing a file name from the hold id. The path is only formed
+    from valid identities, so a malformed id is an explicit refusal.
+    """
+    need(isinstance(artifact, dict), "an archived artifact entry is not a JSON object")
+    for field in ("repository_id", "pack_id"):
+        need(isinstance(artifact.get(field), str) and UUID_HEX.match(artifact[field]),
+             "an archived artifact " + field + " is not a valid uuid")
+    role = artifact.get("role")
+    need(isinstance(role, str) and role in _ROLE_RANK, "an archived artifact role is not pack or idx")
+    return "blob/" + artifact["repository_id"] + "/" + artifact["pack_id"] + "/" + role + "." + role
+
+
+def _archive_paths(artifacts):
+    return [archive_path(entry) for entry in artifacts]
+
+
+def archive_directories(artifacts):
+    """The exact parent ``directory`` paths ``blob_closure::export`` creates.
+
+    For every artifact ``export`` creates ``blob/{repository_id}`` and
+    ``blob/{repository_id}/{pack_id}`` before writing the artifact's file, and
+    ``entries()`` inventories the whole ``blob`` tree, so each real directory
+    is recorded with ``Entry.kind == "directory"``. The ``blob`` root itself is
+    created by ``private_dir`` but inventoried as the root, never a member. The
+    result is sorted and unique, exactly the directory set of one archive.
+    """
+    directories = set()
+    for artifact in artifacts:
+        repository_id = _uuid_in_path(artifact, "repository_id")
+        pack_id = _uuid_in_path(artifact, "pack_id")
+        directories.add("blob/" + repository_id)
+        directories.add("blob/" + repository_id + "/" + pack_id)
+    return sorted(directories)
+
+
+def _uuid_in_path(artifact, field):
+    need(isinstance(artifact, dict) and isinstance(artifact.get(field), str) and UUID_HEX.match(artifact[field]),
+         "an archived artifact " + field + " is not a valid uuid")
+    return artifact[field]
+
+
+def _registration_scope(artifacts, registration, field):
+    """The one uuid ``field`` value both rows of ``registration``'s pair carry.
+
+    Called for every field of :data:`REGISTRATION_IDENTITY` before a scope is
+    built, so a missing, padded or drifted ``repository_id``, ``pack_id`` or
+    ``tenant_id`` is refused on its own name whether or not the caller supplied
+    an independent ``registration_scopes`` expectation.
+    """
+    need(field in REGISTRATION_IDENTITY, "artifact identity field is not part of the pair identity")
+    members = [entry for entry in artifacts if str(entry["registration_id"]) == str(registration)]
+    need(len(members) == len(PAIR_ROLES), "a registration is not exactly one pack(slot 0) + idx(slot 1)")
+    values = {str(member.get(field)) for member in members}
+    need(len(values) == 1 and UUID_HEX.match(values.pop()),
+         "a registration's pack and idx artifacts disagree on their " + field)
+    return str(members[0][field])
+
+
+def _expected_registration_scopes(expected, scopes):
+    """Cross-registration identity: one repository set, tenant, unique packs.
+
+    Each archived pair is one registration of one repository, so every
+    repository it names must be exactly an API-created repository, the archived
+    tenant must be that repository's expected tenant, and two registrations can
+    never share a pack id (their archive paths would then collide too).
+    """
+    bindings = {str(repo["id"]): str(repo.get("owner_id")) for repo in expected["repos"]}
+    # ``called`` is keyed in REGISTRATION_IDENTITY order (repository, pack,
+    # tenant), and only ever built from a scope whose pair already agreed.
+    called = {str(registration): tuple(scopes[str(registration)]) for registration in expected["registered_packs"]}
+    need(all(len(scope) == len(REGISTRATION_IDENTITY) for scope in called.values()),
+         "an archived registration scope is incomplete")
+    pairs = {registration: (scope[0], scope[1]) for registration, scope in called.items()}
+    need(all(repository in bindings for repository, _ in pairs.values()),
+         "an archived artifact names a repository the API did not create")
+    for registration, (repository_id, _, tenant_id) in called.items():
+        need(tenant_id == bindings[repository_id],
+             "an archived artifact tenant is not the tenant of its repository")
+    need(len({pack_id for _, pack_id in pairs.values()}) == len(called),
+         "two registrations share a pack id")
+    # The optional independent source scopes are an additional check of the
+    # same (repository_id, pack_id) pair; they never replace the pair agreement
+    # _registration_scope already proved row by row.
+    source = expected.get("registration_scopes")
+    if source is not None:
+        need(isinstance(source, dict), "the expected registration scopes are not a mapping")
+        parsed = {}
+        for registration, scope in source.items():
+            need(isinstance(scope, (tuple, list)) and len(scope) == 2,
+                 "an expected registration scope is not a (repository_id, pack_id) pair")
+            parsed[str(registration)] = (_uuid(scope[0], "expected repository id"),
+                                         _uuid(scope[1], "expected pack id"))
+        need(parsed == pairs, "the archived registration scopes differ from the source publications")
+    return called
+
+
+def _archive_serving_read(serving_read, repos, tenants, registrations, producer):
+    """The validated marker read, once more bound to this archive's exact set.
+
+    ``serving_read`` is the ``native_marker_checks`` entry (already proven a
+    valid nonempty read on the marker's bound repository/tenant with a
+    distinct requester). Here it must additionally sit on an archived
+    repository whose manifest carries the exact ``repository_id``/``tenant_id``
+    binding, keep its nonempty ``pack_count`` equal to the archived
+    registrations, and never be owned by a repository tenant or the producer.
+    """
+    need(isinstance(serving_read, dict), "format22 expectations carry no validated serving_read marker")
+    for field in ("pin_id", "repository_id", "tenant_id", "owner_id"):
+        need(isinstance(serving_read.get(field), str) and UUID_HEX.match(serving_read[field]),
+             "serving_read " + field + " is not a valid uuid")
+    pack_count = serving_read.get("pack_count")
+    need(isinstance(pack_count, int) and not isinstance(pack_count, bool) and pack_count > 0,
+         "serving_read has no nonempty pack count")
+    bindings = {str(repo["id"]): (str(repo.get("owner_id")), str(repo.get("tenant_id"))) for repo in repos}
+    repo_id = str(serving_read["repository_id"])
+    need(repo_id in bindings, "serving_read names a repository the archive does not carry")
+    owner, tenant = bindings[repo_id]
+    need(str(serving_read["tenant_id"]) in (tenant, owner),
+         "serving_read tenant is not the tenant of its archived repository")
+    need(pack_count == len(registrations),
+         "serving_read pack_count differs from the archived registrations")
+    need(str(serving_read["owner_id"]) not in tenants, "serving_read requester is a repository tenant")
+    need(str(serving_read["owner_id"]) != str(producer), "serving_read requester is the producer")
+    return serving_read
+
+
+def serving_read_tables(alias="public"):
+    """The migration-146 tables one restored serving read must be read from."""
+    need(TABLE_NAME.match(alias), "serving-read table alias is not a safe token")
+    return {"header": alias + ".ref_store_core_serving_reads", "refs": alias + ".ref_store_core_serving_read_refs",
+            "packs": alias + ".ref_store_core_serving_read_packs",
+            "artifacts": alias + ".ref_store_core_serving_read_artifacts"}
+
+
+def format22_restore_sql(serving_read):
+    """One bounded, read-only row of restored serving-read facts for ``pin_id``.
+
+    Only counts and booleans are selected: no ref/oid, locator, digest or lease
+    value leaves the restored database. Every count is scoped to the exact pin
+    or to that pin's own headers/packs, so a second read cannot satisfy it.
+    """
+    marker = _bound_marker(serving_read)
+    pin = q(marker["pin_id"]) + "::uuid"
+    repo, tenant, owner = (q(marker[field]) + "::uuid" for field in ("repository_id", "tenant_id", "owner_id"))
+    tables = serving_read_tables()
+    scope = " AND ".join(column + "=" + value for column, value in
+                         (("repository_id", repo), ("tenant_id", tenant), ("owner_id", owner)))
+    return (
+        "SELECT jsonb_build_object("
+        "'headers', (SELECT count(*) FROM " + tables["header"] + " WHERE pin_id=" + pin + "), "
+        "'bound_headers', (SELECT count(*) FROM " + tables["header"] + " WHERE pin_id=" + pin + " AND " + scope
+        + " AND pack_count=" + str(marker["pack_count"]) + "), "
+        "'refs', (SELECT count(*) FROM " + tables["refs"] + " WHERE pin_id=" + pin + "), "
+        "'declared_ref_count', (SELECT coalesce(max(ref_count), -1) FROM " + tables["header"]
+        + " WHERE pin_id=" + pin + "), "
+        "'packs', (SELECT count(*) FROM " + tables["packs"] + " WHERE pin_id=" + pin + "), "
+        "'declared_pack_count', (SELECT coalesce(max(pack_count), -1) FROM " + tables["header"]
+        + " WHERE pin_id=" + pin + "), "
+        # Every one of the pin's pack rows must carry exactly its slot-0 pack
+        # and slot-1 idx artifact (and nothing else).
+        "'packs_with_exact_pair', (SELECT count(*) FROM " + tables["packs"] + " p WHERE p.pin_id=" + pin
+        + " AND (SELECT count(*) FROM " + tables["artifacts"] + " a WHERE a.pin_id=p.pin_id "
+          "AND a.pack_id=p.pack_id)=2 AND EXISTS (SELECT 1 FROM " + tables["artifacts"] + " a "
+          "WHERE a.pin_id=p.pin_id AND a.pack_id=p.pack_id AND a.role='pack' AND a.slot=0) "
+          "AND EXISTS (SELECT 1 FROM " + tables["artifacts"] + " a WHERE a.pin_id=p.pin_id "
+          "AND a.pack_id=p.pack_id AND a.role='idx' AND a.slot=1)), "
+        # Each pack must carry a verified, nonempty physical identity for both
+        # its pack and its idx artifact (migration-146 CHECKs included).
+        "'packs_with_verified_pair', (SELECT count(*) FROM " + tables["packs"] + " p WHERE p.pin_id=" + pin
+        + " AND (SELECT count(*) FROM " + tables["artifacts"] + " a WHERE a.pin_id=p.pin_id "
+          "AND a.pack_id=p.pack_id AND a.verified_sha256=a.locator_sha256 "
+          "AND a.verified_length=a.locator_length AND a.verified_length>0)=2), "
+        "'artifacts', (SELECT count(*) FROM " + tables["artifacts"] + " WHERE pin_id=" + pin + "))")
+    # Only counts/booleans leave the restored database; sha256 values are
+    # compared inside SQL and never selected.
+
+
+def _bound_marker(serving_read):
+    need(isinstance(serving_read, dict), "format22 checks need the validated serving_read marker")
+    need(set(serving_read) >= {"pin_id", "repository_id", "tenant_id", "owner_id", "pack_count"},
+         "serving_read marker is incomplete")
+    for field in ("pin_id", "repository_id", "tenant_id", "owner_id"):
+        need(isinstance(serving_read[field], str) and UUID_HEX.match(serving_read[field]),
+             "serving_read " + field + " is not a valid uuid")
+    count = serving_read["pack_count"]
+    need(isinstance(count, int) and not isinstance(count, bool) and count > 0,
+         "serving_read has no nonempty pack count")
+    return serving_read
+
+
+def format22_serving_read_checks(observed, serving_read):
+    """Prove the restored database carries exactly the marker's serving read.
+
+    ``observed`` is the JSON object :func:`format22_restore_sql` selected and
+    ``serving_read`` the validated ``markers["serving_read"]`` entry. Only
+    bounded counts/booleans are recorded, never a secret or a locator.
+    """
+    marker = _bound_marker(serving_read)
+    try:
+        observed = json.loads(observed) if isinstance(observed, (str, bytes)) else observed
+    except ValueError as error:
+        raise AssertionError("restored serving-read facts are not JSON: " + str(error)) from None
+    need(isinstance(observed, dict), "restored serving-read facts are not a JSON object")
+    need(set(observed) == {"headers", "bound_headers", "refs", "declared_ref_count", "packs",
+                           "declared_pack_count", "packs_with_exact_pair", "packs_with_verified_pair",
+                           "artifacts"}, "restored serving-read facts carry unexpected fields")
+    for name, value in observed.items():
+        need(isinstance(value, int) and not isinstance(value, bool), "restored serving-read " + name + " is not an int")
+    count = marker["pack_count"]
+    need(observed["headers"] == 1, "the restored database does not carry exactly one marker serving-read header")
+    need(observed["bound_headers"] == 1,
+         "the restored serving read is not bound to the marker repository/tenant/requester and pack_count")
+    need(observed["declared_ref_count"] >= 0 and observed["refs"] == observed["declared_ref_count"],
+         "restored serving-read ref rows differ from the header's declared ref_count")
+    need(observed["declared_pack_count"] == count == observed["packs"],
+         "restored serving-read pack rows differ from the marker pack_count")
+    need(observed["packs_with_exact_pair"] == count,
+         "a restored serving-read pack lacks exactly one slot-0 pack and slot-1 idx artifact")
+    need(observed["artifacts"] == 2 * count, "restored serving-read artifacts are not exactly 2 * pack_count")
+    need(observed["packs_with_verified_pair"] == count,
+         "a restored serving-read pack lacks a verified nonempty pack/id x artifact pair")
+    return {"pin": True, "headers": 1, "refs_equal_declared": True, "pack_count": observed["declared_pack_count"],
+            "packs": count, "packs_with_exact_pair": count, "artifacts": observed["artifacts"],
+            "verified_pairs": count}
+
+
+# ---------------------------------------------------------------------------
+# Corruption negatives (one dedicated, disposable clone per case)
+# ---------------------------------------------------------------------------
+def _uuid(value, what):
+    need(isinstance(value, str) and UUID_HEX.match(value), what + " is not a uuid")
+    return value
+
+
+class Registration:
+    """One complete A4 registration with its actual repository/pack identity.
+
+    ``repository_id``/``pack_id`` are the native SQL target's own
+    ``ref_store_core_pack_publications`` values; they are required and never
+    derived, because the validator names all three ids in every violation.
+    """
+
+    def __init__(self, value, digest, repository_id, pack_id):
+        self.id = _uuid(value, "registration id")
+        need(isinstance(digest, str) and HEX64.match(digest), "registration digest is not a sha256")
+        self.digest = digest
+        self.repository_id = _uuid(repository_id, "repository id")
+        self.pack_id = _uuid(pack_id, "pack id")
+
+    def scope(self):
+        return (self.repository_id, self.pack_id, self.id)
+
+    def __repr__(self):
+        return "Registration(" + self.id + ")"
+
+
+class ValidatorRefusal:
+    """The source-ledger violations an expected corrupted source must yield.
+
+    ``ledger_sets::check_declared`` emits ``<token>:<repository_id>:<pack_id>:
+    <registration_id>`` as plain violation tokens (no digest details): every
+    damaged A4 set is ``canonical_pair_mismatch``, one missing role is
+    ``incomplete_pair``, no artifact rows is ``missing_artifacts``, and a
+    rewritten publication digest is ``declared_set_digest_mismatch:<source>:
+    <repository_id>:<pack_id>:<registration_id>`` for each declaring set kind.
+    A missing durable hold makes the set unrebuildable and a rewritten locator
+    disagrees with its artifact row; both are ``hold_mismatch`` (a missing hold
+    also drops the owner scope, which the summary admits as a dependent code).
+    The snapshot/root/serving-read rechecks of that same registration may add
+    only the dependent tokens below.
+    """
+
+    def __init__(self, cause, source=None):
+        need(cause in CORRUPTION_CASES, "validator refusal has an unknown cause")
+        need(source is None or (cause == "wrong_artifact_set_digest" and source in DECLARED_SOURCES),
+             "only a rewritten digest names a declared-set source")
+        self.cause = cause
+        # Representative declared-set source for one concrete expected line; the
+        # oracle itself accepts any of DECLARED_SOURCES that the product emits.
+        self.source = source
+
+    @property
+    def token(self):
+        """The cause-specific token that distinguishes this case."""
+        return self.required[1]
+
+    @property
+    def required(self):
+        """The violations every refusal carries; the last one names the cause."""
+        return ("canonical_pair_mismatch", {"missing_pack": "incomplete_pair", "missing_idx": "incomplete_pair",
+                                            "missing_all_artifacts": "missing_artifacts",
+                                            "wrong_artifact_set_digest": "declared_set_digest_mismatch",
+                                            "missing_hold": "hold_mismatch",
+                                            "mismatched_hold_locator": "hold_mismatch"}[self.cause])
+
+    def violation(self, registration):
+        """The first required violation for ``registration``'s actual ids."""
+        return ":".join((self.required[0], *registration.scope()))
+
+    def declared_source(self, registration):
+        """The exact ``declared_set_digest_mismatch`` this case expects."""
+        need(self.source is not None, "refusal has no declared-set source")
+        return ":".join((self.required[1], self.source, *registration.scope()))
+
+    def cause_violation(self, registration):
+        """The exact cause-specific violation for ``registration``."""
+        return (self.declared_source(registration) if self.source is not None
+                else ":".join((self.required[1], *registration.scope())))
+
+    def __repr__(self):
+        return "ValidatorRefusal(" + self.cause + ("," + self.source if self.source else "") + ")"
+
+
+class CorruptionCase:
+    """One privileged raw-SQL source corruption and the rows it must break.
+
+    ``statement`` is a single DML statement that only removes rows or changes
+    the stored artifact-set digest or one durable hold locator; it never touches
+    a column the pack tables guard with CHECK constraints, so the corruption is
+    the logical damage of issue #169 and nothing else. A planned case also
+    carries the registration it damages, the single-row target the clone must
+    prove changed, and the source-ledger violation the backup must refuse with.
+    """
+
+    def __init__(self, name, statement, broken_rows, requires=(), registration=None, wrong_value=None,
+                 refusal=None):
+        need(TABLE_NAME.match(name), "corruption case name is not a table-safe token")
+        self.name = name
+        self.statement = statement
+        self.broken_rows = tuple(broken_rows)
+        self.requires = tuple(requires)
+        self.registration = registration
+        self.wrong_value = wrong_value
+        self.refusal = refusal
+
+    @property
+    def planned(self):
+        """A planned positive-row case: the clone must prove one changed row."""
+        return self.registration is not None and self.refusal is not None
+
+    @property
+    def targets_digest(self):
+        return self.statement.startswith("UPDATE public.ref_store_core_pack_publications ")
+
+    @property
+    def targets_hold(self):
+        return self.statement.startswith(("DELETE FROM public.artifact_holds ",
+                                          "UPDATE public.artifact_holds "))
+
+    def fingerprint_tables(self):
+        return sorted({*self.broken_rows, *self.requires})
+
+    def __repr__(self):
+        return "CorruptionCase(" + self.name + ")"
+
+
+def _registration(value):
+    need(isinstance(value, str) and UUID_HEX.match(value), "registration id is not a uuid")
+    return q(value) + "::uuid"
+
+
+def missing_pack(registration):
+    registration = _registration(registration)
+    return CorruptionCase("missing_pack",
+                 "DELETE FROM public.ref_store_core_pack_artifacts WHERE registration_id="
+                 + registration + " AND role='pack'",
+                 ("ref_store_core_pack_artifacts",), ("ref_store_core_pack_memberships",))
+
+
+def missing_idx(registration):
+    registration = _registration(registration)
+    return CorruptionCase("missing_idx",
+                 "DELETE FROM public.ref_store_core_pack_artifacts WHERE registration_id="
+                 + registration + " AND role='idx'",
+                 ("ref_store_core_pack_artifacts",), ("ref_store_core_pack_memberships",))
+
+
+def missing_all(registration):
+    registration = _registration(registration)
+    return CorruptionCase("missing_all_artifacts",
+                 "DELETE FROM public.ref_store_core_pack_artifacts WHERE registration_id=" + registration,
+                 ("ref_store_core_pack_artifacts",), ("ref_store_core_pack_memberships",))
+
+
+def wrong_digest(registration, value):
+    registration = _registration(registration)
+    need(isinstance(value, str) and HEX64.match(value) and value != "0" * 64,
+         "wrong-digest value must be a non-zero sha256")
+    return CorruptionCase("wrong_artifact_set_digest",
+                 "UPDATE public.ref_store_core_pack_publications SET artifact_set_digest=" + q(value)
+                 + " WHERE registration_id=" + registration + " AND artifact_set_digest<>" + q(value),
+                 ("ref_store_core_pack_publications",), ("ref_store_core_pack_artifacts",
+                                                         "ref_store_core_pack_memberships"),
+                 wrong_value=value)
+
+
+def missing_hold(registration):
+    registration = _registration(registration)
+    return CorruptionCase("missing_hold",
+                 "DELETE FROM public.artifact_holds WHERE hold_id IN ("
+                 "SELECT hold_id FROM public.ref_store_core_pack_artifacts WHERE registration_id="
+                 + registration + " AND role='pack')",
+                 ("artifact_holds",), ("ref_store_core_pack_artifacts",
+                                       "ref_store_core_pack_publications"))
+
+
+def mismatched_hold_locator(registration, value):
+    registration = _registration(registration)
+    need(isinstance(value, str) and UUID_HEX.match(value), "mismatched hold tenant is not a uuid")
+    return CorruptionCase("mismatched_hold_locator",
+                 "UPDATE public.artifact_holds SET storage_tenant_id=" + q(value) + " WHERE hold_id IN ("
+                 "SELECT hold_id FROM public.ref_store_core_pack_artifacts WHERE registration_id="
+                 + registration + " AND role='pack')",
+                 ("artifact_holds",), ("ref_store_core_pack_artifacts",
+                                       "ref_store_core_pack_publications"),
+                 wrong_value=value)
+
+
+def mismatched_hold_tenant(registration):
+    """Deterministic replacement locator tenant for one registration."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "issue169:mismatched-hold-locator:" + str(registration)))
+
+
+# The six acceptance negatives of issue #169 and the source-ledger violations
+# each produces once a complete API registration is damaged exactly that way
+# (ledger_sets::check_declared).
+BUILDERS = {"missing_pack": missing_pack, "missing_idx": missing_idx,
+            "missing_all_artifacts": missing_all, "wrong_artifact_set_digest": wrong_digest,
+            "missing_hold": missing_hold, "mismatched_hold_locator": mismatched_hold_locator}
+# A missing artifact is still declared by the pair check (canonical_pair_mismatch)
+# plus its own cause token; a rewritten stored digest keeps every declaring set
+# row, so each kind that still holds the old digest reports
+# declared_set_digest_mismatch with its source. ``membership`` is the
+# representative source used for one concrete expected line; the oracle accepts
+# any of DECLARED_SOURCES that the product actually emits. A hold corruption
+# leaves the publication declaration intact but makes the A4 set unrebuildable,
+# so both hold cases require canonical_pair_mismatch plus hold_mismatch.
+REFUSALS = {
+    "missing_pack": ValidatorRefusal("missing_pack"),
+    "missing_idx": ValidatorRefusal("missing_idx"),
+    "missing_all_artifacts": ValidatorRefusal("missing_all_artifacts"),
+    "wrong_artifact_set_digest": ValidatorRefusal("wrong_artifact_set_digest", DECLARED_SOURCES[0]),
+    "missing_hold": ValidatorRefusal("missing_hold"),
+    "mismatched_hold_locator": ValidatorRefusal("mismatched_hold_locator"),
+}
+
+
+def wrong_digest_value(registration):
+    return hashlib.sha256(("wrong-digest:" + str(registration)).encode()).hexdigest()
+
+
+def _stored_digest(pairs, digests, target):
+    """The one stored digest of an intact pair, or ``None`` when not intact.
+
+    Both facts are required: a registration without its complete recorded pair
+    or without its recorded digests cannot be the target (the harness always
+    passes both from the API source).
+    """
+    if pairs is None or digests is None:
+        return None
+    if {str(role) for role in pairs.get(target, ())} != {role for role, _ in PAIR_ROLES}:
+        return None
+    values = {str(value) for value in digests.get(target, ())}
+    # A stored and a declared digest that disagree is already a damaged source.
+    return values.pop() if len(values) == 1 and all(HEX64.match(value) for value in values) else None
+
+
+def _actual_scope(scopes, target):
+    """The ``(repository_id, pack_id)`` the native SQL holds for ``target``."""
+    need(isinstance(scopes, dict), "the actual repository/pack scopes are required")
+    scope = scopes.get(target)
+    need(isinstance(scope, (tuple, list)) and len(scope) == 2, "no actual repository/pack scope for " + target)
+    return _uuid(scope[0], "actual repository id"), _uuid(scope[1], "actual pack id")
+
+
+def corruption_plan(registered, retainable, scopes, pairs=None, digests=None):
+    """Pick the one retained registration all four cases damage.
+
+    ``registered`` is every registration id; ``retainable`` is the subset a
+    root, snapshot or serving read still declares, so dropping its artifacts
+    must not silently shrink the archived set. ``scopes`` maps every
+    registration to the actual ``(repository_id, pack_id)`` of its
+    ``ref_store_core_pack_publications`` row; it is required and is never
+    derived from the registration id. ``pairs`` maps a registration to the
+    roles it still carries and ``digests`` to the digests its A4 and declaring
+    rows hold (when provided, an earlier case that already damaged a
+    registration makes it ineligible). The first intact retained registration in
+    sorted order is used, so the cases differ only in the removed role or in
+    the stored digest. Without both ``pairs`` and ``digests`` no registration can
+    be proven intact and the plan is refused.
+    """
+    registered = [str(value) for value in registered]
+    retainable = sorted({str(value) for value in retainable} & set(registered))
+    need(len(registered) >= 2, "the base source needs at least two registered packs")
+    need(retainable, "no registered pack is retained by a root/snapshot/read lease")
+    for target in retainable:
+        stored = _stored_digest(pairs, digests, target)
+        value = wrong_digest_value(target)
+        if stored is None or value == stored:
+            continue
+        repository_id, pack_id = _actual_scope(scopes, target)
+        registration = Registration(target, stored, repository_id, pack_id)
+        return [_planned(name, registration, target, value) for name in CORRUPTION_CASES]
+    raise AssertionError("no retained registered pack still carries an intact pack+idx pair and digest")
+
+
+def _planned(name, registration, target, value):
+    """One case statement bound to the actual ids of ``registration``."""
+    if name == "wrong_artifact_set_digest":
+        plan = wrong_digest(target, value)
+    elif name == "mismatched_hold_locator":
+        plan = mismatched_hold_locator(target, mismatched_hold_tenant(target))
+    else:
+        plan = BUILDERS[name](target)
+    return CorruptionCase(plan.name, plan.statement, plan.broken_rows, plan.requires,
+                          registration=registration,
+                          wrong_value=plan.wrong_value,
+                          refusal=REFUSALS[plan.name])
+
+
+def finding(case):
+    """The one stored field the case removes or rewrites."""
+    role = registration_role(case.statement)
+    if case.targets_digest:
+        return "publication:artifact_set_digest"
+    if case.targets_hold:
+        suffix = ":storage_tenant_id" if case.name == "mismatched_hold_locator" else ""
+        return "hold:" + (role or "pack") + suffix
+    return "artifact:" + (role or "pack+idx")
+
+
+def registration_role(statement):
+    """The artifact role a missing-artifact statement removes; ``None`` for all."""
+    if "role='pack'" in statement:
+        return "pack"
+    if "role='idx'" in statement:
+        return "idx"
+    return None
+
+
+# ``rowcount`` of the single DML statement, echoed last by ``corruption_sql``.
+CHANGED = "corruption_changed"
+# The only facts a corruption statement may change: the A4 artifact rows it
+# deletes and the stored publication digest it rewrites.
+AFTER_TABLES = ("ref_store_core_pack_artifacts", "ref_store_core_pack_publications")
+# Facts the corruption statement itself must never touch (migration 142 guards).
+GUARDED_TABLES = ("ref_store_core_pack_memberships", "ref_store_core_pack_history",
+                  "ref_store_core_pack_repo_usage", "ref_store_core_pack_tenant_usage")
+# Migration-142 immutability guards (row and statement forms). They must exist
+# and stay enabled in the clone; the corruption never disables them.
+IMMUTABLE_TRIGGERS = tuple(
+    table + suffix
+    for table in ("ref_store_core_pack_publications", "ref_store_core_pack_artifacts",
+                  "ref_store_core_pack_memberships", "ref_store_core_pack_history")
+    for suffix in ("_immutable", "_no_truncate")) + tuple(
+    table + suffix
+    for table in ("ref_store_core_pack_repo_usage", "ref_store_core_pack_tenant_usage")
+    for suffix in ("_no_delete", "_no_truncate"))
+
+
+def _fact_sql(tables, exclude=None):
+    """One md5 per table over every row, or every row but ``exclude``.
+
+    ``exclude`` is the quoted uuid literal of the target registration whose
+    rows the case is meant to change: those rows are captured separately by
+    ``_target_sql`` so the before/after facts prove nothing else moved.
+    """
+    need(exclude is None or (isinstance(exclude, str) and TARGET_LITERAL.fullmatch(exclude)),
+         "a target exclusion must be one quoted uuid literal")
+    return "jsonb_build_object(" + ", ".join(
+        q(table) + ", COALESCE((SELECT md5(COALESCE(string_agg(to_jsonb(t)::text, E'\\n' "
+        "ORDER BY to_jsonb(t)::text), '')) FROM public.\"" + table + "\" t"
+        + (" WHERE t.registration_id <> " + exclude if exclude is not None else "") + "), '')"
+        for table in tables) + ")"
+
+
+# The JSON key under which one target artifact carries its joined migration-141
+# hold row. The hold is nested, never merged into the artifact row, so the
+# artifact's own ``tenant_id`` (the repository/gate tenant) and the locator
+# ``tenant_id`` (``artifact_holds.storage_tenant_id``) stay distinct.
+HOLD_ROW = "hold"
+
+
+def _target_sql(registration):
+    """The target publication and artifacts, each artifact with its exact hold.
+
+    Migration 142 does not store the locator authority/attempt identity, and the
+    artifact ``tenant_id`` column is the repository tenant, not the locator
+    tenant. The full canonical identity only exists in the immutable migration
+    141 ``artifact_holds`` row that the artifact's ``hold_id`` names, so every
+    artifact is projected with its own row untouched plus exactly one joined
+    hold row under ``HOLD_ROW``; the recomputation refuses a missing or repeated
+    join instead of guessing. A subselect (never a lateral join) keeps the
+    meaning identical on PostgreSQL 17.
+    """
+    return ("(SELECT to_jsonb(t) || jsonb_build_object('repository_id', (SELECT r.id FROM public.repositories r "
+            "WHERE r.id = (SELECT g.repository_id FROM public.ref_store_core_pack_publications g "
+            "WHERE g.registration_id=" + registration + ")), 'pack_id', (SELECT g.pack_id "
+            "FROM public.ref_store_core_pack_publications g WHERE g.registration_id=" + registration + ")) "
+            "FROM public.ref_store_core_pack_publications t WHERE t.registration_id=" + registration + "), "
+            "(SELECT COALESCE(jsonb_agg(a.row || jsonb_build_object(" + q(HOLD_ROW) + ", COALESCE(("
+            "SELECT jsonb_agg(to_jsonb(h) ORDER BY to_jsonb(h)::text) FROM public.artifact_holds h "
+            "WHERE h.hold_id = (a.row->>'hold_id')::uuid), '[]'::jsonb)) ORDER BY a.row->>'role'), '[]'::jsonb) FROM ("
+            "SELECT to_jsonb(a) AS row FROM public.ref_store_core_pack_artifacts a "
+            "WHERE a.registration_id=" + registration + ") a)")
+
+
+def corruption_sql(case):
+    """One transaction on the disposable clone: evidence, the explicitly
+    privileged clone-local DML, and the exact row count it changed.
+
+    The A4 ledger is immutable by design (migration 142 guards, and the
+    publication digest is the membership FK target), so the refusal is lifted
+    for this transaction only with ``SET LOCAL session_replication_role``
+    (needs a superuser; the run-owned admin clone is the only database it is
+    ever run on). ``RESET`` runs before COMMIT; the production schema, triggers
+    and DDL are never changed.
+    """
+    need(isinstance(case, CorruptionCase) and case.planned, "planned corruption case expected")
+    registration = _registration(case.registration.id)
+    return (
+        "BEGIN; SET LOCAL statement_timeout='60s'; SET LOCAL lock_timeout='10s'; "
+        "CREATE TEMP TABLE issue169_before ON COMMIT DROP AS SELECT jsonb_build_object("
+        "'target', jsonb_build_array(" + _target_sql(registration) + "), "
+        "'after', " + _fact_sql(AFTER_TABLES, registration) + ", 'guarded', " + _fact_sql(GUARDED_TABLES) + ") AS snapshot; "
+        "SET LOCAL session_replication_role = replica; " + case.statement + ";\n"
+        "\\echo " + CHANGED + " :ROW_COUNT\n"
+        "RESET session_replication_role; "
+        # A plain SELECT under the runner's psql -qAt mode prints the JSON
+        # object as one line. COPY ... TO STDOUT would apply COPY text
+        # escaping (doubling backslashes inside nested JSON strings), so its
+        # payload is not parseable JSON.
+        "SELECT jsonb_build_object("
+        "'registration', CAST(" + registration + " AS text), "
+        "'superuser', (SELECT rolsuper FROM pg_roles WHERE rolname=current_user), "
+        "'replication_role_default', current_setting('session_replication_role')='origin', "
+        "'intact_triggers', (SELECT count(*) FROM pg_trigger g WHERE NOT g.tgisinternal AND g.tgenabled='O' "
+        "AND g.tgname IN (" + ", ".join(q(name) for name in IMMUTABLE_TRIGGERS) + ")), "
+        "'target', jsonb_build_array(" + _target_sql(registration) + "), "
+        "'after', " + _fact_sql(AFTER_TABLES, registration) + ", 'guarded', " + _fact_sql(GUARDED_TABLES) + ", "
+        "'before', (SELECT snapshot FROM issue169_before))::text; COMMIT")
+
+
+def corruption_findings(case, changed, observed):
+    """Evidence if the clone alone carries exactly the intended corruption.
+
+    ``changed`` is the DML row count the clone reported and ``observed`` the
+    JSON row ``corruption_sql`` printed. A missing or unchanged row, another
+    role/digest, a touched guarded ledger, a non-superuser admin, disabled
+    triggers, or a replication role still set after COMMIT fail the fixture
+    before any backup is attempted.
+    """
+    need(isinstance(case, CorruptionCase) and case.planned, "planned corruption case expected")
+    need(isinstance(changed, int) and not isinstance(changed, bool), "corruption row count is not an integer")
+    try:
+        observed = json.loads(observed) if isinstance(observed, (str, bytes)) else observed
+    except ValueError as error:
+        raise AssertionError("corruption evidence is not JSON: " + str(error)) from None
+    need(isinstance(observed, dict), "corruption evidence is not a JSON object")
+    need(str(observed.get("registration")) == case.registration.id, "corruption ran on another registration")
+    need(observed.get("superuser") is True, "the clone-local corruption needs a superuser admin clone")
+    need(observed.get("replication_role_default") is True, "session_replication_role leaked past the transaction")
+    need(observed.get("intact_triggers") == len(IMMUTABLE_TRIGGERS),
+         "migration-142 immutability triggers are missing or disabled in the clone")
+    for state in (observed.get("before"), observed):
+        need(isinstance(state, dict) and set(state.get("after") or {}) == set(AFTER_TABLES)
+             and set(state.get("guarded") or {}) == set(GUARDED_TABLES), "the clone facts are incomplete")
+    need(observed.get("before", {}).get("after") == observed.get("after"),
+         "corruption changed another pack artifact row")
+    need(observed.get("before", {}).get("guarded") == observed.get("guarded"),
+         "corruption touched the memberships/history/usage ledgers")
+    # The AFTER_TABLES facts exclude the target registration (the exclusion is
+    # proven from the SQL below); its publication and artifacts are compared
+    # exactly through the separately captured target evidence.
+    need("t.registration_id <> '" + case.registration.id + "'::uuid" in corruption_sql(case),
+         "the target registration is not excluded from the after facts")
+    publication, before = _target(observed["before"].get("target"))
+    need(publication is not None and publication.get("registration_id") == case.registration.id,
+         "the target registration has no publication")
+    need(publication.get("repository_id") == case.registration.repository_id
+         and publication.get("pack_id") == case.registration.pack_id, "the target publication is another row")
+    need(publication.get("artifact_set_digest") == case.registration.digest,
+         "the target publication carries another artifact-set digest")
+    need(not case.targets_digest or artifact_set_digest(_digest_rows(publication, before)) == case.registration.digest,
+         "the stored digest is not the digest of the target artifact pair")
+    need(sorted(before) == sorted(role for role, _ in PAIR_ROLES),
+         "the target registration is not an intact pack+idx pair before corruption")
+    after_publication, after = _target(observed.get("target"))
+    need(after_publication is not None and after_publication.get("registration_id") == case.registration.id,
+         "the target publication disappeared")
+    if case.targets_digest:
+        need(changed == 1, case.name + ": exactly one row must change, got " + str(changed))
+        need(after_publication.get("artifact_set_digest") == case.wrong_value,
+             "the stored artifact-set digest was not changed to the intended value")
+        need(after_publication == dict(publication, artifact_set_digest=case.wrong_value),
+             "the wrong-digest corruption changed another publication field")
+        need(after == before, "the wrong-digest corruption changed an artifact row")
+    elif case.targets_hold:
+        role = registration_role(case.statement)
+        need(role in before and role in after, case.name + ": the corrupted artifact role is absent")
+        need(changed == 1, case.name + ": exactly one hold row must change, got " + str(changed))
+        need(after_publication == publication, case.name + ": the publication row changed")
+        need(set(after) == set(before), case.name + ": an artifact row disappeared")
+        for name in after:
+            before_row, after_row = dict(before[name]), dict(after[name])
+            before_hold, after_hold = before_row.pop(HOLD_ROW), after_row.pop(HOLD_ROW)
+            need(after_row == before_row, case.name + ": another artifact field changed")
+            if name != role:
+                need(after_hold == before_hold, case.name + ": another artifact hold changed")
+                continue
+            if case.name == "missing_hold":
+                need(len(before_hold) == 1 and after_hold == [], "the target durable hold was not removed")
+            else:
+                need(len(before_hold) == 1 and len(after_hold) == 1,
+                     "the mismatched hold is not exactly one durable row")
+                need(after_hold[0] == dict(before_hold[0], storage_tenant_id=case.wrong_value),
+                     "the hold locator was not changed to the intended tenant")
+                need(after_hold[0]["storage_tenant_id"] != before_hold[0]["storage_tenant_id"],
+                     "the hold locator was not changed")
+    else:
+        removed = registration_role(case.statement)
+        kept = set(before) - ({removed} if removed else set(before))
+        need(changed == len(before) - len(kept), case.name + ": the deletion row count is not exact")
+        need(set(after) == kept, case.name + ": the wrong artifact roles survived")
+        need(all(after[role] == before[role] for role in after), case.name + ": another artifact row changed")
+        need(after_publication == publication, case.name + ": the publication row changed")
+    return {
+        "case": case.name, "registration_id": case.registration.id, "rows_changed": changed,
+        "finding": finding(case), "removed_roles": sorted(set(before) - set(after)),
+        "stored_digest": after_publication.get("artifact_set_digest"),
+        "clone_local_superuser": True, "session_replication_role": "replica-transaction-local",
+        "guarded_ledgers_unchanged": True,
+    }
+
+
+def _target(value):
+    need(isinstance(value, (list, tuple)) and len(value) == 2, "the target evidence is incomplete")
+    publication, artifacts = value
+    need(publication is None or isinstance(publication, dict), "the target publication is not a row")
+    need(isinstance(artifacts, list) and all(isinstance(row, dict) for row in artifacts),
+         "the target artifacts are not rows")
+    return publication, {row["role"]: row for row in artifacts}
+
+
+# Physical fields written by A4 (migration 142) on the artifact row itself.
+DIGEST_ARTIFACT_PHYSICAL = ("provider", "backend_identity")
+# Locator fields the canonical digest takes ONLY from the joined migration-141
+# hold row. ``sha256`` and ``content_length`` also live on the hold row; the
+# recomputation requires them equal to the artifact's physical row.
+LOCATOR_FIELDS = ("storage_tenant_id", "authority_id", "authority_generation", "attempt_id", "namespace")
+HOLD_DIGEST_FIELDS = LOCATOR_FIELDS + ("sha256", "content_length")
+# Canonical digest inputs of one artifact, in ``ArtifactSetDigest::of`` order.
+# ``tenant_id`` here is the locator tenant (``artifact_holds.storage_tenant_id``).
+DIGEST_IDENTITY = ("hold_id", "tenant_id") + LOCATOR_FIELDS + DIGEST_ARTIFACT_PHYSICAL + (
+    "sha256", "content_length")
+# Stored A4 artifact row (migration 142), unchanged, plus the joined hold row.
+DIGEST_COLUMNS = ("role", "slot", "hold_id", "tenant_id", "authority_id", "authority_generation", "attempt_id",
+                  "namespace", "sha256", "content_length", "provider", "backend_identity")
+U64_MAX = 2 ** 64 - 1
+
+
+def _digest_rows(publication, artifacts):
+    """The pair rebuilt as ``ArtifactSetDigest::of`` sees it, without the product.
+
+    The canonical locator ``tenant_id`` is the joined hold's
+    ``storage_tenant_id`` -- never the artifact row's repository/gate
+    ``tenant_id``. ``authority_id``, ``authority_generation``, ``attempt_id`` and
+    ``namespace`` come only from that same hold row. ``sha256``,
+    ``content_length``, ``provider`` and ``backend_identity`` are the exact
+    physical A4 values production hashes, and the hold must agree on hold id,
+    hash and length. ``publication`` is accepted for the caller but nothing is
+    ever inferred from it: its digest is not an identity source.
+    """
+    del publication
+    need(isinstance(artifacts, dict), "the target artifacts are not role-indexed rows")
+    rows = []
+    for role, artifact in artifacts.items():
+        need(isinstance(artifact, dict), "the artifact row is not a JSON object")
+        physical = ("hold_id", "role", "slot", "sha256", "content_length") + DIGEST_ARTIFACT_PHYSICAL
+        missing = [name for name in physical if name not in artifact]
+        need(not missing, "the artifact row lacks a digest field: " + ",".join(missing))
+        hold = artifact.get(HOLD_ROW)
+        need(isinstance(hold, list) and len(hold) == 1 and isinstance(hold[0], dict),
+             "the artifact evidence lacks exactly one joined artifact_holds row")
+        hold = hold[0]
+        need(not [name for name in HOLD_DIGEST_FIELDS + ("hold_id",) if name not in hold],
+             "the joined artifact hold row lacks a digest field")
+        need(UUID_HEX.match(str(artifact["hold_id"])) and str(hold["hold_id"]) == str(artifact["hold_id"]),
+             "the joined artifact hold row is not the artifact's own hold")
+        need(str(artifact["role"]) == role and slot_of(role) == artifact["slot"]
+             and HEXDIGEST.fullmatch(str(artifact["sha256"]))
+             and 0 < int(artifact["content_length"]) <= U64_MAX,
+             "the artifact row is not a canonical pair member")
+        need(str(hold["sha256"]) == str(artifact["sha256"])
+             and int(hold["content_length"]) == int(artifact["content_length"]),
+             "the joined artifact hold row disagrees with the artifact hash/length")
+        need(UUID_HEX.match(str(hold["storage_tenant_id"])) and UUID_HEX.match(str(hold["authority_id"]))
+             and UUID_HEX.match(str(hold["attempt_id"])) and int(hold["authority_generation"]) > 0
+             and isinstance(hold["namespace"], str) and hold["namespace"],
+             "the joined artifact hold row is not a complete locator")
+        row = {name: artifact[name] for name in DIGEST_COLUMNS if name in artifact}
+        row.update(role=role, slot=artifact["slot"], sha256=artifact["sha256"],
+                   content_length=artifact["content_length"])
+        for name in DIGEST_ARTIFACT_PHYSICAL:
+            row[name] = artifact[name]
+        row["tenant_id"] = hold["storage_tenant_id"]
+        for name in LOCATOR_FIELDS:
+            row[name] = hold[name]
+        rows.append(row)
+    return rows
+
+
+def slot_of(role):
+    return dict(PAIR_ROLES).get(role)
+
+
+HEXDIGEST = re.compile(r"[0-9a-f]{64}")
+VALIDATOR_PREFIX = ("Error: backup failed; requires stopped writers, supported dedicated database and safe new "
+                    "destination; partial files may remain: source artifact ledger cannot be archived: ")
+# The suffix every other backup failure keeps byte-for-byte: a typed-refusal
+# parser must never accept it as a source-ledger refusal.
+GENERIC_REFUSAL = ("Error: backup failed; requires stopped writers, supported dedicated database and safe new "
+                   "destination; partial files may remain\n")
+# Any of these means the failure was not the source-ledger validator: another
+# backend/root, an absent or changed Blob byte, a missing source file, or a
+# broken fixture/CLI invocation. A nonzero exit alone therefore proves nothing.
+UNRELATED_ERRORS = (
+    "blob closure backend differs", "failed verified read-back", "exported from the source backend",
+    "changed during export", "blob closure cannot be captured", "notfound", "digestmismatch",
+    "lengthmismatch", "deadlineexceeded", "database_url", "postgresql 17", "transition fence",
+    "schema_migrations", "search_path", "permission denied", "caused by: syntax error", "deadlock",
+    "connection refused",
+)
+
+
+# ``ledger_sets`` violation tokens that can only be caused by damaging one A4
+# set. ``canonical_pair_mismatch`` is the per-publication digest check; the
+# missing-pair and rewritten-digest tokens are cause-specific.
+SET_TOKENS = ("canonical_pair_mismatch", "incomplete_pair", "missing_artifacts", "declared_set_digest_mismatch")
+# Snapshot/root/serving-read rechecks of that same damaged A4 set. They are a
+# real consequence of it, so they may appear as additional summary codes.
+DEPENDENT_TOKENS = ("snapshot_set_mismatch", "snapshot_membership_mismatch", "root_set_mismatch",
+                    "root_pack_set_mismatch", "serving_read_pack_mismatch", "hold_mismatch",
+                    "owner_scope_mismatch")
+# The CLI's denied-by-policy base refs. They are a local git policy refusal, not
+# a source-ledger violation: a summary naming one is not this validator's line.
+CLI_POLICY_TOKENS = ("private_ref", "hidden_ref", "disallowed_ref", "refspec")
+# The validator stamps its own message with any decode failure before any
+# violation is emitted, so these can never be a plain token violation.
+DECODE_ERRORS = ("stored declared set is malformed", "stored publication digest is invalid",
+                 "stored declared joined revision is invalid", "negative artifact length",
+                 "negative hold length", "source artifact ledger cannot be read")
+# The fixed collapse of every prefix outside the product's allowlist.
+OTHER_CODE = "other"
+# Exactly the one line the backup CLI prints for the typed source-ledger
+# refusal: the generic prefix, the validator context and the fixed summary.
+SUMMARY_LINE = re.compile(re.escape(VALIDATOR_PREFIX) + r"source artifact ledger is inconsistent "
+                          r"\((?P<count>[1-9][0-9]*) violations; codes: (?P<codes>[^\s:;()]+)\)")
+
+
+def summary_lines(case):
+    """The summary codes ``validator_refusal`` may accept for one planned case.
+
+    The two required codes (the canonical-pair digest check first) and the
+    further existing codes a damaged A4 set can legitimately produce:
+    ``incomplete_pair``/``missing_artifacts`` are already required for their
+    case, ``incomplete_pair`` is implicit in an empty pair, a rewritten digest
+    also breaks every declaring set row, and the snapshot/root/serving-read
+    rechecks of the same registration are dependent codes.
+    """
+    required = case.refusal.required
+    further = set(DEPENDENT_TOKENS) - set(required)
+    return required, tuple(sorted(further))
+
+
+def validator_refusal(stderr, case):
+    """Strict causal check of one precise source-ledger validator refusal.
+
+    The backup CLI prints exactly one deterministic line: ``rootyard: <generic
+    backup refusal>: source artifact ledger cannot be archived: source artifact
+    ledger is inconsistent (N violations; codes: <sorted,deduplicated codes>)``.
+    ``N`` must be positive and the codes must be a sorted, unique, comma-joined
+    list of safe code names that carries exactly this case's two required codes
+    and only existing dependent codes as its others. The product's IDs and
+    reason tails are intentionally absent from the CLI summary. The generic
+    refusal, the fixed ``other`` collapse, an arbitrary ``Caused by:`` chain,
+    unrelated or CLI policy codes, duplicates, malformed lines and trailing
+    text are all refused.
+    """
+    need(isinstance(case, CorruptionCase) and case.planned, "planned corruption case expected")
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else (stderr or "")
+    lines = text.splitlines()
+    need(len(lines) == 1 and text.endswith("\n"), "backup did not print exactly one deterministic refusal line")
+    line = lines[0]
+    match = SUMMARY_LINE.fullmatch(line)
+    need(match is not None, "backup refusal is not the typed source-ledger summary: " + line[-600:])
+    count = int(match.group("count"))
+    need(count > 0, "the validator reported no violation")
+    codes = match.group("codes").split(",")
+    need(all(re.fullmatch(r"[a-z][a-z0-9_]*", code) for code in codes), "a summary code is not a code name")
+    need(codes == sorted(codes), "the summary codes are not sorted: " + match.group("codes")[:400])
+    need(len(codes) == len(set(codes)), "the summary repeats a code: " + match.group("codes")[:400])
+    lowered = line.lower()
+    need(not [phrase for phrase in UNRELATED_ERRORS if phrase in lowered],
+         "the refusal also names an unrelated failure: " + line[-300:])
+    need(not [phrase for phrase in DECODE_ERRORS if phrase in lowered],
+         "the refusal carries a decode error instead of summary codes: " + line[-300:])
+    required, further = summary_lines(case)
+    need(OTHER_CODE not in codes, "the summary collapses a violation to other: " + match.group("codes")[:400])
+    need(not set(codes) & set(CLI_POLICY_TOKENS),
+         "the refusal carries a CLI policy code: " + match.group("codes")[:400])
+    missing = [code for code in required if code not in codes]
+    need(not missing, "the summary lacks " + ",".join(missing) + " for the target: " + match.group("codes")[:400])
+    unrelated = [code for code in codes if code not in required + further]
+    need(not unrelated, "the summary carries an unrelated code: " + ",".join(unrelated)[:400])
+    return str(count) + "|" + ",".join(codes)
+
+
+# ---------------------------------------------------------------------------
+# Native fixture helper contract
+# ---------------------------------------------------------------------------
+class NativeFixtureRequest:
+    """Invocation of ``tests/ref_store_format22_backup_fixture.rs`` in seed mode."""
+
+    def __init__(self, binary, database_url, git, seed, data_dir, blob_root):
+        self.binary = Path(binary)
+        self.database_url = database_url
+        self.git = Path(git)
+        self.seed = Path(seed)
+        self.data_dir = Path(data_dir)
+        self.blob_root = blob_root
+
+    def argv(self, env=None):
+        return native_fixture_argv(self.binary, self.seed, self.data_dir, self.blob_root, self.git, env)
+
+    def env(self, base):
+        return {key: value for key, value in base.items() if key != "ROOTYARD_BLOB_ROOT"}
+
+
+def native_fixture_argv(binary, seed, data_dir, blob_root, git, env=None):
+    """Deterministic argv; real absolute paths only and no credential in argv."""
+    seed, data_dir, git = Path(seed), Path(data_dir), Path(git)
+    need(seed.is_absolute() and data_dir.is_absolute() and git.is_absolute(), "fixture paths must be absolute")
+    need(blob_root and not str(blob_root).startswith("/") and ".." not in str(blob_root).split("/"),
+         "ROOTYARD_BLOB_ROOT must be a relative run-owned prefix")
+    return [str(binary), "--seed", str(seed), "--data-dir", str(data_dir), "--git", str(git),
+            "--blob-root", str(blob_root)]
+
+
+_FORBIDDEN_MARKER_TEXT = ("postgres://", "postgresql://", "ryt_", "SECRET_ACCESS_KEY", "ACCESS_KEY_ID", "password")
+
+
+def native_marker_checks(marker):
+    """Validate the helper's seed marker and return the expected-positive set.
+
+    The marker must never carry a DSN, token or S3 credential: only ids,
+    digests, counts and states. ``serving_read`` names the one nonempty
+    transient serving read the helper captured through
+    ``PgServingReads::capture``: its pin, its repository/tenant (exactly the
+    marker's API-created bound repository) and a requester owner that is never a
+    repository tenant or the producer.
+    """
+    need(marker.get("kind") == MARKER_KIND, "native fixture marker has another kind")
+    need(marker.get("format") == 22, "native fixture is not a format22 source")
+    text = json.dumps(marker, sort_keys=True)
+    for forbidden in _FORBIDDEN_MARKER_TEXT:
+        need(forbidden not in text, "native fixture marker leaks " + forbidden)
+    repos = marker.get("repositories") or []
+    need(len(repos) >= 2, "native fixture must create at least two API repositories")
+    producer = str(marker.get("producer_owner_id", ""))
+    bound_repository = str(marker.get("bound_repository_id", ""))
+    marker_tenant = str(marker.get("tenant_id", ""))
+    need(UUID_HEX.match(bound_repository), "native fixture marker has no bound_repository_id")
+    need(UUID_HEX.match(marker_tenant), "native fixture marker has no tenant_id")
+    tenants = {str(repo["owner_id"]) for repo in repos}
+    need(producer and producer not in tenants, "the fixture producer owner must differ from every repository tenant")
+    for repo in repos:
+        need(repo.get("state") == "ready" and repo.get("storage_backend") == "pg_refstore",
+             "an API-created repository is not ready pg_refstore")
+    registrations = marker.get("registrations") or []
+    need(len(registrations) >= 2, "the fixture needs at least two registered packs")
+    for registration in registrations:
+        need(sorted(registration.get("roles") or []) == ["idx", "pack"], "a registration is not a pack+idx pair")
+        need(HEX64.match(str(registration.get("artifact_set_digest") or "x")), "a registration has no set digest")
+    roots = marker.get("roots") or []
+    states = [str(root.get("state")) for root in roots]
+    need(states.count("active") >= 1 and states.count("released") >= 1,
+         "the fixture needs non-empty active and released roots")
+    need({str(root.get("tenant_id")) for root in roots} <= tenants,
+         "a root capture names a tenant that does not own an API-created repository")
+    need(all(str(root.get("owner_id")) == producer for root in roots), "root captures disagree on their producer owner")
+    serving_read = _serving_read_checks(marker.get("serving_read"), repos, producer, len(registrations),
+                                        bound_repository, marker_tenant)
+    return {"repositories": len(repos), "registrations": len(registrations),
+            "roots": {state: states.count(state) for state in ROOT_STATES},
+            "producer_distinct_from_tenant": True, "serving_read": serving_read}
+
+
+def _serving_read_checks(marker, repos, producer, registrations, bound_repository, marker_tenant):
+    """One valid, nonempty transient serving read owned by a third real user.
+
+    Besides being a repository the API created, its repository and tenant must
+    be exactly the marker's bound repository/tenant: a serving read on another
+    API-created (but unbound) repository is not the source the format22 drill
+    archived.
+    """
+    need(isinstance(marker, dict), "native fixture marker carries no serving_read")
+    need(set(marker) == {"pin_id", "repository_id", "tenant_id", "owner_id", "pack_count"},
+         "a serving_read entry carries unexpected fields")
+    for field in ("pin_id", "repository_id", "tenant_id", "owner_id"):
+        need(isinstance(marker.get(field), str) and UUID_HEX.match(marker[field]),
+             "serving_read " + field + " is not a valid uuid")
+    need(isinstance(marker.get("pack_count"), int) and not isinstance(marker["pack_count"], bool)
+         and marker["pack_count"] > 0, "serving_read has no nonempty pack count")
+    need(marker["pack_count"] == registrations, "serving_read pack_count differs from the registration count")
+    repo_id, tenant, owner = (marker[field] for field in ("repository_id", "tenant_id", "owner_id"))
+    owners = {str(repo["id"]): str(repo["owner_id"]) for repo in repos}
+    need(repo_id in owners, "serving_read names a repository that was not API-created")
+    need(tenant == owners[repo_id], "serving_read tenant is not the owning tenant of its repository")
+    need(repo_id == bound_repository, "serving_read repository_id differs from marker.bound_repository_id")
+    need(tenant == marker_tenant, "serving_read tenant_id differs from marker.tenant_id")
+    tenants = set(owners.values())
+    need(owner not in tenants, "serving_read requester is a repository tenant")
+    need(owner != producer, "serving_read requester is the producer")
+    return {"pin_id": marker["pin_id"], "repository_id": repo_id, "tenant_id": tenant, "owner_id": owner,
+            "pack_count": marker["pack_count"], "requester_distinct": True}

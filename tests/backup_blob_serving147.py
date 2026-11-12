@@ -8,6 +8,29 @@ The drill verifies and deletes the exact original pack/idx objects, then must
 rebuild them from the archive at unchanged locators before clone/fsck/replay.
 Product GC stays disabled. This is fresh PG/Blob functionality, not LFS,
 workspace, interrupted-restore, physical durability or HA qualification.
+
+Issue #169 (corruption hardening + positive format22 roots). The six
+dedicated corruption negatives (missing pack, missing idx, missing pack+idx,
+wrong artifact_set_digest, missing durable hold, mismatched hold locator) run
+against their own throw-away `pg_dump` clone of
+the API-produced source, while its original Blob objects still exist and before
+the restore case deletes them. Each clone is imported and corrupted inside one
+statement-timeout-bounded transaction whose only privileged act is a
+transaction-local `SET LOCAL session_replication_role = replica` on the
+admin-owned disposable database (migration 142 keeps the A4 rows and triggers
+immutable); the clone must prove that exactly the intended row/field changed,
+then the clone is dropped with FORCE, so no corrupted source can be read later
+and the API source, the clean archive and the production schema are never
+modified. A backup may refuse only with the case's exact source-ledger
+validator violation, before it creates any file (destination, COMPLETE,
+manifest); any other nonzero exit fails the harness. The captured ledger
+digests and closure are asserted unchanged after every case, then the untouched
+clean archive restores into a fresh target with those exact digests and
+locators. The positive format22 case uses a second, API-produced source
+(source-bound Rust fixture `ref_store_format22_backup_fixture`, built with
+`--features pando-lab,format22-fixture`) with non-empty
+active and released API-created roots and a producer owner that is not the
+repository tenant, then verifies and restores it into a fresh database.
 """
 import argparse
 import contextlib
@@ -15,6 +38,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -27,6 +51,16 @@ from urllib.parse import unquote
 
 from backup import bounded_line
 from backup_blob_barrier_probe import BARRIER_REFUSALS, describe, serving_barrier_probe
+from backup_blob_serving169_support import (
+    CHANGED as CORRUPTION_CHANGED, CORRUPTION_CASES as CORRUPTION_NAMES, NativeFixtureRequest, corruption_findings,
+    corruption_plan, corruption_sql, finding, format22_manifest_checks, format22_restore_sql, format22_serving_read_checks,
+    native_marker_checks, validator_refusal,
+)
+
+
+class FixtureUnavailable(RuntimeError):
+    """A Root-supplied fixture is absent: a red run, never green and never hidden."""
+
 from blob_only_service import (
     BlobOnlyHarness, NativeProfile, ProfileError, ZERO_SHA1,
     assert_receive_report_ok, check_blob_profile, need, pg_replay_counts,
@@ -35,14 +69,33 @@ from blob_only_service import (
 )
 from schema_baseline import CURRENT_BLOB_BACKUP_FORMAT as CURRENT_BACKUP_FORMAT, CURRENT_SCHEMA_VERSION, SCHEMA_VERSIONS, catalog_tables
 
+CORRUPTION_CALLBACKS = {
+    "missing_pack": "corrupt_source_missing_pack_refused_before_publication",
+    "missing_idx": "corrupt_source_missing_idx_refused_before_publication",
+    "missing_all_artifacts": "corrupt_source_missing_all_artifacts_refused_before_publication",
+    "wrong_artifact_set_digest": "corrupt_source_wrong_artifact_set_digest_refused_before_publication",
+    "missing_hold": "corrupt_source_missing_hold_refused_before_publication",
+    "mismatched_hold_locator": "corrupt_source_mismatched_hold_locator_refused_before_publication",
+}
+assert tuple(CORRUPTION_CALLBACKS) == CORRUPTION_NAMES
+# The corruption negatives run while the original store is complete: before the
+# post-backup acknowledged write and before the restore case deletes the
+# original Blob objects.
 CASES = (
     "real_http_sha1_sha256_source_without_persistent_bare",
     "offline_volume_and_postgres_snapshot_barriers",
     "incomplete_and_damaged_archives_rejected_before_sql",
     "existing_database_and_directory_targets_refused",
+    CORRUPTION_CALLBACKS["missing_pack"],
+    CORRUPTION_CALLBACKS["missing_idx"],
+    CORRUPTION_CALLBACKS["missing_all_artifacts"],
+    CORRUPTION_CALLBACKS["wrong_artifact_set_digest"],
+    CORRUPTION_CALLBACKS["missing_hold"],
+    CORRUPTION_CALLBACKS["mismatched_hold_locator"],
     "post_backup_acknowledged_write_excluded",
     "fresh_database_restore_clone_refs_content_fsck",
     "restored_exact_receive_replay_without_second_effect",
+    "format22_active_released_roots_distinct_producer_roundtrip",
 )
 LIMITATIONS = [
     "Restore requires the same physical Blob backend identity (provider, endpoint, bucket, root, region, account) as the archive; a different backend is refused, not remapped.",
@@ -51,6 +104,9 @@ LIMITATIONS = [
     "The restore barrier is proven at the parked pg_restore, and every probe re-proves the exclusive key.",
     "No interrupted restore, multi-host failure, physical power-loss, throughput, or production RPO/RTO qualification is claimed.",
     "No legacy format/schema upgrade is exercised. The current binary must restore its own format22/schema147 archive; format21/schema147 stays readable as a metadata-only historical archive.",
+    "The corruption negatives use one privileged, transaction-local `SET LOCAL session_replication_role = replica` statement on a run-owned admin-owned `pg_dump` clone (the documented outside-the-guarantee case of #169, needs a superuser admin); no application path can create those rows, migration-142 triggers are never disabled outside that transaction, and the API source, the clean archive and the production schema are never modified.",
+    "The negative cases require the failure to be the source-ledger validator reporting a bounded list that carries the target's canonical_pair_mismatch plus its cause-specific violation (incomplete_pair, missing_artifacts, or declared_set_digest_mismatch from a declared-set source), with no destination, no COMPLETE and no manifest; a backend mismatch, missing Blob bytes, another registration/repository or any unrelated refusal fails the harness instead of passing it.",
+    "The positive format22 roots case needs the source-bound ref_store_format22_backup_fixture receipt from the same candidate; without it the case is an explicit red FIXTURE_UNAVAILABLE, never a skip.",
 ]
 
 # Deterministic restore-interval gate. `src/backup/postgres.rs::command` passes
@@ -63,7 +119,11 @@ LIMITATIONS = [
 # passes options, never the executable, as argv). The wrapper never blocks on
 # user-controlled files (only `-f`/`-e` tests, a bounded sleep loop and a
 # bounded marker write), and its directory is removed after each case.
-RESTORE_GATE_TIMEOUT_SECONDS = 30.0
+# Restore verifies the whole archive inventory (hashing 858MB+) before it
+# acquires the lifecycle lock and reaches pg_restore, so the marker wait gets
+# the same generous bound as the post-release finish rather than the 15s used
+# for the lighter advisory-lock observations.
+RESTORE_GATE_TIMEOUT_SECONDS = 120.0
 RESTORE_GATE_POLL_SECONDS = 0.02
 # The wrapper sleeps 0.01s (10ms) per poll, so 6000 polls is a nominal
 # 60-second wait bound before it gives up with exit 70.
@@ -234,6 +294,25 @@ class Drill(BlobOnlyHarness):
         self.restore_admin = os.environ.get("ROOTYARD_RESTORE_TEST_DATABASE_URL", self.admin)
         self.created = []
         self.source_db = self.target_db = None
+        # Issue #169: one run-owned Blob prefix per source copy or run.
+        self.prefix = self.env["ROOTYARD_BLOB_ROOT"]
+        self.base_suffix = "format22-169-" + uuid.uuid4().hex
+        self.managed_suffixes = {self.base_suffix}
+        self.corruption_evidence = {}
+        self.corruption_states = {}
+        self.corruption_plan_used = ()
+        # Issue #169: one dump of the API source and the already-proven clean
+        # archive, both fixed before the first negative.
+        self.corruption_dump = None
+        self.corruption_base = None
+        self.corruption_backend_identity = None
+        self.corruption_bindings = None
+        self.corruption_source_root = None
+        self.corruption_locators = ()
+        self.format22 = None
+        self.format22_env = None
+        self.format22_available = False
+        self.format22_target = None
         self.backup = self.root / "backup"
         self.target = self.root / "restored-data"
         self.source_volume = Path(self.env["ROOTYARD_DATA_DIR"])
@@ -243,7 +322,7 @@ class Drill(BlobOnlyHarness):
         self.owned_blob_suffix = "backup147-" + uuid.uuid4().hex
         self.env["ROOTYARD_BLOB_ROOT"] = "/".join(filter(None, (prefix, self.owned_blob_suffix)))
         self.secrets.extend(sensitive_values(os.environ))
-        self.secrets.extend((self.restore_admin, self.env["ROOTYARD_BLOB_ROOT"]))
+        self.secrets.extend((self.restore_admin, self.env["ROOTYARD_BLOB_ROOT"], self.base_suffix))
         for value in (self.admin, self.restore_admin):
             password = urllib.parse.urlsplit(value).password
             if password:
@@ -444,14 +523,27 @@ class Drill(BlobOnlyHarness):
                 "no_persistent_bare": True, "archive_volume_initialized_by_real_reconcile_cli": True,
                 "closure_artifacts": self.closure_rows["count"], "shared_barrier_loss_stops_service": True}
 
-    def wait_for_advisory_holder(self, database, exclusive, timeout=15):
-        """Wait until a real session on `database` holds the lifecycle key."""
+    def wait_for_advisory_holder(self, database, exclusive, timeout=15, *, child=None, exited=None):
+        """Wait until a real session on `database` holds the lifecycle key.
+
+        Only observing that exact advisory lock satisfies the wait. An optional
+        owned `child` process is polled between attempts: if it exits before the
+        lock is observed, fail at once with only its exit status (never stderr,
+        argv, DSN, credentials or exception text). `exited` optionally names the
+        owned work the child does before taking the lock (e.g. "archive
+        checksum verification") and only annotates the timeout message.
+        """
         mode = "ExclusiveLock" if exclusive else "ShareLock"
         deadline = time.monotonic() + timeout
         sql = ("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=738390103"
                " AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND mode='" + mode + "' AND granted")
         while int(self.query(database, sql)) == 0:
-            assert time.monotonic() < deadline, "lifecycle barrier was not taken"
+            if child is not None:
+                status = child.poll()
+                assert status is None, "owned child exited before taking the lifecycle barrier (exit " + str(status) + ")"
+            assert time.monotonic() < deadline, (
+                ("lifecycle barrier was not taken within " + str(timeout) + "s of the " + exited)
+                if child is not None and exited else "lifecycle barrier was not taken")
             time.sleep(0.05)
 
     def advisory_holds(self, database):
@@ -620,6 +712,12 @@ class Drill(BlobOnlyHarness):
             with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                 restore = subprocess.Popen([self.args.binary, "restore", str(self.backup), "--isolated", "--trust-backup"],
                                            env=env, stdout=stdout, stderr=stderr)
+            # Archive inventory verification and the exclusive lifecycle lock
+            # both happen before pg_restore is exec'd; wait for the wrapper's
+            # marker (bounded generously for the 858MB archive hash) instead of
+            # sampling the advisory lock, then prove the held interval at the
+            # real process boundary. The restore's own child exiting first is
+            # reported by wait_blocked using its status only.
             gate.wait_blocked(restore, time.monotonic() + RESTORE_GATE_TIMEOUT_SECONDS)
             query = lambda sql: self.query(self.target_db, sql)
             served = []
@@ -710,6 +808,511 @@ class Drill(BlobOnlyHarness):
         assert self.ledger_digests(self.target_db) == self.source_rows
         return {"exact_original_report": True, "ledger_counters_unchanged": True, "immutable_rows_unchanged": True}
 
+    # --- issue #169: fail-closed source validation and format22 roots -------------
+    def use_blob_suffix(self, suffix):
+        """Point this harness at one run-owned Blob prefix. A different prefix is
+        an independent backend whose identity never matches the serving binding
+        (so the source cannot be archived at all)."""
+        suffix = "format22-169-" + suffix
+        self.managed_suffixes.add(suffix)
+        self.env["ROOTYARD_BLOB_ROOT"] = self.prefix + "/" + suffix
+        self.secrets.append(suffix)
+        return self.env["ROOTYARD_BLOB_ROOT"]
+
+    def fresh_destination(self, label):
+        destination = self.root / label
+        assert not destination.exists(), label + ": destination already exists"
+        return destination
+
+    def archive_state(self, path):
+        """Observable publication outcome, read but never interpreted."""
+        manifest = None
+        if path.joinpath("manifest.json").is_file():
+            try:
+                manifest = json.loads(path.joinpath("manifest.json").read_text())
+            except (OSError, ValueError):
+                manifest = {"unparseable": True}
+        return {"destination": path.exists(), "manifest": manifest, "complete": path.joinpath("COMPLETE").exists()}
+
+    def assert_failed_closed(self, case, destination, process):
+        assert process.returncode != 0, case + ": backup exited 0 on a corrupted source"
+        state = self.archive_state(destination)
+        assert not state["destination"], case + ": a destination was published for a corrupted source"
+        assert not state["complete"], case + ": COMPLETE was written for a corrupted source"
+        if state["manifest"] is not None:
+            assert state["manifest"].get("blob_closure") is None, case + ": a Blob closure was captured"
+            assert state["manifest"].get("blob_artifacts") == [], case + ": artifact rows were archived"
+        return state
+
+    def reset_target(self):
+        """The negatives need a not-yet-created restore target and database."""
+        if self.target.exists():
+            shutil.rmtree(self.target)
+        tables = int(self.query(self.target_db, "SELECT count(*) FROM pg_tables WHERE schemaname='public'"))
+        assert tables == 0, "the dedicated restore database is not empty"
+
+    def row_digest(self, database, table):
+        assert re.fullmatch(r"[a-z][a-z0-9_]*", table), "unexpected table name"
+        raw = self.query(database, "SELECT count(*)::text || '|' || encode(sha256(convert_to("
+                         "coalesce(string_agg(to_jsonb(t)::text, E'\\n' ORDER BY to_jsonb(t)::text), ''),"
+                         "'UTF8')), 'hex') FROM public.\"" + table + "\" t")
+        count, digest = raw.split("|")
+        return {"count": int(count), "sha256": digest}
+
+    def independent_checks(self):
+        """Raw read-only rows recomputed without the product.
+
+        One registration per (repository, pack); every declared pack carries
+        every role whose hold belongs to the same pack producer; each root
+        generation carries the state it declares; the registered-set and roots
+        ledgers are digested row by row.
+        """
+        database = self.source_db
+        checks = {}
+        groups = {}
+        for line in self.query(database,
+                "SELECT a.repository_id::text || '|' || a.pack_id::text || '|' || a.role || '|' || "
+                "coalesce(h.owner_id::text,'') || '|' || coalesce(r.owner_id::text,'') "
+                "FROM public.ref_store_core_pack_artifacts a "
+                "LEFT JOIN public.artifact_holds h ON h.hold_id=a.hold_id "
+                "LEFT JOIN public.repositories r ON r.id=a.repository_id").splitlines():
+            repository, pack, role, producer, tenant = line.split("|")
+            assert producer and tenant and producer != tenant, "a fixture pack has no distinct producer"
+            groups.setdefault((repository, pack), set()).add(role)
+        for key, roles in groups.items():
+            assert roles == {"pack", "idx"}, "a registered pack is not exactly pack+idx: " + str(sorted(roles))
+        checks["pairs"] = sorted(list(key) + [sorted(roles)] for key, roles in groups.items())
+        for table in ("ref_store_core_pack_memberships", "ref_store_core_snapshot_packs"):
+            for row in self.query(database, "SELECT repository_id::text, pack_id::text FROM public." + table).splitlines():
+                assert tuple(row.split("|")) in groups, table + " declares an unknown pack"
+            checks[table] = self.row_digest(database, table)
+        roots = {}
+        for row in self.query(database,
+                "SELECT h.root_id::text, h.state, h.last_generation::text, r.generation::text, "
+                "coalesce(r.owner_id::text,'') FROM public.ref_store_core_root_heads h "
+                "LEFT JOIN public.ref_store_core_roots r ON r.repository_id=h.repository_id "
+                "AND r.root_id=h.root_id AND r.generation=1 ORDER BY h.root_id").splitlines():
+            root, state, head_generation, generation, owner = row.split("|")
+            assert state in ("active", "released"), "a root head has an unknown state"
+            assert int(generation) == 1 and int(head_generation) == (1 if state == "active" else 2), \
+                "a root head disagrees with its capture"
+            assert owner, "a root capture has no producer owner"
+            roots[root] = {"state": state, "owner": owner}
+        checks["roots"] = roots
+        checks["roots_captured"] = self.row_digest(database, "ref_store_core_roots")
+        checks["heads"] = self.row_digest(database, "ref_store_core_root_heads")
+        return checks
+
+    def wait_for_database_writer(self, backup, timeout=15):
+        """Wait until the real backup process waits on this source's writer."""
+        deadline = time.monotonic() + timeout
+        while not int(self.query(self.source_db,
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name='rootyard-backup' AND wait_event_type='Lock'")):
+            assert backup.poll() is None, "backup exited before its PostgreSQL barrier"
+            assert time.monotonic() < deadline, "backup did not reach the source-writer barrier"
+            time.sleep(0.05)
+
+    def proven_archive(self):
+        """Archive the real API-produced source into an independent Blob prefix.
+
+        Not a new claim: the same cut already passed fresh restore, exact replay
+        and the independent contract checks (``independent_checks``).
+        """
+        destination = self.fresh_destination("proven-base")
+        writer = subprocess.Popen(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"], env=self.pg_env(self.source_db),
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        backup = None
+        try:
+            token_id = str(uuid.UUID(self.revoked["token_id"]))
+            writer.stdin.write(("BEGIN; UPDATE public.tokens SET revoked=true WHERE id='" + token_id +
+                                "';\n\\echo LOCKED\n").encode())
+            writer.stdin.flush()
+            assert bounded_line(writer.stdout, time.monotonic() + 10, "owned token writer") == b"LOCKED"
+            self.use_blob_suffix("proven")
+            backup = subprocess.Popen([self.args.binary, "backup", str(destination), "--offline"], env=self.env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.wait_for_advisory_holder(self.source_db, exclusive=True)
+            self.wait_for_database_writer(backup)
+            writer.stdin.write(b"COMMIT;\n\\q\n")
+            writer.stdin.flush()
+            assert writer.wait(timeout=10) == 0
+            status = backup.wait(timeout=120)
+            assert status == 0, "the proven uncorrupted cut failed"
+        finally:
+            for process in (writer, backup):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+        result = json.loads(backup.stdout.read().decode())
+        assert result["format"] == CURRENT_BACKUP_FORMAT and result["blob_artifacts"] > 0, result
+        return destination
+
+    def dump_to(self, path):
+        # Custom format: `quarantined_copy` imports exactly this file with
+        # `pg_restore`, which only reads the archive formats (never plain SQL).
+        dump = subprocess.Popen(["pg_dump", "--no-password", "--format=custom", "--schema=public", "--no-owner",
+                                 "--no-privileges", "--file", str(path)], env=self.pg_env(self.source_db),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _, stderr = dump.communicate(timeout=300)
+        assert dump.returncode == 0, "source dump failed: " + self.redact(stderr[-2000:])
+
+    def quarantined_copy(self, case, destination):
+        """Disposable admin-owned clone = exact dump of the API source, its
+        backend binding checked, then one privileged clone-local corruption
+        whose exact effect is proven before the caller may run a backup."""
+        assert not destination.exists(), case.name + ": the refusal destination already exists"
+        copy = self.new_database(self.admin)
+        name = urllib.parse.unquote(urllib.parse.urlsplit(copy).path.lstrip("/"))
+        try:
+            # PG17's template0 already carries an empty `public` schema, but the
+            # dumped `CREATE SCHEMA public` must own the exact grants/catalog,
+            # so drop it only inside this freshly created run-owned clone.
+            self.query(copy, "DROP SCHEMA IF EXISTS public CASCADE")
+            # `query` returns the count as text, and the valid "0" is truthy.
+            assert self.query(copy, "SELECT count(*) FROM pg_namespace WHERE nspname = 'public'") == "0", \
+                case.name + ": the clone's public schema survived its drop"
+            restore = subprocess.Popen(["pg_restore", "--no-password", "--exit-on-error", "--no-owner",
+                                        "--no-privileges", "--dbname", name, self.corruption_dump],
+                                       env={k: v for k, v in self.pg_env(copy).items() if k != "PGDATABASE"},
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            _, stderr = restore.communicate(timeout=300)
+            assert restore.returncode == 0, case.name + ": clone restore failed: " + self.redact(stderr[-2000:])
+            binding = self.binding(copy)
+            assert binding == self.corruption_bindings, \
+                case.name + ": the clone's Blob binding is not the valid source root/backend: " + self.redact(binding)
+            corrupted = subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1",
+                                        "--set", "ON_ERROR_ROLLBACK=off", "--file", "-"],
+                                       input=corruption_sql(case).encode(), env=self.pg_env(copy),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            assert corrupted.returncode == 0, case.name + ": clone-local corruption refused: " + \
+                self.redact(corrupted.stderr[-2000:])
+            lines = corrupted.stdout.decode().strip().splitlines()
+            echo = CORRUPTION_CHANGED + " "
+            assert len(lines) == 2 and lines[0].startswith(echo) and re.fullmatch(r"[0-9]+", lines[0][len(echo):]), \
+                case.name + ": the corruption did not report its exact row count: " + self.redact(lines)
+            self.corruption_evidence[case.name] = corruption_findings(case, int(lines[0][len(echo):]), lines[1])
+            return copy
+        except BaseException:
+            self.drop_copy(copy)
+            raise
+
+    def binding(self, database):
+        """The deployed serving binding/backend identity of every API repository."""
+        raw = self.query(database,
+            "SELECT coalesce(string_agg(x, E'\\n' ORDER BY x), '') FROM ("
+            "SELECT r.id::text || '|' || r.storage_backend || '|' || coalesce(b.object_format, '') || '|' || "
+            "coalesce(b.backend_identity, '') AS x FROM public.repositories r "
+            "LEFT JOIN public.ref_store_serving_repositories b ON b.repository_id=r.id) rows")
+        return raw
+
+    def source_backend(self):
+        """The valid source Blob root/backend: the one saved with the clean
+        archive, whose COMPLETE only exists after the paired closure was
+        verified against it, so a clone can never use another root/backend."""
+        assert self.corruption_base is not None and self.corruption_base.joinpath("COMPLETE").is_file(), \
+            "the clean archive was not completed before the first corruption negative"
+        assert self.corruption_bindings, "the source Blob binding was not captured"
+        closure = json.loads(self.corruption_base.joinpath("manifest.json").read_text()).get("blob_closure") or {}
+        assert closure.get("backend_identity"), "the clean archive has no Blob closure backend identity"
+        # Compare the archived closure against the exact backend identity rows
+        # the API source really served from; never derive or synthesize one.
+        identities = {row.rsplit("|", 1)[-1] for row in self.corruption_bindings.splitlines()}
+        assert len(identities) == 1 and "" not in identities, \
+            "the API source does not have one serving Blob backend: " + self.redact(self.corruption_bindings)
+        source_backend = identities.pop()
+        assert closure["backend_identity"] == source_backend, \
+            "the clean archive closure backend does not match the source serving binding"
+        return source_backend
+
+    def drop_copy(self, database):
+        name = urllib.parse.unquote(urllib.parse.urlsplit(database).path.lstrip("/"))
+        self.query(self.admin, 'DROP DATABASE "' + name + '" WITH (FORCE)')
+        self.created = [entry for entry in self.created if entry != (self.admin, name)]
+        names = [entry for _, entry in self.created]
+        assert name not in names, "the owned clone survived its drop"
+
+    def use_source_database(self, database):
+        """Run the real CLI against `database` with the source volume and the
+        exact source Blob root."""
+        self.db = database
+        self.env.update(DATABASE_URL=database, ROOTYARD_DATA_DIR=str(self.source_volume),
+                        ROOTYARD_SCRATCH_DIR=str(self.source_scratch),
+                        ROOTYARD_BLOB_ROOT=self.corruption_source_root)
+
+    def corrupt(self, case):
+        """One dedicated corruption in its own clone; then the clone is dropped."""
+        destination = self.fresh_destination("corrupt-" + case.name)
+        copy = self.quarantined_copy(case, destination)
+        try:
+            self.use_source_database(copy)
+            process = self.run([self.args.binary, "backup", str(destination), "--offline"], check=False)
+            state = self.assert_refused_by_validator(case, destination, process)
+        finally:
+            self.use_source_database(self.source_db)
+            self.drop_copy(copy)
+        return state
+
+    def assert_refused_by_validator(self, case, destination, process):
+        """The backup refused with this case's exact source-ledger violation and
+        wrote nothing, and no corrupted source leaked back into the API source."""
+        assert process.returncode != 0, case.name + ": backup exited 0 on a corrupted source"
+        self.assert_failed_closed(case.name, destination, process)
+        violation = validator_refusal(process.stderr, case)
+        assert self.binding(self.source_db) == self.corruption_bindings, \
+            case.name + ": the API source binding changed during the clone"
+        return violation
+
+    def corruption_source(self):
+        """Capture the API source dump, closure and binding exactly once, with
+        the already-completed clean archive, before the first negative."""
+        if self.corruption_dump is not None:
+            return
+        # snapshot() already created and backup-verified the clean archive from
+        # the API source and its exact original Blob root; use that archive.
+        self.corruption_base = self.backup
+        assert self.corruption_base.joinpath("COMPLETE").is_file() and \
+            self.corruption_base.joinpath("manifest.json").is_file(), "the clean archive is incomplete"
+        self.corruption_source_root = self.env["ROOTYARD_BLOB_ROOT"]
+        assert self.corruption_source_root and not self.corruption_source_root.endswith("/"), "no source Blob root"
+        self.corruption_dump = self.root / "source.pgdump"
+        self.dump_to(self.corruption_dump)
+        assert self.corruption_dump.is_file() and self.corruption_dump.stat().st_size > 0, "the source dump is empty"
+        self.corruption_bindings = self.binding(self.source_db)
+        assert self.corruption_bindings, "the API source has no repository binding"
+        self.corruption_backend_identity = self.source_backend()
+        # The throw-away clones run the real CLI against the source volume; its
+        # scratch directory is run-owned and must exist before the first backup.
+        Path(self.env["ROOTYARD_SCRATCH_DIR"]).mkdir(mode=0o700, exist_ok=True)
+
+    def corruption_plan_rows(self):
+        # The actual publication identity of every registration: the validator
+        # names these exact repository/pack/registration ids, so the plan must
+        # never invent them.
+        scopes, registered = {}, []
+        for row in self.query(self.source_db,
+                "SELECT registration_id::text || '|' || repository_id::text || '|' || pack_id::text "
+                "FROM public.ref_store_core_pack_publications ORDER BY registration_id").splitlines():
+            registration, repository, pack = row.split("|")
+            scopes[registration] = (repository, pack)
+            registered.append(registration)
+        assert len(scopes) == len(registered), "a registration is not unique in its publications"
+        # The real synthetic source has zero serving reads and guarantees only
+        # API-created publications with live memberships: a registered
+        # membership is itself the source declaration that still holds the
+        # registration, so the archived set cannot shrink after artifact loss.
+        retainable = self.query(self.source_db,
+            "SELECT DISTINCT registration_id FROM ("
+            "SELECT registration_id FROM public.ref_store_core_root_packs UNION "
+            "SELECT registration_id FROM public.ref_store_core_snapshot_packs UNION "
+            "SELECT registration_id FROM public.ref_store_core_serving_read_packs UNION "
+            "SELECT registration_id FROM public.ref_store_core_pack_memberships) declared "
+            "ORDER BY registration_id").splitlines()
+        pairs, digests = {}, {}
+        for row in self.query(self.source_db,
+                "SELECT registration_id::text || '|' || role FROM public.ref_store_core_pack_artifacts "
+                "ORDER BY registration_id, role").splitlines():
+            registration, role = row.split("|")
+            pairs.setdefault(registration, set()).add(role)
+        for row in self.query(self.source_db,
+                "SELECT registration_id::text || '|' || artifact_set_digest FROM public.ref_store_core_pack_publications "
+                "UNION ALL SELECT registration_id::text || '|' || artifact_set_digest "
+                "FROM public.ref_store_core_pack_memberships "
+                "UNION ALL SELECT registration_id::text || '|' || artifact_set_digest "
+                "FROM public.ref_store_core_root_packs "
+                "UNION ALL SELECT registration_id::text || '|' || artifact_set_digest "
+                "FROM public.ref_store_core_snapshot_packs "
+                "UNION ALL SELECT p.registration_id::text || '|' || p.artifact_set_digest "
+                "FROM public.ref_store_core_serving_read_packs p").splitlines():
+            registration, digest = row.split("|")
+            digests.setdefault(registration, set()).add(digest)
+        return corruption_plan(registered, retainable, scopes, pairs, digests)
+
+    def corrupt_source_negative(self, name):
+        """One issue-#169 negative: one exact validator refusal on a corrupted
+        clone while the original Blob objects still exist, then the API source,
+        the clean archive and its digest capture are proven unchanged."""
+        assert name in CORRUPTION_NAMES, name + " is not an issue #169 corruption case"
+        assert name not in self.corruption_states, name + ": corruption case ran twice"
+        self.corruption_source()
+        assert self.corruption_dump is not None and self.corruption_base is not None, \
+            name + ": the source dump and clean archive must exist before any clone"
+        if not self.corruption_plan_used:
+            assert self.corruption_base.joinpath("COMPLETE").is_file(), "the clean archive is incomplete"
+            self.corruption_plan_used = tuple(self.corruption_plan_rows())
+            assert [entry.name for entry in self.corruption_plan_used] == list(CORRUPTION_NAMES)
+        case = next(entry for entry in self.corruption_plan_used if entry.name == name)
+        assert case.name not in self.corruption_states, name + ": corruption case ran twice"
+        # Every original Blob object must still exist: a missing byte would be a
+        # different (unrelated) refusal than the ledger validator.
+        client = self.s3_client()
+        for locator in self.originals:
+            self.verify_original(client, locator)
+        violation = self.corrupt(case)
+        self.corruption_states[name] = violation
+        assert self.binding(self.source_db) == self.corruption_bindings and \
+            self.originals == self.original_locators(), name + ": the API source changed during the clone"
+        assert self.ledger_digests(self.source_db) == self.source_rows, name + ": the API source ledgers changed"
+        assert self.corruption_base.joinpath("COMPLETE").is_file(), name + ": the clean archive changed"
+        detail = {"case": case.name, "finding": finding(case),
+                  "statement_changed": case.targets_digest or case.targets_hold,
+                  "breaks": list(case.broken_rows),
+                  "clone_dropped": True, "failed_closed": True,
+                  "validator_refusal": violation.split("|", 1)[0],
+                  "expected_violation": case.refusal.violation(case.registration),
+                  "expected_cause_violation": case.refusal.cause_violation(case.registration),
+                  "original_blob_objects_intact": True, "api_source_unchanged": True,
+                  "corruption_evidence": self.corruption_evidence[case.name]}
+        if len(self.corruption_states) == len(CORRUPTION_NAMES):
+            detail.update(self.restore_clean_base())
+        return detail
+
+    def restore_clean_base(self):
+        """After every negative: the untouched archive restores into a fresh,
+        separate run-owned target with the captured ledger digests and
+        locators, leaving the primary target unused for the later restore."""
+        assert set(self.corruption_states) == set(CORRUPTION_NAMES), "the negatives did not all run"
+        database = self.new_database(self.restore_admin)
+        target = self.fresh_destination("corruption-clean-restore")
+        tables = int(self.query(database, "SELECT count(*) FROM pg_tables WHERE schemaname='public'"))
+        assert tables == 0, "the dedicated corruption restore database is not empty"
+        restored = self.restore_command(source=self.corruption_base, target=target,
+                                        database=database, check=False)
+        assert restored.returncode == 0, "the uncorrupted archive does not restore after the negatives: " + \
+            self.redact(restored.stderr[-2000:])
+        digests = self.ledger_digests(database)
+        assert digests == self.source_rows, "the restore target changed during the corruption negatives"
+        assert self.artifact_rows(database) == self.closure_rows, "the clean archive lost its locators"
+        assert self.original_locators(database) == self.originals, "the restore target changed its locators"
+        shutil.rmtree(target)
+        return {"all_negatives_refused_by_validator": True, "untouched_target_restored": True,
+                "restored_ledger_tables": len(digests), "restored_closure_artifacts": self.closure_rows["count"]}
+
+    def corrupt_source_missing_pack_refused_before_publication(self):
+        return self.corrupt_source_negative("missing_pack")
+
+    def corrupt_source_missing_idx_refused_before_publication(self):
+        return self.corrupt_source_negative("missing_idx")
+
+    def corrupt_source_missing_all_artifacts_refused_before_publication(self):
+        return self.corrupt_source_negative("missing_all_artifacts")
+
+    def corrupt_source_wrong_artifact_set_digest_refused_before_publication(self):
+        return self.corrupt_source_negative("wrong_artifact_set_digest")
+
+    def corrupt_source_missing_hold_refused_before_publication(self):
+        return self.corrupt_source_negative("missing_hold")
+
+    def corrupt_source_mismatched_hold_locator_refused_before_publication(self):
+        return self.corrupt_source_negative("mismatched_hold_locator")
+
+    def format22_unavailable(self, reason):
+        """Only a missing Root-supplied fixture is an environment gap; every
+        other failure stays red."""
+        if not self.args.format22_fixture:
+            raise FixtureUnavailable("FIXTURE_UNAVAILABLE: " + reason
+                                     + "; supply --format22-fixture (the scripts/build_native_test.py receipt)")
+        raise AssertionError(reason)
+
+    def format22_fixture(self):
+        """Migrate a fresh source database and create the API-produced format22
+        source with the source-bound fixture."""
+        source = self.new_database(self.admin)
+        env = self.env.copy()
+        # The seed binds ROOTYARD_BLOB_ROOT to exactly --blob-root (==
+        # self.base_suffix); the saved env, and so backup, verify and restore,
+        # must serve from that same root and no other.
+        env["ROOTYARD_BLOB_ROOT"] = self.base_suffix
+        env.update(DATABASE_URL=source, ROOTYARD_TEST_DATABASE_URL=source,
+                   ROOTYARD_DATA_DIR=str(self.root / "format22-data"),
+                   ROOTYARD_EXPECTED_SOURCE_COMMIT=self.profile.build["workspace_commit"])
+        self.secrets.append(source)
+        self.format22_env = env
+        migrate = subprocess.run([self.args.binary, "migrate"], env=env, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE, timeout=120)
+        assert migrate.returncode == 0, "format22 migrate failed: " + self.redact(migrate.stderr[-2000:])
+        seed = self.root / "format22-seed.json"
+        request = NativeFixtureRequest(self.args.format22_fixture, source, self.profile.git, seed,
+                                       self.root / "format22-data", self.base_suffix)
+        fixture_env = dict(request.env(env), ROOTYARD_BLOB_ROOT=env["ROOTYARD_BLOB_ROOT"])
+        fixture = subprocess.run(request.argv(fixture_env), env=fixture_env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, timeout=900)
+        assert fixture.returncode == 0, "format22 fixture refused: " + self.redact(fixture.stderr[-4000:])
+        self.format22_marker = json.loads(seed.read_text())
+        markers = native_marker_checks(self.format22_marker)
+        self.format22_available = True
+        return self.format22_env
+
+    def format22_archive(self):
+        """Archive the API-produced source and check the format22 contract."""
+        backup = subprocess.run([self.args.binary, "backup", str(self.fresh_destination("format22-forward")),
+                                 "--offline"], env=dict(self.format22_env), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=300)
+        assert backup.returncode == 0, "format22 backup failed: " + self.redact(backup.stderr[-4000:])
+        result = json.loads(backup.stdout.decode())
+        manifest = json.loads(self.root.joinpath("format22-forward", "manifest.json").read_text())
+        markers = self.format22_marker
+        registrations = [row["registration_id"] for row in markers["registrations"]]
+        # The source's own publications, not the archive rows: every registration
+        # is bound to the marker's bound repository and its own pack, so a
+        # self-consistent archive that repoints both members' repository/pack
+        # identity is still refused.
+        registration_scopes = {str(row["registration_id"]): (str(markers["bound_repository_id"]), str(row["pack_id"]))
+                               for row in markers["registrations"]}
+        detail = format22_manifest_checks(manifest, {
+            "format": 22, "schema_versions": SCHEMA_VERSIONS, "schema_baseline": SCHEMA_VERSIONS,
+            "registered_packs": registrations, "registration_scopes": registration_scopes,
+            "artifacts": len(registrations) * 2, "roots": markers["roots"], "repos": markers["repositories"],
+            "producer": markers["producer_owner_id"], "serving_read": markers["serving_read"]})
+        assert result["format"] == 22 and result["blob_artifacts"] == detail["closure_artifacts"], result
+        self.format22 = {"directory": self.root / "format22-forward", "manifest": manifest, "detail": detail}
+        return detail
+
+    def format22_restore(self):
+        """Verify and restore the format22 archive into a fresh database."""
+        path = self.format22["directory"]
+        verify = subprocess.run([self.args.binary, "backup-verify", str(path)], env=self.format22_env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+        assert verify.returncode == 0, "format22 backup-verify refused: " + self.redact(verify.stderr[-2000:])
+        # The target is a fresh TEMPLATE template0 database with no data
+        # directory yet: restore.rs requires that empty-target barrier, so no
+        # migrate (which would create catalog objects) runs here.
+        restore_env = dict(self.format22_env, DATABASE_URL=self.format22_target,
+                           ROOTYARD_DATA_DIR=str(self.root / "format22-restored-data"),
+                           ROOTYARD_SCRATCH_DIR=str(self.root / "format22-scratch"))
+        restore = subprocess.run([self.args.binary, "restore", str(path), "--isolated", "--trust-backup"],
+                                 env=restore_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        assert restore.returncode == 0, "format22 restore failed: " + self.redact(restore.stderr[-4000:])
+        restored = json.loads(restore.stdout.decode())
+        assert restored["restored"] is True and restored["blob_artifacts"] == self.format22["detail"]["closure_artifacts"]
+        rows = self.query(self.format22_target,
+                          "SELECT (SELECT count(*) FROM public.ref_store_core_pack_artifacts) || '|' || "
+                          "(SELECT count(*) FROM public.ref_store_core_root_heads WHERE state='active') || '|' || "
+                          "(SELECT count(*) FROM public.ref_store_core_root_heads WHERE state='released') || '|' || "
+                          "(SELECT count(DISTINCT h.owner_id) FROM public.ref_store_core_root_heads h JOIN "
+                          "public.repositories r ON r.id=h.repository_id WHERE h.owner_id<>r.owner_id)")
+        artifacts, active, released, foreign_owner = (int(value) for value in rows.split("|"))
+        assert artifacts == self.format22["detail"]["closure_artifacts"], "restored artifacts differ"
+        assert active >= 1 and released >= 1, "restored roots lost an active or released capture"
+        assert foreign_owner >= 1, "restored roots lost the non-tenant producer owner"
+        # The one positive serving read must survive as exactly the marker's
+        # read in the fresh restored database (issue #169).
+        serving_read = self.format22["detail"]["serving_read"]
+        observed = self.query(self.format22_target, format22_restore_sql(serving_read))
+        serving_read_detail = format22_serving_read_checks(observed, serving_read)
+        return {"restored": True, "verify": True, "artifacts": artifacts, "active_roots": active,
+                "released_roots": released, "producer_distinct_from_tenant": foreign_owner >= 1,
+                "serving_read": serving_read_detail}
+
+    def format22_active_released_roots_distinct_producer_roundtrip(self):
+        if not self.args.format22_fixture:
+            self.format22_unavailable("the format22 source fixture was not supplied")
+        self.format22_fixture()
+        self.format22_target = self.new_database(self.restore_admin)
+        archive = self.format22_archive()
+        restore = self.format22_restore()
+        return {"format": 22, "archive": archive, "restore": restore}
+
+
     def cleanup(self):
         failures = []
         try:
@@ -732,6 +1335,9 @@ def main(argv=None):
     parser.add_argument("--binary", required=True, help="absolute attested current rootyard binary")
     parser.add_argument("--git", help="absolute trusted stock Git")
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--format22-fixture",
+                        help="absolute receipt of ref_store_format22_backup_fixture built by scripts/build_native_test.py "
+                             "--test ref_store_format22_backup_fixture --features pando-lab,format22-fixture --no-default-features")
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args(argv)
     harness = None
@@ -739,6 +1345,8 @@ def main(argv=None):
     error_text = None
     script_digest = sha256_file(Path(__file__))
     dependency_digest = sha256_file(Path(__file__).with_name("blob_only_service.py"))
+    support_digest = sha256_file(Path(__file__).with_name("backup_blob_serving169_support.py"))
+    fixture_receipt = None
     try:
         profile = NativeProfile(args.binary, args.git, os.environ)
         blob_profile = check_blob_profile(os.environ)
@@ -747,8 +1355,28 @@ def main(argv=None):
             need(shutil.which(executable), executable + " is required")
         harness = Drill(args, profile, blob_profile)
         blob_profile = check_blob_profile(harness.env)
+        # The format22 source comes from a source-bound receipt of the same
+        # candidate and the same source inputs as the executed binary.
+        if args.format22_fixture:
+            fixture_receipt = json.loads(Path(args.format22_fixture).with_suffix(".build.json").read_text())
+            executed = Path(args.format22_fixture).resolve(strict=True)
+            need(fixture_receipt.get("binary_sha256") == sha256_file(executed),
+                 "the format22 fixture receipt does not match its executable")
+            need(fixture_receipt.get("workspace_commit") == profile.build["workspace_commit"],
+                 "the format22 fixture was built from another commit")
+            need(fixture_receipt.get("source_inputs_sha256") == profile.build["source_inputs_sha256"],
+                 "the format22 fixture source inputs differ from the executed binary")
+            need(fixture_receipt.get("integration_test_source_sha256"), "the format22 fixture receipt is incomplete")
         methods = (harness.synthetic_source, harness.snapshot, harness.invalid_archives, harness.existing_targets,
-                   harness.write_after_backup, harness.restore_and_clone, harness.restored_replay)
+                   harness.corrupt_source_missing_pack_refused_before_publication,
+                   harness.corrupt_source_missing_idx_refused_before_publication,
+                   harness.corrupt_source_missing_all_artifacts_refused_before_publication,
+                   harness.corrupt_source_wrong_artifact_set_digest_refused_before_publication,
+                   harness.corrupt_source_missing_hold_refused_before_publication,
+                   harness.corrupt_source_mismatched_hold_locator_refused_before_publication,
+                   harness.write_after_backup,
+                   harness.restore_and_clone, harness.restored_replay,
+                   harness.format22_active_released_roots_distinct_producer_roundtrip)
         for name, method in zip(CASES, methods, strict=True):
             harness.case(name, method)
         success = True
@@ -770,12 +1398,18 @@ def main(argv=None):
               "expected_cases": list(CASES), "cases": harness.results if harness else [],
               "skips": 0, "limitations": LIMITATIONS,
               "harness_sha256": script_digest, "blob_only_service_sha256": dependency_digest,
+              "format22_support_sha256": support_digest,
+              "format22_fixture": None if fixture_receipt is None else {
+                  key: fixture_receipt.get(key) for key in ("binary_sha256", "source_inputs_sha256",
+                                                            "integration_test_source_sha256", "workspace_commit")},
               "independent_blob_closure_backup_claimed": False, "ci_release_gate": False}
     try:
         validate_report_cases(report, CASES)
         need(harness.profile.source_digest() == harness.profile.build["source_inputs_sha256"], "production inputs changed during drill")
         need(sha256_file(Path(__file__)) == script_digest, "drill source changed during execution")
         need(sha256_file(Path(__file__).with_name("blob_only_service.py")) == dependency_digest, "shared harness changed during execution")
+        need(sha256_file(Path(__file__).with_name("backup_blob_serving169_support.py")) == support_digest,
+             "the issue #169 support module changed during execution")
         need(sha256_file(harness.profile.binary) == harness.profile.build["binary_sha256"], "binary changed during execution")
         report["passed"] = success
     except (ProfileError, AttributeError) as error:
@@ -789,6 +1423,9 @@ def main(argv=None):
     if not success:
         report["error"] = error_text
     report["independent_blob_closure_backup_claimed"] = bool(report["passed"])
+    if not success and harness is not None and not harness.format22_available:
+        # Explicit red, never green and never hidden: the fixture was not supplied.
+        report["fixture_unavailable"] = ["--format22-fixture (ref_store_format22_backup_fixture receipt for this candidate)"]
     write_report(args.report, report)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 1

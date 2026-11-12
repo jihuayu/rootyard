@@ -11,7 +11,7 @@
 use super::error::RootError;
 use super::rows::{CaptureRow, stored_oid};
 use super::scope::RootsScope;
-use super::selector::RootSelectorKind;
+use super::selector::{RootSelector, RootSelectorKind};
 use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::pack_commit::{CapturedRef, RegisteredPack, packs_digest, refs_digest};
 use uuid::Uuid;
@@ -83,6 +83,15 @@ pub(super) fn binding_digest(parts: &BindingParts<'_>) -> RequestDigest {
     RequestDigest::of(ROOT_BINDING_DIGEST_DOMAIN, &parts)
 }
 
+/// The register intent digest `register` stores on the head (and every tombstone binds as
+/// `expected_register_digest`), derived only from the complete binding and the sealed scope.
+pub(super) fn register_digest(binding: RequestDigest, root_id: Uuid, purpose: &str) -> RequestDigest {
+    RequestDigest::of(
+        super::candidate::REGISTER_DIGEST_DOMAIN,
+        &[binding.as_bytes(), root_id.as_bytes(), b"generation-1", purpose.as_bytes()],
+    )
+}
+
 fn sorted_oids(oids: &[String]) -> String {
     let mut sorted = oids.to_vec();
     sorted.sort();
@@ -143,6 +152,20 @@ impl RawCapture {
             return Err(RootError::Store(crate::ref_store::contract::RefStoreError::Database(
                 "retained root refs are not sorted and unique".into(),
             )));
+        }
+        // The selector is exactly what `resolve_oids` derives from the stored selector kind: every captured ref
+        // object id plus the captured HEAD for a whole snapshot, and the canonical sorted unique explicit set
+        // otherwise (which also re-validates every stored oid against the capture object format).
+        let resolved = super::selector::resolve_oids(
+            &RootSelector::from_kind(self.header.selector_kind, self.oids.clone()),
+            self.header.object_format,
+            &self.refs,
+            self.header.head_oid.as_deref(),
+        )?;
+        if resolved != self.oids {
+            return Err(RootError::RootSelectorInvalid(
+                "retained root selector oids are not the ones the selector kind resolves to".into(),
+            ));
         }
         if self.oids.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(RootError::Store(crate::ref_store::contract::RefStoreError::Database(

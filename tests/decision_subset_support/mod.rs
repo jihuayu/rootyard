@@ -15,6 +15,7 @@ pub mod cases_a;
 pub mod cases_b;
 pub mod cases_c;
 pub mod cases_d;
+pub mod cases_e;
 pub mod common;
 pub mod fixture;
 pub mod metadata;

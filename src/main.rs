@@ -84,8 +84,7 @@ async fn run() -> Result<()> {
     let pool = db::pool(&config.database_url)?;
     match args.first().map(String::as_str).unwrap_or("serve") {
         "backup" if args.len() == 3 && args[2] == "--offline" => {
-            rootyard::backup::create(&config, std::path::Path::new(&args[1])).await
-                .map_err(|_| anyhow::anyhow!("backup failed; requires stopped writers, supported dedicated database and safe new destination; partial files may remain"))?;
+            rootyard::backup::create(&config, std::path::Path::new(&args[1])).await.map_err(backup_refusal)?;
         }
         "restore"
             if (args.len() == 4
@@ -385,6 +384,35 @@ async fn run() -> Result<()> {
     }
     Ok(())
 }
+
+/// The one generic backup refusal every other failure keeps byte-for-byte.
+const BACKUP_REFUSAL: &str = "backup failed; requires stopped writers, supported dedicated database and safe new \
+    destination; partial files may remain";
+/// The source-validator refusal context, kept between the generic prefix and
+/// the typed summary.
+const LEDGER_CONTEXT: &str = "source artifact ledger cannot be archived";
+
+/// The CLI backup diagnostic. Only a `LedgerValidationRefusal` cause (the
+/// source validator ran every read and check and refused a non-empty violation
+/// set) is named: the generic prefix plus its fixed count + summary-code
+/// summary. Every other error keeps the generic message byte-for-byte, and no
+/// arbitrary anyhow chain is ever printed.
+fn backup_refusal(error: anyhow::Error) -> anyhow::Error {
+    match ledger_refusal(&error) {
+        Some(summary) => anyhow::anyhow!("{BACKUP_REFUSAL}: {LEDGER_CONTEXT}: {summary}"),
+        None => anyhow::anyhow!("{BACKUP_REFUSAL}"),
+    }
+}
+
+/// The summary of the one typed source-ledger cause in `error`'s chain, never
+/// the cause's own text and never any chain text.
+fn ledger_refusal(error: &anyhow::Error) -> Option<String> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<rootyard::backup::LedgerValidationRefusal>())
+        .map(rootyard::backup::LedgerValidationRefusal::diagnostic)
+}
+
 async fn shutdown() {
     let mut term =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("install SIGTERM handler");
