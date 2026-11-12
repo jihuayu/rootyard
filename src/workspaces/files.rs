@@ -180,7 +180,7 @@ async fn put_mutation(
         ))
         .map_err(Error::internal)?,
     ));
-    let _mutation = super::blocking::lock_mutation(id, super::blocking::io_timeout()).await?;
+    let mutation = super::blocking::lock_mutation(id, super::blocking::io_timeout()).await?;
 
     // Phase 1: short pre-check transaction without holding DB locks across disk work.
     {
@@ -215,12 +215,20 @@ async fn put_mutation(
     let repo = service::workspace_repo(&state, id);
     let upper_root = upper_fallback_root(&state, id);
     let path_arg = raw_path.clone();
-    let (digest, scanned, mut put_rb) = super::blocking::run(move || {
-        let mut rb = PutRollback::capture(&repo, &path_arg, upper_root)?;
+    let (digest, scanned, mut put_rb) = super::blocking::run_mutating(&mutation, move |abandoned, fence| {
+        let mut rb = PutRollback::capture(&repo, &path_arg, upper_root, Some(fence))?;
+        if abandoned.is_abandoned() {
+            rb.disarm();
+            return Err(Error::timeout());
+        }
         let target = rb.target().to_path_buf();
         if let Err(error) = atomic_put(&target, &bytes, 0o600) {
             rb.restore_now();
             return Err(error);
+        }
+        if abandoned.is_abandoned() {
+            rb.restore_now();
+            return Err(Error::timeout());
         }
         let scanned = match super::capture::fingerprint(&repo) {
             Ok(fp) => fp,
@@ -229,6 +237,10 @@ async fn put_mutation(
                 return Err(error);
             }
         };
+        if abandoned.is_abandoned() {
+            rb.restore_now();
+            return Err(Error::timeout());
+        }
         Ok((hex::encode(Sha256::digest(&bytes)), scanned, rb))
     })
     .await?;
@@ -344,7 +356,7 @@ async fn git_mutation(
         ))
         .map_err(Error::internal)?,
     ));
-    let _mutation = super::blocking::lock_mutation(id, state.config.git_timeout).await?;
+    let mutation = super::blocking::lock_mutation(id, state.config.git_timeout).await?;
 
     // Phase 1: short pre-check transaction without holding DB locks across Git or FS work.
     {
@@ -379,7 +391,13 @@ async fn git_mutation(
     let upper_root = upper_fallback_root(&state, id);
     let repo_cap = repo.clone();
     let paths_cap = paths.clone();
-    let mut git_rb = super::blocking::run(move || GitRollback::capture(&repo_cap, &paths_cap, upper_root)).await?;
+    let mut git_rb = super::blocking::run_mutating(&mutation, move |abandoned, fence| {
+        if abandoned.is_abandoned() {
+            return Err(Error::timeout());
+        }
+        GitRollback::capture(&repo_cap, &paths_cap, upper_root, Some(fence))
+    })
+    .await?;
 
     let output =
         match super::git::run_in_job_with_git(&state.config.git, &repo, &args, 64 * 1024, state.config.git_timeout)
@@ -392,7 +410,14 @@ async fn git_mutation(
             }
         };
     let repo_fp = repo.clone();
-    let scanned = match super::blocking::run(move || super::capture::fingerprint(&repo_fp)).await {
+    let scanned = match super::blocking::run_mutating(&mutation, move |abandoned, _fence| {
+        if abandoned.is_abandoned() {
+            return Err(Error::timeout());
+        }
+        super::capture::fingerprint(&repo_fp)
+    })
+    .await
+    {
         Ok(fp) => fp,
         Err(error) => {
             git_rb.rollback().await;

@@ -9,6 +9,7 @@ mod freeze;
 #[path = "mounts/registry.rs"]
 mod registry;
 
+pub(super) use self::freeze::with_frozen_fenced;
 pub use self::freeze::{refresh_leases, update_lease, with_frozen, with_frozen_async};
 use self::registry::{Admission, MountEntry, Registry};
 use super::lazy;

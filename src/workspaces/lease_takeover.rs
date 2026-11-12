@@ -66,14 +66,31 @@ pub(super) async fn prepare_takeover(
     cp: Uuid,
     repository_id: Uuid,
     tenant: Uuid,
+    mutation: &blocking::MutationGuard,
 ) -> Result<TakeoverGuards, Error> {
     if mounts::enabled() {
-        let lazy = lazy::prepare(state, id, cp, repository_id, tenant).await?;
+        let lazy = lazy::prepare(state, id, cp, repository_id, tenant, mutation).await?;
         Ok(TakeoverGuards { lazy: Some(lazy), direct: None })
     } else {
         remote::ensure_local(state, cp, repository_id, tenant).await?;
         let state_copy = state.clone();
-        let direct = blocking::run(move || materialize_takeover(&state_copy, id, cp)).await?;
+        let direct = blocking::run_mutating(mutation, move |abandoned, fence| {
+            if abandoned.is_abandoned() {
+                return Err(Error::timeout());
+            }
+            let mut published = materialize_takeover(&state_copy, id, cp)?;
+            if let Some(ref mut guard) = published {
+                guard.attach_fence(fence);
+            }
+            if abandoned.is_abandoned() {
+                if let Some(guard) = published.take() {
+                    guard.cleanup_sync();
+                }
+                return Err(Error::timeout());
+            }
+            Ok(published)
+        })
+        .await?;
         Ok(TakeoverGuards { lazy: None, direct })
     }
 }
@@ -82,6 +99,75 @@ fn materialize_takeover(state: &AppState, id: Uuid, cp: Uuid) -> Result<Option<s
     let source = service::checkpoint_repo(state, cp);
     let destination = mounts::lower_path(state, id);
     materialize_takeover_paths(&source, &destination)
+}
+
+pub(super) async fn commit_lease_tx(
+    state: &AppState,
+    actor: &crate::db::Identity,
+    id: Uuid,
+    expected_lease_epoch: i64,
+    planned_takeover: Option<Uuid>,
+    takeover_guards: &mut TakeoverGuards,
+    commit_started: &std::sync::atomic::AtomicBool,
+) -> Result<(Workspace, i64), Error> {
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let ws = super::locked_inner(
+        &tx,
+        actor,
+        id,
+        crate::members::models::Role::Write,
+        crate::token_scopes::RepoAction::WorkspacesWrite,
+        false,
+    )
+    .await?;
+    if ws.lease_epoch != expected_lease_epoch {
+        return Err(service::conflict());
+    }
+    if let Some(planned_cp) = planned_takeover {
+        if ws.host_id == state.storage.volume_id {
+            return Err(service::conflict());
+        }
+        let expired: bool = tx
+            .query_one("SELECT lease_until<=clock_timestamp() FROM workspaces WHERE id=$1", &[&id])
+            .await
+            .map_err(Error::internal)?
+            .get(0);
+        if !expired || planned_cp != verify_takeover_checkpoint(&tx, &ws).await? {
+            return Err(service::conflict());
+        }
+    } else if ws.host_id != state.storage.volume_id {
+        return Err(service::conflict());
+    }
+    let active: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM sandbox_jobs WHERE workspace_id=$1 AND state IN ('queued','running'))",
+            &[&id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    if active {
+        return Err(service::conflict());
+    }
+    let row = tx
+        .query_opt(
+            &format!(
+                "UPDATE workspaces SET host_id=$2,lease_epoch=lease_epoch+1,lease_until=clock_timestamp()+interval '5 minutes' \
+                 WHERE id=$1 AND lease_epoch=$3 AND (host_id=$2 OR lease_until<=clock_timestamp()) \
+                 RETURNING {},EXTRACT(EPOCH FROM lease_until)::bigint AS lease_deadline",
+                super::WS_COLUMNS
+            ),
+            &[&id, &state.storage.volume_id, &expected_lease_epoch],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(service::conflict)?;
+    let deadline: i64 = row.get("lease_deadline");
+    takeover_guards.keep();
+    commit_started.store(true, std::sync::atomic::Ordering::Release);
+    tx.commit().await.map_err(Error::internal)?;
+    Ok((Workspace::from_row(&row), deadline))
 }
 
 fn materialize_takeover_paths(

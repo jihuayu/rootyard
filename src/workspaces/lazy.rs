@@ -38,6 +38,7 @@ struct LazyManifest {
 pub(super) struct LazyPublished {
     dest: PathBuf,
     sidecar: PathBuf,
+    fence: Option<super::blocking::ScanToken>,
     created: bool,
     kept: bool,
 }
@@ -45,12 +46,22 @@ pub(super) struct LazyPublished {
 impl LazyPublished {
     pub(super) fn keep(mut self) {
         self.kept = true;
+        self.fence = None;
+    }
+
+    pub(super) fn cleanup_sync(mut self) {
+        if self.created && !self.kept {
+            self.kept = true;
+            let fence = self.fence.take();
+            super::cleanup::cleanup_paths_sync(Some(self.dest.clone()), Some(self.sidecar.clone()), true, fence);
+        }
     }
 
     pub(super) async fn cleanup(mut self) {
         if self.created && !self.kept {
             self.kept = true;
-            super::cleanup::cleanup_paths_async(Some(self.dest.clone()), Some(self.sidecar.clone()), true).await;
+            let fence = self.fence.take();
+            super::cleanup::cleanup_paths_async(Some(self.dest.clone()), Some(self.sidecar.clone()), true, fence).await;
         }
     }
 }
@@ -58,7 +69,8 @@ impl LazyPublished {
 impl Drop for LazyPublished {
     fn drop(&mut self) {
         if self.created && !self.kept {
-            super::cleanup::cleanup_paths_on_drop(Some(self.dest.clone()), Some(self.sidecar.clone()), true);
+            let fence = self.fence.take();
+            super::cleanup::cleanup_paths_on_drop(Some(self.dest.clone()), Some(self.sidecar.clone()), true, fence);
         }
     }
 }
@@ -94,12 +106,16 @@ pub(super) async fn prepare(
     cp: Uuid,
     repo: Uuid,
     tenant: Uuid,
+    mutation: &super::blocking::MutationGuard,
 ) -> Result<LazyPublished, Error> {
     let dest = mounts::lower_path(state, id);
     let sidecar = manifest_path(&state.storage.root, id);
     let dest_check = dest.clone();
     let sidecar_check = sidecar.clone();
-    let already_ready = super::blocking::run(move || {
+    let already_ready = super::blocking::run_mutating(mutation, move |abandoned, _fence| {
+        if abandoned.is_abandoned() {
+            return Err(Error::timeout());
+        }
         if !dest_check.exists() {
             return Ok(false);
         }
@@ -111,7 +127,7 @@ pub(super) async fn prepare(
     })
     .await?;
     if already_ready {
-        return Ok(LazyPublished { dest, sidecar, created: false, kept: true });
+        return Ok(LazyPublished { dest, sidecar, fence: None, created: false, kept: true });
     }
     let remote = remote::load_manifest(state, cp, repo, tenant).await?;
     if remote.entries.len() > core::MAX_ENTRIES {
@@ -148,10 +164,14 @@ pub(super) async fn prepare(
     let parent = dest.parent().ok_or_else(Error::bad_request)?.to_path_buf();
     let stage = parent.join(format!(".lazy-{}", Uuid::new_v4()));
     let store = remote::remote_store(state)?;
+    let stage_guard = super::blocking::DirCleanupGuard::with_fence(stage.clone(), Some(mutation.freeze_guard()));
     let parent_init = parent.clone();
     let stage_init = stage.clone();
     let git_rels: Vec<PathBuf> = git_downloads.iter().map(|(rel, _, _)| rel.clone()).collect();
-    super::blocking::run(move || {
+    if let Err(err) = super::blocking::run_mutating(mutation, move |abandoned, _fence| {
+        if abandoned.is_abandoned() {
+            return Err(Error::timeout());
+        }
         fs::create_dir_all(&parent_init).map_err(Error::internal)?;
         fs::create_dir(&stage_init).map_err(Error::internal)?;
         for rel in git_rels {
@@ -160,7 +180,11 @@ pub(super) async fn prepare(
         }
         Ok(())
     })
-    .await?;
+    .await
+    {
+        stage_guard.cleanup().await;
+        return Err(err);
+    }
 
     let download_outcome: Result<(), Error> = async {
         for (rel, obj_key, size) in &git_downloads {
@@ -174,20 +198,20 @@ pub(super) async fn prepare(
     }
     .await;
     if let Err(err) = download_outcome {
-        let cleanup = stage.clone();
-        let _ = super::blocking::run(move || {
-            let _ = fs::remove_dir_all(&cleanup);
-            Ok(())
-        })
-        .await;
+        stage_guard.cleanup().await;
         return Err(err);
     }
 
     let items = remote.entries;
     let dest_out = dest.clone();
     let sidecar_out = sidecar.clone();
-    super::blocking::run(move || {
-        let result = (|| -> Result<(), Error> {
+    let publish_outcome = super::blocking::run_mutating(mutation, move |abandoned, fence| {
+        if abandoned.is_abandoned() {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(Error::timeout());
+        }
+        let mut temp_path: Option<PathBuf> = None;
+        let result = (|| -> Result<LazyPublished, Error> {
             let mut entries = Vec::with_capacity(items.len());
             for item in items {
                 let rel = core::decode_path(&item.path_base64).map_err(|_| Error::bad_request())?;
@@ -228,11 +252,15 @@ pub(super) async fn prepare(
             for path in [".git", ".git/objects", ".git/refs"] {
                 fs::create_dir_all(stage.join(path)).map_err(Error::internal)?;
             }
+            if abandoned.is_abandoned() {
+                return Err(Error::timeout());
+            }
             let manifest = LazyManifest { schema: 1, checkpoint_id: cp, tenant_id: tenant, entries };
             let raw = serde_json::to_vec(&manifest).map_err(Error::internal)?;
             let sidecar_dir = sidecar_out.parent().ok_or_else(Error::bad_request)?;
             fs::create_dir_all(sidecar_dir).map_err(Error::internal)?;
             let temp = sidecar_dir.join(format!(".lazy-{}", Uuid::new_v4()));
+            temp_path = Some(temp.clone());
             let mut output = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -243,21 +271,43 @@ pub(super) async fn prepare(
             output.write_all(&raw).map_err(Error::internal)?;
             output.sync_all().map_err(Error::internal)?;
             core::sync_tree(&stage).map_err(Error::internal)?;
+            if abandoned.is_abandoned() {
+                return Err(Error::timeout());
+            }
             fs::rename(&temp, &sidecar_out).map_err(Error::internal)?;
+            temp_path = None;
             if let Err(err) = fs::rename(&stage, &dest_out) {
                 let _ = fs::remove_file(&sidecar_out);
                 return Err(Error::internal(err));
             }
+            let published =
+                LazyPublished { dest: dest_out, sidecar: sidecar_out, fence: Some(fence), created: true, kept: false };
             File::open(&parent).and_then(|file| file.sync_all()).map_err(Error::internal)?;
-            Ok(())
+            if abandoned.is_abandoned() {
+                published.cleanup_sync();
+                return Err(Error::timeout());
+            }
+            Ok(published)
         })();
+        if let Some(temp) = temp_path {
+            let _ = fs::remove_file(temp);
+        }
         if result.is_err() {
             let _ = fs::remove_dir_all(&stage);
         }
         result
     })
-    .await?;
-    Ok(LazyPublished { dest, sidecar, created: true, kept: false })
+    .await;
+    match publish_outcome {
+        Ok(published) => {
+            stage_guard.keep();
+            Ok(published)
+        }
+        Err(err) => {
+            stage_guard.cleanup().await;
+            Err(err)
+        }
+    }
 }
 
 fn fingerprint_manifest(root: &Path, id: Uuid) -> Result<Option<LazyManifest>, Error> {

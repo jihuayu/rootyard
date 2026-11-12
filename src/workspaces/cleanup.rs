@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 const CLEANUP_CONCURRENCY: usize = 8;
 
-fn cleanup_bulkhead() -> &'static Arc<Semaphore> {
+pub(super) fn cleanup_bulkhead() -> &'static Arc<Semaphore> {
     static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SEM.get_or_init(|| Arc::new(Semaphore::new(CLEANUP_CONCURRENCY)))
 }
@@ -38,16 +38,19 @@ where
             let sem = cleanup_bulkhead().clone();
             handle.spawn(async move {
                 let Ok(permit) = sem.acquire_owned().await else {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
                     return;
                 };
                 let _ = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    worker::blocking(None, work);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker::blocking(None, work)));
                 })
                 .await;
             });
         }
-        Err(_) => work(),
+        Err(_) => {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        }
     }
 }
 
@@ -66,6 +69,21 @@ fn sync_parent_dir(parent: &Path) {
     let _ = File::open(parent).and_then(|directory| directory.sync_all());
 }
 
+fn collect_parents(dir: Option<&Path>, file: Option<&Path>, sync_parent: bool) -> Vec<PathBuf> {
+    let mut parents = Vec::new();
+    if sync_parent {
+        if let Some(parent) = dir.and_then(Path::parent) {
+            parents.push(parent.to_path_buf());
+        }
+        if let Some(parent) = file.and_then(Path::parent)
+            && !parents.iter().any(|existing| existing == parent)
+        {
+            parents.push(parent.to_path_buf());
+        }
+    }
+    parents
+}
+
 fn remove_sync(dir: Option<PathBuf>, file: Option<PathBuf>, parents: Vec<PathBuf>) {
     if let Some(dir) = dir {
         let _ = fs::remove_dir_all(&dir);
@@ -78,41 +96,69 @@ fn remove_sync(dir: Option<PathBuf>, file: Option<PathBuf>, parents: Vec<PathBuf
     }
 }
 
-/// Explicit bounded off-thread cleanup for async pre-`COMMIT` error paths.
-pub(super) async fn cleanup_paths_async(dir: Option<PathBuf>, file: Option<PathBuf>, sync_parent: bool) {
-    let mut parents = Vec::new();
-    if sync_parent {
-        if let Some(parent) = dir.as_deref().and_then(Path::parent) {
-            parents.push(parent.to_path_buf());
-        }
-        if let Some(parent) = file.as_deref().and_then(Path::parent)
-            && !parents.iter().any(|existing| existing == parent)
-        {
-            parents.push(parent.to_path_buf());
+pub(super) fn cleanup_paths_sync(
+    dir: Option<PathBuf>,
+    file: Option<PathBuf>,
+    sync_parent: bool,
+    fence: Option<super::blocking::ScanToken>,
+) {
+    let _fence = fence;
+    let parents = collect_parents(dir.as_deref(), file.as_deref(), sync_parent);
+    remove_sync(dir, file, parents);
+}
+
+struct ArmedPathsCleanup {
+    payload: Option<(Option<PathBuf>, Option<PathBuf>, bool, Option<super::blocking::ScanToken>)>,
+}
+
+impl Drop for ArmedPathsCleanup {
+    fn drop(&mut self) {
+        if let Some((dir, file, sync_parent, fence)) = self.payload.take() {
+            cleanup_paths_on_drop(dir, file, sync_parent, fence);
         }
     }
-    let _ = super::blocking::run(move || {
-        remove_sync(dir, file, parents);
-        Ok(())
+}
+
+/// Explicit non-rejecting off-thread cleanup for async pre-`COMMIT` error paths.
+/// Retains `ArmedPathsCleanup` until the blocking worker begins so task
+/// cancellation mid-semaphore-wait still vacates canonical paths via `Drop`.
+pub(super) async fn cleanup_paths_async(
+    dir: Option<PathBuf>,
+    file: Option<PathBuf>,
+    sync_parent: bool,
+    fence: Option<super::blocking::ScanToken>,
+) {
+    let mut armed = ArmedPathsCleanup { payload: Some((dir, file, sync_parent, fence)) };
+    let Ok(permit) = cleanup_bulkhead().clone().acquire_owned().await else {
+        if let Some((d, f, sp, tok)) = armed.payload.take() {
+            cleanup_paths_sync(d, f, sp, tok);
+        }
+        return;
+    };
+    let operation = worker::blocking_scope();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if let Some((d, f, sp, tok)) = armed.payload.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker::blocking(operation, move || cleanup_paths_sync(d, f, sp, tok));
+            }));
+        }
     })
     .await;
 }
 
 /// Non-blocking `Drop` helper: vacates canonical paths in O(1) via `rename` when
-/// on a Tokio runtime and runs recursive deletion + `fsync` off-thread.
-pub(super) fn cleanup_paths_on_drop(dir: Option<PathBuf>, file: Option<PathBuf>, sync_parent: bool) {
-    let mut parents = Vec::new();
-    if sync_parent {
-        if let Some(parent) = dir.as_deref().and_then(Path::parent) {
-            parents.push(parent.to_path_buf());
-        }
-        if let Some(parent) = file.as_deref().and_then(Path::parent)
-            && !parents.iter().any(|existing| existing == parent)
-        {
-            parents.push(parent.to_path_buf());
-        }
-    }
+/// on a Tokio runtime and runs recursive deletion + `fsync` off-thread while
+/// holding any `ScanToken` until removal finishes.
+pub(super) fn cleanup_paths_on_drop(
+    dir: Option<PathBuf>,
+    file: Option<PathBuf>,
+    sync_parent: bool,
+    fence: Option<super::blocking::ScanToken>,
+) {
+    let mut parents = collect_parents(dir.as_deref(), file.as_deref(), sync_parent);
     if tokio::runtime::Handle::try_current().is_err() {
+        let _fence = fence;
         remove_sync(dir, file, parents);
         return;
     }
@@ -149,9 +195,45 @@ pub(super) fn cleanup_paths_on_drop(dir: Option<PathBuf>, file: Option<PathBuf>,
         None => Some(orig),
     });
     if moved_dir.is_none() && moved_file.is_none() {
+        drop(fence);
         return;
     }
-    dispatch_cleanup(move || remove_sync(moved_dir, moved_file, parents));
+    dispatch_cleanup(move || {
+        let _fence = fence;
+        remove_sync(moved_dir, moved_file, parents);
+    });
+}
+
+/// Guard for temporary staging files so early unwinds, cancellations, or `503`
+/// bulkhead rejections still unlink the file on the cleanup bulkhead.
+pub(super) struct FileCleanupGuard {
+    path: PathBuf,
+    kept: bool,
+}
+
+impl FileCleanupGuard {
+    pub(super) fn new(path: PathBuf) -> Self {
+        Self { path, kept: false }
+    }
+
+    pub(super) fn keep(mut self) {
+        self.kept = true;
+    }
+
+    pub(super) async fn cleanup(mut self) {
+        if !self.kept {
+            self.kept = true;
+            cleanup_paths_async(None, Some(self.path.clone()), false, None).await;
+        }
+    }
+}
+
+impl Drop for FileCleanupGuard {
+    fn drop(&mut self) {
+        if !self.kept {
+            cleanup_paths_on_drop(None, Some(self.path.clone()), false, None);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -169,13 +251,15 @@ mod tests {
         fs::create_dir_all(&workspaces).unwrap();
         fs::create_dir_all(&lazy_dir).unwrap();
 
+        let ws_id = Uuid::new_v4();
+        let scan_tok = super::super::blocking::begin_scan(ws_id).expect("scan token");
         let ws_dir = workspaces.join("ws-1");
         fs::create_dir_all(ws_dir.join("nested")).unwrap();
         fs::write(ws_dir.join("nested/file.txt"), b"uncommitted").unwrap();
         let sidecar = lazy_dir.join("ws-1.json");
         fs::write(&sidecar, b"{}").unwrap();
 
-        cleanup_paths_on_drop(Some(ws_dir.clone()), Some(sidecar.clone()), true);
+        cleanup_paths_on_drop(Some(ws_dir.clone()), Some(sidecar.clone()), true, Some(scan_tok));
         assert!(!ws_dir.exists(), "canonical workspace dir must be vacated before Drop returns");
         assert!(!sidecar.exists(), "canonical lazy sidecar must be vacated before Drop returns");
 
@@ -184,5 +268,7 @@ mod tests {
             assert!(Instant::now() < deadline, "background trash cleanup did not finish");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let guard = super::super::blocking::lock_mutation(ws_id, Duration::from_secs(2)).await.unwrap();
+        drop(guard);
     }
 }

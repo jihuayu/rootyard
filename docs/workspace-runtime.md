@@ -46,41 +46,64 @@ scan keeps its worker slot and the FUSE gate until the filesystem closure
 really returns, so shutdown or lease loss never unfreezes a workspace while a
 scan is still running.
 
-API mutations (file PUT, `git add`/`reset`, checkpoint, restore) still compute
-their post-write fingerprint synchronously inside their existing workspace-lock
-transaction. That preserves the historical revision/event contract: an API
-write is never reported as an external capture, a later native edit still is,
-and a failed baseline cannot silently adopt native changes. It is the remaining
-per-request full-tree read on a locked row; removing it is follow-up work, not
-part of this change. Checkpoint capture still performs its existing full working-tree
-copy; that copy is not covered by the bounded background-scan worker and must
-not be treated as a short-lock or off-thread operation. Explicit API fingerprint
-hashing and checkpoint copy remain existing costs pending a separate safe design.
+API mutations (`POST /workspaces`, `POST /lease`, `PUT /files`, `POST /git`,
+`POST /checkpoints`, and `POST /checkpoints/{id}/restore`) serialize per
+workspace in memory behind `MutationGuard` (`lock_mutation`), which drains any
+active `ScanToken`s before admitting a foreground mutation and blocks
+overlapping background `begin_scan` rounds without holding PostgreSQL row locks
+across filesystem, Git, or object-store I/O:
+
+1. **Phase 1 (Read-only preflight)**: a short transaction verifies repository
+   authorization, idempotency replay, live lease authority, and expected
+   revision/entry/Git generation, then releases the database connection.
+2. **Phase 2 (Bounded off-TX execution)**: working-tree writes, checkpoint and
+   restore copies, cross-host takeover materialization, FUSE prewarm, and
+   post-mutation fingerprint hashing execute off-thread behind the Data I/O
+   bulkhead (`io_slots`). Concurrency and caller waits are bounded by
+   `ROOTYARD_WORKSPACE_IO_CONCURRENCY` (1-64, default 8),
+   `ROOTYARD_WORKSPACE_IO_ACQUIRE_TIMEOUT_MS` (1-300000, default 5000; returns
+   retryable `503` on exhaustion), and `ROOTYARD_WORKSPACE_IO_TIMEOUT_MS`
+   (1-600000, default 120000; returns `504` when the caller stops waiting while
+   the worker keeps its slot until syscalls finish). Workspace-mutating closures
+   and returned pre-`COMMIT` guards (`PutRollback`, `GitRollback`, `Published`,
+   `LazyPublished`, `DirCleanupGuard`) retain `ScanToken`s plus caller
+   abandonment flags until both the OS thread and any rollback/cleanup complete
+   on disk. Fast FUSE mount/freeze/observe operations use an isolated control
+   bulkhead (`control_slots`) so data copies do not starve control traffic.
+3. **Phase 3 (Short `FOR UPDATE` CAS commit and pre-`COMMIT` rollback)**: a
+   short `FOR UPDATE` transaction rechecks idempotency, live lease epoch, and
+   expected versions/fingerprints, records the pre-computed baseline, and
+   commits. Definite pre-`COMMIT` conflicts (`409`) or Phase 2 failures run
+   restoration/cleanup on a dedicated non-rejecting `cleanup_bulkhead` (with
+   `Drop` vacating canonical directory/sidecar paths via O(1) `.trash-*` renames
+   and finishing removal off-thread while keeping `ScanToken` armed).
 
 Workspace repository inspection and mutation commands run through one bounded
 native Git wrapper that reuses the GitFS collector: stdout is capped per call
 (4 MiB for file views, 64 KiB for `add`/`reset`), stderr is drained and
 discarded, the command runs in its own process group, and the shared Git
-timeout applies. A timed-out or cancelled command kills the whole process group
-before the caller continues, so no descendant outlives the request.
+timeout applies. A timed-out or cancelled command kills and reaps the whole
+process group before the caller continues, so no descendant outlives the job.
 
-Reads and mutations take one owned `git_slots` permit before the child is
-spawned, so a full capacity is a retryable 503 instead of unbounded spawning.
-Mutations additionally hand the *entire* operation to an owned Tokio job:
-authentication, transaction, `FOR UPDATE` row lock, lease checks, the Git
-child, and the fingerprint/event/idempotency commit. A client disconnect drops
-only the response future; the job keeps its permit, row lock and child until
-the normal Git deadline and commit finish. The response is then unknown and a
-retry must reuse the same `Idempotency-Key`, which replays the committed result
-instead of repeating the mutation. Completed jobs are pruned on admission and
-graceful HTTP shutdown joins every owned job before the runtime exits. The
-shutdown grace duration is only a warning threshold: the process keeps waiting
-for owned jobs rather than aborting them, because aborting would drop a live
-child into the collector's process-group kill and could leave a real
-`.git/index.lock` behind. An operator force-kill (`SIGKILL`) or a power loss is
-outside that graceful guarantee. Nothing unlinks
-`.git/index.lock`: a lock this process did not create stays untouched and the
-mutation fails cleanly rather than deleting another writer's lock.
+`PUT /files` (`put_slots`, capacity 32) and Git reads/mutations (`git_slots`,
+`ROOTYARD_MAX_CONCURRENT_GIT`) reserve an owned admission permit up front, so
+full capacity fails fast with retryable `503`. Both `PUT /files` and `POST /git`
+execute inside an owned Tokio `JoinSet` job registry: a client disconnect drops
+only the HTTP response future while the owned job finishes its 3-phase execution
+(and any pre-`COMMIT` rollback), allowing a retry with the same
+`Idempotency-Key` to replay a committed result. Completed jobs are pruned on
+admission and graceful HTTP shutdown drains every owned job before exiting (the
+grace duration is a warning threshold rather than an abort). An operator
+`SIGKILL` or power loss remains outside graceful guarantees. Before spawning
+`git`, `GitRollback` snapshots `.git/index`, bounded `.git/objects` entries
+(failing closed before spawning if `.git/objects` cannot be read or exceeds the
+entry cap), and whether `.git/index.lock` already existed. A pre-existing
+`.git/index.lock` created outside that owned job is never unlinked; only when
+`.git/index.lock` was absent before the job and left behind after process-group
+termination or a pre-`COMMIT` rejection does `GitRollback` remove that newly
+created lock, restore `.git/index`, and prune newly created loose objects (with
+direct upper-layer and synchronized `.rootyard-whiteouts.json` fallback if the
+FUSE mount was fenced mid-flight).
 Lease handoff rejects active sandbox jobs, and sandbox admission and execution
 are bound to a persisted lease epoch. A running job is cancelled when its lease
 or database authority disappears. Database lease changes are reflected in the
@@ -121,20 +144,25 @@ that rejection is `EWOULDBLOCK` and is never bypassed. The gate's RAII admission
 count is released on error and panic, and a fenced state is never thawed by a
 freeze guard being dropped.
 
-A same-host lease commit runs inside a single freeze that fences the old epoch
-before that freeze is released, and the committed epoch is authorized afterwards
-through the same fence-then-authorize handoff used by the mount `ensure` path.
+A same-host lease commit acquires its FUSE freeze (`with_frozen_fenced`, holding
+a `ScanToken`) before checking out the Phase 3 PostgreSQL connection or `FOR
+UPDATE` row lock, fences the old epoch before that freeze is released, and
+authorizes the committed epoch afterwards through the same fence-then-authorize
+handoff used by the mount `ensure` path. Freeze acquisition is bounded
+independently from Phase 3 commit execution (and helper freeze completion runs
+on `cleanup_bulkhead`), so control-slot saturation or a slow commit never turns
+a proven pre-`COMMIT` rollback into a false fence or discards a committed epoch.
 The old epoch can therefore not admit a new mutation in the window between the
 commit and the new-epoch authorization, and a handoff that is rejected leaves
 the gate `Fenced` instead of `Healthy` on the superseded epoch. The wrapper
 separates a proven pre-COMMIT rollback from an unknown outcome: an error before
 the commit flag is signalled as a known rollback and thaws the original epoch,
 while commit success, a COMMIT transport error, a panic or a cancelled caller
-(dropped future or lost release channel) leaves the gate `Fenced`. A remaining
-pre-COMMIT conflict such as an active sandbox therefore returns normally and
-keeps the same healthy epoch writable. Such a fenced mount stays read-only,
-returning `EROFS` for new mutations, until a later committed lease epoch is
-authorized by a lease acquire, checkpoint completion or startup reconcile.
+during Phase 3 leaves the gate `Fenced`. A pre-COMMIT conflict such as an active
+sandbox therefore returns normally and keeps the same healthy epoch writable.
+Such a fenced mount stays read-only, returning `EROFS` for new mutations, until
+a later committed lease epoch is authorized by a lease acquire, checkpoint
+completion or startup reconcile.
 
 Lease refresh observations are epoch-ordered under the gate lock. A late epoch
 `N` response that arrives after handoff `N+1` is ignored: it neither fences the

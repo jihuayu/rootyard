@@ -361,9 +361,8 @@ class WorkspaceRuntimeBulkheadTest(unittest.TestCase):
         finally:
             h.cleanup()
 
-    @unittest.skipUnless(os.environ.get("ROOTYARD_OBJECT_STORE_ENDPOINT"), "live S3 fixture required")
     def test_cross_volume_lease_takeover_and_lost_race_recovery_with_live_s3(self):
-        h = new_harness()
+        h = new_harness(require_s3=True)
         try:
             h.setup()
             h.api()

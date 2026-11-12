@@ -154,6 +154,105 @@ pub async fn with_frozen_async<T>(
     commit_started: Arc<AtomicBool>,
     work: impl Future<Output = Result<T, Error>>,
 ) -> Result<T, Error> {
+    with_frozen_inner(id, FREEZE_DEADLINE, commit_started, None, work).await
+}
+
+pub(in crate::workspaces) async fn with_frozen_fenced<T>(
+    id: Uuid,
+    commit_started: Arc<AtomicBool>,
+    scan_token: super::super::blocking::ScanToken,
+    work: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    with_frozen_inner(id, FREEZE_DEADLINE, commit_started, Some(scan_token), work).await
+}
+
+struct PreWorkReleaseGuard {
+    tx: Option<tokio::sync::oneshot::Sender<Release>>,
+}
+
+impl PreWorkReleaseGuard {
+    fn disarm_for_work(&mut self) -> tokio::sync::oneshot::Sender<Release> {
+        self.tx.take().expect("pre-work release sender armed")
+    }
+}
+
+impl Drop for PreWorkReleaseGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Release::KnownRollback);
+        }
+    }
+}
+
+async fn with_frozen_in_process<T>(
+    gate: Arc<MutationGate>,
+    freeze_deadline: std::time::Duration,
+    commit_started: Arc<AtomicBool>,
+    scan_token: Option<super::super::blocking::ScanToken>,
+    work: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    let permit = super::super::blocking::acquire_control_permit().await?;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<Release>();
+    let mut pre_work = PreWorkReleaseGuard { tx: Some(release_tx) };
+    let gate_worker = gate.clone();
+    let mut guard = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _scan = scan_token;
+        gate_worker.freeze_with_decision(|| {
+            if ready_tx.send(()).is_err() {
+                return ((), FreezeDecision::Thaw);
+            }
+            let decision = match release_rx.blocking_recv() {
+                Ok(Release::KnownRollback) => FreezeDecision::Thaw,
+                Ok(Release::Fence) | Err(_) => FreezeDecision::Fence,
+            };
+            ((), decision)
+        });
+    });
+
+    tokio::select! {
+        ready = ready_rx => {
+            if ready.is_err() {
+                let _ = (&mut guard).await;
+                return Err(Error::internal("workspace freeze worker stopped before ready"));
+            }
+        }
+        joined = &mut guard => {
+            let _ = joined;
+            return Err(Error::internal("workspace freeze worker stopped before ready"));
+        }
+        _ = tokio::time::sleep(freeze_deadline) => {
+            drop(pre_work);
+            return Err(Error::timeout());
+        }
+    }
+
+    let release_tx = pre_work.disarm_for_work();
+    let outcome = work.await;
+    let release = release_after(&outcome, commit_started.load(Ordering::Acquire));
+    let _ = release_tx.send(release);
+    match (release, guard.await) {
+        (Release::Fence, Err(_)) => {
+            gate.fence();
+            outcome
+        }
+        (Release::Fence, Ok(())) => outcome,
+        (Release::KnownRollback, Ok(())) => outcome,
+        (Release::KnownRollback, Err(_)) => {
+            gate.fence();
+            outcome
+        }
+    }
+}
+
+async fn with_frozen_inner<T>(
+    id: Uuid,
+    freeze_deadline: std::time::Duration,
+    commit_started: Arc<AtomicBool>,
+    scan_token: Option<super::super::blocking::ScanToken>,
+    work: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
     if !enabled() {
         return work.await;
     }
@@ -166,26 +265,9 @@ pub async fn with_frozen_async<T>(
         }
     };
     if let Some(gate) = gate {
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<Release>();
-        let guard = tokio::spawn(super::super::blocking::run_control(move || {
-            gate.freeze_with_decision(|| {
-                let _ = ready_tx.send(());
-                let decision = match release_rx.blocking_recv() {
-                    Ok(Release::KnownRollback) => FreezeDecision::Thaw,
-                    Ok(Release::Fence) | Err(_) => FreezeDecision::Fence,
-                };
-                ((), decision)
-            });
-            Ok(())
-        }));
-        ready_rx.await.map_err(Error::internal)?;
-        let outcome = work.await;
-        let release = release_after(&outcome, commit_started.load(Ordering::Acquire));
-        let _ = release_tx.send(release);
-        guard.await.map_err(Error::internal)??;
-        return outcome;
+        return with_frozen_in_process(gate, freeze_deadline, commit_started, scan_token, work).await;
     }
+    let _scan = scan_token;
     let Some(client) = client else {
         return Err(Error::internal("workspace FUSE mount missing"));
     };
@@ -203,8 +285,19 @@ pub async fn with_frozen_async<T>(
         Release::KnownRollback => FreezeDecision::Thaw,
         Release::Fence => FreezeDecision::Fence,
     };
-    super::super::blocking::run_control(move || token.finish(decision).map_err(helper_error)).await?;
-    outcome
+    let finish_res = super::super::blocking::run_cleanup(move || token.finish(decision).map_err(helper_error)).await;
+    match (&outcome, decision) {
+        (Ok(_), FreezeDecision::Fence) => {
+            if let Ok(Err(err)) | Err(err) = finish_res {
+                return Err(err);
+            }
+            outcome
+        }
+        _ => {
+            finish_res??;
+            outcome
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +317,9 @@ fn release_after<T>(outcome: &Result<T, Error>, commit_started: bool) -> Release
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_lab::fuse_mount::GatePhase;
+    use axum::http::StatusCode;
+    use std::time::Duration;
 
     #[test]
     fn only_a_precommit_error_is_a_known_rollback() {
@@ -232,5 +328,55 @@ mod tests {
         assert_eq!(release_after(&success, false), Release::Fence);
         assert_eq!(release_after(&error, false), Release::KnownRollback);
         assert_eq!(release_after(&error, true), Release::Fence, "a COMMIT transport error is unknown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_process_freeze_acquisition_timeout_never_hangs_or_fences_unstarted_work() {
+        let gate = MutationGate::new_with_lease(1, i64::MAX).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_mut_tx, release_mut_rx) = std::sync::mpsc::channel();
+        let gate_mut = gate.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = gate_mut.mutation().unwrap();
+            held_tx.send(()).unwrap();
+            release_mut_rx.recv().unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let commit_started = Arc::new(AtomicBool::new(false));
+        let work_ran = Arc::new(AtomicBool::new(false));
+        let work_ran_clone = work_ran.clone();
+        let err = with_frozen_in_process(gate.clone(), Duration::from_millis(60), commit_started, None, async move {
+            work_ran_clone.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::GATEWAY_TIMEOUT);
+        assert!(!work_ran.load(Ordering::SeqCst));
+
+        release_mut_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while gate.phase() != GatePhase::Healthy {
+            assert!(std::time::Instant::now() < deadline, "gate stayed frozen or fenced after pre-work timeout");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_process_freeze_preserves_slow_committed_work_past_acquisition_deadline() {
+        let gate = MutationGate::new_with_lease(1, i64::MAX).unwrap();
+        let commit_started = Arc::new(AtomicBool::new(false));
+        let commit_flag = commit_started.clone();
+        let value = with_frozen_in_process(gate.clone(), Duration::from_millis(40), commit_started, None, async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            commit_flag.store(true, Ordering::Release);
+            Ok(99usize)
+        })
+        .await
+        .expect("committed work must not be discarded by freeze acquisition deadline");
+        assert_eq!(value, 99);
+        assert_eq!(gate.phase(), GatePhase::Fenced);
     }
 }

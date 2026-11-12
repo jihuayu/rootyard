@@ -118,7 +118,7 @@ impl Overlay {
         }
         let entry = Entry::new(&self.upper, &p, true)?;
         entry.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode & 0o777)?;
-        self.whiteouts.remove(&p);
+        self.whiteouts.clear_path(self.gate.epoch(), &p)?;
         let ino = self.ino(&p);
         self.attr(&p, ino)
     }
@@ -129,7 +129,7 @@ impl Overlay {
             return Err(io::Error::from_raw_os_error(libc::EEXIST));
         }
         Entry::new(&self.upper, &p, true)?.mkdir(mode & 0o777)?;
-        self.whiteouts.remove(&p);
+        self.whiteouts.clear_path(self.gate.epoch(), &p)?;
         let ino = self.ino(&p);
         self.attr(&p, ino)
     }
@@ -144,8 +144,7 @@ impl Overlay {
             self.host_entry(&selected, false)?.unlink(false)?;
         }
         if self.checked_entry(&self.lower, &p).is_ok() {
-            self.whiteouts.insert(p);
-            self.save_whiteouts()?;
+            self.whiteouts.insert_path(self.gate.epoch(), p)?;
         }
         Ok(())
     }
@@ -163,8 +162,7 @@ impl Overlay {
             self.host_entry(&selected, false)?.unlink(true)?;
         }
         if self.checked_entry(&self.lower, &p).is_ok() {
-            self.whiteouts.insert(p);
-            self.save_whiteouts()?;
+            self.whiteouts.insert_path(self.gate.epoch(), p)?;
         }
         Ok(())
     }
@@ -202,11 +200,8 @@ impl Overlay {
                 self.paths.insert(ino, new);
             }
         }
-        if self.checked_entry(&self.lower, &src).is_ok() {
-            self.whiteouts.insert(src.clone());
-        }
-        self.whiteouts.remove(&dst);
-        self.save_whiteouts()?;
+        let hide_src = self.checked_entry(&self.lower, &src).is_ok().then(|| src.clone());
+        self.whiteouts.apply_rename(self.gate.epoch(), hide_src, &dst)?;
         Ok(())
     }
 }

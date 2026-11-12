@@ -94,10 +94,11 @@ pub async fn create(
     let dest = service::checkpoint_repo(&state, cp);
     let stable_gate = super::mounts::enabled();
     let state_copy = state.clone();
-    let freeze_guard = mutation.freeze_guard();
-    let (before, published) = super::blocking::run(move || {
-        let _freeze = freeze_guard;
-        let out = super::mounts::with_frozen(id, || {
+    let (before, published) = super::blocking::run_mutating(&mutation, move |abandoned, cp_fence| {
+        if abandoned.is_abandoned() {
+            return Err(Error::timeout());
+        }
+        super::mounts::with_frozen(id, || {
             let before_raw = super::snapshot::Raw::load(&source)?
                 .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
             let before = before_raw.digest().to_owned();
@@ -107,7 +108,15 @@ pub async fn create(
                 return Err(service::conflict());
             }
             let before_index = before_raw.raw_file(FsPath::new(".git/index"))?;
-            let published = super::snapshot::copy(&state_copy, &before_raw, &dest)?;
+            if abandoned.is_abandoned() {
+                return Err(Error::timeout());
+            }
+            let mut published = super::snapshot::copy(&state_copy, &before_raw, &dest)?;
+            published.attach_fence(cp_fence);
+            if abandoned.is_abandoned() {
+                published.cleanup_sync();
+                return Err(Error::timeout());
+            }
             let captured = super::snapshot::fingerprint(&dest)?;
             if before != captured {
                 return Err(service::conflict());
@@ -121,10 +130,12 @@ pub async fn create(
                     return Err(service::conflict());
                 }
             }
+            if abandoned.is_abandoned() {
+                published.cleanup_sync();
+                return Err(Error::timeout());
+            }
             Ok((before, published))
-        });
-        drop(_freeze);
-        out
+        })
     })
     .await?;
 
@@ -287,12 +298,19 @@ async fn restore_inner(
 
     // Phase 2: materialize lower tree and compute initial fingerprint off-thread with zero DB locks held.
     let id = Uuid::new_v4();
-    let _mutation = super::blocking::lock_mutation(id, super::blocking::io_timeout()).await?;
+    let mutation = super::blocking::lock_mutation(id, super::blocking::io_timeout()).await?;
     let lower = super::mounts::lower_path(&state, id);
     let (mut lazy_guard, mut published, initial_fingerprint) = if super::mounts::enabled() && cp_state == "committed" {
-        let lazy_pub = super::lazy::prepare(&state, id, cp, parent.repository_id, owner_id).await?;
+        let lazy_pub = super::lazy::prepare(&state, id, cp, parent.repository_id, owner_id, &mutation).await?;
         let lower_fp = lower.clone();
-        let fp = match super::blocking::run(move || super::capture::fingerprint(&lower_fp)).await {
+        let fp = match super::blocking::run_mutating(&mutation, move |abandoned, _fence| {
+            if abandoned.is_abandoned() {
+                return Err(Error::timeout());
+            }
+            super::capture::fingerprint(&lower_fp)
+        })
+        .await
+        {
             Ok(fp) => fp,
             Err(error) => {
                 lazy_pub.cleanup().await;
@@ -304,9 +322,21 @@ async fn restore_inner(
         super::remote::ensure_local(&state, cp, parent.repository_id, owner_id).await?;
         let cp_repo = service::checkpoint_repo(&state, cp);
         let lower_copy = lower.clone();
-        let (pub_dir, fp) = super::blocking::run(move || {
-            let pub_dir = copy_snapshot(&cp_repo, &lower_copy)?;
+        let (pub_dir, fp) = super::blocking::run_mutating(&mutation, move |abandoned, fence| {
+            if abandoned.is_abandoned() {
+                return Err(Error::timeout());
+            }
+            let mut pub_dir = copy_snapshot(&cp_repo, &lower_copy)?;
+            pub_dir.attach_fence(fence);
+            if abandoned.is_abandoned() {
+                pub_dir.cleanup_sync();
+                return Err(Error::timeout());
+            }
             let fp = super::capture::fingerprint(&lower_copy)?;
+            if abandoned.is_abandoned() {
+                pub_dir.cleanup_sync();
+                return Err(Error::timeout());
+            }
             Ok((pub_dir, fp))
         })
         .await?;
@@ -422,59 +452,5 @@ pub async fn fork(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::copy_snapshot;
-    use std::{fs, os::unix::fs::PermissionsExt, path::Path};
-
-    fn write(root: &Path, name: &str, bytes: &[u8]) {
-        let path = root.join(name);
-        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        fs::write(&path, bytes).expect("write");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("mode");
-    }
-
-    #[test]
-    fn restore_copy_never_replaces_a_preexisting_lower_tree() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let source = root.path().join("checkpoint");
-        fs::create_dir(&source).expect("source");
-        write(&source, "a.txt", b"a");
-
-        let dest = root.path().join("workspaces/id");
-        fs::create_dir_all(&dest).expect("dest");
-        fs::write(dest.join("sentinel"), b"sentinel").expect("sentinel");
-        assert!(copy_snapshot(&source, &dest).is_err(), "an existing lower tree is never replaced");
-        assert_eq!(fs::read(dest.join("sentinel")).expect("sentinel bytes"), b"sentinel");
-        assert!(!dest.join("a.txt").exists(), "nothing is copied into the existing tree");
-        let staged: Vec<String> = fs::read_dir(root.path().join("workspaces"))
-            .expect("workspaces dir")
-            .map(|child| child.expect("entry").file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(!staged.iter().any(|name| name.starts_with(".restore-")), "a refused restore leaves no staging tree");
-
-        let fresh = root.path().join("workspaces/fresh");
-        copy_snapshot(&source, &fresh).expect("restore copy").keep();
-        assert_eq!(fs::read(fresh.join("a.txt")).expect("copied a.txt"), b"a");
-        assert_eq!(fs::read(dest.join("sentinel")).expect("sentinel bytes"), b"sentinel");
-    }
-
-    #[test]
-    fn restore_copy_guard_cleans_up_only_before_commit() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let source = root.path().join("checkpoint");
-        fs::create_dir(&source).expect("source");
-        write(&source, "a.txt", b"a");
-        let workspaces = root.path().join("workspaces");
-        fs::create_dir_all(&workspaces).expect("workspaces dir");
-
-        let failed = workspaces.join("failed");
-        let guard = copy_snapshot(&source, &failed).expect("restore copy");
-        assert_eq!(fs::read(failed.join("a.txt")).expect("copied"), b"a");
-        drop(guard);
-        assert!(!failed.exists(), "a definite pre-COMMIT failure cleans up the published tree");
-
-        let retained = workspaces.join("retained");
-        copy_snapshot(&source, &retained).expect("restore copy").keep();
-        assert_eq!(fs::read(retained.join("a.txt")).expect("copied"), b"a");
-    }
-}
+#[path = "checkpoints_tests.rs"]
+mod tests;

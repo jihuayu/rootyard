@@ -74,9 +74,12 @@ mod inner_ops;
 mod owned_ops;
 #[path = "fuse_mount/ownership.rs"]
 mod ownership;
+#[path = "fuse_mount/whiteouts.rs"]
+mod whiteouts;
 
 use fuse_dispatch::MountFs;
 use fuse_io::{Entry, safe_link_at, walk_dir};
+use whiteouts::WhiteoutStore;
 
 // The owned teardown implementation lives in `ownership`; only this module
 // (and its tests, through `super`) uses it, so no wider re-export is needed.
@@ -161,7 +164,7 @@ pub struct Overlay {
     paths: BTreeMap<u64, PathBuf>,
     ids: BTreeMap<PathBuf, u64>,
     next: u64,
-    whiteouts: BTreeSet<PathBuf>,
+    whiteouts: WhiteoutStore,
     gate: Arc<MutationGate>,
     lazy: Option<Arc<dyn LazySource>>,
 }
@@ -191,21 +194,7 @@ impl Overlay {
         paths.insert(1, PathBuf::new());
         let mut ids = BTreeMap::new();
         ids.insert(PathBuf::new(), 1);
-        let whiteout_meta = match fs::symlink_metadata(upper.join(".rootyard-whiteouts.json")) {
-            Ok(meta) if meta.is_file() => true,
-            Ok(_) => return Err(io::Error::from_raw_os_error(libc::EPERM)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e),
-        };
-        let whiteouts = if whiteout_meta {
-            serde_json::from_slice::<Vec<String>>(&fs::read(upper.join(".rootyard-whiteouts.json"))?)
-                .map_err(io::Error::other)?
-                .into_iter()
-                .map(PathBuf::from)
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
+        let whiteouts = WhiteoutStore::load(upper.clone(), gate.epoch())?;
         Ok(Self { lower, upper, paths, ids, next: 2, whiteouts, gate, lazy })
     }
     fn ino(&mut self, p: &Path) -> u64 {
@@ -233,7 +222,7 @@ impl Overlay {
         Ok(self.rel(parent)?.join(name))
     }
     fn hidden(&self, p: &Path) -> bool {
-        self.whiteouts.iter().any(|w| p == w || p.starts_with(w))
+        self.whiteouts.is_hidden(p)
     }
     fn host_entry(&self, path: &Path, create_parent: bool) -> io::Result<Entry> {
         if let Ok(rel) = path.strip_prefix(&self.upper) {
@@ -253,6 +242,7 @@ impl Overlay {
         Ok(entry)
     }
     fn selected(&self, p: &Path) -> io::Result<PathBuf> {
+        self.whiteouts.sync(self.gate.epoch())?;
         if self.hidden(p) {
             return Err(io::Error::from_raw_os_error(libc::ENOENT));
         }
@@ -329,6 +319,7 @@ impl Overlay {
         Ok(to)
     }
     fn children(&self, p: &Path) -> io::Result<BTreeSet<OsString>> {
+        self.whiteouts.sync(self.gate.epoch())?;
         let mut names = BTreeSet::new();
         for root in [&self.lower, &self.upper] {
             if let Ok(dir) = walk_dir(root, p, false) {
@@ -378,18 +369,6 @@ impl Overlay {
             }
         }
         Ok(())
-    }
-    fn save_whiteouts(&self) -> io::Result<()> {
-        let names: Vec<String> = self.whiteouts.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        let tmp_name = format!(".rootyard-whiteouts.{}.tmp", uuid::Uuid::new_v4());
-        let tmp = Entry::new(&self.upper, Path::new(&tmp_name), false)?;
-        let target = Entry::new(&self.upper, Path::new(".rootyard-whiteouts.json"), false)?;
-        let mut file = tmp.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
-        use io::Write;
-        file.write_all(&serde_json::to_vec(&names)?)?;
-        file.sync_all()?;
-        tmp.rename_to(&target)?;
-        File::open(&self.upper)?.sync_all()
     }
     fn err(e: io::Error) -> i32 {
         e.raw_os_error().unwrap_or(libc::EIO)

@@ -155,12 +155,11 @@ pub(super) async fn reconcile_locked(
     };
     let repo = service::workspace_repo(state, id);
     let stable_gate = super::mounts::enabled();
-    let freeze_guard = guard.freeze_guard();
-    let scanned = super::blocking::run(move || {
-        let _freeze = freeze_guard;
-        let out = super::mounts::with_frozen(id, || scan_workspace_fingerprint(&repo, stable_gate));
-        drop(_freeze);
-        out
+    let scanned = super::blocking::run_mutating(guard, move |abandoned, _fence| {
+        if abandoned.is_abandoned() {
+            return Err(Error::timeout());
+        }
+        super::mounts::with_frozen(id, || scan_workspace_fingerprint(&repo, stable_gate))
     })
     .await?;
     commit_reconciled(state, id, expected_revision, expected_epoch, None, &scanned).await

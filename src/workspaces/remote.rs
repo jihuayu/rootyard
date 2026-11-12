@@ -126,20 +126,27 @@ pub(super) async fn load_manifest(
     })
     .await?;
     let path = stage.join(format!("lazy-manifest-{cp}-{}", Uuid::new_v4()));
+    let temp_guard = super::cleanup::FileCleanupGuard::new(path.clone());
     if let Err(error) = store.get_to_file(&key(tenant, &digest)?, &path, size as u64, deadline()).await {
-        let _ = super::blocking::run(move || {
-            let _ = fs::remove_file(&path);
-            Ok(())
-        })
-        .await;
+        temp_guard.cleanup().await;
         return Err(Error::internal(error));
     }
-    let manifest = super::blocking::run(move || {
+    let manifest = match super::blocking::run(move || {
         let raw = fs::read(&path).map_err(Error::internal);
         let _ = fs::remove_file(&path);
         bounded_manifest(&raw?)
     })
-    .await?;
+    .await
+    {
+        Ok(m) => {
+            temp_guard.keep();
+            m
+        }
+        Err(err) => {
+            temp_guard.cleanup().await;
+            return Err(err);
+        }
+    };
     if manifest.schema != 1
         || manifest.checkpoint_id != cp
         || manifest.repository_id != repo
@@ -291,13 +298,9 @@ pub async fn publish(
         Ok(file)
     })
     .await?;
+    let temp_guard = super::cleanup::FileCleanupGuard::new(file.clone());
     let upload = store.put_file(&key(tenant, &digest)?, &file, raw_len as u64, deadline()).await;
-    let cleanup_file = file.clone();
-    let _ = super::blocking::run(move || {
-        let _ = fs::remove_file(&cleanup_file);
-        Ok(())
-    })
-    .await;
+    temp_guard.cleanup().await;
     upload.map_err(Error::internal)?;
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
@@ -366,11 +369,12 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
     }
 
     let stage = state.storage.root.join("workspace-service/staging").join(format!("restore-{cp}-{}", Uuid::new_v4()));
+    let stage_guard = super::blocking::DirCleanupGuard::new(stage.clone());
     let root = stage.join("repo");
     let root_init = root.clone();
     let stage_init = stage.clone();
     let rels: Vec<PathBuf> = downloads.iter().map(|(rel, _, _)| rel.clone()).collect();
-    super::blocking::run(move || {
+    if let Err(err) = super::blocking::run(move || {
         fs::create_dir_all(&stage_init).map_err(Error::internal)?;
         fs::create_dir(&root_init).map_err(Error::internal)?;
         for rel in rels {
@@ -379,7 +383,11 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
         }
         Ok(())
     })
-    .await?;
+    .await
+    {
+        stage_guard.cleanup().await;
+        return Err(err);
+    }
 
     let download_outcome: Result<(), Error> = async {
         for (rel, obj_key, size) in &downloads {
@@ -390,17 +398,12 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
     }
     .await;
     if let Err(err) = download_outcome {
-        let cleanup = stage.clone();
-        let _ = super::blocking::run(move || {
-            let _ = fs::remove_dir_all(&cleanup);
-            Ok(())
-        })
-        .await;
+        stage_guard.cleanup().await;
         return Err(err);
     }
 
     let entries = manifest.entries;
-    super::blocking::run(move || {
+    let finalize = super::blocking::run(move || {
         let outcome = (|| -> Result<(), Error> {
             let mut expected = Vec::with_capacity(entries.len());
             for entry in entries {
@@ -443,5 +446,15 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
         let _ = fs::remove_dir_all(&stage);
         outcome
     })
-    .await
+    .await;
+    match finalize {
+        Ok(()) => {
+            stage_guard.keep();
+            Ok(())
+        }
+        Err(err) => {
+            stage_guard.cleanup().await;
+            Err(err)
+        }
+    }
 }

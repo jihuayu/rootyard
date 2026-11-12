@@ -34,12 +34,17 @@ use uuid::Uuid;
 /// [`keep`]: Published::keep
 pub(in crate::workspaces) struct Published {
     dest: PathBuf,
+    fence: Option<super::super::blocking::ScanToken>,
     kept: bool,
 }
 
 impl Published {
     fn new(dest: PathBuf) -> Self {
-        Self { dest, kept: false }
+        Self { dest, fence: None, kept: false }
+    }
+
+    pub(in crate::workspaces) fn attach_fence(&mut self, fence: super::super::blocking::ScanToken) {
+        self.fence = Some(fence);
     }
 
     /// Disarm the guard: retain the tree from here on. Call this immediately
@@ -47,12 +52,22 @@ impl Published {
     /// that may already be referenced by a committed row.
     pub(in crate::workspaces) fn keep(mut self) {
         self.kept = true;
+        self.fence = None;
+    }
+
+    pub(in crate::workspaces) fn cleanup_sync(mut self) {
+        if !self.kept {
+            self.kept = true;
+            let fence = self.fence.take();
+            super::super::cleanup::cleanup_paths_sync(Some(self.dest.clone()), None, true, fence);
+        }
     }
 
     pub(in crate::workspaces) async fn cleanup(mut self) {
         if !self.kept {
             self.kept = true;
-            super::super::cleanup::cleanup_paths_async(Some(self.dest.clone()), None, true).await;
+            let fence = self.fence.take();
+            super::super::cleanup::cleanup_paths_async(Some(self.dest.clone()), None, true, fence).await;
         }
     }
 }
@@ -62,7 +77,8 @@ impl Drop for Published {
         if self.kept {
             return;
         }
-        super::super::cleanup::cleanup_paths_on_drop(Some(self.dest.clone()), None, true);
+        let fence = self.fence.take();
+        super::super::cleanup::cleanup_paths_on_drop(Some(self.dest.clone()), None, true, fence);
     }
 }
 

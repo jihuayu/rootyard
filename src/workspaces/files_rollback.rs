@@ -141,10 +141,12 @@ struct PutRollbackState {
     prior: Option<(Vec<u8>, u32)>,
     created_dirs: Vec<PathBuf>,
     upper: Option<UpperPutSnapshot>,
+    fence: Option<super::super::blocking::ScanToken>,
 }
 
 impl PutRollbackState {
-    fn restore_sync(&self) {
+    fn restore_sync(self) {
+        let _fence = self.fence;
         if restore_file_tree(&self.repo, &self.target, &self.prior, &self.created_dirs).is_err()
             && let Some(ref up) = self.upper
         {
@@ -167,7 +169,12 @@ pub(super) struct PutRollback {
 }
 
 impl PutRollback {
-    pub(super) fn capture(repo: &Path, raw_path: &str, upper_root: Option<PathBuf>) -> Result<Self, Error> {
+    pub(super) fn capture(
+        repo: &Path,
+        raw_path: &str,
+        upper_root: Option<PathBuf>,
+        fence: Option<super::super::blocking::ScanToken>,
+    ) -> Result<Self, Error> {
         let target = safe_file(repo, raw_path)?;
         let rel = safe_path(raw_path)?;
         let prior = read_prior_file(&target)?;
@@ -188,7 +195,9 @@ impl PutRollback {
             }
             None => None,
         };
-        Ok(Self { state: Some(PutRollbackState { repo: repo.to_path_buf(), target, prior, created_dirs, upper }) })
+        Ok(Self {
+            state: Some(PutRollbackState { repo: repo.to_path_buf(), target, prior, created_dirs, upper, fence }),
+        })
     }
 
     pub(super) fn target(&self) -> &Path {
@@ -207,11 +216,7 @@ impl PutRollback {
 
     pub(super) async fn rollback(mut self) {
         if let Some(state) = self.state.take() {
-            let _ = super::super::blocking::run(move || {
-                state.restore_sync();
-                Ok(())
-            })
-            .await;
+            let _ = super::super::blocking::run_cleanup(move || state.restore_sync()).await;
         }
     }
 }
@@ -355,10 +360,12 @@ struct UpperGitSnapshot {
 struct GitRollbackState {
     primary: GitTreeSnapshot,
     upper: Option<UpperGitSnapshot>,
+    fence: Option<super::super::blocking::ScanToken>,
 }
 
 impl GitRollbackState {
-    fn restore_sync(&self) {
+    fn restore_sync(self) {
+        let _fence = self.fence;
         if self.primary.restore().is_err()
             && let Some(ref up) = self.upper
         {
@@ -381,7 +388,12 @@ pub(super) struct GitRollback {
 }
 
 impl GitRollback {
-    pub(super) fn capture(repo: &Path, paths: &[String], upper_root: Option<PathBuf>) -> Result<Self, Error> {
+    pub(super) fn capture(
+        repo: &Path,
+        paths: &[String],
+        upper_root: Option<PathBuf>,
+        fence: Option<super::super::blocking::ScanToken>,
+    ) -> Result<Self, Error> {
         for path in paths {
             safe_file(repo, path)?;
         }
@@ -394,7 +406,7 @@ impl GitRollback {
             }
             None => None,
         };
-        Ok(Self { state: Some(GitRollbackState { primary, upper }) })
+        Ok(Self { state: Some(GitRollbackState { primary, upper, fence }) })
     }
 
     pub(super) fn disarm(&mut self) {
@@ -403,11 +415,7 @@ impl GitRollback {
 
     pub(super) async fn rollback(mut self) {
         if let Some(state) = self.state.take() {
-            let _ = super::super::blocking::run(move || {
-                state.restore_sync();
-                Ok(())
-            })
-            .await;
+            let _ = super::super::blocking::run_cleanup(move || state.restore_sync()).await;
         }
     }
 }
@@ -421,78 +429,5 @@ impl Drop for GitRollback {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn put_rollback_restores_files_and_failed_atomic_put_leaves_no_temp_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        fs::write(repo.join("existing.txt"), b"v1\n").unwrap();
-        fs::set_permissions(repo.join("existing.txt"), fs::Permissions::from_mode(0o644)).unwrap();
-
-        let mut rb = PutRollback::capture(repo, "existing.txt", None).unwrap();
-        atomic_put(rb.target(), b"v2-rejected\n", 0o600).unwrap();
-        rb.restore_now();
-        assert_eq!(fs::read(repo.join("existing.txt")).unwrap(), b"v1\n");
-        assert_eq!(fs::metadata(repo.join("existing.txt")).unwrap().permissions().mode() & 0o777, 0o644);
-
-        let mut rb_new = PutRollback::capture(repo, "nested/sub/new.txt", None).unwrap();
-        atomic_put(rb_new.target(), b"created\n", 0o600).unwrap();
-        rb_new.restore_now();
-        assert!(!repo.join("nested").exists());
-
-        fs::create_dir(repo.join("dir_target")).unwrap();
-        assert!(atomic_put(&repo.join("dir_target"), b"boom", 0o600).is_err());
-        let leftovers: Vec<_> = fs::read_dir(repo)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".rootyard-"))
-            .collect();
-        assert!(leftovers.is_empty(), "atomic_put failure must unlink temporary file");
-    }
-
-    #[test]
-    fn git_rollback_cleans_index_lock_fails_closed_and_triggers_upper_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("mount");
-        let upper = dir.path().join("upper");
-        fs::create_dir_all(repo.join(".git/objects/aa")).unwrap();
-        fs::create_dir_all(&upper).unwrap();
-        fs::write(repo.join(".git/index"), b"index-v1").unwrap();
-        fs::write(repo.join(".git/objects/aa/keep"), b"keep").unwrap();
-        fs::write(repo.join("hello.txt"), b"hello").unwrap();
-
-        assert!(walk_git_objects_bounded(&repo.join(".git/objects"), 1).is_err());
-        fs::set_permissions(repo.join(".git/objects/aa"), fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read_dir(repo.join(".git/objects/aa")).is_err() {
-            assert!(GitRollback::capture(&repo, &[String::from("hello.txt")], None).is_err());
-        }
-        fs::set_permissions(repo.join(".git/objects/aa"), fs::Permissions::from_mode(0o700)).unwrap();
-
-        let mut rb = GitRollback::capture(&repo, &[String::from("hello.txt")], Some(upper.clone())).unwrap();
-        fs::create_dir_all(upper.join(".git/objects/bb")).unwrap();
-        fs::write(upper.join(".git/index"), b"index-v2-rejected").unwrap();
-        fs::write(upper.join(".git/index.lock"), b"stranded-by-timeout").unwrap();
-        fs::write(upper.join(".git/objects/bb/newblob"), b"new").unwrap();
-        fs::create_dir_all(repo.join(".git/objects/bb")).unwrap();
-        fs::write(repo.join(".git/objects/bb/newblob"), b"new").unwrap();
-        fs::set_permissions(repo.join(".git/objects/bb"), fs::Permissions::from_mode(0o500)).unwrap();
-
-        rb.state.take().unwrap().restore_sync();
-        fs::set_permissions(repo.join(".git/objects/bb"), fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(!upper.join(".git/index.lock").exists(), "upper fallback must remove index.lock");
-        assert!(!upper.join(".git/index").exists(), "upper fallback must remove copy-up index");
-        assert!(!upper.join(".git/objects/bb").exists(), "upper fallback must prune loose objects");
-
-        let mut rb_direct = GitRollback::capture(&repo, &[String::from("hello.txt")], None).unwrap();
-        fs::write(repo.join(".git/index"), b"index-v2").unwrap();
-        fs::write(repo.join(".git/index.lock"), b"lock").unwrap();
-        fs::create_dir_all(repo.join(".git/objects/cc")).unwrap();
-        fs::write(repo.join(".git/objects/cc/newblob"), b"new").unwrap();
-        fs::set_permissions(repo.join(".git/objects/cc/newblob"), fs::Permissions::from_mode(0o444)).unwrap();
-        rb_direct.state.take().unwrap().restore_sync();
-        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), b"index-v1");
-        assert!(!repo.join(".git/index.lock").exists() && !repo.join(".git/objects/cc").exists());
-    }
-}
+#[path = "files_rollback_tests.rs"]
+mod tests;
