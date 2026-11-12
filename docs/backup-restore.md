@@ -1,12 +1,27 @@
 # ADR 004: an offline backup and isolated restore slice
 
-Status: current integration uses backup format 20 and the exact migration/catalog set embedded in the producing executable (`src/db.rs`, `schema/144_*`). Formats 6, 7, 8, 9, 10, 11, 12, 13, 14 and 15 stay frozen at schema 130, 131, 132, 133, 134, 135, 136, 137, 138 and 139, format 16 stays frozen at schema 140, format 17 stays frozen at schema 141, format 18 stays frozen at schema 142 and format 19 stays frozen at schema 143, for archives made before later migrations; restoring them requires the explicit `--allow-legacy-schema130`, `--allow-legacy-schema131`, `--allow-legacy-schema132`, `--allow-legacy-schema133`, `--allow-legacy-schema134`, `--allow-legacy-schema135`, `--allow-legacy-schema136`, `--allow-legacy-schema137`, `--allow-legacy-schema138`, `--allow-legacy-schema139`, `--allow-legacy-schema140`, `--allow-legacy-schema141`, `--allow-legacy-schema142` or `--allow-legacy-schema143` upgrade path, at most one per restore. This is a Linux, single-node GitFS maintenance tool, not online replication, failover, PITR, encrypted object storage or a zero-loss guarantee. PITR and the delete broker (#77) remain unresolved and are not provided by this slice. It does not stop or deploy a service, switch traffic, or automatically repair unknown pushes.
+Status: current integration embeds frozen PostgreSQL catalog **`schema 147`** (`src/db.rs`, `schema/147_*`, `migrations/001_initial.sql`..`147_ref_store_serving_operations.sql`) and produces two current archive formats selected automatically from source state (never by a CLI flag):
+
+- **`format 21` (`schema 147`)**: produced when the source has zero `pg_refstore` serving repositories (`served == 0`). Captures the PostgreSQL `schema 147` snapshot, private local GitFS volume, hydrated LFS closure, and encrypted Pando remote pack closure. Carries **no** OpenDAL v1 Blob bytes and is never an independent Blob byte backup.
+- **`format 22` (`schema 147`)**: produced automatically whenever the source has at least one `pg_refstore` serving repository (`served > 0`; mixed legacy/Blob sources are refused). Validates every referenced RefStore registration on the single exported `REPEATABLE READ` snapshot (`membership`, `snapshot_packs`, active/released `root_packs`, `serving_read_packs`, `#169` / PR `#214`) and exports the exact OpenDAL v1 Blob `.pack`/`.idx` closure bound to `BlobBackendIdentity`. Restores only into a fresh empty PostgreSQL 17 database and the **same physical `BlobBackendIdentity`** (not full all-content Blob backup `#120` yet: LFS/Workspace/event Blob closures, cross-backend rewrite, and interrupted `format 22` restore resume are unsupported).
+
+| Archive format | Frozen schema | Restore command requirement |
+| --- | --- | --- |
+| **`format 22`** (current paired PG + OpenDAL Blob `.pack`/`.idx` closure) | `schema 147` (`schema/147_*`) | Exact producing binary (`binary_sha256`), `--isolated --trust-backup`, same physical `BlobBackendIdentity`, **no** legacy flag |
+| **`format 21`** (current legacy PG + GitFS volume + LFS + Pando closure) | `schema 147` (`schema/147_*`) | Exact producing binary (`binary_sha256`), `--isolated --trust-backup`, **no** legacy flag |
+| `format 20` (frozen roots/decisions metadata era) | `schema 144` (`schema/144_*`) | Frozen for `backup-verify` / original matching binary only; **no** `--allow-legacy-schema144` upgrade flag |
+| `formats 6..=19` | `schemas 130..=143` (`schema/130_*`..`143_*`) | `--isolated --trust-backup` plus **at most one** matching flag (`--allow-legacy-schema130` through `--allow-legacy-schema143`); verifies frozen source catalog then upgrades in-session to `schema 147` |
+| `format 5` | `schema 060` (`schema/060_*`) | Frozen for `backup-verify` / original matching binary only; **no** `--allow-legacy-schema060` upgrade flag |
+| `format 4` | `schema 007` (`schema/007_*`) | Exact producing binary, or `--isolated --trust-backup --allow-legacy-schema007` (verifies `schema 007`; apply `migrate` separately) |
+| `formats 1..=3` | `schemas 002..=006` | Not accepted by current `restore`; require their original historical executable |
+
+This is a Linux offline maintenance tool, not online replication, automatic failover, PITR, distributed Raft Ref-CAS backup (`#153`), encrypted OpenDAL Blob provider storage, or a zero-loss guarantee. Out-of-band PostgreSQL PITR/basebackup sharing a deletable bucket and an external delete broker (`#77`) remain unresolved and are not provided by this slice. Neither `backup` nor `restore` stops or deploys a service, switches traffic, or automatically repairs `unknown` pushes.
 
 ## Supported boundary
 
-Except for the explicit legacy schema007 compatibility option below, use the exact Rootyard executable that made the backup, Git >= 2.43, PostgreSQL 17 and matching `pg_dump`/`pg_restore` clients. Keep that executable separately in your trusted release archive. The manifest includes its SHA-256; the copied hook runner is evidence, never an executable used by the restore tool.
+Except for the explicit single-flag legacy compatibility options (`--allow-legacy-schema007`, or `--allow-legacy-schema130` through `--allow-legacy-schema143`), use the exact Rootyard executable that made the backup, Git >= 2.43, PostgreSQL 17 and matching `pg_dump`/`pg_restore` clients. Keep that executable separately in your trusted release archive. The manifest includes its SHA-256; the copied hook runner is evidence, never an executable used by the restore tool.
 
-The current format requires the reviewed public catalog embedded in its executable: columns/defaults, constraints, indexes, function definitions and attributes, enabled triggers, rules and row-security policies. Format 20 adds the schema144 retained roots ledger (root heads, immutable captures/refs/selector OIDs, complete registered pack identities, release tombstones, bounded receipts and monotone repository/tenant usage), the publication-decision ledger (scopes, one-way OPEN/CONSUMED/CANCELLED/REJECTED decisions, dependency observations, per-ref verdicts, cancel-before-install tombstones and retained quota) and the separate per-repository protocol state that carries the monotone `roots_revision` and the one-way `decision_required` fence without altering the frozen schema139 gate row shape. Format 19 is exactly schema143: it adds the schema143 A5 pack-snapshot binding, permanent pack-snapshot history and permanent pack-snapshot repository/tenant usage metadata, and additively defaults the A2 snapshot header to `pack_mode=metadata_only` / `pack_count=0` / null membership and snapshot digests / `pack_membership_state=unavailable`, on top of the complete schema142 catalog. Format 18 is exactly schema142: the durable pack-registration, artifact, membership, history and usage ledger on the complete schema141 catalog, whose gate `pack_mode` defaults to `metadata_only`; it stays frozen and requires `--allow-legacy-schema142` for a reviewed upgrade to schema144. Format 17 adds the schema141 global artifact-hold ledger metadata to the complete schema140 catalog. The archive carries those ledger rows as PostgreSQL metadata only: it does not copy Blob bytes or pack bytes, has no hold release, retirement, pack-detach, physical GC or serving path, and cannot activate a hold or claim complete physical protection when object bytes are missing. A metadata-only backup never copies Blob pack/idx bytes and does not make a pack-verified gate claim. Format 16 is exactly schema140: it adds the snapshot/pin contract to the complete schema139 catalog and stays frozen at schema140, requiring `--allow-legacy-schema140` for a reviewed upgrade to schema144. Format 15 is exactly schema139: the explicit RefStore gate, current refs and immutable core-event tables on top of the complete schema138 catalog, and it stays frozen at schema139, requiring `--allow-legacy-schema139` for a reviewed upgrade to schema144. Format 14 stays frozen at schema138 and requires `--allow-legacy-schema138` for a reviewed upgrade to schema144. Format 14 adds the schema138 RefStore operation registry, cancellation tombstones and terminal-immutability triggers to the complete schema137 catalog, including the narrow terminal-admission historical-projection guard added by migration 137, plus the schema136 token-scope catalog, including the token `is_restricted`/`scope_version`/`display_name` columns and the token repository/namespace scope tables and reference indexes added by migration 136, the composite repository/tenant identity foreign keys and unique key added by migration 134, the schema135 partial covering storage-maintenance metrics index, the index-only browser-session/token GC reference indexes from migration 133, and the existing volume UUID. Format 13 stays frozen at schema137; its restore requires `--allow-legacy-schema137`. Format 12 stays frozen at schema136, format 11 at schema135, format 9 at schema133, format 8 at schema132 with the Pando remote-retention authority state, format 7 at the frozen schema131 catalog and format 6 at the frozen schema130 catalog; each is verified against its own `schema/13*_*` fixture set before the reviewed later migrations are applied in the same restore session. Retain each producing executable with its archive; schema125 is still evolving on the draft integration branch and is not a released cross-version compatibility promise. Earlier format-1/schema-002, format-2/schema-003 and format-3/schema-006 archives require their original trusted executable and a separate reviewed upgrade, not this restore command. Unknown tables, non-public application schemas, additional/modified routines, user-defined types, extensions other than plpgsql, large objects, non-permanent/non-ordinary tables and connection `options` are rejected. The connection must explicitly name one host, a user and a database; URLs and passwords are never passed as subprocess arguments. There is no automatic migration on backup or restore. Future schema versions or catalog/deparser changes require an explicit reviewed contract update and another fresh-database restore drill. Database roles, ACLs, configuration, credentials, extensions and tablespaces are not portable backup inputs; restoration owns the imported tables as the destination service identity and does not import owners/ACLs. Legacy sections below describe when each frozen contract was introduced; every successful upgrade continues through all later reviewed migrations and is verified against the current schema144 catalog before publication.
+The current formats (`format 21` and `format 22`) require the reviewed `schema 147` public catalog embedded in the executable: columns/defaults, constraints, indexes, function definitions and attributes, enabled triggers, rules and row-security policies. On top of `schema 144`, migrations `145`–`147` add the durable `ref_store_serving_repositories` binding (`storage_backend='pg_refstore'` + immutable `history_incarnation`, `authority_epoch`, `group_epoch` and 64-hex `backend_identity`), the bounded transient `ref_store_core_serving_reads` read-lease and protected-pack tables, and the `ref_store_serving_operations` HTTP producer-request digest binding; `format 22` pairs that `schema 147` snapshot with the `#169` validated RefStore artifact ledger and same-backend OpenDAL v1 Blob `.pack`/`.idx` bytes, whereas `format 21` carries no OpenDAL Blob bytes. Frozen `format 20` is `schema 144` (retained roots ledger, publication-decision/verdict/cancellation/quota ledger, and `ref_store_core_protocol_repos`). Frozen `format 19` is `schema 143` (A5 pack-snapshot bindings, permanent history and repository/tenant usage); `format 18` is `schema 142` (durable pack registration, artifact, membership, history and usage ledger); `format 17` is `schema 141` (global 64-shard artifact-hold ledger); `format 16` is `schema 140` (metadata snapshot/pin contract); `format 15` is `schema 139` (RefStore gate, current refs and core events); `format 14` is `schema 138` (RefStore operation registry and cancellation tombstones); `format 13` is `schema 137` (terminal-admission projection guard); `format 12` is `schema 136` (scoped PAT columns, tables and reference indexes); `format 11` is `schema 135` (partial storage-maintenance metrics index); `format 10` is `schema 134` (composite repository/tenant FKs); `format 9` is `schema 133` (browser-session/token GC indexes); `format 8` is `schema 132` (Pando remote-retention authority); `format 7` is `schema 131`; and `format 6` is `schema 130`. Restoring any `format 6..=19` archive with its matching `--allow-legacy-schema130`..`--allow-legacy-schema143` flag verifies its exact frozen `schema/130_*`..`143_*` fixture set before applying all reviewed migrations through `schema 147` in the same restore session and re-verifying the `schema 147` catalog before publication. Unknown tables, non-public application schemas, additional/modified routines, user-defined types, extensions other than `plpgsql`, large objects, non-permanent/non-ordinary tables and connection `options` are rejected. The connection must explicitly name one host, a user and a database; URLs and passwords are never passed as subprocess arguments. There is no automatic migration on `backup`, and `restore` runs migrations only for the explicit `formats 6..=19` legacy flags above. Database roles, ACLs, configuration, credentials, extensions and tablespaces are not portable backup inputs; restoration owns the imported tables as the destination service identity and does not import owners/ACLs.
 
 The existing data directory, the backup's parent, the destination's parent and all their ancestors must be real operator-controlled directories. Do not use symlink paths, hostile shared writable parents, nested mounts or concurrent manual filesystem changes. Only the three managed hook symlinks pointing to `.runner` are accepted. Other symlinks, hard-linked regular files, special files, setuid/setgid/sticky modes and non-UTF-8 filenames are rejected. Repositories using alternates/http-alternates, shallow/promisor/partial-clone object storage, commondir/linked-worktree routing or include configuration are rejected rather than depending on the source machine to pass integrity checks.
 
@@ -15,7 +30,10 @@ The existing private `.volume-id` must be present and valid; this tool does not 
 ## Create a backup
 
 1. Disable ingress and scheduled maintenance, stop Rootyard and wait for its Git descendants to exit. Do not run manual Git, migrations, DDL or direct filesystem changes. The tool does **not** stop processes for you. CLI token/admin writes and outbox DML are blocked by the database barrier during capture and can time out, so pause them too.
-2. Supply `DATABASE_URL` and `ROOTYARD_DATA_DIR` through your trusted secret/config mechanism. Use the service identity, not root. The backup path must not exist and must be outside the data directory.
+2. Supply `DATABASE_URL` and `ROOTYARD_DATA_DIR` through your trusted secret/config mechanism (plus `ROOTYARD_PG_CA_PEM` and optional `ROOTYARD_PG_CLIENT_CERT_PEM` / `ROOTYARD_PG_CLIENT_KEY_PEM` when PostgreSQL TLS is enabled), along with the conditional remote-storage environment required by the source:
+   - `ROOTYARD_BLOB_*` (`BlobProfile::from_env()`): **mandatory** whenever the source has any `pg_refstore` serving repository (`served > 0`, which automatically selects `format 22`), pointing to the source's exact physical `BlobBackendIdentity` so `.pack`/`.idx` closures can be validated and exported (missing or mismatched `ROOTYARD_BLOB_*` fails closed).
+   - `ROOTYARD_OBJECT_STORE_*` (`RemoteObjectStore::from_env()`): required for `format 21` (`served == 0`) whenever `state='ready'` LFS objects must be hydrated from remote S3 object storage into `volume/` or `storage_backend='pando'` remote encrypted pack closures must be exported into `pando/<repo_id>`.
+   Use the service identity, not root. The backup path must not exist and must be outside the data directory.
 3. Run:
 
 ```sh
@@ -44,8 +62,11 @@ Backup barrier lock waits are limited to five seconds, and pg_dump uses `--lock-
 A PostgreSQL dump can execute SQL selected by its producer. Hashes detect corruption, **not authenticity**. Use only a trusted backup; do not inspect unknown archives by executing them. `--trust-backup` is an explicit trust decision, not a sandbox.
 
 1. Create a fresh, unused dedicated PostgreSQL 17 database and a private destination parent, with no public ingress, service process, external workers or other clients. The destination data directory itself must not exist. Keep standalone `worker`, `worker-once`, embedded workers and every other target database client stopped until restore succeeds and the target is reviewed. Firewall/credentials/process isolation remains an operator responsibility: `--isolated` does not prove that arbitrary clients cannot connect later.
-2. Configure `DATABASE_URL` for that new database and `ROOTYARD_DATA_DIR` for the new path. Use the same trusted binary as the backup, or the explicit schema007 compatibility option below. Do not point at the source database: the nonempty-database check rejects it, even if a different DSN spelling or proxy is used.
-3. Run:
+2. Configure `DATABASE_URL` for that new database and `ROOTYARD_DATA_DIR` for the new path (plus `ROOTYARD_PG_CA_PEM` and optional client mTLS PEM variables when PostgreSQL TLS is used), along with the archive's conditional remote-storage environment:
+   - `ROOTYARD_BLOB_*` (`BlobProfile::from_env()`): **mandatory** when restoring a `format 22` (`served > 0`) archive, and must resolve to the **identical physical `BlobBackendIdentity`** recorded in `manifest.json` so `.pack`/`.idx` closures can be rebuilt at their exact locators.
+   - `ROOTYARD_OBJECT_STORE_*` (`RemoteObjectStore::from_env()`): required when restoring a non-paired archive (`format 21` or frozen `formats 6..=20`, i.e. `formats 6..=21`) that re-imports `storage_backend='pando'` encrypted pack closures into remote S3 object storage after Pando authority rotation (hydrated LFS bytes in `formats 6..=21` are already local under `volume/` and need no remote endpoint).
+   Use the exact trusted binary that produced the backup (`manifest.binary_sha256`), or pass **at most one** explicit legacy compatibility flag: `--allow-legacy-schema007` for `format 4` (`schema 007`, with `migrate` run separately afterward), or the single matching flag from `--allow-legacy-schema130` through `--allow-legacy-schema143` for frozen `formats 6..=19` (`schemas 130..=143`, upgraded in-session to `schema 147`; `format 5` / `schema 060` and `format 20` / `schema 144` have **no** `--allow-legacy-schema*` upgrade flag). Do not point at the source database: the nonempty-database check rejects it, even if a different DSN spelling or proxy is used.
+3. Run (appending the single matching `--allow-legacy-schema*` flag only for `format 4` or `formats 6..=19` as detailed in [Restored execution authority](#restored-execution-authority) below):
 
 ```sh
 rootyard restore /private-backups/set-2026-11-03 --isolated --trust-backup
@@ -54,7 +75,7 @@ rootyard restore /private-backups/set-2026-11-03 --isolated --trust-backup
 4. The command validates the complete backup before mutating the target, holds the migration advisory lock, refuses existing database objects/other sessions and reserves a persistent `.<destination-name>.rootyard-restoring` guard in the destination's parent. It copies to a new private staging directory, takes its volume lock, runs native `git fsck --full --strict` for every existing repository and compares repository identity, HEAD and refs. It then imports PostgreSQL with `--clean --if-exists --single-transaction --exit-on-error --no-owner --no-privileges`, checks the full schema contract and repository IDs/generations/incident revisions/states/unknown counts, and publishes the directory without replacement. The clean flags allow recreating the initially empty public schema inside the import transaction; they do not authorize replacing a used database, and the operator must prevent clients or DDL from appearing after the empty-target check. Only after parent fsync does it remove and fsync the startup guard.
 5. No service is started. In the isolated environment, start the matching service deliberately, inspect startup recovery and owner audit APIs, perform authenticated clone/fetch, compare expected refs/content, verify revoked/read-only credentials and test a disposable controlled push before considering any separately approved traffic change.
 
-All four Forge tables are captured in full, including personal owner/repository/author identity, Issue/comment text, open/closed state, CAS versions, timestamps and both numbering counters. The durable creation-key table preserves canonical request payloads and original creation responses, even where the current Issue/comment has since been edited. Keys have no automatic expiry or retention deletion. Backup and post-import validation reject committed entries whose creation response is null; such placeholders are valid only inside an uncommitted creation transaction. Restore preserves the captured counters, states and authors, and does not convert Forge changes into Git operations/outbox events. Counters can be lower than the lost source's later values: Issue/comment numbers allocated only after the backup boundary may be reused after restore. This is not global monotonic numbering across data loss; review references to post-boundary content before reopening the service. Issue/comment versions rewind too and can recur in the restored timeline. CAS protects only the current database history, not continuity across disaster recovery. Keys first committed after the backup are lost too: retrying those keys after restore may create another object. Idempotency is scoped to the captured database history, not a disaster-recovery fence. Clients must GET and confirm current content/version after cutover rather than treating cached post-boundary resource/version pairs as a recovery fence. Ready-state and token authorization remain API checks after restore; a recovering repository is not made writable simply because its Issues were restored.
+The complete reviewed `schema 147` `public` catalog is captured in full under the single `REPEATABLE READ` barrier: personal and organization tenants (`users`, `namespaces`, `organizations`, `organization_memberships`, `organization_audit_log`), organization/repository teams and 5-role collaborators (`organization_teams`, `organization_team_members`, `repository_collaborators`, `repository_teams`, `repository_team_members`, `repository_audit_log`), Forge collaboration and governance (`forge_issues`, `forge_issue_comments`, `forge_issue_counters`, `forge_pulls`, `forge_pull_reviews`, `forge_pull_counters`, `forge_check_runs`, `forge_trusted_check_contexts`, `forge_branch_rules`, `forge_creation_requests`), webhooks (`forge_webhooks`, `forge_webhook_deliveries`, `forge_webhook_callbacks`), LFS (`lfs_objects`, `lfs_locks`), CI and execution (`ci_*`, `sandbox_jobs`, `cluster_*`), workspaces/views/changesets (`workspaces`, `workspace_*`), sharding and storage maintenance (`repository_shard_routes`, `shard_*`, `storage_*`), Pando metadata (`pando_*`), web sessions and scoped PATs (`tokens`, `token_repository_scopes`, `token_namespace_scopes`, `web_sessions`), and durable RefStore / artifact-hold ledgers (`artifact_hold*`, `ref_store_*`). Durable idempotency tables are captured too: `forge_creation_requests` preserves canonical request payloads and original creation responses even where an Issue/PR/comment has since been edited (backup and post-import validation reject committed `forge_creation_requests` entries whose `response` is null, which are valid only inside an uncommitted creation transaction), while `organization_creation_keys` and `workspace_creations` preserve committed key-to-resource bindings without automatic expiry. Restore preserves captured counters, states, roles and authors (modulo the intentional execution/session authority fences below) and does not convert Forge or governance rows into Git operations/outbox events. Counters (`forge_issue_counters`, `forge_pull_counters`, comment/audit sequences) can be lower than the lost source's later values: Issue, PR or comment numbers allocated only after the backup boundary may be reused after restore. This is not global monotonic numbering across data loss; review references to post-boundary content before reopening the service. Optimistic CAS versions rewind to the backup boundary as well and can recur in the restored timeline: `expected_version` CAS protects only the current database history, not continuity across disaster recovery. `Idempotency-Key` records first committed after the backup boundary are lost too, so retrying those keys after restore may create another object; idempotency is scoped to the captured database history, not a disaster-recovery fence. Clients must GET and confirm current content/version after cutover rather than treating cached post-boundary resource/version pairs as a recovery fence. Ready-state, 5-role RBAC and PAT scope authorization remain live API checks after restore; a recovering repository is not made writable simply because its collaboration metadata was restored.
 
 SQL unknown counts and retained journal-record counts are separate manifest facts. An unfinished journal may not yet have a SQL operation. Raw evidence, generations, immutable recovery/operation resolutions, incident revisions, observed snapshots, projection provenance and delivery effects are preserved; refs and fsck are never used to manufacture success receipts or clear unknown outcomes. Startup recovery follows the existing protocol, and unresolved unknown repositories stay blocked. Historical inspection fingerprints remain opaque evidence: a new filesystem inode can legitimately change a new inspection fingerprint while the stable volume UUID remains unchanged. Resolved unknown history stays unknown; startup cleanup only accepts the exact evidence already covered by the resolution. Changed or newly introduced journals remain incidents. Database owners/superusers remain trusted administrators: trigger-based immutable history is not protection against privileged TRUNCATE, disabled triggers or direct catalog changes.
 
@@ -79,13 +100,22 @@ The backup records its stopped-writer boundary time. Work acknowledged **after**
 python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
 ```
 
-The schema contract fixtures are generated only from pristine synthetic migrations and their real pg_dump/pg_restore and restored003-upgrade paths using `tests/schema_contract.py`. PostgreSQL normalizes three BETWEEN-derived CHECK expressions on the round trip, so exactly three complete reviewed catalog shapes are accepted: the pristine current migration set, its full pg_dump/pg_restore, and a restored schema003 subsequently upgraded through the current migrations. The last has a normalized old ref CHECK beside native new Forge CHECKs. No arbitrary expression normalization is performed. Do not regenerate fixtures from an altered production database to bypass a rejection. `tests/backup_recovery.py` additionally proves all sixteen tables, resolution protections, volume identity and authenticated operation after a cross-cluster restore.
+The schema contract fixtures are generated only from pristine synthetic migrations and their real pg_dump/pg_restore and restored003-upgrade paths using `tests/schema_contract.py`. PostgreSQL normalizes three BETWEEN-derived CHECK expressions on the round trip, so exactly three complete reviewed catalog shapes are accepted: the pristine current migration set, its full pg_dump/pg_restore, and a restored schema003 subsequently upgraded through the current migrations. The last has a normalized old ref CHECK beside native new Forge CHECKs. No arbitrary expression normalization is performed. Do not regenerate fixtures from an altered production database to bypass a rejection. `tests/backup_recovery.py` dynamically queries and compares all `public` tables in `pg_tables` on `schema 147` alongside `cluster_authority` and `pando_storage_authorities` rotation, immutable resolution/projection protections, `.volume-id` and journal byte identity, and authenticated operation after a cross-cluster restore.
 
-### Current format20 populated RefStore snapshot drill
+### Current `format 22` (`schema 147`) paired PG + OpenDAL Blob closure drill
 
-`tests/backup_refstore_snapshot140.py` is the current-format (format20/schema144) drill for a populated schema140 RefStore. It runs the inherited seven real backup cases (synthetic source, offline barrier/snapshot, corrupt inputs, barrier failure, interrupted restore, post-backup write exclusion, and fresh isolated restore, clone and fsck) and requires a dedicated `ROOTYARD_TEST_DATABASE_URL` with CREATEDB. The migration-139 gate/refs/lane/operation rows remain a direct-SQL metadata fixture, not an adapter or Git acknowledgement.
+`tests/backup_blob_serving147.py` (with source-bound Rust fixture `tests/ref_store_format22_backup_fixture.rs`, built under `--features pando-lab,format22-fixture`) exercises the current `format 22` / `schema 147` paired PostgreSQL + OpenDAL Blob closure contract:
 
-All six migration-140 tables (`ref_store_core_snapshots`, `ref_store_core_snapshot_refs`, `ref_store_core_pins`, `ref_store_core_receipts`, `ref_store_core_repo_usage` and `ref_store_core_tenant_usage`) are populated through the real typed `PgRefStoreCore` adapter in `tests/ref_store_snapshot_backup_fixture.rs`, not by hand-written SQL. Seed mode creates three snapshots with captured refs, an active pin renewed to generation 2, an exactly released pin, and an expired pin whose expiry waits on the real PostgreSQL clock, plus five mutation receipts and repository/tenant usage counters. The drill captures the exact rows, makes the real format20 offline backup, and restores into a fresh database, directory and service under the current schema144 catalog. It compares all six tables exactly, then runs the helper in verify mode: rebuilt typed create/renew/release requests are replayed through the public constructors, must return the original receipts, and must not write, refund or revive a row, counter or timestamp. The migration-140 triggers stay enabled; direct updates, deletes and terminal pin revival are rejected with the rows unchanged. The current archive also carries the schema141 global artifact-hold ledger, the schema142 pack ledger, the schema143 A5 pack-snapshot ledger and the schema144 roots/decision/verdict/quota/protocol tables. This A2 fixture populates none of them: it asserts the generated schema142 pack tables and the four schema143 pack-snapshot tables are present in the dynamic dump and restore empty, that every old snapshot keeps the default `metadata_only`/`unavailable` shape, and that the gate stays at the default `metadata_only` mode. It does not fabricate a pack registration, membership, pack snapshot, pin or history row, does not copy Blob or pack bytes and is not a pack- or hold-backup qualification. This A2 fixture also fabricates no root, decision, verdict, protocol or roots/decision-usage row: those schema144 tables must restore empty under the exact current catalog.
+- Holds the shared database lifecycle barrier (`BackupMutex`) before starting `REPEATABLE READ`, validates every `pg_refstore` registration referenced by `membership`, A5 `snapshot_packs`, active/released `root_packs`, and transient `serving_read_packs` (`src/backup/ledger_validation.rs`, `#169` / PR `#214`), streams and re-verifies every `.pack`/`.idx` object from OpenDAL Blob into the archive, and records `blob_closure` (`backend_identity`, `provider`, counts, bytes, digest) plus `refstore` carry rows in `manifest.json`.
+- Verifies six dedicated corrupt-ledger refusal cases (missing `.pack`, missing `.idx`, missing both, wrong `artifact_set_digest`, missing durable hold, mismatched hold locator) on disposable `pg_dump` clones before any destination file, `manifest.json`, or `COMPLETE` marker can be written.
+- Deletes the original `.pack`/`.idx` objects from the S3 fixture prefix, restores into a fresh PostgreSQL 17 database and rebuilds the exact same-locator objects on the identical physical `BlobBackendIdentity`, then verifies authenticated `serve-blob` clone/content/refs/`git fsck --full --strict`, active/released roots, serving-read records, and idempotent replay.
+- **Explicit limits**: covers pure `pg_refstore` `.pack`/`.idx` closures on the **same physical `BlobBackendIdentity`** only; mixed legacy/Blob repositories are refused; LFS, Workspace checkpoint, and event-archive Blob closures (`#120`, `#145`–`#147`), cross-backend rewrites, interrupted `format 22` restore recovery, multi-host HA, and destructive Blob GC (`BlobStore::delete` remains `DeleteDisabled`) are not claimed.
+
+### Component metadata drill: populated `schema140` RefStore snapshots (`format 21` / `schema 147` unserved mode)
+
+`tests/backup_refstore_snapshot140.py` exercises the unserved (`served == 0`, `format 21` / `schema 147`) metadata round-trip for a populated `schema 140` RefStore. It runs the inherited seven real backup cases (synthetic source, offline barrier/snapshot, corrupt inputs, barrier failure, interrupted restore, post-backup write exclusion, and fresh isolated restore, clone and fsck) and requires a dedicated `ROOTYARD_TEST_DATABASE_URL` with CREATEDB. The migration-139 gate/refs/lane/operation rows remain a direct-SQL metadata fixture, not an adapter or Git acknowledgement.
+
+All six migration-140 tables (`ref_store_core_snapshots`, `ref_store_core_snapshot_refs`, `ref_store_core_pins`, `ref_store_core_receipts`, `ref_store_core_repo_usage` and `ref_store_core_tenant_usage`) are populated through the real typed `PgRefStoreCore` adapter in `tests/ref_store_snapshot_backup_fixture.rs`, not by hand-written SQL. Seed mode creates three snapshots with captured refs, an active pin renewed to generation 2, an exactly released pin, and an expired pin whose expiry waits on the real PostgreSQL clock, plus five mutation receipts and repository/tenant usage counters. The drill captures the exact rows, makes the unserved `format 21` offline backup, and restores into a fresh database, directory and service under the current `schema 147` catalog. It compares all six tables exactly, then runs the helper in verify mode: rebuilt typed create/renew/release requests are replayed through the public constructors, must return the original receipts, and must not write, refund or revive a row, counter or timestamp. The migration-140 triggers stay enabled; direct updates, deletes and terminal pin revival are rejected with the rows unchanged. Because no `pg_refstore` serving repository is registered in this A2 fixture (`served == 0`), the migrated `schema 142`–`147` pack, pack-snapshot, roots/decision, and serving tables restore empty, every old snapshot keeps the default `metadata_only`/`unavailable` shape, the gate stays at `metadata_only`, and no OpenDAL Blob bytes are copied.
 
 The helper is an `#[ignore]`d Rust integration test selected only for this drill. `scripts/build_native_test.py --test ref_store_snapshot_backup_fixture --features pando-lab --output test-results/refstore-snapshot-fixture` clears the rootyard package under the shared build lock, requires exactly one Fresh=false test compiler artifact and a successful build-finished event, checks the source/test/Cargo.lock digests and HEAD/working-tree state are unchanged, and copies the executable outside `CARGO_TARGET_DIR` with mode 0700. Its `test-results/refstore-snapshot-fixture.build.json` receipt binds the relocated binary to the same source inputs as the candidate application build.
 
@@ -127,256 +157,65 @@ remains open. Never point an out-of-band metadata copy at the shared bucket.
 
 ### Restored execution authority
 
-New backups use format13 with the executable's current schema137 catalog and include
-`ci_checkout_jobs` grants, permanent cancellation tombstones and the Pando
-remote-retention authority state. The paired
-volume still supplies source-pin files and native Git roots; SQL rows alone do
-not prove retention. All restored issued checkout grants are permanently marked
-revoked before the restore guard is removed. This deliberately differs from the
-backup's `revoked` values: restoring a snapshot taken before cancellation must
-never resurrect an old bearer. Plans, tombstones and source pins remain intact.
-Use a new job ID and establish its source pin before issuing a new checkout.
-Every restored format 6 or newer archive (legacy 6/7/8/9/10/11/12 and current 13) also rotates cluster delegation incarnation, clears transport nonces, cancels queued/leased CI runs and queued/running sandbox jobs, disables mirror readiness, expires Workspace epochs and revokes browser sessions/tokens. Leased webhook deliveries become pending with a new lease generation. Ordinary
-owner tokens retain the existing backup-boundary restore behavior; reconcile
-post-backup owner-token revocations before reopening external ingress.
+New backups use `format 21` (when `pg_refstore` serving repo count is `0`) or `format 22` (when any `pg_refstore` serving repo exists) with the executable's embedded `schema 147` catalog, including `ci_checkout_jobs` grants, permanent cancellation tombstones, scoped PAT/browser-session tables, Pando remote-retention authority state, and `pg_refstore` ledgers. In `format 21`, the paired volume still supplies source-pin files and native Git roots; SQL rows alone do not prove retention. All restored issued checkout grants (`format >= 5`) are permanently marked `revoked=true` before the restore guard is removed: restoring a snapshot taken before cancellation must never resurrect an old bearer. Plans, tombstones and source pins remain intact; use a new job ID and establish its source pin before issuing a new checkout.
 
-Format4/schema007 archives remain readable against their original, exact
-catalogs and contract digest. Restoring an archive made by a different historical
-binary requires the explicit final option `--allow-legacy-schema007`:
+Every restored `format >= 6` archive (frozen legacy `formats 6..=20` and current `formats 21..=22`) executes `authority::fence` (`src/backup/authority.rs`): it rotates `cluster_authority` incarnation, clears `cluster_transport_nonces`, cancels queued/leased `ci_runs` and queued/preparing/running `sandbox_jobs`, disables `ci_mirror_nodes` readiness, bumps and expires `workspaces` leases, resets leased `forge_webhook_deliveries` to `pending` with an incremented `lease_generation`, and revokes all `browser` tokens and `web_sessions`. Non-paired restores (`formats 6..=21`) also rotate Pando remote-retention storage authority once for the restored database before re-importing any `storage_backend='pando'` pack closures (`src/backup/restore.rs`). Ordinary `api` tokens retain their backup-boundary state (`is_restricted`, `scope_version`, and grant rows are preserved); reconcile post-backup API-token revocations before reopening external ingress.
 
-```
+`format 4` / `schema 007` archives remain readable against their original, exact catalogs and contract digest. Restoring an archive made by a different historical binary requires the explicit final option `--allow-legacy-schema007`:
+
+```sh
 rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema007
 ```
 
-This opt-in is rejected for every other format. It bypasses only the exact-binary hash
-comparison for an already verified format4/schema007 archive. All archive
-checksums, isolated target requirements, restored schema and repository identity
-checks remain mandatory. Restore verifies schema007 before any later `migrate`
-upgrades it to the current schema. Neither checksums nor this compatibility flag establish
-archive authenticity; use only trusted, operator-controlled archives.
+This opt-in is rejected for every other format. It bypasses only the exact-binary hash comparison for an already verified `format 4` / `schema 007` archive. All archive checksums, isolated target requirements, restored schema and repository identity checks remain mandatory. Restore verifies `schema 007` before any separate `migrate` upgrades it to `schema 147`. Neither checksums nor this compatibility flag establish archive authenticity; use only trusted, operator-controlled archives.
 
-Format6/schema130 archives remain readable against their frozen catalogs and
-contract digest. Restoring one with the current format13 binary requires a
-different explicit final option, because the current binary hash necessarily
-differs from the historical producer:
+Frozen `formats 6..=19` (`schemas 130..=143`) each require their single matching `--allow-legacy-schema130` through `--allow-legacy-schema143` final option when restored with the current `schema 147` binary (whose `binary_sha256` differs from the historical producer):
 
-```
+```sh
 rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema130
+# ... equivalent exact flags through:
+rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema143
 ```
 
-This verifies the complete format6/schema130 catalog before applying the
-reviewed migrations 131 through 137 on the same restore session; it never relabels
-an archive as format11 or rewrites its manifest. A format6 archive is rejected
-without this option, and the option is rejected for other formats. Format7/schema131
-archives have the equivalent final opt-in:
+Each flag (`--allow-legacy-schema130` for `format 6`, `--allow-legacy-schema131` for `format 7`, `--allow-legacy-schema132` for `format 8`, `--allow-legacy-schema133` for `format 9`, `--allow-legacy-schema134` for `format 10`, `--allow-legacy-schema135` for `format 11`, `--allow-legacy-schema136` for `format 12`, `--allow-legacy-schema137` for `format 13`, `--allow-legacy-schema138` for `format 14`, `--allow-legacy-schema139` for `format 15`, `--allow-legacy-schema140` for `format 16`, `--allow-legacy-schema141` for `format 17`, `--allow-legacy-schema142` for `format 18`, and `--allow-legacy-schema143` for `format 19`) verifies the archive's complete frozen catalog and contract digest from the restored dump, applies all subsequent reviewed migrations in `crate::db::SCHEMA_VERSIONS` up to **`schema 147`** in the same restore session, and re-verifies the resulting `schema 147` catalog and migration version list before publication; it never rewrites or relabels the archive manifest. At most one legacy flag may be supplied, and every flag is rejected for any non-matching format. `format 5` (`schema 060`) and `format 20` (`schema 144`) have no `--allow-legacy-schema*` upgrade flag and retain the exact-producer rule.
 
-```
-rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema131
-```
+### Remote LFS and Pando closures (`formats 6..=21` vs `format 22`)
 
-It verifies the frozen schema131 catalog and its contract digest before applying
-migrations 132 through 137, it is rejected for formats other than 7, and at most one
-legacy opt-in may be chosen. Format8/schema132 archives have the equivalent final
-opt-in:
+For legacy/unserved archives (`manifest.format >= 6`, current `format 21`), backup inventories every ready LFS object by tenant/repository/OID/size while the database and volume barriers are held. Missing local bytes are downloaded through the configured authenticated remote store, then SHA-256 and size are verified before copying into `volume/`. Backup verification checks local bytes and restore compares imported metadata against the manifest closure, so the restored target needs no remote endpoint for those LFS objects. Failed hydration or digest mismatch prevents backup publication. (`format 22` currently requires all repositories to be `pg_refstore` and does not yet include Blob LFS closure; `#145` and `#120` remain open.)
 
-```
-rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema132
-```
+Pando repositories (`storage_backend='pando'`) are captured under the same `REPEATABLE READ` barrier: `formats 6..=21` export/re-import Pando remote encrypted pack closures (under rotated storage authority from `format 8` / `schema 132`, and after in-session upgrade to `schema 147` when restoring `formats 6..=7`). The archive carries `pando_refs`/`HEAD` rows plus the encrypted pack closure of every Pando repository under `pando/<repo_id>`, and restore rotates the Pando storage authority once before re-importing that closure through the configured remote object store prior to volume publication. A missing or unreachable closure fails the restore instead of publishing a partially complete target. Stop Workspace mounts and all service descendants before the offline capture.
 
-This verifies the frozen schema132 catalog and contract digest, then applies the
-reviewed migrations 133 (index-only GC reference indexes), 134 (composite
-repository/tenant identity constraints), 135 (partial metrics index), 136 (token scopes) and 137
-(terminal-admission projection) in the
-same restore session. A format8
-archive is always rejected without this option, so a restored database can never
-serve the current schema without those reviewed upgrades. Format9/schema133
-archives have the equivalent final opt-in:
+Executed historical receipts (`format 6`–`format 8` era): `evidence/backup-integration.json`, `evidence/backup-remote-lfs.json`, `evidence/backup-upgrade-integration.json` and `evidence/backup-recovery-integration.json`; `format 22` paired Blob closure receipt (`1d1ce62`): `evidence/state-services/paired-blob-archive/README.md`. They record local functional/fault drills, not production RPO/RTO guarantees.
 
-```
-rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema133
-```
+---
 
-This verifies the frozen schema133 catalog and contract digest, then applies the
-reviewed migrations 134 (identity constraints), 135 (partial metrics index),
-136 (token scopes) and 137 (terminal-admission projection)
-in the same restore session. A format9 archive is always rejected without this
-option, and the option is rejected for every other format. Format10/schema134
-archives have the equivalent final opt-in:
+## Historical format & schema increment notes (frozen archives `schema 137`–`schema 144`)
 
-```
-rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema134
-```
+> **Historical Note:** The subsections below document what each frozen migration (`137`–`144`, `formats 13`–`20`) added when introduced and which two-binary legacy drills still await retained historical producer binaries. Under the current codebase, restoring any `format 6..=19` archive with `--allow-legacy-schema130`..`--allow-legacy-schema143` continues past those intermediate schemas all the way to **`schema 147`** in the same restore session.
 
-This verifies the frozen schema134 catalog and contract digest, then applies the
-reviewed migrations 135, 136 and 137 in the same restore session, after which the current
-schema137 catalog and every migration version are verified again. A format10
-archive is always rejected without this option, and the option is rejected for
-every other format. Format11/schema135 archives have the equivalent final opt-in:
+### Frozen `format 19` / `schema 143` archives (`--allow-legacy-schema143`)
 
-```
-rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema135
-```
+`format 19` remains frozen at `schema 143`. After verification against its frozen catalogs, `rootyard restore /absolute/archive --isolated --trust-backup --allow-legacy-schema143` upgrades the restored database in-session through migrations `144`–`147` to `schema 147`. Migration `144`–`147` tables are created empty, preserving all `schema 139`–`143` rows (`pack_mode=metadata_only`/`unavailable` on old A2 snapshots, materialized A4 pack/A3 hold rows, and A5 pack-snapshot binding/history/usage rows) without fabricating roots, decisions, verdicts or serving rows. Qualification of this path still requires a real two-binary drill with Root's retained `format 19` producer; no PASS is claimed here.
 
-This verifies the frozen schema135 catalog and contract digest, then applies the
-reviewed migration 136 (token scope columns, tables and indexes) and 137
-(terminal-admission projection) in the same restore session, after which the current schema137 catalog and every migration
-version are verified again. A format11 archive is always rejected without this
-option, and the option is rejected for every other format. Format12/schema136
-archives have the equivalent final opt-in:
+### Frozen `format 18` / `schema 142` archives (`--allow-legacy-schema142`)
 
-```
-rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema136
-```
+`format 18` remains frozen at `schema 142`. `rootyard restore /absolute/archive --isolated --trust-backup --allow-legacy-schema142` verifies the exact `schema 142` catalog and upgrades in-session through migrations `143`–`147` to `schema 147`, preserving `schema 139`–`142` rows and creating the `143`–`147` tables empty. `tests/backup_legacy142_pack_snapshots.py` is the thin entry point once Root's genuine retained A4 producer binary and archive are supplied; no PASS is claimed here.
 
-This verifies the frozen schema136 catalog and contract digest, then applies the
-reviewed migration 137 (the terminal-admission historical-projection guard) in
-the same restore session, after which the current schema137 catalog and every
-migration version are verified again. A format12 archive is always rejected
-without this option because its producer binary differs, and the option is
-rejected for every other format. The terminal admission ledger does not itself
-store a storage generation: migration 137 binds an UPDATE to the existing
-operation's immutable generation, and the Rust settlement checks the current
-repository generation before a first projection. Format4/format5 archives retain their existing exact-producer
-rule except for the explicit format4/schema007 option above.
+### Frozen `format 17` / `schema 141` archives (`--allow-legacy-schema141`)
 
-### Remote LFS closure
+`format 17` remains frozen at `schema 141` (including the 64 global artifact-hold shard rows, with no `schema 142`+ pack or serving rows). `rootyard restore /absolute/archive --isolated --trust-backup --allow-legacy-schema141` verifies `schema 141` and upgrades in-session through migrations `142`–`147` to `schema 147` with the new tables empty and the core gate at `metadata_only`. `tests/backup_legacy141_packs.py` is the thin entry point once Root's retained `format 17` producer is supplied; no PASS is claimed here.
 
-Formats 6 through 12 inventory every ready LFS object by tenant/repository/OID/size while the database and volume barriers are held. Missing local bytes are downloaded through the configured authenticated remote store, then SHA-256 and size are verified before copying. The manifest carries this closure; backup verification checks local bytes and restore compares imported metadata against it. The restored target needs no remote endpoint for these objects. Failed hydration or digest mismatch prevents backup publication.
+### Frozen `format 16` / `schema 140` and `format 15` / `schema 139` archives (`--allow-legacy-schema140`, `--allow-legacy-schema139`)
 
-Pando repositories are captured the same way: the archive carries `pando_refs`/`HEAD` rows plus the encrypted pack closure of every `storage_backend='pando'` repository, and restore re-imports that closure through the configured object store before the volume is published. A missing or unreachable closure fails the restore instead of publishing a partially complete target. Stop Workspace mounts and all service descendants before the offline capture.
+`format 16` (`schema 140`, A2 metadata snapshots/pins) and `format 15` (`schema 139`, RefStore gate/refs/events core) remain frozen at their respective catalogs and upgrade in-session through reviewed migrations to `schema 147` when restored with `--allow-legacy-schema140` or `--allow-legacy-schema139`. Current-format component drills do not qualify these legacy upgrade paths, which require genuine retained `format 16` / `format 15` producers (`tests/backup_legacy140_holds.py` for `format 16`).
 
-Executed receipts: `evidence/backup-integration.json`, `evidence/backup-remote-lfs.json`, `evidence/backup-upgrade-integration.json` and `evidence/backup-recovery-integration.json`. They record local functional/fault drills, not production RPO/RTO guarantees.
+### Frozen `format 14` / `schema 138` and `format 13` / `schema 137` archives (`--allow-legacy-schema138`, `--allow-legacy-schema137`)
 
-## Schema139 archives
+`format 14` (`schema 138`, RefStore operation registry, cancellation tombstones and terminal-immutability triggers) and `format 13` (`schema 137`, terminal-admission historical-projection guard binding `git_operations` updates to immutable storage generation) remain frozen at their respective catalogs and upgrade in-session through reviewed migrations to `schema 147` when restored with `--allow-legacy-schema138` or `--allow-legacy-schema137`. Adding the RefStore tables during upgrade does not convert legacy `gitfs`/`pando` repositories into `pg_refstore` Blob storage. Each path requires a genuine retained producer and fresh-database native restore drill before qualification.
 
-Format15 remains frozen at schema139. After verification against its own catalogs and binary binding, `rootyard restore /absolute/archive --isolated --trust-backup --allow-legacy-schema139` explicitly upgrades it to schema140/format16 by applying the reviewed migration 140 after the exact schema139 catalog and version list have been verified from the restored dump. The archive carries the schema139 RefStore gate/refs/events core but no snapshot/pin rows. The populated current-format drill above round-trips the schema140 tables for format16, but it does not qualify this legacy upgrade path: `--allow-legacy-schema139` still requires a genuine format15 producer and a fresh-database native restore drill, and CI does not provide such a producer.
+### Durable RefStore ledger layers introduced in `schema 141`–`schema 144` (preserved in `schema 147`)
 
-## Schema143 archives
-
-Format19 remains frozen at schema143. After verification against its own frozen
-catalogs and binary binding, `rootyard restore /absolute/archive --isolated
---trust-backup --allow-legacy-schema143` explicitly upgrades it to
-schema144/format20 by applying the reviewed migration 144 after the exact
-schema143 catalog and version list have been verified from the restored dump.
-A format19 archive without that opt-in is rejected because its producer binary
-differs; the opt-in is rejected for every other format and for a mixed flag set.
-
-Migration 144 is additive. The genuine source's complete schema139/140/141/142/143
-rows are preserved exactly: every A2 snapshot row keeps its captured
-`pack_mode`/membership/snapshot digest columns (old rows stay
-`metadata_only`/`unavailable`), a materialized schema142 pack and schema141 hold
-ledger keeps every publication, artifact, membership, history, hold and usage
-row, and each A5 pack-snapshot binding/history/usage row is retained. The
-migration adds the roots/decision/verdict/quota/protocol tables empty, so the
-upgrade itself fabricates no root, decision, verdict, tombstone or usage row.
-The archived format19 producer binary and archive are supplied by Root; no
-archive is manufactured, edited or relabelled, and `ref_store_core_gates` keeps
-its exact 139/142 row shape. This path is not qualified until that real
-two-binary drill runs, and no PASS is claimed here.
-
-## Schema142 archives
-
-Format18 remains frozen at schema142. After verification against its own frozen
-catalogs and binary binding, `rootyard restore /absolute/archive --isolated
---trust-backup --allow-legacy-schema142` explicitly upgrades it to
-schema144/format20 by applying the reviewed migrations 143 and 144 after the exact
-schema142 catalog and version list have been verified from the restored dump.
-A format18 archive without that opt-in is rejected because its producer binary
-differs; the opt-in is rejected for every other format and for a mixed flag set.
-
-Migration 143 is additive. The genuine source's complete schema139/140/141/142
-rows are preserved exactly: existing A2 snapshot rows keep
-`pack_mode=metadata_only`, `pack_count=0`, null `membership_digest` and
-`snapshot_digest` and `pack_membership_state=unavailable`; a materialized
-schema142 pack/A3 ledger keeps every publication, artifact, membership,
-history, hold and usage row and the captured gate pack mode. The four new
-schema143 pack-snapshot binding/history/permanent-usage tables are created
-empty, so no A5 snapshot, pack pin or history row is fabricated. This drill uses
-the genuine retained A4 producer binary and archive supplied by Root; no archive
-is manufactured, edited or relabelled. `tests/backup_legacy142_pack_snapshots.py`
-is the thin entry point. It is not qualified until that real two-binary drill
-runs, and no PASS is claimed here. The A4 helper's normalized operation-digest
-marker fix is Root's separate merge; this document does not claim it is applied.
-
-## Schema141 archives
-
-Format17 remains frozen at schema141. After verification against its own catalogs and binary binding, `rootyard restore /absolute/archive --isolated --trust-backup --allow-legacy-schema141` explicitly upgrades it to schema144/format20 by applying the reviewed migrations 142 through 144 after the exact schema141 catalog and version list have been verified from the restored dump. The archive carries the schema141 artifact-hold ledger, including the fixed 64 global shard rows, but no schema142 pack publication, artifact, membership, history or usage row. The migrated pack tables and the schema143 A5 pack-snapshot tables must therefore be empty, the core gate keeps its default `metadata_only` mode, and no active pack membership or pack snapshot is fabricated. This path still requires a genuine format17 producer and a fresh-database native restore drill before qualification. Root retains such a producer outside the public worktree and `tests/backup_legacy141_packs.py` is the thin entry point once it is supplied; the legacy141 path is not qualified until that real two-binary drill runs, and no PASS is claimed here.
-
-## Schema138 archives
-
-Format14 remains frozen at schema138. After verification against its own catalogs and binary binding, `rootyard restore /absolute/archive --isolated --trust-backup --allow-legacy-schema138` explicitly upgrades it to the current schema141/format17. It carries the schema138 RefStore operation registry, cancellation tombstones and terminal-immutability triggers, not any pin/root/hold/decision or Blob receipt state. This path requires a genuine format14 producer and a fresh-database native restore drill before qualification.
-
-## Schema137 archives
-
-Format13 remains frozen at schema137. After verification against its own catalogs and binary binding, `rootyard restore /absolute/archive --isolated --trust-backup --allow-legacy-schema137` explicitly upgrades it to the current schema141/format17, applying migrations 138 through 140 (the RefStore operation registry, the minimal gate/refs/events core and the reviewed snapshot contract) in the same restore session. The new RefStore tables do not convert the archive into Blob-only storage; the existing offline legacy GitFS/Pando recovery boundaries remain. This path requires a genuine format13 producer and a fresh-database native restore drill before qualification.
-
-
-## Durable pack-registration metadata (schema142)
-
-Migration 142 adds six retained tables under `ref_store_core_pack_*`: pack
-publications, per-artifact identities, append-only pack memberships, permanent
-pack history, and repository/tenant usage counters. It also adds a one-way
-`pack_mode` column to the core gate, defaulting to `metadata_only`. The A4a
-typed registration/commit path and native `PackVerifier` are exercised by
-the current-format A4 drill `tests/backup_refstore_packs142.py`, which populates
-all six schema142 tables and restores them exactly. The archive still carries
-PostgreSQL metadata only: it does not copy Blob pack/idx bytes. A populated
-`pack_verified` gate is durable metadata, not a serving, physical-GC, complete
-ReadSnapshot or Blob-byte qualification.
-
-## Pack-snapshot metadata (schema143)
-
-Migration 143 is additive over the frozen schema142 shape. It adds four tables:
-`ref_store_core_snapshot_packs` (snapshot-to-registered-pack bindings with a
-RESTRICT membership foreign key), `ref_store_core_pack_snapshot_history`
-(permanent, no-business-FK create/renew/release history) and the two permanent
-no-cascade repository/tenant pack-snapshot usage counters. It also adds
-nullable/defaulted `pack_mode`, `pack_count`, `membership_digest` and
-`snapshot_digest` columns to the A2 snapshot header while keeping every existing
-row at `metadata_only` / `unavailable` / zero packs / null digests. This is the
-A5a durable-metadata foundation only. The archive does not copy Blob bytes or
-verify native Git closure on read, and no complete Git-read snapshot, serving
-route, roots/decisions, GC/detach, encryption or production activation is
-claimed. The older A2/A3/A4 fixtures must show the four schema143 tables empty
-and their own previous ledgers nonempty and preserved; no fixture may fabricate
-an A5 pack snapshot, pin or history row.
-
-## Retained roots, publication decisions and protocol state (schema144)
-
-Migration 144 is additive over the frozen schema143 shape and adds three groups
-of PostgreSQL-only metadata:
-
-* roots: `ref_store_core_root_heads`, `ref_store_core_roots`,
-  `ref_store_core_root_refs`, `ref_store_core_root_oids`,
-  `ref_store_core_root_packs` (complete registered pack plus pack/idx artifact
-  locator identities), `ref_store_core_root_tombstones`,
-  `ref_store_core_root_receipts` (bounded JSON, no raw payload or secret),
-  `ref_store_core_root_repo_usage` and `ref_store_core_root_tenant_usage`;
-* publication decisions: `ref_store_decision_scopes`,
-  `ref_store_publication_decisions`, `ref_store_decision_dependencies`,
-  `ref_store_decision_refs`, `ref_store_decision_cancellations`,
-  `ref_store_decision_repo_usage` and `ref_store_decision_tenant_usage`;
-* separate protocol state: `ref_store_core_protocol_repos` carries the realm,
-  the monotone `roots_revision` and the one-way `decision_required` fence.
-
-No table in these groups has a foreign key to `repositories`, `users`,
-`tenants` or any auth/policy row, so retained roots, decisions and verdicts
-survive a whole-repository delete, source-pin expiry/release, snapshot pruning
-and deleted collaborator/rule/review/check/lock rows. Captures, refs, OIDs, pack
-bindings, receipts, per-ref verdicts and dependency observations are immutable;
-heads only move `active(1) -> released(2)`; decisions only move `OPEN ->
-CONSUMED | CANCELLED | REJECTED`; and the retained repository/tenant counters
-never decrease (no refund, no auto-prune). `ref_store_core_gates` is not
-altered, so the 139/142 gate row shape stays frozen. The archive carries
-PostgreSQL metadata only: it does not copy Blob or pack bytes, does not release
-a root or hold, and restored rows are historical data, never authority to read
-bytes or publish refs. Backups and restores still require the exact matching
-binary or the reviewed explicit legacy opt-in.
-
-## Permanent artifact-hold metadata (schema141)
-
-`tests/backup_refstore_holds141.py` runs the seven inherited offline backup and fresh restore cases with a source-bound Rust helper (`tests/ref_store_holds_backup_fixture.rs`). It seeds two acquire requests through the typed adapter: a two-artifact batch consumed once and a one-artifact batch whose grant is deliberately dropped. The parent operation is a direct SQL fixture, explicitly identified as such. All six new ledger/quota tables are nonempty, including all 64 fixed global shards. After restore, the drill compares the exact global rows and replays the original requests and receipt queries without reminting a grant, changing a counter, or refunding a hold. Retained receipt budgets include each acquire ACK and each consume receipt; logical budgets include their UTF-8 bodies and bounded row overhead.
-
-Build the selected helper with `python3 scripts/build_native_test.py --test ref_store_holds_backup_fixture --features pando-lab --output test-results/refstore-holds-fixture`, then build the candidate application from the same clean source. Run `python3 tests/backup_refstore_holds141.py --binary target/debug/rootyard --holds-fixture-binary test-results/refstore-holds-fixture --report test-results/backup-refstore-holds.json` with the dedicated synthetic PostgreSQL environment. Missing configuration or mismatched source/build receipts fail the drill.
-
-This drill archives PostgreSQL metadata. The holds are permanently active at generation 1 and cannot be released, deleted, truncated or refunded through this increment. No Blob bytes are produced or copied by this fixture; a restored acquire or consume receipt grants no upload authority and does not establish byte availability. The current format20 archive also carries the schema142 pack ledger, the schema143 A5 pack-snapshot ledger and the schema144 roots/decision/verdict/quota/protocol tables, but this A3 fixture inserts no pack publication, artifact, membership, history or usage row and no pack-snapshot binding/history/usage row: the migrated tables must restore empty, every old A2 snapshot keeps the default metadata-only shape, and the gate stays `metadata_only`. Pack commit, retirement, physical GC and serving remain unavailable. Genuine format16, format17 and format18 compatibility use the separate retained schema140, schema141 and A4 schema142 producers through `tests/backup_legacy140_holds.py`, `tests/backup_legacy141_packs.py` and `tests/backup_legacy142_pack_snapshots.py`; neither a rewritten manifest nor this current-format fixture qualifies those paths.
+- **Permanent artifact-hold metadata (`schema 141`)**: `tests/backup_refstore_holds141.py` (with `tests/ref_store_holds_backup_fixture.rs`, built via `python3 scripts/build_native_test.py --test ref_store_holds_backup_fixture --features pando-lab --output test-results/refstore-holds-fixture`) seeds active generation-1 holds across all 64 global shards and verifies exact unserved (`format 21` / `schema 147`) round-trip and idempotent receipt replay without copying Blob bytes or enabling hold release/GC.
+- **Durable pack-registration metadata (`schema 142`)**: six `ref_store_core_pack_*` tables (publications, artifact identities, append-only memberships, permanent pack history, and repo/tenant usage) plus one-way gate `pack_mode` (`metadata_only` default), exercised in unserved metadata mode by `tests/backup_refstore_packs142.py`.
+- **Pack-snapshot metadata (`schema 143`)**: four A5a tables (`ref_store_core_snapshot_packs`, `ref_store_core_pack_snapshot_history`, and permanent repo/tenant pack-snapshot usage counters) plus nullable/defaulted pack-digest columns on `ref_store_core_snapshots`.
+- **Retained roots, publication decisions and protocol state (`schema 144`)**: nine `ref_store_core_root_*` tables, seven `ref_store_decision_*` / `ref_store_publication_decisions` tables, and `ref_store_core_protocol_repos` (`roots_revision` and one-way `decision_required`), intentionally decoupled from `repositories`/`users`/`tenants` FKs so audit/retention records survive repository or membership deletion (`active -> released`, `OPEN -> CONSUMED | CANCELLED | REJECTED`, monotone non-refundable usage counters). In unserved `format 21` archives these rows are PostgreSQL metadata only; when `served > 0`, `format 22` validates and pairs active/released `root_packs`, `snapshot_packs`, `membership` and `serving_read_packs` with their OpenDAL Blob `.pack`/`.idx` bytes.
