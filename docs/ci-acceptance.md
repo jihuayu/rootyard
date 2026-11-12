@@ -213,9 +213,11 @@ and every job asserts `git rev-parse HEAD` equals it before building.
     real S3 backend;
   * `tests/lfs_remote.py` — second-node recovery after source-volume loss;
   * `tests/lfs_retention_acceptance.py` — publication and committed-object
-    retention with **no** object-store endpoint configured. The step clears and
-    asserts `ROOTYARD_OBJECT_STORE_ENDPOINT`/`_BUCKET` empty, so it cannot
-    accidentally inherit the Garage fixture.
+    retention with **no** object-store endpoint configured. The step unsets all
+    `ROOTYARD_OBJECT_STORE_*` variables in shell (never exporting `""` via step
+    `env:`) and asserts `ROOTYARD_OBJECT_STORE_ENDPOINT`/`_BUCKET` are unset, so
+    it cannot accidentally inherit the Garage fixture or trigger empty-endpoint
+    parsing.
   Git LFS 3.6.1 is downloaded by `scripts/install_git_lfs.sh` with bounded
   `curl` timeouts/size caps and its tarball SHA-256 is verified against both the
   official release `sha256sums.asc` cleartext-signed manifest (requiring PGP

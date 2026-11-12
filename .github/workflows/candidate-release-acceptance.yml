@@ -284,15 +284,15 @@ jobs:
             2>&1 | tee test-results/candidate/object-store/lfs-remote.log
       - name: Exercise LFS publication and retention without any remote object store
         timeout-minutes: 25
-        # This suite owns local bytes only; an inherited endpoint would silently
-        # invalidate it. The endpoint is explicitly cleared and asserted empty.
-        env:
-          ROOTYARD_OBJECT_STORE_ENDPOINT: ""
-          ROOTYARD_OBJECT_STORE_BUCKET: ""
+        # This suite owns local bytes only; an inherited or empty-string endpoint
+        # would invalidate it (RemoteObjectStore::from_env treats Some("") as
+        # configured). Unset every object-store variable in shell rather than
+        # setting step env: "", and assert they remain unset.
         run: |
           set -euo pipefail
-          test -z "${ROOTYARD_OBJECT_STORE_ENDPOINT:-}"
-          test -z "${ROOTYARD_OBJECT_STORE_BUCKET:-}"
+          unset ROOTYARD_OBJECT_STORE_ENDPOINT ROOTYARD_OBJECT_STORE_BUCKET ROOTYARD_OBJECT_STORE_REGION ROOTYARD_OBJECT_STORE_ACCESS_KEY ROOTYARD_OBJECT_STORE_SECRET_KEY ROOTYARD_OBJECT_STORE_SESSION_TOKEN
+          test -z "${ROOTYARD_OBJECT_STORE_ENDPOINT+set}"
+          test -z "${ROOTYARD_OBJECT_STORE_BUCKET+set}"
           python3 tests/lfs_retention_acceptance.py \
             --binary target/debug/rootyard \
             --report test-results/candidate/object-store/lfs-retention.json \

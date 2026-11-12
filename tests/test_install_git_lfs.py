@@ -373,8 +373,79 @@ class CandidateAndPrWorkflowWiringTest(unittest.TestCase):
         self.assertIn("--harness scripts/build_native.py", text)
         self.assertIn("test-results/*-evidence/*.jsonl", text)
 
+    def test_candidate_retention_step_unsets_object_store_without_empty_env_exports(self):
+        import re
+
+        lines = (
+            ROOT / ".github/workflows/candidate-release-acceptance.yml"
+        ).read_text(encoding="utf-8").splitlines()
+        object_store_vars = (
+            "ROOTYARD_OBJECT_STORE_ENDPOINT",
+            "ROOTYARD_OBJECT_STORE_BUCKET",
+            "ROOTYARD_OBJECT_STORE_REGION",
+            "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+            "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+            "ROOTYARD_OBJECT_STORE_SESSION_TOKEN",
+        )
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            self.assertIsNone(
+                re.match(r'^ROOTYARD_OBJECT_STORE_[A-Z0-9_]*:\s*(?:""|\'\')?\s*(?:#.*)?$', stripped),
+                f"workflow must never export empty ROOTYARD_OBJECT_STORE_* in YAML env: {line!r}",
+            )
+
+        step_header = "      - name: Exercise LFS publication and retention without any remote object store"
+        self.assertIn(step_header, lines)
+        start = lines.index(step_header) + 1
+        step_lines = []
+        for line in lines[start:]:
+            if line.startswith("      - ") or (line.strip() and not line.lstrip().startswith("#") and len(line) - len(line.lstrip(" ")) < 8):
+                break
+            step_lines.append(line)
+
+        self.assertFalse(
+            any(line.startswith("        env:") for line in step_lines),
+            "retention step must not declare a step-level env: block",
+        )
+        run_idx = step_lines.index("        run: |")
+        run_lines = [
+            line[10:]
+            for line in step_lines[run_idx + 1:]
+            if line.startswith("          ") and not line[10:].lstrip().startswith("#")
+        ]
+        harness_pos = next(
+            i for i, cmd in enumerate(run_lines) if "tests/lfs_retention_acceptance.py" in cmd
+        )
+        prologue = "\n".join(run_lines[:harness_pos])
+        unset_match = re.search(r"(?m)^unset\s+(.+)$", prologue)
+        self.assertIsNotNone(unset_match, f"missing unset before lfs_retention_acceptance.py: {prologue!r}")
+        unset_tokens = unset_match.group(1).split()
+        for var in object_store_vars:
+            self.assertIn(var, unset_tokens)
+
+        after_unset = prologue[unset_match.end():]
+        self.assertIn('test -z "${ROOTYARD_OBJECT_STORE_ENDPOINT+set}"', after_unset)
+        self.assertIn('test -z "${ROOTYARD_OBJECT_STORE_BUCKET+set}"', after_unset)
+        self.assertNotIn("ROOTYARD_OBJECT_STORE_ENDPOINT:-", prologue)
+        self.assertNotIn("ROOTYARD_OBJECT_STORE_BUCKET:-", prologue)
+
+        populated_env = {**os.environ, **{var: "inherited-value" for var in object_store_vars}}
+        probe = subprocess.run(
+            [
+                "bash",
+                "-c",
+                prologue
+                + '\npython3 -c \'import os, sys; sys.exit(1 if [k for k in os.environ if k.startswith("ROOTYARD_OBJECT_STORE_")] else 0)\'',
+            ],
+            env=populated_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(0, probe.returncode, f"stdout: {probe.stdout}\nstderr: {probe.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
