@@ -50,7 +50,10 @@ migration transaction 回滚：`schema_migrations.version=134` 不会出现，�
 两个入口都以真实 PostgreSQL 为准。第二个入口不需要真实 Pando：它只种一类
 `storage_maintenance_jobs.tenant_id` 与 repo owner 不一致的脏行，用来证明升级
 拒绝和显式修复路径；真实 Pando publication 由第一个入口证明。两者不能互相替代，
-也不能用修改 manifest、dump 或手写 migration 子集伪造 legacy schema。
+也不能用修改 manifest、dump 或手写 migration 子集伪造 legacy schema。这两个
+Round-5 原生脚本显式固定断言 `schema_migrations = 134`（`tests/storage_identity_fks.py:294`
+及 `schema 135` 之前的索引基线、`tests/storage_identity_upgrade.py:174`）；当前
+`schema 134..=147` 演进后的每 PR 实时数据库与 worker 回归见下文最后一部分。
 
 ## 负例设计
 
@@ -95,15 +98,38 @@ Garage bucket 保留，脚本不删除任何有效 remote 对象。
   精确主键清理。当前脚本没有这类行。
 - 运行结束只 drop 本进程随机创建的 PostgreSQL schema；真实对象存储内容保留。
 
-## 未闭项（协调者负责）
+## 集成与验收状态
 
-- 真实 PG 目录生成 / `schema/134_*_catalog.json` canonical JSON。
-- backup format 10 与 legacy schema133 恢复支持：134 进入
-  `SCHEMA_VERSIONS` 后，format 9（schema 133 目录）不再自洽。本分支不修改
-  backup 格式，也**不宣称备份门禁通过**。
-- runtime stale-generation / wrong-backend / not-ready fail-closed 仍由
-  `tests/storage_lifecycle.py` 与 `tests/storage_lifecycle_physical.py` 证明，本分支
-  不重复实现，也不用 SQL 字符串检查替代。
-- 本分支的 Python 文件只做了 `py_compile` 与 diff 检查；真实 PostgreSQL、
-  Garage/Vault 与 legacy binary 的 native 运行由协调者在编译后执行，本文不宣称
-  #90 已完成。
+- 冻结目录与当前契约：`schema/134_catalog.json`、`schema/134_restored_catalog.json`
+  与 `schema/134_upgraded_catalog.json` 由真实 PostgreSQL 生成并在 `format 10`
+  （`schema 134`）冻结；当前 `main` 已演进至 `schema 147`（`format 21` 元数据归档 /
+  `format 22` 同物理 Blob 后端 `pg_refstore` `pack`/`idx` OpenDAL Blob 配对闭包归档），
+  完整目录与 `pg_dump`/`pg_restore` 往返契约由 `tests/schema_contract.py` 在每 PR
+  强制校验。
+- Legacy 归档直接迁移恢复：`--allow-legacy-schema133`（仅限 `format 9 / schema 133`
+  冻结归档）在导入 `schema 133` 转储后直接在数据库内按序执行内嵌 SQL 迁移 `134..=147`
+  直达当前 `schema 147`（`src/backup/restore.rs:95, 243-250`），不经过中间 `format 10`
+  归档步骤（`format 10 / schema 134` 为独立冻结归档格式，由 `--allow-legacy-schema134`
+  单独校验恢复）；恢复时轮换新的 Pando storage authority 并重新导入远端对象闭包。
+- Round-5 `schema 134 / format 10` 原生验收收据（候选二进制 `85c66397...`，非 `schema 147`
+  二进制恢复运行）：
+  - `docs/acceptance/round5-security-maintenance-evidence/schema134-legacy133-restore.json`：
+    `format 9 / schema 133` 归档恢复至当期 `schema 134` 并轮换 Pando authority；
+  - `docs/acceptance/round5-security-maintenance-evidence/security134-format10-backup-rerun.json`：
+    `format 10 / schema 134` 离线屏障备份与新环境恢复；
+  - `docs/acceptance/round5-security-maintenance-evidence/schema134-storage-identity-native-rerun.json`：
+    真实 Garage + Vault Transit 双租户 Pando 发布及精确 `23503` 约束负例；
+  - `docs/acceptance/round5-security-maintenance-evidence/schema134-dirty-upgrade-rerun2.json`：
+    真实 `schema 133` 旧二进制脏库升级拒绝、回滚与显式修复后升级至 `schema 134`；
+  - `docs/acceptance/round5-security-maintenance-evidence/security134-storage-lifecycle.json`
+    （`tests/storage_lifecycle.py`）：仅覆盖定时 repack/staging 清理、租约过期重领
+    （lease-expiry reclaim）与进程 `SIGKILL` 卷锁屏障（volume-lock barrier）。
+- 每 PR 实时 PostgreSQL 与真实 Rust worker 门禁（`schema 134..=147`）：
+  `tests/schema_contract.py` 校验冻结目录与转储往返；`tests/test_storage_identity_fks.py`
+  在实时 PostgreSQL 上校验 `schema 134..=147` 复合外键/唯一约束、精确 `23503` 拒绝与
+  `schema 133` 四类脏行单类及 `(1, 1, 1, 1)` 组合升级拒绝/零泄露/回滚；
+  `tests/test_storage_identity_runtime.py` 启动启用 `storage_lifecycle` worker 的真实
+  `rootyard` 二进制，在 GitFS 与 Pando 的 `mark`/`delete` 任务上验证跨租户 `23503` 拒绝、
+  `stale-generation / wrong-backend / not-ready`（`recovering` 与 `provisioning`）运行期
+  fail-closed（不写 tombstone、不退休远端 artifact、不删磁盘对象）及合法 `ready` 任务完整
+  执行。仓库所有权变更期间的维护任务清理仍由 `#85` 独立跟踪。
