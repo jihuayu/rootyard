@@ -322,16 +322,79 @@ digests are recorded in the provenance artifact rather than fabricated in
 advance.
 
 Candidate jobs require Docker with the pinned Garage image, `/usr/bin/chromium`
-and a Playwright client. Dispatch run `43249639303` on `3f21678` exposed the
-container `safe.directory` / `$GITHUB_WORKSPACE` boundary, the official
-`sha256sums.asc` asset name and early-failure `OBJECT_STORE_ENV_FILE` manifest
-handling addressed on this branch; a green `candidate-release-acceptance.yml`
-run on GitHub Actions is still pending before any candidate-release pass or `#76`
-closure is claimed. Locally, workflow/script YAML and bash syntax were
-validated, the owned-fixture cleanup and startup-budget guards are covered by
+and a Playwright client. Earlier hosted dispatches exposed the container
+`safe.directory` / `$GITHUB_WORKSPACE` boundary, official `sha256sums.asc` asset
+name and early-failure `OBJECT_STORE_ENV_FILE` manifest handling (run
+`43249639303` on `3f21678`), OpenDAL `RetryLayer` re-issuing a ranged `GET` on
+truncated 2xx S3 bodies plus Debian vs. Ubuntu `psql` fixture-key collisions
+(run `43292515525` on `027784e`), and step-level YAML `env: KEY: ""` exporting
+empty strings instead of unsetting `ROOTYARD_OBJECT_STORE_*` before
+`tests/lfs_retention_acceptance.py` (run `43303142078` on `66c31a6`). Locally,
+the owned-fixture cleanup and startup-budget guards are covered by
 `tests/test_owned_garage_fixture.py`, the Git LFS `sha256sums.asc` and pinned
-digest checks are covered by `tests/test_install_git_lfs.py`, and the manifest
-contract is covered by `tests/test_native_report_manifest.py`.
+digest checks plus retention `unset` wiring by `tests/test_install_git_lfs.py`,
+and the manifest contract by `tests/test_native_report_manifest.py`.
+
+Hosted `candidate-release-acceptance.yml` run `43306664983`
+(`https://github.com/jihuayu/rootyard/actions/runs/43306664983`,
+`workflow_dispatch` on `codex/ci76-candidate-gate-20261112`, candidate commit
+`a76f6f19b333081b24e06b3f5483d1e4c1a83bf7`, shared `source_inputs_sha256`
+`aca2c480eca111f2acc3ea141e935c23d5680d0dd839a3f7cb425b780c0dc470`,
+`rustc 1.99.1 (58cf8f9c3 2026-10-13)`) passed all 3/3 jobs:
+
+* `browser-native` (job `131491660347`, `success`): container-built `rootyard`
+  SHA-256 `5641446cec9f922f3c1b1f684a0dd4dd477ca141abb6457a81205eb2d68a9171`
+  (`rootyard.build.json` SHA-256
+  `ecb256f9e0762726ac8103caed0e40fffe29ad11f0c1182e4a45f611e2b4b2bc`,
+  `native-job-manifest.json` SHA-256
+  `c7ffd5d453e930f6ca283274d793f04eba0bcd2226eee84fa2ba7eb74ab27119`);
+  fixtures `chromium_version=Chromium 156.0.8078.79 built on Debian GNU/Linux 13 (trixie)`,
+  `playwright_version=1.49.0`,
+  `browser_postgres_server_version=17.11 (Debian 17.11-1.pgdg13+2)`,
+  `browser_postgres_client_version=psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)`;
+  `browser_ui` (`browser-ui.json`, SHA-256
+  `2993cc6d1305dcb8e7d322713183beb4368f9860e01efdab28baf68ed3b376a4`) passed
+  `chromium_browser_workflow` (`6.5513s`) against `/usr/bin/chromium`.
+* `object-store-native` (job `131491659861`, `success`): host-built `rootyard`
+  SHA-256 `2aeb51c56ad3bfed0d56dd8ed9876471db871c1ce744ed2c53dd5507adbdcc76`
+  (`rootyard.build.json` SHA-256
+  `abdb633847824a3b0ba264992ac39ffeb66671f514b4b37766974d00c677d847`,
+  `native-job-manifest.json` SHA-256
+  `cd889e139984b47ceb86dc99cb70bec70f0b51f1f25b8b159966d21fc1de1c1a`);
+  fixtures `garage_version=2.1.0`
+  (`dxflrs/garage:v2.1.0@sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a`,
+  image id `sha256:246f9db8485da30929ce4d25e87016ae432bac009a26d206667aaaf59906fe6c`),
+  `git_lfs_version=3.6.1`
+  (`git-lfs/3.6.1 (GitHub; linux amd64; go 1.23.3; git ea47a34b)`),
+  `git_lfs_tarball_sha256=2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76`,
+  `object_store_postgres_server_version=17.11 (Debian 17.11-1.pgdg13+2)`,
+  `object_store_postgres_client_version=psql (PostgreSQL) 17.12 (Ubuntu 17.12-1.pgdg24.04+1)`;
+  passed `lfs_hydration` (`lfs-hydration.json`, SHA-256
+  `c1ac04984727631aa1431693b4a77547686494606dd90fbba8906b6408e3c62f`,
+  `concurrent_cold_hydration`, `16.4449s` — shared singleflight `backend_gets=1` /
+  `backend_heads=1`, 502 retry, truncated 2xx body `backend_gets_for_shared_flight=1`
+  with `partial_final_published=false` and `staging_leftovers=0`, cancellation
+  recovery), `lfs_remote` (`lfs-remote.json`, SHA-256
+  `9ff78b352866af42f25b40173438a2d50d4416d899ddc850a01152fb2bc27f11`,
+  `stock_lfs_second_node_recovery`, `5.4776s`), and `lfs_retention`
+  (`lfs-retention.json`, SHA-256
+  `7380a6cbc4b72491aac15f532dcea45715d270e3820c8fb5edd658f0f704185e`,
+  `valid_and_compatible_publication` `4.6544s`,
+  `committed_bytes_survive_failures` `0.1889s`,
+  `gitfs_maintenance_during_pointer_publication` `4.7284s` with all
+  `ROOTYARD_OBJECT_STORE_*` variables unset).
+* `release-gate` (job `131493914554`, `success`): `candidate-release-gate.json`
+  (`status: "passed"`, SHA-256
+  `7579f03d7c51ef7f49e807a6e1e0e32d78edf843c77bc1cf8af4b4b0aa55c8ed`) verified
+  identical `source_commit` and `source_inputs_sha256` across both build
+  environments, re-verified all 15 harness digests against the checkout, and
+  re-hashed every downloaded report, log and build receipt against its job
+  manifest.
+
+Recording run `43306664983` in this file produces a documentation-only follow-up
+commit on top of the exact verified code tree `a76f6f1`
+(`a76f6f19b333081b24e06b3f5483d1e4c1a83bf7`); no workflow, script, harness or
+Rust source changed after `a76f6f1`.
 
 ## Limits
 
