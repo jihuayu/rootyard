@@ -169,7 +169,9 @@ jobs:
       - name: Verify parallel track and schema baseline boundaries
         run: python3 -m unittest discover -s tests -p 'test_parallel_boundaries.py'
       - name: Run all Python unit and Tier-5 adversarial contract suites
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
+        # Full discovery stays unfiltered; the runner adds per-test progress and
+        # periodic stderr thread stacks without changing exit semantics.
+        run: python3 scripts/run_python_ci_tests.py
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary "$ROOTYARD_BIN" --report test-results/e2e.json
       - name: Exercise exact-commit CI read mirror

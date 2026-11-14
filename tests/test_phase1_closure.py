@@ -250,10 +250,10 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
 
         self.assertIn("python3 scripts/check_design_docs.py", ci_text)
         self.assertIn("python3 tests/e2e_tiers.py", ci_text)
-        self.assertRegex(
+        self.assertIn(
+            "python3 scripts/run_python_ci_tests.py",
             ci_text,
-            r"python3\s+-m\s+unittest\s+discover\s+-s\s+tests\s+-p\s+['\"]test_\*\.py['\"]",
-            "ci.yml must run full unittest discovery over tests/test_*.py",
+            "ci.yml must run full tests/test_*.py discovery via the diagnostics runner",
         )
 
     def test_ci_workspace_autocapture_acceptance_wiring(self) -> None:

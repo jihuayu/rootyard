@@ -8020,8 +8020,8 @@ class Phase1ClosureAndDocsFixture:
             raise AssertionError("CI workflow missing Verify schema-030 catalog step")
         if "python3 scripts/check_design_docs.py" not in text:
             raise AssertionError("CI workflow missing check_design_docs.py step")
-        if "python3 -m unittest discover -s tests -p 'test_*.py'" not in text:
-            raise AssertionError("CI workflow missing full unittest discover -s tests -p 'test_*.py'")
+        if "python3 scripts/run_python_ci_tests.py" not in text:
+            raise AssertionError("CI workflow missing full tests/test_*.py discovery runner")
 
         for suite_rel in cls.REQUIRED_CI_SUITES:
             if suite_rel not in text:
@@ -15330,7 +15330,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         self.assertIn("Verify schema-030 catalog and dump round trip", ci_text)
         self.assertNotIn("Verify schema-008 catalog", ci_text)
         self.assertIn("python3 scripts/check_design_docs.py", ci_text)
-        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", ci_text)
+        self.assertIn("python3 scripts/run_python_ci_tests.py", ci_text)
 
     def test_t1_f20_04_ci_workflow_wires_all_phase1_black_box_and_4tier_e2e_suites(self) -> None:
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

@@ -580,10 +580,10 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertLess(seed, pg_index, "the fixture must be seeded before the pg_tests suite runs")
 
     def test_ci_discovers_the_issue169_tests_and_runs_the_native_drill(self) -> None:
-        # ci.yml's full unittest discovery is what executes the static #169
-        # contracts (this module and the digest/corruption plan tests).
+        # ci.yml's full unittest discovery runner is what executes the static
+        # #169 contracts (this module and the digest/corruption plan tests).
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", ci)
+        self.assertIn("python3 scripts/run_python_ci_tests.py", ci)
         self.assertTrue((ROOT / "tests" / "test_backup_blob_serving169_support.py").is_file())
         # The native drill (all six PG corruption negatives plus the format22
         # positive) is a command in the RefStore acceptance workflow, fed the

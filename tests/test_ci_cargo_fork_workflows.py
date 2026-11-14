@@ -319,7 +319,7 @@ PRESERVE = {
         "scripts/install_ci_native_tools.sh install",
         "scripts/build_native_batch.py",
         "scripts/export_native_artifacts.py",
-        "python3 -m unittest discover -s tests -p 'test_*.py'",
+        "python3 scripts/run_python_ci_tests.py",
         "test-results/native-pr-gate.json",
     ),
     "refstore-protocol-acceptance.yml": (
