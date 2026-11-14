@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -579,11 +580,20 @@ def make_preflight_fixture(root, block, schema="v2", jobs=None,
         )
         receipts.atomic_write_json(lib.with_suffix(".build.json"), test_receipt)
         receipts.atomic_write_json(cli.with_suffix(".build.json"), cli_receipt)
+    # The producers publish adjacent receipts as readonly managed-CAS aliases.
+    # The CLI --output is this fixture's evidence/rootyard-cli, so the consumed
+    # receipt path and the evidence alias are deliberately the same path.
+    lib_receipt = lib.with_suffix(".build.json")
+    cli_receipt_path = cli.with_suffix(".build.json")
+    for published in (lib_receipt, cli_receipt_path):
+        published.chmod(0o444)
     return {
         "root": root,
         "evidence": evidence,
         "lib": lib,
         "cli": cli,
+        "lib_receipt": lib_receipt,
+        "cli_receipt": cli_receipt_path,
         "fake_bin": evidence / "fake-bin",
         "head": head,
         "record": record_path,
@@ -643,7 +653,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             capture_output=True,
         )
 
-    def run_preflight_validator(self, fixture, environment=None):
+    def run_preflight_validator(self, fixture, environment=None, block=None):
         environment = dict(os.environ if environment is None else environment)
         environment.update({
             "GITHUB_WORKSPACE": str(fixture["root"]),
@@ -654,7 +664,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             [sys.executable, "-", str(fixture["lib"]), str(fixture["cli"])],
             cwd=fixture["root"],
             env=environment,
-            input=self.preflight_validator,
+            input=self.preflight_validator if block is None else block,
             text=True,
             capture_output=True,
         )
@@ -667,12 +677,138 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             capture_output=True,
         )
 
+    def write_preflight_receipt(self, fixture, key, payload):
+        binary = fixture["lib"] if key == "lib" else fixture["cli"]
+        path = binary.with_suffix(".build.json")
+        path.chmod(0o644)
+        path.write_text(json.dumps(payload))
+        path.chmod(0o444)
+
     def edit_preflight_receipt(self, fixture, key, mutate):
         binary = fixture["lib"] if key == "lib" else fixture["cli"]
         path = binary.with_suffix(".build.json")
         payload = json.loads(path.read_text())
         mutate(payload)
-        path.write_text(json.dumps(payload))
+        self.write_preflight_receipt(fixture, key, payload)
+
+    def relocate_consumed_cli(self, fixture):
+        """Move the consumed CLI away from the evidence alias destination.
+
+        The real producer may publish the evidence alias at the same path it
+        consumes.  Tests of the absent/corrupt/symlink destination branches
+        need a valid consumed receipt that is not that destination.
+        """
+        directory = fixture["root"] / "consumed-cli"
+        directory.mkdir()
+        binary = directory / "rootyard-cli"
+        shutil.copyfile(fixture["cli"], binary)
+        binary.chmod(0o555)
+        receipt = binary.with_suffix(".build.json")
+        shutil.copyfile(fixture["cli_receipt"], receipt)
+        receipt.chmod(0o444)
+        relocated = dict(fixture)
+        relocated["cli"] = binary
+        relocated["cli_receipt"] = receipt
+        return relocated
+
+    def guarded_preflight_block(self, destination):
+        """Prepend runtime guards that forbid every write to one path."""
+        target = os.path.abspath(destination)
+        guard = f"""
+import builtins as _guard_builtins
+import os as _guard_os
+import pathlib as _guard_pathlib
+
+_guard_target = {target!r}
+
+
+def _guard_matches(path):
+    try:
+        return _guard_os.path.abspath(_guard_os.fspath(path)) == _guard_target
+    except TypeError:
+        return False
+
+
+def _guard_forbid(operation):
+    raise AssertionError('provenance write forbidden: ' + operation)
+
+
+def _guard_wrap_path_write(name):
+    original = getattr(_guard_pathlib.Path, name)
+
+    def guarded(self, *args, **kwargs):
+        if _guard_matches(self):
+            _guard_forbid('Path.' + name)
+        return original(self, *args, **kwargs)
+
+    setattr(_guard_pathlib.Path, name, guarded)
+
+
+for _guard_name in ('write_bytes', 'write_text', 'touch', 'chmod', 'unlink',
+                    'rename', 'replace'):
+    _guard_wrap_path_write(_guard_name)
+
+_guard_path_open = _guard_pathlib.Path.open
+
+
+def _guard_guarded_open(self, mode='r', *args, **kwargs):
+    if _guard_matches(self) and any(flag in mode for flag in 'wax+'):
+        _guard_forbid('Path.open(' + mode + ')')
+    return _guard_path_open(self, mode, *args, **kwargs)
+
+
+_guard_pathlib.Path.open = _guard_guarded_open
+_guard_os_open = _guard_os.open
+
+
+def _guard_guarded_os_open(path, flags, *args, **kwargs):
+    write_flags = (_guard_os.O_WRONLY | _guard_os.O_RDWR | _guard_os.O_CREAT
+                   | _guard_os.O_TRUNC | _guard_os.O_APPEND | _guard_os.O_EXCL)
+    if _guard_matches(path) and flags & write_flags:
+        _guard_forbid('os.open')
+    return _guard_os_open(path, flags, *args, **kwargs)
+
+
+_guard_os.open = _guard_guarded_os_open
+_guard_builtin_open = _guard_builtins.open
+
+
+def _guard_guarded_builtin_open(file, mode='r', *args, **kwargs):
+    if _guard_matches(file) and any(flag in mode for flag in 'wax+'):
+        _guard_forbid('open(' + mode + ')')
+    return _guard_builtin_open(file, mode, *args, **kwargs)
+
+
+_guard_builtins.open = _guard_guarded_builtin_open
+
+
+def _guard_wrap_forbidden(name):
+    def guarded(*args, **kwargs):
+        _guard_forbid('os.' + name)
+
+    return guarded
+
+
+for _guard_name in ('chmod', 'fchmod', 'truncate'):
+    setattr(_guard_os, _guard_name, _guard_wrap_forbidden(_guard_name))
+
+
+def _guard_wrap_two_path(name, first, second):
+    original = getattr(_guard_os, name)
+
+    def guarded(*args, **kwargs):
+        if (len(args) > 0 and _guard_matches(args[0])) or \
+                (len(args) > 1 and _guard_matches(args[1])):
+            _guard_forbid('os.' + name)
+        return original(*args, **kwargs)
+
+    setattr(_guard_os, name, guarded)
+
+
+for _guard_name in ('rename', 'replace', 'link', 'unlink', 'remove'):
+    _guard_wrap_two_path(_guard_name, 'path', 'destination')
+"""
+        return guard + self.preflight_validator
 
     def assert_preflight_passes(self, fixture):
         process = self.run_preflight_validator(fixture)
@@ -892,11 +1028,31 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
         self.assertIn("recorded_support != current_support", block)
         self.assertIn("bound_input_inventory", block)
         self.assertNotIn("test_receipt.get('test_source_closure')", block)
-        # Exact raw receipt bytes are anchored and copied without re-serialization.
+        # Exact raw receipt bytes are anchored.  The CLI evidence alias is
+        # reused only when already byte-identical; an absent copy is created
+        # exclusively and no destination is ever re-serialized or overwritten.
         self.assertIn("sha_bytes(test_receipt_bytes)", block)
         self.assertIn("sha_bytes(cli_receipt_bytes)", block)
-        self.assertIn("write_bytes(cli_receipt_bytes)", block)
+        self.assertIn("def save_consumed_cli_receipt(", block)
+        self.assertIn("def _existing_cli_receipt_copy_matches(", block)
+        self.assertIn("os.O_EXCL", block)
+        self.assertIn("O_NOFOLLOW", block)
+        self.assertIn("stat.S_ISLNK(info.st_mode)", block)
+        self.assertIn("stat.S_ISREG(info.st_mode)", block)
+        self.assertIn("existing != raw", block)
+        self.assertIn("sha_bytes(existing) != expected_sha", block)
+        self.assertIn("stream.write(raw)", block)
+        self.assertNotIn("write_bytes(cli_receipt_bytes)", block)
         self.assertNotIn("json.dumps(cli_receipt", block)
+        self.assertLess(
+            block.index("def _existing_cli_receipt_copy_matches("),
+            block.index("def save_consumed_cli_receipt("))
+        save_at = block.index("def save_consumed_cli_receipt(")
+        check_at = block.index(
+            "_existing_cli_receipt_copy_matches(destination, raw, expected_sha)", save_at)
+        create_at = block.index("os.open(destination, flags, 0o444)")
+        self.assertLess(save_at, check_at)
+        self.assertLess(check_at, create_at)
         self.assertIn("'lib_receipt'", block)
         self.assertIn("'cli_receipt'", block)
         self.assertIn("'sha256': test_validated.receipt_sha256", block)
@@ -1225,6 +1381,99 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             self.assertEqual(cli_copy.read_bytes(), cli_receipt.read_bytes())
             self.assertEqual(digest(cli_copy), digest(cli_receipt))
 
+    def test_preflight_reuses_readonly_cli_receipt_alias_without_writes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(temporary, self.preflight_validator)
+            destination = fixture["evidence"] / "rootyard-cli.build.json"
+            self.assertEqual(destination, fixture["cli_receipt"])
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o444)
+            before = os.lstat(destination)
+            before_bytes = destination.read_bytes()
+            block = self.guarded_preflight_block(destination)
+            process = self.run_preflight_validator(fixture, block=block)
+            self.assertEqual(
+                process.returncode, 0,
+                f"guarded preflight failed:\n{process.stdout[-2000:]}\n{process.stderr[-2000:]}",
+            )
+            after = os.lstat(destination)
+            for field in ("st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"):
+                self.assertEqual(getattr(after, field), getattr(before, field),
+                                 "readonly CLI receipt alias changed " + field)
+            self.assertEqual(destination.read_bytes(), before_bytes)
+            preflight = json.loads((fixture["evidence"] / "preflight.json").read_text())
+            self.assertEqual(preflight["cli_receipt"]["sha256"],
+                             hashlib.sha256(before_bytes).hexdigest())
+
+    def test_preflight_creates_absent_cli_receipt_copy_exclusively(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.relocate_consumed_cli(
+                make_preflight_fixture(temporary, self.preflight_validator))
+            destination = fixture["evidence"] / "rootyard-cli.build.json"
+            self.assertNotEqual(destination, fixture["cli_receipt"])
+            destination.unlink()
+            source_before = os.lstat(fixture["cli_receipt"])
+            source_bytes = fixture["cli_receipt"].read_bytes()
+            preflight = self.assert_preflight_passes(fixture)
+            self.assertTrue(destination.is_file())
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(destination.read_bytes(), source_bytes)
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o444)
+            self.assertEqual(preflight["cli_receipt"]["sha256"],
+                             hashlib.sha256(source_bytes).hexdigest())
+            source_after = os.lstat(fixture["cli_receipt"])
+            for field in ("st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"):
+                self.assertEqual(getattr(source_after, field), getattr(source_before, field),
+                                 "consumed CLI receipt changed " + field)
+            self.assertEqual(fixture["cli_receipt"].read_bytes(), source_bytes)
+
+    def test_preflight_rejects_different_cli_receipt_destination_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.relocate_consumed_cli(
+                make_preflight_fixture(temporary, self.preflight_validator))
+            destination = fixture["evidence"] / "rootyard-cli.build.json"
+            destination.unlink()
+            destination.write_bytes(b'{"receipt": "different"}\n')
+            destination.chmod(0o640)
+            before = os.lstat(destination)
+            before_bytes = destination.read_bytes()
+            self.assert_preflight_fails(
+                fixture, "CLI receipt evidence destination does not match the consumed bytes")
+            after = os.lstat(destination)
+            for field in ("st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"):
+                self.assertEqual(getattr(after, field), getattr(before, field),
+                                 "conflicting CLI receipt destination changed " + field)
+            self.assertEqual(destination.read_bytes(), before_bytes)
+
+    def test_preflight_rejects_symlink_cli_receipt_destination_without_writing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.relocate_consumed_cli(
+                make_preflight_fixture(temporary, self.preflight_validator))
+            destination = fixture["evidence"] / "rootyard-cli.build.json"
+            destination.unlink()
+            alias_source = fixture["root"] / "same-byte-receipt.json"
+            alias_source.write_bytes(fixture["cli_receipt"].read_bytes())
+            alias_source.chmod(0o444)
+            before_target = os.lstat(alias_source)
+            before_bytes = alias_source.read_bytes()
+            destination.symlink_to(alias_source)
+            self.assert_preflight_fails(
+                fixture, "CLI receipt evidence destination must not be a symlink")
+            self.assertTrue(destination.is_symlink())
+            self.assertEqual(os.readlink(destination), str(alias_source))
+            after_target = os.lstat(alias_source)
+            for field in ("st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"):
+                self.assertEqual(getattr(after_target, field), getattr(before_target, field),
+                                 "symlink target changed " + field)
+            self.assertEqual(alias_source.read_bytes(), before_bytes)
+
+            destination.unlink()
+            destination.symlink_to(fixture["root"] / "missing-receipt.json")
+            self.assert_preflight_fails(
+                fixture, "CLI receipt evidence destination must not be a symlink")
+            self.assertTrue(destination.is_symlink())
+            self.assertFalse(destination.exists())
+
     def test_preflight_propagates_cas_store_to_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = make_preflight_fixture(temporary, self.preflight_validator)
@@ -1242,7 +1491,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
                     'output_alias': {'path': str(binary)},
                 }
                 payload['artifact_store'] = record
-                path.write_text(json.dumps(payload))
+                self.write_preflight_receipt(fixture, key, payload)
                 injected[key] = record
             preflight = self.assert_preflight_passes(fixture)
             for key in ('lib', 'cli'):
@@ -1285,7 +1534,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
                 # can reject it.
                 row["source"] = source
                 row["source_sha256"] = digest(fixture["root"] / source)
-                path.write_text(json.dumps(payload))
+                self.write_preflight_receipt(fixture, key, payload)
                 parsed = receipts.load_receipt(
                     path, source_root=fixture["root"], binary_path=binary,
                     expected_commit=fixture["head"], verify_source_files=True)

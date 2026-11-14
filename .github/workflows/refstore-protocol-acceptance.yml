@@ -1329,7 +1329,7 @@ jobs:
           PY
           if ! python3 - "$lib" "$cli" <<'PY' 2>&1 | tee "$evidence/preflight.log"
           # The owned database name arrives only through DATABASE_URL; it is never printed.
-          import hashlib, json, os, pathlib, re, subprocess, sys
+          import hashlib, json, os, pathlib, re, stat, subprocess, sys
           sys.path.insert(0, str(pathlib.Path('scripts').resolve()))
           import native_build_receipt as receipts
           lib, cli = sys.argv[1:3]
@@ -1411,6 +1411,64 @@ jobs:
 
           def sha_bytes(raw):
               return hashlib.sha256(raw).hexdigest()
+
+
+          def _existing_cli_receipt_copy_matches(destination, raw, expected_sha):
+              '''Return True only for an exact same-byte regular non-symlink copy.'''
+              try:
+                  info = os.lstat(destination)
+              except FileNotFoundError:
+                  return False
+              except OSError as error:
+                  fail('cannot inspect the CLI receipt evidence destination: '
+                       + type(error).__name__)
+              if stat.S_ISLNK(info.st_mode):
+                  fail('CLI receipt evidence destination must not be a symlink')
+              if not stat.S_ISREG(info.st_mode):
+                  fail('CLI receipt evidence destination must be a regular file')
+              try:
+                  existing = destination.read_bytes()
+              except OSError as error:
+                  fail('cannot read the CLI receipt evidence destination: '
+                       + type(error).__name__)
+              if existing != raw:
+                  fail('CLI receipt evidence destination does not match the consumed bytes')
+              if sha_bytes(existing) != expected_sha:
+                  fail('CLI receipt evidence destination does not match the consumed SHA-256')
+              return True
+
+
+          def save_consumed_cli_receipt(destination, raw, expected_sha):
+              '''Reuse an exact readonly alias or create one absent copy, never replacing it.'''
+              destination = pathlib.Path(destination)
+              if _existing_cli_receipt_copy_matches(destination, raw, expected_sha):
+                  return 'reused'
+              flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+              for _attempt in range(3):
+                  try:
+                      fd = os.open(destination, flags, 0o444)
+                  except FileExistsError:
+                      # A concurrent producer won the creation race.  Reuse its
+                      # exact bytes if they match; otherwise fail without replacing it.
+                      if _existing_cli_receipt_copy_matches(destination, raw, expected_sha):
+                          return 'reused'
+                      continue
+                  except OSError as error:
+                      fail('cannot create the CLI receipt evidence copy: '
+                           + type(error).__name__)
+                  try:
+                      with os.fdopen(fd, 'wb') as stream:
+                          stream.write(raw)
+                          stream.flush()
+                          os.fchmod(stream.fileno(), 0o444)
+                          os.fsync(stream.fileno())
+                  except OSError as error:
+                      fail('cannot write the CLI receipt evidence copy: '
+                           + type(error).__name__)
+                  if sha(destination) != expected_sha:
+                      fail('saved CLI receipt bytes differ from the consumed bytes')
+                  return 'created'
+              fail('CLI receipt evidence destination kept changing during no-overwrite creation')
 
 
           def toolchain_record():
@@ -1602,11 +1660,13 @@ jobs:
               fail('CLI receipt bytes changed between consumption and validation')
           test_receipt = test_validated.payload
           cli_receipt = cli_validated.payload
-          # The consumed CLI receipt is copied as raw bytes; it is never re-serialized.
-          try:
-              (evidence / 'rootyard-cli.build.json').write_bytes(cli_receipt_bytes)
-          except OSError as error:
-              fail('could not save the consumed CLI receipt bytes: ' + type(error).__name__)
+          # The consumed CLI receipt is copied as raw bytes and never re-serialized.
+          # The producer may already have published it as a readonly managed-CAS
+          # alias at this exact path; reuse those proven bytes without any write,
+          # chmod or rename, and only create an absent copy under O_EXCL.
+          save_consumed_cli_receipt(
+              evidence / 'rootyard-cli.build.json', cli_receipt_bytes,
+              cli_validated.receipt_sha256)
           if sha(evidence / 'rootyard-cli.build.json') != cli_validated.receipt_sha256:
               fail('saved CLI receipt bytes differ from the consumed bytes')
           if sha(test_receipt_path) != test_validated.receipt_sha256:
