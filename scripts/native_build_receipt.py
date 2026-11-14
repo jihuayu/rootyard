@@ -367,18 +367,66 @@ def source_digest_from_entries(entries):
 
 # -- git / atomic evidence ----------------------------------------------------
 def git_state(root):
-    """HEAD, commit, tree and tracked working-tree status for one explicit root."""
+    """HEAD/commit/tree plus tracked and non-ignored untracked working state.
+
+    ``status`` is retained as the historical tracked-only porcelain status.
+    ``status_with_untracked`` uses ``--untracked-files=normal``, so real
+    untracked source files are reported while ignored build outputs (for
+    example an ignored target directory) remain ignored: ``--ignored`` is
+    never passed and file contents are never read.  ``untracked`` lists the
+    repository-relative paths Git reported.  This helper is producer-only; the
+    reader never invokes Git.
+    """
     root = Path(root)
 
     def git_output(*arguments):
         return subprocess.check_output(["git", *arguments], cwd=root, text=True)
 
+    head = git_output("rev-parse", "HEAD").strip()
+    commit = git_output("rev-parse", "--verify", "HEAD^{commit}").strip()
+    tree = git_output("rev-parse", "HEAD^{tree}").strip()
+    tracked_status = git_output("status", "--porcelain", "--untracked-files=no")
+    status_with_untracked = git_output("status", "--porcelain", "--untracked-files=normal")
+    untracked = [
+        line[3:]
+        for line in status_with_untracked.splitlines()
+        if line.startswith("?? ")
+    ]
     return {
-        "head": git_output("rev-parse", "HEAD").strip(),
-        "commit": git_output("rev-parse", "--verify", "HEAD^{commit}").strip(),
-        "tree": git_output("rev-parse", "HEAD^{tree}").strip(),
-        "status": git_output("status", "--porcelain", "--untracked-files=no"),
+        "head": head,
+        "commit": commit,
+        "tree": tree,
+        "status": tracked_status,
+        "tracked_status": tracked_status,
+        "status_with_untracked": status_with_untracked,
+        "untracked": untracked,
+        "untracked_count": len(untracked),
+        "tracked_dirty": bool(tracked_status.strip()),
+        "dirty": bool(status_with_untracked.strip()),
+        "clean": not status_with_untracked.strip(),
     }
+
+
+def require_clean_git_state(root):
+    """Fail closed unless tracked and non-ignored untracked state are clean.
+
+    Ignored build outputs stay ignored because Git is queried with
+    ``--untracked-files=normal`` and never with ``--ignored``.  The error names
+    only the kind/count of dirty state, not file contents or environment.
+    """
+    state = git_state(root)
+    problems = []
+    if state["tracked_dirty"]:
+        problems.append("tracked changes")
+    if state["untracked_count"]:
+        problems.append(f"{state['untracked_count']} untracked file(s)")
+    if problems:
+        raise ReceiptError(
+            "source tree is not clean: "
+            + ", ".join(problems)
+            + "; commit the inputs or add generated outputs to .gitignore before building"
+        )
+    return state
 
 
 def atomic_write_json(path, payload):
@@ -994,6 +1042,16 @@ def _normalize_profile(profile, label):
     return result
 
 
+def _require_kind_profile(kind, profile, label):
+    """One centralized kind/profile consistency check for capture and reading."""
+    expects_test = kind in ("test", "lib-test")
+    _require(
+        profile["test"] is expects_test,
+        label,
+        f"{kind} artifact profile.test must be exactly {str(expects_test).lower()}",
+    )
+
+
 def cargo_artifact_record(event, source_root, kind=None):
     """Capture one selected Cargo compiler-artifact as a v2 row.
 
@@ -1024,14 +1082,9 @@ def cargo_artifact_record(event, source_root, kind=None):
         _require("test" in kinds, "cargo artifact", "test kind does not match the Cargo target")
     elif kind == "bin":
         _require("bin" in kinds, "cargo artifact", "bin kind does not match the Cargo target")
-        _require(profile["test"] is False, "cargo artifact", "bin artifact was built as a test unit")
     else:
         _require("lib" in kinds, "cargo artifact", "lib kind does not match the Cargo target")
-        _require(
-            profile["test"] == (kind == "lib-test"),
-            "cargo artifact",
-            "lib/lib-test kind does not match the Cargo test profile",
-        )
+    _require_kind_profile(kind, profile, "cargo artifact")
     fresh = event.get("fresh")
     _require(_is_bool(fresh), "cargo artifact", "fresh must be a JSON boolean")
     src_path = target.get("src_path")
@@ -1390,15 +1443,15 @@ def _validate_v2_artifacts(rows, label):
             label,
             f"cargo_artifacts[{index}].fresh must be a JSON boolean (true or false)",
         )
-        _normalize_profile(row.get("profile"), row_label)
+        profile = _normalize_profile(row.get("profile"), row_label)
+        _require_kind_profile(kind, profile, row_label)
         source = _require_relative_path(row.get("source"), label, f"cargo_artifacts[{index}].source")
         _require_sha256(row.get("source_sha256"), label, f"cargo_artifacts[{index}].source_sha256")
         if kind in EXECUTABLE_KINDS:
             _require_absolute_path(row.get("executable"), label, f"cargo_artifacts[{index}].executable")
-            if "executable_sha256" in row:
-                _require_sha256(
-                    row.get("executable_sha256"), label, f"cargo_artifacts[{index}].executable_sha256"
-                )
+            _require_sha256(
+                row.get("executable_sha256"), label, f"cargo_artifacts[{index}].executable_sha256"
+            )
         else:
             _require(
                 "executable" not in row and "executable_sha256" not in row,
@@ -1417,33 +1470,26 @@ def _validate_primary_artifact(payload, artifacts, binary_digest, label, binary_
     _require(bool(executable_rows), label, "cargo_artifacts has no executable artifact")
     relocated = payload.get("relocated_artifact", False)
     _require(_is_bool(relocated), label, "relocated_artifact must be a JSON boolean")
-    hashed_rows = [row for row in executable_rows if "executable_sha256" in row]
     if relocated:
         original = _require_sha256(
             payload.get("original_artifact_sha256"), label, "original_artifact_sha256"
         )
-        if hashed_rows:
-            _require(
-                any(row["executable_sha256"] == original for row in hashed_rows),
-                label,
-                "no selected executable artifact matches original_artifact_sha256",
-            )
+        _require(
+            binary_digest == original,
+            label,
+            "relocated binary_sha256 does not match original_artifact_sha256",
+        )
+        _require(
+            any(row["executable_sha256"] == original for row in executable_rows),
+            label,
+            "no selected executable artifact matches original_artifact_sha256",
+        )
         return
-    if hashed_rows:
-        _require(
-            any(row["executable_sha256"] == binary_digest for row in hashed_rows),
-            label,
-            "no selected executable artifact matches binary_sha256",
-        )
-    if binary_path is not None:
-        resolved = Path(binary_path).resolve()
-        path_match = any(Path(row["executable"]).resolve() == resolved for row in executable_rows)
-        hash_match = any(row.get("executable_sha256") == binary_digest for row in executable_rows)
-        _require(
-            path_match or hash_match,
-            label,
-            "no selected executable artifact matches the supplied binary path or SHA-256",
-        )
+    _require(
+        any(row["executable_sha256"] == binary_digest for row in executable_rows),
+        label,
+        "no selected executable artifact matches binary_sha256",
+    )
 
 
 def _validate_batch_link(payload, label, binary_path):
@@ -2048,6 +2094,7 @@ __all__ = [
     "reject_external_cargo_config",
     "reject_passthrough_environment",
     "require_build_finished",
+    "require_clean_git_state",
     "require_in_repository_config",
     "sha256_bytes",
     "sha256_file",

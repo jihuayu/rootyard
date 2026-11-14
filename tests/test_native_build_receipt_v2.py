@@ -505,6 +505,82 @@ class V2BindingTest(ReceiptFixture):
         )
         self.assert_rejected(tampered, "missing required compiled asset")
 
+    def test_executable_artifacts_require_a_hash_and_kind_profile_consistency(self):
+        artifacts = self.artifacts() + [
+            receipts.cargo_artifact_record(self.event("lib-test", True), self.root),
+            receipts.cargo_artifact_record(self.event("test", True), self.root),
+        ]
+        payload = self.make_v2(artifacts=artifacts)
+
+        for index in (1, 2, 3):
+            with self.subTest(kind=payload["cargo_artifacts"][index]["kind"]):
+                missing = copy.deepcopy(payload)
+                del missing["cargo_artifacts"][index]["executable_sha256"]
+                self.assert_rejected(missing, "executable_sha256")
+
+        profile_cases = (
+            (0, True, "lib artifact profile.test must be exactly false"),
+            (1, True, "bin artifact profile.test must be exactly false"),
+            (2, False, "lib-test artifact profile.test must be exactly true"),
+            (3, False, "test artifact profile.test must be exactly true"),
+        )
+        for index, test_profile, message in profile_cases:
+            with self.subTest(index=index):
+                tampered = copy.deepcopy(payload)
+                tampered["cargo_artifacts"][index]["profile"]["test"] = test_profile
+                self.assert_rejected(tampered, message)
+
+        constructor_rows = copy.deepcopy(artifacts)
+        constructor_rows[1]["profile"]["test"] = True
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            self.make_v2(artifacts=constructor_rows)
+        self.assertIn("bin artifact profile.test", str(caught.exception))
+
+    def test_primary_binary_must_match_a_selected_executable_artifact(self):
+        payload = self.make_v2()
+        tampered = copy.deepcopy(payload)
+        tampered["binary_sha256"] = "0" * 64
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.validate_receipt(tampered)
+        self.assertIn("no selected executable artifact matches binary_sha256", str(caught.exception))
+
+    def test_relocated_artifact_hashes_must_be_identical_for_a_cache_hit(self):
+        original = receipts.sha256_file(self.binary)
+        relocated = self.root / "cache/rootyard"
+        self.write("cache/rootyard", self.binary.read_bytes())
+
+        for fresh in (True, False):
+            with self.subTest(fresh=fresh):
+                lib, bin_row = self.artifacts(lib_fresh=fresh, bin_fresh=fresh)
+                payload = self.make_v2(artifacts=[lib, bin_row])
+                payload["relocated_artifact"] = True
+                payload["original_artifact_sha256"] = original
+                payload["binary_sha256"] = receipts.sha256_file(relocated)
+                self.validate(payload, binary_path=relocated)
+
+        unrelated = self.root / "cache/unrelated"
+        self.write("cache/unrelated", b"unrelated-relocated-binary")
+        unrelated_sha = receipts.sha256_file(unrelated)
+
+        mismatched = copy.deepcopy(payload)
+        mismatched["binary_sha256"] = unrelated_sha
+        mismatched["original_artifact_sha256"] = original
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.validate_receipt(mismatched)
+        self.assertIn("relocated binary_sha256 does not match", str(caught.exception))
+
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            self.validate(mismatched, binary_path=unrelated)
+        self.assertIn("relocated binary_sha256 does not match", str(caught.exception))
+
+        no_artifact_match = copy.deepcopy(payload)
+        no_artifact_match["binary_sha256"] = "0" * 64
+        no_artifact_match["original_artifact_sha256"] = "0" * 64
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.validate_receipt(no_artifact_match)
+        self.assertIn("no selected executable artifact matches original_artifact_sha256",
+                      str(caught.exception))
+
     def test_inventory_and_summary_tampering_is_rejected(self):
         payload = self.make_v2()
         digest = copy.deepcopy(payload)
@@ -678,6 +754,83 @@ class BuildEnvironmentTest(ReceiptFixture):
                 environ={"PATH": "", "CARGO_BUILD_JOBS": "2"},
             )
         self.assertIn("CARGO_BUILD_JOBS", str(caught.exception))
+
+
+class GitStateTest(ReceiptFixture):
+    """Producer git metadata includes non-ignored untracked state."""
+
+    def fake_git(self, tracked="", with_untracked=""):
+        commands = []
+        head = "c" * 40
+        tree = "d" * 40
+
+        def check_output(command, cwd=None, text=None):
+            self.assertEqual(cwd, self.root)
+            self.assertTrue(text)
+            arguments = command[1:]
+            commands.append(arguments)
+            if arguments == ["rev-parse", "HEAD"]:
+                return head + "\n"
+            if arguments == ["rev-parse", "--verify", "HEAD^{commit}"]:
+                return head + "\n"
+            if arguments == ["rev-parse", "HEAD^{tree}"]:
+                return tree + "\n"
+            if arguments[:1] == ["status"]:
+                self.assertNotIn("--ignored", arguments)
+                if "--untracked-files=no" in arguments:
+                    return tracked
+                if "--untracked-files=normal" in arguments:
+                    return with_untracked
+            raise AssertionError(command)
+
+        return check_output, commands
+
+    def test_git_state_exposes_untracked_without_listing_ignored_outputs(self):
+        tracked = " M src/lib.rs\n"
+        untracked = "?? notes.txt\n"
+        fake, commands = self.fake_git(tracked=tracked, with_untracked=tracked + untracked)
+        with mock.patch.object(
+            receipts.subprocess, "check_output", side_effect=fake
+        ):
+            state = receipts.git_state(self.root)
+
+        self.assertEqual(state["commit"], "c" * 40)
+        self.assertEqual(state["tree"], "d" * 40)
+        self.assertEqual(state["status"], tracked)
+        self.assertEqual(state["tracked_status"], tracked)
+        self.assertEqual(state["status_with_untracked"], tracked + untracked)
+        self.assertEqual(state["untracked"], ["notes.txt"])
+        self.assertEqual(state["untracked_count"], 1)
+        self.assertIs(state["tracked_dirty"], True)
+        self.assertIs(state["dirty"], True)
+        self.assertIs(state["clean"], False)
+        self.assertNotIn("target/", state["status_with_untracked"])
+        self.assertIn(["status", "--porcelain", "--untracked-files=normal"], commands)
+        self.assertTrue(
+            all("--ignored" not in arguments for arguments in commands)
+        )
+
+    def test_require_clean_git_state_rejects_dirty_or_untracked(self):
+        cases = (
+            (" M src/lib.rs\n", " M src/lib.rs\n", "tracked changes"),
+            ("", "?? notes.txt\n", "1 untracked file"),
+        )
+        for tracked, with_untracked, message in cases:
+            with self.subTest(message=message):
+                fake, _ = self.fake_git(tracked=tracked, with_untracked=with_untracked)
+                with mock.patch.object(
+                    receipts.subprocess, "check_output", side_effect=fake
+                ):
+                    with self.assertRaises(receipts.ReceiptError) as caught:
+                        receipts.require_clean_git_state(self.root)
+                self.assertIn("source tree is not clean", str(caught.exception))
+                self.assertIn(message, str(caught.exception))
+
+        fake, _ = self.fake_git(tracked="", with_untracked="")
+        with mock.patch.object(receipts.subprocess, "check_output", side_effect=fake):
+            state = receipts.require_clean_git_state(self.root)
+        self.assertIs(state["clean"], True)
+        self.assertEqual(state["untracked"], [])
 
 
 class ProducerHelperTest(ReceiptFixture):
