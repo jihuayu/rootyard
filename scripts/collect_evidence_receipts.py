@@ -137,17 +137,18 @@ def collect_raw_receipt(source: Path, destination: Path, expected_sha: str) -> s
 
 def _anchors(preflight_path: Path, optional: bool):
     try:
-        document = json.loads(Path(preflight_path).read_text())
+        raw = _read_regular_nofollow(Path(preflight_path), "preflight evidence")
     except FileNotFoundError:
+        # Only a genuinely absent preflight.json may be skipped for a partial
+        # earlier failure.  A present unreadable/malformed/non-regular file
+        # still fails closed, even with --optional.
         if optional:
             print("session174 receipt collection: no preflight.json; receipts skipped")
             return None
         raise CollectionError("unreadable preflight evidence: FileNotFoundError")
-    except (OSError, ValueError) as exc:
-        if optional:
-            print("session174 receipt collection: preflight anchors unavailable ("
-                  + type(exc).__name__ + "); receipts skipped")
-            return None
+    try:
+        document = json.loads(raw)
+    except ValueError as exc:
         raise CollectionError(
             "unreadable preflight evidence: " + type(exc).__name__
         ) from exc

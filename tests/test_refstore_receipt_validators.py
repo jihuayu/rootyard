@@ -705,6 +705,33 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
         arguments.extend([str(preflight), str(source), str(destination)])
         return subprocess.run(arguments, text=True, capture_output=True)
 
+    def make_collector_fixture(self, root):
+        source = Path(root) / "evidence"
+        destination = Path(root) / "upload"
+        source.mkdir()
+        destination.mkdir()
+        lib_bytes = b'{"receipt": "lib", "raw": true}\n'
+        cli_bytes = b'{"receipt": "cli", "raw": true}\n'
+        for name, raw in (
+            ("session174-lib-tests.build.json", lib_bytes),
+            ("rootyard-cli.build.json", cli_bytes),
+        ):
+            (source / name).write_bytes(raw)
+            (source / name).chmod(0o444)
+        preflight = {
+            "lib_receipt": {
+                "path": str(source / "session174-lib-tests.build.json"),
+                "sha256": hashlib.sha256(lib_bytes).hexdigest(),
+            },
+            "cli_receipt": {
+                "path": str(source / "rootyard-cli.build.json"),
+                "sha256": hashlib.sha256(cli_bytes).hexdigest(),
+            },
+        }
+        preflight_path = source / "preflight.json"
+        preflight_path.write_text(json.dumps(preflight))
+        return source, destination, preflight_path, lib_bytes, cli_bytes
+
     def receipt_anchor(self, path):
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -1985,6 +2012,159 @@ for _guard_name in ('rename', 'replace', 'link', 'unlink', 'remove'):
             self.assertFalse((destination / "rootyard-cli.build.json").exists())
             self.assertIn("skip missing", process.stdout)
             self.assertFalse((destination / "rootyard-cli.build.json").exists())
+
+    def test_evidence_receipt_collector_optional_absent_preflight_passes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source, destination, preflight, _lib, _cli = self.make_collector_fixture(
+                temporary)
+            preflight.unlink()
+            process = self.run_evidence_receipt_collector(
+                preflight, source, destination, optional=True)
+            self.assertEqual(process.returncode, 0, process.stderr[-2000:])
+            self.assertIn("no preflight.json; receipts skipped", process.stdout)
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_evidence_receipt_collector_optional_rejects_malformed_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source, destination, preflight, lib_bytes, _cli = self.make_collector_fixture(
+                temporary)
+            preflight.write_text("{not valid json")
+            destination_file = destination / "session174-lib-tests.build.json"
+            destination_file.write_bytes(lib_bytes)
+            destination_file.chmod(0o444)
+            before = os.lstat(destination_file)
+
+            process = self.run_evidence_receipt_collector(
+                preflight, source, destination, optional=True)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("unreadable preflight evidence", process.stderr)
+            self.assert_stat_unchanged(
+                before, os.lstat(destination_file), "readonly receipt after malformed preflight")
+            self.assertEqual(destination_file.read_bytes(), lib_bytes)
+            self.assertFalse((destination / "rootyard-cli.build.json").exists())
+
+    def test_evidence_receipt_collector_optional_rejects_unreadable_preflight(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root can read a 0000 preflight fixture")
+        with tempfile.TemporaryDirectory() as temporary:
+            source, destination, preflight, lib_bytes, _cli = self.make_collector_fixture(
+                temporary)
+            preflight.chmod(0o000)
+            destination_file = destination / "session174-lib-tests.build.json"
+            destination_file.write_bytes(lib_bytes)
+            destination_file.chmod(0o444)
+            before = os.lstat(destination_file)
+
+            process = self.run_evidence_receipt_collector(
+                preflight, source, destination, optional=True)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("preflight evidence", process.stderr)
+            self.assert_stat_unchanged(
+                before, os.lstat(destination_file),
+                "readonly receipt after unreadable preflight")
+            self.assertEqual(destination_file.read_bytes(), lib_bytes)
+
+    def test_evidence_receipt_collector_optional_rejects_bad_preflight_shapes(self):
+        malformed_shapes = (
+            ("nonobject", b"[]", "preflight evidence is not an object"),
+            ("bad-anchor",
+             b'{"lib_receipt": {"sha256": "not-hex"}, '
+             b'"cli_receipt": {"sha256": "not-hex"}}',
+             "has no lowercase 64-hex anchor"),
+        )
+        for name, raw, marker in malformed_shapes:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                source, destination, preflight, lib_bytes, _cli = \
+                    self.make_collector_fixture(temporary)
+                preflight.write_bytes(raw)
+                destination_file = destination / "session174-lib-tests.build.json"
+                destination_file.write_bytes(lib_bytes)
+                destination_file.chmod(0o444)
+                before = os.lstat(destination_file)
+                process = self.run_evidence_receipt_collector(
+                    preflight, source, destination, optional=True)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertIn(marker, process.stderr)
+                self.assert_stat_unchanged(
+                    before, os.lstat(destination_file),
+                    "readonly receipt after bad preflight " + name)
+                self.assertEqual(destination_file.read_bytes(), lib_bytes)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source, destination, preflight, _lib, _cli = self.make_collector_fixture(
+                temporary)
+            real = source / "real-preflight.json"
+            real.write_bytes(preflight.read_bytes())
+            preflight.unlink()
+            preflight.symlink_to(real)
+            process = self.run_evidence_receipt_collector(
+                preflight, source, destination, optional=True)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("must not be a symlink", process.stderr)
+            self.assertTrue(preflight.is_symlink())
+            self.assertEqual(list(destination.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source, destination, preflight, _lib, _cli = self.make_collector_fixture(
+                temporary)
+            preflight.unlink()
+            preflight.symlink_to(source / "missing-preflight.json")
+            process = self.run_evidence_receipt_collector(
+                preflight, source, destination, optional=True)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("must not be a symlink", process.stderr)
+            self.assertTrue(preflight.is_symlink())
+            self.assertEqual(list(destination.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source, destination, preflight, _lib, _cli = self.make_collector_fixture(
+                temporary)
+            preflight.unlink()
+            preflight.mkdir()
+            process = self.run_evidence_receipt_collector(
+                preflight, source, destination, optional=True)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("must be a regular file", process.stderr)
+            self.assertTrue(preflight.is_dir())
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_174_always_collector_keeps_logs_when_preflight_is_corrupt(self):
+        block = workflow_run_block(self.source, "Collect #174 acceptance evidence")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            (work / "scripts").mkdir(parents=True)
+            shutil.copyfile(SCRIPTS / "collect_evidence_receipts.py",
+                            work / "scripts/collect_evidence_receipts.py")
+            evidence = root / "runner/session174-foundation"
+            evidence.mkdir(parents=True)
+            lib_bytes = b'{"receipt": "lib", "raw": true}\n'
+            lib_source = evidence / "session174-lib-tests.build.json"
+            lib_source.write_bytes(lib_bytes)
+            lib_source.chmod(0o444)
+            (evidence / "preflight.json").write_text("{not valid json")
+            (evidence / "preflight.log").write_text("preflight log\n")
+            (evidence / "cases.log").write_text("cases log\n")
+            (evidence / "case-1.log").write_text("case 1\n")
+            upload = work / "test-results/refstore/session174-foundation"
+            upload.mkdir(parents=True)
+            destination_file = upload / "session174-lib-tests.build.json"
+            destination_file.write_bytes(lib_bytes)
+            destination_file.chmod(0o444)
+            destination_before = os.lstat(destination_file)
+            environment = dict(os.environ, RUNNER_TEMP=str(root / "runner"))
+
+            process = subprocess.run(
+                ["bash", "-c", block], cwd=work, env=environment,
+                text=True, capture_output=True)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("unreadable preflight evidence", process.stderr)
+            for name in ("preflight.json", "preflight.log", "cases.log", "case-1.log"):
+                self.assertTrue((upload / name).is_file(), name)
+            self.assert_stat_unchanged(
+                destination_before, os.lstat(destination_file),
+                "readonly receipt after corrupt preflight")
+            self.assertEqual(destination_file.read_bytes(), lib_bytes)
 
     def test_174_always_collector_runs_idempotently_with_partial_evidence(self):
         block = workflow_run_block(self.source, "Collect #174 acceptance evidence")
