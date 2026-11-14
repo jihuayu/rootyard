@@ -1321,6 +1321,22 @@ class ReportValidationTest(unittest.TestCase):
             with self.subTest(marker=marker), self.assertRaises(baseline.BaselineError):
                 baseline.validate_no_secrets({**payload, "note": marker}, [])
 
+    def test_short_secret_is_matched_only_as_a_complete_value(self):
+        payload = {"postgres_server_version": "17.1", "kind": "rootyard/state-services-blob-baseline"}
+        self.assertTrue(baseline.validate_no_secrets(payload, ["postgres", "rootyard"]))
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_no_secrets({**payload, "hostname": "postgres"}, ["postgres"])
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_no_secrets({"note": "prefix long-access-key-id-0001 suffix"},
+                                         ["long-access-key-id-0001"])
+
+    def test_common_database_password_does_not_block_its_own_report(self):
+        env = {"ROOTYARD_TEST_DATABASE_URL": "postgresql://postgres:postgres@db.invalid:5432/rootyard"}
+        sensitive = baseline.sensitive_values(env)
+        self.assertIn("postgres", sensitive)
+        self.assertIn("postgresql://postgres:postgres@db.invalid:5432/rootyard", sensitive)
+        self.assertTrue(baseline.validate_no_secrets(report_payload(), sensitive))
+
     def test_public_blob_profile_enums_are_not_treated_as_secrets(self):
         env = {"ROOTYARD_BLOB_DRIVER": "opendal", "ROOTYARD_BLOB_SERVICE": "s3",
                "ROOTYARD_BLOB_DELETE": "disabled",

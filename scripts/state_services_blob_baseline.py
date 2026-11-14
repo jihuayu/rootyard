@@ -170,6 +170,10 @@ SENSITIVE_PATTERN = re.compile(r"BLOB|DATABASE|DSN|PASS|SECRET|TOKEN|KEY|CREDENT
 # Non-secret profile enums that check_blob_profile intentionally echoes in blob_profile.
 # Treating them as secrets would make a valid run refuse to write its own report.
 PUBLIC_BLOB_PROFILE_ENV = frozenset({"ROOTYARD_BLOB_DRIVER", "ROOTYARD_BLOB_SERVICE", "ROOTYARD_BLOB_DELETE"})
+# Short sensitive values are matched only as complete JSON string values. Otherwise
+# a common database password such as "postgres" would match "postgres_server_version"
+# and a valid report could never be written.
+SECRET_SUBSTRING_MIN = 12
 CONNECTION_ESTABLISHED = "01"
 LISTEN = "0A"
 WILDCARD = ("0.0.0.0", "::")
@@ -678,10 +682,18 @@ def validate_binding(binding):
 
 
 def validate_no_secrets(value, sensitive_values):
-    """Reject any report payload containing a configured sensitive value or credential-shaped URL."""
+    """Reject any report payload containing a configured sensitive value or credential-shaped URL.
+
+    Values at least ``SECRET_SUBSTRING_MIN`` characters long are searched as
+    substrings. Shorter values must appear as a complete JSON string value, so a
+    short database password such as ``postgres`` does not match a legitimate
+    field such as ``postgres_server_version``.
+    """
     text = json.dumps(value, sort_keys=True)
     for secret in sensitive_values or ():
-        if isinstance(secret, str) and len(secret) >= 4 and secret in text:
+        if not isinstance(secret, str) or len(secret) < 4 or secret not in text:
+            continue
+        if len(secret) >= SECRET_SUBSTRING_MIN or json.dumps(secret) in text:
             raise BaselineError("report contains a configured sensitive value; refusing to write it")
     lowered = text.lower()
     for marker in ("://user:", "password=", "secret_access_key", "authorization:"):
