@@ -268,39 +268,6 @@ fn trusted_callback_target(input:&CiCallbackInput)
     Ok((run_id,job_id,base_oid,generation,pull_number,attempt))
 }
 
-async fn lock_trusted_callback_run(tx:&tokio_postgres::Transaction<'_>,repo_id:Uuid,
-    context:&str,input:&CiCallbackInput,target:&(Uuid,Uuid,String,i64,i64,i64),
-)->Result<(),Error>{
-    let (run_id,job_id,base_oid,generation,pull_number,attempt)=target;
-    let row=tx.query_opt(
-        "SELECT c.context,c.state,c.job_id,c.head_oid,c.base_oid,c.pull_number, \
-          c.pull_version,c.attempt,c.lease_generation, \
-          (c.lease_expires_unix>extract(epoch FROM clock_timestamp())) AS lease_valid, \
-          p.state AS live_state,p.head_oid AS live_head,p.base_oid AS live_base, \
-          p.version AS live_version \
-         FROM ci_runs c JOIN forge_pulls p ON p.repository_id=c.repository_id \
-           AND p.number=c.pull_number \
-         WHERE c.id=$1 AND c.repository_id=$2 FOR UPDATE OF c",
-        &[run_id,&repo_id],
-    ).await.map_err(Error::internal)?
-        .ok_or_else(||Error(StatusCode::CONFLICT,"CI run attempt or candidate changed"))?;
-    let valid=row.get::<_,String>("context").as_str()==context
-        && row.get::<_,String>("state").as_str()=="leased"
-        && row.get::<_,Uuid>("job_id")==*job_id
-        && row.get::<_,String>("head_oid").as_str()==input.commit_oid.as_str()
-        && row.get::<_,String>("base_oid").as_str()==base_oid.as_str()
-        && row.get::<_,i64>("pull_number")==*pull_number
-        && row.get::<_,i64>("attempt")==*attempt
-        && row.get::<_,i64>("lease_generation")==*generation
-        && row.get::<_,bool>("lease_valid")
-        && row.get::<_,String>("live_state").as_str()=="open"
-        && row.get::<_,String>("live_head").as_str()==input.commit_oid.as_str()
-        && row.get::<_,String>("live_base").as_str()==base_oid.as_str()
-        && row.get::<_,i64>("live_version")==row.get::<_,i64>("pull_version");
-    if !valid { return Err(Error(StatusCode::CONFLICT,"CI run attempt or candidate changed")); }
-    Ok(())
-}
-
 /// HMAC-authenticated, idempotent CI callback ingestion. The HTTP admission and
 /// signature checks happen before the short callback transaction.
 #[rustfmt::skip]
@@ -453,7 +420,7 @@ pub(crate) async fn ci_callback(
     // under the policy fence and require the same current attempt/candidate
     // before any check or provenance write.
     if let Some(target)=trusted_target.as_ref() {
-        lock_trusted_callback_run(&tx,repo_id,&context,&input,target).await?;
+        crate::webhooks::trust::lock_trusted_callback_run(&tx,repo_id,&context,&input,target).await?;
     }
 
     let check_run = upsert_callback_check_run(
