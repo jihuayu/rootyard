@@ -1,0 +1,404 @@
+{
+  "binary_sha256": "66fdfba3b7c55d9ceb659afc86d806a74b1336e0c1ee63904f6f17c82ee06cb3",
+  "blob_profile": {
+    "delete_policy": "disabled",
+    "driver": "opendal",
+    "endpoint_loopback": true,
+    "endpoint_scheme": "http",
+    "root_configured": false,
+    "service": "s3"
+  },
+  "cache_semantics": {
+    "cold": "cold = process-local materialized view after this run's graceful service restart with an emptied and freshly recreated service-local scratch root; the scratch root was verified empty immediately before and immediately after the cold read. Backing object-store/provider cache state is unknown and was not observed; this is not provider-cold.",
+    "cold_scope": "process_local_materialized_view_only",
+    "provider_cache_observed": false,
+    "provider_cache_state": "unknown",
+    "scratch_empty_after_read": true,
+    "scratch_empty_before_read": true
+  },
+  "cases": [
+    {
+      "name": "provision",
+      "pg_samples": {
+        "errors": [],
+        "exact_lock_wait_ms": null,
+        "interval_seconds": 0.25,
+        "matched_by": "two-layer ownership: PID-owned sockets (service /proc/<pid>/fd inodes joined with /proc/<pid>/net/tcp{,6}, ESTABLISHED only) whose remote address and DSN port hit the configured database endpoint are filtered and counted only; pg_stat_activity rows in the current database are identified by the source-defined application_name IN ('rootyard', 'rootyard-blob-barrier'), and every sample requires that named count to equal the PID's endpoint socket count (nonzero); local socket address:port is never compared with client_addr/client_port, which NAT rewrites",
+        "note": "observed lower bounds; waits shorter than one sampling interval can be missed; no exact lock-wait milliseconds are derived",
+        "observed_lower_bound": true,
+        "peak_active": 0,
+        "peak_idle": 4,
+        "peak_lock_waiters": 0,
+        "peak_sessions": 4,
+        "samples": 3,
+        "samples_with_connection": 3,
+        "scans_without_connection": 0,
+        "sessions_nonzero_samples": 3,
+        "sql_helper": "BlobOnlyHarness.sql against the dedicated baseline database in the harness isolated random schema (no pooler, no shared database)"
+      },
+      "sampled": true,
+      "seconds": 0.058323,
+      "service_epoch": 0,
+      "status": "passed"
+    },
+    {
+      "name": "seed_push",
+      "pg_samples": {
+        "errors": [],
+        "exact_lock_wait_ms": null,
+        "interval_seconds": 0.25,
+        "matched_by": "two-layer ownership: PID-owned sockets (service /proc/<pid>/fd inodes joined with /proc/<pid>/net/tcp{,6}, ESTABLISHED only) whose remote address and DSN port hit the configured database endpoint are filtered and counted only; pg_stat_activity rows in the current database are identified by the source-defined application_name IN ('rootyard', 'rootyard-blob-barrier'), and every sample requires that named count to equal the PID's endpoint socket count (nonzero); local socket address:port is never compared with client_addr/client_port, which NAT rewrites",
+        "note": "observed lower bounds; waits shorter than one sampling interval can be missed; no exact lock-wait milliseconds are derived",
+        "observed_lower_bound": true,
+        "peak_active": 1,
+        "peak_idle": 4,
+        "peak_lock_waiters": 0,
+        "peak_sessions": 4,
+        "samples": 9,
+        "samples_with_connection": 9,
+        "scans_without_connection": 0,
+        "sessions_nonzero_samples": 9,
+        "sql_helper": "BlobOnlyHarness.sql against the dedicated baseline database in the harness isolated random schema (no pooler, no shared database)"
+      },
+      "sampled": true,
+      "seconds": 1.601852,
+      "service_epoch": 0,
+      "status": "passed"
+    },
+    {
+      "name": "concurrent_read_clones",
+      "pg_samples": {
+        "errors": [],
+        "exact_lock_wait_ms": null,
+        "interval_seconds": 0.25,
+        "matched_by": "two-layer ownership: PID-owned sockets (service /proc/<pid>/fd inodes joined with /proc/<pid>/net/tcp{,6}, ESTABLISHED only) whose remote address and DSN port hit the configured database endpoint are filtered and counted only; pg_stat_activity rows in the current database are identified by the source-defined application_name IN ('rootyard', 'rootyard-blob-barrier'), and every sample requires that named count to equal the PID's endpoint socket count (nonzero); local socket address:port is never compared with client_addr/client_port, which NAT rewrites",
+        "note": "observed lower bounds; waits shorter than one sampling interval can be missed; no exact lock-wait milliseconds are derived",
+        "observed_lower_bound": true,
+        "peak_active": 0,
+        "peak_idle": 4,
+        "peak_lock_waiters": 0,
+        "peak_sessions": 4,
+        "samples": 6,
+        "samples_with_connection": 6,
+        "scans_without_connection": 0,
+        "sessions_nonzero_samples": 6,
+        "sql_helper": "BlobOnlyHarness.sql against the dedicated baseline database in the harness isolated random schema (no pooler, no shared database)"
+      },
+      "sampled": true,
+      "seconds": 1.003734,
+      "service_epoch": 0,
+      "status": "passed"
+    },
+    {
+      "name": "restart",
+      "pg_samples": null,
+      "sampled": false,
+      "seconds": 0.372328,
+      "service_epoch": 1,
+      "status": "passed"
+    },
+    {
+      "name": "cold_clone",
+      "pg_samples": {
+        "errors": [],
+        "exact_lock_wait_ms": null,
+        "interval_seconds": 0.25,
+        "matched_by": "two-layer ownership: PID-owned sockets (service /proc/<pid>/fd inodes joined with /proc/<pid>/net/tcp{,6}, ESTABLISHED only) whose remote address and DSN port hit the configured database endpoint are filtered and counted only; pg_stat_activity rows in the current database are identified by the source-defined application_name IN ('rootyard', 'rootyard-blob-barrier'), and every sample requires that named count to equal the PID's endpoint socket count (nonzero); local socket address:port is never compared with client_addr/client_port, which NAT rewrites",
+        "note": "observed lower bounds; waits shorter than one sampling interval can be missed; no exact lock-wait milliseconds are derived",
+        "observed_lower_bound": true,
+        "peak_active": 0,
+        "peak_idle": 4,
+        "peak_lock_waiters": 0,
+        "peak_sessions": 4,
+        "samples": 7,
+        "samples_with_connection": 7,
+        "scans_without_connection": 0,
+        "sessions_nonzero_samples": 7,
+        "sql_helper": "BlobOnlyHarness.sql against the dedicated baseline database in the harness isolated random schema (no pooler, no shared database)"
+      },
+      "sampled": true,
+      "seconds": 1.053514,
+      "service_epoch": 1,
+      "status": "passed"
+    }
+  ],
+  "cold_clone": {
+    "cold_scope": "process_local_materialized_view_only",
+    "expected_oid": "579337b459fcbbda15aa7291865d986e3a6c39c6",
+    "files_verified": true,
+    "fsck": true,
+    "head_oid": "579337b459fcbbda15aa7291865d986e3a6c39c6",
+    "includes_local_verification": false,
+    "provider_cache_observed": false,
+    "provider_cache_state": "unknown",
+    "samples_across_restart": false,
+    "scratch_empty_after": true,
+    "scratch_empty_before": true,
+    "seconds": 1.01017,
+    "semantics": "cold = process-local materialized view after this run's graceful service restart with an emptied and freshly recreated service-local scratch root; the scratch root was verified empty immediately before and immediately after the cold read. Backing object-store/provider cache state is unknown and was not observed; this is not provider-cold.",
+    "service_restarted": true,
+    "verification_scope": "local OID/bytes/fsck checks follow the clone timer and are excluded, exactly as for every concurrent worker",
+    "verification_seconds": null
+  },
+  "concurrent": {
+    "aggregate_definition": "max(clone end) - min(clone start): from the first git clone call start to the last git clone call return; local OID/content/object-format/fsck verification runs only after the window closes",
+    "aggregate_seconds": 0.952046,
+    "concurrency_window_ratio": 1.000338,
+    "concurrent_write_pushes": false,
+    "expected_oid": "579337b459fcbbda15aa7291865d986e3a6c39c6",
+    "identical_commit_oid_by_construction": true,
+    "includes_local_verification": false,
+    "mode": "single_repository_independent_read_clones",
+    "read_only_token": true,
+    "repositories": [
+      "blob-baseline",
+      "blob-baseline"
+    ],
+    "repositories_cloned_per_worker": 1,
+    "timed_scope": "git clone only, for every worker and for the aggregate: the aggregate runs from the first clone start to the last clone return, and every local OID/content/object-format/fsck check runs afterwards on the main thread, outside every timed boundary",
+    "verification_scope": "per-worker verification_seconds are informational only: with a fixed worker pool later workers verify after their clone timer stops, so these are never compared or summed",
+    "worker_seconds": [
+      0.907927,
+      0.951724
+    ],
+    "workers": [
+      {
+        "destination": "concurrent-worker-1",
+        "kind": "read_clone",
+        "label": "worker-1",
+        "seconds": 0.907927,
+        "verification_seconds": 0.012751
+      },
+      {
+        "destination": "concurrent-worker-2",
+        "kind": "read_clone",
+        "label": "worker-2",
+        "seconds": 0.951724,
+        "verification_seconds": 0.013553
+      }
+    ]
+  },
+  "fixture_retention": {
+    "keep_requested": false,
+    "reason": "passed run removes its owned temporary fixture; the random schema is always dropped",
+    "retained": false,
+    "root": null
+  },
+  "git_sha256": "a0e562e4bd3c4c79379e91d8c07a10104b2cefe8fac966dc6bd4874a57a807f3",
+  "harness_sha256": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+  "input_sha256": {
+    "runner": "c274c81d015f80f5f21e6a487bc726e87e15aee50f90ca17e09072eec031f5d7",
+    "scripts/build_native.py": "00ed12b102e37f02b6c55a7b7d1d3855898355b826c9bc1c45ebb0bf66761dfa",
+    "tests/blob_only_service.py": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+    "tests/e2e.py": "dfb6ecd2126b803466d9c360a4fc359491a668e735d611aa3b204d526f07bfea",
+    "tests/native_evidence.py": "a4cdec21201c94ce7c21ebb1852d6ec91c7f57b5a5af528af05cc3c61f1cfe2e",
+    "tests/ops_provenance.py": "f9b3ec80d853b2cf949743be1a0cb95ae19e029e50c3a188e04ae8111a218b37",
+    "tests/owned_fuse_cleanup.py": "1df7299f4ff20199cd338e812fd2d58af8626e024e0130249b864c7a4f0c91de"
+  },
+  "issue": {
+    "budgets_frozen": false,
+    "claim": "baseline_entry_only",
+    "issue_complete": false,
+    "number": 106,
+    "statement": "Native Blob-only baseline entry; it neither marks #106 complete nor freezes budgets."
+  },
+  "kind": "rootyard/state-services-blob-baseline",
+  "legacy_pando_profile_used": false,
+  "limitations": [
+    "One loopback HTTP origin, one PostgreSQL server and one configured OpenDAL S3 provider on one host; no HA, multi-host, physical durability or production-latency claim. PostgreSQL scope: Issue106 lane dedicated baseline PostgreSQL database + harness isolated random schema; requires no concurrent same-name Rootyard CLI/service on that database and no PostgreSQL pooler or shared database. A pre-start check requires zero named sessions and every sample requires the named session count to equal the service PID's endpoint socket count (nonzero), so an extra same-name session is rejected.",
+    "The restart is a SIGTERM to this harness's own serve-blob process group; kernel/power-loss behavior is not tested.",
+    "The concurrent case times 2 independent read-clone destinations from the same single seeded repository; receive-pack writes are not measured.",
+    "PostgreSQL counts are 250 ms point samples of current-database sessions named by the serve-blob sources (application_name 'rootyard'/'rootyard-blob-barrier'), cross-checked against the service PID's own ESTABLISHED sockets to the configured database endpoint: observed lower bounds only; short waits can be missed and exact lock-wait milliseconds are unmeasured. Scope: Issue106 lane dedicated baseline PostgreSQL database + harness isolated random schema; requires no concurrent same-name Rootyard CLI/service on that database and no PostgreSQL pooler or shared database. A pre-start check requires zero named sessions and every sample requires the named session count to equal the service PID's endpoint socket count (nonzero), so an extra same-name session is rejected.",
+    "The scope is a COUNT of named sessions and of PID-owned sockets (count equality per sample): it is never a per-socket four-tuple or PID-to-backend mapping, and NAT-rewritten client address/port pairs are never compared or attributed.",
+    "OpenDAL GET byte/phase metrics are unmeasured: the current service exposes no such counters to this runner.",
+    "cold = process-local materialized view after this run's graceful service restart with an emptied and freshly recreated service-local scratch root; the scratch root was verified empty immediately before and immediately after the cold read. Backing object-store/provider cache state is unknown and was not observed; this is not provider-cold.",
+    "Workload is one small deterministic repository bounded to 256 KiB cloned into two independent read-only destinations; no throughput, percentile or regression budget is inferred.",
+    "HTTP request/response byte counts are not measured: seed_push.payload_bytes is the deterministic file payload size, not wire bytes.",
+    "This report is a baseline entry for #106; it does not claim #106 complete and freezes no budget.",
+    "Blob deletion stays disabled; objects uploaded under the fixture root are not reclaimed by this harness."
+  ],
+  "limits": [
+    "One loopback HTTP origin, one PostgreSQL server and one configured OpenDAL S3 provider on one host; no HA, multi-host, physical durability or production-latency claim. PostgreSQL scope: Issue106 lane dedicated baseline PostgreSQL database + harness isolated random schema; requires no concurrent same-name Rootyard CLI/service on that database and no PostgreSQL pooler or shared database. A pre-start check requires zero named sessions and every sample requires the named session count to equal the service PID's endpoint socket count (nonzero), so an extra same-name session is rejected.",
+    "The restart is a SIGTERM to this harness's own serve-blob process group; kernel/power-loss behavior is not tested.",
+    "The concurrent case times 2 independent read-clone destinations from the same single seeded repository; receive-pack writes are not measured.",
+    "PostgreSQL counts are 250 ms point samples of current-database sessions named by the serve-blob sources (application_name 'rootyard'/'rootyard-blob-barrier'), cross-checked against the service PID's own ESTABLISHED sockets to the configured database endpoint: observed lower bounds only; short waits can be missed and exact lock-wait milliseconds are unmeasured. Scope: Issue106 lane dedicated baseline PostgreSQL database + harness isolated random schema; requires no concurrent same-name Rootyard CLI/service on that database and no PostgreSQL pooler or shared database. A pre-start check requires zero named sessions and every sample requires the named session count to equal the service PID's endpoint socket count (nonzero), so an extra same-name session is rejected.",
+    "The scope is a COUNT of named sessions and of PID-owned sockets (count equality per sample): it is never a per-socket four-tuple or PID-to-backend mapping, and NAT-rewritten client address/port pairs are never compared or attributed.",
+    "OpenDAL GET byte/phase metrics are unmeasured: the current service exposes no such counters to this runner.",
+    "cold = process-local materialized view after this run's graceful service restart with an emptied and freshly recreated service-local scratch root; the scratch root was verified empty immediately before and immediately after the cold read. Backing object-store/provider cache state is unknown and was not observed; this is not provider-cold.",
+    "Workload is one small deterministic repository bounded to 256 KiB cloned into two independent read-only destinations; no throughput, percentile or regression budget is inferred.",
+    "HTTP request/response byte counts are not measured: seed_push.payload_bytes is the deterministic file payload size, not wire bytes.",
+    "This report is a baseline entry for #106; it does not claim #106 complete and freezes no budget.",
+    "Blob deletion stays disabled; objects uploaded under the fixture root are not reclaimed by this harness."
+  ],
+  "measured_profile": "blob-only-serve-blob-fresh-install",
+  "measurement_kind": "native_execution",
+  "native_profile": {
+    "attested": true,
+    "binary_sha256": "66fdfba3b7c55d9ceb659afc86d806a74b1336e0c1ee63904f6f17c82ee06cb3",
+    "build_receipt_sha256": "53d6b3c0a94995195daec1fcfc77cb38827a4438caf5792e2bd7a877941af25e",
+    "harness_sha256": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+    "inputs_unchanged": true,
+    "runner_sha256": "c274c81d015f80f5f21e6a487bc726e87e15aee50f90ca17e09072eec031f5d7",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "source_inputs_sha256": "25ca6845620267c131d50f91d32f0a50d5e8266157722598cd413fe44286a678",
+    "trusted_git_sha256": "a0e562e4bd3c4c79379e91d8c07a10104b2cefe8fac966dc6bd4874a57a807f3",
+    "workspace_commit": "ce1aaa3caccb6e9bca73cd960e4803aac8dfd862"
+  },
+  "pg_ownership_samples": {
+    "configured_database_endpoint_reported": false,
+    "differenced_across_processes": false,
+    "exact_lock_wait_ms": null,
+    "observed_lower_bound": true,
+    "ownership_layers": {
+      "cross_check": "each sample requires the named session count to be nonzero and exactly equal to the PID's ESTABLISHED endpoint socket count; client_addr/client_port are never compared with local socket address:port because NAT or a published port rewrites them; additional same-name sessions break the equality and are rejected (count only, never a per-socket four-tuple or PID mapping)",
+      "process_sockets": "kernel ownership: ESTABLISHED sockets of socket inodes held by the service PID (/proc/<pid>/fd) in its own /proc/<pid>/net/tcp{,6} whose remote address and DSN-configured port are the resolved database endpoint; used only to filter and count the configured database endpoint",
+      "server_sessions": "server identity: pg_stat_activity rows of the current test database with application_name IN ('rootyard', 'rootyard-blob-barrier'), the application pool and lifecycle barrier names set by the current Rust sources; runner and psql helper connections are not counted; scope: dedicated baseline database + harness isolated random schema, no pooler/shared database"
+    },
+    "per_case": true,
+    "per_socket_four_tuple_attribution": false,
+    "pid_to_backend_mapping": false,
+    "prestart_requires_zero_sessions": true,
+    "procedure": "two-layer ownership per sample: filter/count the service PID's own ESTABLISHED sockets to the configured database endpoint from /proc/<pid>/fd and /proc/<pid>/net/tcp{,6}, then count current-database pg_stat_activity sessions by the source-defined application_name names and require zero-free count equality, read through the isolated psql helper; before the first start (after setup migrations/accounts) and before the restart's start, the same fixed SQL must return zero named sessions",
+    "reset_per_process": true,
+    "restart_case_sampled": false,
+    "scope": "Issue106 lane dedicated baseline PostgreSQL database + harness isolated random schema; requires no concurrent same-name Rootyard CLI/service on that database and no PostgreSQL pooler or shared database. A pre-start check requires zero named sessions and every sample requires the named session count to equal the service PID's endpoint socket count (nonzero), so an extra same-name session is rejected.",
+    "sql_helper": "BlobOnlyHarness.sql (dedicated baseline database + isolated random schema; fixed literal PG_STAT_QUERY, no pooler, no shared database)"
+  },
+  "prior_baseline_used": false,
+  "qualification_kind": "clean-candidate",
+  "report_version": 3,
+  "runner_sha256": "c274c81d015f80f5f21e6a487bc726e87e15aee50f90ca17e09072eec031f5d7",
+  "runtime": {
+    "architecture": "aarch64",
+    "cgroup": {
+      "cpu_max": {
+        "format": "cgroup-v2",
+        "limited": false,
+        "raw": "max 100000",
+        "source": "cgroup-v2",
+        "status": "unlimited"
+      },
+      "cpuset_cpus_effective": {
+        "cpu_count": 12,
+        "format": "cgroup-v2",
+        "raw": "0-11",
+        "source": "cgroup-v2",
+        "status": "observed"
+      },
+      "memory_max": {
+        "format": "cgroup-v2",
+        "limited": false,
+        "raw": "max",
+        "source": "cgroup-v2",
+        "status": "unlimited"
+      },
+      "version": "v2"
+    },
+    "cpu_model": "unavailable",
+    "git_version": "git version 2.47.3",
+    "host_memory_total_kb": 49315216,
+    "hostname": "orbstack",
+    "kernel": "7.2.12-orbstack-00394-gbecdd6130068",
+    "logical_cpus": 12,
+    "machine": "aarch64",
+    "postgres_server_version": "17.11 (Debian 17.11-1.pgdg13+2)",
+    "procfs": true,
+    "psql_version": "psql (PostgreSQL) 17.11 (Debian 17.11-1.pgdg13+2)",
+    "python": "3.13.5"
+  },
+  "seed_push": {
+    "expected_oid": "579337b459fcbbda15aa7291865d986e3a6c39c6",
+    "ls_remote_seconds": 0.655786,
+    "object_format": "sha1",
+    "oid": "579337b459fcbbda15aa7291865d986e3a6c39c6",
+    "payload_bytes": 262144,
+    "push_wall_seconds": 0.739071,
+    "ref": "refs/heads/main"
+  },
+  "service_admission": {
+    "byte_budget_capacity": 2,
+    "capacity_covers_measured_concurrency": true,
+    "effective_upload_pack_capacity": 2,
+    "explanation": "smart_http reserves max_request_bytes per upload-pack body before spooling it; byte_budget_capacity = max_inflight_bytes // max_request_bytes and effective capacity = min(max_concurrent_git, byte_budget_capacity); measured concurrency must fit",
+    "measured_clone_concurrency": 2,
+    "scope": "configured admission only: the values are read, never overridden or widened; this is neither a measured throughput nor a frozen performance budget",
+    "settings": {
+      "max_concurrent_git": {
+        "range": [
+          1,
+          256
+        ],
+        "source": "src/standalone/config.rs default",
+        "value": 8
+      },
+      "max_inflight_bytes": {
+        "range": [
+          65536,
+          17179869184
+        ],
+        "source": "src/standalone/config.rs default",
+        "value": 268435456
+      },
+      "max_request_bytes": {
+        "range": [
+          65536,
+          4294967296
+        ],
+        "source": "src/standalone/config.rs default",
+        "value": 134217728
+      }
+    },
+    "upload_pack_reservation_bytes": 134217728,
+    "upload_pack_reservation_source": "one full ROOTYARD_MAX_REQUEST_BYTES admission lease per upload-pack body before spooling (src/blob_git_gateway/smart_http.rs)"
+  },
+  "setup": {
+    "ordered_before": "provision",
+    "provisioning_sampled": true,
+    "scope": "schema migration, fixture accounts and serve-blob start/readiness; never a measured case",
+    "seconds": 0.729686,
+    "service_running_before_provision": true
+  },
+  "simulated_fields": false,
+  "source_head": "ce1aaa3caccb6e9bca73cd960e4803aac8dfd862",
+  "source_inputs_sha256": "25ca6845620267c131d50f91d32f0a50d5e8266157722598cd413fe44286a678",
+  "status": "passed",
+  "transport": {
+    "git_client": "stock Git Smart HTTP",
+    "origin": "fixture loopback",
+    "scheme": "http",
+    "server": "rootyard serve-blob",
+    "service_argv": [
+      "serve-blob"
+    ],
+    "ssh_exercised": false
+  },
+  "unmeasured": {
+    "exact_lock_wait_ms": null,
+    "opendal_get_bytes": null,
+    "opendal_get_phase_ms": null,
+    "opendal_reason": "the current serve-blob process exposes no OpenDAL GET byte/phase counters to this runner",
+    "provider_cache_reason": "no provider or service counter distinguishes cache hits; object-store cache state is unknown",
+    "provider_cache_state": null,
+    "throughput": null
+  },
+  "workload": {
+    "concurrency": 2,
+    "files": 4,
+    "fingerprint_sha256": "554e7b78f5f19bc227bc3c106af23cdbecf45bdc7b5b6dc02a1c8c6e3616cabd",
+    "mode": "single_repository_independent_read_clones",
+    "payload_bound_bytes": 262144,
+    "provision": {
+      "object_format": "sha1",
+      "status": 201,
+      "storage_backend": "pg_refstore"
+    },
+    "read_repositories": [
+      "blob-baseline",
+      "blob-baseline"
+    ],
+    "repositories_provisioned_via": "POST /api/repos",
+    "seed_repository": "blob-baseline",
+    "total_bytes": 262144,
+    "version": 1
+  }
+}
