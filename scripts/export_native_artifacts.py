@@ -12,11 +12,12 @@ record:
 * test rows export the explicit readonly ``--output`` alias;
 * receipts export the adjacent same-byte ``.build.json`` alias.
 
-The store root, the manifest and its raw SHA-256 are exported as well so a
-later step can bind the exact files it consumed.  A missing row, a changed
-hash, a writable or symlinked file, a foreign store root, a record that is not
-one of the manifest's sealed entries, or a receipt that does not match the
-sealed identity fails closed before anything is written.
+The store root, the manifest and the SHA-256 of the exact raw manifest bytes
+that were parsed and validated are exported as well so a later step can bind
+the exact files it consumed.  A missing row, a changed hash, a writable or
+symlinked file, a foreign store root, a record that is not one of the
+manifest's sealed entries, or a receipt that does not match the sealed
+identity fails closed before anything is written.
 """
 from __future__ import annotations
 
@@ -97,7 +98,15 @@ def _load_json(path, label):
 
 
 def _load_store(manifest_path):
-    manifest = _load_json(manifest_path, "batch manifest")
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError as error:
+        raise ExportError(f"batch manifest cannot be read: {error}") from None
+    manifest_sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ExportError(f"batch manifest is not valid JSON: {error}") from None
     require(isinstance(manifest, dict), "batch manifest must be a JSON object")
     require(manifest.get("kind") == BATCH_KIND, "batch manifest has an invalid kind")
     version = manifest.get("manifest_version")
@@ -143,7 +152,7 @@ def _load_store(manifest_path):
         all(isinstance(item, dict) for item in rows),
         "batch manifest artifacts entries must be objects",
     )
-    return manifest, store, root, sealed
+    return manifest, store, root, sealed, manifest_sha256
 
 
 def _row(manifest, target, kind, label):
@@ -333,7 +342,7 @@ def parse_assignments(values, flag):
 def build_exports(args):
     manifest_path = Path(args.manifest)
     require(manifest_path.is_file(), f"batch manifest is missing: {manifest_path}")
-    manifest, store, root, sealed = _load_store(manifest_path)
+    manifest, store, root, sealed, manifest_sha256 = _load_store(manifest_path)
     exports = {}
 
     def add(name, value):
@@ -345,7 +354,7 @@ def build_exports(args):
 
     add(args.store_var, str(root))
     add(args.manifest_var, str(manifest_path.resolve()))
-    add(args.manifest_sha256_var, sha256_file(manifest_path))
+    add(args.manifest_sha256_var, manifest_sha256)
     for target, name in parse_assignments(args.bin, "--bin").items():
         binary, _ = validate_bin(manifest, target, root, sealed, f"bin {target}")
         add(name, str(binary))

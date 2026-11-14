@@ -7,7 +7,9 @@ the exact version-2 manifest/artifact-store layout documented for
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/export_native_artifacts.py"
@@ -313,6 +316,79 @@ class ExportNativeArtifactsTest(unittest.TestCase):
     def test_rejects_unsafe_environment_name(self):
         _, process = self.fixture.run("--bin", "rootyard=lower-case", expect=1)
         self.assertIn("unsafe environment name", process.stderr)
+
+    def test_rejects_malformed_manifest(self):
+        self.fixture.manifest.write_bytes(b'{"kind": ')
+        _, process = self.fixture.run("--bin", "rootyard=ROOTYARD_BIN", expect=1)
+        self.assertIn("not valid JSON", process.stderr)
+
+    def test_rejects_changed_selected_bin_artifact(self):
+        manifest = json.loads(self.fixture.manifest.read_text(encoding="utf-8"))
+        manifest["artifacts"][0]["artifact"] = str(self.fixture.store / "foreign")
+        self.fixture.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        _, process = self.fixture.run("--bin", "rootyard=ROOTYARD_BIN", expect=1)
+        self.assertIn("artifact is not the canonical snapshot", process.stderr)
+
+    def test_manifest_rewrite_after_read_keeps_validated_raw_sha(self):
+        spec = importlib.util.spec_from_file_location(
+            "export_native_artifacts_under_test", SCRIPT
+        )
+        exporter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(exporter)
+
+        original_bytes = self.fixture.manifest.read_bytes()
+        replacement = json.loads(original_bytes)
+        replacement["status"] = "failed"
+        replacement_bytes = (json.dumps(replacement, indent=2) + "\n").encode()
+        self.assertNotEqual(replacement_bytes, original_bytes)
+        rewritten = []
+        original_read_bytes = Path.read_bytes
+        original_read_text = Path.read_text
+
+        def rewrite_once(path):
+            if path == self.fixture.manifest and not rewritten:
+                rewritten.append(path)
+                path.write_bytes(replacement_bytes)
+
+        def read_bytes_then_rewrite(path):
+            data = original_read_bytes(path)
+            rewrite_once(path)
+            return data
+
+        def read_text_then_rewrite(path, *args, **kwargs):
+            data = original_read_text(path, *args, **kwargs)
+            rewrite_once(path)
+            return data
+
+        arguments = argparse.Namespace(
+            manifest=str(self.fixture.manifest),
+            bin=["rootyard=ROOTYARD_BIN"],
+            bin_receipt=[],
+            test=[],
+            store_var="ROOTYARD_ARTIFACT_STORE",
+            manifest_var="ROOTYARD_BATCH_MANIFEST",
+            manifest_sha256_var="ROOTYARD_BATCH_MANIFEST_SHA256",
+        )
+        previous = Path.cwd()
+        try:
+            os.chdir(self.fixture.workspace)
+            with mock.patch.object(Path, "read_bytes", read_bytes_then_rewrite), \
+                    mock.patch.object(Path, "read_text", read_text_then_rewrite):
+                exports = exporter.build_exports(arguments)
+        finally:
+            os.chdir(previous)
+
+        self.assertEqual(rewritten, [self.fixture.manifest])
+        self.assertEqual(self.fixture.manifest.read_bytes(), replacement_bytes)
+        self.assertEqual(
+            exports["ROOTYARD_BATCH_MANIFEST_SHA256"],
+            hashlib.sha256(original_bytes).hexdigest(),
+        )
+        self.assertNotEqual(
+            exports["ROOTYARD_BATCH_MANIFEST_SHA256"],
+            hashlib.sha256(replacement_bytes).hexdigest(),
+        )
+        self.assertEqual(exports["ROOTYARD_BIN"], str(self.fixture.snapshot_bin))
 
 
 if __name__ == "__main__":
