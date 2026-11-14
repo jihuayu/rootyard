@@ -189,8 +189,10 @@ LIMITS = [
     "compared or attributed.",
     "OpenDAL GET byte/phase metrics are unmeasured: the current service exposes no such counters to this runner.",
     COLD_SEMANTICS,
-    "Workload is one small deterministic repository bounded to 256 KiB plus three identical read-only "
-    "repositories; no throughput, percentile or regression budget is inferred.",
+    "Workload is one small deterministic repository bounded to 256 KiB cloned into two independent read-only "
+    "destinations; no throughput, percentile or regression budget is inferred.",
+    "HTTP request/response byte counts are not measured: seed_push.payload_bytes is the deterministic file "
+    "payload size, not wire bytes.",
     "This report is a baseline entry for #106; it does not claim #106 complete and freezes no budget.",
     "Blob deletion stays disabled; objects uploaded under the fixture root are not reclaimed by this harness.",
 ]

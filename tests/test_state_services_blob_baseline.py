@@ -1354,6 +1354,11 @@ class ReportValidationTest(unittest.TestCase):
         text = json.dumps(payload)
         for forbidden in ("ROOTYARD_BLOB_ENDPOINT", "bucket", "s3://", "postgres://", PG_ADDRESS + ":"):
             self.assertNotIn(forbidden, text)
+        limits = json.dumps(payload["limits"])
+        self.assertIn("two independent read-only destinations", limits)
+        self.assertNotIn("three identical read-only", limits)
+        self.assertIn("HTTP request/response byte counts are not measured", limits)
+        self.assertIn("payload_bytes is the deterministic file payload size, not wire bytes", limits)
 
     def test_report_version_scope_and_no_four_tuple_claim(self):
         payload = report_payload()
