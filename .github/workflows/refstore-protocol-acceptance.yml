@@ -183,17 +183,150 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Order matters: build_native_test.py clears the rootyard package, while
-          # build_native.py clears it too and must leave the final product binary.
-          # The harness derives <fixture>.build.json next to the executable, so
-          # both stay under test-results/refstore/ and reach the artifact.
+          # Both builders seal independent immutable CAS snapshots under the one
+          # shared per-runner store.  Their --output paths are readonly aliases;
+          # the harness derives <fixture>.build.json next to the frozen fixture
+          # path, while the standalone CLI alias stays outside the uploaded tree.
           fixture_dir="$GITHUB_WORKSPACE/test-results/refstore"
+          artifact_store="$HOME/.cache/rootyard/native-artifacts"
+          standalone_dir="$RUNNER_TEMP/refstore-standalone"
+          mkdir -p "$standalone_dir"
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
           python3 scripts/build_native_test.py --test ref_store_format22_backup_fixture \
             --features pando-lab,format22-fixture --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$artifact_store" \
             --output "$fixture_dir/ref_store_format22_backup_fixture" \
             > "$fixture_dir/format22-fixture-build.json"
           python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$artifact_store" \
+            --output "$standalone_dir/rootyard" \
             > test-results/refstore/standalone-build.json
+          python3 - "$fixture_dir/format22-fixture-build.json" \
+            test-results/refstore/standalone-build.json \
+            "$fixture_dir/ref_store_format22_backup_fixture" \
+            "$fixture_dir/ref_store_format22_backup_fixture.build.json" \
+            "$standalone_dir/rootyard" "$standalone_dir/rootyard.build.json" \
+            "$GITHUB_ENV" <<'PY'
+          import hashlib, json, os, pathlib, re, stat, sys
+
+          store = pathlib.Path(os.path.expanduser('~/.cache/rootyard/native-artifacts')).resolve()
+          fixture_report, cli_report = (pathlib.Path(value) for value in sys.argv[1:3])
+          fixture_alias, fixture_alias_receipt = (pathlib.Path(value) for value in sys.argv[3:5])
+          cli_alias, cli_alias_receipt = (pathlib.Path(value) for value in sys.argv[5:7])
+          github_env = pathlib.Path(sys.argv[7])
+          HEX64 = re.compile(r'^[0-9a-f]{64}$')
+          STORE_SCHEMA = 'rootyard/native-artifact-store/v1'
+
+
+          def fail(message):
+              raise SystemExit('immutable native metadata: ' + message)
+
+
+          def sha(path):
+              digest = hashlib.sha256()
+              with pathlib.Path(path).open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(1 << 20), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def readonly_file(path, label):
+              path = pathlib.Path(path)
+              if not path.is_absolute() or '..' in path.parts:
+                  fail(label + ' is not a safe absolute path: ' + str(path))
+              if path.is_symlink() or not path.is_file():
+                  fail(label + ' is not a regular non-symlink file: ' + str(path))
+              info = path.stat()
+              if not stat.S_ISREG(info.st_mode):
+                  fail(label + ' is not a regular file: ' + str(path))
+              if info.st_uid != os.geteuid():
+                  fail(label + ' is not owned by the current user: ' + str(path))
+              if info.st_mode & 0o222:
+                  fail(label + ' must be readonly: ' + str(path))
+              return path
+
+
+          def load(path, label):
+              try:
+                  payload = json.loads(pathlib.Path(path).read_text(encoding='utf-8'))
+              except (OSError, ValueError) as error:
+                  fail(label + ' is not readable JSON: ' + type(error).__name__)
+              if not isinstance(payload, dict):
+                  fail(label + ' is not a JSON object')
+              return payload
+
+
+          def require_store(payload, alias, alias_receipt, label):
+              record = payload.get('artifact_store')
+              if not isinstance(record, dict):
+                  fail(label + ' has no artifact_store record')
+              if record.get('schema') != STORE_SCHEMA:
+                  fail(label + ' artifact_store schema is invalid')
+              root = pathlib.Path(record.get('root') or '')
+              if not root.is_absolute() or root.resolve() != store:
+                  fail(label + ' artifact_store root is not the shared store')
+              binary = readonly_file(record.get('binary'), label + ' canonical binary')
+              receipt = readonly_file(record.get('receipt'), label + ' canonical receipt')
+              build_receipt = readonly_file(
+                  record.get('build_receipt'), label + ' canonical build receipt')
+              objects = readonly_file(record.get('object'), label + ' content object')
+              for path, name in ((binary, 'binary'), (receipt, 'receipt'),
+                                 (build_receipt, 'build receipt'), (objects, 'object')):
+                  if store != path and store not in path.parents:
+                      fail(label + ' ' + name + ' is outside the shared store')
+              if receipt.name != binary.name + '.receipt.json':
+                  fail(label + ' canonical receipt is not adjacent to the binary')
+              if build_receipt.name != binary.name + '.build.json':
+                  fail(label + ' canonical build receipt is not adjacent to the binary')
+              if receipt.parent != binary.parent or build_receipt.parent != binary.parent:
+                  fail(label + ' canonical receipts are not adjacent to the binary')
+              binary_sha = record.get('binary_sha256')
+              if not isinstance(binary_sha, str) or HEX64.fullmatch(binary_sha) is None:
+                  fail(label + ' artifact_store binary_sha256 is invalid')
+              for path, name in ((binary, 'canonical binary'), (objects, 'content object'),
+                                 (readonly_file(alias, label + ' output alias'), 'output alias')):
+                  if sha(path) != binary_sha:
+                      fail(label + ' ' + name + ' does not match the sealed digest')
+              if sha(build_receipt) != sha(readonly_file(alias_receipt, label + ' alias receipt')):
+                  fail(label + ' alias receipt bytes differ from the canonical build receipt')
+              output = record.get('output_alias')
+              if not isinstance(output, dict):
+                  fail(label + ' artifact_store has no output_alias record')
+              if pathlib.Path(output.get('path') or '').resolve() != alias.resolve():
+                  fail(label + ' output_alias path is not the frozen alias')
+              if pathlib.Path(output.get('receipt') or '').resolve() != alias_receipt.resolve():
+                  fail(label + ' output_alias receipt is not adjacent to the frozen alias')
+              if output.get('method') not in ('hardlink', 'copy'):
+                  fail(label + ' output_alias method is invalid')
+              if not isinstance(output.get('same_inode_as_cas_object'), bool):
+                  fail(label + ' output_alias inode observation is invalid')
+              if output.get('overwrote_existing') is not False:
+                  fail(label + ' output_alias must not overwrite an existing path')
+              return record
+
+
+          fixture = require_store(
+              load(fixture_report, 'format22 fixture report'),
+              fixture_alias, fixture_alias_receipt, 'format22 fixture')
+          cli = require_store(
+              load(cli_report, 'standalone CLI report'),
+              cli_alias, cli_alias_receipt, 'standalone CLI')
+          exported = {
+              'ROOTYARD_ARTIFACT_STORE': str(store),
+              'ROOTYARD_FORMAT22_FIXTURE': fixture['binary'],
+              'ROOTYARD_FORMAT22_FIXTURE_RECEIPT': fixture['build_receipt'],
+              'ROOTYARD_STANDALONE_BIN': cli['binary'],
+              'ROOTYARD_STANDALONE_RECEIPT': cli['build_receipt'],
+          }
+          for name, value in exported.items():
+              if '\n' in value or '\r' in value or '\x00' in value:
+                  fail(name + ' is not a single safe line')
+              if re.fullmatch(r'[A-Z][A-Z0-9_]*', name) is None:
+                  fail('unsafe environment name')
+          with github_env.open('a', encoding='utf-8') as stream:
+              for name, value in exported.items():
+                  stream.write(name + '=' + value + '\n')
+          PY
           set -a
           . "$RUNNER_TEMP/refstore-object-store.env"
           set +a
@@ -205,7 +338,7 @@ jobs:
           export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
           export ROOTYARD_BLOB_ROOT="standalone-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           export ROOTYARD_GIT="$(command -v git)"
-          binary="$GITHUB_WORKSPACE/target/debug/rootyard"
+          binary="$standalone_dir/rootyard"
           fixture="$fixture_dir/ref_store_format22_backup_fixture"
           # tests/blob_only_service.py -> e2e.Harness.setup() migrates only a random search_path
           # schema, so the job-owned service database needs the production public migration first.
@@ -266,8 +399,8 @@ jobs:
           # The DSN is passed only through the environment and never echoed.
           export ROOTYARD_TEST_DATABASE_URL="${ROOTYARD_TEST_DATABASE_URL%/*}/$database"
           export DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL"
-          fixture="$GITHUB_WORKSPACE/test-results/refstore/ref_store_format22_backup_fixture"
-          binary="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/rootyard"
+          fixture="${ROOTYARD_FORMAT22_FIXTURE:?missing immutable format22 fixture}"
+          binary="${ROOTYARD_STANDALONE_BIN:?missing immutable standalone CLI}"
           test -x "$fixture" && test -x "$binary"
           evidence="test-results/refstore/format22-pg-tests"
           mkdir -p "$evidence"
@@ -303,7 +436,9 @@ jobs:
         run: |
           set -euo pipefail
           pair="$RUNNER_TEMP/refstore-126-pair"
+          artifact_store="$HOME/.cache/rootyard/native-artifacts"
           mkdir -p "$pair" test-results/refstore/blob_git_gateway
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
           git_status="$(git status --porcelain --untracked-files=normal)"
           if [ -n "$git_status" ]; then
             echo "worktree check failed: the worktree is not clean before building the #126 test pair" >&2
@@ -311,15 +446,141 @@ jobs:
           fi
           test_binary="$pair/blob-git-gateway"
           serving_binary="$pair/rootyard"
-          # Both builders run to completion before anything consumes their outputs; receipts stay external.
+          test_report="$pair/blob-git-gateway-build.json"
+          serving_report="$pair/rootyard-build.json"
+          # Both builders seal immutable snapshots before anything consumes their
+          # readonly aliases; receipts stay adjacent to those external aliases.
           python3 scripts/build_native_test.py --test blob_git_gateway --features pando-lab \
-            --no-default-features --package-debug 0 --strip-debuginfo --output "$test_binary"
+            --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$artifact_store" --output "$test_binary" > "$test_report"
           python3 scripts/build_native.py --features pando-lab --no-default-features \
-            --package-debug 0 --strip-debuginfo
-          cp target/debug/rootyard "$serving_binary"
-          cp target/debug/rootyard.build.json "$pair/rootyard.build.json"
+            --package-debug 0 --strip-debuginfo \
+            --artifact-store "$artifact_store" --output "$serving_binary" > "$serving_report"
+          python3 - "$test_report" "$serving_report" \
+            "$test_binary" "$test_binary.build.json" \
+            "$serving_binary" "$serving_binary.build.json" \
+            "$GITHUB_ENV" <<'PY'
+          import hashlib, json, os, pathlib, re, stat, sys
+
+          store = pathlib.Path(os.path.expanduser('~/.cache/rootyard/native-artifacts')).resolve()
+          test_report, cli_report = (pathlib.Path(value) for value in sys.argv[1:3])
+          test_alias, test_alias_receipt = (pathlib.Path(value) for value in sys.argv[3:5])
+          cli_alias, cli_alias_receipt = (pathlib.Path(value) for value in sys.argv[5:7])
+          github_env = pathlib.Path(sys.argv[7])
+          HEX64 = re.compile(r'^[0-9a-f]{64}$')
+          STORE_SCHEMA = 'rootyard/native-artifact-store/v1'
+
+
+          def fail(message):
+              raise SystemExit('immutable #126 metadata: ' + message)
+
+
+          def sha(path):
+              digest = hashlib.sha256()
+              with pathlib.Path(path).open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(1 << 20), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def readonly_file(path, label):
+              path = pathlib.Path(path)
+              if not path.is_absolute() or '..' in path.parts:
+                  fail(label + ' is not a safe absolute path: ' + str(path))
+              if path.is_symlink() or not path.is_file():
+                  fail(label + ' is not a regular non-symlink file: ' + str(path))
+              info = path.stat()
+              if not stat.S_ISREG(info.st_mode):
+                  fail(label + ' is not a regular file: ' + str(path))
+              if info.st_uid != os.geteuid():
+                  fail(label + ' is not owned by the current user: ' + str(path))
+              if info.st_mode & 0o222:
+                  fail(label + ' must be readonly: ' + str(path))
+              return path
+
+
+          def load(path, label):
+              try:
+                  payload = json.loads(pathlib.Path(path).read_text(encoding='utf-8'))
+              except (OSError, ValueError) as error:
+                  fail(label + ' is not readable JSON: ' + type(error).__name__)
+              if not isinstance(payload, dict):
+                  fail(label + ' is not a JSON object')
+              return payload
+
+
+          def require_store(payload, alias, alias_receipt, label):
+              record = payload.get('artifact_store')
+              if not isinstance(record, dict):
+                  fail(label + ' has no artifact_store record')
+              if record.get('schema') != STORE_SCHEMA:
+                  fail(label + ' artifact_store schema is invalid')
+              root = pathlib.Path(record.get('root') or '')
+              if not root.is_absolute() or root.resolve() != store:
+                  fail(label + ' artifact_store root is not the shared store')
+              binary = readonly_file(record.get('binary'), label + ' canonical binary')
+              receipt = readonly_file(record.get('receipt'), label + ' canonical receipt')
+              build_receipt = readonly_file(
+                  record.get('build_receipt'), label + ' canonical build receipt')
+              objects = readonly_file(record.get('object'), label + ' content object')
+              for path, name in ((binary, 'binary'), (receipt, 'receipt'),
+                                 (build_receipt, 'build receipt'), (objects, 'object')):
+                  if store != path and store not in path.parents:
+                      fail(label + ' ' + name + ' is outside the shared store')
+              if receipt.name != binary.name + '.receipt.json':
+                  fail(label + ' canonical receipt is not adjacent to the binary')
+              if build_receipt.name != binary.name + '.build.json':
+                  fail(label + ' canonical build receipt is not adjacent to the binary')
+              if receipt.parent != binary.parent or build_receipt.parent != binary.parent:
+                  fail(label + ' canonical receipts are not adjacent to the binary')
+              binary_sha = record.get('binary_sha256')
+              if not isinstance(binary_sha, str) or HEX64.fullmatch(binary_sha) is None:
+                  fail(label + ' artifact_store binary_sha256 is invalid')
+              for path, name in ((binary, 'canonical binary'), (objects, 'content object'),
+                                 (readonly_file(alias, label + ' output alias'), 'output alias')):
+                  if sha(path) != binary_sha:
+                      fail(label + ' ' + name + ' does not match the sealed digest')
+              if sha(build_receipt) != sha(readonly_file(alias_receipt, label + ' alias receipt')):
+                  fail(label + ' alias receipt bytes differ from the canonical build receipt')
+              output = record.get('output_alias')
+              if not isinstance(output, dict):
+                  fail(label + ' artifact_store has no output_alias record')
+              if pathlib.Path(output.get('path') or '').resolve() != alias.resolve():
+                  fail(label + ' output_alias path is not the frozen alias')
+              if pathlib.Path(output.get('receipt') or '').resolve() != alias_receipt.resolve():
+                  fail(label + ' output_alias receipt is not adjacent to the frozen alias')
+              if output.get('method') not in ('hardlink', 'copy'):
+                  fail(label + ' output_alias method is invalid')
+              if not isinstance(output.get('same_inode_as_cas_object'), bool):
+                  fail(label + ' output_alias inode observation is invalid')
+              if output.get('overwrote_existing') is not False:
+                  fail(label + ' output_alias must not overwrite an existing path')
+              return record
+
+
+          test_store = require_store(
+              load(test_report, '#126 test report'), test_alias, test_alias_receipt, '#126 test')
+          cli_store = require_store(
+              load(cli_report, '#126 CLI report'), cli_alias, cli_alias_receipt, '#126 CLI')
+          exported = {
+              'ROOTYARD_126_TEST_BIN': test_store['binary'],
+              'ROOTYARD_126_TEST_RECEIPT': test_store['build_receipt'],
+              'ROOTYARD_126_SERVING_BIN': cli_store['binary'],
+              'ROOTYARD_126_SERVING_RECEIPT': cli_store['build_receipt'],
+              'ROOTYARD_LFS_BIN': cli_store['binary'],
+              'ROOTYARD_LFS_RECEIPT': cli_store['build_receipt'],
+          }
+          for name, value in exported.items():
+              if '\n' in value or '\r' in value or '\x00' in value:
+                  fail(name + ' is not a single safe line')
+              if re.fullmatch(r'[A-Z][A-Z0-9_]*', name) is None:
+                  fail('unsafe environment name')
+          with github_env.open('a', encoding='utf-8') as stream:
+              for name, value in exported.items():
+                  stream.write(name + '=' + value + '\n')
+          PY
           test_receipt="$test_binary.build.json"
-          serving_receipt="$pair/rootyard.build.json"
+          serving_receipt="$serving_binary.build.json"
           [ -x "$test_binary" ] && [ -f "$test_receipt" ]
           [ -x "$serving_binary" ] && [ -f "$serving_receipt" ]
           git_status="$(git status --porcelain --untracked-files=normal)"
@@ -722,7 +983,7 @@ jobs:
           export ROOTYARD_BLOB_ROOT="blob-git-gateway-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           export ROOTYARD_TEST_GIT="$(command -v git)"
           export ROOTYARD_SERVING_BINARY="$serving_binary"
-          export CARGO_BIN_EXE_ROOTYARD="$GITHUB_WORKSPACE/target/debug/rootyard"
+          export CARGO_BIN_EXE_ROOTYARD="$serving_binary"
           report_dir=test-results/refstore/blob_git_gateway
           "$test_binary" --ignored --list > "$report_dir/ignored-inventory.txt" 2>&1
           python3 - "$report_dir/ignored-inventory.txt" <<'PY'
@@ -791,8 +1052,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          : "${ROOTYARD_LFS_BIN:?missing immutable #126 CLI snapshot}"
+          : "${ROOTYARD_LFS_RECEIPT:?missing immutable #126 CLI receipt}"
           mkdir -p test-results/refstore
-          cp target/debug/rootyard.build.json test-results/refstore/lfs-build-receipt.json
+          # Preserve the named raw receipt input as the same bytes of the
+          # canonical adjacent immutable alias; never re-serialize it.
+          cp "$ROOTYARD_LFS_RECEIPT" test-results/refstore/lfs-build-receipt.json
+          cmp "$ROOTYARD_LFS_RECEIPT" test-results/refstore/lfs-build-receipt.json
           set -a
           . "$RUNNER_TEMP/refstore-object-store.env"
           set +a
@@ -804,7 +1070,7 @@ jobs:
           createdb --host 127.0.0.1 --port 55432 --username rootyard "$database"
           export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$database"
           export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
-          binary="$GITHUB_WORKSPACE/target/debug/rootyard"
+          binary="$ROOTYARD_LFS_BIN"
           "$binary" migrate 2>&1 | tee test-results/refstore/lfs-migrate.log
           mkdir -p "$RUNNER_TEMP/rootyard-lfs/schema_migrations"
           psql --host 127.0.0.1 --port 55432 --username rootyard --dbname "$database" \
@@ -873,10 +1139,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          : "${ROOTYARD_LFS_BIN:?missing immutable #126 CLI snapshot}"
           python3 scripts/native_report_manifest.py --mode job --expect-commit "$GITHUB_SHA" \
             --manifest-out test-results/refstore/lfs-native-job.json \
             --build-receipt test-results/refstore/lfs-build-receipt.json \
-            --binary target/debug/rootyard \
+            --binary "$ROOTYARD_LFS_BIN" \
             --report lfs=test-results/refstore/lfs.json \
             --log lfs-migrate=test-results/refstore/lfs-migrate.log \
             --log lfs-db-facts=test-results/refstore/lfs-db-facts.json \

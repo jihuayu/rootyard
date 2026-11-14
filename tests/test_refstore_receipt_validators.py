@@ -714,6 +714,44 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
         shutil.copyfile(fixture["serving_receipt"], directory / "rootyard.build.json")
         return directory
 
+    def test_non_174_builders_use_the_shared_immutable_store(self):
+        start = self.source.index("Build and exercise the minimal Blob")
+        end = self.source.index('"Exercise the #174 HTTP foundation cases')
+        section = self.source[start:end]
+        self.assertEqual(section.count(
+            'artifact_store="$HOME/.cache/rootyard/native-artifacts"'), 2)
+        self.assertEqual(section.count('--artifact-store "$artifact_store"'), 4)
+        for alias in (
+            '--output "$fixture_dir/ref_store_format22_backup_fixture"',
+            '--output "$standalone_dir/rootyard"',
+            '--output "$test_binary"',
+            '--output "$serving_binary"',
+        ):
+            self.assertIn(alias, section)
+        # Every later non-174 consumer reads an exported immutable path, never
+        # the mutable Cargo target or a receipt copied from it.
+        self.assertNotIn("target/debug", section)
+        self.assertNotIn("cargo clean", section)
+        self.assertNotIn("clears the rootyard package", self.source)
+        for name in (
+            "ROOTYARD_ARTIFACT_STORE",
+            "ROOTYARD_FORMAT22_FIXTURE",
+            "ROOTYARD_FORMAT22_FIXTURE_RECEIPT",
+            "ROOTYARD_STANDALONE_BIN",
+            "ROOTYARD_STANDALONE_RECEIPT",
+            "ROOTYARD_LFS_BIN",
+            "ROOTYARD_LFS_RECEIPT",
+        ):
+            self.assertIn("'" + name + "'", section)
+        self.assertIn('binary="${ROOTYARD_STANDALONE_BIN:?', section)
+        self.assertIn('binary="$ROOTYARD_LFS_BIN"', section)
+        self.assertIn('--binary "$ROOTYARD_LFS_BIN"', section)
+        self.assertIn('export CARGO_BIN_EXE_ROOTYARD="$serving_binary"', section)
+        self.assertIn('cp "$ROOTYARD_LFS_RECEIPT" test-results/refstore/lfs-build-receipt.json',
+                      section)
+        self.assertNotIn('cp target/debug/rootyard', section)
+        self.assertNotIn('cp "$GITHUB_WORKSPACE/target/debug/rootyard', section)
+
     def test_validators_parse_and_use_the_shared_reader(self):
         self.assertEqual(len(self.validators), 2)
         for block in self.validators:
