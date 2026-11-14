@@ -42,7 +42,15 @@ mod snapshot;
 mod state;
 
 #[cfg(test)]
+mod admission_race_acceptance;
+#[cfg(test)]
 mod session_http_acceptance;
+
+/// Serializes the two top-level cfg(test) native cases that each pin their own
+/// fixture schema and Blob prefix. The wider session harness (including its
+/// negative cases) still requires the documented `--test-threads=1` run.
+#[cfg(test)]
+pub(crate) static NATIVE_ACCEPTANCE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use std::sync::Arc;
 

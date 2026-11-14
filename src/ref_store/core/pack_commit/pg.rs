@@ -12,7 +12,7 @@
 use super::closure::PackClosureContext;
 use super::context::PackCommitBaseline;
 use super::contract::{MAX_ACTIVE_MEMBERSHIPS, MAX_CAPTURE_REFS, PackMode};
-use super::error::{PackCommitError, PackCommitRejectCode, PackCommitRejection};
+use super::error::{GATE_REVISION_MISMATCH_DETAIL, PackCommitError, PackCommitRejectCode, PackCommitRejection};
 use super::plan::PackCommitPlan;
 use super::receipt::{PackCommitTerminal, PackRegistrationReceipt};
 use super::request::PackPendingToken;
@@ -283,7 +283,7 @@ pub(super) fn ensure_gate_matches(
         return Err(reject(PackCommitRejectCode::HistoryIncarnationMismatch, "gate epochs differ"));
     }
     if gate.revision() != plan.expected().revision() {
-        return Err(reject(PackCommitRejectCode::RevisionMismatch, "gate revision differs"));
+        return Err(reject(PackCommitRejectCode::RevisionMismatch, GATE_REVISION_MISMATCH_DETAIL));
     }
     if gate.digest() != plan.expected().gate_digest() {
         return Err(reject(PackCommitRejectCode::GateDigestMismatch, "gate digest differs"));
