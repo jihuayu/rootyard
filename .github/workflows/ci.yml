@@ -99,6 +99,36 @@ jobs:
       - name: Verify PostgreSQL RefStore registry and metadata-core contracts
         timeout-minutes: 5
         run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds -- --ignored --test-threads=1
+      - name: Build relocated rootyard library test harness for the PostgreSQL start gate
+        timeout-minutes: 10
+        run: |
+          python3 scripts/build_native_test.py \
+            --lib \
+            --features pando-lab \
+            --strip-debuginfo \
+            --output test-results/rootyard-lib-tests
+      - name: Verify managed PostgreSQL sandbox start-gate lock order
+        timeout-minutes: 10
+        run: |
+          python3 scripts/run_pg_start_gate.py \
+            --test-binary test-results/rootyard-lib-tests \
+            --build-receipt test-results/rootyard-lib-tests.build.json \
+            --report test-results/pg-start-gate.json \
+            --expected-commit "$GITHUB_SHA"
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/native-pg-start-gate.json \
+            --build-receipt test-results/rootyard-lib-tests.build.json \
+            --binary test-results/rootyard-lib-tests \
+            --expect-commit "$GITHUB_SHA" \
+            --report pg_start_gate=test-results/pg-start-gate.json \
+            --require-case pg_start_gate=sandbox::runner::tests::start_gate_serializes_context_removal_under_policy_fence \
+            --harness scripts/run_pg_start_gate.py \
+            --harness tests/test_pg_start_gate_runner.py \
+            --harness src/sandbox/runner.rs \
+            --harness scripts/build_native_test.py \
+            --harness scripts/build_native.py \
+            --harness scripts/native_report_manifest.py \
+            --harness .github/workflows/ci.yml
       - name: Build native bins and RefStore fixtures in one batch
         timeout-minutes: 10
         run: |
@@ -111,6 +141,9 @@ jobs:
             --test ref_store_holds_backup_fixture \
             --output test-results/refstore-holds-fixture \
             --manifest-out test-results/native-build-batch.json
+      - name: Exercise trusted CI HTTP authority boundaries
+        timeout-minutes: 10
+        run: python3 tests/ci_trust_boundaries.py --binary target/debug/rootyard --report test-results/ci-trust-boundaries.json --expected-commit "$GITHUB_SHA"
       - name: Verify design documentation integrity
         run: python3 scripts/check_design_docs.py
       - name: Verify schema-030 catalog and dump round trip
@@ -348,6 +381,7 @@ jobs:
             --report ci_source_pins=test-results/ci-source-pins.json \
             --report ci_job_checkouts=test-results/ci-job-checkouts.json \
             --report ci_dependencies=test-results/ci-dependencies.json \
+            --report ci_trust_boundaries=test-results/ci-trust-boundaries.json \
             --report shard_marker_transitions=test-results/shard-marker-transitions.json \
             --require-case shard_marker_transitions=takeover-after-source-marker \
             --require-case shard_marker_transitions=fence-audit-rollback \
@@ -406,6 +440,13 @@ jobs:
             --harness tests/mixed_ref_support.py \
             --harness tests/refusal_audit_sql.py \
             --harness scripts/build_native.py \
+            --harness tests/ci_trust_boundaries.py \
+            --harness tests/source_bound_binary.py \
+            --harness tests/ops_provenance.py \
+            --harness tests/test_ci_trust_boundaries_privacy.py \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/build_native_batch.py \
+            --harness .github/workflows/ci.yml \
             --fixture postgres=postgres:17 \
             --fixture workspace_mount_mode=direct \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix \
@@ -436,6 +477,14 @@ jobs:
             --require-case ci_dependencies=integration_claim_prepares_exact_dependencies \
             --require-case ci_dependencies=origin_fallback_dependency_credential_boundaries \
             --require-case ci_dependencies=unsafe_gitmodules_url_receives_no_credentials \
+            --require-case "ci_trust_boundaries=trusted two-repository matrix setup" \
+            --require-case "ci_trust_boundaries=trusted positive report/callback flows" \
+            --require-case "ci_trust_boundaries=revoked trusted context cannot unlock merge" \
+            --require-case "ci_trust_boundaries=ordinary writer and cross-context/repository refusals" \
+            --require-case "ci_trust_boundaries=changed candidate invalidates prior evidence" \
+            --require-case "ci_trust_boundaries=revoked registration, rotated secret and late attempt" \
+            --require-case "ci_trust_boundaries=removed webhook context revokes claim/report/merge authority" \
+            --require-case "ci_trust_boundaries=API principal token revocation remains management-only" \
             --fixture rust="$(rustc -V)" \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \

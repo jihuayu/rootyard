@@ -7927,6 +7927,14 @@ class Phase1ClosureAndDocsFixture:
             if any("build_native_batch.py" in token for token in tokens)
         ]
         matches = [tokens for tokens in references if tokens[:2] == prefix]
+        # A `--harness scripts/build_native_batch.py` binding in the native
+        # manifest is not a command invocation; only the python3 command counts.
+        unexpected = [
+            tokens
+            for tokens in references
+            if tokens[:2] != prefix
+            and tokens[:2] != ["python3", "scripts/native_report_manifest.py"]
+        ]
         expected = [
             "python3", "scripts/build_native_batch.py", "--all-bins",
             "--features", "pando-lab", "--strip-debuginfo",
@@ -7936,15 +7944,15 @@ class Phase1ClosureAndDocsFixture:
             "--output", "test-results/refstore-holds-fixture",
             "--manifest-out", "test-results/native-build-batch.json",
         ]
-        if len(references) != 1:
-            raise AssertionError(
-                f"CI workflow must contain exactly one scripts/build_native_batch.py command, "
-                f"found {len(references)} references"
-            )
         if len(matches) != 1:
             raise AssertionError(
+                f"CI workflow must contain exactly one scripts/build_native_batch.py command, "
+                f"found {len(matches)} invocations"
+            )
+        if unexpected:
+            raise AssertionError(
                 "CI workflow has a suspicious build_native_batch.py reference that does not start with "
-                f"'python3 scripts/build_native_batch.py': {references[0]}"
+                f"'python3 scripts/build_native_batch.py': {unexpected[0]}"
             )
         if matches[0] != expected:
             raise AssertionError(
