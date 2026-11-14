@@ -398,6 +398,8 @@ def _check_manifest_entry(manifest, entry, kind, target, validated, receipt_row,
         if kind == "bin":
             _require(validated.payload.get("relocated_artifact") is not True,
                      label + " non-CAS bin receipt may not be relocated")
+        _require(sha256_file(consumed_receipt) == validated.receipt_sha256,
+                 label + " consumed receipt bytes do not match the parsed receipt SHA")
         return
     _require(isinstance(store, dict), label + " manifest artifact_store must be an object")
     _require(store.get("schema") == STORE_SCHEMA,
@@ -451,6 +453,12 @@ def _check_manifest_entry(manifest, entry, kind, target, validated, receipt_row,
     else:
         _require(record.get("output_alias") is None,
                  label + " sealed bin record may not carry an output alias")
+    _require(sha256_file(consumed_receipt) == validated.receipt_sha256,
+             label + " consumed receipt bytes do not match the parsed receipt SHA")
+    _require(sha256_file(Path(record["receipt"])) == validated.receipt_sha256,
+             label + " canonical receipt bytes do not match the parsed receipt SHA")
+    _require(sha256_file(Path(record["build_receipt"])) == validated.receipt_sha256,
+             label + " build receipt bytes do not match the parsed receipt SHA")
 
 
 def _check_exporter_anchors(environ, manifest_path, raw_sha256, label):

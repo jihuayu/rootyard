@@ -569,6 +569,13 @@ class RefStoreReceiptFixture(unittest.TestCase):
         for path in receipt_paths:
             self.rewrite_readonly(path, text)
 
+    def rewrite_receipt_group(self, paths, marker):
+        payload = json.loads(Path(paths[0]).read_text())
+        payload["post_load_race"] = marker
+        text = json.dumps(payload, indent=2) + "\n"
+        for path in paths:
+            self.rewrite_readonly(path, text)
+
     def cas_fixture(self):
         target = self.pair()[0]["cargo_artifacts"][0]["target"]
         helper, app, helper_record, app_record = self.cas_pair(target)
@@ -843,6 +850,22 @@ class ExpectedSourceCommitCases:
             self.validate_cas_pair(
                 helper, app, helper_record, app_record, manifest,
                 mutate=mutate)
+
+    def test_v2_post_load_receipt_alias_rewrite_fails(self):
+        (helper, app, helper_record, app_record, manifest,
+         manifest_path, helper_paths, app_paths) = self.cas_fixture()
+        real_load = binding._load_batch_manifest
+
+        def racing_load(path, label):
+            self.rewrite_receipt_group(helper_paths, "helper-post-load")
+            self.rewrite_receipt_group(app_paths, "app-post-load")
+            return real_load(path, label)
+
+        with mock.patch.object(
+                binding, "_load_batch_manifest", side_effect=racing_load):
+            with self.assertRaisesRegex(AssertionError, "parsed receipt SHA"):
+                self.validate_cas_pair(
+                    helper, app, helper_record, app_record, manifest)
 
     def test_v2_non_cas_manifest_rejects_relocated_bin_receipt(self):
         helper, app = self.pair()
