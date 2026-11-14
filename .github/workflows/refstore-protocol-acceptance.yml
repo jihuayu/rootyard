@@ -927,17 +927,15 @@ jobs:
               '--config', 'profile.dev.package.rootyard.strip="debuginfo"',
               '--message-format=json-render-diagnostics',
           ]
+          EXPECTED_CARGO_COMMIT = '64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          EXPECTED_CARGO_RELEASE = '1.101.0'
+          EXPECTED_RUST_RELEASE = '1.99.1'
+          EXPECTED_FEATURES = {'enabled': [], 'no_default_features': True}
+          FULL_COMMIT = re.compile(r'^[0-9a-f]{40,64}$')
 
 
           def fail(message):
               raise SystemExit('session174 preflight: ' + message)
-
-
-          def load(path):
-              try:
-                  return json.loads(pathlib.Path(path).read_text())
-              except (OSError, ValueError) as error:
-                  fail('unreadable receipt ' + repr(str(path)) + ': ' + type(error).__name__)
 
 
           def sha(path):
@@ -951,35 +949,188 @@ jobs:
               return digest.hexdigest()
 
 
-          def require_command(command, expected, label):
-              '''Require the receipt command to equal the expected argv exactly.'''
+          def sha_bytes(raw):
+              return hashlib.sha256(raw).hexdigest()
+
+
+          def toolchain_record():
+              path = workspace / 'test-results/refstore/cargo-fork.json'
+              try:
+                  record = json.loads(path.read_text())
+              except (OSError, ValueError) as error:
+                  fail('unreadable trusted toolchain record ' + repr(str(path)) + ': ' + type(error).__name__)
+              if not isinstance(record, dict):
+                  fail('trusted toolchain record is not an object')
+              if record.get('revision') != EXPECTED_CARGO_COMMIT:
+                  fail('trusted toolchain record revision is not the pinned Cargo commit')
+              if record.get('commit_hash') != EXPECTED_CARGO_COMMIT:
+                  fail('trusted toolchain record commit-hash is not the pinned Cargo commit')
+              if record.get('release') != EXPECTED_CARGO_RELEASE:
+                  fail('trusted toolchain record release is not Cargo 1.101.0')
+              if not isinstance(record.get('host'), str) or not record['host']:
+                  fail('trusted toolchain record has no host')
+              if not isinstance(record.get('binary_sha256'), str) or not hex64.fullmatch(record['binary_sha256']):
+                  fail('trusted toolchain record has no lowercase 64-hex executable SHA-256')
+              rustc = record.get('rustc')
+              if not isinstance(rustc, dict):
+                  fail('trusted toolchain record has no rustc identity')
+              if rustc.get('release') != EXPECTED_RUST_RELEASE:
+                  fail('trusted rustc release is not 1.99.1')
+              if not isinstance(rustc.get('commit_hash'), str) or not FULL_COMMIT.fullmatch(rustc['commit_hash']):
+                  fail('trusted rustc commit-hash is not a full lowercase commit')
+              if not isinstance(rustc.get('host'), str) or not rustc['host']:
+                  fail('trusted rustc identity has no host')
+              if record.get('host') != rustc['host']:
+                  fail('trusted Cargo and rustc hosts differ')
+              if not isinstance(rustc.get('full_version'), str) or not rustc['full_version'].startswith('rustc ' + EXPECTED_RUST_RELEASE):
+                  fail('trusted rustc full version is not 1.99.1')
+              if not isinstance(record.get('full_version'), str) or not record['full_version'].startswith('cargo ' + EXPECTED_CARGO_RELEASE):
+                  fail('trusted Cargo full version is not 1.101.0')
+              return record
+
+
+          def expected_toolchain(record):
+              rustc = record['rustc']
+              return {
+                  'cargo': {
+                      'version': record['full_version'],
+                      'release': record['release'],
+                      'commit_hash': record['commit_hash'],
+                      'host': record['host'],
+                      'executable_sha256': record['binary_sha256'],
+                  },
+                  'rustc': {
+                      'version': rustc['full_version'],
+                      'release': rustc['release'],
+                      'commit_hash': rustc['commit_hash'],
+                      'host': rustc['host'],
+                  },
+                  'target_triple': rustc['host'],
+                  'pinned_channel': EXPECTED_RUST_RELEASE,
+              }
+
+
+          def require_v2_toolchain(validated, expected, label):
+              actual = validated.toolchain
+              if not isinstance(actual, dict):
+                  fail(label + ' receipt has no toolchain identity')
+              for tool in ('cargo', 'rustc'):
+                  identity = actual.get(tool)
+                  if not isinstance(identity, dict):
+                      fail(label + ' receipt has no ' + tool + ' identity')
+                  for field, value in expected[tool].items():
+                      if identity.get(field) != value:
+                          fail(label + ' receipt ' + tool + '.' + field + ' does not match the trusted CI pin')
+              for field in ('target_triple', 'pinned_channel'):
+                  if actual.get(field) != expected[field]:
+                      fail(label + ' receipt toolchain.' + field + ' does not match the trusted CI pin')
+
+
+          def support_files():
+              files = {}
+              for directory in receipts.TEST_SUPPORT_DIRS:
+                  base = workspace / directory
+                  if base.is_dir():
+                      for item in base.rglob('*'):
+                          if item.is_file():
+                              files[item.relative_to(workspace).as_posix()] = sha(item)
+              return files
+
+
+          def legacy_support_digest(files):
+              digest = hashlib.sha256()
+              for relative in sorted(files):
+                  digest.update(relative.encode('utf-8') + b'\0')
+                  digest.update(bytes.fromhex(files[relative]))
+              return digest.hexdigest()
+
+
+          def support_digest_from_inventory(entries):
+              if not isinstance(entries, list):
+                  fail('receipt bound_input_inventory is not a list')
+              digest = hashlib.sha256()
+              for entry in sorted(entries, key=lambda item: item.get('path', '')):
+                  if not isinstance(entry, dict):
+                      fail('receipt bound_input_inventory entry is not an object')
+                  if entry.get('present') is True and entry.get('role') == 'test_support':
+                      path = entry.get('path')
+                      value = entry.get('sha256')
+                      if not isinstance(path, str) or not isinstance(value, str) or not hex64.fullmatch(value):
+                          fail('receipt test-support inventory entry is malformed')
+                      digest.update(path.encode('utf-8') + b'\0')
+                      digest.update(bytes.fromhex(value))
+              return digest.hexdigest()
+
+
+          def require_command(payload, expected, label, schema):
+              '''Require the exact producer argv; v2 may append one positive --jobs budget.'''
+              command = payload.get('command')
               if not isinstance(command, list) or any(not isinstance(item, str) for item in command):
                   fail(label + ' receipt command is not a list of strings')
-              if command != expected:
-                  fail(label + ' receipt command is ' + repr(command) + ', expected exactly ' + repr(expected))
+              if command == expected:
+                  if schema == 'v2':
+                      options = payload.get('build_options')
+                      if not isinstance(options, dict):
+                          fail(label + ' v2 receipt has no build_options metadata')
+                      if options.get('jobs') is not None:
+                          fail(label + ' v2 receipt omits a recorded positive jobs budget')
+                  return
+              if (schema == 'v2' and len(command) == len(expected) + 2
+                      and command[:len(expected)] == expected and command[-2] == '--jobs'):
+                  if re.fullmatch(r'[1-9][0-9]*', command[-1]) is None:
+                      fail(label + ' receipt has a non-positive or non-decimal --jobs budget')
+                  jobs = int(command[-1])
+                  options = payload.get('build_options')
+                  if not isinstance(options, dict):
+                      fail(label + ' v2 receipt has no build_options metadata')
+                  if (not isinstance(options.get('jobs'), int) or isinstance(options.get('jobs'), bool)
+                          or options.get('jobs') != jobs):
+                      fail(label + ' v2 receipt --jobs budget does not match build_options.jobs')
+                  return
+              fail(label + ' receipt command is ' + repr(command) + ', expected exactly ' + repr(expected)
+                   + ' with an optional explicit positive trailing --jobs budget')
 
 
           test_receipt_path = pathlib.Path(lib).with_suffix('.build.json')
           cli_receipt_path = workspace / 'target' / 'debug' / 'rootyard.build.json'
-          test_receipt = load(test_receipt_path)
-          cli_receipt = load(cli_receipt_path)
-          (evidence / 'rootyard-cli.build.json').write_text(json.dumps(cli_receipt, indent=2) + '\n')
+          try:
+              test_receipt_bytes = test_receipt_path.read_bytes()
+              cli_receipt_bytes = cli_receipt_path.read_bytes()
+          except OSError as error:
+              fail('unreadable receipt: ' + type(error).__name__)
           head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=workspace, text=True).strip()
           if not re.fullmatch(r'[0-9a-f]{40}', head):
               fail('HEAD is not a lowercase 40-hex commit')
           try:
               test_validated = receipts.load_receipt(
                   test_receipt_path, binary_path=lib, expected_commit=head,
-                  verify_source_files=False)
+                  source_root=workspace, verify_source_files=True)
               cli_validated = receipts.load_receipt(
                   cli_receipt_path, binary_path=cli, expected_commit=head,
-                  verify_source_files=False)
+                  source_root=workspace, verify_source_files=True)
           except receipts.ReceiptError as error:
               fail('receipt parser rejected ' + str(error))
+          if test_validated.receipt_sha256 != sha_bytes(test_receipt_bytes):
+              fail('lib receipt bytes changed between consumption and validation')
+          if cli_validated.receipt_sha256 != sha_bytes(cli_receipt_bytes):
+              fail('CLI receipt bytes changed between consumption and validation')
+          test_receipt = test_validated.payload
+          cli_receipt = cli_validated.payload
+          # The consumed CLI receipt is copied as raw bytes; it is never re-serialized.
+          try:
+              (evidence / 'rootyard-cli.build.json').write_bytes(cli_receipt_bytes)
+          except OSError as error:
+              fail('could not save the consumed CLI receipt bytes: ' + type(error).__name__)
+          if sha(evidence / 'rootyard-cli.build.json') != cli_validated.receipt_sha256:
+              fail('saved CLI receipt bytes differ from the consumed bytes')
+          if sha(test_receipt_path) != test_validated.receipt_sha256:
+              fail('saved lib receipt bytes differ from the consumed bytes')
           if test_receipt.get('kind') != 'rust-library-test':
               fail('lib receipt kind is not rust-library-test')
           if test_receipt.get('relocated_artifact') is not True:
               fail('lib receipt is not a relocated artifact')
+          record = toolchain_record()
+          trusted = expected_toolchain(record)
           if test_validated.schema == 'v1':
               if test_receipt.get('fresh') is not False:
                   fail('lib receipt is not a historical Fresh=false artifact')
@@ -988,6 +1139,28 @@ jobs:
               # CLI receipt (build_native.py version 1, no kind, no support digest).
               if cli_receipt.get('version') != 1:
                   fail('CLI receipt is not a version 1 build_native.py receipt')
+              recorded_support = test_receipt.get('lib_test_support_inputs_sha256')
+              if not isinstance(recorded_support, str) or not hex64.fullmatch(recorded_support):
+                  fail('lib receipt lacks a lowercase 64-hex lib_test_support_inputs_sha256')
+              current_support_files = support_files()
+              current_support = legacy_support_digest(current_support_files)
+              if recorded_support != current_support:
+                  fail('lib receipt lib_test_support_inputs_sha256 does not match the current historical support closure')
+              inventory = test_receipt.get('bound_input_inventory')
+              if inventory is not None:
+                  if not isinstance(inventory, list):
+                      fail('legacy lib receipt bound_input_inventory is not a list')
+                  rows = [entry for entry in inventory
+                          if isinstance(entry, dict) and entry.get('role') == 'test_support']
+                  recorded_paths = {entry.get('path') for entry in rows}
+                  if recorded_paths != set(current_support_files):
+                      fail('legacy support inventory does not cover the full historical support closure')
+                  for entry in rows:
+                      path = entry.get('path')
+                      if entry.get('present') is not True or entry.get('sha256') != current_support_files.get(path):
+                          fail('legacy support inventory entry does not match the current closure')
+                  if support_digest_from_inventory(inventory) != recorded_support:
+                      fail('legacy lib-test support digest does not match its bound inventory')
           else:
               if test_validated.schema != 'v2':
                   fail('lib receipt schema is not v1 or v2')
@@ -995,6 +1168,25 @@ jobs:
                   fail('lib receipt schema discriminator is not v2')
               if cli_receipt.get('receipt_schema') != receipts.RECEIPT_SCHEMA_V2:
                   fail('CLI receipt schema discriminator is not v2')
+              if test_receipt.get('profile') != 'test':
+                  fail('lib receipt top-level profile is not test')
+              if cli_receipt.get('profile') != 'dev':
+                  fail('CLI receipt top-level profile is not dev')
+              for label, payload in (('lib', test_receipt), ('CLI', cli_receipt)):
+                  features = payload.get('features')
+                  if not isinstance(features, dict):
+                      fail(label + ' receipt has no features metadata')
+                  if features.get('enabled') != EXPECTED_FEATURES['enabled']:
+                      fail(label + ' receipt enables unexpected features')
+                  if features.get('no_default_features') is not EXPECTED_FEATURES['no_default_features']:
+                      fail(label + ' receipt does not record no_default_features=true')
+              require_v2_toolchain(test_validated, trusted, 'lib')
+              require_v2_toolchain(cli_validated, trusted, 'CLI')
+              for tool in ('cargo', 'rustc'):
+                  if test_validated.toolchain.get(tool) != cli_validated.toolchain.get(tool):
+                      fail('lib and CLI receipts bind different ' + tool + ' identities')
+          if test_validated.schema != cli_validated.schema:
+              fail('lib and CLI receipts use different schemas')
           if test_receipt.get('workspace_commit') != head or cli_receipt.get('workspace_commit') != head:
               fail('a receipt does not bind the current HEAD')
           source = test_receipt.get('source_inputs_sha256')
@@ -1012,15 +1204,21 @@ jobs:
           cli_rustc = rustc_of(cli_validated)
           if not test_rustc or test_rustc != cli_rustc:
               fail('lib and CLI receipts bind different rustc')
+          if test_validated.schema == 'v1':
+              if re.match(r'^rustc 1\.99\.1(?:\s|$)', test_rustc) is None:
+                  fail('legacy lib receipt rustc is not the trusted 1.99.1 pin')
           support = test_receipt.get('lib_test_support_inputs_sha256')
           if not isinstance(support, str) or not hex64.fullmatch(support):
               fail('lib receipt lacks a lowercase 64-hex lib_test_support_inputs_sha256')
           if 'lib_test_support_inputs_sha256' in cli_receipt:
               fail('CLI receipt unexpectedly carries a test-support digest')
+          if test_validated.schema == 'v2':
+              if support_digest_from_inventory(test_receipt.get('bound_input_inventory')) != support:
+                  fail('lib-test support digest does not match its bound inventory')
           # Lib receipt: exact build_native_test.py --lib argv (cargo test --locked
           # --no-default-features --lib --no-run with the package debug/strip configs).
-          require_command(test_receipt.get('command'), EXPECTED_LIB_COMMAND, 'lib')
-          require_command(cli_receipt.get('command'), EXPECTED_CLI_COMMAND, 'CLI')
+          require_command(test_receipt, EXPECTED_LIB_COMMAND, 'lib', test_validated.schema)
+          require_command(cli_receipt, EXPECTED_CLI_COMMAND, 'CLI', cli_validated.schema)
           if sha(lib) != test_receipt.get('binary_sha256'):
               fail('relocated libtest binary does not match its receipt')
           if sha(cli) != cli_receipt.get('binary_sha256'):
@@ -1038,6 +1236,11 @@ jobs:
           profile = test_artifact.get('profile')
           if not isinstance(profile, dict) or profile.get('test') is not True or profile.get('debuginfo') != 0:
               fail('lib-test artifact profile is not the debug=0 test harness')
+          if test_validated.schema == 'v2':
+              if test_receipt.get('original_artifact_sha256') != test_receipt.get('binary_sha256'):
+                  fail('lib receipt original artifact hash does not match the immutable copy')
+              if test_artifact.get('executable_sha256') != test_receipt.get('binary_sha256'):
+                  fail('lib-test artifact executable hash does not match the immutable copy')
           if cli_receipt.get('target_dir') is None:
               fail('CLI receipt is not the build_native.py receipt')
           cli_artifacts = list(cli_validated.artifacts)
@@ -1049,6 +1252,17 @@ jobs:
                          if cli_validated.schema == 'v2'):
               fail('CLI receipt lacks exactly the rootyard lib and bin artifacts')
           cli_bin = next(item for item in cli_artifacts if item.get('kind') == 'bin')
+          if cli_validated.schema == 'v2':
+              for item in cli_artifacts:
+                  item_profile = item.get('profile')
+                  if not isinstance(item_profile, dict) or item_profile.get('test') is not False \
+                          or item_profile.get('debuginfo') != 0:
+                      fail('CLI receipt artifact is not the debug=0 dev profile')
+              if cli_bin.get('executable_sha256') != cli_receipt.get('binary_sha256'):
+                  fail('CLI bin artifact executable hash does not match the immutable copy')
+              if 'original_artifact_sha256' in cli_receipt \
+                      and cli_receipt.get('original_artifact_sha256') != cli_receipt.get('binary_sha256'):
+                  fail('CLI receipt original artifact hash does not match the immutable copy')
           executable = cli_bin.get('executable') or ''
           if pathlib.Path(executable).resolve() != (workspace / 'target' / 'debug' / 'rootyard').resolve():
               fail('CLI bin artifact is not the workspace target binary')
@@ -1072,16 +1286,45 @@ jobs:
               text=True, capture_output=True)
           if checked.returncode != 0 or checked.stdout.strip() != 't':
               fail('public.cluster_authority is absent from the owned database public schema')
-          (evidence / 'preflight.json').write_text(json.dumps({
+          toolchain_summary = {
+              'cargo': {key: trusted['cargo'][key]
+                        for key in ('release', 'commit_hash', 'host', 'executable_sha256')},
+              'rustc': {key: trusted['rustc'][key]
+                        for key in ('release', 'commit_hash', 'host', 'version')},
+          }
+          preflight = {
               'passed': True, 'head': head, 'source_inputs_sha256': source,
               'lib_test_support_inputs_sha256': support, 'rustc': test_rustc,
               'receipt_schema': test_validated.schema,
               'feature_set': ['no-default-features'],
+              'toolchain': toolchain_summary,
+              'lib_receipt': {
+                  'schema': test_validated.schema,
+                  'path': str(test_validated.receipt_path),
+                  'sha256': test_validated.receipt_sha256,
+                  'evidence_path': str(evidence / 'session174-lib-tests.build.json'),
+              },
+              'cli_receipt': {
+                  'schema': cli_validated.schema,
+                  'path': str(cli_validated.receipt_path),
+                  'sha256': cli_validated.receipt_sha256,
+                  'evidence_path': str(evidence / 'rootyard-cli.build.json'),
+              },
               'lib_command': test_receipt['command'], 'cli_command': cli_receipt['command'],
               'lib_binary_sha256': test_receipt['binary_sha256'],
               'cli_binary_sha256': cli_receipt['binary_sha256'],
+              'lib_artifact': {'target': test_artifact['target'], 'kind': test_artifact['kind'],
+                               'fresh': test_artifact['fresh']},
+              'cli_artifact': {'target': cli_bin['target'], 'kind': cli_bin['kind'],
+                               'fresh': cli_bin['fresh']},
               'cluster_authority': 'public.cluster_authority', 'required_names': names,
-          }, indent=2) + '\n')
+          }
+          if test_validated.schema == 'v2':
+              preflight['v2_features'] = EXPECTED_FEATURES
+              preflight['v2_profiles'] = {'lib': test_receipt['profile'], 'cli': cli_receipt['profile']}
+              preflight['lib_artifact_profile'] = test_artifact['profile']
+              preflight['cli_artifact_profiles'] = [item['profile'] for item in cli_artifacts]
+          (evidence / 'preflight.json').write_text(json.dumps(preflight, indent=2) + '\n')
           print('session174 preflight: receipts bound, CLI migrated, public.cluster_authority present')
           PY
           then
@@ -1214,6 +1457,45 @@ jobs:
           for log in "$evidence"/case-*.log; do
             if [ -f "$log" ]; then cp "$log" test-results/refstore/session174-foundation/; fi
           done
+          # Re-hash the raw consumed receipt copies; never rewrite their JSON.
+          python3 - "$evidence" test-results/refstore/session174-foundation <<'PY'
+          import hashlib, json, pathlib, sys
+
+          source = pathlib.Path(sys.argv[1])
+          target = pathlib.Path(sys.argv[2])
+          try:
+              preflight = json.loads((source / 'preflight.json').read_text())
+          except (OSError, ValueError) as error:
+              raise SystemExit('session174 receipt copy check failed: unreadable preflight evidence: '
+                               + type(error).__name__)
+          checked = {}
+          for key, name in (('lib_receipt', 'session174-lib-tests.build.json'),
+                            ('cli_receipt', 'rootyard-cli.build.json')):
+              record = preflight.get(key)
+              if not isinstance(record, dict):
+                  raise SystemExit('session174 receipt copy check failed: ' + key + ' is missing')
+              anchored = record.get('sha256')
+              if not isinstance(anchored, str) or len(anchored) != 64:
+                  raise SystemExit('session174 receipt copy check failed: ' + key + ' has no anchored SHA-256')
+              consumed = record.get('path')
+              if not isinstance(consumed, str) or not consumed:
+                  raise SystemExit('session174 receipt copy check failed: ' + key + ' has no consumed path')
+              for candidate in (source / name, target / name):
+                  if not candidate.is_file():
+                      raise SystemExit('session174 receipt copy check failed: ' + key
+                                       + ' copy is missing at ' + str(candidate))
+                  actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                  if actual != anchored:
+                      raise SystemExit('session174 receipt copy check failed: ' + key
+                                       + ' bytes changed after verification')
+              checked[key] = {'consumed_path': consumed,
+                              'evidence_path': str(source / name),
+                              'upload_path': str(target / name),
+                              'sha256': anchored}
+          document = {'version': 1, 'issue': 174, 'checked': checked}
+          (source / 'receipt-copy-check.json').write_text(json.dumps(document, indent=2) + '\n')
+          (target / 'receipt-copy-check.json').write_text(json.dumps(document, indent=2) + '\n')
+          PY
           if [ "$status" -ne 0 ]; then
             echo "session174 cases failed (status $status)" >&2
             exit "$status"
@@ -1309,7 +1591,8 @@ jobs:
           mkdir -p "$upload"
           for name in preflight.json preflight.log session174-lib-tests.build.json \
                       session174-lib-tests.stdout.log rootyard-cli.build.json standalone-build.json \
-                      cases.log session174-foundation.json database-cleanup.log; do
+                      cases.log session174-foundation.json database-cleanup.log \
+                      receipt-copy-check.json; do
             [ -f "$evidence/$name" ] && cp "$evidence/$name" "$upload/"
           done
           # One case-N.log per required case; never a fixed case-1..case-4 list.

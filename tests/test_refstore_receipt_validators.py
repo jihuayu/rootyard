@@ -305,7 +305,33 @@ def make_batch_fixture(root, schema, expected, fresh=(True, False), jobs=2,
     }
 
 
-def make_preflight_fixture(root, block):
+def legacy_support_digest(root):
+    """The historical v1 lib-test support closure, recomputed from metadata."""
+    files = {}
+    for directory in receipts.TEST_SUPPORT_DIRS:
+        base = Path(root) / directory
+        if base.is_dir():
+            for item in base.rglob("*"):
+                if item.is_file():
+                    files[item.relative_to(root).as_posix()] = digest(item)
+    folded = hashlib.sha256()
+    for relative in sorted(files):
+        folded.update(relative.encode("utf-8") + b"\0")
+        folded.update(bytes.fromhex(files[relative]))
+    return folded.hexdigest(), files
+
+
+def support_digest_from_inventory(entries):
+    folded = hashlib.sha256()
+    for entry in sorted(entries, key=lambda item: item.get("path", "")):
+        if entry.get("present") is True and entry.get("role") == "test_support":
+            folded.update(entry["path"].encode("utf-8") + b"\0")
+            folded.update(bytes.fromhex(entry["sha256"]))
+    return folded.hexdigest()
+
+
+def make_preflight_fixture(root, block, schema="v2", jobs=None,
+                           fresh=(True, True, False), features=None):
     root = Path(root).resolve()
     tree = ast.parse(block)
     constants = {}
@@ -323,8 +349,11 @@ def make_preflight_fixture(root, block):
     for relative, content in (
         ("Cargo.toml", '[package]\nname = "rootyard"\n'),
         ("Cargo.lock", "version = 3\n"),
+        ("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.1"\n'),
         ("src/lib.rs", "pub fn production() -> u8 { 1 }\n"),
         ("src/main.rs", "fn main() {}\n"),
+        ("tests/blob_gateway_support/helper.rs", "pub fn helper() {}\n"),
+        ("tests/fixtures/asset.bin", "asset-bytes\n"),
         ("experimental/pando/schema.sql", PANDO_SCHEMA_SQL),
     ):
         path = root / relative
@@ -377,9 +406,11 @@ def make_preflight_fixture(root, block):
             "host": "x86_64-unknown-linux-gnu",
         }
 
+    cargo_commit = "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"
+    rust_commit = "d" * 40
     toolchain = {
-        "cargo": identity("cargo", "1.101.0", "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"),
-        "rustc": dict(identity("rustc", "1.99.1", "d" * 40),
+        "cargo": identity("cargo", "1.101.0", cargo_commit),
+        "rustc": dict(identity("rustc", "1.99.1", rust_commit),
                       path_entry=str(toolchain_dir / "rustc"), proxy=False),
         "rustup": {
             "executable": str(toolchain_dir / "rustup"),
@@ -391,8 +422,33 @@ def make_preflight_fixture(root, block):
         "pinned_channel": "1.99.1",
         "pin_source": "rust-toolchain.toml",
     }
+    results = root / "test-results/refstore"
+    results.mkdir(parents=True)
+    record = {
+        "schema": "rootyard/cargo-fork/v1",
+        "revision": cargo_commit,
+        "release": "1.101.0",
+        "full_version": toolchain["cargo"]["version"],
+        "commit_hash": cargo_commit,
+        "host": "x86_64-unknown-linux-gnu",
+        "binary_sha256": toolchain["cargo"]["executable_sha256"],
+        "rustc": {
+            "full_version": toolchain["rustc"]["version"],
+            "release": "1.99.1",
+            "commit_hash": rust_commit,
+            "host": "x86_64-unknown-linux-gnu",
+        },
+    }
+    record_path = results / "cargo-fork.json"
+    record_path.write_text(json.dumps(record))
+
     bound = receipts.capture_bound_inputs(root, environ={"PATH": ""})
-    dev_profile = {"opt_level": "0", "debuginfo": 2, "debug_assertions": True,
+    v2_support = support_digest_from_inventory(bound["bound_input_inventory"])
+    v1_support, _support_files = legacy_support_digest(root)
+    assert v2_support == v1_support, "fixture support closures disagree"
+    source = receipts.source_digest(root)
+    rustc = "rustc 1.99.1 (fake)"
+    dev_profile = {"opt_level": "0", "debuginfo": 0, "debug_assertions": True,
                    "overflow_checks": True, "test": False}
     test_profile = {"opt_level": "0", "debuginfo": 0, "debug_assertions": True,
                     "overflow_checks": True, "test": True}
@@ -401,72 +457,128 @@ def make_preflight_fixture(root, block):
     original_lib.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(lib, original_lib)
     original_lib.chmod(0o700)
-    lib_artifact = receipts.cargo_artifact_record(
-        {
-            "reason": "compiler-artifact",
-            "package_id": "rootyard 0.1.0",
-            "target": {"name": "rootyard", "kind": ["lib"],
-                       "src_path": str(root / "src/lib.rs")},
-            "profile": test_profile,
-            "fresh": True,
-            "executable": str(original_lib),
-        },
-        root,
-    )
-    test_receipt = receipts.make_receipt_v2(
-        binary_path=lib,
-        command=expected_lib,
-        profile="test",
-        artifacts=[lib_artifact],
-        toolchain=toolchain,
-        bound_inputs=bound,
-        workspace_commit=head,
-        target_dir=root / "target",
-        target_triple="x86_64-unknown-linux-gnu",
-        extra={
+
+    commands = (list(expected_lib), list(expected_cli))
+    if schema == "v1":
+        assert jobs is None, "the legacy exact-command anchor has no --jobs fragment"
+    elif jobs is not None:
+        commands = (
+            commands[0] + ["--jobs", str(jobs)],
+            commands[1] + ["--jobs", str(jobs)],
+        )
+
+    if schema == "v1":
+        test_receipt = {
             "kind": "rust-library-test",
             "relocated_artifact": True,
             "original_artifact_sha256": digest(original_lib),
-            "lib_test_support_inputs_sha256": "c" * 64,
-        },
-    )
-    receipts.atomic_write_json(lib.with_suffix(".build.json"), test_receipt)
-
-    cli_lib = receipts.cargo_artifact_record(
-        {
-            "reason": "compiler-artifact",
-            "package_id": "rootyard 0.1.0",
-            "target": {"name": "rootyard", "kind": ["lib"],
-                       "src_path": str(root / "src/lib.rs")},
-            "profile": dev_profile,
-            "fresh": True,
-        },
-        root,
-    )
-    cli_bin = receipts.cargo_artifact_record(
-        {
-            "reason": "compiler-artifact",
-            "package_id": "rootyard 0.1.0",
-            "target": {"name": "rootyard", "kind": ["bin"],
-                       "src_path": str(root / "src/main.rs")},
-            "profile": dev_profile,
+            "workspace_commit": head,
             "fresh": False,
-            "executable": str(target_cli),
-        },
-        root,
-    )
-    cli_receipt = receipts.make_receipt_v2(
-        binary_path=cli,
-        command=expected_cli,
-        profile="dev",
-        artifacts=[cli_lib, cli_bin],
-        toolchain=toolchain,
-        bound_inputs=bound,
-        workspace_commit=head,
-        target_dir=root / "target",
-        target_triple="x86_64-unknown-linux-gnu",
-    )
-    receipts.atomic_write_json(target_cli.with_suffix(".build.json"), cli_receipt)
+            "source_inputs_sha256": source,
+            "binary_sha256": digest(lib),
+            "lib_test_support_inputs_sha256": v1_support,
+            "cargo_lock_sha256": digest(root / "Cargo.lock"),
+            "command": commands[0],
+            "rustc": rustc,
+            "package_rebuilt": True,
+            "fresh_false_artifacts": [
+                {"target": "rootyard", "kind": "lib-test", "fresh": False,
+                 "profile": test_profile, "executable": str(original_lib)},
+            ],
+        }
+        cli_receipt = {
+            "version": 1,
+            "binary_sha256": digest(cli),
+            "source_inputs_sha256": source,
+            "workspace_commit": head,
+            "rustc": rustc,
+            "command": commands[1],
+            "package_rebuilt": True,
+            "target_dir": str(root / "target"),
+            "lock_file": str(root / "Cargo.lock"),
+            "fresh_false_artifacts": [
+                {"target": "rootyard", "kind": "lib", "fresh": False},
+                {"target": "rootyard", "kind": "bin", "fresh": False,
+                 "executable": str(target_cli)},
+            ],
+        }
+        receipts.atomic_write_json(lib.with_suffix(".build.json"), test_receipt)
+        receipts.atomic_write_json(target_cli.with_suffix(".build.json"), cli_receipt)
+    else:
+        if features is None:
+            features = {"enabled": [], "no_default_features": True}
+        lib_artifact = receipts.cargo_artifact_record(
+            {
+                "reason": "compiler-artifact",
+                "package_id": "rootyard 0.1.0",
+                "target": {"name": "rootyard", "kind": ["lib"],
+                           "src_path": str(root / "src/lib.rs")},
+                "profile": test_profile,
+                "fresh": fresh[0],
+                "executable": str(original_lib),
+            },
+            root,
+        )
+        test_receipt = receipts.make_receipt_v2(
+            binary_path=lib,
+            command=commands[0],
+            profile="test",
+            artifacts=[lib_artifact],
+            toolchain=toolchain,
+            bound_inputs=bound,
+            workspace_commit=head,
+            target_dir=root / "target",
+            target_triple="x86_64-unknown-linux-gnu",
+            features=features,
+            extra={
+                "kind": "rust-library-test",
+                "relocated_artifact": True,
+                "original_artifact_sha256": digest(original_lib),
+                "lib_test_support_inputs_sha256": v2_support,
+                "build_options": {"jobs": jobs},
+            },
+        )
+        cli_lib = receipts.cargo_artifact_record(
+            {
+                "reason": "compiler-artifact",
+                "package_id": "rootyard 0.1.0",
+                "target": {"name": "rootyard", "kind": ["lib"],
+                           "src_path": str(root / "src/lib.rs")},
+                "profile": dev_profile,
+                "fresh": fresh[1],
+            },
+            root,
+        )
+        cli_bin = receipts.cargo_artifact_record(
+            {
+                "reason": "compiler-artifact",
+                "package_id": "rootyard 0.1.0",
+                "target": {"name": "rootyard", "kind": ["bin"],
+                           "src_path": str(root / "src/main.rs")},
+                "profile": dev_profile,
+                "fresh": fresh[2],
+                "executable": str(target_cli),
+            },
+            root,
+        )
+        cli_receipt = receipts.make_receipt_v2(
+            binary_path=cli,
+            command=commands[1],
+            profile="dev",
+            artifacts=[cli_lib, cli_bin],
+            toolchain=toolchain,
+            bound_inputs=bound,
+            workspace_commit=head,
+            target_dir=root / "target",
+            target_triple="x86_64-unknown-linux-gnu",
+            features=features,
+            extra={
+                "kind": "native-binary",
+                "build_options": {"jobs": jobs},
+            },
+        )
+        receipts.atomic_write_json(lib.with_suffix(".build.json"), test_receipt)
+        receipts.atomic_write_json(target_cli.with_suffix(".build.json"), cli_receipt)
     return {
         "root": root,
         "evidence": evidence,
@@ -474,6 +586,12 @@ def make_preflight_fixture(root, block):
         "cli": cli,
         "fake_bin": evidence / "fake-bin",
         "head": head,
+        "record": record_path,
+        "schema": schema,
+        "support": v2_support if schema == "v2" else v1_support,
+        "source": source,
+        "target_cli": target_cli,
+        "original_lib": original_lib,
     }
 
 
@@ -498,6 +616,10 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             block for block in blocks
             if "build-pair receipt copy check failed" in block
         )
+        cls.receipt_copy_check = next(
+            block for block in blocks
+            if "session174 receipt copy check failed" in block
+        )
         cls.batch_constants = validator_constants(cls.batch_validator)
 
     def run_batch_validator(self, fixture):
@@ -520,6 +642,53 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def run_preflight_validator(self, fixture, environment=None):
+        environment = dict(os.environ if environment is None else environment)
+        environment.update({
+            "GITHUB_WORKSPACE": str(fixture["root"]),
+            "DATABASE_URL": "postgresql://fixture.invalid/rootyard",
+            "PATH": str(fixture["fake_bin"]) + os.pathsep + environment.get("PATH", ""),
+        })
+        return subprocess.run(
+            [sys.executable, "-", str(fixture["lib"]), str(fixture["cli"])],
+            cwd=fixture["root"],
+            env=environment,
+            input=self.preflight_validator,
+            text=True,
+            capture_output=True,
+        )
+
+    def run_receipt_copy_check(self, source, target):
+        return subprocess.run(
+            [sys.executable, "-", str(source), str(target)],
+            input=self.receipt_copy_check,
+            text=True,
+            capture_output=True,
+        )
+
+    def edit_preflight_receipt(self, fixture, key, mutate):
+        binary = fixture["lib"] if key == "lib" else fixture["target_cli"]
+        path = binary.with_suffix(".build.json")
+        payload = json.loads(path.read_text())
+        mutate(payload)
+        path.write_text(json.dumps(payload))
+
+    def assert_preflight_passes(self, fixture):
+        process = self.run_preflight_validator(fixture)
+        self.assertEqual(
+            process.returncode, 0,
+            f"preflight failed:\n{process.stdout[-2000:]}\n{process.stderr[-2000:]}",
+        )
+        return json.loads((fixture["evidence"] / "preflight.json").read_text())
+
+    def assert_preflight_fails(self, fixture, marker):
+        process = self.run_preflight_validator(fixture)
+        self.assertNotEqual(process.returncode, 0,
+                            f"preflight unexpectedly passed:\n{process.stdout[-2000:]}")
+        self.assertIn(marker, process.stderr,
+                      f"preflight failed without {marker!r}:\n{process.stderr[-2000:]}")
+        return process
 
     def assert_batch_passes(self, fixture):
         process = self.run_batch_validator(fixture)
@@ -556,7 +725,9 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             self.assertNotIn("cargo_artifact_record", block)
         self.assertIn("source_root=workspace", self.batch_validator)
         self.assertIn("verify_source_files=True", self.batch_validator)
-        self.assertIn("verify_source_files=False", self.preflight_validator)
+        self.assertIn("source_root=workspace", self.preflight_validator)
+        self.assertIn("verify_source_files=True", self.preflight_validator)
+        self.assertNotIn("verify_source_files=False", self.preflight_validator)
 
     def test_batch_validator_keeps_v1_and_accepts_v2_booleans(self):
         block = self.batch_validator
@@ -599,13 +770,38 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
         self.assertIn("not isinstance(test_artifact.get('fresh'), bool)", block)
         self.assertIn("EXPECTED_LIB_COMMAND", block)
         self.assertIn("EXPECTED_CLI_COMMAND", block)
+        self.assertIn("EXPECTED_FEATURES", block)
         self.assertIn("test_artifact.get('kind') != 'lib-test'", block)
         self.assertIn("cli_receipt.get('target_dir')", block)
         self.assertIn("pathlib.Path(executable).resolve()", block)
+        # v2 feature/profile/toolchain anchors and the independent setup record.
+        self.assertIn("features.get('enabled') != EXPECTED_FEATURES['enabled']", block)
+        self.assertIn("no_default_features", block)
+        self.assertIn("test_receipt.get('profile') != 'test'", block)
+        self.assertIn("cli_receipt.get('profile') != 'dev'", block)
+        self.assertIn("require_v2_toolchain", block)
+        self.assertIn("test-results/refstore/cargo-fork.json", block)
+        self.assertIn("bind different ' + tool + ' identities", block)
+        # v1 support is recomputed from the closed legacy closure, never echoed.
+        self.assertIn("legacy_support_digest", block)
+        self.assertIn("recorded_support != current_support", block)
+        self.assertIn("bound_input_inventory", block)
+        self.assertNotIn("test_receipt.get('test_source_closure')", block)
+        # Exact raw receipt bytes are anchored and copied without re-serialization.
+        self.assertIn("sha_bytes(test_receipt_bytes)", block)
+        self.assertIn("sha_bytes(cli_receipt_bytes)", block)
+        self.assertIn("write_bytes(cli_receipt_bytes)", block)
+        self.assertNotIn("json.dumps(cli_receipt", block)
+        self.assertIn("'lib_receipt'", block)
+        self.assertIn("'cli_receipt'", block)
+        self.assertIn("'sha256': test_validated.receipt_sha256", block)
         # The old freshness/rebuilt demands are inside the v1 branch.
         v1_branch = block.index("if test_validated.schema == 'v1':")
         self.assertGreater(block.index("test_receipt.get('fresh') is not False"), v1_branch)
         self.assertGreater(block.index("test_receipt.get('package_rebuilt') is not True"), v1_branch)
+        # The immutable copies are hashed; the mutable original need not exist.
+        self.assertIn("original_artifact_sha256", block)
+        self.assertNotIn("original_artifact_sha256.is_file", block)
 
     def test_batch_validator_accepts_positive_v2_cache_hits(self):
         cases = (
@@ -772,31 +968,281 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             self.assertNotEqual(process.returncode, 0)
             self.assertIn("bytes changed after verification", process.stderr)
 
-    def test_preflight_validator_runs_on_v2_receipts_without_a_build(self):
+    def test_preflight_validator_accepts_v2_receipts_and_exact_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = make_preflight_fixture(temporary, self.preflight_validator)
-            environment = os.environ.copy()
-            environment.update({
-                "GITHUB_WORKSPACE": str(fixture["root"]),
-                "DATABASE_URL": "postgresql://fixture.invalid/rootyard",
-                "PATH": str(fixture["fake_bin"]) + os.pathsep + environment.get("PATH", ""),
-            })
-            process = subprocess.run(
-                [sys.executable, "-", str(fixture["lib"]), str(fixture["cli"])],
-                cwd=fixture["root"],
-                env=environment,
-                input=self.preflight_validator,
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(
-                process.returncode, 0,
-                f"v2 preflight failed:\n{process.stdout[-2000:]}\n{process.stderr[-2000:]}",
-            )
-            preflight = json.loads((fixture["evidence"] / "preflight.json").read_text())
+            preflight = self.assert_preflight_passes(fixture)
             self.assertEqual(preflight["receipt_schema"], "v2")
             self.assertEqual(preflight["head"], fixture["head"])
             self.assertEqual(preflight["rustc"], "rustc 1.99.1 (fake)")
+            self.assertEqual(preflight["lib_test_support_inputs_sha256"], fixture["support"])
+            self.assertEqual(preflight["v2_features"],
+                             {"enabled": [], "no_default_features": True})
+            self.assertEqual(preflight["v2_profiles"], {"lib": "test", "cli": "dev"})
+            self.assertEqual(preflight["lib_artifact_profile"]["test"], True)
+            self.assertEqual(preflight["lib_artifact_profile"]["debuginfo"], 0)
+            self.assertTrue(all(row["test"] is False and row["debuginfo"] == 0
+                                for row in preflight["cli_artifact_profiles"]))
+            self.assertEqual(preflight["toolchain"]["cargo"]["release"], "1.101.0")
+            self.assertEqual(preflight["toolchain"]["cargo"]["commit_hash"],
+                             "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b")
+            self.assertEqual(preflight["toolchain"]["rustc"]["release"], "1.99.1")
+            lib_receipt = fixture["lib"].with_suffix(".build.json")
+            cli_receipt = fixture["target_cli"].with_suffix(".build.json")
+            self.assertEqual(preflight["lib_receipt"]["path"], str(lib_receipt.resolve()))
+            self.assertEqual(preflight["lib_receipt"]["sha256"], digest(lib_receipt))
+            self.assertEqual(preflight["cli_receipt"]["path"], str(cli_receipt.resolve()))
+            self.assertEqual(preflight["cli_receipt"]["sha256"], digest(cli_receipt))
+            self.assertEqual(preflight["lib_receipt"]["evidence_path"], str(lib_receipt.resolve()))
+            cli_copy = fixture["evidence"] / "rootyard-cli.build.json"
+            self.assertEqual(cli_copy.read_bytes(), cli_receipt.read_bytes())
+            self.assertEqual(digest(cli_copy), digest(cli_receipt))
+
+    def test_preflight_validator_accepts_positive_v2_cache_hits(self):
+        cases = (
+            ((True, True, True), None),
+            ((False, False, False), None),
+            ((True, False, True), 2),
+        )
+        for fresh, jobs in cases:
+            with self.subTest(fresh=fresh, jobs=jobs), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_preflight_fixture(
+                    temporary, self.preflight_validator, fresh=fresh, jobs=jobs)
+                preflight = self.assert_preflight_passes(fixture)
+                self.assertEqual(preflight["lib_artifact"]["fresh"], fresh[0])
+                self.assertEqual(preflight["cli_artifact"]["fresh"], fresh[2])
+                if jobs is None:
+                    self.assertNotIn("--jobs", preflight["lib_command"])
+                    self.assertNotIn("--jobs", preflight["cli_command"])
+                else:
+                    self.assertEqual(preflight["lib_command"][-2:], ["--jobs", str(jobs)])
+                    self.assertEqual(preflight["cli_command"][-2:], ["--jobs", str(jobs)])
+
+    def test_preflight_validator_does_not_require_original_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(temporary, self.preflight_validator)
+            # Only the immutable same-hash copies and the receipt under target/
+            # remain; the mutable Cargo artifacts and compiler originals do not.
+            fixture["target_cli"].unlink()
+            fixture["original_lib"].unlink()
+            preflight = self.assert_preflight_passes(fixture)
+            self.assertEqual(preflight["lib_receipt"]["sha256"],
+                             digest(fixture["lib"].with_suffix(".build.json")))
+            self.assertEqual(preflight["cli_receipt"]["sha256"],
+                             digest(fixture["target_cli"].with_suffix(".build.json")))
+
+    def test_preflight_validator_accepts_fully_bound_v1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(
+                temporary, self.preflight_validator, schema="v1")
+            preflight = self.assert_preflight_passes(fixture)
+            self.assertEqual(preflight["receipt_schema"], "v1")
+            self.assertEqual(preflight["lib_test_support_inputs_sha256"], fixture["support"])
+            self.assertEqual(preflight["lib_test_support_inputs_sha256"],
+                             legacy_support_digest(fixture["root"])[0])
+            self.assertNotIn("v2_features", preflight)
+            self.assertNotIn("v2_profiles", preflight)
+            self.assertEqual(preflight["lib_receipt"]["sha256"],
+                             digest(fixture["lib"].with_suffix(".build.json")))
+            self.assertEqual(preflight["cli_receipt"]["sha256"],
+                             digest(fixture["target_cli"].with_suffix(".build.json")))
+
+    def test_preflight_validator_rejects_tampered_v2_contracts(self):
+        def features(payload):
+            payload["features"]["enabled"] = ["pando-lab"]
+
+        def no_default(payload):
+            payload["features"]["no_default_features"] = False
+
+        def lib_profile(payload):
+            payload["profile"] = "dev"
+
+        def cli_profile(payload):
+            payload["profile"] = "test"
+
+        def lib_artifact_profile(payload):
+            payload["cargo_artifacts"][0]["profile"]["test"] = False
+
+        def cli_artifact_profile(payload):
+            for item in payload["cargo_artifacts"]:
+                if item["kind"] == "bin":
+                    item["profile"]["debuginfo"] = 2
+
+        def lib_toolchain(payload):
+            payload["toolchain"]["cargo"]["executable_sha256"] = "0" * 64
+
+        def cli_toolchain(payload):
+            payload["toolchain"]["rustc"]["commit_hash"] = "e" * 40
+
+        def lib_support(payload):
+            payload["lib_test_support_inputs_sha256"] = "0" * 64
+
+        def cli_support(payload):
+            payload["lib_test_support_inputs_sha256"] = "0" * 64
+
+        def lib_command(payload):
+            index = payload["command"].index("--no-default-features")
+            payload["command"][index] = "--default-features"
+
+        def jobs_mismatch(payload):
+            payload["build_options"]["jobs"] = 3
+
+        def record_release(fixture):
+            record = json.loads(fixture["record"].read_text())
+            record["rustc"]["release"] = "1.99.2"
+            fixture["record"].write_text(json.dumps(record))
+
+        def record_cargo_sha(fixture):
+            record = json.loads(fixture["record"].read_text())
+            record["binary_sha256"] = "0" * 64
+            fixture["record"].write_text(json.dumps(record))
+
+        def record_revision(fixture):
+            record = json.loads(fixture["record"].read_text())
+            record["revision"] = "e" * 40
+            fixture["record"].write_text(json.dumps(record))
+
+        def source_file(fixture):
+            (fixture["root"] / "src/lib.rs").write_text("pub fn changed() -> u8 { 2 }\n")
+
+        def support_file(fixture):
+            (fixture["root"] / "tests/blob_gateway_support/helper.rs").write_text(
+                "pub fn helper() -> u8 { 2 }\n")
+
+        cases = (
+            ("lib-features", "lib", features, "lib receipt enables unexpected features"),
+            ("cli-features", "cli", features, "CLI receipt enables unexpected features"),
+            ("lib-no-default", "lib", no_default,
+             "lib receipt does not record no_default_features=true"),
+            ("cli-no-default", "cli", no_default,
+             "CLI receipt does not record no_default_features=true"),
+            ("lib-profile", "lib", lib_profile, "lib receipt top-level profile is not test"),
+            ("cli-profile", "cli", cli_profile, "CLI receipt top-level profile is not dev"),
+            ("lib-artifact-profile", "lib", lib_artifact_profile,
+             "profile.test must be exactly true"),
+            ("cli-artifact-profile", "cli", cli_artifact_profile,
+             "CLI receipt artifact is not the debug=0 dev profile"),
+            ("lib-toolchain", "lib", lib_toolchain,
+             "does not match the trusted CI pin"),
+            ("cli-toolchain", "cli", cli_toolchain,
+             "does not match the trusted CI pin"),
+            ("lib-support", "lib", lib_support,
+             "lib-test support digest does not match its bound inventory"),
+            ("cli-support", "cli", cli_support,
+             "CLI receipt unexpectedly carries a test-support digest"),
+            ("lib-command", "lib", lib_command, "expected exactly"),
+            ("source", None, source_file, "differs from the current source root"),
+            ("support", None, support_file,
+             "bound input inventory differs from the current source root"),
+            ("record", None, record_release, "trusted rustc release is not 1.99.1"),
+            ("record-cargo-sha", None, record_cargo_sha,
+             "does not match the trusted CI pin"),
+            ("record-revision", None, record_revision,
+             "trusted toolchain record revision is not the pinned Cargo commit"),
+        )
+        for name, key, mutate, marker in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_preflight_fixture(temporary, self.preflight_validator)
+                if key is None:
+                    mutate(fixture)
+                else:
+                    self.edit_preflight_receipt(fixture, key, mutate)
+                self.assert_preflight_fails(fixture, marker)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(
+                temporary, self.preflight_validator, jobs=2)
+            self.edit_preflight_receipt(fixture, "lib", jobs_mismatch)
+            self.assert_preflight_fails(fixture, "--jobs budget does not match build_options.jobs")
+
+    def test_preflight_validator_rejects_weak_legacy_support(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(
+                temporary, self.preflight_validator, schema="v1")
+            self.edit_preflight_receipt(
+                fixture, "lib",
+                lambda payload: payload.update(lib_test_support_inputs_sha256="0" * 64))
+            parsed = receipts.load_receipt(
+                fixture["lib"].with_suffix(".build.json"),
+                source_root=fixture["root"], binary_path=fixture["lib"],
+                expected_commit=fixture["head"], verify_source_files=True)
+            self.assertEqual(parsed.schema, "v1")
+            self.assert_preflight_fails(
+                fixture, "does not match the current historical support closure")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(
+                temporary, self.preflight_validator, schema="v1")
+            self.edit_preflight_receipt(
+                fixture, "lib",
+                lambda payload: payload.pop("lib_test_support_inputs_sha256"))
+            parsed = receipts.load_receipt(
+                fixture["lib"].with_suffix(".build.json"),
+                source_root=fixture["root"], binary_path=fixture["lib"],
+                expected_commit=fixture["head"], verify_source_files=True)
+            self.assertEqual(parsed.schema, "v1")
+            self.assert_preflight_fails(fixture, "lacks a lowercase 64-hex")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(
+                temporary, self.preflight_validator, schema="v1")
+            (fixture["root"] / "tests/blob_gateway_support/helper.rs").write_text(
+                "pub fn helper() -> u8 { 2 }\n")
+            parsed = receipts.load_receipt(
+                fixture["lib"].with_suffix(".build.json"),
+                source_root=fixture["root"], binary_path=fixture["lib"],
+                expected_commit=fixture["head"], verify_source_files=True)
+            self.assertEqual(parsed.schema, "v1")
+            self.assert_preflight_fails(
+                fixture, "does not match the current historical support closure")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(
+                temporary, self.preflight_validator, schema="v1")
+            for key in ("lib", "cli"):
+                self.edit_preflight_receipt(
+                    fixture, key,
+                    lambda payload: payload.update(rustc="rustc 1.99.2 (fake)"))
+            self.assert_preflight_fails(
+                fixture, "legacy lib receipt rustc is not the trusted 1.99.1 pin")
+
+    def test_receipt_copy_check_rejects_copied_bytes_changed_after_anchor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "evidence"
+            target = root / "upload"
+            source.mkdir()
+            target.mkdir()
+            lib_bytes = b'{"receipt": "lib"}\n'
+            cli_bytes = b'{"receipt": "cli"}\n'
+            for directory in (source, target):
+                (directory / "session174-lib-tests.build.json").write_bytes(lib_bytes)
+                (directory / "rootyard-cli.build.json").write_bytes(cli_bytes)
+            preflight = {
+                "lib_receipt": {
+                    "path": str(source / "session174-lib-tests.build.json"),
+                    "sha256": hashlib.sha256(lib_bytes).hexdigest(),
+                },
+                "cli_receipt": {
+                    "path": str(source / "rootyard-cli.build.json"),
+                    "sha256": hashlib.sha256(cli_bytes).hexdigest(),
+                },
+            }
+            (source / "preflight.json").write_text(json.dumps(preflight))
+            process = self.run_receipt_copy_check(source, target)
+            self.assertEqual(process.returncode, 0, process.stderr[-2000:])
+            checked = json.loads((target / "receipt-copy-check.json").read_text())
+            self.assertEqual(checked["checked"]["lib_receipt"]["sha256"],
+                             hashlib.sha256(lib_bytes).hexdigest())
+            self.assertEqual(checked["checked"]["cli_receipt"]["sha256"],
+                             hashlib.sha256(cli_bytes).hexdigest())
+
+            with (target / "rootyard-cli.build.json").open("ab") as stream:
+                stream.write(b"\n")
+            process = self.run_receipt_copy_check(source, target)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("bytes changed after verification", process.stderr)
+            self.assertIn("cli_receipt", process.stderr)
 
     def test_validators_never_build_or_probe(self):
         """Only metadata/validation calls are allowed, never a build command."""
