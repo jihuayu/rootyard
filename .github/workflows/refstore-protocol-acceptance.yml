@@ -385,6 +385,8 @@ jobs:
               except (OSError, ValueError) as error:
                   fail('unreadable trusted toolchain record ' + repr(str(path)) + ': ' + type(error).__name__)
               check(isinstance(record, dict), 'trusted toolchain record is not an object')
+              check(record.get('schema') == 'rootyard/ci-cargo-fork/v1',
+                    'trusted toolchain record schema is not rootyard/ci-cargo-fork/v1')
               check(record.get('revision') == EXPECTED_CARGO_COMMIT,
                     'trusted toolchain record revision is not the pinned Cargo commit')
               check(record.get('commit_hash') == EXPECTED_CARGO_COMMIT,
@@ -961,6 +963,8 @@ jobs:
                   fail('unreadable trusted toolchain record ' + repr(str(path)) + ': ' + type(error).__name__)
               if not isinstance(record, dict):
                   fail('trusted toolchain record is not an object')
+              if record.get('schema') != 'rootyard/ci-cargo-fork/v1':
+                  fail('trusted toolchain record schema is not rootyard/ci-cargo-fork/v1')
               if record.get('revision') != EXPECTED_CARGO_COMMIT:
                   fail('trusted toolchain record revision is not the pinned Cargo commit')
               if record.get('commit_hash') != EXPECTED_CARGO_COMMIT:

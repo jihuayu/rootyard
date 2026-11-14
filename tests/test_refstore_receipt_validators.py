@@ -150,7 +150,7 @@ def make_batch_fixture(root, schema, expected, fresh=(True, False), jobs=2,
         "pin_source": "rust-toolchain.toml",
     }
     record = {
-        "schema": "rootyard/cargo-fork/v1",
+        "schema": "rootyard/ci-cargo-fork/v1",
         "revision": cargo_commit,
         "release": cargo_release,
         "full_version": toolchain["cargo"]["version"],
@@ -425,7 +425,7 @@ def make_preflight_fixture(root, block, schema="v2", jobs=None,
     results = root / "test-results/refstore"
     results.mkdir(parents=True)
     record = {
-        "schema": "rootyard/cargo-fork/v1",
+        "schema": "rootyard/ci-cargo-fork/v1",
         "revision": cargo_commit,
         "release": "1.101.0",
         "full_version": toolchain["cargo"]["version"],
@@ -934,6 +934,58 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
                 fixture = make_batch_fixture(temporary, "v2", self.batch_constants)
                 mutate(fixture)
                 self.assert_batch_fails(fixture, marker)
+
+    def installer_cargo_fork_schema(self):
+        installer = (SCRIPTS / "install_ci_cargo_fork.sh").read_text(encoding="utf-8")
+        match = re.search(r"^readonly SCHEMA=(\S+)$", installer, re.MULTILINE)
+        self.assertIsNotNone(match, "installer no longer declares a SCHEMA")
+        return match.group(1)
+
+    def edit_toolchain_record(self, fixture, mutate):
+        record = json.loads(fixture["record"].read_text())
+        mutate(record)
+        fixture["record"].write_text(json.dumps(record))
+
+    def test_loaders_accept_the_actual_installer_toolchain_schema(self):
+        schema = self.installer_cargo_fork_schema()
+        self.assertEqual(schema, "rootyard/ci-cargo-fork/v1")
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_batch_fixture(temporary, "v2", self.batch_constants)
+            record = json.loads(fixture["record"].read_text())
+            self.assertEqual(record["schema"], schema)
+            manifest = self.assert_batch_passes(fixture)
+            # The trusted rustc version still comes from rustc.full_version;
+            # this is the mapping a retracted review rumor called a KeyError.
+            self.assertEqual(manifest["toolchain"]["rustc"]["version"],
+                             record["rustc"]["full_version"])
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(temporary, self.preflight_validator)
+            record = json.loads(fixture["record"].read_text())
+            self.assertEqual(record["schema"], schema)
+            preflight = self.assert_preflight_passes(fixture)
+            self.assertEqual(preflight["toolchain"]["rustc"]["version"],
+                             record["rustc"]["full_version"])
+
+    def test_loaders_reject_missing_or_foreign_toolchain_schema(self):
+        schema = self.installer_cargo_fork_schema()
+        marker = "trusted toolchain record schema is not " + schema
+        cases = (
+            ("missing", lambda record: record.pop("schema")),
+            ("invented", lambda record: record.update(schema="rootyard/cargo-fork/v1")),
+            ("foreign-version",
+             lambda record: record.update(schema="rootyard/ci-cargo-fork/v2")),
+        )
+        for name, mutate in cases:
+            with self.subTest(validator="batch", case=name), \
+                    tempfile.TemporaryDirectory() as temporary:
+                fixture = make_batch_fixture(temporary, "v2", self.batch_constants)
+                self.edit_toolchain_record(fixture, mutate)
+                self.assert_batch_fails(fixture, marker)
+            with self.subTest(validator="preflight", case=name), \
+                    tempfile.TemporaryDirectory() as temporary:
+                fixture = make_preflight_fixture(temporary, self.preflight_validator)
+                self.edit_toolchain_record(fixture, mutate)
+                self.assert_preflight_fails(fixture, marker)
 
     def test_batch_validator_rejects_v1_source_and_integration_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
