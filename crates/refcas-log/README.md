@@ -17,9 +17,10 @@ identity, vote, optional committed log ID and optional exact native purged log
 ID. `log_entry` stores the index and JSON for the native log ID and entry.
 Both tables store SHA-256 checksums over length-prefixed fields with separate
 metadata and entry domains. Reads verify checksums before decoding. Opening
-validates metadata, identity, the final entry and optionally SQLite
-`quick_check`; it does not scan every historical entry. Unknown formats,
-corruption and identity mismatch cause errors without resetting the database.
+validates metadata, identity, the final entry, and retained-index density from
+the correct lower bound through the tail; it does not decode every historical
+entry. SQLite `quick_check` remains optional. Unknown formats, corruption and
+identity mismatch cause errors without resetting the database.
 
 Mutations commit before returning. `append` reports `LogFlushed` success only
 after COMMIT. If storage returns an error, callers must treat persistence as
@@ -59,6 +60,41 @@ reads. SQLite `quick_check` cannot see a lost row; this check is what catches
 one. Without a persisted end (after deletes from a prefix back to the tail) no
 evidence of a hole remains, and the reduced log is reported, as openraft permits.
 
+`open` also runs the density check before returning a handle. With a persisted
+purge boundary, the required live lower bound is the boundary's successor; the
+exact boundary row is allowed residue but is excluded from the live aggregate and
+never substitutes for the successor. Without a boundary, the smallest stored row
+is the only observable lower bound. The pinned openraft 0.9.26
+`RaftLogStorage`/`RaftLogReader` contract requires consecutive entries but does
+not require a fresh retained store to begin at index 0: `Raft::initialize` is
+what places the initial membership log at index 0, and this store's trait contract
+also accepts a legal positive first index. The startup check therefore does not
+invent an index-zero invariant. On-disk compatibility is unchanged: the format
+marker remains `rootyard-refcas-log/3`, a dense existing database opens normally,
+and no migration is attempted.
+
+The density proof is a primary-key aggregate (`count`, `min`, `max`) over the
+required live range, with a first-gap index lookup only on mismatch. Memory is
+O(1) and historical row payloads are not decoded, but a healthy open now pays an
+O(N) covering-index scan instead of the previous O(log N) tail lookup. That
+startup cost is the price of refusing a store with an internal missing row before
+`get_log_state` or any range read can present it as healthy. `quick_check` remains
+a separate optional O(N) check.
+
+The startup check cannot prove absence of loss without an independent witness.
+Deleting the entire log leaves a valid empty store; deleting a fresh prefix moves
+the only observable lower bound up; deleting an uncommitted suffix moves the tail
+down; and deleting a span together with every later row leaves a shorter dense
+log. The persisted purge boundary and the surviving rows are the only inputs used
+here; the optional committed log ID is not treated as a live lower bound because
+purge may legally advance beyond it. Detecting those cases needs an independent
+expected bound, such as durable state-machine/snapshot progress or out-of-band
+replica evidence. Read-time checks remain in place as defense in depth and can
+still fail when a request's known lower bound intersects a lost row, but they do
+not repair or infer a missing witness. This checkpoint therefore establishes
+bounded startup refusal for internal holes and purge-successor gaps, not a
+whole-log physical-loss guarantee.
+
 `purge` is inclusive and writes its `meta` boundary in the same transaction that
 deletes rows, so the only row a purge can leave at the boundary index is one
 carrying the boundary's own `LogId` (an entry whose commit was lost). That row is
@@ -84,12 +120,18 @@ cargo clippy --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 cargo test --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 ```
 
-Twenty-one unit tests in `src/lib.rs` cover restart, exact purge identity,
+Twenty-four unit tests in `src/lib.rs` cover restart, exact purge identity,
 replay, committed rewrite refusal, holes, truncation, snapshot-style purge,
-bounds, identity/lock refusal, and malformed or valid-JSON corruption. They
-delete rows directly in SQLite (after a passing `quick_check`) and reopen: an
-internal row, index 0 with several holes, the row after the purge boundary, and
-a prefix-to-tail deletion with its documented limit. Limited reads are covered
+bounds, identity/lock refusal, and malformed or valid-JSON corruption. Startup
+contiguity regressions delete a middle live row in a still-valid SQLite database,
+verify that later rows remain, and require a fresh `open` to refuse before
+`get_log_state` or a range read; a purge-successor gap is refused even when the
+allowed exact boundary row is present, while a dense suffix above that residue
+still opens. A positive-first-index dense store is accepted without an index-zero
+assumption. The older hole tests now delete rows behind a retained handle so the
+read-time defense-in-depth checks still run, then require the corresponding fresh
+open to refuse; the fresh-prefix-to-tail deletion remains a successful open and
+is explicitly documented as the no-witness limit. Limited reads are covered
 when the lost head or middle index is followed by enough rows to fill the count
 budget (fcb22c5 returned them), and when a byte budget stops below the count
 budget (fcb22c5 called that valid prefix a hole); a full read over either budget
@@ -159,9 +201,8 @@ State machine storage, snapshots, RPC, TLS, ReadIndex, complete openraft suite,
 Ref-CAS integration and multi-host qualification remain unimplemented. This
 slice does not complete issues #149 or #115 and has no production routing.
 
-A separate follow-up must decide whether to fail closed on a non-dense retained
-log during `open` and whether a fresh unpurged store must start at index 0: a
-middle-row delete can currently pass `open` and fail a later read, and the
-pinned OpenRaft storage contract and existing tests must be checked before
-changing first-index behavior. This checkpoint does not combine that contiguity
-change.
+This checkpoint adds bounded startup refusal for a non-dense retained log and
+preserves legal positive first indexes without changing the on-disk format. It
+does not implement migration of already-corrupt stores, whole-log physical-loss
+detection, state-machine/snapshot witnesses, or the rest of #149. A non-dense
+database is refused, not repaired; an operator must investigate or restore it.
