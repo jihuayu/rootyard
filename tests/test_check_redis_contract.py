@@ -858,7 +858,12 @@ class RedisContractWorkflowTest(unittest.TestCase):
             "--package-debug 0",
             "--strip-debuginfo",
             "--output test-results/state-redis/rootyard-lib-test",
+            '--artifact-store "$HOME/.cache/rootyard/native-artifacts"',
             "> test-results/state-redis/build-summary.json",
+            "test -f test-results/state-redis/rootyard-lib-test",
+            "test -f test-results/state-redis/rootyard-lib-test.build.json",
+            "test ! -w test-results/state-redis/rootyard-lib-test",
+            "test ! -w test-results/state-redis/rootyard-lib-test.build.json",
         ):
             self.assertIn(required, builder_block)
         upload = self._index("uses: actions/upload-artifact@v4")
@@ -870,9 +875,12 @@ class RedisContractWorkflowTest(unittest.TestCase):
             "--log-dir test-results/state-redis/logs",
         ):
             self.assertIn(required, checker_block)
+        self.assertNotIn("--artifact-store", checker_block)
         upload_block = "\n".join(self.lines[upload:])
         self.assertIn("test-results/state-redis/rootyard-lib-test.build.json", upload_block)
         self.assertIn("test-results/state-redis/build-summary.json", upload_block)
+        self.assertNotIn("native-artifacts", upload_block)
+        self.assertNotIn("test-results/state-redis/rootyard-lib-test\n", upload_block)
         self.assertIn("if: always()", self.text)
 
     def test_existing_toolchain_clippy_redis_fixture_and_budget_are_preserved(self):

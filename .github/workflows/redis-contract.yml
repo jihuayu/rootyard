@@ -72,7 +72,12 @@ jobs:
             --package-debug 0 \
             --strip-debuginfo \
             --output test-results/state-redis/rootyard-lib-test \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
             > test-results/state-redis/build-summary.json
+          test -f test-results/state-redis/rootyard-lib-test
+          test -f test-results/state-redis/rootyard-lib-test.build.json
+          test ! -w test-results/state-redis/rootyard-lib-test
+          test ! -w test-results/state-redis/rootyard-lib-test.build.json
       - name: Run owned plaintext, TLS, untrusted-CA and restored-trust contract
         run: |
           mkdir -p test-results/state-redis
