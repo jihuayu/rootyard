@@ -546,17 +546,17 @@ fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res
     let (rows, stop) = read_rows(conn, idx_to_i64(first)?, idx_to_i64(end)?, limited)?;
     // The head is required for every result, budget stops included.
     if rows.first().is_none_or(|(idx, _)| *idx != first) {
-        if purged.is_none() {
-            if let Some(min) = stored_min(conn)? {
-                // The requested interval ended before any stored row: there is no live index in it.
-                if end <= min {
-                    return Ok(Vec::new());
-                }
-                if min > first {
-                    return Err(E::Refused(format!(
-                        "log range starts at {first} below the retained first index {min} with no purge boundary; the unavailable prefix cannot be served"
-                    )));
-                }
+        if purged.is_none()
+            && let Some(min) = stored_min(conn)?
+        {
+            // The requested interval ended before any stored row: there is no live index in it.
+            if end <= min {
+                return Ok(Vec::new());
+            }
+            if min > first {
+                return Err(E::Refused(format!(
+                    "log range starts at {first} below the retained first index {min} with no purge boundary; the unavailable prefix cannot be served"
+                )));
             }
         }
         return Err(E::Refused(format!("log entry {first} is missing although it is stored")));
