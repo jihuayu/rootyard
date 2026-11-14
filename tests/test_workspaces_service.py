@@ -143,7 +143,8 @@ class WorkspaceServiceTest(unittest.TestCase):
         The replay intentionally carries the pre-restart expected revision and
         lease epoch. It must return the stored result instead of a version
         conflict, and neither replay nor the rejected stale mutation may advance
-        the revision, change the file/index bytes, or append an event.
+        the revision, change the working-tree, index, or HEAD bytes, or append
+        an event.
         """
         h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
         try:
@@ -153,6 +154,8 @@ class WorkspaceServiceTest(unittest.TestCase):
                 extra_headers={"Idempotency-Key":"replay-create"}))
             wid = ws["id"]
             path = f"/api/workspaces/{wid}/files?path=hello.txt"
+            def file_view(kind):
+                return json.loads(h.expect(f"{path}&view={kind}",200,token=h.alice))
             put = {"content_base64":base64.b64encode(b"v1\n").decode(),"expected_entry_version":0,
                    "expected_workspace_revision":0,"lease_epoch":ws["lease_epoch"]}
             first_put = json.loads(h.expect(path,200,token=h.alice,method="PUT",body=put,
@@ -163,13 +166,24 @@ class WorkspaceServiceTest(unittest.TestCase):
                 method="POST",body=checkpoint_body,extra_headers={"Idempotency-Key":"replay-checkpoint"}))
             self.assertEqual(checkpoint["captured_revision"],1)
             self.assertEqual(checkpoint["workspace_revision"],2)
+            index_before_restart = file_view("index")
+            head_before_restart = file_view("head")
+            self.assertEqual(index_before_restart["workspace_revision"],2)
+            self.assertEqual(head_before_restart["workspace_revision"],2)
+            self.assertEqual(index_before_restart["entry_version"],1)
+            self.assertEqual(base64.b64decode(index_before_restart["content_base64"]),b"second\n")
+            self.assertEqual(base64.b64decode(head_before_restart["content_base64"]),b"second\n")
             h.stop(hard=True); h.start()
             replay = json.loads(h.expect(f"/api/workspaces/{wid}/checkpoints",200,token=h.alice,
                 method="POST",body=checkpoint_body,extra_headers={"Idempotency-Key":"replay-checkpoint"}))
             self.assertEqual(replay,checkpoint)
+            self.assertEqual(file_view("index"),index_before_restart)
+            self.assertEqual(file_view("head"),head_before_restart)
             put_replay = json.loads(h.expect(path,200,token=h.alice,method="PUT",body=put,
                 extra_headers={"Idempotency-Key":"replay-put"}))
             self.assertEqual(put_replay,first_put)
+            self.assertEqual(file_view("index"),index_before_restart)
+            self.assertEqual(file_view("head"),head_before_restart)
             current = json.loads(h.expect(f"/api/workspaces/{wid}",200,token=h.alice))
             self.assertEqual(current["revision"],2)
             self.assertEqual(current["last_checkpoint_id"],checkpoint["checkpoint_id"])
@@ -178,15 +192,28 @@ class WorkspaceServiceTest(unittest.TestCase):
             lease = json.loads(h.expect(f"/api/workspaces/{wid}/lease",200,token=h.alice,method="POST",
                 body={"expected_lease_epoch":1}))
             self.assertEqual(lease["lease_epoch"],2)
+            index_before_stale = file_view("index")
+            head_before_stale = file_view("head")
+            working_before_stale = file_view("working")
+            self.assertEqual(index_before_stale,index_before_restart)
+            self.assertEqual(head_before_stale,head_before_restart)
+            self.assertEqual(index_before_stale["entry_version"],1)
+            self.assertEqual(base64.b64decode(index_before_stale["content_base64"]),b"second\n")
             stale_put = {"content_base64":base64.b64encode(b"stale\n").decode(),"expected_entry_version":1,
                          "expected_workspace_revision":2,"lease_epoch":1}
             status, raw, _ = h.http(path,token=h.alice,method="PUT",body=stale_put,
                 extra_headers={"Idempotency-Key":"replay-stale-put"})
             self.assertEqual(status,409,raw)
+            self.assertEqual(file_view("index"),index_before_stale)
+            self.assertEqual(file_view("head"),head_before_stale)
+            self.assertEqual(file_view("working"),working_before_stale)
             status, raw, _ = h.http(f"/api/workspaces/{wid}/checkpoints",token=h.alice,method="POST",
                 body={"expected_workspace_revision":2,"lease_epoch":1},
                 extra_headers={"Idempotency-Key":"replay-stale-checkpoint"})
             self.assertEqual(status,409,raw)
+            self.assertEqual(file_view("index"),index_before_stale)
+            self.assertEqual(file_view("head"),head_before_stale)
+            self.assertEqual(file_view("working"),working_before_stale)
             current = json.loads(h.expect(f"/api/workspaces/{wid}",200,token=h.alice))
             self.assertEqual(current["revision"],2)
             self.assertEqual(current["lease_epoch"],2)
