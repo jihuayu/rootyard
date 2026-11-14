@@ -28,6 +28,8 @@ use uuid::Uuid;
 
 const OP_SECONDS: u64 = 120;
 const ROOT_ENV: &str = "ROOTYARD_BLOB_ROOT";
+/// The fixture-owned relative prefix that isolates every test process.
+pub const RUN_BLOB_PREFIX: &str = "blob-gateway-suite/";
 
 pub fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(OP_SECONDS)
@@ -151,7 +153,7 @@ impl RunEnvironment {
             .map_err(|_| anyhow::anyhow!("ROOTYARD_TEST_DATABASE_URL must be set for the blob_git_gateway suite"))?;
         let schema = format!("blob_git_gateway_{}", Uuid::new_v4().simple());
         let pinned = with_search_path(&url, &schema)?;
-        let root = format!("blob-gateway-suite/{}", Uuid::new_v4().simple());
+        let root = format!("{RUN_BLOB_PREFIX}{}", Uuid::new_v4().simple());
         ensure!(!root.starts_with('/') && root.split('/').all(|part| !part.is_empty()), "fixture prefix is relative");
         // SAFETY: every read of these variables in this test binary goes through
         // this module's `OnceLock`, i.e. strictly after this single write, and

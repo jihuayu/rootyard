@@ -62,6 +62,7 @@ pub use contract::{
     TENANT_MAX_RECEIPTS, TENANT_MAX_REGISTRATIONS, VERIFIER_MAX_CONCURRENT, VERIFIER_MAX_OBJECTS, VERIFIER_MAX_PAIRS,
     VERIFIER_MAX_RESULT_REFS, VERIFIER_MAX_TOTAL_BYTES,
 };
+pub(crate) use error::GATE_REVISION_MISMATCH_DETAIL;
 pub use error::{PackCommitError, PackCommitRejectCode, PackCommitRejection};
 pub(crate) use facts::{RefFacts, VerifiedPublicationFacts};
 pub use pg::PgPackCommit;
