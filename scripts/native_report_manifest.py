@@ -13,7 +13,9 @@ Two modes:
 * ``--mode job`` validates one ``scripts/build_native.py`` receipt plus the
   reports and logs produced by that job, and writes a job manifest containing
   the commit, the compiled source-input digest, the binary digest, the harness
-  digests and the safe (credential-free) fixture versions.
+  digests and the safe (credential-free) fixture versions.  An optional
+  exporter-provided expected batch-manifest SHA-256 (and path) anchors the exact
+  raw bytes consumed and recorded as provenance.
 * ``--mode release`` consumes job manifests, re-verifies their harness digests
   against the current checkout, requires one shared commit and one shared
   source-input digest, checks the candidate-scoped reports and pinned fixture
@@ -422,8 +424,34 @@ def load_receipt(path, binary_override):
     return receipt, validated, file, binary
 
 
-def verify_batch_receipt(receipt, validated, receipt_file, binary):
+def verify_batch_receipt(receipt, validated, receipt_file, binary,
+                         expected_manifest_sha=None, expected_manifest_path=None):
+    """Validate the batch link and bind the exact manifest bytes consumed.
+
+    ``expected_manifest_sha`` and ``expected_manifest_path`` are optional
+    exporter-provided trust anchors.  When supplied, the SHA-256 is compared
+    against the same raw byte buffer that is parsed and later recorded as the
+    job manifest provenance, so a later re-read cannot hide a rewrite.
+    """
+    if expected_manifest_sha is not None:
+        require(
+            isinstance(expected_manifest_sha, str)
+            and len(expected_manifest_sha) == 64
+            and expected_manifest_sha == expected_manifest_sha.lower()
+            and all(char in "0123456789abcdef" for char in expected_manifest_sha),
+            "expected batch manifest SHA-256 must be 64 lowercase hexadecimal characters",
+        )
+    if expected_manifest_path is not None:
+        expected_path = _absolute_recorded(
+            expected_manifest_path, "expected batch manifest", "path"
+        )
+    else:
+        expected_path = None
     if not isinstance(receipt, dict) or "batch" not in receipt:
+        require(
+            expected_manifest_sha is None and expected_path is None,
+            "an explicit batch manifest anchor was supplied but the build receipt has no batch link",
+        )
         return None
     batch = receipt["batch"]
     require(isinstance(batch, dict), "batch receipt must be an object")
@@ -458,6 +486,11 @@ def verify_batch_receipt(receipt, validated, receipt_file, binary):
         manifest_path.is_symlink() is False,
         "batch receipt manifest must not be a symlink",
     )
+    if expected_path is not None:
+        require(
+            _resolved_equal(manifest_path, expected_path),
+            "batch receipt manifest path does not match the exporter-provided path",
+        )
     targets = batch.get("targets")
     require(
         isinstance(targets, list) and targets,
@@ -469,8 +502,19 @@ def verify_batch_receipt(receipt, validated, receipt_file, binary):
     )
 
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
+        raw = manifest_path.read_bytes()
+    except OSError as error:
+        raise ManifestError(f"batch receipt manifest cannot be read: {error}") from error
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    if expected_manifest_sha is not None:
+        require(
+            raw_sha256 == expected_manifest_sha,
+            "batch receipt manifest SHA-256 does not match the exporter-validated SHA-256",
+        )
+
+    try:
+        manifest = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as error:
         raise ManifestError("batch receipt manifest is not valid JSON") from error
     require(isinstance(manifest, dict), "batch receipt manifest must be an object")
     require(
@@ -672,14 +716,21 @@ def verify_batch_receipt(receipt, validated, receipt_file, binary):
 
     return {
         "file": str(manifest_path.resolve()),
-        "sha256": digest(manifest_path),
+        "sha256": raw_sha256,
         "target": entry["target"],
     }
 
 
 def job_manifest(args):
     receipt, validated, receipt_file, binary = load_receipt(args.build_receipt, args.binary)
-    batch_manifest = verify_batch_receipt(receipt, validated, receipt_file, binary)
+    batch_manifest = verify_batch_receipt(
+        receipt,
+        validated,
+        receipt_file,
+        binary,
+        expected_manifest_sha=args.expect_batch_manifest_sha,
+        expected_manifest_path=args.expect_batch_manifest_path,
+    )
     commit = args.expect_commit or receipt["workspace_commit"]
     require(
         commit == receipt["workspace_commit"],
@@ -1273,6 +1324,8 @@ def main():
     parser.add_argument("--expect-commit", default=os.environ.get("GITHUB_SHA"))
     parser.add_argument("--build-receipt")
     parser.add_argument("--binary")
+    parser.add_argument("--expect-batch-manifest-sha")
+    parser.add_argument("--expect-batch-manifest-path")
     parser.add_argument("--report", action="append", default=[])
     parser.add_argument("--require-case", action="append", default=[])
     parser.add_argument("--log", action="append", default=[])
@@ -1298,6 +1351,11 @@ def main():
                 "reports": sorted(payload["reports"]),
             }
         else:
+            require(
+                args.expect_batch_manifest_sha is None
+                and args.expect_batch_manifest_path is None,
+                "--expect-batch-manifest-sha/--expect-batch-manifest-path are only valid in job mode",
+            )
             payload = release_manifest(args)
             summary = {
                 "status": payload["status"],

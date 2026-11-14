@@ -367,6 +367,8 @@ jobs:
             --manifest-out test-results/native-pr-gate.json \
             --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
             --binary "$ROOTYARD_BIN" \
+            --expect-batch-manifest "$ROOTYARD_BATCH_MANIFEST" \
+            --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
             --report web_sessions=test-results/web-sessions.json \
             --report metrics=test-results/metrics.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \

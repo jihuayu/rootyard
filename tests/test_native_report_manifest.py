@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/native_report_manifest.py"
@@ -21,6 +22,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import native_build_receipt as receipts  # noqa: E402
+import native_report_manifest as manifest_gate  # noqa: E402
 
 
 def digest(path):
@@ -546,6 +548,96 @@ class TestJobManifest(unittest.TestCase):
             job["build_receipt"]["batch_manifest"]["file"], str(batch_path.resolve())
         )
         self.assertEqual(job["build_receipt"]["batch_manifest"]["target"], "rootyard")
+
+    def test_accepts_exporter_expected_batch_manifest_sha_and_path(self):
+        batch_path = self.fixture.enable_v2_cas_batch_receipt()
+        expected = digest(batch_path)
+        job = json.loads(
+            self.fixture.job(
+                extra=(
+                    "--expect-batch-manifest-sha", expected,
+                    "--expect-batch-manifest-path", str(batch_path.resolve()),
+                )
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(job["build_receipt"]["batch_manifest"]["sha256"], expected)
+        self.assertEqual(
+            job["build_receipt"]["batch_manifest"]["file"], str(batch_path.resolve())
+        )
+
+    def test_rejects_expected_manifest_sha_after_a_raw_metadata_change(self):
+        batch_path = self.fixture.enable_v2_cas_batch_receipt()
+        expected = digest(batch_path)
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        # An unknown top-level field remains semantically acceptable to the
+        # validator, so only the exporter-provided raw SHA can catch the rewrite.
+        manifest["acceptance_note"] = "rewritten after export"
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.assertNotEqual(digest(batch_path), expected)
+
+        self.fixture.job(extra=("--expect-batch-manifest-sha", expected), expect=1)
+
+        self.assertIn(
+            "SHA-256 does not match the exporter-validated SHA-256",
+            self.fixture.last_process.stderr,
+        )
+        failed = json.loads((self.fixture.root / "manifests/job.json").read_text())
+        self.assertEqual(failed["status"], "failed")
+
+    def test_rejects_malformed_explicit_batch_manifest_anchors(self):
+        self.fixture.enable_v2_cas_batch_receipt()
+        for anchor in ("not-a-sha", "A" * 64, "a" * 63):
+            with self.subTest(anchor=anchor):
+                self.fixture.job(
+                    extra=("--expect-batch-manifest-sha", anchor), expect=1
+                )
+                self.assertIn(
+                    "64 lowercase hexadecimal characters",
+                    self.fixture.last_process.stderr,
+                )
+        relative = "test-results/native-build-batch.json"
+        self.fixture.job(
+            extra=("--expect-batch-manifest-path", relative), expect=1
+        )
+        self.assertIn("must be absolute", self.fixture.last_process.stderr)
+
+    def test_rejects_explicit_batch_manifest_anchor_without_a_batch_link(self):
+        self.fixture.job(
+            extra=("--expect-batch-manifest-sha", "a" * 64), expect=1
+        )
+        self.assertIn(
+            "build receipt has no batch link", self.fixture.last_process.stderr
+        )
+
+    def test_batch_manifest_anchor_hashes_the_parsed_buffer_without_a_reread(self):
+        batch_path = self.fixture.enable_v2_cas_batch_receipt()
+        receipt, validated, receipt_file, binary = manifest_gate.load_receipt(
+            self.fixture.receipt, self.fixture.binary
+        )
+        raw = batch_path.read_bytes()
+        expected = hashlib.sha256(raw).hexdigest()
+        reads = []
+
+        def read_batch_manifest_once(path):
+            reads.append(Path(path))
+            if len(reads) > 1:
+                return b'{"kind": "rewritten-after-the-exporter-validated-it"}'
+            return raw
+
+        with mock.patch.object(Path, "read_bytes", read_batch_manifest_once):
+            recorded = manifest_gate.verify_batch_receipt(
+                receipt,
+                validated,
+                receipt_file,
+                binary,
+                expected_manifest_sha=expected,
+                expected_manifest_path=str(batch_path),
+            )
+
+        self.assertEqual(recorded["sha256"], expected)
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(reads[0], batch_path.resolve())
 
     def test_rejects_cas_consumed_binary_that_is_not_the_sealed_snapshot(self):
         self.fixture.enable_v2_cas_batch_receipt()
