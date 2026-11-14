@@ -345,6 +345,16 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
     let tenant = Uuid::new_v4();
     let authority = Uuid::new_v4();
     let limits = profile.resource_limits();
+    // The caller's absolute deadline must win over the SDK's own object/IO
+    // timeout, otherwise the test would observe an SDK timeout instead of the
+    // intended caller stop. Default profiles have 30s/60s; a deliberately tiny
+    // fixture timeout is a hard setup error, not a flaky pass.
+    let provider_wait = profile.object_timeout().min(profile.io_timeout());
+    assert!(
+        provider_wait >= Duration::from_secs(2),
+        "this checkpoint needs at least two seconds of provider object/IO timeout"
+    );
+    let timeout_case_budget = (provider_wait / 2).min(Duration::from_secs(10));
     let mut owned_keys: Vec<String> = Vec::new();
     let mut contexts: Vec<Arc<ResourceContext>> = Vec::new();
 
@@ -365,7 +375,7 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
             proxied.new_upload(tenant, authority, 1, "cancel-contract", &digest, size).expect("timed-out intent");
         let timed_out = timed_out_intent.locator().clone();
         owned_keys.push(timed_out.path());
-        let upload_deadline = Instant::now() + Duration::from_secs(10);
+        let upload_deadline = Instant::now() + timeout_case_budget;
         let upload_source = source.clone();
         let upload = tokio::spawn(async move {
             let result = proxied.put_file(timed_out_intent, &upload_source, upload_deadline).await;
