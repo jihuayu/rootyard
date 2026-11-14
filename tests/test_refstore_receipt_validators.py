@@ -1,8 +1,9 @@
-"""Static guards for the two refstore inline receipt validators.
+"""Static and focused guards for the refstore inline receipt validators.
 
 The workflow runs its validators in shell heredocs, so these checks keep the
 version-dispatched parser wired in, preserve the old v1 freshness/rebuilt
-requirements, and ensure no validator starts a Cargo, rustc or builder probe.
+requirements, ensure no validator starts a Cargo, rustc or builder probe, and
+exercise the idempotent #174 raw-receipt collector twice.
 """
 import ast
 import hashlib
@@ -46,6 +47,25 @@ def heredoc_blocks(text):
             for line in lines
         ))
     return blocks
+
+
+def workflow_run_block(text, step_name):
+    """Extract one workflow step's literal ``run: |`` script."""
+    marker = '- name: "' + step_name + '"'
+    start = text.index(marker)
+    run_marker = "        run: |\n"
+    body_start = text.index(run_marker, start) + len(run_marker)
+    script = []
+    for line in text[body_start:].splitlines():
+        if line.startswith("      - "):
+            break
+        if line.startswith(" " * 10):
+            script.append(line[10:])
+        elif not line.strip():
+            script.append("")
+        else:
+            break
+    return "\n".join(script) + "\n"
 
 
 def validator_constants(block):
@@ -676,6 +696,22 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def run_evidence_receipt_collector(self, preflight, source, destination,
+                                       optional=False):
+        arguments = [sys.executable, str(SCRIPTS / "collect_evidence_receipts.py")]
+        if optional:
+            arguments.append("--optional")
+        arguments.extend([str(preflight), str(source), str(destination)])
+        return subprocess.run(arguments, text=True, capture_output=True)
+
+    def receipt_anchor(self, path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def assert_stat_unchanged(self, before, after, label):
+        for field in ("st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"):
+            self.assertEqual(getattr(after, field), getattr(before, field),
+                             label + " changed " + field)
 
     def write_preflight_receipt(self, fixture, key, payload):
         binary = fixture["lib"] if key == "lib" else fixture["cli"]
@@ -1786,6 +1822,270 @@ for _guard_name in ('rename', 'replace', 'link', 'unlink', 'remove'):
             self.assertNotEqual(process.returncode, 0)
             self.assertIn("bytes changed after verification", process.stderr)
             self.assertIn("cli_receipt", process.stderr)
+
+    def test_evidence_receipt_collector_reuses_readonly_copy_twice(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "evidence"
+            destination = root / "upload"
+            source.mkdir()
+            destination.mkdir()
+            lib_bytes = b'{"receipt": "lib", "raw": true}\n'
+            cli_bytes = b'{"receipt": "cli", "raw": true}\n'
+            (source / "session174-lib-tests.build.json").write_bytes(lib_bytes)
+            (source / "rootyard-cli.build.json").write_bytes(cli_bytes)
+            for path in source.iterdir():
+                path.chmod(0o444)
+            preflight = {
+                "lib_receipt": {
+                    "path": str(source / "session174-lib-tests.build.json"),
+                    "sha256": hashlib.sha256(lib_bytes).hexdigest(),
+                },
+                "cli_receipt": {
+                    "path": str(source / "rootyard-cli.build.json"),
+                    "sha256": hashlib.sha256(cli_bytes).hexdigest(),
+                },
+            }
+            preflight_path = source / "preflight.json"
+            preflight_path.write_text(json.dumps(preflight))
+            source_stats = {
+                name: os.lstat(source / name)
+                for name in ("session174-lib-tests.build.json", "rootyard-cli.build.json")
+            }
+
+            first = self.run_evidence_receipt_collector(preflight_path, source, destination)
+            self.assertEqual(first.returncode, 0, first.stderr[-2000:])
+            for name, expected in (
+                ("session174-lib-tests.build.json", lib_bytes),
+                ("rootyard-cli.build.json", cli_bytes),
+            ):
+                published = destination / name
+                self.assertEqual(published.read_bytes(), expected)
+                self.assertEqual(stat.S_IMODE(published.stat().st_mode), 0o444)
+            destination_stats = {
+                name: os.lstat(destination / name)
+                for name in ("session174-lib-tests.build.json", "rootyard-cli.build.json")
+            }
+
+            second = self.run_evidence_receipt_collector(preflight_path, source, destination)
+            self.assertEqual(second.returncode, 0, second.stderr[-2000:])
+            for name in ("session174-lib-tests.build.json", "rootyard-cli.build.json"):
+                self.assert_stat_unchanged(
+                    destination_stats[name], os.lstat(destination / name),
+                    "readonly collected receipt " + name)
+                self.assert_stat_unchanged(
+                    source_stats[name], os.lstat(source / name),
+                    "readonly consumed receipt " + name)
+            self.assertEqual((destination / "rootyard-cli.build.json").read_bytes(), cli_bytes)
+            self.assertIn("reused", second.stdout)
+
+    def test_evidence_receipt_collector_rejects_different_destination_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "evidence"
+            destination = root / "upload"
+            source.mkdir()
+            destination.mkdir()
+            lib_bytes = b'{"receipt": "lib"}\n'
+            cli_bytes = b'{"receipt": "cli"}\n'
+            for name, raw in (
+                ("session174-lib-tests.build.json", lib_bytes),
+                ("rootyard-cli.build.json", cli_bytes),
+            ):
+                (source / name).write_bytes(raw)
+                (source / name).chmod(0o444)
+            preflight = {
+                "lib_receipt": {"sha256": hashlib.sha256(lib_bytes).hexdigest()},
+                "cli_receipt": {"sha256": hashlib.sha256(cli_bytes).hexdigest()},
+            }
+            preflight_path = source / "preflight.json"
+            preflight_path.write_text(json.dumps(preflight))
+            conflicting = b'{"receipt": "conflicting"}\n'
+            destination_file = destination / "session174-lib-tests.build.json"
+            destination_file.write_bytes(conflicting)
+            destination_file.chmod(0o640)
+            before = os.lstat(destination_file)
+
+            process = self.run_evidence_receipt_collector(preflight_path, source, destination)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("bytes differ", process.stderr)
+            self.assert_stat_unchanged(
+                before, os.lstat(destination_file), "conflicting receipt destination")
+            self.assertEqual(destination_file.read_bytes(), conflicting)
+            self.assertFalse((destination / "rootyard-cli.build.json").exists())
+
+    def test_evidence_receipt_collector_rejects_symlink_destination_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "evidence"
+            destination = root / "upload"
+            source.mkdir()
+            destination.mkdir()
+            lib_bytes = b'{"receipt": "lib"}\n'
+            cli_bytes = b'{"receipt": "cli"}\n'
+            for name, raw in (
+                ("session174-lib-tests.build.json", lib_bytes),
+                ("rootyard-cli.build.json", cli_bytes),
+            ):
+                (source / name).write_bytes(raw)
+                (source / name).chmod(0o444)
+            preflight = {
+                "lib_receipt": {"sha256": hashlib.sha256(lib_bytes).hexdigest()},
+                "cli_receipt": {"sha256": hashlib.sha256(cli_bytes).hexdigest()},
+            }
+            preflight_path = source / "preflight.json"
+            preflight_path.write_text(json.dumps(preflight))
+            target = root / "same-byte-receipt.json"
+            target.write_bytes(lib_bytes)
+            target.chmod(0o444)
+            target_before = os.lstat(target)
+            destination_file = destination / "session174-lib-tests.build.json"
+            destination_file.symlink_to(target)
+
+            process = self.run_evidence_receipt_collector(preflight_path, source, destination)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("must not be a symlink", process.stderr)
+            self.assertTrue(destination_file.is_symlink())
+            self.assertEqual(os.readlink(destination_file), str(target))
+            self.assert_stat_unchanged(target_before, os.lstat(target), "symlink target")
+
+            destination_file.unlink()
+            dangling = root / "missing-receipt.json"
+            destination_file.symlink_to(dangling)
+            process = self.run_evidence_receipt_collector(preflight_path, source, destination)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("must not be a symlink", process.stderr)
+            self.assertTrue(destination_file.is_symlink())
+            self.assertFalse(destination_file.exists())
+            self.assertFalse(dangling.exists())
+
+    def test_evidence_receipt_collector_optional_missing_source_keeps_available(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "evidence"
+            destination = root / "upload"
+            source.mkdir()
+            destination.mkdir()
+            lib_bytes = b'{"receipt": "lib"}\n'
+            cli_bytes = b'{"receipt": "cli"}\n'
+            (source / "session174-lib-tests.build.json").write_bytes(lib_bytes)
+            (source / "session174-lib-tests.build.json").chmod(0o444)
+            preflight = {
+                "lib_receipt": {"sha256": hashlib.sha256(lib_bytes).hexdigest()},
+                "cli_receipt": {"sha256": hashlib.sha256(cli_bytes).hexdigest()},
+            }
+            preflight_path = source / "preflight.json"
+            preflight_path.write_text(json.dumps(preflight))
+
+            process = self.run_evidence_receipt_collector(
+                preflight_path, source, destination, optional=True)
+            self.assertEqual(process.returncode, 0, process.stderr[-2000:])
+            self.assertEqual((destination / "session174-lib-tests.build.json").read_bytes(),
+                             lib_bytes)
+            self.assertFalse((destination / "rootyard-cli.build.json").exists())
+            self.assertIn("skip missing", process.stdout)
+            self.assertFalse((destination / "rootyard-cli.build.json").exists())
+
+    def test_174_always_collector_runs_idempotently_with_partial_evidence(self):
+        block = workflow_run_block(self.source, "Collect #174 acceptance evidence")
+        self.assertIn("scripts/collect_evidence_receipts.py --optional", block)
+        self.assertIn('if [ -f "$evidence/$name" ]; then', block)
+        self.assertNotIn('[ -f "$evidence/$name" ] && cp', block)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            (work / "scripts").mkdir(parents=True)
+            shutil.copyfile(SCRIPTS / "collect_evidence_receipts.py",
+                            work / "scripts/collect_evidence_receipts.py")
+            evidence = root / "runner/session174-foundation"
+            evidence.mkdir(parents=True)
+            lib_bytes = b'{"receipt": "lib", "raw": true}\n'
+            cli_bytes = b'{"receipt": "cli", "raw": true}\n'
+            lib_source = evidence / "session174-lib-tests.build.json"
+            lib_source.write_bytes(lib_bytes)
+            lib_source.chmod(0o444)
+            preflight = {
+                "lib_receipt": {"sha256": hashlib.sha256(lib_bytes).hexdigest()},
+                "cli_receipt": {"sha256": hashlib.sha256(cli_bytes).hexdigest()},
+            }
+            (evidence / "preflight.json").write_text(json.dumps(preflight))
+            (evidence / "preflight.log").write_text("preflight log\n")
+            (evidence / "cases.log").write_text("cases log\n")
+            (evidence / "case-1.log").write_text("case 1\n")
+            # Leave database-cleanup.log, standalone-build.json, the second
+            # receipt source, and additional case logs absent on purpose.
+            environment = dict(os.environ, RUNNER_TEMP=str(root / "runner"))
+            first = subprocess.run(
+                ["bash", "-c", block], cwd=work, env=environment,
+                text=True, capture_output=True)
+            self.assertEqual(first.returncode, 0,
+                             f"collector failed:\n{first.stdout[-2000:]}\n{first.stderr[-2000:]}")
+            upload = work / "test-results/refstore/session174-foundation"
+            for name in ("preflight.json", "preflight.log", "cases.log", "case-1.log",
+                         "session174-lib-tests.build.json"):
+                self.assertTrue((upload / name).is_file(), name)
+            self.assertFalse((upload / "rootyard-cli.build.json").exists())
+            self.assertFalse((upload / "database-cleanup.log").exists())
+            self.assertEqual((upload / "session174-lib-tests.build.json").read_bytes(),
+                             lib_bytes)
+            self.assertEqual(
+                stat.S_IMODE((upload / "session174-lib-tests.build.json").stat().st_mode),
+                0o444)
+            source_before = os.lstat(lib_source)
+            destination_before = os.lstat(upload / "session174-lib-tests.build.json")
+
+            second = subprocess.run(
+                ["bash", "-c", block], cwd=work, env=environment,
+                text=True, capture_output=True)
+            self.assertEqual(second.returncode, 0,
+                             f"collector failed:\n{second.stdout[-2000:]}\n{second.stderr[-2000:]}")
+            self.assert_stat_unchanged(
+                source_before, os.lstat(lib_source), "collector source receipt")
+            self.assert_stat_unchanged(
+                destination_before,
+                os.lstat(upload / "session174-lib-tests.build.json"),
+                "collector readonly receipt")
+            self.assertEqual((upload / "session174-lib-tests.build.json").read_bytes(),
+                             lib_bytes)
+
+            # A failure before preflight.json is written must still collect the
+            # available logs and must not turn the readonly receipt into an error.
+            (evidence / "preflight.json").unlink()
+            third = subprocess.run(
+                ["bash", "-c", block], cwd=work, env=environment,
+                text=True, capture_output=True)
+            self.assertEqual(third.returncode, 0,
+                             f"collector failed:\n{third.stdout[-2000:]}\n{third.stderr[-2000:]}")
+            self.assertIn("no preflight.json; receipts skipped", third.stdout)
+            self.assertTrue((upload / "preflight.log").is_file())
+            self.assertTrue((upload / "cases.log").is_file())
+            self.assert_stat_unchanged(
+                destination_before,
+                os.lstat(upload / "session174-lib-tests.build.json"),
+                "collector readonly receipt after preflight loss")
+
+    def test_174_receipt_collection_uses_one_helper_at_both_sites(self):
+        start = self.source.index('"Exercise the #174 HTTP foundation cases')
+        end = self.source.index('"Drop only the run-owned #174 foundation database"')
+        step19 = self.source[start:end]
+        self.assertIn("scripts/collect_evidence_receipts.py", step19)
+        self.assertNotIn('cp "$evidence/session174-lib-tests.build.json"', step19)
+        self.assertNotIn('cp "$evidence/rootyard-cli.build.json"', step19)
+        self.assertIn("receipt-copy-check.json", step19)
+        self.assertIn("bytes changed after verification", step19)
+
+        start = self.source.index('"Collect #174 acceptance evidence"')
+        end = self.source.index('Stop only the job-owned Garage fixture', start)
+        collector = self.source[start:end]
+        self.assertIn("scripts/collect_evidence_receipts.py --optional", collector)
+        self.assertIn('if [ -f "$evidence/$name" ]; then', collector)
+        self.assertNotIn('[ -f "$evidence/$name" ] && cp', collector)
+        for name in ("preflight.json", "preflight.log", "session174-lib-tests.stdout.log",
+                     "standalone-build.json", "cases.log", "session174-foundation.json",
+                     "database-cleanup.log", "receipt-copy-check.json"):
+            self.assertIn(name, collector)
+        self.assertIn("case-*.log", collector)
+        self.assertIn('exit "$status"', collector)
 
     def test_validators_never_build_or_probe(self):
         """Only metadata/validation calls are allowed, never a build command."""

@@ -2018,10 +2018,14 @@ jobs:
             status=$?
           fi
           cp "$evidence/preflight.json" "$evidence/preflight.log" \
-            "$evidence/session174-lib-tests.build.json" "$evidence/session174-lib-tests.stdout.log" \
-            "$evidence/rootyard-cli.build.json" "$evidence/standalone-build.json" \
+            "$evidence/session174-lib-tests.stdout.log" \
+            "$evidence/standalone-build.json" \
             "$evidence/cases.log" "$evidence/session174-foundation.json" \
             test-results/refstore/session174-foundation/ 2>/dev/null || true
+          # The raw receipts are readonly producer aliases; collect them
+          # idempotently so an existing same-byte copy is never rewritten.
+          python3 scripts/collect_evidence_receipts.py \
+            "$evidence/preflight.json" "$evidence" test-results/refstore/session174-foundation
           # Every required case writes its own case-N.log; copy all of them.
           for log in "$evidence"/case-*.log; do
             if [ -f "$log" ]; then cp "$log" test-results/refstore/session174-foundation/; fi
@@ -2158,17 +2162,26 @@ jobs:
             exit 0
           fi
           mkdir -p "$upload"
-          for name in preflight.json preflight.log session174-lib-tests.build.json \
-                      session174-lib-tests.stdout.log rootyard-cli.build.json standalone-build.json \
-                      cases.log session174-foundation.json database-cleanup.log \
-                      receipt-copy-check.json; do
-            [ -f "$evidence/$name" ] && cp "$evidence/$name" "$upload/"
+          status=0
+          for name in preflight.json preflight.log session174-lib-tests.stdout.log \
+                      standalone-build.json cases.log session174-foundation.json \
+                      database-cleanup.log receipt-copy-check.json; do
+            if [ -f "$evidence/$name" ]; then
+              cp "$evidence/$name" "$upload/" || status=1
+            fi
           done
           # One case-N.log per required case; never a fixed case-1..case-4 list.
           for log in "$evidence"/case-*.log; do
-            if [ -f "$log" ]; then cp "$log" "$upload/"; fi
+            if [ -f "$log" ]; then cp "$log" "$upload/" || status=1; fi
           done
+          # The receipt copies are readonly anchored evidence.  Reuse an exact
+          # existing copy and create only an absent copy; partial earlier
+          # failures may omit a receipt source, so --optional skips only a
+          # missing source rather than an unreadable conflicting destination.
+          python3 scripts/collect_evidence_receipts.py --optional \
+            "$evidence/preflight.json" "$evidence" "$upload" || status=1
           ls -la "$upload"
+          exit "$status"
       - name: Stop only the job-owned Garage fixture
         if: always()
         run: |
