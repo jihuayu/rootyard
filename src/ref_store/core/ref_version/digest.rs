@@ -194,11 +194,13 @@ fn validate_intents(refs: &[RefVersionIntent], object_format: GitObjectFormat) -
 }
 
 fn validate_intent(intent: &RefVersionIntent, object_format: GitObjectFormat) -> Result<(), RefVersionCodecError> {
+    // `GitOid` variants are public, so `parse()` alone cannot guarantee a live
+    // nonzero OID. Every field tagged present is checked here before encoding.
     if let Some(oid) = intent.precondition().oid() {
-        ensure_oid_format(object_format, oid, "old_oid")?;
+        ensure_present_oid(object_format, oid, "old_oid")?;
     }
     if let Some(oid) = intent.target().oid() {
-        ensure_oid_format(object_format, oid, "target_oid")?;
+        ensure_present_oid(object_format, oid, "target_oid")?;
     }
     if matches!(intent.base(), BaseRequestSelector::ExplicitAbsent)
         && !matches!(intent.precondition(), RefPrecondition::Absent)
@@ -258,7 +260,7 @@ fn validate_packs(packs: &[PlannedPack]) -> Result<(), RefVersionCodecError> {
     Ok(())
 }
 
-fn ensure_oid_format(
+fn ensure_present_oid(
     object_format: GitObjectFormat,
     oid: GitOid,
     field: &'static str,
@@ -266,7 +268,17 @@ fn ensure_oid_format(
     if oid.format() != object_format {
         return Err(RefVersionCodecError::ObjectFormatMismatch { field });
     }
+    if oid_is_zero(oid) {
+        return Err(RefVersionCodecError::ZeroObjectId { field });
+    }
     Ok(())
+}
+
+fn oid_is_zero(oid: GitOid) -> bool {
+    match oid {
+        GitOid::Sha1(bytes) => bytes.iter().all(|byte| *byte == 0),
+        GitOid::Sha256(bytes) => bytes.iter().all(|byte| *byte == 0),
+    }
 }
 
 fn require_non_nil(value: uuid::Uuid, field: &'static str) -> Result<(), RefVersionCodecError> {
@@ -800,6 +812,68 @@ mod tests {
             vec![pack_one()],
         );
         assert!(matches!(digest(&bad_head), Err(RefVersionCodecError::InvalidRequestShape { .. })));
+    }
+
+    #[test]
+    fn directly_constructed_zero_oids_are_refused_before_present_encoding() {
+        let sha1_old_zero = input(
+            uuid(4),
+            vec![main_intent(
+                RefVersionKind::Publish,
+                RefPrecondition::Present(GitOid::Sha1([0; 20])),
+                BaseRequestSelector::Present(version(0x22)),
+                RefTarget::Oid(oid(0x33)),
+            )],
+            vec![pack_one()],
+        );
+        assert_eq!(digest(&sha1_old_zero), Err(RefVersionCodecError::ZeroObjectId { field: "old_oid" }));
+
+        let sha1_target_zero = input(
+            uuid(4),
+            vec![main_intent(
+                RefVersionKind::Publish,
+                RefPrecondition::Present(oid(0x44)),
+                BaseRequestSelector::Present(version(0x22)),
+                RefTarget::Oid(GitOid::Sha1([0; 20])),
+            )],
+            vec![pack_one()],
+        );
+        assert_eq!(digest(&sha1_target_zero), Err(RefVersionCodecError::ZeroObjectId { field: "target_oid" }));
+
+        let sha256_realm = realm_with(uuid(1), uuid(2), uuid(3), 7, 0, 9, GitObjectFormat::Sha256);
+        let sha256_old_zero = build_input_with_realm(
+            sha256_realm,
+            uuid(5),
+            uuid(6),
+            uuid(4),
+            3,
+            41,
+            vec![main_intent(
+                RefVersionKind::Publish,
+                RefPrecondition::Present(GitOid::Sha256([0; 32])),
+                BaseRequestSelector::Present(version(0x22)),
+                RefTarget::Oid(GitOid::Sha256([0x33; 32])),
+            )],
+            vec![pack_one()],
+        );
+        assert_eq!(digest(&sha256_old_zero), Err(RefVersionCodecError::ZeroObjectId { field: "old_oid" }));
+
+        let sha256_target_zero = build_input_with_realm(
+            sha256_realm,
+            uuid(5),
+            uuid(6),
+            uuid(4),
+            3,
+            41,
+            vec![main_intent(
+                RefVersionKind::Publish,
+                RefPrecondition::Present(GitOid::Sha256([0x44; 32])),
+                BaseRequestSelector::Present(version(0x22)),
+                RefTarget::Oid(GitOid::Sha256([0; 32])),
+            )],
+            vec![pack_one()],
+        );
+        assert_eq!(digest(&sha256_target_zero), Err(RefVersionCodecError::ZeroObjectId { field: "target_oid" }));
     }
 
     #[test]

@@ -362,6 +362,7 @@ pub(crate) enum RefVersionCodecError {
     DuplicateRefName,
     DuplicatePackIdentity,
     ObjectFormatMismatch { field: &'static str },
+    ZeroObjectId { field: &'static str },
     InvalidRequestShape { reason: &'static str },
     InvalidContentDigest,
     LengthOverflow { field: &'static str },
@@ -389,6 +390,7 @@ impl fmt::Display for RefVersionCodecError {
             Self::ObjectFormatMismatch { field } => {
                 write!(formatter, "{field} does not match the realm object format")
             }
+            Self::ZeroObjectId { field } => write!(formatter, "{field} must not be the zero object id"),
             Self::InvalidRequestShape { reason } => write!(formatter, "invalid request shape: {reason}"),
             Self::InvalidContentDigest => formatter.write_str("planned content digest is not a sha256 digest"),
             Self::LengthOverflow { field } => write!(formatter, "{field} length cannot be encoded"),
