@@ -29,8 +29,8 @@ CASE_METHODS = (
     "withdrawal", "audit_boundary", "token_revocation", "team_matrix",
 )
 MAX_MODULE_LINES = 700
-# tests/source_bound_binary.py copied from the P1 lane (commit a4b9d49), unmodified.
-HELPER_SHA256 = "714d08ea518b6ac84a3f8f32329f9f9e172338f917bcc6e0d131eea7e3860b09"
+# tests/source_bound_binary.py: P1 lane helper plus shared v1/v2 receipt dispatch.
+HELPER_SHA256 = "23e153888dd58f6e2d5300fe9bb8f5d3f81f97ec0c2069ceb8bbeddbb3748da3"
 # Registered case name -> case method, in execution order (see execute()).
 REGISTERED_CASES = (
     "git_matrix_version", "git_command_coverage", "source_bound_receipt", "environment",

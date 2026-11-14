@@ -1,22 +1,24 @@
-"""Bind an executed binary to the candidate's current production source bytes.
+"""Bind an executed binary to the candidate's production source bytes.
 
 ``native_evidence.build_record`` only proves that an adjacent
 ``<binary>.build.json`` receipt describes *some* build whose digest equals the
-binary.  That is a neighbour-JSON claim: it says nothing about this checkout.
-This module adds the missing binding, reusing the reviewed definitions instead
-of re-inventing them:
+binary.  This module adds the source binding, reusing the shared v1/v2 receipt
+reader instead of re-inventing it:
 
-* the source-input digest is ``scripts/build_native.source_digest()`` itself --
-  production inputs only (``Cargo.toml``, ``Cargo.lock``, ``build.rs``,
-  ``src/``, ``migrations/``, ``schema/``, ``vendor/``), so a different HEAD that
-  only moved tests or docs is acceptable when those bytes are identical;
-* the binary digest is ``ops_provenance.sha256_file`` and the process identity
-  check mirrors ``blob_only_service.NativeProfile``'s receipt rules.
+* v2 receipts carry a self-consistent ``bound_input_inventory`` with the
+  production source, Cargo.lock, config/toolchain and selected artifact source
+  hashes.  Acceptance therefore uses the recorded digest and does not require
+  the mutable original source tree, original executable or historical compiler
+  installation.
+* v1 receipts retain their historical behaviour: production inputs are
+  compared against ``scripts/build_native.source_digest()`` in this checkout.
+* in both schemas the supplied ``--binary`` is the one hashed, an
+  ``expected_commit`` is exact and the receipt bytes are never rewritten.
 
 Nothing here claims a native run happened; it only decides whether a native
-run would be attributable to the current source.
+run would be attributable to the supplied source-bound binary.  No Cargo,
+rustc, rustup, builder or toolchain probe is invoked.
 """
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -40,6 +42,7 @@ def _need(condition, message):
 
 def production_source_digest():
     """The reviewed build-time digest of production source bytes only."""
+    import importlib.util
     spec = importlib.util.spec_from_file_location("rootyard_build_native", ROOT / "scripts" / "build_native.py")
     _need(spec is not None and spec.loader is not None, "scripts/build_native.py is unavailable")
     module = importlib.util.module_from_spec(spec)
@@ -54,23 +57,7 @@ def _git(*args):
         return None
 
 
-def bind(binary, expected_commit=None, environ=None):
-    """Return evidence binding ``binary`` to the current source, or raise.
-
-    ``expected_commit`` (or ``ROOTYARD_EXPECTED_SOURCE_COMMIT``) additionally
-    requires the receipt's ``workspace_commit`` to be that commit.  The current
-    checkout HEAD is recorded for audit but never required to equal it: a
-    test/doc-only commit legitimately changes HEAD without changing production
-    bytes.
-    """
-    environ = os.environ if environ is None else environ
-    path = Path(binary).resolve()
-    _need(path.is_file() and os.access(path, os.X_OK), "binary is not an executable file: " + str(path))
-    try:
-        record = native_evidence.build_record(path)
-    except Exception as error:  # receipt/binary digest mismatch is a hard failure
-        raise SourceBindingError("build receipt rejected: " + type(error).__name__) from None
-    _need(record.get("attested") is True, "no matching adjacent receipt: " + str(record.get("reason")))
+def _v1_record(validated, record, path, expected):
     missing = [name for name in REQUIRED_FIELDS if not record.get(name)]
     _need(not missing, "build receipt is missing " + ", ".join(missing))
     digest = ops_provenance.sha256_file(path)
@@ -79,7 +66,6 @@ def bind(binary, expected_commit=None, environ=None):
     _need(current_digest == record["source_inputs_sha256"], (
         "the executed binary does not match this checkout's production source inputs "
         "(receipt " + record["source_inputs_sha256"][:16] + "..., current " + current_digest[:16] + "...)"))
-    expected = expected_commit or environ.get("ROOTYARD_EXPECTED_SOURCE_COMMIT") or environ.get("GITHUB_SHA")
     if expected:
         _need(record["workspace_commit"] == expected,
               "stale build receipt: workspace_commit differs from the expected source commit")
@@ -88,6 +74,7 @@ def bind(binary, expected_commit=None, environ=None):
     production_dirty = [line for line in (dirty or "").splitlines()
                         if _production_path(line[3:] if len(line) > 3 else "")]
     return {
+        "schema": validated.schema,
         "attested": True,
         "binary_sha256": digest,
         "receipt_binary_sha256": record["binary_sha256"],
@@ -95,11 +82,82 @@ def bind(binary, expected_commit=None, environ=None):
         "current_source_inputs_sha256": current_digest,
         "production_inputs_bound": True,
         "workspace_commit": record["workspace_commit"],
+        "expected_commit": expected,
         "current_head": head,
         "head_differs_from_receipt": head != record["workspace_commit"],
         "current_head_production_dirty": production_dirty,
+        "receipt_sha256": validated.receipt_sha256,
+        "receipt_immutable": True,
         "receipt_toolchain": {"rustc": record["rustc"], "command": record["command"]},
     }
+
+
+def _v2_record(validated, record, path, expected):
+    """Accept a copied/CAS snapshot bound by the receipt, without a probe."""
+    _need(validated.toolchain is not None, "v2 build receipt has no toolchain metadata")
+    _need(len(str(validated.source_inputs_sha256)) == 64,
+          "receipt source_inputs_sha256 is not a SHA-256")
+    if expected:
+        _need(validated.workspace_commit == expected,
+              "stale build receipt: workspace_commit differs from the expected source commit")
+    digest = ops_provenance.sha256_file(path)
+    _need(digest == validated.binary_sha256,
+          "the supplied binary does not match the receipt's bound SHA-256")
+    head = _git("rev-parse", "HEAD")
+    dirty = _git("status", "--porcelain")
+    production_dirty = [line for line in (dirty or "").splitlines()
+                        if _production_path(line[3:] if len(line) > 3 else "")]
+    return {
+        "schema": validated.schema,
+        "attested": True,
+        "binary_sha256": digest,
+        "receipt_binary_sha256": validated.binary_sha256,
+        "source_inputs_sha256": validated.source_inputs_sha256,
+        "config_digest": validated.config_digest,
+        "cargo_lock_sha256": record.get("cargo_lock_sha256"),
+        "production_inputs_bound": True,
+        "source_snapshot_bound": True,
+        "workspace_commit": validated.workspace_commit,
+        "expected_commit": expected,
+        "current_head": head,
+        "head_differs_from_receipt": head != validated.workspace_commit,
+        "current_head_production_dirty": production_dirty,
+        "receipt_sha256": validated.receipt_sha256,
+        "receipt_immutable": True,
+        "receipt_toolchain": {
+            "rustc": validated.toolchain["rustc"]["version"],
+            "cargo": validated.toolchain["cargo"]["version"],
+            "target_triple": validated.toolchain["target_triple"],
+            "command": record["command"],
+        },
+    }
+
+
+def bind(binary, expected_commit=None, environ=None):
+    """Return evidence binding ``binary`` to its recorded source, or raise.
+
+    ``expected_commit`` (or ``ROOTYARD_EXPECTED_SOURCE_COMMIT``) additionally
+    requires the receipt's ``workspace_commit`` to be that commit.  For v2 the
+    current checkout HEAD is recorded for audit but is never required to equal
+    it: an immutable copied/CAS snapshot remains valid if the mutable original
+    later changes.  v1 keeps its historical current-production-source check.
+    """
+    environ = os.environ if environ is None else environ
+    path = Path(binary).resolve()
+    _need(path.is_file() and os.access(path, os.X_OK), "binary is not an executable file: " + str(path))
+    try:
+        validated = native_evidence.load_validated(path)
+    except Exception as error:  # receipt/binary digest mismatch is a hard failure
+        raise SourceBindingError("build receipt rejected: " + type(error).__name__) from None
+    _need(validated is not None, "no matching adjacent receipt")
+    expected = expected_commit or environ.get("ROOTYARD_EXPECTED_SOURCE_COMMIT") or environ.get("GITHUB_SHA")
+    if expected:
+        _need(validated.workspace_commit == expected,
+              "stale build receipt: workspace_commit differs from the expected source commit")
+    record = validated.payload
+    if validated.schema == "v2":
+        return _v2_record(validated, record, path, expected)
+    return _v1_record(validated, record, path, expected)
 
 
 def _production_path(raw):
