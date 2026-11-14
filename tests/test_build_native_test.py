@@ -83,6 +83,9 @@ class Fixture(unittest.TestCase):
         (self.root / "tests" / "example.rs").write_text("#[test]\nfn one() {}\n")
         (self.root / "tests" / "other.rs").write_text("#[test]\nfn other() {}\n")
         (self.root / "tests" / "helper.rs").write_text("pub fn helper() {}\n")
+        (self.root / "experimental" / "pando").mkdir(parents=True)
+        shutil.copyfile(ROOT / "experimental" / "pando" / "schema.sql",
+                        self.root / "experimental" / "pando" / "schema.sql")
         (self.root / "tests" / "fixtures" / "data.txt").write_text("fixture\n")
         (self.root / "tests" / "serving_support" / "support.rs").write_text("pub fn s() {}\n")
         (self.root / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.99.1"\n')
@@ -360,7 +363,7 @@ class SelectionRefusalTests(Fixture):
             bnt.selected_artifact([], "example")
         wrong_profile = self.events(kind="test", name="example")
         wrong_profile[0]["profile"]["test"] = False
-        with self.assertRaisesRegex(BuildError, "not built with a test profile"):
+        with self.assertRaisesRegex(BuildError, "test artifact profile.test must be exactly true"):
             bnt.selected_artifact(wrong_profile, "example")
         with self.assertRaisesRegex(BuildError, "2 example test artifacts"):
             bnt.selected_artifact(self.events(kind="test", name="example") * 2, "example")

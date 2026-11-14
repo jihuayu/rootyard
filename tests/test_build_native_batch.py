@@ -21,7 +21,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = REPO_ROOT / 'scripts'
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
@@ -159,6 +160,9 @@ class BatchTest(unittest.TestCase):
         (self.root / 'tests' / 'other.rs').write_text('#[test]\nfn other() {}\n')
         (self.root / CARGO_CONFIG).write_text(CARGO_CONFIG_TEXT)
         (self.root / 'build.rs').write_text('fn main() {}\n')
+        asset = self.root / 'experimental' / 'pando' / 'schema.sql'
+        asset.parent.mkdir(parents=True)
+        shutil.copyfile(REPO_ROOT / 'experimental' / 'pando' / 'schema.sql', asset)
         for name in ('cargo', 'rustc', 'rustup'):
             (self.root / 'toolchain' / name).write_bytes(('fake-' + name).encode())
         self.outdir = Path(os.path.join(self.tempdir, 'test-results'))

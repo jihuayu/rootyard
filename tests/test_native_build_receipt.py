@@ -96,6 +96,9 @@ class BuildReceiptTest(unittest.TestCase):
         (self.root / 'src' / 'lib.rs').write_text('pub fn hello() {}\n')
         (self.root / 'tests' / 'example.rs').write_text('#[test]\nfn one() {}\n')
         (self.root / 'tests' / 'fixtures' / 'data.txt').write_text('fixture\n')
+        (self.root / 'experimental' / 'pando').mkdir(parents=True)
+        shutil.copyfile(SCRIPTS.parent / 'experimental' / 'pando' / 'schema.sql',
+                        self.root / 'experimental' / 'pando' / 'schema.sql')
         (self.root / '.cargo' / 'config.toml').write_text('[build]\njobs = 4\n')
         (self.root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "1.99.1"\n')
         for name, content in (('cargo', b'fake-cargo'), ('rustc', b'fake-rustc'),
