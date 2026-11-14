@@ -74,7 +74,12 @@ import sys
 
 args = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as stream:
-    stream.write(json.dumps({"tool": "candidate", "args": args}) + "\\n")
+    stream.write(
+        json.dumps(
+            {"tool": "candidate", "args": args, "path": os.path.realpath(sys.argv[0])}
+        )
+        + "\\n"
+    )
 if args == ["-vV"]:
     release = os.environ.get("FAKE_CARGO_RELEASE", "__RELEASE__")
     commit = os.environ.get("FAKE_CARGO_COMMIT", "__REVISION__")
@@ -86,6 +91,44 @@ if args == ["-vV"]:
     print("host: " + host)
     raise SystemExit(0)
 raise SystemExit(0)
+"""
+
+FAULT_PYTHON = """#!__PYTHON__
+import os
+import sys
+
+# write_metadata is the only helper call with the full 21-argument payload.
+if os.environ.get("FAULT_METADATA_WRITE") == "1" and len(sys.argv) == 23:
+    if any(argument.endswith("metadata.json") for argument in sys.argv[1:]):
+        sys.stderr.write("injected metadata write failure\\n")
+        raise SystemExit(73)
+if os.environ.get("FAULT_METADATA_SHA") == "1" and len(sys.argv) == 23:
+    sys.argv[15] = "0" * 64
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+"""
+
+FAULT_MV = """#!/bin/sh
+if [ "${FAULT_PUBLISH_MV:-}" = 1 ]; then
+  if [ "$1" = "--" ]; then
+    src=$2
+    dst=$3
+  else
+    src=$1
+    dst=$2
+  fi
+  case "$src" in
+    */installs/.adopt-*)
+      case "${dst##*/}" in
+        .previous-* | .bad-*) ;;
+        *)
+          echo "injected install publish failure" >&2
+          exit 75
+          ;;
+      esac
+      ;;
+  esac
+fi
+exec __MV__ "$@"
 """
 
 HOST_COMMANDS = (
@@ -220,6 +263,43 @@ class CargoForkHelperTest(unittest.TestCase):
     def _clear_log(self) -> None:
         self.log.unlink(missing_ok=True)
 
+    def _fault_path(self) -> str:
+        fault_bin = self.temp / "fault-bin"
+        fault_bin.mkdir(exist_ok=True)
+        self._script(fault_bin / "python3", FAULT_PYTHON)
+        mv = shutil.which("mv")
+        self.assertIsNotNone(mv)
+        (fault_bin / "mv").write_text(
+            FAULT_MV.replace("__MV__", str(mv)), encoding="utf-8"
+        )
+        (fault_bin / "mv").chmod(0o755)
+        return f"{fault_bin}:{self.system_bin}:{self.fake_bin}"
+
+    def _assert_no_install_attempt(self) -> None:
+        for call in self._calls():
+            if call.get("tool") == "rustup":
+                self.assertNotIn("install", call.get("args", []), call)
+
+    def _assert_no_published_state(self) -> None:
+        self.assertFalse(self.record.exists())
+        self.assertFalse((self.cache / "bin" / "cargo").is_symlink())
+        self.assertFalse(list(self.cache.glob("installs/*/metadata.json")))
+        for pattern in (".adopt-*", ".build-*", ".previous-*", ".bad-*"):
+            self.assertFalse(list((self.cache / "installs").glob(pattern)), pattern)
+        env_text = (
+            self.github_env.read_text(encoding="utf-8")
+            if self.github_env.exists()
+            else ""
+        )
+        path_text = (
+            self.github_path.read_text(encoding="utf-8")
+            if self.github_path.exists()
+            else ""
+        )
+        self.assertNotIn("CARGO_FORK_BIN=", env_text)
+        self.assertNotIn(str(self.cache / "bin"), path_text)
+        self._assert_no_install_attempt()
+
     def test_helper_pins_full_revision_and_bootstraps_with_rustup_cargo(self) -> None:
         text = HELPER.read_text(encoding="utf-8")
         self.assertIn(REVISION, text)
@@ -263,6 +343,7 @@ class CargoForkHelperTest(unittest.TestCase):
     def test_cache_hit_does_not_rebuild_or_reobserve_the_candidate(self) -> None:
         first = self._install()
         self.assertEqual(first.returncode, 0, first.stderr)
+        installed = str(Path(self._record()["installed_path"]).resolve())
         self._clear_log()
 
         second = self._run(
@@ -274,7 +355,11 @@ class CargoForkHelperTest(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertIn("source=cache", second.stdout)
         calls = self._calls()
-        self.assertFalse([call for call in calls if call.get("path") == str(self.candidate)])
+        probed_paths = {
+            call.get("path") for call in calls if call.get("tool") == "candidate"
+        }
+        self.assertEqual(probed_paths, {installed})
+        self.assertNotIn(str(self.candidate.resolve()), probed_paths)
         rustup_args = [call["args"] for call in calls if call["tool"] == "rustup"]
         self.assertEqual(rustup_args, [["run", "1.99.1", "cargo", "-vV"]])
 
@@ -359,12 +444,139 @@ class CargoForkHelperTest(unittest.TestCase):
             hashlib.sha256(self.candidate.read_bytes()).hexdigest(),
         )
 
-    def test_rejects_wrong_release_commit_or_architecture(self) -> None:
-        for name, environment in (
+    def test_adoption_metadata_write_failure_fails_closed(self) -> None:
+        result = self._run(
+            "install",
+            "--cache-dir", str(self.cache),
+            "--reuse", str(self.candidate),
+            "--record", str(self.record),
+            env={"FAULT_METADATA_WRITE": "1"},
+            path=self._fault_path(),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed to write adoption metadata", result.stderr)
+        self._assert_no_published_state()
+
+    def test_adoption_publish_failure_fails_closed(self) -> None:
+        result = self._run(
+            "install",
+            "--cache-dir", str(self.cache),
+            "--reuse", str(self.candidate),
+            "--record", str(self.record),
+            env={"FAULT_PUBLISH_MV": "1"},
+            path=self._fault_path(),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed to publish", result.stderr)
+        self._assert_no_published_state()
+
+    def test_published_metadata_must_validate_the_actual_binary(self) -> None:
+        result = self._run(
+            "install",
+            "--cache-dir", str(self.cache),
+            "--reuse", str(self.candidate),
+            "--record", str(self.record),
+            env={"FAULT_METADATA_SHA": "1"},
+            path=self._fault_path(),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed metadata/binary validation", result.stderr)
+        self._assert_no_published_state()
+
+    def test_cache_metadata_refresh_failure_preserves_valid_cache(self) -> None:
+        first = self._install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        metadata = next(self.cache.glob("installs/*/metadata.json"))
+        installed = Path(self._record()["installed_path"])
+        metadata_before = metadata.read_bytes()
+        binary_before = installed.read_bytes()
+        record_before = self.record.read_bytes()
+        self._clear_log()
+
+        result = self._run(
+            "install",
+            "--cache-dir", str(self.cache),
+            "--record", str(self.record),
+            env={"FAULT_METADATA_WRITE": "1"},
+            path=self._fault_path(),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed to refresh cache metadata", result.stderr)
+        self.assertEqual(metadata.read_bytes(), metadata_before)
+        self.assertEqual(installed.read_bytes(), binary_before)
+        self.assertEqual(self.record.read_bytes(), record_before)
+        self._assert_no_install_attempt()
+        env_text = (
+            self.github_env.read_text(encoding="utf-8")
+            if self.github_env.exists()
+            else ""
+        )
+        path_text = (
+            self.github_path.read_text(encoding="utf-8")
+            if self.github_path.exists()
+            else ""
+        )
+        self.assertNotIn("CARGO_FORK_BIN=", env_text)
+        self.assertNotIn(str(self.cache / "bin"), path_text)
+
+    def test_adoption_failure_preserves_existing_install(self) -> None:
+        first = self._install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        metadata = next(self.cache.glob("installs/*/metadata.json"))
+        installed = Path(self._record()["installed_path"])
+        metadata_before = metadata.read_bytes()
+        binary_before = installed.read_bytes()
+        record_before = self.record.read_bytes()
+        # Force a cache miss without changing the installed bytes or metadata:
+        # adoption must stage privately and leave this entry alone on failure.
+        installed.chmod(0o644)
+
+        for variable, needle in (
+            ("FAULT_METADATA_WRITE", "failed to write adoption metadata"),
+            ("FAULT_PUBLISH_MV", "failed to publish"),
+        ):
+            with self.subTest(variable=variable):
+                self._clear_log()
+                result = self._run(
+                    "install",
+                    "--cache-dir", str(self.cache),
+                    "--reuse", str(self.candidate),
+                    "--record", str(self.record),
+                    env={variable: "1"},
+                    path=self._fault_path(),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(needle, result.stderr)
+                self.assertEqual(metadata.read_bytes(), metadata_before)
+                self.assertEqual(installed.read_bytes(), binary_before)
+                self.assertEqual(self.record.read_bytes(), record_before)
+                self._assert_no_install_attempt()
+                for pattern in (".adopt-*", ".previous-*", ".bad-*"):
+                    self.assertFalse(
+                        list((self.cache / "installs").glob(pattern)), pattern
+                    )
+
+        installed.chmod(0o755)
+        verified = self._run(
+            "verify",
+            "--cache-dir", str(self.cache),
+            "--no-github",
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_rejects_wrong_release_commit_architecture_or_host_triple(self) -> None:
+        cases = [
             ("release", {"FAKE_CARGO_RELEASE": "1.102.0"}),
             ("commit", {"FAKE_CARGO_COMMIT": "d" * 40}),
             ("architecture", {"FAKE_CARGO_HOST": "riscv64gc-unknown-linux-gnu"}),
-        ):
+        ]
+        if self.host.endswith("-gnu"):
+            cases.append(("abi", {"FAKE_CARGO_HOST": self.host[:-4] + "musl"}))
+        else:
+            cases.append(
+                ("host-suffix", {"FAKE_CARGO_HOST": self.host + "-variant"})
+            )
+        for name, environment in cases:
             with self.subTest(name=name):
                 self._clear_log()
                 cache = self.temp / f"cache-{name}"
