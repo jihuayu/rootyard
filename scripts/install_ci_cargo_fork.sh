@@ -38,11 +38,11 @@
 #                                    [--record FILE] [--require-os OS]
 #                                    [--require-arch ARCH] [--no-github]
 #
-# `install` prepends $CACHE_DIR/bin to GITHUB_PATH and exports
-# CARGO_FORK_* plus CARGO_FORK_AUTO_UPDATE=0 through GITHUB_ENV when those
-# GitHub Actions files are present.  The current shell may source the printed
-# CARGO_FORK_BIN or the caller may use a separate step, because a child process
-# cannot modify its parent's PATH.
+# `install` prepends $CACHE_DIR/bin to GITHUB_PATH and exports CARGO_FORK_*
+# plus CARGO_FORK_AUTO_UPDATE=0 through GITHUB_ENV when those GitHub Actions
+# files are present.  It also prints the resolved path.  A subsequent step is
+# the safe way to use it, because a child process cannot modify its parent's
+# PATH.
 set -euo pipefail
 
 readonly REVISION=64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b
@@ -90,12 +90,20 @@ absolute_file() {
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
+    sha256sum -- "$1" | awk '{print $1}'
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
+    shasum -a 256 -- "$1" | awk '{print $1}'
   else
     fail "sha256sum or shasum is required"
   fi
+}
+
+validate_full_commit() {
+  local label=$1 value=$2
+  case "$value" in
+    *[!0-9a-f]*) fail "$label is not a lowercase hexadecimal commit: $value" ;;
+  esac
+  [ "${#value}" -ge 40 ] || fail "$label is shorter than a full commit: $value"
 }
 
 detect_platform() {
@@ -134,6 +142,7 @@ probe_bootstrap() {
   [ "$bootstrap_release" = "$BOOTSTRAP_TOOLCHAIN" ] ||
     fail "bootstrap Cargo release is ${bootstrap_release:-unknown}, expected $BOOTSTRAP_TOOLCHAIN"
   [ -n "$bootstrap_commit" ] || fail "bootstrap Cargo did not report a full commit-hash"
+  validate_full_commit "bootstrap Cargo commit-hash" "$bootstrap_commit"
   [ "$bootstrap_commit" != "$REVISION" ] ||
     fail "refusing to bootstrap the fork with the fork itself"
 
@@ -146,6 +155,7 @@ probe_bootstrap() {
   rustc_commit=$(printf '%s\n' "$rustc_verbose" | sed -n 's/^commit-hash: //p' | sed -n '1p')
   rustc_host=$(printf '%s\n' "$rustc_verbose" | sed -n 's/^host: //p' | sed -n '1p')
   [ -n "$rustc_commit" ] || fail "rustc did not report a full commit-hash"
+  validate_full_commit "rustc commit-hash" "$rustc_commit"
   [ -n "$rustc_host" ] || fail "rustc did not report a host triple"
 }
 
@@ -180,11 +190,12 @@ verify_cargo() {
 # or tampered metadata file cannot bless a different binary.
 metadata_sha() {
   local metadata=$1
-  python3 - "$metadata" "$REVISION" "$RELEASE" "$os" "$arch" "$bootstrap_commit" "$SCHEMA" <<'PY'
+  python3 - "$metadata" "$REVISION" "$RELEASE" "$os" "$arch" "$bootstrap_commit" "$SCHEMA" "$BOOTSTRAP_TOOLCHAIN" <<'PY'
 import json
+import re
 import sys
 
-path, revision, release, os_name, arch, bootstrap, schema = sys.argv[1:8]
+path, revision, release, os_name, arch, bootstrap, schema, bootstrap_toolchain = sys.argv[1:9]
 with open(path, encoding="utf-8") as stream:
     document = json.load(stream)
 if document.get("schema") != schema:
@@ -194,12 +205,12 @@ if document.get("revision") != revision or document.get("release") != release:
 if document.get("os") != os_name or document.get("arch") != arch:
     raise SystemExit(1)
 bootstrap_document = document.get("bootstrap") or {}
-if bootstrap_document.get("toolchain") != "1.99.1":
+if bootstrap_document.get("toolchain") != bootstrap_toolchain:
     raise SystemExit(1)
 if bootstrap_document.get("commit_hash") != bootstrap:
     raise SystemExit(1)
 digest = document.get("binary_sha256")
-if not isinstance(digest, str) or len(digest) != 64:
+if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
     raise SystemExit(1)
 print(digest)
 PY
@@ -356,6 +367,12 @@ done
 [ -n "$cache_dir" ] || fail "--cache-dir must not be empty"
 mkdir -p -- "$cache_dir"
 cache_dir=$(absolute_directory "$cache_dir") || fail "could not resolve --cache-dir"
+[ "$cache_dir" != "/" ] || fail "refusing to use the filesystem root as --cache-dir"
+case "$cache_dir" in
+  /bin | /boot | /dev | /etc | /home | /lib | /opt | /proc | /root | /sbin | /sys | /tmp | /usr | /var)
+    fail "refusing to use a top-level system directory as --cache-dir: $cache_dir"
+    ;;
+esac
 mkdir -p -- "$cache_dir/bin" "$cache_dir/installs"
 
 detect_platform

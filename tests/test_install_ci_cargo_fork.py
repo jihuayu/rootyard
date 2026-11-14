@@ -381,6 +381,11 @@ class CargoForkHelperTest(unittest.TestCase):
                 self.assertFalse(record.exists())
                 self.assertFalse((cache / "bin" / "cargo").exists())
 
+    def test_rejects_the_filesystem_root_as_a_cache_dir(self) -> None:
+        result = self._run("install", "--cache-dir", "/", "--no-github")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("filesystem root", result.stderr)
+
     def test_requires_rustc_to_remain_1991(self) -> None:
         result = self._install(env={"FAKE_RUSTC_RELEASE": "1.98.0"})
         self.assertNotEqual(result.returncode, 0)
