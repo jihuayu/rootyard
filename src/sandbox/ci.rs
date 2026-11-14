@@ -544,7 +544,7 @@ pub(super) async fn gate_authorized(
         FOR SHARE OF c,w,b,p,r,i"
     );
     let plan = serde_json::to_value(&claim.plan).map_err(Error::internal)?;
-    Ok(tx
+    let authorized = tx
         .query_opt(
             &sql,
             &[
@@ -561,9 +561,12 @@ pub(super) async fn gate_authorized(
                 &plan,
             ],
         )
-        .await
-        .map_err(Error::internal)?
-        .is_some())
+        .await;
+    #[cfg(test)]
+    if let Err(error) = &authorized {
+        crate::sandbox::gate_probe::observe_pg_error(crate::sandbox::gate_probe::GateStage::AuthoritySelect, error);
+    }
+    Ok(authorized.map_err(Error::internal)?.is_some())
 }
 async fn load_job(state: &AppState, claim: &ClaimedRun, id: Uuid) -> Result<CiJob, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;

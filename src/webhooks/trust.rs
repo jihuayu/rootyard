@@ -28,7 +28,13 @@ async fn policy_lock_tx(tx:&deadpool_postgres::Transaction<'_>,repo:Uuid,sql:&st
     ->Result<(),Error>{
     // The advisory lock and metadata write share one PostgreSQL transaction,
     // so a lost session cannot publish a policy change after dropping the gate.
-    tx.query_one(sql,&[&POLICY_LOCK_DOMAIN,&repo]).await.map_err(Error::internal)?;
+    let locked=tx.query_one(sql,&[&POLICY_LOCK_DOMAIN,&repo]).await;
+    #[cfg(test)]
+    if let Err(error)=&locked {
+        crate::sandbox::gate_probe::observe_pg_error(
+            crate::sandbox::gate_probe::GateStage::PoolTxPolicy,error);
+    }
+    locked.map_err(Error::internal)?;
     Ok(())
 }
 

@@ -133,8 +133,29 @@ fn leader_exited(pid: i32) -> std::io::Result<bool> {
     Ok(unsafe { info.assume_init().si_pid() != 0 })
 }
 async fn open_start_gate(state: &AppState, job: Uuid, source: &Source, root: &Path) -> Result<(), Error> {
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
+    #[cfg(test)]
+    let probe = super::gate_probe::GateProbe::current();
+    let mut client = state
+        .pool
+        .get()
+        .await
+        .inspect_err(|_error| {
+            #[cfg(test)]
+            if let Some(probe) = &probe {
+                probe.record_pool_error(super::gate_probe::GateStage::PoolTxPolicy, _error);
+            }
+        })
+        .map_err(Error::internal)?;
+    let tx = client
+        .transaction()
+        .await
+        .inspect_err(|_error| {
+            #[cfg(test)]
+            if let Some(probe) = &probe {
+                probe.record_pg_error(super::gate_probe::GateStage::PoolTxPolicy, _error);
+            }
+        })
+        .map_err(Error::internal)?;
     // Lock order: repository policy fence -> sandbox_jobs -> CI authority rows.
     // Trusted bind/revoke/PATCH writers take the same fence exclusively before
     // their binding/webhook/run row locks. A shared reader is enough here and
@@ -143,7 +164,18 @@ async fn open_start_gate(state: &AppState, job: Uuid, source: &Source, root: &Pa
     // supplies the repository identity; authority is revalidated below after
     // all rows are locked.
     if let Source::Ci { claim, .. } = source {
-        crate::webhooks::trust::lock_policy_shared_tx(&tx, claim.repository_id).await?;
+        let locked = crate::webhooks::trust::lock_policy_shared_tx(&tx, claim.repository_id).await;
+        #[cfg(test)]
+        if locked.is_err()
+            && let Some(probe) = &probe
+        {
+            probe.record(super::gate_probe::GateStage::PoolTxPolicy, super::gate_probe::StageOutcome::Failed);
+        }
+        locked?;
+    }
+    #[cfg(test)]
+    if let Some(probe) = &probe {
+        probe.record(super::gate_probe::GateStage::PoolTxPolicy, super::gate_probe::StageOutcome::Ok);
     }
     let row = tx
         .query_opt(
@@ -152,10 +184,34 @@ async fn open_start_gate(state: &AppState, job: Uuid, source: &Source, root: &Pa
             &[&job, &state.storage.volume_id],
         )
         .await
+        .inspect_err(|_error| {
+            #[cfg(test)]
+            if let Some(probe) = &probe {
+                probe.record_pg_error(super::gate_probe::GateStage::JobSelect, _error);
+            }
+        })
         .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
+        .ok_or_else(|| {
+            #[cfg(test)]
+            if let Some(probe) = &probe {
+                probe.record(super::gate_probe::GateStage::JobSelect, super::gate_probe::StageOutcome::Failed);
+            }
+            Error::not_found()
+        })?;
+    #[cfg(test)]
+    if let Some(probe) = &probe {
+        probe.record(super::gate_probe::GateStage::JobSelect, super::gate_probe::StageOutcome::Ok);
+    }
     if row.get::<_, String>(0) != "running" {
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            probe.record(super::gate_probe::GateStage::StateGuard, super::gate_probe::StageOutcome::Refused);
+        }
         return Err(Error::internal("sandbox cancelled before start"));
+    }
+    #[cfg(test)]
+    if let Some(probe) = &probe {
+        probe.record(super::gate_probe::GateStage::StateGuard, super::gate_probe::StageOutcome::Ok);
     }
     // The policy fence used the immutable claim repository. Revalidate the
     // locked job's immutable CI identity before trusting that claim below.
@@ -164,27 +220,94 @@ async fn open_start_gate(state: &AppState, job: Uuid, source: &Source, root: &Pa
             || row.get::<_, Option<i64>>(2) != Some(claim.attempt)
             || row.get::<_, Option<i64>>(3) != Some(claim.lease_generation))
     {
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            probe.record(super::gate_probe::GateStage::IdentityGuard, super::gate_probe::StageOutcome::Refused);
+        }
         return Err(Error::internal("sandbox cancelled before start"));
     }
+    #[cfg(test)]
+    if let Source::Ci { .. } = source
+        && let Some(probe) = &probe
+    {
+        probe.record(super::gate_probe::GateStage::IdentityGuard, super::gate_probe::StageOutcome::Ok);
+    }
     let authorized = match source {
-        Source::Ci { claim, .. } => super::ci::gate_authorized(&tx, claim).await?,
-        Source::Workspace { .. } => tx
-            .query_opt(
-                "SELECT 1 FROM workspaces w JOIN sandbox_jobs j \
+        Source::Ci { claim, .. } => {
+            let result = super::ci::gate_authorized(&tx, claim).await;
+            #[cfg(test)]
+            if result.is_err()
+                && let Some(probe) = &probe
+            {
+                probe.record(super::gate_probe::GateStage::AuthoritySelect, super::gate_probe::StageOutcome::Failed);
+            }
+            let authorized = result?;
+            #[cfg(test)]
+            if let Some(probe) = &probe {
+                probe.record(
+                    super::gate_probe::GateStage::AuthoritySelect,
+                    if authorized {
+                        super::gate_probe::StageOutcome::Ok
+                    } else {
+                        super::gate_probe::StageOutcome::Refused
+                    },
+                );
+            }
+            authorized
+        }
+        Source::Workspace { .. } => {
+            let authorized = tx
+                .query_opt(
+                    "SELECT 1 FROM workspaces w JOIN sandbox_jobs j \
             ON j.workspace_id=w.id WHERE j.id=$1 AND j.lease_epoch=w.lease_epoch \
             AND j.host_id=w.host_id AND w.lease_until>clock_timestamp()+interval '2 seconds' \
             FOR SHARE OF w",
-                &[&job],
-            )
-            .await
-            .map_err(Error::internal)?
-            .is_some(),
+                    &[&job],
+                )
+                .await
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    if let Some(probe) = &probe {
+                        probe.record_pg_error(super::gate_probe::GateStage::AuthoritySelect, _error);
+                    }
+                })
+                .map_err(Error::internal)?
+                .is_some();
+            #[cfg(test)]
+            if let Some(probe) = &probe {
+                probe.record(
+                    super::gate_probe::GateStage::AuthoritySelect,
+                    if authorized {
+                        super::gate_probe::StageOutcome::Ok
+                    } else {
+                        super::gate_probe::StageOutcome::Refused
+                    },
+                );
+            }
+            authorized
+        }
     };
     if !authorized {
         return Err(Error::internal("sandbox authority expired before start"));
     }
-    fs::write(root.join("control/start"), b"start").map_err(Error::internal)?;
-    tx.commit().await.map_err(Error::internal)?;
+    let marker = fs::write(root.join("control/start"), b"start");
+    #[cfg(test)]
+    if let Some(probe) = &probe {
+        probe.record(
+            super::gate_probe::GateStage::Marker,
+            if marker.is_ok() { super::gate_probe::StageOutcome::Ok } else { super::gate_probe::StageOutcome::Failed },
+        );
+    }
+    marker.map_err(Error::internal)?;
+    let committed = tx.commit().await;
+    #[cfg(test)]
+    if let Some(probe) = &probe {
+        match &committed {
+            Ok(()) => probe.record(super::gate_probe::GateStage::Commit, super::gate_probe::StageOutcome::Ok),
+            Err(_error) => probe.record_pg_error(super::gate_probe::GateStage::Commit, _error),
+        }
+    }
+    committed.map_err(Error::internal)?;
     Ok(())
 }
 
@@ -875,6 +998,7 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::{Source, bwrap_supports_size, open_start_gate};
+    use crate::sandbox::gate_probe::{GATE_PROBE, GateProbe};
     use crate::{
         AppState,
         ci_checkouts::{Plan, dependencies::Manifest},
@@ -938,14 +1062,25 @@ mod tests {
     ) -> anyhow::Result<BackendWait> {
         loop {
             let found = {
-                let client = pool.get().await?;
+                let client = pool.get().await.map_err(|error| {
+                    anyhow::anyhow!(
+                        "backend observation pool error sqlstate={}",
+                        crate::sandbox::gate_probe::safe_pool_sqlstate(&error).unwrap_or("none")
+                    )
+                })?;
                 let rows = client
                     .query(
                         "SELECT query,wait_event_type,wait_event FROM pg_stat_activity \
                          WHERE application_name=$1 AND state='active' AND pid<>pg_backend_pid()",
                         &[&application_name],
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "backend observation query error sqlstate={}",
+                            crate::sandbox::gate_probe::safe_pg_sqlstate(&error).unwrap_or("none")
+                        )
+                    })?;
                 rows.into_iter().find_map(|row| {
                     let query: String = row.get(0);
                     let wait_event_type: Option<String> = row.get(1);
@@ -974,7 +1109,7 @@ mod tests {
     {
         match tokio::time::timeout(Duration::from_secs(15), &mut *handle).await {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(anyhow::anyhow!("{label} task failed: {error}")),
+            Ok(Err(_)) => Err(anyhow::anyhow!("{label} task failed")),
             Err(_) => {
                 handle.abort();
                 Err(anyhow::anyhow!("{label} timed out"))
@@ -998,6 +1133,11 @@ mod tests {
     /// lock instead. This case proves PostgreSQL authority lock ordering only:
     /// it does not launch bubblewrap, an executor or a kernel process.
     ///
+    /// A cfg(test)-only task-local probe reports a fixed stage name, any
+    /// validated five-character SQLSTATE, whether the shared fence wait was
+    /// observed, and the revoke HTTP status. It records no SQL, parameters,
+    /// error Display, causes, URLs, tokens or paths.
+    ///
     /// Run with `ROOTYARD_TEST_DATABASE_URL=... cargo test --lib
     /// start_gate_serializes_context_removal_under_policy_fence -- --ignored`.
     #[tokio::test]
@@ -1012,7 +1152,7 @@ mod tests {
         admin.get().await?.batch_execute(&format!("CREATE SCHEMA \"{schema}\"")).await?;
         let case = tokio::spawn(run_gate_lock_case(base_url, schema.clone())).await;
         let cleanup = admin.get().await?.batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
-        let case = case.map_err(|error| anyhow::anyhow!("gate lock case panicked: {error}"))?;
+        let case = case.map_err(|_| anyhow::anyhow!("gate lock case panicked"))?;
         cleanup?;
         case
     }
@@ -1149,6 +1289,7 @@ mod tests {
             ))
             .await?;
 
+        let probe = Arc::new(GateProbe::default());
         let revoke_state = state.clone();
         let mut revoke = tokio::spawn(async move {
             crate::webhooks::trust::revoke(
@@ -1166,10 +1307,12 @@ mod tests {
             &["UPDATE forge_trusted_check_contexts"],
             Instant::now() + Duration::from_secs(10),
         )
-        .await?;
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}; {}", probe.snapshot()))?;
         anyhow::ensure!(
             writer_wait.wait_event_type.as_deref() == Some("Lock"),
-            "writer did not reach the binding barrier"
+            "writer did not reach the binding barrier; {}",
+            probe.snapshot()
         );
 
         let gate_state = state.clone();
@@ -1188,9 +1331,14 @@ mod tests {
             job_id: ci_job_id,
             plan,
         };
+        let gate_probe = Arc::clone(&probe);
         let mut gate = tokio::spawn(async move {
-            let source = Source::Ci { checkout: PathBuf::from("/unused-gate-checkout"), claim };
-            open_start_gate(&gate_state, sandbox_job_id, &source, &gate_root).await
+            GATE_PROBE
+                .scope(gate_probe, async move {
+                    let source = Source::Ci { checkout: PathBuf::from("/unused-gate-checkout"), claim };
+                    open_start_gate(&gate_state, sandbox_job_id, &source, &gate_root).await
+                })
+                .await
         });
         let gate_wait = wait_backend(
             &pool,
@@ -1201,28 +1349,46 @@ mod tests {
         .await;
         let observed_shared = gate_wait.as_ref().is_ok_and(|wait| wait.query.contains("pg_advisory_xact_lock_shared"));
         let observed_event = gate_wait.as_ref().ok().and_then(|wait| wait.wait_event.clone());
+        probe.note_shared_policy_advisory_wait(observed_shared);
 
         let unlocked: bool =
             barrier_client.query_one("SELECT pg_advisory_unlock(hashtextextended($1,0))", &[&barrier]).await?.get(0);
-        anyhow::ensure!(unlocked, "test barrier was not released");
+        anyhow::ensure!(unlocked, "test barrier was not released; {}", probe.snapshot());
         drop(barrier_client);
 
-        let revoke = join_timeout(&mut revoke, "revoke").await?;
-        let gate = join_timeout(&mut gate, "gate").await?;
-        let gate_wait = gate_wait?;
-        anyhow::ensure!(observed_shared, "gate did not wait on the shared policy fence");
+        let revoke = join_timeout(&mut revoke, "revoke")
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}; {}", probe.snapshot()))?;
+        let revoke_status = match &revoke {
+            Ok(response) => response.status().as_u16(),
+            Err(error) => error.0.as_u16(),
+        };
+        probe.note_revoke_final_http_status(revoke_status);
+        let gate =
+            join_timeout(&mut gate, "gate").await.map_err(|error| anyhow::anyhow!("{error}; {}", probe.snapshot()))?;
+        let gate_wait = gate_wait.map_err(|error| anyhow::anyhow!("{error}; {}", probe.snapshot()))?;
+        anyhow::ensure!(observed_shared, "gate did not wait on the shared policy fence; {}", probe.snapshot());
         anyhow::ensure!(
             observed_event.as_deref() == Some("advisory"),
-            "gate waited on the old authority row order: {:?}",
-            gate_wait.wait_event
+            "gate waited on the old authority row order: {:?}; {}",
+            gate_wait.wait_event,
+            probe.snapshot()
         );
-        let response = revoke.map_err(|error| anyhow::anyhow!("revoke returned HTTP {}", error.0))?;
-        anyhow::ensure!(response.status() == StatusCode::OK, "revoke returned {}", response.status());
-        let error = gate.err().ok_or_else(|| anyhow::anyhow!("gate unexpectedly authorized"))?;
+        let response =
+            revoke.map_err(|error| anyhow::anyhow!("revoke returned HTTP {}; {}", error.0, probe.snapshot()))?;
+        anyhow::ensure!(
+            response.status() == StatusCode::OK,
+            "revoke returned {}; {}",
+            response.status(),
+            probe.snapshot()
+        );
+        let error = gate.err().ok_or_else(|| anyhow::anyhow!("gate unexpectedly authorized; {}", probe.snapshot()))?;
         anyhow::ensure!(
             error.1 == "sandbox authority expired before start",
-            "gate returned a different refusal: {}",
-            error.1
+            "gate returned a different refusal: HTTP {} {}; {}",
+            error.0.as_u16(),
+            error.1,
+            probe.snapshot()
         );
 
         let client = pool.get().await?;
@@ -1235,9 +1401,13 @@ mod tests {
             .get(0);
         let generation: i64 =
             client.query_one("SELECT lease_generation FROM ci_runs WHERE id=$1", &[&run_id]).await?.get(0);
-        anyhow::ensure!(!active, "context removal did not deactivate the binding");
-        anyhow::ensure!(generation == 2, "context removal did not advance the run epoch");
-        anyhow::ensure!(!job_root.join("control/start").exists(), "failed gate wrote the start marker");
+        anyhow::ensure!(!active, "context removal did not deactivate the binding; {}", probe.snapshot());
+        anyhow::ensure!(generation == 2, "context removal did not advance the run epoch; {}", probe.snapshot());
+        anyhow::ensure!(
+            !job_root.join("control/start").exists(),
+            "failed gate wrote the start marker; {}",
+            probe.snapshot()
+        );
         Ok(())
     }
 
