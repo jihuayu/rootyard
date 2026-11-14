@@ -50,6 +50,7 @@ Python orchestration only: the executable artifacts are the Rust targets Cargo
 builds, and the batch never invokes a second Cargo build or a clean.
 """
 import argparse
+import contextlib
 from dataclasses import dataclass
 import hashlib
 import json
@@ -399,6 +400,84 @@ class Plan:
     requested_bin_names: tuple
 
 
+def _require_file_destination(path, label):
+    """A final file destination must not be a symlink or an existing directory."""
+    path = Path(path)
+    if path.is_symlink():
+        raise BuildError(label + ' must not be a symlink: ' + str(path))
+    if path.exists() and path.is_dir():
+        raise BuildError(label + ' must not be an existing directory: ' + str(path))
+
+
+def final_destinations(plan, target):
+    """Every final file this batch transaction owns, in its documented order."""
+    destinations = [(('bin receipt ' + spec['name']), Path(path))
+                    for spec, path, _implicit in bin_receipt_locations(plan, target)]
+    for spec, output in zip(plan.tests, plan.outputs):
+        destinations.append(('test output ' + spec['name'], Path(output)))
+        destinations.append(('test receipt ' + spec['name'], Path(str(output) + '.build.json')))
+    destinations.append(('batch manifest', Path(plan.manifest_out)))
+    return destinations
+
+
+def _validate_disjoint_destinations(destinations):
+    """Check file destinations are non-symlink, unique and pairwise disjoint."""
+    seen = {}
+    for label, path in destinations:
+        _require_file_destination(path, label)
+        if path in seen:
+            raise BuildError(label + ' ' + str(path) + ' collides with ' + seen[path])
+        seen[path] = label
+    items = list(seen.items())
+    for index, (path, label) in enumerate(items):
+        for other, other_label in items[index + 1:]:
+            if path in other.parents or other in path.parents:
+                raise BuildError(label + ' ' + str(path) + ' conflicts with ancestor/descendant ' +
+                                 other_label + ' ' + str(other))
+
+
+def preflight_request_paths(args, target):
+    """Validate the explicit file requests before even reading Cargo metadata.
+
+    The full final set also depends on metadata-selected bin names, so
+    :func:`validate_final_destinations` checks it after planning.  This early
+    pass is what guarantees a raw symlink, an existing directory at a ``.json``
+    manifest path or an explicit output/manifest collision never reaches a
+    Cargo process, a lock acquisition or any cleanup.
+    """
+    outputs = [resolve_output(raw, '--output') for raw in args.output or []]
+    if len(set(outputs)) != len(outputs):
+        raise BuildError('--output repeats a destination')
+    for output in outputs:
+        if output == target or target in output.parents:
+            raise BuildError('--output must be outside CARGO_TARGET_DIR so cache eviction cannot '
+                             'delete it: ' + str(output))
+    for raw in args.bin_destination or []:
+        resolve_output(raw, '--bin-destination')
+    manifest_out = resolve_manifest_output(args.manifest_out)
+    if manifest_out == target or target in manifest_out.parents:
+        raise BuildError('--manifest-out must be outside CARGO_TARGET_DIR')
+    explicit = [('--output destination', output) for output in outputs]
+    explicit += [('test receipt destination', Path(str(output) + '.build.json'))
+                 for output in outputs]
+    explicit.append(('batch manifest destination', manifest_out))
+    _validate_disjoint_destinations(explicit)
+    return outputs, manifest_out
+
+
+def validate_final_destinations(plan, target):
+    """Fail closed before any cleanup, lock, mkdir or Cargo build mutation.
+
+    Every final path -- requested and implicit bin receipts, relocated test
+    outputs and their receipts, and the manifest -- must be a non-symlink file
+    destination, unique, and pairwise disjoint with no ancestor/descendant
+    relationship.  Otherwise a cleanup or publication could touch a path that
+    belongs to another destination or to the caller's data.
+    """
+    destinations = final_destinations(plan, target)
+    _validate_disjoint_destinations(destinations)
+
+
 def enabled_bins(manifest, args):
     """Every metadata bin whose required-features the batch's own selection enables."""
     enabled = enabled_features(manifest, args)
@@ -426,9 +505,57 @@ def implicit_bins_for(manifest, args):
     return [entry for entry in enabled_bins(manifest, args) if entry['name'] not in requested]
 
 
-def resolve_output(raw):
+def _raw_output(raw):
+    """The requested path before any symlink resolution (relative to the workspace)."""
     value = Path(raw).expanduser()
-    return (_root() / value if not value.is_absolute() else value).resolve()
+    return _root() / value if not value.is_absolute() else value
+
+
+def resolve_output(raw, label='path'):
+    """Resolve one explicit file destination without silently following a symlink.
+
+    ``Path.resolve()`` follows a file symlink to its referent, which would make
+    cleanup and publication operate on a path the caller never named.  Reject
+    the raw final component first, then canonicalize only its parent so the
+    returned path is stable for collision checks.
+    """
+    raw_path = _raw_output(raw)
+    if raw_path.is_symlink():
+        raise BuildError(label + ' must not be a symlink: ' + str(raw_path))
+    if raw_path.exists() and raw_path.is_dir():
+        raise BuildError(label + ' must not be an existing directory: ' + str(raw_path))
+    resolved = raw_path.parent.resolve() / raw_path.name
+    if resolved.is_symlink():
+        raise BuildError(label + ' must not be a symlink: ' + str(resolved))
+    if resolved.exists() and resolved.is_dir():
+        raise BuildError(label + ' must not be an existing directory: ' + str(resolved))
+    return resolved
+
+
+def resolve_manifest_output(raw):
+    """Resolve --manifest-out, preserving the directory-form convenience.
+
+    A path whose final component ends in ``.json`` is an explicit manifest
+    file; anything else is a directory that receives ``MANIFEST_NAME``.  The
+    raw directory must not be a symlink or an existing non-directory, so the
+    directory form cannot silently follow a referent either.
+    """
+    raw_path = _raw_output(raw)
+    if raw_path.is_symlink():
+        raise BuildError('--manifest-out must not be a symlink: ' + str(raw_path))
+    if raw_path.suffix == '.json':
+        return resolve_output(raw, '--manifest-out')
+    if raw_path.exists() and not raw_path.is_dir():
+        raise BuildError('--manifest-out must be a directory or a .json file: ' + str(raw_path))
+    directory = raw_path.resolve()
+    if not directory.is_dir() and directory.exists():
+        raise BuildError('--manifest-out must be a directory or a .json file: ' + str(directory))
+    manifest_path = directory / MANIFEST_NAME
+    if manifest_path.is_symlink():
+        raise BuildError('--manifest-out manifest must not be a symlink: ' + str(manifest_path))
+    if manifest_path.exists() and manifest_path.is_dir():
+        raise BuildError('--manifest-out manifest must not be an existing directory: ' + str(manifest_path))
+    return manifest_path
 
 
 def plan_batch(args, manifest):
@@ -453,7 +580,7 @@ def plan_batch(args, manifest):
                              'enabled explicitly; --no-default-features would silently change the profile')
 
     target = canonical_target()
-    outputs = [resolve_output(raw) for raw in args.output or []]
+    outputs = [resolve_output(raw, '--output') for raw in args.output or []]
     if len(set(outputs)) != len(outputs):
         raise BuildError('--output repeats a destination')
     for output in outputs:
@@ -468,7 +595,7 @@ def plan_batch(args, manifest):
     if len(destinations) != len(bin_specs):
         raise BuildError('--bin-destination must be given exactly once per --bin')
     for spec, raw in zip(bin_specs, destinations):
-        if resolve_output(raw) != target / 'debug' / spec['name']:
+        if resolve_output(raw, '--bin-destination') != target / 'debug' / spec['name']:
             raise BuildError('binary ' + spec['name'] + ' may only be recorded at its canonical '
                              '"<target>/debug/' + spec['name'] + '" location')
     for spec in test_specs:
@@ -477,15 +604,17 @@ def plan_batch(args, manifest):
         if not spec['source'].is_file():
             raise BuildError('integration-test source is missing: ' + str(spec['source']))
 
-    manifest_out = resolve_output(args.manifest_out)
-    manifest_out = manifest_out if manifest_out.suffix == '.json' else manifest_out / MANIFEST_NAME
+    manifest_out = resolve_manifest_output(args.manifest_out)
     if manifest_out == target or target in manifest_out.parents:
         raise BuildError('--manifest-out must be outside CARGO_TARGET_DIR')
     implicit = implicit_bins_for(manifest, args)
     requested_names = tuple(entry['name'] for entry in bin_specs) if args.all_bins else \
         tuple(spec['name'] for spec in bin_specs)
-    return Plan(Selection(args.features, args.no_default_features, args.package_debug, args.strip_debuginfo),
-                bin_specs, test_specs, outputs, manifest_out, implicit, requested_names)
+    plan = Plan(Selection(args.features, args.no_default_features, args.package_debug,
+                          args.strip_debuginfo), bin_specs, test_specs, outputs, manifest_out,
+                implicit, requested_names)
+    validate_final_destinations(plan, target)
+    return plan
 
 
 # -- Cargo events -------------------------------------------------------------
@@ -502,9 +631,9 @@ def emit_command(selection):
 def prepare_destinations(plan):
     """Create every destination's parent directory before anything is measured."""
     for output in plan.outputs:
+        _require_file_destination(output, '--output')
         output.parent.mkdir(parents=True, exist_ok=True)
-        if output.is_dir() and not output.is_symlink():
-            raise BuildError('--output is a directory: ' + str(output))
+    _require_file_destination(plan.manifest_out, '--manifest-out')
     plan.manifest_out.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -801,14 +930,26 @@ class Publisher:
 
 
 def remove_paths(paths):
+    """Remove only files, symlinks and empty invocation-private directories.
+
+    Final destinations are preflight-checked files, so a directory here is
+    either an invocation-owned temporary directory (``rmdir`` after its files)
+    or an unknown pre-existing directory that this transaction must never
+    recursively delete.  Non-empty directories are conservatively preserved.
+    """
     if isinstance(paths, (str, Path)):
         paths = [paths]
     for path in paths:
         path = Path(path)
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
-        elif path.exists() or path.is_symlink():
-            path.unlink()
+        if path.is_symlink():
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        elif path.is_dir():
+            with contextlib.suppress(OSError):
+                path.rmdir()
+        elif path.exists():
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
 
 
 def verified_copy(source, destination):
@@ -1075,13 +1216,18 @@ def run_batch(args):
     # The target set is Cargo's: the metadata document is read before the
     # request is planned, so --all-bins, a --bin name, a --test that is a
     # metadata test and the implicit bins all come from one target list.
+    target = canonical_target()
+    preflight_request_paths(args, target)
     metadata_before = cargo_metadata(environment)
     manifest = batch_manifest(metadata_before)
     plan = plan_batch(args, manifest)
     selection = plan.selection
-    target = canonical_target()
     started = time.monotonic()
 
+    # Re-check the complete destination set immediately before the first
+    # mutation; a pre-existing directory or symlink at a final file path is
+    # refused rather than cleaned, and every final path stays disjoint.
+    validate_final_destinations(plan, target)
     prepare_destinations(plan)
     command = emit_command(selection)
     for spec in plan.bins:
@@ -1106,6 +1252,10 @@ def run_batch(args):
              + [plan.manifest_out]
              + list(plan.outputs))
     with build_lock(target) as lock_path:
+        # Re-check under the lock, before any cleanup: a path that changed
+        # between planning and lock acquisition must still be refused, never
+        # followed or recursively deleted.
+        validate_final_destinations(plan, target)
         # A failed or interrupted batch never leaves a receipt, manifest or
         # relocated executable from an earlier or partial transaction behind.
         remove_paths(owned + [path.with_name('.' + path.name + '.batch-new') for path in owned])

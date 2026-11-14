@@ -802,6 +802,88 @@ class BatchTest(unittest.TestCase):
         (self.root / 'tests' / 'example.rs').unlink()
         planning_failure(self.args(), 'integration-test source is missing')
 
+    def test_preflight_refuses_output_symlink_without_touching_referent(self):
+        sentinel = self.tempdir / 'sentinel-output'
+        sentinel.write_text('keep')
+        output = self.outdir / 'example'
+        output.parent.mkdir(parents=True)
+        output.symlink_to(sentinel)
+        prior = self.target / 'debug' / 'rootyard.build.json'
+        prior.parent.mkdir(parents=True)
+        prior.write_text('{"stale": true}\n')
+        args = self.args(outputs=[str(output)])
+        with self.assertRaises(batch.BuildError) as caught:
+            self.build(args=args)
+        self.assertIn('symlink', str(caught.exception))
+        self.assertEqual(self.metadata_calls, [], 'preflight must run before Cargo metadata')
+        self.assertEqual(self.popen_calls, [])
+        self.assertEqual(sentinel.read_text(), 'keep')
+        self.assertTrue(output.is_symlink())
+        self.assertTrue(prior.exists(), 'preflight refusal must not run cleanup')
+        self.assertFalse(self.lock_path.exists(), 'preflight refusal must not create the build lock')
+
+    def test_preflight_refuses_manifest_json_directory_and_preserves_sentinel(self):
+        manifest = self.outdir / 'manifest.json'
+        manifest.mkdir(parents=True)
+        sentinel = manifest / 'keep'
+        sentinel.write_text('keep')
+        with self.assertRaises(batch.BuildError) as caught:
+            self.build(args=self.args(manifest_out=manifest))
+        self.assertIn('existing directory', str(caught.exception))
+        self.assertEqual(self.metadata_calls, [], 'preflight must run before Cargo metadata')
+        self.assertEqual(self.popen_calls, [])
+        self.assertEqual(sentinel.read_text(), 'keep')
+        self.assertTrue(manifest.is_dir())
+
+    def test_preflight_refuses_directory_at_bin_receipt_and_preserves_sentinel(self):
+        receipt_path = self.target / 'debug' / (BINS[0] + '.build.json')
+        receipt_path.mkdir(parents=True)
+        sentinel = receipt_path / 'keep'
+        sentinel.write_text('keep')
+        with self.assertRaises(batch.BuildError) as caught:
+            self.build(args=self.args())
+        self.assertIn('existing directory', str(caught.exception))
+        self.assertEqual(self.popen_calls, [])
+        self.assertEqual(sentinel.read_text(), 'keep')
+        self.assertFalse(self.lock_path.exists())
+
+    def test_preflight_refuses_destination_collisions_and_ancestry(self):
+        manifest_receipts = self.outdir / 'native-build-batch.receipts'
+        implicit_name = self.implicit_bins(BINS, TESTS)[0]
+        cases = [
+            (self.args(outputs=[str(self.outdir / 'same.json')],
+                       manifest_out=self.outdir / 'same.json'), 'collides'),
+            (self.args(outputs=[str(self.outdir / 'tree')],
+                       manifest_out=self.outdir / 'tree' / 'manifest.json'), 'ancestor/descendant'),
+            (self.args(outputs=[str(manifest_receipts / (implicit_name + '.build.json'))],
+                       manifest_out=self.outdir / 'native-build-batch.json'), 'collides'),
+        ]
+        for args, message in cases:
+            with self.subTest(message=message, outputs=args.output, manifest=args.manifest_out):
+                with self.assertRaises(batch.BuildError) as caught:
+                    self.build(args=args)
+                self.assertIn(message, str(caught.exception))
+                self.assertEqual(self.popen_calls, [])
+                self.assertFalse(self.lock_path.exists())
+
+    def test_directory_form_manifest_out_remains_valid(self):
+        directory = self.outdir / 'batch-dir'
+        args = self.args(manifest_out=directory)
+        report = self.build(args=args)
+        manifest = directory / batch.MANIFEST_NAME
+        self.assertTrue(manifest.is_file())
+        self.assertEqual(json.loads(manifest.read_text()), report)
+        self.assertTrue(Path(args.output[0]).is_file())
+
+    def test_remove_paths_never_recursively_deletes_unknown_directories(self):
+        directory = self.tempdir / 'unknown-directory'
+        directory.mkdir()
+        sentinel = directory / 'keep'
+        sentinel.write_text('keep')
+        batch.remove_paths([directory])
+        self.assertTrue(sentinel.is_file())
+        self.assertTrue(directory.is_dir())
+
     def test_metadata_only_non_lib_bin_test_target_is_refused(self):
         document = json.loads(self.metadata_json())
         document['packages'][0]['targets'].append(
