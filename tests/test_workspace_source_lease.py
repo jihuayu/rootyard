@@ -10,11 +10,13 @@ import time
 import unittest
 
 from tests.e2e import Harness
+from tests.runtime_binary import select_runtime_binary
 
 
 class SourceLeaseTest(unittest.TestCase):
     def test_clone_and_namespace_git_children_stop_before_retry(self):
-        h=Harness(argparse.Namespace(binary="target/debug/rootyard",
+        binary,_=select_runtime_binary()
+        h=Harness(argparse.Namespace(binary=str(binary),
             keep=os.environ.get("ROOTYARD_KEEP_TEST")=="1"))
         try:
             h.setup();h.api();h.roundtrip()

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Per-PR live Rust storage_lifecycle worker fence regression (#90).
 
-A source-bound prebuilt ``target/debug/rootyard`` (or an explicit
-``ROOTYARD_TEST_BINARY``) and its adjacent build receipt are required in every
-environment. Run the explicit native build preparation step first; this module
-never invokes Cargo or ``scripts/build_native.py``. A missing or stale artifact
-fails hard instead of compiling. In CI (``GITHUB_ACTIONS=true``)
-``ROOTYARD_TEST_DATABASE_URL`` is also required; locally, unset configuration
-starts an ephemeral PostgreSQL cluster under ``TMPDIR``.
+A source-bound prebuilt ``target/debug/rootyard`` (or an artifact selected by
+``ROOTYARD_BIN``, ``ROOTYARD_TEST_BINARY`` or the legacy ``ROOTYARD_BINARY``)
+and its adjacent build receipt are required in every environment. Run the
+explicit native build preparation step first; this module never invokes Cargo
+or ``scripts/build_native.py``. A missing or stale artifact fails hard instead
+of compiling. In CI (``GITHUB_ACTIONS=true``) ``ROOTYARD_TEST_DATABASE_URL`` is
+also required; locally, unset configuration starts an ephemeral PostgreSQL
+cluster under ``TMPDIR``.
 """
 import base64
 import json
@@ -29,7 +30,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import schema_baseline  # noqa: E402
-import source_bound_binary  # noqa: E402
+import runtime_binary  # noqa: E402
 from test_storage_identity_fks import (  # noqa: E402
     JOBS_OWNER_FK,
     psql_exec,
@@ -41,35 +42,24 @@ from test_storage_identity_fks import (  # noqa: E402
 DEFAULT_BINARY = schema_baseline.ROOT / "target" / "debug" / "rootyard"
 FENCE_DIAGNOSTIC = "maintenance claim or repository generation changed"
 PREBUILT_INSTRUCTION = (
-    "run the explicit native build preparation step and set ROOTYARD_TEST_BINARY "
-    "(or leave the documented target/debug/rootyard) before this runtime acceptance; "
+    "run the explicit native build preparation step and set ROOTYARD_BIN "
+    "(legacy ROOTYARD_TEST_BINARY/ROOTYARD_BINARY are also accepted), or leave "
+    "the documented target/debug/rootyard, before this runtime acceptance; "
     "this test never invokes Cargo or build_native.py"
 )
 
 
 def resolve_binary_path(environ, default_binary):
-    raw = (environ.get("ROOTYARD_TEST_BINARY") or "").strip()
-    candidate = Path(raw) if raw else Path(default_binary)
-    if not (candidate.is_file() and os.access(candidate, os.X_OK)):
-        raise RuntimeError(
-            f"prebuilt rootyard binary is required at {candidate}; no local build fallback exists. "
-            f"Please {PREBUILT_INSTRUCTION}"
-        )
-    return candidate.resolve()
+    return runtime_binary.select_runtime_binary_path(
+        environ, default_binary=default_binary,
+        instruction=PREBUILT_INSTRUCTION)
 
 
 def source_bound_prebuilt_binary(environ, default_binary, binder=None):
     """Require a prebuilt binary whose receipt and production inputs match this checkout."""
     path = resolve_binary_path(environ, default_binary)
-    binder = source_bound_binary.bind if binder is None else binder
-    try:
-        binding = binder(path, environ=environ)
-    except Exception as error:
-        raise RuntimeError(
-            f"prebuilt rootyard binary {path} is not bound to this checkout "
-            f"(source, contents or build receipt rejected: {error}). "
-            f"Please {PREBUILT_INSTRUCTION}; provenance is never rewritten by acceptance."
-        ) from error
+    binding = runtime_binary.bind_runtime_binary(
+        path, environ, binder=binder, instruction=PREBUILT_INSTRUCTION)
     return path, binding
 
 

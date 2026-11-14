@@ -4,11 +4,13 @@ import json
 import unittest
 
 from tests.e2e import Harness
+from tests.runtime_binary import select_runtime_binary
 
 
 class ChangeSetServiceTest(unittest.TestCase):
     def test_crash_after_first_ref_and_recover(self):
-        h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+        binary,_=select_runtime_binary()
+        h=Harness(argparse.Namespace(binary=str(binary),keep=False))
         try:
             h.setup();h.api();h.roundtrip()
             other=json.loads(h.expect("/api/repos",201,token=h.alice,method="POST",body={"name":"other"}))
