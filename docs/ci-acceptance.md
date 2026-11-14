@@ -292,6 +292,28 @@ and every job asserts `git rev-parse HEAD` equals it before building.
   unavailable, unsigned, malformed, unsigned-tailed or ambiguous the step fails
   rather than installing an unverified binary. The installed `git-lfs/<version>`
   output and `$RUNNER_TEMP/bin/git-lfs` precedence on `PATH` are asserted.
+Both native jobs build their one candidate binary through the explicit v2 CAS
+producer:
+
+```bash
+python3 scripts/build_native.py \
+  --features pando-lab \
+  --package-debug 0 \
+  --strip-debuginfo \
+  --artifact-store "$HOME/.cache/rootyard/native-artifacts"
+```
+
+`--artifact-store` is a Python producer option and is never added to the
+recorded Cargo argv. The store is one per-runner root outside the workspace and
+`target/`. Each job validates the producer's own JSON output and exports the
+actual `artifact_store.binary` and `artifact_store.build_receipt` as
+`ROOTYARD_BINARY` and `ROOTYARD_BUILD_RECEIPT`; the self-check, every browser
+and LFS harness, and both job manifests consume those canonical paths. Only a
+byte-identical copy of the raw `.build.json` receipt is placed under
+`test-results/candidate/...` for download. No mutable `target/debug` binary is
+copied or uploaded, and neither the artifact store nor a target/dependency tree
+is an artifact.
+
 * `release-gate` downloads both job manifests and runs
   `scripts/native_report_manifest.py --mode release`. It requires the two jobs to
   share the dispatched commit and one compiled source-input digest, re-verifies

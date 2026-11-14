@@ -143,15 +143,57 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
           mkdir -p test-results/candidate/browser
-          python3 scripts/build_native.py --features pando-lab --package-debug 0 --strip-debuginfo
-          test "$(target/debug/rootyard --rootyard-hook-self-check)" = rootyard-hook-v1
-          cp target/debug/rootyard.build.json test-results/candidate/browser/rootyard.build.json
+          python3 scripts/build_native.py \
+            --features pando-lab \
+            --package-debug 0 \
+            --strip-debuginfo \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            | tee "${RUNNER_TEMP:?}/candidate-browser-native-build.json"
+      - name: Export the canonical candidate binary and build receipt
+        run: |
+          python3 - "${RUNNER_TEMP:?}/candidate-browser-native-build.json" "$GITHUB_ENV" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          build = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          store = build.get("artifact_store")
+          if not isinstance(store, dict):
+              raise SystemExit("build_native output has no artifact_store record")
+          exported = {}
+          for field, name in (
+              ("binary", "ROOTYARD_BINARY"),
+              ("build_receipt", "ROOTYARD_BUILD_RECEIPT"),
+          ):
+              value = store.get(field)
+              if not isinstance(value, str) or not value:
+                  raise SystemExit("artifact_store.%s is missing" % field)
+              if "\n" in value or "\r" in value or "\x00" in value:
+                  raise SystemExit("artifact_store.%s is not a single safe line" % field)
+              path = Path(value)
+              if not path.is_absolute() or path.is_symlink() or not path.is_file():
+                  raise SystemExit("artifact_store.%s is not an absolute regular file: %s" % (field, value))
+              exported[name] = str(path)
+          binary = Path(exported["ROOTYARD_BINARY"])
+          receipt = Path(exported["ROOTYARD_BUILD_RECEIPT"])
+          if receipt != Path(str(binary) + ".build.json"):
+              raise SystemExit("build receipt is not adjacent to the canonical binary")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as stream:
+              for name in sorted(exported):
+                  stream.write("%s=%s\n" % (name, exported[name]))
+          PY
+      - name: Self-check the canonical candidate binary and copy its raw receipt
+        run: |
+          set -euo pipefail
+          test -x "$ROOTYARD_BINARY"
+          test "$("$ROOTYARD_BINARY" --rootyard-hook-self-check)" = rootyard-hook-v1
+          cp -- "$ROOTYARD_BUILD_RECEIPT" test-results/candidate/browser/rootyard.build.json
       - name: Exercise real Chromium sign-in, Issue/PR workflow and session revocation
         timeout-minutes: 20
         run: |
           set -euo pipefail
           test-results/tools/playwright-venv/bin/python tests/browser_ui.py \
-            --binary target/debug/rootyard \
+            --binary "$ROOTYARD_BINARY" \
             --report test-results/candidate/browser/browser-ui.json \
             2>&1 | tee test-results/candidate/browser/browser-ui.log
       - name: Bind the browser report to the built binary
@@ -165,8 +207,8 @@ jobs:
           rust_version=$(rustc -V 2>/dev/null || true)
           python3 scripts/native_report_manifest.py --mode job \
             --manifest-out test-results/candidate/browser/native-job-manifest.json \
-            --build-receipt test-results/candidate/browser/rootyard.build.json \
-            --binary target/debug/rootyard \
+            --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+            --binary "$ROOTYARD_BINARY" \
             --report browser_ui=test-results/candidate/browser/browser-ui.json \
             --require-case browser_ui=chromium_browser_workflow \
             --log browser_ui=test-results/candidate/browser/browser-ui.log \
@@ -286,9 +328,51 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
           mkdir -p test-results/candidate/object-store
-          python3 scripts/build_native.py --features pando-lab --package-debug 0 --strip-debuginfo
-          test "$(target/debug/rootyard --rootyard-hook-self-check)" = rootyard-hook-v1
-          cp target/debug/rootyard.build.json test-results/candidate/object-store/rootyard.build.json
+          python3 scripts/build_native.py \
+            --features pando-lab \
+            --package-debug 0 \
+            --strip-debuginfo \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            | tee "${RUNNER_TEMP:?}/candidate-object-store-native-build.json"
+      - name: Export the canonical candidate binary and build receipt
+        run: |
+          python3 - "${RUNNER_TEMP:?}/candidate-object-store-native-build.json" "$GITHUB_ENV" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          build = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          store = build.get("artifact_store")
+          if not isinstance(store, dict):
+              raise SystemExit("build_native output has no artifact_store record")
+          exported = {}
+          for field, name in (
+              ("binary", "ROOTYARD_BINARY"),
+              ("build_receipt", "ROOTYARD_BUILD_RECEIPT"),
+          ):
+              value = store.get(field)
+              if not isinstance(value, str) or not value:
+                  raise SystemExit("artifact_store.%s is missing" % field)
+              if "\n" in value or "\r" in value or "\x00" in value:
+                  raise SystemExit("artifact_store.%s is not a single safe line" % field)
+              path = Path(value)
+              if not path.is_absolute() or path.is_symlink() or not path.is_file():
+                  raise SystemExit("artifact_store.%s is not an absolute regular file: %s" % (field, value))
+              exported[name] = str(path)
+          binary = Path(exported["ROOTYARD_BINARY"])
+          receipt = Path(exported["ROOTYARD_BUILD_RECEIPT"])
+          if receipt != Path(str(binary) + ".build.json"):
+              raise SystemExit("build receipt is not adjacent to the canonical binary")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as stream:
+              for name in sorted(exported):
+                  stream.write("%s=%s\n" % (name, exported[name]))
+          PY
+      - name: Self-check the canonical candidate binary and copy its raw receipt
+        run: |
+          set -euo pipefail
+          test -x "$ROOTYARD_BINARY"
+          test "$("$ROOTYARD_BINARY" --rootyard-hook-self-check)" = rootyard-hook-v1
+          cp -- "$ROOTYARD_BUILD_RECEIPT" test-results/candidate/object-store/rootyard.build.json
       - name: Start the job-owned Garage 2.1 S3 fixture
         timeout-minutes: 12
         run: |
@@ -312,7 +396,7 @@ jobs:
           . "$OBJECT_STORE_ENV_FILE"
           set +a
           python3 tests/lfs_hydration_concurrency.py \
-            --binary target/debug/rootyard \
+            --binary "$ROOTYARD_BINARY" \
             --report test-results/candidate/object-store/lfs-hydration.json \
             2>&1 | tee test-results/candidate/object-store/lfs-hydration.log
       - name: Exercise second-node LFS recovery after source volume loss
@@ -323,7 +407,7 @@ jobs:
           . "$OBJECT_STORE_ENV_FILE"
           set +a
           python3 tests/lfs_remote.py \
-            --binary target/debug/rootyard \
+            --binary "$ROOTYARD_BINARY" \
             --report test-results/candidate/object-store/lfs-remote.json \
             2>&1 | tee test-results/candidate/object-store/lfs-remote.log
       - name: Exercise LFS publication and retention without any remote object store
@@ -338,7 +422,7 @@ jobs:
           test -z "${ROOTYARD_OBJECT_STORE_ENDPOINT+set}"
           test -z "${ROOTYARD_OBJECT_STORE_BUCKET+set}"
           python3 tests/lfs_retention_acceptance.py \
-            --binary target/debug/rootyard \
+            --binary "$ROOTYARD_BINARY" \
             --report test-results/candidate/object-store/lfs-retention.json \
             2>&1 | tee test-results/candidate/object-store/lfs-retention.log
       - name: Bind object-store reports to the built binary
@@ -370,8 +454,8 @@ jobs:
           rust_version=$(rustc -V 2>/dev/null || true)
           python3 scripts/native_report_manifest.py --mode job \
             --manifest-out test-results/candidate/object-store/native-job-manifest.json \
-            --build-receipt test-results/candidate/object-store/rootyard.build.json \
-            --binary target/debug/rootyard \
+            --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+            --binary "$ROOTYARD_BINARY" \
             --report lfs_hydration=test-results/candidate/object-store/lfs-hydration.json \
             --report lfs_remote=test-results/candidate/object-store/lfs-remote.json \
             --report lfs_retention=test-results/candidate/object-store/lfs-retention.json \

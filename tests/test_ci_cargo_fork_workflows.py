@@ -137,6 +137,41 @@ class CargoForkWorkflowTest(unittest.TestCase):
         self.assertLess(text.index(SETUP), text.index("Build the candidate binary once"))
         self.assertLess(text.rindex(SETUP), text.rindex("Build the candidate binary once"))
 
+    def test_candidate_builds_once_in_shared_cas_and_consumes_canonical_paths(self) -> None:
+        text = self.workflow("candidate-release-acceptance.yml")
+        builder = (
+            "python3 scripts/build_native.py \\\n"
+            "            --features pando-lab \\\n"
+            "            --package-debug 0 \\\n"
+            "            --strip-debuginfo \\\n"
+            '            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \\'
+        )
+        self.assertEqual(text.count(builder), 2)
+        self.assertNotIn("target/debug/rootyard", text)
+        self.assertNotIn("cp target/debug", text)
+        self.assertEqual(text.count('--build-receipt "$ROOTYARD_BUILD_RECEIPT" \\'), 2)
+        self.assertEqual(text.count('--binary "$ROOTYARD_BINARY" \\'), 6)
+        self.assertIn(
+            "cp -- \"$ROOTYARD_BUILD_RECEIPT\" test-results/candidate/browser/rootyard.build.json",
+            text,
+        )
+        self.assertIn(
+            "cp -- \"$ROOTYARD_BUILD_RECEIPT\" test-results/candidate/object-store/rootyard.build.json",
+            text,
+        )
+        # The exported paths are the producer's own JSON fields, not a guessed
+        # store layout. Both jobs validate them before writing $GITHUB_ENV.
+        self.assertEqual(text.count('("binary", "ROOTYARD_BINARY")'), 2)
+        self.assertEqual(text.count('("build_receipt", "ROOTYARD_BUILD_RECEIPT")'), 2)
+        self.assertEqual(text.count('if receipt != Path(str(binary) + ".build.json"):'), 2)
+        self.assertNotIn("json.dump", text)
+        for artifact in ("candidate-browser", "candidate-object-store"):
+            upload = text[text.index(f"name: {artifact}"):]
+            upload = upload.split("if-no-files-found:", 1)[0]
+            self.assertIn("test-results/candidate/", upload)
+            self.assertNotIn("target/", upload)
+            self.assertNotIn("native-artifacts", upload)
+
     def test_ci_consumes_immutable_batch_artifacts(self) -> None:
         text = self.workflow("ci.yml")
         self.assertIn(
