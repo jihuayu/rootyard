@@ -6,7 +6,10 @@ This runbook pairs the privacy-preserving structured error log
 loopback Prometheus exposition ([metrics.md](metrics.md)). Every `rootyard_*`
 metric name, label key, `kind`, `scope`, `worker`, `phase`, and `remote_op`
 referenced here is validated against the Rust source by
-`tests/test_observability_runbook.py`.
+`tests/test_observability_runbook.py`. The PromQL below assumes the Rootyard
+metrics scrape uses `job_name: rootyard-metrics`; replace that label value if
+your deployment names the job differently. Rootyard does not export `up`;
+Prometheus synthesizes it per target.
 
 ## Fault taxonomy overview
 
@@ -39,12 +42,16 @@ mistake relational invariant bugs for transient network blips:
 * Private repositories intentionally return `404` to unauthenticated callers and
   non-members so existence is never disclosed, and `403` only when a verified
   member lacks the required role or PAT action scope.
-* Do **not** page infrastructure oncall for elevated `4xx` rates when
-  `rootyard_postgres_up == 1` and HTTP `503` responses are zero.
+* Do **not** page infrastructure oncall for elevated `4xx` rates while the
+  Rootyard metrics target is up (`up{job="rootyard-metrics"} == 1`), a
+  successful scrape reports `rootyard_postgres_up == 1` and
+  `rootyard_db_pool_waiting == 0`, and HTTP `503` responses are zero.
 
 ```promql
 # Healthy backend check while triaging external 4xx spikes:
-rootyard_postgres_up == 1 and rootyard_db_pool_waiting == 0
+rootyard_postgres_up == 1
+  and up{job="rootyard-metrics"} == 1
+  and rootyard_db_pool_waiting == 0
 ```
 
 ### Operator troubleshooting entrypoint
@@ -76,9 +83,13 @@ rootyard_postgres_up == 1 and rootyard_db_pool_waiting == 0
 ### Executable PromQL alert predicates
 
 ```promql
-# Alert: RootyardPostgresSnapshotDown (page, for: 1m)
-# A failed or >5s SQL scrape returns HTTP 503 and omits SQL-derived gauges.
-absent(rootyard_postgres_up) or rootyard_postgres_up == 0
+# Alert: RootyardMetricsScrapeFailed (page, for: 1m)
+# A failed or >5s SQL snapshot makes /metrics return HTTP 503. Prometheus
+# records this target's up as 0 and discards the 503 body, including its
+# rootyard_postgres_up 0 and process-local gauges. Keep the selector scoped to
+# the Rootyard metrics job and do not aggregate, so one failed instance still
+# alerts while another instance of the same job is healthy.
+up{job="rootyard-metrics"} == 0
 
 # Alert: RootyardDbPoolSaturated (page, for: 2m)
 # Pool checkout queue is backing up while zero idle connections remain.
@@ -96,6 +107,25 @@ increase(rootyard_lfs_remote_failures_total[5m]) > 0
 # Admitted in-flight LFS remote repair tasks are holding semaphore permits.
 rootyard_lfs_remote_repair_backlog > 0
 ```
+
+`up` is Prometheus's per-target scrape result, not a Rootyard metric. The
+`job="rootyard-metrics"` matcher must match the metrics scrape's `job_name`; it
+keeps unrelated jobs out of this page. The expression is intentionally not
+aggregated: one failed instance still yields a series when another instance of
+the same job is healthy. A target removed from service discovery has no `up`
+sample at all; cover that separately with target-inventory monitoring. An
+absence check on a SQL-derived gauge cannot distinguish that case from a
+healthy peer, because a single failed target's samples disappear while a
+healthy target keeps the metric present.
+
+The HTTP `503` body still contains a valid exposition with
+`rootyard_postgres_up 0` and the process-local pool, Git, transfer, LFS,
+error-log, and GC series. That body is a manual diagnostic for
+`curl -i http://127.0.0.1:9108/metrics`; it is not ingested by Prometheus, so
+those body values are not collected samples and must not be used in a PromQL
+condition. The ingested failure signal is `up 0`. After this alert fires,
+inspect `/health/ready` and the manual `503` body to distinguish a database
+snapshot failure from a listener or network failure.
 
 ### Structured stderr correlation predicates
 
@@ -119,10 +149,14 @@ jq -c 'select(.event == "rootyard_error" and (.kind == "remote_store" or .kind =
 
 ### Operator troubleshooting entrypoint
 
-1. **PostgreSQL saturation or timeout (`rootyard_postgres_up == 0`, `57014`, `53300`, `08*`)**:
-   * Probe `GET /health/ready` and `curl -i http://127.0.0.1:9108/metrics`. On
-     HTTP `503`, confirm whether `rootyard_db_pool_busy` equals
+1. **PostgreSQL saturation or timeout (`up{job="rootyard-metrics"} == 0`, `57014`, `53300`, `08*`)**:
+   * Probe `GET /health/ready` and `curl -i http://127.0.0.1:9108/metrics`. A
+     Prometheus `up{...} == 0` or an HTTP `503` from this manual probe means the
+     scrape failed. Inspect the manual `503` body for `rootyard_postgres_up 0`
+     and confirm whether `rootyard_db_pool_busy` equals
      `rootyard_db_pool_max_size` and whether `rootyard_db_pool_waiting > 0`.
+     Those body gauges are manual diagnostics, not collected Prometheus
+     samples, so they cannot be used in an alert expression.
    * Inspect PostgreSQL `pg_stat_activity` and `pg_locks` for long-running
      blockers cancelling statements at the 5 s app pool or 4 s metrics
      `statement_timeout` (`sqlstate:"57014"`).

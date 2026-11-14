@@ -3,12 +3,80 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PROM_JOB = "rootyard-metrics"
+PROMPTOOL = os.environ.get("PROMPTOOL") or shutil.which("promtool")
+RULES_FIXTURE = ROOT / "tests" / "fixtures" / "prometheus" / "rootyard-metrics.rules.yml"
+RULE_TEST_FIXTURE = ROOT / "tests" / "fixtures" / "prometheus" / "rootyard-metrics.test.yml"
+
+
+def _promql_blocks(text: str) -> str:
+    return "\n".join(re.findall(r"```promql\n(.*?)```", text, re.S))
+
+
+def _validate_scrape_failure_alert(page_name: str, text: str) -> None:
+    """Require a job-scoped per-instance `up` alert and reject body-based predicates."""
+    promql = _promql_blocks(text)
+    expected = re.search(
+        rf'(?m)^\s*up\{{job="{re.escape(PROM_JOB)}"\}}\s*==\s*0\s*$',
+        promql,
+    )
+    if not expected:
+        raise AssertionError(
+            f"{page_name}: missing job-scoped per-instance alert `up{{job=\"rootyard-metrics\"}} == 0`"
+        )
+    for pattern, message in (
+        (
+            r"absent\s*\(\s*rootyard_postgres_up\s*\)",
+            "rootyard_postgres_up is absent from a rejected 503 body and absent() misses a single failed target",
+        ),
+        (
+            r"rootyard_postgres_up\s*==\s*0",
+            "rootyard_postgres_up 0 exists only in a 503 body that Prometheus does not ingest",
+        ),
+        (
+            r"(?m)^\s*up\s*==\s*0\s*$",
+            "bare up == 0 also pages on unrelated jobs; scope it with job=\"rootyard-metrics\"",
+        ),
+    ):
+        if re.search(pattern, promql):
+            raise AssertionError(f"{page_name}: {message}")
+
+
+def _validate_manual_503_diagnostics(page_name: str, text: str) -> None:
+    """Require the 503 body to be described as manual data, never as scraped samples."""
+    paragraphs = [
+        re.sub(r"[`*_]", "", re.sub(r"\s+", " ", p)).strip().lower()
+        for p in re.split(r"\n\s*\n", text)
+    ]
+    matching = [p for p in paragraphs if "503 body" in p]
+    if not matching:
+        raise AssertionError(f"{page_name}: missing the HTTP 503 body diagnostic contract")
+    if not any(
+        "manual diagnostic" in p and ("not ingested" in p or "not collected" in p)
+        for p in matching
+    ):
+        raise AssertionError(
+            f"{page_name}: 503 body must be described in one paragraph as a manual diagnostic "
+            "that Prometheus does not ingest or collect"
+        )
+    for paragraph in matching:
+        for misleading in (
+            "ingests the 503 body",
+            "prometheus ingests the 503",
+            "prometheus collects the 503",
+            "503 body is ingested",
+        ):
+            if misleading in paragraph:
+                raise AssertionError(f"{page_name}: misleading 503 ingestion claim: {misleading!r}")
 
 
 def _rust_non_test_source(path: Path) -> str:
@@ -301,6 +369,8 @@ class ObservabilityRunbookTest(unittest.TestCase):
             "remote_store",
             "remote_status",
             "rootyard_postgres_up",
+            'up{job="rootyard-metrics"} == 0',
+            "RootyardMetricsScrapeFailed",
             "rootyard_db_pool_available",
             "rootyard_db_pool_waiting",
             "rootyard_lfs_remote_failures_total",
@@ -318,6 +388,82 @@ class ObservabilityRunbookTest(unittest.TestCase):
             "rootyard_error_log_dropped_total",
         ):
             self.assertIn(required_token, alerts_doc, f"Runbook missing required coverage token {required_token!r}")
+
+    def test_scrape_failure_docs_are_job_scoped_and_per_instance(self) -> None:
+        for rel in ("docs/observability-alerts.md", "docs/metrics.md"):
+            page = ROOT / rel
+            text = page.read_text(encoding="utf-8")
+            _validate_scrape_failure_alert(page.name, text)
+            _validate_manual_503_diagnostics(page.name, text)
+            for stale in (
+                "absent(rootyard_postgres_up)",
+                "rootyard_postgres_up == 0",
+                "rootyard_postgres_up=0",
+            ):
+                self.assertNotIn(stale, text, f"{page.name}: stale body-only alert predicate {stale!r}")
+
+    def test_prometheus_rule_fixture_covers_one_failed_target_only(self) -> None:
+        rules = RULES_FIXTURE.read_text(encoding="utf-8")
+        rule_tests = RULE_TEST_FIXTURE.read_text(encoding="utf-8")
+        self.assertIn("alert: RootyardMetricsScrapeFailed", rules)
+        self.assertIn(f'expr: up{{job="{PROM_JOB}"}} == 0', rules)
+        self.assertIn("for: 1m", rules)
+        for required in (
+            f'up{{job="{PROM_JOB}",instance="127.0.0.1:9108"}}',
+            f'up{{job="{PROM_JOB}",instance="127.0.0.1:9109"}}',
+            'up{job="unrelated-metrics",instance="127.0.0.1:9200"}',
+            "instance: 127.0.0.1:9109",
+            "exp_alerts: []",
+        ):
+            self.assertIn(required, rule_tests, f"Prometheus fixture missing {required!r}")
+
+    def test_prometheus_rule_fixture_behavior(self) -> None:
+        if not PROMPTOOL:
+            message = (
+                "promtool is not installed; run `promtool check rules "
+                f"{RULES_FIXTURE} && promtool test rules {RULE_TEST_FIXTURE}`"
+            )
+            if os.environ.get("ROOTYARD_REQUIRE_PROMPTOOL") == "1":
+                self.fail(message)
+            self.skipTest(message)
+        checked = subprocess.run(
+            [PROMPTOOL, "check", "rules", str(RULES_FIXTURE)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr or checked.stdout)
+        tested = subprocess.run(
+            [PROMPTOOL, "test", "rules", str(RULE_TEST_FIXTURE)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(tested.returncode, 0, tested.stderr or tested.stdout)
+
+    def test_validators_reject_omitted_or_body_based_scrape_alerts(self) -> None:
+        valid_503_note = "\nA 503 body is a manual diagnostic and is not ingested.\n"
+        for snippet in (
+            "```promql\nrootyard_postgres_up == 1\n```\n" + valid_503_note,
+            "```promql\nabsent(rootyard_postgres_up)\n```\n" + valid_503_note,
+            "```promql\nrootyard_postgres_up == 0\n```\n" + valid_503_note,
+            "```promql\nup == 0\n```\n" + valid_503_note,
+        ):
+            with self.subTest(snippet=snippet):
+                with self.assertRaises(AssertionError):
+                    _validate_scrape_failure_alert("synthetic.md", snippet)
+
+        for snippet in (
+            "```promql\nup{job=\"rootyard-metrics\"} == 0\n```\nA manual diagnostic: Prometheus ingests the 503 body.\n",
+            "```promql\nup{job=\"rootyard-metrics\"} == 0\n```\nPrometheus discards the 503 body and does not ingest it.\n",
+            "```promql\nup{job=\"rootyard-metrics\"} == 0\n```\nA manual diagnostic says the 503 body is ingested by Prometheus.\n",
+            "```promql\nup{job=\"rootyard-metrics\"} == 0\n```\nA manual diagnostic retains the 503 body.\n",
+        ):
+            with self.subTest(snippet=snippet):
+                with self.assertRaises(AssertionError):
+                    _validate_manual_503_diagnostics("synthetic.md", snippet)
 
     def test_validators_reject_synthetic_invalid_metrics_labels_and_fields(self) -> None:
         invalid_metric_snippets = (

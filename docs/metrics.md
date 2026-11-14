@@ -16,7 +16,7 @@ labels. Database strings are never interpolated into exposition.
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `rootyard_error_log_dropped_total` | counter | Accepted safe error records lost to queue/startup/write failure; excludes rate limiting and queued records at exit |
-| `rootyard_postgres_up` | gauge | 1 only when the complete authoritative SQL snapshot succeeds |
+| `rootyard_postgres_up` | gauge | 1 only when the complete authoritative SQL snapshot succeeds; 0 appears only in an HTTP 503 body, which Prometheus does not ingest |
 | `rootyard_git_capacity` | gauge | Configured native Git concurrency limit |
 | `rootyard_git_in_flight` | gauge | Occupied Git slots, including provisioning and process cleanup |
 | `rootyard_db_pool_max_size` | gauge | Configured maximum PostgreSQL pool connections |
@@ -85,23 +85,40 @@ established pool objects, excluding creation in progress; it is not a live
 socket probe. `available` and `waiting` are derived from pool users, and
 `waiting` can include connection creation. `busy = size - available` is a
 derived observation. A scrape that later fails to acquire a connection still
-exports the process-local status it observed.
+writes the process-local status it observed into the HTTP 503 body; that body
+is a manual diagnostic and is not ingested.
 
 PostgreSQL is the source of truth. Each scrape opens one read-only
 `REPEATABLE READ` transaction, so every statement in that scrape observes the
 same MVCC snapshot without holding a lock or blocking writers. A four-second
 server-side statement timeout bounds each query; pool acquisition and the whole
 snapshot have a combined five-second timeout. On
-any database/schema/query failure or timeout, the endpoint returns HTTP 503,
-exports `rootyard_postgres_up 0` plus the process-local pool gauges, transfer
-counters, `rootyard_lfs_remote_failures_total` (the LFS failure counter),
-`rootyard_lfs_remote_repair_backlog` (the LFS backlog gauge), and four GC counters,
-and omits every database-derived gauge,
-including all four browser-session gauges. The process-local metrics remain
-exported because they do not assert database health. The endpoint never
-substitutes an empty/healthy backlog or serves a stale cached snapshot. Alert on both
-Prometheus scrape failure and PostgreSQL health; standard Prometheus marks a
-503 scrape unsuccessful rather than ingesting its body.
+any database/schema/query failure or timeout, the endpoint returns HTTP 503.
+The response body still renders `rootyard_postgres_up 0` plus the process-local
+pool gauges, transfer counters, `rootyard_lfs_remote_failures_total` (the LFS
+failure counter), `rootyard_lfs_remote_repair_backlog` (the LFS backlog gauge),
+`rootyard_error_log_dropped_total`, and four GC counters, and omits every
+database-derived gauge, including all four browser-session gauges. The
+process-local metrics stay in the body because they do not assert database
+health. The endpoint never substitutes an empty/healthy backlog or serves a
+stale cached snapshot.
+
+That HTTP 503 body is a manual diagnostic for `curl -i` only. Prometheus marks
+the scrape unsuccessful, records `up 0` for the target, and discards every
+sample in the body, including `rootyard_postgres_up 0` and the process-local
+gauges. Those body values are not collected samples and must not be used in
+PromQL. A collected healthy scrape always reports `rootyard_postgres_up 1`.
+Alert on the scrape result instead, scoped to the Rootyard metrics job so an
+unrelated failed job does not page this service, and kept per-instance so one
+failed target is not hidden by a healthy peer:
+
+```promql
+up{job="rootyard-metrics"} == 0
+```
+
+Rootyard does not itself export `up`; Prometheus synthesizes it from each
+target's scrape result. Replace `rootyard-metrics` with your scrape
+configuration's `job_name`.
 
 Counters reset on process restart and saturate at `u64::MAX`. They measure
 Git subprocess HTTP activity, not successful Git ref mutations, durable
@@ -173,8 +190,10 @@ oldest such repository is.
 
 ## PromQL and triage
 
-All samples are aggregate counts or ages; a failed snapshot removes every
-SQL-derived series, so alert on the scrape itself as well.
+Each scrape is all-or-nothing: HTTP 200 carries the complete series set,
+while HTTP 503 carries only the manual diagnostic body (`rootyard_postgres_up
+0` plus process-local series) and is discarded by Prometheus. Alert on the
+scrape result rather than on a sample that exists only in the rejected body.
 
 ```promql
 # Capture verification is older than 16 minutes on one host.
@@ -202,17 +221,20 @@ rootyard_storage_maintenance_oldest_overdue_scan_age_seconds > 3600
 # refresh it, and the scheduler behaviour is unchanged).
 max by (backend) (rootyard_storage_maintenance_repos{state="stale_generation"}) > 0
 
-# The scrape itself failed: every SQL gauge above disappears.
-absent(rootyard_postgres_up) or rootyard_postgres_up == 0
+# The scrape itself failed: Prometheus records up=0 for this target and
+# discards the 503 body, so every SQL gauge above disappears from this target.
+up{job="rootyard-metrics"} == 0
 ```
 
 Do not alert uniformly on `missing_scan`: a repository whose maintenance scan
 was never recorded may be newly created, and the scheduler run is the recovery
 path. Do not alert uniformly on leases either: ready-but-expired workspace
 leases can be legitimate handoffs or finished sessions. Alert on sustained
-capture age, on due backlog growth and expired running leases, and on
-`rootyard_postgres_up == 0` / scrape failure. Treat terminal-failure history as
-an investigation input, not a permanent fault or retryable-backlog alert.
+capture age, on due backlog growth and expired running leases, and on the
+Rootyard metrics target scrape failure (`up{job="rootyard-metrics"} == 0`,
+which is per-target). Do not alert on `rootyard_postgres_up 0` from a rejected
+503 body. Treat terminal-failure history as an investigation input, not a
+permanent fault or retryable-backlog alert.
 
 For the complete operator troubleshooting runbook, executable PromQL alert
 expressions, and structured `jq` stderr correlation rules across expected `4xx`
@@ -325,3 +347,16 @@ binds every metric name, label set, and structured error field in
 [observability-alerts.md](observability-alerts.md),
 [observability-errors.md](observability-errors.md), and
 [worker-diagnostics.md](worker-diagnostics.md) to the Rust source.
+
+The executable scrape-failure rule and its behavioral cases live in
+`tests/fixtures/prometheus/`: one failed Rootyard metrics target alerts even
+while a healthy peer and an unrelated failed job are present, while a failed
+unrelated job does not page Rootyard. When `promtool` is available,
+`tests/test_observability_runbook.py` runs `promtool check rules` and
+`promtool test rules` against those fixtures; otherwise that single test skips
+and reports the exact commands to run:
+
+```
+promtool check rules tests/fixtures/prometheus/rootyard-metrics.rules.yml
+promtool test rules tests/fixtures/prometheus/rootyard-metrics.test.yml
+```
