@@ -732,37 +732,81 @@ class ReportContractTest(unittest.TestCase):
 
     def assert_aborted_report(self, failure):
         workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 2, "file_bytes": 64})
-        before = set(os.listdir(tempfile.gettempdir()))
-        with _AbortedRun(failure) as aborted:
-            status, report = self.run_main_in_process(workload)
-        self.assertEqual(status, 0)
-        self.assertIsNotNone(report, "an aborted run that started work must still write a report")
-        self.assertTrue(report["truncated"])
-        self.assertFalse(report["metrics"]["pg.round_trip.latency_ms"]["status"] == "measured")
-        budget = aborted.budget
-        self.assertIsNotNone(budget)
-        self.assertFalse(budget.root, "the owned root must be removed")
-        self.assertEqual(set(os.listdir(tempfile.gettempdir())), before, "no residue from the aborted run")
-        temp = report["metrics"]["runner.temp_bytes"]
-        limits = report["limits"]["temp_budget"]
-        for facts in (temp, limits):
-            self.assertEqual(facts["budget_bytes"], budget.budget)
-            self.assertEqual(facts["peak_charged_bytes"], budget.peak)
-            self.assertEqual(facts["checkpoints"], budget.checkpoints)
-            self.assertEqual(facts["returned_pushes_per_repo"], 1,
-                             "the effective push count survives an aborted run")
-        self.assertEqual(temp["cleaned"], True)
-        self.assertIn(str(failure), temp["stop_reason"])
-        self.assertEqual(limits["estimate_bytes"], budget.estimate)
-        self.assertEqual(temp["admission_estimate_bytes"], budget.estimate)
-        self.assertEqual(report["limits"]["admission"]["returned_pushes_per_repo"], 1)
-        self.assertNotIn("cleanup_error", temp)
+        # Own every temporary path this helper creates. main allocates its
+        # fixture root through tempfile.mkdtemp; redirecting tempfile.tempdir
+        # for the run keeps that root (and run_main_in_process's workload and
+        # report files) under this private parent instead of the shared system
+        # temp directory. The residue check therefore observes only paths this
+        # helper owns, not unrelated host or worker temp activity.
+        parent = tempfile.TemporaryDirectory(prefix="rootyard-w0-aborted-")
+        try:
+            owned = Path(parent.name)
+            before = set(os.listdir(owned))
+            with mock.patch.object(tempfile, "tempdir", str(owned)):
+                with _AbortedRun(failure) as aborted:
+                    status, report = self.run_main_in_process(workload)
+                self.assertEqual(status, 0)
+                self.assertIsNotNone(report, "an aborted run that started work must still write a report")
+                self.assertTrue(report["truncated"])
+                self.assertFalse(report["metrics"]["pg.round_trip.latency_ms"]["status"] == "measured")
+                budget = aborted.budget
+                self.assertIsNotNone(budget)
+                self.assertFalse(budget.root, "the owned root must be removed")
+                self.assertEqual(set(os.listdir(owned)), before,
+                                 "no residue from the aborted run in the owned temp parent")
+                temp = report["metrics"]["runner.temp_bytes"]
+                limits = report["limits"]["temp_budget"]
+                for facts in (temp, limits):
+                    self.assertEqual(facts["budget_bytes"], budget.budget)
+                    self.assertEqual(facts["peak_charged_bytes"], budget.peak)
+                    self.assertEqual(facts["checkpoints"], budget.checkpoints)
+                    self.assertEqual(facts["returned_pushes_per_repo"], 1,
+                                     "the effective push count survives an aborted run")
+                self.assertEqual(temp["cleaned"], True)
+                self.assertIn(str(failure), temp["stop_reason"])
+                self.assertEqual(limits["estimate_bytes"], budget.estimate)
+                self.assertEqual(temp["admission_estimate_bytes"], budget.estimate)
+                self.assertEqual(report["limits"]["admission"]["returned_pushes_per_repo"], 1)
+                self.assertNotIn("cleanup_error", temp)
+        finally:
+            parent.cleanup()
 
     def test_pre_first_push_budget_violation_still_reports_truncation_and_budget(self):
         self.assert_aborted_report(baseline.BudgetViolation("git commit: owned fixture tree holds 9 bytes"))
 
     def test_generic_limit_exceeded_still_reports_truncation_and_budget(self):
         self.assert_aborted_report(baseline.LimitExceeded("child ignored SIGKILL; aborting runner"))
+
+    def test_aborted_report_ignores_unrelated_system_temp_churn(self):
+        # An unrelated host/worker temp directory may disappear while the
+        # helper runs. Only the helper's own private parent is in scope.
+        unrelated = tempfile.TemporaryDirectory(prefix="rootyard-w0-unrelated-")
+        original_cleanup = baseline.TempBudget.cleanup
+
+        def cleanup_with_unrelated_churn(budget):
+            unrelated.cleanup()
+            return original_cleanup(budget)
+
+        try:
+            with mock.patch.object(baseline.TempBudget, "cleanup", cleanup_with_unrelated_churn):
+                self.assert_aborted_report(baseline.LimitExceeded("unrelated temp churn"))
+        finally:
+            unrelated.cleanup()
+
+    def test_aborted_report_fails_on_owned_temp_residue(self):
+        original_cleanup = baseline.TempBudget.cleanup
+
+        def cleanup_leaving_owned_residue(budget):
+            error = original_cleanup(budget)
+            owned_parent = Path(tempfile.gettempdir())
+            residue = owned_parent / "rootyard-w0-git-owned-residue"
+            residue.mkdir()
+            (residue / "payload").write_bytes(b"owned residue")
+            return error
+
+        with mock.patch.object(baseline.TempBudget, "cleanup", cleanup_leaving_owned_residue):
+            with self.assertRaisesRegex(AssertionError, "no residue from the aborted run"):
+                self.assert_aborted_report(baseline.LimitExceeded("owned residue must fail"))
 
     def test_redaction_and_scan_detect_secret_shapes(self):
         redacted = baseline.redact({"dsn": "a", "note": "see postgresql://u:pw@host/db", "nested": [{"password": "x"}]})
