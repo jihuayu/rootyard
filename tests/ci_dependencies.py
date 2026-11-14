@@ -70,6 +70,13 @@ class DependencyCheckoutHarness(JobCheckoutHarness):
         self.origin_child_token = None
         self.service_token = None
 
+    def start_mirror(self):
+        # mirror_env is snapshotted into the mirror process at spawn. Alice is
+        # created by setup(), so bind the source token at the actual startup
+        # (and any later restart), never before fixture initialization.
+        self.mirror_env["ROOTYARD_CI_MIRROR_SOURCE_TOKEN"] = self.alice["token"]
+        super().start_mirror()
+
     def make_repo(self, name):
         repo = json.loads(self.expect("/api/repos", 201, token=self.alice,
                                       method="POST", body={"name": name}))
@@ -92,7 +99,6 @@ class DependencyCheckoutHarness(JobCheckoutHarness):
         assert status in (401, 403, 404, 409), (status, raw[:300])
 
     def setup_dependency_fixture(self):
-        self.mirror_env["ROOTYARD_CI_MIRROR_SOURCE_TOKEN"] = self.alice["token"]
         self.setup_mirror()
         self.grand, self.grand_work = self.make_repo("grand")
         self.git("lfs", "install", "--local", cwd=self.grand_work)
