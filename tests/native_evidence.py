@@ -13,6 +13,17 @@ if str(SCRIPTS) not in sys.path:
 import native_build_receipt as receipts  # noqa: E402
 
 
+def record(harness, event, **fields):
+    destination = os.environ.get("ROOTYARD_TEST_EVIDENCE_DIR")
+    if not destination:
+        return
+    root = Path(destination)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {"event": event, "monotonic_ns": time.monotonic_ns(), **fields}
+    with (root / (harness.schema + ".jsonl")).open("a") as output:
+        output.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
 def load_validated(binary, expected_commit=None):
     """Read the adjacent receipt through the shared v1/v2 reader.
 
