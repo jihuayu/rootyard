@@ -53,11 +53,12 @@
 //! ever printed.
 
 // The integration suite compiles the whole fixture tree. This library harness
-// includes the narrow `session.rs` entry point, which exposes only the real
-// actor/database/Git modules this harness drives, so no `dead_code` allowance
-// is needed on either side.
+// includes the narrow `session.rs` entry point once, exposing only the real
+// actor/database/Git modules the HTTP harnesses drive. The admission case
+// imports these same modules instead of loading the files a second time, so
+// no `dead_code` allowance is needed on either side.
 #[path = "../../tests/blob_gateway_support/session.rs"]
-mod fixtures;
+pub(super) mod fixtures;
 mod negative_tests;
 mod support;
 
@@ -75,6 +76,7 @@ use super::repo_session::BEHIND_MESSAGE;
 #[tokio::test]
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and Git"]
 async fn push_token_bounds_repeated_http_reads() -> Result<()> {
+    let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     let db = Db::setup().await?;
     let outcome = case(&db).await;
     db.finish(outcome).await

@@ -10,6 +10,10 @@ use crate::ref_store::contract::RefStoreError;
 use std::fmt;
 use uuid::Uuid;
 
+/// The exact detail emitted by the admission gate-revision check. The gateway's
+/// pre-admission rebase matcher consumes this constant, never a copied literal.
+pub(crate) const GATE_REVISION_MISMATCH_DETAIL: &str = "gate revision differs";
+
 /// Stable machine-readable reason for a refused pack commit step. Codes are
 /// fixed literals: they are part of the persisted rejection terminal and must
 /// never be derived from SQL text, Git output or caller strings.
