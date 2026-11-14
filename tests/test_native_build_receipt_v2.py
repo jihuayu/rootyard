@@ -43,6 +43,7 @@ class ReceiptFixture(unittest.TestCase):
         self.write("src/main.rs", "fn main() {}\n")
         self.write("tests/example.rs", "#[test]\nfn example() {}\n")
         self.write("tests/fixtures/data.txt", "fixture-data\n")
+        self.write("experimental/pando/schema.sql", "create table pando_session();\n")
         self.write(".cargo/config.toml", "[build]\njobs = 4\n")
         self.write("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.1"\n')
         self.binary = self.root / "target/debug/rootyard"
@@ -370,6 +371,7 @@ class V2BindingTest(ReceiptFixture):
             ("rust-toolchain.toml", '[toolchain]\nchannel = "1.98.0"\n'),
             ("Cargo.toml", '[package]\nname = "rootyard"\nversion = "0.1.1"\n'),
             ("Cargo.lock", "version = 4\n"),
+            ("experimental/pando/schema.sql", "create table pando_session_v2();\n"),
         )
         for relative, replacement in cases:
             with self.subTest(relative=relative):
@@ -462,6 +464,46 @@ class V2BindingTest(ReceiptFixture):
         source_sha = copy.deepcopy(payload)
         source_sha["cargo_artifacts"][0]["source_sha256"] = "0" * 64
         self.assert_rejected(source_sha, "artifact source")
+
+    def test_artifact_source_must_match_the_bound_inventory_without_a_source_root(self):
+        payload = self.make_v2()
+
+        unbound = copy.deepcopy(payload)
+        unbound["cargo_artifacts"][1]["source"] = "not/bound.rs"
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.validate_receipt(unbound)
+        self.assertIn("not present in bound_input_inventory", str(caught.exception))
+
+        wrong_hash = copy.deepcopy(payload)
+        wrong_hash["cargo_artifacts"][1]["source_sha256"] = "0" * 64
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.validate_receipt(wrong_hash)
+        self.assertIn("hash does not match bound_input_inventory", str(caught.exception))
+
+        self.validate(payload)
+
+    def test_missing_required_compiled_asset_is_rejected_with_recomputed_summary(self):
+        payload = self.make_v2()
+        tampered = copy.deepcopy(payload)
+        tampered["bound_input_inventory"] = [
+            entry for entry in tampered["bound_input_inventory"]
+            if entry["path"] != "experimental/pando/schema.sql"
+        ]
+        entries = tampered["bound_input_inventory"]
+        present = [entry for entry in entries if entry["present"]]
+        by_role = {role: 0 for role in receipts.BOUND_ROLES}
+        for entry in present:
+            by_role[entry["role"]] += 1
+        tampered["bound_inputs"].update(
+            {
+                "digest": receipts.bound_inputs_digest_from_entries(entries),
+                "present_count": len(present),
+                "absent_count": len(entries) - len(present),
+                "absent": [entry["path"] for entry in entries if not entry["present"]],
+                "by_role": by_role,
+            }
+        )
+        self.assert_rejected(tampered, "missing required compiled asset")
 
     def test_inventory_and_summary_tampering_is_rejected(self):
         payload = self.make_v2()
@@ -657,6 +699,7 @@ class ProducerHelperTest(ReceiptFixture):
         self.assertEqual(by_path["src/lib.rs"]["role"], "production_source")
         self.assertEqual(by_path["tests/example.rs"]["role"], "integration_test_source")
         self.assertEqual(by_path["tests/fixtures/data.txt"]["role"], "test_support")
+        self.assertEqual(by_path["experimental/pando/schema.sql"]["role"], "compiled_asset")
         self.assertEqual(by_path[".cargo/config.toml"]["role"], "cargo_config")
         self.assertEqual(by_path["rust-toolchain.toml"]["role"], "toolchain")
         self.assertEqual(by_path["rust-toolchain"]["present"], False)
@@ -667,10 +710,62 @@ class ProducerHelperTest(ReceiptFixture):
 
         serialized = json.dumps(self.bound)
         for content in ("jobs = 4", "pub fn production", "fn main()", "#[test]",
-                        "fixture-data", 'channel = "1.99.1"'):
+                        "fixture-data", 'channel = "1.99.1"',
+                        "create table pando_session"):
             self.assertNotIn(content, serialized)
         self.assertEqual(self.bound["config_digest"],
                          receipts.config_digest_from_entries(entries))
+
+    def test_compile_time_pando_asset_changes_full_inventory_not_v1_digest(self):
+        before = self.capture()
+        by_path = {entry["path"]: entry for entry in before["bound_input_inventory"]}
+        self.assertEqual(by_path["experimental/pando/schema.sql"]["role"], "compiled_asset")
+        self.assertEqual(before["bound_inputs"]["by_role"]["compiled_asset"], 1)
+
+        payload = self.make_v2()
+        self.write("experimental/pando/schema.sql", "create table pando_session_v2();\n")
+        after = self.capture()
+        self.assertNotEqual(before["bound_inputs"]["digest"], after["bound_inputs"]["digest"])
+        self.assertEqual(before["source_inputs_sha256"], after["source_inputs_sha256"])
+        self.assert_rejected(payload, "inventory differs")
+
+        (self.root / "experimental/pando/schema.sql").unlink()
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            self.capture()
+        self.assertIn("required compiled asset", str(caught.exception))
+        self.assert_rejected(payload, "required compiled asset")
+
+    def test_literal_compile_time_include_outside_covered_dirs_is_bound(self):
+        self.write(
+            "src/embedded.rs",
+            'pub const EXTRA: &str = include_str!("../experimental/pando/extra.txt");\n',
+        )
+        self.write("experimental/pando/extra.txt", "extra-one\n")
+        entries, _ = receipts.bound_input_inventory(self.root)
+        by_path = {entry["path"]: entry for entry in entries}
+        self.assertEqual(by_path["experimental/pando/extra.txt"]["role"], "compiled_asset")
+
+        first = self.capture()
+        self.write("experimental/pando/extra.txt", "extra-two\n")
+        second = self.capture()
+        self.assertNotEqual(first["bound_inputs"]["digest"], second["bound_inputs"]["digest"])
+
+        (self.root / "experimental/pando/extra.txt").unlink()
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            self.capture()
+        self.assertIn("compile-time include target", str(caught.exception))
+
+    def test_compile_time_include_outside_the_repository_is_rejected(self):
+        self.write(
+            "src/outside.rs",
+            'pub const OUTSIDE: &str = include_str!("../../outside.txt");\n',
+        )
+        outside = self.tempdir.parent / "outside.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        self.addCleanup(outside.unlink, missing_ok=True)
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            self.capture()
+        self.assertIn("resolves outside", str(caught.exception))
 
     def test_external_cargo_config_is_rejected_without_reading_contents(self):
         sentinel = "SENTINEL-CONFIG-VALUE"

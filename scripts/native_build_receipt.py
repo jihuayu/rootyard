@@ -14,7 +14,8 @@ The module owns:
   ``root`` argument instead of a module-global repository path;
 * the batch-style bound-input inventory (path, role, presence and raw-byte
   SHA-256, including absent fixed candidates) extended with the production
-  source closure, Cargo manifests, test support and a common config digest;
+  source closure, Cargo manifests, test support, literal compile-time
+  ``include_*!`` assets and a common config digest;
 * conservative in-repository Cargo-config checks and an environment-name guard
   that never records environment values; scheduling is split out explicitly:
   :func:`normalize_build_environment` turns ``CARGO_BUILD_JOBS`` into an
@@ -73,6 +74,12 @@ TEST_SUPPORT_DIRS = (
     "tests/serving_support",
     "tests/fixtures",
 )
+#: Literal in-repository files embedded at compile time by ``include_str!``,
+#: ``include_bytes!`` or ``include!`` from a bound Rust source file.  This is
+#: the explicit closed set of assets used by the current production closure;
+#: additional literal includes are discovered from the bound sources and bound
+#: with the same role.  It is not a copy of the repository.
+COMPILED_ASSETS = ("experimental/pando/schema.sql",)
 
 BOUND_ROLES = (
     "production_source",
@@ -83,6 +90,7 @@ BOUND_ROLES = (
     "test_support",
     "toolchain",
     "cargo_config",
+    "compiled_asset",
 )
 CONFIG_ROLES = ("build_script", "toolchain", "cargo_config")
 BOUND_INPUTS_DIGEST_ALGORITHM = (
@@ -145,6 +153,12 @@ ALLOWED_TARGET_DIR = "CARGO_TARGET_DIR"
 BUILD_JOBS_VARIABLE = "CARGO_BUILD_JOBS"
 
 TOML_KEY = re.compile(r'\s*(?:"([^"]*)"|([A-Za-z0-9_.\-]+))\s*=(.*)$')
+_INCLUDE_LITERAL = re.compile(
+    r'\binclude(?:_str|_bytes)?!\s*\(\s*'
+    r'(?:r(?P<hashes>#+)"(?P<raw>.*?)"(?P=hashes)|"(?P<plain>(?:\\.|[^"\\])*)")'
+    r'\s*\)',
+    re.DOTALL,
+)
 PATH_KEYS = (
     "rustflags",
     "linker",
@@ -544,6 +558,46 @@ def _files_under(root, base):
             yield path
 
 
+def _discover_compiled_assets(root, source_paths):
+    """Literal in-repository ``include_*!`` targets from bound Rust sources.
+
+    Only string/raw-string literal arguments are considered.  A literal must be
+    repository-relative and resolve inside ``root``; a missing target fails
+    closed rather than being silently omitted.  Non-literal forms such as
+    ``include!(concat!(env!("OUT_DIR"), ...))`` are generated build outputs,
+    not repository inputs, and are left to Cargo.
+    """
+    root = Path(root).resolve()
+    discovered = {}
+    for relative in sorted(source_paths):
+        if not relative.endswith(".rs"):
+            continue
+        path = root / relative
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in _INCLUDE_LITERAL.finditer(text):
+            literal = match.group("raw")
+            if literal is None:
+                literal = match.group("plain")
+            if literal is None:
+                continue
+            target = Path(literal)
+            if target.is_absolute():
+                raise ReceiptError(
+                    f"bound input: compile-time include {literal!r} in {relative} "
+                    "must be repository-relative"
+                )
+            resolved = (path.parent / target).resolve()
+            _require(
+                _is_within(resolved, root),
+                "bound input",
+                f"compile-time include {literal!r} in {relative} resolves outside {root}",
+            )
+            discovered[resolved.relative_to(root).as_posix()] = relative
+    return discovered
+
+
 def bound_input_inventory(root):
     """Return ``(entries, blobs)`` for the full v2 input inventory.
 
@@ -552,6 +606,9 @@ def bound_input_inventory(root):
     digest computation and are never serialized.  Fixed absent candidates are
     listed.  Production files reproduce the exact ``source_digest`` closure;
     the test closure binds ``tests/**/*.rs`` plus the known support directories.
+    Files embedded by literal ``include_*!`` macros are bound as
+    ``compiled_asset`` even when they live outside those directories; the
+    explicit :data:`COMPILED_ASSETS` set is required to be present.
     """
     root = Path(root).resolve()
     _require(root.is_dir(), "bound input", f"source root {root} is not a directory")
@@ -587,6 +644,22 @@ def bound_input_inventory(root):
         if base.is_dir():
             for path in _files_under(root, base):
                 roles[path.relative_to(root).as_posix()] = "test_support"
+
+    for relative in COMPILED_ASSETS:
+        _require(
+            (root / relative).is_file(),
+            "bound input",
+            f"required compiled asset {relative} is missing from {root}",
+        )
+        roles[relative] = "compiled_asset"
+    for relative in _discover_compiled_assets(root, list(roles)):
+        if relative not in roles:
+            _require(
+                (root / relative).is_file(),
+                "bound input",
+                f"compile-time include target {relative} is missing from {root}",
+            )
+            roles[relative] = "compiled_asset"
 
     entries, blobs = [], {}
     for relative in sorted(set(roles) | absent):
@@ -1171,7 +1244,17 @@ def _validate_v1_artifacts(rows, label):
     return result
 
 
-def _validate_inventory(entries, summary, label, *, require_fixed, require_manifests, full_roles, algorithm_exact):
+def _validate_inventory(
+    entries,
+    summary,
+    label,
+    *,
+    require_fixed,
+    require_manifests,
+    require_compiled_assets=False,
+    full_roles,
+    algorithm_exact,
+):
     entries = _require_list(entries, label, "bound_input_inventory")
     seen = set()
     for index, entry in enumerate(entries):
@@ -1189,6 +1272,11 @@ def _validate_inventory(entries, summary, label, *, require_fixed, require_manif
             _require_sha256(entry.get("sha256"), label, f"bound input {path}.sha256")
         else:
             _require(entry.get("sha256") is None, label, f"absent bound input {path} must have null sha256")
+            _require(
+                entry["role"] != "compiled_asset",
+                label,
+                f"compiled asset {path} must be present",
+            )
     paths = [entry["path"] for entry in entries]
     _require(paths == sorted(paths), label, "bound_input_inventory must be path-sorted")
     by_path = {entry["path"]: entry for entry in entries}
@@ -1199,6 +1287,13 @@ def _validate_inventory(entries, summary, label, *, require_fixed, require_manif
         for path in MANIFEST_INPUTS:
             _require(path in by_path, label, f"bound_input_inventory is missing {path}")
             _require(by_path[path]["present"] is True, label, f"{path} must be present")
+    if require_compiled_assets:
+        for path in COMPILED_ASSETS:
+            _require(
+                path in by_path and by_path[path]["present"] is True,
+                label,
+                f"bound_input_inventory is missing required compiled asset {path}",
+            )
 
     summary = _require_mapping(summary, label, "bound_inputs")
     computed = bound_inputs_digest_from_entries(entries)
@@ -1492,6 +1587,7 @@ def _validate_v2_payload(payload, label, binary_path=None):
         label,
         require_fixed=True,
         require_manifests=True,
+        require_compiled_assets=True,
         full_roles=True,
         algorithm_exact=True,
     )
@@ -1512,6 +1608,19 @@ def _validate_v2_payload(payload, label, binary_path=None):
         "config_digest does not match the config/toolchain/build-script inventory entries",
     )
     artifacts = _validate_v2_artifacts(payload.get("cargo_artifacts"), label)
+    entries_by_path = {entry["path"]: entry for entry in entries}
+    for row in artifacts:
+        bound_entry = entries_by_path.get(row["source"])
+        _require(
+            bound_entry is not None and bound_entry["present"] is True,
+            label,
+            f"artifact source {row['source']} is not present in bound_input_inventory",
+        )
+        _require(
+            bound_entry["sha256"] == row["source_sha256"],
+            label,
+            f"artifact source {row['source']} hash does not match bound_input_inventory",
+        )
     _validate_primary_artifact(payload, artifacts, binary_digest, label, binary_path)
     batch = _validate_batch_link(payload, label, binary_path)
     return ValidatedReceipt(
@@ -1907,6 +2016,7 @@ __all__ = [
     "BOUND_ROLES",
     "BUILD_JOBS_VARIABLE",
     "CARGO_CONFIG_FILES",
+    "COMPILED_ASSETS",
     "CONFIG_ROLES",
     "EXECUTABLE_KINDS",
     "FIXED_CANDIDATES",
