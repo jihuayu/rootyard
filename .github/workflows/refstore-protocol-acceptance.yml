@@ -328,28 +328,48 @@ jobs:
             exit 1
           fi
           python3 - "$test_receipt" "$serving_receipt" "$test_binary" "$serving_binary" tests/blob_git_gateway.rs <<'PY'
-          import hashlib, json, pathlib, subprocess, sys
+          import hashlib, json, pathlib, re, subprocess, sys
 
           sys.path.insert(0, str(pathlib.Path('scripts').resolve()))
           import native_build_receipt as receipts
 
           test_receipt_path, serving_receipt_path, test_binary, serving_binary, test_source = sys.argv[1:]
+          workspace = pathlib.Path.cwd().resolve()
           test_receipt = json.loads(pathlib.Path(test_receipt_path).read_text())
           serving_receipt = json.loads(pathlib.Path(serving_receipt_path).read_text())
           head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-          try:
-              test_validated = receipts.load_receipt(
-                  test_receipt_path, binary_path=test_binary, expected_commit=head,
-                  verify_source_files=False)
-              serving_validated = receipts.load_receipt(
-                  serving_receipt_path, binary_path=serving_binary, expected_commit=head,
-                  verify_source_files=False)
-          except receipts.ReceiptError as error:
-              raise SystemExit('build receipt verification failed: ' + str(error))
+
+          EXPECTED_CARGO_COMMIT = '64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          EXPECTED_CARGO_RELEASE = '1.101.0'
+          EXPECTED_RUST_RELEASE = '1.99.1'
+          EXPECTED_FEATURES = {'enabled': ['pando-lab'], 'no_default_features': True}
+          EXPECTED_TEST_COMMAND = [
+              'cargo',
+              '--config', 'profile.dev.package.rootyard.debug=0',
+              '--config', 'profile.test.package.rootyard.debug=0',
+              '--config', 'profile.dev.package.rootyard.strip="debuginfo"',
+              '--config', 'profile.test.package.rootyard.strip="debuginfo"',
+              'rustc', '--locked', '--profile', 'test', '--test', 'blob_git_gateway',
+              '--features', 'pando-lab', '--no-default-features',
+              '--message-format=json-render-diagnostics',
+          ]
+          EXPECTED_SERVING_COMMAND = [
+              'cargo', 'build', '--locked', '--no-default-features',
+              '--config', 'profile.dev.package.rootyard.debug=0',
+              '--bin', 'rootyard', '--features', 'pando-lab',
+              '--config', 'profile.dev.package.rootyard.strip="debuginfo"',
+              '--message-format=json-render-diagnostics',
+          ]
+          CLOSURE_LABEL = b'tests/blob-git-gateway-closure\0'
+          HEX64 = re.compile(r'^[0-9a-f]{64}$')
+          FULL_COMMIT = re.compile(r'^[0-9a-f]{40,64}$')
+
+          def fail(message):
+              raise SystemExit('build receipt verification failed: ' + message)
 
           def check(condition, message):
               if not condition:
-                  raise SystemExit('build receipt verification failed: ' + message)
+                  fail(message)
 
           def sha256(path):
               digest = hashlib.sha256()
@@ -358,7 +378,106 @@ jobs:
                       digest.update(chunk)
               return digest.hexdigest()
 
-          def receipts_of(validated, label):
+          def toolchain_record():
+              path = workspace / 'test-results/refstore/cargo-fork.json'
+              try:
+                  record = json.loads(path.read_text())
+              except (OSError, ValueError) as error:
+                  fail('unreadable trusted toolchain record ' + repr(str(path)) + ': ' + type(error).__name__)
+              check(isinstance(record, dict), 'trusted toolchain record is not an object')
+              check(record.get('revision') == EXPECTED_CARGO_COMMIT,
+                    'trusted toolchain record revision is not the pinned Cargo commit')
+              check(record.get('commit_hash') == EXPECTED_CARGO_COMMIT,
+                    'trusted toolchain record commit-hash is not the pinned Cargo commit')
+              check(record.get('release') == EXPECTED_CARGO_RELEASE,
+                    'trusted toolchain record release is not Cargo 1.101.0')
+              check(isinstance(record.get('host'), str) and bool(record['host']),
+                    'trusted toolchain record has no host')
+              check(isinstance(record.get('binary_sha256'), str)
+                    and HEX64.match(record['binary_sha256']) is not None,
+                    'trusted toolchain record has no lowercase 64-hex executable SHA-256')
+              rustc = record.get('rustc')
+              check(isinstance(rustc, dict), 'trusted toolchain record has no rustc identity')
+              check(rustc.get('release') == EXPECTED_RUST_RELEASE,
+                    'trusted rustc release is not 1.99.1')
+              check(isinstance(rustc.get('commit_hash'), str)
+                    and FULL_COMMIT.match(rustc['commit_hash']) is not None,
+                    'trusted rustc commit-hash is not a full lowercase commit')
+              check(isinstance(rustc.get('host'), str) and bool(rustc['host']),
+                    'trusted rustc identity has no host')
+              check(record.get('host') == rustc['host'],
+                    'trusted Cargo and rustc hosts differ')
+              check(isinstance(rustc.get('full_version'), str)
+                    and rustc['full_version'].startswith('rustc ' + EXPECTED_RUST_RELEASE),
+                    'trusted rustc full version is not 1.99.1')
+              check(isinstance(record.get('full_version'), str)
+                    and record['full_version'].startswith('cargo ' + EXPECTED_CARGO_RELEASE),
+                    'trusted Cargo full version is not 1.101.0')
+              return record
+
+          def expected_toolchain(record):
+              rustc = record['rustc']
+              return {
+                  'cargo': {
+                      'version': record['full_version'],
+                      'release': record['release'],
+                      'commit_hash': record['commit_hash'],
+                      'host': record['host'],
+                      'executable_sha256': record['binary_sha256'],
+                  },
+                  'rustc': {
+                      'version': rustc['full_version'],
+                      'release': rustc['release'],
+                      'commit_hash': rustc['commit_hash'],
+                      'host': rustc['host'],
+                  },
+                  'target_triple': rustc['host'],
+                  'pinned_channel': EXPECTED_RUST_RELEASE,
+              }
+
+          def require_v2_toolchain(validated, expected, label):
+              actual = validated.toolchain
+              check(isinstance(actual, dict), label + ' receipt has no toolchain identity')
+              for tool in ('cargo', 'rustc'):
+                  identity = actual.get(tool)
+                  check(isinstance(identity, dict), label + ' receipt has no ' + tool + ' identity')
+                  for field, value in expected[tool].items():
+                      check(identity.get(field) == value,
+                            label + ' receipt ' + tool + '.' + field + ' does not match the trusted CI pin')
+              for field in ('target_triple', 'pinned_channel'):
+                  check(actual.get(field) == expected[field],
+                        label + ' receipt toolchain.' + field + ' does not match the trusted CI pin')
+
+          def require_command(payload, expected, label, schema):
+              command = payload.get('command')
+              check(isinstance(command, list) and all(isinstance(item, str) for item in command),
+                    label + ' receipt command is not a list of strings')
+              if command == expected:
+                  if schema == 'v2':
+                      options = payload.get('build_options')
+                      check(isinstance(options, dict),
+                            label + ' v2 receipt has no build_options metadata')
+                      check(options.get('jobs') is None,
+                            label + ' v2 receipt omits a recorded positive jobs budget')
+                  return
+              if (schema == 'v2' and len(command) == len(expected) + 2
+                      and command[:len(expected)] == expected and command[-2] == '--jobs'):
+                  check(re.fullmatch(r'[1-9][0-9]*', command[-1]) is not None,
+                        label + ' receipt has a non-positive or non-decimal --jobs budget')
+                  jobs = int(command[-1])
+                  options = payload.get('build_options')
+                  check(isinstance(options, dict),
+                        label + ' v2 receipt has no build_options metadata')
+                  check(isinstance(options.get('jobs'), int)
+                        and not isinstance(options.get('jobs'), bool)
+                        and options.get('jobs') == jobs,
+                        label + ' v2 receipt --jobs budget does not match build_options.jobs')
+                  return
+              fail(label + ' receipt command is ' + repr(command)
+                   + ', expected exactly ' + repr(expected)
+                   + ' with an optional explicit positive trailing --jobs budget')
+
+          def artifacts_of(validated, label):
               entries = list(validated.artifacts)
               check(bool(entries), label + ' receipt has no selected artifacts')
               if validated.schema == 'v1':
@@ -371,33 +490,74 @@ jobs:
                             label + ' cargo_artifacts[' + str(index) + '] fresh is not a JSON boolean')
               return entries
 
+          record = toolchain_record()
+          trusted = expected_toolchain(record)
+          try:
+              test_validated = receipts.load_receipt(
+                  test_receipt_path, source_root=workspace, binary_path=test_binary,
+                  expected_commit=head, verify_source_files=True)
+              serving_validated = receipts.load_receipt(
+                  serving_receipt_path, source_root=workspace, binary_path=serving_binary,
+                  expected_commit=head, verify_source_files=True)
+          except receipts.ReceiptError as error:
+              fail(str(error))
+
           check(test_validated.workspace_commit == head, 'test receipt workspace_commit differs from HEAD')
           check(serving_validated.workspace_commit == head, 'product receipt workspace_commit differs from HEAD')
+          check(test_validated.schema == serving_validated.schema,
+                'test and product receipts use different schemas')
           check(isinstance(test_receipt.get('source_inputs_sha256'), str)
                 and test_receipt.get('source_inputs_sha256') == serving_receipt.get('source_inputs_sha256'),
                 'test and product receipts disagree on source_inputs_sha256')
           if test_validated.schema == 'v1':
               check(test_receipt.get('fresh') is False, 'test receipt fresh is not false')
               check(test_receipt.get('package_rebuilt') is True, 'test receipt does not record a package rebuild')
+              check(isinstance(test_receipt.get('rustc'), str)
+                    and re.match(r'^rustc 1\.99\.1(?:\s|$)', test_receipt['rustc']) is not None,
+                    'legacy test receipt rustc is not the trusted 1.99.1 pin')
+              check(test_receipt.get('rustc') == serving_receipt.get('rustc'),
+                    'legacy test and product receipts bind different rustc')
           else:
               check(test_validated.schema == 'v2', 'test receipt schema is not v1 or v2')
               check(test_receipt.get('receipt_schema') == receipts.RECEIPT_SCHEMA_V2,
                     'test receipt schema discriminator is not v2')
+              check(test_receipt.get('profile') == 'test', 'test receipt top-level profile is not test')
+              check(serving_receipt.get('profile') == 'dev', 'product receipt top-level profile is not dev')
+              for label, payload in (('test', test_receipt), ('product', serving_receipt)):
+                  features = payload.get('features')
+                  check(isinstance(features, dict), label + ' receipt has no features metadata')
+                  check(features.get('enabled') == EXPECTED_FEATURES['enabled'],
+                        label + ' receipt enables unexpected features')
+                  check(features.get('no_default_features') is EXPECTED_FEATURES['no_default_features'],
+                        label + ' receipt does not record no_default_features=true')
+              require_v2_toolchain(test_validated, trusted, 'test')
+              require_v2_toolchain(serving_validated, trusted, 'product')
+              for tool in ('cargo', 'rustc'):
+                  check(test_validated.toolchain.get(tool) == serving_validated.toolchain.get(tool),
+                        'test and product receipts bind different ' + tool + ' identities')
+
+          require_command(test_receipt, EXPECTED_TEST_COMMAND, 'test', test_validated.schema)
+          require_command(serving_receipt, EXPECTED_SERVING_COMMAND, 'product', serving_validated.schema)
           check(test_receipt.get('kind') == 'rust-integration-test', 'test receipt kind is not rust-integration-test')
           check(test_receipt.get('relocated_artifact') is True, 'test receipt does not describe a relocated artifact')
           check(test_receipt.get('integration_test_source_sha256') == sha256(test_source),
-                'test receipt source SHA does not match tests/blob_git_gateway.rs')
+                'test receipt source SHA does not match ' + test_source)
           check(test_receipt.get('binary_sha256') == sha256(test_binary),
                 'relocated test executable SHA-256 does not match its receipt')
           check(serving_receipt.get('binary_sha256') == sha256(serving_binary),
                 'copied rootyard executable SHA-256 does not match its receipt')
+          if 'original_artifact_sha256' in test_receipt:
+              check(test_receipt.get('original_artifact_sha256') == sha256(test_binary),
+                    'test receipt original artifact hash does not match the relocated executable')
+          if 'original_artifact_sha256' in serving_receipt:
+              check(serving_receipt.get('original_artifact_sha256') == sha256(serving_binary),
+                    'product receipt original artifact hash does not match the supplied executable')
 
           closure_paths = subprocess.check_output(
-              ['git', 'ls-files', '-z', '--', 'tests/blob_git_gateway.rs', 'tests/blob_gateway_support'],
+              ['git', 'ls-files', '-z', '--', test_source, 'tests/blob_gateway_support'],
               text=True).split('\0')
           closure_files = sorted(path for path in closure_paths if path)
-          check(test_source in closure_files,
-                'tracked test source closure does not include ' + test_source)
+          check(test_source in closure_files, 'tracked test source closure does not include ' + test_source)
           check(len(closure_files) == len(set(closure_files)),
                 'tracked test source closure lists duplicate paths')
           check(all(pathlib.Path(path).is_file() for path in closure_files),
@@ -405,22 +565,50 @@ jobs:
           closure_digest = hashlib.sha256()
           for path in closure_files:
               file_sha = sha256(path)
-              closure_digest.update(b'tests/blob-git-gateway-closure\0')
+              closure_digest.update(CLOSURE_LABEL)
               closure_digest.update(path.encode('utf-8') + b'\0')
               closure_digest.update(file_sha.encode('ascii') + b'\n')
+          closure_sha256 = closure_digest.hexdigest()
+          # Historical v1 receipts carry no integration-test/support closure
+          # field (and v2 inventory is a different, schema-owned shape).  The
+          # pre/post-build clean-worktree checks bind this tree to the receipt
+          # workspace_commit, so recomputing the tracked closure here is the
+          # legacy v1 proof; a receipt-supplied digest is never echoed and no
+          # v1 field is invented.
 
-          test_artifacts = list(receipts_of(test_validated, 'test'))
+          test_artifacts = artifacts_of(test_validated, 'test')
           selected = [entry for entry in test_artifacts
                       if entry.get('target') == 'blob_git_gateway' and entry.get('kind') == 'test']
           check(len(selected) == 1, 'test receipt does not name exactly one blob_git_gateway/test artifact')
           check(len(test_artifacts) == 1, 'test receipt names extra selected artifacts')
-          serving_artifacts = list(receipts_of(serving_validated, 'product'))
+          if test_validated.schema == 'v2':
+              selected_profile = selected[0].get('profile')
+              check(isinstance(selected_profile, dict)
+                    and selected_profile.get('test') is True
+                    and selected_profile.get('debuginfo') == 0,
+                    'test artifact is not the debug=0 test-profile executable')
+          serving_artifacts = artifacts_of(serving_validated, 'product')
           binaries = [entry for entry in serving_artifacts
                       if entry.get('target') == 'rootyard' and entry.get('kind') == 'bin']
           check(len(binaries) == 1, 'product receipt does not name exactly one rootyard/bin artifact')
+          if serving_validated.schema == 'v2':
+              check(sorted(entry.get('kind') for entry in serving_artifacts) == ['bin', 'lib'],
+                    'product receipt does not name exactly the rootyard lib and bin artifacts')
+              check(all(entry.get('target') == 'rootyard' for entry in serving_artifacts),
+                    'product receipt names an artifact outside the rootyard package')
+              binary_profile = binaries[0].get('profile')
+              check(isinstance(binary_profile, dict)
+                    and binary_profile.get('test') is False
+                    and binary_profile.get('debuginfo') == 0,
+                    'product bin artifact is not the debug=0 dev-profile executable')
 
           def recorded_artifacts(validated, entries):
-              record = {'receipt_schema': validated.schema, 'cargo_artifacts': entries}
+              record = {
+                  'receipt_schema': validated.schema,
+                  'receipt_path': str(validated.receipt_path),
+                  'receipt_sha256': validated.receipt_sha256,
+                  'cargo_artifacts': entries,
+              }
               if validated.schema == 'v1':
                   record['fresh_false_artifacts'] = entries
                   if 'fresh' in validated.payload:
@@ -431,7 +619,13 @@ jobs:
               'version': 1, 'issue': 126, 'test': 'blob_git_gateway',
               'workspace_commit': head,
               'source_inputs_sha256': test_receipt['source_inputs_sha256'],
-              'test_source_closure': {'sha256': closure_digest.hexdigest(), 'files': closure_files},
+              'test_source_closure': {'sha256': closure_sha256, 'files': closure_files},
+              'toolchain': {
+                  'cargo': {key: trusted['cargo'][key]
+                            for key in ('release', 'commit_hash', 'host', 'executable_sha256')},
+                  'rustc': {key: trusted['rustc'][key]
+                            for key in ('release', 'commit_hash', 'host', 'version')},
+              },
               'test_executable': {'name': 'blob-git-gateway', 'sha256': sha256(test_binary)},
               'serving_executable': {'name': 'rootyard', 'sha256': sha256(serving_binary)},
               'test_receipt': recorded_artifacts(test_validated, test_artifacts),
@@ -443,6 +637,30 @@ jobs:
           # Pair verification passed; copy the raw receipts (kept in $pair) into the uploaded evidence directory.
           cp "$test_receipt" test-results/refstore/blob_git_gateway/blob-git-gateway.build.json
           cp "$serving_receipt" test-results/refstore/blob_git_gateway/rootyard.build.json
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+
+          directory = pathlib.Path('test-results/refstore/blob_git_gateway')
+          manifest = json.loads((directory / 'build-pair.json').read_text())
+          checked = {}
+          for key, name in (('test_receipt', 'blob-git-gateway.build.json'),
+                            ('serving_receipt', 'rootyard.build.json')):
+              record = manifest.get(key)
+              if not isinstance(record, dict):
+                  raise SystemExit('build-pair receipt copy check failed: ' + key + ' is missing')
+              anchored = record.get('receipt_sha256')
+              if not isinstance(anchored, str) or len(anchored) != 64:
+                  raise SystemExit('build-pair receipt copy check failed: ' + key + ' has no anchored SHA-256')
+              copied = directory / name
+              if not copied.is_file():
+                  raise SystemExit('build-pair receipt copy check failed: ' + key + ' copy is missing')
+              actual = hashlib.sha256(copied.read_bytes()).hexdigest()
+              if actual != anchored:
+                  raise SystemExit('build-pair receipt copy check failed: ' + key + ' bytes changed after verification')
+              checked[key] = {'path': str(copied), 'sha256': actual}
+          (directory / 'receipt-copy-check.json').write_text(
+              json.dumps({'version': 1, 'issue': 126, 'checked': checked}, indent=2) + '\n')
+          PY
           set -a
           . "$RUNNER_TEMP/refstore-object-store.env"
           set +a
