@@ -59,21 +59,26 @@ fixture integration-test executables, recording the batch in
 | `tests/web_detail_pagination.py` | Real web Issue comments and PR reviews across the 100-row page boundary (105 rows seeded plus the 106th written through real HTTP/Git), including cursor/actor/revocation checks | `test-results/web-detail-pagination.json` |
 | `tests/web_repository_pagination.py` | Browser repository-discovery keyset pagination, actor/membership binding and restricted/anonymous scope checks | `test-results/web-repository-pagination.json` |
 | `tests/worker_diagnostics.py` | Source-bound structured worker-operation diagnostics isolation under real PostgreSQL `statement_timeout` | `test-results/worker-diagnostics.json` |
+| `tests/lfs_read_amplification.py` | Native `/proc/<pid>/io` `rchar` warm-read bound, verification singleflight coalescing, and offline/removed object-store verified local 200 vs. fail-closed cold-miss semantics | `test-results/lfs-read-amplification.json` |
+| `tests/lfs_split_tx_races.py` | Split-transaction LFS DB pool release, concurrent `pending -> ready` verification (including three-pass conflict bound and corrupt-byte rejection), post-`ensure_readable` re-authorization (`401`/`403`/`404`/`409`), and duplicate-OID repair deduplication | `test-results/lfs-split-tx-races.json` |
 
 A final step, `scripts/native_report_manifest.py --mode job`, fails the job
 unless every report was produced by the exact binary whose SHA-256 appears in
 `target/debug/rootyard.build.json`, every declared case passed, the
 `ci_webhook_regressions` log is non-empty and contains each expected phase
 marker, and the receipt's commit and compiled source-input digest were recorded.
-The manifest also binds the pagination, webhook reconciliation and worker
-diagnostics reports (`repository-pagination.json`,
-`organization-pagination.json`, `web-detail-pagination.json`,
-`web-repository-pagination.json`, `webhook-pagination.json`,
-`webhook-pr-sync.json`, `worker-diagnostics.json`) together with the other
-verify-job reports and their harness sources to that same build receipt, so none
-can be produced by a different binary. These harnesses are real functional
-regressions over real API, PostgreSQL, HTTP and Git state, not scalability
-benchmarks.
+The manifest also binds the pagination, webhook reconciliation, worker
+diagnostics and Git LFS concurrency/split-transaction reports
+(`repository-pagination.json`, `organization-pagination.json`,
+`web-detail-pagination.json`, `web-repository-pagination.json`,
+`webhook-pagination.json`, `webhook-pr-sync.json`,
+`worker-diagnostics.json`, `lfs-read-amplification.json`,
+`lfs-split-tx-races.json`) together with the other verify-job reports and their
+harness sources (`tests/lfs.py`, `tests/lfs_remote_contract.py`,
+`tests/lfs_read_amplification.py`, `tests/lfs_split_tx_races.py`) to that same
+build receipt, so none can be produced by a different binary. These harnesses
+are real functional regressions over real API, PostgreSQL, HTTP and Git state,
+not scalability benchmarks.
 The manifest (`test-results/native-pr-gate.json`) also stores harness SHA-256
 digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
 `git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
@@ -309,6 +314,8 @@ python3 tests/organization_pagination.py --binary target/debug/rootyard --report
 python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json
 python3 tests/web_repository_pagination.py --binary target/debug/rootyard --report test-results/web-repository-pagination.json
 python3 tests/worker_diagnostics.py --binary target/debug/rootyard --report test-results/worker-diagnostics.json
+python3 tests/lfs_read_amplification.py --binary target/debug/rootyard --report test-results/lfs-read-amplification.json
+python3 tests/lfs_split_tx_races.py --binary target/debug/rootyard --report test-results/lfs-split-tx-races.json
 ```
 
 The native host profile in this change was validated locally only: workflow

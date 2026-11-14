@@ -202,7 +202,15 @@ class ReadAmplificationHarness(LfsHarness):
             payload = os.urandom(PAYLOAD_BYTES)
             oid = hashlib.sha256(payload).hexdigest()
             size = len(payload)
+            before_pending = fixture.snapshot()
             batch = self.lfs_batch("upload", [{"oid": oid, "size": size}], token=self.alice)
+            dup_pending = self.lfs_batch(
+                "upload", [{"oid": oid, "size": size}, {"oid": oid, "size": size}], token=self.alice
+            )
+            assert all("upload" in item.get("actions", {}) for item in dup_pending["objects"]), dup_pending
+            assert self._remote_delta(before_pending, fixture.snapshot()) == {
+                "HEAD": 0, "GET": 0, "PUT": 0, "POST": 0, "DELETE": 0
+            }, "missing or pending upload batch rows must not run remote ensure_readable"
             actions = batch["objects"][0]["actions"]
             before_upload = fixture.snapshot()
             self.lfs_put(actions["upload"]["href"], payload, token=self.alice, code=200)
@@ -298,6 +306,18 @@ class ReadAmplificationHarness(LfsHarness):
             os.chmod(final, 0o600)
             self.lfs_get(get_path, token=self.reader, code=200)
 
+            symlink_target = self._repo_dir() / "symlink-target"
+            symlink_target.write_bytes(payload)
+            os.chmod(symlink_target, 0o600)
+            final.unlink()
+            os.symlink(symlink_target, final)
+            self.lfs_get(get_path, token=self.reader, code=(422, 500, 503))
+            final.unlink()
+            symlink_target.unlink()
+            final.write_bytes(payload)
+            os.chmod(final, 0o600)
+            self.lfs_get(get_path, token=self.reader, code=200)
+
             final.unlink()
             self.lfs_get(get_path, token=self.reader, code=(422, 500, 503))
             assert not final.exists()
@@ -379,7 +399,7 @@ class ReadAmplificationHarness(LfsHarness):
                     "read_amplification_ratio": round(offline_delta / size, 4),
                     "remote_requests": {k: 0 for k in ("HEAD", "GET", "PUT")},
                 },
-                "local_failure_modes": ["corrupt", "truncated", "replaced", "missing"],
+                "local_failure_modes": ["corrupt", "truncated", "replaced", "symlink", "missing"],
                 "concurrent_cold_reads": {
                     "readers": CONCURRENT_READERS,
                     "backend_gets": cold_counts["GET"],
