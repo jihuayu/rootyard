@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Native E2E regression for structured worker error correlation, redaction, and backlog metrics.
 
-A source-bound prebuilt ``target/debug/rootyard`` (or the binary under
-``CARGO_TARGET_DIR``) and its adjacent build receipt are required in every
-environment. Run the explicit native build preparation step first; this module
-never invokes Cargo or ``scripts/build_native.py``. A missing or stale artifact
-fails hard with that instruction. ``ROOTYARD_TEST_DATABASE_URL`` stays optional
+A source-bound prebuilt rootyard is required in every environment.  Explicit
+selection follows the shared server precedence: ``ROOTYARD_BIN`` (canonical CI
+export), then legacy ``ROOTYARD_TEST_BINARY`` and ``ROOTYARD_BINARY``; present
+variables must agree.  With no explicit variable the historical
+``CARGO_TARGET_DIR/debug/rootyard`` (or ``target/debug/rootyard``) is used.
+Run the explicit native build preparation step first; this module never invokes
+Cargo or ``scripts/build_native.py``.  A missing, conflicting or stale artifact
+fails hard with that instruction.  ``ROOTYARD_TEST_DATABASE_URL`` stays optional
 locally (an ephemeral PostgreSQL cluster starts) and is required in CI.
 """
 from __future__ import annotations
@@ -18,12 +21,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e  # noqa: E402
 import metrics as metrics_suite  # noqa: E402
-import source_bound_binary  # noqa: E402
+import runtime_binary  # noqa: E402
 
 LFS_MIME = "application/vnd.git-lfs+json"
 PREBUILT_INSTRUCTION = (
-    "run the explicit native build preparation step for this checkout and point CARGO_TARGET_DIR "
-    "at its output; this acceptance test never invokes Cargo or scripts/build_native.py"
+    "run the explicit native build preparation step and set ROOTYARD_BIN "
+    "(legacy ROOTYARD_TEST_BINARY/ROOTYARD_BINARY are also accepted), or point "
+    "CARGO_TARGET_DIR at a prepared output when no explicit choice is set; "
+    "this acceptance test never invokes Cargo or scripts/build_native.py"
 )
 
 
@@ -117,24 +122,8 @@ def _scrape_metrics(port: int) -> tuple[int, str, dict[str, str]]:
 
 def _resolve_prebuilt_binary(environ, binder=None) -> tuple[Path, dict]:
     """Require the prepared binary and bind it to this checkout before any E2E work."""
-    raw_target = Path(environ.get("CARGO_TARGET_DIR") or (ROOT / "target")).expanduser()
-    target_dir = (raw_target if raw_target.is_absolute() else ROOT / raw_target).resolve()
-    binary = (target_dir / "debug" / "rootyard").resolve()
-    if not (binary.is_file() and os.access(binary, os.X_OK)):
-        raise RuntimeError(
-            f"prebuilt rootyard binary is required at {binary}; no local build fallback exists. "
-            f"Please {PREBUILT_INSTRUCTION}"
-        )
-    binder = source_bound_binary.bind if binder is None else binder
-    try:
-        binding = binder(binary, environ=environ)
-    except Exception as error:
-        raise RuntimeError(
-            f"prebuilt rootyard binary {binary} is not bound to this checkout "
-            f"(source, contents or build receipt rejected: {error}). "
-            f"Please {PREBUILT_INSTRUCTION}; provenance is never rewritten by acceptance."
-        ) from error
-    return binary, binding
+    return runtime_binary.select_runtime_binary(
+        environ, root=ROOT, binder=binder, instruction=PREBUILT_INSTRUCTION)
 
 
 class PrebuiltBinaryContractTest(unittest.TestCase):
@@ -150,6 +139,14 @@ class PrebuiltBinaryContractTest(unittest.TestCase):
         debug.mkdir()
         binary = debug / "rootyard"
         binary.write_bytes(b"prebuilt fixture")
+        binary.chmod(0o755)
+        return binary
+
+    def _explicit_executable(self) -> Path:
+        directory = self.root / "canonical"
+        directory.mkdir()
+        binary = directory / "rootyard"
+        binary.write_bytes(b"explicit prebuilt fixture")
         binary.chmod(0o755)
         return binary
 
@@ -181,6 +178,33 @@ class PrebuiltBinaryContractTest(unittest.TestCase):
         self.assertEqual(path, binary.resolve())
         self.assertTrue(binding["production_inputs_bound"])
         binder.assert_called_once_with(binary.resolve(), environ=environment)
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_each_explicit_variable_overrides_the_legacy_target(self) -> None:
+        self._executable()
+        explicit = self._explicit_executable()
+        for variable in ("ROOTYARD_BIN", "ROOTYARD_TEST_BINARY", "ROOTYARD_BINARY"):
+            with self.subTest(variable=variable):
+                binder = mock.Mock(return_value={"production_inputs_bound": True})
+                environment = {variable: str(explicit), "CARGO_TARGET_DIR": str(self.root)}
+                with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+                    path, binding = _resolve_prebuilt_binary(environment, binder=binder)
+                self.assertEqual(path, explicit.resolve())
+                self.assertTrue(binding["production_inputs_bound"])
+                binder.assert_called_once_with(explicit.resolve(), environ=environment)
+                run.assert_not_called()
+                popen.assert_not_called()
+
+    def test_missing_explicit_binary_fails_without_legacy_fallback(self) -> None:
+        self._executable()
+        missing = self.root / "missing" / "rootyard"
+        binder = mock.Mock(side_effect=AssertionError("binding must not run for a missing artifact"))
+        environment = {"ROOTYARD_BIN": str(missing), "CARGO_TARGET_DIR": str(self.root)}
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "ROOTYARD_BIN"):
+                _resolve_prebuilt_binary(environment, binder=binder)
+        binder.assert_not_called()
         run.assert_not_called()
         popen.assert_not_called()
 
