@@ -378,8 +378,7 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
         let upload_deadline = Instant::now() + timeout_case_budget;
         let upload_source = source.clone();
         let upload = tokio::spawn(async move {
-            let result = proxied.put_file(timed_out_intent, &upload_source, upload_deadline).await;
-            (result, Instant::now())
+            proxied.put_file(timed_out_intent, &upload_source, upload_deadline).await
         });
         let observed = gate.wait_observation(Duration::from_secs(30)).await;
         assert_eq!(observed.method, GateMethod::Put, "the real backend must receive the signed S3 PUT");
@@ -388,14 +387,14 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
             "the real backend rejected the gated PUT with status {}",
             observed.status
         );
-        let (result, stopped_at) = timeout(Duration::from_secs(30), upload)
+        assert!(
+            observed.at < upload_deadline,
+            "the real backend answered at or after the caller's absolute deadline; this run does not prove the request reached it before timeout"
+        );
+        let result = timeout(Duration::from_secs(30), upload)
             .await
             .expect("timed-out upload did not settle")
             .expect("timed-out upload task panicked");
-        assert!(
-            observed.at <= stopped_at,
-            "the real backend answered only after the caller's deadline; this run does not prove the request reached it before cancellation"
-        );
         assert!(
             gate.is_holding(),
             "the real backend response must still be withheld when the caller's deadline expires"
