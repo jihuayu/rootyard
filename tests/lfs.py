@@ -131,14 +131,17 @@ class LfsHarness(Harness):
             assert status == code, f"POST {path}: expected {code}, got {status}: {body[:300]!r}"
         return json.loads(body)
 
-    def _lfs_lock_http(self, path, token, method="GET", body=None, code=200):
+    def _lfs_lock_http(self, path, token, method="GET", body=None, code=200,
+                       extra_headers=None):
+        request_headers = {"Accept": LFS_MIME}
+        request_headers.update(extra_headers or {})
         status, raw, headers = self.http(
             self._rel_path(path),
             token=token if token is not False else None,
             method=method,
             body=None if body is None else json.dumps(body).encode(),
             content_type=None if body is None else LFS_MIME,
-            extra_headers={"Accept": LFS_MIME},
+            extra_headers=request_headers,
         )
         norm_headers = {k.lower(): v for k, v in headers.items()}
         expected = code if isinstance(code, tuple) else (code,)
@@ -177,6 +180,22 @@ class LfsHarness(Harness):
             body={"force": force},
         )
         return body["lock"]
+
+    def lfs_lock_audit_rows(self, path):
+        return self.sql(
+            "SELECT action || '|' || target_type || '|' || target_name || '|' || "
+            "actor_name || '|' || COALESCE(details->>'force','') || '|' || "
+            "COALESCE(details->>'id','') || '|' || tenant_id::text || '|' || "
+            "repository_id::text FROM repository_audit_log "
+            f"WHERE repository_id='{self.repo['id']}' AND target_name='{path}' "
+            "AND action IN ('lfs_lock.created','lfs_lock.removed') ORDER BY id"
+        ).splitlines()
+
+    def lfs_lock_idempotency_rows(self, key):
+        return int(self.sql(
+            "SELECT count(*) FROM forge_creation_requests "
+            f"WHERE repository_id='{self.repo['id']}' AND idempotency_key='{key}'"
+        ))
 
     def batch_upload_stream_verify_and_download(self):
         # 64 KiB payload exceeds the global 16 KiB DefaultBodyLimit on JSON routes
@@ -639,6 +658,116 @@ class LfsHarness(Harness):
         assert self.lfs_lock_list(other_locks, self.alice, path=foreign_path)["locks"] == []
         assert self.lfs_lock_list(bob_locks, self.bob, path=cross_path)["locks"] == []
 
+        # Native mutation semantics: same-key replay returns the saved body
+        # without a second lock or audit row; reusing the key for another path
+        # conflicts; a released path re-locks under a new immutable ID and the
+        # stale ID cannot remove the replacement.
+        mutation_path = "docs/mutation.bin"
+        conflict_path = "docs/mutation-conflict.bin"
+        mutation_key = "lfs-mutation-" + self.repo["id"]
+        tenant_id = self.alice["user_id"]
+        repo_id = self.repo["id"]
+        audit_count_sql = (
+            f"SELECT count(*) FROM repository_audit_log WHERE repository_id='{repo_id}'"
+        )
+        audit_before = int(self.sql(audit_count_sql))
+        key_headers = {"Idempotency-Key": mutation_key}
+        _, first_raw, _ = self._lfs_lock_http(
+            source_locks, self.alice, method="POST", body={"path": mutation_path},
+            code=201, extra_headers=key_headers)
+        first = json.loads(first_raw)["lock"]
+        assert first["id"] and first["path"] == mutation_path
+        assert first["owner"] == {"name": "alice"}
+        creation_audit = (
+            f"lfs_lock.created|lfs_lock|{mutation_path}|alice||{first['id']}|"
+            f"{tenant_id}|{repo_id}"
+        )
+        assert self.lfs_lock_audit_rows(mutation_path) == [creation_audit]
+        assert self.lfs_lock_idempotency_rows(mutation_key) == 1
+        assert int(self.sql(audit_count_sql)) == audit_before + 1
+
+        _, replay_raw, _ = self._lfs_lock_http(
+            source_locks, self.alice, method="POST", body={"path": mutation_path},
+            code=201, extra_headers=key_headers)
+        replay = json.loads(replay_raw)
+        assert replay == json.loads(first_raw)
+        assert replay["lock"]["id"] == first["id"]
+        assert self.lfs_lock_audit_rows(mutation_path) == [creation_audit]
+        assert self.lfs_lock_idempotency_rows(mutation_key) == 1
+        assert int(self.sql(audit_count_sql)) == audit_before + 1
+
+        _, conflict_raw, _ = self._lfs_lock_http(
+            source_locks, self.alice, method="POST", body={"path": conflict_path},
+            code=409, extra_headers=key_headers)
+        assert conflict_raw
+        assert self.lfs_lock_list(source_locks, self.alice, path=conflict_path)["locks"] == []
+        assert self.lfs_lock_audit_rows(conflict_path) == []
+        assert self.lfs_lock_idempotency_rows(mutation_key) == 1
+        assert self.sql(
+            "SELECT request->>'path' FROM forge_creation_requests "
+            f"WHERE repository_id='{repo_id}' AND idempotency_key='{mutation_key}'"
+        ) == mutation_path
+        assert int(self.sql(audit_count_sql)) == audit_before + 1
+
+        removed = self.lfs_lock_unlock(source_locks, first["id"], self.alice)
+        assert removed["id"] == first["id"]
+        owner_removal_audit = (
+            f"lfs_lock.removed|lfs_lock|{mutation_path}|alice|false|{first['id']}|"
+            f"{tenant_id}|{repo_id}"
+        )
+        assert self.lfs_lock_audit_rows(mutation_path) == [
+            creation_audit, owner_removal_audit
+        ]
+        assert int(self.sql(audit_count_sql)) == audit_before + 2
+
+        replacement_key = mutation_key + "-replacement"
+        _, replacement_raw, _ = self._lfs_lock_http(
+            source_locks, self.alice, method="POST", body={"path": mutation_path},
+            code=201, extra_headers={"Idempotency-Key": replacement_key})
+        replacement = json.loads(replacement_raw)["lock"]
+        assert replacement["id"] != first["id"]
+        replacement_create_audit = (
+            f"lfs_lock.created|lfs_lock|{mutation_path}|alice||{replacement['id']}|"
+            f"{tenant_id}|{repo_id}"
+        )
+        assert [
+            lock["id"]
+            for lock in self.lfs_lock_list(source_locks, self.alice, path=mutation_path)["locks"]
+        ] == [replacement["id"]]
+        assert self.lfs_lock_audit_rows(mutation_path) == [
+            creation_audit, owner_removal_audit, replacement_create_audit
+        ]
+        assert self.lfs_lock_idempotency_rows(replacement_key) == 1
+        assert int(self.sql(audit_count_sql)) == audit_before + 3
+
+        _, stale_raw, _ = self._lfs_lock_http(
+            f"{source_locks}/{first['id']}/unlock", self.alice, method="POST",
+            body={"force": False}, code=404)
+        assert first["id"].encode() not in stale_raw
+        assert mutation_path.encode() not in stale_raw
+        assert [
+            lock["id"]
+            for lock in self.lfs_lock_list(source_locks, self.alice, path=mutation_path)["locks"]
+        ] == [replacement["id"]]
+        assert self.lfs_lock_audit_rows(mutation_path) == [
+            creation_audit, owner_removal_audit, replacement_create_audit
+        ]
+        assert int(self.sql(audit_count_sql)) == audit_before + 3
+
+        removed_replacement = self.lfs_lock_unlock(
+            source_locks, replacement["id"], self.alice)
+        assert removed_replacement["id"] == replacement["id"]
+        replacement_removal_audit = (
+            f"lfs_lock.removed|lfs_lock|{mutation_path}|alice|false|{replacement['id']}|"
+            f"{tenant_id}|{repo_id}"
+        )
+        assert self.lfs_lock_audit_rows(mutation_path) == [
+            creation_audit, owner_removal_audit, replacement_create_audit,
+            replacement_removal_audit,
+        ]
+        assert int(self.sql(audit_count_sql)) == audit_before + 4
+        assert self.lfs_lock_list(source_locks, self.alice, path=mutation_path)["locks"] == []
+
         self.expect("/api/repos/alice/demo/collaborators/bob", 201, token=self.alice,
                     method="PUT", body={"role": "write"})
         denied = self.git("lfs", "unlock", "docs/design.bin", cwd=self.work, token=self.bob, check=False)
@@ -650,6 +779,10 @@ class LfsHarness(Harness):
                     method="PUT", body={"role": "admin"})
         forced = self.git("lfs", "unlock", "--force", "docs/design.bin", cwd=self.work, token=self.bob)
         assert b"Unlocked docs/design.bin" in forced.stdout
+        assert self.lfs_lock_audit_rows("docs/design.bin") == [
+            f"lfs_lock.created|lfs_lock|docs/design.bin|alice||{design_id}|{tenant_id}|{repo_id}",
+            f"lfs_lock.removed|lfs_lock|docs/design.bin|bob|true|{design_id}|{tenant_id}|{repo_id}",
+        ]
 
         def lock_attempt(_):
             return self.http("/git/alice/demo.git/info/lfs/locks", token=self.alice,
@@ -667,6 +800,10 @@ class LfsHarness(Harness):
             "stock_locks_verify_foreign_ids_paths_hidden": True,
             "source_owner_unlock": True,
             "other_repository_owner_unlock": True,
+            "lock_create_idempotency_replay": True,
+            "lock_key_path_conflict_without_rows": True,
+            "stale_lock_id_cannot_remove_replacement": True,
+            "lock_audit_attributes": True,
         }
 
     def storage_layout_for_backup(self):
