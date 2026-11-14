@@ -167,12 +167,17 @@ INPUT_FILES = ("tests/blob_only_service.py", "tests/e2e.py", "tests/native_evide
                "tests/ops_provenance.py", "tests/owned_fuse_cleanup.py", "scripts/build_native.py")
 # Names whose values must never reach a report (checked before writing, not trusted).
 SENSITIVE_PATTERN = re.compile(r"BLOB|DATABASE|DSN|PASS|SECRET|TOKEN|KEY|CREDENTIAL", re.IGNORECASE)
-# Non-secret profile enums that check_blob_profile intentionally echoes in blob_profile.
-# Treating them as secrets would make a valid run refuse to write its own report.
-PUBLIC_BLOB_PROFILE_ENV = frozenset({"ROOTYARD_BLOB_DRIVER", "ROOTYARD_BLOB_SERVICE", "ROOTYARD_BLOB_DELETE"})
-# Short sensitive values are matched only as complete JSON string values. Otherwise
-# a common database password such as "postgres" would match "postgres_server_version"
-# and a valid report could never be written.
+# Public profile enums that check_blob_profile intentionally echoes in blob_profile.
+# Only the exact validated value is excluded; any other configured value, including
+# a credential that happens to equal an enum, remains sensitive.
+PUBLIC_BLOB_PROFILE_VALUES = {
+    "ROOTYARD_BLOB_DRIVER": frozenset({"opendal"}),
+    "ROOTYARD_BLOB_SERVICE": frozenset({"s3"}),
+    "ROOTYARD_BLOB_DELETE": frozenset({"disabled"}),
+}
+# Long sensitive values are substring-matched against JSON string values; shorter
+# values (1..11 characters) must equal a string value exactly and are never dropped.
+# Only values are scanned, so keys such as postgres_server_version never match.
 SECRET_SUBSTRING_MIN = 12
 CONNECTION_ESTABLISHED = "01"
 LISTEN = "0A"
@@ -681,23 +686,40 @@ def validate_binding(binding):
     return binding
 
 
+def string_values(value):
+    """Yield every string value in a JSON-shaped object; object keys are never yielded."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from string_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from string_values(item)
+
+
 def validate_no_secrets(value, sensitive_values):
     """Reject any report payload containing a configured sensitive value or credential-shaped URL.
 
-    Values at least ``SECRET_SUBSTRING_MIN`` characters long are searched as
-    substrings. Shorter values must appear as a complete JSON string value, so a
-    short database password such as ``postgres`` does not match a legitimate
-    field such as ``postgres_server_version``.
+    Only JSON string values are scanned, never object keys. Sensitive values of at
+    least ``SECRET_SUBSTRING_MIN`` characters are matched as substrings of those
+    values; shorter values, including 1-3 characters, must equal a complete string
+    value. A short credential equal to a public enum is not skipped: it remains
+    sensitive and fails the run.
     """
-    text = json.dumps(value, sort_keys=True)
+    values = list(string_values(value))
     for secret in sensitive_values or ():
-        if not isinstance(secret, str) or len(secret) < 4 or secret not in text:
+        if not isinstance(secret, str) or not secret:
             continue
-        if len(secret) >= SECRET_SUBSTRING_MIN or json.dumps(secret) in text:
-            raise BaselineError("report contains a configured sensitive value; refusing to write it")
-    lowered = text.lower()
+        if len(secret) >= SECRET_SUBSTRING_MIN:
+            leaked = any(secret in item for item in values)
+        else:
+            leaked = secret in values
+        need(not leaked, "report contains a configured sensitive value; refusing to write it")
+    lowered = [item.lower() for item in values]
     for marker in ("://user:", "password=", "secret_access_key", "authorization:"):
-        need(marker not in lowered, "report contains a credential-shaped marker: " + marker)
+        need(not any(marker in item for item in lowered),
+             "report contains a credential-shaped marker: " + marker)
     return True
 
 
@@ -1450,10 +1472,12 @@ def sensitive_values(env):
     """Values a report must never contain: credentials and private connection/endpoint material.
 
     The public driver/service/delete-policy enums are reported as blob_profile
-    facts, so they are not secrets and must never trip the report scan.
+    facts, so only their exact validated values are excluded. Credentials, private
+    connection/endpoint material and misdeclared profile values remain sensitive.
     """
     values = [value for name, value in env.items()
-              if value and name not in PUBLIC_BLOB_PROFILE_ENV and SENSITIVE_PATTERN.search(name)]
+              if value and SENSITIVE_PATTERN.search(name)
+              and not (name in PUBLIC_BLOB_PROFILE_VALUES and value in PUBLIC_BLOB_PROFILE_VALUES[name])]
     values.extend(serving.sensitive_values(env))
     return sorted({value for value in values if isinstance(value, str)})
 

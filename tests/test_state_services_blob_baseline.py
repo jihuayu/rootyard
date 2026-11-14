@@ -1330,6 +1330,37 @@ class ReportValidationTest(unittest.TestCase):
             baseline.validate_no_secrets({"note": "prefix long-access-key-id-0001 suffix"},
                                          ["long-access-key-id-0001"])
 
+    def test_short_bucket_name_never_matches_a_static_key(self):
+        sensitive = baseline.sensitive_values({"ROOTYARD_BLOB_BUCKET": "service"})
+        self.assertIn("service", sensitive)
+        payload = {"blob_profile": {"service": "s3"}, "cases": []}
+        self.assertTrue(baseline.validate_no_secrets(payload, sensitive))
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_no_secrets({"blob_profile": {"service": "service"}}, sensitive)
+
+    def test_long_secret_never_matches_a_static_key(self):
+        self.assertTrue(baseline.validate_no_secrets({"long-static-key-name": "public-value"},
+                                                     ["long-static-key-name"]))
+
+    def test_short_secret_scans_nested_values_but_not_nested_keys(self):
+        self.assertTrue(baseline.validate_no_secrets({"outer": [{"pw": "public-value"}]}, ["pw"]))
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_no_secrets({"outer": [{"inner": "pw"}]}, ["pw"])
+
+    def test_short_sensitive_values_are_never_dropped(self):
+        for secret in ("k", "pw", "s3"):
+            with self.subTest(secret=secret):
+                with self.assertRaises(baseline.BaselineError):
+                    baseline.validate_no_secrets({"note": secret}, [secret])
+                self.assertTrue(baseline.validate_no_secrets({"note": secret + "-suffix"}, [secret]))
+
+    def test_sensitive_value_equal_to_public_enum_fails_safely(self):
+        sensitive = baseline.sensitive_values({"ROOTYARD_BLOB_SERVICE": "s3",
+                                               "ROOTYARD_BLOB_BUCKET": "s3"})
+        self.assertIn("s3", sensitive)  # the bucket value, not the public service setting
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_no_secrets({"blob_profile": {"service": "s3"}}, sensitive)
+
     def test_common_database_password_does_not_block_its_own_report(self):
         env = {"ROOTYARD_TEST_DATABASE_URL": "postgresql://postgres:postgres@db.invalid:5432/rootyard"}
         sensitive = baseline.sensitive_values(env)
@@ -1349,6 +1380,11 @@ class ReportValidationTest(unittest.TestCase):
             self.assertNotIn(public, sensitive)
         for private in ("http://127.0.0.1:9000", "private-bucket", "private-secret", "db-password"):
             self.assertIn(private, sensitive)
+        for name, invalid in (("ROOTYARD_BLOB_DRIVER", "not-opendal"),
+                              ("ROOTYARD_BLOB_SERVICE", "not-s3"),
+                              ("ROOTYARD_BLOB_DELETE", "exact-locator")):
+            with self.subTest(invalid=name):
+                self.assertIn(invalid, baseline.sensitive_values({**env, name: invalid}))
         payload = report_payload()
         payload["blob_profile"]["delete_policy"] = "disabled"
         self.assertTrue(baseline.validate_no_secrets(payload, sensitive))
