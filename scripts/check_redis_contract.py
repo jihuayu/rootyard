@@ -2,11 +2,12 @@
 """Optional source-bound real-Redis contract gate for the state-redis feature.
 
 The runner owns one disposable Docker Redis fixture (official redis:7.2.6-alpine
-image), builds the library test binary from the current sources, runs the six
-ignored real-Redis cases over plaintext loopback and verified private-CA TLS,
-then proves an untrusted CA fails and the owned CA restores trust. It never
-uses an inherited Redis endpoint, never changes host trust, and redacts URLs,
-ACL passwords and private key material before writing logs or reports.
+image), consumes one explicit prebuilt library-test executable plus its v1/v2
+source receipt, runs the six ignored real-Redis cases over plaintext loopback
+and verified private-CA TLS, then proves an untrusted CA fails and the owned CA
+restores trust. It never compiles, cleans or probes a compiler, never uses an
+inherited Redis endpoint, never changes host trust, and redacts URLs, ACL
+passwords and private key material before writing logs or reports.
 """
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
-import build_native  # noqa: E402
+import native_build_receipt as receipt  # noqa: E402
 
 REDIS_IMAGE = "redis:7.2.6-alpine"
 REDIS_VERSION = "7.2.6"
@@ -49,16 +50,29 @@ EXPECTED_CASES = frozenset({
 })
 CONTAINER_PORT = 6379
 TLS_CONTAINER_PORT = 6380
-CLEAN_COMMAND = ["cargo", "clean", "--package", "rootyard"]
-BUILD_COMMAND = [
-    "cargo",
+EXPECTED_TARGET = "rootyard"
+EXPECTED_ARTIFACT_KIND = "lib-test"
+REDIS_FEATURE = "state-redis"
+PROFILE_CONFIG_ARGUMENTS = (
     "--config", "profile.dev.package.rootyard.debug=0",
     "--config", "profile.test.package.rootyard.debug=0",
     "--config", 'profile.dev.package.rootyard.strip="debuginfo"',
     "--config", 'profile.test.package.rootyard.strip="debuginfo"',
-    "test", "--locked", "--lib", "--features", "state-redis",
-    "--no-run", "--message-format=json-render-diagnostics",
+)
+# The v2 explicit test producer emits features before --lib.
+EXPECTED_V2_COMMAND = [
+    "cargo", *PROFILE_CONFIG_ARGUMENTS,
+    "test", "--locked", "--features", REDIS_FEATURE, "--lib", "--no-run",
+    "--message-format=json-render-diagnostics",
 ]
+# The historical v1 producer used --lib before --features and recorded a
+# separate clean_command.  Read it exactly; never rewrite it.
+EXPECTED_V1_COMMAND = [
+    "cargo", *PROFILE_CONFIG_ARGUMENTS,
+    "test", "--locked", "--lib", "--features", REDIS_FEATURE, "--no-run",
+    "--message-format=json-render-diagnostics",
+]
+COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 SENSITIVE_ENV = (
     "ROOTYARD_TEST_REDIS_URL",
     "ROOTYARD_TEST_REDIS_DESTRUCTIVE",
@@ -575,83 +589,247 @@ class OwnedRedisFixture:
                     errors.append("private fixture directory could not be removed")
         return errors
 
-def build_libtest() -> dict:
-    """Build one fresh source-bound rootyard lib test executable via Cargo JSON."""
-    source_before = build_native.source_digest()
-    lock_sha = sha256_file(ROOT / "Cargo.lock")
-    rustc_version = run_command(["rustc", "--version"], cwd=ROOT, timeout=60)
-    if rustc_version.returncode != 0:
-        raise RunnerError("rustc --version failed")
-    clean = run_command(CLEAN_COMMAND, cwd=ROOT, timeout=300)
-    if clean.returncode != 0:
-        raise RunnerError(f"cargo clean failed with status {clean.returncode}")
-    result = run_command(BUILD_COMMAND, cwd=ROOT, timeout=1800)
-    if result.returncode != 0:
-        detail = redact(result.stderr.strip()[-4000:])
-        raise RunnerError(f"cargo test --no-run failed with status {result.returncode}: {detail}")
-    events = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise RunnerError("cargo wrote non-JSON to stdout") from error
-        if not isinstance(event, dict):
-            raise RunnerError("cargo JSON event was not an object")
-        events.append(event)
-    artifacts = []
-    finished = []
-    for event in events:
-        if event.get("reason") == "build-finished":
-            finished.append(event)
-        if event.get("reason") != "compiler-artifact":
-            continue
-        target = event.get("target") or {}
-        profile = event.get("profile") or {}
-        if target.get("name") != "rootyard" or "lib" not in (target.get("kind") or []):
-            continue
-        if profile.get("test") is not True:
-            continue
-        if event.get("fresh") is not False:
-            raise RunnerError("cargo reported a Fresh rootyard test lib; refusing a stale run")
-        executable = event.get("executable")
-        if not executable:
-            raise RunnerError("rootyard test lib artifact has no executable path")
-        artifacts.append(event)
-    if len(artifacts) != 1:
-        raise RunnerError("cargo did not report exactly one rootyard profile.test lib executable")
-    if any(event.get("success") is False for event in finished):
-        raise RunnerError("cargo reported an unsuccessful build-finished event")
-    executable = Path(artifacts[0]["executable"]).resolve()
-    if not executable.is_file():
-        raise RunnerError("source-bound test executable is missing")
-    binary_sha = sha256_file(executable)
-    source_after = build_native.source_digest()
-    if source_before != source_after:
-        raise RunnerError("source inputs changed during the test build")
+def _source_state() -> dict[str, str]:
+    """Current production source, lock, config and inventory digests."""
+    entries, blobs = receipt.bound_input_inventory(ROOT)
     return {
-        "kind": "rust-library-test",
-        "command": list(BUILD_COMMAND),
-        "clean_command": list(CLEAN_COMMAND),
-        "workspace_commit": run_command(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, timeout=30).stdout.strip(),
-        "rustc": rustc_version.stdout.strip(),
-        "cargo_lock_sha256": lock_sha,
-        "source_inputs_sha256": source_before,
-        "source_after_build_sha256": source_after,
-        "executable": str(executable),
-        "binary_sha256": binary_sha,
-        "fresh": False,
-        "profile_test": True,
-        "cargo_returncode": result.returncode,
-        "build_finished": finished,
-        "artifact": {
-            "target": "rootyard", "kind": "lib",
-            "fresh": artifacts[0]["fresh"], "profile": artifacts[0].get("profile"),
-        },
+        "source_inputs_sha256": receipt.source_digest(ROOT),
+        "cargo_lock_sha256": hashlib.sha256(blobs["Cargo.lock"]).hexdigest(),
+        "config_digest": receipt.config_digest(entries, blobs),
+        "bound_inputs_digest": receipt.bound_inputs_digest(entries, blobs),
     }
+
+
+def current_commit() -> str:
+    """Resolve the real current Git commit without invoking Cargo or rustc."""
+    try:
+        commit = receipt.git_state(ROOT)["commit"]
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RunnerError(f"cannot resolve current Git HEAD: {redact(error)}") from error
+    if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
+        raise RunnerError("current Git HEAD is not a full 40- or 64-hex commit")
+    return commit.lower()
+
+
+def commit_anchor(expected_commit: str | None) -> str:
+    """Require an explicit anchor, when supplied, to equal the current HEAD."""
+    current = current_commit()
+    if expected_commit is None:
+        return current
+    anchor = str(expected_commit).strip().lower()
+    if not COMMIT_RE.fullmatch(anchor):
+        raise RunnerError("expected commit must be a full 40- or 64-hex commit")
+    if anchor != current:
+        raise RunnerError("expected commit does not match the current Git HEAD")
+    return anchor
+
+
+def _support_digest(entries: list[dict]) -> str:
+    """The builder's exact lib-test test-support digest, recomputed locally."""
+    digest = hashlib.sha256()
+    for entry in sorted(entries, key=lambda item: item.get("path", "")):
+        if entry.get("present") is True and entry.get("role") == "test_support":
+            digest.update(entry["path"].encode() + b"\0")
+            digest.update(bytes.fromhex(entry["sha256"]))
+    return digest.hexdigest()
+
+
+def _command_matches(command: object, expected: list[str], *, allow_jobs: bool) -> bool:
+    """Match the exact producer argv, with an explicit trailing job budget."""
+    if not isinstance(command, (list, tuple)):
+        return False
+    actual = list(command)
+    if actual == expected:
+        return True
+    if not allow_jobs or len(actual) != len(expected) + 2:
+        return False
+    if actual[:len(expected)] != expected or actual[-2] != "--jobs":
+        return False
+    return re.fullmatch(r"[1-9][0-9]*", actual[-1]) is not None
+
+
+def _v2_evidence(result: receipt.ValidatedReceipt) -> dict:
+    """Require the selected v2 artifact and truthful freshness provenance."""
+    payload = result.payload
+    label = "prebuilt receipt"
+    if payload.get("kind") != "rust-library-test":
+        raise RunnerError(f"{label} kind is not rust-library-test")
+    if payload.get("profile") != "test":
+        raise RunnerError(f"{label} profile is not test")
+    features = payload.get("features")
+    if not isinstance(features, dict):
+        raise RunnerError(f"{label} has no features object")
+    if features.get("enabled") != [REDIS_FEATURE]:
+        raise RunnerError(f"{label} does not enable exactly {REDIS_FEATURE}")
+    if features.get("no_default_features") is not False:
+        raise RunnerError(f"{label} drops default features")
+    if not _command_matches(payload.get("command"), EXPECTED_V2_COMMAND, allow_jobs=True):
+        raise RunnerError(f"{label} command does not match the explicit state-redis lib-test build")
+    artifacts = list(result.artifacts)
+    if len(artifacts) != 1:
+        raise RunnerError(f"{label} must select exactly one artifact")
+    row = artifacts[0]
+    if row.get("target") != EXPECTED_TARGET or row.get("kind") != EXPECTED_ARTIFACT_KIND:
+        raise RunnerError(f"{label} does not select the rootyard lib-test artifact")
+    profile = row.get("profile") or {}
+    if profile.get("test") is not True:
+        raise RunnerError(f"{label} artifact was not built with a test profile")
+    if not str(row.get("source", "")).startswith("src/"):
+        raise RunnerError(f"{label} lib-test source is outside src/")
+    if row.get("fresh") not in (True, False):
+        raise RunnerError(f"{label} has no literal Cargo freshness")
+    if payload.get("relocated_artifact") is not True:
+        raise RunnerError(f"{label} does not describe a relocated prebuilt executable")
+    original = payload.get("original_artifact_sha256")
+    if original != result.binary_sha256:
+        raise RunnerError(f"{label} original artifact hash does not match the executable")
+    if row.get("executable_sha256") != result.binary_sha256:
+        raise RunnerError(f"{label} artifact executable hash does not match the supplied executable")
+    support = payload.get("lib_test_support_inputs_sha256")
+    expected_support = _support_digest(payload.get("bound_input_inventory") or [])
+    if support != expected_support:
+        raise RunnerError(f"{label} lib-test support digest does not match its bound inventory")
+    return {
+        "receipt_schema": result.schema,
+        "kind": payload["kind"],
+        "target": row["target"],
+        "artifact_kind": row["kind"],
+        "profile": payload["profile"],
+        "profile_test": True,
+        "features": {"enabled": list(features["enabled"]),
+                     "no_default_features": features["no_default_features"]},
+        "command": list(payload["command"]),
+        "fresh": row["fresh"],
+        "freshness_source": "cargo_artifacts[0].fresh",
+        "relocated_artifact": True,
+        "original_artifact_sha256": original,
+        "lib_test_support_inputs_sha256": support,
+        "workspace_commit": result.workspace_commit,
+        "source_inputs_sha256": result.source_inputs_sha256,
+        "cargo_lock_sha256": payload.get("cargo_lock_sha256"),
+        "config_digest": result.config_digest,
+        "target_triple": payload.get("target_triple"),
+    }
+
+
+def _v1_evidence(result: receipt.ValidatedReceipt) -> dict:
+    """Read the historical v1 fields exactly, without inventing freshness."""
+    payload = result.payload
+    label = "legacy prebuilt receipt"
+    if "profile_test" in payload and payload.get("profile_test") is not True:
+        raise RunnerError(f"{label} profile_test is not true")
+    if "cargo_lock_sha256" not in payload:
+        raise RunnerError(f"{label} does not bind Cargo.lock")
+    candidates: list[dict] = []
+    if isinstance(payload.get("artifact"), dict):
+        candidates.append(payload["artifact"])
+    candidates.extend(result.artifacts)
+    if not candidates:
+        raise RunnerError(f"{label} does not identify the rootyard lib-test artifact")
+    matching = [
+        row for row in candidates
+        if isinstance(row, dict)
+        and row.get("target") == EXPECTED_TARGET
+        and row.get("kind") in ("lib", "lib-test")
+    ]
+    if len(matching) != 1:
+        raise RunnerError(f"{label} must identify exactly one rootyard lib/lib-test artifact")
+    row = matching[0]
+    profile = row.get("profile") or {}
+    if profile.get("test") is not True:
+        raise RunnerError(f"{label} artifact was not built with a test profile")
+    if "fresh" in payload and payload.get("fresh") is not False:
+        raise RunnerError(f"{label} top-level fresh must be exactly false")
+    if "fresh" in row and row.get("fresh") is not False:
+        raise RunnerError(f"{label} artifact fresh must be exactly false")
+    fresh = row.get("fresh", payload.get("fresh")) if (
+        "fresh" in row or "fresh" in payload) else None
+    if not _command_matches(payload.get("command"), EXPECTED_V1_COMMAND, allow_jobs=False):
+        raise RunnerError(f"{label} command does not match the historical state-redis lib-test build")
+    after = payload.get("source_after_build_sha256")
+    if after is not None and after != result.source_inputs_sha256:
+        raise RunnerError(f"{label} source inputs changed during the original build")
+    if "cargo_returncode" in payload and payload.get("cargo_returncode") != 0:
+        raise RunnerError(f"{label} recorded a failed Cargo build")
+    return {
+        "receipt_schema": result.schema,
+        "kind": payload.get("kind", "rust-library-test"),
+        "target": row["target"],
+        "artifact_kind": row["kind"],
+        "profile": "test",
+        "profile_test": True,
+        "features": {"enabled": [REDIS_FEATURE], "no_default_features": False},
+        "command": list(payload["command"]),
+        "fresh": fresh,
+        "freshness_source": (
+            "artifact.fresh" if "fresh" in row
+            else "fresh" if "fresh" in payload
+            else None),
+        "relocated_artifact": payload.get("relocated_artifact"),
+        "original_artifact_sha256": payload.get("original_artifact_sha256"),
+        "lib_test_support_inputs_sha256": payload.get("lib_test_support_inputs_sha256"),
+        "workspace_commit": result.workspace_commit,
+        "source_inputs_sha256": result.source_inputs_sha256,
+        "cargo_lock_sha256": payload.get("cargo_lock_sha256"),
+        "config_digest": result.config_digest,
+        "target_triple": (payload.get("toolchain") or {}).get("target_triple"),
+        "rustc": payload.get("rustc"),
+    }
+
+
+def verify_prebuilt(
+    executable: Path, build_receipt: Path, expected_commit: str | None = None,
+) -> dict:
+    """Validate one prebuilt executable and receipt without running a compiler.
+
+    The shared v1/v2 reader recomputes the source, lock, config and inventory
+    bindings from the current tree and hashes the supplied executable bytes.
+    This function adds the Redis-specific artifact, feature and command
+    semantics.  It never calls Cargo, rustc, cargo metadata or a producer.
+    """
+    executable = Path(executable)
+    build_receipt = Path(build_receipt)
+    if not executable.is_file():
+        raise RunnerError(f"prebuilt executable is missing: {executable}")
+    if not build_receipt.is_file():
+        raise RunnerError(f"prebuilt build receipt is missing: {build_receipt}")
+    anchor = commit_anchor(expected_commit)
+    state_before = _source_state()
+    try:
+        result = receipt.load_receipt(
+            build_receipt,
+            source_root=ROOT,
+            binary_path=executable,
+            expected_commit=anchor,
+            forbid_implicit_build=True,
+        )
+    except receipt.ReceiptError as error:
+        raise RunnerError(f"prebuilt receipt rejected: {redact(error)}") from error
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RunnerError(f"prebuilt receipt could not be read: {redact(error)}") from error
+    if result.schema == "v2":
+        evidence = _v2_evidence(result)
+    elif result.schema == "v1":
+        evidence = _v1_evidence(result)
+    else:
+        raise RunnerError(f"prebuilt receipt has unsupported schema {result.schema!r}")
+    binary_path = executable.resolve()
+    binary_sha256 = receipt.sha256_file(binary_path)
+    if binary_sha256 != result.binary_sha256:
+        raise RunnerError("prebuilt executable bytes do not match the receipt")
+    state_after = _source_state()
+    if state_before != state_after:
+        raise RunnerError("source, config or lock inputs changed during receipt verification")
+    evidence.update({
+        "receipt_path": str(Path(result.receipt_path).resolve()),
+        "receipt_sha256": result.receipt_sha256,
+        "binary": {
+            "path": str(binary_path),
+            "sha256": binary_sha256,
+            "size": binary_path.stat().st_size,
+        },
+    })
+    return evidence
 
 
 def run_case_set(
@@ -685,20 +863,122 @@ def run_case_set(
         "observed_counts": [parsed["passed"], parsed["failed"], parsed["ignored"]],
     })
     return parsed
-def execute(report_path: Path, log_dir: Path) -> tuple[int, dict]:
-    source_before = build_native.source_digest()
+def _fixture_report(fixture, container_id: str | None) -> dict | None:
+    if fixture is None:
+        return None
+    return {
+        "provider": "Redis", "image": REDIS_IMAGE, "image_id": fixture.image_id,
+        "image_digest": fixture.image_digest, "version": fixture.version_line,
+        "owned_container_id": container_id, "uid_gid": f"{os.getuid()}:{os.getgid()}",
+        "plain_port": fixture.plain_port, "tls_port": fixture.tls_port,
+        "maxmemory_bytes": MAXMEMORY_BYTES, "eviction": "allkeys-lru",
+        "persistence": False, "default_user_disabled": True,
+        "tls_ephemeral_ca": True, "loopback_only": True,
+        "scope": "disposable single-host fixture; task ACL user has full commands",
+    }
+
+
+def _report_document(
+    *, status: str, prebuilt: dict | None, fixture, container_id: str | None,
+    runs: list[dict], failures: list[str], source_before: dict | None,
+    source_after: dict | None, binary_still_matches: bool,
+    receipt_still_matches: bool,
+) -> dict:
+    source_still_matches = (
+        source_before is not None and source_after is not None
+        and source_before == source_after
+    )
+    config_still_matches = (
+        source_before is not None and source_after is not None
+        and source_before["config_digest"] == source_after["config_digest"]
+    )
+    inventory_still_matches = (
+        source_before is not None and source_after is not None
+        and source_before["bound_inputs_digest"] == source_after["bound_inputs_digest"]
+    )
+    return {
+        "status": status,
+        "gate": "optional-state-redis-real-contract",
+        "prebuilt_only": True,
+        "forbid_implicit_build": True,
+        "prebuilt": prebuilt,
+        "fixture": _fixture_report(fixture, container_id),
+        "runs": runs,
+        "case_counts": {run["name"]: {
+            "passed": run["passed"], "failed": run["failed"], "ignored": run["ignored"],
+        } for run in runs},
+        "zero_skipped": bool(runs) and all(run["ignored"] == 0 for run in runs),
+        "source_inputs_sha256": (
+            source_before["source_inputs_sha256"] if source_before else None),
+        "source_after_all_sha256": (
+            source_after["source_inputs_sha256"] if source_after else None),
+        "source_still_matches": source_still_matches,
+        "config_digest_before": (
+            source_before["config_digest"] if source_before else None),
+        "config_digest_after": (
+            source_after["config_digest"] if source_after else None),
+        "config_still_matches": config_still_matches,
+        "inventory_digest_before": (
+            source_before["bound_inputs_digest"] if source_before else None),
+        "inventory_digest_after": (
+            source_after["bound_inputs_digest"] if source_after else None),
+        "inventory_still_matches": inventory_still_matches,
+        "receipt_still_matches": receipt_still_matches,
+        "binary_still_matches": binary_still_matches,
+        "failures": failures,
+        "limits": [
+            "one disposable loopback container; no HA, Sentinel, Cluster or physical fault-domain claim",
+            "task ACL user permits CONFIG and destructive test commands; not a production ACL model",
+            "no serving-cache consumer integration; issue 111 remains incomplete",
+        ],
+    }
+
+
+def _write_failure_report(
+    report_path: Path, failures: list[str], source_before: dict | None,
+) -> dict:
+    try:
+        source_after = _source_state()
+    except Exception:  # noqa: BLE001 - the original evidence failure is primary
+        source_after = None
+    report = _report_document(
+        status="failed", prebuilt=None, fixture=None, container_id=None, runs=[],
+        failures=failures, source_before=source_before, source_after=source_after,
+        binary_still_matches=False, receipt_still_matches=False,
+    )
+    write_json_atomic(report_path, report, ())
+    print(json.dumps(redact_tree({
+        "status": "failed", "report": str(report_path), "failures": failures,
+    }, ()), sort_keys=True))
+    return report
+
+
+def execute(
+    report_path: Path, log_dir: Path, executable: Path, build_receipt: Path,
+    expected_commit: str | None = None,
+) -> tuple[int, dict]:
+    """Verify prebuilt evidence first, then run the owned Redis fixture."""
+    try:
+        source_before = _source_state()
+    except Exception as error:  # noqa: BLE001 - fail before allocating the fixture
+        return 1, _write_failure_report(
+            report_path, [redact(error)], None)
+    try:
+        prebuilt = verify_prebuilt(executable, build_receipt, expected_commit)
+    except Exception as error:  # noqa: BLE001 - fail before allocating the fixture
+        return 1, _write_failure_report(
+            report_path, [redact(error)], source_before)
+
     fixture = OwnedRedisFixture()
-    build = None
     runs: list[dict] = []
     failures: list[str] = []
     container_id = None
     try:
-        build = build_libtest()
         fixture.start()
-        executable = Path(build["executable"])
+        executable_path = Path(prebuilt["binary"]["path"])
         plain_environment = child_environment(fixture.url(tls=False), fixture.ca_certificate)
         runs.append(run_case_set(
-            executable, "plain", [TEST_FILTER, "--ignored"], plain_environment,
+            executable_path, "plain", [TEST_FILTER, "--ignored"], plain_environment,
             expected_cases=EXPECTED_CASES, expected_passed=TEST_CASE_COUNT,
             expected_failed=0, expected_ignored=0, log_dir=log_dir,
             secrets=(fixture.secret,),
@@ -706,20 +986,20 @@ def execute(report_path: Path, log_dir: Path) -> tuple[int, dict]:
         tls_url = fixture.url(tls=True)
         tls_environment = child_environment(tls_url, fixture.ca_certificate)
         runs.append(run_case_set(
-            executable, "tls", [TEST_FILTER, "--ignored"], tls_environment,
+            executable_path, "tls", [TEST_FILTER, "--ignored"], tls_environment,
             expected_cases=EXPECTED_CASES, expected_passed=TEST_CASE_COUNT,
             expected_failed=0, expected_ignored=0, log_dir=log_dir,
             secrets=(fixture.secret,),
         ))
         untrusted_environment = child_environment(tls_url, fixture.untrusted_ca_certificate)
         runs.append(run_case_set(
-            executable, "untrusted-ca-refused", ["--ignored", "--exact", NEGATIVE_CASE],
+            executable_path, "untrusted-ca-refused", ["--ignored", "--exact", NEGATIVE_CASE],
             untrusted_environment, expected_cases=frozenset({NEGATIVE_CASE}),
             expected_passed=0, expected_failed=1, expected_ignored=0,
             log_dir=log_dir, secrets=(fixture.secret,),
         ))
         runs.append(run_case_set(
-            executable, "trusted-ca-restored", ["--ignored", "--exact", NEGATIVE_CASE],
+            executable_path, "trusted-ca-restored", ["--ignored", "--exact", NEGATIVE_CASE],
             tls_environment, expected_cases=frozenset({NEGATIVE_CASE}),
             expected_passed=1, expected_failed=0, expected_ignored=0,
             log_dir=log_dir, secrets=(fixture.secret,),
@@ -729,68 +1009,81 @@ def execute(report_path: Path, log_dir: Path) -> tuple[int, dict]:
     finally:
         container_id = fixture.cid or container_id
         failures.extend(fixture.stop())
-    source_after = build_native.source_digest()
-    if source_before != source_after:
-        failures.append("source inputs changed during the contract gate")
-    binary_still_matches = False
-    if build and Path(build["executable"]).is_file():
-        binary_still_matches = sha256_file(Path(build["executable"])) == build["binary_sha256"]
-    if build and not binary_still_matches:
-        failures.append("test executable changed after the recorded build")
+
+    try:
+        source_after = _source_state()
+    except Exception as error:  # noqa: BLE001 - a mutated tree must fail the gate
+        source_after = None
+        failures.append(
+            f"could not re-read source inputs after the contract gate: {redact(error)}")
+    binary_path = Path(prebuilt["binary"]["path"])
+    binary_still_matches = (
+        binary_path.is_file()
+        and sha256_file(binary_path) == prebuilt["binary"]["sha256"]
+    )
+    if not binary_still_matches:
+        failures.append("prebuilt test executable changed after verification")
+    receipt_path = Path(prebuilt["receipt_path"])
+    receipt_still_matches = (
+        receipt_path.is_file()
+        and sha256_file(receipt_path) == prebuilt["receipt_sha256"]
+    )
+    if not receipt_still_matches:
+        failures.append("build receipt changed after verification")
+    source_still_matches = (
+        source_before is not None and source_after is not None
+        and source_before == source_after
+    )
+    if not source_still_matches:
+        failures.append("source, config or lock inputs changed during the contract gate")
     expected_labels = ["plain", "tls", "untrusted-ca-refused", "trusted-ca-restored"]
     if [run["name"] for run in runs] != expected_labels:
         failures.append("contract gate did not execute all four required runs")
     status = "passed" if not failures else "failed"
-    report = {
-        "status": status,
-        "gate": "optional-state-redis-real-contract",
-        "build": build,
-        "receipt": build,
-        "fixture": {
-            "provider": "Redis", "image": REDIS_IMAGE, "image_id": fixture.image_id,
-            "image_digest": fixture.image_digest, "version": fixture.version_line,
-            "owned_container_id": container_id, "uid_gid": f"{os.getuid()}:{os.getgid()}",
-            "plain_port": fixture.plain_port, "tls_port": fixture.tls_port,
-            "maxmemory_bytes": MAXMEMORY_BYTES, "eviction": "allkeys-lru",
-            "persistence": False, "default_user_disabled": True,
-            "tls_ephemeral_ca": True, "loopback_only": True,
-            "scope": "disposable single-host fixture; task ACL user has full commands",
-        },
-        "runs": runs,
-        "case_counts": {run["name"]: {
-            "passed": run["passed"], "failed": run["failed"], "ignored": run["ignored"],
-        } for run in runs},
-        "zero_skipped": all(run["ignored"] == 0 for run in runs),
-        "source_inputs_sha256": source_before,
-        "source_after_all_sha256": source_after,
-        "source_still_matches": source_before == source_after,
-        "binary_still_matches": binary_still_matches,
-        "failures": failures,
-        "limits": [
-            "one disposable loopback container; no HA, Sentinel, Cluster or physical fault-domain claim",
-            "task ACL user permits CONFIG and destructive test commands; not a production ACL model",
-            "no serving-cache consumer integration; issue 111 remains incomplete",
-        ],
-    }
+    report = _report_document(
+        status=status, prebuilt=prebuilt, fixture=fixture, container_id=container_id,
+        runs=runs, failures=failures, source_before=source_before,
+        source_after=source_after, binary_still_matches=binary_still_matches,
+        receipt_still_matches=receipt_still_matches,
+    )
     write_json_atomic(report_path, report, (fixture.secret,))
     summary = {
         "status": status, "report": str(report_path), "image": REDIS_IMAGE,
         "image_digest": fixture.image_digest, "owned_container_id": container_id,
-        "runs": report["case_counts"], "failures": failures,
+        "runs": report["case_counts"],
+        "receipt": {
+            "path": prebuilt["receipt_path"],
+            "sha256": prebuilt["receipt_sha256"],
+            "schema": prebuilt["receipt_schema"],
+        },
+        "binary": prebuilt["binary"],
+        "failures": failures,
     }
     print(json.dumps(redact_tree(summary, (fixture.secret,)), sort_keys=True))
     return (0 if status == "passed" else 1), report
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the owned real-Redis state-redis contract gate.")
+    parser = argparse.ArgumentParser(
+        description="Run the owned real-Redis state-redis contract gate on one prebuilt executable.")
+    parser.add_argument(
+        "--executable", type=Path, required=True,
+        help="required prebuilt rootyard lib-test executable")
+    parser.add_argument(
+        "--build-receipt", type=Path, required=True,
+        help="required v1/v2 receipt adjacent to the prebuilt executable")
+    parser.add_argument(
+        "--expected-commit",
+        help="optional full commit anchor; must equal the current Git HEAD")
     parser.add_argument(
         "--report", type=Path, default=ROOT / "test-results/state-redis-contract.json")
     parser.add_argument(
         "--log-dir", type=Path, default=ROOT / "test-results/state-redis")
     arguments = parser.parse_args(argv)
     try:
-        status, _report = execute(arguments.report, arguments.log_dir)
+        status, _report = execute(
+            arguments.report, arguments.log_dir, arguments.executable,
+            arguments.build_receipt, arguments.expected_commit)
         return status
     except RunnerError as error:
         print(f"check_redis_contract: {redact(error)}", file=sys.stderr)
