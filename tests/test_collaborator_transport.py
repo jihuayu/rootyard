@@ -246,6 +246,13 @@ class SourceBindingSchemaContract(unittest.TestCase):
     def git_output(*args):
         return CURRENT_HEAD if args == ("rev-parse", "HEAD") else ""
 
+    def v2_report(self, binary, env=None):
+        with mock.patch.object(source_bound_binary, "_git", side_effect=self.git_output), \
+                mock.patch.object(source_bound_binary, "production_source_digest",
+                                  side_effect=AssertionError("v2 measured current source")):
+            return collaborator_contract.prerequisite.source_binding(
+                self.harness(binary, env))
+
     def test_v1_positive_keeps_current_production_byte_identity(self):
         with tempfile.TemporaryDirectory() as root:
             binary = self.v1_receipt(root, source_bound_binary.production_source_digest())
@@ -258,6 +265,18 @@ class SourceBindingSchemaContract(unittest.TestCase):
         self.assertEqual(report["current_source_inputs_sha256"],
                          report["source_inputs_sha256"])
         self.assertEqual(report["source_identity"], "current production bytes")
+
+    def test_v1_ignores_github_sha_and_allows_test_only_head(self):
+        """v1 keeps the historical explicit-only filter and byte binding."""
+        with tempfile.TemporaryDirectory() as root:
+            binary = self.v1_receipt(root, source_bound_binary.production_source_digest())
+            h = self.harness(binary, {"GITHUB_SHA": "e" * 40})
+            with mock.patch.object(source_bound_binary, "_git", side_effect=self.git_output):
+                report = collaborator_contract.prerequisite.source_binding(h)
+        self.assertIsNone(report["expected_commit"])
+        self.assertEqual(report["source_commit"], CURRENT_HEAD)
+        self.assertEqual(report["binary_source_commit"], "b" * 40)
+        self.assertNotEqual(report["source_commit"], report["binary_source_commit"])
 
     def test_v1_rejects_current_digest_mismatch_and_dirty_production_inputs(self):
         with tempfile.TemporaryDirectory() as root:
@@ -283,6 +302,7 @@ class SourceBindingSchemaContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             fixture = V2ReceiptFixture(root)
             fixture.make_v2()
+            expected_binary = digest(fixture.binary)
             h = self.harness(fixture.binary,
                              {"ROOTYARD_EXPECTED_SOURCE_COMMIT": V2_COMMIT})
             with mock.patch.object(source_bound_binary, "_git", side_effect=self.git_output), \
@@ -310,7 +330,50 @@ class SourceBindingSchemaContract(unittest.TestCase):
         self.assertEqual(report["source_inputs_sha256"],
                          fixture.bound["source_inputs_sha256"])
         self.assertEqual(report["config_digest"], fixture.bound["config_digest"])
+        self.assertEqual(report["cargo_lock_sha256"], fixture.bound["cargo_lock_sha256"])
+        self.assertEqual(report["binary_sha256"], expected_binary)
         self.assertEqual(report["source_identity"], "recorded source snapshot")
+
+    def test_v2_ci_github_sha_match_is_enforced_and_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            fixture = V2ReceiptFixture(root)
+            fixture.make_v2()
+            report = self.v2_report(fixture.binary, {"GITHUB_SHA": V2_COMMIT})
+        self.assertEqual(report["expected_commit"], V2_COMMIT)
+        self.assertEqual(report["source_commit"], V2_COMMIT)
+        self.assertEqual(report["binary_source_commit"], V2_COMMIT)
+        self.assertEqual(report["current_head"], CURRENT_HEAD)
+
+    def test_v2_ci_github_sha_stale_mismatch_rejected_without_echo(self):
+        bad = "e" * 40
+        with tempfile.TemporaryDirectory() as root:
+            fixture = V2ReceiptFixture(root)
+            fixture.make_v2()
+            with self.assertRaises(AssertionError) as caught:
+                self.v2_report(fixture.binary, {"GITHUB_SHA": bad})
+        message = str(caught.exception)
+        self.assertIn("stale build receipt", message)
+        self.assertNotIn(bad, message)
+
+    def test_v2_explicit_expected_commit_precedes_github_sha(self):
+        with tempfile.TemporaryDirectory() as root:
+            fixture = V2ReceiptFixture(root)
+            fixture.make_v2()
+            report = self.v2_report(fixture.binary, {
+                "ROOTYARD_EXPECTED_SOURCE_COMMIT": V2_COMMIT,
+                "GITHUB_SHA": "e" * 40,
+            })
+            bad = "f" * 40
+            with self.assertRaises(AssertionError) as caught:
+                self.v2_report(fixture.binary, {
+                    "ROOTYARD_EXPECTED_SOURCE_COMMIT": bad,
+                    "GITHUB_SHA": V2_COMMIT,
+                })
+        self.assertEqual(report["expected_commit"], V2_COMMIT)
+        self.assertEqual(report["source_commit"], V2_COMMIT)
+        message = str(caught.exception)
+        self.assertIn("stale build receipt", message)
+        self.assertNotIn(bad, message)
 
     def test_v2_rejects_unvalidated_snapshot_or_input_flags(self):
         with tempfile.TemporaryDirectory() as root:

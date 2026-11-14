@@ -160,8 +160,11 @@ class prerequisite:
         checkout HEAD whose bytes were just measured. v2 receipts are
         recorded-snapshot receipts: the validated source, config, toolchain and
         input binding is the artifact's identity, so the reported source commit
-        is the receipt's ``workspace_commit``. The mutable checkout HEAD is
-        exposed separately and is never substituted for the recorded snapshot.
+        is the receipt's ``workspace_commit``. A v2 receipt must also match an
+        explicit ``ROOTYARD_EXPECTED_SOURCE_COMMIT``, else a present
+        ``GITHUB_SHA``; v1 deliberately keeps its historical explicit-only
+        filter. The mutable checkout HEAD is exposed separately and is never
+        substituted for the recorded snapshot.
         """
         from source_bound_binary import SourceBindingError, bind
         env = getattr(self, "env", {})
@@ -208,8 +211,14 @@ class prerequisite:
                 "v2 receipt did not validate its recorded source snapshot")
             assert evidence["production_inputs_bound"] is True, (
                 "v2 receipt did not validate its production inputs")
+            expected = (env.get("ROOTYARD_EXPECTED_SOURCE_COMMIT")
+                        or env.get("GITHUB_SHA"))
+            if expected and evidence["workspace_commit"] != expected:
+                raise AssertionError(
+                    "stale build receipt: workspace_commit differs from the expected source commit")
             report.update(source_commit=evidence["workspace_commit"],
                           source_identity="recorded source snapshot",
+                          expected_commit=expected,
                           config_digest=evidence["config_digest"],
                           cargo_lock_sha256=evidence["cargo_lock_sha256"],
                           source_snapshot_bound=evidence["source_snapshot_bound"],
