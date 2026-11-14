@@ -17,6 +17,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/native_report_manifest.py"
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+import native_build_receipt as receipts  # noqa: E402
 
 
 def digest(path):
@@ -58,13 +62,16 @@ class ManifestFixture:
         self.harness = self.root / "tests/web_sessions.py"
         self.harness.parent.mkdir(parents=True, exist_ok=True)
         self.harness.write_text("# harness\n")
+        (self.root / "Cargo.toml").write_text('[package]\nname = "rootyard"\n')
+        (self.root / "Cargo.lock").write_text("version = 3\n")
 
     def enable_batch_receipt(self):
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         target_dir = str(self.binary.parent.parent.resolve())
         toolchain = {"rustc": receipt["rustc"], "cargo": "cargo 1.99.1"}
         architecture = {"target_triple": "x86_64-unknown-linux-gnu"}
-        bound_inputs = {"digest": "c" * 64}
+        bound = receipts.capture_bound_inputs(self.root, environ={"PATH": ""})
+        bound_inputs = bound["bound_inputs"]
         batch_path = self.root / "test-results/native-build-batch.json"
         batch_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -72,12 +79,13 @@ class ManifestFixture:
         receipt["architecture"] = architecture
         receipt["target_dir"] = target_dir
         receipt["bound_inputs"] = bound_inputs
+        receipt["bound_input_inventory"] = bound["bound_input_inventory"]
         receipt["batch"] = {
             "kind": "rootyard/native-build-batch",
             "receipt_version": 1,
             "binary": "rootyard",
             "targets": ["rootyard", "rootyard"],
-            "bound_inputs_sha256": "c" * 64,
+            "bound_inputs_sha256": bound_inputs["digest"],
             "manifest": str(batch_path.resolve()),
         }
         self.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
@@ -108,6 +116,143 @@ class ManifestFixture:
                     "artifact": str(self.binary.resolve()),
                     "receipt": str(self.receipt.resolve()),
                     "fresh": False,
+                    "implicit": False,
+                    "sha256": digest(self.binary),
+                }
+            ],
+        }
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return batch_path
+
+    def _v2_toolchain(self):
+        directory = self.root / "toolchain"
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in ("cargo", "rustc", "rustup"):
+            (directory / name).write_bytes(("fake-" + name).encode())
+
+        def identity(name, release, commit_hash):
+            executable = directory / name
+            return {
+                "executable": str(executable),
+                "executable_sha256": digest(executable),
+                "version": f"{name} {release} (fake 2026-01-01)",
+                "release": release,
+                "commit_hash": commit_hash,
+                "commit_date": "2026-01-01",
+                "host": "x86_64-unknown-linux-gnu",
+            }
+
+        return {
+            "cargo": identity("cargo", "1.101.0", "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"),
+            "rustc": dict(
+                identity("rustc", "1.99.1", "d" * 40),
+                path_entry=str(directory / "rustc"),
+                proxy=False,
+            ),
+            "rustup": {
+                "executable": str(directory / "rustup"),
+                "executable_sha256": digest(directory / "rustup"),
+                "resolved_rustc": str(directory / "rustc"),
+                "resolved_rustc_sha256": digest(directory / "rustc"),
+            },
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "pinned_channel": "1.99.1",
+            "pin_source": "rust-toolchain.toml",
+        }
+
+    def enable_v2_receipt(self, *, lib_fresh=True, bin_fresh=False):
+        for relative, content in (
+            ("Cargo.toml", '[package]\nname = "rootyard"\n'),
+            ("Cargo.lock", "version = 3\n"),
+            ("src/lib.rs", "pub fn production() -> u8 { 1 }\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.1"\n'),
+        ):
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        profile = {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": True,
+            "overflow_checks": True,
+            "test": False,
+        }
+
+        def event(name, kind, source, executable, fresh):
+            target = {"name": name, "kind": [kind], "src_path": str(source)}
+            payload = {
+                "reason": "compiler-artifact",
+                "package_id": "rootyard 0.1.0",
+                "target": target,
+                "profile": profile,
+                "fresh": fresh,
+            }
+            if executable is not None:
+                payload["executable"] = str(executable)
+            return payload
+
+        artifacts = [
+            receipts.cargo_artifact_record(
+                event("rootyard", "lib", self.root / "src/lib.rs", None, lib_fresh),
+                self.root,
+            ),
+            receipts.cargo_artifact_record(
+                event("rootyard", "bin", self.root / "src/main.rs", self.binary, bin_fresh),
+                self.root,
+            ),
+        ]
+        bound = receipts.capture_bound_inputs(self.root, environ={"PATH": ""})
+        payload = receipts.make_receipt_v2(
+            binary_path=self.binary,
+            command=["cargo", "build", "--locked", "--bin", "rootyard"],
+            profile="dev",
+            artifacts=artifacts,
+            toolchain=self._v2_toolchain(),
+            bound_inputs=bound,
+            workspace_commit=self.commit,
+            target_dir=self.binary.parent.parent,
+            target_triple="x86_64-unknown-linux-gnu",
+            features="pando-lab",
+        )
+        self.source_inputs = payload["source_inputs_sha256"]
+        self.receipt.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return payload
+
+    def enable_v2_batch_receipt(self, *, lib_fresh=True, bin_fresh=False):
+        receipt = self.enable_v2_receipt(lib_fresh=lib_fresh, bin_fresh=bin_fresh)
+        batch_path = self.root / "test-results/native-build-batch.json"
+        batch_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt["batch"] = {
+            "kind": "rootyard/native-build-batch",
+            "receipt_version": 2,
+            "binary": "rootyard",
+            "targets": [row["target"] for row in receipt["cargo_artifacts"]],
+            "bound_inputs_sha256": receipt["bound_inputs"]["digest"],
+            "manifest": str(batch_path.resolve()),
+        }
+        self.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        manifest = {
+            "kind": "rootyard/native-build-batch",
+            "manifest_version": 2,
+            "status": "passed",
+            "source_commit": receipt["workspace_commit"],
+            "source_inputs_sha256": receipt["source_inputs_sha256"],
+            "toolchain": receipt["toolchain"],
+            "architecture": receipt["target_triple"],
+            "target_directory": receipt["target_dir"],
+            "bound_inputs": receipt["bound_inputs"],
+            "build": {
+                "command": receipt["command"],
+                "cargo_artifacts": receipt["cargo_artifacts"],
+            },
+            "artifacts": [
+                {
+                    "kind": "bin",
+                    "target": "rootyard",
+                    "artifact": str(self.binary.resolve()),
+                    "receipt": str(self.receipt.resolve()),
+                    "fresh": bin_fresh,
                     "implicit": False,
                     "sha256": digest(self.binary),
                 }
@@ -260,6 +405,52 @@ class TestJobManifest(unittest.TestCase):
                 "target": "rootyard",
             },
         )
+
+    def test_accepts_v2_actual_freshness_true_false_and_mixed(self):
+        for lib_fresh, bin_fresh in ((True, True), (False, False), (True, False), (False, True)):
+            with self.subTest(lib_fresh=lib_fresh, bin_fresh=bin_fresh):
+                self.fixture.enable_v2_receipt(lib_fresh=lib_fresh, bin_fresh=bin_fresh)
+                job = json.loads(self.fixture.job().read_text(encoding="utf-8"))
+                self.assertEqual(job["status"], "passed")
+                receipt = json.loads(self.fixture.receipt.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    [row["fresh"] for row in receipt["cargo_artifacts"]],
+                    [lib_fresh, bin_fresh],
+                )
+
+    def test_accepts_v2_batch_manifest_without_clean_or_rebuilt(self):
+        batch_path = self.fixture.enable_v2_batch_receipt(lib_fresh=True, bin_fresh=False)
+        job = json.loads(self.fixture.job().read_text(encoding="utf-8"))
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(job["build_receipt"]["batch_manifest"]["target"], "rootyard")
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        self.assertNotIn("clean", manifest)
+        self.assertNotIn("fresh_false_artifacts", manifest["build"])
+        self.assertNotIn("package_rebuilt", manifest)
+
+    def test_rejects_v2_manifest_freshness_not_matching_the_receipt(self):
+        batch_path = self.fixture.enable_v2_batch_receipt(lib_fresh=True, bin_fresh=False)
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["build"]["cargo_artifacts"][1]["fresh"] = True
+        batch_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.fixture.job(expect=1)
+        self.assertIn("freshness does not match", self.fixture.last_process.stderr)
+
+    def test_rejects_v2_manifest_freshness_that_is_not_a_json_boolean(self):
+        batch_path = self.fixture.enable_v2_batch_receipt(lib_fresh=True, bin_fresh=False)
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["build"]["cargo_artifacts"][0]["fresh"] = "true"
+        batch_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.fixture.job(expect=1)
+        self.assertIn("fresh must be a JSON boolean", self.fixture.last_process.stderr)
+
+    def test_rejects_v2_manifest_artifact_wrong_source_or_profile(self):
+        batch_path = self.fixture.enable_v2_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["build"]["cargo_artifacts"][1]["source"] = "src/other.rs"
+        batch_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.fixture.job(expect=1)
+        self.assertIn("source does not match the receipt", self.fixture.last_process.stderr)
 
     def test_accepts_batch_receipt_copied_outside_target(self):
         self.fixture.enable_batch_receipt()
@@ -484,6 +675,51 @@ class TestReleaseGate(unittest.TestCase):
             "browser": self.fixture.artifact_directory("browser", self.browser),
             "object-store": self.fixture.artifact_directory("object-store", self.store),
         }
+
+    def enable_v2_batch_jobs(self):
+        self.fixture.enable_v2_batch_receipt(lib_fresh=True, bin_fresh=False)
+        self.browser = self.fixture.job(
+            "browser.json",
+            reports={"browser_ui": self.fixture.report("browser_ui")},
+        )
+        self.store = self.fixture.job(
+            "object-store.json",
+            reports={
+                "lfs_hydration": self.fixture.report("lfs_hydration"),
+                "lfs_retention": self.fixture.report("lfs_retention"),
+            },
+            extra=(
+                "--fixture", "garage=garage 2.1.0",
+                "--fixture", "git_lfs=git-lfs/3.6.1",
+            ),
+        )
+        self.staged = {
+            "browser": self.fixture.artifact_directory("browser", self.browser),
+            "object-store": self.fixture.artifact_directory("object-store", self.store),
+        }
+
+    def test_release_accepts_v2_batch_jobs_with_cache_hit_freshness(self):
+        self.enable_v2_batch_jobs()
+        process, gate_path = self.release()
+        self.assertEqual(process.returncode, 0)
+        gate = json.loads(gate_path.read_text())
+        self.assertEqual(gate["status"], "passed")
+        self.assertIn(
+            "build:batch_manifest",
+            gate["jobs"]["browser"]["artifacts"],
+        )
+
+    def test_release_rejects_v2_batch_manifest_tampered_freshness(self):
+        self.enable_v2_batch_jobs()
+        batch_path = self.staged["browser"] / "native-build-batch.json"
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["build"]["cargo_artifacts"][1]["fresh"] = True
+        batch_path.write_text(json.dumps(manifest), encoding="utf-8")
+        job = json.loads(self.browser.read_text(encoding="utf-8"))
+        job["build_receipt"]["batch_manifest"]["sha256"] = digest(batch_path)
+        self.browser.write_text(json.dumps(job), encoding="utf-8")
+        process, _ = self.release(expect=1)
+        self.assertIn("freshness does not match", process.stderr)
 
     def test_release_verifies_downloaded_batch_manifest(self):
         self.enable_batch_jobs()
