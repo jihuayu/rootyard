@@ -310,6 +310,147 @@ fn stored_max(conn: &Connection) -> Res<Option<(i64, LogId<u64>)>> {
         .map(|entry| (entry.get_log_id().index as i64, *entry.get_log_id())))
 }
 
+/// Lowest stored row key, if any. Uses the integer primary-key index and reads no payload.
+fn stored_min(conn: &Connection) -> Res<Option<u64>> {
+    let min: Option<i64> = conn.query_row("SELECT min(idx) FROM log_entry", [], |r| r.get(0))?;
+    min.map(idx_from_i64).transpose()
+}
+
+/// Count and index bounds of stored rows (`count`, `min`, `max`), optionally restricted to
+/// `idx >= lower`. Uses one aggregate over the integer primary-key index, so its memory is O(1).
+fn row_bounds(conn: &Connection, lower: Option<i64>) -> Res<(u64, Option<u64>, Option<u64>)> {
+    let (count, min, max): (i64, Option<i64>, Option<i64>) = match lower {
+        Some(lower) => {
+            conn.query_row("SELECT count(*),min(idx),max(idx) FROM log_entry WHERE idx >= ?1", [lower], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+        }
+        None => conn.query_row("SELECT count(*),min(idx),max(idx) FROM log_entry", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?,
+    };
+    Ok((
+        u64::try_from(count).map_err(|_| E::Codec("negative stored row count".into()))?,
+        min.map(idx_from_i64).transpose()?,
+        max.map(idx_from_i64).transpose()?,
+    ))
+}
+
+/// First missing index in `[lower, max]`; only used after the aggregate proves the range is not
+/// dense. The index is streamed, so a sparse log does not require loading its rows together.
+fn first_missing_index(conn: &Connection, lower: u64, max: u64) -> Res<u64> {
+    let mut st = conn.prepare("SELECT idx FROM log_entry WHERE idx >= ?1 AND idx <= ?2 ORDER BY idx")?;
+    let mut rows = st.query([idx_to_i64(lower)?, idx_to_i64(max)?])?;
+    let mut expected = lower;
+    while let Some(row) = rows.next()? {
+        let actual = idx_from_i64(row.get(0)?)?;
+        if actual != expected {
+            return Ok(expected);
+        }
+        expected = expected.checked_add(1).ok_or_else(|| E::Refused("log index overflow".into()))?;
+    }
+    Ok(expected)
+}
+
+/// Refuse a retained log that is not dense from its correct lower bound through its stored tail.
+///
+/// With a persisted purge boundary, the first required live index is its successor. The exact
+/// boundary row is allowed residue, is excluded by the aggregate query, and never satisfies the
+/// requirement for the successor. Without a boundary, the smallest stored row is the only
+/// observable lower bound: this store accepts a legal positive first index, and a missing fresh
+/// prefix is not distinguishable from such a first index without an independent witness.
+///
+/// The aggregate count is compared with the inclusive range length. Primary-key uniqueness makes
+/// that comparison exactly equivalent to every index in the range being present. A lone missing
+/// tail row or an empty log simply moves the observed bound; absence of a live row leaves no
+/// evidence, which is why deletion of the whole log or a fresh prefix/uncommitted suffix is not
+/// detectable here.
+fn validate_density(conn: &Connection, purged: Option<&LogId<u64>>) -> Res<()> {
+    let lower = purged
+        .map(|p| {
+            p.index.checked_add(1).ok_or_else(|| E::Refused("purge boundary has no representable successor".into()))
+        })
+        .transpose()?;
+    let sql_lower = lower
+        .map(|lower| i64::try_from(lower).map_err(|_| E::Refused("purge successor does not fit a SQLite key".into())))
+        .transpose()?;
+    // `read_last` has already rejected every row at or below a boundary except the exact boundary
+    // row, which the `idx >= successor` aggregate excludes from the live set.
+    let (count, min, max) = row_bounds(conn, sql_lower)?;
+    let Some(max) = max else { return Ok(()) };
+    let lower = match (lower, min) {
+        (Some(lower), _) => lower,
+        (None, Some(min)) => min,
+        (None, None) => return Ok(()),
+    };
+    // Stored keys created by this store are always valid write keys. A direct SQL insertion can
+    // still produce a negative index or the reserved i64::MAX; refuse it rather than derive an
+    // oversized or nonsensical expected range.
+    idx_to_i64(lower)?;
+    idx_to_i64(max)?;
+    let expected = max
+        .checked_sub(lower)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| E::Refused(format!("retained log range [{lower}, {max}] has no representable length")))?;
+    if count != expected {
+        let missing = first_missing_index(conn, lower, max)?;
+        return Err(E::Refused(format!(
+            "retained log is not dense from {lower} to {max}: log entry {missing} is missing although it is stored ({count} rows, expected {expected})"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse committed metadata that the retained log cannot satisfy.
+///
+/// A committed entry may be absent when the persisted purge boundary removed its row. A boundary
+/// strictly after the commit (`purged.index > committed.index`) is the legitimate snapshot-install
+/// ordering: the engine may advance purge beyond older persisted committed metadata, and the state
+/// machine restores the newer committed point on startup. At the *same* index the boundary must
+/// identify the same full `LogId`, because `LogId` includes the leader identity and one index names
+/// one Raft entry. A boundary below the commit does not cover it. `purge` is the only supported
+/// operation that removes a committed row; `append` never rewrites one, and `truncate` refuses
+/// through it. So without valid coverage, the row at the committed index must exist with the exact
+/// committed `LogId`. A missing row, a different `LogId`, a committed value ahead of the retained
+/// tail, or a commit with no retained row and no purge boundary is known loss, not a valid
+/// empty/partial log.
+fn validate_committed(
+    conn: &Connection,
+    committed: Option<&LogId<u64>>,
+    purged: Option<&LogId<u64>>,
+    last: Option<LogId<u64>>,
+) -> Res<()> {
+    let Some(c) = committed else { return Ok(()) };
+    let Some(l) = last else {
+        return Err(E::Refused(format!(
+            "committed {c} is recorded but the retained log is empty and no purge boundary explains it"
+        )));
+    };
+    if c.index > l.index {
+        return Err(E::Refused(format!("committed {c} is ahead of last log {l}")));
+    }
+    if let Some(p) = purged {
+        if p.index == c.index {
+            if p == c {
+                return Ok(());
+            }
+            return Err(E::Refused(format!("committed {c} conflicts with purge boundary {p} at the same index")));
+        }
+        if p.index > c.index {
+            return Ok(());
+        }
+    }
+    match read_row(conn, idx_to_i64(c.index)?)? {
+        Some((stored, _)) if &stored == c => Ok(()),
+        Some((stored, _)) => Err(E::Refused(format!(
+            "committed {c} does not match stored log {stored} at its index and no purge boundary covers it"
+        ))),
+        None => {
+            Err(E::Refused(format!("committed {c} is missing from the retained log and no purge boundary covers it")))
+        }
+    }
+}
+
 /// First row (with full checksum/identity validation) of an `{cols}`-templated index query, or
 /// `None` when the query yields no row.
 fn read_indexed_row<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Res<Option<EntryOf>> {
@@ -380,6 +521,12 @@ fn read_rows(conn: &Connection, from: i64, to: i64, limited: bool) -> Res<(Vec<(
 /// stored. Whatever is returned must begin with `first` and have no internal gap, including a
 /// limited read stopped by its count or byte budget. Only a complete read must also reach
 /// `min(known, hi)`; past that end (and past `hi`) short reads and empty results stay valid.
+///
+/// Without a purge boundary, a request whose whole interval lies below the smallest stored row
+/// asks for no live index and returns empty, matching the allowed short read. If it starts below
+/// that row and overlaps retained data, it is refused as an unavailable prefix instead of silently
+/// shifting to the first stored row. That refusal does not claim the prefix was ever stored, so it
+/// neither invents an index-zero invariant nor turns a legal positive-first log into a loss.
 fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res<Vec<EntryOf>> {
     if hi.is_some_and(|h| h <= lo) {
         return Ok(Vec::new()); // empty range: never touches SQL
@@ -399,6 +546,19 @@ fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res
     let (rows, stop) = read_rows(conn, idx_to_i64(first)?, idx_to_i64(end)?, limited)?;
     // The head is required for every result, budget stops included.
     if rows.first().is_none_or(|(idx, _)| *idx != first) {
+        if purged.is_none()
+            && let Some(min) = stored_min(conn)?
+        {
+            // The requested interval ended before any stored row: there is no live index in it.
+            if end <= min {
+                return Ok(Vec::new());
+            }
+            if min > first {
+                return Err(E::Refused(format!(
+                    "log range starts at {first} below the retained first index {min} with no purge boundary; the unavailable prefix cannot be served"
+                )));
+            }
+        }
         return Err(E::Refused(format!("log entry {first} is missing although it is stored")));
     }
     // No gap may follow either: a later row cannot stand in for a lost one.
@@ -506,13 +666,18 @@ impl Inner {
         read_meta_vote(&conn).map_err(|e| E::Refused(format!("stored vote: {e}")))?;
         let committed: Option<LogId<u64>> =
             meta(&conn, K_COMMITTED).map_err(|e| E::Refused(format!("stored committed: {e}")))?;
-        purged_boundary(&conn).map_err(|e| E::Refused(format!("stored purge boundary: {e}")))?;
+        let purged = purged_boundary(&conn).map_err(|e| E::Refused(format!("stored purge boundary: {e}")))?;
         let last = read_last(&conn)?;
-        if let (Some(c), Some(l)) = (committed, last)
-            && c.index > l.index
-        {
-            return Err(E::Refused(format!("committed {c} is ahead of last log {l}")));
-        }
+        // Density is a startup invariant, not a repair: `read_last` has already rejected invalid
+        // residue, and this bounded aggregate refuses an internal live-row gap before a handle is
+        // returned. It deliberately derives the lower bound from the purge successor or the
+        // smallest stored row, never from an assumed index 0.
+        validate_density(&conn, purged.as_ref())?;
+        // A persisted commit is evidence that at least its row existed. It may be gone only under
+        // a valid covering purge boundary (a strictly later index, or the identical equal-index
+        // LogId); otherwise the exact row must remain, so an all-row deletion with retained
+        // committed metadata is refused rather than mistaken for a fresh empty log.
+        validate_committed(&conn, committed.as_ref(), purged.as_ref(), last)?;
         Ok(Inner { _lock: lock, conn })
     }
 
@@ -559,13 +724,17 @@ fn append_entries(inner: &mut Inner, entries: Vec<EntryOf>) -> Res<()> {
     let tx = inner.tx()?;
     let last = read_last(&tx)?;
     let committed: Option<LogId<u64>> = meta(&tx, K_COMMITTED)?;
+    let purged = purged_boundary(&tx)?;
+    // Do not extend a state whose persisted commit is already known lost. Valid purge orderings
+    // (a strictly later boundary, the identical equal-index boundary, or a commit inside the live
+    // log) pass this check.
+    validate_committed(&tx, committed.as_ref(), purged.as_ref(), last)?;
     if let (Some(first), Some(prev)) = (entries.first(), last) {
         let i = first.get_log_id().index;
         if i > prev.index.saturating_add(1) {
             return Err(E::Refused(format!("append starts at {i} but log ends at {prev} (hole)")));
         }
     }
-    let purged = purged_boundary(&tx)?;
     if entries.first().is_some_and(|first| purged.is_some_and(|p| first.log_id.index <= p.index)) {
         return Err(E::Refused("append would revive a purged prefix".into()));
     }
@@ -634,10 +803,40 @@ fn truncate_to(inner: &mut Inner, idx: u64) -> Res<()> {
 /// durable purge boundary. Compaction may remove committed logs and may advance past the local
 /// tail (snapshot install). The boundary only moves forward, so an older purge is absorbed but
 /// never makes a newer boundary older; when advancing, the caller's exact `LogId` is stored.
+///
+/// Before deleting anything, validate the committed witness already stored and the caller's
+/// boundary identity. A purge is evidence about one entry, so a different `LogId` at the same index
+/// as the commit, a retained row, or the persisted boundary is refused instead of deleting the
+/// conflicting evidence. A strictly later boundary still covers an older commit as the pinned
+/// snapshot-install ordering. All checks run on the transaction before any row or metadata write.
 fn purge_to(inner: &mut Inner, log_id: LogId<u64>) -> Res<()> {
     let idx = idx_to_i64(log_id.index)?;
     let tx = inner.tx()?;
     let stored: Option<LogId<u64>> = meta(&tx, K_PURGED)?;
+    let committed: Option<LogId<u64>> = meta(&tx, K_COMMITTED)?;
+    let last = read_last(&tx)?;
+    // Do not let a purge erase evidence that the already-persisted state is inconsistent. This is
+    // the same witness check open, append and save_committed(Some) perform.
+    validate_committed(&tx, committed.as_ref(), stored.as_ref(), last)?;
+    if let Some(c) = committed.as_ref()
+        && c.index == log_id.index
+        && *c != log_id
+    {
+        return Err(E::Refused(format!("purge boundary {log_id} conflicts with committed {c} at the same index")));
+    }
+    if let Some(p) = stored.as_ref()
+        && p.index == log_id.index
+        && *p != log_id
+    {
+        return Err(E::Refused(format!(
+            "purge boundary {log_id} conflicts with persisted boundary {p} at the same index"
+        )));
+    }
+    if let Some((row, _)) = read_row(&tx, idx)?
+        && row != log_id
+    {
+        return Err(E::Refused(format!("purge boundary {log_id} conflicts with retained log {row} at the same index")));
+    }
     if stored.as_ref().is_none_or(|p| p.index < log_id.index) {
         set_meta(&tx, K_PURGED, Some(&je(&log_id)?))?;
     }
@@ -669,7 +868,8 @@ pub struct PersistentLog {
 
 impl PersistentLog {
     /// Open (or create) the store in `dir`; `node_id` is bound on creation and verified later.
-    /// `check_on_open` enables `quick_check` and metadata decode.
+    /// Metadata and retained-log density are always validated. `check_on_open` additionally runs
+    /// SQLite `quick_check`; it is not a switch for the density proof.
     pub async fn open(path: impl AsRef<Path>, node_id: u64, check_on_open: bool) -> Res<Self> {
         let dir = path.as_ref().to_path_buf();
         let inner = tokio::task::spawn_blocking(move || Inner::open(&dir, node_id, check_on_open))
@@ -733,6 +933,13 @@ impl RaftLogStorage<LogTypeConfig> for PersistentLog {
     async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
         with_inner(self.inner.clone(), move |i| {
             let tx = i.tx()?;
+            if committed.is_some() {
+                let purged = purged_boundary(&tx)?;
+                let last = read_last(&tx)?;
+                // Refuse at write time exactly what open would refuse, so a successful
+                // `save_committed` never creates an unreopenable store. Clearing stays allowed.
+                validate_committed(&tx, committed.as_ref(), purged.as_ref(), last)?;
+            }
             set_meta(&tx, K_COMMITTED, committed.as_ref().map(je).transpose()?.as_deref())?;
             tx.commit()?;
             Ok(())
@@ -827,6 +1034,7 @@ mod tests {
     use super::*;
     use openraft::CommittedLeaderId;
     use openraft::EntryPayload;
+    use openraft::storage::RaftLogReaderExt as _;
 
     fn lid(term: u64, index: u64) -> LogId<u64> {
         LogId::new(CommittedLeaderId::new(term, 1), index)
@@ -896,8 +1104,10 @@ mod tests {
             let mut s = open(&rt, dir.path());
             rt.block_on(s.save_vote(&Vote::new(3, 7))).unwrap();
             append_ok(&rt, &s, vec![blank(2, 0), normal(2, 1, b"a"), normal(2, 2, b"b")]);
+            // The purge boundary names the committed entry exactly: same index, same full LogId.
+            // A same-index boundary with another leader is a conflicting entry, not coverage.
             rt.block_on(s.save_committed(Some(lid(2, 1)))).unwrap();
-            let purge_at = LogId::new(CommittedLeaderId::new(2, 5), 1);
+            let purge_at = lid(2, 1);
             rt.block_on(s.purge(purge_at)).unwrap();
             assert_eq!(
                 state(&rt, &mut s),
@@ -908,7 +1118,7 @@ mod tests {
         assert_eq!(rt.block_on(s.read_vote()).unwrap(), Some(Vote::new(3, 7)));
         assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(2, 1)));
         let st = state(&rt, &mut s);
-        assert_eq!(st.last_purged_log_id, Some(LogId::new(CommittedLeaderId::new(2, 5), 1)), "exact native LogId");
+        assert_eq!(st.last_purged_log_id, Some(lid(2, 1)), "exact native LogId");
         assert_eq!(st.last_log_id, Some(lid(2, 2)));
         assert_eq!(logs(&rt, &mut s, 0..10), vec![normal(2, 2, b"b")]);
     }
@@ -1016,15 +1226,18 @@ mod tests {
         rt.block_on(s.truncate(lid(1, 5))).unwrap();
         assert_eq!(logs(&rt, &mut s, 2..9), (2..5).map(|i| blank(1, i)).collect::<Vec<_>>());
         drop(s);
-        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
-        assert_eq!(conn.execute("DELETE FROM log_entry WHERE idx=3", []).unwrap(), 1);
-        drop(conn);
+        // A valid reopen first, so the read-time checks below still run against a retained handle
+        // after the row is removed behind it. A fresh open is required to refuse the same state.
         let mut s = open(&rt, dir.path());
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=3");
         assert!(rt.block_on(s.try_get_log_entries(2..5)).is_err(), "full reader accepted an internal gap");
         let mut reader = rt.block_on(s.get_log_reader());
         assert!(rt.block_on(reader.limited_get_log_entries(2, 5)).is_err(), "limited reader accepted an internal gap");
         assert_eq!(logs(&rt, &mut s, 4..5), vec![blank(1, 4)]);
         assert!(logs(&rt, &mut s, 2..2).is_empty());
+        drop(reader);
+        drop(s);
+        assert_density_refused(&rt, dir.path());
     }
 
     #[test]
@@ -1121,9 +1334,38 @@ mod tests {
         };
         msg.contains("refused: log entry ") && msg.contains(" is missing although it is stored")
     }
+    /// True only for the explicit below-retained-first refusal on an unpurged log.
+    fn is_unavailable_prefix(r: &Result<Vec<EntryOf>, StorageError<u64>>) -> bool {
+        let msg = match r {
+            Ok(_) => return false,
+            Err(StorageError::IO { source }) => source.to_string(),
+            Err(other) => panic!("unexpected error kind: {other:?}"),
+        };
+        msg.contains("refused: log range starts at ")
+            && msg.contains(" below the retained first index ")
+            && msg.contains(" no purge boundary; the unavailable prefix cannot be served")
+    }
     /// Adapter for the in-crate peers that return [`E`].
     fn missing_in_core(r: &Res<Vec<EntryOf>>) -> bool {
         is_missing(&r.as_ref().cloned().map_err(|e| ioerr(ErrorSubject::Logs, ErrorVerb::Read, e)))
+    }
+    /// A fresh open must run startup density validation and fail before returning a handle. The
+    /// caller must have dropped any live handle so the lock error cannot mask the density refusal.
+    fn assert_density_refused(rt: &tokio::runtime::Runtime, dir: &Path) -> String {
+        let err = match rt.block_on(PersistentLog::open(dir, 7, true)) {
+            Ok(_) => panic!("startup accepted a non-dense retained log"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("retained log is not dense"), "{err}");
+        assert!(err.contains("is missing although it is stored"), "{err}");
+        err
+    }
+    /// Copy the SQLite file while no mutation is in flight, for a startup probe that must not
+    /// disturb the original retained handle.
+    fn copy_fixture(dir: &Path) -> tempfile::TempDir {
+        let copy = tempfile::tempdir().unwrap();
+        std::fs::copy(dir.join(DB_FILE), copy.path().join(DB_FILE)).unwrap();
+        copy
     }
 
     #[test]
@@ -1137,10 +1379,10 @@ mod tests {
         let mut r = rt.block_on(s.get_log_reader());
         assert_eq!(indices(&rt.block_on(r.try_get_log_entries(1..5)).unwrap()), vec![1, 2, 3, 4]);
         drop(r);
-        drop(s);
+        // Keep a pre-corruption handle for the read-time defense-in-depth checks; a fresh open is
+        // what must now refuse before `get_log_state` or a read can observe the hole.
         delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=3");
 
-        let mut s = open(&rt, dir.path());
         let st = state(&rt, &mut s);
         assert_eq!((st.last_purged_log_id, st.last_log_id), (None, Some(lid(1, 7))), "state is unchanged");
         let mut r = rt.block_on(s.get_log_reader());
@@ -1170,21 +1412,25 @@ mod tests {
         // silently: the next read still fails.
         append_ok(&rt, &s, vec![blank(1, 8)]);
         assert!(missing_in_core(&rt.block_on(with_inner(s.inner.clone(), |i| read_range(&i.conn, 2, Some(9), false)))));
+        drop(s);
+        assert_density_refused(&rt, dir.path());
         // Bootstrap entry and multiple holes are found too.
-        drop(s);
         let dir = tempfile::tempdir().unwrap();
-        let s = open(&rt, dir.path());
-        append_ok(&rt, &s, (0..10).map(|i| blank(1, i)).collect());
-        drop(s);
-        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx IN (0, 4, 7)");
         let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..10).map(|i| blank(1, i)).collect());
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx IN (0, 4, 7)");
         let mut r = rt.block_on(s.get_log_reader());
-        assert!(is_missing(&rt.block_on(r.try_get_log_entries(0..2))), "bootstrap entry lost");
-        assert!(is_missing(&rt.block_on(r.try_get_log_entries(0..10))), "three holes");
+        // The deleted head is an unavailable prefix, not a row the reader may silently skip.
+        assert!(is_unavailable_prefix(&rt.block_on(r.try_get_log_entries(0..2))), "bootstrap entry lost");
+        assert!(is_unavailable_prefix(&rt.block_on(r.try_get_log_entries(0..10))), "prefix overlaps live rows");
+        assert!(rt.block_on(r.try_get_log_entries(0..1)).unwrap().is_empty(), "wholly below retained first");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(1..10))), "internal holes remain detected");
         assert!(rt.block_on(r.try_get_log_entries(1..4)).unwrap().len() == 3, "hole-free range below the gap");
         assert_eq!(indices(&rt.block_on(r.try_get_log_entries(5..7)).unwrap()), vec![5, 6], "between holes");
         assert!(is_missing(&rt.block_on(r.try_get_log_entries(6..8))), "second hole");
         drop(r);
+        drop(s);
+        assert_density_refused(&rt, dir.path());
     }
 
     #[test]
@@ -1199,11 +1445,9 @@ mod tests {
         let mut r = rt.block_on(s.get_log_reader());
         assert_eq!(indices(&rt.block_on(r.try_get_log_entries(2..10)).unwrap()), vec![2, 3, 4]);
         drop(r);
-        drop(s);
         // Row 2 is required: it is the live row right after the boundary and the start of every
         // engine read of the committed log; losing it silently shifts the prefix's first row.
         delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=2");
-        let mut s = open(&rt, dir.path());
         let st = state(&rt, &mut s);
         assert_eq!((st.last_purged_log_id, st.last_log_id), (Some(lid(1, 1)), Some(lid(1, 4))));
         let mut r = rt.block_on(s.get_log_reader());
@@ -1214,9 +1458,14 @@ mod tests {
         assert!(rt.block_on(r.try_get_log_entries(0..2)).unwrap().is_empty(), "wholly purged");
         assert!(rt.block_on(r.try_get_log_entries(1..2)).unwrap().is_empty(), "at the purge boundary");
         assert!(rt.block_on(r.try_get_log_entries(10..12)).unwrap().is_empty(), "past the stored last");
+        drop(r);
+        drop(s);
+        assert_density_refused(&rt, dir.path());
 
         // Deletes from a prefix back to the tail: the later deletes remove the very rows that would
-        // otherwise reveal the hole, so the derived end itself shrinks.
+        // otherwise reveal the hole, so the derived end itself shrinks. This is the documented
+        // no-independent-witness limit: with no purge and no other persisted lower bound, the
+        // remaining `{0, 1}` is a valid dense log and a fresh open still succeeds.
         let dir = tempfile::tempdir().unwrap();
         let s = open(&rt, dir.path());
         append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
@@ -1272,39 +1521,68 @@ mod tests {
         assert!(rt.block_on(r.limited_get_log_entries(0, 0)).unwrap().is_empty());
         drop(r);
 
-        // Purge through 4: the boundary index is gone, the next index is required.
+        // Purge through 4: the boundary index is gone, the next index is required. A fresh open
+        // here is still valid and proves the purge boundary did not turn the retained log sparse.
         rt.block_on(s.purge(lid(1, 4))).unwrap();
         drop(s);
         let mut s = open(&rt, dir.path());
         let mut r = rt.block_on(s.get_log_reader());
         assert_eq!(indices(&rt.block_on(r.try_get_log_entries(4..8)).unwrap()), vec![5, 6, 7], "first stored");
         drop(r);
-        drop(s);
         delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=5");
-        let mut s = open(&rt, dir.path());
         let mut r = rt.block_on(s.get_log_reader());
         assert!(is_missing(&rt.block_on(r.try_get_log_entries(5..8))), "row after the boundary lost");
         assert!(is_missing(&rt.block_on(r.try_get_log_entries(4..8))), "including the boundary index");
         assert!(rt.block_on(r.try_get_log_entries(0..5)).unwrap().is_empty(), "wholly purged");
         assert_eq!(indices(&rt.block_on(r.try_get_log_entries(6..8)).unwrap()), vec![6, 7]);
-        // Snapshot-style purge past the local tail: no stored log exists at all.
+        // The retained handle above can still show read-time defense in depth; a fresh open of a
+        // copy of the same file must refuse the missing purge successor.
+        let copy = copy_fixture(dir.path());
+        assert_density_refused(&rt, copy.path());
+        // Snapshot-style purge past the local tail: no stored log exists at all, so the gaps left
+        // by a later snapshot purge are gone and empty/past-tail reads stay valid.
         rt.block_on(s.purge(LogId::new(CommittedLeaderId::new(9, 3), 5000))).unwrap();
         assert!(rt.block_on(r.try_get_log_entries(0..6000)).unwrap().is_empty());
         assert!(rt.block_on(r.limited_get_log_entries(0, 6000)).unwrap().is_empty());
         assert!(rt.block_on(r.try_get_log_entries(5001..)).unwrap().is_empty());
+        drop(r);
+        drop(s);
+        let mut s = open(&rt, dir.path());
+        assert_eq!(state(&rt, &mut s).last_purged_log_id, Some(LogId::new(CommittedLeaderId::new(9, 3), 5000)));
+        assert!(rt.block_on(s.try_get_log_entries(0..6000)).unwrap().is_empty());
     }
 
-    /// Pins the purge boundary with a matching meta checksum (upsert).
-    fn set_purged(dir: &Path, boundary: LogId<u64>) {
-        let value = je(&boundary).unwrap();
-        let hash = checksum(&[b"meta", K_PURGED.as_bytes(), value.as_bytes()]);
+    /// Upserts a metadata value with its matching checksum, as a direct-SQL corruption would.
+    fn set_meta_value(dir: &Path, key: &str, value: &str) {
+        let hash = checksum(&[b"meta", key.as_bytes(), value.as_bytes()]);
         Connection::open(dir.join(DB_FILE))
             .unwrap()
             .execute(
                 "INSERT INTO meta(k, v, checksum) VALUES(?1, ?2, ?3) ON CONFLICT(k) DO UPDATE SET v=excluded.v, checksum=excluded.checksum",
-                (K_PURGED, &value, hash),
+                (key, value, hash),
             )
             .unwrap();
+    }
+    /// Pins the purge boundary with a matching meta checksum (upsert).
+    fn set_purged(dir: &Path, boundary: LogId<u64>) {
+        set_meta_value(dir, K_PURGED, &je(&boundary).unwrap());
+    }
+    /// Pins the committed log ID with a matching meta checksum (upsert).
+    fn set_committed(dir: &Path, committed: LogId<u64>) {
+        set_meta_value(dir, K_COMMITTED, &je(&committed).unwrap());
+    }
+    /// Raw rows and committed/purged metadata, for proving a refusal changed neither.
+    fn stored_state(dir: &Path) -> (Vec<i64>, Option<String>, Option<String>) {
+        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        let rows: Vec<i64> = conn
+            .prepare("SELECT idx FROM log_entry ORDER BY idx")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let get = |key: &str| conn.query_row("SELECT v FROM meta WHERE k=?1", [key], |r| r.get(0)).ok();
+        (rows, get(K_COMMITTED), get(K_PURGED))
     }
     /// Replaces a row's whole `LogId` (leader id included) with valid, checksum-consistent data.
     fn rewrite_row(dir: &Path, idx: u64, new_id: LogId<u64>) {
@@ -1408,12 +1686,17 @@ mod tests {
             // To observe state and reads on their own, a handle is opened with the rule's input
             // momentarily absent (no boundary pinned), then the boundary is restored, as a purge
             // would, through another connection; the handle's state and read paths must still refuse.
+            // Without a boundary, startup also validates the observable index span, so fill the
+            // purged positions with valid seeded rows; the target residue stays where it is.
             let probe_dir = tempfile::tempdir().unwrap();
             std::fs::copy(dir.path().join(DB_FILE), probe_dir.path().join(DB_FILE)).unwrap();
             Connection::open(probe_dir.path().join(DB_FILE))
                 .unwrap()
                 .execute("DELETE FROM meta WHERE k=?1", [K_PURGED])
                 .unwrap();
+            for missing in (idx + 1)..=3 {
+                insert_row(probe_dir.path(), missing, &rows[missing as usize]);
+            }
             let mut s = open(&rt, probe_dir.path());
             set_purged(probe_dir.path(), lid(1, 3));
             let state_err = rt.block_on(s.get_log_state()).expect_err("residue on state");
@@ -1620,6 +1903,10 @@ mod tests {
         append_ok(&rt, &s, vec![blank(1, MAX_BATCH_ENTRIES as u64)]);
         drop(s);
         delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=0");
+        // No purge pins a lower bound, so deleting the first live row shifts the observable lower
+        // bound to 1. Startup cannot distinguish that fresh-prefix loss from a legal positive first
+        // index without a witness; this open is the documented limit, and the read-time head check
+        // below explicitly refuses an overlapping request that starts at 0.
         let mut s = open(&rt, dir.path());
         let mut r = rt.block_on(s.get_log_reader());
         // fcb's count-budget early return skipped the head check; the regression sees it returning.
@@ -1628,18 +1915,21 @@ mod tests {
             "probe: fcb no longer skips the head check at the count budget"
         );
         let got = rt.block_on(r.limited_get_log_entries(0, u64::MAX));
-        assert!(is_missing(&got), "lost head, later rows fill the budget: {got:?}");
+        assert!(is_unavailable_prefix(&got), "lost head, later rows fill the budget: {got:?}");
+        assert!(
+            rt.block_on(r.try_get_log_entries(0..1)).unwrap().is_empty(),
+            "single missing prefix index is a short read"
+        );
         drop(r);
         drop(s);
 
-        // A middle index is missing and the later rows still fill the count budget.
+        // A middle index is missing and the later rows still fill the count budget. Keep the
+        // pre-deletion handle for the read-time checks, then require a fresh open to refuse.
         let dir = tempfile::tempdir().unwrap();
-        let s = open(&rt, dir.path());
+        let mut s = open(&rt, dir.path());
         append_ok(&rt, &s, (0..MAX_BATCH_ENTRIES as u64).map(|i| blank(1, i)).collect());
         append_ok(&rt, &s, vec![blank(1, MAX_BATCH_ENTRIES as u64)]);
-        drop(s);
         delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=1");
-        let mut s = open(&rt, dir.path());
         let mut r = rt.block_on(s.get_log_reader());
         assert!(
             rt.block_on(with_inner(s.inner.clone(), |i| { fcb_read_range(&i.conn, 0, Some(u64::MAX), true) })).is_ok(),
@@ -1651,6 +1941,9 @@ mod tests {
         assert!(msg.contains("log entry 1 is missing"), "{msg}");
         // A hole-free part of the log still reads normally.
         assert_eq!(indices(&rt.block_on(r.limited_get_log_entries(2, u64::MAX)).unwrap()).len(), MAX_BATCH_ENTRIES - 1);
+        drop(r);
+        drop(s);
+        assert_density_refused(&rt, dir.path());
     }
 
     #[test]
@@ -1679,16 +1972,22 @@ mod tests {
         // A full read of the same range still refuses to exceed the budget.
         let msg = format!("{}", rt.block_on(r.try_get_log_entries(0..30)).unwrap_err());
         assert!(msg.contains("exceeds its read budget"), "{msg}");
-        // A hole inside a byte-limited prefix still fails closed.
+        // A hole inside a byte-limited prefix still fails closed. Keep the retained handle for
+        // those read-time checks, then probe a copy: a fresh open must refuse before any state or
+        // range read can see the missing middle row.
         drop(r);
-        drop(s);
         delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=1");
-        let mut s = open(&rt, dir.path());
+        let copy = copy_fixture(dir.path());
+        assert_density_refused(&rt, copy.path());
         let mut r = rt.block_on(s.get_log_reader());
         assert!(is_missing(&rt.block_on(r.limited_get_log_entries(0, 30))), "gap inside a byte prefix");
         // An empty or wholly-purged request keeps returning an empty result, never an error.
         rt.block_on(s.purge(lid(1, 40))).unwrap();
         assert!(rt.block_on(r.limited_get_log_entries(0, 30)).unwrap().is_empty());
+        drop(r);
+        drop(s);
+        let mut s = open(&rt, dir.path());
+        assert!(rt.block_on(s.try_get_log_entries(0..30)).unwrap().is_empty(), "purged log reopens empty");
     }
 
     #[test]
@@ -1721,13 +2020,375 @@ mod tests {
         assert_eq!(indices(&rt.block_on(r.try_get_log_entries(1..10)).unwrap()), vec![3, 4], "below it");
         assert!(rt.block_on(r.try_get_log_entries(0..3)).unwrap().is_empty(), "wholly purged");
         drop(r);
-        drop(s);
-        // With the first live row deleted, a request spanning it fails closed.
+        // With the first live row deleted, a request spanning it fails closed on the retained
+        // handle; a fresh open must refuse the same boundary-successor gap before any read.
         delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=3");
-        let mut s = open(&rt, dir.path());
         let mut r = rt.block_on(s.get_log_reader());
         assert!(is_missing(&rt.block_on(r.try_get_log_entries(3..10))), "first live row lost");
         assert_eq!(indices(&rt.block_on(r.try_get_log_entries(4..10)).unwrap()), vec![4], "after the hole");
         assert!(rt.block_on(r.try_get_log_entries(0..3)).unwrap().is_empty(), "purged reads unchanged");
+        drop(r);
+        drop(s);
+        assert_density_refused(&rt, dir.path());
+    }
+
+    #[test]
+    fn open_refuses_internal_gap_with_later_rows_before_state_or_read() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..8).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=3");
+
+        // The deletion is only an index hole: SQLite itself stays valid and every later row remains.
+        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        let preserved: Vec<i64> = conn
+            .prepare("SELECT idx FROM log_entry ORDER BY idx")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(preserved, vec![0, 1, 2, 4, 5, 6, 7], "later rows must remain after the middle delete");
+        drop(conn);
+
+        // Startup returns no handle at all, so `get_log_state`/range reads cannot observe a healthy
+        // store before discovering the gap. `check_on_open` only controls quick_check; density is
+        // unconditional.
+        let err = assert_density_refused(&rt, dir.path());
+        assert!(err.contains("log entry 3 is missing"), "{err}");
+        let unchecked = match rt.block_on(PersistentLog::open(dir.path(), 7, false)) {
+            Ok(_) => panic!("density validation was skipped without quick_check"),
+            Err(e) => e.to_string(),
+        };
+        assert!(unchecked.contains("retained log is not dense"), "{unchecked}");
+        assert!(unchecked.contains("log entry 3 is missing"), "{unchecked}");
+    }
+
+    #[test]
+    fn open_refuses_purge_successor_gap_even_with_exact_boundary_residue() {
+        let rt = rt();
+        let rows: Vec<_> = (0..=5).map(|i| seeded_row(&rt, i)).collect();
+
+        // Purge is inclusive through index 2; index 3 is the required live lower bound.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..6).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 2))).unwrap();
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx=3");
+        // The allowed exact boundary row is not live and cannot stand in for its successor.
+        insert_row(dir.path(), 2, &rows[2]);
+        let err = assert_density_refused(&rt, dir.path());
+        assert!(err.contains("from 3 to 5"), "{err}");
+        assert!(err.contains("log entry 3 is missing"), "{err}");
+
+        // The matching boundary row above a dense live suffix remains supported.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..6).map(|i| blank(1, i)).collect());
+        rt.block_on(s.purge(lid(1, 2))).unwrap();
+        drop(s);
+        insert_row(dir.path(), 2, &rows[2]);
+        let mut s = open(&rt, dir.path());
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (Some(lid(1, 2)), Some(lid(1, 5))));
+        assert_eq!(indices(&rt.block_on(s.try_get_log_entries(0..10)).unwrap()), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn open_accepts_dense_positive_first_index_without_purge() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        // At the storage layer a dense retained slice may begin at a positive index; no index-zero
+        // invariant is invented. This is not an engine-startup claim: pinned 0.9.26
+        // `LogIdList::load_log_ids` probes index 0 when no purge boundary exists, and the next test
+        // pins the explicit unavailable-prefix refusal.
+        append_ok(&rt, &s, (7..10).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 8)))).unwrap();
+        drop(s);
+
+        let mut s = open(&rt, dir.path());
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (None, Some(lid(1, 9))), "positive first index");
+        // Range checks remain keyed to the requested lower bound or purge successor; a legal
+        // positive first index is preserved, not rewritten to 0.
+        assert_eq!(indices(&rt.block_on(s.try_get_log_entries(7..12)).unwrap()), vec![7, 8, 9]);
+        assert_eq!(indices(&rt.block_on(s.try_get_log_entries(8..)).unwrap()), vec![8, 9]);
+        assert!(rt.block_on(s.try_get_log_entries(5..5)).unwrap().is_empty(), "empty below-first range");
+        assert!(rt.block_on(s.try_get_log_entries(10..12)).unwrap().is_empty(), "past the tail");
+    }
+
+    #[test]
+    fn positive_first_prefix_read_is_explicitly_unavailable() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (7..10).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 8)))).unwrap();
+        drop(s);
+
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        // Wholly below the retained first row: no live index was requested, so this stays a valid
+        // short read, including the single-index extension used by `try_get_log_entry`.
+        assert!(rt.block_on(r.try_get_log_entries(0..1)).unwrap().is_empty());
+        assert!(rt.block_on(r.try_get_log_entries(5..7)).unwrap().is_empty());
+        assert_eq!(rt.block_on(r.try_get_log_entry(0)).unwrap(), None);
+        // Overlapping the retained row from below is refused instead of silently starting at 7 or
+        // claiming that the unavailable prefix was stored.
+        for got in [
+            rt.block_on(r.try_get_log_entries(0..8)),
+            rt.block_on(r.try_get_log_entries(0..10)),
+            rt.block_on(r.try_get_log_entries(..)),
+            rt.block_on(r.limited_get_log_entries(0, 10)),
+        ] {
+            assert!(is_unavailable_prefix(&got), "expected explicit unavailable-prefix refusal: {got:?}");
+        }
+        // Pinned 0.9.26 startup probes `get_log_id(0)` when `last_purged_log_id` is `None`; this
+        // store reproduces that probe as a refusal, so no stronger engine-level reader support is
+        // claimed for an unpurged positive-first log.
+        assert!(rt.block_on(r.get_log_id(0)).is_err());
+        drop(r);
+        // A persisted purge boundary supplies the lower bound; the positive-first live slice is
+        // then the normal engine-supported shape and requests below it are wholly purged.
+        rt.block_on(s.purge(lid(1, 6))).unwrap();
+        let mut r = rt.block_on(s.get_log_reader());
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(0..10)).unwrap()), vec![7, 8, 9]);
+        assert!(rt.block_on(r.try_get_log_entries(0..7)).unwrap().is_empty(), "wholly purged below the boundary");
+    }
+
+    #[test]
+    fn open_refuses_committed_with_all_rows_deleted() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 4)), "commit acknowledged");
+        delete_rows(dir.path(), "DELETE FROM log_entry");
+        {
+            let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+            let rows: i64 = conn.query_row("SELECT count(*) FROM log_entry", [], |r| r.get(0)).unwrap();
+            let commits: i64 =
+                conn.query_row("SELECT count(*) FROM meta WHERE k=?1", [K_COMMITTED], |r| r.get(0)).unwrap();
+            let purges: i64 = conn.query_row("SELECT count(*) FROM meta WHERE k=?1", [K_PURGED], |r| r.get(0)).unwrap();
+            let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap();
+            assert_eq!((rows, commits, purges), (0, 1, 0), "valid SQLite kept committed metadata");
+            assert_eq!(check, "ok");
+        }
+        // A retained handle cannot append past the known-loss state.
+        let err = append(&rt, &s, vec![blank(1, 5)]).expect_err("append must refuse a known-lost commit");
+        let msg = format!("{err}");
+        assert!(msg.contains("committed") && msg.contains("no purge boundary"), "{msg}");
+        drop(s);
+
+        for check in [true, false] {
+            let err = match rt.block_on(PersistentLog::open(dir.path(), 7, check)) {
+                Ok(_) => panic!("startup accepted committed metadata with no log rows"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("committed"), "{err}");
+            assert!(err.contains("no purge boundary"), "{err}");
+        }
+        // Refusal is neither a reset nor a migration: the rows stay gone and the commit stays.
+        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM log_entry", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM meta WHERE k=?1", [K_COMMITTED], |r| r.get::<_, i64>(0)).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn committed_validation_matches_write_and_purge_orderings() {
+        let rt = rt();
+        // A fresh empty log cannot accept a commit: there is no row and no purge boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        let err = rt.block_on(s.save_committed(Some(lid(1, 0)))).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("committed") && msg.contains("no purge boundary"), "{msg}");
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), None, "refused write persisted nothing");
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        let err = rt.block_on(s.save_committed(Some(lid(1, 5)))).unwrap_err();
+        assert!(format!("{err}").contains("ahead of last log"), "{err}");
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 4)), "refused write kept the old commit");
+        // A purge behind the commit cannot explain losing the committed row.
+        rt.block_on(s.purge(lid(1, 2))).unwrap();
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry");
+        let err = match rt.block_on(PersistentLog::open(dir.path(), 7, true)) {
+            Ok(_) => panic!("non-covering purge explained a lost commit"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("committed") && err.contains("ahead of last log"), "{err}");
+
+        // Losing the committed row while later rows survive is also known loss, not a legal
+        // positive-first start: the committed index itself was never purged.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..6).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx <= 4");
+        let err = match rt.block_on(PersistentLog::open(dir.path(), 7, true)) {
+            Ok(_) => panic!("positive-first start hid a missing committed row"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("committed") && err.contains("missing from the retained log"), "{err}");
+
+        // A purge at or above the commit legitimately explains an empty live log. The persisted
+        // committed value may equal or lag that boundary (snapshot-style ordering).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        rt.block_on(s.purge(lid(1, 4))).unwrap();
+        // save_committed shares the identity rule: another LogId at the boundary index is refused
+        // and leaves the exact equal-index witness in place.
+        let err = rt
+            .block_on(s.save_committed(Some(LogId::new(CommittedLeaderId::new(2, 5), 4))))
+            .expect_err("save_committed accepted a conflicting same-index purge boundary");
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts with purge boundary") && msg.contains("at the same index"), "{msg}");
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 4)), "refused save kept the witness");
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry");
+        let mut s = open(&rt, dir.path());
+        assert_eq!(state(&rt, &mut s), LogState { last_purged_log_id: Some(lid(1, 4)), last_log_id: Some(lid(1, 4)) });
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 4)));
+        assert!(rt.block_on(s.try_get_log_entries(0..10)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn purge_rejects_equal_index_identity_conflicts_without_mutation() {
+        let rt = rt();
+
+        // The committed entry pins its index. A same-index boundary with another leader must not
+        // delete the acknowledged row or record a boundary that could later excuse its absence.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, vec![blank(1, 0), normal(1, 1, b"a"), normal(1, 2, b"b")]);
+        rt.block_on(s.save_committed(Some(lid(1, 1)))).unwrap();
+        let before = stored_state(dir.path());
+        let err = rt
+            .block_on(s.purge(LogId::new(CommittedLeaderId::new(2, 5), 1)))
+            .expect_err("purge accepted a conflicting LogId at the committed index");
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts with committed") && msg.contains("at the same index"), "{msg}");
+        assert_eq!(stored_state(dir.path()), before, "refused purge mutated rows or metadata");
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 1)));
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (None, Some(lid(1, 2))));
+        assert_eq!(
+            logs(&rt, &mut s, 0..3),
+            vec![blank(1, 0), normal(1, 1, b"a"), normal(1, 2, b"b")],
+            "acknowledged rows remain readable"
+        );
+
+        // A retained row at the supplied boundary is also a hard identity conflict. The committed
+        // row is below it, so only the row check can reject this call.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, vec![blank(1, 0), normal(1, 1, b"a"), normal(1, 2, b"b")]);
+        rt.block_on(s.save_committed(Some(lid(1, 1)))).unwrap();
+        let before = stored_state(dir.path());
+        let err = rt
+            .block_on(s.purge(LogId::new(CommittedLeaderId::new(2, 5), 2)))
+            .expect_err("purge accepted a conflicting LogId at a retained row");
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts with retained log") && msg.contains("at the same index"), "{msg}");
+        assert_eq!(stored_state(dir.path()), before, "refused purge mutated rows or metadata");
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (None, Some(lid(1, 2))));
+        assert_eq!(logs(&rt, &mut s, 0..3).len(), 3);
+
+        // The already persisted boundary pins the same identity even after the row is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, vec![blank(1, 0), normal(1, 1, b"a")]);
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        let before = stored_state(dir.path());
+        let err = rt
+            .block_on(s.purge(LogId::new(CommittedLeaderId::new(2, 5), 1)))
+            .expect_err("purge accepted a conflicting LogId at the persisted boundary");
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts with persisted boundary") && msg.contains("at the same index"), "{msg}");
+        assert_eq!(stored_state(dir.path()), before, "refused purge mutated rows or metadata");
+    }
+
+    #[test]
+    fn open_refuses_equal_index_committed_purge_mismatch() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, vec![blank(1, 0), normal(1, 1, b"a"), normal(1, 2, b"b")]);
+        rt.block_on(s.save_committed(Some(lid(1, 1)))).unwrap();
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        drop(s);
+        // The matching boundary and witness are valid before the database is corrupted.
+        let mut s = open(&rt, dir.path());
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 1)));
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (Some(lid(1, 1)), Some(lid(1, 2))));
+        drop(s);
+        let pristine = copy_fixture(dir.path());
+        let bad = LogId::new(CommittedLeaderId::new(2, 5), 1);
+
+        // A checksum-valid purge boundary with the committed index but another leader must not
+        // reopen: index-only coverage would report the acknowledged entry as legally purged.
+        set_purged(dir.path(), bad);
+        let before = stored_state(dir.path());
+        for check in [true, false] {
+            let err = match rt.block_on(PersistentLog::open(dir.path(), 7, check)) {
+                Ok(_) => panic!("startup accepted a conflicting same-index purge boundary"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("conflicts with purge boundary") && err.contains("at the same index"), "{err}");
+        }
+        assert_eq!(stored_state(dir.path()), before, "refused open mutated rows or metadata");
+
+        // The symmetric corruption, a conflicting committed witness at the boundary's index, is
+        // refused by the same full-identity rule.
+        set_committed(pristine.path(), bad);
+        let before = stored_state(pristine.path());
+        for check in [true, false] {
+            let err = match rt.block_on(PersistentLog::open(pristine.path(), 7, check)) {
+                Ok(_) => panic!("startup accepted a conflicting same-index committed log ID"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("conflicts with purge boundary") && err.contains("at the same index"), "{err}");
+        }
+        assert_eq!(stored_state(pristine.path()), before, "refused open mutated rows or metadata");
+    }
+
+    #[test]
+    fn greater_index_purge_accepts_older_committed_witness() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 2)))).unwrap();
+        // Snapshot installation may advance purge past an older persisted committed witness.
+        let snap = LogId::new(CommittedLeaderId::new(5, 9), 7);
+        rt.block_on(s.purge(snap)).unwrap();
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 2)), "older witness retained");
+        assert_eq!(state(&rt, &mut s), LogState { last_purged_log_id: Some(snap), last_log_id: Some(snap) });
+        assert!(rt.block_on(s.try_get_log_entries(0..10)).unwrap().is_empty());
+        drop(s);
+        let mut s = open(&rt, dir.path());
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 2)), "reopen keeps the witness");
+        assert_eq!(
+            state(&rt, &mut s),
+            LogState { last_purged_log_id: Some(snap), last_log_id: Some(snap) },
+            "greater-index snapshot lag remains accepted"
+        );
+        append_ok(&rt, &s, vec![blank(5, 8)]);
+        assert_eq!(state(&rt, &mut s).last_log_id, Some(lid(5, 8)));
     }
 }

@@ -53,6 +53,19 @@ service restart does not clear them. Paired database and volume backup/restore
 preserves both the rows and their owner/path/lock-time state. The service has no
 lock expiry: a lock remains until an authorized unlock or repository deletion.
 
+## Identity and version behavior
+
+Lock IDs are opaque and immutable for the lifetime of a lock. A path conflict is
+an HTTP `409` from the lock API and does not replace the existing lock or its ID.
+Unlocking retires that ID; locking the path again creates a new ID. A stale ID
+does not address the replacement and an unlock with it returns `404`.
+
+The `lfs_locks.version` column is internal storage metadata. It is not returned
+by the lock API, is not a client-visible compare-and-swap/ETag token, and the
+standard Git LFS protocol has no `expected_version` request field. Clients must
+not send or rely on an invented version parameter; path conflicts and
+authorization, not client CAS, decide these requests.
+
 ## Locks versus push
 
 A lock is a path-level collaboration lock, not a working-tree, object-transfer

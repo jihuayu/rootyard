@@ -14,6 +14,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Response,
 };
+use deadpool_postgres::Transaction;
 use std::sync::Arc;
 
 async fn authorized_read_lease(state:&AppState,actor:&db::Identity,owner:&str,name:&str,
@@ -50,6 +51,60 @@ async fn require_repo_oid_format(state:&AppState,repo:uuid::Uuid,oid:&str)->Resu
         return Err(Error(StatusCode::CONFLICT,"check commit OID format differs from repository"));
     }
     Ok(())
+}
+
+async fn reconcile_check_run(
+    tx: &Transaction<'_>,
+    cur: CheckRun,
+    input: &CheckRunInput,
+    tenant_id: uuid::Uuid,
+    repo: uuid::Uuid,
+    commit_oid: &str,
+) -> Result<(StatusCode, CheckRun), Error> {
+    let incoming_order = (input.attempt, input.sequence);
+    let current_order = (cur.attempt, cur.sequence);
+    if incoming_order > current_order {
+        // Move only the monotonic attempt/sequence payload. Provenance columns
+        // (issuer_webhook_id, ci_run_id, ci_base_oid, ci_lease_generation) and
+        // the immutable row identity stay untouched.
+        let updated = tx
+            .query_one(
+                &format!(
+                    "UPDATE forge_check_runs SET attempt=$5,sequence=$6,status=$7,conclusion=$8,output=$9,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 AND context=$4 RETURNING {CHECK_FIELDS}"
+                ),
+                &[
+                    &tenant_id,
+                    &repo,
+                    &commit_oid,
+                    &input.context,
+                    &input.attempt,
+                    &input.sequence,
+                    &input.status,
+                    &input.conclusion,
+                    &input.output,
+                ],
+            )
+            .await
+            .map_err(Error::internal)?;
+        Ok((StatusCode::OK, CheckRun::row(&updated)))
+    } else if incoming_order == current_order {
+        if cur.status == input.status
+            && cur.conclusion == input.conclusion
+            && cur.output == input.output
+        {
+            Ok((StatusCode::OK, cur))
+        } else {
+            Err(Error(
+                StatusCode::CONFLICT,
+                "conflicting check run state for same attempt and sequence",
+            ))
+        }
+    } else {
+        Err(Error(
+            StatusCode::CONFLICT,
+            "stale check run attempt or sequence",
+        ))
+    }
 }
 
 pub async fn upsert_check_run(
@@ -157,11 +212,28 @@ async fn upsert_check_inner(
         .map_err(Error::internal)?;
 
     let (status_code, check_run) = match existing {
+        Some(row) => {
+            reconcile_check_run(
+                &tx,
+                CheckRun::row(&row),
+                &input,
+                actor.id,
+                repo,
+                &commit_oid,
+            )
+            .await?
+        }
         None => {
-            let row = tx
-                .query_one(
+            // The SELECT above cannot lock a row that does not exist yet. Pull
+            // orchestration can insert the same primary key between that SELECT
+            // and this insert with ON CONFLICT DO NOTHING. Make our insert
+            // conflict-safe too: if the other writer wins, this waits for it and
+            // returns no row instead of raising a unique violation that would be
+            // reported as a generic 503.
+            let inserted = tx
+                .query_opt(
                     &format!(
-                        "INSERT INTO forge_check_runs (tenant_id,repository_id,commit_oid,context,attempt,sequence,status,conclusion,output) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING {CHECK_FIELDS}"
+                        "INSERT INTO forge_check_runs (tenant_id,repository_id,commit_oid,context,attempt,sequence,status,conclusion,output) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (tenant_id,repository_id,commit_oid,context) DO NOTHING RETURNING {CHECK_FIELDS}"
                     ),
                     &[
                         &actor.id,
@@ -177,50 +249,35 @@ async fn upsert_check_inner(
                 )
                 .await
                 .map_err(Error::internal)?;
-            (StatusCode::CREATED, CheckRun::row(&row))
-        }
-        Some(row) => {
-            let cur = CheckRun::row(&row);
-            let incoming_order = (input.attempt, input.sequence);
-            let current_order = (cur.attempt, cur.sequence);
-            if incoming_order > current_order {
-                let updated = tx
-                    .query_one(
-                        &format!(
-                            "UPDATE forge_check_runs SET attempt=$5,sequence=$6,status=$7,conclusion=$8,output=$9,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 AND context=$4 RETURNING {CHECK_FIELDS}"
-                        ),
-                        &[
-                            &actor.id,
-                            &repo,
-                            &commit_oid,
-                            &input.context,
-                            &input.attempt,
-                            &input.sequence,
-                            &input.status,
-                            &input.conclusion,
-                            &input.output,
-                        ],
+            match inserted {
+                Some(row) => (StatusCode::CREATED, CheckRun::row(&row)),
+                None => {
+                    // Another writer committed the row while we waited on the
+                    // primary key. Lock the winner and apply the same exact
+                    // (attempt, sequence) reconciliation as any existing row;
+                    // never bypass those checks with a blind overwrite.
+                    let row = tx
+                        .query_opt(
+                            &format!(
+                                "SELECT {CHECK_FIELDS} FROM forge_check_runs WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 AND context=$4 FOR UPDATE"
+                            ),
+                            &[&actor.id, &repo, &commit_oid, &input.context],
+                        )
+                        .await
+                        .map_err(Error::internal)?
+                        .ok_or_else(|| {
+                            Error::internal("check run vanished after insert conflict")
+                        })?;
+                    reconcile_check_run(
+                        &tx,
+                        CheckRun::row(&row),
+                        &input,
+                        actor.id,
+                        repo,
+                        &commit_oid,
                     )
-                    .await
-                    .map_err(Error::internal)?;
-                (StatusCode::OK, CheckRun::row(&updated))
-            } else if incoming_order == current_order {
-                if cur.status == input.status
-                    && cur.conclusion == input.conclusion
-                    && cur.output == input.output
-                {
-                    (StatusCode::OK, cur)
-                } else {
-                    return Err(Error(
-                        StatusCode::CONFLICT,
-                        "conflicting check run state for same attempt and sequence",
-                    ));
+                    .await?
                 }
-            } else {
-                return Err(Error(
-                    StatusCode::CONFLICT,
-                    "stale check run attempt or sequence",
-                ));
             }
         }
     };
