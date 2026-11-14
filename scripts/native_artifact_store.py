@@ -261,6 +261,13 @@ def _open_regular_nofollow(path, label, flags=os.O_RDONLY):
         raise
 
 
+def _require_readonly_executable(st, label):
+    if stat.S_IMODE(st.st_mode) != READONLY_EXECUTABLE:
+        raise ArtifactStoreError(
+            f"{label}: must have exact read-only executable mode 0555"
+        )
+
+
 def _sha256_fd(fd):
     os.lseek(fd, 0, os.SEEK_SET)
     digest = hashlib.sha256()
@@ -596,8 +603,7 @@ def _validate_existing_object(object_path, sha):
         uid = _current_uid()
         if uid is not None and st.st_uid != uid:
             raise ArtifactStoreError("object: is not owned by the current user")
-        if st.st_mode & 0o222:
-            raise ArtifactStoreError("object: must be read-only")
+        _require_readonly_executable(st, "object")
         before = _content_token(st)
         digest, size = _sha256_fd(fd)
         if _content_token(os.fstat(fd)) != before:
@@ -654,8 +660,7 @@ def _publish_object(root, sha, source_fd, source_path, source_before):
         uid = _current_uid()
         if uid is not None and published.st_uid != uid:
             raise ArtifactStoreError("object: published file is not owned by the current user")
-        if published.st_mode & 0o222:
-            raise ArtifactStoreError("object: published file is writable")
+        _require_readonly_executable(published, "object: published file")
         source_now = os.fstat(source_fd)
         if (published.st_dev, published.st_ino) == (source_now.st_dev, source_now.st_ino):
             raise ArtifactStoreError("object: must not share an inode with mutable source")
@@ -921,8 +926,7 @@ def write_receipt(sealed, payload):
         uid = _current_uid()
         if uid is not None and snapshot_stat.st_uid != uid:
             raise ArtifactStoreError("snapshot: is not owned by the current user")
-        if snapshot_stat.st_mode & 0o222:
-            raise ArtifactStoreError("snapshot: must be read-only")
+        _require_readonly_executable(snapshot_stat, "snapshot")
         object_stat = os.lstat(object_path)
         if (snapshot_stat.st_dev, snapshot_stat.st_ino) != (
             object_stat.st_dev,

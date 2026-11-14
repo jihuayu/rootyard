@@ -4,6 +4,7 @@ These tests never invoke Cargo, rustc, Git or any builder.  They seal fixtures
 through the public API and assert immutable CAS/reflink/copy semantics,
 snapshot independence, traversal guards and no-overwrite receipts.
 """
+import errno
 import hashlib
 import json
 import os
@@ -57,6 +58,20 @@ class ArtifactStoreTest(unittest.TestCase):
         arguments.update(overrides)
         return artifacts.seal_binary(source or self.source, **arguments)
 
+    def seal_with_copied_snapshot(self):
+        """Seal normally but force the snapshot's reflink/copy fallback."""
+        sha = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        object_path = self.store_root / artifacts.OBJECTS_DIR / artifacts.SHA256_DIR / sha
+        real_link = os.link
+
+        def link_except_object(src, dst, *args, **kwargs):
+            if Path(src) == object_path:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real_link(src, dst, *args, **kwargs)
+
+        with mock.patch.object(artifacts.os, "link", side_effect=link_except_object):
+            return self.seal()
+
     # -- canonical keys and safe IDs ----------------------------------------
     def test_configuration_key_is_canonical_and_sorted(self):
         first = artifacts.configuration_key({"b": [2, 3], "a": 1})
@@ -107,8 +122,8 @@ class ArtifactStoreTest(unittest.TestCase):
         self.assertEqual(_sha(sealed.object_path), sealed.sha256)
         self.assertEqual(_sha(sealed.binary_path), sealed.sha256)
 
-        self.assertEqual(_mode(sealed.object_path) & 0o222, 0)
-        self.assertEqual(_mode(sealed.binary_path) & 0o222, 0)
+        self.assertEqual(_mode(sealed.object_path), 0o555)
+        self.assertEqual(_mode(sealed.binary_path), 0o555)
         self.assertEqual(_mode(self.source), snapshot_before)
         self.assertNotEqual(
             os.stat(self.source).st_ino, os.stat(sealed.object_path).st_ino
@@ -138,6 +153,8 @@ class ArtifactStoreTest(unittest.TestCase):
         self.assertTrue(second.reused)
         self.assertEqual(second.method, "reuse")
         self.assertEqual(second.copied_bytes, 0)
+        self.assertEqual(_mode(first.object_path), 0o555)
+        self.assertEqual(_mode(second.binary_path), 0o555)
         self.assertEqual(first.object_path, second.object_path)
         self.assertEqual(first.sha256, second.sha256)
         self.assertNotEqual(first.binary_path, second.binary_path)
@@ -195,7 +212,7 @@ class ArtifactStoreTest(unittest.TestCase):
         sha = hashlib.sha256(target_bytes).hexdigest()
         object_path = self.store_root / artifacts.OBJECTS_DIR / artifacts.SHA256_DIR / sha
         object_path.write_bytes(b"corrupt-object-bytes")
-        os.chmod(object_path, 0o444)
+        os.chmod(object_path, 0o555)
 
         with self.assertRaises(artifacts.ArtifactStoreError):
             self.seal()
@@ -205,6 +222,29 @@ class ArtifactStoreTest(unittest.TestCase):
             before_builds,
         )
         self.assertIn(seed_sealed.build_id, before_builds)
+
+    def test_existing_non_executable_object_is_refused_without_snapshot_or_repair(self):
+        sealed = self.seal()
+        object_bytes = sealed.object_path.read_bytes()
+        snapshot_bytes = sealed.binary_path.read_bytes()
+        config_dir = (
+            self.store_root
+            / artifacts.SNAPSHOTS_DIR
+            / self.commit
+            / self.config_key
+        )
+        before_builds = {entry.name for entry in config_dir.iterdir()}
+        os.chmod(sealed.object_path, 0o444)
+
+        with self.assertRaises(artifacts.ArtifactStoreError):
+            self.seal(build_id="mode-fix-refused")
+
+        self.assertEqual(_mode(sealed.object_path), 0o444)
+        self.assertEqual(sealed.object_path.read_bytes(), object_bytes)
+        self.assertEqual(_mode(sealed.binary_path), 0o444)
+        self.assertEqual(sealed.binary_path.read_bytes(), snapshot_bytes)
+        self.assertEqual({entry.name for entry in config_dir.iterdir()}, before_builds)
+        self.assertFalse((config_dir / "mode-fix-refused").exists())
 
     def test_write_receipt_validates_hashes_commit_and_never_overwrites(self):
         sealed = self.seal()
@@ -249,11 +289,61 @@ class ArtifactStoreTest(unittest.TestCase):
         sealed = self.seal()
         os.unlink(sealed.binary_path)
         sealed.binary_path.write_bytes(b"tampered-snapshot")
-        os.chmod(sealed.binary_path, 0o444)
+        os.chmod(sealed.binary_path, 0o555)
 
         with self.assertRaises(artifacts.ArtifactStoreError):
             artifacts.write_receipt(sealed, {"fresh": True})
         self.assertFalse(sealed.receipt_path.exists())
+
+    def test_write_receipt_refuses_non_executable_hardlink_snapshot_and_object(self):
+        sealed = self.seal()
+        self.assertEqual(
+            os.stat(sealed.binary_path).st_ino, os.stat(sealed.object_path).st_ino
+        )
+        object_bytes = sealed.object_path.read_bytes()
+        snapshot_bytes = sealed.binary_path.read_bytes()
+        os.chmod(sealed.binary_path, 0o444)
+        self.assertEqual(_mode(sealed.object_path), 0o444)
+
+        with self.assertRaises(artifacts.ArtifactStoreError):
+            artifacts.write_receipt(sealed, {"fresh": True})
+
+        self.assertFalse(sealed.receipt_path.exists())
+        self.assertEqual(_mode(sealed.object_path), 0o444)
+        self.assertEqual(_mode(sealed.binary_path), 0o444)
+        self.assertEqual(sealed.object_path.read_bytes(), object_bytes)
+        self.assertEqual(sealed.binary_path.read_bytes(), snapshot_bytes)
+
+    def test_write_receipt_accepts_separate_readonly_executable_snapshot(self):
+        sealed = self.seal_with_copied_snapshot()
+        self.assertEqual(_mode(sealed.object_path), 0o555)
+        self.assertEqual(_mode(sealed.binary_path), 0o555)
+        self.assertNotEqual(
+            os.stat(sealed.binary_path).st_ino, os.stat(sealed.object_path).st_ino
+        )
+
+        path = artifacts.write_receipt(sealed, {"fresh": True})
+        self.assertEqual(path, sealed.receipt_path)
+        self.assertTrue(path.is_file())
+        self.assertEqual(_mode(path), 0o444)
+
+    def test_write_receipt_refuses_non_executable_separate_snapshot(self):
+        sealed = self.seal_with_copied_snapshot()
+        self.assertNotEqual(
+            os.stat(sealed.binary_path).st_ino, os.stat(sealed.object_path).st_ino
+        )
+        object_bytes = sealed.object_path.read_bytes()
+        snapshot_bytes = sealed.binary_path.read_bytes()
+        os.chmod(sealed.binary_path, 0o444)
+
+        with self.assertRaises(artifacts.ArtifactStoreError):
+            artifacts.write_receipt(sealed, {"fresh": True})
+
+        self.assertFalse(sealed.receipt_path.exists())
+        self.assertEqual(_mode(sealed.object_path), 0o555)
+        self.assertEqual(_mode(sealed.binary_path), 0o444)
+        self.assertEqual(sealed.object_path.read_bytes(), object_bytes)
+        self.assertEqual(sealed.binary_path.read_bytes(), snapshot_bytes)
 
     def test_write_receipt_refuses_preexisting_symlink_target(self):
         sealed = self.seal()
@@ -343,6 +433,8 @@ class ArtifactStoreTest(unittest.TestCase):
         self.assertEqual(sealed.method, "copy")
         self.assertEqual(sealed.copied_bytes, len(self.source.read_bytes()))
         self.assertEqual(sealed.object_path.read_bytes(), self.source.read_bytes())
+        self.assertEqual(_mode(sealed.object_path), 0o555)
+        self.assertEqual(_mode(sealed.binary_path), 0o555)
 
     def test_unverified_clone_is_discarded_for_a_verified_copy(self):
         with mock.patch.object(artifacts, "_reflink_supported", return_value=True), \
@@ -351,6 +443,8 @@ class ArtifactStoreTest(unittest.TestCase):
         self.assertEqual(sealed.method, "copy")
         self.assertEqual(sealed.copied_bytes, len(self.source.read_bytes()))
         self.assertEqual(sealed.object_path.read_bytes(), self.source.read_bytes())
+        self.assertEqual(_mode(sealed.object_path), 0o555)
+        self.assertEqual(_mode(sealed.binary_path), 0o555)
 
     def test_verified_clone_is_reported_as_reflink(self):
         def fake_clone(source_fd, dest_fd):
@@ -369,6 +463,8 @@ class ArtifactStoreTest(unittest.TestCase):
         self.assertEqual(sealed.method, "reflink")
         self.assertEqual(sealed.copied_bytes, 0)
         self.assertEqual(sealed.object_path.read_bytes(), self.source.read_bytes())
+        self.assertEqual(_mode(sealed.object_path), 0o555)
+        self.assertEqual(_mode(sealed.binary_path), 0o555)
 
     def test_concurrent_publish_reuses_one_validated_object(self):
         workers = 8
@@ -391,10 +487,12 @@ class ArtifactStoreTest(unittest.TestCase):
         )
         object_path = sealed[0].object_path
         expected = _sha(object_path)
+        self.assertEqual(_mode(object_path), 0o555)
         for item in sealed:
             self.assertEqual(item.sha256, expected)
             self.assertTrue(item.binary_path.is_file())
             self.assertEqual(_sha(item.binary_path), expected)
+            self.assertEqual(_mode(item.binary_path), 0o555)
         self.assertFalse(list(object_path.parent.glob(".*.tmp")))
 
     def test_concurrent_publish_across_processes_reuses_one_object(self):
@@ -446,8 +544,10 @@ class ArtifactStoreTest(unittest.TestCase):
         self.assertEqual(len({record["binary"] for record in records}), workers)
         self.assertEqual(sum(1 for record in records if record["reused"]), workers - 1)
         for record in records:
+            self.assertEqual(_mode(record["object"]), 0o555)
             self.assertTrue(Path(record["binary"]).is_file())
             self.assertEqual(_sha(record["binary"]), record["sha256"])
+            self.assertEqual(_mode(record["binary"]), 0o555)
 
     # -- preserve unknown and historical paths ------------------------------
     def test_unknown_paths_and_old_records_are_never_deleted_or_rewritten(self):
