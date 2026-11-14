@@ -13,10 +13,13 @@ constraint trigger on ref_store_core_events waits on a session advisory lock
 held only by this harness. The service therefore issues the real final COMMIT
 and waits past its own 30-second verifier deadline while the outer 60-second
 request budget is still open. The wire response must be the typed unknown 503
-with the operation id and no Git report. Releasing the lock lets the same
+with the operation id and no Git report. The unchanged/pending ledger is
+asserted while the lock is still held. Releasing the lock lets the same
 server-side COMMIT settle; the authenticated GET operations route then resolves
-the same id. Exact persisted ref, gate, event, terminal and pack rows are
-snapshotted rather than counted.
+the same id. If settlement leaves a durable pending operation, the exact same
+operation id and wire body are retried once and the final GET must be committed;
+a permanent pending result fails the case. Exact persisted ref, gate, event,
+terminal and pack rows are snapshotted rather than counted.
 
 By default the same native process also re-runs the existing exact receive
 replay/digest-conflict and transient-read cleanup cases from
@@ -48,7 +51,7 @@ CASES = (COMMIT_CASE, EXACT_REPLAY_CASE, TRANSIENT_READ_CASE)
 LIMITATIONS = list(blob.LIMITATIONS) + [
     "The COMMIT ambiguity is fixture-owned PostgreSQL deferred-trigger/advisory-lock timing, not a kernel or power-loss claim.",
     "The harness waits for the service's own verifier deadline; it does not inject a product success or override the wire verdict.",
-    "A pending GET result means the same COMMIT did not land; the case then requires exact no-ref/no-event/no-terminal state rather than claiming success.",
+    "A settled pending GET is not resolved acceptance; the case retries the exact same operation id and wire body and fails unless the final GET is committed with exactly one ref/gate/event/pack effect.",
 ]
 
 
@@ -225,6 +228,9 @@ class CheckpointHarness(blob.BlobOnlyHarness):
     def receive_pack_commit_unknown_resolves_exact(self):
         repo, _remote, work, old_oid = self.seed("commit-unknown", self.alice)
         before = self.exact_ledger(repo["id"])
+        seed_operations = rows(before["operations"])
+        assert len(seed_operations) == 1, seed_operations
+        seed_operation = seed_operations[0]
         base_revision = rows(before["gate"])[0]["revision"]
         assert base_revision >= 2, base_revision
         new_revision = base_revision + 1
@@ -248,6 +254,36 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             self._await_waiting_commit()
             assert not future.done(), "receive-pack returned before the deferred COMMIT barrier"
             wire_status, response, response_headers = future.result(timeout=80)
+            # The COMMIT barrier is still held. Assert the unknown boundary and
+            # the unchanged/pending state now, before any release can let the
+            # server-side COMMIT land.
+            assert wire_status == 503, ("COMMIT ambiguity wire status=" + str(wire_status)
+                                        + ": " + repr(response[:300]))
+            assert blob.header_value(response_headers, "x-rootyard-operation") == operation, response_headers
+            wire_error = json.loads(response)
+            assert wire_error == {"error": "publication outcome is unknown; query the operation or inspect refs"}, wire_error
+            for marker in (b"unpack ok", b"ok refs/heads/main", b"ng refs/heads/main"):
+                assert marker not in response, "unknown COMMIT carried a Git report: " + repr(response[:300])
+            inflight = self.exact_ledger(repo["id"])
+            assert rows(inflight["refs"]) == rows(before["refs"]), "unknown COMMIT moved a ref before release"
+            assert rows(inflight["gate"]) == rows(before["gate"]), "unknown COMMIT moved the gate before release"
+            assert rows(inflight["events"]) == rows(before["events"]), "unknown COMMIT wrote an event before release"
+            inflight_operations = rows(inflight["operations"])
+            assert len(inflight_operations) == 2, inflight_operations
+            assert row_for(inflight_operations, "operation_id", seed_operation["operation_id"]) == seed_operation
+            inflight_operation = self.operation_row(repo["id"], operation)
+            assert inflight_operation == row_for(inflight_operations, "operation_id", operation)
+            assert inflight_operation["state"] == "pending", inflight_operation
+            assert inflight_operation["terminal_result"] is None, inflight_operation
+            inflight_pack = self.pack_identity(repo["id"], operation)
+            inflight_publications = rows(inflight_pack["publications"])
+            inflight_artifacts = rows(inflight_pack["artifacts"])
+            assert len(inflight_publications) == 1, inflight_publications
+            assert len(inflight_artifacts) == 2, inflight_artifacts
+            assert sorted(item["role"] for item in inflight_artifacts) == ["idx", "pack"], inflight_artifacts
+            assert inflight_publications[0]["plan_operation_id"] == operation, inflight_publications
+            assert ({item["registration_id"] for item in inflight_artifacts}
+                    == {inflight_publications[0]["registration_id"]}), inflight_artifacts
             self._release_blocker(blocker)
             blocker = None
         finally:
@@ -261,27 +297,6 @@ class CheckpointHarness(blob.BlobOnlyHarness):
                 finally:
                     self._drop_commit_gate()
 
-        assert wire_status == 503, "COMMIT ambiguity wire status=" + str(wire_status) + ": " + repr(response[:300])
-        assert blob.header_value(response_headers, "x-rootyard-operation") == operation, response_headers
-        wire_error = json.loads(response)
-        assert wire_error == {"error": "publication outcome is unknown; query the operation or inspect refs"}, wire_error
-        for marker in (b"unpack ok", b"ok refs/heads/main", b"ng refs/heads/main"):
-            assert marker not in response, "unknown COMMIT carried a Git report: " + repr(response[:300])
-
-        ambiguous = self.exact_ledger(repo["id"])
-        assert rows(ambiguous["refs"]) == rows(before["refs"]), "unknown COMMIT moved a ref"
-        assert rows(ambiguous["gate"]) == rows(before["gate"]), "unknown COMMIT moved the gate"
-        assert rows(ambiguous["events"]) == rows(before["events"]), "unknown COMMIT wrote an event"
-        ambiguous_operation = self.operation_row(repo["id"], operation)
-        assert ambiguous_operation["state"] == "pending", ambiguous_operation
-        assert ambiguous_operation["terminal_result"] is None, ambiguous_operation
-        ambiguous_pack = self.pack_identity(repo["id"], operation)
-        assert rows(ambiguous_pack["publications"]), "the durable A4 pack identity is missing"
-        assert rows(ambiguous_pack["artifacts"]), "the durable A4 artifact identity is missing"
-
-        # The core COMMIT contract permits the server-side transaction to land
-        # or abort after the client stops waiting. A pending GET is the explicit
-        # unknown state, never a success; both branches are checked exactly.
         operation_path = ("/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/"
                           + urllib.parse.quote(repo["name"], safe="") + "/operations/" + operation)
         get_status, raw, headers = self.http(operation_path, token=self.alice)
@@ -290,59 +305,138 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         view = json.loads(raw)
         assert view["operation_id"] == operation
         assert view["state"] in ("pending", "committed"), view
+
+        retry_status = None
+        retry_report_ok = False
+        retry_unknown = False
+        if view["state"] == "committed":
+            resolved_by = "query"
+        else:
+            # All COMMIT statements settled while the operation is still
+            # pending: the original transaction rolled back. This is a durable
+            # no-effect state, never a resolved acceptance.
+            settled = self.exact_ledger(repo["id"])
+            assert rows(settled["refs"]) == rows(before["refs"]), "settled pending COMMIT moved a ref"
+            assert rows(settled["gate"]) == rows(before["gate"]), "settled pending COMMIT moved the gate"
+            assert rows(settled["events"]) == rows(before["events"]), "settled pending COMMIT wrote an event"
+            settled_operations = rows(settled["operations"])
+            assert len(settled_operations) == 2, settled_operations
+            assert row_for(settled_operations, "operation_id", seed_operation["operation_id"]) == seed_operation
+            settled_operation = self.operation_row(repo["id"], operation)
+            assert row_for(settled_operations, "operation_id", operation) == settled_operation
+            assert settled_operation["state"] == "pending", settled_operation
+            assert settled_operation["terminal_result"] is None, settled_operation
+            assert self.pack_identity(repo["id"], operation) == inflight_pack, \
+                "pending settlement changed the durable pack identity"
+            assert view["terminal"] is None, view
+
+            # Retry exactly the same operation id and exact same wire bytes. A
+            # new operation id is not a resolution of the original unknown.
+            retry_status, retry_body, retry_headers = self._long_http(path, self.alice, body, operation)
+            assert blob.header_value(retry_headers, "x-rootyard-operation") == operation, retry_headers
+            if retry_status == 200:
+                blob.assert_receive_report_ok(retry_body, "refs/heads/main")
+                retry_report_ok = True
+            else:
+                assert retry_status == 503, ("same-operation retry returned an unexpected status: "
+                                             + str(retry_status) + " body=" + repr(retry_body[:300]))
+                retry_error = json.loads(retry_body)
+                assert retry_error == {"error": "publication outcome is unknown; query the operation or inspect refs"}, retry_error
+                for marker in (b"unpack ok", b"ok refs/heads/main", b"ng refs/heads/main"):
+                    assert marker not in retry_body, "unknown retry carried a Git report: " + repr(retry_body[:300])
+                retry_unknown = True
+
+            # The final authenticated query is authoritative. A 503 retry that
+            # still observes committed only proves a late original COMMIT; it is
+            # not a retry resolution. A final pending state is unresolved.
+            get_status, raw, headers = self.http(operation_path, token=self.alice)
+            assert get_status == 200, "GET operation after retry: " + str(get_status) + ": " + repr(raw[:300])
+            assert blob.header_value(headers, "cache-control") == "no-store"
+            view = json.loads(raw)
+            assert view["operation_id"] == operation
+            if view["state"] == "pending":
+                assert retry_unknown, "same-operation retry reported success but the operation stayed pending"
+                raise AssertionError("permanent pending after exact same-operation retry: "
+                                     "the operation never reached a committed terminal")
+            assert view["state"] == "committed", "same-operation retry left a non-terminal state: " + str(view)
+            resolved_by = "retry" if retry_report_ok else "query_after_retry"
+
         terminal = view["terminal"]
+        assert terminal is not None, view
 
         resolved = self.exact_ledger(repo["id"])
         resolved_operation = self.operation_row(repo["id"], operation)
         resolved_pack = self.pack_identity(repo["id"], operation)
-        assert resolved_pack == ambiguous_pack, "COMMIT settlement changed the durable pack identity"
+        assert resolved_pack == inflight_pack, "COMMIT settlement changed the durable pack identity"
 
-        seed_operations = rows(before["operations"])
-        assert len(seed_operations) == 1, seed_operations
-        seed_operation = seed_operations[0]
         resolved_operations = rows(resolved["operations"])
         assert len(resolved_operations) == 2, resolved_operations
         assert row_for(resolved_operations, "operation_id", seed_operation["operation_id"]) == seed_operation
+        assert row_for(resolved_operations, "operation_id", operation) == resolved_operation
+        assert view["state"] == "committed", view
 
-        if view["state"] == "committed":
-            ref_rows = rows(resolved["refs"])
-            assert len(ref_rows) == 1, ref_rows
-            ref_row = row_for(ref_rows, "ref_name", "refs/heads/main")
-            assert ref_row["oid"] == new_oid and ref_row["revision"] == new_revision, ref_row
-            gate_row = rows(resolved["gate"])[0]
-            assert gate_row["revision"] == new_revision and gate_row["head_ref"] == "refs/heads/main", gate_row
-            event_rows = rows(resolved["events"])
-            assert len(event_rows) == len(rows(before["events"])) + 1, event_rows
-            event = row_for(event_rows, "operation_id", operation)
-            assert event["outcome"] == "committed" and event["revision"] == new_revision, event
-            assert event["payload"] == terminal, "event payload differs from the queried terminal"
-            assert resolved_operation["state"] == "committed", resolved_operation
-            assert resolved_operation["terminal_result"] == terminal, resolved_operation
-            assert terminal["kind"] == "committed" and terminal["revision"] == new_revision, terminal
-            assert terminal["head_ref"] == "refs/heads/main", terminal
-            assert terminal["refs"][0]["name"] == "refs/heads/main", terminal
-            assert terminal["refs"][0]["new_oid"] == new_oid, terminal
-            publications = rows(ambiguous_pack["publications"])
-            registrations = terminal["registrations"]
-            assert registrations, terminal
-            assert {(item["pack_id"], item["registration_id"], item["artifact_set_digest"])
-                    for item in registrations} == {(item["pack_id"], item["registration_id"],
-                                                    item["artifact_set_digest"]) for item in publications}
-        else:
-            assert rows(resolved["refs"]) == rows(before["refs"]), "pending COMMIT moved a ref"
-            assert rows(resolved["gate"]) == rows(before["gate"]), "pending COMMIT moved the gate"
-            assert rows(resolved["events"]) == rows(before["events"]), "pending COMMIT wrote an event"
-            assert terminal is None, terminal
-            assert resolved_operation == ambiguous_operation, "pending operation changed after release"
-            assert rows(resolved["operations"]) == rows(ambiguous["operations"])
+        ref_rows = rows(resolved["refs"])
+        assert len(ref_rows) == 1, ref_rows
+        ref_row = row_for(ref_rows, "ref_name", "refs/heads/main")
+        assert ref_row["oid"] == new_oid and ref_row["revision"] == new_revision, ref_row
+        gate_rows = rows(resolved["gate"])
+        assert len(gate_rows) == 1, gate_rows
+        gate_row = gate_rows[0]
+        assert gate_row["revision"] == new_revision and gate_row["head_ref"] == "refs/heads/main", gate_row
+        event_rows = rows(resolved["events"])
+        assert len(event_rows) == len(rows(before["events"])) + 1, event_rows
+        for prior_event in rows(before["events"]):
+            assert row_for(event_rows, "event_id", prior_event["event_id"]) == prior_event, \
+                "an existing event changed during COMMIT settlement"
+        event = row_for(event_rows, "operation_id", operation)
+        assert event["outcome"] == "committed" and event["revision"] == new_revision, event
+        assert event["payload"] == terminal, "event payload differs from the queried terminal"
+        assert resolved_operation["state"] == "committed", resolved_operation
+        assert resolved_operation["terminal_result"] == terminal, resolved_operation
+        assert terminal["kind"] == "committed" and terminal["revision"] == new_revision, terminal
+        assert terminal["head_ref"] == "refs/heads/main", terminal
+        assert len(terminal["refs"]) == 1, terminal
+        assert terminal["refs"][0]["name"] == "refs/heads/main", terminal
+        assert terminal["refs"][0]["new_oid"] == new_oid, terminal
+        publications = rows(inflight_pack["publications"])
+        artifacts = rows(inflight_pack["artifacts"])
+        assert len(publications) == 1, publications
+        assert len(artifacts) == 2, artifacts
+        registrations = terminal["registrations"]
+        assert len(registrations) == 1, terminal
+        assert {(item["pack_id"], item["registration_id"], item["artifact_set_digest"])
+                for item in registrations} == {(item["pack_id"], item["registration_id"],
+                                                item["artifact_set_digest"]) for item in publications}
+
+        # Authenticated operation lookup is issuer/admin only. These are
+        # denials, never operation detail or a terminal body.
+        def denied(lookup_path, token=None, codes=(401, 403, 404)):
+            code, raw, _ = self.http(lookup_path, token=token)
+            assert code in codes, (code, raw[:300])
+            body = json.loads(raw)
+            assert set(body) == {"error"}, body
+            assert "terminal" not in body and "operation_id" not in body, body
+
+        denied(operation_path, codes=(401,))
+        denied(operation_path, {"username": "alice", "token": "ryt_" + "0" * 64}, codes=(401,))
+        denied(operation_path, self.bob, codes=(403, 404))
+        other_repo, _ = self.create("commit-unknown-other", self.alice)
+        other_path = ("/api/repos/" + urllib.parse.quote(other_repo["owner"], safe="") + "/"
+                      + urllib.parse.quote(other_repo["name"], safe="") + "/operations/" + operation)
+        denied(other_path, self.alice, codes=(404,))
 
         return {
             "operation": operation,
             "wire_status": wire_status,
             "wire_error": wire_error["error"],
             "resolved_state": view["state"],
+            "resolved_by": resolved_by,
+            "retry_status": retry_status,
+            "retry_unknown": retry_unknown,
+            "retry_report_ok": retry_report_ok,
             "operation_get_status": get_status,
-            "commit_landed": view["state"] == "committed",
+            "commit_landed": True,
+            "one_effect_checked": True,
             "base_revision": base_revision,
             "new_revision": new_revision,
             "ack_oid": new_oid,
@@ -357,7 +451,7 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             "events_sha256": digest(resolved["events"]),
             "terminal_sha256": digest(json.dumps(terminal, sort_keys=True, separators=(",", ":"))),
             "pack_identity_sha256": digest(json.dumps(resolved_pack, sort_keys=True, separators=(",", ":"))),
-            "pack_registration_ids": [item["registration_id"] for item in rows(ambiguous_pack["publications"])],
+            "pack_registration_ids": [item["registration_id"] for item in rows(inflight_pack["publications"])],
             "pack_identity_unchanged": True,
             "exact_ref_gate_event_terminal_checked": True,
         }
