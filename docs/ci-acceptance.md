@@ -116,8 +116,9 @@ entry keyed by OS, architecture, full revision and the bootstrap Cargo commit,
 or adopts a valid fork passed with `--reuse`; a valid entry is not cleaned,
 forced or rebuilt. Reuse re-verifies the full `cargo -vV` release/commit/host
 and the binary SHA-256 against the recorded metadata. The helper records the
-resolved path, full version, revision and SHA under
-`test-results/.../cargo-fork.json`.
+resolved path, full version, revision and SHA in a `cargo-fork.json` file (under
+`test-results/...` where the job uploads that tree, and in the native-kernel
+receipt directory).
 
 Each job then runs a separate pre-Cargo `verify --require-path` step. It requires
 the `cargo` on `PATH` to be the recorded fork, greps `cargo -vV` for
