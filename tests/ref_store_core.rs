@@ -1545,13 +1545,31 @@ async fn commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once() -
     Ok(())
 }
 
-/// Focused acceptance at the internal PostgreSQL service boundary for the two
-/// cancel/commit orders. Cancellation may add a tombstone, but it can never
-/// replace a committed terminal; a registered pending operation cancelled
-/// first can never be committed later. Both terminal reads are exact replays.
+/// Focused acceptance at the internal PostgreSQL service boundary for two
+/// serialized cancel/commit orders; this is not an overlapping race. Cancellation
+/// may add a tombstone, but it can never replace a committed terminal; a
+/// registered pending operation cancelled first can never be committed later.
+/// Both terminal reads are exact replays.
 mod cancellation {
     use super::*;
     use rootyard::ref_store::{OperationRecord, PgRefStore};
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CoreRef {
+        name: String,
+        oid: String,
+        revision: i64,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CoreEvent {
+        event_id: Uuid,
+        repository_id: Uuid,
+        revision: i64,
+        operation_id: Uuid,
+        outcome: String,
+        payload: serde_json::Value,
+    }
 
     async fn register_pending(pool: &Pool, claim: &CommitRefsRequest) -> Result<()> {
         let mut client = pool.get().await?;
@@ -1569,6 +1587,39 @@ mod cancellation {
             OperationLookup::Known(record) => Ok(record),
             OperationLookup::Unknown => anyhow::bail!("operation {operation_id} must stay queryable"),
         }
+    }
+
+    /// Exact persisted ref OIDs and complete event identity/payload values, so
+    /// an in-place rewrite cannot hide behind unchanged row counts.
+    async fn refs_and_events(pool: &Pool, repo: Uuid) -> Result<(Vec<CoreRef>, Vec<CoreEvent>)> {
+        let client = pool.get().await?;
+        let refs: Vec<CoreRef> = client
+            .query(
+                "SELECT ref_name,oid,revision FROM ref_store_core_refs WHERE repository_id=$1 ORDER BY ref_name",
+                &[&repo],
+            )
+            .await?
+            .into_iter()
+            .map(|row| CoreRef { name: row.get(0), oid: row.get(1), revision: row.get(2) })
+            .collect();
+        let events: Vec<CoreEvent> = client
+            .query(
+                "SELECT event_id,repository_id,revision,operation_id,outcome,payload
+                 FROM ref_store_core_events WHERE repository_id=$1 ORDER BY event_id",
+                &[&repo],
+            )
+            .await?
+            .into_iter()
+            .map(|row| CoreEvent {
+                event_id: row.get(0),
+                repository_id: row.get(1),
+                revision: row.get(2),
+                operation_id: row.get(3),
+                outcome: row.get(4),
+                payload: row.get(5),
+            })
+            .collect();
+        Ok((refs, events))
     }
 
     #[tokio::test]
@@ -1604,6 +1655,18 @@ mod cancellation {
             };
             assert_eq!(committed_version.revision(), 2);
 
+            let committed_rows = refs_and_events(&pool, repo).await?;
+            assert_eq!(committed_rows.0.len(), 1, "winning commit must persist exactly one ref row");
+            assert_eq!(committed_rows.0[0].name, "refs/heads/main");
+            assert_eq!(committed_rows.0[0].oid, oid(format, 1).as_hex());
+            assert_eq!(committed_rows.1.len(), 1, "winning commit must persist exactly one event row");
+            let committed_event = &committed_rows.1[0];
+            assert_eq!(committed_event.repository_id, repo);
+            assert_eq!(committed_event.revision, 2);
+            assert_eq!(committed_event.operation_id, committed_attempt.identity().operation_id());
+            assert_eq!(committed_event.outcome, "committed");
+            assert_eq!(&committed_event.payload, committed_terminal.value());
+
             let after_commit = cancel(&pool, committed_attempt.identity()).await?;
             assert!(after_commit.tombstone_created);
             let after_commit_record = after_commit.record.expect("committed operation stays registered");
@@ -1614,18 +1677,24 @@ mod cancellation {
                 after_commit_record,
                 "GET operation equivalent must replay the exact committed terminal"
             );
+            assert_eq!(
+                refs_and_events(&pool, repo).await?,
+                committed_rows,
+                "cancelling after a committed terminal must not rewrite or add any ref/event row"
+            );
 
             let replay = commit(&pool, &committed_attempt).await?;
             assert!(replay.replayed);
             assert_eq!(replay.record.terminal_result(), Some(&committed_terminal));
             assert_eq!(replay.terminal, committed.terminal);
-            assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1", repo).await?, 1);
             assert_eq!(
-                count(&pool, "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1", repo).await?,
-                1
+                refs_and_events(&pool, repo).await?,
+                committed_rows,
+                "a committed replay must not rewrite or add any ref/event row"
             );
 
-            // Cancel wins after registration. The late core commit is a typed
+            // Cancel wins after registration (a serialized order, not an
+            // overlapping race). The late core commit is a typed
             // definite cancellation and the cancelled terminal is queryable
             // exactly once, with no ref or event written.
             let cancelled_attempt = request(
@@ -1667,10 +1736,10 @@ mod cancellation {
                 cancelled_record,
                 "the failed late commit must not rewrite the cancelled terminal"
             );
-            assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1", repo).await?, 1);
             assert_eq!(
-                count(&pool, "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1", repo).await?,
-                1
+                refs_and_events(&pool, repo).await?,
+                committed_rows,
+                "a cancelled late commit must not rewrite or add any ref/event row"
             );
             assert_eq!(
                 count(&pool, "SELECT count(*) FROM ref_store_cancellations WHERE repository_id=$1", repo).await?,
