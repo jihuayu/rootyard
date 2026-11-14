@@ -7,6 +7,7 @@ copied literally and never forced, the previous receipt is invalidated on every
 failure path, and installation is atomic under the target-directory flock.
 """
 import argparse
+import errno
 import fcntl
 import hashlib
 import io
@@ -84,6 +85,9 @@ class BuildReceiptTest(unittest.TestCase):
     def setUp(self):
         self.tempdir = Path(tempfile.mkdtemp(prefix='rootyard-build-receipt-v2-'))
         self.addCleanup(shutil.rmtree, self.tempdir, ignore_errors=True)
+        self.external = Path(tempfile.mkdtemp(prefix='rootyard-build-receipt-cas-'))
+        self.addCleanup(shutil.rmtree, self.external, ignore_errors=True)
+        self.store = self.external / 'store'
         self.root = self.tempdir.resolve()
         (self.root / 'src').mkdir()
         (self.root / 'tests' / 'fixtures').mkdir(parents=True)
@@ -214,13 +218,15 @@ class BuildReceiptTest(unittest.TestCase):
 
     @staticmethod
     def args(features=None, bins=False, package_debug=None, no_default_features=False,
-             strip_debuginfo=False):
+             strip_debuginfo=False, artifact_store=None, output=None):
         return argparse.Namespace(
             features=features,
             bins=bins,
             package_debug=package_debug,
             no_default_features=no_default_features,
             strip_debuginfo=strip_debuginfo,
+            artifact_store=artifact_store,
+            output=output,
         )
 
     def events(self, fresh=False, executable=None, kinds=('lib', 'bin'), lib_fresh=None,
@@ -341,6 +347,153 @@ class BuildReceiptTest(unittest.TestCase):
         self.assertEqual(report['command'], command)
         self.assertEqual(report['features'], {'enabled': ['pando-lab'], 'no_default_features': False})
         self.assertEqual(report['cargo_artifacts'][0]['fresh'], False)
+
+    # -- CAS opt-in ---------------------------------------------------------
+    def test_artifact_store_optin_seals_canonical_snapshot(self):
+        args = self.args(artifact_store=str(self.store))
+        report = self.build(self.events(), args=args)
+        stored = report['artifact_store']
+        snapshot = Path(stored['binary'])
+        canonical_receipt = Path(stored['receipt'])
+        build_receipt = Path(stored['build_receipt'])
+        cas_object = Path(stored['object'])
+        self.assertEqual(report['binary_sha256'], receipt.sha256_file(snapshot))
+        self.assertEqual(report['binary_sha256'],
+                         report['cargo_artifacts'][1]['executable_sha256'])
+        self.assertEqual(report['cargo_artifacts'][1]['executable'], str(self.binary.resolve()))
+        self.assertEqual(report['relocated_artifact'], True)
+        self.assertEqual(report['original_artifact_sha256'], report['binary_sha256'])
+        self.assertEqual(stored['binary_sha256'], report['binary_sha256'])
+        self.assertEqual(canonical_receipt.read_bytes(), build_receipt.read_bytes())
+        for path, mode in ((cas_object, 0o555), (snapshot, 0o555),
+                           (canonical_receipt, 0o444), (build_receipt, 0o444)):
+            self.assertTrue(path.is_file(), path)
+            self.assertEqual(path.stat().st_mode & 0o777, mode, path)
+        self.assertNotEqual(os.stat(snapshot).st_ino, os.stat(self.binary).st_ino)
+        self.assertNotEqual(os.stat(cas_object).st_ino, os.stat(self.binary).st_ino)
+        self.assertFalse(self.receipt.exists(), 'CAS mode must not write the mutable-output receipt')
+        self.assertIsNone(stored['output_alias'])
+        validated = receipt.load_receipt(
+            canonical_receipt, binary_path=snapshot, expected_commit='a' * 40,
+            expected_binary_sha256=report['binary_sha256'])
+        self.assertEqual(validated.binary_sha256, report['binary_sha256'])
+        # A later overwrite of the mutable compiler output cannot change the snapshot.
+        self.binary.write_bytes(b'overwritten-mutable-output')
+        self.assertEqual(receipt.sha256_file(snapshot), report['binary_sha256'])
+        self.assertEqual(receipt.sha256_file(build_receipt),
+                         receipt.sha256_file(canonical_receipt))
+
+    def test_artifact_store_reuses_one_object_and_ignores_jobs(self):
+        args = self.args(artifact_store=str(self.store))
+        first = self.build(self.events(bin_fresh=False), args=args)
+        os.environ['CARGO_BUILD_JOBS'] = '2'
+        try:
+            second = self.build(self.events(bin_fresh=True), args=args)
+        finally:
+            os.environ.pop('CARGO_BUILD_JOBS', None)
+        self.assertEqual(first['artifact_store']['object'], second['artifact_store']['object'])
+        self.assertEqual(first['artifact_store']['config_key'],
+                         second['artifact_store']['config_key'])
+        self.assertNotEqual(first['artifact_store']['binary'], second['artifact_store']['binary'])
+        self.assertNotEqual(first['artifact_store']['receipt'], second['artifact_store']['receipt'])
+        self.assertEqual(second['artifact_store']['method'], 'reuse')
+        self.assertTrue(second['artifact_store']['reused'])
+        self.assertEqual(second['artifact_store']['copied_bytes'], 0)
+        self.assertEqual(first['cargo_artifacts'][1]['fresh'], False)
+        self.assertEqual(second['cargo_artifacts'][1]['fresh'], True)
+        self.assertEqual(second['build_options'], {'jobs': 2})
+
+    def test_artifact_store_config_key_binds_features(self):
+        first = self.build(self.events(), args=self.args(artifact_store=str(self.store)))
+        second = self.build(self.events(),
+                            args=self.args(features='pando-lab', artifact_store=str(self.store)))
+        self.assertNotEqual(first['artifact_store']['config_key'],
+                            second['artifact_store']['config_key'])
+        self.assertEqual(first['artifact_store']['object'], second['artifact_store']['object'])
+
+    def test_artifact_store_output_alias_is_no_overwrite(self):
+        alias = self.external / 'aliases' / 'rootyard'
+        args = self.args(artifact_store=str(self.store), output=str(alias))
+        report = self.build(self.events(), args=args)
+        alias_receipt = Path(str(alias) + '.build.json')
+        canonical_receipt = Path(report['artifact_store']['receipt'])
+        snapshot = Path(report['artifact_store']['binary'])
+        self.assertTrue(alias.is_file())
+        self.assertEqual(alias.read_bytes(), snapshot.read_bytes())
+        self.assertEqual(alias_receipt.read_bytes(), canonical_receipt.read_bytes())
+        self.assertEqual(alias.stat().st_mode & 0o777, 0o555)
+        self.assertEqual(alias_receipt.stat().st_mode & 0o777, 0o444)
+        alias_info = report['artifact_store']['output_alias']
+        self.assertEqual(alias_info['path'], str(alias.resolve()))
+        self.assertEqual(alias_info['receipt'], str(alias_receipt.resolve()))
+        self.assertIn(alias_info['method'], ('hardlink', 'copy'))
+        self.assertEqual(alias_info['same_inode_as_cas_object'],
+                         alias_info['method'] == 'hardlink')
+        self.assertFalse(alias_info['overwrote_existing'])
+        # A repeated invocation refuses the existing alias before Cargo or a new seal.
+        before_alias = alias.read_bytes()
+        before_receipt = alias_receipt.read_bytes()
+        builds = len(self.popen_calls)
+        with self.assertRaises(build_native.BuildError) as caught:
+            self.build(self.events(), args=args)
+        self.assertIn('already exists', str(caught.exception))
+        self.assertEqual(len(self.popen_calls), builds)
+        self.assertEqual(alias.read_bytes(), before_alias)
+        self.assertEqual(alias_receipt.read_bytes(), before_receipt)
+
+    def test_output_alias_requires_artifact_store(self):
+        with self.assertRaises(build_native.BuildError) as caught:
+            self.build(self.events(), args=self.args(output=str(self.external / 'rootyard')))
+        self.assertIn('requires an explicit --artifact-store', str(caught.exception))
+        self.assertEqual(self.popen_calls, [])
+        self.assertFalse((self.external / 'rootyard').exists())
+
+    def test_output_alias_symlink_and_directory_are_refused_before_build(self):
+        sentinel = self.external / 'sentinel'
+        sentinel.write_text('keep')
+        link = self.external / 'link'
+        link.symlink_to(sentinel)
+        directory = self.external / 'directory'
+        directory.mkdir()
+        for alias, message in ((link, 'symlink'), (directory, 'existing directory')):
+            with self.subTest(alias=alias):
+                with self.assertRaises(build_native.BuildError) as caught:
+                    self.build(self.events(), args=self.args(
+                        artifact_store=str(self.store), output=str(alias)))
+                self.assertIn(message, str(caught.exception))
+                self.assertEqual(self.popen_calls, [])
+                self.assertFalse(self.store.exists())
+        self.assertEqual(sentinel.read_text(), 'keep')
+
+    def test_alias_copy_fallback_is_verified_and_independent(self):
+        source = self.external / 'source'
+        source.write_bytes(b'verified-source-bytes')
+        os.chmod(source, 0o555)
+        destination = self.external / 'copy-alias'
+        real_link = os.link
+
+        def cross_device_link(src, dst, *arguments, **keywords):
+            if Path(src) == source or Path(src).name.startswith('.copy-alias.'):
+                raise OSError(errno.EXDEV, 'cross-device link')
+            return real_link(src, dst, *arguments, **keywords)
+
+        with mock.patch.object(build_native.os, 'link', cross_device_link):
+            method = build_native._publish_immutable_alias(source, destination, 'alias')
+        self.assertEqual(method, 'copy')
+        self.assertEqual(destination.read_bytes(), source.read_bytes())
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o555)
+        self.assertNotEqual(os.stat(destination).st_ino, os.stat(source).st_ino)
+
+    def test_artifact_store_failure_leaves_no_false_valid_receipt(self):
+        args = self.args(artifact_store=str(self.store))
+        with mock.patch.object(build_native, '_publish_immutable_alias',
+                               side_effect=build_native.BuildError('publication refused')):
+            with self.assertRaises(build_native.BuildError) as caught:
+                self.build(self.events(), args=args)
+        self.assertIn('publication refused', str(caught.exception))
+        self.assertFalse([path for path in self.store.rglob('*')
+                          if path.is_file() and path.name.endswith(('.build.json', '.receipt.json'))])
+        self.assertFalse([path for path in (self.store / 'snapshots').rglob('*') if path.is_file()])
 
     def test_source_digest_is_unchanged_and_bound_to_the_receipt(self):
         before = build_native.source_digest()
