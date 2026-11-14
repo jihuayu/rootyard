@@ -634,6 +634,74 @@ def _support_digest(entries: list[dict]) -> str:
     return digest.hexdigest()
 
 
+def _legacy_support_files() -> dict[str, str]:
+    """Every present file in the historical v1 lib-test support closure."""
+    files: dict[str, str] = {}
+    for directory in receipt.TEST_SUPPORT_DIRS:
+        path = ROOT / directory
+        if path.is_dir():
+            for item in path.rglob("*"):
+                if item.is_file():
+                    files[item.relative_to(ROOT).as_posix()] = receipt.sha256_file(item)
+    return files
+
+
+def _legacy_support_digest() -> str:
+    """The original v1 builder's path+content support digest, recomputed locally.
+
+    This is the exact legacy algorithm from build_native_test.py: walk the
+    fixed support directories, hash every regular file, then fold each
+    repository-relative path and file SHA-256 in path order.  Only file
+    metadata and bytes are read; no builder, Cargo or compiler is imported or
+    invoked.
+    """
+    digest = hashlib.sha256()
+    for relative, file_sha256 in sorted(_legacy_support_files().items()):
+        digest.update(relative.encode() + b"\0")
+        digest.update(bytes.fromhex(file_sha256))
+    return digest.hexdigest()
+
+
+def _v1_support_evidence(payload: dict) -> str:
+    """Require a recorded v1 support digest that matches the full current closure.
+
+    A v1 receipt may also record the shared bound-input inventory.  When it
+    does, that inventory must cover every file in the historical support
+    closure (never an arbitrary subset) and agree with the recorded digest.
+    """
+    label = "legacy prebuilt receipt"
+    recorded = payload.get("lib_test_support_inputs_sha256")
+    if not isinstance(recorded, str) or re.fullmatch(r"[0-9a-f]{64}", recorded) is None:
+        raise RunnerError(
+            f"{label} does not record a lowercase 64-hex lib-test support digest")
+    current_files = _legacy_support_files()
+    current = _legacy_support_digest()
+    if recorded != current:
+        raise RunnerError(
+            f"{label} lib-test support digest does not match the current historical support closure")
+    inventory = payload.get("bound_input_inventory")
+    if inventory is not None:
+        if not isinstance(inventory, list):
+            raise RunnerError(f"{label} bound_input_inventory is not a list")
+        rows = [
+            entry for entry in inventory
+            if isinstance(entry, dict) and entry.get("role") == "test_support"
+        ]
+        recorded_paths = {entry.get("path") for entry in rows}
+        if recorded_paths != set(current_files):
+            raise RunnerError(
+                f"{label} support inventory does not cover the full historical support closure")
+        for entry in rows:
+            path = entry.get("path")
+            if entry.get("present") is not True or entry.get("sha256") != current_files[path]:
+                raise RunnerError(
+                    f"{label} support inventory entry {path} does not match the current closure")
+        if _support_digest(inventory) != recorded:
+            raise RunnerError(
+                f"{label} lib-test support digest does not match its bound inventory")
+    return recorded
+
+
 def _command_matches(command: object, expected: list[str], *, allow_jobs: bool) -> bool:
     """Match the exact producer argv, with an explicit trailing job budget."""
     if not isinstance(command, (list, tuple)):
@@ -713,9 +781,18 @@ def _v2_evidence(result: receipt.ValidatedReceipt) -> dict:
 
 
 def _v1_evidence(result: receipt.ValidatedReceipt) -> dict:
-    """Read the historical v1 fields exactly, without inventing freshness."""
+    """Read the historical v1 fields exactly, without inventing freshness.
+
+    The legacy path is accepted only when the receipt records a lib-test
+    support binding that still matches the complete current support closure.
+    Absent, malformed, partial or changed support evidence is refused before
+    any fixture exists.
+    """
     payload = result.payload
     label = "legacy prebuilt receipt"
+    kind = payload.get("kind")
+    if kind is not None and kind != "rust-library-test":
+        raise RunnerError(f"{label} kind is not rust-library-test compatible")
     if "profile_test" in payload and payload.get("profile_test") is not True:
         raise RunnerError(f"{label} profile_test is not true")
     if "cargo_lock_sha256" not in payload:
@@ -751,9 +828,10 @@ def _v1_evidence(result: receipt.ValidatedReceipt) -> dict:
         raise RunnerError(f"{label} source inputs changed during the original build")
     if "cargo_returncode" in payload and payload.get("cargo_returncode") != 0:
         raise RunnerError(f"{label} recorded a failed Cargo build")
+    support = _v1_support_evidence(payload)
     return {
         "receipt_schema": result.schema,
-        "kind": payload.get("kind", "rust-library-test"),
+        "kind": kind or "rust-library-test",
         "target": row["target"],
         "artifact_kind": row["kind"],
         "profile": "test",
@@ -767,7 +845,7 @@ def _v1_evidence(result: receipt.ValidatedReceipt) -> dict:
             else None),
         "relocated_artifact": payload.get("relocated_artifact"),
         "original_artifact_sha256": payload.get("original_artifact_sha256"),
-        "lib_test_support_inputs_sha256": payload.get("lib_test_support_inputs_sha256"),
+        "lib_test_support_inputs_sha256": support,
         "workspace_commit": result.workspace_commit,
         "source_inputs_sha256": result.source_inputs_sha256,
         "cargo_lock_sha256": payload.get("cargo_lock_sha256"),

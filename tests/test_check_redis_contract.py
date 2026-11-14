@@ -122,6 +122,20 @@ def _support_digest(entries):
     return digest.hexdigest()
 
 
+def _legacy_support_digest(root):
+    """Independent copy of the original v1 builder's support-closure digest."""
+    files = []
+    for directory in receipt.TEST_SUPPORT_DIRS:
+        path = Path(root) / directory
+        if path.is_dir():
+            files.extend(item for item in path.rglob("*") if item.is_file())
+    digest = hashlib.sha256()
+    for path in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
 class FakeFixture:
     secret = SECRET
     cid = "c" * 64
@@ -269,7 +283,9 @@ class PrebuiltReceiptTest(unittest.TestCase):
         receipt.atomic_write_json(self.receipt_path, payload)
         return payload
 
-    def v1_payload(self, *, include_fresh=True, fresh=False, mutate=None):
+    def v1_payload(
+        self, *, include_fresh=True, fresh=False, include_inventory=False, mutate=None,
+    ):
         source = receipt.source_digest(self.root)
         payload = {
             "kind": "rust-library-test",
@@ -280,6 +296,7 @@ class PrebuiltReceiptTest(unittest.TestCase):
             "cargo_lock_sha256": receipt.sha256_file(self.root / "Cargo.lock"),
             "source_inputs_sha256": source,
             "source_after_build_sha256": source,
+            "lib_test_support_inputs_sha256": _legacy_support_digest(self.root),
             "executable": str(self.original),
             "binary_sha256": receipt.sha256_file(self.relocated),
             "fresh": fresh,
@@ -289,6 +306,15 @@ class PrebuiltReceiptTest(unittest.TestCase):
                 "profile": {"test": True},
             },
         }
+        if include_inventory:
+            bound = receipt.capture_bound_inputs(self.root, environ={})
+            payload.update({
+                "source_inputs_sha256": bound["source_inputs_sha256"],
+                "cargo_lock_sha256": bound["cargo_lock_sha256"],
+                "config_digest": bound["config_digest"],
+                "bound_inputs": bound["bound_inputs"],
+                "bound_input_inventory": bound["bound_input_inventory"],
+            })
         if not include_fresh:
             payload.pop("fresh")
             payload["artifact"].pop("fresh", None)
@@ -441,6 +467,8 @@ class PrebuiltReceiptTest(unittest.TestCase):
         self.assertIs(False, evidence["fresh"])
         self.assertEqual("artifact.fresh", evidence["freshness_source"])
         self.assertEqual(gate.EXPECTED_V1_COMMAND, evidence["command"])
+        self.assertEqual(_legacy_support_digest(self.root),
+                         evidence["lib_test_support_inputs_sha256"])
         self.assertNotIn("clean_command", evidence)
         self.assertEqual(before, self.receipt_path.read_bytes())
         self.v1_payload(include_fresh=False)
@@ -448,8 +476,70 @@ class PrebuiltReceiptTest(unittest.TestCase):
         evidence = self.verify()
         self.assertEqual("v1", evidence["receipt_schema"])
         self.assertIsNone(evidence["fresh"])
+        self.assertEqual(_legacy_support_digest(self.root),
+                         evidence["lib_test_support_inputs_sha256"])
         self.assertEqual(before, self.receipt_path.read_bytes())
         self.assertNotIn("fresh", json.loads(before))
+
+    def test_v1_support_binding_is_required_and_must_match_the_closure(self):
+        digest = _legacy_support_digest(self.root)
+        tampered = {
+            "missing": lambda payload: payload.pop("lib_test_support_inputs_sha256"),
+            "uppercase": lambda payload: payload.update(
+                lib_test_support_inputs_sha256=digest.upper()),
+            "wrong": lambda payload: payload.update(
+                lib_test_support_inputs_sha256="0" * 64),
+            "non-hex": lambda payload: payload.update(
+                lib_test_support_inputs_sha256="not-a-support-digest"),
+        }
+        for name, mutate in tampered.items():
+            with self.subTest(name=name):
+                self.v1_payload(mutate=mutate)
+                self.assert_rejected("support")
+
+    def test_v1_changed_or_extended_support_inputs_are_rejected(self):
+        support = self.root / "tests" / "serving_support" / "support.rs"
+        original = support.read_text()
+        self.v1_payload()
+        support.write_text("pub fn changed() {}\n")
+        self.assert_rejected("support")
+        support.write_text(original)
+        self.v1_payload()
+        extra = support.with_name("extra.rs")
+        extra.write_text("pub fn extra() {}\n")
+        self.assert_rejected("support")
+        extra.unlink()
+        self.v1_payload()
+        (self.root / "tests" / "fixtures" / "data.txt").unlink()
+        self.assert_rejected("support")
+
+    def test_v1_top_level_kind_must_be_library_test_compatible(self):
+        self.v1_payload(mutate=lambda payload: payload.pop("kind"))
+        self.assertEqual("rust-library-test", self.verify()["kind"])
+        for kind in ("rust-integration-test", "bin", "test", "library-test"):
+            with self.subTest(kind=kind):
+                self.v1_payload(mutate=lambda payload, kind=kind: payload.update(kind=kind))
+                self.assert_rejected("kind")
+
+    def test_v1_bound_inventory_must_cover_the_full_support_closure(self):
+        self.v1_payload(include_inventory=True)
+        evidence = self.verify()
+        self.assertEqual(_legacy_support_digest(self.root),
+                         evidence["lib_test_support_inputs_sha256"])
+
+        def drop_support(payload):
+            entries = payload["bound_input_inventory"]
+            payload["bound_input_inventory"] = [
+                entry for entry in entries if entry["role"] != "test_support"]
+            blobs = {
+                entry["path"]: (self.root / entry["path"]).read_bytes()
+                for entry in payload["bound_input_inventory"] if entry["present"]
+            }
+            payload["bound_inputs"] = receipt.bound_inputs_summary(
+                payload["bound_input_inventory"], blobs)
+
+        self.v1_payload(include_inventory=True, mutate=drop_support)
+        self.assert_rejected("full historical support closure")
 
     def test_v1_feature_profile_kind_and_freshness_tampering_is_rejected(self):
         self.v1_payload(mutate=lambda payload: payload.update(fresh=True))
@@ -478,6 +568,49 @@ class PrebuiltReceiptTest(unittest.TestCase):
         self.assertIsNone(report["fixture"])
         self.assertEqual([], report["runs"])
         self.assertTrue((self.root / "report.json").is_file())
+
+    def test_v1_missing_support_fails_before_fixture_allocation(self):
+        self.v1_payload(mutate=lambda payload: payload.pop(
+            "lib_test_support_inputs_sha256"))
+        with mock.patch.object(
+                gate, "OwnedRedisFixture",
+                side_effect=AssertionError("fixture must not be allocated")):
+            status, report = gate.execute(
+                self.root / "report.json", self.root / "logs",
+                self.relocated, self.receipt_path)
+        self.assertEqual(1, status)
+        self.assertEqual("failed", report["status"])
+        self.assertIsNone(report["prebuilt"])
+        self.assertIsNone(report["fixture"])
+        self.assertEqual([], report["runs"])
+        self.assertTrue(any("support" in failure for failure in report["failures"]))
+
+    def test_execute_accepts_a_fully_bound_historical_v1(self):
+        self.v1_payload()
+        fixture = FakeFixture()
+
+        def fake_run_case(executable, label, arguments, environment, **kwargs):
+            counts = (6, 0, 0) if label in ("plain", "tls") else (
+                (0, 1, 0) if label == "untrusted-ca-refused" else (1, 0, 0))
+            return {
+                "name": label, "passed": counts[0], "failed": counts[1],
+                "ignored": counts[2], "cases": {}, "failed_cases": [],
+            }
+
+        with mock.patch.object(gate, "OwnedRedisFixture", return_value=fixture), \
+             mock.patch.object(gate, "run_case_set", side_effect=fake_run_case), \
+             mock.patch.object(gate, "run_command", side_effect=AssertionError("no cargo")):
+            status, report = gate.execute(
+                self.root / "report.json", self.root / "logs",
+                self.relocated, self.receipt_path)
+        self.assertEqual(0, status)
+        self.assertEqual("passed", report["status"])
+        self.assertEqual("v1", report["prebuilt"]["receipt_schema"])
+        self.assertEqual(
+            _legacy_support_digest(self.root),
+            report["prebuilt"]["lib_test_support_inputs_sha256"])
+        self.assertTrue(fixture.started)
+        self.assertTrue(fixture.stopped)
 
     def test_execute_records_exact_receipt_schema_hash_and_binary_identity(self):
         self.v2_payload(fresh=True)

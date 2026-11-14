@@ -32,23 +32,31 @@ flow and never uses an inherited Redis endpoint.
   proves the full id and every ownership label before removal; otherwise it
   keeps the private directory and reports cleanup unresolved.
 
-## Build and case contract
+## Prebuilt receipt and case contract
 
-The runner performs `cargo clean --package rootyard` and then one
-`cargo --config profile.dev.package.rootyard.debug=0 --config
-profile.test.package.rootyard.debug=0 --config
-profile.dev.package.rootyard.strip="debuginfo" --config
-profile.test.package.rootyard.strip="debuginfo" test --locked --lib --features
-state-redis --no-run --message-format=json-render-diagnostics`. Those config
-flags apply only to this test build; the default deployable library profile is
-unchanged. It requires a `Fresh=false`
-`profile.test` library artifact with an executable, requires the build to
-complete, records the actual command, `Cargo.lock` digest, source digest and
-rustc version, and verifies the source digest did not change.
+The runner consumes one explicit prebuilt `rootyard` lib-test executable and
+its adjacent v1/v2 receipt. It does not run `cargo clean`, a Cargo build, a
+compiler probe or any producer; invalid evidence is refused before the Redis
+fixture is allocated. A v2 receipt must select the `rust-library-test`,
+`profile.test` rootyard artifact with literal Cargo freshness (`true` or
+`false`), exactly the state-redis build command (allowing only a trailing
+`--jobs N`), the recorded command/features/profile, a support digest bound to
+its full inventory, and matching original and relocated executable hashes.
 
-It then runs the six ignored `real_redis_` cases with `--test-threads=1` over
-plaintext loopback and again over verified private-CA TLS, requiring exactly
-`6 passed; 0 failed; 0 ignored` in both runs. It next runs the exact
+The historical v1 path is accepted only when it actually records a lowercase
+64-hex `lib_test_support_inputs_sha256` that matches the complete current
+lib-test support closure recomputed with the original builder's file-only
+algorithm. A v1 receipt that also carries a bound inventory must cover every
+file in that closure rather than an arbitrary subset. Missing, malformed,
+partial or changed support evidence is refused, as is any present top-level
+`kind` other than `rust-library-test`; a weak historical receipt is reported
+as failed, never counted as a pass. The v1 command shape, artifact fields and
+absent freshness are read without rewriting the historical receipt.
+
+The runner then runs the six ignored `real_redis_` cases with
+`--test-threads=1` over plaintext loopback and again over verified private-CA
+TLS, requiring exactly `6 passed; 0 failed; 0 ignored` in both runs. It next
+runs the exact
 `cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read`
 case with an untrusted CA, requiring exactly one failure, then repeats that
 exact case with the owned CA, requiring one pass. A zero-test, skipped-test or
@@ -61,15 +69,18 @@ are redacted before writing.
 pinned Rust toolchain, native prerequisites used by the existing CI
 (OpenSSL/FUSE/pkg-config/CMake/Clang), Rust caching, an explicit
 `docker pull redis:7.2.6-alpine`, runner unit tests without Docker, all-target Clippy
-with `state-redis` and denied warnings, the owned fixture gate, and an
-always-uploaded report. The existing `.github/workflows/ci.yml` verify flow is
-not changed.
+with `state-redis` and denied warnings, the prebuilt build, the owned fixture
+gate, and an always-uploaded report. The existing
+`.github/workflows/ci.yml` verify flow is not changed.
 
-Local invocation (requires Docker, OpenSSL, Cargo and the official image):
+Local invocation (requires Docker, OpenSSL and the official image; the
+executable and receipt must already exist):
 
 ```sh
 docker pull redis:7.2.6-alpine
 python3 scripts/check_redis_contract.py \
+  --executable /path/to/rootyard-lib-test \
+  --build-receipt /path/to/rootyard-lib-test.build.json \
   --report test-results/state-redis/contract.json \
   --log-dir test-results/state-redis/logs
 ```
