@@ -15,13 +15,36 @@ pub(crate) async fn policy_repo_id(state:&AppState,owner:&str,name:&str)
         .ok_or_else(Error::not_found)?.get(0);
     Ok(repo)
 }
-pub(crate) async fn lock_policy_tx(tx:&deadpool_postgres::Transaction<'_>,repo:Uuid)
+/// One repository policy lock domain shared by every authority reader and
+/// writer. The prefix is part of the hashed key; do not introduce a second
+/// domain for the same repository policy.
+const POLICY_LOCK_DOMAIN:&str="rootyard-publication-v1:";
+const POLICY_LOCK_EXCLUSIVE:&str=
+    "SELECT pg_advisory_xact_lock(hashtextextended($1 || $2::uuid::text, 0))";
+const POLICY_LOCK_SHARED:&str=
+    "SELECT pg_advisory_xact_lock_shared(hashtextextended($1 || $2::uuid::text, 0))";
+
+async fn policy_lock_tx(tx:&deadpool_postgres::Transaction<'_>,repo:Uuid,sql:&str)
     ->Result<(),Error>{
     // The advisory lock and metadata write share one PostgreSQL transaction,
     // so a lost session cannot publish a policy change after dropping the gate.
-    tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended('rootyard-publication-v1:' || $1::uuid::text, 0))",
-        &[&repo]).await.map_err(Error::internal)?;
+    tx.query_one(sql,&[&POLICY_LOCK_DOMAIN,&repo]).await.map_err(Error::internal)?;
     Ok(())
+}
+
+/// Exclusive fence for trusted bind/revoke, webhook PATCH, claims, reports and
+/// other policy writers. Take it before any binding/webhook/run row lock.
+pub(crate) async fn lock_policy_tx(tx:&deadpool_postgres::Transaction<'_>,repo:Uuid)
+    ->Result<(),Error>{
+    policy_lock_tx(tx,repo,POLICY_LOCK_EXCLUSIVE).await
+}
+
+/// Shared fence for readers that must stay stable across several authority
+/// rows but never upgrade to a writer. The sandbox start gate uses it before
+/// `sandbox_jobs` and the `ci_runs`/binding/webhook row locks.
+pub(crate) async fn lock_policy_shared_tx(tx:&deadpool_postgres::Transaction<'_>,repo:Uuid)
+    ->Result<(),Error>{
+    policy_lock_tx(tx,repo,POLICY_LOCK_SHARED).await
 }
 
 /// Revoke bindings owned by one webhook and invalidate the run fencing that

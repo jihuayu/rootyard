@@ -135,15 +135,35 @@ fn leader_exited(pid: i32) -> std::io::Result<bool> {
 async fn open_start_gate(state: &AppState, job: Uuid, source: &Source, root: &Path) -> Result<(), Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    // Lock order: repository policy fence -> sandbox_jobs -> CI authority rows.
+    // Trusted bind/revoke/PATCH writers take the same fence exclusively before
+    // their binding/webhook/run row locks. A shared reader is enough here and
+    // never upgrades. No policy writer locks sandbox_jobs, so taking the fence
+    // before the job row cannot create a policy/job cycle. The immutable claim
+    // supplies the repository identity; authority is revalidated below after
+    // all rows are locked.
+    if let Source::Ci { claim, .. } = source {
+        crate::webhooks::trust::lock_policy_shared_tx(&tx, claim.repository_id).await?;
+    }
     let row = tx
         .query_opt(
-            "SELECT state FROM sandbox_jobs WHERE id=$1 AND host_id=$2 FOR UPDATE",
+            "SELECT state,ci_run_id,ci_attempt,ci_lease_generation FROM sandbox_jobs \
+             WHERE id=$1 AND host_id=$2 FOR UPDATE",
             &[&job, &state.storage.volume_id],
         )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     if row.get::<_, String>(0) != "running" {
+        return Err(Error::internal("sandbox cancelled before start"));
+    }
+    // The policy fence used the immutable claim repository. Revalidate the
+    // locked job's immutable CI identity before trusting that claim below.
+    if let Source::Ci { claim, .. } = source
+        && (row.get::<_, Option<Uuid>>(1) != Some(claim.run_id)
+            || row.get::<_, Option<i64>>(2) != Some(claim.attempt)
+            || row.get::<_, Option<i64>>(3) != Some(claim.lease_generation))
+    {
         return Err(Error::internal("sandbox cancelled before start"));
     }
     let authorized = match source {
@@ -854,7 +874,372 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::bwrap_supports_size;
+    use super::{Source, bwrap_supports_size, open_start_gate};
+    use crate::{
+        AppState,
+        ci_checkouts::{Plan, dependencies::Manifest},
+        config::Config,
+        db, dispatch, metrics,
+        storage::Storage,
+        webhooks::{claimed::ClaimedRun, trust::ContextInput},
+    };
+    use axum::{
+        Json,
+        extract::{Path, State},
+        http::{HeaderMap, HeaderValue, StatusCode, header},
+    };
+    use deadpool_postgres::{Manager, Pool};
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use tokio::time::Instant;
+    use uuid::Uuid;
+
+    const GATE_CONTEXT: &str = "ci/trusted";
+
+    struct BackendWait {
+        query: String,
+        wait_event_type: Option<String>,
+        wait_event: Option<String>,
+    }
+
+    fn app_state(pool: Pool, data_dir: PathBuf) -> AppState {
+        let config = Config {
+            database_url: String::new(),
+            data_dir,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            git: PathBuf::from("/usr/bin/git"),
+            max_request_bytes: 1024 * 1024,
+            max_output_bytes: 1024 * 1024,
+            max_concurrent_git: 1,
+            git_timeout: Duration::from_secs(10),
+            git_memory_bytes: 1024 * 1024 * 1024,
+            max_repo_bytes: 1024 * 1024,
+            max_pending_deliveries: 100,
+            outbox_worker: false,
+            metrics_bind: None,
+        };
+        let storage = Storage::open(&config).expect("test storage");
+        AppState {
+            mirror_primary: None,
+            dispatch: dispatch::Signals::default(),
+            config,
+            pool,
+            storage,
+            hooks: None,
+            transfer_metrics: Arc::new(metrics::TransferCounters::default()),
+            git_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    async fn wait_backend(
+        pool: &Pool,
+        application_name: &str,
+        patterns: &[&str],
+        deadline: Instant,
+    ) -> anyhow::Result<BackendWait> {
+        loop {
+            let found = {
+                let client = pool.get().await?;
+                let rows = client
+                    .query(
+                        "SELECT query,wait_event_type,wait_event FROM pg_stat_activity \
+                         WHERE application_name=$1 AND state='active' AND pid<>pg_backend_pid()",
+                        &[&application_name],
+                    )
+                    .await?;
+                rows.into_iter().find_map(|row| {
+                    let query: String = row.get(0);
+                    let wait_event_type: Option<String> = row.get(1);
+                    if patterns.iter().any(|pattern| query.contains(*pattern))
+                        && wait_event_type.as_deref() == Some("Lock")
+                    {
+                        Some(BackendWait { query, wait_event_type, wait_event: row.get(2) })
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some(found) = found {
+                return Ok(found);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("no backend reached the expected test barrier");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn join_timeout<T>(handle: &mut tokio::task::JoinHandle<T>, label: &str) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+    {
+        match tokio::time::timeout(Duration::from_secs(15), &mut *handle).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(anyhow::anyhow!("{label} task failed: {error}")),
+            Err(_) => {
+                handle.abort();
+                Err(anyhow::anyhow!("{label} timed out"))
+            }
+        }
+    }
+
+    /// PostgreSQL-only lock-order regression for the sandbox start gate.
+    ///
+    /// The real `open_start_gate` transaction and the real trusted-context
+    /// revoke path run concurrently. Revoke (like PATCH) first takes the
+    /// repository policy fence exclusively, then the binding `FOR UPDATE`, and
+    /// only afterwards updates `ci_runs`. The test makes that binding update
+    /// wait on a private advisory barrier, starts the gate while the writer is
+    /// paused, and releases the barrier.
+    ///
+    /// Before the fix the gate locked `sandbox_jobs`, then the authority rows
+    /// `FOR SHARE`; it could hold the run row and wait for the binding while the
+    /// writer held the binding and waited for the run. The old order deadlocks.
+    /// The fixed gate must be observed waiting on the shared policy advisory
+    /// lock instead. This case proves PostgreSQL authority lock ordering only:
+    /// it does not launch bubblewrap, an executor or a kernel process.
+    ///
+    /// Run with `ROOTYARD_TEST_DATABASE_URL=... cargo test --lib
+    /// start_gate_serializes_context_removal_under_policy_fence -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and PostgreSQL schema creation permission"]
+    async fn start_gate_serializes_context_removal_under_policy_fence() -> anyhow::Result<()> {
+        let Ok(base_url) = std::env::var("ROOTYARD_TEST_DATABASE_URL") else {
+            eprintln!("skipping: ROOTYARD_TEST_DATABASE_URL is not set");
+            return Ok(());
+        };
+        let admin = db::pool(&base_url)?;
+        let schema = format!("gate_lock_{}", Uuid::new_v4().simple());
+        admin.get().await?.batch_execute(&format!("CREATE SCHEMA \"{schema}\"")).await?;
+        let case = tokio::spawn(run_gate_lock_case(base_url, schema.clone())).await;
+        let cleanup = admin.get().await?.batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
+        let case = case.map_err(|error| anyhow::anyhow!("gate lock case panicked: {error}"))?;
+        cleanup?;
+        case
+    }
+
+    async fn run_gate_lock_case(base_url: String, schema: String) -> anyhow::Result<()> {
+        let mut config: tokio_postgres::Config = base_url.parse()?;
+        config.application_name(schema.as_str());
+        config.options(format!("-c search_path={schema} -c statement_timeout=30000 -c lock_timeout=15000"));
+        let pool = Pool::builder(Manager::new(config, tokio_postgres::NoTls))
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .max_size(16)
+            .build()?;
+        db::migrate(&pool).await?;
+
+        let storage = tempfile::tempdir()?;
+        let state = Arc::new(app_state(pool.clone(), storage.path().join("data")));
+        let job_root = storage.path().join("job");
+        std::fs::create_dir_all(job_root.join("control"))?;
+
+        let owner = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let hook_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let ci_job_id = Uuid::new_v4();
+        let sandbox_job_id = Uuid::new_v4();
+        let token = format!("ryt_{}", "ab".repeat(32));
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        let now: i64 = {
+            let client = pool.get().await?;
+            client.query_one("SELECT extract(epoch FROM clock_timestamp())::bigint", &[]).await?.get(0)
+        };
+        let expires = now + 3600;
+        let plan = Plan {
+            version: 1,
+            job_id: ci_job_id,
+            owner_id: owner,
+            repository_id: repo_id,
+            storage_generation: 1,
+            object_format: "sha1".into(),
+            target_oid: head.clone(),
+            source_receipt_sha256: "d".repeat(64),
+            mirror_audience: Uuid::new_v4(),
+            expires_unix: expires,
+            dependencies: Manifest { version: 1, ..Default::default() },
+        };
+        let plan_json = serde_json::to_value(&plan)?;
+        let client = pool.get().await?;
+        client.execute("INSERT INTO users(id,username) VALUES($1,'alice')", &[&owner]).await?;
+        client
+            .execute(
+                "INSERT INTO repositories(id,owner_id,name,state,storage_generation) \
+                 VALUES($1,$2,'gate','ready',1)",
+                &[&repo_id, &owner],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO tokens(id,user_id,digest,read_only) VALUES($1,$2,$3,false)",
+                &[&token_id, &owner, &db::digest(&token)],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO forge_pulls(tenant_id,repository_id,number,author_id,title,state, \
+                   head_ref,base_ref,head_oid,base_oid,version) \
+                 VALUES($1,$2,1,$1,'gate fixture','open','refs/heads/feature', \
+                   'refs/heads/main',$3,$4,1)",
+                &[&owner, &repo_id, &head, &base],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO forge_webhooks(id,tenant_id,repository_id,url,secret,secret_sha256, \
+                   events,ci_contexts,active) \
+                 VALUES($1,$2,$3,'http://127.0.0.1:1/hook','gate-secret-0123456789',$4, \
+                   '[\"pull_request\"]'::jsonb,$5::jsonb,true)",
+                &[&hook_id, &owner, &repo_id, &"c".repeat(64), &serde_json::json!([GATE_CONTEXT])],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO forge_trusted_check_contexts(tenant_id,repository_id,context,webhook_id,active) \
+                 VALUES($1,$2,$3,$4,true)",
+                &[&owner, &repo_id, &GATE_CONTEXT, &hook_id],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO ci_runs(id,tenant_id,repository_id,pull_number,pull_version,context, \
+                   job_id,head_oid,base_oid,storage_generation,config_sha256,state,attempt, \
+                   lease_generation,lease_expires_unix,runner_id,source_url) \
+                 VALUES($1,$2,$3,1,1,$4,$5,$6,$7,1,$8,'leased',1,1,$9,'runner','origin')",
+                &[&run_id, &owner, &repo_id, &GATE_CONTEXT, &ci_job_id, &head, &base, &"e".repeat(64), &expires],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO ci_integration_checkout_jobs(run_id,attempt,lease_generation, \
+                   repository_id,job_id,owner_id,issuer_webhook_id,plan,credential_digest,expires_unix) \
+                 VALUES($1,1,1,$2,$3,$4,$5,$6,$7,$8)",
+                &[&run_id, &repo_id, &ci_job_id, &owner, &hook_id, &plan_json, &vec![7u8; 32], &expires],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO sandbox_jobs(id,workspace_id,actor_id,host_id,state,argv, \
+                   timeout_seconds,lease_epoch,workspace_access,ci_run_id,ci_attempt, \
+                   ci_lease_generation,ci_hook_id,ci_runner_id,ci_head_oid,ci_storage_generation,terminal) \
+                 VALUES($1,NULL,NULL,$2,'running','[]'::jsonb,60,0,'private',$3,1,1,$4,'runner',$5,1,false)",
+                &[&sandbox_job_id, &state.storage.volume_id, &run_id, &hook_id, &head],
+            )
+            .await?;
+        drop(client);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}"))?);
+        // Hold this private barrier in the test session. The real revoke
+        // writer reaches the binding trigger after taking the policy fence and
+        // the binding row lock, then waits here before it can update ci_runs.
+        let barrier = format!("gate-lock-{schema}");
+        let barrier_client = pool.get().await?;
+        let held: bool =
+            barrier_client.query_one("SELECT pg_try_advisory_lock(hashtextextended($1,0))", &[&barrier]).await?.get(0);
+        anyhow::ensure!(held, "test barrier was not available");
+        pool.get()
+            .await?
+            .batch_execute(&format!(
+                "CREATE FUNCTION {schema}.gate_pause() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN PERFORM pg_advisory_xact_lock(hashtextextended('{barrier}',0)); RETURN NEW; END $$; \
+                 CREATE TRIGGER gate_pause AFTER UPDATE ON forge_trusted_check_contexts \
+                 FOR EACH ROW EXECUTE FUNCTION {schema}.gate_pause();"
+            ))
+            .await?;
+
+        let revoke_state = state.clone();
+        let mut revoke = tokio::spawn(async move {
+            crate::webhooks::trust::revoke(
+                State(revoke_state),
+                Path(("alice".to_owned(), "gate".to_owned(), hook_id)),
+                headers,
+                Json(ContextInput { context: GATE_CONTEXT.to_owned() }),
+            )
+            .await
+        });
+
+        let writer_wait = wait_backend(
+            &pool,
+            &schema,
+            &["UPDATE forge_trusted_check_contexts"],
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await?;
+        anyhow::ensure!(
+            writer_wait.wait_event_type.as_deref() == Some("Lock"),
+            "writer did not reach the binding barrier"
+        );
+
+        let gate_state = state.clone();
+        let gate_root = job_root.clone();
+        let claim = ClaimedRun {
+            run_id,
+            hook_id,
+            repository_id: repo_id,
+            tenant_id: owner,
+            head_oid: head.clone(),
+            storage_generation: 1,
+            attempt: 1,
+            lease_generation: 1,
+            runner_id: "runner".into(),
+            source: "origin".into(),
+            job_id: ci_job_id,
+            plan,
+        };
+        let mut gate = tokio::spawn(async move {
+            let source = Source::Ci { checkout: PathBuf::from("/unused-gate-checkout"), claim };
+            open_start_gate(&gate_state, sandbox_job_id, &source, &gate_root).await
+        });
+        let gate_wait = wait_backend(
+            &pool,
+            &schema,
+            &["pg_advisory_xact_lock_shared", "FROM ci_runs c"],
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        let observed_shared = gate_wait.as_ref().is_ok_and(|wait| wait.query.contains("pg_advisory_xact_lock_shared"));
+        let observed_event = gate_wait.as_ref().ok().and_then(|wait| wait.wait_event.clone());
+
+        let unlocked: bool =
+            barrier_client.query_one("SELECT pg_advisory_unlock(hashtextextended($1,0))", &[&barrier]).await?.get(0);
+        anyhow::ensure!(unlocked, "test barrier was not released");
+        drop(barrier_client);
+
+        let revoke = join_timeout(&mut revoke, "revoke").await?;
+        let gate = join_timeout(&mut gate, "gate").await?;
+        let gate_wait = gate_wait?;
+        anyhow::ensure!(observed_shared, "gate did not wait on the shared policy fence");
+        anyhow::ensure!(
+            observed_event.as_deref() == Some("advisory"),
+            "gate waited on the old authority row order: {:?}",
+            gate_wait.wait_event
+        );
+        let response = revoke.map_err(|error| anyhow::anyhow!("revoke returned HTTP {}", error.0))?;
+        anyhow::ensure!(response.status() == StatusCode::OK, "revoke returned {}", response.status());
+        let error = gate.err().ok_or_else(|| anyhow::anyhow!("gate unexpectedly authorized"))?;
+        anyhow::ensure!(
+            error.1 == "sandbox authority expired before start",
+            "gate returned a different refusal: {}",
+            error.1
+        );
+
+        let client = pool.get().await?;
+        let active: bool = client
+            .query_one(
+                "SELECT active FROM forge_trusted_check_contexts WHERE repository_id=$1 AND context=$2",
+                &[&repo_id, &GATE_CONTEXT],
+            )
+            .await?
+            .get(0);
+        let generation: i64 =
+            client.query_one("SELECT lease_generation FROM ci_runs WHERE id=$1", &[&run_id]).await?.get(0);
+        anyhow::ensure!(!active, "context removal did not deactivate the binding");
+        anyhow::ensure!(generation == 2, "context removal did not advance the run epoch");
+        anyhow::ensure!(!job_root.join("control/start").exists(), "failed gate wrote the start marker");
+        Ok(())
+    }
 
     /// The capability probe must fail closed for a binary that is missing or
     /// unusable instead of reporting a usable runtime.

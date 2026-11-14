@@ -531,6 +531,9 @@ pub(super) async fn still_active(state: &AppState, claim: &ClaimedRun, job: Uuid
         .map_err(Error::internal)?
         .is_some())
 }
+/// Check the bound authority rows. The caller must already hold the shared
+/// repository policy fence, acquired before the sandbox job lock and before
+/// these row locks; this function only takes the row locks themselves.
 pub(super) async fn gate_authorized(
     tx: &deadpool_postgres::Transaction<'_>,
     claim: &ClaimedRun,
