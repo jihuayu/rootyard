@@ -5,7 +5,7 @@
 Use 64-bit Linux, Git >= 2.43, Python 3, the `psql`, `pg_dump` and `pg_restore`
 clients and PostgreSQL 17.
 
-Two different Rust versions matter and are deliberately kept apart:
+Three tool identities matter and are deliberately kept apart:
 
 - **Minimum supported Rust (build floor): 1.88**, declared as
   `rust-version = "1.88"` in `Cargo.toml`. That is the lowest toolchain that can
@@ -13,30 +13,58 @@ Two different Rust versions matter and are deliberately kept apart:
   `src/storage`, `src/sharding` and `src/workspace_lab` (let-chains stabilize in
   1.88). Dependencies declare at most 1.85, so the crate floor governs. Verify
   the floor itself with `cargo +1.88.0 check --locked --lib`.
-- **Accepted gate toolchain: 1.99.1** (rustc 1.99.1, cargo 1.99.1, rustfmt
-  1.10.0-stable, clippy 0.1.99), pinned by `channel = "1.99.1"` in
-  `rust-toolchain.toml` and installed by the same numbered step in
-  `.github/workflows/ci.yml`. This is the "known good" version: the formatting,
-  lint and test gates below and the recorded acceptance evidence come from it.
-  A build with 1.88-1.99.0 is supported by the declared floor but is not the
-  gate version; pin 1.99.1 when reproducing gate results.
+- **Accepted gate compiler: 1.99.1** (rustc 1.99.1, rustfmt 1.10.0-stable,
+  clippy 0.1.99), pinned by `channel = "1.99.1"` in `rust-toolchain.toml` and
+  installed by the numbered rustup step in each formal Rust workflow. This is
+  the "known good" compiler: the formatting, lint and test gates below and the
+  recorded acceptance evidence come from it. A build with 1.88-1.99.0 is
+  supported by the declared floor but is not the gate version; pin 1.99.1 when
+  reproducing gate results.
+- **Accepted gate Cargo driver: CargoFork 1.101.0** at full commit
+  `64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b`, installed and selected by
+  `scripts/install_ci_cargo_fork.sh`. This is a Cargo executable, not a rustup
+  toolchain. Formal CI first installs rustup 1.99.1, then prepends the verified
+  fork and checks that `cargo -vV` reports `release: 1.101.0` and
+  `commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b` while `rustc -V`
+  remains `rustc 1.99.1`. The helper bootstraps only with rustup's own Cargo
+  (`rustup run 1.99.1 cargo install`), never with `rustup which cargo`, and it
+  reuses a valid cache/adopted install without `cargo clean`, `--force` or a
+  rebuild.
 
 `rust-toolchain.toml` pins `channel = "1.99.1"` with the `rustfmt` and `clippy`
-components, so a plain `cargo`/`rustfmt`/`cargo clippy` invocation inside this
-checkout resolves to the gate toolchain. Hosts must have that exact toolchain
+components, so a plain `rustfmt`/`rustc`/`cargo clippy` invocation inside this
+checkout resolves formatting, linting and compilation to the gate compiler even
+when the CargoFork is first on `PATH`. Hosts must have that exact toolchain
 installed (`rustup toolchain install 1.99.1 --profile minimal --component
 rustfmt --component clippy`); an offline or packaged host that cannot install it
 will fail the toolchain override loudly rather than silently building the gates
 with a different compiler. If you must use another installed toolchain, select
 it explicitly (for example `cargo +1.88.0 check --locked --lib`) and treat its
-formatting/lint output as advisory, not as the gate result. CI installs the same
-numbered toolchain before running the gates.
+formatting/lint output as advisory, not as the gate result.
+
+The formal Cargo driver is the fork. A `cargo` from rustup 1.99.1, or the
+explicit `cargo +1.99.1` form, is official Cargo and is useful for debugging or
+MSRV checks, but it is not the formal gate driver. Do not describe a local
+`cargo 1.99.1` run as a reproduction of the formal CargoFork gate.
+
+`scripts/install_ci_cargo_fork.sh` keys its executable cache by OS, architecture,
+full revision and the full commit of the bootstrap Cargo. It verifies the full
+`cargo -vV` release/commit/host and the binary SHA-256 against its recorded
+metadata, and records the resolved path, full version, revision and SHA. The
+fork keeps one shared compiler cache in `~/.cargo/targets` per runner/worktree;
+do not point `CARGO_TARGET_DIR` or `--target-dir` at a per-commit or per-worktree
+compiler tree, and do not clone a whole `target` directory per commit. Those
+settings only choose where final binaries and libraries are uplifted.
 
 ## Build and gate commands
 
 Commit `Cargo.lock` for reproducible dependency resolution. Containers use moving
 official image tags; deployments needing reproducible base images should pin
-reviewed image digests. Run the gates exactly as CI does:
+reviewed image digests. The formal Docker build stage uses the version-pinned
+`rust:1.99.1` image plus the same CargoFork helper, and the final runtime image
+copies only the binary (no compiler or Cargo cache). Run the gates exactly as
+CI does; in formal CI the `cargo` on `PATH` has already been verified as
+CargoFork 1.101.0/full `64a6ee6a` while `rustc` remains 1.99.1:
 
 ```sh
 cargo fmt --all -- --check
@@ -152,7 +180,7 @@ python3 tests/e2e.py --binary target/debug/rootyard --report test-results/e2e.js
 
 Add `--keep` to retain temporary storage for debugging; treat retained data as private. The JSON report can be retained as a verification artifact; CI uploads it even when a test step fails.
 
-The harness is the executable source of truth for covered cases. Review its output and the exact tested versions before describing compatibility or reliability. GitHub Actions runs formatting, linting, Rust tests and the Python harness inside an official Rust Debian 13 container against a PostgreSQL 17 service (on an Ubuntu runner). The job enables Docker's init reaper, matching Compose, so orphaned Git grandchildren are reaped after timeout cleanup. It installs PostgreSQL 17 client tools explicitly; an older `pg_dump` cannot dump a newer server.
+The harness is the executable source of truth for covered cases. Review its output and the exact tested versions before describing compatibility or reliability. GitHub Actions runs formatting, linting, Rust tests and the Python harness on the Ubuntu host against a PostgreSQL 17 service; the separate `container` job builds the deployable image in a `rust:1.99.1` build stage and copies only the compiled binary and runtime clients into the final image. The host job installs PostgreSQL 17 client tools explicitly; an older `pg_dump` cannot dump a newer server.
 
 Important acceptance areas include real client clone/commit/push/fetch, file modes and symlinks, ref updates and conflicts, protocol negotiation, atomic pushes, invalid authentication, owner isolation, malformed paths, read-only/revoked tokens, stream limits, interrupted operations, concurrency, restart survival and provisioning recovery. A checklist item is not proof it has been executed: report unsupported or untested cases explicitly.
 

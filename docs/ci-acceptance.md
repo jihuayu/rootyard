@@ -91,6 +91,53 @@ The `e2e-report` artifact includes `target/debug/rootyard.build.json`,
 and `test-results/*-evidence/*.jsonl`, so downloaded job manifests can be
 checked against the build receipt and batch manifest.
 
+## Pinned CargoFork in formal Rust jobs
+
+This section documents the tool-selection contract now present in the workflows;
+it does not record a hosted workflow run. Every formal Rust job installs rustup
+1.99.1 and then calls the shared `scripts/install_ci_cargo_fork.sh` before any
+`cargo fmt`, `cargo clippy`, `cargo test` or model build:
+
+* `ci.yml` (`verify`)
+* `refstore-protocol-acceptance.yml` (`native`)
+* `redis-contract.yml` (`redis-contract`)
+* `pando-lab.yml` (`isolated-lab`)
+* `refcas-log.yml` (`log-storage`)
+* `native-kernel-acceptance.yml` (`native-kernel-cgroup`)
+* `candidate-release-acceptance.yml` (`browser-native` and
+  `object-store-native`)
+
+The helper pins `jihuayu/cargo` at full revision
+`64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b` (Cargo 1.101.0). It bootstraps only
+with rustup 1.99.1's own Cargo (`rustup run 1.99.1 cargo install --git ...
+--rev ... --locked`), never with `rustup which cargo` and never by using the
+selected `cargo` on `PATH` as the bootstrap compiler. It reuses a valid cache
+entry keyed by OS, architecture, full revision and the bootstrap Cargo commit,
+or adopts a valid fork passed with `--reuse`; a valid entry is not cleaned,
+forced or rebuilt. Reuse re-verifies the full `cargo -vV` release/commit/host
+and the binary SHA-256 against the recorded metadata. The helper records the
+resolved path, full version, revision and SHA under
+`test-results/.../cargo-fork.json`.
+
+Each job then runs a separate pre-Cargo `verify --require-path` step. It requires
+the `cargo` on `PATH` to be the recorded fork, greps `cargo -vV` for
+`release: 1.101.0` and
+`commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b`, and requires
+`rustc -V` to remain `rustc 1.99.1`. If any check fails, no Cargo build or test
+runs.
+
+`actions/cache@v4` restores and saves only the fork executable. The fork keeps
+one shared compiler cache in `~/.cargo/targets` per runner/worktree; the
+workflows do not set a per-commit `CARGO_TARGET_DIR`, do not clone a whole
+`target` tree, and do not add a remote service or a new job. Explicit Rust
+checks stay separate from the prebuilt Python acceptance suites, and no Python
+harness invokes the install helper.
+
+The `CI` `container` job builds through `Dockerfile` with a pinned
+`rust:1.99.1` build stage and the same helper, then copies only
+`/build/target/release/rootyard` into `debian:trixie-slim`. The final runtime
+image contains no rustup, compiler or Cargo cache.
+
 ## 专项与完整 candidate 分层 (specialised suites vs. the complete gate)
 
 The existing GitHub Actions workflow layering and required checks are unchanged.
@@ -213,7 +260,9 @@ and every job asserts `git rev-parse HEAD` equals it before building.
   `object_store_postgres_server_version` / `object_store_postgres_client_version`
   so Debian container vs. Ubuntu PGDG client strings do not collide in
   `release-gate`, while `rust` stays shared); the `rust:1-trixie` container tag
-  and apt packages are mutable inputs, not immutable pins.
+  and apt packages are mutable base inputs, not immutable pins. The job still
+  installs rustup 1.99.1 and the pinned CargoFork before building, so the base
+  image's Cargo is never the formal driver.
 * `object-store-native` starts an ephemeral, job-owned Garage container pinned
   by tag and digest (`dxflrs/garage:v2.1.0@sha256:4c9b34c1...`) and runs:
   * `tests/lfs_hydration_concurrency.py` — concurrent cold hydration through the

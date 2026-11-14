@@ -1,9 +1,14 @@
 # Toolchain contract for local builds, `cargo fmt` and `cargo clippy`.
 #
-# `channel` pins the exact toolchain the recorded formatting/lint gates and the
-# acceptance evidence were produced with (rustc/cargo 1.99.1, rustfmt
-# 1.10.0-stable, clippy 0.1.99). CI installs the same numbered toolchain before
-# running the gates. Hosts that need bit-reproducible builds should mirror it.
+# `channel` pins the exact compiler, formatter and linter the recorded gates
+# used: rustc 1.99.1, rustfmt 1.10.0-stable and clippy 0.1.99. Formal CI still
+# installs this numbered toolchain before running the gates, then prepends the
+# separately pinned CargoFork (Cargo 1.101.0, full commit
+# 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b) with
+# `scripts/install_ci_cargo_fork.sh`. CargoFork is an executable, not a rustup
+# toolchain: `rustc -V` stays 1.99.1 and `cargo -vV` reports 1.101.0/full 64a6
+# only after the helper has selected the fork. Do not change `channel` to
+# 1.101.0 to emulate the Cargo driver; that would move the compiler too.
 #
 # This is *not* the minimum supported Rust version: `rust-version` in Cargo.toml
 # is 1.88 because the crate uses edition-2024 let-chains. See
