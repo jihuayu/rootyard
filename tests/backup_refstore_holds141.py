@@ -129,7 +129,8 @@ def candidate_receipt(path):
             return option
     raise AssertionError("no build receipt next to " + str(path) + " (expected " + str(path) + ".build.json)")
 
-def validate_holds_fixture_binary(helper, app_binary, helper_receipt=None, app_receipt=None):
+def validate_holds_fixture_binary(helper, app_binary, helper_receipt=None,
+                                  app_receipt=None, environ=None):
     """Bind the selected helper executable to its schema-appropriate build.
 
     A historical v1 receipt keeps the original ``package_rebuilt=True`` and
@@ -140,8 +141,11 @@ def validate_holds_fixture_binary(helper, app_binary, helper_receipt=None, app_r
     ``pando-lab`` flags and the batch link.  In both cases the candidate
     application receipt must bind its own binary; a v2 pair must also select the
     exact rootyard lib/bin rows and share the source, config, toolchain and
-    batch closure.  V2 freshness is the literal Cargo boolean, never a
-    fabricated ``fresh=False`` claim.
+    batch closure.  For v2, an explicit ``ROOTYARD_EXPECTED_SOURCE_COMMIT``
+    (else ``GITHUB_SHA``) is also passed to the shared reader for both
+    receipts, so a stale build fails closed; the v1 path keeps its historical
+    explicit-only behavior and no checkout-HEAD probe.  V2 freshness is the
+    literal Cargo boolean, never a fabricated ``fresh=False`` claim.
     """
     helper = Path(helper)
     assert helper.is_file(), "artifact-hold fixture binary is missing: " + str(helper)
@@ -157,6 +161,7 @@ def validate_holds_fixture_binary(helper, app_binary, helper_receipt=None, app_r
             helper_receipt=receipt_path,
             app_receipt=app_receipt_path,
             label="artifact-hold fixture",
+            environ=environ,
         )
     receipt = load_receipt(receipt_path, "artifact-hold fixture build receipt")
     actual = sha256_file(helper)
@@ -456,7 +461,8 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
         self.holds_helper = validate_holds_fixture_binary(
             self.args.holds_fixture_binary, self.args.binary,
             getattr(self.args, "holds_fixture_receipt", None),
-            getattr(self.args, "candidate_receipt", None))
+            getattr(self.args, "candidate_receipt", None),
+            environ=self.env)
         result = super().seed_core_fixture()
         marker = self.run_holds_fixture("seed")
         self.assert_binary_binding("seed")

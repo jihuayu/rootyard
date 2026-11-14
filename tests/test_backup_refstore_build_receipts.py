@@ -353,34 +353,146 @@ class RefStoreReceiptFixture(unittest.TestCase):
         receipt[binary_field] = digest(self.app_binary)
         return receipt
 
-    def validate_snapshot(self, helper_payload, app_payload, *, default_paths=False):
+    def validate_snapshot(self, helper_payload, app_payload, *, default_paths=False,
+                          environ=None):
         helper_receipt = self.write_receipt(
             Path(str(self.snapshot_output) + ".build.json") if default_paths
             else self.root / "receipts/snapshot.build.json", helper_payload)
         app_receipt = self.write_receipt(
             Path(str(self.app_output) + ".build.json") if default_paths
             else self.root / "receipts/application.build.json", app_payload)
+        selected_environ = {} if environ is None else environ
         if default_paths:
             return snapshot140.validate_snapshot_fixture_binary(
-                self.snapshot_output, self.app_output)
+                self.snapshot_output, self.app_output,
+                environ=selected_environ)
         return snapshot140.validate_snapshot_fixture_binary(
-            self.snapshot_output, self.app_output, helper_receipt, app_receipt)
+            self.snapshot_output, self.app_output, helper_receipt, app_receipt,
+            environ=selected_environ)
 
-    def validate_holds(self, helper_payload, app_payload, *, default_paths=False):
+    def validate_holds(self, helper_payload, app_payload, *, default_paths=False,
+                       environ=None):
         helper_receipt = self.write_receipt(
             Path(str(self.holds_output) + ".build.json") if default_paths
             else self.root / "receipts/holds.build.json", helper_payload)
         app_receipt = self.write_receipt(
             Path(str(self.app_output) + ".build.json") if default_paths
             else self.root / "receipts/holds-application.build.json", app_payload)
+        selected_environ = {} if environ is None else environ
         if default_paths:
             return holds141.validate_holds_fixture_binary(
-                self.holds_output, self.app_output)
+                self.holds_output, self.app_output,
+                environ=selected_environ)
         return holds141.validate_holds_fixture_binary(
-            self.holds_output, self.app_output, helper_receipt, app_receipt)
+            self.holds_output, self.app_output, helper_receipt, app_receipt,
+            environ=selected_environ)
 
 
-class Snapshot140ReceiptDispatchTest(RefStoreReceiptFixture):
+class ExpectedSourceCommitCases:
+    """The v2 expected-source-commit contract, exercised by both drills."""
+
+    def pair(self, *, v1=False):
+        raise NotImplementedError
+
+    def validate_pair(self, helper_payload, app_payload, environ):
+        raise NotImplementedError
+
+    def test_v2_explicit_expected_source_commit_matches(self):
+        report = self.validate_pair(
+            *self.pair(),
+            {"ROOTYARD_EXPECTED_SOURCE_COMMIT": self.commit})
+        self.assertEqual(report["expected_source_commit"], self.commit)
+        self.assertEqual(report["expected_source_commit_source"],
+                         "ROOTYARD_EXPECTED_SOURCE_COMMIT")
+        self.assertEqual(report["workspace_commit"], self.commit)
+
+    def test_v2_explicit_expected_source_commit_mismatch_fails(self):
+        with self.assertRaises(AssertionError):
+            self.validate_pair(
+                *self.pair(),
+                {"ROOTYARD_EXPECTED_SOURCE_COMMIT": "0" * 40})
+
+    def test_v2_diagnostic_zero_expected_commit_rejects_dd0_receipt(self):
+        helper, app = self.pair()
+        actual = "dd0b7788bf5ce7a590bb4c6ac953c2d95e3b06ce"
+        helper["workspace_commit"] = actual
+        app["workspace_commit"] = actual
+        with self.assertRaises(AssertionError):
+            self.validate_pair(
+                helper, app,
+                {"ROOTYARD_EXPECTED_SOURCE_COMMIT": "0" * 40})
+
+    def test_v2_github_sha_fallback_matches(self):
+        report = self.validate_pair(*self.pair(), {"GITHUB_SHA": self.commit})
+        self.assertEqual(report["expected_source_commit"], self.commit)
+        self.assertEqual(report["expected_source_commit_source"], "GITHUB_SHA")
+
+    def test_v2_github_sha_fallback_mismatch_fails(self):
+        with self.assertRaises(AssertionError):
+            self.validate_pair(*self.pair(), {"GITHUB_SHA": "0" * 40})
+
+    def test_v2_explicit_wins_over_github_sha(self):
+        report = self.validate_pair(
+            *self.pair(),
+            {"ROOTYARD_EXPECTED_SOURCE_COMMIT": self.commit,
+             "GITHUB_SHA": "0" * 40})
+        self.assertEqual(report["expected_source_commit"], self.commit)
+        self.assertEqual(report["expected_source_commit_source"],
+                         "ROOTYARD_EXPECTED_SOURCE_COMMIT")
+        with self.assertRaises(AssertionError):
+            self.validate_pair(
+                *self.pair(),
+                {"ROOTYARD_EXPECTED_SOURCE_COMMIT": "0" * 40,
+                 "GITHUB_SHA": self.commit})
+
+    def test_v2_empty_explicit_falls_back_to_github_sha(self):
+        report = self.validate_pair(
+            *self.pair(),
+            {"ROOTYARD_EXPECTED_SOURCE_COMMIT": "", "GITHUB_SHA": self.commit})
+        self.assertEqual(report["expected_source_commit"], self.commit)
+        self.assertEqual(report["expected_source_commit_source"], "GITHUB_SHA")
+
+    def test_v2_invalid_expected_source_commit_fails_closed(self):
+        for environ in (
+                {"ROOTYARD_EXPECTED_SOURCE_COMMIT": "not-a-commit"},
+                {"ROOTYARD_EXPECTED_SOURCE_COMMIT": "0" * 39},
+                {"ROOTYARD_EXPECTED_SOURCE_COMMIT": " "},
+                {"GITHUB_SHA": "not-a-commit"}):
+            with self.subTest(environ=environ), self.assertRaises(AssertionError):
+                self.validate_pair(*self.pair(), environ)
+
+    def test_v2_no_expected_source_commit_reports_none(self):
+        report = self.validate_pair(*self.pair(), {})
+        self.assertIsNone(report["expected_source_commit"])
+        self.assertIsNone(report["expected_source_commit_source"])
+
+    def test_v2_expected_commit_anchors_application_too(self):
+        helper, app = self.pair()
+        app["workspace_commit"] = "f" * 40
+        with self.assertRaises(AssertionError):
+            self.validate_pair(
+                helper, app,
+                {"ROOTYARD_EXPECTED_SOURCE_COMMIT": self.commit})
+
+    def test_v1_ignores_expected_source_commit_environment(self):
+        report = self.validate_pair(
+            *self.pair(v1=True),
+            {"ROOTYARD_EXPECTED_SOURCE_COMMIT": "0" * 40,
+             "GITHUB_SHA": "0" * 40})
+        self.assertNotIn("expected_source_commit", report)
+        self.assertNotIn("expected_source_commit_source", report)
+        self.assertEqual(report["package_rebuilt"], True)
+
+
+class Snapshot140ReceiptDispatchTest(ExpectedSourceCommitCases, RefStoreReceiptFixture):
+    def pair(self, *, v1=False):
+        if v1:
+            return self.v1_helper_receipt(), self.v1_app_receipt()
+        return self.helper_receipt(), self.app_receipt()
+
+    def validate_pair(self, helper_payload, app_payload, environ):
+        return self.validate_snapshot(helper_payload, app_payload, environ=environ)
+
     def test_v1_pair_preserves_legacy_report_fields(self):
         report = self.validate_snapshot(
             self.v1_helper_receipt(), self.v1_app_receipt())
@@ -595,7 +707,16 @@ class Snapshot140ReceiptDispatchTest(RefStoreReceiptFixture):
         self.assertEqual(report["receipt_schema"], binding.RECEIPT_SCHEMA_V2)
 
 
-class Holds141ReceiptDispatchTest(RefStoreReceiptFixture):
+class Holds141ReceiptDispatchTest(ExpectedSourceCommitCases, RefStoreReceiptFixture):
+    def pair(self, *, v1=False):
+        if v1:
+            return (self.v1_helper_receipt(target=HOLDS_TARGET),
+                    self.v1_app_receipt())
+        return self.helper_receipt(target=HOLDS_TARGET), self.app_receipt()
+
+    def validate_pair(self, helper_payload, app_payload, environ):
+        return self.validate_holds(helper_payload, app_payload, environ=environ)
+
     def assert_holds_rejects(self, helper_payload, app_payload):
         with self.assertRaises(AssertionError):
             self.validate_holds(helper_payload, app_payload)

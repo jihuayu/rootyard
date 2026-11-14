@@ -173,7 +173,8 @@ def candidate_receipt(path):
     raise AssertionError("no build receipt next to " + str(path) + " (expected " + str(path) + ".build.json)")
 
 
-def validate_snapshot_fixture_binary(helper, app_binary, helper_receipt=None, app_receipt=None):
+def validate_snapshot_fixture_binary(helper, app_binary, helper_receipt=None,
+                                     app_receipt=None, environ=None):
     """Bind the helper executable to its schema-appropriate real build receipt.
 
     A v1 receipt keeps the historical requirements: the real builder compiled the
@@ -185,8 +186,12 @@ def validate_snapshot_fixture_binary(helper, app_binary, helper_receipt=None, ap
     the test profile, the ``pando-lab`` flags and the batch link.  In both cases
     the candidate application binary must match its own real build receipt; a v2
     pair must also select the exact rootyard lib/bin rows and share the same
-    source, config, toolchain and batch closure.  V2 freshness is the literal
-    Cargo boolean (true or false), never a fabricated ``fresh=False`` claim.
+    source, config, toolchain and batch closure.  For v2, an explicit
+    ``ROOTYARD_EXPECTED_SOURCE_COMMIT`` (else ``GITHUB_SHA``) is also passed to
+    the shared reader for both receipts, so a stale build fails closed; the v1
+    path keeps its historical explicit-only behavior and no checkout-HEAD
+    probe.  V2 freshness is the literal Cargo boolean (true or false), never a
+    fabricated ``fresh=False`` claim.
     """
     helper = Path(helper)
     assert helper.is_file(), "snapshot fixture binary is missing: " + str(helper)
@@ -202,6 +207,7 @@ def validate_snapshot_fixture_binary(helper, app_binary, helper_receipt=None, ap
             helper_receipt=receipt_path,
             app_receipt=app_receipt_path,
             label="snapshot fixture",
+            environ=environ,
         )
     receipt = load_receipt(receipt_path, "snapshot fixture build receipt")
     actual = sha256_file(helper)
@@ -454,7 +460,8 @@ class BackupRefStoreSnapshot140Harness(BackupRefStoreCore139Harness):
         self.snapshot_helper = validate_snapshot_fixture_binary(
             self.args.snapshot_fixture_binary, self.args.binary,
             getattr(self.args, "snapshot_fixture_receipt", None),
-            getattr(self.args, "candidate_receipt", None))
+            getattr(self.args, "candidate_receipt", None),
+            environ=self.env)
         result = super().seed_core_fixture()
         repository = uuid_literal(self.core_repo["id"])
         marker = self.run_snapshot_fixture("seed")

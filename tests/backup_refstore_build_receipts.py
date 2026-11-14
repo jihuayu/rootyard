@@ -36,6 +36,7 @@ source/config/toolchain closure is still enforced.
 from pathlib import Path
 import hashlib
 import json
+import os
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,10 +109,29 @@ def receipt_pair_schema(helper_receipt, app_receipt, label):
     return helper_schema
 
 
-def _load_v2(path, binary, label):
+def expected_source_commit(environ=None):
+    """Return the v2 expected source commit and its honest source label.
+
+    Mirrors the collaborator transport contract: an explicit nonempty
+    ``ROOTYARD_EXPECTED_SOURCE_COMMIT`` wins, otherwise a present ``GITHUB_SHA``
+    is the fallback.  An empty explicit value is treated as absent; a malformed
+    nonempty value is passed to the reader so it fails closed.
+    """
+    environ = os.environ if environ is None else environ
+    explicit = environ.get("ROOTYARD_EXPECTED_SOURCE_COMMIT")
+    fallback = environ.get("GITHUB_SHA")
+    if explicit:
+        return explicit, "ROOTYARD_EXPECTED_SOURCE_COMMIT"
+    if fallback:
+        return fallback, "GITHUB_SHA"
+    return None, None
+
+
+def _load_v2(path, binary, label, expected_commit=None):
     try:
         return native_receipts.load_receipt(
-            path, binary_path=binary, forbid_implicit_build=True)
+            path, binary_path=binary, expected_commit=expected_commit,
+            forbid_implicit_build=True)
     except native_receipts.ReceiptError as error:
         raise AssertionError(label + " v2 build receipt is invalid: " + str(error)) from error
 
@@ -163,7 +183,8 @@ def _same_toolchain(helper, application, label):
 
 
 def validate_v2_pair(*, helper, app_binary, helper_target, helper_source,
-                     helper_source_relative, helper_receipt, app_receipt, label):
+                     helper_source_relative, helper_receipt, app_receipt, label,
+                     environ=None):
     """Validate one v2 helper/application pair through the shared pure reader."""
     helper = Path(helper)
     app_binary = Path(app_binary)
@@ -174,8 +195,12 @@ def validate_v2_pair(*, helper, app_binary, helper_target, helper_source,
     _require(app_binary.is_file(), "candidate application binary is missing: " + str(app_binary))
     _require(helper_source.is_file(), "helper source is missing: " + str(helper_source))
 
-    helper_valid = _load_v2(helper_receipt, helper, label)
-    app_valid = _load_v2(app_receipt, app_binary, "candidate application")
+    expected_commit, expected_source = expected_source_commit(environ)
+    helper_valid = _load_v2(
+        helper_receipt, helper, label, expected_commit=expected_commit)
+    app_valid = _load_v2(
+        app_receipt, app_binary, "candidate application",
+        expected_commit=expected_commit)
     helper_payload = helper_valid.payload
     app_payload = app_valid.payload
     _require(helper_valid.schema == "v2", label + " helper receipt is not v2")
@@ -324,6 +349,8 @@ def validate_v2_pair(*, helper, app_binary, helper_target, helper_source,
         "integration_test_source_matches_source_file": True,
         "source_inputs_sha256": helper_valid.source_inputs_sha256,
         "workspace_commit": helper_valid.workspace_commit,
+        "expected_source_commit": expected_commit,
+        "expected_source_commit_source": expected_source,
         "bound_inputs_sha256": helper_payload["bound_inputs"]["digest"],
         "cargo_lock_sha256": helper_payload["cargo_lock_sha256"],
         "config_digest": helper_valid.config_digest,
