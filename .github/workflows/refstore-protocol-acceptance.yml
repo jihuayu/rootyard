@@ -88,6 +88,27 @@ jobs:
         run: |
           rustup toolchain install 1.99.1 --profile minimal
           rustup default 1.99.1
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/refstore/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
       - name: Start the job-owned Garage S3 fixture
         timeout-minutes: 12
         run: |

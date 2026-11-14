@@ -35,6 +35,27 @@ jobs:
         with:
           key: state-redis-contract
           workspaces: ". -> target"
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/state-redis/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
       - name: Pull the official Redis 7.2.6 image
         run: docker pull redis:7.2.6-alpine
       - name: Unit-test the contract runner without Docker
@@ -66,6 +87,7 @@ jobs:
         with:
           name: redis-contract-report
           path: |
+            test-results/state-redis/cargo-fork.json
             test-results/state-redis/contract.json
             test-results/state-redis/logs/*.log
             test-results/state-redis/rootyard-lib-test.build.json
