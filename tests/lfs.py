@@ -576,10 +576,11 @@ class LfsHarness(Harness):
             "lfs", "locks", "--verify", "--json", cwd=self.work, token=self.alice
         )
         cli_json = json.loads(cli_json_result.stdout)
+        assert set(cli_json) == {"ours", "theirs"}, cli_json
+        assert cli_json["theirs"] == [], cli_json
         assert {lock["id"] for lock in cli_json["ours"]} == {
             design_id, source_lock["id"]
         }, cli_json
-        assert cli_json.get("theirs", []) == [], cli_json
         assert {lock["path"] for lock in cli_json["ours"]} == {
             "docs/design.bin", cross_path
         }, cli_json

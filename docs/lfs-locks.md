@@ -66,9 +66,13 @@ or filesystem lock:
   the changed paths. It derives paths from commits not already reachable from a
   ref and from the old-tip-to-new-tip diff, so an earlier commit hidden in a new
   branch is not missed.
-- Publishing a changed path locked by another user fails with `409`; the lock
-  owner may publish it. History and path scans are bounded and fail closed if
-  they cannot be completed.
+- When a push would publish a changed path locked by another user, the native
+  receive-pack/ref-publication check rejects that ref update. Stock Git reports
+  the pushed ref as rejected and exits nonzero; this is a Git ref rejection, not
+  an HTTP `409` response from the Git transport. The lock API's `409` remains the
+  create-conflict response for a path already locked. The lock owner may publish
+  the path. History and path scans are bounded and fail closed if they cannot be
+  completed.
 - An `admin` does not get an implicit push bypass while another user's lock
   exists. An authorized force-unlock removes the lock, records the audit event,
   and then the normal ref authorization applies. Force unlock does not revert
