@@ -29,12 +29,17 @@ webhook has no persisted creator-token binding in this schema, so an API-token
 revocation is not represented as revoking the webhook's independent secret.
 This harness does not claim that unsupported binding.
 
-Concurrency coverage: the merge/revocation case uses a fixture-held binding row
-and waits on the real policy advisory lock, scheduling revocation first and
-proving merge waits and then refuses. The claim/heartbeat and post-Git callback
-rechecks do not install a pause inside checkout preparation or Git verification,
-so only their end-state refusals, not a specific overlapping interleaving, are
-claimed by this harness.
+Concurrency coverage: the merge/revocation case uses a fixture-held binding row.
+It identifies the real revoke backend by the exact policy advisory key plus the
+fixture row-lock blocker, and the publication owner by the exact base-ref
+advisory key in ``pg_locks``. It proves the publication owner repeatedly
+advances ``query_start`` through the nonblocking enter-window statements on the
+same backend, without waiting on a lock, while the revoker still owns the shared
+policy fence. Revocation is scheduled first; the case then requires revoke 200,
+merge 409 with the exact policy error, and unchanged PR state. The
+claim/heartbeat and post-Git callback rechecks do not install a pause inside
+checkout preparation or Git verification, so only their end-state refusals, not
+a specific overlapping interleaving, are claimed by this harness.
 
 Required environment (same as the other native CI harnesses):
 ROOTYARD_TEST_DATABASE_URL, a trusted Git executable, and a Linux PostgreSQL 17
@@ -596,22 +601,151 @@ class TrustBoundaryHarness(WebhooksHarness):
             assert row["ci_run_id"] == run["id"], row
             assert row["ci_base_oid"] == self.base_oids[repo], row
 
-    def wait_for_backend_lock(self, marker, deadline=10.0):
+    def policy_advisory_key(self, repo_id):
+        """The exact repository policy key shared with PublicationWindow."""
+        return (
+            "hashtextextended('rootyard-publication-v1:' || "
+            f"{self.q(repo_id)}::uuid::text, 0)"
+        )
+
+    def ref_advisory_key(self, repo_id, ref_name):
+        """The exact ref key PublicationGuard acquires before enter_window."""
+        return (
+            "hashtextextended('rootyard-ref-v1:' || "
+            f"{self.q(repo_id)}::uuid::text || ':' || {self.q(ref_name)}, 0)"
+        )
+
+    def wait_for_policy_revoker(self, repo_id, fixture_pid, deadline=10.0):
+        """Identify the revoke backend by its exact policy key and blocker.
+
+        The backend must hold the same repository advisory domain as
+        PublicationWindow and be waiting on the fixture-held binding row
+        (``pg_blocking_pids`` names the fixture backend). This uses no query
+        text and excludes the observer's own backend.
+        """
+        key = self.policy_advisory_key(repo_id)
         stop = time.monotonic() + deadline
         while time.monotonic() < stop:
-            count = int(
-                self.sql(
-                    "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE datname=current_database() AND state='active' "
-                    f"AND application_name={self.q(self.schema)} "
-                    f"AND query LIKE {self.q('%' + marker + '%')} "
-                    "AND wait_event_type='Lock'"
+            pid = self.sql(
+                "SELECT a.pid::text FROM pg_locks l "
+                "JOIN pg_stat_activity a ON a.pid=l.pid "
+                "JOIN pg_database d ON d.oid=l.database "
+                "WHERE l.locktype='advisory' AND l.granted "
+                "AND l.objsubid=1 AND l.mode='ExclusiveLock' "
+                "AND d.datname=current_database() "
+                f"AND a.application_name={self.q(self.schema)} "
+                "AND a.pid<>pg_backend_pid() "
+                "AND a.wait_event_type='Lock' "
+                f"AND {int(fixture_pid)} = ANY(pg_blocking_pids(a.pid)) "
+                f"AND l.classid=((({key})::bigint >> 32) & 4294967295)::oid "
+                f"AND l.objid=((({key})::bigint) & 4294967295)::oid "
+                "LIMIT 1"
+            ).strip()
+            if pid:
+                return int(pid)
+            time.sleep(0.02)
+        raise AssertionError(
+            "real revoke backend never held the repository policy advisory key "
+            "while blocked by the fixture-held binding row"
+        )
+
+    def observe_publication_owner_retry(self, repo_id, base_ref, revoker_pid, deadline=1.5):
+        """Observe the real publication owner retrying the nonblocking fence.
+
+        The owner is identified only by the granted exact-ref advisory key.
+        While the revoker still holds the exact repository policy key, the same
+        owner backend must advance query_start through repeated enter-window
+        statements and must not wait on a lock. The observer excludes its own
+        backend and never acquires either advisory key.
+        """
+        ref_key = self.ref_advisory_key(repo_id, base_ref)
+        policy_key = self.policy_advisory_key(repo_id)
+        stop = time.monotonic() + deadline
+        owner_pid = None
+        backend_start = None
+        starts = []
+        while time.monotonic() < stop:
+            row = self.sql(
+                "WITH policy_lock AS ("
+                "SELECT l.pid FROM pg_locks l JOIN pg_database d ON d.oid=l.database "
+                "WHERE l.locktype='advisory' AND l.granted AND l.objsubid=1 "
+                "AND l.mode='ExclusiveLock' AND d.datname=current_database() "
+                f"AND l.classid=((({policy_key})::bigint >> 32) & 4294967295)::oid "
+                f"AND l.objid=((({policy_key})::bigint) & 4294967295)::oid"
+                "), ref_lock AS ("
+                "SELECT l.pid FROM pg_locks l JOIN pg_database d ON d.oid=l.database "
+                "WHERE l.locktype='advisory' AND l.granted AND l.objsubid=1 "
+                "AND l.mode='ExclusiveLock' AND d.datname=current_database() "
+                f"AND l.classid=((({ref_key})::bigint >> 32) & 4294967295)::oid "
+                f"AND l.objid=((({ref_key})::bigint) & 4294967295)::oid"
+                ") SELECT policy_lock.pid::text || '|' || ref_lock.pid::text || '|' || "
+                "a.pid::text || '|' || extract(epoch FROM a.backend_start)::text || '|' || "
+                "a.state || '|' || coalesce(a.wait_event_type,'') || '|' || "
+                "extract(epoch FROM a.query_start)::text || '|' || "
+                "CASE "
+                "WHEN a.query LIKE '%pg_try_advisory_xact_lock%' "
+                "AND a.query LIKE '%rootyard-publication-v1:%' THEN 'try' "
+                "WHEN a.query LIKE 'SELECT storage_generation,state,transition_state "
+                "FROM repositories WHERE id=$1%' THEN 'row' "
+                "ELSE 'other' END "
+                "FROM policy_lock CROSS JOIN ref_lock "
+                "JOIN pg_stat_activity a ON a.pid=ref_lock.pid "
+                "WHERE policy_lock.pid<>ref_lock.pid AND policy_lock.pid<>pg_backend_pid() "
+                "AND ref_lock.pid<>pg_backend_pid() "
+                f"AND a.application_name={self.q(self.schema)} "
+                "LIMIT 1"
+            ).strip()
+            if row:
+                fields = row.split("|")
+                assert len(fields) == 8, (len(fields), fields)
+                (
+                    policy_pid,
+                    ref_pid,
+                    observed_pid,
+                    observed_start,
+                    state,
+                    wait_event,
+                    query_start,
+                    shape,
+                ) = fields
+                assert int(policy_pid) == revoker_pid, (
+                    "policy fence changed backend during merge observation",
+                    int(policy_pid),
+                    revoker_pid,
                 )
-            )
-            if count >= 1:
-                return
-            time.sleep(0.05)
-        raise AssertionError(f"no backend reached the {marker!r} lock barrier")
+                assert int(ref_pid) == int(observed_pid)
+                assert int(observed_pid) != revoker_pid
+                if owner_pid is None:
+                    owner_pid = int(observed_pid)
+                    backend_start = float(observed_start)
+                else:
+                    assert int(observed_pid) == owner_pid, (observed_pid, owner_pid)
+                    assert float(observed_start) == backend_start, (
+                        observed_start,
+                        backend_start,
+                    )
+                if shape in ("try", "row"):
+                    assert state in ("active", "idle in transaction"), (state, shape)
+                    assert wait_event != "Lock", (state, wait_event, shape)
+                    started = float(query_start)
+                    if not starts or started > starts[-1]:
+                        starts.append(started)
+            if len(starts) >= 4:
+                break
+            time.sleep(0.01)
+        assert owner_pid is not None, (
+            "publication owner never held the exact base-ref advisory key"
+        )
+        assert len(starts) >= 4, (len(starts), starts)
+        gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+        assert starts[-1] - starts[0] >= 0.04, starts
+        assert max(gaps) <= 0.75, gaps
+        return {
+            "owner_pid": owner_pid,
+            "revoker_pid": revoker_pid,
+            "samples": len(starts),
+            "span_seconds": starts[-1] - starts[0],
+        }
 
     def revocation_blocks_merge(self):
         hook = self.issuers[("forge", "ci/trusted")]
@@ -640,19 +774,32 @@ class TrustBoundaryHarness(WebhooksHarness):
             )
 
         # Hold the binding row so the real revoke request acquires the policy
-        # fence, then waits on the row. A concurrent merge must wait on that
-        # fence rather than evaluating the still-visible active binding.
+        # fence, then waits on the row. Identify that backend by the exact
+        # advisory key, start the merge, and prove the real publication owner is
+        # retrying the nonblocking repository fence while the revoker still owns
+        # it. Release promptly so the revoke stays inside its existing SQL
+        # lock_timeout and commits 200 rather than timing out.
         with self.held_transaction(
             "SELECT 1 FROM forge_trusted_check_contexts "
             f"WHERE repository_id={self.q(repo_id)} "
             "AND context='ci/trusted' FOR UPDATE"
-        ):
+        ) as fixture:
+            fixture.stdin.write("SELECT 'fixture_pid|' || pg_backend_pid();\n")
+            fixture.stdin.flush()
+            fixture_line = fixture.stdout.readline().strip()
+            assert fixture_line.startswith("fixture_pid|"), fixture_line
+            fixture_pid = int(fixture_line.split("|", 1)[1])
             revoker = threading.Thread(target=revoke)
             revoker.start()
-            self.wait_for_backend_lock("UPDATE forge_trusted_check_contexts")
+            revoker_pid = self.wait_for_policy_revoker(repo_id, fixture_pid)
             merger = threading.Thread(target=merge)
             merger.start()
-            self.wait_for_backend_lock("pg_advisory_xact_lock")
+            self.observe_publication_owner_retry(
+                repo_id, pr["base_ref"], revoker_pid
+            )
+            assert merger.is_alive(), (
+                "merge finished before publication-owner contention was observed"
+            )
         revoker.join(timeout=15)
         merger.join(timeout=15)
         assert not revoker.is_alive(), "revocation did not finish"
