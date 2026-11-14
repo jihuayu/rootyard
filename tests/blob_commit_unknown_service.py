@@ -14,12 +14,17 @@ held only by this harness. The service therefore issues the real final COMMIT
 and waits past its own 30-second verifier deadline while the outer 60-second
 request budget is still open. The wire response must be the typed unknown 503
 with the operation id and no Git report. The unchanged/pending ledger is
-asserted while the lock is still held. Releasing the lock lets the same
-server-side COMMIT settle; the authenticated GET operations route then resolves
-the same id. If settlement leaves a durable pending operation, the exact same
-operation id and wire body are retried once and the final GET must be committed;
-a permanent pending result fails the case. Exact persisted ref, gate, event,
-terminal and pack rows are snapshotted rather than counted.
+asserted while the lock is still held. The fixture then terminates the
+still-blocked COMMIT backend when present and releases its lock, so the original
+final transaction is durably aborted and the registered operation remains
+pending. This fixture resolves the pending operation only through the explicit
+authorized POST .../cancel route; it never retries the same operation id
+expecting an automatic recommit. A separate real committed operation proves the
+commit-wins branch: Cancel must return that exact old terminal. The fixture
+snapshots exact refs,
+gate identity, events, terminal and pack rows rather than counting them, and
+covers unknown/cross-repository/no-A3/non-admin/read-only/invalid-auth refusals
+without creating a ready repository through SQL.
 
 By default the same native process also re-runs the existing exact receive
 replay/digest-conflict and transient-read cleanup cases from
@@ -48,10 +53,15 @@ COMMIT_CASE = "receive_pack_commit_unknown_resolves_exact"
 EXACT_REPLAY_CASE = "exact_receive_post_replays_before_native_without_second_effect"
 TRANSIENT_READ_CASE = "registered_read_cycles_do_not_exhaust_retained_snapshot_quota"
 CASES = (COMMIT_CASE, EXACT_REPLAY_CASE, TRANSIENT_READ_CASE)
-LIMITATIONS = list(blob.LIMITATIONS) + [
+LIMITATIONS = [item for item in blob.LIMITATIONS
+               if not item.startswith("No SQL row creates a ready repository")] + [
     "The COMMIT ambiguity is fixture-owned PostgreSQL deferred-trigger/advisory-lock timing, not a kernel or power-loss claim.",
     "The harness waits for the service's own verifier deadline; it does not inject a product success or override the wire verdict.",
-    "A settled pending GET is not resolved acceptance; the case retries the exact same operation id and wire body and fails unless the final GET is committed with exactly one ref/gate/event/pack effect.",
+    "A settled pending operation is not resolved by an automatic same-ID recommit. It is resolved only by the explicit authorized Cancel route; a same-wire receive replay after that Cancel must return the stable cancellation report, and a fresh operation ID is required for a later publication.",
+    "The cancel-wins path terminates only the fixture-blocked COMMIT backend when it is still present, then releases the deferred trigger and waits for every COMMIT statement to finish before calling Cancel. The original COMMIT is durably aborted; this is a serialized abort-then-cancel sequence, not an overlapping cancel/commit race and not power-loss evidence.",
+    "The commit-wins path is exercised by a separate real committed operation; Cancel must return that exact committed terminal and must not relabel it cancelled.",
+    "Cancel-COMMIT ambiguity is retained as a 503-unknown code path but is not forced by this fixture.",
+    "The no-A3 refusal fixture inserts one migration-138 pending operation row without its migration-147 binding into a real API-created repository; it does not create a ready repository, decision, ref or ACK.",
 ]
 
 
@@ -86,6 +96,19 @@ def pack_identity_summary(pack):
                          for item in rows(pack["publications"])],
         "artifacts": [{field: item[field] for field in artifact_fields} for item in rows(pack["artifacts"])],
     }
+
+
+# Fields that identify the gate realm and must not move when a cancellation
+# leaves refs/events unchanged. Revision and digest are expected to move only
+# with a real publication, so they are compared separately.
+GATE_IDENTITY_FIELDS = ("repository_id", "tenant_id", "object_format", "history_incarnation",
+                        "authority_epoch", "group_epoch", "head_ref")
+
+
+def gate_identity(gate):
+    items = rows(gate)
+    assert len(items) == 1, items
+    return {field: items[0][field] for field in GATE_IDENTITY_FIELDS}
 
 
 class CheckpointHarness(blob.BlobOnlyHarness):
@@ -141,13 +164,56 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         }
 
     def operation_row(self, repo_id, operation):
+        row = self.operation_row_optional(repo_id, operation)
+        assert row is not None, "operation row is missing"
+        return row
+
+    def operation_row_optional(self, repo_id, operation):
         rid = str(uuid.UUID(repo_id))
         operation = str(uuid.UUID(operation))
         raw = self.sql(
             "SELECT to_jsonb(o)::text FROM ref_store_operations o "
             "WHERE o.repository_id='" + rid + "' AND o.operation_id='" + operation + "'")
-        assert raw, "operation row is missing"
-        return json.loads(raw)
+        return json.loads(raw) if raw else None
+
+    def cancellation_snapshot(self, repo_id, operation):
+        """The two durable cancellation tombstones for one repository operation."""
+        rid = str(uuid.UUID(repo_id))
+        operation = str(uuid.UUID(operation))
+        return {
+            "legacy": rows(self.sql(
+                "SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.sequence), '[]'::jsonb)::text "
+                "FROM ref_store_cancellations c WHERE c.repository_id='" + rid
+                + "' AND c.operation_id='" + operation + "'")),
+            "decision": rows(self.sql(
+                "SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.operation_id), '[]'::jsonb)::text "
+                "FROM ref_store_decision_cancellations d WHERE d.repository_id='" + rid
+                + "' AND d.operation_id='" + operation + "'")),
+        }
+
+    def insert_unbound_operation(self, repo_id, seed_operation, operation):
+        """Insert one real migration-138 pending row without its A3 producer binding.
+
+        This is not a ready-repository or ACK fixture: the repository was created
+        and seeded through the real API/Git path. It exists only to prove the
+        cancel route refuses a core row that lacks its exact migration-147
+        binding instead of falling back to a weaker cancellation.
+        """
+        rid = str(uuid.UUID(repo_id))
+        issuer = str(uuid.UUID(seed_operation["issuer_id"]))
+        operation = str(uuid.UUID(operation))
+        lane = seed_operation["lane"]
+        # Migration 138's lane CHECK allows exactly this alphabet; asserting it
+        # keeps the fixture's SQL interpolation exact.
+        assert lane and all(c.isalnum() or c in "._:-" for c in lane), lane
+        sequence = int(seed_operation["sequence"]) + 1000000
+        request_digest = digest("unbound-operation:" + operation)
+        self.sql(
+            "INSERT INTO ref_store_operations"
+            "(repository_id,issuer_id,lane,sequence,operation_id,request_digest,state) "
+            "VALUES('" + rid + "','" + issuer + "','" + lane + "'," + str(sequence)
+            + ",'" + operation + "','" + request_digest + "','pending')")
+        return request_digest
 
     def _create_commit_gate(self, key):
         self.sql(
@@ -197,17 +263,27 @@ class CheckpointHarness(blob.BlobOnlyHarness):
                 process.kill()
                 process.wait(timeout=5)
 
-    def _waiting_commit_pid(self):
+    @staticmethod
+    def _advisory_key_parts(key):
+        key = int(key)
+        return (key >> 32) & 0xFFFFFFFF, key & 0xFFFFFFFF
+
+    def _waiting_commit_pid(self, key):
+        """The one service COMMIT waiting on this fixture's advisory-lock key."""
+        classid, objid = self._advisory_key_parts(key)
         return self.sql(
             "SELECT a.pid FROM pg_stat_activity a "
+            "JOIN pg_locks l ON l.pid=a.pid AND l.locktype='advisory' "
             "WHERE a.datname=current_database() AND a.state='active' "
             "AND regexp_replace(a.query, '\\s+', '', 'g') IN ('COMMIT','COMMIT;') "
-            "AND a.wait_event_type='Lock' AND a.wait_event='advisory' LIMIT 1")
+            "AND a.wait_event_type='Lock' AND a.wait_event='advisory' "
+            "AND l.granted=false AND l.classid::bigint=" + str(classid)
+            + " AND l.objid::bigint=" + str(objid) + " AND l.objsubid=1 LIMIT 1")
 
-    def _await_waiting_commit(self):
+    def _await_waiting_commit(self, key):
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            pid = self._waiting_commit_pid()
+            pid = self._waiting_commit_pid(key)
             if pid:
                 return int(pid)
             time.sleep(0.1)
@@ -228,6 +304,7 @@ class CheckpointHarness(blob.BlobOnlyHarness):
     def receive_pack_commit_unknown_resolves_exact(self):
         repo, _remote, work, old_oid = self.seed("commit-unknown", self.alice)
         before = self.exact_ledger(repo["id"])
+        baseline_gate_identity = gate_identity(before["gate"])
         seed_operations = rows(before["operations"])
         assert len(seed_operations) == 1, seed_operations
         seed_operation = seed_operations[0]
@@ -251,7 +328,7 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             self._create_commit_gate(key)
             blocker = self._start_blocker(key, application_name)
             future = executor.submit(self._long_http, path, self.alice, body, operation)
-            self._await_waiting_commit()
+            commit_pid = self._await_waiting_commit(key)
             assert not future.done(), "receive-pack returned before the deferred COMMIT barrier"
             wire_status, response, response_headers = future.result(timeout=80)
             # The COMMIT barrier is still held. Assert the unknown boundary and
@@ -284,6 +361,17 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             assert inflight_publications[0]["plan_operation_id"] == operation, inflight_publications
             assert ({item["registration_id"] for item in inflight_artifacts}
                     == {inflight_publications[0]["registration_id"]}), inflight_artifacts
+            # Force a deterministic durable-pending settlement: terminate only
+            # the service's fixture-blocked COMMIT backend, then release the
+            # fixture lock. The service already returned the typed unknown; its
+            # server-side transaction is aborted, so the pending row remains and
+            # explicit Cancel is the only resolution. This is a serialized
+            # abort-then-cancel sequence, not an overlapping cancel/commit race.
+            blocked_pid = self._waiting_commit_pid(key)
+            if blocked_pid:
+                assert int(blocked_pid) == commit_pid, "fixture found a different blocked COMMIT backend"
+                terminated = self.sql("SELECT pg_terminate_backend(" + str(commit_pid) + ")")
+                assert terminated == "t", "fixture could not terminate the blocked COMMIT backend"
             self._release_blocker(blocker)
             blocker = None
         finally:
@@ -297,83 +385,158 @@ class CheckpointHarness(blob.BlobOnlyHarness):
                 finally:
                     self._drop_commit_gate()
 
-        operation_path = ("/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/"
-                          + urllib.parse.quote(repo["name"], safe="") + "/operations/" + operation)
-        get_status, raw, headers = self.http(operation_path, token=self.alice)
-        assert get_status == 200, "GET operation after release: " + str(get_status) + ": " + repr(raw[:300])
-        assert blob.header_value(headers, "cache-control") == "no-store"
-        view = json.loads(raw)
-        assert view["operation_id"] == operation
-        assert view["state"] in ("pending", "committed"), view
+        def repo_operation_path(target_operation):
+            return ("/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/"
+                    + urllib.parse.quote(repo["name"], safe="") + "/operations/" + target_operation)
 
-        retry_status = None
-        retry_report_ok = False
-        retry_unknown = False
-        if view["state"] == "committed":
-            resolved_by = "query"
-        else:
-            # All COMMIT statements settled while the operation is still
-            # pending: the original transaction rolled back. This is a durable
-            # no-effect state, never a resolved acceptance.
-            settled = self.exact_ledger(repo["id"])
-            assert rows(settled["refs"]) == rows(before["refs"]), "settled pending COMMIT moved a ref"
-            assert rows(settled["gate"]) == rows(before["gate"]), "settled pending COMMIT moved the gate"
-            assert rows(settled["events"]) == rows(before["events"]), "settled pending COMMIT wrote an event"
-            settled_operations = rows(settled["operations"])
-            assert len(settled_operations) == 2, settled_operations
-            assert row_for(settled_operations, "operation_id", seed_operation["operation_id"]) == seed_operation
-            settled_operation = self.operation_row(repo["id"], operation)
-            assert row_for(settled_operations, "operation_id", operation) == settled_operation
-            assert settled_operation["state"] == "pending", settled_operation
-            assert settled_operation["terminal_result"] is None, settled_operation
-            assert self.pack_identity(repo["id"], operation) == inflight_pack, \
-                "pending settlement changed the durable pack identity"
-            assert view["terminal"] is None, view
+        def cancel_path_for(target_operation):
+            return repo_operation_path(target_operation) + "/cancel"
 
-            # Retry exactly the same operation id and exact same wire bytes. A
-            # new operation id is not a resolution of the original unknown.
-            retry_status, retry_body, retry_headers = self._long_http(path, self.alice, body, operation)
-            assert blob.header_value(retry_headers, "x-rootyard-operation") == operation, retry_headers
-            if retry_status == 200:
-                blob.assert_receive_report_ok(retry_body, "refs/heads/main")
-                retry_report_ok = True
-            else:
-                assert retry_status == 503, ("same-operation retry returned an unexpected status: "
-                                             + str(retry_status) + " body=" + repr(retry_body[:300]))
-                retry_error = json.loads(retry_body)
-                assert retry_error == {"error": "publication outcome is unknown; query the operation or inspect refs"}, retry_error
-                for marker in (b"unpack ok", b"ok refs/heads/main", b"ng refs/heads/main"):
-                    assert marker not in retry_body, "unknown retry carried a Git report: " + repr(retry_body[:300])
-                retry_unknown = True
+        def get_view(target_operation, label, expected=None):
+            status, raw, headers = self.http(repo_operation_path(target_operation), token=self.alice)
+            assert status == 200, "GET operation " + label + ": " + str(status) + ": " + repr(raw[:300])
+            assert blob.header_value(headers, "cache-control") == "no-store", headers
+            parsed = json.loads(raw)
+            assert parsed["operation_id"] == target_operation, parsed
+            if expected is not None:
+                assert parsed["state"] == expected, parsed
+            return status, parsed
 
-            # The final authenticated query is authoritative. A 503 retry that
-            # still observes committed only proves a late original COMMIT; it is
-            # not a retry resolution. A final pending state is unresolved.
-            get_status, raw, headers = self.http(operation_path, token=self.alice)
-            assert get_status == 200, "GET operation after retry: " + str(get_status) + ": " + repr(raw[:300])
-            assert blob.header_value(headers, "cache-control") == "no-store"
-            view = json.loads(raw)
-            assert view["operation_id"] == operation
-            if view["state"] == "pending":
-                assert retry_unknown, "same-operation retry reported success but the operation stayed pending"
-                raise AssertionError("permanent pending after exact same-operation retry: "
-                                     "the operation never reached a committed terminal")
-            assert view["state"] == "committed", "same-operation retry left a non-terminal state: " + str(view)
-            resolved_by = "retry" if retry_report_ok else "query_after_retry"
+        def post_cancel(target_operation, token=None):
+            status, raw, headers = self.http(cancel_path_for(target_operation), token=token, method="POST")
+            assert blob.header_value(headers, "cache-control") == "no-store", headers
+            return status, raw, headers
 
-        terminal = view["terminal"]
-        assert terminal is not None, view
+        def assert_error(raw):
+            body = json.loads(raw)
+            assert set(body) == {"error"}, body
+            return body["error"]
+
+        view = get_view(operation, "after settlement")[1]
+        # The fixture terminated the blocked COMMIT backend before releasing
+        # its lock, so the original final transaction is durably aborted and the
+        # operation is still pending. This is a no-effect state, never an
+        # acceptance. Only the explicit authorized Cancel resolves it.
+        assert view["state"] == "pending", view
+        assert view["terminal"] is None, view
+        resolved_by = "explicit_cancel"
+        settled = self.exact_ledger(repo["id"])
+        assert settled["refs"] == before["refs"], "settled pending COMMIT moved a ref"
+        assert settled["gate"] == before["gate"], "settled pending COMMIT moved the gate"
+        assert gate_identity(settled["gate"]) == baseline_gate_identity, settled["gate"]
+        assert settled["events"] == before["events"], "settled pending COMMIT wrote an event"
+        settled_operations = rows(settled["operations"])
+        assert len(settled_operations) == 2, settled_operations
+        assert row_for(settled_operations, "operation_id", seed_operation["operation_id"]) == seed_operation
+        settled_operation = self.operation_row(repo["id"], operation)
+        assert row_for(settled_operations, "operation_id", operation) == settled_operation
+        assert settled_operation["state"] == "pending", settled_operation
+        assert settled_operation["terminal_result"] is None, settled_operation
+        assert self.pack_identity(repo["id"], operation) == inflight_pack, \
+            "pending settlement changed the durable pack identity"
+
+        cancel_status, cancel_raw, _ = post_cancel(operation, self.alice)
+        assert cancel_status == 200, "pending cancel: " + str(cancel_status) + ": " + repr(cancel_raw[:300])
+        cancel_view = json.loads(cancel_raw)
+        assert set(cancel_view) == {"operation_id", "state", "terminal"}, cancel_view
+        assert cancel_view["operation_id"] == operation, cancel_view
+        assert cancel_view["state"] == "cancelled", cancel_view
+        cancel_terminal = cancel_view["terminal"]
+        assert cancel_terminal == {"state": "cancelled", "reason": "cancel_requested"}, cancel_terminal
+
+        _, canonical = get_view(operation, "after explicit cancel", "cancelled")
+        assert canonical == cancel_view
+
+        cancelled = self.exact_ledger(repo["id"])
+        assert cancelled["refs"] == before["refs"], "cancel moved a ref"
+        assert cancelled["gate"] == before["gate"], "cancel moved the gate"
+        assert gate_identity(cancelled["gate"]) == baseline_gate_identity, cancelled["gate"]
+        assert cancelled["events"] == before["events"], "cancel wrote an event"
+        cancelled_operation = self.operation_row(repo["id"], operation)
+        assert cancelled_operation["state"] == "cancelled", cancelled_operation
+        assert cancelled_operation["terminal_result"] == cancel_terminal, cancelled_operation
+        assert row_for(rows(cancelled["operations"]), "operation_id",
+                       seed_operation["operation_id"]) == seed_operation
+        assert self.pack_identity(repo["id"], operation) == inflight_pack, \
+            "cancel changed the durable pack identity"
+
+        tombstones = self.cancellation_snapshot(repo["id"], operation)
+        assert len(tombstones["legacy"]) == 1, tombstones
+        legacy = tombstones["legacy"][0]
+        assert legacy["operation_id"] == operation, legacy
+        assert legacy["request_digest"] == settled_operation["request_digest"], legacy
+        assert len(tombstones["decision"]) == 1, tombstones
+        decision = tombstones["decision"][0]
+        assert decision["reason"] == "http_cancel_requested", decision
+        assert decision["actor_id"] == self.alice["user_id"], decision
+
+        # The exact same wire bytes for the cancelled operation ID replay the
+        # stable cancellation report without touching any durable effect.
+        same_wire_status, same_wire_body, same_wire_headers = self._long_http(
+            path, self.alice, body, operation)
+        assert same_wire_status == 200, ("same-wire cancellation replay: "
+                                         + str(same_wire_status) + " " + repr(same_wire_body[:300]))
+        assert blob.header_value(same_wire_headers, "x-rootyard-operation") == operation, same_wire_headers
+        unpack, statuses = blob.parse_receive_report(same_wire_body)
+        assert unpack == "unpack ok", unpack
+        assert statuses == ["ng refs/heads/main operation was cancelled"], statuses
+        after_replay = self.exact_ledger(repo["id"])
+        assert after_replay == cancelled, "same-wire cancellation replay changed durable state"
+        assert self.pack_identity(repo["id"], operation) == inflight_pack
+        assert self.cancellation_snapshot(repo["id"], operation) == tombstones, \
+            "same-wire cancellation replay changed a tombstone"
+        _, replay_view = get_view(operation, "after same-wire replay", "cancelled")
+        assert replay_view == cancel_view
+
+        # A different wire body under the same operation ID is a conflict,
+        # never a second cancellation or an inherited unknown outcome.
+        divergent_oid = self.commit_files(work, "divergent wire body",
+                                          {"divergent.txt": "a different wire body\n"})
+        divergent_pack = self.run([str(self.profile.git), "--no-pager",
+                                   "pack-objects", "--stdout", "--all"],
+                                  cwd=work, data=b"").stdout
+        assert divergent_pack.startswith(b"PACK") and len(divergent_pack) > 32
+        divergent_body = blob.receive_pack_request(old_oid, divergent_oid, "refs/heads/main", divergent_pack)
+        divergent_status, divergent_raw, divergent_headers = self._long_http(
+            path, self.alice, divergent_body, operation)
+        assert divergent_status == 409, ("divergent-wire cancel replay: "
+                                         + str(divergent_status) + " " + repr(divergent_raw[:300]))
+        assert blob.header_value(divergent_headers, "x-rootyard-operation") == operation, divergent_headers
+        assert blob.header_value(divergent_headers, "cache-control") == "no-store", divergent_headers
+        divergent_error = assert_error(divergent_raw)
+        assert "different request" in divergent_error, divergent_error
+        for marker in (b"unpack ok", b"ok refs/heads/main", b"ng refs/heads/main"):
+            assert marker not in divergent_raw, "divergent replay carried a Git report: " + repr(divergent_raw[:300])
+        after_divergent = self.exact_ledger(repo["id"])
+        assert after_divergent == cancelled, "divergent-wire conflict changed durable state"
+        assert self.pack_identity(repo["id"], operation) == inflight_pack
+        assert self.cancellation_snapshot(repo["id"], operation) == tombstones, \
+            "divergent-wire conflict changed a tombstone"
+        _, divergent_view = get_view(operation, "after divergent wire", "cancelled")
+        assert divergent_view == cancel_view
+
+        # After cancellation the client may use a NEW operation ID for the
+        # same wire bytes; that fresh operation must be able to commit and
+        # must not mutate the old cancelled operation or its pack snapshot.
+        new_operation = str(uuid.uuid4())
+        new_status, new_body, new_headers = self._long_http(path, self.alice, body, new_operation)
+        assert new_status == 200, ("new operation after cancellation: "
+                                   + str(new_status) + " " + repr(new_body[:300]))
+        assert blob.header_value(new_headers, "x-rootyard-operation") == new_operation, new_headers
+        blob.assert_receive_report_ok(new_body, "refs/heads/main")
+        _, new_view = get_view(new_operation, "new operation", "committed")
+        new_terminal = new_view["terminal"]
+        assert new_terminal is not None and new_terminal["kind"] == "committed", new_view
 
         resolved = self.exact_ledger(repo["id"])
-        resolved_operation = self.operation_row(repo["id"], operation)
-        resolved_pack = self.pack_identity(repo["id"], operation)
-        assert resolved_pack == inflight_pack, "COMMIT settlement changed the durable pack identity"
-
         resolved_operations = rows(resolved["operations"])
-        assert len(resolved_operations) == 2, resolved_operations
+        assert len(resolved_operations) == 3, resolved_operations
         assert row_for(resolved_operations, "operation_id", seed_operation["operation_id"]) == seed_operation
-        assert row_for(resolved_operations, "operation_id", operation) == resolved_operation
-        assert view["state"] == "committed", view
+        assert row_for(resolved_operations, "operation_id", operation) == cancelled_operation
+        new_operation_row = self.operation_row(repo["id"], new_operation)
+        assert row_for(resolved_operations, "operation_id", new_operation) == new_operation_row
+        assert new_operation_row["state"] == "committed", new_operation_row
+        assert new_operation_row["terminal_result"] == new_terminal, new_operation_row
 
         ref_rows = rows(resolved["refs"])
         assert len(ref_rows) == 1, ref_rows
@@ -383,77 +546,184 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert len(gate_rows) == 1, gate_rows
         gate_row = gate_rows[0]
         assert gate_row["revision"] == new_revision and gate_row["head_ref"] == "refs/heads/main", gate_row
+        assert gate_identity(resolved["gate"]) == baseline_gate_identity, resolved["gate"]
         event_rows = rows(resolved["events"])
         assert len(event_rows) == len(rows(before["events"])) + 1, event_rows
         for prior_event in rows(before["events"]):
             assert row_for(event_rows, "event_id", prior_event["event_id"]) == prior_event, \
-                "an existing event changed during COMMIT settlement"
-        event = row_for(event_rows, "operation_id", operation)
+                "an existing event changed during the new operation"
+        event = row_for(event_rows, "operation_id", new_operation)
         assert event["outcome"] == "committed" and event["revision"] == new_revision, event
-        assert event["payload"] == terminal, "event payload differs from the queried terminal"
-        assert resolved_operation["state"] == "committed", resolved_operation
-        assert resolved_operation["terminal_result"] == terminal, resolved_operation
-        assert terminal["kind"] == "committed" and terminal["revision"] == new_revision, terminal
-        assert terminal["head_ref"] == "refs/heads/main", terminal
-        assert len(terminal["refs"]) == 1, terminal
-        assert terminal["refs"][0]["name"] == "refs/heads/main", terminal
-        assert terminal["refs"][0]["new_oid"] == new_oid, terminal
-        publications = rows(inflight_pack["publications"])
-        artifacts = rows(inflight_pack["artifacts"])
-        assert len(publications) == 1, publications
-        assert len(artifacts) == 2, artifacts
-        registrations = terminal["registrations"]
-        assert len(registrations) == 1, terminal
+        assert event["payload"] == new_terminal, "new event payload differs from its terminal"
+
+        assert self.pack_identity(repo["id"], operation) == inflight_pack, \
+            "the new operation changed the cancelled pack snapshot"
+        new_pack = self.pack_identity(repo["id"], new_operation)
+        new_publications = rows(new_pack["publications"])
+        new_artifacts = rows(new_pack["artifacts"])
+        assert len(new_publications) == 1, new_publications
+        assert len(new_artifacts) == 2, new_artifacts
         assert {(item["pack_id"], item["registration_id"], item["artifact_set_digest"])
-                for item in registrations} == {(item["pack_id"], item["registration_id"],
-                                                item["artifact_set_digest"]) for item in publications}
+                for item in new_publications} == {
+                    (item["pack_id"], item["registration_id"], item["artifact_set_digest"])
+                    for item in new_terminal["registrations"]}
 
-        # Authenticated operation lookup is issuer/admin only. These are
-        # denials, never operation detail or a terminal body.
-        def denied(lookup_path, token=None, codes=(401, 403, 404)):
-            code, raw, _ = self.http(lookup_path, token=token)
-            assert code in codes, (code, raw[:300])
-            body = json.loads(raw)
-            assert set(body) == {"error"}, body
-            assert "terminal" not in body and "operation_id" not in body, body
+        final_view = cancel_view
+        final_operation = cancelled_operation
+        final_pack = inflight_pack
 
-        denied(operation_path, codes=(401,))
-        denied(operation_path, {"username": "alice", "token": "ryt_" + "0" * 64}, codes=(401,))
-        denied(operation_path, self.bob, codes=(403, 404))
+        # A real committed operation is a serialized commit-wins outcome: the
+        # commit was durable before Cancel. The route must return that exact old
+        # terminal, never a fabricated cancellation, and must not move refs,
+        # gate, events or the committed pack snapshot.
+        seed_terminal = seed_operation["terminal_result"]
+        assert isinstance(seed_terminal, dict), seed_operation
+        seed_ledger_before = self.exact_ledger(repo["id"])
+        seed_pack_before = self.pack_identity(repo["id"], seed_operation["operation_id"])
+        seed_cancel_status, seed_cancel_raw, _ = post_cancel(seed_operation["operation_id"], self.alice)
+        assert seed_cancel_status == 200, (seed_cancel_status, seed_cancel_raw[:300])
+        seed_view = json.loads(seed_cancel_raw)
+        assert set(seed_view) == {"operation_id", "state", "terminal"}, seed_view
+        assert seed_view == {
+            "operation_id": seed_operation["operation_id"],
+            "state": "committed",
+            "terminal": seed_terminal,
+        }, seed_view
+        seed_ledger_after = self.exact_ledger(repo["id"])
+        assert seed_ledger_after == seed_ledger_before, "committed cancel changed durable state"
+        assert self.pack_identity(repo["id"], seed_operation["operation_id"]) == seed_pack_before
+        seed_tombstones = self.cancellation_snapshot(repo["id"], seed_operation["operation_id"])
+        assert len(seed_tombstones["legacy"]) == 1, seed_tombstones
+        # A committed operation returns AlreadyConsumed before bind_cancellation,
+        # so it gets only the migration-138 tombstone; no decision-level
+        # cancellation row is fabricated for a commit that already won.
+        assert not seed_tombstones["decision"], seed_tombstones
+        _, seed_get = get_view(seed_operation["operation_id"], "seed commit-wins", "committed")
+        assert seed_get == seed_view
+
+        # Refusals must not reveal operation existence or write a tombstone. The
+        # repository remains a real API-created, Git-seeded repository; the only
+        # SQL fixture below is one migration-138 pending row without an A3
+        # binding, because that refusal cannot be produced by a successful push.
+        unknown = str(uuid.uuid4())
+        unknown_status, unknown_raw, _ = post_cancel(unknown, self.alice)
+        assert unknown_status == 404, (unknown_status, unknown_raw[:300])
+        assert assert_error(unknown_raw) == "not found"
+        assert self.operation_row_optional(repo["id"], unknown) is None
+        assert self.cancellation_snapshot(repo["id"], unknown) == {"legacy": [], "decision": []}
+
         other_repo, _ = self.create("commit-unknown-other", self.alice)
         other_path = ("/api/repos/" + urllib.parse.quote(other_repo["owner"], safe="") + "/"
-                      + urllib.parse.quote(other_repo["name"], safe="") + "/operations/" + operation)
-        denied(other_path, self.alice, codes=(404,))
+                      + urllib.parse.quote(other_repo["name"], safe="") + "/operations/" + operation + "/cancel")
+        crossrepo_status, crossrepo_raw, _ = self.http(other_path, token=self.alice, method="POST")
+        assert crossrepo_status == 404, (crossrepo_status, crossrepo_raw[:300])
+        assert assert_error(crossrepo_raw) == "not found"
+        assert self.operation_row_optional(other_repo["id"], operation) is None
+        assert self.cancellation_snapshot(other_repo["id"], operation) == {"legacy": [], "decision": []}
+        assert self.operation_row(repo["id"], operation) == final_operation
+
+        unbound = str(uuid.uuid4())
+        unbound_before = self.exact_ledger(repo["id"])
+        self.insert_unbound_operation(repo["id"], seed_operation, unbound)
+        no_a3_status, no_a3_raw, _ = post_cancel(unbound, self.alice)
+        assert no_a3_status == 409, (no_a3_status, no_a3_raw[:300])
+        assert set(json.loads(no_a3_raw)) == {"error"}
+        assert self.operation_row(repo["id"], unbound)["state"] == "pending"
+        assert self.cancellation_snapshot(repo["id"], unbound) == {"legacy": [], "decision": []}
+        unbound_after = self.exact_ledger(repo["id"])
+        assert unbound_after["refs"] == unbound_before["refs"]
+        assert unbound_after["gate"] == unbound_before["gate"]
+        assert unbound_after["events"] == unbound_before["events"]
+
+        # Bob is a real write collaborator but not an owner/admin. The route must
+        # refuse him before resolving any operation, and must not let him
+        # distinguish a known UUID from an unknown one.
+        grant_status, grant_raw, _ = self.http(
+            "/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/"
+            + urllib.parse.quote(repo["name"], safe="") + "/collaborators/bob",
+            token=self.alice, method="PUT", body={"role": "write", "username": "bob"})
+        assert grant_status in (200, 201), (grant_status, grant_raw[:300])
+        seed_before = self.cancellation_snapshot(repo["id"], seed_operation["operation_id"])
+        nonadmin_status, nonadmin_raw, _ = post_cancel(seed_operation["operation_id"], self.bob)
+        assert nonadmin_status == 403, (nonadmin_status, nonadmin_raw[:300])
+        nonadmin_unknown_status, nonadmin_unknown_raw, _ = post_cancel(unknown, self.bob)
+        assert nonadmin_unknown_status == 403, (nonadmin_unknown_status, nonadmin_unknown_raw[:300])
+        assert self.cancellation_snapshot(repo["id"], seed_operation["operation_id"]) == seed_before
+        assert self.cancellation_snapshot(repo["id"], unknown) == {"legacy": [], "decision": []}
+
+        read_only_status, read_only_raw, _ = post_cancel(seed_operation["operation_id"], self.reader)
+        assert read_only_status == 403, (read_only_status, read_only_raw[:300])
+        invalid_status, invalid_raw, _ = post_cancel(
+            seed_operation["operation_id"], {"username": "alice", "token": "ryt_" + "0" * 64})
+        assert invalid_status == 401, (invalid_status, invalid_raw[:300])
+        assert set(json.loads(invalid_raw)) == {"error"}
+        assert self.cancellation_snapshot(repo["id"], seed_operation["operation_id"]) == seed_before
+
+        for raw_id in ("not-a-uuid", "00000000-0000-0000-0000-000000000000"):
+            malformed_status, malformed_raw, _ = post_cancel(raw_id, self.alice)
+            assert malformed_status == 400, (raw_id, malformed_status, malformed_raw[:300])
+            assert assert_error(malformed_raw) == "invalid operation identifier"
+
+        final_ledger = self.exact_ledger(repo["id"])
+        _, fresh_final_view = get_view(operation, "final resolution")
+        assert fresh_final_view == final_view, (fresh_final_view, final_view)
+        assert fresh_final_view["state"] == "cancelled", fresh_final_view
 
         return {
             "operation": operation,
             "wire_status": wire_status,
             "wire_error": wire_error["error"],
-            "resolved_state": view["state"],
+            "resolved_state": final_view["state"],
             "resolved_by": resolved_by,
-            "retry_status": retry_status,
-            "retry_unknown": retry_unknown,
-            "retry_report_ok": retry_report_ok,
-            "operation_get_status": get_status,
-            "commit_landed": True,
+            "cancel_status": cancel_status,
+            "cancel_state": final_view["state"],
+            "cancel_terminal": cancel_terminal,
+            "operation_get_status": 200,
+            "commit_landed": False,
+            "unknown_commit_landed": False,
+            "cancel_won": True,
+            "new_operation_committed": True,
+            "seed_commit_wins_operation": seed_operation["operation_id"],
+            "seed_commit_wins_state": seed_view["state"],
+            "seed_commit_wins_terminal_sha256": digest(
+                json.dumps(seed_view["terminal"], sort_keys=True, separators=(",", ":"))),
+            "seed_commit_wins_refs_sha256": digest(seed_ledger_after["refs"]),
+            "seed_commit_wins_gate_sha256": digest(seed_ledger_after["gate"]),
+            "seed_commit_wins_events_sha256": digest(seed_ledger_after["events"]),
+            "seed_commit_wins_checked": True,
+            "new_operation": new_operation,
+            "new_operation_state": new_view["state"] if new_view is not None else None,
+            "new_operation_terminal": new_view["terminal"] if new_view is not None else None,
+            "same_wire_status": same_wire_status,
+            "divergent_wire_status": divergent_status,
+            "unknown_cancel_status": unknown_status,
+            "crossrepo_cancel_status": crossrepo_status,
+            "no_a3_cancel_status": no_a3_status,
+            "nonadmin_cancel_status": nonadmin_status,
+            "nonadmin_unknown_cancel_status": nonadmin_unknown_status,
+            "read_only_cancel_status": read_only_status,
+            "invalid_auth_cancel_status": invalid_status,
             "one_effect_checked": True,
             "base_revision": base_revision,
             "new_revision": new_revision,
             "ack_oid": new_oid,
-            "exact_refs": rows(resolved["refs"]),
-            "exact_gate": rows(resolved["gate"]),
-            "exact_events": rows(resolved["events"]),
-            "exact_terminal": terminal,
-            "exact_operation": resolved_operation,
-            "pack_identity": pack_identity_summary(resolved_pack),
-            "refs_sha256": digest(resolved["refs"]),
-            "gate_sha256": digest(resolved["gate"]),
-            "events_sha256": digest(resolved["events"]),
-            "terminal_sha256": digest(json.dumps(terminal, sort_keys=True, separators=(",", ":"))),
-            "pack_identity_sha256": digest(json.dumps(resolved_pack, sort_keys=True, separators=(",", ":"))),
-            "pack_registration_ids": [item["registration_id"] for item in rows(inflight_pack["publications"])],
+            "gate_identity": gate_identity(final_ledger["gate"]),
+            "exact_refs": rows(final_ledger["refs"]),
+            "exact_gate": rows(final_ledger["gate"]),
+            "exact_events": rows(final_ledger["events"]),
+            "exact_terminal": final_view["terminal"],
+            "exact_operation": final_operation,
+            "pack_identity": pack_identity_summary(final_pack),
+            "new_pack_identity": pack_identity_summary(new_pack) if new_pack is not None else None,
+            "refs_sha256": digest(final_ledger["refs"]),
+            "gate_sha256": digest(final_ledger["gate"]),
+            "events_sha256": digest(final_ledger["events"]),
+            "terminal_sha256": digest(json.dumps(final_view["terminal"], sort_keys=True, separators=(",", ":"))),
+            "pack_identity_sha256": digest(json.dumps(final_pack, sort_keys=True, separators=(",", ":"))),
+            "pack_registration_ids": [item["registration_id"] for item in rows(final_pack["publications"])],
             "pack_identity_unchanged": True,
             "exact_ref_gate_event_terminal_checked": True,
+            "cancel_commit_ambiguity_not_forced": True,
         }
 
 
