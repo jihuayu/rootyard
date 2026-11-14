@@ -6,6 +6,8 @@
 //! view inside an owned RAII directory that is deleted when the request
 //! finishes. Durable refs live in the PostgreSQL core and durable bytes in Blob,
 //! so deleting a compute view can never lose an acknowledged ref or byte.
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -47,6 +49,10 @@ pub struct BlobGitState {
     inflight: Arc<AtomicU64>,
     workspace: Arc<AtomicU64>,
     sessions: Option<SessionTokens>,
+    /// Acceptance-only rendezvous. It is absent in every non-test build and
+    /// cannot be selected by any request, header or runtime configuration.
+    #[cfg(test)]
+    admission_pause: Option<Arc<AdmissionPause>>,
 }
 
 impl BlobGitState {
@@ -69,6 +75,8 @@ impl BlobGitState {
             inflight: Arc::new(AtomicU64::new(0)),
             workspace: Arc::new(AtomicU64::new(0)),
             sessions: None,
+            #[cfg(test)]
+            admission_pause: None,
         })
     }
 
@@ -78,6 +86,24 @@ impl BlobGitState {
     pub fn with_sessions(mut self, sessions: SessionTokens) -> Self {
         self.sessions = Some(sessions);
         self
+    }
+
+    /// Acceptance-only: attach a private rendezvous to this gateway instance.
+    /// The production constructor has no parameter, environment variable or
+    /// route that can reach this field.
+    #[cfg(test)]
+    pub(crate) fn with_admission_pause(mut self, pause: Arc<AdmissionPause>) -> Self {
+        self.admission_pause = Some(pause);
+        self
+    }
+
+    /// Called after the publish baseline was captured and before the admission
+    /// transaction starts. In production this method does not exist.
+    #[cfg(test)]
+    pub(crate) async fn pause_before_admission(&self, operation_id: Uuid) {
+        if let Some(pause) = &self.admission_pause {
+            pause.pause(operation_id).await;
+        }
     }
 
     pub fn pool(&self) -> &Pool {
@@ -175,6 +201,48 @@ impl BlobGitState {
     /// Create one canonical private per-request directory.
     pub(super) fn temp_dir(&self, prefix: &str) -> Result<TempDir, GatewayError> {
         TempDir::create(&self.scratch, prefix)
+    }
+}
+
+/// Acceptance-only rendezvous used by the deterministic pre-admission race
+/// case. The pause is keyed by operation UUID and can fire at most once.
+#[cfg(test)]
+pub(crate) struct AdmissionPause {
+    operation: Uuid,
+    paused: AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AdmissionPause {
+    pub(crate) fn new(operation: Uuid) -> Self {
+        Self {
+            operation,
+            paused: AtomicBool::new(false),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn pause(&self, operation: Uuid) {
+        if operation != self.operation || self.paused.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // `notify_one` stores a permit, so a test that starts waiting after the
+        // request arrived still observes the rendezvous.
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
+
+    /// Wait until the selected operation reached the post-capture pause.
+    pub(crate) async fn wait_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Let the paused operation continue into admission.
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
     }
 }
 
@@ -292,5 +360,23 @@ mod tests {
         let path = dir.path().to_path_buf();
         drop(dir);
         assert!(!path.exists(), "temp dir subtree must be removed");
+    }
+
+    #[tokio::test]
+    async fn acceptance_pause_waits_once_for_only_its_operation() {
+        let target = Uuid::new_v4();
+        let pause = Arc::new(AdmissionPause::new(target));
+        let waiting = {
+            let pause = pause.clone();
+            tokio::spawn(async move { pause.pause(target).await })
+        };
+        pause.wait_reached().await;
+        assert!(!waiting.is_finished(), "the selected operation must remain paused until release");
+        pause.release();
+        waiting.await.expect("pause task");
+        // The rendezvous is one-shot and keyed by operation: a rebase retry or
+        // any other operation passes without blocking.
+        pause.pause(target).await;
+        pause.pause(Uuid::new_v4()).await;
     }
 }
