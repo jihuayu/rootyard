@@ -44,6 +44,7 @@ class CargoForkDocumentationTest(unittest.TestCase):
             "~/.cargo/targets",
             "CARGO_TARGET_DIR",
             "do not clone a whole `target` directory",
+            "frozen schema007 legacy build",
         ):
             with self.subTest(token=token):
                 self.assertIn(token, self.development)

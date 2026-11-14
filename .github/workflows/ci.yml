@@ -188,6 +188,9 @@ jobs:
           test "$(git_owned rev-parse --verify HEAD)" = "$legacy"
           (
             cd "$legacy_root/repo"
+            # Output uplift only: CargoFork keeps the shared compiler cache in
+            # ~/.cargo/targets and writes this frozen legacy binary here. Do not
+            # copy a target tree per commit.
             CARGO_TARGET_DIR="$workspace/target/legacy-build" cargo build --locked --manifest-path Cargo.toml --bin rootyard
           )
           cp "$workspace/target/legacy-build/debug/rootyard" "$workspace/target/rootyard-schema007"

@@ -54,7 +54,10 @@ metadata, and records the resolved path, full version, revision and SHA. The
 fork keeps one shared compiler cache in `~/.cargo/targets` per runner/worktree;
 do not point `CARGO_TARGET_DIR` or `--target-dir` at a per-commit or per-worktree
 compiler tree, and do not clone a whole `target` directory per commit. Those
-settings only choose where final binaries and libraries are uplifted.
+settings only choose where final binaries and libraries are uplifted. The one
+deliberate per-build output in the gate is the frozen schema007 legacy build in
+`ci.yml`; it still uses the shared compiler cache and exists only because that
+binary comes from a different source commit.
 
 ## Build and gate commands
 
