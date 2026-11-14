@@ -45,6 +45,12 @@ standalone producers:
 * a test output on another filesystem is staged in that destination's own
   directory, its hash is compared with the compiled artifact, and only then is
   it renamed.  The compiled artifact remains in ``CARGO_TARGET_DIR``.
+* an optional explicit ``--artifact-store`` seals every selected bin/test
+  executable once into a managed immutable content-addressed store.  Canonical
+  manifest artifacts/receipts are the per-commit/config/invocation readonly
+  snapshots; each test ``--output`` and every receipt stay no-overwrite
+  aliases of those readonly snapshots.  Without the option the legacy
+  interface and publication paths are unchanged.
 
 Python orchestration only: the executable artifacts are the Rust targets Cargo
 builds, and the batch never invokes a second Cargo build or a clean.
@@ -63,8 +69,10 @@ import sys
 import time
 
 import build_native
+import native_artifact_store as artifact_store
 import native_build_receipt as receipt
-from build_native import BuildError, build_lock, source_digest
+from build_native import (BuildError, build_lock, source_digest, _publish_immutable_alias,
+                          _require_absent, _schedule_free_command, _toolchain_identity)
 from build_native_test import FEATURES
 
 
@@ -74,6 +82,7 @@ def _root():
 
 
 NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]{0,127}$')
+CAS_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z')
 PACKAGE = 'rootyard'
 DEFAULT_BIN = 'rootyard'
 KIND = receipt.BATCH_KIND
@@ -409,10 +418,18 @@ def _require_file_destination(path, label):
         raise BuildError(label + ' must not be an existing directory: ' + str(path))
 
 
-def final_destinations(plan, target):
-    """Every final file this batch transaction owns, in its documented order."""
-    destinations = [(('bin receipt ' + spec['name']), Path(path))
-                    for spec, path, _implicit in bin_receipt_locations(plan, target)]
+def final_destinations(plan, target, cas=False):
+    """Every final file this batch transaction owns, in its documented order.
+
+    In CAS mode requested/implicit bin receipts are published as canonical
+    receipts inside the managed store, not at their legacy target paths, so
+    only the relocated test output/receipt and the manifest are final paths of
+    this transaction.
+    """
+    destinations = []
+    if not cas:
+        destinations += [(('bin receipt ' + spec['name']), Path(path))
+                         for spec, path, _implicit in bin_receipt_locations(plan, target)]
     for spec, output in zip(plan.tests, plan.outputs):
         destinations.append(('test output ' + spec['name'], Path(output)))
         destinations.append(('test receipt ' + spec['name'], Path(str(output) + '.build.json')))
@@ -465,16 +482,77 @@ def preflight_request_paths(args, target):
     return outputs, manifest_out
 
 
-def validate_final_destinations(plan, target):
+def cas_store_root(args):
+    raw = getattr(args, 'artifact_store', None)
+    if not raw:
+        return None
+    value = Path(raw).expanduser()
+    if not value.is_absolute():
+        value = _root() / value
+    return Path(os.path.abspath(value))
+
+
+def _canonical_store_path(store_root):
+    """Resolve symlinked parents for overlap checks without following the store itself."""
+    store_root = Path(store_root)
+    return store_root.parent.resolve() / store_root.name
+
+
+def _reject_store_collision(store_root, path, label):
+    """A final path and the managed store tree must not contain one another."""
+    path = Path(path)
+    if path == store_root or store_root in path.parents or path in store_root.parents:
+        raise BuildError(label + ' must be outside the artifact store and disjoint from it: ' +
+                         str(path))
+
+
+def preflight_cas(args, target, manifest_out):
+    """Validate the opt-in store and every relocated output alias before Cargo.
+
+    CAS mode does not publish request/implicit bin receipts at their legacy
+    target paths; those become canonical store receipts.  The existing
+    per-test --output paths remain compatibility aliases and, together with
+    their adjacent receipts, are no-overwrite publications from the immutable
+    snapshot.  No final path may be inside the managed store (or contain it):
+    the store must stay a helper-owned tree, and a manifest alias must never be
+    mistaken for managed content.
+    """
+    store_root = cas_store_root(args)
+    if store_root is None:
+        return None
+    canonical_store = _canonical_store_path(store_root)
+    if canonical_store == target or target in canonical_store.parents:
+        raise BuildError('--artifact-store must be outside CARGO_TARGET_DIR')
+    if canonical_store == _root() or _root() in canonical_store.parents:
+        raise BuildError('--artifact-store must be outside the source repository')
+    if store_root.is_symlink():
+        raise BuildError('--artifact-store must not be a symlink: ' + str(store_root))
+    if store_root.exists() and not store_root.is_dir():
+        raise BuildError('--artifact-store must be a directory: ' + str(store_root))
+    _reject_store_collision(canonical_store, manifest_out, 'batch manifest destination')
+    for raw in getattr(args, 'output', []) or []:
+        output = resolve_output(raw, '--output')
+        if not CAS_NAME.match(output.name):
+            raise BuildError('--output basename is not a safe CAS snapshot name: ' + output.name)
+        _reject_store_collision(canonical_store, output, '--output')
+        _reject_store_collision(canonical_store, Path(str(output) + '.build.json'),
+                                '--output receipt')
+        _require_absent(output, '--output')
+        _require_absent(Path(str(output) + '.build.json'), '--output receipt')
+    return store_root
+
+
+def validate_final_destinations(plan, target, cas=False):
     """Fail closed before any cleanup, lock, mkdir or Cargo build mutation.
 
-    Every final path -- requested and implicit bin receipts, relocated test
-    outputs and their receipts, and the manifest -- must be a non-symlink file
-    destination, unique, and pairwise disjoint with no ancestor/descendant
-    relationship.  Otherwise a cleanup or publication could touch a path that
-    belongs to another destination or to the caller's data.
+    Every final path -- requested and implicit bin receipts (legacy mode),
+    relocated test outputs and their receipts, and the manifest -- must be a
+    non-symlink file destination, unique, and pairwise disjoint with no
+    ancestor/descendant relationship.  Otherwise a cleanup or publication
+    could touch a path that belongs to another destination or to the caller's
+    data.
     """
-    destinations = final_destinations(plan, target)
+    destinations = final_destinations(plan, target, cas=cas)
     _validate_disjoint_destinations(destinations)
 
 
@@ -558,7 +636,7 @@ def resolve_manifest_output(raw):
     return manifest_path
 
 
-def plan_batch(args, manifest):
+def plan_batch(args, manifest, cas=False):
     """Validate one batch request completely before any Cargo command runs."""
     if args.features and not FEATURES.match(args.features):
         raise BuildError('--features must be comma-separated Rust feature identifiers')
@@ -613,7 +691,7 @@ def plan_batch(args, manifest):
     plan = Plan(Selection(args.features, args.no_default_features, args.package_debug,
                           args.strip_debuginfo), bin_specs, test_specs, outputs, manifest_out,
                 implicit, requested_names)
-    validate_final_destinations(plan, target)
+    validate_final_destinations(plan, target, cas=cas)
     return plan
 
 
@@ -1139,7 +1217,8 @@ def _make_receipt(**arguments):
 
 
 def binary_receipt(*, path, bound, toolchain, command, targets, lock_path, timings,
-                   manifest_path, selection, environment, git, implicit=None):
+                   manifest_path, selection, environment, git, implicit=None,
+                   artifact_store_record=None):
     """A shared v2 bin receipt for this batch's single build."""
     path = Path(path)
     extra = {
@@ -1151,6 +1230,13 @@ def binary_receipt(*, path, bound, toolchain, command, targets, lock_path, timin
     }
     if implicit is not None:
         extra['implicit_build'] = implicit
+    if artifact_store_record is not None:
+        extra['artifact_store'] = artifact_store_record
+        # The canonical bin path is a relocation of the mutable Cargo output,
+        # exactly like the standalone CLI CAS producer; the original path/hash
+        # remain in cargo_artifacts, and this selected digest is the same bytes.
+        extra['relocated_artifact'] = True
+        extra['original_artifact_sha256'] = artifact_store_record['binary_sha256']
     return _make_receipt(
         binary_path=path,
         command=command,
@@ -1171,7 +1257,8 @@ def binary_receipt(*, path, bound, toolchain, command, targets, lock_path, timin
 
 
 def test_receipt(*, path, binary_name, artifact, bound, toolchain, command, link_targets,
-                 lock_path, timings, manifest_path, selection, environment, git):
+                 lock_path, timings, manifest_path, selection, environment, git,
+                 artifact_store_record=None):
     """A shared v2 receipt for one relocated integration-test executable."""
     path = Path(path)
     extra = {
@@ -1185,6 +1272,8 @@ def test_receipt(*, path, binary_name, artifact, bound, toolchain, command, link
         'build_options': environment['build_options'],
         'selection': selection.as_record(),
     }
+    if artifact_store_record is not None:
+        extra['artifact_store'] = artifact_store_record
     return _make_receipt(
         binary_path=path,
         command=command,
@@ -1217,17 +1306,19 @@ def run_batch(args):
     # request is planned, so --all-bins, a --bin name, a --test that is a
     # metadata test and the implicit bins all come from one target list.
     target = canonical_target()
-    preflight_request_paths(args, target)
+    _outputs, manifest_out = preflight_request_paths(args, target)
+    store_root = preflight_cas(args, target, manifest_out)
+    cas = store_root is not None
     metadata_before = cargo_metadata(environment)
     manifest = batch_manifest(metadata_before)
-    plan = plan_batch(args, manifest)
+    plan = plan_batch(args, manifest, cas=cas)
     selection = plan.selection
     started = time.monotonic()
 
     # Re-check the complete destination set immediately before the first
     # mutation; a pre-existing directory or symlink at a final file path is
     # refused rather than cleaned, and every final path stays disjoint.
-    validate_final_destinations(plan, target)
+    validate_final_destinations(plan, target, cas=cas)
     prepare_destinations(plan)
     command = emit_command(selection)
     for spec in plan.bins:
@@ -1247,26 +1338,47 @@ def run_batch(args):
     bin_receipts = bin_receipt_locations(plan, target)
     test_receipts = list(zip(plan.tests, plan.outputs, [Path(str(output) + '.build.json')
                                                         for output in plan.outputs]))
-    owned = ([path for _, path, _ in bin_receipts]
-             + [path for _, _, path in test_receipts]
-             + [plan.manifest_out]
-             + list(plan.outputs))
+    if cas:
+        # CAS bin receipts are canonical store records, not legacy target
+        # paths; only the test aliases and the manifest are final paths of
+        # this transaction.
+        owned = ([path for _, _, path in test_receipts]
+                 + [plan.manifest_out]
+                 + list(plan.outputs))
+    else:
+        owned = ([path for _, path, _ in bin_receipts]
+                 + [path for _, _, path in test_receipts]
+                 + [plan.manifest_out]
+                 + list(plan.outputs))
+    staging = [path.with_name('.' + path.name + '.batch-new') for path in owned]
     with build_lock(target) as lock_path:
         # Re-check under the lock, before any cleanup: a path that changed
         # between planning and lock acquisition must still be refused, never
         # followed or recursively deleted.
-        validate_final_destinations(plan, target)
-        # A failed or interrupted batch never leaves a receipt, manifest or
-        # relocated executable from an earlier or partial transaction behind.
-        remove_paths(owned + [path.with_name('.' + path.name + '.batch-new') for path in owned])
+        validate_final_destinations(plan, target, cas=cas)
+        if cas:
+            # CAS never withdraws a pre-existing output/receipt record; the
+            # alias publication is a strict no-overwrite operation.
+            for output in plan.outputs:
+                _require_absent(output, '--output')
+                _require_absent(Path(str(output) + '.build.json'), '--output receipt')
+            remove_paths(staging)
+        else:
+            # A failed or interrupted batch never leaves a receipt, manifest
+            # or relocated executable from an earlier or partial transaction
+            # behind.
+            remove_paths(owned + staging)
         try:
             return publish_transaction(plan, owned, lock_path, metadata_before, command,
-                                       started, environment, normalized)
+                                       started, environment, normalized,
+                                       store_root=store_root)
         except BaseException:
             # Staging siblings of this transaction may sit in the target
             # directory and in every output directory (each on its own
-            # filesystem); withdraw them wherever the failure happened.
-            remove_paths(owned + [path.with_name('.' + path.name + '.batch-new') for path in owned])
+            # filesystem); withdraw them wherever the failure happened.  In
+            # CAS mode the publication helper already withdrew its own
+            # canonical snapshots/receipts and aliases.
+            remove_paths(staging if cas else owned + staging)
             raise
 
 
@@ -1283,8 +1395,318 @@ def _features_record(selection):
     return {'enabled': enabled, 'no_default_features': selection.no_default_features}
 
 
+def manifest_payload(*, plan, selection, target, lock_path, metadata_after, normalized,
+                     bound, toolchain, git, command, build_seconds, started, artifacts,
+                     cargo_artifacts, artifact_store_record=None):
+    """The exact v2 batch manifest; CAS mode adds one top-level store record."""
+    manifest = {
+        'kind': KIND,
+        'manifest_version': MANIFEST_VERSION,
+        'status': 'passed',
+        'source_commit': git['commit'],
+        'git_head': git['head'],
+        'working_tree': {'tree': git['tree'], 'status': git['status']},
+        'source_inputs_sha256': bound['source_inputs_sha256'],
+        'cargo_lock_sha256': bound['cargo_lock_sha256'],
+        'config_digest': bound['config_digest'],
+        'bound_inputs': bound['bound_inputs'],
+        'bound_input_inventory': bound['bound_input_inventory'],
+        'toolchain': toolchain,
+        'features': _features_record(selection),
+        'profile': 'test',
+        'target_triple': toolchain['target_triple'],
+        'selection': selection.as_record(),
+        'architecture': {'target_triple': toolchain['target_triple'],
+                         'host': toolchain['rustc']['host']},
+        'target_directory': str(target),
+        'lock_file': str(lock_path),
+        'cargo_metadata_target_directory': metadata_after['target_directory'],
+        'cargo_package_id': metadata_after['package_id'],
+        'build_options': normalized['build_options'],
+        'build': {'command': command, 'commands': 1, 'duration_seconds': build_seconds,
+                  'cargo_artifacts': cargo_artifacts},
+        'artifacts': artifacts,
+        'duration_seconds': round(time.monotonic() - started, 3),
+    }
+    if artifact_store_record is not None:
+        manifest['artifact_store'] = artifact_store_record
+    return manifest
+
+
+def _cas_command_config(command):
+    """Stable command identity: no scheduling budget and no cache placement.
+
+    The batch deliberately names its canonical target directory in the executed
+    command, but that absolute cache path is not part of the built binary's
+    identity.  Omitting it keeps the configuration key stable across worktrees
+    that share content and toolchain, exactly like the standalone producers.
+    """
+    filtered = _schedule_free_command(command)
+    result = []
+    index = 0
+    while index < len(filtered):
+        token = filtered[index]
+        if token == '--config' and index + 1 < len(filtered) and (
+                filtered[index + 1].startswith('build.target-dir = ') or
+                filtered[index + 1].startswith('build.target-dir=')):
+            index += 2
+            continue
+        result.append(token)
+        index += 1
+    return result
+
+
+def _batch_artifact_config(artifact, *, kind, target_name, implicit, command, selection,
+                           toolchain, bound):
+    enabled = sorted(name for name in (selection.features or '').split(',') if name)
+    return artifact_store.configuration_key({
+        'kind': 'native-build-batch',
+        'artifact_kind': kind,
+        'target': target_name,
+        'implicit': bool(implicit),
+        'profile': artifact['profile'],
+        'source': artifact['source'],
+        'command': _cas_command_config(command),
+        'features': {'enabled': enabled,
+                     'no_default_features': selection.no_default_features},
+        'target_triple': toolchain['target_triple'],
+        'toolchain': _toolchain_identity(toolchain),
+        'content': {
+            'source_inputs_sha256': bound['source_inputs_sha256'],
+            'cargo_lock_sha256': bound['cargo_lock_sha256'],
+            'config_digest': bound['config_digest'],
+            'bound_inputs_digest': bound['bound_inputs']['digest'],
+        },
+    })
+
+
+def _cas_artifact_record(sealed, *, store_root, kind, target, implicit, build_alias,
+                         output_alias):
+    """One self-contained CAS provenance record for a receipt and the manifest."""
+    return {
+        'schema': artifact_store.STORE_SCHEMA,
+        'root': str(store_root),
+        'kind': kind,
+        'target': target,
+        'implicit': bool(implicit),
+        'object': str(sealed.object_path),
+        'binary': str(sealed.binary_path),
+        'receipt': str(sealed.receipt_path),
+        'build_receipt': str(build_alias),
+        'binary_sha256': sealed.sha256,
+        'config_key': sealed.config_key,
+        'build_id': sealed.build_id,
+        'method': sealed.method,
+        'reused': sealed.reused,
+        'copied_bytes': sealed.copied_bytes,
+        'output_alias': output_alias,
+    }
+
+
+def _seal_batch_executable(artifact, *, store_root, commit, config_key, name):
+    try:
+        return artifact_store.seal_binary(
+            artifact['executable'],
+            store_root=store_root,
+            commit=commit,
+            config_key=config_key,
+            expected_sha256=artifact['executable_sha256'],
+            name=name,
+        )
+    except artifact_store.ArtifactStoreError as error:
+        raise _as_build_error(error) from error
+
+
+def _publish_cas_receipt(sealed, payload):
+    try:
+        return artifact_store.write_receipt(sealed, payload)
+    except artifact_store.ArtifactStoreError as error:
+        raise _as_build_error(error) from error
+
+
+def publish_transaction_cas(*, plan, lock_path, command, started, environment, normalized,
+                            store_root, lib, bins, tests, bound, toolchain, git, timings,
+                            build_seconds, metadata_after):
+    """Seal every selected executable once and publish the manifest last.
+
+    Bin artifacts/receipts and test receipts are canonical immutable store
+    records.  Each test --output remains the required legacy path as a
+    no-overwrite hard-link/verified-copy alias of its immutable snapshot, and
+    its adjacent receipt is a same-byte alias of the canonical receipt.  No
+    target/dependency tree is copied and no executable is copied twice when
+    the managed object can be hard-linked.
+    """
+    selection = plan.selection
+    target = canonical_target()
+    selected_bins = [artifact for artifact, _ in bins]
+    targets = [lib] + selected_bins
+    test_targets = targets + list(tests)
+    test_receipts = list(zip(plan.tests, plan.outputs,
+                             [Path(str(output) + '.build.json') for output in plan.outputs]))
+    publisher = Publisher()
+    sealed_all = []
+    sealed_records = []
+    artifacts = []
+    published_build_aliases = []
+    published_outputs = []
+    published_output_receipts = []
+
+    def cleanup_publication():
+        for path in published_output_receipts:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        for path in published_build_aliases:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        for sealed in sealed_all:
+            with contextlib.suppress(OSError):
+                sealed.receipt_path.unlink()
+            with contextlib.suppress(OSError):
+                sealed.binary_path.unlink()
+            directory = sealed.binary_path.parent
+            for _ in range(3):
+                with contextlib.suppress(OSError):
+                    directory.rmdir()
+                directory = directory.parent
+        for path in published_outputs:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        publisher.abort()
+
+    try:
+        for (artifact, implicit), spec in zip(bins, plan.bins + plan.implicit_bins):
+            marker = {'requested_by': '--test',
+                      'reason': 'Cargo also builds the selected package\'s enabled bins when an '
+                                'integration test is selected (an integration test runs through its '
+                                'package\'s bins); this bin was reported by that same build, not '
+                                'selected by this batch',
+                      'acceptance': 'not-server-acceptance',
+                      'target_source': artifact['source']} if implicit else None
+            config_key = _batch_artifact_config(
+                artifact, kind='bin', target_name=spec['name'], implicit=implicit,
+                command=command, selection=selection, toolchain=toolchain, bound=bound)
+            sealed = _seal_batch_executable(
+                artifact, store_root=store_root, commit=git['commit'],
+                config_key=config_key, name=spec['name'])
+            sealed_all.append(sealed)
+            if sealed.sha256 != artifact['executable_sha256']:
+                raise BuildError('sealed bin ' + spec['name'] + ' does not match the Cargo artifact')
+            build_alias = sealed.binary_path.with_name(sealed.binary_path.name + '.build.json')
+            record = _cas_artifact_record(
+                sealed, store_root=store_root, kind='bin', target=spec['name'],
+                implicit=implicit, build_alias=build_alias, output_alias=None)
+            payload = binary_receipt(path=sealed.binary_path, bound=bound,
+                                     toolchain=toolchain, command=command,
+                                     targets=targets, lock_path=lock_path,
+                                     timings=timings, manifest_path=plan.manifest_out,
+                                     selection=selection, environment=normalized,
+                                     git=git, implicit=marker,
+                                     artifact_store_record=record)
+            _publish_cas_receipt(sealed, payload)
+            _publish_immutable_alias(sealed.receipt_path, build_alias,
+                                     'canonical compatibility receipt')
+            published_build_aliases.append(build_alias)
+            stat = os.stat(sealed.binary_path)
+            sealed_records.append(record)
+            # The manifest names the adjacent .build.json compatibility alias
+            # so a reader that appends it to the canonical snapshot finds the
+            # same immutable bytes; the record keeps the .receipt.json path.
+            artifacts.append({
+                'kind': 'bin', 'target': spec['name'],
+                'artifact': str(sealed.binary_path),
+                'original_artifact': artifact['executable'],
+                'original_artifact_sha256': artifact['executable_sha256'],
+                'receipt': str(build_alias), 'fresh': artifact['fresh'],
+                'sha256': sealed.sha256, 'size': stat.st_size,
+                'mtime_ns': stat.st_mtime_ns, 'duration_seconds': build_seconds,
+                'package_id': artifact['package_id'], 'profile': artifact['profile'],
+                'source': artifact['source'], 'artifact_store': record,
+            } | ({'implicit': True, 'target_source': artifact['source']}
+                 if implicit else {'implicit': False}))
+
+        for (spec, output, receipt_dest), artifact in zip(test_receipts, tests):
+            config_key = _batch_artifact_config(
+                artifact, kind='test', target_name=spec['name'], implicit=False,
+                command=command, selection=selection, toolchain=toolchain, bound=bound)
+            sealed = _seal_batch_executable(
+                artifact, store_root=store_root, commit=git['commit'],
+                config_key=config_key, name=output.name)
+            sealed_all.append(sealed)
+            if sealed.sha256 != artifact['executable_sha256']:
+                raise BuildError('sealed test ' + spec['name'] + ' does not match the Cargo artifact')
+            build_alias = sealed.binary_path.with_name(sealed.binary_path.name + '.build.json')
+            alias_method = _publish_immutable_alias(sealed.binary_path, output, '--output')
+            published_outputs.append(output)
+            alias_stat = os.stat(output)
+            object_stat = os.stat(sealed.object_path)
+            record = _cas_artifact_record(
+                sealed, store_root=store_root, kind='test', target=spec['name'],
+                implicit=False, build_alias=build_alias,
+                output_alias={
+                    'path': str(output),
+                    'receipt': str(receipt_dest),
+                    'method': alias_method,
+                    'same_inode_as_cas_object': (
+                        (alias_stat.st_dev, alias_stat.st_ino) ==
+                        (object_stat.st_dev, object_stat.st_ino)),
+                    'overwrote_existing': False,
+                })
+            payload = test_receipt(path=sealed.binary_path, binary_name=output.name,
+                                   artifact=artifact, bound=bound,
+                                   toolchain=toolchain, command=command,
+                                   link_targets=test_targets, lock_path=lock_path,
+                                   timings=timings, manifest_path=plan.manifest_out,
+                                   selection=selection, environment=normalized,
+                                   git=git, artifact_store_record=record)
+            _publish_cas_receipt(sealed, payload)
+            _publish_immutable_alias(sealed.receipt_path, build_alias,
+                                     'canonical compatibility receipt')
+            published_build_aliases.append(build_alias)
+            _publish_immutable_alias(sealed.receipt_path, receipt_dest, '--output receipt')
+            published_output_receipts.append(receipt_dest)
+            sealed_records.append(record)
+            artifacts.append({
+                'kind': 'test', 'target': spec['name'],
+                'artifact': str(output),
+                'original_artifact': artifact['executable'],
+                'original_artifact_sha256': artifact['executable_sha256'],
+                'receipt': str(receipt_dest), 'fresh': artifact['fresh'],
+                'sha256': sealed.sha256, 'size': alias_stat.st_size,
+                'source': artifact['source'], 'source_sha256': artifact['source_sha256'],
+                'package_id': artifact['package_id'], 'profile': artifact['profile'],
+                'duration_seconds': build_seconds, 'artifact_store': record,
+            })
+
+        artifact_store_record = {
+            'schema': artifact_store.STORE_SCHEMA,
+            'root': str(store_root),
+            'objects': sorted({str(sealed.object_path) for sealed in sealed_all}),
+            'sealed': sealed_records,
+        }
+        manifest = manifest_payload(
+            plan=plan, selection=selection, target=target, lock_path=lock_path,
+            metadata_after=metadata_after, normalized=normalized, bound=bound,
+            toolchain=toolchain, git=git, command=command,
+            build_seconds=build_seconds, started=started,
+            artifacts=artifacts, cargo_artifacts=test_targets,
+            artifact_store_record=artifact_store_record)
+        if capture_bound_inputs(environment) != bound:
+            raise BuildError('bound build inputs changed after their inventory was frozen')
+        if git_state() != git:
+            raise BuildError('HEAD or working-tree state changed after the build; refusing the receipt')
+        publisher.text(plan.manifest_out, manifest)
+        publisher.publish()
+        return manifest
+    except artifact_store.ArtifactStoreError as error:
+        cleanup_publication()
+        raise _as_build_error(error) from error
+    except BaseException:
+        cleanup_publication()
+        raise
+
+
 def publish_transaction(plan, owned, lock_path, metadata_before, command, started,
-                        environment, normalized):
+                        environment, normalized, store_root=None):
     """Build, verify and publish one batch under the canonical flock (no clean)."""
     selection = plan.selection
     target = canonical_target()
@@ -1292,15 +1714,21 @@ def publish_transaction(plan, owned, lock_path, metadata_before, command, starte
     bin_receipts = [(spec, path) for spec, path, _ in locations]
     test_receipts = list(zip(plan.tests, plan.outputs, [Path(str(output) + '.build.json')
                                                         for output in plan.outputs]))
-    # ``owned`` is every final path of this transaction, in the order run_batch
-    # names them: bin receipts (requested, then implicit), test receipts, the
-    # manifest, then the outputs.
-    assert bin_receipts == list(zip(plan.bins + plan.implicit_bins, owned[:len(locations)]))
-    bins_count = len(locations)
-    assert test_receipts == list(zip(plan.tests, plan.outputs,
-                                     owned[bins_count:bins_count + len(plan.tests)]))
-    assert owned[bins_count + len(plan.tests)] == plan.manifest_out
-    assert owned[bins_count + len(plan.tests) + 1:] == list(plan.outputs)
+    # ``owned`` is every final path of this transaction.  Legacy order is bin
+    # receipts (requested, then implicit), test receipts, the manifest, then
+    # the outputs.  CAS mode owns only the test aliases and the manifest.
+    if store_root is None:
+        assert bin_receipts == list(zip(plan.bins + plan.implicit_bins, owned[:len(locations)]))
+        bins_count = len(locations)
+        assert test_receipts == list(zip(plan.tests, plan.outputs,
+                                         owned[bins_count:bins_count + len(plan.tests)]))
+        assert owned[bins_count + len(plan.tests)] == plan.manifest_out
+        assert owned[bins_count + len(plan.tests) + 1:] == list(plan.outputs)
+    else:
+        assert test_receipts == list(zip(plan.tests, plan.outputs,
+                                         owned[:len(plan.tests)]))
+        assert owned[len(plan.tests)] == plan.manifest_out
+        assert owned[len(plan.tests) + 1:] == list(plan.outputs)
     before = source_snapshot(plan, environment)
     toolchain_before = probe_toolchain(environment)
     build_started = time.monotonic()
@@ -1332,6 +1760,13 @@ def publish_transaction(plan, owned, lock_path, metadata_before, command, starte
     selected_bins = [artifact for artifact, _ in bins]
     targets = [lib] + selected_bins
     test_targets = targets + list(tests)
+    if store_root is not None:
+        return publish_transaction_cas(
+            plan=plan, lock_path=lock_path, command=command, started=started,
+            environment=environment, normalized=normalized, store_root=store_root,
+            lib=lib, bins=bins, tests=tests, bound=bound, toolchain=toolchain_after,
+            git=git, timings=timings, build_seconds=build_seconds,
+            metadata_after=metadata_after)
     publisher = Publisher()
     artifacts = []
     # Bin receipts bind the lib and every selected bin from this one build.
@@ -1394,35 +1829,12 @@ def publish_transaction(plan, owned, lock_path, metadata_before, command, starte
         finally:
             remove_paths([receipt_input, receipt_input_dir])
         publisher.text(path, payload)
-    manifest = {
-        'kind': KIND,
-        'manifest_version': MANIFEST_VERSION,
-        'status': 'passed',
-        'source_commit': git['commit'],
-        'git_head': git['head'],
-        'working_tree': {'tree': git['tree'], 'status': git['status']},
-        'source_inputs_sha256': bound['source_inputs_sha256'],
-        'cargo_lock_sha256': bound['cargo_lock_sha256'],
-        'config_digest': bound['config_digest'],
-        'bound_inputs': bound['bound_inputs'],
-        'bound_input_inventory': bound['bound_input_inventory'],
-        'toolchain': toolchain_after,
-        'features': _features_record(selection),
-        'profile': 'test',
-        'target_triple': toolchain_after['target_triple'],
-        'selection': selection.as_record(),
-        'architecture': {'target_triple': toolchain_after['target_triple'],
-                         'host': toolchain_after['rustc']['host']},
-        'target_directory': str(target),
-        'lock_file': str(lock_path),
-        'cargo_metadata_target_directory': metadata_after['target_directory'],
-        'cargo_package_id': metadata_after['package_id'],
-        'build_options': normalized['build_options'],
-        'build': {'command': command, 'commands': 1, 'duration_seconds': build_seconds,
-                  'cargo_artifacts': test_targets},
-        'artifacts': artifacts,
-        'duration_seconds': round(time.monotonic() - started, 3),
-    }
+    manifest = manifest_payload(
+        plan=plan, selection=selection, target=target, lock_path=lock_path,
+        metadata_after=metadata_after, normalized=normalized, bound=bound,
+        toolchain=toolchain_after, git=git, command=command,
+        build_seconds=build_seconds, started=started, artifacts=artifacts,
+        cargo_artifacts=test_targets)
     # Stage every remaining payload, then re-check the sources at the moment
     # the receipts are about to become visible; publish renames each staged
     # sibling onto its own destination in that destination's directory.
@@ -1470,6 +1882,9 @@ def parse_args(argv):
                         help='relocated executable path outside CARGO_TARGET_DIR, once per --test, in --test order')
     parser.add_argument('--manifest-out', required=True,
                         help='batch manifest path (a directory receives ' + MANIFEST_NAME + ')')
+    parser.add_argument('--artifact-store',
+                        help='explicit managed artifact-store root; opt in to sealing every selected '
+                             'bin/test executable and publishing canonical CAS receipts in the manifest')
     return parser.parse_args(argv)
 
 

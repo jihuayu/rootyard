@@ -166,6 +166,7 @@ class BatchTest(unittest.TestCase):
         for name in ('cargo', 'rustc', 'rustup'):
             (self.root / 'toolchain' / name).write_bytes(('fake-' + name).encode())
         self.outdir = Path(os.path.join(self.tempdir, 'test-results'))
+        self.store = Path(os.path.join(self.tempdir, 'artifact-store'))
         self.target = Path(os.path.join(self.root, 'target')).resolve()
         self.lock_path = self.target / build_native.LOCK_NAME
         self.popen_calls = []
@@ -329,7 +330,7 @@ class BatchTest(unittest.TestCase):
 
     def args(self, bins=None, tests=TESTS, features='pando-lab', no_default_features=False,
              package_debug=None, strip_debuginfo=True, outputs=None, all_bins=False,
-             manifest_out=None):
+             manifest_out=None, artifact_store=None):
         bins = [] if all_bins else (BINS if bins is None else bins)
         outputs = outputs if outputs is not None else [
             str(os.path.join(self.outdir, name.replace('_', '-'))) for name in tests]
@@ -337,6 +338,7 @@ class BatchTest(unittest.TestCase):
                                   package_debug=package_debug, strip_debuginfo=strip_debuginfo,
                                   all_bins=all_bins, bin=list(bins), bin_destination=[],
                                   test=list(tests), output=outputs,
+                                  artifact_store=artifact_store,
                                   manifest_out=str(manifest_out or
                                                    self.outdir / 'native-build-batch.json'))
 
@@ -937,6 +939,313 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(test_receipt['bound_inputs'], second['bound_inputs'])
         self.assertEqual(test_receipt['bound_input_inventory'], second['bound_input_inventory'])
         self.assertEqual(len(self.popen_calls), 2)
+
+
+    def cas_args(self, *, suffix='a', **overrides):
+        overrides.setdefault('artifact_store', str(self.store))
+        overrides.setdefault('manifest_out', self.outdir / ('cas-' + suffix + '.json'))
+        overrides.setdefault('outputs', [str(self.outdir / ('cas-' + suffix + '-example'))])
+        return self.args(**overrides)
+
+    @staticmethod
+    def sealed_by_kind_target(report):
+        return {(record['kind'], record['target']): record
+                for record in report['artifact_store']['sealed']}
+
+    def test_cas_batch_seals_all_executables_and_publishes_manifest_last(self):
+        args = self.cas_args()
+        events = self.default_events(bins=args.bin, tests=args.test, fresh=False)
+        seen = []
+        real_replace = os.replace
+
+        def record(source, destination, *arguments, **keywords):
+            seen.append((Path(source), Path(destination)))
+            return real_replace(source, destination, *arguments, **keywords)
+
+        with mock.patch.object(batch.os, 'replace', record):
+            report = self.build(events=events, args=args)
+        store_record = report['artifact_store']
+        self.assertEqual(store_record['schema'], batch.artifact_store.STORE_SCHEMA)
+        self.assertEqual(store_record['root'], str(self.store))
+        self.assertEqual(json.loads(Path(args.manifest_out).read_text()), report)
+        self.assertEqual(seen[-1][1], Path(args.manifest_out).resolve())
+
+        bins = [row for row in report['artifacts'] if row['kind'] == 'bin']
+        tests = [row for row in report['artifacts'] if row['kind'] == 'test']
+        expected_bins = list(BINS) + list(self.implicit_bins(BINS, TESTS))
+        self.assertEqual([row['target'] for row in bins], expected_bins)
+        self.assertEqual([row['target'] for row in tests], list(TESTS))
+        for row in bins:
+            artifact = Path(row['artifact'])
+            record = row['artifact_store']
+            self.assertEqual(record['binary'], str(artifact))
+            self.assertEqual(record['binary_sha256'], row['sha256'])
+            self.assertFalse((self.target / 'debug' / (row['target'] + '.build.json')).exists(),
+                             'CAS bin receipts must be canonical store records')
+            self.assertTrue(artifact.is_file())
+            self.assertEqual(artifact.stat().st_mode & 0o777, 0o555)
+            self.assertEqual(batch.sha256_file(artifact), row['sha256'])
+            self.assertEqual(row['sha256'], row['original_artifact_sha256'])
+            self.assertEqual(row['original_artifact'], self.binary(row['target']))
+            self.assertEqual(Path(row['receipt']), Path(record['build_receipt']))
+            self.assertEqual(Path(row['receipt']).stat().st_mode & 0o777, 0o444)
+            self.assertEqual(Path(row['receipt']).read_bytes(),
+                             Path(record['receipt']).read_bytes())
+            self.assertEqual(os.stat(artifact).st_ino, os.stat(record['object']).st_ino)
+            self.assertNotEqual(os.stat(artifact).st_ino,
+                                os.stat(self.binary(row['target'])).st_ino)
+            self.assertIsNone(record['output_alias'])
+        for row in tests:
+            alias = Path(row['artifact'])
+            record = row['artifact_store']
+            self.assertTrue(alias.is_file())
+            self.assertEqual(alias.stat().st_mode & 0o777, 0o555)
+            self.assertEqual(batch.sha256_file(alias), row['sha256'])
+            self.assertEqual(record['binary_sha256'], row['sha256'])
+            self.assertEqual(alias.read_bytes(), Path(record['binary']).read_bytes())
+            self.assertEqual(row['sha256'], row['original_artifact_sha256'])
+            self.assertEqual(Path(row['receipt']), Path(record['output_alias']['receipt']))
+            self.assertEqual(Path(row['receipt']).stat().st_mode & 0o777, 0o444)
+            self.assertEqual(Path(row['receipt']).read_bytes(),
+                             Path(record['receipt']).read_bytes())
+            self.assertIn(record['output_alias']['method'], ('hardlink', 'copy'))
+            self.assertEqual(record['output_alias']['same_inode_as_cas_object'],
+                             record['output_alias']['method'] == 'hardlink')
+            self.assertFalse(record['output_alias']['overwrote_existing'])
+            self.assertNotEqual(os.stat(alias).st_ino,
+                                os.stat(row['original_artifact']).st_ino)
+        objects = [Path(path) for path in store_record['objects']]
+        unique_hashes = {receipt.sha256_file(event['executable'])
+                         for event in events if 'executable' in event}
+        self.assertEqual(len(objects), len(unique_hashes))
+        for path in objects:
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o555)
+            self.assertEqual(batch.sha256_file(path), path.name)
+        for sealed in store_record['sealed']:
+            self.assertEqual(os.stat(sealed['binary']).st_ino,
+                             os.stat(sealed['object']).st_ino)
+            self.assertFalse(sealed['output_alias'] is not None and
+                             sealed['kind'] == 'bin')
+
+    def test_cas_batch_reuses_objects_and_preserves_actual_freshness(self):
+        first_args = self.cas_args(suffix='first')
+        second_args = self.cas_args(suffix='second')
+        first = self.build(events=self.default_events(bins=first_args.bin,
+                                                     tests=first_args.test, fresh=False),
+                           args=first_args)
+        second = self.build(events=self.default_events(bins=second_args.bin,
+                                                      tests=second_args.test, fresh=True),
+                            args=second_args)
+        first_records = self.sealed_by_kind_target(first)
+        second_records = self.sealed_by_kind_target(second)
+        self.assertEqual(set(first_records), set(second_records))
+        for key in first_records:
+            self.assertEqual(first_records[key]['object'], second_records[key]['object'])
+            self.assertEqual(first_records[key]['config_key'],
+                             second_records[key]['config_key'])
+            self.assertNotEqual(first_records[key]['binary'],
+                                second_records[key]['binary'])
+            self.assertNotEqual(first_records[key]['receipt'],
+                                second_records[key]['receipt'])
+            self.assertTrue(second_records[key]['reused'])
+            self.assertEqual(second_records[key]['method'], 'reuse')
+            self.assertEqual(second_records[key]['copied_bytes'], 0)
+        self.assertEqual([row['fresh'] for row in first['artifacts']],
+                         [False] * len(first['artifacts']))
+        self.assertEqual([row['fresh'] for row in second['artifacts']],
+                         [True] * len(second['artifacts']))
+        self.assertEqual([row['fresh'] for row in first['build']['cargo_artifacts']],
+                         [False] * len(first['build']['cargo_artifacts']))
+        self.assertEqual([row['fresh'] for row in second['build']['cargo_artifacts']],
+                         [True] * len(second['build']['cargo_artifacts']))
+
+    def test_cas_batch_refuses_existing_output_or_receipt_without_overwrite(self):
+        args = self.cas_args()
+        events = self.default_events(bins=args.bin, tests=args.test)
+        self.build(events=events, args=args)
+        output = Path(args.output[0])
+        receipt = Path(args.output[0] + '.build.json')
+        before_output = output.read_bytes()
+        before_receipt = receipt.read_bytes()
+        calls = len(self.popen_calls)
+        metadata_calls = len(self.metadata_calls)
+        with self.assertRaises(batch.BuildError) as caught:
+            self.build(events=events, args=args)
+        self.assertIn('already exists', str(caught.exception))
+        self.assertEqual(len(self.popen_calls), calls)
+        self.assertEqual(len(self.metadata_calls), metadata_calls)
+        self.assertEqual(output.read_bytes(), before_output)
+        self.assertEqual(receipt.read_bytes(), before_receipt)
+        output.unlink()
+        with self.assertRaises(batch.BuildError) as caught:
+            self.build(events=events, args=args)
+        self.assertIn('already exists', str(caught.exception))
+        self.assertEqual(len(self.popen_calls), calls)
+        self.assertEqual(receipt.read_bytes(), before_receipt)
+
+    def test_cas_batch_failure_withdraws_aliases_receipts_and_snapshots(self):
+        args = self.cas_args()
+        events = self.default_events(bins=args.bin, tests=args.test)
+        with mock.patch.object(batch.Publisher, 'publish',
+                               side_effect=batch.BuildError('manifest refused')):
+            with self.assertRaises(batch.BuildError) as caught:
+                self.build(events=events, args=args)
+        self.assertIn('manifest refused', str(caught.exception))
+        self.assertFalse(Path(args.manifest_out).exists())
+        for output in args.output:
+            self.assertFalse(Path(output).exists())
+            self.assertFalse(Path(output + '.build.json').exists())
+        self.assertFalse([path for path in self.store.rglob('*')
+                          if path.is_file() and
+                          path.name.endswith(('.build.json', '.receipt.json'))])
+        self.assertFalse([path for path in (self.store / 'snapshots').rglob('*')
+                          if path.is_file()])
+        self.assertTrue([path for path in (self.store / 'objects').rglob('*')
+                         if path.is_file()], 'content objects may remain after a failed batch')
+
+    def test_cas_batch_config_key_ignores_jobs_and_reuses_objects(self):
+        first_args = self.cas_args(suffix='jobs-none')
+        first = self.build(events=self.default_events(bins=first_args.bin,
+                                                     tests=first_args.test), args=first_args)
+        second_args = self.cas_args(suffix='jobs-two')
+        os.environ['CARGO_BUILD_JOBS'] = '2'
+        try:
+            second = self.build(events=self.default_events(bins=second_args.bin,
+                                                          tests=second_args.test), args=second_args)
+        finally:
+            os.environ.pop('CARGO_BUILD_JOBS', None)
+        self.assertEqual(first['build_options'], {'jobs': None})
+        self.assertEqual(second['build_options'], {'jobs': 2})
+        self.assertEqual(second['build']['command'][-2:], ['--jobs', '2'])
+        first_records = self.sealed_by_kind_target(first)
+        second_records = self.sealed_by_kind_target(second)
+        for key in first_records:
+            self.assertEqual(first_records[key]['config_key'],
+                             second_records[key]['config_key'])
+            self.assertEqual(first_records[key]['object'], second_records[key]['object'])
+            self.assertTrue(second_records[key]['reused'])
+            self.assertEqual(second_records[key]['copied_bytes'], 0)
+
+    def test_cas_config_key_ignores_target_directory(self):
+        toolchain = self.fake_toolchain()
+        bound = batch.capture_bound_inputs()
+        artifact = {'profile': {'opt_level': '0', 'debuginfo': 2, 'debug_assertions': True,
+                                'overflow_checks': True, 'test': False},
+                    'source': 'src/main.rs'}
+        selection = batch.Selection('pando-lab', False, None, True)
+
+        def config_key(target, jobs=None):
+            command = ['cargo', 'build', '--locked', '--profile', 'test',
+                       '--config', 'build.target-dir = "' + target + '"',
+                       '--bin', 'rootyard', '--message-format=json-render-diagnostics']
+            if jobs is not None:
+                command += ['--jobs', str(jobs)]
+            return batch._batch_artifact_config(
+                artifact, kind='bin', target_name='rootyard', implicit=False,
+                command=command, selection=selection, toolchain=toolchain, bound=bound)
+
+        self.assertEqual(config_key('/one/worktree/target'),
+                         config_key('/another/worktree/target'))
+        self.assertEqual(config_key('/one/worktree/target', jobs=1),
+                         config_key('/another/worktree/target', jobs=8))
+
+    def test_cas_preflight_refuses_store_and_final_path_overlaps_before_cargo(self):
+        cases = [
+            ('store inside source', self.root / 'cas-store', self.outdir / 'source-alias',
+             self.outdir / 'source.json', 'outside the source repository'),
+            ('store inside target', self.target / 'cas-store', self.outdir / 'target-alias',
+             self.outdir / 'target.json', 'outside CARGO_TARGET_DIR'),
+            ('output inside store', self.store, self.store / 'alias',
+             self.outdir / 'inside.json', 'outside the artifact store'),
+            ('manifest inside store', self.store, self.outdir / 'manifest-alias',
+             self.store / 'manifest.json', 'outside the artifact store'),
+            ('store inside output', self.outdir / 'parent-output' / 'nested-store',
+             self.outdir / 'parent-output', self.outdir / 'nested.json',
+             'outside the artifact store'),
+        ]
+        for label, store, output, manifest, message in cases:
+            with self.subTest(label=label):
+                args = self.args(outputs=[str(output)], manifest_out=str(manifest),
+                                 artifact_store=str(store))
+                with self.assertRaises(batch.BuildError) as caught:
+                    self.build(args=args)
+                self.assertIn(message, str(caught.exception))
+        self.assertEqual(self.metadata_calls, [])
+        self.assertEqual(self.popen_calls, [])
+
+    def test_cas_preserves_legacy_receipt_and_survives_mutable_output_overwrite(self):
+        legacy = self.target / 'debug' / 'rootyard.build.json'
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text('{"legacy": true}\n')
+        args = self.cas_args()
+        report = self.build(args=args)
+        self.assertEqual(legacy.read_text(), '{"legacy": true}\n')
+        bins = [row for row in report['artifacts'] if row['kind'] == 'bin']
+        self.assertTrue(bins)
+        for row in bins:
+            snapshot = Path(row['artifact'])
+            mutable = Path(row['original_artifact'])
+            self.assertNotEqual(Path(row['receipt']), legacy)
+            before = snapshot.read_bytes()
+            mutable.write_bytes(b'overwritten mutable compiler output')
+            self.assertEqual(snapshot.read_bytes(), before)
+            self.assertEqual(batch.sha256_file(snapshot), row['sha256'])
+            self.assertEqual(Path(row['artifact_store']['object']).read_bytes(), before)
+            self.assertNotEqual(os.stat(snapshot).st_ino, os.stat(mutable).st_ino)
+
+    def test_cas_bins_only_publishes_snapshots_without_legacy_receipts(self):
+        args = self.args(bins=BINS, tests=[], outputs=[], artifact_store=str(self.store),
+                         manifest_out=self.outdir / 'cas-bins.json')
+        report = self.build(events=self.default_events(bins=args.bin, tests=[], implicit=False),
+                            args=args)
+        self.assertEqual([row['kind'] for row in report['artifacts']], ['bin'] * len(BINS))
+        self.assertEqual(len(report['artifact_store']['objects']), len(BINS))
+        for row in report['artifacts']:
+            self.assertEqual(Path(row['artifact']), Path(row['artifact_store']['binary']))
+            self.assertEqual(batch.sha256_file(row['artifact']), row['sha256'])
+            self.assertFalse((self.target / 'debug' / (row['target'] + '.build.json')).exists())
+
+    def test_cas_manifest_store_records_and_receipts_are_self_consistent(self):
+        args = self.cas_args()
+        report = self.build(args=args)
+        required = {
+            'kind', 'manifest_version', 'status', 'source_commit', 'git_head',
+            'working_tree', 'source_inputs_sha256', 'cargo_lock_sha256', 'config_digest',
+            'bound_inputs', 'bound_input_inventory', 'toolchain', 'features', 'profile',
+            'target_triple', 'selection', 'architecture', 'target_directory', 'lock_file',
+            'cargo_metadata_target_directory', 'cargo_package_id', 'build_options',
+            'build', 'artifacts', 'duration_seconds', 'artifact_store',
+        }
+        self.assertEqual(set(report), required)
+        store_record = report['artifact_store']
+        self.assertEqual(set(store_record), {'schema', 'root', 'objects', 'sealed'})
+        fields = {'schema', 'root', 'kind', 'target', 'implicit', 'object', 'binary',
+                  'receipt', 'build_receipt', 'binary_sha256', 'config_key', 'build_id',
+                  'method', 'reused', 'copied_bytes', 'output_alias'}
+        by_key = {(row['kind'], row['target']): row for row in report['artifacts']}
+        sealed_by_key = {(row['kind'], row['target']): row for row in store_record['sealed']}
+        self.assertEqual(set(by_key), set(sealed_by_key))
+        for key, row in by_key.items():
+            record = row['artifact_store']
+            self.assertEqual(set(record), fields)
+            self.assertEqual(record, sealed_by_key[key])
+            self.assertEqual(record['schema'], batch.artifact_store.STORE_SCHEMA)
+            self.assertEqual(record['root'], str(self.store))
+            self.assertEqual(record['binary_sha256'], row['sha256'])
+            loaded = receipt.load_receipt(
+                row['receipt'], binary_path=row['artifact'],
+                expected_commit=report['source_commit'],
+                expected_source_digest=report['source_inputs_sha256'],
+                expected_config_digest=report['config_digest'],
+                expected_batch_manifest=args.manifest_out)
+            self.assertEqual(loaded.binary_sha256, row['sha256'])
+            self.assertEqual(loaded.payload['artifact_store'], record)
+            if row['kind'] == 'bin':
+                self.assertIs(loaded.payload['relocated_artifact'], True)
+                self.assertEqual(loaded.payload['original_artifact_sha256'], row['sha256'])
+            self.assertEqual({item['fresh'] for item in loaded.payload['cargo_artifacts']},
+                             {row['fresh']})
 
 
 if __name__ == '__main__':
