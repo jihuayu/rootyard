@@ -493,6 +493,29 @@ jobs:
                             label + ' cargo_artifacts[' + str(index) + '] fresh is not a JSON boolean')
               return entries
 
+          def require_v2_artifact_sources(validated, expected, label):
+              # v2 rows are already hash- and inventory-bound by the shared
+              # reader.  The caller adds the logical source path (and its file
+              # hash) for each intended target/kind, without reimplementing the
+              # shared source-closure algorithm.  v1 rows never carried a
+              # source field, so historical receipts keep their existing checks.
+              if validated.schema != 'v2':
+                  return
+              rows = list(validated.artifacts)
+              check(len(rows) == len(expected),
+                    label + ' receipt does not name exactly the expected v2 artifacts')
+              by_key = {(row.get('target'), row.get('kind')): row for row in rows}
+              check(len(by_key) == len(rows),
+                    label + ' receipt repeats a v2 artifact target/kind')
+              for target, kind, source in expected:
+                  row = by_key.get((target, kind))
+                  check(row is not None,
+                        label + ' receipt lacks the ' + kind + '/' + target + ' artifact')
+                  check(row.get('source') == source,
+                        label + ' ' + kind + ' artifact source is not ' + source)
+                  check(row.get('source_sha256') == sha256(workspace / source),
+                        label + ' ' + kind + ' artifact source SHA does not match ' + source)
+
           record = toolchain_record()
           trusted = expected_toolchain(record)
           try:
@@ -604,6 +627,10 @@ jobs:
                     and selected_profile.get('test') is True
                     and selected_profile.get('debuginfo') == 0,
                     'test artifact is not the debug=0 test-profile executable')
+          require_v2_artifact_sources(
+              test_validated,
+              [('blob_git_gateway', 'test', test_source)],
+              'test receipt')
           serving_artifacts = artifacts_of(serving_validated, 'product')
           binaries = [entry for entry in serving_artifacts
                       if entry.get('target') == 'rootyard' and entry.get('kind') == 'bin']
@@ -618,6 +645,11 @@ jobs:
                     and binary_profile.get('test') is False
                     and binary_profile.get('debuginfo') == 0,
                     'product bin artifact is not the debug=0 dev-profile executable')
+          require_v2_artifact_sources(
+              serving_validated,
+              [('rootyard', 'lib', 'src/lib.rs'),
+               ('rootyard', 'bin', 'src/main.rs')],
+              'product receipt')
 
           def recorded_artifacts(validated, entries):
               record = {
@@ -1110,6 +1142,30 @@ jobs:
                    + ' with an optional explicit positive trailing --jobs budget')
 
 
+          def require_v2_artifact_sources(validated, expected, label):
+              # The shared reader already owns source hashing, inventory and
+              # closure consistency.  This caller anchor adds the intended
+              # logical target/kind -> source-path binding (and confirms the
+              # recorded source hash matches that path).  Legacy v1 rows never
+              # carried source fields, so their established checks stay as-is.
+              if validated.schema != 'v2':
+                  return
+              rows = list(validated.artifacts)
+              if len(rows) != len(expected):
+                  fail(label + ' receipt does not name exactly the expected v2 artifacts')
+              by_key = {(row.get('target'), row.get('kind')): row for row in rows}
+              if len(by_key) != len(rows):
+                  fail(label + ' receipt repeats a v2 artifact target/kind')
+              for target, kind, source in expected:
+                  row = by_key.get((target, kind))
+                  if row is None:
+                      fail(label + ' receipt lacks the ' + kind + '/' + target + ' artifact')
+                  if row.get('source') != source:
+                      fail(label + ' ' + kind + ' artifact source is not ' + source)
+                  if row.get('source_sha256') != sha(workspace / source):
+                      fail(label + ' ' + kind + ' artifact source SHA does not match ' + source)
+
+
           test_receipt_path = pathlib.Path(lib).with_suffix('.build.json')
           cli_receipt_path = workspace / 'target' / 'debug' / 'rootyard.build.json'
           try:
@@ -1260,6 +1316,8 @@ jobs:
                   fail('lib receipt original artifact hash does not match the immutable copy')
               if test_artifact.get('executable_sha256') != test_receipt.get('binary_sha256'):
                   fail('lib-test artifact executable hash does not match the immutable copy')
+          require_v2_artifact_sources(
+              test_validated, [('rootyard', 'lib-test', 'src/lib.rs')], 'lib receipt')
           if cli_receipt.get('target_dir') is None:
               fail('CLI receipt is not the build_native.py receipt')
           cli_artifacts = list(cli_validated.artifacts)
@@ -1282,6 +1340,11 @@ jobs:
               if 'original_artifact_sha256' in cli_receipt \
                       and cli_receipt.get('original_artifact_sha256') != cli_receipt.get('binary_sha256'):
                   fail('CLI receipt original artifact hash does not match the immutable copy')
+          require_v2_artifact_sources(
+              cli_validated,
+              [('rootyard', 'lib', 'src/lib.rs'),
+               ('rootyard', 'bin', 'src/main.rs')],
+              'CLI receipt')
           executable = cli_bin.get('executable') or ''
           if pathlib.Path(executable).resolve() != (workspace / 'target' / 'debug' / 'rootyard').resolve():
               fail('CLI bin artifact is not the workspace target binary')

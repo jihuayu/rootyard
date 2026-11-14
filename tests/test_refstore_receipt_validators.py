@@ -777,6 +777,10 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
         # The selected artifact identity and exact executable hashes remain.
         self.assertIn("'blob_git_gateway' and entry.get('kind') == 'test'", block)
         self.assertIn("serving_receipt.get('binary_sha256') == sha256(serving_binary)", block)
+        # v2 rows carry the intended source path and hash; v1 rows do not.
+        self.assertIn("require_v2_artifact_sources", block)
+        self.assertIn("('rootyard', 'lib', 'src/lib.rs')", block)
+        self.assertIn("('rootyard', 'bin', 'src/main.rs')", block)
 
     def test_preflight_validator_keeps_v1_and_accepts_v2_booleans(self):
         block = self.preflight_validator
@@ -791,6 +795,9 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
         self.assertIn("EXPECTED_FEATURES", block)
         self.assertIn("test_artifact.get('kind') != 'lib-test'", block)
         self.assertIn("cli_receipt.get('target_dir')", block)
+        self.assertIn("require_v2_artifact_sources", block)
+        self.assertIn("('rootyard', 'lib-test', 'src/lib.rs')", block)
+        self.assertIn("('rootyard', 'bin', 'src/main.rs')", block)
         self.assertIn("pathlib.Path(executable).resolve()", block)
         # v2 feature/profile/toolchain anchors and the independent setup record.
         self.assertIn("features.get('enabled') != EXPECTED_FEATURES['enabled']", block)
@@ -917,6 +924,37 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
                 (fixture["root"]
                  / "test-results/refstore/blob_git_gateway/build-pair.json").exists(),
                 "swapped receipt still emitted a build-pair manifest")
+
+    def test_batch_validator_rejects_self_consistent_wrong_v2_artifact_sources(self):
+        cases = (
+            ("test", "test_receipt", "test", "tests/blob_gateway_support/helper.rs",
+             "test receipt test artifact source is not tests/blob_git_gateway.rs"),
+            ("serving-lib", "serving_receipt", "lib", "src/main.rs",
+             "product receipt lib artifact source is not src/lib.rs"),
+            ("serving-bin", "serving_receipt", "bin", "src/lib.rs",
+             "product receipt bin artifact source is not src/main.rs"),
+        )
+        for name, key, kind, source, marker in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_batch_fixture(temporary, "v2", self.batch_constants)
+                path = fixture[key]
+                payload = json.loads(path.read_text())
+                row = next(item for item in payload["cargo_artifacts"]
+                           if item["kind"] == kind)
+                # Both paths exist in the repo and are present in the bound
+                # inventory, so this rewrite is hash- and inventory-consistent.
+                row["source"] = source
+                row["source_sha256"] = digest(fixture["root"] / source)
+                path.write_text(json.dumps(payload))
+                head = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=fixture["root"], text=True).strip()
+                binary = (fixture["test_binary"] if key == "test_receipt"
+                          else fixture["serving_binary"])
+                parsed = receipts.load_receipt(
+                    path, source_root=fixture["root"], binary_path=binary,
+                    expected_commit=head, verify_source_files=True)
+                self.assertEqual(parsed.schema, "v2")
+                self.assert_batch_fails(fixture, marker)
 
     def test_batch_validator_rejects_tampered_contracts(self):
         def edit_receipt(fixture, key, mutate):
@@ -1106,6 +1144,36 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             cli_copy = fixture["evidence"] / "rootyard-cli.build.json"
             self.assertEqual(cli_copy.read_bytes(), cli_receipt.read_bytes())
             self.assertEqual(digest(cli_copy), digest(cli_receipt))
+
+    def test_preflight_validator_rejects_self_consistent_wrong_v2_artifact_sources(self):
+        cases = (
+            ("lib", "lib", "lib-test", "src/main.rs",
+             "lib receipt lib-test artifact source is not src/lib.rs"),
+            ("cli-lib", "cli", "lib", "src/main.rs",
+             "CLI receipt lib artifact source is not src/lib.rs"),
+            ("cli-bin", "cli", "bin", "src/lib.rs",
+             "CLI receipt bin artifact source is not src/main.rs"),
+        )
+        for name, key, kind, source, marker in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_preflight_fixture(temporary, self.preflight_validator)
+                binary = fixture["lib"] if key == "lib" else fixture["cli"]
+                receipt_binary = fixture["lib"] if key == "lib" else fixture["target_cli"]
+                path = receipt_binary.with_suffix(".build.json")
+                payload = json.loads(path.read_text())
+                row = next(item for item in payload["cargo_artifacts"]
+                           if item["kind"] == kind)
+                # A real alternate source with its own matching hash keeps the
+                # shared reader happy; only the caller's logical-path anchor
+                # can reject it.
+                row["source"] = source
+                row["source_sha256"] = digest(fixture["root"] / source)
+                path.write_text(json.dumps(payload))
+                parsed = receipts.load_receipt(
+                    path, source_root=fixture["root"], binary_path=binary,
+                    expected_commit=fixture["head"], verify_source_files=True)
+                self.assertEqual(parsed.schema, "v2")
+                self.assert_preflight_fails(fixture, marker)
 
     def test_preflight_validator_accepts_positive_v2_cache_hits(self):
         cases = (
