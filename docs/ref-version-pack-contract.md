@@ -67,18 +67,16 @@ alone.
 | `repository_id` | Non-nil; same repository only. README links and UI names cannot substitute. |
 | `history_incarnation` | Current gate/binding value. A restore creates a new incarnation; old version IDs are not reinterpreted. |
 | `authority_kind` | `pg_refstore` or `raft_refstore`, fixed at provision. |
-| `authority_epoch`, `group_id`, `group_epoch` | Current realm. `group_id = 0` only for PG; a different realm is a different version namespace. |
+| `authority_epoch`, `group_id`, `group_epoch`, `object_format` | Current realm; object format binds OID width and is part of the ID preimage. `group_id = 0` only for PG; a different realm is a different version namespace. |
 | `ref_name` | Canonical Git ref name; same-ref base dependency only. |
 | `ref_generation` | Positive per-ref sequence starting at 1; every successful publish/delete/repack advances exactly one. No reuse after tombstone or pruning. |
 | `operation_id` + `operation_digest` | The exact operation identity/digest that produced the version; replay equality requires all of these fields. |
 
-`VersionId` is a domain-separated, length-delimited SHA-256 over the realm, ref
-name, `ref_generation`, operation UUID and operation digest. The stored
-`VersionRecord` additionally binds `authority_seq` (the existing repo-wide core
-gate revision is reused), `kind` (`publish`, `delete`, `repack`), the target OID
-or tombstone marker, the own pack-set digest, sorted object-dependency version
-IDs, and `commit_set_id`. `record_digest` covers that complete record. A bare
-`git_oid` is not a version ID.
+`VersionId = SHA-256(L("ry-ref-version-id-v1") || L(tenant) || L(repo) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || L(ref_name) || u64(ref_generation) || L(operation_id) || L(operation_digest))`; `L` and tag encoding are defined in §2.5. It excludes `CommitSetId` and `record_digest`.
+The stored `VersionRecord` additionally binds `authority_seq` (the existing core gate revision), `kind` (`publish`, `delete`, `repack`), target or tombstone marker, own pack-set digest, sorted object-dependency VersionIds and `commit_set_id`.
+`record_digest = SHA-256(L("ry-ref-version-record-v1") || L(VersionId) || u64(authority_seq) || u8(version_kind) || u8(target_tag) [|| L(target_oid)] || u8(base_tag) [|| L(base_version_id)] || dep-list || L(pack_set_digest) || L(commit_set_id))`; `dep-list = u32_be(count)||sorted(L(dep_version_id))` (entries unique); it never contains itself.
+A `VersionId` is immutable: exactly one `record_digest` per VersionId. `VersionId` is the primary key, `(realm, ref_name, ref_generation)` and `(realm, operation_id, ref_name)` are unique, and version rows are insert-only; re-presenting any different record is `version_id_record_conflict`, never an upsert. Readers recompute both digests and reject mismatch. PG and Raft apply the same rule.
+A bare `git_oid` is not a version ID.
 
 Do not conflate namespaces: `pin_generation` is a lease generation; Blob locator
 `authority_generation` is physical Blob state; `authority_epoch` is a
@@ -125,8 +123,7 @@ existing registered packs. Each pack is exactly one pack + one idx with:
   `packs_digest`; append-only registration/history rows are separate immutable
   rows enforced by migration 142 constraints/triggers, not by this digest.
 
-The set digest is `H("ry-version-pack-set-v1", sorted(pack_id,
-registration_id, artifact_set_digest))`. Locators and digests are never rewritten
+`PackSetDigest = SHA-256(L("ry-version-pack-set-v1") || u32_be(count) || sorted entries)`, unique entries sorted by `(pack_id, registration_id)`, where `entry = L(pack_id)||L(registration_id)||L(artifact_set_digest)`; `artifact_set_digest` is the current 32-byte `ArtifactSetDigest`, and `joined_revision` is not part of this version pack set. Locators and digests are never rewritten
 in place. A changed locator/content is a different pack registration and a
 different set digest. Version pack sets and their exact locators are
 authoritative for version reads/roots; the current active membership is the
@@ -200,7 +197,7 @@ separately and are not an unbounded request-time closure.
 
 ### 2.5 Commit sets and atomic visibility
 
-Every committed version batch has one `CommitSet`. Canonical encoding: `L(x)=u64_be(len(x))||x`; integers are `u8/u32_be/u64_be`; UUID/OID/VersionId/digest fields are raw bytes (OID width from `object_format`); lists are `u32_be(count)||entries`, versions sorted by `(ref_name, VersionId)`, results by `ref_name`. Tags: authority 1=pg/2=raft; format 1=sha1/2=sha256; version kind 1=publish/2=delete/3=repack (publish/delete may mix; repack only in an all-repack maintenance set; delete uses target_tag=0, publish/repack target_tag=1); target/head/old/new tags 0=absent/1=present; `commit_set_tag` 0=absent/1=present; terminal kind 1=committed/2=rejected/3=cancelled; outcome 1=applied/2=not_applied; `reason` is UTF-8 (empty for applied).
+Every committed version batch has one `CommitSet`. Canonical encoding: `L(x)=u64_be(len(x))||x`; integers are `u8/u32_be/u64_be`; UUID/OID/VersionId/digest fields are raw bytes (OID width from `object_format`); lists are `u32_be(count)||entries`, versions and results have unique ref names, versions are sorted by `(ref_name, VersionId)`, results by `ref_name`. Tags: authority 1=pg/2=raft; format 1=sha1/2=sha256; version kind 1=publish/2=delete/3=repack (publish/delete may mix; repack only in an all-repack maintenance set; delete uses target_tag=0, publish/repack target_tag=1); target/head/base/old/new tags 0=absent/1=present; `commit_set_tag` 0=absent/1=present; terminal kind 1=committed/2=rejected/3=cancelled; outcome 1=applied/2=not_applied; `reason` is UTF-8 (empty for applied).
 
 `CS = L("ry-version-commit-set-id-v1") || L(tenant) || L(repo) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || u64(authority_seq) || L(operation_id) || L(operation_digest) || version-list || head_tag [|| L(head_ref) || target_tag [|| L(head_oid)]]`.
 `version-entry = L(ref_name)||L(VersionId)||u8(version_kind)||u8(target_tag)||[L(target_oid)]`; `CommitSetId = SHA-256(CS)`. `CS` excludes every terminal byte/digest and every version-record digest; `VersionId` excludes `CommitSetId`.
@@ -210,8 +207,9 @@ Every committed version batch has one `CommitSet`. Canonical encoding: `L(x)=u64
 
 Fixed vector (`11*32` means 32 bytes of 0x11; `33*20` means 20 bytes of 0x33; VersionId bytes are fixed synthetic inputs here, with derivation in a separate checkpoint): `tenant=00000000-0000-0000-0000-000000000001`, `repo=00000000-0000-0000-0000-000000000002`, `history=00000000-0000-0000-0000-000000000003`, `authority=1`, `authority_epoch=7`, `group_id=0`, `group_epoch=9`, `object_format=1`, `authority_seq=42`, `operation_id=00000000-0000-0000-0000-000000000004`, `operation_digest=11*32`, one version `(refs/heads/main, VersionId=22*32, kind=1, target_tag=1, target_oid=33*20)`, `head_tag=1`, `head_ref=refs/heads/main`, head `target_tag=1`, `head_oid=33*20`, `commit_set_tag=1`, `terminal_kind=1`, one result `(refs/heads/main, outcome=1, old_tag=1, old_oid=44*20, new_tag=1, new_oid=33*20, reason="")`. Expected: `CS` length 355; `CommitSetId=00fee34e0745b3b5557cd40620d276b623a63a3cdcbd469fbea796968e53f7e5`; `T` length 336; `TerminalDigest=081d960f2ce44a95fa19866189f83a604de5b6f78d9dfeac941ca7efddb92ab9`.
 Mixed delete/publish vector (same realm, fixed VersionId inputs, committed, `commit_set_tag=1`): versions `[(refs/heads/main, 22*32, kind=1, target_tag=1, target_oid=33*20), (refs/heads/topic, 66*32, kind=2, target_tag=0)]`, HEAD `refs/heads/main` -> `33*20`, results `[main applied old=44*20 new=33*20 reason="", topic applied old=77*20 new=absent reason=""]`; expected `CS` length 421, `CommitSetId=ffcd8426b98ee6724cffc3c2918ec6450c86a33203c0cc10f2c3820c0fddd6ad`, `T` length 399, `TerminalDigest=24d30b09e01477656e53d93703cd968d1820f43edd5a985f77b684962fbfe37a`.
+Identity-chain vector (same realm and operation as the fixed vector, `authority_seq=42`, ref main, generation 1, kind=1, target=33*20, base absent, deps empty, pack set one entry `(pack_id=99*16, registration_id=aa*16, artifact_set_digest=bb*32)`, committed, `commit_set_tag=1`, result applied old=44*20 new=33*20): `VersionId=7ed6b0d771d7133059718f42fa2dab89fb50003d57128536ffb908d11816c373`; `PackSetDigest=fd3461afbd34e518f8bf1d6c677f2a023346733925ec9cd6eb7ca76f3c1a4c22`; with that VersionId the single-version `CS` is 355 bytes and `CommitSetId=9ffcf9731fb04dd56ceac420d7707c1b2b792deaa431d0bd35e3f53bee721932`, `record_digest=01ef64d5effb40e4ee835437e78eeb31a9b7781500767ce9255cfb8e5e238da9`, `T` is 336 bytes and `TerminalDigest=25de02843735a28ec5b4fd178cb06d12de16e71a46915acb4a3cd99ee572da19`.
 
-Commit set, versions, edges, ref-heads, membership and terminal are one authority-atomic unit: readers see all or none; a rejected ref gets no version.
+Commit set, versions, edges, ref-heads, membership and terminal are one authority-atomic unit: readers see all or none; a rejected ref gets no version. A committed set has at least one version and `commit_set_tag=1`; rejected/cancelled terminals use `commit_set_tag=0`.
 
 ## 3. Publication ordering and operation states [PROPOSED]
 
@@ -425,7 +423,7 @@ unchanged until its exit criteria pass. [CURRENT] C0 is this document only.
 | # | Scope | Likely files | Exit check |
 | --- | --- | --- | --- |
 | C0 | This contract and state diagram | `docs/ref-version-pack-contract.md`, design index | Docs/link checks pass; no production/migration/Cargo changes |
-| C1 | Pure identity/edge/limit types and canonical digests; no schema/route | `src/ref_store/core/ref_version/{mod,contract,digest,limits}.rs` | Pure tests + test vectors; no PG/Blob/native |
+| C1 | Pure identity/edge/limit types and canonical digests; no schema/route | `src/ref_store/core/ref_version/{mod,contract,digest,limits}.rs` | VersionId/PackSetDigest/CommitSetId/record_digest/T vectors fixed before C2/C7; no PG/Blob/native |
 | C2 | PG version/head/commit-set/edge tables and authoritative insert under the existing 138/gate lock prefix | next safe migration; `core/ref_version/pg*.rs`; existing `pack_commit/pg_commit.rs` extension point | Real-PG tests for CAS, atomic/subset, tombstone/ABA, replay/unknown; no read route |
 | C3 | Bind current A4 registered pack identities and verifier-selected OBJECT deps; prove dependency pinning through commit | `core/ref_version/*`, `pack_commit/{plan,closure,proof,artifact}.rs` extension points | Cross-tenant/missing/corrupt/depth/byte/cycle tests; no default serving change |
 | C4 | Strong snapshot records/binds version heads/deps without weakening the current fallback | `core/pack_snapshot/*` extension; current strong tests | Full-snapshot tests remain green; version IDs optional until enabled |
@@ -449,7 +447,8 @@ Pure contract (`tests/ref_version_contract.rs` proposal): `version_id_binds_tena
 `dependency_cycle_self_same_commit_set_and_cross_realm_are_refused`;
 `depth_fanout_edges_packs_bytes_bounds_are_exact_and_fail_closed`;
 `closed_closure_is_ordered_and_digest_stable`;
-`mixed_publish_delete_commit_set_is_canonical`; `per_version_kind_is_not_inferred_from_target`.
+`mixed_publish_delete_commit_set_is_canonical`; `per_version_kind_is_not_inferred_from_target`;
+`version_id_record_binding_is_immutable`; `record_digest_exact_preimage`; `pack_set_digest_exact_preimage`.
 
 PG authority (`tests/ref_version_pg.rs` proposal, ignored, real PG):
 `same_old_version_only_one_writer_wins` (a competing same-new-OID push still
