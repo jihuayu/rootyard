@@ -1,4 +1,7 @@
 //! Process kill/reopen of an acknowledged log append; no quorum, state-machine or power-loss claim.
+//!
+//! The Linux fixture check rejects known network mount types. That negative list does not prove
+//! the backing device is local, and non-Linux hosts perform no filesystem qualification.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader};
@@ -66,7 +69,8 @@ impl OwnedChild {
         self.0.as_mut().expect("child is still owned")
     }
 
-    fn finish(&mut self, kill: bool, timeout: Duration) -> ExitStatus {
+    /// Consumes the owned handle. On return the child has been reaped; otherwise this panics.
+    fn finish(mut self, kill: bool, timeout: Duration) -> ExitStatus {
         let child = self.0.as_mut().expect("child is still owned");
         if kill {
             let _ = child.kill();
@@ -78,37 +82,52 @@ impl OwnedChild {
 }
 
 impl Drop for OwnedChild {
+    /// Last-resort bounded cleanup, normally while unwinding. Reaping is claimed only when
+    /// `try_wait` returns the status; an expired deadline is reported as unconfirmed, not as
+    /// success.
     fn drop(&mut self) {
         let Some(mut child) = self.0.take() else { return };
         let _ = child.kill();
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(child.wait());
-        });
-        let _ = receiver.recv_timeout(REAP);
+        let message = match wait_bounded(&mut child, REAP) {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                format!("owned child did not quiesce within {REAP:?} after kill; reaping remains unconfirmed")
+            }
+            Err(error) => format!("owned child cleanup wait failed: {error}; reaping remains unconfirmed"),
+        };
+        if std::thread::panicking() {
+            eprintln!("{message}");
+        } else {
+            panic!("{message}");
+        }
+    }
+}
+
+fn wait_bounded(child: &mut Child, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 fn wait_with_deadline(child: &mut Child, timeout: Duration) -> ExitStatus {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                let _ = child.kill();
-                let reap_deadline = Instant::now() + REAP;
-                while Instant::now() < reap_deadline {
-                    match child.try_wait() {
-                        Ok(Some(_)) => break,
-                        Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                        Err(_) => break,
-                    }
-                }
-                panic!("child did not exit within {timeout:?}");
+    match wait_bounded(child, timeout) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = child.kill();
+            match wait_bounded(child, REAP) {
+                Ok(Some(_)) => panic!("child did not exit within {timeout:?}"),
+                Ok(None) => panic!("child did not exit within {timeout:?} or quiesce within {REAP:?} after kill"),
+                Err(error) => panic!("child wait failed after timeout: {error}"),
             }
-            Err(error) => panic!("child wait failed: {error}"),
         }
+        Err(error) => panic!("child wait failed: {error}"),
     }
 }
 
@@ -128,7 +147,7 @@ fn line(child: &mut Child, timeout: Duration) -> String {
 #[test]
 fn acknowledged_log_append_survives_sigkill_and_a_fresh_process() {
     let directory = tempfile::tempdir().expect("fixture directory");
-    let fixture = assert_local_fixture(directory.path());
+    let fixture = qualify_fixture(directory.path());
     let executable = env!("CARGO_BIN_EXE_log-probe");
     let expected = expected_entries();
 
@@ -150,7 +169,6 @@ fn acknowledged_log_append_survives_sigkill_and_a_fresh_process() {
     // awaited the public LogFlushed callback. Cleanup paths also kill a stuck owned child.
     let status = writer.finish(true, REAP);
     assert_eq!(status.signal(), Some(SIGKILL), "writer was not killed by SIGKILL: {status}");
-    drop(writer);
 
     let mut reader = OwnedChild::spawn(
         Command::new(executable).arg("read").arg(directory.path()).stdin(Stdio::null()).stdout(Stdio::piped()),
@@ -166,45 +184,65 @@ fn acknowledged_log_append_survives_sigkill_and_a_fresh_process() {
     assert_eq!(read.last_log_id, Some(log_id(3, 4)), "fresh process last log id");
     let status = reader.finish(false, EXIT);
     assert!(status.success(), "fresh read process failed: {status}");
-    drop(reader);
 
     assert_stored_rows(&fixture, &expected, committed());
 }
 
+/// Applies the available fixture checks. Passing them is not proof that the backing device is
+/// local, and only Linux performs any filesystem-type check.
 #[cfg(target_os = "linux")]
-fn assert_local_fixture(dir: &Path) -> PathBuf {
+fn qualify_fixture(dir: &Path) -> PathBuf {
     let canonical = canonical_fixture(dir);
     let (device, fstype, mount_point) = fixture_mount(&canonical).expect("Linux fixture mount info");
     const NETWORK: &[&str] = &[
         "nfs",
         "nfs4",
         "cifs",
+        "smb",
         "smb3",
         "smbfs",
-        "fuse.sshfs",
-        "fuse.rclone",
         "9p",
         "ceph",
         "glusterfs",
         "afs",
         "davfs",
+        "davfs2",
         "lustre",
         "gpfs",
+        "fuse.sshfs",
+        "fuse.rclone",
+        "fuse.glusterfs",
+        "fuse.ceph",
+        "fuse.smbnetfs",
+        "fuse.davfs",
+        "fuse.davfs2",
+        "fuse.s3fs",
+        "fuse.gcsfuse",
+        "fuse.goofys",
+        "fuse.juicefs",
     ];
     let lowered = fstype.to_ascii_lowercase();
     assert!(
         !NETWORK.iter().any(|kind| lowered.as_str() == *kind || lowered.starts_with(&format!("{kind}."))),
-        "fixture filesystem {fstype} at {mount_point} is a network filesystem"
+        "fixture filesystem {fstype} at {mount_point} is a known network filesystem"
     );
+    // A FUSE name does not identify its backing store. Refuse every FUSE mount, not only the
+    // named remote types above, because this test has no positive locality qualification.
+    let is_fuse = matches!(lowered.as_str(), "fuse" | "fuseblk") || lowered.starts_with("fuse.");
+    assert!(!is_fuse, "fixture filesystem {fstype} at {mount_point} is an unqualified FUSE mount");
     let metadata_device = std::fs::metadata(&canonical).expect("fixture metadata").dev();
-    eprintln!("fixture device={device} fstype={fstype} mount={mount_point} metadata_dev={metadata_device}");
+    eprintln!(
+        "fixture mount observation device={device} fstype={fstype} mount={mount_point} metadata_dev={metadata_device}; known-network denylist passed, not proof of a local backing device"
+    );
     canonical
 }
 
+/// Only binds the canonical fixture to the temp directory; this platform has no filesystem
+/// qualification.
 #[cfg(not(target_os = "linux"))]
-fn assert_local_fixture(dir: &Path) -> PathBuf {
+fn qualify_fixture(dir: &Path) -> PathBuf {
     let canonical = canonical_fixture(dir);
-    eprintln!("fixture mount check unavailable on this platform; path bound only");
+    eprintln!("fixture mount check unavailable on this platform; no filesystem qualification, path bound only");
     canonical
 }
 
@@ -268,6 +306,8 @@ fn decode_mount_escape(value: &str) -> String {
 fn assert_stored_rows(dir: &Path, expected: &[EntryOf], committed: LogId<u64>) {
     #[cfg(target_os = "linux")]
     {
+        // Equal `st_dev` only shows the database did not cross a device boundary; it does not
+        // prove that device is local or directly attached.
         let fixture_device = std::fs::metadata(dir).expect("fixture metadata").dev();
         let database_device = std::fs::metadata(dir.join("log.sqlite3")).expect("database metadata").dev();
         assert_eq!(database_device, fixture_device, "database is on a different device than the fixture");

@@ -84,62 +84,74 @@ cargo clippy --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 cargo test --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 ```
 
-Twenty-one unit tests cover restart, exact purge identity, replay, committed
-rewrite refusal, holes, truncation, snapshot-style purge, bounds, identity/lock
-refusal, and malformed or valid-JSON corruption. They delete rows directly in
-SQLite (after a passing `quick_check`) and reopen: an internal row, index 0 with
-several holes, the row after the purge boundary, and a prefix-to-tail deletion
-with its documented limit. Limited reads are covered when the lost head or
-middle index is followed by enough rows to fill the count budget (fcb22c5
-returned them), and when a byte budget stops below the count budget (fcb22c5
-called that valid prefix a hole); a full read over either budget still refuses.
-Boundary tests pin empty, totally purged, first-live, past-the-end and budget-cap
-reads. Purge-residue tests pin a boundary row carrying the boundary's own LogId
-(served from its successor) and rows at or below the boundary with another
-`LogId`, which fail `open` (fcb22c5 reported them as the tail). One regression
-hides invalid residue below the boundary and at it beneath a valid live tail:
-8a8ceb9's max-only check, graded through its own helper, accepts it, while open,
-state and reads here refuse it and the matching boundary row stays supported.
-The four regressions for the fcb22c5 defects grade fcb22c5 through its own reader
-helpers and fail on it; the own-`LogId` leftover test passes there through the
-purge pin that shortens whole-range starts, and the grading probes inside it show
-that. Tests exercise the same durable helpers as the trait implementations.
+Twenty-one unit tests in `src/lib.rs` cover restart, exact purge identity,
+replay, committed rewrite refusal, holes, truncation, snapshot-style purge,
+bounds, identity/lock refusal, and malformed or valid-JSON corruption. They
+delete rows directly in SQLite (after a passing `quick_check`) and reopen: an
+internal row, index 0 with several holes, the row after the purge boundary, and
+a prefix-to-tail deletion with its documented limit. Limited reads are covered
+when the lost head or middle index is followed by enough rows to fill the count
+budget (fcb22c5 returned them), and when a byte budget stops below the count
+budget (fcb22c5 called that valid prefix a hole); a full read over either budget
+still refuses. Boundary tests pin empty, totally purged, first-live,
+past-the-end and budget-cap reads. Purge-residue tests pin a boundary row
+carrying the boundary's own LogId (served from its successor) and rows at or
+below the boundary with another `LogId`, which fail `open` (fcb22c5 reported
+them as the tail). One regression hides invalid residue below the boundary and
+at it beneath a valid live tail: 8a8ceb9's max-only check, graded through its
+own helper, accepts it, while open, state and reads here refuse it and the
+matching boundary row stays supported. The four regressions for the fcb22c5
+defects grade fcb22c5 through its own reader helpers and fail on it; the
+own-`LogId` leftover test passes there through the purge pin that shortens
+whole-range starts, and the grading probes inside it show that. Tests exercise
+the same durable helpers as the trait implementations.
 
-Two integration tests use owned child processes. The vote test calls the public
-vote trait in a child, waits for a persisted-vote acknowledgement, sends SIGKILL,
-and verifies that a fresh process reads the identical vote. The log test calls
-openraft's public `RaftLogStorageExt::blocking_append`, the public path that
-constructs `LogFlushed`, invokes `RaftLogStorage::append`, and waits for that
-callback; `LogFlushed::new` itself is private in pinned openraft 0.9.26. The
-child writes exact native entries and log IDs, saves exact committed metadata,
-reads both back, and only then prints `ACK`. Thus the parent's SIGKILL cannot
-run on a merely queued append, and a storage `append` that returns without
+Two integration tests in `tests/` use owned child processes. The vote test calls
+the public vote trait in a child, waits for a persisted-vote acknowledgement,
+sends SIGKILL, and verifies that a fresh process reads the identical vote. The
+log test calls openraft's public `RaftLogStorageExt::blocking_append`, the
+public path that constructs `LogFlushed`, invokes `RaftLogStorage::append`, and
+waits for that callback; `LogFlushed::new` itself is private in pinned openraft
+0.9.26. The child writes exact native entries and log IDs, saves exact committed
+metadata, reads both back, and only then prints `ACK`. Thus the parent's SIGKILL
+cannot run on a merely queued append, and a storage `append` that returns without
 completing its callback cannot yield the ACK: the extension either waits for
 the callback or reports the dropped sender as an error, and the startup
 deadline bounds either outcome. After the acknowledgement the parent sends
 SIGKILL to its own writer and reaps it under a deadline. A fresh process opens
-the store and reads
-the exact contiguous entries, log IDs, committed metadata and checksum-verified
-rows; the parent then re-reads `log_entry` and `meta` directly to pin the stored
-SHA-256 values. Startup, output, wait, kill and reap are bounded, and `Drop`
-kills and reaps an owned child on every failure path.
+the store and reads the exact contiguous entries, log IDs, committed metadata
+and checksum-verified rows; the parent then re-reads `log_entry` and `meta`
+directly to pin the stored SHA-256 values. Startup, output, wait, kill and reap
+are bounded. The success path consumes the owned handle through `finish`, which
+kills when requested and returns only after `try_wait` confirms reaping. On a
+panic path `Drop` makes one bounded kill-and-poll attempt; if the child has not
+been reaped when that deadline expires, `Drop` reports that reaping remains
+unconfirmed instead of counting cleanup as successful.
 
-The log fixture is a fresh local temporary directory. On Linux the test reads
-`/proc/self/mountinfo`, records the mount device and filesystem type, fails on
-known network filesystem types, and requires the database file to stay on the
-fixture's device; other Unix hosts report that the mount check is unavailable.
-The test uses at most one writer and one reader child, never concurrently, with
-no socket, loopback server, peer process or state machine. It sends SIGKILL only
-to its own writer after the callback-backed acknowledgement and waits for the
-reader to exit normally.
+The log fixture is a fresh temporary directory. On Linux the test reads
+`/proc/self/mountinfo`, records the longest matching mount point's device and
+filesystem type, rejects an explicit denylist of known network filesystem types
+(including `fuse.glusterfs` and other named remote FUSE types), and additionally
+refuses every FUSE mount because its backing store is not qualified. It also
+requires the database file and fixture directory to report the same `st_dev`.
+This is a negative denylist, not positive proof that the backing device is local
+or directly attached: an unlisted non-FUSE remote type can still pass. Non-Linux
+hosts perform no filesystem qualification and only bind the fixture to the
+canonical temp path. The test uses at most one writer and one reader child,
+never concurrently, with no socket, loopback server, peer process or state
+machine. It sends SIGKILL only to its own writer after the callback-backed
+acknowledgement and waits for the reader to exit normally.
 
 The dedicated workflow runs these checks independently of Rootyard's Cargo
 workspace. The SIGKILL tests establish only vote and acknowledged-log
-persistence across a process crash on the tested local filesystem. They do not
-establish power-loss durability, quorum or peer acknowledgements, Git
-acknowledgements, three-host behavior, state-machine/snapshot atomicity, or
-whole-#149 completion. Past-tail empty reads starting at `last_log_id.index + 1`
-remain valid: range ends are exclusive.
+persistence across a process crash on the Linux fixture whose mount type passed
+the network denylist; on other Unix hosts they establish vote and
+acknowledged-log persistence across a process crash with no filesystem
+qualification. They do not establish power-loss or hardware-failure durability,
+quorum or peer acknowledgements, Git acknowledgements, three-host behavior,
+state-machine/snapshot atomicity, or whole-#149 completion. Past-tail empty
+reads starting at `last_log_id.index + 1` remain valid: range ends are
+exclusive.
 
 ## Remaining scope
 
