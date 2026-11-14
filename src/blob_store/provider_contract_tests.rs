@@ -645,10 +645,10 @@ impl UploadTasks {
     }
 
     fn abort_at(&mut self, index: usize) {
-        if let Some(slot) = self.slots.get_mut(index) {
-            if !slot.completed {
-                slot.handle.abort();
-            }
+        if let Some(slot) = self.slots.get_mut(index)
+            && !slot.completed
+        {
+            slot.handle.abort();
         }
     }
 
