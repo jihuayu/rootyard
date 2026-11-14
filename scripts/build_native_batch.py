@@ -1,108 +1,53 @@
 #!/usr/bin/env python3
-"""Build one batch of native binaries and integration tests from one clean.
+"""Build several native binaries and integration tests from one explicit Cargo build.
 
-``scripts/build_native.py`` and ``scripts/build_native_test.py`` each clear the
-rootyard package and then compile; running them for N selected artifacts costs
-N clean+compile cycles of the rootyard library. This driver keeps every safety
-property of those two transactions but pays for the clean once:
+This driver migrates the batch producer to the shared v2 contract.  It never
+runs ``cargo clean`` and accepts either literal Cargo freshness value, so a
+correctly-keyed shared Cargo cache can satisfy a repeated or cross-worktree
+build without forcing a rebuild.  It still keeps every safety property of the
+standalone producers:
 
-* it holds the same canonical ``build_lock`` in ``canonical_target()`` for the
-  whole transaction, so no ``build_native.py``, ``build_native_test.py`` or
-  other batch can interleave a ``cargo clean`` or overwrite an artifact;
-* it runs exactly one ``cargo clean --package rootyard`` and then exactly one
-  ``cargo build --locked --profile test`` that selects every requested
-  ``--bin`` and ``--test`` target with the same features, no-default-features,
-  ``[build] target``, package debug/``strip=debuginfo`` override and
-  toolchain. ``cargo build --locked --profile test`` accepts ``--bin`` *and*
-  ``--test`` in one invocation, so the application binaries and the selected
-  integration tests come from one compiler run (``cargo rustc --profile
-  test`` takes a single target and cannot);
-* the bin and test target set is Cargo's own: one
-  ``cargo metadata --no-deps`` is the authority for the ``rootyard`` package's
-  targets, their paths and their ``required-features``, so a bin Cargo
-  auto-discovers from ``src/bin/*.rs`` is selected exactly like a ``[[bin]]``.
-  ``--all-bins`` builds every metadata bin whose required features are enabled
-  by this batch's ``--features``/``--no-default-features``; a ``--bin`` or
-  ``--test`` name Cargo does not list for the package is refused;
-* with any ``--test`` selected, Cargo also builds the other enabled bins of the
-  package *without* a ``--bin`` flag of its own (an implicit build: a bin
-  integration test runs through its package's bins). Each such bin is accepted
-  only when metadata confirms it exists in this package, requires nothing this
-  selection lacks, is reported Fresh=false with its own executable at
-  ``<canonical target>/debug/<name>``, and is typed ``bin`` by Cargo. It gets
-  the same full bin receipt as a requested bin and is marked ``implicit`` in
-  that receipt and in the manifest instead of a receipt path; any other
-  unselected bin artifact is still refused. Without a ``--test`` the command
-  names every bin, so Cargo builds no extra bin and only requested bins are
-  accepted. ``rootyard-view-lab`` and ``rootyard-workspace-lab`` are such
-  bins: compiling them is part of this package's build, but installing them is
-  not acceptance of the ``rootyard`` server, and their receipts say so;
-* Cargo events are filtered by package: artifacts of the selected rootyard
-  package are indexed by their real ``target.kind`` (``lib``/``bin``/``test``),
-  name, executable and profile; artifacts of dependencies Cargo happens to
-  rebuild in the same invocation are skipped and never receipted, because a
-  legal dependency must not make a build fail;
-* it fails closed unless every selected artifact is reported ``Fresh=false``,
-  the rootyard lib is ``Fresh=false`` and is bound to every binary receipt,
-  the exact-rootyard-package binary artifacts carry their executable path and
-  resolve to ``<canonical target>/debug/<name>``, exactly one selected test
-  artifact is reported per ``--test`` with a ``test`` profile, a ``Fresh=false``
-  event and an on-disk executable, exactly one successful ``build-finished``
-  event exists, and the source-input digest, ``Cargo.lock``, every bound input,
-  HEAD and the working-tree state are identical before and after the build;
-* the bound inputs are what an integration test or the toolchain can compile
-  or read beyond the production sources: every ``*.rs`` file under ``tests/``
-  (selected entries, transitive ``mod`` helpers and untracked new helpers
-  alike), ``rust-toolchain``/``rust-toolchain.toml``, the fixed build-affecting
-  ``.cargo/*.toml`` files and the workspace ``build.rs``. Each is recorded by
-  repository-relative path, presence and raw-byte SHA-256, every absent
-  candidate is listed too, and one ``bound_inputs_sha256`` hashes the sorted
-  inventory when it was the same before and after the build. Receipts and the
-  manifest carry that summary and the full inventory, so a missing, added or
-  edited input cannot disappear from a receipt; ``source_inputs_sha256`` keeps
-  its production meaning for the existing receipts. The batch does not parse
-  the Rust module graph: ``tests/**/*.rs`` is taken as a whole. Only in-repo
-  configuration is hashed, by raw bytes and path: its keys are inspected and no
-  value is recorded, and a config whose keys redirect inputs (flags, linker,
-  source replacement or a directory) is refused rather than half-recorded;
-* it copies test executables outside ``CARGO_TARGET_DIR`` (mode 0700) so a
-  later ``cargo clean --package rootyard`` cannot delete them, and it never
-  moves or rewrites a binary in ``CARGO_TARGET_DIR``. The compiled artifact and
-  each destination may live on different filesystems (a target directory on one
-  device and a mounted output volume on another): the copy is staged as a
-  hidden ``.<name>.batch-new`` sibling *in the destination's own directory*,
-  its SHA-256 is verified against the artifact, and only then is it renamed over
-  the destination inside that filesystem. No step requires a rename across
-  directories or devices;
-* receipts use the field sets of the two standalone builders, so
-  ``native_report_manifest.py``, ``NativeProfile`` (``blob_only_service.py``)
-  and the RefStore backup drills accept them unchanged. ``command`` is the
-  exact one cargo invocation and ``clean_command`` the single clean, so no
-  receipt pretends each artifact was cleaned and built on its own. A bin Cargo
-  built implicitly alongside a selected test also carries ``implicit_build``:
-  it is a real artifact of this package's build, but not one this batch
-  requested, and the batch records it rather than dropping it;
-* receipts and the batch manifest are published only after *all* requirements
-  hold and the sources are still unchanged, each by one ``os.replace`` of its
-  own staged sibling onto its own destination; a failure removes every
-  receipt/manifest and relocated executable this transaction could have
-  installed. There is no option that skips Cargo.
+* one canonical ``build_lock`` in ``canonical_target()`` for the whole
+  transaction, so no other producer or batch can interleave a build or replace
+  an artifact while this transaction measures and publishes;
+* exactly one explicit ``cargo build --locked --profile test`` invocation that
+  selects every requested ``--bin`` and ``--test`` with the same features,
+  no-default-features, ``[build] target-dir``, package debug/``strip`` override
+  and toolchain.  ``CARGO_BUILD_JOBS`` is normalized to an explicit ``--jobs``
+  argument and the guard-safe environment is passed to every helper and to
+  Cargo; a rejected compiler/profile selector fails closed instead of being
+  dropped;
+* the target set is Cargo metadata's own.  ``--all-bins`` selects every enabled
+  metadata bin, a bin auto-discovered from ``src/bin/*.rs`` is selected exactly
+  like a ``[[bin]]``, and an unknown ``--bin``/``--test`` is refused.  With a
+  selected test Cargo also builds the other enabled package bins; each is
+  accepted only after metadata confirms its name/source and is marked
+  ``implicit_build`` in its receipt and manifest entry;
+* artifacts are filtered by the selected package and bound by exact
+  ``target.kind``, name, profile, source path, executable path and executable
+  SHA-256.  Freshness is copied from the selected event, never forced.  The
+  selected test executable is copied (never hardlinked or moved) outside
+  ``CARGO_TARGET_DIR`` to a fixed 0700 output; its original and relocated
+  digests are both recorded;
+* every receipt is a shared v2 receipt built by
+  ``native_build_receipt.make_receipt_v2``: production source, test/config,
+  lock and toolchain inventory, actual compiler executable digests and full
+  commits, command/profile/target/features, executable digest, real Git HEAD
+  and the batch link.  No v2 receipt carries ``package_rebuilt``,
+  ``clean_command``, ``clean_commands``, ``fresh_false_artifacts`` or a
+  top-level ``fresh`` alias;
+* receipts and the batch manifest are staged beside their destinations and
+  renamed into place only after all checks pass.  The batch manifest is the
+  last rename and is the commit marker; a failed transaction withdraws every
+  receipt, output and staging sibling it could have installed.  Payloads are
+  not one cross-directory atomic set, but each file appears complete or not at
+  all;
+* a test output on another filesystem is staged in that destination's own
+  directory, its hash is compared with the compiled artifact, and only then is
+  it renamed.  The compiled artifact remains in ``CARGO_TARGET_DIR``.
 
-The set of payloads is *not* published atomically. Each file (a bin receipt in
-``CARGO_TARGET_DIR``, a relocated executable and its receipt, the batch
-manifest) appears complete or not at all, but they may live in different
-directories or filesystems and become visible one after another. The commit
-marker is the last-renamed batch manifest: a per-file receipt on its own is not
-an accepted batch, and a consumer must treat receipts as bound only once the
-manifest for that transaction exists.
-
-Cargo's own target-dir resolution is recorded rather than reimplemented: the
-build appends ``--config build.target-dir=<canonical target>`` (the real
-project has no relative ``[build].target-dir`` and ignores it), and
-``cargo metadata`` is recorded so a toolchain that redirected executables
-elsewhere is visible in the batch manifest.
-
-Python here orchestrates; the only executable artifacts are those Rust targets.
+Python orchestration only: the executable artifacts are the Rust targets Cargo
+builds, and the batch never invokes a second Cargo build or a clean.
 """
 import argparse
 from dataclasses import dataclass
@@ -110,7 +55,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import re
 import shutil
 import subprocess
@@ -118,6 +62,7 @@ import sys
 import time
 
 import build_native
+import native_build_receipt as receipt
 from build_native import BuildError, build_lock, source_digest
 from build_native_test import FEATURES
 
@@ -130,40 +75,14 @@ def _root():
 NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]{0,127}$')
 PACKAGE = 'rootyard'
 DEFAULT_BIN = 'rootyard'
-KIND = 'rootyard/native-build-batch'
-RECEIPT_VERSION = 1
+KIND = receipt.BATCH_KIND
+RECEIPT_VERSION = 2
+MANIFEST_VERSION = 2
 MANIFEST_NAME = 'rootyard-native-build-batch.json'
-CLEAN_COMMAND = ['cargo', 'clean', '--package', PACKAGE]
-#: Environment that would silently change the workspace, profile or target.
-PASSTHROUGH_VARIABLES = (
-    'RUSTFLAGS',
-    'CARGO_ENCODED_RUSTFLAGS',
-    'CARGO_BUILD_TARGET',
-    'CARGO_BUILD_RUSTFLAGS',
-    'CARGO_BUILD_TARGET_DIR',
-    'CARGO_BUILD_BUILD_DIR',
-    'CARGO_PROFILE_DEV_DEBUG',
-    'CARGO_PROFILE_TEST_DEBUG',
-    'CARGO_PROFILE_DEV_STRIP',
-    'CARGO_PROFILE_TEST_STRIP',
-)
-#: Compiler or toolchain selectors that would replace the pinned build.
-REJECTED_COMPILER_VARIABLES = (
-    'RUSTC',
-    'RUSTC_WRAPPER',
-    'RUSTC_WORKSPACE_WRAPPER',
-    'RUSTDOC',
-    'RUSTDOCFLAGS',
-    'RUSTUP_TOOLCHAIN',
-    'RUSTC_BOOTSTRAP',
-)
-#: Namespace prefixes whose every variable changes the profile or build.
-REJECTED_VARIABLE_PREFIXES = (
-    'CARGO_PROFILE_',
-    'CARGO_BUILD_',
-)
-#: Exact name: it defines the batch's canonical target directory.
-ALLOWED_TARGET_DIR = 'CARGO_TARGET_DIR'
+PASSTHROUGH_VARIABLES = receipt.PASSTHROUGH_VARIABLES
+REJECTED_COMPILER_VARIABLES = receipt.REJECTED_COMPILER_VARIABLES
+REJECTED_VARIABLE_PREFIXES = receipt.REJECTED_VARIABLE_PREFIXES
+ALLOWED_TARGET_DIR = receipt.ALLOWED_TARGET_DIR
 
 
 def canonical_target():
@@ -179,77 +98,56 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def git_output(*arguments):
-    return subprocess.check_output(['git', *arguments], cwd=_root(), text=True)
+def _as_build_error(error):
+    if isinstance(error, BuildError):
+        return error
+    return BuildError(str(error))
+
+
+def normalize_environment(environ=None):
+    try:
+        return receipt.normalize_build_environment(os.environ if environ is None else environ)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
+
+
+def capture_bound_inputs(environment=None):
+    environment = os.environ if environment is None else environment
+    try:
+        return receipt.capture_bound_inputs(_root(), environ=environment)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
+
+
+def probe_toolchain(environment=None):
+    environment = os.environ if environment is None else environment
+    def run(command):
+        return subprocess.run(command, cwd=_root(), capture_output=True, text=True,
+                              check=False, env=environment)
+    try:
+        return receipt.probe_toolchain(_root(), environ=environment, run=run)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
 
 
 def git_state():
-    """HEAD commit/tree plus the tracked working-tree state (staged and unstaged).
-
-    ``--untracked-files=no`` keeps the comparison about source Cargo reads: a
-    build writes only ignored ``test-results/`` and ``target/`` files.
-    """
-    head = git_output('rev-parse', 'HEAD').strip()
-    commit = git_output('rev-parse', '--verify', 'HEAD^{commit}').strip()
-    tree = git_output('rev-parse', 'HEAD^{tree}').strip()
-    status = git_output('status', '--porcelain', '--untracked-files=no')
-    return {'head': head, 'commit': commit, 'tree': tree, 'status': status}
-
-
-def run_tool(command):
-    """Run a probe (``rustup``, ``cargo --version``); Cargo itself is only started by run_json_build."""
-    return subprocess.run(command, cwd=_root(), capture_output=True, text=True, check=False)
-
-
-def toolchain_channel():
-    path = _root() / 'rust-toolchain.toml'
-    if path.is_file():
-        match = re.search(r'^\s*channel\s*=\s*"([^"]+)"', path.read_text(), re.MULTILINE)
-        if match:
-            return match.group(1), 'rust-toolchain.toml'
-    override = run_tool(['rustup', 'show', 'active-toolchain'])
-    if override.returncode == 0 and override.stdout.split():
-        return override.stdout.split()[0], 'rustup override'
-    raise BuildError('no pinned Rust toolchain: rust-toolchain.toml is missing and rustup reports no override')
+    """HEAD commit/tree plus the tracked working-tree state."""
+    try:
+        return receipt.git_state(_root())
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise BuildError('cannot read Git state: ' + str(error)) from error
 
 
 def is_rejected_environment_name(name):
-    """Whether this variable name would change the compiler, profile, workspace or target."""
-    if name in PASSTHROUGH_VARIABLES or name in REJECTED_COMPILER_VARIABLES:
-        return True
-    if name == ALLOWED_TARGET_DIR:
-        return False
-    if name.startswith(REJECTED_VARIABLE_PREFIXES):
-        return True
-    return (name.startswith('CARGO_TARGET_') and
-            (name.endswith('_LINKER') or name.endswith('_RUSTFLAGS')))
+    return receipt.is_rejected_environment_name(name)
 
 
-def reject_passthrough_environment():
-    found = sorted(name for name in os.environ if os.environ.get(name) and
-                   is_rejected_environment_name(name))
-    if found:
-        raise BuildError('refusing inherited profile/target environment: ' + ', '.join(found) +
-                         '; pass the batch options instead so the recorded command is the build')
-
-
-def host_architecture():
-    machine = platform.machine()
-    return {'target_triple': target_triple(), 'os': platform.system().lower(), 'machine': machine,
-            'cpu_count': os.cpu_count()}
-
-
-def target_triple():
-    """The triple this compile will use, from a scratch rustc invocation (no RUSTFLAGS)."""
-    output = subprocess.check_output(['rustc', '-vV'], text=True)
-    for line in output.splitlines():
-        if line.startswith('host: '):
-            return line.split(': ', 1)[1].strip()
-    raise BuildError('rustc -vV did not report a host triple')
-
-
-def rustc_version():
-    return subprocess.check_output(['rustc', '--version'], text=True).strip()
+def reject_passthrough_environment(environ=None):
+    environment = os.environ if environ is None else environ
+    try:
+        receipt.reject_passthrough_environment(environment)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
 
 
 # -- Cargo.toml metadata (batch-local, deliberately small) ---------------------
@@ -560,7 +458,7 @@ def plan_batch(args, manifest):
         raise BuildError('--output repeats a destination')
     for output in outputs:
         if output == target or target in output.parents:
-            raise BuildError('--output must be outside CARGO_TARGET_DIR so a later clean cannot delete '
+            raise BuildError('--output must be outside CARGO_TARGET_DIR so cache eviction cannot delete '
                              'it: ' + str(output))
     if len(outputs) != len(test_specs):
         raise BuildError('--output must be given exactly once per --test (got ' + str(len(outputs)) +
@@ -610,10 +508,12 @@ def prepare_destinations(plan):
     plan.manifest_out.parent.mkdir(parents=True, exist_ok=True)
 
 
-def run_json_build(argv):
+def run_json_build(argv, environment=None):
     """Stream Cargo JSON events; non-JSON stdout, a crash or a non-zero status fails."""
+    environment = os.environ if environment is None else environment
     events = []
-    process = subprocess.Popen(argv, cwd=_root(), stdout=subprocess.PIPE, stderr=None, text=True, bufsize=1)
+    process = subprocess.Popen(argv, cwd=_root(), stdout=subprocess.PIPE, stderr=None,
+                               text=True, bufsize=1, env=environment)
     try:
         # Explicit close (not an abandoned loop-local reference) releases the
         # pipe the moment the last event was read.
@@ -640,81 +540,67 @@ def run_json_build(argv):
     return events
 
 
-def _profile(event):
-    profile = event.get('profile') or {}
-    return {key: profile.get(key) for key in ('opt_level', 'debuginfo', 'debug_assertions',
-                                               'overflow_checks', 'test')}
-
-
-def _unbound_source(record, target):
-    """The source of an indexed artifact when no metadata target set was supplied.
-
-    ``target.src_path`` is still required (an event without one is refused),
-    but it is not compared with metadata: only the standalone index, which
-    has no metadata document, is allowed to index this way. The batch itself
-    always passes its metadata targets, so receipts never carry an unchecked
-    source.
-    """
-    source = target.get('src_path')
-    if not source:
-        raise BuildError('Cargo reported ' + record['kind'] + ' ' + record['target'] +
+def _require_src_path(target, kind, name):
+    if not target.get('src_path'):
+        raise BuildError('Cargo reported ' + kind + ' ' + str(name) +
                          ' without a target src_path')
+
+
+def _source_required(record, target):
+    """Require the selected event's own source path; used by the standalone index."""
+    _require_src_path(target, record['kind'], record['target'])
+    source = target.get('src_path')
     try:
-        return str(Path(source).resolve())
+        return Path(source).resolve()
     except OSError as error:
         raise BuildError('Cargo reported ' + record['kind'] + ' ' + record['target'] +
                          ' with an unusable src_path ' + repr(source) + ': ' + str(error)) from error
 
 
+def _record(event, kind):
+    """Capture one selected event through the shared v2 artifact helper."""
+    name = (event.get('target') or {}).get('name')
+    fresh = event.get('fresh')
+    if fresh is not True and fresh is not False:
+        raise BuildError('Cargo reported ' + kind + ' ' + str(name) +
+                         " with absent or non-boolean freshness; Cargo's reported freshness "
+                         'must be the literal JSON boolean true or false')
+    try:
+        return receipt.cargo_artifact_record(event, source_root=_root(), kind=kind)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
+
+
 def _bind_source(record, target, targets):
-    """Require the event's ``target.src_path`` to be the metadata target's canonical source."""
+    """Require the selected artifact's source to be the metadata target's source."""
     name, kind = record['target'], record['kind']
     spec = targets.get((kind, name))
     if spec is None:
         raise BuildError('Cargo reported ' + kind + ' ' + name + ' that cargo metadata does not list for the ' +
                          PACKAGE + ' package')
-    source = target.get('src_path')
-    if not source:
-        raise BuildError('Cargo reported ' + kind + ' ' + name + ' without a target src_path')
-    try:
-        reported = Path(source).resolve()
-    except OSError as error:
-        raise BuildError('Cargo reported ' + kind + ' ' + name + ' with an unusable src_path ' + repr(source) +
-                         ': ' + str(error)) from error
-    if reported != Path(spec['source']):
+    _source_required(record, target)
+    reported = (_root().resolve() / record['source']).resolve()
+    if reported != Path(spec['source']).resolve():
         raise BuildError('Cargo reported ' + kind + ' ' + name + ' from ' + str(reported) +
                          ', but cargo metadata lists its source as ' + spec['source'])
-    record['source'] = spec['source']
 
 
 def artifact_index(events, package, targets=()):
-    """Index the fresh=False lib/bin/test compiler artifacts of exactly one selected package.
+    """Index the selected lib/bin/test compiler artifacts of exactly one package.
 
-    Cargo reports every unit it built or found fresh in this invocation, so a
-    selected package with a dependency that is rebuilt reports that
-    dependency's artifacts in the same stream (a ``depcrate`` lib next to
-    ``rootyard``). Only events whose
-    ``package_id`` is the selected package are indexed: a foreign artifact
-    says nothing about what this batch compiled (a fresh or dirty foreign
-    dependency is Cargo's own concern, not a receipt for a selected target),
-    so it is skipped rather than failed on. Inside the selected package the
-    checks stay closed: any Fresh=true selected artifact, a lib other than
-    the package-named one, a duplicate, a kind other than lib/bin/test, a
-    bin/test without an executable, or a bin the event lists as ``test``
-    (which Cargo would run as a unit test) is rejected. When ``targets``
-    (the metadata targets) is given, every lib, bin and test artifact must be
-    the metadata target of its kind and name, and its ``target.src_path`` must
-    be that target's canonical source path: Cargo cannot mean another library,
-    program or test source by a known name. A missing or foreign source path is
-    rejected. ``targets`` is optional only for a standalone index that has no
-    metadata document (as in :mod:`tests`); then every artifact's source is
-    still required from its own event, but it is not compared with metadata.
-    The batch path always passes its metadata targets (and
-    :func:`select_artifacts` refuses to run without them).
+    Cargo reports every unit it built or found fresh in this invocation.  Only
+    events whose ``package_id`` is the selected package are indexed; foreign
+    dependency artifacts are skipped and never receipted.  Inside the selected
+    package the checks stay closed: a lib other than the package-named one, a
+    duplicate, an unexpected kind, a bin/test without an executable, or a bin
+    built as a test unit is rejected.  Freshness is copied literally from the
+    event, so both cache-miss and cache-hit builds are captured.
 
-    ``target.kind`` (``["test"]``) is the classification of a target, not
-    ``profile.test``: a ``harness = false`` integration test has kind
-    ``["test"]`` and Cargo still reports ``profile.test`` for it.
+    When ``targets`` (the metadata targets) is given, every lib, bin and test
+    artifact must be the metadata target of its kind and name, and its
+    ``target.src_path`` must be that target's canonical source.  ``targets`` is
+    optional only for a standalone index with no metadata document; the batch
+    path always supplies them.
     """
     if not package:
         raise BuildError('no rootyard package id to bind artifacts to')
@@ -731,19 +617,18 @@ def artifact_index(events, package, targets=()):
         target = event.get('target') or {}
         name = target.get('name')
         kinds = list(target.get('kind') or [])
-        if event.get('fresh') is not False:
-            raise BuildError(f'Cargo reported a Fresh {name} artifact of {PACKAGE}; refusing a stale receipt')
         if kinds == ['lib']:
             if name != PACKAGE:
                 raise BuildError(f'{PACKAGE} reported an unexpected lib target {name!r}; the batch binds '
                                  f'the {PACKAGE} lib to every receipt')
             if lib is not None:
                 raise BuildError(f'Cargo reported two {PACKAGE} lib artifacts for one build')
-            record = {'target': name, 'kind': 'lib', 'fresh': False, 'package_id': event.get('package_id')}
+            _require_src_path(target, 'lib', name)
+            record = _record(event, 'lib')
             if targets:
                 _bind_source(record, target, targets)
             else:
-                record['source'] = _unbound_source(record, target)
+                _source_required(record, target)
             lib = record
         elif kinds == ['bin']:
             executable = event.get('executable')
@@ -751,18 +636,17 @@ def artifact_index(events, package, targets=()):
                 raise BuildError(f'{PACKAGE} binary artifact {name} has no executable path')
             if not name or name in bins:
                 raise BuildError(f'Cargo reported a duplicate or unnamed {PACKAGE} bin artifact: {name!r}')
-            if event.get('profile', {}).get('test') is not False:
+            if (event.get('profile') or {}).get('test') is not False:
                 raise BuildError(f'{PACKAGE} bin artifact {name} was built as a test unit, not the binary')
-            record = {'target': name, 'kind': 'bin', 'fresh': False,
-                      'executable': str(Path(executable).resolve()),
-                      'package_id': event.get('package_id'), 'profile': _profile(event)}
+            _require_src_path(target, 'bin', name)
+            record = _record(event, 'bin')
             if targets:
                 _bind_source(record, target, targets)
-                if str(Path(executable).resolve().with_suffix('')) != str(canonical_target() / 'debug' / name):
-                    raise BuildError('binary ' + name + ' was built at ' + str(executable) +
+                if Path(record['executable']).resolve() != canonical_target() / 'debug' / name:
+                    raise BuildError('binary ' + name + ' was built at ' + record['executable'] +
                                      ', not at its canonical location')
             else:
-                record['source'] = _unbound_source(record, target)
+                _source_required(record, target)
             bins[name] = record
         elif kinds == ['test']:
             executable = event.get('executable')
@@ -771,13 +655,12 @@ def artifact_index(events, package, targets=()):
             if not name or name in tests:
                 raise BuildError(f'Cargo reported duplicate {name!r} {PACKAGE} test artifacts; '
                                  'expected exactly one')
-            record = {'target': name, 'kind': 'test', 'fresh': False,
-                      'profile': _profile(event), 'executable': str(Path(executable).resolve()),
-                      'package_id': event.get('package_id')}
+            _require_src_path(target, 'test', name)
+            record = _record(event, 'test')
             if targets:
                 _bind_source(record, target, targets)
             else:
-                record['source'] = _unbound_source(record, target)
+                _source_required(record, target)
             tests[name] = record
         else:
             raise BuildError(f'unexpected {PACKAGE} artifact {name!r} {kinds}; only lib, bin and test '
@@ -788,9 +671,10 @@ def artifact_index(events, package, targets=()):
 
 
 def require_build_finished(events):
-    finished = [event for event in events if event.get('reason') == 'build-finished']
-    if len(finished) != 1 or finished[0].get('success') is not True:
-        raise BuildError('Cargo did not report exactly one successful build-finished event')
+    try:
+        receipt.require_build_finished(events)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
 
 
 def select_artifacts(events, package, plan, targets=()):
@@ -944,18 +828,19 @@ def verified_copy(source, destination):
         raise BuildError('published copy ' + str(destination) + ' does not match the artifact')
 
 
-def cargo_metadata():
+def cargo_metadata(environment=None):
     """The Cargo metadata document this batch plans and verifies from.
 
     It is the authority for the package id, the target directory the lock
     covers, and the ``rootyard`` targets (bins included: auto-discovery is
     Cargo's, not this script's). Cargo's own resolution is used (no extra
-    ``--config``), exactly as before; the document is read once when the
-    batch is planned and once after the build, under the lock.
+    ``--config``); the document is read once when the batch is planned and
+    once after the build, under the lock, with the guard-safe environment.
     """
+    environment = os.environ if environment is None else environment
     output = subprocess.check_output(
         ['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1', '--offline'],
-        cwd=_root(), text=True)
+        cwd=_root(), text=True, env=environment)
     return metadata_record(json.loads(output))
 
 
@@ -994,256 +879,69 @@ def batch_manifest(document):
 
 
 # -- bound build inputs -------------------------------------------------------
-#: The inputs beyond the production ``source_digest()`` that a test build reads
-#: or is configured by: the whole ``tests/**/*.rs`` tree, the toolchain pins, the
-#: fixed in-repo Cargo config files and the workspace ``build.rs``. Each is
-#: bound by repository-relative path and raw bytes, listed (absent ones too) and
-#: frozen before and after the build, so no helper, config or toolchain edit can
-#: hide behind a selected entry that did not itself change.
-#: Roles of the bound inputs, in the order the summary lists them.
-BOUND_ROLES = ('integration_test_source', 'toolchain', 'cargo_config', 'build_script')
-#: Toolchain pin files; both are listed, and whichever exists is bound.
-TOOLCHAIN_PINS = ('rust-toolchain.toml', 'rust-toolchain')
-#: Build-affecting configuration Cargo reads from ``.cargo/`` without a
-#: command-line ``--config``. ``credentials.toml`` is authentication, not part of
-#: what is compiled, and other files in ``.cargo/`` are neither hashed nor refused.
-CARGO_CONFIG_FILES = ('.cargo/config.toml', '.cargo/config')
-#: Cargo config keys that change what is compiled or where inputs come from
-#: (flags, linker, source replacement, the target directory Cargo writes to),
-#: matched case-insensitively as ``<key>``, ``name.<key>`` or
-#: ``<triple>.<key>``. ``runner`` is not one: it only runs a built binary.
-PATH_KEYS = ('rustflags', 'linker', 'target-dir', 'directory', 'local-registry',
-             'registry', 'CARGO_TARGET_DIR')
-BUILD_REDIRECT_KEYS = ('target', 'rustc', 'rustc-wrapper', 'rustc-workspace-wrapper')
-PATH_TABLES = ('build', 'target', 'source', 'env')
-TOML_KEY = re.compile(r'\s*(?:"([^"]*)"|([A-Za-z0-9_.\-]+))\s*=(.*)$')
-#: ``[target.<triple>]`` table names come from rustc's ``-vV`` output, which is
-#: JSON-encoded as a config value, so the body of a ``[target.'...'.linker]``
-#: without a separate ``[target.'...']`` segment is unambiguous only in practice;
-#: treating an unknown dotted name as a triple can therefore over- rather than
-#: under-refuse.
-def _relative(path):
-    return Path(path).relative_to(_root()).as_posix()
+#: The shared inventory roles, including production sources, manifests, tests,
+#: test support and the configuration candidates the receipts bind.
+BOUND_ROLES = receipt.BOUND_ROLES
+TOOLCHAIN_PINS = receipt.TOOLCHAIN_PINS
+CARGO_CONFIG_FILES = receipt.CARGO_CONFIG_FILES
 
 
 def config_path_keys(raw):
-    """The keys of one Cargo config that redirect inputs or override the compiler/profile."""
-    table, keys, seen = None, [], set()
-    for line in raw.decode('utf-8', 'replace').splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            continue
-        if stripped.startswith('[') and stripped.endswith(']'):
-            table = stripped.strip('[]<>').strip().strip('"')
-            continue
-        match = TOML_KEY.match(stripped)
-        if not match:
-            continue
-        key = match.group(1) if match.group(1) is not None else match.group(2)
-        names = [key] if table is None else table.split('.') + [key]
-        candidates = {key, '.'.join(names[-2:]), '.'.join(names[-3:])}
-        table_names = names[:-1]
-        if len(table_names) >= 2 and table_names[0] in PATH_TABLES:
-            candidates.add(table_names[0] + '.' + table_names[1] + '.' + key)
-        folded = {candidate.lower() for candidate in candidates}
-        hit = None
-        for pattern in PATH_KEYS:
-            if pattern.lower() in folded:
-                hit = table + '.' + key if table is not None and key != 'CARGO_TARGET_DIR' else pattern
-                break
-        if hit is None and table is not None:
-            parts = table.split('.')
-            if table == 'build' and key in BUILD_REDIRECT_KEYS:
-                hit = 'build.' + key
-            elif parts[0] == 'profile':
-                hit = table + '.' + key
-        if hit is not None and hit not in seen:
-            seen.add(hit)
-            keys.append(hit)
-    return keys
+    return receipt.config_path_keys(raw)
 
 
 def require_in_repository_config(name, raw):
-    """Refuse a bound config that redirects Cargo to inputs or outputs this batch cannot bind."""
-    keys = config_path_keys(raw)
-    if keys:
-        raise BuildError(name + ' sets ' + ', '.join(repr(key) for key in keys) +
-                         ', a value that redirects build inputs or overrides the compiler or '
-                         'build profile; this batch binds in-repository configuration only and '
-                         'refuses rather than record a partial input set')
-
-
-def reject_external_cargo_config():
-    """Refuse to run when a Cargo config outside the workspace could change the build."""
-    root = _root()
-    cargo_home = os.environ.get('CARGO_HOME')
-    if cargo_home:
-        home = Path(cargo_home)
-        if not home.is_absolute():
-            home = root / home
-        candidates = [home / 'config.toml', home / 'config']
-    else:
-        user_home = os.environ.get('HOME')
-        if user_home:
-            candidates = [Path(user_home) / '.cargo' / 'config.toml',
-                          Path(user_home) / '.cargo' / 'config']
-        else:
-            candidates = []
-    for ancestor in root.resolve().parents:
-        candidates.append(ancestor / '.cargo' / 'config.toml')
-        candidates.append(ancestor / '.cargo' / 'config')
-    for path in candidates:
-        if path.is_file():
-            raise BuildError('Cargo configuration outside the workspace at ' +
-                             os.path.abspath(str(path)) +
-                             ' could change this build; this batch binds in-repository '
-                             'configuration only and refuses to proceed')
-
-
-def bound_input_files():
-    """Every in-repository file the batch binds, sorted by path, plus the absent fixed candidates."""
-    present, absent = {}, []
-    for name in TOOLCHAIN_PINS:
-        if (_root() / name).is_file():
-            present[name] = 'toolchain'
-        else:
-            absent.append(name)
-    for name in CARGO_CONFIG_FILES:
-        if (_root() / name).is_file():
-            present[name] = 'cargo_config'
-        else:
-            absent.append(name)
-    if (_root() / 'build.rs').is_file():
-        present['build.rs'] = 'build_script'
-    else:
-        absent.append('build.rs')
-    # Every Rust file under tests/, not only the selected entries: a helper a
-    # selected entry reaches (or a new, still untracked one) is an input too.
-    # The module graph is not parsed; the whole test source tree is bound.
-    tests = _root() / 'tests'
-    if tests.is_dir():
-        for path in tests.rglob('*'):
-            if path.is_file() and path.suffix == '.rs':
-                present[_relative(path)] = 'integration_test_source'
-    return present, sorted(absent)
-
-
-def _read_bound(relative):
-    """Raw bytes of one present bound input, or None when it vanished after being listed."""
     try:
-        return (_root() / relative).read_bytes()
-    except FileNotFoundError:
-        return None
+        receipt.require_in_repository_config(name, raw)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
+
+
+def reject_external_cargo_config(environ=None):
+    environment = os.environ if environ is None else environ
+    try:
+        receipt.reject_external_cargo_config(_root(), environment)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
 
 
 def bound_input_inventory():
-    """Path, role, presence and raw-byte SHA-256 of every bound input, in one canonical order.
-
-    The raw bytes are read here once: the inventory of one measurement and the
-    digest taken from it describe the same bytes, not two later reads.
-    """
-    present, absent = bound_input_files()
-    entries, blobs = [], {}
-    for relative in sorted(present):
-        raw = _read_bound(relative)
-        if raw is None:
-            absent.append(relative)
-            continue
-        if present[relative] == 'cargo_config':
-            require_in_repository_config(relative, raw)
-        blobs[relative] = raw
-        entries.append({'path': relative, 'role': present[relative], 'present': True,
-                        'sha256': hashlib.sha256(raw).hexdigest()})
-    for relative in absent:
-        entries.append({'path': relative, 'role': _fixed_role(relative), 'present': False,
-                        'sha256': None})
-    entries.sort(key=lambda entry: entry['path'])
-    return entries, blobs
-
-
-def _fixed_role(relative):
-    if relative in TOOLCHAIN_PINS:
-        return 'toolchain'
-    if relative in CARGO_CONFIG_FILES:
-        return 'cargo_config'
-    return 'build_script'
+    """The shared path/role/presence/raw-byte inventory for this workspace."""
+    try:
+        return receipt.bound_input_inventory(_root())
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
 
 
 def bound_inputs_digest(entries, blobs):
-    """One digest over the path and raw bytes of every present bound input, in the given order.
-
-    Only "present" entries are folded in, and ``blobs`` must be the bytes the
-    entries' SHA-256 values were taken from; a present entry without them is an
-    error rather than a silently dropped input. Absent candidates are listed in
-    the inventory and the summary, so adding or removing one still changes the
-    inventory; the digest is the bytes identity of what was read.
-    """
-    digest = hashlib.sha256()
-    for path in sorted(entry['path'] for entry in entries if entry['present']):
-        raw = blobs.get(path)
-        if raw is None:
-            raise BuildError('bound input ' + path + ' is present but its bytes were not measured')
-        digest.update(bound_entry_line(path, raw))
-    return digest.hexdigest()
+    try:
+        return receipt.bound_inputs_digest(entries, blobs)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
 
 
 def bound_entry_line(path, raw):
-    digest = hashlib.sha256()
-    digest.update(path.encode() + b'\0')
-    digest.update(hashlib.sha256(raw).digest())
-    return digest.digest()
+    return receipt.bound_entry_line(path, raw)
 
 
 def bound_inputs_summary(entries, blobs):
-    present = [entry for entry in entries if entry['present']]
-    by_role = {role: sum(1 for entry in present if entry['role'] == role) for role in BOUND_ROLES}
-    return {'digest_algorithm': 'sha256(concat sha256(path\\0sha256(bytes)) over present inputs, path-sorted)',
-            'digest': bound_inputs_digest(entries, blobs),
-            'present_count': len(present), 'absent_count': len(entries) - len(present),
-            'total_bytes': sum(len(blobs[entry['path']]) for entry in present), 'by_role': by_role,
-            'absent': [entry['path'] for entry in entries if not entry['present']]}
+    try:
+        return receipt.bound_inputs_summary(entries, blobs)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
 
 
-def source_snapshot(plan):
+def source_snapshot(plan, environment=None):
     """Every input whose change after the build invalidates the whole batch."""
-    bound_inputs, bound_blobs = bound_input_inventory()
-    production_inputs = source_digest()
+    bound = capture_bound_inputs(environment)
     return {
-        'source_inputs': production_inputs,
-        'cargo_lock': sha256_file(_root() / 'Cargo.lock'),
+        'bound': bound,
+        'source_inputs': bound['source_inputs_sha256'],
+        'cargo_lock': bound['cargo_lock_sha256'],
+        'config_digest': bound['config_digest'],
         'tests': {spec['name']: sha256_file(spec['source']) for spec in plan.tests},
-        'bound_inputs': bound_inputs,
-        # The very bytes inventoried above, not a second read: the digest and
-        # any summary derived later must be taken from these, not from disk again.
-        'bound_input_blobs': bound_blobs,
-        'bound_inputs_digest': bound_inputs_digest(bound_inputs, bound_blobs),
         'git': git_state(),
     }
-
-
-def bound_inputs_for_receipts(before, after):
-    """Re-measure the inputs at freeze time and refuse unless they are the pre-build ones.
-
-    The production digest of ``after`` was taken after the build by
-    ``require_unchanged``; the bound inputs are read from disk again here, so an
-    input changed and restored between the build and publication is still hashed
-    anew. Returns the frozen inventory the receipts and manifest record.
-    """
-    measured = after['bound_inputs']
-    old = {entry['path']: entry for entry in before['bound_inputs']}
-    new = {entry['path']: entry for entry in measured}
-    added = sorted(set(new) - set(old))
-    removed = sorted(set(old) - set(new))
-    changed = sorted(path for path in set(old) & set(new) if old[path] != new[path])
-    if added or removed or changed:
-        details = ', '.join([path + ' (added)' for path in added] +
-                            [path + ' (removed)' for path in removed] +
-                            [path + ' (changed)' for path in changed])
-        raise BuildError('bound build inputs changed during build: ' + details +
-                         '; refusing the receipt')
-    if after['bound_inputs_digest'] != before['bound_inputs_digest']:
-        raise BuildError('bound build inputs digest changed during build; refusing the receipt')
-    return measured
 
 
 def require_unchanged(before, after, metadata_before=None, metadata_after=None):
@@ -1255,133 +953,129 @@ def require_unchanged(before, after, metadata_before=None, metadata_after=None):
     for name in before['tests']:
         if before['tests'][name] != after['tests'][name]:
             raise BuildError('integration-test source ' + name + ' changed during build; refusing the receipt')
+    if before['config_digest'] != after['config_digest']:
+        raise BuildError('config, build-script or toolchain inputs changed during build; refusing the receipt')
+    if before['bound'] != after['bound']:
+        old = {entry['path']: entry for entry in before['bound']['bound_input_inventory']}
+        new = {entry['path']: entry for entry in after['bound']['bound_input_inventory']}
+        changed = sorted(path for path in set(old) | set(new) if old.get(path) != new.get(path))
+        raise BuildError('bound build inputs changed during build: ' + ', '.join(changed) +
+                         '; refusing the receipt')
     if before['git'] != after['git']:
         raise BuildError('HEAD or working-tree state changed during build; refusing the receipt')
     if metadata_after is not None and metadata_before != metadata_after:
         raise BuildError('cargo metadata (package id or target directory) changed during build')
 
 
-def bind_inputs(plan, before):
-    """Freeze the bound inputs at publish time and return the receipt fields for them.
-
-    ``after`` is measured now, after the build and before publication; it must
-    equal the pre-build inventory and digest, and the recorded summary is derived
-    from that same frozen inventory. Every receipt and the manifest record this
-    one frozen value, so neither can omit an input.
-    """
-    after = source_snapshot(plan)
-    entries = bound_inputs_for_receipts(before, after)
-    summary = bound_inputs_summary(entries, after['bound_input_blobs'])
-    return {'bound_inputs': summary, 'bound_input_inventory': entries}
+def bind_inputs(plan, before, environment=None):
+    """Freeze the shared bound inventory after the build and return it for receipts."""
+    after = source_snapshot(plan, environment)
+    require_unchanged(before, after)
+    return after['bound']
 
 
-def tool_version(command):
-    process = run_tool(command)
-    return process.stdout.strip() if process.returncode == 0 else None
+def toolchain_record(environment=None):
+    """The shared metadata-only toolchain identity of this build."""
+    return probe_toolchain(environment)
 
 
-def toolchain_record(selection):
-    """Pin, active toolchain, compiler, Cargo, features, profile and architecture of the build."""
-    channel, source = toolchain_channel()
-    active = run_tool(['rustup', 'show', 'active-toolchain'])
-    reported = active.stdout.strip() if active.returncode == 0 else ''
-    if not reported.startswith(channel):
-        raise BuildError(f'active toolchain {reported!r} is not the pinned {channel!r} ({source}); '
-                         'install and select it before building')
-    return {'pinned_channel': channel, 'pin_source': source, 'active_toolchain': reported,
-            'rustc': rustc_version(), 'cargo': tool_version(['cargo', '--version']),
-            **selection.as_record(), 'architecture': host_architecture()}
-
-
-def binary_receipt(*, path, digests, toolchain, command, targets, lock_path, timings, bound,
-                   manifest_path,
-                   implicit=None):
-    """The ``build_native.py`` receipt fields, bound to this batch's single build.
-
-    ``implicit`` (``None`` for a requested bin) is the ``implicit_build``
-    record of a bin Cargo also built for a selected test: a real artifact of
-    this build that was neither requested nor part of the server acceptance.
-    """
-    path = Path(path)
+def _batch_link(manifest_path, binary_name, targets, bound):
     return {
-        'version': RECEIPT_VERSION,
-        'binary_sha256': sha256_file(path),
-        'source_inputs_sha256': digests['source_inputs'],
-        'workspace_commit': digests['commit'],
-        'git_head': digests['git_head'],
-        'working_tree': digests['working_tree'],
-        'cargo_lock_sha256': digests['cargo_lock'],
-        'integration_test_sources_sha256': digests['test_sources'],
-        'toolchain': toolchain,
-        'rustc': toolchain['rustc'],
-        'features': {'enabled': toolchain['features'],
-                     'no_default_features': toolchain['no_default_features'], 'profile': 'test',
-                     'package_debug': toolchain['package_debug'],
-                     'strip_debuginfo': toolchain['strip_debuginfo']},
-        'architecture': toolchain['architecture'],
-        'command': command,
-        'package_rebuilt': True,
-        'clean_command': CLEAN_COMMAND,
-        'clean_commands': 1,
-        'build_commands': 1,
-        'target_dir': str(canonical_target()),
-        'lock_file': str(lock_path),
-        'fresh_false_artifacts': targets,
-        'duration_seconds': timings,
-        # Additive to the standalone fields: the existing consumers of these
-        # receipts do not verify them, so they are not claimed to be verified
-        # until a consumer gate binds them.
-        'bound_inputs': bound['bound_inputs'],
-        'bound_input_inventory': bound['bound_input_inventory'],
-        'batch': {'kind': KIND, 'receipt_version': RECEIPT_VERSION, 'binary': path.name,
-                  'targets': [item['target'] for item in targets],
-                  'bound_inputs_sha256': bound['bound_inputs']['digest'],
-                  'manifest': str(Path(manifest_path).resolve())},
-        **({'implicit_build': implicit} if implicit is not None else {}),
+        'kind': KIND,
+        'receipt_version': RECEIPT_VERSION,
+        'binary': Path(binary_name).name,
+        'targets': [item['target'] for item in targets],
+        'bound_inputs_sha256': bound['bound_inputs']['digest'],
+        'manifest': str(Path(manifest_path).resolve()),
     }
 
 
-def test_receipt(*, path, artifact, digests, toolchain, command, targets, lock_path, timings, bound,
-                 manifest_path):
-    """The ``build_native_test.py`` receipt fields for one relocated test executable."""
+def _make_receipt(**arguments):
+    try:
+        return receipt.make_receipt_v2(**arguments)
+    except receipt.ReceiptError as error:
+        raise _as_build_error(error) from error
+
+
+def binary_receipt(*, path, bound, toolchain, command, targets, lock_path, timings,
+                   manifest_path, selection, environment, git, implicit=None):
+    """A shared v2 bin receipt for this batch's single build."""
     path = Path(path)
-    return {
+    extra = {
+        'kind': 'native-build-batch-bin',
+        'batch': _batch_link(manifest_path, path.name, targets, bound),
+        'timings': timing_record(timings),
+        'build_options': environment['build_options'],
+        'selection': selection.as_record(),
+    }
+    if implicit is not None:
+        extra['implicit_build'] = implicit
+    return _make_receipt(
+        binary_path=path,
+        command=command,
+        profile='test',
+        artifacts=targets,
+        toolchain=toolchain,
+        bound_inputs=bound,
+        workspace_commit=git['commit'],
+        target_dir=canonical_target(),
+        features=selection.features,
+        no_default_features=selection.no_default_features,
+        lock_file=lock_path,
+        git_head=git['head'],
+        working_tree={'tree': git['tree'], 'status': git['status']},
+        duration_seconds=timings['build_seconds'],
+        extra=extra,
+    )
+
+
+def test_receipt(*, path, binary_name, artifact, bound, toolchain, command, link_targets,
+                 lock_path, timings, manifest_path, selection, environment, git):
+    """A shared v2 receipt for one relocated integration-test executable."""
+    path = Path(path)
+    extra = {
         'kind': 'rust-integration-test',
         'relocated_artifact': True,
-        'original_artifact_sha256': artifact['original_artifact_sha256'],
-        'workspace_commit': digests['commit'],
-        'fresh': False,
-        'source_inputs_sha256': digests['source_inputs'],
-        'binary_sha256': sha256_file(path),
+        'original_artifact_sha256': artifact['executable_sha256'],
+        'integration_test_source': artifact['source'],
         'integration_test_source_sha256': artifact['source_sha256'],
-        'cargo_lock_sha256': digests['cargo_lock'],
-        'command': command,
-        'rustc': toolchain['rustc'],
-        'package_rebuilt': True,
-        'fresh_false_artifacts': [artifact],
-        'integration_test_source': str(Path(artifact['source'])),
-        'toolchain': toolchain,
-        'architecture': toolchain['architecture'],
-        'target_dir': str(canonical_target()),
-        'lock_file': str(lock_path),
-        'duration_seconds': timings,
-        'bound_inputs': bound['bound_inputs'],
-        'bound_input_inventory': bound['bound_input_inventory'],
-        'batch': {'kind': KIND, 'receipt_version': RECEIPT_VERSION, 'binary': path.name,
-                  'targets': [item['target'] for item in targets] + [artifact['target']],
-                  'bound_inputs_sha256': bound['bound_inputs']['digest'],
-                  'manifest': str(Path(manifest_path).resolve())},
+        'batch': _batch_link(manifest_path, binary_name, link_targets, bound),
+        'timings': timing_record(timings),
+        'build_options': environment['build_options'],
+        'selection': selection.as_record(),
     }
+    return _make_receipt(
+        binary_path=path,
+        command=command,
+        profile='test',
+        artifacts=[artifact],
+        toolchain=toolchain,
+        bound_inputs=bound,
+        workspace_commit=git['commit'],
+        target_dir=canonical_target(),
+        features=selection.features,
+        no_default_features=selection.no_default_features,
+        lock_file=lock_path,
+        git_head=git['head'],
+        working_tree={'tree': git['tree'], 'status': git['status']},
+        duration_seconds=timings['build_seconds'],
+        extra=extra,
+    )
+
+
+def timing_record(timings):
+    return {key: timings[key] for key in ('build_seconds',) if key in timings}
 
 
 def run_batch(args):
     """Run the whole transaction and return the published batch manifest."""
-    reject_passthrough_environment()
-    reject_external_cargo_config()
+    normalized = normalize_environment()
+    environment = normalized['environment']
+    reject_external_cargo_config(environment)
     # The target set is Cargo's: the metadata document is read before the
     # request is planned, so --all-bins, a --bin name, a --test that is a
     # metadata test and the implicit bins all come from one target list.
-    metadata_before = cargo_metadata()
+    metadata_before = cargo_metadata(environment)
     manifest = batch_manifest(metadata_before)
     plan = plan_batch(args, manifest)
     selection = plan.selection
@@ -1389,7 +1083,6 @@ def run_batch(args):
     started = time.monotonic()
 
     prepare_destinations(plan)
-    toolchain = toolchain_record(selection)
     command = emit_command(selection)
     for spec in plan.bins:
         command += ['--bin', spec['name']]
@@ -1400,6 +1093,7 @@ def run_batch(args):
     if selection.no_default_features:
         command += ['--no-default-features']
     command += ['--message-format=json-render-diagnostics']
+    command += list(normalized['cargo_args'])
 
     # Requested bins keep their receipts at <target>/debug/<bin>.build.json;
     # an implicitly built bin's receipt (it has no slot in that fixed
@@ -1407,15 +1101,17 @@ def run_batch(args):
     bin_receipts = bin_receipt_locations(plan, target)
     test_receipts = list(zip(plan.tests, plan.outputs, [Path(str(output) + '.build.json')
                                                         for output in plan.outputs]))
-    owned = [path for _, path, _ in bin_receipts] + [path for _, _, path in test_receipts] + \
-        [plan.manifest_out] + list(plan.outputs)
+    owned = ([path for _, path, _ in bin_receipts]
+             + [path for _, _, path in test_receipts]
+             + [plan.manifest_out]
+             + list(plan.outputs))
     with build_lock(target) as lock_path:
         # A failed or interrupted batch never leaves a receipt, manifest or
         # relocated executable from an earlier or partial transaction behind.
         remove_paths(owned + [path.with_name('.' + path.name + '.batch-new') for path in owned])
         try:
-            return publish_transaction(plan, owned, lock_path, metadata_before, toolchain, command,
-                                       started)
+            return publish_transaction(plan, owned, lock_path, metadata_before, command,
+                                       started, environment, normalized)
         except BaseException:
             # Staging siblings of this transaction may sit in the target
             # directory and in every output directory (each on its own
@@ -1432,13 +1128,16 @@ def bin_receipt_locations(plan, target):
     return requested + implicit
 
 
-def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, command, started):
-    """Clean, build, verify and publish one batch; it runs under the canonical lock."""
+def _features_record(selection):
+    enabled = [name for name in (selection.features or '').split(',') if name]
+    return {'enabled': enabled, 'no_default_features': selection.no_default_features}
+
+
+def publish_transaction(plan, owned, lock_path, metadata_before, command, started,
+                        environment, normalized):
+    """Build, verify and publish one batch under the canonical flock (no clean)."""
     selection = plan.selection
     target = canonical_target()
-    # Bin receipts stay in CARGO_TARGET_DIR (the single clean was the only
-    # destructive step on it), implicitly built bins' beside the manifest, and
-    # test receipts beside their relocated output.
     locations = bin_receipt_locations(plan, target)
     bin_receipts = [(spec, path) for spec, path, _ in locations]
     test_receipts = list(zip(plan.tests, plan.outputs, [Path(str(output) + '.build.json')
@@ -1452,104 +1151,125 @@ def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, comm
                                      owned[bins_count:bins_count + len(plan.tests)]))
     assert owned[bins_count + len(plan.tests)] == plan.manifest_out
     assert owned[bins_count + len(plan.tests) + 1:] == list(plan.outputs)
-    before = source_snapshot(plan)
-    clean_started = time.monotonic()
-    subprocess.run(CLEAN_COMMAND, cwd=_root(), check=True)
-    clean_seconds = round(time.monotonic() - clean_started, 3)
+    before = source_snapshot(plan, environment)
+    toolchain_before = probe_toolchain(environment)
     build_started = time.monotonic()
-    events = run_json_build(command)
+    events = run_json_build(command, environment)
     build_seconds = round(time.monotonic() - build_started, 3)
-    after = source_snapshot(plan)
+    after = source_snapshot(plan, environment)
     require_unchanged(before, after)
+    toolchain_after = probe_toolchain(environment)
+    if toolchain_before != toolchain_after:
+        raise BuildError('Toolchain identity changed during build; refusing the receipt')
     lib, bins, tests = select_artifacts(events, metadata_before['package_id'], plan,
                                         metadata_targets(metadata_before))
-    metadata_after = cargo_metadata()
+    metadata_after = cargo_metadata(environment)
     # The target set is planned from the first document, so a target added or
     # removed while building is a mismatch like a redirected target directory.
-    if {key: metadata_after[key] for key in ('target_directory', 'package_id', 'targets')} != \
-            {key: metadata_before[key] for key in ('target_directory', 'package_id', 'targets')}:
+    metadata_keys = ('target_directory', 'package_id', 'targets')
+    if ({key: metadata_after[key] for key in metadata_keys}
+            != {key: metadata_before[key] for key in metadata_keys}):
         raise BuildError('cargo metadata (package id or target directory) changed during build')
-    require_unchanged(before, after)
+    require_unchanged(before, after, metadata_before, metadata_after)
     if tests:
         for artifact, output in zip(tests, plan.outputs):
             if Path(artifact['executable']).resolve() == output:
                 raise BuildError('relocated output would overwrite the compiled artifact ' + str(output))
 
-    digests = {'source_inputs': before['source_inputs'], 'cargo_lock': before['cargo_lock'],
-               'commit': before['git']['commit'], 'git_head': before['git']['head'],
-               'working_tree': {key: before['git'][key] for key in ('tree', 'status')},
-               'test_sources': before['tests']}
-    timings = {'clean_seconds': clean_seconds, 'build_seconds': build_seconds}
-    # The one frozen bound-input record of this batch, re-measured now.
-    bound = bind_inputs(plan, before)
+    bound = bind_inputs(plan, before, environment)
+    git = before['git']
+    timings = {'build_seconds': build_seconds}
     selected_bins = [artifact for artifact, _ in bins]
     targets = [lib] + selected_bins
+    test_targets = targets + list(tests)
     publisher = Publisher()
     artifacts = []
-    # Receipts describe the sources and artifacts after everything that can
-    # change them was measured; their digests are taken when they are staged.
+    # Bin receipts bind the lib and every selected bin from this one build.
     for (spec, path), (artifact, implicit) in zip(bin_receipts, bins):
         marker = {'requested_by': '--test', 'reason': 'Cargo also builds the selected package\'s enabled bins '
                   'when an integration test is selected (an integration test runs through its package\'s '
                   'bins); this bin was reported by that same build, not selected by this batch',
                   'acceptance': 'not-server-acceptance', 'target_source': artifact['source']} \
             if implicit else None
-        publisher.text(path, binary_receipt(path=artifact['executable'], digests=digests,
-                                            toolchain=toolchain, command=command, targets=targets,
-                                            lock_path=lock_path, timings=timings, bound=bound,
-                                            manifest_path=plan.manifest_out,
-                                            implicit=marker))
+        publisher.text(path, binary_receipt(path=artifact['executable'], bound=bound,
+                                            toolchain=toolchain_after, command=command,
+                                            targets=targets, lock_path=lock_path,
+                                            timings=timings, manifest_path=plan.manifest_out,
+                                            selection=selection, environment=normalized,
+                                            git=git, implicit=marker))
         stat = os.stat(artifact['executable'])
         artifacts.append({'kind': 'bin', 'target': spec['name'], 'artifact': artifact['executable'],
-                          'receipt': str(path), 'fresh': False,
-                          'sha256': sha256_file(artifact['executable']), 'size': stat.st_size,
-                          'mtime_ns': stat.st_mtime_ns, 'duration_seconds': build_seconds}
+                          'receipt': str(path), 'fresh': artifact['fresh'],
+                          'sha256': artifact['executable_sha256'], 'size': stat.st_size,
+                          'mtime_ns': stat.st_mtime_ns, 'duration_seconds': build_seconds,
+                          'package_id': artifact['package_id'], 'profile': artifact['profile'],
+                          'source': artifact['source']}
                          | ({'implicit': True, 'target_source': artifact['source']} if implicit else
-                            {'implicit': False, 'target_source': artifact['source']}))
+                            {'implicit': False}))
     copy_receipts = []
     for (spec, output, path), artifact in zip(test_receipts, tests):
         original = artifact['executable']
-        copy_artifact = dict(artifact, source=str(spec['source']), output=str(output),
-                             source_sha256=before['tests'][spec['name']],
-                             original_artifact_sha256=sha256_file(original))
         publisher.copy(original, output)
-        copy_receipts.append((path, copy_artifact))
+        copy_receipts.append((path, output, artifact, spec))
         artifacts.append({'kind': 'test', 'target': spec['name'], 'artifact': str(output),
                           'original_artifact': original,
-                          'original_artifact_sha256': copy_artifact['original_artifact_sha256'],
-                          'receipt': str(path), 'fresh': False,
-                          'sha256': copy_artifact['original_artifact_sha256'],
-                          'source': str(spec['source']), 'source_sha256': copy_artifact['source_sha256'],
+                          'original_artifact_sha256': artifact['executable_sha256'],
+                          'receipt': str(path), 'fresh': artifact['fresh'],
+                          'sha256': artifact['executable_sha256'],
+                          'source': artifact['source'], 'source_sha256': artifact['source_sha256'],
+                          'package_id': artifact['package_id'], 'profile': artifact['profile'],
                           'duration_seconds': build_seconds})
     # A test receipt hashes the relocated executable, which only exists when
     # the batch stages it; build the payload after staging the copies.
     publisher.stage()
-    for path, artifact in copy_receipts:
-        staged = Path(artifact['output']).with_name('.' + Path(artifact['output']).name + '.batch-new')
-        publisher.text(path, test_receipt(path=staged, artifact=artifact, digests=digests,
-                                          toolchain=toolchain, command=command, targets=targets,
-                                          lock_path=lock_path, timings=timings, bound=bound,
-                                          manifest_path=plan.manifest_out))
+    for path, output, artifact, spec in copy_receipts:
+        staged = Path(output).with_name('.' + Path(output).name + '.batch-new')
+        # The shared v2 reader requires the receipt's binary basename to match
+        # the batch link.  The final output is still unpublished, so measure a
+        # private staged copy that carries the final basename; it is removed as
+        # soon as the receipt payload has been built.
+        receipt_input_dir = Path(output).parent / ('.' + Path(output).name + '.receipt-input')
+        receipt_input = receipt_input_dir / Path(output).name
+        receipt_input_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copyfile(staged, receipt_input)
+            os.chmod(receipt_input, 0o700)
+            payload = test_receipt(path=receipt_input, binary_name=Path(output).name,
+                                   artifact=artifact, bound=bound,
+                                   toolchain=toolchain_after, command=command,
+                                   link_targets=test_targets, lock_path=lock_path,
+                                   timings=timings, manifest_path=plan.manifest_out,
+                                   selection=selection, environment=normalized,
+                                   git=git)
+        finally:
+            remove_paths([receipt_input, receipt_input_dir])
+        publisher.text(path, payload)
     manifest = {
         'kind': KIND,
-        'manifest_version': RECEIPT_VERSION,
+        'manifest_version': MANIFEST_VERSION,
         'status': 'passed',
-        'source_commit': digests['commit'],
-        'source_inputs_sha256': digests['source_inputs'],
-        'working_tree': digests['working_tree'],
-        'cargo_lock_sha256': digests['cargo_lock'],
+        'source_commit': git['commit'],
+        'git_head': git['head'],
+        'working_tree': {'tree': git['tree'], 'status': git['status']},
+        'source_inputs_sha256': bound['source_inputs_sha256'],
+        'cargo_lock_sha256': bound['cargo_lock_sha256'],
+        'config_digest': bound['config_digest'],
         'bound_inputs': bound['bound_inputs'],
         'bound_input_inventory': bound['bound_input_inventory'],
-        'toolchain': toolchain,
-        'features': selection.as_record(),
-        'architecture': toolchain['architecture'],
+        'toolchain': toolchain_after,
+        'features': _features_record(selection),
+        'profile': 'test',
+        'target_triple': toolchain_after['target_triple'],
+        'selection': selection.as_record(),
+        'architecture': {'target_triple': toolchain_after['target_triple'],
+                         'host': toolchain_after['rustc']['host']},
         'target_directory': str(target),
         'lock_file': str(lock_path),
         'cargo_metadata_target_directory': metadata_after['target_directory'],
         'cargo_package_id': metadata_after['package_id'],
-        'clean': {'command': CLEAN_COMMAND, 'commands': 1, 'duration_seconds': clean_seconds},
+        'build_options': normalized['build_options'],
         'build': {'command': command, 'commands': 1, 'duration_seconds': build_seconds,
-                  'fresh_false_artifacts': targets},
+                  'cargo_artifacts': test_targets},
         'artifacts': artifacts,
         'duration_seconds': round(time.monotonic() - started, 3),
     }
@@ -1565,12 +1285,11 @@ def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, comm
         entry['size'] = os.path.getsize(staged)
         staged_receipt = (Path(entry['receipt']).parent /
                           ('.' + Path(entry['receipt']).name + '.batch-new'))
-        receipt = json.loads(staged_receipt.read_text())
-        if receipt['binary_sha256'] != entry['sha256']:
+        stored = json.loads(staged_receipt.read_text())
+        if stored['binary_sha256'] != entry['sha256']:
             raise BuildError('staged ' + entry['target'] + ' copy does not match its receipt')
-    require_unchanged(before, source_snapshot(plan))
-    if bound_inputs_for_receipts(before, source_snapshot(plan)) != \
-            bound['bound_input_inventory']:
+    require_unchanged(before, source_snapshot(plan, environment))
+    if bind_inputs(plan, before, environment) != bound:
         raise BuildError('bound build inputs changed after their inventory was frozen')
     # The payloads are not renamed as one atomic set across directories or
     # filesystems. The batch manifest is the last renamed payload: its
@@ -1583,7 +1302,7 @@ def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, comm
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description='Build several native binaries and integration tests from one clean.')
+        description='Build several native binaries and integration tests from one explicit Cargo invocation.')
     selection = parser.add_argument_group('common build selection (one value for the whole batch)')
     selection.add_argument('--features')
     selection.add_argument('--no-default-features', action='store_true')
@@ -1612,7 +1331,8 @@ def main(argv=None):
         print('build_native_batch: ' + str(error), file=sys.stderr)
         return 1
     print(json.dumps({key: batch[key] for key in ('status', 'source_commit', 'source_inputs_sha256',
-                                                  'toolchain', 'features', 'architecture', 'clean', 'build')}
+                                                  'toolchain', 'features', 'profile', 'target_triple',
+                                                  'architecture', 'build')}
                      | {'artifacts': [{'kind': entry['kind'], 'target': entry['target'],
                                        'artifact': entry['artifact'], 'receipt': entry['receipt'],
                                        'fresh': entry['fresh']} for entry in batch['artifacts']]},
