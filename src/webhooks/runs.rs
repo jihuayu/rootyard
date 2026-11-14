@@ -179,7 +179,8 @@ pub async fn report(
     }
     let row = tx.query_opt(
         "SELECT c.context,c.head_oid,c.base_oid,c.state,c.attempt,c.lease_generation,c.result_sha256, \
-          p.head_oid AS live_head,p.base_oid AS live_base,p.version AS live_version,c.pull_version \
+          p.head_oid AS live_head,p.base_oid AS live_base,p.version AS live_version, \
+          p.state AS live_state,c.pull_version \
          FROM ci_runs c JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
           AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
          JOIN forge_pulls p ON p.repository_id=c.repository_id AND p.number=c.pull_number \
@@ -187,18 +188,25 @@ pub async fn report(
         &[&run_id,&repo,&hook_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let digest = sha256_hex(format!("{}\0{}",input.conclusion,input.output).as_bytes());
+    // Replays are idempotent only while the exact candidate still owns this
+    // run. A revoked context binding removes the row above (404); a changed
+    // head/base/version must not return a stale successful result.
+    let candidate_current = row.get::<_,String>("head_oid")==row.get::<_,String>("live_head") &&
+        row.get::<_,String>("base_oid")==row.get::<_,String>("live_base") &&
+        row.get::<_,i64>("pull_version")==row.get::<_,i64>("live_version") &&
+        row.get::<_,String>("live_state")=="open";
     if row.get::<_,String>("state")=="completed" &&
         row.get::<_,i64>("attempt")==input.attempt &&
         row.get::<_,i64>("lease_generation")==input.lease_generation &&
         row.get::<_,Option<String>>("result_sha256").as_deref()==Some(&digest) {
+        if !candidate_current {
+            return Err(Error(StatusCode::CONFLICT,"CI run attempt or candidate changed"));
+        }
         tx.commit().await.map_err(Error::internal)?;
         return Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"run_id":run_id,"replay":true}))).into_response());
     }
     if row.get::<_,String>("state")!="leased" || row.get::<_,i64>("attempt")!=input.attempt ||
-        row.get::<_,i64>("lease_generation")!=input.lease_generation ||
-        row.get::<_,String>("head_oid")!=row.get::<_,String>("live_head") ||
-        row.get::<_,String>("base_oid")!=row.get::<_,String>("live_base") ||
-        row.get::<_,i64>("pull_version")!=row.get::<_,i64>("live_version") {
+        row.get::<_,i64>("lease_generation")!=input.lease_generation || !candidate_current {
         return Err(Error(StatusCode::CONFLICT,"CI run attempt or candidate changed"));
     }
     let lease_valid: bool = tx.query_one(
