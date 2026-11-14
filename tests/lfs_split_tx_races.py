@@ -7,10 +7,12 @@ Covers Issue #79 R3 invariants:
    without clobbering the committed `'ready'` row back to `'pending'`, rejects
    same-size corrupt local/remote bytes, and fails closed with `409 Conflict`
    after 3 passes of continuous `ready -> new ready` churn.
-2. Token revocation, role downgrade, collaborator removal, or repository
-   `recovering` transition while `ensure_readable` is in flight fails closed
-   (`401`/`403`/`404`/`409`) across `batch_download`, `batch_upload` dedup,
-   `verify_object`, and `PUT` upload dedup without scheduling remote repairs.
+2. Token revocation, expiry, role downgrade, collaborator removal, repository
+   identity swap, or repository `recovering` transition while
+   `ensure_readable` is in flight fails closed (`401`/`403`/`404`/`409`)
+   across `batch_download`, direct GET, `batch_upload` dedup, `verify_object`,
+   and `PUT` upload dedup without scheduling remote repairs or streaming the
+   verified body.
 3. Duplicate OIDs in `batch_upload` deduplicate `(oid, size)` before calling
    `schedule_remote_repair` so `MAX_CONCURRENT_REPAIRS = 2` is not exhausted.
 """
@@ -23,6 +25,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -195,6 +198,13 @@ class SplitTxRacesHarness(LfsHarness):
         )
         return status, body
 
+    def _raw_get(self, oid, token, size=None):
+        path = f"/git/alice/demo.git/info/lfs/objects/{oid}"
+        if size is not None:
+            path += f"/{size}"
+        status, body, _ = self.http(path, token=token, method="GET")
+        return status, body
+
     def _gated_batch_upload(self, fixture, oid_gate, size_gate, oid_second, size_second, on_gated):
         if self._final(oid_gate).exists():
             self._final(oid_gate).unlink()
@@ -338,7 +348,7 @@ class SplitTxRacesHarness(LfsHarness):
             reauth_payload = os.urandom(32 * 1024)
             oid_reauth, size_reauth = self._upload_ready_object(reauth_payload)
 
-            def run_inflight(req_fn, mutate_fn, cleanup_fn=None):
+            def run_inflight_full(req_fn, mutate_fn, cleanup_fn=None):
                 if self._final(oid_reauth).exists():
                     self._final(oid_reauth).unlink()
                 fixture.arm_get_gate(oid_reauth)
@@ -355,7 +365,11 @@ class SplitTxRacesHarness(LfsHarness):
                 delta = fixture.delta_oid(oid_reauth, before_rel)
                 if cleanup_fn:
                     cleanup_fn()
-                return holder["res"][0], delta
+                return holder["res"], delta
+
+            def run_inflight(req_fn, mutate_fn, cleanup_fn=None):
+                res, delta = run_inflight_full(req_fn, mutate_fn, cleanup_fn)
+                return res[0], delta
 
             def set_collab(role):
                 self.expect("/api/repos/alice/demo/collaborators/bob", (200, 201),
@@ -385,7 +399,73 @@ class SplitTxRacesHarness(LfsHarness):
             )
             assert code == 409, code
 
-            # 2b–2d. Write split-TX endpoints: batch_upload dedup, verify_object, PUT upload dedup
+            # 2b. Direct GET (read role): revoked/expired token -> 401, collaborator
+            # removed -> 404, repository identity swap or recovering -> 409.
+            def get_object(token, size=None):
+                return self._raw_get(oid_reauth, token, size)
+
+            rev_tok = self.account("create-token", "alice", "--read-only")
+            code, delta = run_inflight(
+                lambda: get_object(rev_tok),
+                lambda: self.sql(f"UPDATE tokens SET revoked=true WHERE id='{rev_tok['token_id']}'"),
+            )
+            assert code == 401, code
+            assert delta["GET"] == 1, delta
+
+            expired_tok = self.account("create-token", "alice", "--read-only")
+            code, delta = run_inflight(
+                lambda: get_object(expired_tok, size_reauth),
+                lambda: self.sql(
+                    f"UPDATE tokens SET expires_at=clock_timestamp() - interval '1 second' "
+                    f"WHERE id='{expired_tok['token_id']}'"
+                ),
+            )
+            assert code == 401, code
+            assert delta["GET"] == 1, delta
+
+            set_collab("read")
+            code, delta = run_inflight(lambda: get_object(self.bob), del_collab)
+            assert code == 404, code
+            assert delta["GET"] == 1, delta
+
+            code, delta = run_inflight(
+                lambda: get_object(self.alice),
+                lambda: set_repo_state("recovering"),
+                lambda: set_repo_state("ready"),
+            )
+            assert code == 409, code
+            assert delta["GET"] == 1, delta
+
+            replacement_id = str(uuid.uuid4())
+
+            def swap_repo_identity():
+                self.sql(f"UPDATE repositories SET name='demo-fenced' WHERE id='{repo_id}'")
+                self.sql(
+                    f"INSERT INTO repositories (id, owner_id, name, state) "
+                    f"VALUES ('{replacement_id}', '{tenant_id}', 'demo', 'ready')"
+                )
+
+            def restore_repo_identity():
+                self.sql(f"DELETE FROM repositories WHERE id='{replacement_id}'")
+                self.sql(f"UPDATE repositories SET name='demo' WHERE id='{repo_id}'")
+
+            code, delta = run_inflight(
+                lambda: get_object(self.alice),
+                swap_repo_identity,
+                restore_repo_identity,
+            )
+            assert code == 409, code
+            assert delta["GET"] == 1, delta
+
+            (status, body), delta = run_inflight_full(
+                lambda: get_object(self.alice),
+                lambda: None,
+            )
+            assert status == 200, (status, body)
+            assert body == reauth_payload
+            assert delta["GET"] == 1, delta
+
+            # 2c–2e. Write split-TX endpoints: batch_upload dedup, verify_object, PUT upload dedup
             write_endpoints = [
                 ("batch_upload_dedup", lambda t: self._raw_batch("upload", dl_obj, t), True),
                 ("verify_object", lambda t: self._raw_verify(oid_reauth, size_reauth, t), False),
@@ -452,6 +532,7 @@ class SplitTxRacesHarness(LfsHarness):
                 "three_pass_conflict_bound_verified": True,
                 "post_ensure_readable_reauth_paths": [
                     "batch_download",
+                    "direct_get",
                     "batch_upload_dedup",
                     "verify_object",
                     "put_upload_dedup",

@@ -308,6 +308,21 @@ async fn download_inner(
 
     let stream_body =
         storage::open_verified_download_stream_until(&state, repo_id, tenant_id, &oid, expected_size, deadline).await?;
+    // Opening the stream may verify local bytes or hydrate from the object store.
+    // Re-authorize the exact token and repository generation after that slow work,
+    // with no database connection held across it, before any response body is sent.
+    reauthorize_repo(
+        &state,
+        &actor,
+        &owner,
+        name,
+        repo_id,
+        tenant_id,
+        auth::Role::Read,
+        crate::token_scopes::RepoAction::ContentsRead,
+        false,
+    )
+    .await?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
