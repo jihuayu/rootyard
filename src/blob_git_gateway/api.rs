@@ -264,11 +264,7 @@ pub(super) async fn get_operation(
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
     let name = strip_name(&raw_name)?;
-    let operation_id =
-        Uuid::parse_str(&operation).map_err(|_| GatewayError::BadRequest("invalid operation identifier"))?;
-    if operation_id.is_nil() {
-        return Err(GatewayError::BadRequest("invalid operation identifier"));
-    }
+    let operation_id = parse_operation_id(&operation)?;
     let identity = authenticate(&state, &headers).await?;
     let deadline = state.deadline();
     // Reading a historical operation is a read: it must not require write
@@ -343,6 +339,119 @@ pub(super) async fn get_operation(
     let terminal = record.terminal_result().map(|result| result.value().clone());
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(OperationView { operation_id, state: current_state, terminal }))
         .into_response())
+}
+
+/// The one fixed server-side reason for an HTTP cancellation. It is not a
+/// caller field: every retry of this route records the same reason, so the
+/// decision tombstone binds a stable value rather than request text.
+const HTTP_CANCEL_REASON: &str = "http_cancel_requested";
+
+/// `POST /api/repos/{owner}/{name}/operations/{operation}/cancel`
+///
+/// Cancels one **known** repository-scoped operation. The caller supplies only
+/// the non-nil UUID in the path: no identity, digest, lane, sequence or reason.
+///
+/// Before the operation is resolved, the handler authenticates a live writable
+/// token, resolves the repository through the existing ready `pg_refstore`
+/// serving lookup bound to this process's Blob backend, and requires a current
+/// owner/admin role. Those checks happen before any 200/404 existence answer, so
+/// a non-admin cannot enumerate operation UUIDs.
+///
+/// The facade then opens exactly one bounded `synchronous_commit=on` transaction,
+/// takes the migration-138 operation advisory key, resolves the core record and
+/// its migration-147 producer binding, and calls the existing authorized
+/// coordinator. The coordinator rechecks live authority for the known mutation
+/// and either wins with an immutable `Cancelled` terminal or returns the exact
+/// committed/rejected terminal that already won. An unknown UUID is `404` and
+/// writes no tombstone; a core row without its exact A3 producer binding fails
+/// closed. An ambiguous cancellation `COMMIT` remains the typed `503` unknown.
+pub(super) async fn cancel_operation(
+    State(state): State<Arc<BlobGitState>>,
+    Path((owner, raw_name, operation)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, GatewayError> {
+    let name = strip_name(&raw_name)?;
+    let operation_id = parse_operation_id(&operation)?;
+    let identity = authenticate(&state, &headers).await?;
+    authorize_write(&identity)?;
+    let deadline = state.deadline();
+    let serving = lookup(state.pool(), &identity, &owner, name, true, state.store().backend_identity(), deadline)
+        .await
+        .map_err(authority_error)?;
+    require_cancel_admin(&state, &identity, &serving, deadline).await?;
+    let record = super::publish::authorized(&state)?
+        .cancel_known(state.pool(), &identity, serving.gate.repository_id(), operation_id, HTTP_CANCEL_REASON, deadline)
+        .await
+        .map_err(super::publish::map_authorized)?;
+    let Some(record) = record else {
+        // No row for this repository+UUID: never synthesize a cancellation
+        // tombstone from an HTTP identifier that lacks the full core identity.
+        return Err(GatewayError::NotFound);
+    };
+    let terminal = record.terminal_result().map(|result| result.value().clone());
+    if terminal.is_none() {
+        return Err(GatewayError::Internal("cancelled operation has no immutable terminal result"));
+    }
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(OperationView { operation_id, state: record.state().as_str(), terminal }),
+    )
+        .into_response())
+}
+
+/// One short read-only preflight of the caller's current effective role.
+///
+/// The preceding writable serving lookup already proved the live token, write
+/// scope, ready binding and Blob backend. This second, separate transaction adds
+/// the owner/admin requirement without taking any repository/gate row lock into
+/// the later cancellation transaction or preceding its operation advisory prefix.
+/// The coordinator rechecks the same authority inside the known mutation.
+async fn require_cancel_admin(
+    state: &BlobGitState,
+    identity: &crate::db::Identity,
+    serving: &crate::ref_store::serving::ServingRepository,
+    deadline: tokio::time::Instant,
+) -> Result<(), GatewayError> {
+    let mut client = state.pooled(deadline).await?;
+    let tx = tokio::time::timeout_at(deadline, client.transaction())
+        .await
+        .map_err(|_| GatewayError::Timeout)?
+        .map_err(|_| GatewayError::Internal("authorization transaction failed"))?;
+    let loaded: Result<Option<Role>, GatewayError> = async {
+        crate::ref_store::pg::bound(&tx, deadline).await.map_err(GatewayError::from)?;
+        crate::members::rbac::resolve_effective_role(
+            &*tx,
+            serving.gate.repository_id(),
+            serving.gate.tenant_id(),
+            identity.id,
+        )
+        .await
+        .map_err(GatewayError::from)
+        .map(|role| role.map(|(effective, _, _)| effective))
+    }
+    .await;
+    let cleanup = tokio::time::timeout_at(deadline, tx.rollback()).await;
+    drop(client);
+    let role = match (loaded, cleanup) {
+        (_, Err(_)) => return Err(GatewayError::Timeout),
+        (_, Ok(Err(_))) => return Err(GatewayError::Internal("authorization transaction cleanup failed")),
+        (Ok(role), Ok(Ok(()))) => role,
+        (Err(error), Ok(Ok(()))) => return Err(error),
+    };
+    if role.is_none_or(|role| role < Role::Admin) {
+        return Err(GatewayError::Forbidden("operation is cancellable only by a repository owner or admin"));
+    }
+    Ok(())
+}
+
+/// Parse the path operation identifier exactly as [`get_operation`] does: a
+/// malformed or nil UUID is a typed bad request.
+fn parse_operation_id(raw: &str) -> Result<Uuid, GatewayError> {
+    let operation_id = Uuid::parse_str(raw).map_err(|_| GatewayError::BadRequest("invalid operation identifier"))?;
+    if operation_id.is_nil() {
+        return Err(GatewayError::BadRequest("invalid operation identifier"));
+    }
+    Ok(operation_id)
 }
 
 /// Explicit refusal: the smart HTTP vertical does not implement an LFS media
