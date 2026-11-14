@@ -67,33 +67,36 @@ pub(crate) fn operation_digest(input: &OperationDigestInput) -> Result<Operation
     Ok(OperationDigest::from_canonical_hash(writer.finish()))
 }
 
-/// Candidate `VersionId` over the immutable realm/ref/operation identity.
+/// Candidate `VersionId` for one ref of a complete operation input.
+///
+/// The caller supplies the full operation input and the digest previously
+/// produced from that exact input. This function recomputes the digest and
+/// refuses a mismatch before selecting the requested ref, so the realm,
+/// operation id, ref name and base selector cannot be rebound independently.
+/// The selected ref's own base selector decides whether it may mint: a legacy
+/// sibling does not block an eligible explicit-base ref in the same operation.
 ///
 /// This is not a registered version or a capability. `base_generation_from_authority`
 /// is the authority/store value for an exact present base; it is never a client
 /// generation field. Explicit absent derives generation 1. A present base uses a
 /// checked `base + 1`; a missing, zero or overflowing authority generation is a
-/// typed refusal. The legacy selector always returns
-/// [`RefVersionCodecError::NoMintForLegacyBase`], even when another input is
-/// invalid, so a legacy operation digest can never mint a candidate version id.
-/// `base_selector` must be the exact selector encoded in `operation_digest`;
-/// proving that, the base row and the current head is an authority check. The
-/// authority still must prove that a present base exists, is the exact current
-/// head of this ref/realm, and has the supplied generation.
+/// typed refusal. The authority still must prove that a present base exists, is
+/// the exact current head of this ref/realm, and has the supplied generation.
 pub(crate) fn derive_candidate_version_id(
-    realm: &RefVersionRealm,
+    input: &OperationDigestInput,
+    expected_operation_digest: OperationDigest,
     ref_name: &RefName,
-    base_selector: &BaseRequestSelector,
     base_generation_from_authority: Option<u64>,
-    operation_id: uuid::Uuid,
-    operation_digest: OperationDigest,
 ) -> Result<VersionId, RefVersionCodecError> {
-    if matches!(base_selector, BaseRequestSelector::LegacyNotSupplied) {
-        return Err(RefVersionCodecError::NoMintForLegacyBase);
+    let computed_operation_digest = operation_digest(input)?;
+    if computed_operation_digest != expected_operation_digest {
+        return Err(RefVersionCodecError::OperationDigestMismatch);
     }
+    let intent =
+        input.refs().iter().find(|intent| intent.name() == ref_name).ok_or(RefVersionCodecError::RefNotInOperation)?;
+    let realm = input.realm();
     let realm_numbers = validate_realm(realm)?;
-    require_non_nil(operation_id, "operation_id")?;
-    let generation = candidate_generation(base_selector, base_generation_from_authority)?;
+    let generation = candidate_generation(intent.base(), base_generation_from_authority)?;
     let mut writer = CanonicalWriter::new();
     writer.push_len_prefixed(VERSION_ID_DOMAIN)?;
     writer.push_len_prefixed(realm.tenant_id().as_bytes())?;
@@ -106,8 +109,8 @@ pub(crate) fn derive_candidate_version_id(
     writer.push_u8(format_tag(realm.object_format()));
     writer.push_len_prefixed(ref_name.as_str().as_bytes())?;
     writer.push_u64(generation);
-    writer.push_len_prefixed(operation_id.as_bytes())?;
-    writer.push_len_prefixed(operation_digest.as_bytes())?;
+    writer.push_len_prefixed(input.operation_id().as_bytes())?;
+    writer.push_len_prefixed(computed_operation_digest.as_bytes())?;
     Ok(VersionId::from_canonical_hash(writer.finish()))
 }
 
@@ -896,193 +899,147 @@ mod tests {
 
     #[test]
     fn candidate_version_ids_match_contract_a_b_c_d_vectors() {
-        let a_operation = operation_digest(&input(uuid(4), vec![a_intent()], vec![pack_one()])).unwrap();
-        let a = derive_candidate_version_id(
-            &realm(),
-            &main_name(),
-            &BaseRequestSelector::Present(version(0x22)),
-            Some(1),
-            uuid(4),
-            a_operation,
-        )
-        .unwrap();
+        let a_input = input(uuid(4), vec![a_intent()], vec![pack_one()]);
+        let a_operation = operation_digest(&a_input).unwrap();
+        let a = derive_candidate_version_id(&a_input, a_operation, &main_name(), Some(1)).unwrap();
         assert_eq!(a.as_hex(), A_VERSION_ID);
 
-        let b_operation = operation_digest(&input(uuid(4), vec![b_intent()], vec![pack_one()])).unwrap();
-        let b = derive_candidate_version_id(
-            &realm(),
-            &main_name(),
-            &BaseRequestSelector::Present(version(0x77)),
-            Some(1),
-            uuid(4),
-            b_operation,
-        )
-        .unwrap();
+        let b_input = input(uuid(4), vec![b_intent()], vec![pack_one()]);
+        let b_operation = operation_digest(&b_input).unwrap();
+        let b = derive_candidate_version_id(&b_input, b_operation, &main_name(), Some(1)).unwrap();
         assert_eq!(b.as_hex(), B_VERSION_ID);
         assert_ne!(a.as_hex(), b.as_hex());
 
-        let c_operation = operation_digest(&input(uuid(7), vec![c_intent()], vec![pack_one()])).unwrap();
-        let c = derive_candidate_version_id(
-            &realm(),
-            &main_name(),
-            &BaseRequestSelector::ExplicitAbsent,
-            None,
-            uuid(7),
-            c_operation,
-        )
-        .unwrap();
+        let c_input = input(uuid(7), vec![c_intent()], vec![pack_one()]);
+        let c_operation = operation_digest(&c_input).unwrap();
+        let c = derive_candidate_version_id(&c_input, c_operation, &main_name(), None).unwrap();
         assert_eq!(c.as_hex(), C_VERSION_ID);
 
-        let d_operation = operation_digest(&input(uuid(8), vec![d_intent()], vec![pack_one()])).unwrap();
-        let d = derive_candidate_version_id(
-            &realm(),
-            &main_name(),
-            &BaseRequestSelector::Present(version(0x22)),
-            Some(1),
-            uuid(8),
-            d_operation,
-        )
-        .unwrap();
+        let d_input = input(uuid(8), vec![d_intent()], vec![pack_one()]);
+        let d_operation = operation_digest(&d_input).unwrap();
+        let d = derive_candidate_version_id(&d_input, d_operation, &main_name(), Some(1)).unwrap();
         assert_eq!(d.as_hex(), D_VERSION_ID);
 
-        let a_retry = derive_candidate_version_id(
-            &realm(),
-            &main_name(),
-            &BaseRequestSelector::Present(version(0x22)),
-            Some(1),
-            uuid(4),
-            a_operation,
-        )
-        .unwrap();
+        let a_retry = derive_candidate_version_id(&a_input, a_operation, &main_name(), Some(1)).unwrap();
         assert_eq!(a_retry, a);
     }
 
     #[test]
     fn legacy_base_never_mints_a_candidate_version_id() {
-        let legacy_operation = operation_digest(&input(uuid(4), vec![legacy_intent()], vec![pack_one()])).unwrap();
+        let legacy_input = input(uuid(4), vec![legacy_intent()], vec![pack_one()]);
+        let legacy_operation = operation_digest(&legacy_input).unwrap();
         for base_generation in [None, Some(1_u64)] {
             assert_eq!(
-                derive_candidate_version_id(
-                    &realm(),
-                    &main_name(),
-                    &BaseRequestSelector::LegacyNotSupplied,
-                    base_generation,
-                    uuid(4),
-                    legacy_operation,
-                ),
+                derive_candidate_version_id(&legacy_input, legacy_operation, &main_name(), base_generation),
                 Err(RefVersionCodecError::NoMintForLegacyBase)
             );
         }
-        let nil_realm = realm_with(Uuid::nil(), uuid(2), uuid(3), 7, 0, 9, GitObjectFormat::Sha1);
+
+        // A legacy digest cannot be paired with a caller-swapped explicit-absent
+        // input: derivation recomputes the full input digest first.
+        let explicit_absent_input = input(uuid(4), vec![c_intent()], vec![pack_one()]);
         assert_eq!(
-            derive_candidate_version_id(
-                &nil_realm,
-                &main_name(),
-                &BaseRequestSelector::LegacyNotSupplied,
-                None,
-                Uuid::nil(),
-                legacy_operation,
-            ),
-            Err(RefVersionCodecError::NoMintForLegacyBase)
+            derive_candidate_version_id(&explicit_absent_input, legacy_operation, &main_name(), None),
+            Err(RefVersionCodecError::OperationDigestMismatch)
+        );
+        let explicit_absent_operation = operation_digest(&explicit_absent_input).unwrap();
+        assert!(
+            derive_candidate_version_id(&explicit_absent_input, explicit_absent_operation, &main_name(), None).is_ok()
         );
     }
 
     #[test]
     fn candidate_generation_is_derived_not_client_supplied() {
-        let a_operation = operation_digest(&input(uuid(4), vec![a_intent()], vec![pack_one()])).unwrap();
-        let present = BaseRequestSelector::Present(version(0x22));
+        let a_input = input(uuid(4), vec![a_intent()], vec![pack_one()]);
+        let a_operation = operation_digest(&a_input).unwrap();
         assert_eq!(
-            derive_candidate_version_id(&realm(), &main_name(), &present, None, uuid(4), a_operation),
+            derive_candidate_version_id(&a_input, a_operation, &main_name(), None),
             Err(RefVersionCodecError::MissingAuthorityBaseGeneration)
         );
         assert_eq!(
-            derive_candidate_version_id(&realm(), &main_name(), &present, Some(0), uuid(4), a_operation),
+            derive_candidate_version_id(&a_input, a_operation, &main_name(), Some(0)),
             Err(RefVersionCodecError::ZeroAuthorityBaseGeneration)
         );
         assert_eq!(
-            derive_candidate_version_id(&realm(), &main_name(), &present, Some(u64::MAX), uuid(4), a_operation,),
+            derive_candidate_version_id(&a_input, a_operation, &main_name(), Some(u64::MAX)),
             Err(RefVersionCodecError::GenerationOverflow)
         );
+
+        let c_input = input(uuid(7), vec![c_intent()], vec![pack_one()]);
+        let c_operation = operation_digest(&c_input).unwrap();
         assert_eq!(
-            derive_candidate_version_id(
-                &realm(),
-                &main_name(),
-                &BaseRequestSelector::ExplicitAbsent,
-                Some(1),
-                uuid(7),
-                a_operation,
-            ),
+            derive_candidate_version_id(&c_input, c_operation, &main_name(), Some(1)),
             Err(RefVersionCodecError::UnexpectedAuthorityBaseGeneration)
         );
+
+        let nil_operation_input = input(Uuid::nil(), vec![a_intent()], vec![pack_one()]);
         assert_eq!(
-            derive_candidate_version_id(&realm(), &main_name(), &present, Some(1), Uuid::nil(), a_operation),
+            derive_candidate_version_id(&nil_operation_input, a_operation, &main_name(), Some(1)),
             Err(RefVersionCodecError::NilIdentifier { field: "operation_id" })
         );
+
         let negative_realm = realm_with(uuid(1), uuid(2), uuid(3), -1, 0, 9, GitObjectFormat::Sha1);
+        let negative_realm_input = build_input_with_realm(
+            negative_realm,
+            uuid(5),
+            uuid(6),
+            uuid(4),
+            3,
+            41,
+            vec![a_intent()],
+            vec![pack_one()],
+        );
         assert_eq!(
-            derive_candidate_version_id(&negative_realm, &main_name(), &present, Some(1), uuid(4), a_operation),
+            derive_candidate_version_id(&negative_realm_input, a_operation, &main_name(), Some(1)),
             Err(RefVersionCodecError::NegativeCounter { field: "authority_epoch" })
         );
     }
 
     #[test]
-    fn candidate_version_id_binds_realm_ref_operation_and_digest() {
-        let c_operation = operation_digest(&input(uuid(7), vec![c_intent()], vec![pack_one()])).unwrap();
-        let c = derive_candidate_version_id(
-            &realm(),
-            &main_name(),
-            &BaseRequestSelector::ExplicitAbsent,
-            None,
-            uuid(7),
-            c_operation,
-        )
-        .unwrap();
-        assert_eq!(c.as_hex(), C_VERSION_ID);
+    fn candidate_version_id_refuses_rebound_operation_components() {
+        let a_input = input(uuid(4), vec![a_intent()], vec![pack_one()]);
+        let a_operation = operation_digest(&a_input).unwrap();
 
-        let other_tenant = realm_with(uuid(9), uuid(2), uuid(3), 7, 0, 9, GitObjectFormat::Sha1);
-        let tenant_changed = derive_candidate_version_id(
-            &other_tenant,
-            &main_name(),
-            &BaseRequestSelector::ExplicitAbsent,
-            None,
-            uuid(7),
-            c_operation,
-        )
-        .unwrap();
-        assert_ne!(tenant_changed.as_hex(), C_VERSION_ID);
+        assert_eq!(
+            derive_candidate_version_id(&a_input, a_operation, &topic_name(), Some(1)),
+            Err(RefVersionCodecError::RefNotInOperation)
+        );
 
-        let ref_changed = derive_candidate_version_id(
-            &realm(),
-            &topic_name(),
-            &BaseRequestSelector::ExplicitAbsent,
-            None,
-            uuid(7),
-            c_operation,
-        )
-        .unwrap();
-        assert_ne!(ref_changed.as_hex(), C_VERSION_ID);
+        let other_realm = realm_with(uuid(9), uuid(2), uuid(3), 7, 0, 9, GitObjectFormat::Sha1);
+        let other_realm_input =
+            build_input_with_realm(other_realm, uuid(5), uuid(6), uuid(4), 3, 41, vec![a_intent()], vec![pack_one()]);
+        assert_eq!(
+            derive_candidate_version_id(&other_realm_input, a_operation, &main_name(), Some(1)),
+            Err(RefVersionCodecError::OperationDigestMismatch)
+        );
 
-        let operation_changed = derive_candidate_version_id(
-            &realm(),
-            &main_name(),
-            &BaseRequestSelector::ExplicitAbsent,
-            None,
-            uuid(9),
-            c_operation,
-        )
-        .unwrap();
-        assert_ne!(operation_changed.as_hex(), C_VERSION_ID);
+        let other_operation_input = input(uuid(9), vec![a_intent()], vec![pack_one()]);
+        assert_eq!(
+            derive_candidate_version_id(&other_operation_input, a_operation, &main_name(), Some(1)),
+            Err(RefVersionCodecError::OperationDigestMismatch)
+        );
 
-        let digest_changed_operation = operation_digest(&input(uuid(7), vec![c_intent()], vec![pack_two()])).unwrap();
-        let digest_changed = derive_candidate_version_id(
-            &realm(),
-            &main_name(),
-            &BaseRequestSelector::ExplicitAbsent,
-            None,
-            uuid(7),
-            digest_changed_operation,
-        )
-        .unwrap();
-        assert_ne!(digest_changed.as_hex(), C_VERSION_ID);
+        let other_selector_input = input(uuid(4), vec![b_intent()], vec![pack_one()]);
+        assert_eq!(
+            derive_candidate_version_id(&other_selector_input, a_operation, &main_name(), Some(1)),
+            Err(RefVersionCodecError::OperationDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn mixed_legacy_and_eligible_refs_are_decided_per_selected_ref() {
+        let mixed_input = input(uuid(4), vec![legacy_intent(), topic_intent()], vec![pack_one()]);
+        let mixed_operation = operation_digest(&mixed_input).unwrap();
+        assert_eq!(
+            derive_candidate_version_id(&mixed_input, mixed_operation, &main_name(), Some(1)),
+            Err(RefVersionCodecError::NoMintForLegacyBase)
+        );
+        let topic_version = derive_candidate_version_id(&mixed_input, mixed_operation, &topic_name(), None).unwrap();
+
+        let topic_only_input = input(uuid(4), vec![topic_intent()], vec![pack_one()]);
+        let topic_only_operation = operation_digest(&topic_only_input).unwrap();
+        let topic_only =
+            derive_candidate_version_id(&topic_only_input, topic_only_operation, &topic_name(), None).unwrap();
+        assert_ne!(topic_version, topic_only);
     }
 }

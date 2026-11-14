@@ -10,11 +10,15 @@
 //! An `OperationDigest` or `VersionId` returned here is only a deterministic
 //! value. It does not prove that a request is authorized, that a version was
 //! committed or registered, that a record exists, that objects or dependencies
-//! are present, or that any data is safe to collect. The legacy base shape is
-//! digestible for replay separation, but a candidate `VersionId` is never
-//! minted for it. A caller cannot supply a client generation: explicit absent
-//! derives generation 1 and a present base uses the supplied authority base
-//! generation plus one, checked for overflow.
+//! are present, or that any data is safe to collect. Candidate derivation takes
+//! the complete operation input and recomputes its digest before selecting one
+//! ref, so realm, operation id, ref name and base selector cannot be rebound
+//! independently. The legacy base shape is digestible for replay separation,
+//! but a candidate `VersionId` is never minted for a selected legacy ref; an
+//! eligible sibling ref in the same operation is still derived per ref. A caller
+//! cannot supply a client generation: explicit absent derives generation 1 and a
+//! present base uses the supplied authority base generation plus one, checked for
+//! overflow.
 //!
 //! No Cargo dependency, legacy v1 digest, PostgreSQL schema, runtime path,
 //! Blob/native Git code or Raft authority is changed by this checkpoint.
