@@ -401,6 +401,47 @@ fn validate_density(conn: &Connection, purged: Option<&LogId<u64>>) -> Res<()> {
     Ok(())
 }
 
+/// Refuse committed metadata that the retained log cannot satisfy.
+///
+/// A committed entry may be absent only when the exact persisted purge boundary covers it
+/// (`committed.index <= purged.index`). That ordering is legitimate: snapshot install can advance
+/// the purge boundary beyond a persisted committed value, and the state machine restores the newer
+/// committed point on startup. `purge` is the only supported operation that removes a committed
+/// row; `append` never rewrites one, and `truncate` refuses through it. So with no covering
+/// boundary, the row at the committed index must exist with the exact committed `LogId`. A missing
+/// row, a different `LogId`, a committed value ahead of the retained tail, or a commit with no
+/// retained row and no purge boundary is known loss, not a valid empty/partial log.
+fn validate_committed(
+    conn: &Connection,
+    committed: Option<&LogId<u64>>,
+    purged: Option<&LogId<u64>>,
+    last: Option<LogId<u64>>,
+) -> Res<()> {
+    let Some(c) = committed else { return Ok(()) };
+    let Some(l) = last else {
+        return Err(E::Refused(format!(
+            "committed {c} is recorded but the retained log is empty and no purge boundary explains it"
+        )));
+    };
+    if c.index > l.index {
+        return Err(E::Refused(format!("committed {c} is ahead of last log {l}")));
+    }
+    // Purge is inclusive; a boundary at or above the commit legally removed that row. A commit
+    // below the boundary is the snapshot-style lagging-committed case.
+    if purged.is_some_and(|p| p.index >= c.index) {
+        return Ok(());
+    }
+    match read_row(conn, idx_to_i64(c.index)?)? {
+        Some((stored, _)) if &stored == c => Ok(()),
+        Some((stored, _)) => Err(E::Refused(format!(
+            "committed {c} does not match stored log {stored} at its index and no purge boundary covers it"
+        ))),
+        None => Err(E::Refused(format!(
+            "committed {c} is missing from the retained log and no purge boundary covers it"
+        ))),
+    }
+}
+
 /// First row (with full checksum/identity validation) of an `{cols}`-templated index query, or
 /// `None` when the query yields no row.
 fn read_indexed_row<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Res<Option<EntryOf>> {
@@ -623,11 +664,10 @@ impl Inner {
         // returned. It deliberately derives the lower bound from the purge successor or the
         // smallest stored row, never from an assumed index 0.
         validate_density(&conn, purged.as_ref())?;
-        if let (Some(c), Some(l)) = (committed, last)
-            && c.index > l.index
-        {
-            return Err(E::Refused(format!("committed {c} is ahead of last log {l}")));
-        }
+        // A persisted commit is evidence that at least its row existed. It may be gone only under
+        // a covering purge boundary; otherwise the exact row must remain, so an all-row deletion
+        // with retained committed metadata is refused rather than mistaken for a fresh empty log.
+        validate_committed(&conn, committed.as_ref(), purged.as_ref(), last)?;
         Ok(Inner { _lock: lock, conn })
     }
 
@@ -674,13 +714,16 @@ fn append_entries(inner: &mut Inner, entries: Vec<EntryOf>) -> Res<()> {
     let tx = inner.tx()?;
     let last = read_last(&tx)?;
     let committed: Option<LogId<u64>> = meta(&tx, K_COMMITTED)?;
+    let purged = purged_boundary(&tx)?;
+    // Do not extend a state whose persisted commit is already known lost. Valid purge orderings
+    // (a boundary covering the commit, or a commit inside the live log) pass this check.
+    validate_committed(&tx, committed.as_ref(), purged.as_ref(), last)?;
     if let (Some(first), Some(prev)) = (entries.first(), last) {
         let i = first.get_log_id().index;
         if i > prev.index.saturating_add(1) {
             return Err(E::Refused(format!("append starts at {i} but log ends at {prev} (hole)")));
         }
     }
-    let purged = purged_boundary(&tx)?;
     if entries.first().is_some_and(|first| purged.is_some_and(|p| first.log_id.index <= p.index)) {
         return Err(E::Refused("append would revive a purged prefix".into()));
     }
@@ -849,6 +892,13 @@ impl RaftLogStorage<LogTypeConfig> for PersistentLog {
     async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
         with_inner(self.inner.clone(), move |i| {
             let tx = i.tx()?;
+            if committed.is_some() {
+                let purged = purged_boundary(&tx)?;
+                let last = read_last(&tx)?;
+                // Refuse at write time exactly what open would refuse, so a successful
+                // `save_committed` never creates an unreopenable store. Clearing stays allowed.
+                validate_committed(&tx, committed.as_ref(), purged.as_ref(), last)?;
+            }
             set_meta(&tx, K_COMMITTED, committed.as_ref().map(je).transpose()?.as_deref())?;
             tx.commit()?;
             Ok(())
@@ -2046,5 +2096,105 @@ mod tests {
         let mut r = rt.block_on(s.get_log_reader());
         assert_eq!(indices(&rt.block_on(r.try_get_log_entries(0..10)).unwrap()), vec![7, 8, 9]);
         assert!(rt.block_on(r.try_get_log_entries(0..7)).unwrap().is_empty(), "wholly purged below the boundary");
+    }
+
+    #[test]
+    fn open_refuses_committed_with_all_rows_deleted() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 4)), "commit acknowledged");
+        delete_rows(dir.path(), "DELETE FROM log_entry");
+        {
+            let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+            let rows: i64 = conn.query_row("SELECT count(*) FROM log_entry", [], |r| r.get(0)).unwrap();
+            let commits: i64 =
+                conn.query_row("SELECT count(*) FROM meta WHERE k=?1", [K_COMMITTED], |r| r.get(0)).unwrap();
+            let purges: i64 =
+                conn.query_row("SELECT count(*) FROM meta WHERE k=?1", [K_PURGED], |r| r.get(0)).unwrap();
+            let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap();
+            assert_eq!((rows, commits, purges), (0, 1, 0), "valid SQLite kept committed metadata");
+            assert_eq!(check, "ok");
+        }
+        // A retained handle cannot append past the known-loss state.
+        let err = append(&rt, &s, vec![blank(1, 5)]).expect_err("append must refuse a known-lost commit");
+        let msg = format!("{err}");
+        assert!(msg.contains("committed") && msg.contains("no purge boundary"), "{msg}");
+        drop(s);
+
+        for check in [true, false] {
+            let err = match rt.block_on(PersistentLog::open(dir.path(), 7, check)) {
+                Ok(_) => panic!("startup accepted committed metadata with no log rows"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("committed"), "{err}");
+            assert!(err.contains("no purge boundary"), "{err}");
+        }
+        // Refusal is neither a reset nor a migration: the rows stay gone and the commit stays.
+        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM log_entry", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM meta WHERE k=?1", [K_COMMITTED], |r| r.get::<_, i64>(0)).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn committed_validation_matches_write_and_purge_orderings() {
+        let rt = rt();
+        // A fresh empty log cannot accept a commit: there is no row and no purge boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        let err = rt.block_on(s.save_committed(Some(lid(1, 0)))).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("committed") && msg.contains("no purge boundary"), "{msg}");
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), None, "refused write persisted nothing");
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        let err = rt.block_on(s.save_committed(Some(lid(1, 5)))).unwrap_err();
+        assert!(format!("{err}").contains("ahead of last log"), "{err}");
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 4)), "refused write kept the old commit");
+        // A purge behind the commit cannot explain losing the committed row.
+        rt.block_on(s.purge(lid(1, 2))).unwrap();
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry");
+        let err = match rt.block_on(PersistentLog::open(dir.path(), 7, true)) {
+            Ok(_) => panic!("non-covering purge explained a lost commit"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("committed") && err.contains("ahead of last log"), "{err}");
+
+        // Losing the committed row while later rows survive is also known loss, not a legal
+        // positive-first start: the committed index itself was never purged.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..6).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx <= 4");
+        let err = match rt.block_on(PersistentLog::open(dir.path(), 7, true)) {
+            Ok(_) => panic!("positive-first start hid a missing committed row"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("committed") && err.contains("missing from the retained log"), "{err}");
+
+        // A purge at or above the commit legitimately explains an empty live log. The persisted
+        // committed value may equal or lag that boundary (snapshot-style ordering).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
+        rt.block_on(s.purge(lid(1, 4))).unwrap();
+        drop(s);
+        delete_rows(dir.path(), "DELETE FROM log_entry");
+        let mut s = open(&rt, dir.path());
+        assert_eq!(
+            state(&rt, &mut s),
+            LogState { last_purged_log_id: Some(lid(1, 4)), last_log_id: Some(lid(1, 4)) }
+        );
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 4)));
+        assert!(rt.block_on(s.try_get_log_entries(0..10)).unwrap().is_empty());
     }
 }
