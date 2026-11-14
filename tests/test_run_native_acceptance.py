@@ -1050,13 +1050,38 @@ class PlanValidationTest(unittest.TestCase):
             (["python3", "-B", "scripts/build_native_test.py", "--test", "fixture"], "build_native_test.py"),
             (["python3", "-m", "build_native_batch", "--all-bins"], "build_native_batch.py"),
             (["/usr/bin/env", "python3", "scripts/build_native_batch.py", "--all-bins"], "build_native_batch.py"),
-            (["python3", "scripts/check_redis_contract.py"], "check_redis_contract.py"),
         ):
             with self.subTest(argv=argv):
                 with self.assertRaises(acceptance.PlanError) as caught:
                     acceptance.validate_plan({"suites": [suite(argv)]})
                 self.assertIn("prebuilt-only", str(caught.exception))
                 self.assertIn(command, str(caught.exception))
+
+    def test_prebuilt_redis_contract_checker_is_admitted(self):
+        self.assertNotIn("check_redis_contract.py", acceptance.BUILD_SCRIPTS)
+        self.assertNotIn("check_redis_contract", acceptance.BUILD_MODULES)
+
+        def suite(argv):
+            return {"id": "redis-contract", "phase": "smoke", "argv": argv, "timeout_seconds": 1800,
+                    "resources": {"loopback:6379": "exclusive"}}
+
+        for argv in (
+            [sys.executable, "scripts/check_redis_contract.py",
+             "--executable", "test-results/state-redis/rootyard-lib-test",
+             "--build-receipt", "test-results/state-redis/rootyard-lib-test.build.json",
+             "--report", "{run_dir}/contract.json",
+             "--log-dir", "{run_dir}/logs"],
+            ["env", "-u", "CARGO_HOME", "timeout", "1800s", sys.executable,
+             "scripts/check_redis_contract.py",
+             "--executable", "test-results/state-redis/rootyard-lib-test",
+             "--build-receipt", "test-results/state-redis/rootyard-lib-test.build.json",
+             "--report", "{run_dir}/contract.json",
+             "--log-dir", "{run_dir}/logs"],
+        ):
+            with self.subTest(argv=argv):
+                validated = acceptance.validate_plan({"suites": [suite(argv)]})
+                self.assertEqual("redis-contract", validated["suites"][0]["id"])
+                self.assertEqual(argv, validated["suites"][0]["argv"])
 
     def test_env_and_timeout_wrappers_cannot_hide_a_builder(self):
         def suite(argv):

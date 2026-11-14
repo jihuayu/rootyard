@@ -43,10 +43,10 @@ Plan shape (JSON)::
 ``argv`` runs with ``shell=False`` under ``scripts/native_acceptance_supervisor.py``.
 ``{run_id}``, ``{suite_id}`` and ``{run_dir}`` are substituted in argv, suite
 environment and isolation values. Plans are operator-trusted, but validation
-refuses direct known compiler/builder commands (Cargo/rustc, the
-``build_native*.py`` helpers and ``check_redis_contract.py``) behind a finite
-literal-argv wrapper set: ``env`` assignments and its supported operand options,
-and ``timeout`` options plus a duration. A recognized wrapper form that cannot be
+refuses direct known compiler/builder commands (Cargo/rustc and the
+``build_native*.py`` helpers) behind a finite literal-argv wrapper set: ``env``
+assignments and its supported operand options, and ``timeout`` options plus a
+duration. A recognized wrapper form that cannot be
 peeled safely is refused rather than guessed. Run explicit build preparation
 outside the runner and pass only the prepared artifact. This is not a general
 shell sandbox: shell text, ``env -S`` strings, ``python -c`` bodies and renamed
@@ -127,8 +127,9 @@ SENSITIVE_ENV = re.compile(r"SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY
 # Direct commands whose purpose is compiling or cleaning this checkout. This is
 # an accidental-build guard for operator-trusted plans, not a security boundary.
 BUILD_EXECUTABLES = frozenset({"cargo", "rustc", "cargo-clippy", "clippy-driver"})
-BUILD_SCRIPTS = frozenset({"build_native.py", "build_native_test.py", "build_native_batch.py",
-                           "check_redis_contract.py"})
+# check_redis_contract.py is a reviewed prebuilt-only consumer, not a producer: it
+# requires an explicit executable and receipt and is intentionally not listed.
+BUILD_SCRIPTS = frozenset({"build_native.py", "build_native_test.py", "build_native_batch.py"})
 BUILD_MODULES = frozenset(name[:-3] for name in BUILD_SCRIPTS)
 PYTHON_EXECUTABLE = re.compile(r"^(?:python|python3|python3\.\d+|pypy3?)(?:\.exe)?$", re.I)
 URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
