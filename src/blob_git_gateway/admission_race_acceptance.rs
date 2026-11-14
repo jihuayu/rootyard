@@ -66,7 +66,11 @@ use crate::{
     blob_git_gateway::{BlobGitConfig, BlobGitState, router, state::AdmissionPause},
     blob_store::{BlobProvider, config::BlobProfile, opendal::BlobStore},
     ref_store::{
-        core::decision_commit::{PgDecisionProtocol, RealmExpectation},
+        CommitRejectCode, RefCommitResult, TerminalKind,
+        core::{
+            decision_commit::{PgDecisionProtocol, RealmExpectation},
+            pack_commit::PackCommitTerminal,
+        },
         serving::lookup,
     },
 };
@@ -307,14 +311,22 @@ async fn case(db: &Db) -> Result<()> {
         .ok_or_else(|| anyhow!("the losing operation has no durable row"))?;
     ensure!(loser_state == "rejected", "the losing operation is {loser_state}, not rejected");
     let terminal = loser_terminal.ok_or_else(|| anyhow!("the rejected operation has no terminal"))?;
-    let refs = terminal["refs"].as_array().ok_or_else(|| anyhow!("the rejected terminal has no refs"))?;
-    ensure!(refs.len() == 1, "the rejected terminal does not cover exactly one ref: {terminal}");
-    ensure!(refs[0]["name"].as_str() == Some(SEED_REF), "the rejected terminal names another ref: {terminal}");
-    let code = refs[0]["reason"]["code"].as_str().or_else(|| refs[0]["reason"].as_str()).unwrap_or_default();
-    ensure!(
-        code.contains("OldOidMismatch") || code.contains("old_oid_mismatch"),
-        "the rejected terminal carries {code:?}: {terminal}"
-    );
+    let terminal: PackCommitTerminal = serde_json::from_value(terminal)
+        .map_err(|_| anyhow!("the rejected terminal does not match the pack terminal schema"))?;
+    ensure!(terminal.kind == TerminalKind::Rejected, "the rejected terminal has another kind: {terminal:?}");
+    ensure!(terminal.refs.len() == 1, "the rejected terminal does not cover exactly one ref: {terminal:?}");
+    match &terminal.refs[0] {
+        RefCommitResult::NotApplied { name, reason } => {
+            ensure!(name.as_str() == SEED_REF, "the rejected terminal names another ref: {terminal:?}");
+            ensure!(
+                *reason == CommitRejectCode::OldOidMismatch,
+                "the rejected terminal reason is {reason:?}, not OldOidMismatch: {terminal:?}"
+            );
+        }
+        RefCommitResult::Applied { .. } => {
+            return Err(anyhow!("the rejected terminal contains an applied ref: {terminal:?}"));
+        }
+    }
     let revision_after = gate_revision(db, repository_id).await?;
     ensure!(
         revision_after == revision_before + 1,
