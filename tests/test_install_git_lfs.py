@@ -370,7 +370,17 @@ class CandidateAndPrWorkflowWiringTest(unittest.TestCase):
             ("lfs_split_tx_races", "test-results/lfs-split-tx-races.json", "tests/lfs_split_tx_races.py"),
             ("lfs_lock_policy", "test-results/lfs-lock-policy.json", "tests/lfs_lock_policy.py"),
         ):
-            self.assertIn(f"python3 {harness} --binary target/debug/rootyard --report {report_path}", text)
+            # The job exports ROOTYARD_BIN from the immutable CAS snapshot; a
+            # mutable target/debug path is absent at this point and must never
+            # be recreated just to satisfy the static contract.
+            self.assertIn(
+                f'python3 {harness} --binary "$ROOTYARD_BIN" --report {report_path}',
+                text,
+            )
+            self.assertNotIn(
+                f"python3 {harness} --binary target/debug/rootyard --report {report_path}",
+                text,
+            )
             self.assertIn(f"--report {report_key}={report_path}", text)
             self.assertIn(f"--harness {harness}", text)
         for shared_lfs_harness in ("tests/lfs.py", "tests/lfs_remote_contract.py"):

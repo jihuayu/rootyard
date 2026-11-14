@@ -352,14 +352,26 @@ class CaseContractTest(unittest.TestCase):
 
     def test_ci_browse_step_runs_the_seventeen_case_mode(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        # CI exports ROOTYARD_BIN from the exporter-validated immutable CAS
+        # snapshot; the acceptance harness must consume that path rather than
+        # the mutable compiler output that no longer exists in the job.
         command = ('run: python3 tests/browse.py --mixed-refs --git "$(command -v git)" '
-                   '--binary target/debug/rootyard --report test-results/browse.json')
+                   '--binary "$ROOTYARD_BIN" --report test-results/browse.json')
         self.assertEqual(workflow.count(command), 1)
+        self.assertNotIn(
+            '--binary target/debug/rootyard --report test-results/browse.json', workflow)
         self.assertEqual(workflow.count("tests/browse.py"), 2,
                          "the Browse step and its native manifest harness may reference it")
-        # Other suites keep their exact commands.
-        for untouched in ("python3 tests/pulls.py --binary target/debug/rootyard --report test-results/pulls.json",
-                          "python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json"):
+        # The seventeen fixed cases remain the default inventory and the two
+        # mixed cases remain an explicit --mixed-refs opt-in (asserted above).
+        self.assertEqual(len(browse.CASE_NAMES), 17)
+        self.assertEqual(workflow.count("--mixed-refs"), 1)
+        for name in mixed_ref_cases.MIXED_REF_CASES:
+            self.assertIn("--require-case browse=" + name, workflow)
+        # Other suites keep their exact commands, now bound to the same
+        # exporter-validated binary variable.
+        for untouched in ("python3 tests/pulls.py --binary \"$ROOTYARD_BIN\" --report test-results/pulls.json",
+                          "python3 tests/lfs.py --binary \"$ROOTYARD_BIN\" --report test-results/lfs.json"):
             self.assertIn("run: " + untouched, workflow)
         if shutil.which("git"):
             # The shell substitution yields an absolute path accepted by --git.
