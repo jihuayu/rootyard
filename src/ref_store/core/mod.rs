@@ -49,6 +49,9 @@ pub mod pg;
 /// Publication decisions: live PG authorization/policy, single-use decision
 /// capabilities and the cancel-before-install tombstone (crate-private surface).
 pub(crate) mod publication_decision;
+/// C1a pure canonical `OperationDigest`/candidate `VersionId` codec. Unwired:
+/// no authorization, registration, retention, record, PG or Raft surface.
+pub(crate) mod ref_version;
 /// Durable, non-expiring retention **roots** over one existing pack-verified
 /// snapshot (library only, unserved).
 pub mod retention_root;
