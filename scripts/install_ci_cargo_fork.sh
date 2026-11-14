@@ -459,7 +459,6 @@ if [ "$github" = 1 ]; then
       printf 'CARGO_FORK_BIN=%s\n' "$resolved"
       printf 'CARGO_FORK_REVISION=%s\n' "$REVISION"
       printf 'CARGO_FORK_RELEASE=%s\n' "$RELEASE"
-      printf 'CARGO_FORK_VERSION=%s\n' "$verified_full_version"
       printf 'CARGO_FORK_SHA256=%s\n' "$verified_sha"
       printf 'CARGO_FORK_CACHE_DIR=%s\n' "$cache_dir"
       printf 'CARGO_FORK_CACHE_KEY=%s\n' "$key"
