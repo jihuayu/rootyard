@@ -556,6 +556,40 @@ class LfsHarness(Harness):
             assert own_id in ours, verified
             assert foreign_id not in visible, verified
 
+        # Stock `locks --verify` uses the verify endpoint and marks this
+        # repository's locks with O. A same-actor lock with a unique path in
+        # another repository must not appear in either CLI mode.
+        foreign_path = "docs/other-only.bin"
+        foreign_lock = self.lfs_lock_create(other_locks, foreign_path, self.alice)
+        design_id = self.lfs_lock_list(
+            source_locks, self.alice, path="docs/design.bin"
+        )["locks"][0]["id"]
+        cli_verify = self.git("lfs", "locks", "--verify", cwd=self.work, token=self.alice)
+        cli_lines = cli_verify.stdout.decode().splitlines()
+        assert len(cli_lines) == 2, cli_lines
+        assert all(line.startswith("O ") for line in cli_lines), cli_lines
+        assert {line.split()[1] for line in cli_lines} == {
+            "docs/design.bin", cross_path
+        }, cli_lines
+        assert b"alice" in cli_verify.stdout
+        cli_json_result = self.git(
+            "lfs", "locks", "--verify", "--json", cwd=self.work, token=self.alice
+        )
+        cli_json = json.loads(cli_json_result.stdout)
+        assert {lock["id"] for lock in cli_json["ours"]} == {
+            design_id, source_lock["id"]
+        }, cli_json
+        assert cli_json.get("theirs", []) == [], cli_json
+        assert {lock["path"] for lock in cli_json["ours"]} == {
+            "docs/design.bin", cross_path
+        }, cli_json
+        assert {lock["owner"]["name"] for lock in cli_json["ours"]} == {"alice"}, cli_json
+        for foreign_id in (other_lock["id"], bob_lock["id"], foreign_lock["id"]):
+            assert foreign_id.encode() not in cli_verify.stdout, foreign_id
+            assert foreign_id.encode() not in cli_json_result.stdout, foreign_id
+        assert foreign_path.encode() not in cli_verify.stdout
+        assert foreign_path.encode() not in cli_json_result.stdout
+
         # Force unlock through the wrong repository URL must hide the source
         # lock (404, no path/ID echo), even when the caller owns the other repo.
         for base, token in ((other_locks, self.alice), (bob_locks, self.bob)):
@@ -594,13 +628,14 @@ class LfsHarness(Harness):
 
         # Authorized owners in the other repositories retain positive unlock
         # control over their own locks.
-        assert self.lfs_lock_unlock(
-            other_locks, other_lock["id"], self.alice
-        )["id"] == other_lock["id"]
-        assert self.lfs_lock_unlock(
-            bob_locks, bob_lock["id"], self.bob
-        )["id"] == bob_lock["id"]
+        for base, lock, token in (
+            (other_locks, other_lock, self.alice),
+            (other_locks, foreign_lock, self.alice),
+            (bob_locks, bob_lock, self.bob),
+        ):
+            assert self.lfs_lock_unlock(base, lock["id"], token)["id"] == lock["id"]
         assert self.lfs_lock_list(other_locks, self.alice, path=cross_path)["locks"] == []
+        assert self.lfs_lock_list(other_locks, self.alice, path=foreign_path)["locks"] == []
         assert self.lfs_lock_list(bob_locks, self.bob, path=cross_path)["locks"] == []
 
         self.expect("/api/repos/alice/demo/collaborators/bob", 201, token=self.alice,
@@ -627,6 +662,8 @@ class LfsHarness(Harness):
             "same_path_locks_in_three_repositories": 3,
             "cross_repository_force_unlock_denied": 2,
             "cross_repository_id_path_verify_hidden": True,
+            "stock_locks_verify_owner_marked": True,
+            "stock_locks_verify_foreign_ids_paths_hidden": True,
             "source_owner_unlock": True,
             "other_repository_owner_unlock": True,
         }
