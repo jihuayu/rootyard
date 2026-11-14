@@ -12,21 +12,39 @@
 //! skipped or passed. Purely local assertions (strict profile parsing,
 //! locator/layout invariants, backend-identity binding and foreign-intent
 //! refusal) run as normal unit tests over the `cfg(test)` memory operator.
+//!
+//! The cancellation checkpoint fronts the configured real HTTP-loopback S3
+//! endpoint with a bounded owned pass-through gate. The gate forwards the real
+//! signed request and withholds only the real backend's response; it never
+//! synthesizes an S3 answer, opens deletion or records request paths, headers,
+//! bodies or credentials. It retains only the request method, numeric response
+//! status and arrival instant.
 
 use futures_util::FutureExt;
 use sha2::{Digest, Sha256};
-use std::panic::AssertUnwindSafe;
 use std::{
     fs::File,
     io::{Read, Write},
+    panic::AssertUnwindSafe,
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::watch,
+    task::JoinHandle,
+    time::timeout,
 };
 use uuid::Uuid;
 
 use super::{
     BlobBackendIdentity, BlobDeletePolicy, BlobError, BlobLocator, BlobProvider,
-    budget::{LEASE_UNIT_BYTES, ResourceLimits},
+    budget::{LEASE_UNIT_BYTES, ResourceContext, ResourceLimits},
     config::BlobProfile,
     opendal::{BlobStore, MAX_RANGE_BYTES},
     test_support,
@@ -294,6 +312,611 @@ async fn real_provider_publish_verify_range_delete_contract() {
         std::panic::resume_unwind(error);
     }
     assert!(cleanup_ok, "exact owned fixture cleanup failed");
+}
+
+/// Timeout and caller-cancel isolation against the real provider.
+///
+/// A bounded owned pass-through gate sits in front of the configured HTTP
+/// loopback S3 endpoint. It forwards the real signed PUT, records only the
+/// request method, final numeric status and arrival instant, then withholds
+/// that real response until the test releases it. Both cases stop the caller
+/// after the real backend has answered, rather than merely interrupting a local
+/// stall that never reached the provider.
+///
+/// The timeout case must return no receipt even though the backend committed;
+/// the cancelled case must leave no caller-visible receipt at all. In both
+/// cases a fresh attempt address stays absent until explicitly published, and
+/// fixture-only exact cleanup of the old attempt after the new attempt exists
+/// must not disturb the new object. Product deletion stays disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires real ROOTYARD_BLOB_* provider"]
+async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
+    let profile = BlobProfile::from_env().expect("real provider configuration is required");
+    require_loopback_http_s3(&profile);
+    let endpoint = profile.endpoint().expect("configured endpoint").clone();
+    let raw = fixture_operator(&profile);
+    let dir = tempfile::tempdir().unwrap();
+    let payload_len = profile.max_object_bytes().clamp(1, 256 * 1024) as usize;
+    let bytes: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
+    let source = dir.path().join("cancellation-source");
+    File::create(&source).unwrap().write_all(&bytes).unwrap();
+    let digest = sha256_file(&source);
+    let size = bytes.len() as u64;
+    let tenant = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let limits = profile.resource_limits();
+    let mut owned_keys: Vec<String> = Vec::new();
+    let mut contexts: Vec<Arc<ResourceContext>> = Vec::new();
+
+    let outcome = AssertUnwindSafe(async {
+        // --- Absolute deadline while the real backend PUT has already answered.
+        let gate = RealProviderFaultGate::start(&endpoint).await;
+        let resources = Arc::new(ResourceContext::new(limits));
+        contexts.push(Arc::clone(&resources));
+        let real = BlobStore::open_with_resources(profile.clone(), Arc::clone(&resources))
+            .expect("real provider must pass the startup capability gate");
+        let proxied = BlobStore::open_with_resources(
+            profile.clone().with_test_endpoint(gate.endpoint()).expect("fault gate endpoint is a valid origin"),
+            Arc::clone(&resources),
+        )
+        .expect("proxied provider must pass the startup capability gate");
+
+        let timed_out_intent =
+            proxied.new_upload(tenant, authority, 1, "cancel-contract", &digest, size).expect("timed-out intent");
+        let timed_out = timed_out_intent.locator().clone();
+        owned_keys.push(timed_out.path());
+        let upload_deadline = Instant::now() + Duration::from_secs(10);
+        let upload_source = source.clone();
+        let upload = tokio::spawn(async move {
+            let result = proxied.put_file(timed_out_intent, &upload_source, upload_deadline).await;
+            (result, Instant::now())
+        });
+        let observed = gate.wait_observation(Duration::from_secs(30)).await;
+        assert_eq!(observed.method, GateMethod::Put, "the real backend must receive the signed S3 PUT");
+        assert!(
+            (200..300).contains(&observed.status),
+            "the real backend rejected the gated PUT with status {}",
+            observed.status
+        );
+        let (result, stopped_at) = timeout(Duration::from_secs(30), upload)
+            .await
+            .expect("timed-out upload did not settle")
+            .expect("timed-out upload task panicked");
+        assert!(
+            observed.at <= stopped_at,
+            "the real backend answered only after the caller's deadline; this run does not prove the request reached it before cancellation"
+        );
+        assert!(
+            gate.is_holding(),
+            "the real backend response must still be withheld when the caller's deadline expires"
+        );
+        let error = match result {
+            Ok(_) => panic!("a timed-out upload must not return a receipt"),
+            Err(error) => error,
+        };
+        assert!(matches!(&error, BlobError::DeadlineExceeded), "expected a deadline failure, got {error}");
+        assert_no_private_details(&error, &timed_out, profile.bucket(), profile.root());
+        assert_eq!(
+            real.head(&timed_out, deadline()).await.unwrap(),
+            Some(size),
+            "the real backend PUT observed before the timeout must have committed"
+        );
+        gate.release();
+        assert!(
+            settle_bounded(&resources, Duration::from_secs(30)).await,
+            "timed-out upload cleanup did not settle its owned capacity"
+        );
+
+        // A fresh one-use attempt is not written by the timed-out attempt. The
+        // stale exact fixture cleanup of the old attempt runs only after this
+        // new attempt exists, so a prefix/old-at-least delete would be caught.
+        let fresh_intent =
+            real.new_upload(tenant, authority, 1, "cancel-contract", &digest, size).expect("fresh intent");
+        let fresh = fresh_intent.locator().clone();
+        owned_keys.push(fresh.path());
+        assert!(timed_out.path() != fresh.path(), "a fresh intent must never reuse the stale attempt path");
+        assert_eq!(
+            real.head(&fresh, deadline()).await.unwrap(),
+            None,
+            "a timed-out attempt must not publish a fresh attempt address"
+        );
+        let fresh_receipt = real.put_file(fresh_intent, &source, deadline()).await.expect("fresh attempt publish");
+        assert!(fresh_receipt.matches(&fresh));
+        raw.delete(&timed_out.path())
+            .await
+            .unwrap_or_else(|error| panic!("fixture late cleanup failed ({})", error.kind()));
+        let fresh_reverified = real
+            .verify(&fresh, deadline())
+            .await
+            .expect("late exact cleanup of the old attempt must preserve the new attempt");
+        assert!(fresh_reverified.matches(&fresh));
+        let delete_error = real.delete(&fresh, deadline()).await.expect_err("product delete must stay disabled");
+        assert_no_private_details(&delete_error, &fresh, profile.bucket(), profile.root());
+        real.verify(&fresh, deadline()).await.expect("disabled product delete must not remove the new attempt");
+        drop(gate);
+
+        // --- Caller cancellation after the real backend PUT has already answered.
+        let gate = RealProviderFaultGate::start(&endpoint).await;
+        let resources = Arc::new(ResourceContext::new(limits));
+        contexts.push(Arc::clone(&resources));
+        let real = BlobStore::open_with_resources(profile.clone(), Arc::clone(&resources))
+            .expect("real provider must pass the startup capability gate");
+        let proxied = BlobStore::open_with_resources(
+            profile.clone().with_test_endpoint(gate.endpoint()).expect("fault gate endpoint is a valid origin"),
+            Arc::clone(&resources),
+        )
+        .expect("proxied provider must pass the startup capability gate");
+
+        let cancelled_intent =
+            proxied.new_upload(tenant, authority, 1, "cancel-contract", &digest, size).expect("cancelled intent");
+        let cancelled = cancelled_intent.locator().clone();
+        owned_keys.push(cancelled.path());
+        let upload_source = source.clone();
+        let upload = tokio::spawn(async move {
+            proxied.put_file(cancelled_intent, &upload_source, Instant::now() + Duration::from_secs(120)).await
+        });
+        let observed = gate.wait_observation(Duration::from_secs(30)).await;
+        assert_eq!(observed.method, GateMethod::Put, "the real backend must receive the cancelled signed S3 PUT");
+        assert!(
+            (200..300).contains(&observed.status),
+            "the real backend rejected the gated PUT with status {}",
+            observed.status
+        );
+        assert!(
+            observed.at <= Instant::now(),
+            "the real backend must answer before this caller is cancelled"
+        );
+        upload.abort();
+        let join_error = match upload.await {
+            Ok(_) => panic!("an aborted caller must not return a publication"),
+            Err(error) => error,
+        };
+        assert!(join_error.is_cancelled(), "the outer caller must be reported as cancelled");
+        assert!(gate.is_holding(), "the real backend response must still be withheld when the caller is cancelled");
+        assert_no_private_text(&join_error.to_string(), &cancelled, profile.bucket(), profile.root());
+        gate.release();
+        assert!(
+            settle_bounded(&resources, Duration::from_secs(30)).await,
+            "cancelled upload's late completion did not settle its owned capacity"
+        );
+        assert_eq!(
+            real.head(&cancelled, deadline()).await.unwrap(),
+            Some(size),
+            "a late real-backend commit is an orphan at the cancelled attempt's own path"
+        );
+
+        let replacement_intent =
+            real.new_upload(tenant, authority, 1, "cancel-contract", &digest, size).expect("replacement intent");
+        let replacement = replacement_intent.locator().clone();
+        owned_keys.push(replacement.path());
+        assert!(
+            cancelled.path() != replacement.path(),
+            "a fresh intent must never reuse the cancelled attempt path"
+        );
+        assert_eq!(
+            real.head(&replacement, deadline()).await.unwrap(),
+            None,
+            "late completion must not publish a replacement attempt address"
+        );
+        let replacement_receipt =
+            real.put_file(replacement_intent, &source, deadline()).await.expect("replacement attempt publish");
+        assert!(replacement_receipt.matches(&replacement));
+        raw.delete(&cancelled.path())
+            .await
+            .unwrap_or_else(|error| panic!("fixture stale cleanup failed ({})", error.kind()));
+        let replacement_reverified = real
+            .verify(&replacement, deadline())
+            .await
+            .expect("stale cleanup of the cancelled attempt must preserve the replacement attempt");
+        assert!(replacement_reverified.matches(&replacement));
+        assert_eq!(real.head(&replacement, deadline()).await.unwrap(), Some(size));
+        drop(gate);
+    })
+    .catch_unwind()
+    .await;
+
+    // Gate drops release both held responses. Bound the late-task drain before
+    // exact cleanup so a failed assertion cannot leave an upload rewriting a key.
+    let mut settled = true;
+    for resources in &contexts {
+        if !settle_bounded(resources, Duration::from_secs(30)).await {
+            settled = false;
+        }
+    }
+    let mut cleanup_ok = true;
+    for key in owned_keys {
+        if raw.delete(&key).await.is_err() {
+            cleanup_ok = false;
+        }
+    }
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+    assert!(settled, "late cancellation cleanup did not release its owned capacity");
+    assert!(cleanup_ok, "exact owned fixture cleanup failed");
+}
+
+/// Bounded owned pass-through gate for the real provider contract.
+///
+/// It never answers S3 itself: bytes are forwarded to the configured real
+/// endpoint, and only the real backend's first final response is withheld. The
+/// recorded observation is a request method, numeric status and arrival
+/// instant; request paths, headers, bodies, credentials and locators are never
+/// retained. Connection, header, byte and hold bounds keep a failed test from
+/// hanging a fixture.
+struct RealProviderFaultGate {
+    endpoint: String,
+    observed: watch::Receiver<Option<GateObservation>>,
+    release: watch::Sender<bool>,
+    holding: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl RealProviderFaultGate {
+    async fn start(upstream: &reqwest::Url) -> Self {
+        let host = upstream.host_str().expect("real endpoint host").to_owned();
+        let port = upstream.port_or_known_default().expect("real endpoint port");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("fault gate loopback bind");
+        let address = listener.local_addr().expect("fault gate local address");
+        let (observed_tx, observed) = watch::channel::<Option<GateObservation>>(None);
+        let (release_tx, release_rx) = watch::channel::<bool>(false);
+        let holding = Arc::new(AtomicBool::new(false));
+        let task_holding = Arc::clone(&holding);
+        let task = tokio::spawn(async move {
+            let mut admitted = 0usize;
+            loop {
+                let Ok((client, _)) = listener.accept().await else { break };
+                if admitted >= GATE_MAX_CONNECTIONS {
+                    drop(client);
+                    continue;
+                }
+                admitted += 1;
+                let host = host.clone();
+                let observed = observed_tx.clone();
+                let release = release_rx.clone();
+                let holding = Arc::clone(&task_holding);
+                tokio::spawn(async move {
+                    let _ = proxy_connection(client, &host, port, observed, release, holding).await;
+                });
+            }
+        });
+        Self { endpoint: format!("http://{address}"), observed, release: release_tx, holding, task }
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn is_holding(&self) -> bool {
+        self.holding.load(Ordering::SeqCst)
+    }
+
+    async fn wait_observation(&self, limit: Duration) -> GateObservation {
+        let mut observed = self.observed.clone();
+        timeout(limit, async move {
+            loop {
+                if let Some(observation) = *observed.borrow() {
+                    return observation;
+                }
+                observed.changed().await.expect("fault gate observation sender was dropped");
+            }
+        })
+        .await
+        .expect("real backend never answered the gated upload")
+    }
+
+    fn release(&self) {
+        let _ = self.release.send(true);
+    }
+}
+
+impl Drop for RealProviderFaultGate {
+    fn drop(&mut self) {
+        let _ = self.release.send(true);
+        self.task.abort();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateMethod {
+    Put,
+    Post,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GateObservation {
+    method: GateMethod,
+    status: u16,
+    /// When the real backend's final response arrived at the gate. The test
+    /// compares this with the caller's stop time so a backend that answered
+    /// only after the deadline cannot be reported as pre-cancellation evidence.
+    at: Instant,
+}
+
+/// Clears the "holding" marker on every exit path, including a dropped future,
+/// a timeout or a broken client socket.
+struct GateHolding(Arc<AtomicBool>);
+
+impl Drop for GateHolding {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+const GATE_MAX_CONNECTIONS: usize = 8;
+const GATE_MAX_HEADER_BYTES: usize = 64 * 1024;
+const GATE_COPY_BYTES: usize = 16 * 1024;
+const GATE_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+const GATE_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+const GATE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const GATE_HOLD_TIMEOUT: Duration = Duration::from_secs(60);
+const GATE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn gate_timeout(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, message)
+}
+
+fn gate_invalid(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+/// Only the method is retained; the request target is deliberately dropped.
+fn first_request_method(head: &[u8]) -> GateMethod {
+    let line = head.split(|byte| *byte == b'\n').next().unwrap_or(b"");
+    if line.starts_with(b"PUT ") {
+        GateMethod::Put
+    } else if line.starts_with(b"POST ") {
+        GateMethod::Post
+    } else {
+        GateMethod::Other
+    }
+}
+
+fn response_status(head: &[u8]) -> Option<u16> {
+    let line = head.split(|byte| *byte == b'\n').next()?;
+    let mut fields = line.split(|byte| *byte == b' ').filter(|field| !field.is_empty());
+    let version = fields.next()?;
+    if !version.starts_with(b"HTTP/") {
+        return None;
+    }
+    std::str::from_utf8(fields.next()?).ok()?.parse().ok()
+}
+
+async fn proxy_connection(
+    client: TcpStream,
+    host: &str,
+    port: u16,
+    observed: watch::Sender<Option<GateObservation>>,
+    release: watch::Receiver<bool>,
+    holding: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    let upstream = match timeout(GATE_IO_TIMEOUT, TcpStream::connect((host, port))).await {
+        Ok(Ok(upstream)) => upstream,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => return Err(gate_timeout("fault gate upstream connect timed out")),
+    };
+    let (mut client_read, mut client_write) = client.into_split();
+    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+    let (method_tx, method_rx) = watch::channel::<Option<GateMethod>>(None);
+
+    let request = async move {
+        let mut head = Vec::new();
+        let mut method_observed = false;
+        let mut buffer = vec![0u8; GATE_COPY_BYTES];
+        let mut total = 0u64;
+        loop {
+            let read = match timeout(GATE_IO_TIMEOUT, client_read.read(&mut buffer)).await {
+                Ok(Ok(read)) => read,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(gate_timeout("fault gate client request read timed out")),
+            };
+            if read == 0 {
+                break;
+            }
+            if total.saturating_add(read as u64) > GATE_MAX_REQUEST_BYTES {
+                return Err(gate_invalid("fault gate client request exceeded its byte cap"));
+            }
+            if !method_observed && head.len() < GATE_MAX_HEADER_BYTES {
+                let take = read.min(GATE_MAX_HEADER_BYTES - head.len());
+                head.extend_from_slice(&buffer[..take]);
+                if find_subsequence(&head, b"\r\n\r\n").is_some() || head.len() >= GATE_MAX_HEADER_BYTES {
+                    let method = first_request_method(&head);
+                    method_tx.send_if_modified(|slot| {
+                        if slot.is_none() {
+                            *slot = Some(method);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    // Keep only the finite method; request headers can carry
+                    // authorization material and are no longer needed.
+                    head.clear();
+                    method_observed = true;
+                }
+            }
+            match timeout(GATE_IO_TIMEOUT, upstream_write.write_all(&buffer[..read])).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(gate_timeout("fault gate upstream request write timed out")),
+            }
+            total = total.saturating_add(read as u64);
+        }
+        let _ = upstream_write.shutdown().await;
+        Ok(())
+    };
+
+    let response = async move {
+        let mut head = Vec::new();
+        let mut scanning = true;
+        let mut buffer = vec![0u8; GATE_COPY_BYTES];
+        let mut total = 0u64;
+        loop {
+            let read = match timeout(GATE_IO_TIMEOUT, upstream_read.read(&mut buffer)).await {
+                Ok(Ok(read)) => read,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(gate_timeout("fault gate upstream response read timed out")),
+            };
+            if read == 0 {
+                break;
+            }
+            if total.saturating_add(read as u64) > GATE_MAX_RESPONSE_BYTES {
+                return Err(gate_invalid("fault gate upstream response exceeded its byte cap"));
+            }
+            total = total.saturating_add(read as u64);
+            if scanning {
+                if head.len().saturating_add(read) > GATE_MAX_HEADER_BYTES {
+                    return Err(gate_invalid("fault gate upstream response headers exceeded their byte cap"));
+                }
+                head.extend_from_slice(&buffer[..read]);
+                let Some(end) = find_subsequence(&head, b"\r\n\r\n") else { continue };
+                let status = response_status(&head[..end + 4])
+                    .ok_or_else(|| gate_invalid("fault gate upstream response status was not HTTP/1.x"))?;
+                let method = wait_gate_method(method_rx.clone()).await?;
+                let candidate = GateObservation { method, status, at: Instant::now() };
+                let mut claimed = false;
+                observed.send_if_modified(|slot| {
+                    if slot.is_none() {
+                        *slot = Some(candidate);
+                        claimed = true;
+                        holding.store(true, Ordering::SeqCst);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                scanning = false;
+                if claimed {
+                    let _holding = GateHolding(Arc::clone(&holding));
+                    wait_gate_release(release.clone()).await?;
+                }
+                match timeout(GATE_IO_TIMEOUT, client_write.write_all(&head)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => return Err(gate_timeout("fault gate client response write timed out")),
+                }
+                head.clear();
+            } else {
+                match timeout(GATE_IO_TIMEOUT, client_write.write_all(&buffer[..read])).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => return Err(gate_timeout("fault gate client response write timed out")),
+                }
+            }
+        }
+        Ok(())
+    };
+
+    let _ = timeout(GATE_CONNECTION_TIMEOUT, async { tokio::join!(request, response) }).await;
+    Ok(())
+}
+
+async fn wait_gate_method(mut method: watch::Receiver<Option<GateMethod>>) -> std::io::Result<GateMethod> {
+    let wait = async move {
+        loop {
+            if let Some(method) = *method.borrow() {
+                return Ok(method);
+            }
+            if method.changed().await.is_err() {
+                return Err(gate_invalid("fault gate method channel closed"));
+            }
+        }
+    };
+    match timeout(GATE_IO_TIMEOUT, wait).await {
+        Ok(result) => result,
+        Err(_) => Err(gate_timeout("fault gate request method did not arrive")),
+    }
+}
+
+async fn wait_gate_release(mut release: watch::Receiver<bool>) -> std::io::Result<()> {
+    let wait = async move {
+        loop {
+            if *release.borrow() {
+                return Ok(());
+            }
+            if release.changed().await.is_err() {
+                return Err(gate_invalid("fault gate release channel closed"));
+            }
+        }
+    };
+    match timeout(GATE_HOLD_TIMEOUT, wait).await {
+        Ok(result) => result,
+        Err(_) => Err(gate_timeout("fault gate hold timed out")),
+    }
+}
+
+fn require_loopback_http_s3(profile: &BlobProfile) {
+    assert_eq!(profile.provider(), BlobProvider::S3, "this cancellation checkpoint qualifies the real S3 profile only");
+    let endpoint = profile.endpoint().expect("standalone profile needs an explicit endpoint");
+    assert_eq!(
+        endpoint.scheme(),
+        "http",
+        "the owned fault gate requires a plain HTTP loopback S3 fixture; TLS is not terminated here"
+    );
+    assert!(
+        matches!(endpoint.host_str(), Some("127.0.0.1" | "localhost" | "::1")),
+        "the owned fault gate requires a loopback endpoint"
+    );
+}
+
+async fn settle_bounded(resources: &ResourceContext, limit: Duration) -> bool {
+    let limits = resources.limits();
+    timeout(limit, async {
+        loop {
+            if resources.available_uploads() == limits.active_uploads()
+                && resources.available_readers() == limits.active_readers()
+                && resources.available_staging_bytes() == limits.staging_bytes()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+fn assert_no_private_details(error: &BlobError, locator: &BlobLocator, bucket: &str, root: &str) {
+    assert_no_private_text(&format!("{error} {error:?}"), locator, bucket, root);
+}
+
+fn assert_no_private_text(text: &str, locator: &BlobLocator, bucket: &str, root: &str) {
+    for private in [
+        locator.path(),
+        locator.sha256().to_owned(),
+        locator.tenant_id().to_string(),
+        locator.authority_id().to_string(),
+        locator.attempt_id().to_string(),
+    ] {
+        assert!(!text.contains(private.as_str()), "error text leaked a private locator field");
+    }
+    // A short bucket/root can occur by chance in a fixed diagnostic sentence.
+    // Long configured values are still checked for a literal leak.
+    if bucket.len() >= 8 {
+        assert!(!text.contains(bucket), "error text leaked the configured bucket/container");
+    }
+    if root.len() >= 8 {
+        assert!(!text.contains(root), "error text leaked the configured root prefix");
+    }
+    let lower = text.to_ascii_lowercase();
+    for marker in [
+        "authorization",
+        "credential",
+        "secret",
+        "signature",
+        "session_token",
+        "access_key",
+        "x-amz-",
+        "http://",
+        "https://",
+    ] {
+        assert!(!lower.contains(marker), "error text leaked credential or transport context");
+    }
 }
 
 fn fixture_operator(profile: &BlobProfile) -> opendal::Operator {
