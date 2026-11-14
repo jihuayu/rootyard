@@ -70,9 +70,10 @@ alone.
 | `authority_epoch`, `group_id`, `group_epoch`, `object_format` | Current realm; object format binds OID width and is part of the ID preimage. `group_id = 0` only for PG; a different realm is a different version namespace. |
 | `ref_name` | Canonical Git ref name; same-ref base dependency only. |
 | `ref_generation` | Positive per-ref sequence starting at 1; every successful publish/delete/repack advances exactly one. No reuse after tombstone or pruning. |
-| `operation_id` + `operation_digest` | The exact operation identity/digest that produced the version; replay equality requires all of these fields. |
+| `operation_id` + `operation_digest` | The exact operation identity and §2.6 canonical request digest that produced the version; replay equality requires all of these fields plus the bound base selector. |
 
 `VersionId = SHA-256(L("ry-ref-version-id-v1") || L(tenant) || L(repo) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || L(ref_name) || u64(ref_generation) || L(operation_id) || L(operation_digest))`; `L` and tag encoding are defined in §2.5. It excludes `CommitSetId` and `record_digest`.
+`operation_digest` is the §2.6 canonical request digest. It binds every ref's base selector and base VersionId, kind, old-OID/absence precondition, target/tombstone, the expected gate state, HEAD update, planned packs and old membership. A changed base selector or base VersionId therefore changes both `operation_digest` and `VersionId`; it cannot be an exact replay. The synthetic `operation_digest=11*32` vectors in §2.5 remain valid as opaque fixed inputs.
 The stored `VersionRecord` additionally binds `authority_seq` (the existing core gate revision), `kind` (`publish`, `delete`, `repack`), target or tombstone marker, own pack-set digest, sorted object-dependency VersionIds and `commit_set_id`.
 `record_digest = SHA-256(L("ry-ref-version-record-v1") || L(VersionId) || u64(authority_seq) || u8(version_kind) || u8(target_tag) [|| L(target_oid)] || u8(base_tag) [|| L(base_version_id)] || dep-list || L(pack_set_digest) || L(commit_set_id))`; `dep-list = u32_be(count)||sorted(L(dep_version_id))` (entries unique); it never contains itself.
 A `VersionId` is immutable: exactly one `record_digest` per VersionId. `VersionId` is the primary key, `(realm, ref_name, ref_generation)` and `(realm, operation_id, ref_name)` are unique, and version rows are insert-only; re-presenting any different record is `version_id_record_conflict`, never an upsert. Readers recompute both digests and reject mismatch. PG and Raft apply the same rule.
@@ -104,10 +105,23 @@ projection of that head, not the version history.
   high-water row fails closed; the server may not mint generation 1 again under
   the same history.
 - Stock Git sees OIDs, not version IDs. `force-with-lease` remains an old-OID
-  lease and cannot detect an OID recreated by ABA. Internal/API callers needing
-  version-level ABA safety send `base_version_id` in addition to the old OID.
-  A server-side retry uses the original operation + base; a fresh request
-  against the current same OID is a new operation, not a replay.
+  lease and cannot detect an OID recreated by ABA. Every [PROPOSED] ref-version
+  write sends a base selector in addition to the old-OID/absence lease:
+  `1 = absent` (first version of this ref) or `2 = present` with the exact
+  32-byte `base_version_id`. The legacy `0 = not supplied` shape is bound for
+  replay separation but cannot mint a `VersionRecord` under this proposal.
+- A tombstone base is `base_tag=2` plus its VersionId; a tombstone target is
+  `target_tag=0` with no OID. Never encode a tombstone as a zero OID. A present
+  non-tombstone base requires `precondition_tag=1` and the same old OID as the
+  base target; a tombstone base requires `precondition_tag=0`. Explicit absent
+  is generation 1; present base is generation `base.ref_generation + 1`; a
+  caller-supplied generation is not a request field.
+- `operation_digest` binds the selector and ID per ref. A change from absent to
+  present, present to absent, B1 to B2, or a tombstone base to a live base
+  changes `operation_digest` and `VersionId` even when old/new OIDs stay the
+  same. A server-side retry uses the original operation + base; a fresh request
+  against the current same OID is a new operation and must not replay the old
+  terminal or version.
 
 ### 2.3 Immutable pack sets and compaction
 
@@ -205,11 +219,152 @@ Every committed version batch has one `CommitSet`. Canonical encoding: `L(x)=u64
 `T = L("ry-version-terminal-v1") || u8(commit_set_tag) [|| L(CommitSetId)] || L(tenant) || L(repo) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || u64(authority_seq) || L(operation_id) || L(operation_digest) || u8(terminal_kind) || result-list`.
 `result-entry = L(ref_name)||u8(outcome)||u8(old_tag)||[L(old_oid)]||u8(new_tag)||[L(new_oid)]||L(reason)`; `TerminalDigest = SHA-256(T)`. `T` is the exact ACK/replay body; a JSON wrapper may store it as base64 but must not re-encode it. `T` contains CommitSetId when `commit_set_tag=1`; it never contains TerminalDigest. A commit-set row may store TerminalDigest as an integrity column, but CommitSetId does not hash it. Order: versions/head -> CS/CommitSetId -> T/TerminalDigest -> rows+terminal -> ACK. The graph is acyclic.
 
-Fixed vector (`11*32` means 32 bytes of 0x11; `33*20` means 20 bytes of 0x33; VersionId bytes are fixed synthetic inputs here, with derivation in a separate checkpoint): `tenant=00000000-0000-0000-0000-000000000001`, `repo=00000000-0000-0000-0000-000000000002`, `history=00000000-0000-0000-0000-000000000003`, `authority=1`, `authority_epoch=7`, `group_id=0`, `group_epoch=9`, `object_format=1`, `authority_seq=42`, `operation_id=00000000-0000-0000-0000-000000000004`, `operation_digest=11*32`, one version `(refs/heads/main, VersionId=22*32, kind=1, target_tag=1, target_oid=33*20)`, `head_tag=1`, `head_ref=refs/heads/main`, head `target_tag=1`, `head_oid=33*20`, `commit_set_tag=1`, `terminal_kind=1`, one result `(refs/heads/main, outcome=1, old_tag=1, old_oid=44*20, new_tag=1, new_oid=33*20, reason="")`. Expected: `CS` length 355; `CommitSetId=00fee34e0745b3b5557cd40620d276b623a63a3cdcbd469fbea796968e53f7e5`; `T` length 336; `TerminalDigest=081d960f2ce44a95fa19866189f83a604de5b6f78d9dfeac941ca7efddb92ab9`.
+Fixed vector (`11*32` means 32 bytes of 0x11; `33*20` means 20 bytes of 0x33; VersionId bytes are fixed synthetic inputs here, while §2.6 defines the upstream operation digest and its own vector): `tenant=00000000-0000-0000-0000-000000000001`, `repo=00000000-0000-0000-0000-000000000002`, `history=00000000-0000-0000-0000-000000000003`, `authority=1`, `authority_epoch=7`, `group_id=0`, `group_epoch=9`, `object_format=1`, `authority_seq=42`, `operation_id=00000000-0000-0000-0000-000000000004`, `operation_digest=11*32`, one version `(refs/heads/main, VersionId=22*32, kind=1, target_tag=1, target_oid=33*20)`, `head_tag=1`, `head_ref=refs/heads/main`, head `target_tag=1`, `head_oid=33*20`, `commit_set_tag=1`, `terminal_kind=1`, one result `(refs/heads/main, outcome=1, old_tag=1, old_oid=44*20, new_tag=1, new_oid=33*20, reason="")`. Expected: `CS` length 355; `CommitSetId=00fee34e0745b3b5557cd40620d276b623a63a3cdcbd469fbea796968e53f7e5`; `T` length 336; `TerminalDigest=081d960f2ce44a95fa19866189f83a604de5b6f78d9dfeac941ca7efddb92ab9`.
 Mixed delete/publish vector (same realm, fixed VersionId inputs, committed, `commit_set_tag=1`): versions `[(refs/heads/main, 22*32, kind=1, target_tag=1, target_oid=33*20), (refs/heads/topic, 66*32, kind=2, target_tag=0)]`, HEAD `refs/heads/main` -> `33*20`, results `[main applied old=44*20 new=33*20 reason="", topic applied old=77*20 new=absent reason=""]`; expected `CS` length 421, `CommitSetId=ffcd8426b98ee6724cffc3c2918ec6450c86a33203c0cc10f2c3820c0fddd6ad`, `T` length 399, `TerminalDigest=24d30b09e01477656e53d93703cd968d1820f43edd5a985f77b684962fbfe37a`.
-Identity-chain vector (same realm and operation as the fixed vector, `authority_seq=42`, ref main, generation 1, kind=1, target=33*20, base absent, deps empty, pack set one entry `(pack_id=99*16, registration_id=aa*16, artifact_set_digest=bb*32)`, committed, `commit_set_tag=1`, result applied old=44*20 new=33*20): `VersionId=7ed6b0d771d7133059718f42fa2dab89fb50003d57128536ffb908d11816c373`; `PackSetDigest=fd3461afbd34e518f8bf1d6c677f2a023346733925ec9cd6eb7ca76f3c1a4c22`; with that VersionId the single-version `CS` is 355 bytes and `CommitSetId=9ffcf9731fb04dd56ceac420d7707c1b2b792deaa431d0bd35e3f53bee721932`, `record_digest=01ef64d5effb40e4ee835437e78eeb31a9b7781500767ce9255cfb8e5e238da9`, `T` is 336 bytes and `TerminalDigest=25de02843735a28ec5b4fd178cb06d12de16e71a46915acb4a3cd99ee572da19`.
+Identity-chain vector (same realm and operation as the fixed vector, `authority_seq=42`, ref main, generation 1, kind=1, target=33*20, record-level base absent, deps empty, pack set one entry `(pack_id=99*16, registration_id=aa*16, artifact_set_digest=bb*32)`, committed, `commit_set_tag=1`, result applied old=44*20 new=33*20; its `operation_digest=11*32` remains a synthetic fixed input, not the §2.6 absent-base value): `VersionId=7ed6b0d771d7133059718f42fa2dab89fb50003d57128536ffb908d11816c373`; `PackSetDigest=fd3461afbd34e518f8bf1d6c677f2a023346733925ec9cd6eb7ca76f3c1a4c22`; with that VersionId the single-version `CS` is 355 bytes and `CommitSetId=9ffcf9731fb04dd56ceac420d7707c1b2b792deaa431d0bd35e3f53bee721932`, `record_digest=01ef64d5effb40e4ee835437e78eeb31a9b7781500767ce9255cfb8e5e238da9`, `T` is 336 bytes and `TerminalDigest=25de02843735a28ec5b4fd178cb06d12de16e71a46915acb4a3cd99ee572da19`.
 
 Commit set, versions, edges, ref-heads, membership and terminal are one authority-atomic unit: readers see all or none; a rejected ref gets no version. A committed set has at least one version and `commit_set_tag=1`; rejected/cancelled terminals use `commit_set_tag=0`.
+
+### 2.6 Canonical operation/request digest
+
+`operation_digest` is `SHA-256(OD)` over the complete prospective mutation, not over a post-commit row. The canonical encoding of §2.5 applies.
+
+`OD = L("ry-ref-version-operation-v1") || L(tenant) || L(repo) || L(owner) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || L(issuer) || L(lane) || u64(issuer_sequence) || L(operation_id) || u64(expected_gate_revision) || L(expected_gate_digest) || u8(commit_mode) || u8(head_action_tag) [|| L(head_ref)] || u32_be(ref_count) || ref-entry-list || L(old_membership_digest) || u32_be(pack_count) || pack-entry-list`.
+
+`ref-entry = L(ref_name)||u8(version_kind)||u8(precondition_tag)[||L(old_oid)]||u8(base_request_tag)[||L(base_version_id)]||u8(target_tag)[||L(target_oid)]`.
+`pack-entry = L(pack_id)||L(registration_id)||u32_be(2)||u8(1)||L(pack_content_digest)||u64(pack_length)||u8(2)||L(idx_content_digest)||u64(idx_length)`.
+
+Rules:
+
+- `ref-entry-list` is the **original request order**, one entry per ref, unique
+  names. Order is part of the digest because accepted-subset verdicts and some
+  HEAD/prefix decisions are made in that order; do not sort it. `ref_name` is
+  UTF-8, `old_oid`/`target_oid` are raw OID bytes of the `object_format` width,
+  `base_version_id` and content digests are 32 raw bytes, UUIDs are raw 16
+  bytes, and absent fields contribute no bytes.
+- `pack-entry-list` is unique and sorted by `(pack_id, registration_id)`, with
+  exactly the two artifacts in role order `1=pack`, `2=idx`. The digest binds
+  `pack_id`, `registration_id`, artifact role, declared content digest and
+  length. It excludes attempt paths, final locators and the actual
+  `ArtifactSetDigest`; those are post-A3 and are bound by `PackSetDigest` and
+  `record_digest`.
+- Tags: `commit_mode` 1=atomic/2=accepted_subset; `head_action_tag` 0=keep/1=retarget; `version_kind` 1=publish/2=delete/3=repack; `precondition_tag` 0=absent/1=present; `base_request_tag` 0=not supplied/1=explicitly absent/2=present-with-ID; `target_tag` 0=absent/1=present. The `base_tag` inside `record_digest` remains the two-state post-commit tag 0=absent/1=present.
+- `base_request_tag=1` is an explicit absent precondition and is legal only for
+  generation 1 of a never-existing ref. `base_request_tag=2` is the exact
+  current head VersionId, same ref and realm, and implies generation
+  `base.ref_generation + 1`. The legacy `0` shape is included to separate old
+  requests, but a [PROPOSED] version write must use `1` or `2`; a `0` request
+  cannot mint a `VersionRecord`.
+- `kind=delete` requires `target_tag=0` and a present base (a tombstone target
+  is not an absent base). `kind=publish/repack` requires `target_tag=1`.
+  `repack` requires target OID equal to the base target OID and appears only in
+  an all-repack maintenance set. Publish/delete may mix.
+- A base selector, old-OID/absence precondition and target must be coherent: a
+  live base requires `precondition_tag=1` with the base target OID; a tombstone
+  base requires `precondition_tag=0`; explicit absent requires
+  `precondition_tag=0`. Violations are typed pre-write refusals before any
+  `VersionId`. A supplied generation is never a separate field.
+- `expected_gate_revision` is positive and is the revision the plan was
+  prepared against; `expected_gate_digest` is the exact 32-byte gate digest.
+  `old_membership_digest` is the exact captured membership digest. Live
+  authorization, SQL text, provider paths, attempt locators and observed
+  current OIDs are not request fields and are not hashed here.
+- `owner`, `issuer`, `lane` and `issuer_sequence` are immutable operation scope,
+  so a changed issuer/owner cannot silently reuse a request digest. They are
+  inside `operation_digest`; they are not separate `VersionId` fields.
+- `OD` excludes `authority_seq`, every new `VersionId`, `PackSetDigest`,
+  `record_digest`, `CommitSetId`, `TerminalDigest`, terminal bytes and all
+  OBJECT dependency IDs. Base VersionIds are strictly older; OBJECT deps are
+  verifier-selected after prepare and are bound by the sealed proof/grant plus
+  `record_digest`. A changed dependency selection cannot reuse a `VersionRecord`
+  (the record digest conflict is a hard refusal); a changed request or
+  precondition is a new operation, never a replay.
+- Non-circular order: base VersionIds/old membership/planned packs ->
+  `operation_digest` -> `VersionId` -> `CommitSetId` -> terminal `T`; actual
+  `PackSetDigest` -> `record_digest` after `CommitSetId`. No digest contains a
+  later digest. A changed base therefore changes `operation_digest` and
+  `VersionId` before any record exists, and cannot replay the old operation.
+
+Compatibility: this is a new v2 domain. [CURRENT]
+`core-pack-commit-plan-v1`/`core-pack-commit-plan-subset-v1` in
+`src/ref_store/core/pack_commit/plan.rs` remain unchanged. C1/C3 must add the
+base selector/kind fields and use the v2 digest as `operation_digest` for new
+ref-version operations only; no existing operation or version row is
+reinterpreted, and no current replay behavior is claimed to change.
+
+Fixed vector. Common fields: `tenant=00000000-0000-0000-0000-000000000001`,
+`repo=00000000-0000-0000-0000-000000000002`,
+`owner=00000000-0000-0000-0000-000000000005`,
+`history=00000000-0000-0000-0000-000000000003`, `authority=1`,
+`authority_epoch=7`, `group_id=0`, `group_epoch=9`, `object_format=1`,
+`issuer=00000000-0000-0000-0000-000000000006`, `lane="main"`,
+`issuer_sequence=3`, `expected_gate_revision=41`,
+`expected_gate_digest=55*32`, `commit_mode=1`, `head_action_tag=1`,
+`head_ref=refs/heads/main`, `old_membership_digest=66*32`, one planned pack
+`(pack_id=99*16, registration_id=aa*16, pack content=bb*32 length=123, idx
+content=cc*32 length=45)`. The common ref is `refs/heads/main`. Cases A, B and C
+use kind=1 and target present `target_oid=33*20`; A/B use precondition present
+`old_oid=44*20` with a present base, C uses precondition absent with an absent
+base, and D uses kind=2, the A/B precondition and base, and target absent.
+
+| Case | operation_id | base selector | generation | OperationDigest | VersionId |
+| --- | --- | --- | --- | --- | --- |
+| A | `...0004` | present `22*32` | 2 | `0851116cdafd58f653a85e086b65628ea1b65cebcfb4605f518c993d4198ba25` | `3db387d1417cab677d130c02867b16043a47812808e99ab9049656728b6fb85d` |
+| B | `...0004` | present `77*32` | 2 | `612e1751cbcfd54eac3ef660fb92e10a06aca197a4d950ff995d309c67fb8124` | `548bcbd1983bdb5348d8224fab36c753d81c51a1a98f761f7db0b6dc473c6bdd` |
+| C | `...0007` | explicit absent tag 1 | 1 | `de3497686e155bdee2a6abe6e385e2a2ba6554fa3a8c6f2221d874f289d05781` | `fac94dbd1da16187c13859bceb966afa85834b366dafcd419672bf9501ed2dc6` |
+| D | `...0008` | present `22*32`, kind=2/target absent | 2 | `a1f3bd39d3ccb7c08e8b41a1bb71944077586bc76fa9aa840b4bcefbbe4e00d8` | `04e21d0353a3b9e4fb8e285547478c47a50dd90c5fba572c9953d98b97f8da7e` |
+
+A and B are the same operation ID and every field except the base VersionId.
+They are conflicting requests, not replays: the changed ABA precondition changes
+both digests. An exact retry of A reproduces A's `OperationDigest` and
+`VersionId`. C is a standalone first-version request with explicit absent and an
+absent old-OID precondition; D exercises a delete/tombstone target with a
+present base and old-OID precondition. The `22*32`/`77*32` values are synthetic
+alternative base VersionIds at generation 1 with target `44*20`; a real ref
+cannot expose both at once, which is why B is a conflict rather than a valid
+second retry. Validity is checked before a `VersionId` is minted.
+
+The following Python 3 stdlib check is contract evidence, not runtime code:
+
+```python
+import hashlib, struct
+L = lambda b: struct.pack(">Q", len(b)) + b
+u8, u32, u64 = lambda n: struct.pack(">B", n), lambda n: struct.pack(">I", n), lambda n: struct.pack(">Q", n)
+H = lambda b: hashlib.sha256(b).hexdigest()
+U = lambda n: n.to_bytes(16, "big")
+B = lambda n: bytes([n]) * 32
+OID, OLD = bytes([0x33]) * 20, bytes([0x44]) * 20
+COMMON = (L(U(1)) + L(U(2)) + L(U(5)) + L(U(3)) + u8(1) + u64(7) + u64(0) + u64(9) + u8(1)
+          + L(U(6)) + L(b"main") + u64(3))
+EXPECT = u64(41) + L(B(0x55)) + u8(1) + u8(1) + L(b"refs/heads/main")
+PACK = (u32(1) + L(bytes([0x99]) * 16) + L(bytes([0xaa]) * 16) + u32(2)
+        + u8(1) + L(B(0xbb)) + u64(123) + u8(2) + L(B(0xcc)) + u64(45))
+def od(op_id, kind, pre_tag, pre_oid, base_tag, base_vid, target_tag, target_oid):
+    ref = L(b"refs/heads/main") + u8(kind) + u8(pre_tag)
+    if pre_tag: ref += L(pre_oid)
+    ref += u8(base_tag)
+    if base_tag == 2: ref += L(base_vid)
+    ref += u8(target_tag)
+    if target_tag: ref += L(target_oid)
+    return H(L(b"ry-ref-version-operation-v1") + COMMON + L(op_id) + EXPECT + u32(1) + ref + L(B(0x66)) + PACK)
+def vid(gen, op_id, digest):
+    return H(L(b"ry-ref-version-id-v1") + L(U(1)) + L(U(2)) + L(U(3)) + u8(1) + u64(7) + u64(0) + u64(9)
+             + u8(1) + L(b"refs/heads/main") + u64(gen) + L(op_id) + L(bytes.fromhex(digest)))
+A = od(U(4), 1, 1, OLD, 2, B(0x22), 1, OID)
+Bv = od(U(4), 1, 1, OLD, 2, B(0x77), 1, OID)
+C = od(U(7), 1, 0, None, 1, None, 1, OID)
+D = od(U(8), 2, 1, OLD, 2, B(0x22), 0, None)
+assert A == "0851116cdafd58f653a85e086b65628ea1b65cebcfb4605f518c993d4198ba25"
+assert Bv == "612e1751cbcfd54eac3ef660fb92e10a06aca197a4d950ff995d309c67fb8124"
+assert C == "de3497686e155bdee2a6abe6e385e2a2ba6554fa3a8c6f2221d874f289d05781"
+assert D == "a1f3bd39d3ccb7c08e8b41a1bb71944077586bc76fa9aa840b4bcefbbe4e00d8"
+assert vid(2, U(4), A) == "3db387d1417cab677d130c02867b16043a47812808e99ab9049656728b6fb85d"
+assert vid(2, U(4), Bv) == "548bcbd1983bdb5348d8224fab36c753d81c51a1a98f761f7db0b6dc473c6bdd"
+assert vid(1, U(7), C) == "fac94dbd1da16187c13859bceb966afa85834b366dafcd419672bf9501ed2dc6"
+assert vid(2, U(8), D) == "04e21d0353a3b9e4fb8e285547478c47a50dd90c5fba572c9953d98b97f8da7e"
+assert od(U(4), 1, 1, OLD, 2, B(0x22), 1, OID) == A
+print("operation-digest vectors: ok")
+```
 
 ## 3. Publication ordering and operation states [PROPOSED]
 
@@ -423,7 +578,7 @@ unchanged until its exit criteria pass. [CURRENT] C0 is this document only.
 | # | Scope | Likely files | Exit check |
 | --- | --- | --- | --- |
 | C0 | This contract and state diagram | `docs/ref-version-pack-contract.md`, design index | Docs/link checks pass; no production/migration/Cargo changes |
-| C1 | Pure identity/edge/limit types and canonical digests; no schema/route | `src/ref_store/core/ref_version/{mod,contract,digest,limits}.rs` | VersionId/PackSetDigest/CommitSetId/record_digest/T vectors fixed before C2/C7; no PG/Blob/native |
+| C1 | Pure identity/edge/limit types and canonical digests; no schema/route | `src/ref_store/core/ref_version/{mod,contract,digest,limits}.rs` | VersionId/OperationDigest/PackSetDigest/CommitSetId/record_digest/T vectors fixed before C2/C7; no PG/Blob/native |
 | C2 | PG version/head/commit-set/edge tables and authoritative insert under the existing 138/gate lock prefix | next safe migration; `core/ref_version/pg*.rs`; existing `pack_commit/pg_commit.rs` extension point | Real-PG tests for CAS, atomic/subset, tombstone/ABA, replay/unknown; no read route |
 | C3 | Bind current A4 registered pack identities and verifier-selected OBJECT deps; prove dependency pinning through commit | `core/ref_version/*`, `pack_commit/{plan,closure,proof,artifact}.rs` extension points | Cross-tenant/missing/corrupt/depth/byte/cycle tests; no default serving change |
 | C4 | Strong snapshot records/binds version heads/deps without weakening the current fallback | `core/pack_snapshot/*` extension; current strong tests | Full-snapshot tests remain green; version IDs optional until enabled |
@@ -448,7 +603,9 @@ Pure contract (`tests/ref_version_contract.rs` proposal): `version_id_binds_tena
 `depth_fanout_edges_packs_bytes_bounds_are_exact_and_fail_closed`;
 `closed_closure_is_ordered_and_digest_stable`;
 `mixed_publish_delete_commit_set_is_canonical`; `per_version_kind_is_not_inferred_from_target`;
-`version_id_record_binding_is_immutable`; `record_digest_exact_preimage`; `pack_set_digest_exact_preimage`.
+`version_id_record_binding_is_immutable`; `record_digest_exact_preimage`;
+`pack_set_digest_exact_preimage`; `operation_digest_binds_base_selector_kind_and_request_order`;
+`base_version_change_changes_operation_and_version_id`.
 
 PG authority (`tests/ref_version_pg.rs` proposal, ignored, real PG):
 `same_old_version_only_one_writer_wins` (a competing same-new-OID push still
