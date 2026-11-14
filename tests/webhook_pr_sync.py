@@ -36,6 +36,36 @@ def wait_for(label, fn, timeout=30.0, interval=0.15):
     raise AssertionError(f"timeout after {timeout}s waiting for {label}")
 
 
+def observe_queued_pin(marker, queued_run, pin_oid, expected_pin):
+    """Return the exact queued job once its marker, run row and pin agree.
+
+    The progress marker, ``ci_runs`` row and pin ref are independent reads. A
+    committed marker can therefore be observed before the queued run query sees
+    its row, and a visible run can still have a stale pin. Those are incomplete
+    observations to retry, not ``None`` jobs to pass into ``pin_oid``. Probe
+    errors are deliberately not caught here: only absence or mismatched state is
+    retryable.
+    """
+    if not marker():
+        return None
+    job = queued_run()
+    if job is None:
+        return None
+    pin = pin_oid(job)
+    return job if pin == expected_pin else None
+
+
+def wait_queued_pin(label, marker, queued_run, pin_oid, expected_pin,
+                    timeout=30.0, interval=0.15):
+    """Poll the independently-read marker/run/pin until all three converge."""
+    return wait_for(
+        label,
+        lambda: observe_queued_pin(marker, queued_run, pin_oid, expected_pin),
+        timeout=timeout,
+        interval=interval,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard")
@@ -92,6 +122,16 @@ def main():
         bare = h.root / "data" / "repos" / (repository_id + ".git")
         return h.git("--git-dir=" + str(bare), "rev-parse", "refs/rootyard-ci/jobs/" + job_id).stdout.decode().strip()
 
+    def wait_pin(repository_id, pull_number, version, head, base, expected_pin, label, timeout=30.0):
+        return wait_queued_pin(
+            label,
+            lambda: marker(repository_id, pull_number, version, head, base),
+            lambda: queued_run(repository_id, pull_number, version, head, base),
+            lambda job: pin_oid(repository_id, job),
+            expected_pin,
+            timeout=timeout,
+        )
+
     def paths(user, repo_name):
         root = f"/api/repos/{user}/{repo_name}"
         return root + "/webhooks", root + "/pulls", root + "/branch-rules"
@@ -110,10 +150,10 @@ def main():
         return pr
 
     def wait_initial(repo_id, pr, base_oid, feat_oid):
-        return wait_for("initial pin, queued run and progress marker", lambda: (
-            lambda job: job if marker(repo_id, pr["number"], pr["version"], feat_oid, base_oid)
-            and pin_oid(repo_id, job) == feat_oid else None
-        )(queued_run(repo_id, pr["number"], pr["version"], feat_oid, base_oid)))
+        return wait_pin(
+            repo_id, pr["number"], pr["version"], feat_oid, base_oid, feat_oid,
+            "initial pin, queued run and progress marker",
+        )
 
     def push_head(work, feat_oid, token):
         h.git("checkout", "-B", "feature", feat_oid, cwd=work)
@@ -161,20 +201,20 @@ def main():
         updated = wait_for("background PR head update", lambda: (
             lambda p: p if p["head_oid"] == head and p["version"] > pr["version"] else None
         )(h.document(f"{pulls}/{pr['number']}", token=token)))
-        head_job = wait_for("queued run and marker for pushed head", lambda: (
-            lambda job: job if marker(repo_id, pr["number"], updated["version"], head, base_oid)
-            and pin_oid(repo_id, job) == head else None
-        )(queued_run(repo_id, pr["number"], updated["version"], head, base_oid)))
+        head_job = wait_pin(
+            repo_id, pr["number"], updated["version"], head, base_oid, head,
+            "queued run and marker for pushed head",
+        )
         assert h.document(f"{pulls}/{pr['number']}/checks", token=token)["items"], "pushed head has no check runs"
 
         base = push_base(work, base_oid, token, pulls)
         base_updated = wait_for("background PR base update", lambda: (
             lambda p: p if p["base_oid"] == base and p["version"] > updated["version"] else None
         )(h.document(f"{pulls}/{pr['number']}", token=token)))
-        base_job = wait_for("queued run and marker for updated base", lambda: (
-            lambda job: job if marker(repo_id, pr["number"], base_updated["version"], head, base)
-            and pin_oid(repo_id, job) == head else None
-        )(queued_run(repo_id, pr["number"], base_updated["version"], head, base)))
+        base_job = wait_pin(
+            repo_id, pr["number"], base_updated["version"], head, base, head,
+            "queued run and marker for updated base",
+        )
         assert base_job == head_job, (base_job, head_job)
         return {
             "repository_id": repo_id, "pull_number": pr["number"],
@@ -284,12 +324,11 @@ def main():
         seventeenth = wait_for("seventeenth PR head update beyond the first page", lambda: (
             lambda p: p if p["head_oid"] == second and p["version"] > created[16]["version"] else None
         )(h.document(f"{pulls}/{created[16]['number']}")), timeout=45)
-        job = wait_for("seventeenth PR marker and queued run", lambda: (
-            lambda job: job if marker(cursor_repo["id"], seventeenth["number"],
-                                      seventeenth["version"], second, cursor_base)
-            and pin_oid(cursor_repo["id"], job) == second else None
-        )(queued_run(cursor_repo["id"], seventeenth["number"], seventeenth["version"],
-                     second, cursor_base)), timeout=30)
+        job = wait_pin(
+            cursor_repo["id"], seventeenth["number"], seventeenth["version"],
+            second, cursor_base, second, "seventeenth PR marker and queued run",
+            timeout=30,
+        )
         assert h.receiver.requests == []
         assert h.sql(f"SELECT count(*) FROM forge_webhook_deliveries WHERE repository_id='{cursor_repo['id']}'" ) == "0"
         return {"pull_count": 17, "first_page_updated": 16,
