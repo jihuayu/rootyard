@@ -5,20 +5,29 @@ These checks need no binary, database or network: they prove the harness
 declares the Git commands it runs, parses Git versions fail-closed, registers
 its twenty cases once each, keeps every module under the size cap, and binds
 the corrected product contracts (single initialization, one resolved Git,
-Idempotency-Key on the first merge, real maintain/admin authority). They are a
-focused oracle, not native evidence.
+Idempotency-Key on the first merge, real maintain/admin authority). Real v1 and
+v2 receipt fixtures also exercise the source-binding consumer so v1 current
+bytes and v2 recorded snapshots stay distinct. They are a focused oracle, not
+native evidence.
 """
 import ast
 import hashlib
+import json
 import re
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import types
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(ROOT / "scripts"))
+import collaborator_contract  # noqa: E402
 import collaborator_transport as harness  # noqa: E402
+import native_build_receipt as receipts  # noqa: E402
 import source_bound_binary  # noqa: E402
 
 CASE_METHODS = (
@@ -42,6 +51,105 @@ REGISTERED_CASES = (
     "withdrawal_revokes_new_requests", "git_receipts_are_not_repository_audit_log",
     "team_inherited_read_write_admin", "token_revocation_401",
 )
+
+TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
+V2_COMMIT = "a" * 40
+CURRENT_HEAD = "c" * 40
+CARGO_FORK_COMMIT = "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class V2ReceiptFixture:
+    """A minimal real v2 receipt produced through the shared producer API."""
+
+    def __init__(self, root):
+        self.root = Path(root).resolve()
+        for relative, content in (
+            ("Cargo.toml", '[package]\nname = "rootyard"\n'),
+            ("Cargo.lock", "version = 3\n"),
+            ("build.rs", "fn main() {}\n"),
+            ("src/lib.rs", "pub fn production() -> u8 { 1 }\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.1"\n'),
+            ("experimental/pando/schema.sql", "-- separate pando namespace\n"),
+        ):
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        self.binary = self.root / "target/debug/rootyard"
+        self.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.binary.write_bytes(b"native-binary")
+        self.binary.chmod(0o700)
+        self.toolchain_dir = self.root / "toolchain"
+        self.toolchain_dir.mkdir()
+        for name in ("cargo", "rustc", "rustup"):
+            (self.toolchain_dir / name).write_bytes(("fake-" + name).encode())
+        self.bound = receipts.capture_bound_inputs(self.root, environ={"PATH": ""})
+        self.profile = {
+            "opt_level": "0", "debuginfo": 2, "debug_assertions": True,
+            "overflow_checks": True, "test": False,
+        }
+
+    def toolchain(self):
+        def identity(name, release, commit_hash):
+            executable = self.toolchain_dir / name
+            return {
+                "executable": str(executable),
+                "executable_sha256": digest(executable),
+                "version": f"{name} {release} (fixture)",
+                "release": release,
+                "commit_hash": commit_hash,
+                "commit_date": "2026-01-01",
+                "host": TARGET_TRIPLE,
+            }
+
+        return {
+            "cargo": identity("cargo", "1.101.0", CARGO_FORK_COMMIT),
+            "rustc": dict(identity("rustc", "1.99.1", "d" * 40),
+                          path_entry=str(self.toolchain_dir / "rustc"), proxy=False),
+            "rustup": {
+                "executable": str(self.toolchain_dir / "rustup"),
+                "executable_sha256": digest(self.toolchain_dir / "rustup"),
+                "resolved_rustc": str(self.toolchain_dir / "rustc"),
+                "resolved_rustc_sha256": digest(self.toolchain_dir / "rustc"),
+            },
+            "target_triple": TARGET_TRIPLE,
+            "pinned_channel": "1.99.1",
+            "pin_source": "rust-toolchain.toml",
+        }
+
+    def artifact(self, kind, source, executable=None):
+        event = {
+            "reason": "compiler-artifact",
+            "package_id": "rootyard 0.1.0",
+            "target": {"name": "rootyard", "kind": [kind], "src_path": str(source)},
+            "profile": self.profile,
+            "fresh": True,
+        }
+        if executable is not None:
+            event["executable"] = str(executable)
+        return receipts.cargo_artifact_record(event, self.root)
+
+    def make_v2(self):
+        payload = receipts.make_receipt_v2(
+            binary_path=self.binary,
+            command=["cargo", "build", "--locked", "--bin", "rootyard"],
+            profile="dev",
+            artifacts=[
+                self.artifact("lib", self.root / "src/lib.rs"),
+                self.artifact("bin", self.root / "src/main.rs", executable=self.binary),
+            ],
+            toolchain=self.toolchain(),
+            bound_inputs=self.bound,
+            workspace_commit=V2_COMMIT,
+            target_dir=self.binary.parent.parent,
+            target_triple=TARGET_TRIPLE,
+        )
+        receipts.atomic_write_json(self.binary.with_suffix(".build.json"), payload)
+        return payload
 
 
 class HarnessModules:
@@ -106,6 +214,137 @@ class GitMatrixContract(unittest.TestCase):
         lifecycle = (ROOT / "tests" / "collaborator_lifecycle.py").read_text()
         self.assertEqual(lifecycle.count("self.setup()"), 1,
                          "the owned schema/service must be initialized exactly once")
+
+
+class SourceBindingSchemaContract(unittest.TestCase):
+    """The harness must not read v1 current-byte fields from a v2 snapshot."""
+
+    @staticmethod
+    def harness(binary, env=None):
+        return types.SimpleNamespace(
+            args=types.SimpleNamespace(binary=str(binary)),
+            env=dict(env or {}), case_module_files=())
+
+    @staticmethod
+    def v1_receipt(root, source_digest):
+        binary = Path(root) / "target/debug/rootyard"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b"native-v1-binary")
+        binary.chmod(0o700)
+        payload = {
+            "version": 1,
+            "binary_sha256": digest(binary),
+            "source_inputs_sha256": source_digest,
+            "workspace_commit": "b" * 40,
+            "rustc": "rustc 1.99.1",
+            "command": ["cargo", "build", "--locked", "--bin", "rootyard"],
+        }
+        binary.with_suffix(".build.json").write_text(json.dumps(payload))
+        return binary
+
+    @staticmethod
+    def git_output(*args):
+        return CURRENT_HEAD if args == ("rev-parse", "HEAD") else ""
+
+    def test_v1_positive_keeps_current_production_byte_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = self.v1_receipt(root, source_bound_binary.production_source_digest())
+            h = self.harness(binary)
+            with mock.patch.object(source_bound_binary, "_git", side_effect=self.git_output):
+                report = collaborator_contract.prerequisite.source_binding(h)
+        self.assertEqual(report["schema"], "v1")
+        self.assertEqual(report["source_commit"], CURRENT_HEAD)
+        self.assertEqual(report["binary_source_commit"], "b" * 40)
+        self.assertEqual(report["current_source_inputs_sha256"],
+                         report["source_inputs_sha256"])
+        self.assertEqual(report["source_identity"], "current production bytes")
+
+    def test_v1_rejects_current_digest_mismatch_and_dirty_production_inputs(self):
+        with tempfile.TemporaryDirectory() as root:
+            mismatch = self.v1_receipt(root, "2" * 64)
+            h = self.harness(mismatch)
+            with mock.patch.object(source_bound_binary, "_git", side_effect=self.git_output):
+                with self.assertRaisesRegex(AssertionError,
+                                            "does not match this checkout's production source"):
+                    collaborator_contract.prerequisite.source_binding(h)
+        with tempfile.TemporaryDirectory() as root:
+            binary = self.v1_receipt(root, source_bound_binary.production_source_digest())
+            h = self.harness(binary)
+
+            def dirty(*args):
+                return " M src/main.rs" if args == ("status", "--porcelain") \
+                    else self.git_output(*args)
+
+            with mock.patch.object(source_bound_binary, "_git", side_effect=dirty):
+                with self.assertRaisesRegex(AssertionError, "production inputs differ"):
+                    collaborator_contract.prerequisite.source_binding(h)
+
+    def test_actual_v2_snapshot_without_current_digest_is_accepted_and_separate(self):
+        with tempfile.TemporaryDirectory() as root:
+            fixture = V2ReceiptFixture(root)
+            fixture.make_v2()
+            h = self.harness(fixture.binary,
+                             {"ROOTYARD_EXPECTED_SOURCE_COMMIT": V2_COMMIT})
+            with mock.patch.object(source_bound_binary, "_git", side_effect=self.git_output), \
+                    mock.patch.object(source_bound_binary, "production_source_digest",
+                                      side_effect=AssertionError("v2 measured current source")):
+                report = collaborator_contract.prerequisite.source_binding(h)
+            without_expected = self.harness(fixture.binary)
+            with mock.patch.object(source_bound_binary, "_git", side_effect=self.git_output), \
+                    mock.patch.object(source_bound_binary, "production_source_digest",
+                                      side_effect=AssertionError("v2 measured current source")):
+                unbound = collaborator_contract.prerequisite.source_binding(without_expected)
+        self.assertIsNone(unbound["expected_commit"])
+        self.assertEqual(unbound["source_commit"], V2_COMMIT)
+        self.assertEqual(report["schema"], "v2")
+        self.assertNotIn("current_source_inputs_sha256", report,
+                         "a v2 snapshot has no current-byte digest alias")
+        self.assertEqual(report["source_commit"], V2_COMMIT)
+        self.assertEqual(report["binary_source_commit"], V2_COMMIT)
+        self.assertEqual(report["current_head"], CURRENT_HEAD)
+        self.assertNotEqual(report["source_commit"], report["current_head"])
+        self.assertTrue(report["head_differs_from_receipt"])
+        self.assertEqual(report["expected_commit"], V2_COMMIT)
+        self.assertTrue(report["source_snapshot_bound"])
+        self.assertTrue(report["production_inputs_bound"])
+        self.assertEqual(report["source_inputs_sha256"],
+                         fixture.bound["source_inputs_sha256"])
+        self.assertEqual(report["config_digest"], fixture.bound["config_digest"])
+        self.assertEqual(report["source_identity"], "recorded source snapshot")
+
+    def test_v2_rejects_unvalidated_snapshot_or_input_flags(self):
+        with tempfile.TemporaryDirectory() as root:
+            fixture = V2ReceiptFixture(root)
+            fixture.make_v2()
+            h = self.harness(fixture.binary)
+            with mock.patch.object(source_bound_binary, "_git", side_effect=self.git_output):
+                actual = source_bound_binary.bind(fixture.binary, environ={})
+        for flag in ("source_snapshot_bound", "production_inputs_bound"):
+            with mock.patch.object(source_bound_binary, "bind",
+                                   return_value=dict(actual, **{flag: False})):
+                with self.assertRaisesRegex(AssertionError, "did not validate"):
+                    collaborator_contract.prerequisite.source_binding(h)
+
+    def test_rejected_binding_and_expected_commit_cannot_bypass(self):
+        h = self.harness(ROOT / "target" / "debug" / "rootyard")
+        with mock.patch.object(source_bound_binary, "bind",
+                               side_effect=source_bound_binary.SourceBindingError("rejected")):
+            with self.assertRaisesRegex(AssertionError,
+                                        "required dependency missing: source binding failed"):
+                collaborator_contract.prerequisite.source_binding(h)
+        with tempfile.TemporaryDirectory() as root:
+            fixture = V2ReceiptFixture(root)
+            fixture.make_v2()
+            stale = self.harness(fixture.binary,
+                                 {"ROOTYARD_EXPECTED_SOURCE_COMMIT": "e" * 40})
+            with self.assertRaisesRegex(AssertionError, "stale build receipt"):
+                collaborator_contract.prerequisite.source_binding(stale)
+
+    def test_unknown_schema_fails_closed(self):
+        h = self.harness(ROOT / "target" / "debug" / "rootyard")
+        with mock.patch.object(source_bound_binary, "bind", return_value={"schema": "v3"}):
+            with self.assertRaisesRegex(AssertionError, "unsupported source binding schema"):
+                collaborator_contract.prerequisite.source_binding(h)
 
 
 class HarnessContract(unittest.TestCase):
