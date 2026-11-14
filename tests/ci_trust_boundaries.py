@@ -9,6 +9,10 @@ repositories; every negative below then asserts an exact status and error.
 
 Current semantics intentionally covered:
 * a write collaborator cannot write a bound check context through the direct API;
+* that same non-owner collaborator can create an unbound manual check, which is
+  persisted under the repository tenant and is byte-identical in the owner's
+  and writer's commit/PR check listings, while an unaffiliated user still gets
+  404 and binding management remains maintainer-only;
 * an issuer cannot claim/report outside its own repository, context or run;
 * revoking a trusted-context binding or disabling a webhook refuses a current
   lease report, and an exact old signed-callback replay is refused after the
@@ -210,11 +214,14 @@ class TrustBoundaryHarness(WebhooksHarness):
         repo_id = self.repo["id"] if repo == "forge" else self.other["id"]
         raw = self.sql(
             "SELECT coalesce(json_agg(json_build_object("
+            "'repository_id',repository_id::text,'tenant_id',tenant_id::text,"
+            "'commit_oid',commit_oid,'context',context,"
             "'attempt',attempt,'sequence',sequence,'status',status,"
             "'conclusion',conclusion,'output',output,"
             "'issuer_webhook_id',issuer_webhook_id::text,"
             "'ci_run_id',ci_run_id::text,'ci_base_oid',ci_base_oid,"
-            "'ci_lease_generation',ci_lease_generation)),'[]'::json)::text "
+            "'ci_lease_generation',ci_lease_generation,"
+            "'created_at',created_at::text,'updated_at',updated_at::text)),'[]'::json)::text "
             f"FROM forge_check_runs WHERE repository_id={self.q(repo_id)} "
             f"AND commit_oid={self.q(head)} AND context={self.q(context)}"
         )
@@ -851,22 +858,104 @@ class TrustBoundaryHarness(WebhooksHarness):
                 )
         # The same collaborator is genuinely writable for an unbound context;
         # the 403 above is context ownership, not a missing write role.
+        commit_checks = (
+            f"/api/repos/alice/forge/commits/{self.head_v1['forge']}/checks"
+        )
+        pull_checks = self.pull_path("forge") + "/checks"
+        manual_body = {
+            "commit_oid": self.head_v1["forge"],
+            "context": "ci/writer-manual",
+            "status": "completed",
+            "conclusion": "success",
+            "attempt": 1,
+            "sequence": 1,
+            "output": "unprotected manual check",
+        }
         manual = self.document(
             self.checks_paths["forge"],
             201,
             token=self.writer,
             method="POST",
-            body={
-                "commit_oid": self.head_v1["forge"],
-                "context": "ci/writer-manual",
-                "status": "completed",
-                "conclusion": "success",
-                "attempt": 1,
-                "sequence": 1,
-                "output": "unprotected manual check",
+            headers={"Idempotency-Key": "writer-manual-check-1"},
+            body=manual_body,
+        )
+        assert manual["sequence"] == 1, manual
+        assert manual["output"] == "unprotected manual check", manual
+        replay = self.document(
+            self.checks_paths["forge"],
+            200,
+            token=self.writer,
+            method="POST",
+            headers={"Idempotency-Key": "writer-manual-check-1"},
+            body=manual_body,
+        )
+        assert replay == manual, (replay, manual)
+        manual = self.document(
+            self.checks_paths["forge"],
+            200,
+            token=self.writer,
+            method="POST",
+            headers={"Idempotency-Key": "writer-manual-check-2"},
+            body=manual_body
+            | {
+                "sequence": 2,
+                "output": "unprotected manual check advanced",
             },
         )
-        assert manual["context"] == "ci/writer-manual", manual
+        expected_manual = {
+            "repository_id": self.repo["id"],
+            "commit_oid": self.head_v1["forge"],
+            "context": "ci/writer-manual",
+            "attempt": 1,
+            "sequence": 2,
+            "status": "completed",
+            "conclusion": "success",
+            "output": "unprotected manual check advanced",
+        }
+        for field, value in expected_manual.items():
+            assert manual[field] == value, (field, manual)
+        persisted = self.check_row(
+            "forge", self.head_v1["forge"], "ci/writer-manual"
+        )
+        owner_id = self.sql(
+            "SELECT owner_id::text FROM repositories "
+            f"WHERE id={self.q(self.repo['id'])}"
+        )
+        assert persisted["tenant_id"] == owner_id, persisted
+        assert persisted["tenant_id"] == self.alice["user_id"], persisted
+        assert persisted["tenant_id"] != self.writer["user_id"], persisted
+        for field, value in expected_manual.items():
+            assert persisted[field] == value, (field, persisted)
+
+        def listed_manual(items):
+            matches = [
+                item for item in items if item["context"] == "ci/writer-manual"
+            ]
+            assert len(matches) == 1, items
+            return matches[0]
+
+        owner_commit = self.document(commit_checks, token=self.alice)
+        writer_commit = self.document(commit_checks, token=self.writer)
+        owner_pull = self.document(pull_checks, token=self.alice)
+        writer_pull = self.document(pull_checks, token=self.writer)
+        assert owner_commit["commit_oid"] == self.head_v1["forge"], owner_commit
+        assert writer_commit["commit_oid"] == self.head_v1["forge"], writer_commit
+        assert owner_pull["pull_number"] == self.pulls["forge"]["number"], owner_pull
+        assert writer_pull["pull_number"] == self.pulls["forge"]["number"], writer_pull
+        assert owner_pull["head_oid"] == self.head_v1["forge"], owner_pull
+        assert writer_pull["head_oid"] == self.head_v1["forge"], writer_pull
+        for listed in (owner_commit, writer_commit, owner_pull, writer_pull):
+            assert listed_manual(listed["items"]) == manual, listed
+
+        # A user with no membership in alice/forge cannot observe the row through
+        # either check listing; this is the unchanged repository scope boundary.
+        for protected_path in (commit_checks, pull_checks):
+            status, raw, headers = self.http(protected_path, token=self.bob)
+            assert status == 404, (protected_path, status, raw[:200])
+            norm = {key.lower(): value for key, value in headers.items()}
+            assert norm.get("cache-control") == "no-store", norm
+            assert json.loads(raw)["error"] == "not found", raw[:200]
+
         for (repo, context), before in protected_before.items():
             after = self.check_row(repo, self.head_v1[repo], context)
             assert after == before, (repo, context, before, after)

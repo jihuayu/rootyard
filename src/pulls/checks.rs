@@ -159,8 +159,14 @@ async fn upsert_check_inner(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     crate::webhooks::trust::lock_policy_tx(&tx,expected_repo).await?;
-    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::ChecksWrite).await?.repo_id;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::ChecksWrite).await?;
+    let repo = access.repo_id;
     same_repository(expected_repo,repo)?;
+    // Check rows are owned by the repository tenant, not by the acting
+    // principal. A write collaborator can act on the repository without being
+    // its owner; using the actor UUID here would violate the
+    // (repository_id, tenant_id) foreign key and conflate actor with tenant.
+    let tenant_id = access.owner_id;
     lease.guard(require_repo_oid_format(&state,repo,&commit_oid)).await??;
     lease.ensure_active()?;
     let trusted: bool = tx.query_one(
@@ -182,7 +188,7 @@ async fn upsert_check_inner(
             "sequence": input.sequence,
             "output": input.output,
         });
-        if let Some(response) = creation_replay(&tx, actor.id, repo, key, &request).await? {
+        if let Some(response) = creation_replay(&tx, tenant_id, repo, key, &request).await? {
             finish(tx, &actor, true).await?;
             return Ok(json(StatusCode::OK, response));
         }
@@ -206,7 +212,7 @@ async fn upsert_check_inner(
             &format!(
                 "SELECT {CHECK_FIELDS} FROM forge_check_runs WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 AND context=$4 FOR UPDATE"
             ),
-            &[&actor.id, &repo, &commit_oid, &input.context],
+            &[&tenant_id, &repo, &commit_oid, &input.context],
         )
         .await
         .map_err(Error::internal)?;
@@ -217,7 +223,7 @@ async fn upsert_check_inner(
                 &tx,
                 CheckRun::row(&row),
                 &input,
-                actor.id,
+                tenant_id,
                 repo,
                 &commit_oid,
             )
@@ -236,7 +242,7 @@ async fn upsert_check_inner(
                         "INSERT INTO forge_check_runs (tenant_id,repository_id,commit_oid,context,attempt,sequence,status,conclusion,output) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (tenant_id,repository_id,commit_oid,context) DO NOTHING RETURNING {CHECK_FIELDS}"
                     ),
                     &[
-                        &actor.id,
+                        &tenant_id,
                         &repo,
                         &commit_oid,
                         &input.context,
@@ -261,7 +267,7 @@ async fn upsert_check_inner(
                             &format!(
                                 "SELECT {CHECK_FIELDS} FROM forge_check_runs WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 AND context=$4 FOR UPDATE"
                             ),
-                            &[&actor.id, &repo, &commit_oid, &input.context],
+                            &[&tenant_id, &repo, &commit_oid, &input.context],
                         )
                         .await
                         .map_err(Error::internal)?
@@ -272,7 +278,7 @@ async fn upsert_check_inner(
                         &tx,
                         CheckRun::row(&row),
                         &input,
-                        actor.id,
+                        tenant_id,
                         repo,
                         &commit_oid,
                     )
@@ -283,7 +289,7 @@ async fn upsert_check_inner(
     };
 
     let val = serde_json::to_value(&check_run).map_err(Error::internal)?;
-    record_creation(&tx, actor.id, repo, key, &val).await?;
+    record_creation(&tx, tenant_id, repo, key, &val).await?;
     finish(tx, &actor, true).await?;
     Ok(json(status_code, val))
 }
@@ -302,8 +308,10 @@ pub async fn list_commit_checks(
     let (expected_repo,lease)=authorized_read_lease(&state,&actor,&owner,&name,false).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ChecksRead).await?.repo_id;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ChecksRead).await?;
+    let repo = access.repo_id;
     same_repository(expected_repo,repo)?;
+    let tenant_id = access.owner_id;
     lease.guard(require_repo_oid_format(&state,repo,&oid)).await??;
     lease.ensure_active()?;
     let rows = tx
@@ -311,7 +319,7 @@ pub async fn list_commit_checks(
             &format!(
                 "SELECT {CHECK_FIELDS} FROM forge_check_runs WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 ORDER BY context ASC OFFSET $4 LIMIT $5"
             ),
-            &[&actor.id, &repo, &oid, &after, &(limit + 1)],
+            &[&tenant_id, &repo, &oid, &after, &(limit + 1)],
         )
         .await
         .map_err(Error::internal)?;
@@ -345,12 +353,14 @@ pub async fn list_pull_checks(
     let (expected_repo,lease)=authorized_read_lease(&state,&actor,&owner,&name,false).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ChecksRead).await?.repo_id;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ChecksRead).await?;
+    let repo = access.repo_id;
     same_repository(expected_repo,repo)?;
+    let tenant_id = access.owner_id;
     let head_oid: String = tx
         .query_opt(
             "SELECT head_oid FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3",
-            &[&actor.id, &repo, &number],
+            &[&tenant_id, &repo, &number],
         )
         .await
         .map_err(Error::internal)?
@@ -363,7 +373,7 @@ pub async fn list_pull_checks(
             &format!(
                 "SELECT {CHECK_FIELDS} FROM forge_check_runs WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 ORDER BY context ASC OFFSET $4 LIMIT $5"
             ),
-            &[&actor.id, &repo, &head_oid, &after, &(limit + 1)],
+            &[&tenant_id, &repo, &head_oid, &after, &(limit + 1)],
         )
         .await
         .map_err(Error::internal)?;
