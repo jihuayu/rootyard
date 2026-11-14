@@ -146,6 +146,7 @@ jobs:
             --bin rootyard-workspace-lab=ROOTYARD_WORKSPACE_LAB_BIN \
             --bin rootyard-view-lab=ROOTYARD_VIEW_LAB_BIN \
             --bin rootyard-pando-lab=ROOTYARD_PANDO_LAB_BIN \
+            --bin rootyard-vfs-mount=ROOTYARD_VFS_MOUNT_BIN \
             --bin-receipt rootyard=ROOTYARD_BUILD_RECEIPT \
             --test ref_store_snapshot_backup_fixture=ROOTYARD_SNAPSHOT_FIXTURE \
             --test ref_store_holds_backup_fixture=ROOTYARD_HOLDS_FIXTURE

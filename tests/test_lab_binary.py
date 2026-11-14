@@ -219,6 +219,17 @@ class LabSelectorSourceContractTest(unittest.TestCase):
         self.assertIn("def __init__(self, binary_path=None, reference_only=False)", text)
         self.assertNotIn("cargo build", text)
 
+    def test_workspace_fuse_uses_explicit_mount_environment(self):
+        text = (Path(__file__).resolve().parent / "test_workspace_fuse.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ROOTYARD_VFS_MOUNT_BIN", text)
+        self.assertNotIn("cargo build", text)
+        workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--bin rootyard-vfs-mount=ROOTYARD_VFS_MOUNT_BIN", workflow)
+
     def test_pando_runtime_selects_environment_and_offline_tests_stay_mocked(self):
         tests = Path(__file__).resolve().parent
         for name in ("test_tier5_adversarial.py", "test_pando_migration.py"):
