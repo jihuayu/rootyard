@@ -26,6 +26,14 @@ gate identity, events, terminal and pack rows rather than counting them, and
 covers unknown/cross-repository/no-A3/non-admin/read-only/invalid-auth refusals
 without creating a ready repository through SQL.
 
+A separate real API-created and stock-Git-seeded proof repository carries the
+one-row `repository_collaborators` write-role fixture used to prove Bob's actual
+read and write path, a real committed operation/terminal, and identical 403
+refusals for his known operation and an unknown UUID. That SQL row is role
+metadata only; it never writes readiness, refs, operations, A3/A4 bindings,
+ACKs, gate/events or a terminal. The original strict ledger stays separate from
+this proof repository so its counts and final equality are unchanged.
+
 By default the same native process also re-runs the existing exact receive
 replay/digest-conflict and transient-read cleanup cases from
 `tests/blob_only_service.py`.
@@ -62,6 +70,8 @@ LIMITATIONS = [item for item in blob.LIMITATIONS
     "The commit-wins path is exercised by a separate real committed operation; Cancel must return that exact committed terminal and must not relabel it cancelled.",
     "Cancel-COMMIT ambiguity is retained as a 503-unknown code path but is not forced by this fixture.",
     "The no-A3 refusal fixture inserts one migration-138 pending operation row without its migration-147 binding into a real API-created repository; it does not create a ready repository, decision, ref or ACK.",
+    "The write-role fixture is one direct repository_collaborators role-metadata row in this run's random schema. The standalone serve-blob router does not mount the product collaborator-management route; this is not a product-route or service-level collaboration-management test.",
+    "That role-metadata row never writes readiness, serving bindings, refs, operations, A3/A4 bindings, ACKs, gate/event state, cancellation tombstones or a terminal. Bob's actual GET, clone, commit, push and committed operation/terminal are produced separately by the real API and stock Git.",
 ]
 
 
@@ -214,6 +224,45 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             "VALUES('" + rid + "','" + issuer + "','" + lane + "'," + str(sequence)
             + ",'" + operation + "','" + request_digest + "','pending')")
         return request_digest
+
+    def add_write_collaborator(self, repo, label):
+        """Insert exactly one repository_collaborators role-metadata row.
+
+        The standalone serve-blob router deliberately does not mount the product
+        collaborator-management API. This fixture therefore stores Bob's write
+        role directly in this process's own random schema, only after the
+        repository was created through POST /api/repos and seeded with stock
+        Git. The SQL is role configuration only. It never creates a ready
+        repository, serving binding, ref, operation, A3 producer binding, A4
+        publication, gate/event/ACK, cancellation tombstone or terminal; those
+        remain outcomes of the real API and stock Git calls.
+        """
+        schema = self.sql("SELECT current_schema()")
+        assert schema == self.schema, ("phase=" + label + " collaborator fixture: not the owned schema", schema)
+        rid = str(uuid.UUID(repo["id"]))
+        bob_id = str(uuid.UUID(self.bob["user_id"]))
+        actual = self.sql(
+            "SELECT r.owner_id::text || '|' || u.id::text "
+            "FROM repositories r JOIN users u ON u.id='" + bob_id + "' "
+            "WHERE r.id='" + rid + "' AND u.username='bob'")
+        assert actual, ("phase=" + label + " collaborator fixture: missing owned repository or Bob user",
+                        rid, bob_id)
+        owner_id, resolved_bob = actual.split("|", 1)
+        assert resolved_bob == bob_id, ("phase=" + label + " collaborator fixture: Bob id mismatch", actual)
+        assert owner_id != bob_id, ("phase=" + label + " collaborator fixture: Bob must not be the owner", actual)
+        # Migration 050 binds collaborators (repository_id, tenant_id) to
+        # repositories (id, owner_id), so the actual tenant is the owner id read
+        # from this run's repository row, never a global/user-supplied value.
+        inserted = self.sql(
+            "INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role) "
+            "VALUES('" + rid + "','" + owner_id + "','" + bob_id + "','write') "
+            "RETURNING role || '|' || tenant_id::text || '|' || user_id::text")
+        assert inserted == "write|" + owner_id + "|" + bob_id, (
+            "phase=" + label + " collaborator fixture: unexpected inserted role row", inserted)
+        count = self.sql(
+            "SELECT count(*) FROM repository_collaborators "
+            "WHERE repository_id='" + rid + "' AND tenant_id='" + owner_id + "' AND user_id='" + bob_id + "'")
+        assert count == "1", ("phase=" + label + " collaborator fixture: expected exactly one role row", count)
 
     def _create_commit_gate(self, key):
         self.sql(
@@ -635,21 +684,134 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert unbound_after["gate"] == unbound_before["gate"]
         assert unbound_after["events"] == unbound_before["events"]
 
-        # Bob is a real write collaborator but not an owner/admin. The route must
-        # refuse him before resolving any operation, and must not let him
-        # distinguish a known UUID from an unknown one.
-        grant_status, grant_raw, _ = self.http(
-            "/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/"
-            + urllib.parse.quote(repo["name"], safe="") + "/collaborators/bob",
-            token=self.alice, method="PUT", body={"role": "write", "username": "bob"})
-        assert grant_status in (200, 201), (grant_status, grant_raw[:300])
+        # Bob is a real write collaborator but not an owner/admin. The standalone
+        # serve-blob router does not mount the product collaborator-management
+        # route, so add exactly one role-metadata row in this run's own schema
+        # after a separate repository has been created by the real API and
+        # seeded with stock Git. Keeping this proof on its own repository leaves
+        # the original unknown/commit-wins ledger counts and hashes untouched.
         seed_before = self.cancellation_snapshot(repo["id"], seed_operation["operation_id"])
-        nonadmin_status, nonadmin_raw, _ = post_cancel(seed_operation["operation_id"], self.bob)
-        assert nonadmin_status == 403, (nonadmin_status, nonadmin_raw[:300])
-        nonadmin_unknown_status, nonadmin_unknown_raw, _ = post_cancel(unknown, self.bob)
-        assert nonadmin_unknown_status == 403, (nonadmin_unknown_status, nonadmin_unknown_raw[:300])
-        assert self.cancellation_snapshot(repo["id"], seed_operation["operation_id"]) == seed_before
-        assert self.cancellation_snapshot(repo["id"], unknown) == {"legacy": [], "decision": []}
+        original_strict_before_rbac = self.exact_ledger(repo["id"])
+
+        rbac_repo, _ = self.create("commit-unknown-rbac", self.alice)
+        rbac_remote = self.base + rbac_repo["clone_path"]
+        rbac_seed_work = self.root / "commit-unknown-rbac-seed-work"
+        self.clone(rbac_remote, rbac_seed_work, self.alice)
+        self.configure(rbac_seed_work)
+        rbac_base_oid = self.commit_files(
+            rbac_seed_work, "seed rbac proof repo", {"rbac-base.txt": "rbac proof base\n"})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=rbac_seed_work, token=self.alice)
+        assert self.remote_refs(rbac_remote, self.alice).get("refs/heads/main") == rbac_base_oid, \
+            "phase=rbac-seed: stock Git main ref is not the seed OID"
+        rbac_seed_ledger = self.exact_ledger(rbac_repo["id"])
+        rbac_seed_operations = rows(rbac_seed_ledger["operations"])
+        assert len(rbac_seed_operations) == 1, ("phase=rbac-seed", rbac_seed_operations)
+        rbac_seed_events = rows(rbac_seed_ledger["events"])
+        rbac_gate_identity = gate_identity(rbac_seed_ledger["gate"])
+
+        self.add_write_collaborator(rbac_repo, "bob-write-role")
+
+        rbac_path = ("/api/repos/" + urllib.parse.quote(rbac_repo["owner"], safe="") + "/"
+                     + urllib.parse.quote(rbac_repo["name"], safe=""))
+        visible_status, visible_raw, _ = self.http(rbac_path, token=self.bob)
+        assert visible_status == 200, ("phase=bob-repo-get", visible_status, visible_raw[:300])
+        visible = json.loads(visible_raw)
+        assert visible["id"] == rbac_repo["id"] and visible["owner"] == rbac_repo["owner"], \
+            ("phase=bob-repo-get: repository identity", visible)
+        assert visible["name"] == rbac_repo["name"] and visible["state"] == "ready", visible
+
+        bob_work = self.root / "commit-unknown-rbac-bob-work"
+        self.clone(rbac_remote, bob_work, self.bob)
+        self.configure(bob_work)
+        bob_oid = self.commit_files(
+            bob_work, "bob write-role proof", {"bob-rbac.txt": "bob write role proof\n"})
+        assert bob_oid != rbac_base_oid
+        bob_operation = str(uuid.uuid4())
+        bob_push = self.git(
+            "-c", "http.extraHeader=X-Rootyard-Operation: " + bob_operation,
+            "push", "--porcelain", "origin", "HEAD:refs/heads/bob-rbac-proof",
+            cwd=bob_work, token=self.bob, check=False)
+        assert bob_push.returncode == 0, (
+            "phase=bob-write-push", json.dumps(blob.git_failure(bob_push)))
+        assert blob.push_success(blob.parse_push(bob_push.stdout.decode()),
+                                 "refs/heads/bob-rbac-proof"), \
+            ("phase=bob-write-push", bob_push.stdout.decode(errors="replace")[-1000:])
+        rbac_remote_refs = self.remote_refs(rbac_remote, self.bob)
+        assert rbac_remote_refs.get("refs/heads/bob-rbac-proof") == bob_oid, (
+            "phase=bob-write-push: durable advertised ref missing", rbac_remote_refs)
+        assert rbac_remote_refs.get("refs/heads/main") == rbac_base_oid, rbac_remote_refs
+
+        rbac_after_push = self.exact_ledger(rbac_repo["id"])
+        rbac_ref_rows = rows(rbac_after_push["refs"])
+        bob_ref = row_for(rbac_ref_rows, "ref_name", "refs/heads/bob-rbac-proof")
+        assert bob_ref["oid"] == bob_oid, ("phase=bob-write-ledger: ref OID", bob_ref)
+        assert row_for(rbac_ref_rows, "ref_name", "refs/heads/main")["oid"] == rbac_base_oid
+        rbac_operation_rows = rows(rbac_after_push["operations"])
+        assert len(rbac_operation_rows) == len(rbac_seed_operations) + 1, rbac_operation_rows
+        bob_operation_row = self.operation_row(rbac_repo["id"], bob_operation)
+        assert bob_operation_row["issuer_id"] == self.bob["user_id"], (
+            "phase=bob-write-ledger: operation issuer is not Bob", bob_operation_row)
+        assert bob_operation_row["state"] == "committed", bob_operation_row
+        bob_terminal = bob_operation_row["terminal_result"]
+        assert isinstance(bob_terminal, dict) and bob_terminal.get("kind") == "committed", bob_terminal
+        rbac_event_rows = rows(rbac_after_push["events"])
+        assert len(rbac_event_rows) == len(rbac_seed_events) + 1, rbac_event_rows
+        bob_event = row_for(rbac_event_rows, "operation_id", bob_operation)
+        assert bob_event["outcome"] == "committed" and bob_event["payload"] == bob_terminal, bob_event
+        assert gate_identity(rbac_after_push["gate"]) == rbac_gate_identity, rbac_after_push["gate"]
+        bob_pack = self.pack_identity(rbac_repo["id"], bob_operation)
+        bob_publications = rows(bob_pack["publications"])
+        bob_artifacts = rows(bob_pack["artifacts"])
+        assert len(bob_publications) == 1 and len(bob_artifacts) == 2, bob_pack
+        assert bob_publications[0]["plan_operation_id"] == bob_operation, bob_publications
+        assert {(item["pack_id"], item["registration_id"], item["artifact_set_digest"])
+                for item in bob_publications} == {
+                    (item["pack_id"], item["registration_id"], item["artifact_set_digest"])
+                    for item in bob_terminal["registrations"]}, (bob_publications, bob_terminal)
+
+        # A second fresh stock-Git clone proves the acknowledged new branch is
+        # actually served with the committed bytes.
+        bob_proof_clone = self.root / "commit-unknown-rbac-bob-proof-clone"
+        self.clone(rbac_remote, bob_proof_clone, self.bob)
+        assert self.git("rev-parse", "refs/remotes/origin/bob-rbac-proof",
+                        cwd=bob_proof_clone).stdout.decode().strip() == bob_oid
+        assert self.git("show", "refs/remotes/origin/bob-rbac-proof:bob-rbac.txt",
+                        cwd=bob_proof_clone).stdout == b"bob write role proof\n"
+
+        # The route must refuse Bob before resolving any operation, and must not
+        # let him distinguish his known operation from an unknown UUID. Both
+        # refusals must leave refs, gate, events, operations, pack rows and both
+        # cancellation tombstones exactly unchanged.
+        def rbac_cancel_path(target_operation):
+            return rbac_path + "/operations/" + target_operation + "/cancel"
+
+        rbac_ledger_before_refusals = self.exact_ledger(rbac_repo["id"])
+        rbac_pack_before_refusals = self.pack_identity(rbac_repo["id"], bob_operation)
+        rbac_known_tombstones = self.cancellation_snapshot(rbac_repo["id"], bob_operation)
+        rbac_unknown_tombstones = self.cancellation_snapshot(rbac_repo["id"], unknown)
+        nonadmin_status, nonadmin_raw, nonadmin_headers = self.http(
+            rbac_cancel_path(bob_operation), token=self.bob, method="POST")
+        nonadmin_unknown_status, nonadmin_unknown_raw, nonadmin_unknown_headers = self.http(
+            rbac_cancel_path(unknown), token=self.bob, method="POST")
+        assert nonadmin_status == 403 and nonadmin_unknown_status == 403, (
+            "phase=bob-cancel-nonadmin", nonadmin_status, nonadmin_raw[:300],
+            nonadmin_unknown_status, nonadmin_unknown_raw[:300])
+        assert nonadmin_raw == nonadmin_unknown_raw, (
+            "phase=bob-cancel-nonadmin: known and unknown responses differ",
+            nonadmin_raw[:300], nonadmin_unknown_raw[:300])
+        assert assert_error(nonadmin_raw) == "operation is cancellable only by a repository owner or admin"
+        assert blob.header_value(nonadmin_headers, "cache-control") == "no-store"
+        assert blob.header_value(nonadmin_unknown_headers, "cache-control") == "no-store"
+        assert self.operation_row(rbac_repo["id"], bob_operation) == bob_operation_row
+        assert self.operation_row_optional(rbac_repo["id"], unknown) is None
+        assert self.exact_ledger(rbac_repo["id"]) == rbac_ledger_before_refusals, \
+            "phase=bob-cancel-nonadmin: refusals changed the RBAC proof ledger"
+        assert self.pack_identity(rbac_repo["id"], bob_operation) == rbac_pack_before_refusals
+        assert self.cancellation_snapshot(rbac_repo["id"], bob_operation) == rbac_known_tombstones
+        assert self.cancellation_snapshot(rbac_repo["id"], unknown) == rbac_unknown_tombstones
+        assert rbac_known_tombstones == {"legacy": [], "decision": []}, rbac_known_tombstones
+        assert self.exact_ledger(repo["id"]) == original_strict_before_rbac, \
+            "the separate RBAC proof repo changed the original strict ledger"
 
         read_only_status, read_only_raw, _ = post_cancel(seed_operation["operation_id"], self.reader)
         assert read_only_status == 403, (read_only_status, read_only_raw[:300])
@@ -665,6 +827,8 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             assert assert_error(malformed_raw) == "invalid operation identifier"
 
         final_ledger = self.exact_ledger(repo["id"])
+        assert final_ledger == original_strict_before_rbac, \
+            "refusals after the RBAC proof changed the original strict ledger"
         _, fresh_final_view = get_view(operation, "final resolution")
         assert fresh_final_view == final_view, (fresh_final_view, final_view)
         assert fresh_final_view["state"] == "cancelled", fresh_final_view
@@ -701,6 +865,17 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             "no_a3_cancel_status": no_a3_status,
             "nonadmin_cancel_status": nonadmin_status,
             "nonadmin_unknown_cancel_status": nonadmin_unknown_status,
+            "nonadmin_cancel_response_identical": nonadmin_raw == nonadmin_unknown_raw,
+            "rbac_proof_repository": rbac_repo["id"],
+            "rbac_proof_operation": bob_operation,
+            "rbac_proof_operation_state": bob_operation_row["state"],
+            "rbac_proof_issuer_id": bob_operation_row["issuer_id"],
+            "rbac_proof_ref": "refs/heads/bob-rbac-proof",
+            "rbac_proof_oid": bob_oid,
+            "rbac_proof_clone_oid": bob_oid,
+            "rbac_role_fixture": "repository_collaborators(write) metadata in the run-owned schema",
+            "rbac_refusal_ledger_pack_tombstones_unchanged": True,
+            "original_strict_ledger_unchanged_by_rbac_proof": True,
             "read_only_cancel_status": read_only_status,
             "invalid_auth_cancel_status": invalid_status,
             "one_effect_checked": True,
