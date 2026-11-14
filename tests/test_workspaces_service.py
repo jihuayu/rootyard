@@ -137,5 +137,68 @@ class WorkspaceServiceTest(unittest.TestCase):
         finally:
             h.cleanup()
 
+    def test_checkpoint_replay_across_restart_and_stale_epoch_rejection(self):
+        """A committed operation survives a hard restart; an old epoch cannot write.
+
+        The replay intentionally carries the pre-restart expected revision and
+        lease epoch. It must return the stored result instead of a version
+        conflict, and neither replay nor the rejected stale mutation may advance
+        the revision, change the file/index bytes, or append an event.
+        """
+        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        try:
+            h.setup(); h.api(); h.roundtrip()
+            ws = json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",
+                body={"owner":"alice","repository":"demo","agent_id":"replay","base_oid":h.second},
+                extra_headers={"Idempotency-Key":"replay-create"}))
+            wid = ws["id"]
+            path = f"/api/workspaces/{wid}/files?path=hello.txt"
+            put = {"content_base64":base64.b64encode(b"v1\n").decode(),"expected_entry_version":0,
+                   "expected_workspace_revision":0,"lease_epoch":ws["lease_epoch"]}
+            first_put = json.loads(h.expect(path,200,token=h.alice,method="PUT",body=put,
+                extra_headers={"Idempotency-Key":"replay-put"}))
+            self.assertEqual(first_put["workspace_revision"],1)
+            checkpoint_body = {"expected_workspace_revision":1,"lease_epoch":ws["lease_epoch"]}
+            checkpoint = json.loads(h.expect(f"/api/workspaces/{wid}/checkpoints",201,token=h.alice,
+                method="POST",body=checkpoint_body,extra_headers={"Idempotency-Key":"replay-checkpoint"}))
+            self.assertEqual(checkpoint["captured_revision"],1)
+            self.assertEqual(checkpoint["workspace_revision"],2)
+            h.stop(hard=True); h.start()
+            replay = json.loads(h.expect(f"/api/workspaces/{wid}/checkpoints",200,token=h.alice,
+                method="POST",body=checkpoint_body,extra_headers={"Idempotency-Key":"replay-checkpoint"}))
+            self.assertEqual(replay,checkpoint)
+            put_replay = json.loads(h.expect(path,200,token=h.alice,method="PUT",body=put,
+                extra_headers={"Idempotency-Key":"replay-put"}))
+            self.assertEqual(put_replay,first_put)
+            current = json.loads(h.expect(f"/api/workspaces/{wid}",200,token=h.alice))
+            self.assertEqual(current["revision"],2)
+            self.assertEqual(current["last_checkpoint_id"],checkpoint["checkpoint_id"])
+            events = json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=0",200,token=h.alice))
+            self.assertEqual([(e["revision"],e["kind"]) for e in events["events"]],[(1,"file_put"),(2,"checkpoint")])
+            lease = json.loads(h.expect(f"/api/workspaces/{wid}/lease",200,token=h.alice,method="POST",
+                body={"expected_lease_epoch":1}))
+            self.assertEqual(lease["lease_epoch"],2)
+            stale_put = {"content_base64":base64.b64encode(b"stale\n").decode(),"expected_entry_version":1,
+                         "expected_workspace_revision":2,"lease_epoch":1}
+            status, raw, _ = h.http(path,token=h.alice,method="PUT",body=stale_put,
+                extra_headers={"Idempotency-Key":"replay-stale-put"})
+            self.assertEqual(status,409,raw)
+            status, raw, _ = h.http(f"/api/workspaces/{wid}/checkpoints",token=h.alice,method="POST",
+                body={"expected_workspace_revision":2,"lease_epoch":1},
+                extra_headers={"Idempotency-Key":"replay-stale-checkpoint"})
+            self.assertEqual(status,409,raw)
+            current = json.loads(h.expect(f"/api/workspaces/{wid}",200,token=h.alice))
+            self.assertEqual(current["revision"],2)
+            self.assertEqual(current["lease_epoch"],2)
+            self.assertEqual(current["last_checkpoint_id"],checkpoint["checkpoint_id"])
+            stored = json.loads(h.expect(path,200,token=h.alice))
+            self.assertEqual(stored["entry_version"],1)
+            self.assertEqual(stored["workspace_revision"],2)
+            self.assertEqual(base64.b64decode(stored["content_base64"]),b"v1\n")
+            events = json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=0",200,token=h.alice))
+            self.assertEqual([(e["revision"],e["kind"]) for e in events["events"]],[(1,"file_put"),(2,"checkpoint")])
+        finally:
+            h.cleanup()
+
 
 if __name__ == "__main__": unittest.main()
