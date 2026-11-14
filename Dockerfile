@@ -18,7 +18,7 @@ RUN /usr/local/bin/install_ci_cargo_fork.sh verify \
       --require-os linux \
       --require-path \
       --record /build/ci-cargo-fork.json
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY vendor ./vendor
 COPY src ./src
 COPY migrations ./migrations

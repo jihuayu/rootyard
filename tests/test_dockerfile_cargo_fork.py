@@ -49,7 +49,7 @@ class DockerfileCargoForkTest(unittest.TestCase):
         build = self.build_stage.index("cargo build --release --locked")
         self.assertLess(verify, build)
         self.assertIn("RUN cargo -vV", self.build_stage)
-        self.assertIn("COPY Cargo.toml Cargo.lock ./", self.build_stage)
+        self.assertIn("COPY Cargo.toml Cargo.lock rust-toolchain.toml ./", self.build_stage)
 
     def test_runtime_image_contains_no_compiler_or_cache(self) -> None:
         self.assertTrue(self.runtime_stage.lstrip().startswith("FROM debian:trixie-slim"))
