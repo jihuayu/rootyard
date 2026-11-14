@@ -26,9 +26,20 @@
 //! The external `tests/blob_git_gateway.rs` race case and its exact one-ok /
 //! one-ng assertions remain untouched; it stays the unsynchronized stress case.
 //!
-//! Run explicitly by Root (hard-fails when PostgreSQL, Blob or Git is absent):
+//! Blob lifecycle: this case intentionally retains every object it writes. It
+//! requires `ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1`, which attests that the
+//! caller owns the whole configured bucket/namespace and will dispose of the
+//! complete test fixture after the run. The existing fixture pins a fresh
+//! relative `blob-gateway-suite/<uuid>` prefix for this run; per-key deletion is
+//! not attempted because remote PUT quiescence after a provider timeout cannot
+//! be proven here. No product deletion path is used, no object is claimed to
+//! have been removed, and whole-fixture disposal is the caller's responsibility.
+//!
+//! Run explicitly by Root (hard-fails when the ownership opt-in, PostgreSQL,
+//! Blob or Git is absent):
 //!
 //! ```text
+//! ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1 \
 //! ROOTYARD_TEST_DATABASE_URL=... ROOTYARD_BLOB_*... ROOTYARD_TEST_GIT=/usr/bin/git \
 //! cargo test --lib admission_race_acceptance -- --ignored --test-threads=1
 //! ```
@@ -38,7 +49,7 @@
 // modules in the cfg(test) library graph.
 use super::session_http_acceptance::fixtures::{
     actor::{self, Actor},
-    db::{Db, deadline},
+    db::{Db, RUN_BLOB_PREFIX, deadline},
     git::{self, Git},
 };
 
@@ -79,6 +90,7 @@ const SEED_FILE: &str = "seed.txt";
 const SEED_CONTENT: &str = "seed\n";
 const SEED_REF: &str = "refs/heads/main";
 const MAX_CAPTURED_RESPONSE: usize = 64 * 1024 * 1024;
+const OWNED_BLOB_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB";
 
 /// A parsed `report-status`: the `unpack` status and `(ref, ng reason)` rows.
 type GitReport = (String, Vec<(String, Option<String>)>);
@@ -152,11 +164,37 @@ fn pinned_operation(request: &Request<Body>) -> Option<Uuid> {
         .and_then(|value| Uuid::parse_str(value).ok())
 }
 
+/// The provider acceptance reserves remote objects under the fixture's per-run
+/// prefix. It must never run against a shared bucket with an unowned lifecycle.
+fn require_owned_disposable_blob_fixture() -> Result<()> {
+    ensure!(
+        matches!(std::env::var(OWNED_BLOB_OPT_IN).as_deref(), Ok("1")),
+        "this provider acceptance requires {OWNED_BLOB_OPT_IN}=1: the caller must own the whole configured Blob bucket/namespace and dispose of the complete fixture after the run"
+    );
+    Ok(())
+}
+
+/// The existing `Db` fixture pins one random relative prefix per process. Fail
+/// before opening the store if the job-level shared prefix was not replaced by
+/// that fixture-owned namespace.
+fn require_per_run_blob_prefix() -> Result<()> {
+    let root =
+        std::env::var("ROOTYARD_BLOB_ROOT").map_err(|_| anyhow!("the fixture did not pin ROOTYARD_BLOB_ROOT"))?;
+    let suffix = root.strip_prefix(RUN_BLOB_PREFIX).unwrap_or_default();
+    ensure!(
+        suffix.len() == 32 && suffix.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+        "the fixture did not pin its per-run Blob prefix"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and Git"]
 async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch() -> Result<()> {
+    require_owned_disposable_blob_fixture()?;
     let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     let db = Db::setup().await?;
+    require_per_run_blob_prefix()?;
     let outcome = case(&db).await;
     db.finish(outcome).await
 }
