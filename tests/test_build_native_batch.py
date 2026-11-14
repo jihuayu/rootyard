@@ -10,6 +10,7 @@ fail-closed behaviour on every malformed stream, source change and unsafe path.
 """
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -1103,6 +1104,46 @@ class BatchTest(unittest.TestCase):
                           if path.is_file()])
         self.assertTrue([path for path in (self.store / 'objects').rglob('*')
                          if path.is_file()], 'content objects may remain after a failed batch')
+
+    def test_cas_batch_alias_race_withdraws_false_receipts_and_preserves_cas(self):
+        args = self.cas_args()
+        events = self.default_events(bins=args.bin, tests=args.test)
+        output = Path(args.output[0]).resolve()
+        sentinel = b'concurrent-batch-alias-winner'
+        sentinel_mode = 0o640
+        real_link = os.link
+
+        def racing_link(src, dst, *arguments, **keywords):
+            if Path(dst) != output:
+                return real_link(src, dst, *arguments, **keywords)
+            if Path(src).name.endswith('.alias-tmp'):
+                # A concurrent writer creates the test output after the shared
+                # helper's absence check and immediately before publication.
+                Path(dst).write_bytes(sentinel)
+                os.chmod(dst, sentinel_mode)
+            else:
+                raise OSError(errno.EXDEV, 'cross-device link')
+            return real_link(src, dst, *arguments, **keywords)
+
+        with mock.patch.object(batch.os, 'link', racing_link):
+            with self.assertRaisesRegex(batch.BuildError, 'already exists'):
+                self.build(events=events, args=args)
+        self.assertEqual(output.read_bytes(), sentinel)
+        self.assertEqual(output.stat().st_mode & 0o777, sentinel_mode)
+        self.assertFalse(Path(args.manifest_out).exists())
+        for other in args.output:
+            self.assertFalse(Path(other + '.build.json').exists())
+        self.assertFalse([path for path in self.store.rglob('*')
+                          if path.is_file() and
+                          path.name.endswith(('.build.json', '.receipt.json'))])
+        self.assertFalse([path for path in (self.store / 'snapshots').rglob('*')
+                          if path.is_file()])
+        self.assertFalse(list(output.parent.glob('.' + output.name + '.*.alias-tmp')))
+        objects = [path for path in (self.store / 'objects').rglob('*') if path.is_file()]
+        self.assertTrue(objects, 'content objects may remain after a failed batch')
+        for path in objects:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o555)
+            self.assertEqual(batch.sha256_file(path), path.name)
 
     def test_cas_batch_config_key_ignores_jobs_and_reuses_objects(self):
         first_args = self.cas_args(suffix='jobs-none')

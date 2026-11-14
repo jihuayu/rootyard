@@ -297,7 +297,11 @@ def _publish_immutable_alias(source, destination, label):
     No pre-existing path is replaced.  A hard link is preferred so the alias
     and the immutable CAS object share one inode; the verified copy fallback is
     used only when the filesystem cannot hard-link across the source/destination
-    pair.  Either way the destination bytes and mode are re-verified.
+    pair.  The copy is staged in the destination directory and published with a
+    no-replace hard link, so a destination created concurrently is preserved.
+    If the filesystem cannot provide that atomic no-replace publication the
+    helper fails closed rather than renaming over it.  Either way the
+    destination bytes and mode are re-verified.
     """
     source, destination = Path(source), Path(destination)
     _require_absent(destination, label)
@@ -341,14 +345,15 @@ def _publish_immutable_alias(source, destination, label):
                     raise BuildError(label + ' already exists; refusing to overwrite: ' +
                                      str(destination)) from link_error
                 except OSError as link_error:
-                    if link_error.errno not in _ALIAS_LINK_FALLBACK:
-                        raise BuildError(label + ': cannot publish copy: ' +
-                                         str(link_error)) from link_error
-                    if os.path.lexists(destination):
-                        raise BuildError(label + ' already exists; refusing to overwrite: ' +
-                                         str(destination))
-                    os.replace(temporary, destination)
-                    created = True
+                    # The template lives in the destination directory, so a
+                    # no-replace hard link is the only publication primitive
+                    # needed.  Never add a check-then-replace fallback: that
+                    # would clobber an alias created after the absence check.
+                    raise BuildError(
+                        label + ': cannot atomically publish the verified copy without '
+                        'replacing the destination; refusing to overwrite: ' +
+                        str(destination) + ' (' +
+                        (link_error.strerror or str(link_error)) + ')') from link_error
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     temporary.unlink()

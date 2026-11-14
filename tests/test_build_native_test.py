@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
 from pathlib import Path
@@ -599,6 +600,42 @@ class CasProducerTests(Fixture):
                           path.name.endswith((".build.json", ".receipt.json"))])
         self.assertFalse([path for path in (self.store / "snapshots").rglob("*")
                           if path.is_file()])
+
+    def test_cas_alias_race_leaves_no_false_valid_receipt_and_preserves_cas(self):
+        output = self.output.resolve()
+        sentinel = b"concurrent-alias-winner"
+        sentinel_mode = 0o640
+        real_link = os.link
+
+        def racing_link(src, dst, *arguments, **keywords):
+            if Path(dst) != output:
+                return real_link(src, dst, *arguments, **keywords)
+            if Path(src).name.endswith(".alias-tmp"):
+                # A concurrent writer creates the output after the shared
+                # helper's absence check and immediately before publication.
+                Path(dst).write_bytes(sentinel)
+                os.chmod(dst, sentinel_mode)
+            else:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real_link(src, dst, *arguments, **keywords)
+
+        with mock.patch.object(bnt.os, "link", racing_link):
+            with self.assertRaisesRegex(BuildError, "already exists"):
+                self.run_with(self.events(), args=self.cas_args())
+        self.assertEqual(self.output.read_bytes(), sentinel)
+        self.assertEqual(self.output.stat().st_mode & 0o777, sentinel_mode)
+        self.assertFalse(self.receipt_path().exists())
+        self.assertFalse([path for path in self.store.rglob("*")
+                          if path.is_file() and
+                          path.name.endswith((".build.json", ".receipt.json"))])
+        self.assertFalse([path for path in (self.store / "snapshots").rglob("*")
+                          if path.is_file()])
+        self.assertFalse(list(self.output.parent.glob("." + self.output.name + ".*.alias-tmp")))
+        objects = [path for path in (self.store / "objects").rglob("*") if path.is_file()]
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0].read_bytes(), b"binary-rootyard")
+        self.assertEqual(objects[0].stat().st_mode & 0o777, 0o555)
+        self.assertEqual(receipt.sha256_file(objects[0]), objects[0].name)
 
 
 if __name__ == "__main__":

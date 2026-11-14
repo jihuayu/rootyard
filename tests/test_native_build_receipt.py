@@ -473,7 +473,10 @@ class BuildReceiptTest(unittest.TestCase):
         real_link = os.link
 
         def cross_device_link(src, dst, *arguments, **keywords):
-            if Path(src) == source or Path(src).name.startswith('.copy-alias.'):
+            # Only the CAS-to-destination link crosses filesystems.  The
+            # temporary copy and destination are in the same directory and
+            # must still use the no-replace hard-link publication.
+            if Path(src) == source:
                 raise OSError(errno.EXDEV, 'cross-device link')
             return real_link(src, dst, *arguments, **keywords)
 
@@ -483,6 +486,88 @@ class BuildReceiptTest(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), source.read_bytes())
         self.assertEqual(destination.stat().st_mode & 0o777, 0o555)
         self.assertNotEqual(os.stat(destination).st_ino, os.stat(source).st_ino)
+        self.assertFalse(list(self.external.glob('.copy-alias.*.alias-tmp')))
+
+    def test_alias_hardlink_race_preserves_concurrent_destination(self):
+        source = self.external / 'source'
+        source.write_bytes(b'verified-source-bytes')
+        os.chmod(source, 0o555)
+        destination = self.external / 'raced-alias'
+        sentinel = b'concurrent-winner'
+        sentinel_mode = 0o640
+        real_link = os.link
+
+        def racing_link(src, dst, *arguments, **keywords):
+            if Path(dst) == destination:
+                # Create the destination after the caller's absence check and
+                # before the publication attempt.
+                Path(dst).write_bytes(sentinel)
+                os.chmod(dst, sentinel_mode)
+            return real_link(src, dst, *arguments, **keywords)
+
+        with mock.patch.object(build_native.os, 'link', racing_link):
+            with mock.patch.object(build_native.os, 'replace',
+                                   side_effect=AssertionError('os.replace must not run')):
+                with self.assertRaisesRegex(build_native.BuildError, 'already exists'):
+                    build_native._publish_immutable_alias(source, destination, 'alias')
+        self.assertEqual(destination.read_bytes(), sentinel)
+        self.assertEqual(destination.stat().st_mode & 0o777, sentinel_mode)
+        self.assertEqual(source.read_bytes(), b'verified-source-bytes')
+        self.assertEqual(source.stat().st_mode & 0o777, 0o555)
+
+    def test_alias_copy_race_preserves_concurrent_destination(self):
+        source = self.external / 'source'
+        source.write_bytes(b'verified-source-bytes')
+        os.chmod(source, 0o555)
+        destination = self.external / 'raced-copy-alias'
+        sentinel = b'concurrent-copy-winner'
+        sentinel_mode = 0o640
+        real_link = os.link
+
+        def racing_link(src, dst, *arguments, **keywords):
+            if Path(src) == source:
+                raise OSError(errno.EXDEV, 'cross-device link')
+            self.assertTrue(Path(src).name.startswith('.raced-copy-alias.'))
+            self.assertTrue(Path(src).exists())
+            # Create the destination after the caller's absence check and the
+            # verified same-directory copy, immediately before publication.
+            Path(dst).write_bytes(sentinel)
+            os.chmod(dst, sentinel_mode)
+            return real_link(src, dst, *arguments, **keywords)
+
+        with mock.patch.object(build_native.os, 'link', racing_link):
+            with mock.patch.object(build_native.os, 'replace',
+                                   side_effect=AssertionError('os.replace must not run')):
+                with self.assertRaisesRegex(build_native.BuildError, 'already exists'):
+                    build_native._publish_immutable_alias(source, destination, 'alias')
+        self.assertEqual(destination.read_bytes(), sentinel)
+        self.assertEqual(destination.stat().st_mode & 0o777, sentinel_mode)
+        self.assertEqual(source.read_bytes(), b'verified-source-bytes')
+        self.assertEqual(source.stat().st_mode & 0o777, 0o555)
+        self.assertFalse(list(self.external.glob('.raced-copy-alias.*.alias-tmp')))
+
+    def test_alias_copy_fails_closed_without_atomic_noreplace(self):
+        source = self.external / 'source'
+        source.write_bytes(b'verified-source-bytes')
+        os.chmod(source, 0o555)
+        destination = self.external / 'unsupported-alias'
+
+        def unsupported_link(src, dst, *arguments, **keywords):
+            if Path(src) == source:
+                raise OSError(errno.EXDEV, 'cross-device link')
+            raise OSError(errno.EOPNOTSUPP, 'operation not supported')
+
+        with mock.patch.object(build_native.os, 'link', unsupported_link):
+            with mock.patch.object(build_native.os, 'replace',
+                                   side_effect=AssertionError('os.replace must not run')):
+                with self.assertRaises(build_native.BuildError) as caught:
+                    build_native._publish_immutable_alias(source, destination, 'alias')
+        self.assertIn('cannot atomically publish', str(caught.exception))
+        self.assertIn('refusing to overwrite', str(caught.exception))
+        self.assertFalse(os.path.lexists(destination))
+        self.assertEqual(source.read_bytes(), b'verified-source-bytes')
+        self.assertEqual(source.stat().st_mode & 0o777, 0o555)
+        self.assertFalse(list(self.external.glob('.unsupported-alias.*.alias-tmp')))
 
     def test_artifact_store_failure_leaves_no_false_valid_receipt(self):
         args = self.args(artifact_store=str(self.store))
@@ -494,6 +579,43 @@ class BuildReceiptTest(unittest.TestCase):
         self.assertFalse([path for path in self.store.rglob('*')
                           if path.is_file() and path.name.endswith(('.build.json', '.receipt.json'))])
         self.assertFalse([path for path in (self.store / 'snapshots').rglob('*') if path.is_file()])
+
+    def test_alias_race_failure_leaves_no_false_receipt_and_preserves_cas(self):
+        alias = (self.external / 'aliases' / 'rootyard').resolve()
+        args = self.args(artifact_store=str(self.store), output=str(alias))
+        sentinel = b'concurrent-alias-winner'
+        sentinel_mode = 0o640
+        real_link = os.link
+
+        def racing_link(src, dst, *arguments, **keywords):
+            if Path(dst) != alias:
+                return real_link(src, dst, *arguments, **keywords)
+            if Path(src).name.endswith('.alias-tmp'):
+                # The verified same-directory copy exists; a concurrent writer
+                # creates the destination immediately before publication.
+                Path(dst).write_bytes(sentinel)
+                os.chmod(dst, sentinel_mode)
+            else:
+                # Force the verified copy fallback as a cross-device link would.
+                raise OSError(errno.EXDEV, 'cross-device link')
+            return real_link(src, dst, *arguments, **keywords)
+
+        with mock.patch.object(build_native.os, 'link', racing_link):
+            with self.assertRaisesRegex(build_native.BuildError, 'already exists'):
+                self.build(self.events(), args=args)
+        self.assertEqual(alias.read_bytes(), sentinel)
+        self.assertEqual(alias.stat().st_mode & 0o777, sentinel_mode)
+        self.assertFalse(Path(str(alias) + '.build.json').exists())
+        self.assertFalse([path for path in self.store.rglob('*')
+                          if path.is_file() and path.name.endswith(('.build.json', '.receipt.json'))])
+        self.assertFalse([path for path in (self.store / 'snapshots').rglob('*') if path.is_file()])
+        self.assertFalse(list(alias.parent.glob('.' + alias.name + '.*.alias-tmp')))
+        objects = [path for path in (self.store / 'objects').rglob('*') if path.is_file()]
+        self.assertTrue(objects, 'the immutable content object may remain')
+        for path in objects:
+            self.assertEqual(path.read_bytes(), b'native-binary')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o555)
+            self.assertEqual(receipt.sha256_file(path), path.name)
 
     def test_source_digest_is_unchanged_and_bound_to_the_receipt(self):
         before = build_native.source_digest()
