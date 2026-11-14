@@ -622,14 +622,14 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
         )
         cls.batch_constants = validator_constants(cls.batch_validator)
 
-    def run_batch_validator(self, fixture):
+    def run_batch_validator(self, fixture, block=None):
         return subprocess.run(
             [sys.executable, "-",
              fixture["test_receipt"], fixture["serving_receipt"],
              fixture["test_binary"], fixture["serving_binary"],
              fixture["test_source"]],
             cwd=fixture["root"],
-            input=self.batch_validator,
+            input=self.batch_validator if block is None else block,
             text=True,
             capture_output=True,
         )
@@ -723,6 +723,24 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             self.assertNotIn("probe_toolchain", block)
             self.assertNotIn("capture_bound_inputs", block)
             self.assertNotIn("cargo_artifact_record", block)
+        self.assertNotIn("json.loads(pathlib.Path(test_receipt_path)", self.batch_validator)
+        self.assertNotIn("json.loads(pathlib.Path(serving_receipt_path)", self.batch_validator)
+        self.assertIn("test_receipt_bytes = pathlib.Path(test_receipt_path).read_bytes()",
+                      self.batch_validator)
+        self.assertIn("serving_receipt_bytes = pathlib.Path(serving_receipt_path).read_bytes()",
+                      self.batch_validator)
+        self.assertIn("sha256_bytes(test_receipt_bytes)", self.batch_validator)
+        self.assertIn("sha256_bytes(serving_receipt_bytes)", self.batch_validator)
+        self.assertIn("test_receipt = test_validated.payload", self.batch_validator)
+        self.assertIn("serving_receipt = serving_validated.payload", self.batch_validator)
+        read_at = self.batch_validator.index(
+            "test_receipt_bytes = pathlib.Path(test_receipt_path).read_bytes()")
+        bound_at = self.batch_validator.index(
+            "test_validated.receipt_sha256 == sha256_bytes(test_receipt_bytes)")
+        payload_at = self.batch_validator.index(
+            "test_receipt = test_validated.payload")
+        self.assertLess(read_at, bound_at)
+        self.assertLess(bound_at, payload_at)
         self.assertIn("source_root=workspace", self.batch_validator)
         self.assertIn("verify_source_files=True", self.batch_validator)
         self.assertIn("source_root=workspace", self.preflight_validator)
@@ -860,6 +878,45 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             self.assertEqual(parsed.schema, "v1")
             # ...but unproven acceptance is rejected before functional use.
             self.assert_batch_fails(weak, "expected exactly")
+
+    def test_batch_validator_rejects_receipt_swap_between_read_and_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_batch_fixture(temporary, "v2", self.batch_constants)
+            approved = json.loads(fixture["test_receipt"].read_text())
+            swapped = dict(approved, kind="native-binary")
+            swapped_path = fixture["root"] / "swapped-test.build.json"
+            swapped_path.write_text(json.dumps(swapped))
+            self.assertNotEqual(digest(swapped_path), digest(fixture["test_receipt"]))
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=fixture["root"], text=True).strip()
+            # The replacement is shape-valid and source-consistent, so the
+            # shared reader accepts it.  Only the raw-byte/SHA binding can stop
+            # its receipt hash from being paired with the first receipt's
+            # already-approved payload.
+            parsed = receipts.load_receipt(
+                swapped_path, source_root=fixture["root"],
+                binary_path=fixture["test_binary"], expected_commit=head,
+                verify_source_files=True)
+            self.assertEqual(parsed.payload["kind"], "native-binary")
+            trigger = "test_receipt_bytes = pathlib.Path(test_receipt_path).read_bytes()"
+            self.assertEqual(self.batch_validator.count(trigger), 1)
+            line = next(
+                line for line in self.batch_validator.splitlines() if trigger in line)
+            indent = line[:len(line) - len(line.lstrip())]
+            raced = self.batch_validator.replace(
+                line,
+                line + "\n" + indent + "pathlib.Path(" + repr(str(swapped_path))
+                + ").replace(test_receipt_path)", 1)
+            process = self.run_batch_validator(fixture, block=raced)
+            self.assertNotEqual(
+                process.returncode, 0,
+                "validator accepted a swapped receipt:\n" + process.stdout[-2000:])
+            self.assertIn("test receipt bytes changed between consumption and validation",
+                          process.stderr, process.stderr[-2000:])
+            self.assertFalse(
+                (fixture["root"]
+                 / "test-results/refstore/blob_git_gateway/build-pair.json").exists(),
+                "swapped receipt still emitted a build-pair manifest")
 
     def test_batch_validator_rejects_tampered_contracts(self):
         def edit_receipt(fixture, key, mutate):

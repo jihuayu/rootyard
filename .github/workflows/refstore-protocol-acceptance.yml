@@ -335,8 +335,6 @@ jobs:
 
           test_receipt_path, serving_receipt_path, test_binary, serving_binary, test_source = sys.argv[1:]
           workspace = pathlib.Path.cwd().resolve()
-          test_receipt = json.loads(pathlib.Path(test_receipt_path).read_text())
-          serving_receipt = json.loads(pathlib.Path(serving_receipt_path).read_text())
           head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 
           EXPECTED_CARGO_COMMIT = '64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
@@ -377,6 +375,9 @@ jobs:
                   for chunk in iter(lambda: source.read(1024 * 1024), b''):
                       digest.update(chunk)
               return digest.hexdigest()
+
+          def sha256_bytes(raw):
+              return hashlib.sha256(raw).hexdigest()
 
           def toolchain_record():
               path = workspace / 'test-results/refstore/cargo-fork.json'
@@ -495,15 +496,29 @@ jobs:
           record = toolchain_record()
           trusted = expected_toolchain(record)
           try:
+              # Consume the raw bytes that are about to be validated.  The
+              # receipt parser hashes the exact bytes it parsed; comparing that
+              # hash with this pre-read proves the payload used below belongs to
+              # those same bytes and did not change between reads.
+              test_receipt_bytes = pathlib.Path(test_receipt_path).read_bytes()
+              serving_receipt_bytes = pathlib.Path(serving_receipt_path).read_bytes()
               test_validated = receipts.load_receipt(
                   test_receipt_path, source_root=workspace, binary_path=test_binary,
                   expected_commit=head, verify_source_files=True)
               serving_validated = receipts.load_receipt(
                   serving_receipt_path, source_root=workspace, binary_path=serving_binary,
                   expected_commit=head, verify_source_files=True)
+          except OSError as error:
+              fail('unreadable receipt: ' + type(error).__name__)
           except receipts.ReceiptError as error:
               fail(str(error))
 
+          check(test_validated.receipt_sha256 == sha256_bytes(test_receipt_bytes),
+                'test receipt bytes changed between consumption and validation')
+          check(serving_validated.receipt_sha256 == sha256_bytes(serving_receipt_bytes),
+                'product receipt bytes changed between consumption and validation')
+          test_receipt = test_validated.payload
+          serving_receipt = serving_validated.payload
           check(test_validated.workspace_commit == head, 'test receipt workspace_commit differs from HEAD')
           check(serving_validated.workspace_commit == head, 'product receipt workspace_commit differs from HEAD')
           check(test_validated.schema == serving_validated.schema,
