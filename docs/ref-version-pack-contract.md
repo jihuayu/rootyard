@@ -29,7 +29,7 @@ vendor internals, database choice, performance or an implemented algorithm:
 | Authority/gate | `src/ref_store/core/contract.rs`; `migrations/139_ref_store_core.sql`; `migrations/145_ref_store_serving.sql` | One PG gate per repository with `tenant_id`, object format, `history_incarnation`, `authority_epoch`, `group_epoch`, `head_ref`, repo-wide `revision`. Serving binding fixes a single `pg_refstore` authority and Blob backend. |
 | Operation identity | `src/ref_store/contract.rs`; `src/ref_store/pg.rs`; `migrations/138_ref_store_operation_identity.sql` | Repository + issuer + lane + sequence + operation UUID + request digest; pending/committed/rejected/cancelled terminal; cancel-before-register tombstone; exact terminal replay; ambiguous commit is unknown. |
 | Ref mutation | `src/ref_store/core/pack_commit/plan.rs`, `closure.rs`, `proof.rs`, `pg_commit.rs` | Plan binds expected gate revision/digest, old refs/HEAD and old membership; closure captures old refs plus **all** old active packs and the new packs; a private native proof is required; refs, gate, membership, terminal, event and history are written in one short PG transaction. |
-| Pack identity | `src/ref_store/core/pack_commit/artifact.rs`; `migrations/142_ref_store_core_packs.sql` | Exactly one `.pack` and one `.idx` per registered pack; full locator (tenant/authority/generation/attempt/namespace/SHA-256/length), provider, backend identity, verified length/digest and `ArtifactSetDigest`. Membership is repository-wide and append-only. |
+| Pack identity | `src/ref_store/core/pack_commit/artifact.rs`; `migrations/142_ref_store_core_packs.sql` | Exactly one `.pack` and one `.idx` per registered pack; full locator (tenant/authority/generation/attempt/namespace/SHA-256/length), provider, backend identity, verified length/digest and `ArtifactSetDigest` over artifact fields. Pack/registration identity and append-only ledger rows are separate bindings; membership is repository-wide and append-only. |
 | Bytes/holds | `src/ref_store/core/artifact_hold/*`; `src/blob_store/protected.rs`; `src/blob_store/readback.rs` | Durable acquire/consume holds; upload only after consume; full provider read-back of length and SHA-256; no receipt on unknown upload; physical Blob delete is disabled. |
 | Strong read | `src/ref_store/core/pack_snapshot/serving_read.rs`; `materialize.rs`; `src/blob_git_gateway/snapshot.rs` | One capture under the core gate lock contains every ref, HEAD and every active registered pack; a transient pin protects exactly that capture; the materializer verifies every locator, SHA-256/length, pack/idx pair and native connectivity outside PG, then rechecks pin/generation/scope and cluster incarnation at T2. |
 | Roots/decisions | `src/ref_store/core/retention_root/*`; `src/ref_store/core/publication_decision/*`; `migrations/144_ref_store_core_roots_decisions.sql` | Durable roots retain a captured snapshot/ref set and exact pack locators; authorized publication installs a single-use decision and writes its effects with the terminal. These are library/serving components, not a general version DAG. |
@@ -119,8 +119,11 @@ existing registered packs. Each pack is exactly one pack + one idx with:
 - `pack_id`, globally unique `registration_id`, two A3 hold ids;
 - full Blob locator/provider/backend identity;
 - exact verified SHA-256 and length for both artifacts;
-- `ArtifactSetDigest` over the complete artifact rows and the immutable
-  registration/history rows in migration 142.
+- `ArtifactSetDigest` over exactly the artifact fields: role, slot, hold id,
+  full locator/provider/backend and verified digest/length.
+- Pack/registration identity is bound separately by `RegisteredPack::new` and
+  `packs_digest`; append-only registration/history rows are separate immutable
+  rows enforced by migration 142 constraints/triggers, not by this digest.
 
 The set digest is `H("ry-version-pack-set-v1", sorted(pack_id,
 registration_id, artifact_set_digest))`. Locators and digests are never rewritten
