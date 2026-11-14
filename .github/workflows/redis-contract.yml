@@ -41,10 +41,23 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_check_redis_contract.py'
       - name: Clippy all targets with state-redis and warnings denied
         run: cargo clippy --locked --all-targets --features state-redis -- -D warnings
+      - name: Build the fixed state-redis lib-test prebuilt artifact
+        timeout-minutes: 30
+        run: |
+          mkdir -p test-results/state-redis
+          python3 scripts/build_native_test.py \
+            --lib \
+            --features state-redis \
+            --package-debug 0 \
+            --strip-debuginfo \
+            --output test-results/state-redis/rootyard-lib-test \
+            > test-results/state-redis/build-summary.json
       - name: Run owned plaintext, TLS, untrusted-CA and restored-trust contract
         run: |
           mkdir -p test-results/state-redis
           python3 scripts/check_redis_contract.py \
+            --executable test-results/state-redis/rootyard-lib-test \
+            --build-receipt test-results/state-redis/rootyard-lib-test.build.json \
             --report test-results/state-redis/contract.json \
             --log-dir test-results/state-redis/logs
       - name: Upload Redis contract report
@@ -55,4 +68,6 @@ jobs:
           path: |
             test-results/state-redis/contract.json
             test-results/state-redis/logs/*.log
+            test-results/state-redis/rootyard-lib-test.build.json
+            test-results/state-redis/build-summary.json
           if-no-files-found: warn

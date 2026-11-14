@@ -695,5 +695,60 @@ class CaseRunnerTest(unittest.TestCase):
         self.assertEqual([0, 1, 0], parsed["observed_counts"])
 
 
+class RedisContractWorkflowTest(unittest.TestCase):
+    """Static guard: one explicit builder precedes the prebuilt-only checker."""
+
+    def setUp(self):
+        self.path = ROOT / ".github" / "workflows" / "redis-contract.yml"
+        self.text = self.path.read_text(encoding="utf-8")
+        self.lines = self.text.splitlines()
+
+    def _index(self, needle):
+        matches = [index for index, line in enumerate(self.lines) if needle in line]
+        self.assertEqual(1, len(matches), f"expected one {needle!r} line: {matches}")
+        return matches[0]
+
+    def test_fixed_prebuilt_builder_precedes_checker_and_receipt_upload(self):
+        self.assertEqual(1, self.text.count("scripts/build_native_test.py"))
+        self.assertEqual(1, self.text.count("scripts/check_redis_contract.py"))
+        builder = self._index("scripts/build_native_test.py")
+        checker = self._index("scripts/check_redis_contract.py")
+        self.assertLess(builder, checker)
+        builder_block = "\n".join(self.lines[builder:checker])
+        for required in (
+            "--lib",
+            "--features state-redis",
+            "--package-debug 0",
+            "--strip-debuginfo",
+            "--output test-results/state-redis/rootyard-lib-test",
+            "> test-results/state-redis/build-summary.json",
+        ):
+            self.assertIn(required, builder_block)
+        upload = self._index("uses: actions/upload-artifact@v4")
+        checker_block = "\n".join(self.lines[checker:upload])
+        for required in (
+            "--executable test-results/state-redis/rootyard-lib-test",
+            "--build-receipt test-results/state-redis/rootyard-lib-test.build.json",
+            "--report test-results/state-redis/contract.json",
+            "--log-dir test-results/state-redis/logs",
+        ):
+            self.assertIn(required, checker_block)
+        upload_block = "\n".join(self.lines[upload:])
+        self.assertIn("test-results/state-redis/rootyard-lib-test.build.json", upload_block)
+        self.assertIn("test-results/state-redis/build-summary.json", upload_block)
+        self.assertIn("if: always()", self.text)
+
+    def test_existing_toolchain_clippy_redis_fixture_and_budget_are_preserved(self):
+        for required in (
+            "rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy",
+            "rustup default 1.99.1",
+            "cargo clippy --locked --all-targets --features state-redis -- -D warnings",
+            "docker pull redis:7.2.6-alpine",
+            "timeout-minutes: 45",
+        ):
+            self.assertIn(required, self.text)
+        self.assertNotIn("cargo clean", self.text)
+
+
 if __name__ == "__main__":
     unittest.main()
