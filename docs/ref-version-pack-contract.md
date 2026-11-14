@@ -211,7 +211,7 @@ separately and are not an unbounded request-time closure.
 
 ### 2.5 Commit sets and atomic visibility
 
-Every committed version batch has one `CommitSet`. Canonical encoding: `L(x)=u64_be(len(x))||x`; integers are `u8/u32_be/u64_be`; UUID/OID/VersionId/digest fields are raw bytes (OID width from `object_format`); lists are `u32_be(count)||entries`, versions and results have unique ref names, versions are sorted by `(ref_name, VersionId)`, results by `ref_name`. Tags: authority 1=pg/2=raft; format 1=sha1/2=sha256; version kind 1=publish/2=delete/3=repack (publish/delete may mix; repack only in an all-repack maintenance set; delete uses target_tag=0, publish/repack target_tag=1); target/head/base/old/new tags 0=absent/1=present; `commit_set_tag` 0=absent/1=present; terminal kind 1=committed/2=rejected/3=cancelled; outcome 1=applied/2=not_applied; `reason` is UTF-8 (empty for applied).
+Every committed version batch has one `CommitSet`. Canonical encoding: `L(x)=u64_be(len(x))||x`; integers are `u8/u32_be/u64_be`; UUID/OID/VersionId/digest fields are raw bytes (OID width from `object_format`); lists are `u32_be(count)||entries`, versions and results have unique ref names, versions are sorted by `(ref_name, VersionId)`, results by `ref_name`. Tags: authority 1=pg/2=raft; format 1=sha1/2=sha256; version kind 1=publish/2=delete/3=repack (publish/delete may mix; repack only in an all-repack maintenance set; delete uses target_tag=0, publish/repack target_tag=1); target/head/base/old/new tags 0=absent/1=present; `commit_set_tag` 0=absent/1=present; terminal kind 1=committed/2=rejected/3=cancelled; outcome 1=applied/2=not_applied; `reason` is `L(code)`, where `code=""` for applied and a §2.5.2 canonical ASCII code for not_applied; no other reason string is valid.
 
 `CS = L("ry-version-commit-set-id-v1") || L(tenant) || L(repo) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || u64(authority_seq) || L(operation_id) || L(operation_digest) || version-list || head_tag [|| L(head_ref) || target_tag [|| L(head_oid)]]`.
 `version-entry = L(ref_name)||L(VersionId)||u8(version_kind)||u8(target_tag)||[L(target_oid)]`; `CommitSetId = SHA-256(CS)`. `CS` excludes every terminal byte/digest and every version-record digest; `VersionId` excludes `CommitSetId`.
@@ -219,9 +219,121 @@ Every committed version batch has one `CommitSet`. Canonical encoding: `L(x)=u64
 `T = L("ry-version-terminal-v1") || u8(commit_set_tag) [|| L(CommitSetId)] || L(tenant) || L(repo) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || u64(authority_seq) || L(operation_id) || L(operation_digest) || u8(terminal_kind) || result-list`.
 `result-entry = L(ref_name)||u8(outcome)||u8(old_tag)||[L(old_oid)]||u8(new_tag)||[L(new_oid)]||L(reason)`; `TerminalDigest = SHA-256(T)`. `T` is the exact ACK/replay body; a JSON wrapper may store it as base64 but must not re-encode it. `T` contains CommitSetId when `commit_set_tag=1`; it never contains TerminalDigest. A commit-set row may store TerminalDigest as an integrity column, but CommitSetId does not hash it. Order: versions/head -> CS/CommitSetId -> T/TerminalDigest -> rows+terminal -> ACK. The graph is acyclic.
 
+#### 2.5.1 Result semantics and terminal invariants
+
+`result-list` is `u32_be(count)` followed by every original request ref exactly
+once, sorted by `ref_name`; this is independent of the operation digest's
+original request order. `reason` is always present as `L(code)`; applied uses
+`L("")` and not_applied uses a §2.5.2 code.
+
+- `outcome=1 applied`: `old_oid` is the exact prior current OID replaced
+  (`old_tag=0` only when the ref was absent before the commit), `new_oid` is the
+  exact committed target (`new_tag=0` only for a delete), and `reason=""`.
+  These are resulting values and equal the version/target and resulting head
+  projection.
+- `outcome=2 not_applied`: `old_oid`/`new_oid` are the **frozen requested
+  precondition and target** from the operation preimage (§2.6), not a live
+  observed OID, not a resulting value, and never a zero OID. `old_tag` follows
+  the requested precondition; `new_tag` follows the requested target
+  (delete = absent). The authority must not substitute the current/observed OID
+  at rejection time. `reason` is one canonical §2.5.2 code. Observed/expected
+  diagnostics may be retained outside T but must never change T, the ACK body
+  or replay bytes.
+- `authority_seq`: for a committed set it is the new repository commit
+  revision; for rejected/cancelled terminals it is the captured expected gate
+  revision from the operation (the same revision as `expected_gate_revision`),
+  never a later observation. This makes T deterministic across PG/Raft.
+- `terminal_kind=1 committed`: `commit_set_tag=1`, at least one applied result,
+  and CS contains exactly the applied refs. An accepted-subset commit may add
+  not_applied results for the rejected refs.
+- `terminal_kind=2 rejected`: `commit_set_tag=0`, no VersionRecord/ref/head is
+  written, every original ref is not_applied, and there is at least one result.
+- `terminal_kind=3 cancelled`: `commit_set_tag=0`, `result-list` count is zero;
+  cancellation is an operation-level outcome, not a per-ref applied/not_applied
+  verdict.
+- No other combination is valid. A committed set with zero applied results, a
+  rejected terminal with a commit set or an applied result, a cancelled terminal
+  with results, or a result set that omits/duplicates a requested ref is a hard
+  encoding error, never repaired by a second terminal.
+
+#### 2.5.2 Stable reason-code vocabulary
+
+`reason` is not free text. For `outcome=2`, it is exactly one literal from this
+closed table, encoded as `L(ASCII)`; `outcome=1` uses `L("")`. The `id` column is
+a stable API/log ordinal and is not encoded in T. The literal is the canonical
+encoding, so existing applied T vectors remain byte-identical.
+
+| id | canonical reason | meaning |
+| --- | --- | --- |
+| 1 | `base_version_mismatch` | Supplied base VersionId is not the exact current head of the same ref/realm, or its generation/tombstone state contradicts the request. |
+| 2 | `old_oid_mismatch` | The requested old-OID/absence lease does not match the captured head and no base-specific mismatch took precedence. |
+| 3 | `prefix_conflict` | Strict `a` versus `a/b` ref-name conflict in the sealed selection. |
+| 4 | `head_deleted_without_retarget` | The kept HEAD branch would be deleted. |
+| 5 | `head_target_missing` | A retargeted HEAD does not name a final live branch. |
+| 6 | `missing_target` | The requested target OID is absent from the verified pack closure. |
+| 7 | `bad_object_type` | A branch target exists but is not a commit. |
+| 8 | `policy_denied` | Policy/RBAC/force-push/pull-flow denial, including the refinements below. |
+| 9 | `protected_branch` | Branch protection denied the update. |
+| 10 | `missing_approvals` | Required approvals/reviews are missing, including self-approval denial. |
+| 11 | `required_check_failed` | A required check failed or is untrusted. |
+| 12 | `lfs_locked` | An LFS lock denied the update. |
+| 13 | `ref_not_writable` | The ref namespace is not writable by this operation. |
+| 14 | `head_dependency_missing` | A sealed accepted update depends on a missing HEAD/ref fact. |
+| 15 | `no_ref_applied` | The accepted-subset selection accepted zero refs and no more specific sealed per-ref code exists; stamped on all results, not a generic atomic wrapper. |
+| 16 | `object_format_mismatch` | OID width/object format differs from the gate. |
+| 17 | `gate_not_found` | The repository gate is missing. |
+| 18 | `tenant_mismatch` | Tenant/binding mismatch. |
+| 19 | `history_incarnation_mismatch` | Restore/reprovision changed the history incarnation. |
+| 20 | `authority_epoch_mismatch` | Stale authority epoch. |
+| 21 | `group_epoch_mismatch` | Stale group epoch. |
+| 22 | `gate_digest_mismatch` | The exact gate digest changed. |
+| 23 | `revision_mismatch` | The expected gate revision changed. |
+| 24 | `mode_mismatch` | The sealed commit mode/selection binding changed. |
+| 25 | `old_membership_mismatch` | The captured old pack membership changed. |
+| 26 | `dependency_missing` | A sealed OBJECT dependency is no longer available. |
+| 27 | `dependency_corrupt` | A sealed dependency/pack failed byte or locator verification. |
+| 28 | `dependency_realm_mismatch` | A dependency is outside the tenant/repository/history/authority realm. |
+| 29 | `dependency_cycle_integrity` | A dependency cycle or corrupt edge was detected. |
+| 30 | `closure_too_large` | A closure/depth/fanout/byte bound was exceeded. |
+| 31 | `ref_generation_exhausted` | The per-ref generation counter cannot advance. |
+| 32 | `version_id_record_conflict` | A different VersionRecord was presented for an existing VersionId. |
+
+Rules:
+
+- Bounds: ASCII `^[a-z][a-z0-9_]{0,63}$`, 1..=64 bytes; no Unicode, spaces,
+  quotes, `:` or localization. Unknown, alias, refinement or localized strings
+  are invalid T, not a fallback.
+- Decision refinements map before T and never become separate bytes:
+  `force_push_denied`/`pull_flow_violation` -> `policy_denied`;
+  `self_approval_denied` -> `missing_approvals`;
+  `check_untrusted` -> `required_check_failed`.
+- The code is sealed with the per-ref verdict before the authority commit; PG
+  and Raft encode that sealed code. They must not re-derive a different code
+  from live timing, map iteration or SQL row order. If both the base and
+  old-OID checks fail, `base_version_mismatch` wins. If a recheck would select a
+  different code than the sealed verdict, or the two authorities cannot derive
+  the same outcome, it is an unknown/integrity outcome, not a second terminal.
+  A whole-operation failure
+  is stamped on all requested results and suppresses per-ref codes. In atomic
+  mode a per-ref failure is promoted to the whole batch with that same code on
+  every result; it is never replaced by `no_ref_applied`. That code is used only
+  for the accepted-subset case where the selection accepts zero refs and no
+  more specific sealed per-ref code exists; specific sealed per-ref codes take
+  precedence. Other ties use the prepare/proof evaluation order, never
+  observation order.
+- Codes never change meaning, and adding one is a contract revision. Renaming,
+  aliasing or reusing a code requires a new terminal domain tag. A condition
+  that cannot be represented by this table is not a rejected terminal: fail
+  closed as unknown/pending or return a typed non-terminal error; never invent
+  a code.
+
 Fixed vector (`11*32` means 32 bytes of 0x11; `33*20` means 20 bytes of 0x33; VersionId bytes are fixed synthetic inputs here, while §2.6 defines the upstream operation digest and its own vector): `tenant=00000000-0000-0000-0000-000000000001`, `repo=00000000-0000-0000-0000-000000000002`, `history=00000000-0000-0000-0000-000000000003`, `authority=1`, `authority_epoch=7`, `group_id=0`, `group_epoch=9`, `object_format=1`, `authority_seq=42`, `operation_id=00000000-0000-0000-0000-000000000004`, `operation_digest=11*32`, one version `(refs/heads/main, VersionId=22*32, kind=1, target_tag=1, target_oid=33*20)`, `head_tag=1`, `head_ref=refs/heads/main`, head `target_tag=1`, `head_oid=33*20`, `commit_set_tag=1`, `terminal_kind=1`, one result `(refs/heads/main, outcome=1, old_tag=1, old_oid=44*20, new_tag=1, new_oid=33*20, reason="")`. Expected: `CS` length 355; `CommitSetId=00fee34e0745b3b5557cd40620d276b623a63a3cdcbd469fbea796968e53f7e5`; `T` length 336; `TerminalDigest=081d960f2ce44a95fa19866189f83a604de5b6f78d9dfeac941ca7efddb92ab9`.
 Mixed delete/publish vector (same realm, fixed VersionId inputs, committed, `commit_set_tag=1`): versions `[(refs/heads/main, 22*32, kind=1, target_tag=1, target_oid=33*20), (refs/heads/topic, 66*32, kind=2, target_tag=0)]`, HEAD `refs/heads/main` -> `33*20`, results `[main applied old=44*20 new=33*20 reason="", topic applied old=77*20 new=absent reason=""]`; expected `CS` length 421, `CommitSetId=ffcd8426b98ee6724cffc3c2918ec6450c86a33203c0cc10f2c3820c0fddd6ad`, `T` length 399, `TerminalDigest=24d30b09e01477656e53d93703cd968d1820f43edd5a985f77b684962fbfe37a`.
 Identity-chain vector (same realm and operation as the fixed vector, `authority_seq=42`, ref main, generation 1, kind=1, target=33*20, record-level base absent, deps empty, pack set one entry `(pack_id=99*16, registration_id=aa*16, artifact_set_digest=bb*32)`, committed, `commit_set_tag=1`, result applied old=44*20 new=33*20; its `operation_digest=11*32` remains a synthetic fixed input, not the §2.6 absent-base value): `VersionId=7ed6b0d771d7133059718f42fa2dab89fb50003d57128536ffb908d11816c373`; `PackSetDigest=fd3461afbd34e518f8bf1d6c677f2a023346733925ec9cd6eb7ca76f3c1a4c22`; with that VersionId the single-version `CS` is 355 bytes and `CommitSetId=9ffcf9731fb04dd56ceac420d7707c1b2b792deaa431d0bd35e3f53bee721932`, `record_digest=01ef64d5effb40e4ee835437e78eeb31a9b7781500767ce9255cfb8e5e238da9`, `T` is 336 bytes and `TerminalDigest=25de02843735a28ec5b4fd178cb06d12de16e71a46915acb4a3cd99ee572da19`.
+
+All-rejected vector (accepted-subset mode, same synthetic realm/operation as the fixed vector, `authority_seq=42` is the captured expected revision, `commit_set_tag=0`, `terminal_kind=2`): results sorted by ref are `(refs/heads/main, not_applied, old_tag=1 old=44*20, new_tag=1 new=33*20, reason="base_version_mismatch")` and `(refs/heads/topic, not_applied, old_tag=1 old=77*20, new_tag=0, reason="old_oid_mismatch")`. The live observed old OID for main is `99*20`; it is a diagnostic and is not an input, so T still uses the requested `44*20`. Expected `T` length 396; `TerminalDigest=7a610bec25315ef167631587e824b5ba03802e30c9f9b3f397d4fd5142eedb7f`.
+Mixed accepted/rejected vector (same CS accepted main version as the fixed vector, `commit_set_tag=1`, `terminal_kind=1`): results sorted by ref are `(refs/heads/feature, not_applied, old_tag=0, new_tag=1 new=88*20, reason="policy_denied")`, `(refs/heads/main, applied, old_tag=1 old=44*20, new_tag=1 new=33*20, reason="")`, and `(refs/heads/topic, not_applied, old_tag=1 old=77*20, new_tag=0, reason="old_oid_mismatch")`. Expected `CS` length 355, `CommitSetId=00fee34e0745b3b5557cd40620d276b623a63a3cdcbd469fbea796968e53f7e5`; `T` length 493; `TerminalDigest=6a71a85aadbb0c4e0f44e59faa293e137a20819c5b57af7c34c227e1aae6d6fd`.
+Cancelled vector (same synthetic realm/operation, `commit_set_tag=0`, `terminal_kind=3`, empty result list; `authority_seq=42` captured expected revision): `T` length 206; `TerminalDigest=b5d3703c67a4b055716eb806c9c6e51700a11fb1a9eae1a8ac5a3304bde9900e`.
 
 Commit set, versions, edges, ref-heads, membership and terminal are one authority-atomic unit: readers see all or none; a rejected ref gets no version. A committed set has at least one version and `commit_set_tag=1`; rejected/cancelled terminals use `commit_set_tag=0`.
 
@@ -399,7 +511,7 @@ The required order is:
 2. **Durable bytes + holds.** A3 acquire/consume durable Blob holds before upload; upload each pack/idx to a unique attempt locator; fully read back length, SHA-256 and the actually opened backend. A4 registration binds the exact pair, both holds, planned content and parent digest. A missing/failed registration leaves retained holds and no publishable version; provider success is not a byte proof.
 3. **Proof + decisions.** Capture the authoritative base and candidate dependency versions/packs; pin/hold old packs through proof and commit. Verify full native connectivity, exact ref/HEAD result, exact accepted set, dependency realms and all bounds. The verifier selects exact OBJECT dependencies; the plan/proof binds them. A PG single-use decision or [PROPOSED/RAFT] signed grant binds operation, realm, base, selection, proof and deps. No ref mutation precedes this step.
 4. **Authoritative atomic commit.** PG: one short transaction takes the 138 operation/lane prefix, repository/usage/gate locks, rechecks base/dependencies, writes ref heads/current refs + version rows + commit set + edges + membership + terminal + event, and consumes the decision. Raft: one deterministic applied command validates local head/realm/grant/dependency indexes and writes the same logical records; no PG query, Blob read or native child in apply.
-5. **ACK and replay.** Only an acknowledged authority commit produces the ACK/report-status, carrying the exact commit set and per-ref terminal (version IDs after commit). Identical replay returns stored terminal bytes. `COMMIT`/apply ambiguity returns unknown with the operation identity; query the same operation. Do not retry with a new identity or convert unknown to `ng`/failure.
+5. **ACK and replay.** Only an acknowledged authority commit produces the ACK/report-status, carrying the exact commit set and per-ref terminal (version IDs after commit). Identical replay returns stored terminal bytes, including a rejected/cancelled T with its sealed reason codes; it never re-renders T from live observations. `COMMIT`/apply ambiguity returns unknown with the operation identity; query the same operation. Do not retry with a new identity or convert unknown to `ng`/failure.
 
 Cancellation shares the same operation prefix. PG cancel/commit has exactly one
 winner in the gate/operation transaction. Raft cancel must be a command in the
@@ -412,14 +524,17 @@ querying the original operation.
 
 - **Atomic** (`CommitMode::Atomic`): all requested updates and all their versions
   apply or none do. A failure at any ref yields no version/ref/HEAD effect for the
-  batch, one rejected terminal, and an unchanged gate revision.
+  batch, one rejected terminal with all refs not_applied using the frozen
+  requested old/new values and §2.5.2 codes, and an unchanged gate revision. A
+  rejected terminal has no commit set.
 - **Accepted subset** (`CommitMode::AcceptedSubset`): the sealed selection fixes
   every original ref verdict in original request order. Only accepted refs get
   versions and a commit set; rejected refs retain their prior heads and are
-  reported in the terminal. Shared pack/old-base corruption fails the whole
-  operation. Final proof/decision consumption cannot silently shrink the sealed
-  accepted set. An all-rejected selection writes a rejected terminal and no
-  commit set.
+  reported in the terminal with their frozen requested old/new values and sealed
+  §2.5.2 code, never a post-rejection observed OID. Shared pack/old-base
+  corruption fails the whole operation as all-ref rejection. Final
+  proof/decision consumption cannot silently shrink the sealed accepted set. An
+  all-rejected selection writes a rejected terminal and no commit set.
 - Same old version/OID competition: the authority's current-head CAS permits
   exactly one new base from a given head. The loser must not produce a second
   version; if the same new OID is pushed, it is still a different future version
@@ -553,8 +668,10 @@ Rules:
 
 Both implementations must return the same canonical `VersionRecord`,
 `CommitSet`, dependency closure and immutable terminal bytes for the same logical
-operation. The shared tests below run the same contract against an adapter, not
-two unrelated test suites.
+operation, including not_applied results, frozen requested old/new values and
+sealed §2.5.2 reasons. Live observed OIDs, timing and evaluation order are not
+terminal inputs. The shared tests below run the same contract against an adapter,
+not two unrelated test suites.
 
 No false transaction is allowed:
 
@@ -578,7 +695,7 @@ unchanged until its exit criteria pass. [CURRENT] C0 is this document only.
 | # | Scope | Likely files | Exit check |
 | --- | --- | --- | --- |
 | C0 | This contract and state diagram | `docs/ref-version-pack-contract.md`, design index | Docs/link checks pass; no production/migration/Cargo changes |
-| C1 | Pure identity/edge/limit types and canonical digests; no schema/route | `src/ref_store/core/ref_version/{mod,contract,digest,limits}.rs` | VersionId/OperationDigest/PackSetDigest/CommitSetId/record_digest/T vectors fixed before C2/C7; no PG/Blob/native |
+| C1 | Pure identity/edge/limit types and canonical digests; no schema/route | `src/ref_store/core/ref_version/{mod,contract,digest,limits}.rs` | VersionId/OperationDigest/PackSetDigest/CommitSetId/record_digest/T and rejected/cancelled vectors fixed before C2/C7; no PG/Blob/native |
 | C2 | PG version/head/commit-set/edge tables and authoritative insert under the existing 138/gate lock prefix | next safe migration; `core/ref_version/pg*.rs`; existing `pack_commit/pg_commit.rs` extension point | Real-PG tests for CAS, atomic/subset, tombstone/ABA, replay/unknown; no read route |
 | C3 | Bind current A4 registered pack identities and verifier-selected OBJECT deps; prove dependency pinning through commit | `core/ref_version/*`, `pack_commit/{plan,closure,proof,artifact}.rs` extension points | Cross-tenant/missing/corrupt/depth/byte/cycle tests; no default serving change |
 | C4 | Strong snapshot records/binds version heads/deps without weakening the current fallback | `core/pack_snapshot/*` extension; current strong tests | Full-snapshot tests remain green; version IDs optional until enabled |
@@ -605,7 +722,9 @@ Pure contract (`tests/ref_version_contract.rs` proposal): `version_id_binds_tena
 `mixed_publish_delete_commit_set_is_canonical`; `per_version_kind_is_not_inferred_from_target`;
 `version_id_record_binding_is_immutable`; `record_digest_exact_preimage`;
 `pack_set_digest_exact_preimage`; `operation_digest_binds_base_selector_kind_and_request_order`;
-`base_version_change_changes_operation_and_version_id`.
+`base_version_change_changes_operation_and_version_id`;
+`not_applied_encodes_requested_old_new_and_frozen_reason`;
+`terminal_optional_fields_and_result_order_are_exact`.
 
 PG authority (`tests/ref_version_pg.rs` proposal, ignored, real PG):
 `same_old_version_only_one_writer_wins` (a competing same-new-OID push still
@@ -618,13 +737,15 @@ cannot produce a second version from the same base);
 `cross_tenant_history_authority_dependency_rejected`;
 `root_pin_backup_unknown_operation_protect_versions_and_packs`;
 `unknown_operation_is_not_collected_by_ttl`;
+`rejected_subset_uses_frozen_request_values_and_no_observed_oid`;
 `head_protection_prefix_and_force_with_lease_remain_authoritative`.
 
 Raft/distributed (`tests/ref_version_raft.rs` proposal, ignored, real quorum):
 the same logical contract suite through the Raft adapter;
 `read_index_not_pg_projection`; `partition_fails_closed_without_pg_ref_fallback`;
 `apply_replay_is_idempotent`; `projection_lag_does_not_rewrite_terminal`;
-`raft_cancel_and_commit_have_one_log_order`; `grant_replay_cannot_install_twice`.
+`pg_raft_rejected_terminal_bytes_match`; `raft_cancel_and_commit_have_one_log_order`;
+`grant_replay_cannot_install_twice`.
 
 Regression inputs for the matrix (existing targets, not run here):
 `tests/ref_store_packs.rs`, `tests/ref_store_operations.rs`,
