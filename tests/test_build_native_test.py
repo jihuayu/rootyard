@@ -72,6 +72,9 @@ class Fixture(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
+        self.external = Path(tempfile.mkdtemp(prefix="rootyard-test-producer-cas-"))
+        self.addCleanup(shutil.rmtree, self.external, ignore_errors=True)
+        self.store = self.external / "store"
         (self.root / "src").mkdir()
         (self.root / "tests" / "fixtures").mkdir(parents=True)
         (self.root / "tests" / "serving_support").mkdir()
@@ -174,7 +177,7 @@ class Fixture(unittest.TestCase):
     def args(self, **overrides):
         values = dict(lib=True, test=None, features=None, no_default_features=False,
                       package_debug=None, strip_debuginfo=False,
-                      output=str(self.output))
+                      output=str(self.output), artifact_store=None)
         values.update(overrides)
         return argparse.Namespace(**values)
 
@@ -478,6 +481,124 @@ class RunRefusalTests(Fixture):
         with self.assertRaises(BuildError):
             self.run_with(self.events()[:-1])
         self.assert_no_output()
+
+
+class CasProducerTests(Fixture):
+    def cas_args(self, **overrides):
+        overrides.setdefault("artifact_store", str(self.store))
+        return self.args(**overrides)
+
+    def test_cas_lib_snapshot_and_legacy_output_alias(self):
+        report = self.run_with(self.events(fresh=True), args=self.cas_args())
+        stored = report["artifact_store"]
+        snapshot = Path(stored["binary"])
+        canonical = Path(stored["receipt"])
+        build_receipt = Path(stored["build_receipt"])
+        cas_object = Path(stored["object"])
+        original_sha = receipt.sha256_file(self.lib_artifact)
+        self.assertEqual(report["binary_sha256"], original_sha)
+        self.assertEqual(report["original_artifact_sha256"], original_sha)
+        self.assertEqual(report["cargo_artifacts"][0]["executable"], str(self.lib_artifact))
+        self.assertEqual(report["cargo_artifacts"][0]["executable_sha256"], original_sha)
+        self.assertEqual(report["cargo_artifacts"][0]["fresh"], True)
+        self.assertEqual(snapshot.read_bytes(), self.output.read_bytes())
+        self.assertEqual(canonical.read_bytes(), build_receipt.read_bytes())
+        self.assertEqual(canonical.read_bytes(), self.receipt_path().read_bytes())
+        for path, mode in ((cas_object, 0o555), (snapshot, 0o555), (self.output, 0o555),
+                           (canonical, 0o444), (build_receipt, 0o444),
+                           (self.receipt_path(), 0o444)):
+            self.assertTrue(path.is_file(), path)
+            self.assertEqual(path.stat().st_mode & 0o777, mode, path)
+        self.assertNotEqual(os.stat(snapshot).st_ino, os.stat(self.lib_artifact).st_ino)
+        self.assertNotEqual(os.stat(cas_object).st_ino, os.stat(self.lib_artifact).st_ino)
+        alias = stored["output_alias"]
+        self.assertEqual(alias["path"], str(self.output.resolve()))
+        self.assertEqual(alias["receipt"], str(self.receipt_path().resolve()))
+        self.assertIn(alias["method"], ("hardlink", "copy"))
+        self.assertEqual(alias["same_inode_as_cas_object"], alias["method"] == "hardlink")
+        validated = receipt.load_receipt(
+            canonical, binary_path=snapshot, expected_commit="a" * 40,
+            expected_binary_sha256=original_sha)
+        self.assertEqual(validated.binary_sha256, original_sha)
+        self.lib_artifact.write_bytes(b"changed-mutable-artifact")
+        self.assertEqual(receipt.sha256_file(snapshot), original_sha)
+        self.assertEqual(receipt.sha256_file(self.output), original_sha)
+
+    def test_cas_integration_reuses_one_object_across_outputs(self):
+        output_a = self.root / "relocated" / "example-a"
+        output_b = self.root / "relocated" / "example-b"
+        args_a = self.cas_args(lib=False, test="example", output=str(output_a))
+        args_b = self.cas_args(lib=False, test="example", output=str(output_b))
+        first = self.run_with(
+            self.events(kind="test", name="example", fresh=False), args=args_a)
+        second = self.run_with(
+            self.events(kind="test", name="example", fresh=True), args=args_b)
+        self.assertEqual(first["artifact_store"]["object"],
+                         second["artifact_store"]["object"])
+        self.assertEqual(first["artifact_store"]["config_key"],
+                         second["artifact_store"]["config_key"])
+        self.assertNotEqual(first["artifact_store"]["binary"],
+                            second["artifact_store"]["binary"])
+        self.assertEqual(first["cargo_artifacts"][0]["fresh"], False)
+        self.assertEqual(second["cargo_artifacts"][0]["fresh"], True)
+        self.assertTrue(second["artifact_store"]["reused"])
+        self.assertEqual(second["artifact_store"]["copied_bytes"], 0)
+        self.assertEqual(output_a.read_bytes(), self.test_artifact.read_bytes())
+        self.assertEqual(output_b.read_bytes(), self.test_artifact.read_bytes())
+        self.assertNotEqual(self.receipt_path(output_a).read_bytes(),
+                            self.receipt_path(output_b).read_bytes())
+        self.assertEqual(self.receipt_path(output_a).read_bytes(),
+                         Path(first["artifact_store"]["receipt"]).read_bytes())
+        self.assertEqual(self.receipt_path(output_b).read_bytes(),
+                         Path(second["artifact_store"]["receipt"]).read_bytes())
+
+    def test_cas_output_reuse_is_refused_without_overwrite(self):
+        args = self.cas_args()
+        self.run_with(self.events(), args=args)
+        before_output = self.output.read_bytes()
+        before_receipt = self.receipt_path().read_bytes()
+        calls = len(self.popen_calls)
+        with self.assertRaisesRegex(BuildError, "already exists"):
+            self.run_with(self.events(), args=args)
+        self.assertEqual(len(self.popen_calls), calls)
+        self.assertEqual(self.output.read_bytes(), before_output)
+        self.assertEqual(self.receipt_path().read_bytes(), before_receipt)
+
+    def test_cas_symlink_output_is_refused_before_build(self):
+        sentinel = self.external / "sentinel"
+        sentinel.write_text("keep")
+        self.output.parent.mkdir(parents=True)
+        self.output.symlink_to(sentinel)
+        with self.assertRaisesRegex(BuildError, "symlink"):
+            self.run_with(self.events(), args=self.cas_args())
+        self.assertEqual(self.popen_calls, [])
+        self.assertEqual(sentinel.read_text(), "keep")
+        self.assertFalse(self.store.exists())
+
+    def test_cas_config_key_binds_lib_support_closure(self):
+        output_a = self.root / "relocated" / "lib-a"
+        output_b = self.root / "relocated" / "lib-b"
+        first = self.run_with(self.events(), args=self.cas_args(output=str(output_a)))
+        (self.root / "tests" / "serving_support" / "support.rs").write_text(
+            "pub fn s() { /* changed */ }\n")
+        second = self.run_with(self.events(), args=self.cas_args(output=str(output_b)))
+        self.assertNotEqual(first["artifact_store"]["config_key"],
+                            second["artifact_store"]["config_key"])
+        self.assertEqual(first["artifact_store"]["object"],
+                         second["artifact_store"]["object"])
+
+    def test_cas_alias_failure_leaves_no_false_valid_receipt(self):
+        with mock.patch.object(bnt, "_publish_immutable_alias",
+                               side_effect=BuildError("alias refused")):
+            with self.assertRaisesRegex(BuildError, "alias refused"):
+                self.run_with(self.events(), args=self.cas_args())
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.receipt_path().exists())
+        self.assertFalse([path for path in self.store.rglob("*")
+                          if path.is_file() and
+                          path.name.endswith((".build.json", ".receipt.json"))])
+        self.assertFalse([path for path in (self.store / "snapshots").rglob("*")
+                          if path.is_file()])
 
 
 if __name__ == "__main__":
