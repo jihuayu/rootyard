@@ -106,6 +106,30 @@ class ArtifactFixture:
         self.rows.append(row)
         return binary, build_receipt, record
 
+    def set_nested_implicit(self, target, value):
+        """Rewrite one selected record, its sealed copy and its receipts in sync."""
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        row = next(
+            item for item in manifest["artifacts"]
+            if item.get("target") == target
+        )
+        record = row["artifact_store"]
+        record["implicit"] = value
+        for sealed in manifest["artifact_store"]["sealed"]:
+            if sealed.get("binary") == record.get("binary"):
+                sealed["implicit"] = value
+        receipt = Path(record["receipt"])
+        build_receipt = Path(record["build_receipt"])
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        payload["artifact_store"] = record
+        receipt_bytes = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+        for path in (receipt, build_receipt):
+            os.chmod(path, 0o644)
+            path.write_bytes(receipt_bytes)
+            os.chmod(path, 0o444)
+        self.manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return row, record
+
     def create(self):
         snapshot_bin, snapshot_receipt, _ = self._seal("bin", "rootyard", "rootyard")
         view_bin, view_receipt, _ = self._seal("bin", "rootyard-view-lab", "rootyard-view-lab")
@@ -244,6 +268,16 @@ class ExportNativeArtifactsTest(unittest.TestCase):
         self.assertEqual(exports["ROOTYARD_ARTIFACT_STORE"], str(self.fixture.store))
         self.assertEqual(exports["ROOTYARD_BATCH_MANIFEST"], str(self.fixture.manifest.resolve()))
         self.assertEqual(exports["ROOTYARD_BATCH_MANIFEST_SHA256"], digest(self.fixture.manifest))
+        manifest = json.loads(self.fixture.manifest.read_text(encoding="utf-8"))
+        bin_row = next(row for row in manifest["artifacts"] if row["target"] == "rootyard")
+        test_row = next(
+            row for row in manifest["artifacts"]
+            if row["target"] == "ref_store_snapshot_backup_fixture"
+        )
+        self.assertIs(bin_row["implicit"], False)
+        self.assertIs(bin_row["artifact_store"]["implicit"], False)
+        self.assertNotIn("implicit", test_row)
+        self.assertIs(test_row["artifact_store"]["implicit"], False)
 
     def test_rejects_non_cas_manifest(self):
         manifest = json.loads(self.fixture.manifest.read_text(encoding="utf-8"))
@@ -265,6 +299,28 @@ class ExportNativeArtifactsTest(unittest.TestCase):
         self.fixture.manifest.write_text(json.dumps(manifest), encoding="utf-8")
         _, process = self.fixture.run("--bin", "rootyard=ROOTYARD_BIN", expect=1)
         self.assertIn("implicit", process.stderr)
+
+    def test_rejects_selected_nested_test_record_implicit_true(self):
+        self.fixture.set_nested_implicit("ref_store_snapshot_backup_fixture", True)
+        _, process = self.fixture.run(
+            "--test", "ref_store_snapshot_backup_fixture=ROOTYARD_SNAPSHOT_FIXTURE",
+            expect=1,
+        )
+        self.assertIn("selected artifact_store record implicit", process.stderr)
+
+    def test_rejects_selected_nested_bin_record_implicit_true(self):
+        self.fixture.set_nested_implicit("rootyard", True)
+        _, process = self.fixture.run("--bin", "rootyard=ROOTYARD_BIN", expect=1)
+        self.assertIn("selected artifact_store record implicit", process.stderr)
+
+    def test_rejects_selected_nested_record_non_false_implicit(self):
+        for value in (0, None, "false"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                fixture = ArtifactFixture(temporary)
+                fixture.create()
+                fixture.set_nested_implicit("rootyard", value)
+                _, process = fixture.run("--bin", "rootyard=ROOTYARD_BIN", expect=1)
+                self.assertIn("selected artifact_store record implicit", process.stderr)
 
     def test_rejects_writable_sealed_binary(self):
         os.chmod(self.fixture.snapshot_bin, 0o755)

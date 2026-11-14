@@ -760,6 +760,13 @@ class ExpectedSourceCommitCases:
         self.assertEqual(report["batch_manifest_status"], "passed")
         self.assertEqual(report["candidate_application_sha256"],
                          digest(app_binary))
+        helper_entry = self.manifest_entry(
+            manifest, "test", helper["cargo_artifacts"][0]["target"])
+        app_entry = self.manifest_entry(manifest, "bin", binding.APP_TARGET)
+        self.assertNotIn("implicit", helper_entry)
+        self.assertIs(helper_entry["artifact_store"]["implicit"], False)
+        self.assertIs(app_entry["implicit"], False)
+        self.assertIs(app_entry["artifact_store"]["implicit"], False)
 
     def test_v2_cas_missing_or_corrupt_object_fails(self):
         for mode in ("missing", "corrupt"):
@@ -847,6 +854,34 @@ class ExpectedSourceCommitCases:
                     "method", "hardlink"))
 
         with self.assertRaisesRegex(AssertionError, "hardlink"):
+            self.validate_cas_pair(
+                helper, app, helper_record, app_record, manifest,
+                mutate=mutate)
+
+    def test_v2_cas_selected_helper_nested_record_implicit_true_fails(self):
+        (helper, app, helper_record, app_record, manifest,
+         manifest_path, helper_paths, app_paths) = self.cas_fixture()
+
+        def mutate(helper_receipt, app_receipt):
+            self.mutate_cas_record(
+                manifest_path, helper_record, helper_paths,
+                lambda record: record.__setitem__("implicit", True))
+
+        with self.assertRaisesRegex(AssertionError, "implicit"):
+            self.validate_cas_pair(
+                helper, app, helper_record, app_record, manifest,
+                mutate=mutate)
+
+    def test_v2_cas_selected_rootyard_bin_nested_record_implicit_true_fails(self):
+        (helper, app, helper_record, app_record, manifest,
+         manifest_path, helper_paths, app_paths) = self.cas_fixture()
+
+        def mutate(helper_receipt, app_receipt):
+            self.mutate_cas_record(
+                manifest_path, app_record, app_paths,
+                lambda record: record.__setitem__("implicit", True))
+
+        with self.assertRaisesRegex(AssertionError, "implicit"):
             self.validate_cas_pair(
                 helper, app, helper_record, app_record, manifest,
                 mutate=mutate)

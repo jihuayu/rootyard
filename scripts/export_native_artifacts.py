@@ -173,6 +173,10 @@ def _record(row, store_root, sealed, label):
         f"{label}: artifact_store record is not exactly one sealed entry",
     )
     require(record.get("schema") == STORE_SCHEMA, f"{label}: artifact_store record schema is invalid")
+    require(
+        record.get("implicit") is False,
+        f"{label}: selected artifact_store record implicit must be false",
+    )
     require(record.get("root") == str(store_root), f"{label}: artifact_store record root is foreign")
     require(record.get("kind") == row.get("kind"), f"{label}: artifact_store record kind is foreign")
     require(record.get("target") == row.get("target"), f"{label}: artifact_store record target is foreign")
