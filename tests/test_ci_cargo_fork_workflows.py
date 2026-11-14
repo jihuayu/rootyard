@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Static contracts for the formal Rust CI CargoFork wiring.
 
-These tests read workflow text and parse YAML; they never run a workflow, Cargo,
-a container, a database or a network request.
+These tests read workflow text, parse YAML, and statically parse Python test
+sources with ``ast``; they never run a workflow, Cargo, a container, a database
+or a network request.
 """
 from __future__ import annotations
 
+import ast
+import re
 import unittest
+import warnings
 from pathlib import Path
 
 try:  # PyYAML is optional on the runner; the structural checks never need it.
@@ -20,6 +24,278 @@ REVISION = "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"
 RELEASE = "1.101.0"
 SETUP = "scripts/install_ci_cargo_fork.sh install"
 VERIFY = "scripts/install_ci_cargo_fork.sh verify"
+INSTALLER = "install_ci_cargo_fork.sh"
+INSTALLER_UNIT_TEST = "test_install_ci_cargo_fork.py"
+COMPILER_EXECUTABLES = frozenset({"cargo", "rustc", "rustup"})
+_PROCESS_CALLS = frozenset({
+    "subprocess.run",
+    "subprocess.Popen",
+    "subprocess.call",
+    "subprocess.check_call",
+    "subprocess.check_output",
+    "subprocess.getoutput",
+    "subprocess.getstatusoutput",
+    "os.system",
+    "os.popen",
+    "os.execv",
+    "os.execve",
+    "os.execvp",
+    "os.execvpe",
+    "os.execl",
+    "os.execle",
+    "os.execlp",
+    "os.execlpe",
+    "os.spawnv",
+    "os.spawnve",
+    "os.spawnvp",
+    "os.spawnvpe",
+    "os.spawnl",
+    "os.spawnle",
+    "os.spawnlp",
+    "os.spawnlpe",
+    "asyncio.create_subprocess_exec",
+    "asyncio.create_subprocess_shell",
+})
+
+
+def _import_aliases(tree: ast.AST) -> dict[str, str]:
+    """Resolve the small set of execution modules used by the test tree."""
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in ("asyncio", "os", "subprocess"):
+                    aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module in (
+            "asyncio",
+            "os",
+            "subprocess",
+        ):
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = node.module + "." + alias.name
+    return aliases
+
+
+def _resolved_name(node: ast.AST, aliases: dict[str, str]) -> str:
+    if isinstance(node, ast.Name):
+        return aliases.get(node.id, node.id)
+    if isinstance(node, ast.Attribute):
+        base = _resolved_name(node.value, aliases)
+        return (base + "." if base else "") + node.attr
+    return ""
+
+
+def _walk_scope_nodes(node: ast.AST):
+    """Yield nodes in one lexical scope, never descending into a nested scope."""
+    nested = (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef, ast.Lambda)
+    if isinstance(node, nested):
+        return
+    yield node
+    for child in ast.iter_child_nodes(node):
+        yield from _walk_scope_nodes(child)
+
+
+def _target_names(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return {node.attr}
+    if isinstance(node, ast.Starred):
+        return _target_names(node.value)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        names: set[str] = set()
+        for item in node.elts:
+            names.update(_target_names(item))
+        return names
+    return set()
+
+
+def _mentions_installer(node: ast.AST, tainted: set[str]) -> bool:
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Constant)
+            and isinstance(child.value, str)
+            and INSTALLER in child.value
+        ):
+            return True
+        if isinstance(child, ast.Name) and child.id in tainted:
+            return True
+        if isinstance(child, ast.Attribute) and child.attr in tainted:
+            return True
+    return False
+
+
+def _scope_taint(statements: list[ast.stmt], inherited: set[str]) -> set[str]:
+    """Names in this scope that carry the installer path, including local aliases."""
+    tainted = set(inherited)
+    assignments: list[tuple[set[str], ast.AST]] = []
+    for statement in statements:
+        for node in _walk_scope_nodes(statement):
+            if isinstance(node, ast.Assign):
+                names: set[str] = set()
+                for target in node.targets:
+                    names.update(_target_names(target))
+                assignments.append((names, node.value))
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                assignments.append((_target_names(node.target), node.value))
+            elif isinstance(node, ast.NamedExpr):
+                assignments.append((_target_names(node.target), node.value))
+    changed = True
+    while changed:
+        changed = False
+        for names, value in assignments:
+            if names and _mentions_installer(value, tainted):
+                before = len(tainted)
+                tainted.update(names)
+                changed = changed or len(tainted) != before
+    return tainted
+
+
+def _command_nodes(call: ast.Call, name: str) -> list[ast.AST]:
+    if name.startswith("subprocess."):
+        nodes = list(call.args[:1])
+        for keyword in call.keywords:
+            if keyword.arg in ("args", "cmd", "command"):
+                nodes.append(keyword.value)
+        return nodes
+    if name in ("os.system", "os.popen"):
+        return list(call.args[:1])
+    if name.startswith(("os.exec", "os.spawn")):
+        return list(call.args)
+    if name == "asyncio.create_subprocess_shell":
+        return list(call.args[:1])
+    if name == "asyncio.create_subprocess_exec":
+        return list(call.args)
+    return []
+
+
+def _contains_installer_literal(node: ast.AST) -> bool:
+    return any(
+        isinstance(child, ast.Constant)
+        and isinstance(child.value, str)
+        and INSTALLER in child.value
+        for child in ast.walk(node)
+    )
+
+
+def _executable_name(command: ast.AST) -> str | None:
+    if isinstance(command, ast.Constant) and isinstance(command.value, str):
+        value = command.value.strip()
+        if not value:
+            return None
+        token = value.split()[0]
+    elif isinstance(command, (ast.List, ast.Tuple)) and command.elts:
+        first = command.elts[0]
+        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+            return None
+        token = first.value
+    else:
+        return None
+    return token.rsplit("/", 1)[-1]
+
+
+class _ProcessExecutionScanner(ast.NodeVisitor):
+    """Find actual process execution, never source reading or string comparison."""
+
+    def __init__(self, filename: str) -> None:
+        self.filename = filename
+        self.aliases: dict[str, str] = {}
+        self.taints: list[set[str]] = []
+        self.function_depth = 0
+        self.findings: list[dict[str, object]] = []
+
+    def scan(self, tree: ast.AST) -> list[dict[str, object]]:
+        self.aliases = _import_aliases(tree)
+        self.visit(tree)
+        return self.findings
+
+    def _visit_scope(self, statements: list[ast.stmt]) -> None:
+        self.taints.append(_scope_taint(statements, self.taints[-1]))
+        for statement in statements:
+            self.visit(statement)
+        self.taints.pop()
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self.taints.append(set())
+        self._visit_scope(node.body)
+        self.taints.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.function_depth += 1
+        self._visit_scope(node.body)
+        self.function_depth -= 1
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_scope(node.body)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = _resolved_name(node.func, self.aliases)
+        if name in _PROCESS_CALLS:
+            for command in _command_nodes(node, name):
+                installer = _mentions_installer(command, self.taints[-1])
+                executable = _executable_name(command)
+                if not installer and executable not in COMPILER_EXECUTABLES:
+                    continue
+                if not installer:
+                    reason = "compiler"
+                elif self.function_depth == 0:
+                    reason = "module-import-side-effect"
+                elif _contains_installer_literal(command):
+                    reason = "literal"
+                else:
+                    reason = "dynamic"
+                self.findings.append({
+                    "file": self.filename,
+                    "line": node.lineno,
+                    "call": name,
+                    "executable": executable,
+                    "installer": installer,
+                    "reason": reason,
+                })
+        self.generic_visit(node)
+
+
+def process_execution_findings(
+    source: str, filename: str = "<string>"
+) -> list[dict[str, object]]:
+    """Process calls that execute the installer or a Rust toolchain binary."""
+    with warnings.catch_warnings():
+        # Test sources may contain non-raw regex escapes.  They are valid Python
+        # today and unrelated to process execution; parsing must not leak a
+        # SyntaxWarning into the test runner (or fail under -W error).
+        warnings.simplefilter("ignore", SyntaxWarning)
+        tree = ast.parse(source)
+    return _ProcessExecutionScanner(filename).scan(tree)
+
+
+def installer_execution_findings(
+    source: str, filename: str = "<string>"
+) -> list[dict[str, object]]:
+    """Only process calls whose command argument references the installer.
+
+    A module that only reads the installer text, compares a schema string, or
+    mentions the path in a comment produces no finding.
+    """
+    return [
+        finding
+        for finding in process_execution_findings(source, filename)
+        if finding["installer"]
+    ]
+
+
+def compiler_execution_findings(
+    source: str, filename: str = "<string>"
+) -> list[dict[str, object]]:
+    return [
+        finding
+        for finding in process_execution_findings(source, filename)
+        if finding["executable"] in COMPILER_EXECUTABLES
+    ]
+
+
 CACHE_KEY = (
     "rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-"
     "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1"
@@ -282,11 +558,148 @@ class CargoForkWorkflowTest(unittest.TestCase):
 
     def test_no_hidden_setup_from_python_acceptance(self) -> None:
         for path in sorted((ROOT / "tests").glob("*.py")):
-            if "cargo_fork" in path.name:
-                continue
             text = path.read_text(encoding="utf-8")
+            findings = installer_execution_findings(text, path.name)
+            if path.name == INSTALLER_UNIT_TEST:
+                # This exact unit-test module runs the helper against fake
+                # rustup/cargo programs on a private PATH.  It is the intended
+                # installer test, not a hidden CI setup step.  Other modules
+                # whose names happen to contain "cargo_fork" are still scanned.
+                self.assertIn("FAKE_RUSTUP", text)
+                self.assertIn("FAKE_CARGO", text)
+                continue
             with self.subTest(test=path.name):
-                self.assertNotIn("install_ci_cargo_fork.sh", text)
+                self.assertEqual(
+                    [],
+                    findings,
+                    path.name + " must not execute the CargoFork installer; "
+                    "source reads and schema string comparisons are allowed",
+                )
+
+    def test_installer_source_read_fixture_is_not_an_invocation(self) -> None:
+        path = ROOT / "tests" / "test_refstore_receipt_validators.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(INSTALLER, text)
+        self.assertEqual([], process_execution_findings(text, path.name))
+        self.assertEqual(
+            [], installer_execution_findings(text, path.name)
+        )
+
+    def test_installer_scanner_rejects_every_execution_form(self) -> None:
+        read_only = (
+            "from pathlib import Path\n"
+            'HELPER = Path("scripts/install_ci_cargo_fork.sh")\n'
+            "def test_schema():\n"
+            "    text = HELPER.read_text()\n"
+            '    assert "install_ci_cargo_fork.sh" in text\n'
+        )
+        self.assertEqual([], process_execution_findings(read_only))
+
+        cases = {
+            "literal": (
+                "import subprocess\n"
+                "def test_install():\n"
+                '    subprocess.run(["scripts/install_ci_cargo_fork.sh", "install"])\n',
+                "literal",
+            ),
+            "dynamic": (
+                "import subprocess\n"
+                'HELPER = "scripts/install_ci_cargo_fork.sh"\n'
+                "def test_install():\n"
+                '    subprocess.run([HELPER, "install"])\n',
+                "dynamic",
+            ),
+            "module-import-side-effect": (
+                "import subprocess\n"
+                'HELPER = "scripts/install_ci_cargo_fork.sh"\n'
+                'subprocess.run([HELPER, "install"])\n',
+                "module-import-side-effect",
+            ),
+            "local-alias": (
+                "import subprocess\n"
+                'HELPER = "scripts/install_ci_cargo_fork.sh"\n'
+                "def test_install():\n"
+                '    command = [HELPER, "install"]\n'
+                "    subprocess.run(command)\n",
+                "dynamic",
+            ),
+            "import-alias": (
+                "from subprocess import run as execute\n"
+                'HELPER = "scripts/install_ci_cargo_fork.sh"\n'
+                "def test_install():\n"
+                '    execute([HELPER, "install"])\n',
+                "dynamic",
+            ),
+            "os-system": (
+                "import os\n"
+                "def test_install():\n"
+                '    os.system("scripts/install_ci_cargo_fork.sh install")\n',
+                "literal",
+            ),
+        }
+        for name, (source, reason) in cases.items():
+            with self.subTest(case=name):
+                findings = installer_execution_findings(source, name + ".py")
+                self.assertEqual(1, len(findings), findings)
+                self.assertTrue(findings[0]["installer"])
+                self.assertEqual(reason, findings[0]["reason"])
+
+    def test_compiler_scanner_detects_direct_cargo_build(self) -> None:
+        source = (
+            "import subprocess\n"
+            "def test_lab():\n"
+            '    subprocess.run(["cargo", "build", "--locked"], check=True)\n'
+        )
+        findings = compiler_execution_findings(source, "synthetic.py")
+        self.assertEqual(["cargo"], [row["executable"] for row in findings])
+        self.assertFalse(findings[0]["installer"])
+
+    def test_strengthened_scanner_detects_active_view_lab_cargo(self) -> None:
+        # The labs worker owns replacing this fallback with the canonical
+        # ROOTYARD_VIEW_LAB_BIN input.  Until that lands, the strengthened
+        # scanner must still see the active compiler call rather than hiding it
+        # behind a raw text exclusion.
+        path = ROOT / "tests" / "test_view_lab.py"
+        text = path.read_text(encoding="utf-8")
+        findings = compiler_execution_findings(text, path.name)
+        active = re.search(
+            r'subprocess\.(?:run|Popen|call|check_call|check_output)\(\s*'
+            r'\[\s*["\']cargo["\']',
+            text,
+        )
+        if active:
+            self.assertTrue(
+                findings,
+                "test_view_lab.py still invokes cargo but the scanner missed it",
+            )
+            self.assertIn("cargo", [row["executable"] for row in findings])
+        else:
+            self.assertEqual(
+                [],
+                findings,
+                "the canonical lab-binary path must not look like a compiler call",
+            )
+
+    def test_no_hidden_compiler_build_from_python_acceptance(self) -> None:
+        # Every test module must consume an immutable prepared binary.  The one
+        # pending labs-owned file may still carry exactly its single known
+        # active cargo fallback; any additional compiler call there (or any
+        # compiler call anywhere else) fails this guard.
+        for path in sorted((ROOT / "tests").glob("*.py")):
+            findings = compiler_execution_findings(
+                path.read_text(encoding="utf-8"), path.name
+            )
+            with self.subTest(test=path.name):
+                if path.name == "test_view_lab.py" and findings:
+                    self.assertEqual(1, len(findings), findings)
+                    self.assertEqual("cargo", findings[0]["executable"], findings)
+                    continue
+                self.assertEqual(
+                    [],
+                    findings,
+                    path.name + " must consume an immutable prepared binary, "
+                    "never invoke cargo/rustc/rustup",
+                )
 
 
 if __name__ == "__main__":
