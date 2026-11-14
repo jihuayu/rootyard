@@ -144,7 +144,15 @@ async fn merge_pull_inner(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    // Take the policy fence before the token/repository locks, matching the
+    // trust bind/revoke and check-write paths. Evaluation and the native ref
+    // publication then cannot outlive a concurrent context/webhook revocation.
+    let policy_repo_id = repo_id;
+    crate::webhooks::trust::lock_policy_tx(&tx, policy_repo_id).await?;
     let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::PullsWrite).await?.repo_id;
+    if repo_id != policy_repo_id {
+        return Err(Error(StatusCode::CONFLICT, "repository changed"));
+    }
 
     let current_gen: i64 = tx
         .query_one(
