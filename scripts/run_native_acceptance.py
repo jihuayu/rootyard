@@ -42,14 +42,21 @@ Plan shape (JSON)::
 
 ``argv`` runs with ``shell=False`` under ``scripts/native_acceptance_supervisor.py``.
 ``{run_id}``, ``{suite_id}`` and ``{run_dir}`` are substituted in argv, suite
-environment and isolation values. Sensitive credentials and credential URLs
-belong to the runner process environment, never to the plan. Validation only
-refuses URI-like values under sensitive top-level environment keys. Inherited
-sensitive values are redacted from the report, but suite logs (mode 0600) may
-contain secrets and must stay private. ``--dry-run`` starts nothing and creates
-no run directory; a real run creates the run directory and report parent. The
-lock directory must already exist, and lock, run, log and report paths must
-resolve outside ``--verify-host`` (the plan file need not).
+environment and isolation values. Plans are operator-trusted, but validation
+refuses direct known compiler/builder commands (Cargo/rustc, the
+``build_native*.py`` helpers and ``check_redis_contract.py``, including simple
+``env``/Python wrappers) so an accidental hidden build or clean cannot ride in an
+acceptance suite. Run explicit build preparation outside the runner and pass
+only the prepared artifact. This is not a general shell sandbox: shell text,
+``python -c`` bodies and renamed wrappers are not interpreted. Sensitive
+credentials and credential URLs belong to the runner process environment, never
+to the plan. Validation only refuses URI-like values under sensitive top-level
+environment keys. Inherited sensitive values are redacted from the report, but
+suite logs (mode 0600) may contain secrets and must stay private. ``--dry-run``
+starts nothing and creates no run directory; a real run creates the run
+directory and report parent. The lock directory must already exist, and lock,
+run, log and report paths must resolve outside ``--verify-host`` (the plan file
+need not).
 
 Owned-descendant lifecycle (Linux only): the runner passes suite argv to the
 supervisor. The Linux supervisor is a child subreaper, so orphaned descendants are reparented to it or to an intermediate descendant subreaper rather than to init, remaining within the supervisor's descendant tree. It builds a ``/proc`` parent-child
@@ -115,6 +122,13 @@ SELF_ENV = ("ROOTYARD_ACCEPTANCE_RUN_ID", "ROOTYARD_ACCEPTANCE_SUITE", "ROOTYARD
 LEASE_ENV_PREFIXES = ("ROOTYARD_OBJECT_STORE_", "ROOTYARD_BLOB_")
 SENSITIVE_ENV = re.compile(r"SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|API_KEY"
                            r"|DATABASE_URL|POSTGRES_URL", re.I)
+# Direct commands whose purpose is compiling or cleaning this checkout. This is
+# an accidental-build guard for operator-trusted plans, not a security boundary.
+BUILD_EXECUTABLES = frozenset({"cargo", "rustc", "cargo-clippy", "clippy-driver"})
+BUILD_SCRIPTS = frozenset({"build_native.py", "build_native_test.py", "build_native_batch.py",
+                           "check_redis_contract.py"})
+BUILD_MODULES = frozenset(name[:-3] for name in BUILD_SCRIPTS)
+PYTHON_EXECUTABLE = re.compile(r"^(?:python|python3|python3\.\d+|pypy3?)(?:\.exe)?$", re.I)
 URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
 AUTH_HEADER = re.compile(r"(?i)((?:authorization|proxy-authorization)\s*:\s*)(?:basic|bearer|token)\s+\S+")
 SENSITIVE_ASSIGNMENT = re.compile(
@@ -195,6 +209,78 @@ def load_plan(path):
     return plan
 
 
+def _command_name(token):
+    name = Path(token).name.lower()
+    return name[:-4] if name.endswith(".exe") else name
+
+
+def _env_command(arguments):
+    """Strip ``env`` options and NAME=VALUE assignments; this is not shell parsing."""
+    index = 0
+    while index < len(arguments):
+        item = arguments[index]
+        if item == "--":
+            return arguments[index + 1:]
+        if not item.startswith("-") and "=" not in item:
+            return arguments[index:]
+        index += 1
+    return []
+
+
+def _python_script(arguments):
+    """Return the script/module after interpreter options; ``-c`` is not interpreted."""
+    index = 0
+    while index < len(arguments):
+        item = arguments[index]
+        if item == "-m":
+            return arguments[index + 1] if index + 1 < len(arguments) else None
+        if item == "-c":
+            return None
+        if item in ("-W", "-X"):
+            index += 2
+        elif item.startswith("-"):
+            index += 1
+        else:
+            return item
+    return None
+
+
+def _known_build_command(argv):
+    """Name the direct builder a simple ``env``/Python wrapper would execute, if any."""
+    words = list(argv)
+    for _ in range(3):
+        if not words:
+            return None
+        name = _command_name(words[0])
+        if name in BUILD_EXECUTABLES or name in BUILD_SCRIPTS:
+            return name
+        if name == "env":
+            words = _env_command(words[1:])
+            continue
+        if PYTHON_EXECUTABLE.match(name):
+            target = _python_script(words[1:])
+            if not target:
+                return None
+            name = _command_name(target)
+            if name in BUILD_SCRIPTS:
+                return name
+            module = name[:-3] if name.endswith(".py") else name.replace("/", ".").rsplit(".", 1)[-1]
+            return module + ".py" if module in BUILD_MODULES else None
+        return None
+    return None
+
+
+def reject_build_commands(suite_id, argv):
+    command = _known_build_command(argv)
+    require(
+        command is None,
+        f"{suite_id}: argv is a recognized build/clean command ({command}); acceptance plans are "
+        "prebuilt-only. Run build or clean preparation explicitly outside this runner and pass only "
+        "the prepared artifact to the suite. This fixed guard stops accidental hidden builds; it is "
+        "not a general shell sandbox.",
+    )
+
+
 def validate_suite(suite, seen):
     require(isinstance(suite, dict), "every suite must be an object")
     suite_id = suite.get("id")
@@ -205,6 +291,7 @@ def validate_suite(suite, seen):
     argv = suite.get("argv")
     require(isinstance(argv, list) and argv and all(isinstance(item, str) and item for item in argv),
             f"{suite_id}: argv must be a non-empty array of strings")
+    reject_build_commands(suite_id, argv)
     timeout = suite.get("timeout_seconds")
     require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and 0 < timeout <= 86400,
             f"{suite_id}: timeout_seconds must be a positive number")

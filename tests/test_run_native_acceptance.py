@@ -1035,6 +1035,41 @@ class PlanValidationTest(unittest.TestCase):
                    "resources": {"loopback:2": "exclusive"}, "depends_on": ["a"]}]
         self.assert_rejected({"suites": cyclic}, "cycle")
 
+    def test_direct_compiler_and_builder_argv_are_refused(self):
+        def suite(argv):
+            return {"id": "build", "phase": "smoke", "argv": argv, "timeout_seconds": 5,
+                    "resources": {"loopback:1": "exclusive"}}
+
+        for argv, command in (
+            (["cargo", "build", "--locked"], "cargo"),
+            (["/usr/local/cargo/bin/cargo", "clean"], "cargo"),
+            (["rustc", "--version"], "rustc"),
+            (["rustc.exe", "--version"], "rustc"),
+            (["scripts/build_native.py"], "build_native.py"),
+            (["python3", "scripts/build_native.py", "--bins"], "build_native.py"),
+            (["python3", "-B", "scripts/build_native_test.py", "--test", "fixture"], "build_native_test.py"),
+            (["python3", "-m", "build_native_batch", "--all-bins"], "build_native_batch.py"),
+            (["/usr/bin/env", "python3", "scripts/build_native_batch.py", "--all-bins"], "build_native_batch.py"),
+            (["python3", "scripts/check_redis_contract.py"], "check_redis_contract.py"),
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(acceptance.PlanError) as caught:
+                    acceptance.validate_plan({"suites": [suite(argv)]})
+                self.assertIn("prebuilt-only", str(caught.exception))
+                self.assertIn(command, str(caught.exception))
+
+    def test_prebuilt_argv_that_mentions_cargo_is_accepted(self):
+        for argv in (
+            ["target/debug/rootyard", "serve", "--cargo-cache", "shared"],
+            ["/opt/tools/cargo-reporter", "report", "scripts/build_native.py"],
+            [sys.executable, "tests/worker.py", "--binary", "target/debug/rootyard", "--label", "cargo"],
+        ):
+            with self.subTest(argv=argv):
+                acceptance.validate_plan({"suites": [{
+                    "id": "a", "phase": "smoke", "argv": argv, "timeout_seconds": 5,
+                    "resources": {"loopback:1": "exclusive"},
+                }]})
+
     def test_exclude_keeps_an_unreferenced_suite_removed(self):
         plan = acceptance.validate_plan({
             "suites": [{"id": "kept", "phase": "smoke", "argv": ["true"], "timeout_seconds": 5,
