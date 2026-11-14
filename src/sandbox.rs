@@ -49,7 +49,7 @@ pub(crate) mod gate_probe {
             }
         }
 
-        const fn label(self) -> &'static str {
+        pub(crate) const fn label(self) -> &'static str {
             match self {
                 Self::StateGuard => "state_guard",
                 Self::IdentityGuard => "identity_guard",
@@ -77,6 +77,23 @@ pub(crate) mod gate_probe {
         Ok,
         Refused,
         Failed,
+    }
+
+    /// Typed read-only view of one recorded stage. Regression assertions use
+    /// this instead of parsing the human-readable diagnostics snapshot.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum StageRecord {
+        NotReached,
+        Ok,
+        Refused,
+        Failed,
+        SqlState([u8; 5]),
+    }
+
+    impl StageRecord {
+        pub(crate) fn is_failed(self) -> bool {
+            matches!(self, Self::Failed | Self::SqlState(_))
+        }
     }
 
     #[derive(Default)]
@@ -129,6 +146,28 @@ pub(crate) mod gate_probe {
             self.stages[index].store(4, Ordering::SeqCst);
         }
 
+        pub(crate) fn stage_record(&self, stage: GateStage) -> StageRecord {
+            match self.stages[stage.index()].load(Ordering::SeqCst) {
+                1 => StageRecord::Ok,
+                2 => StageRecord::Refused,
+                3 => StageRecord::Failed,
+                4 => match self.sqlstate_bytes(stage.index()) {
+                    Some(code) => StageRecord::SqlState(code),
+                    None => StageRecord::Failed,
+                },
+                _ => StageRecord::NotReached,
+            }
+        }
+
+        pub(crate) fn shared_policy_advisory_wait_observed(&self) -> bool {
+            self.shared_policy_advisory_wait_observed.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn revoke_final_http_status(&self) -> Option<axum::http::StatusCode> {
+            let status = self.revoke_final_http_status.load(Ordering::SeqCst);
+            if status == 0 { None } else { axum::http::StatusCode::from_u16(status).ok() }
+        }
+
         pub(crate) fn note_shared_policy_advisory_wait(&self, observed: bool) {
             self.shared_policy_advisory_wait_observed.store(observed, Ordering::SeqCst);
         }
@@ -163,12 +202,17 @@ pub(crate) mod gate_probe {
         }
 
         fn sqlstate(&self, index: usize) -> Option<String> {
+            self.sqlstate_bytes(index).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        fn sqlstate_bytes(&self, index: usize) -> Option<[u8; 5]> {
             let packed = self.sqlstates[index].load(Ordering::SeqCst);
             if packed == 0 {
                 return None;
             }
-            let bytes = packed.to_be_bytes();
-            std::str::from_utf8(&bytes[3..]).ok().map(str::to_owned)
+            let mut bytes = [0; 5];
+            bytes.copy_from_slice(&packed.to_be_bytes()[3..]);
+            Some(bytes)
         }
     }
 

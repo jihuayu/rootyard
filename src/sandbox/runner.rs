@@ -998,7 +998,7 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::{Source, bwrap_supports_size, open_start_gate};
-    use crate::sandbox::gate_probe::{GATE_PROBE, GateProbe};
+    use crate::sandbox::gate_probe::{GATE_PROBE, GateProbe, GateStage, StageRecord};
     use crate::{
         AppState,
         ci_checkouts::{Plan, dependencies::Manifest},
@@ -1117,6 +1117,46 @@ mod tests {
         }
     }
 
+    fn ensure_refused_gate_probe(probe: &GateProbe) -> anyhow::Result<()> {
+        let expected_stages = [
+            (GateStage::StateGuard, StageRecord::Ok),
+            (GateStage::IdentityGuard, StageRecord::Ok),
+            (GateStage::PoolTxPolicy, StageRecord::Ok),
+            (GateStage::JobSelect, StageRecord::Ok),
+            (GateStage::AuthoritySelect, StageRecord::Refused),
+            (GateStage::Marker, StageRecord::NotReached),
+            (GateStage::Commit, StageRecord::NotReached),
+        ];
+        for (stage, expected) in expected_stages {
+            let actual = probe.stage_record(stage);
+            anyhow::ensure!(
+                !actual.is_failed(),
+                "gate stage {} recorded an error or SQLSTATE; {}",
+                stage.label(),
+                probe.snapshot()
+            );
+            anyhow::ensure!(
+                actual == expected,
+                "gate stage {} was not the expected typed outcome {:?}; {}",
+                stage.label(),
+                expected,
+                probe.snapshot()
+            );
+        }
+        anyhow::ensure!(
+            probe.shared_policy_advisory_wait_observed(),
+            "gate probe did not observe the shared policy advisory wait; {}",
+            probe.snapshot()
+        );
+        anyhow::ensure!(
+            probe.revoke_final_http_status() == Some(StatusCode::OK),
+            "revoke probe did not record HTTP {}; {}",
+            StatusCode::OK.as_u16(),
+            probe.snapshot()
+        );
+        Ok(())
+    }
+
     /// PostgreSQL-only lock-order regression for the sandbox start gate.
     ///
     /// The real `open_start_gate` transaction and the real trusted-context
@@ -1136,7 +1176,8 @@ mod tests {
     /// A cfg(test)-only task-local probe reports a fixed stage name, any
     /// validated five-character SQLSTATE, whether the shared fence wait was
     /// observed, and the revoke HTTP status. It records no SQL, parameters,
-    /// error Display, causes, URLs, tokens or paths.
+    /// error Display, causes, URLs, tokens or paths. Assertions read typed
+    /// stage records; the formatted snapshot is diagnostics only.
     ///
     /// Run with `ROOTYARD_TEST_DATABASE_URL=... cargo test --lib
     /// start_gate_serializes_context_removal_under_policy_fence -- --ignored`.
@@ -1383,11 +1424,17 @@ mod tests {
             probe.snapshot()
         );
         let error = gate.err().ok_or_else(|| anyhow::anyhow!("gate unexpectedly authorized; {}", probe.snapshot()))?;
+        ensure_refused_gate_probe(&probe)?;
         anyhow::ensure!(
-            error.1 == "sandbox authority expired before start",
-            "gate returned a different refusal: HTTP {} {}; {}",
+            error.0 == StatusCode::SERVICE_UNAVAILABLE,
+            "gate returned HTTP {} instead of the canonical {}; {}",
             error.0.as_u16(),
-            error.1,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            probe.snapshot()
+        );
+        anyhow::ensure!(
+            error.1 == "service temporarily unavailable",
+            "gate did not return the fixed public internal-error message; {}",
             probe.snapshot()
         );
 
