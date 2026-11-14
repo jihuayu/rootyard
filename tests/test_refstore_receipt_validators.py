@@ -28,6 +28,14 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+PANDO_SCHEMA_SQL = (
+    "-- Separate namespace, never applied by Rootyard's production migration runner.\n"
+    "CREATE SCHEMA IF NOT EXISTS pando_lab;\n"
+    "CREATE TABLE IF NOT EXISTS pando_lab.repositories (\n"
+    " id uuid PRIMARY KEY, generation bigint NOT NULL DEFAULT 0);\n"
+)
+
+
 def heredoc_blocks(text):
     blocks = []
     for match in re.finditer(r"<<'PY'[^\n]*\n(.*?)\n\s*PY\n", text, re.S):
@@ -62,6 +70,7 @@ def make_batch_fixture(root, schema):
         "src/main.rs": "fn main() {}\n",
         "tests/blob_git_gateway.rs": "#[test]\nfn example() {}\n",
         "tests/blob_gateway_support/helper.rs": "pub fn helper() {}\n",
+        "experimental/pando/schema.sql": PANDO_SCHEMA_SQL,
     }
     for relative, content in files.items():
         path = root / relative
@@ -148,10 +157,11 @@ def make_batch_fixture(root, schema):
             "pin_source": "rust-toolchain.toml",
         }
         bound = receipts.capture_bound_inputs(root, environ={"PATH": ""})
-        profile = {"opt_level": "0", "debuginfo": 2, "debug_assertions": True,
-                   "overflow_checks": True, "test": False}
+        dev_profile = {"opt_level": "0", "debuginfo": 2, "debug_assertions": True,
+                       "overflow_checks": True, "test": False}
+        test_profile = dict(dev_profile, test=True)
         original_test = evidence / "original-test"
-        original_test.write_bytes(b"original-test-binary")
+        shutil.copyfile(test_binary, original_test)
         original_test.chmod(0o700)
         test_artifact = receipts.cargo_artifact_record(
             {
@@ -159,7 +169,7 @@ def make_batch_fixture(root, schema):
                 "package_id": "rootyard 0.1.0",
                 "target": {"name": "blob_git_gateway", "kind": ["test"],
                            "src_path": str(root / "tests/blob_git_gateway.rs")},
-                "profile": profile,
+                "profile": test_profile,
                 "fresh": True,
                 "executable": str(original_test),
             },
@@ -171,7 +181,7 @@ def make_batch_fixture(root, schema):
                 "package_id": "rootyard 0.1.0",
                 "target": {"name": "rootyard", "kind": ["bin"],
                            "src_path": str(root / "src/main.rs")},
-                "profile": profile,
+                "profile": dev_profile,
                 "fresh": False,
                 "executable": str(serving_binary),
             },
@@ -238,6 +248,7 @@ def make_preflight_fixture(root, block):
         ("Cargo.lock", "version = 3\n"),
         ("src/lib.rs", "pub fn production() -> u8 { 1 }\n"),
         ("src/main.rs", "fn main() {}\n"),
+        ("experimental/pando/schema.sql", PANDO_SCHEMA_SQL),
     ):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -311,7 +322,7 @@ def make_preflight_fixture(root, block):
 
     original_lib = root / "target/debug/deps/libtest-original"
     original_lib.parent.mkdir(parents=True, exist_ok=True)
-    original_lib.write_bytes(b"original-libtest")
+    shutil.copyfile(lib, original_lib)
     original_lib.chmod(0o700)
     lib_artifact = receipts.cargo_artifact_record(
         {

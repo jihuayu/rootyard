@@ -27,6 +27,13 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+PANDO_SCHEMA_SQL = (
+    "-- Separate namespace, never applied by Rootyard's production migration runner.\n"
+    "CREATE SCHEMA IF NOT EXISTS pando_lab;\n"
+    "CREATE TABLE IF NOT EXISTS pando_lab.repositories (\n"
+    " id uuid PRIMARY KEY, generation bigint NOT NULL DEFAULT 0);\n"
+)
+
 WORKSPACE_CAPTURE_REQUIRED_CASES = (
     "__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix",
     "__main__.WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture",
@@ -64,6 +71,9 @@ class ManifestFixture:
         self.harness.write_text("# harness\n")
         (self.root / "Cargo.toml").write_text('[package]\nname = "rootyard"\n')
         (self.root / "Cargo.lock").write_text("version = 3\n")
+        schema = self.root / "experimental/pando/schema.sql"
+        schema.parent.mkdir(parents=True, exist_ok=True)
+        schema.write_text(PANDO_SCHEMA_SQL)
 
     def enable_batch_receipt(self):
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))

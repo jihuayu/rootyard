@@ -28,6 +28,13 @@ import native_build_receipt as receipts  # noqa: E402
 import native_evidence  # noqa: E402
 import source_bound_binary  # noqa: E402
 
+PANDO_SCHEMA_SQL = (
+    "-- Separate namespace, never applied by Rootyard's production migration runner.\n"
+    "CREATE SCHEMA IF NOT EXISTS pando_lab;\n"
+    "CREATE TABLE IF NOT EXISTS pando_lab.repositories (\n"
+    " id uuid PRIMARY KEY, generation bigint NOT NULL DEFAULT 0);\n"
+)
+
 TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
 COMMIT = "a" * 40
 CARGO_FORK_COMMIT = "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"
@@ -47,6 +54,7 @@ class V2EvidenceFixture:
             ("src/lib.rs", "pub fn production() -> u8 { 1 }\n"),
             ("src/main.rs", "fn main() {}\n"),
             ("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.1"\n'),
+            ("experimental/pando/schema.sql", PANDO_SCHEMA_SQL),
         ):
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
