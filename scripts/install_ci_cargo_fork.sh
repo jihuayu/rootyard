@@ -302,7 +302,7 @@ replace_install() {
 }
 
 adopt_candidate() {
-  local candidate=$1 temporary
+  local candidate=$1
   verify_cargo "$candidate" || return 1
   temporary="$cache_dir/installs/.adopt-$$"
   rm -rf -- "$temporary"
@@ -311,10 +311,12 @@ adopt_candidate() {
   chmod 0755 "$temporary/bin/cargo"
   if ! verify_cargo "$temporary/bin/cargo"; then
     rm -rf -- "$temporary"
+    temporary=
     return 1
   fi
   write_metadata "$temporary/metadata.json" reuse "$install_root/bin/cargo" "$cache_dir/bin/cargo"
   replace_install "$temporary"
+  temporary=
   adopted_source=reuse
   return 0
 }
