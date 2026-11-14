@@ -1061,6 +1061,69 @@ class TrustBoundaryHarness(WebhooksHarness):
         self.document(self.hook_path("forge", hook), token=self.alice)
 
 
+def run_cases(harness, cases):
+    """Run cases without letting an original exception escape redaction.
+
+    ``PullsHarness.case`` records a redacted failure and prints a redacted
+    traceback, then re-raises. If that exception reached the interpreter it
+    would print the original assertion payload a second time, including any
+    claimed checkout token. This outer boundary prints only redacted
+    diagnostics; the failed case result remains in ``harness.results``.
+    """
+    try:
+        for name, fn in cases:
+            harness.case(name, fn)
+    except Exception as error:
+        print(
+            harness.redact(f"{type(error).__name__}: {error}"),
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    return True
+
+
+def run_harness(harness, cases):
+    """Run setup, cases and cleanup behind one redaction boundary."""
+    success = False
+    try:
+        harness.setup()
+        success = run_cases(harness, cases)
+    except Exception as error:
+        harness.results.append(
+            {
+                "name": "harness setup",
+                "status": "failed",
+                "seconds": 0.0,
+                "error": harness.redact(error),
+            }
+        )
+        print(
+            harness.redact(f"{type(error).__name__}: {error}"),
+            file=sys.stderr,
+            flush=True,
+        )
+    finally:
+        try:
+            harness.cleanup()
+        except Exception as error:
+            harness.results.append(
+                {
+                    "name": "cleanup",
+                    "status": "failed",
+                    "seconds": 0.0,
+                    "error": harness.redact(error),
+                }
+            )
+            print(
+                harness.redact(f"cleanup failed: {type(error).__name__}: {error}"),
+                file=sys.stderr,
+                flush=True,
+            )
+            success = False
+    return success
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/rootyard")
@@ -1068,37 +1131,35 @@ def main():
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
     harness = TrustBoundaryHarness(args)
-    try:
-        harness.setup()
-        harness.case("trusted two-repository matrix setup", harness.configure)
-        harness.case("trusted positive report/callback flows", harness.positive_matrix)
-        harness.case(
+    cases = [
+        ("trusted two-repository matrix setup", harness.configure),
+        ("trusted positive report/callback flows", harness.positive_matrix),
+        (
             "revoked trusted context cannot unlock merge",
             harness.revocation_blocks_merge,
-        )
-        harness.case(
+        ),
+        (
             "ordinary writer and cross-context/repository refusals",
             harness.ordinary_writer_and_cross_scope_refusals,
-        )
-        harness.case(
+        ),
+        (
             "changed candidate invalidates prior evidence",
             harness.candidate_change_invalidates_evidence,
-        )
-        harness.case(
+        ),
+        (
             "revoked registration, rotated secret and late attempt",
             harness.revocation_and_late_attempt_matrix,
-        )
-        harness.case(
+        ),
+        (
             "removed webhook context revokes claim/report/merge authority",
             harness.context_removal_revokes_authority,
-        )
-        harness.case(
+        ),
+        (
             "API principal token revocation remains management-only",
             harness.api_principal_token_revocation,
-        )
-        return 0
-    finally:
-        harness.cleanup()
+        ),
+    ]
+    return 0 if run_harness(harness, cases) else 1
 
 
 if __name__ == "__main__":
