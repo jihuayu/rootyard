@@ -41,10 +41,11 @@ use crate::{
         core::{
             CommitMode,
             pack_commit::{
-                AuthorizedCommitError, AuthorizedCommitMode, ContentDigest, PackArtifactRole, PackCommitBaseline,
-                PackCommitError, PackCommitExpectation, PackCommitPlan, PackCommitRejectCode, PackCommitScope,
-                PackCommitTerminal, PackMembershipEntry, PackPendingToken, PackRegistrationRequest, PgAuthorizedCommit,
-                PgPackCommit, PlannedArtifact, PlannedPack, PrepareOutcome,
+                AuthorizedCommitError, AuthorizedCommitMode, ContentDigest, GATE_REVISION_MISMATCH_DETAIL,
+                PackArtifactRole, PackCommitBaseline, PackCommitError, PackCommitExpectation, PackCommitPlan,
+                PackCommitRejectCode, PackCommitScope, PackCommitTerminal, PackMembershipEntry, PackPendingToken,
+                PackRegistrationRequest, PgAuthorizedCommit, PgPackCommit, PlannedArtifact, PlannedPack,
+                PrepareOutcome,
             },
         },
         tx::{begin_bounded, commit_bounded},
@@ -67,6 +68,13 @@ const ISSUER_LANE: &str = "blob-git-receive";
 /// The one fixed 409 refusal for a durable cancellation tombstone, shared with
 /// `RefStoreError::Cancelled`. It carries no operation id or provider detail.
 const DURABLY_CANCELLED: GatewayError = GatewayError::Conflict("operation is durably cancelled");
+
+/// A typed gate-revision refusal under `begin_serving_pending_in_tx` is raised
+/// only inside the caller-owned admission transaction, before its `COMMIT`.
+/// Each retry therefore observes a definitively rolled-back pending row and
+/// sequence reservation. The bound is deliberately tiny: a request may race at
+/// most this many distinct winners against the same original deadline.
+const MAX_ADMISSION_REBASES: usize = 2;
 
 /// One staged `.pack` + `.idx` pair with its verified content digest.
 pub(super) struct Pair {
@@ -99,7 +107,16 @@ pub(super) enum PushOutcome {
 enum Start {
     Terminal(PackCommitTerminal),
     Cancelled(&'static str),
-    Fresh { _token: PackPendingToken, plan: Box<PackCommitPlan> },
+    Fresh {
+        _token: PackPendingToken,
+        plan: Box<PackCommitPlan>,
+    },
+    /// The admission transaction proved this plan's captured gate revision was
+    /// superseded and rolled back before any pending row, binding or sequence
+    /// reservation became durable. The caller may capture a fresh baseline and
+    /// rebuild the plan once more, still under the same request/operation
+    /// identity and absolute deadline.
+    Rebaseline,
 }
 
 /// Drive the full protected publication for one already-parsed push.
@@ -118,13 +135,73 @@ pub(super) async fn push(
     // The baseline is captured after native ingestion and is the authoritative
     // old-tip set for this plan. A concurrent commit is handled per-ref by the
     // accepted-subset facade, not by comparing against the earlier lookup.
-    let baseline = capture_baseline(state, serving.gate.repository_id(), serving.gate.tenant_id(), deadline).await?;
-    let owner = repository_owner(state, serving.gate.repository_id(), deadline).await?;
-    match begin(state, serving, actor, operation_id, request_digest, request, pairs, mode, owner, &baseline, deadline)
+    //
+    // One narrow exception is required *before* admission: the migration-138
+    // pending prefix locks and checks the gate revision inside the same
+    // transaction that would create the pending row. If a winner commits
+    // between this capture and that check, `begin_serving_pending_in_tx`
+    // returns the typed `RevisionMismatch` refusal and the caller-owned
+    // transaction is rolled back. That refusal is not a Git verdict, but
+    // returning it as HTTP 409 would hide the now-current CAS fact from the
+    // client. Re-capture and rebuild the plan under the original deadline so
+    // the normal native-facts selection can persist the exact
+    // `OldOidMismatch` rejection. Nothing else is retried here. The producer
+    // operation id/digest and the received request/pack bytes stay identical;
+    // only the core plan's expected revision, ref set and old-membership set
+    // are rebuilt. The rolled-back attempt created no A3/A4 effect and no
+    // closure proof, so prepare/verify later recompute those from the refreshed
+    // baseline instead of rebinding an existing proof.
+    let mut rebases = 0usize;
+    let start = loop {
+        let baseline =
+            capture_baseline(state, serving.gate.repository_id(), serving.gate.tenant_id(), deadline).await?;
+        #[cfg(test)]
+        state.pause_before_admission(operation_id).await;
+        // A rebase may adopt a newer revision/ref/membership set, and a
+        // legitimate winner may also retarget HEAD or activate pack-verified
+        // mode; those are rebuilt and revalidated by prepare/select/verify.
+        // It must never adopt a different tenant, format, history incarnation
+        // or authority/group epoch. The request was authorized against the
+        // original serving realm; a moved realm is a conflict to resolve, not a
+        // baseline to silently adopt. The admission prefix itself re-checks the
+        // realm before any pending row becomes durable, so a second move still
+        // fails closed.
+        if rebases > 0 && !admission_realm_matches_serving(&baseline, serving) {
+            return Err(GatewayError::Conflict("repository authority changed; retry"));
+        }
+        let owner = repository_owner(state, serving.gate.repository_id(), deadline).await?;
+        match begin(
+            state,
+            serving,
+            actor,
+            operation_id,
+            request_digest,
+            request,
+            pairs,
+            mode,
+            owner,
+            &baseline,
+            deadline,
+        )
         .await?
-    {
+        {
+            Start::Rebaseline => {
+                if rebases >= MAX_ADMISSION_REBASES {
+                    return Err(GatewayError::Conflict("repository gate changed during publication admission"));
+                }
+                rebases += 1;
+                if Instant::now() >= deadline {
+                    return Err(GatewayError::Timeout);
+                }
+                continue;
+            }
+            start => break start,
+        }
+    };
+    match start {
         Start::Terminal(terminal) => Ok(PushOutcome::Terminal(terminal)),
         Start::Cancelled(reason) => Ok(PushOutcome::Cancelled(reason)),
+        Start::Rebaseline => Err(GatewayError::Internal("admission rebase escaped its bounded loop")),
         Start::Fresh { plan, _token: token } => {
             let result = async {
                 for (index, pair) in pairs.iter().enumerate() {
@@ -164,6 +241,37 @@ async fn repository_owner(state: &BlobGitState, repository_id: Uuid, deadline: I
             .map_err(|_| GatewayError::Internal("repository owner read failed"))?
             .ok_or(GatewayError::NotFound)?;
     Ok(row.get(0))
+}
+
+/// The original authorized realm must survive every baseline recapture. A
+/// rebase may follow a newer revision, ref set and pack membership set, but it
+/// must never follow a different repository history, authority epoch, group
+/// epoch, tenant or object format.
+fn admission_realm_matches_serving(baseline: &PackCommitBaseline, serving: &ServingRepository) -> bool {
+    let gate = baseline.gate();
+    let authorized = &serving.gate;
+    gate.repository_id() == authorized.repository_id()
+        && gate.tenant_id() == authorized.tenant_id()
+        && gate.object_format() == authorized.object_format()
+        && gate.history_incarnation() == authorized.history_incarnation()
+        && gate.authority_epoch() == authorized.authority_epoch()
+        && gate.group_epoch() == authorized.group_epoch()
+}
+
+/// Only the exact typed refusal raised by `ensure_gate_matches` inside the
+/// freshly created pending prefix is eligible for a rebase. It can only be
+/// produced after `begin_fresh` observed `Lookup::Unknown` while holding the
+/// operation advisory lock in that same transaction, so no pending row can
+/// already exist for this operation. Every other refusal (cancellation,
+/// already verified, history/authority/mode, digest, ambiguity, timeout,
+/// provider or permission error) keeps its original outcome.
+fn is_rolled_back_revision_mismatch(error: &PackCommitError) -> bool {
+    matches!(
+        error,
+        PackCommitError::Rejected(rejection)
+            if rejection.code == PackCommitRejectCode::RevisionMismatch
+                && rejection.detail == GATE_REVISION_MISMATCH_DETAIL
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -208,6 +316,10 @@ enum Reserved {
     /// reservation is rolled back unused and the answer comes from that durable
     /// state alone.
     Known(Claim),
+    /// The freshly created pending prefix saw the locked gate advance between
+    /// the captured baseline and this transaction. Nothing was committed, so
+    /// the caller may recapture and rebuild.
+    Rebaseline,
     /// This transaction created the pending row *and* its producer binding; only
     /// `COMMIT` may publish the reserved sequence, the pending row and the
     /// binding together.
@@ -287,7 +399,16 @@ async fn begin_fresh(
                 // The durable producer value stays in its own migration-147 row,
                 // written by the core adapter in this same transaction.
                 let plan = build_plan(request, pairs, mode, owner, baseline, identity)?;
-                let token = PgPackCommit.begin_serving_pending_in_tx(&tx, &plan, request_digest, deadline).await?;
+                let token = match PgPackCommit.begin_serving_pending_in_tx(&tx, &plan, request_digest, deadline).await {
+                    Ok(token) => token,
+                    Err(error) if is_rolled_back_revision_mismatch(&error) => {
+                        // The pending prefix was created by this transaction and
+                        // the gate check failed before `COMMIT`; the caller rolls
+                        // the whole transaction back below. No admission exists.
+                        return Ok(Reserved::Rebaseline);
+                    }
+                    Err(error) => return Err(GatewayError::from(error)),
+                };
                 Ok(Reserved::Created { _token: token, plan: Box::new(plan) })
             }
         }
@@ -302,21 +423,33 @@ async fn begin_fresh(
             commit_bounded(tx, deadline, repository_id, Some(operation_id)).await.map_err(ref_error)?;
             Ok(Start::Fresh { _token, plan })
         }
+        Ok(Reserved::Rebaseline) => {
+            // The transaction contains no publishable admission. A rebase is
+            // allowed only after the rollback itself is acknowledged; an
+            // unknown cleanup outcome stays an error instead of being retried.
+            rollback_bounded(tx, deadline).await?;
+            Ok(Start::Rebaseline)
+        }
         Ok(Reserved::Known(claim)) => {
-            rollback_bounded(tx, deadline).await;
+            let _ = rollback_bounded(tx, deadline).await;
             start_from_claim(claim)
         }
         Err(error) => {
-            rollback_bounded(tx, deadline).await;
+            let _ = rollback_bounded(tx, deadline).await;
             Err(error)
         }
     }
 }
 
-/// Bounded best-effort rollback of a caller-owned transaction.
-///
-async fn rollback_bounded(tx: tokio_postgres::Transaction<'_>, deadline: Instant) {
-    let _ = timeout_at(deadline, tx.rollback()).await;
+/// Bounded rollback of a caller-owned transaction. A rebase requires the
+/// acknowledged success; callers that already have a definite non-retryable
+/// answer may keep that answer if cleanup itself is unconfirmed.
+async fn rollback_bounded(tx: tokio_postgres::Transaction<'_>, deadline: Instant) -> Result<(), GatewayError> {
+    match timeout_at(deadline, tx.rollback()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(GatewayError::Internal("admission rollback was not acknowledged")),
+        Err(_) => Err(GatewayError::Timeout),
+    }
 }
 
 fn start_from_claim(claim: Claim) -> Result<Start, GatewayError> {
@@ -599,6 +732,31 @@ mod tests {
         ));
         assert!(matches!(map_protected_upload(ProtectedUploadError::Checkout), GatewayError::Internal(_)));
         assert!(matches!(map_protected_upload(ProtectedUploadError::ForeignBackend), GatewayError::Internal(_)));
+    }
+
+    #[test]
+    fn only_the_exact_rolled_back_gate_revision_refusal_is_rebasable() {
+        use crate::ref_store::RefStoreError;
+
+        let rejected = |code: PackCommitRejectCode, detail: &'static str| {
+            PackCommitError::Rejected(PackCommitRejection::new(code, detail))
+        };
+        assert!(is_rolled_back_revision_mismatch(&rejected(
+            PackCommitRejectCode::RevisionMismatch,
+            GATE_REVISION_MISMATCH_DETAIL
+        )));
+        for error in [
+            rejected(PackCommitRejectCode::RevisionMismatch, "another fixed detail"),
+            rejected(PackCommitRejectCode::HistoryIncarnationMismatch, GATE_REVISION_MISMATCH_DETAIL),
+            rejected(PackCommitRejectCode::ModeMismatch, GATE_REVISION_MISMATCH_DETAIL),
+            rejected(PackCommitRejectCode::Cancelled, GATE_REVISION_MISMATCH_DETAIL),
+            rejected(PackCommitRejectCode::AlreadyVerified, GATE_REVISION_MISMATCH_DETAIL),
+            rejected(PackCommitRejectCode::GateDigestMismatch, GATE_REVISION_MISMATCH_DETAIL),
+            PackCommitError::RefStore(RefStoreError::Timeout),
+            PackCommitError::CommitUnknown { repository_id: Uuid::new_v4(), operation_id: Uuid::new_v4() },
+        ] {
+            assert!(!is_rolled_back_revision_mismatch(&error), "{error:?} must not rebase");
+        }
     }
 
     fn rejected(code: PackCommitRejectCode) -> AuthorizedCommitError {
