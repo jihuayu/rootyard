@@ -25,11 +25,12 @@ webhook has no persisted creator-token binding in this schema, so an API-token
 revocation is not represented as revoking the webhook's independent secret.
 This harness does not claim that unsupported binding.
 
-Concurrency limitation: the claim/heartbeat, post-Git callback, and merge
-rechecks are serialized by the policy advisory fence, but this harness does not
-install a test-only pause inside checkout preparation or Git verification.
-It proves the end-state refusals and current code paths, not a specific
-overlapping interleaving.
+Concurrency coverage: the merge/revocation case uses a fixture-held binding row
+and waits on the real policy advisory lock, scheduling revocation first and
+proving merge waits and then refuses. The claim/heartbeat and post-Git callback
+rechecks do not install a pause inside checkout preparation or Git verification,
+so only their end-state refusals, not a specific overlapping interleaving, are
+claimed by this harness.
 
 Required environment (same as the other native CI harnesses):
 ROOTYARD_TEST_DATABASE_URL, a trusted Git executable, and a Linux PostgreSQL 17
@@ -48,6 +49,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import urllib.parse
 
 from webhooks import WebhooksHarness
 
@@ -61,6 +63,11 @@ class TrustBoundaryHarness(WebhooksHarness):
         return "'" + str(value).replace("'", "''") + "'"
 
     def setup(self):
+        parts = urllib.parse.urlsplit(self.db)
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        query.append(("application_name", self.schema))
+        self.db = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+        self.env["DATABASE_URL"] = self.db
         self.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"] = "16"
         self.env["ROOTYARD_CI_ORIGIN_FALLBACK_PER_REPO"] = "8"
         self.env["ROOTYARD_CI_MIRROR_AUDIENCE"] = "f4b6bac2-3e5c-4d6f-8a4f-4a7c6f2d9e11"
@@ -351,6 +358,7 @@ class TrustBoundaryHarness(WebhooksHarness):
                 self.sql(
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE datname=current_database() AND state='active' "
+                    f"AND application_name={self.q(self.schema)} "
                     f"AND query LIKE {self.q('%' + marker + '%')} "
                     "AND wait_event_type='Lock'"
                 )
