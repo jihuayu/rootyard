@@ -79,6 +79,8 @@ class RefStoreReceiptFixture(unittest.TestCase):
             b"holds-helper-binary")
         self.holds_output = self.write(
             "outputs/refstore-holds-fixture", b"holds-helper-binary")
+        self.store_root = Path(tempfile.mkdtemp(prefix="rootyard-refstore-store-"))
+        self.addCleanup(shutil.rmtree, self.store_root, ignore_errors=True)
         for name in ("cargo", "rustc", "rustup"):
             self.write("toolchain/" + name, ("fake-" + name).encode())
         self.environ = {"PATH": ""}
@@ -190,7 +192,8 @@ class RefStoreReceiptFixture(unittest.TestCase):
                        fresh=True, output=None, original=None, manifest=None,
                        bound=None, toolchain=None, profile="test",
                        kind="rust-integration-test", relocated=True,
-                       with_batch=True, with_selection=True):
+                       with_batch=True, with_selection=True,
+                       batch_targets=None, artifact_store=None):
         if source is None:
             source = SNAPSHOT_SOURCE if target == SNAPSHOT_TARGET else HOLDS_SOURCE
         output = Path(output or (self.snapshot_output if target == SNAPSHOT_TARGET
@@ -206,15 +209,19 @@ class RefStoreReceiptFixture(unittest.TestCase):
         row = receipts.cargo_artifact_record(event, self.root)
         extra = {
             "kind": kind,
+            "build_options": {"jobs": 2},
             "integration_test_source": row["source"],
             "integration_test_source_sha256": row["source_sha256"],
         }
         if relocated:
             extra["relocated_artifact"] = True
             extra["original_artifact_sha256"] = row["executable_sha256"]
+        if artifact_store is not None:
+            extra["artifact_store"] = artifact_store
         if with_batch:
             extra["batch"] = self.batch_link(
-                manifest, output.name, ["rootyard", "rootyard", target], bound)
+                manifest, output.name,
+                batch_targets or ["rootyard", "rootyard", target], bound)
         if with_selection:
             extra["selection"] = self.selection(profile)
         return receipts.make_receipt_v2(
@@ -241,9 +248,9 @@ class RefStoreReceiptFixture(unittest.TestCase):
                     lib_fresh=True, bin_fresh=False, lib_source=binding.APP_LIB_SOURCE,
                     bin_source=binding.APP_BIN_SOURCE, bin_target=binding.APP_TARGET,
                     bin_executable=None, output=None, original_sha256=None,
-                    manifest=None, bound=None, toolchain=None, relocated=True,
+                    manifest=None, bound=None, toolchain=None, relocated=False,
                     with_batch=True, with_selection=True, implicit=False,
-                    extra_bins=()):
+                    extra_bins=(), artifact_store=None):
         bin_executable = Path(bin_executable or self.app_binary)
         if relocated:
             binary_path = Path(output or self.app_output)
@@ -269,12 +276,14 @@ class RefStoreReceiptFixture(unittest.TestCase):
                 executable=extra.get("executable"), fresh=extra.get("fresh", True))
             rows.append(receipts.cargo_artifact_record(extra_event, self.root))
             targets.append(extra["target"])
-        extra = {"kind": kind}
+        extra = {"kind": kind, "build_options": {"jobs": 2}}
         if implicit:
             extra["implicit_build"] = True
         if relocated:
             extra["relocated_artifact"] = True
             extra["original_artifact_sha256"] = original_sha256 or bin_row["executable_sha256"]
+        if artifact_store is not None:
+            extra["artifact_store"] = artifact_store
         if with_batch:
             extra["batch"] = self.batch_link(manifest, binary_path.name, targets, bound)
         if with_selection:
@@ -304,6 +313,216 @@ class RefStoreReceiptFixture(unittest.TestCase):
         overrides.setdefault("with_batch", False)
         overrides.setdefault("with_selection", False)
         return self.app_receipt(**overrides)
+
+    # -- producer-shaped batch manifest -----------------------------------
+    def manifest_artifact_row(self, row, artifact, receipt, implicit=None):
+        entry = {
+            "kind": row["kind"],
+            "target": row["target"],
+            "artifact": str(artifact),
+            "original_artifact": row.get("executable", str(artifact)),
+            "original_artifact_sha256": row.get("executable_sha256"),
+            "receipt": str(receipt),
+            "fresh": row["fresh"],
+            "sha256": row.get("executable_sha256") or digest(artifact),
+            "size": Path(artifact).stat().st_size if Path(artifact).is_file() else 0,
+            "mtime_ns": 0,
+            "duration_seconds": 1.0,
+            "package_id": row["package_id"],
+            "profile": row["profile"],
+            "source": row["source"],
+        }
+        if row["kind"] == "test":
+            entry["source_sha256"] = row["source_sha256"]
+        if implicit is not None:
+            entry["implicit"] = implicit
+        return entry
+
+    def producer_manifest(self, helper_payload, app_payload, helper_receipt,
+                          app_receipt, app_binary, *, manifest_app_payload=None):
+        helper_row = helper_payload["cargo_artifacts"][0]
+        helper_binary = (self.snapshot_output
+                         if helper_row["target"] == SNAPSHOT_TARGET
+                         else self.holds_output)
+        cas = (helper_payload.get("artifact_store") is not None
+               or app_payload.get("artifact_store") is not None)
+        if app_payload.get("batch") is None or "cargo_artifacts" not in app_payload:
+            app_payload = manifest_app_payload
+            if app_payload is None:
+                app_payload = self.app_receipt(relocated=False)
+            app_receipt = Path(str(self.app_binary) + ".build.json")
+            app_binary = self.app_binary
+        app_rows = list(app_payload["cargo_artifacts"])
+        extra_row = receipts.cargo_artifact_record(self.event(
+            target="rootyard-pando-lab", kind="bin",
+            source="src/bin/rootyard-pando-lab.rs", profile=self.profile,
+            executable=self.other_bin, fresh=True), self.root)
+        build_rows = app_rows + [extra_row, helper_row]
+        helper_payload["batch"]["targets"] = [row["target"] for row in build_rows]
+        artifacts = []
+        if not cas:
+            artifacts.append(self.manifest_artifact_row(
+                extra_row, self.other_bin,
+                Path(str(self.other_bin) + ".build.json"), implicit=False))
+        for row in app_rows:
+            if row["kind"] != "bin":
+                continue
+            if row["target"] == binding.APP_TARGET:
+                artifact_path = app_binary
+                receipt_path = app_receipt
+                record = app_payload.get("artifact_store")
+            else:
+                artifact_path = self.other_bin
+                receipt_path = Path(str(self.other_bin) + ".build.json")
+                record = None
+            entry = self.manifest_artifact_row(
+                row, artifact_path, receipt_path, implicit=False)
+            if record is not None:
+                entry["artifact_store"] = record
+            artifacts.append(entry)
+        helper_entry = self.manifest_artifact_row(
+            helper_row, helper_binary, helper_receipt)
+        if helper_payload.get("artifact_store") is not None:
+            helper_entry["artifact_store"] = helper_payload["artifact_store"]
+        artifacts.append(helper_entry)
+        manifest = {
+            "kind": binding.BATCH_KIND,
+            "manifest_version": 2,
+            "status": "passed",
+            "source_commit": helper_payload["workspace_commit"],
+            "git_head": helper_payload.get("git_head"),
+            "working_tree": helper_payload.get("working_tree"),
+            "source_inputs_sha256": helper_payload["source_inputs_sha256"],
+            "cargo_lock_sha256": helper_payload["cargo_lock_sha256"],
+            "config_digest": helper_payload["config_digest"],
+            "bound_inputs": helper_payload["bound_inputs"],
+            "bound_input_inventory": helper_payload["bound_input_inventory"],
+            "toolchain": helper_payload["toolchain"],
+            "features": helper_payload["features"],
+            "profile": helper_payload["profile"],
+            "target_triple": helper_payload["target_triple"],
+            "selection": helper_payload.get("selection"),
+            "architecture": {
+                "target_triple": helper_payload["target_triple"],
+                "host": helper_payload["toolchain"]["rustc"]["host"],
+            },
+            "target_directory": helper_payload["target_dir"],
+            "lock_file": helper_payload.get("lock_file"),
+            "cargo_metadata_target_directory": helper_payload["target_dir"],
+            "cargo_package_id": "rootyard 0.1.0",
+            "build_options": helper_payload.get("build_options"),
+            "build": {
+                "command": helper_payload["command"],
+                "commands": 1,
+                "duration_seconds": 1.0,
+                "cargo_artifacts": build_rows,
+            },
+            "artifacts": artifacts,
+            "duration_seconds": 2.0,
+        }
+        if cas:
+            helper_record = helper_payload.get("artifact_store")
+            app_record = app_payload.get("artifact_store")
+            assert isinstance(helper_record, dict) and isinstance(app_record, dict)
+            manifest["artifact_store"] = {
+                "schema": binding.STORE_SCHEMA,
+                "root": str(self.store_root),
+                "objects": [helper_record["object"], app_record["object"]],
+                "sealed": [helper_record, app_record],
+            }
+        return manifest
+
+    def write_manifest(self, path, payload):
+        return self.write_receipt(Path(path), payload)
+
+    def cas_records(self, helper_target, helper_receipt):
+        """Create canonical CAS binaries and return the helper/app store records."""
+        helper_binary = (self.snapshot_output if helper_target == SNAPSHOT_TARGET
+                         else self.holds_output)
+        app_binary = self.app_output
+        helper_sha = digest(helper_binary)
+        app_sha = digest(app_binary)
+        helper_dir = self.store_root / "snapshots" / self.commit / ("c" * 64) / "helper-build"
+        app_dir = self.store_root / "snapshots" / self.commit / ("d" * 64) / "app-build"
+        helper_dir.mkdir(parents=True, exist_ok=True)
+        app_dir.mkdir(parents=True, exist_ok=True)
+        helper_object = self.store_root / "objects/sha256" / helper_sha
+        app_object = self.store_root / "objects/sha256" / app_sha
+        helper_object.parent.mkdir(parents=True, exist_ok=True)
+        app_object.parent.mkdir(parents=True, exist_ok=True)
+        helper_object.write_bytes(helper_binary.read_bytes())
+        app_object.write_bytes(app_binary.read_bytes())
+        helper_canonical = helper_dir / helper_binary.name
+        app_canonical = app_dir / "rootyard"
+        helper_canonical.write_bytes(helper_binary.read_bytes())
+        app_canonical.write_bytes(app_binary.read_bytes())
+        helper_build = helper_dir / (helper_canonical.name + ".build.json")
+        helper_canonical_receipt = helper_dir / (helper_canonical.name + ".receipt.json")
+        app_build = app_dir / "rootyard.build.json"
+        app_canonical_receipt = app_dir / "rootyard.receipt.json"
+        helper_record = {
+            "schema": binding.STORE_SCHEMA,
+            "root": str(self.store_root),
+            "kind": "test",
+            "target": helper_target,
+            "implicit": False,
+            "object": str(helper_object),
+            "binary": str(helper_canonical),
+            "receipt": str(helper_canonical_receipt),
+            "build_receipt": str(helper_build),
+            "binary_sha256": helper_sha,
+            "config_key": "c" * 64,
+            "build_id": "helper-build",
+            "method": "copy",
+            "reused": False,
+            "copied_bytes": helper_canonical.stat().st_size,
+            "output_alias": {
+                "path": str(helper_binary),
+                "receipt": str(helper_receipt),
+                "method": "copy",
+                "same_inode_as_cas_object": False,
+                "overwrote_existing": False,
+            },
+        }
+        app_record = {
+            "schema": binding.STORE_SCHEMA,
+            "root": str(self.store_root),
+            "kind": "bin",
+            "target": binding.APP_TARGET,
+            "implicit": False,
+            "object": str(app_object),
+            "binary": str(app_canonical),
+            "receipt": str(app_canonical_receipt),
+            "build_receipt": str(app_build),
+            "binary_sha256": app_sha,
+            "config_key": "d" * 64,
+            "build_id": "app-build",
+            "method": "copy",
+            "reused": False,
+            "copied_bytes": app_canonical.stat().st_size,
+            "output_alias": None,
+        }
+        return helper_record, app_record
+
+    def finalize_cas(self, helper_record, app_record, helper_receipt, app_receipt):
+        helper_bytes = Path(helper_receipt).read_bytes()
+        app_bytes = Path(app_receipt).read_bytes()
+        Path(helper_record["build_receipt"]).write_bytes(helper_bytes)
+        Path(helper_record["receipt"]).write_bytes(helper_bytes)
+        Path(app_record["build_receipt"]).write_bytes(app_bytes)
+        Path(app_record["receipt"]).write_bytes(app_bytes)
+
+    def cas_pair(self, target):
+        helper_output = (self.snapshot_output if target == SNAPSHOT_TARGET
+                         else self.holds_output)
+        helper_receipt = Path(str(helper_output) + ".build.json")
+        helper_record, app_record = self.cas_records(target, helper_receipt)
+        helper = self.helper_receipt(
+            target=target, relocated=True, artifact_store=helper_record)
+        app = self.app_receipt(
+            relocated=True, output=app_record["binary"],
+            artifact_store=app_record)
+        return helper, app, helper_record, app_record
 
     # -- v1 receipts ------------------------------------------------------
     def v1_helper_receipt(self, *, target=SNAPSHOT_TARGET, fresh=False,
@@ -354,37 +573,61 @@ class RefStoreReceiptFixture(unittest.TestCase):
         return receipt
 
     def validate_snapshot(self, helper_payload, app_payload, *, default_paths=False,
-                          environ=None):
-        helper_receipt = self.write_receipt(
-            Path(str(self.snapshot_output) + ".build.json") if default_paths
-            else self.root / "receipts/snapshot.build.json", helper_payload)
-        app_receipt = self.write_receipt(
-            Path(str(self.app_output) + ".build.json") if default_paths
-            else self.root / "receipts/application.build.json", app_payload)
+                          environ=None, manifest=None, manifest_app_payload=None,
+                          app_binary=None, finalize=None):
+        app_binary = (app_binary or
+                      (self.app_output if app_payload.get("relocated_artifact") is True
+                       else self.app_binary))
+        helper_receipt = Path(str(self.snapshot_output) + ".build.json")
+        app_receipt = Path(str(app_binary) + ".build.json")
         selected_environ = {} if environ is None else environ
+        if "receipt_schema" in helper_payload:
+            manifest_payload = manifest
+            if manifest_payload is None:
+                manifest_payload = self.producer_manifest(
+                    helper_payload, app_payload, helper_receipt, app_receipt,
+                    app_binary, manifest_app_payload=manifest_app_payload)
+            if manifest_payload is not False:
+                self.write_manifest(
+                    helper_payload["batch"]["manifest"], manifest_payload)
+        self.write_receipt(helper_receipt, helper_payload)
+        self.write_receipt(app_receipt, app_payload)
+        if finalize is not None:
+            finalize(helper_receipt, app_receipt)
         if default_paths:
             return snapshot140.validate_snapshot_fixture_binary(
-                self.snapshot_output, self.app_output,
-                environ=selected_environ)
+                self.snapshot_output, app_binary, environ=selected_environ)
         return snapshot140.validate_snapshot_fixture_binary(
-            self.snapshot_output, self.app_output, helper_receipt, app_receipt,
+            self.snapshot_output, app_binary, helper_receipt, app_receipt,
             environ=selected_environ)
 
     def validate_holds(self, helper_payload, app_payload, *, default_paths=False,
-                       environ=None):
-        helper_receipt = self.write_receipt(
-            Path(str(self.holds_output) + ".build.json") if default_paths
-            else self.root / "receipts/holds.build.json", helper_payload)
-        app_receipt = self.write_receipt(
-            Path(str(self.app_output) + ".build.json") if default_paths
-            else self.root / "receipts/holds-application.build.json", app_payload)
+                       environ=None, manifest=None, manifest_app_payload=None,
+                       app_binary=None, finalize=None):
+        app_binary = (app_binary or
+                      (self.app_output if app_payload.get("relocated_artifact") is True
+                       else self.app_binary))
+        helper_receipt = Path(str(self.holds_output) + ".build.json")
+        app_receipt = Path(str(app_binary) + ".build.json")
         selected_environ = {} if environ is None else environ
+        if "receipt_schema" in helper_payload:
+            manifest_payload = manifest
+            if manifest_payload is None:
+                manifest_payload = self.producer_manifest(
+                    helper_payload, app_payload, helper_receipt, app_receipt,
+                    app_binary, manifest_app_payload=manifest_app_payload)
+            if manifest_payload is not False:
+                self.write_manifest(
+                    helper_payload["batch"]["manifest"], manifest_payload)
+        self.write_receipt(helper_receipt, helper_payload)
+        self.write_receipt(app_receipt, app_payload)
+        if finalize is not None:
+            finalize(helper_receipt, app_receipt)
         if default_paths:
             return holds141.validate_holds_fixture_binary(
-                self.holds_output, self.app_output,
-                environ=selected_environ)
+                self.holds_output, app_binary, environ=selected_environ)
         return holds141.validate_holds_fixture_binary(
-            self.holds_output, self.app_output, helper_receipt, app_receipt,
+            self.holds_output, app_binary, helper_receipt, app_receipt,
             environ=selected_environ)
 
 
@@ -396,6 +639,191 @@ class ExpectedSourceCommitCases:
 
     def validate_pair(self, helper_payload, app_payload, environ):
         raise NotImplementedError
+
+    def validate_manifest_pair(self, helper_payload, app_payload, manifest,
+                               environ=None):
+        raise NotImplementedError
+
+    def validate_cas_pair(self, helper_payload, app_payload, helper_record,
+                          app_record, manifest):
+        raise NotImplementedError
+
+    def default_manifest(self, helper_payload, app_payload, *, app_binary=None):
+        helper_target = helper_payload["cargo_artifacts"][0]["target"]
+        helper_output = (self.snapshot_output if helper_target == SNAPSHOT_TARGET
+                         else self.holds_output)
+        app_binary = (app_binary or
+                      (self.app_output if app_payload.get("relocated_artifact") is True
+                       else self.app_binary))
+        return self.producer_manifest(
+            helper_payload, app_payload,
+            Path(str(helper_output) + ".build.json"),
+            Path(str(app_binary) + ".build.json"),
+            app_binary)
+
+    def manifest_entry(self, manifest, kind, target):
+        return next(row for row in manifest["artifacts"]
+                    if row["kind"] == kind and row["target"] == target)
+
+    def test_v2_manifest_positive_binds_path_raw_sha_and_not_first_row(self):
+        helper, app = self.pair()
+        manifest = self.default_manifest(helper, app)
+        report = self.validate_manifest_pair(helper, app, manifest, {})
+        path = Path(helper["batch"]["manifest"])
+        self.assertEqual(Path(report["batch_manifest"]).resolve(), path.resolve())
+        self.assertEqual(report["batch_manifest_sha256"], digest(path))
+        self.assertEqual(report["batch_manifest_version"], 2)
+        self.assertEqual(report["batch_manifest_status"], "passed")
+        self.assertIsNone(report["expected_batch_manifest"])
+        self.assertIsNone(report["expected_batch_manifest_sha256"])
+        self.assertEqual(manifest["artifacts"][0]["target"], "rootyard-pando-lab")
+
+    def test_v2_cas_manifest_positive(self):
+        target = self.pair()[0]["cargo_artifacts"][0]["target"]
+        helper, app, helper_record, app_record = self.cas_pair(target)
+        app_binary = Path(app_record["binary"])
+        manifest = self.default_manifest(helper, app, app_binary=app_binary)
+        report = self.validate_cas_pair(
+            helper, app, helper_record, app_record, manifest)
+        self.assertEqual(report["batch_manifest_sha256"],
+                         digest(Path(helper["batch"]["manifest"])))
+        self.assertEqual(report["batch_manifest_status"], "passed")
+        self.assertEqual(report["candidate_application_sha256"],
+                         digest(app_binary))
+
+    def test_v2_non_cas_manifest_rejects_relocated_bin_receipt(self):
+        helper, app = self.pair()
+        self.assertFalse(app.get("relocated_artifact") is True)
+        app["relocated_artifact"] = True
+        app["original_artifact_sha256"] = app["binary_sha256"]
+        manifest = self.default_manifest(helper, app)
+        with self.assertRaises(AssertionError):
+            self.validate_manifest_pair(helper, app, manifest, {})
+
+    def test_v2_manifest_missing_or_nonpassed_fails(self):
+        helper, app = self.pair()
+        with self.assertRaises(AssertionError):
+            self.validate_manifest_pair(helper, app, False, {})
+        helper, app = self.pair()
+        manifest = self.default_manifest(helper, app)
+        manifest["status"] = "failed"
+        with self.assertRaises(AssertionError):
+            self.validate_manifest_pair(helper, app, manifest, {})
+
+    def test_v2_manifest_wrong_missing_or_duplicate_helper_row_fails(self):
+        helper, app = self.pair()
+        target = helper["cargo_artifacts"][0]["target"]
+        for mutation in ("wrong_hash", "wrong_receipt", "missing", "duplicate"):
+            helper, app = self.pair()
+            manifest = self.default_manifest(helper, app)
+            entry = self.manifest_entry(manifest, "test", target)
+            if mutation == "wrong_hash":
+                entry["sha256"] = "0" * 64
+            elif mutation == "wrong_receipt":
+                entry["receipt"] = str(self.root / "foreign/helper.build.json")
+            elif mutation == "missing":
+                manifest["artifacts"].remove(entry)
+            else:
+                manifest["artifacts"].append(copy.deepcopy(entry))
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                self.validate_manifest_pair(helper, app, manifest, {})
+
+    def test_v2_manifest_wrong_missing_or_duplicate_app_row_fails(self):
+        helper, app = self.pair()
+        for mutation in ("wrong_hash", "wrong_receipt", "missing", "duplicate"):
+            helper, app = self.pair()
+            manifest = self.default_manifest(helper, app)
+            entry = self.manifest_entry(manifest, "bin", binding.APP_TARGET)
+            if mutation == "wrong_hash":
+                entry["sha256"] = "0" * 64
+            elif mutation == "wrong_receipt":
+                entry["receipt"] = str(self.root / "foreign/rootyard.build.json")
+            elif mutation == "missing":
+                manifest["artifacts"].remove(entry)
+            else:
+                manifest["artifacts"].append(copy.deepcopy(entry))
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                self.validate_manifest_pair(helper, app, manifest, {})
+
+    def test_v2_manifest_mutation_with_expected_sha_fails(self):
+        helper, app = self.pair()
+        manifest = self.default_manifest(helper, app)
+        path = Path(helper["batch"]["manifest"])
+        self.write_manifest(path, manifest)
+        expected_sha = digest(path)
+        # A harmless field the content validator does not bind: only the raw
+        # exporter SHA can detect this mutation.
+        manifest["duration_seconds"] = 999
+        with self.assertRaises(AssertionError):
+            self.validate_manifest_pair(
+                helper, app, manifest,
+                {"ROOTYARD_BATCH_MANIFEST_SHA256": expected_sha})
+
+    def test_v2_manifest_expected_path_and_sha_positive(self):
+        helper, app = self.pair()
+        manifest = self.default_manifest(helper, app)
+        path = Path(helper["batch"]["manifest"])
+        self.write_manifest(path, manifest)
+        expected_sha = digest(path)
+        report = self.validate_manifest_pair(
+            helper, app, manifest,
+            {"ROOTYARD_BATCH_MANIFEST": str(path),
+             "ROOTYARD_BATCH_MANIFEST_SHA256": expected_sha})
+        self.assertEqual(Path(report["expected_batch_manifest"]).resolve(),
+                         path.resolve())
+        self.assertEqual(report["expected_batch_manifest_sha256"], expected_sha)
+
+    def test_v2_manifest_expected_path_mismatch_fails(self):
+        helper, app = self.pair()
+        manifest = self.default_manifest(helper, app)
+        with self.assertRaises(AssertionError):
+            self.validate_manifest_pair(
+                helper, app, manifest,
+                {"ROOTYARD_BATCH_MANIFEST": str(self.root / "foreign/manifest.json")})
+
+    def test_v2_manifest_invalid_path_anchor_fails(self):
+        helper, app = self.pair()
+        manifest = self.default_manifest(helper, app)
+        with self.assertRaises(AssertionError):
+            self.validate_manifest_pair(
+                helper, app, manifest,
+                {"ROOTYARD_BATCH_MANIFEST": "relative/manifest.json"})
+        path = Path(helper["batch"]["manifest"])
+        self.write_manifest(path, manifest)
+        link = self.root / "manifest-link.json"
+        if not link.exists():
+            os.symlink(path, link)
+        with self.assertRaises(AssertionError):
+            self.validate_manifest_pair(
+                helper, app, manifest,
+                {"ROOTYARD_BATCH_MANIFEST": str(link)})
+
+    def test_v2_manifest_raw_sha_empty_is_ignored_and_invalid_fails(self):
+        helper, app = self.pair()
+        manifest = self.default_manifest(helper, app)
+        report = self.validate_manifest_pair(
+            helper, app, manifest, {"ROOTYARD_BATCH_MANIFEST_SHA256": ""})
+        self.assertIsNone(report["expected_batch_manifest_sha256"])
+        for value in ("not-a-sha", "A" * 64, "0" * 63):
+            with self.subTest(value=value), self.assertRaises(AssertionError):
+                self.validate_manifest_pair(
+                    helper, app, manifest,
+                    {"ROOTYARD_BATCH_MANIFEST_SHA256": value})
+
+    def test_v2_manifest_header_and_receipt_link_mismatches_fail(self):
+        mutations = (
+            lambda m: m.__setitem__("source_commit", "f" * 40),
+            lambda m: m.__setitem__("config_digest", "f" * 64),
+            lambda m: m["build"].__setitem__("command", ["false"]),
+            lambda m: m["bound_inputs"].__setitem__("digest", "f" * 64),
+        )
+        helper, app = self.pair()
+        for mutate in mutations:
+            helper, app = self.pair()
+            manifest = self.default_manifest(helper, app)
+            mutate(manifest)
+            with self.subTest(mutation=mutate), self.assertRaises(AssertionError):
+                self.validate_manifest_pair(helper, app, manifest, {})
 
     def test_v2_explicit_expected_source_commit_matches(self):
         report = self.validate_pair(
@@ -492,6 +920,19 @@ class Snapshot140ReceiptDispatchTest(ExpectedSourceCommitCases, RefStoreReceiptF
 
     def validate_pair(self, helper_payload, app_payload, environ):
         return self.validate_snapshot(helper_payload, app_payload, environ=environ)
+
+    def validate_manifest_pair(self, helper_payload, app_payload, manifest,
+                               environ=None):
+        return self.validate_snapshot(
+            helper_payload, app_payload, manifest=manifest, environ=environ)
+
+    def validate_cas_pair(self, helper_payload, app_payload, helper_record,
+                          app_record, manifest):
+        return self.validate_snapshot(
+            helper_payload, app_payload, manifest=manifest,
+            app_binary=Path(app_record["binary"]),
+            finalize=lambda helper_receipt, app_receipt: self.finalize_cas(
+                helper_record, app_record, helper_receipt, app_receipt))
 
     def test_v1_pair_preserves_legacy_report_fields(self):
         report = self.validate_snapshot(
@@ -631,7 +1072,7 @@ class Snapshot140ReceiptDispatchTest(ExpectedSourceCommitCases, RefStoreReceiptF
                 bin_executable=self.other_bin,
                 original_sha256=digest(self.app_binary),
                 extra_bins=[{
-                    "target": "rootyard-pando-lab",
+                    "target": "rootyard-extra",
                     "source": "src/bin/rootyard-pando-lab.rs",
                     "executable": self.app_binary,
                 }]))
@@ -716,6 +1157,19 @@ class Holds141ReceiptDispatchTest(ExpectedSourceCommitCases, RefStoreReceiptFixt
 
     def validate_pair(self, helper_payload, app_payload, environ):
         return self.validate_holds(helper_payload, app_payload, environ=environ)
+
+    def validate_manifest_pair(self, helper_payload, app_payload, manifest,
+                               environ=None):
+        return self.validate_holds(
+            helper_payload, app_payload, manifest=manifest, environ=environ)
+
+    def validate_cas_pair(self, helper_payload, app_payload, helper_record,
+                          app_record, manifest):
+        return self.validate_holds(
+            helper_payload, app_payload, manifest=manifest,
+            app_binary=Path(app_record["binary"]),
+            finalize=lambda helper_receipt, app_receipt: self.finalize_cas(
+                helper_record, app_record, helper_receipt, app_receipt))
 
     def assert_holds_rejects(self, helper_payload, app_payload):
         with self.assertRaises(AssertionError):
@@ -822,7 +1276,7 @@ class Holds141ReceiptDispatchTest(ExpectedSourceCommitCases, RefStoreReceiptFixt
                 bin_executable=self.other_bin,
                 original_sha256=digest(self.app_binary),
                 extra_bins=[{
-                    "target": "rootyard-pando-lab",
+                    "target": "rootyard-extra",
                     "source": "src/bin/rootyard-pando-lab.rs",
                     "executable": self.app_binary,
                 }]))

@@ -182,6 +182,340 @@ def _same_toolchain(helper, application, label):
                  label + " helper and application toolchain." + field + " differ")
 
 
+STORE_SCHEMA = "rootyard/native-artifact-store/v1"
+MANIFEST_VERSION = 2
+
+
+def _absolute_manifest_path(value, label, what):
+    _require(isinstance(value, str) and bool(value),
+             label + " " + what + " must be a nonempty path string")
+    path = Path(value)
+    _require(path.is_absolute(), label + " " + what + " must be absolute")
+    _require(".." not in path.parts, label + " " + what + " must not traverse")
+    return path
+
+
+def _regular_manifest_file(path, label, what):
+    path = Path(path)
+    _require(path.exists(), label + " " + what + " is missing: " + str(path))
+    _require(path.is_file(), label + " " + what + " must be a regular file")
+    _require(not path.is_symlink(), label + " " + what + " must not be a symlink")
+    return path
+
+
+def _resolved_equal(left, right):
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _inside(path, root):
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _manifest_artifact_rows(manifest, label):
+    build = manifest.get("build")
+    _require(isinstance(build, dict), label + " manifest build must be an object")
+    rows = None
+    for key in ("cargo_artifacts", "artifacts"):
+        if isinstance(build.get(key), list):
+            rows = build[key]
+            break
+    if rows is None:
+        for key in ("cargo_artifacts", "artifacts"):
+            if isinstance(manifest.get(key), list):
+                rows = manifest[key]
+                break
+    _require(isinstance(rows, list) and bool(rows),
+             label + " manifest must record a nonempty cargo_artifacts list")
+    _require(all(isinstance(row, dict) for row in rows),
+             label + " manifest cargo_artifacts entries must be objects")
+    seen = set()
+    for row in rows:
+        _require(row.get("kind") in native_receipts.ARTIFACT_KINDS,
+                 label + " manifest artifact kind is invalid")
+        _require(isinstance(row.get("target"), str) and bool(row.get("target")),
+                 label + " manifest artifact target must be a nonempty string")
+        _require(isinstance(row.get("fresh"), bool),
+                 label + " manifest artifact fresh must be a JSON boolean")
+        key = (row.get("kind"), row.get("target"))
+        _require(key not in seen, label + " manifest has a duplicate artifact row")
+        seen.add(key)
+    return rows, [(row["kind"], row["target"]) for row in rows]
+
+
+def _manifest_build_row(rows, kind, target, label):
+    matches = [row for row in rows
+               if row.get("kind") == kind and row.get("target") == target]
+    _require(len(matches) == 1,
+             label + " manifest must record exactly one (" + kind + ", " + target +
+             ") build artifact")
+    return matches[0]
+
+
+def _manifest_entry(manifest, kind, target, label):
+    artifacts = manifest.get("artifacts")
+    _require(isinstance(artifacts, list) and bool(artifacts),
+             label + " manifest artifacts must be a nonempty list")
+    _require(all(isinstance(row, dict) for row in artifacts),
+             label + " manifest artifacts entries must be objects")
+    matches = [row for row in artifacts
+               if row.get("kind") == kind and row.get("target") == target]
+    _require(len(matches) == 1,
+             label + " manifest must record exactly one published (" + kind + ", " +
+             target + ") artifact")
+    return matches[0]
+
+
+def _compare_build_row(manifest_row, receipt_row, label):
+    for field in ("package_id", "profile", "source", "source_sha256",
+                  "executable", "executable_sha256"):
+        if field in manifest_row:
+            _require(manifest_row[field] == receipt_row[field],
+                     label + " manifest artifact " + field +
+                     " does not match the receipt row")
+    _require(manifest_row["fresh"] is receipt_row["fresh"],
+             label + " manifest artifact freshness does not match the receipt")
+    _require(manifest_row["source"] == receipt_row["source"],
+             label + " manifest artifact source does not match the receipt")
+    _require(manifest_row["source_sha256"] == receipt_row["source_sha256"],
+             label + " manifest artifact source digest does not match the receipt")
+
+
+def _check_manifest_header(manifest, validated, batch, label):
+    payload = validated.payload
+    batch_version = batch.get("receipt_version")
+    _require(batch_version == MANIFEST_VERSION,
+             label + " batch receipt version must be 2")
+    _require(manifest.get("manifest_version") == MANIFEST_VERSION,
+             label + " manifest version must be 2")
+    _require(manifest.get("manifest_version") == batch_version,
+             label + " manifest version does not match the batch receipt")
+    _require(manifest.get("source_commit") == validated.workspace_commit,
+             label + " manifest source_commit does not match the receipt")
+    _require(manifest.get("source_inputs_sha256") == validated.source_inputs_sha256,
+             label + " manifest source_inputs_sha256 does not match the receipt")
+    _require(manifest.get("cargo_lock_sha256") == payload.get("cargo_lock_sha256"),
+             label + " manifest Cargo.lock digest does not match the receipt")
+    _require(manifest.get("config_digest") == validated.config_digest,
+             label + " manifest config digest does not match the receipt")
+    _require(manifest.get("profile") == payload.get("profile"),
+             label + " manifest profile does not match the receipt")
+    _require(manifest.get("features") == payload.get("features"),
+             label + " manifest features do not match the receipt")
+    _require(manifest.get("target_triple") == payload.get("target_triple"),
+             label + " manifest target triple does not match the receipt")
+    if payload.get("selection") is not None:
+        _require(manifest.get("selection") == payload.get("selection"),
+                 label + " manifest selection does not match the receipt")
+    if payload.get("build_options") is not None:
+        _require(manifest.get("build_options") == payload.get("build_options"),
+                 label + " manifest build options do not match the receipt")
+    if payload.get("git_head") is not None:
+        _require(manifest.get("git_head") == payload.get("git_head"),
+                 label + " manifest git_head does not match the receipt")
+    if payload.get("working_tree") is not None:
+        _require(manifest.get("working_tree") == payload.get("working_tree"),
+                 label + " manifest working tree does not match the receipt")
+    receipt_bound = payload.get("bound_inputs")
+    manifest_bound = manifest.get("bound_inputs")
+    _require(isinstance(receipt_bound, dict) and isinstance(manifest_bound, dict),
+             label + " manifest and receipt bound_inputs must be objects")
+    _require(manifest_bound == receipt_bound,
+             label + " manifest bound_inputs do not match the receipt")
+    _require(manifest_bound.get("digest") == batch.get("bound_inputs_sha256"),
+             label + " manifest bound-input digest does not match the batch link")
+    _require(manifest.get("bound_input_inventory") == payload.get("bound_input_inventory"),
+             label + " manifest bound-input inventory does not match the receipt")
+    _same_toolchain(manifest.get("toolchain"), validated.toolchain, label + " manifest")
+    architecture = manifest.get("architecture")
+    if isinstance(architecture, dict):
+        _require(architecture.get("target_triple") == payload.get("target_triple"),
+                 label + " manifest architecture target does not match the receipt")
+        if "host" in architecture:
+            _require(architecture.get("host") == validated.toolchain["rustc"]["host"],
+                     label + " manifest architecture host does not match the toolchain")
+    else:
+        _require(architecture == payload.get("target_triple"),
+                 label + " manifest architecture does not match the receipt")
+    _require(_resolved_equal(manifest.get("target_directory"), payload.get("target_dir")),
+             label + " manifest target directory does not match the receipt")
+    if payload.get("lock_file") is not None:
+        _require(_resolved_equal(manifest.get("lock_file"), payload.get("lock_file")),
+                 label + " manifest lock file does not match the receipt")
+    build = manifest.get("build")
+    _require(isinstance(build, dict), label + " manifest build must be an object")
+    _require(build.get("command") == payload.get("command"),
+             label + " manifest build command does not match the receipt")
+    _require(build.get("commands") == 1,
+             label + " manifest build must record exactly one command")
+
+
+def _check_manifest_entry(manifest, entry, kind, target, validated, receipt_row,
+                          consumed_binary, consumed_receipt, label):
+    _require(entry.get("kind") == kind,
+             label + " manifest artifact kind does not match")
+    _require(entry.get("target") == target,
+             label + " manifest artifact target does not match")
+    if kind == "bin":
+        _require(entry.get("implicit") is False,
+                 label + " manifest bin artifact must not be implicit")
+    else:
+        _require(entry.get("implicit") is not True,
+                 label + " manifest test artifact must not be implicit")
+    _require(entry.get("fresh") is receipt_row["fresh"],
+             label + " manifest artifact freshness does not match the receipt")
+    _require(entry.get("sha256") == validated.binary_sha256,
+             label + " manifest artifact digest does not match the receipt")
+    _require(entry.get("source") == receipt_row["source"],
+             label + " manifest artifact source does not match the receipt")
+    if "source_sha256" in entry:
+        _require(entry["source_sha256"] == receipt_row["source_sha256"],
+                 label + " manifest artifact source digest does not match the receipt")
+    _require(entry.get("profile") == receipt_row["profile"],
+             label + " manifest artifact profile does not match the receipt")
+    if "package_id" in entry:
+        _require(entry["package_id"] == receipt_row["package_id"],
+                 label + " manifest artifact package id does not match the receipt")
+    if "original_artifact_sha256" in entry:
+        _require(entry["original_artifact_sha256"] == receipt_row["executable_sha256"],
+                 label + " manifest original artifact digest does not match the receipt")
+    _require(_resolved_equal(entry.get("artifact"), consumed_binary),
+             label + " manifest artifact path does not match the consumed binary")
+    _require(_resolved_equal(entry.get("receipt"), consumed_receipt),
+             label + " manifest receipt path does not match the consumed receipt")
+
+    store = manifest.get("artifact_store")
+    if store is None:
+        _require(validated.payload.get("artifact_store") is None,
+                 label + " non-CAS manifest receipt may not carry artifact_store")
+        if kind == "bin":
+            _require(validated.payload.get("relocated_artifact") is not True,
+                     label + " non-CAS bin receipt may not be relocated")
+        return
+    _require(isinstance(store, dict), label + " manifest artifact_store must be an object")
+    _require(store.get("schema") == STORE_SCHEMA,
+             label + " manifest artifact_store schema is invalid")
+    root = _absolute_manifest_path(store.get("root"), label, "artifact_store.root")
+    sealed = store.get("sealed")
+    _require(isinstance(sealed, list) and bool(sealed),
+             label + " manifest artifact_store.sealed must be a nonempty list")
+    record = entry.get("artifact_store")
+    _require(isinstance(record, dict),
+             label + " CAS manifest artifact must carry artifact_store")
+    _require(sum(1 for item in sealed if item == record) == 1,
+             label + " CAS manifest artifact is not exactly one sealed record")
+    _require(record.get("schema") == STORE_SCHEMA,
+             label + " sealed record schema is invalid")
+    _require(_resolved_equal(record.get("root"), root),
+             label + " sealed record root is foreign")
+    _require(record.get("kind") == kind,
+             label + " sealed record kind does not match the manifest row")
+    _require(record.get("target") == target,
+             label + " sealed record target does not match the manifest row")
+    _require(record.get("binary_sha256") == entry.get("sha256"),
+             label + " sealed record digest does not match the manifest row")
+    _require(validated.payload.get("artifact_store") == record,
+             label + " receipt artifact_store does not match the sealed record")
+    canonical_binary = _absolute_manifest_path(record.get("binary"), label, "sealed binary")
+    canonical_receipt = _absolute_manifest_path(record.get("receipt"), label, "sealed receipt")
+    build_receipt = _absolute_manifest_path(record.get("build_receipt"),
+                                            label, "sealed build receipt")
+    for path, what in ((canonical_binary, "sealed binary"),
+                       (canonical_receipt, "sealed receipt"),
+                       (build_receipt, "sealed build receipt")):
+        _require(_inside(path, root), label + " " + what + " is outside the store")
+        _require(path.is_file(), label + " " + what + " is missing")
+    _require(sha256_file(canonical_binary) == record.get("binary_sha256"),
+             label + " sealed canonical binary digest does not match its record")
+    _require(sha256_file(canonical_receipt) == sha256_file(build_receipt),
+             label + " sealed receipt aliases are not the same bytes")
+    if kind == "bin":
+        _require(validated.payload.get("relocated_artifact") is True,
+                 label + " CAS bin receipt must be relocated")
+        _require(_resolved_equal(consumed_binary, canonical_binary),
+                 label + " consumed binary is not the sealed canonical snapshot")
+        _require(_resolved_equal(consumed_receipt, build_receipt),
+                 label + " consumed receipt is not the sealed .build.json alias")
+        _require(canonical_binary.name == target,
+                 label + " sealed bin basename is not the target")
+        _require(record.get("output_alias") is None,
+                 label + " sealed bin record may not carry an output alias")
+    else:
+        _require(canonical_binary.name == consumed_binary.name,
+                 label + " sealed test snapshot basename is not the output basename")
+        _require(canonical_receipt.name == canonical_binary.name + ".receipt.json",
+                 label + " sealed test receipt basename is invalid")
+        _require(build_receipt.name == canonical_binary.name + ".build.json",
+                 label + " sealed test build receipt basename is invalid")
+        alias = record.get("output_alias")
+        _require(isinstance(alias, dict),
+                 label + " sealed test record must carry output_alias")
+        _require(_resolved_equal(alias.get("path"), consumed_binary),
+                 label + " test output alias path does not match the consumed binary")
+        _require(_resolved_equal(alias.get("receipt"), consumed_receipt),
+                 label + " test output alias receipt does not match the consumed receipt")
+        _require(alias.get("overwrote_existing") is False,
+                 label + " test output alias must not overwrite an existing path")
+        _require(isinstance(alias.get("same_inode_as_cas_object"), bool),
+                 label + " test output alias same_inode flag must be a boolean")
+        _require(alias.get("method") in ("hardlink", "copy"),
+                 label + " test output alias method is invalid")
+        _require(not _inside(consumed_binary, root),
+                 label + " test output alias must be outside the artifact store")
+        _require(not _inside(consumed_receipt, root),
+                 label + " test output receipt must be outside the artifact store")
+        _require(sha256_file(consumed_receipt) == sha256_file(build_receipt),
+                 label + " test output receipt is not the sealed receipt bytes")
+
+
+def _check_exporter_anchors(environ, manifest_path, raw_sha256, label):
+    environ = os.environ if environ is None else environ
+    expected_path = environ.get("ROOTYARD_BATCH_MANIFEST")
+    expected_sha = environ.get("ROOTYARD_BATCH_MANIFEST_SHA256")
+    if expected_path:
+        anchor = _absolute_manifest_path(
+            expected_path, label, "ROOTYARD_BATCH_MANIFEST")
+        _require(not anchor.is_symlink(),
+                 label + " ROOTYARD_BATCH_MANIFEST must not be a symlink")
+        _require(_resolved_equal(anchor, manifest_path),
+                 label + " consumed batch manifest does not match ROOTYARD_BATCH_MANIFEST")
+    if expected_sha:
+        _require(isinstance(expected_sha, str) and len(expected_sha) == 64
+                 and expected_sha == expected_sha.lower()
+                 and all(char in "0123456789abcdef" for char in expected_sha),
+                 label + " ROOTYARD_BATCH_MANIFEST_SHA256 must be 64 lowercase hex")
+        _require(expected_sha == raw_sha256,
+                 label + " consumed batch manifest SHA-256 does not match the exporter anchor")
+    return (expected_path or None), (expected_sha or None)
+
+
+def _load_batch_manifest(path, label):
+    manifest_path = _absolute_manifest_path(path, label, "batch manifest")
+    _regular_manifest_file(manifest_path, label, "batch manifest")
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError as error:
+        raise AssertionError(label + " batch manifest cannot be read: " + str(error)) from error
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        manifest = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise AssertionError(label + " batch manifest is not valid JSON") from error
+    _require(isinstance(manifest, dict), label + " batch manifest must be a JSON object")
+    _require(manifest.get("kind") == BATCH_KIND, label + " batch manifest kind is invalid")
+    _require(manifest.get("status") == "passed",
+             label + " batch manifest must have passed status")
+    _require(manifest.get("manifest_version") == MANIFEST_VERSION,
+             label + " batch manifest version must be 2")
+    return manifest_path, raw_sha256, manifest
+
+
 def validate_v2_pair(*, helper, app_binary, helper_target, helper_source,
                      helper_source_relative, helper_receipt, app_receipt, label,
                      environ=None):
@@ -256,11 +590,11 @@ def validate_v2_pair(*, helper, app_binary, helper_target, helper_source,
     _require(app_kind in (APP_BATCH_KIND, APP_CLI_KIND),
              "candidate application receipt kind is " + repr(app_kind))
     app_profile = app_payload.get("profile")
+    app_batch = app_valid.batch
     if app_kind == APP_BATCH_KIND:
         _require(app_profile == "test",
                  "candidate application batch profile is " + repr(app_profile) +
                  ", expected test")
-        app_batch = app_valid.batch
         _require(app_batch is not None,
                  "candidate application batch receipt has no batch link")
         _require(app_batch["kind"] == BATCH_KIND, "candidate application batch.kind is invalid")
@@ -315,6 +649,38 @@ def validate_v2_pair(*, helper, app_binary, helper_target, helper_source,
              Path(app_payload["lock_file"]).is_absolute(),
              "candidate application receipt has no absolute lock_file")
 
+    # --- the actual published batch manifest (never a receipt self-claim) --
+    manifest_path, manifest_sha256, manifest = _load_batch_manifest(
+        helper_batch["manifest"], label)
+    expected_batch_manifest, expected_batch_manifest_sha256 = _check_exporter_anchors(
+        environ, manifest_path, manifest_sha256, label)
+    if app_batch is not None:
+        _require(_resolved_equal(app_batch["manifest"], manifest_path),
+                 "helper and candidate application receipts do not name the same "
+                 "consumed batch manifest")
+    build_rows, typed_targets = _manifest_artifact_rows(manifest, label)
+    _check_manifest_header(manifest, helper_valid, helper_batch, label)
+    helper_build_row = _manifest_build_row(build_rows, "test", helper_target, label)
+    _compare_build_row(helper_build_row, helper_row, label)
+    helper_entry = _manifest_entry(manifest, "test", helper_target, label)
+    _check_manifest_entry(
+        manifest, helper_entry, "test", helper_target, helper_valid, helper_row,
+        helper, helper_receipt, label)
+    _require(helper_batch["targets"] == [target for kind, target in typed_targets],
+             label + " helper batch targets do not match the manifest build rows")
+    if app_batch is not None:
+        _check_manifest_header(manifest, app_valid, app_batch, "candidate application")
+        for row in app_valid.artifacts:
+            manifest_row = _manifest_build_row(
+                build_rows, row["kind"], row["target"], label)
+            _compare_build_row(manifest_row, row, "candidate application")
+        _require(app_batch["targets"] == [row["target"] for row in app_valid.artifacts],
+                 "candidate application batch targets do not match its artifact rows")
+        app_entry = _manifest_entry(manifest, "bin", APP_TARGET, label)
+        _check_manifest_entry(
+            manifest, app_entry, "bin", APP_TARGET, app_valid, bin_row,
+            app_binary, app_receipt, "candidate application")
+
     # --- one build closure across both receipts --------------------------
     _require(helper_valid.source_inputs_sha256 == app_valid.source_inputs_sha256,
              "helper and candidate application source_inputs_sha256 differ")
@@ -355,7 +721,12 @@ def validate_v2_pair(*, helper, app_binary, helper_target, helper_source,
         "cargo_lock_sha256": helper_payload["cargo_lock_sha256"],
         "config_digest": helper_valid.config_digest,
         "target_triple": helper_valid.toolchain["target_triple"],
-        "batch_manifest": helper_batch["manifest"],
+        "batch_manifest": str(manifest_path),
+        "batch_manifest_sha256": manifest_sha256,
+        "batch_manifest_version": manifest.get("manifest_version"),
+        "batch_manifest_status": manifest.get("status"),
+        "expected_batch_manifest": expected_batch_manifest,
+        "expected_batch_manifest_sha256": expected_batch_manifest_sha256,
         "batch_receipt_version": helper_batch["receipt_version"],
         "candidate_application_receipt": str(app_receipt),
         "candidate_application_receipt_sha256": app_valid.receipt_sha256,

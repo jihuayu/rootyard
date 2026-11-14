@@ -144,8 +144,9 @@ def validate_holds_fixture_binary(helper, app_binary, helper_receipt=None,
     batch closure.  For v2, an explicit ``ROOTYARD_EXPECTED_SOURCE_COMMIT``
     (else ``GITHUB_SHA``) is also passed to the shared reader for both
     receipts, so a stale build fails closed; the v1 path keeps its historical
-    explicit-only behavior and no checkout-HEAD probe.  V2 freshness is the
-    literal Cargo boolean, never a fabricated ``fresh=False`` claim.
+    receipt checks and adds no expected-source-commit constraint, and no
+    checkout-HEAD probe is made.  V2 freshness is the literal Cargo boolean,
+    never a fabricated ``fresh=False`` claim.
     """
     helper = Path(helper)
     assert helper.is_file(), "artifact-hold fixture binary is missing: " + str(helper)
