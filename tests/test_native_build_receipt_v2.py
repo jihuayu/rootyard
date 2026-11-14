@@ -468,6 +468,18 @@ class V2BindingTest(ReceiptFixture):
     def test_artifact_source_must_match_the_bound_inventory_without_a_source_root(self):
         payload = self.make_v2()
 
+        missing_source = copy.deepcopy(payload)
+        del missing_source["cargo_artifacts"][1]["source"]
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.validate_receipt(missing_source)
+        self.assertIn("cargo_artifacts[1].source", str(caught.exception))
+
+        missing_hash = copy.deepcopy(payload)
+        del missing_hash["cargo_artifacts"][1]["source_sha256"]
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.validate_receipt(missing_hash)
+        self.assertIn("cargo_artifacts[1].source_sha256", str(caught.exception))
+
         unbound = copy.deepcopy(payload)
         unbound["cargo_artifacts"][1]["source"] = "not/bound.rs"
         with self.assertRaises(receipts.ReceiptError) as caught:
