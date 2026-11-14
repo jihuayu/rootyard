@@ -602,10 +602,16 @@ jobs:
           export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
           export ROOTYARD_BLOB_ROOT="session174-foundation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           export ROOTYARD_TEST_GIT="$(command -v git)"
+          # The admission-race libtest retains objects under the Db fixture's
+          # per-run prefix. This job-owned Garage is disposed as a whole after
+          # the run; no per-key deletion is attempted.
+          export ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1
           export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$SESSION174_DATABASE"
           export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
           lib="$evidence/session174-lib-tests"
           cli="$evidence/rootyard-cli"
+          # Build the libtest before the CLI. The case loop below only executes
+          # the relocated libtest, so it cannot overwrite the receipted CLI.
           # Keep builder stdout off the atomically written <output>.build.json receipt path;
           # the canonical receipt is copied from that path below.
           python3 scripts/build_native_test.py --lib --no-default-features --package-debug 0 --strip-debuginfo \
@@ -634,6 +640,7 @@ jobs:
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::corrupting_a_registered_pack_after_capture_refuses_the_sealed_materialization',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_returns_none_for_a_checked_empty_capture',
+              'blob_git_gateway::admission_race_acceptance::pre_admission_revision_mismatch_rebases_to_old_oid_mismatch',
           ]
           # Exact argv recorded by the builder invocations above, as emitted by the
           # current scripts/build_native_test.py --lib and scripts/build_native.py.
@@ -798,6 +805,7 @@ jobs:
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::corrupting_a_registered_pack_after_capture_refuses_the_sealed_materialization',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_returns_none_for_a_checked_empty_capture',
+              'blob_git_gateway::admission_race_acceptance::pre_admission_revision_mismatch_rebases_to_old_oid_mismatch',
           ]
           summary = re.compile(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; '
                                r'(\d+) measured; (\d+) filtered out; finished in ([0-9.]+)s$', re.M)
