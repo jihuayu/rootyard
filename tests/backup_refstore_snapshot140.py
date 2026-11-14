@@ -51,10 +51,15 @@ pin still pages (through a real keyset cursor), the released pin denies as
 ``MetadataPinReleased`` and the expired pin denies as ``MetadataPinExpired``.
 
 The helper executable is only trusted when a matching ``.build.json`` receipt
-binds its SHA-256, records a ``rust-integration-test`` build with
-``package_rebuilt=True`` and one test artifact with ``fresh=False``, and shares the candidate
-application receipt's ``source_inputs_sha256``.  A missing binary, missing
-receipt, digest mismatch or a helper run that does not report exactly one
+binds its SHA-256.  Historical v1 receipts keep the original requirements
+(``package_rebuilt=True`` plus one ``fresh=False`` test artifact), while v2
+receipts are dispatched to the shared pure reader: they must select the exact
+``rust-integration-test``/``test`` row, the integration-test source path and
+digest, the relocated executable digest, the test profile, the ``pando-lab``
+flags and the batch link, and must share the candidate application receipt's
+source, config, toolchain and batch closure.  V2 freshness is the literal Cargo
+boolean and is never forced false.  A missing binary, missing receipt, digest
+mismatch, unknown schema or a helper run that does not report exactly one
 passing test fails the whole drill: there is no skip and no zero-test pass.
 
 Limits: metadata rows only.  No Git object, pack membership, physical GC,
@@ -71,6 +76,7 @@ from pathlib import Path
 import sys
 import uuid
 
+from backup_refstore_build_receipts import receipt_pair_schema, validate_v2_pair
 from backup_refstore_core139 import BackupRefStoreCore139Harness, uuid_literal
 from schema_baseline import A5_PACK_SNAPSHOT_TABLES, CURRENT_BACKUP_FORMAT, SCHEMA_VERSIONS
 
@@ -91,6 +97,7 @@ HELPER_TEST = "snapshot_backup_metadata_fixture"
 HELPER_TARGET = "ref_store_snapshot_backup_fixture"
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_SOURCE = ROOT / "tests" / "ref_store_snapshot_backup_fixture.rs"
+HELPER_SOURCE_RELATIVE = "tests/ref_store_snapshot_backup_fixture.rs"
 
 
 def catalog_tables(version):
@@ -167,21 +174,35 @@ def candidate_receipt(path):
 
 
 def validate_snapshot_fixture_binary(helper, app_binary, helper_receipt=None, app_receipt=None):
-    """Bind the helper executable to the real integration-test build that made it.
+    """Bind the helper executable to its schema-appropriate real build receipt.
 
-    The real builder (build-state-integration-test.py / build_native_test.py)
-    compiles the actual rootyard package (package_rebuilt=True) and records exactly
-    one fresh_false_artifacts entry for the requested test target with fresh=False
-    and a test profile.  The receipt therefore proves this is the integration-test
-    executable of an unmodified package build, not a stub: its SHA-256 must equal
-    the receipt digest, the target name must be exact, the recorded
-    integration-test source digest must equal this source file, and the candidate
-    application binary must match its own real build receipt and share the same
-    compiled source inputs.
+    A v1 receipt keeps the historical requirements: the real builder compiled the
+    actual rootyard package (``package_rebuilt=True``) and recorded exactly one
+    ``fresh_false_artifacts`` entry for the requested test target with
+    ``fresh=False`` and a test profile.  A v2 receipt is dispatched to the pure
+    shared reader, which binds the exact ``rust-integration-test``/``test`` row,
+    the integration-test source path and digest, the relocated executable digest,
+    the test profile, the ``pando-lab`` flags and the batch link.  In both cases
+    the candidate application binary must match its own real build receipt; a v2
+    pair must also select the exact rootyard lib/bin rows and share the same
+    source, config, toolchain and batch closure.  V2 freshness is the literal
+    Cargo boolean (true or false), never a fabricated ``fresh=False`` claim.
     """
     helper = Path(helper)
     assert helper.is_file(), "snapshot fixture binary is missing: " + str(helper)
     receipt_path = Path(helper_receipt) if helper_receipt else candidate_receipt(helper)
+    app_receipt_path = Path(app_receipt) if app_receipt else candidate_receipt(Path(app_binary))
+    if receipt_pair_schema(receipt_path, app_receipt_path, "snapshot fixture") == "v2":
+        return validate_v2_pair(
+            helper=helper,
+            app_binary=app_binary,
+            helper_target=HELPER_TARGET,
+            helper_source=HELPER_SOURCE,
+            helper_source_relative=HELPER_SOURCE_RELATIVE,
+            helper_receipt=receipt_path,
+            app_receipt=app_receipt_path,
+            label="snapshot fixture",
+        )
     receipt = load_receipt(receipt_path, "snapshot fixture build receipt")
     actual = sha256_file(helper)
     recorded = receipt_field(receipt, ("binary_sha256", "artifact_sha256", "sha256"), "binary sha256")
@@ -212,7 +233,6 @@ def validate_snapshot_fixture_binary(helper, app_binary, helper_receipt=None, ap
     source_inputs = receipt_field(receipt, ("source_inputs_sha256", "source_inputs"), "source_inputs_sha256")
     assert isinstance(source_inputs, str) and len(source_inputs) == 64, (
         "snapshot fixture receipt has no source-input digest")
-    app_receipt_path = Path(app_receipt) if app_receipt else candidate_receipt(Path(app_binary))
     app = load_receipt(app_receipt_path, "candidate application build receipt")
     app_actual = sha256_file(Path(app_binary))
     app_recorded = receipt_field(app, ("binary_sha256", "artifact_sha256", "sha256"), "candidate binary sha256")
