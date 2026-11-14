@@ -197,16 +197,17 @@ separately and are not an unbounded request-time closure.
 
 ### 2.5 Commit sets and atomic visibility
 
-Every authoritative version commit belongs to exactly one `CommitSet`:
+Every committed version batch has one `CommitSet`. Canonical encoding: `L(x)=u64_be(len(x))||x`; integers are `u8/u32_be/u64_be`; UUID/OID/VersionId/digest fields are raw bytes (OID width from `object_format`); lists are `u32_be(count)||entries`, versions sorted by `(ref_name, VersionId)`, results by `ref_name`. Tags: authority 1=pg/2=raft; format 1=sha1/2=sha256; commit kind 1=publish/2=delete/3=repack; target/head/old/new tags 0=absent/1=present; `commit_set_tag` 0=absent/1=present; terminal kind 1=committed/2=rejected/3=cancelled; outcome 1=applied/2=not_applied; `reason` is UTF-8 (empty for applied).
 
-`CommitSetId = H("ry-version-commit-set-v1", realm, authority_seq, operation_id,
-kind, sorted(VersionIds), accepted-ref results, terminal digest)`.
+`CS = L("ry-version-commit-set-id-v1") || L(tenant) || L(repo) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || u64(authority_seq) || L(operation_id) || L(operation_digest) || u8(commit_kind) || version-list || head_tag [|| L(head_ref) || target_tag [|| L(head_oid)]]`.
+`version-entry = L(ref_name)||L(VersionId)||u8(target_tag)||[L(target_oid)]`; `CommitSetId = SHA-256(CS)`. `CS` excludes every terminal byte/digest and every version-record digest; `VersionId` excludes `CommitSetId`.
 
-One commit set records the accepted per-ref version IDs, resulting HEAD name/OID
-(or absent), terminal and event identity. Commit set, versions, edges, ref-head
-changes, membership changes and terminal are one authority-atomic unit: a reader
-sees all or none. A commit set containing a version contains every version of the
-same atomic request; a rejected ref never gets a version.
+`T = L("ry-version-terminal-v1") || u8(commit_set_tag) [|| L(CommitSetId)] || L(tenant) || L(repo) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || u64(authority_seq) || L(operation_id) || L(operation_digest) || u8(terminal_kind) || result-list`.
+`result-entry = L(ref_name)||u8(outcome)||u8(old_tag)||[L(old_oid)]||u8(new_tag)||[L(new_oid)]||L(reason)`; `TerminalDigest = SHA-256(T)`. `T` is the exact ACK/replay body; a JSON wrapper may store it as base64 but must not re-encode it. `T` contains CommitSetId when `commit_set_tag=1`; it never contains TerminalDigest. A commit-set row may store TerminalDigest as an integrity column, but CommitSetId does not hash it. Order: versions/head -> CS/CommitSetId -> T/TerminalDigest -> rows+terminal -> ACK. The graph is acyclic.
+
+Fixed vector (`11*32` means 32 bytes of 0x11; `33*20` means 20 bytes of 0x33): `tenant=00000000-0000-0000-0000-000000000001`, `repo=00000000-0000-0000-0000-000000000002`, `history=00000000-0000-0000-0000-000000000003`, `authority=1`, `authority_epoch=7`, `group_id=0`, `group_epoch=9`, `object_format=1`, `authority_seq=42`, `operation_id=00000000-0000-0000-0000-000000000004`, `operation_digest=11*32`, `commit_kind=1`, one version `(refs/heads/main, VersionId=22*32, target_tag=1, target_oid=33*20)`, `head_tag=1`, `head_ref=refs/heads/main`, `head_target_tag=1`, `head_oid=33*20`, `commit_set_tag=1`, `terminal_kind=1`, one result `(refs/heads/main, outcome=1, old_tag=1, old_oid=44*20, new_tag=1, new_oid=33*20, reason="")`. Expected: `CS` length 355; `CommitSetId=7d969f99b1bd8a6f0b72c0f6c663a266c72b64b6f0661bd015a4fc45a4cfec7d`; `T` length 336; `TerminalDigest=0a21193dc9eecb1ecab91a533359cf5216ac06cdee137bb1f8876e82f11f1310`.
+
+Commit set, versions, edges, ref-heads, membership and terminal are one authority-atomic unit: readers see all or none; a rejected ref gets no version.
 
 ## 3. Publication ordering and operation states [PROPOSED]
 
