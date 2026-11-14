@@ -139,7 +139,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run().await {
-        let message = error.to_string().replace('\n', " ").replace('\r', " ");
+        let message = error.to_string().replace(['\n', '\r'], " ");
         println!("ERR {message}");
         let _ = io::stdout().flush();
         std::process::exit(1);
