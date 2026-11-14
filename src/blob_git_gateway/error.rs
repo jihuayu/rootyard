@@ -71,9 +71,10 @@ impl GatewayError {
 /// The credential scheme one protocol advertises on its `401`.
 ///
 /// The variant is chosen by the route protocol, never by the failure: the same
-/// [`GatewayError::Unauthorized`] is a JSON/API refusal on `/api` and a Smart
-/// HTTP refusal on `/git`, and only the latter may ask the client for Basic
-/// credentials.
+/// [`GatewayError::Unauthorized`] is a gateway JSON refusal on `/api/repos` and
+/// a Smart HTTP refusal on `/git`; only the latter may ask the client for Basic
+/// credentials. The merged shared `/api/tokens` and `/api/sessions` routes use
+/// `crate::Error` and keep its existing Basic challenge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Challenge {
     /// The standard Smart HTTP Git challenge; a native Git client retries with
