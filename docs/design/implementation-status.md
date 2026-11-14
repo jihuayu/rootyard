@@ -4,7 +4,7 @@
 
 ## 当前基线与剩余工作
 
-本页状态以 [PR #170](https://github.com/jihuayu/rootyard/pull/170)（`codex/rubicon-all-pr-merge` → `main`）作为当前集成的权威记录；其最终合并状态、CI 结论与产出以该 PR 的最终检查和 artifacts 为准，本页不预先断言。该 PR 集成 32 个组件 PR（原 30 个及后来加入的 #172、#173），各组件 PR 的目标分支已统一为 `main`，实际合并状态以 PR #170 和原始 PR 记录为准；集成过程中的修复与合并结果见下节“集成状态”。集成状态不改变运行时边界：默认入口仍是既有 `serve`（legacy GitFS/Pando），Blob 单机仍是显式 `serve-blob` 候选，Raft 运行时未启用；分项组件验收不表示默认服务已替换，也不表示任何实施任务 epic 已全部完成。历史基线 PR #142 / `49f09c2` 的四组原生 8+11+12+20=51 场景（零失败、零忽略）及其证据见 [roots/decisions 证据](../../evidence/state-services/roots-decisions144/README.md)，保持原范围（其中的 CI 通过结论限于当时提交，不延伸到本分支）。
+本页状态以 [PR #170](https://github.com/jihuayu/rootyard/pull/170)（`codex/rubicon-all-pr-merge` → `main`）作为当前集成的权威记录；其最终合并状态、CI 结论与产出以该 PR 的最终检查和 artifacts 为准，本页不预先断言。该 PR 集成 32 个组件 PR（原 30 个及后来加入的 #172、#173），各组件 PR 的目标分支已统一为 `main`，实际合并状态以 PR #170 和原始 PR 记录为准；集成过程中的修复与合并结果见下节“集成状态”。集成状态不改变运行时边界：默认入口仍是既有 `serve`（legacy GitFS/Pando），Blob 单机仍是显式 `serve-blob` 候选，Raft 运行时未启用；分项组件验收不表示默认服务已替换，也不表示任何实施任务 epic 已全部完成。历史基线 PR #142 / `49f09c2` 的四组原生 8+11+12+20=51 场景（零失败、零忽略）及其证据见 [roots/decisions 证据](../../evidence/state-services/roots-decisions144/README.md)，保持原范围（其中的 CI 通过结论限于当时提交，不延伸到本分支）。当前 profile/拒绝边界与冻结 W0 归档的区分见 [state-services/README.md](state-services/README.md)；默认入口 cutover 由 [#148](https://github.com/jihuayu/rootyard/issues/148) 单独跟踪，不是 #106 契约/基线的前置循环。
 
 | 能力 | 当前状态 | 后续范围 |
 | --- | --- | --- |
@@ -20,6 +20,8 @@
 ## Blob 单机服务候选：`serve-blob`
 
 `rootyard serve-blob` 是显式的候选入口（`src/standalone.rs`），默认 `serve` 不受影响。它基于 schema147 的正常仓库创建、PG RefStore、OpenDAL Blob 和可丢弃 Git 计算视图运行；启动时检查未完成恢复标记、持有数据库级共享生命周期屏障，屏障丢失即关闭准入。
+
+独立的 root-run 有界基线见 [evidence/state-services/blob-baseline-20261114](../../evidence/state-services/blob-baseline-20261114/README.md)：绑定 source `ce1aaa3caccb6e9bca73cd960e4803aac8dfd862`，覆盖一个 256 KiB 仓库、两个并发只读 clone、restart/empty-scratch cold clone 与 250 ms PG session 采样；它不是 provider-cold、精确锁等待、OpenDAL GET bytes/phases、请求 wire bytes、容量或 SLO 的声明，也不改变 #106 的 OPEN 状态。
 
 服务能力与验收（同机、真实 PostgreSQL/S3/原生 Git、当前源码绑定二进制）：
 
@@ -89,7 +91,9 @@ LFS、PR/Merge、Workspace、CI/Namespace 的新服务接入、默认入口替�
 
 # 历史实现记录
 
-## 当前：状态服务 W0（提案，不是已实现能力）
+## 历史：状态服务 W0 冻结契约（d689bf8/bcd3918；不是当前能力）
+
+> 以下 W0 记录冻结于 `d689bf8`/rebase parent `bcd3918`。其 deployment-contract/config JSON、producers、budgets、dependencies 和 snapshot 是**历史归档输入**，只由既有 validator 校验归档完整性；它们不定义当前 deployment profile。当前模式/拒绝表见 [state-services/README.md](state-services/README.md)。本节文字中的“提案/未实现”只描述该归档时点，不描述当前代码：当前已有显式 `serve-blob` 候选路径，但分布式 Raft 仍未实现，且 `serve-blob` 不是默认入口。
 
 issue #105/#106 W0 已提交[原始第 12 章设计快照](state-services/historical-w0/README.md)（后来被彻底取代，当前章节以其后 canonical 分支为准）、[可执行生产者清单](state-services/producers.json)、[部署契约/配置 schema](state-services/deployment-contract.json)、[provisional 预算](state-services/budgets.json)、[依赖冻结证据](state-services/dependencies.json)与[有限基线工具](state-services/README.md)。设计仍为**提案**：RefStore、BlobStore/OpenDAL、Scope CLOSING/CancelDecision、W1–W9 均未实现；现有 GitFS/PG 与 Pando remote+Vault 路径仍是 legacy/既有边界，不是 target 新部署。
 

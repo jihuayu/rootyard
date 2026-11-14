@@ -61,6 +61,7 @@ fixture integration-test executables, recording the batch in
 | `tests/worker_diagnostics.py` | Source-bound structured worker-operation diagnostics isolation under real PostgreSQL `statement_timeout` | `test-results/worker-diagnostics.json` |
 | `tests/lfs_read_amplification.py` | Native `/proc/<pid>/io` `rchar` warm-read bound, verification singleflight coalescing, and offline/removed object-store verified local 200 vs. fail-closed cold-miss semantics | `test-results/lfs-read-amplification.json` |
 | `tests/lfs_split_tx_races.py` | Split-transaction LFS DB pool release, concurrent `pending -> ready` verification (including three-pass conflict bound and corrupt-byte rejection), post-`ensure_readable` re-authorization (`401`/`403`/`404`/`409`), and duplicate-OID repair deduplication | `test-results/lfs-split-tx-races.json` |
+| `tests/lfs_lock_policy.py` | Native receive-pack rejection of a locked path hidden in new-branch ancestry with the client hook disabled, stock unlock after branch switch, and verify body cursor pagination with invalid-limit/unknown-field rejection | `test-results/lfs-lock-policy.json` |
 
 A final step, `scripts/native_report_manifest.py --mode job`, fails the job
 unless every report was produced by the exact binary whose SHA-256 appears in
@@ -68,15 +69,16 @@ unless every report was produced by the exact binary whose SHA-256 appears in
 `ci_webhook_regressions` log is non-empty and contains each expected phase
 marker, and the receipt's commit and compiled source-input digest were recorded.
 The manifest also binds the pagination, webhook reconciliation, worker
-diagnostics and Git LFS concurrency/split-transaction reports
+diagnostics and Git LFS lock/concurrency/split-transaction reports
 (`repository-pagination.json`, `organization-pagination.json`,
 `web-detail-pagination.json`, `web-repository-pagination.json`,
 `webhook-pagination.json`, `webhook-pr-sync.json`,
 `worker-diagnostics.json`, `lfs-read-amplification.json`,
-`lfs-split-tx-races.json`) together with the other verify-job reports and their
-harness sources (`tests/lfs.py`, `tests/lfs_remote_contract.py`,
-`tests/lfs_read_amplification.py`, `tests/lfs_split_tx_races.py`) to that same
-build receipt, so none can be produced by a different binary. These harnesses
+`lfs-split-tx-races.json`, `lfs-lock-policy.json`) together with the other
+verify-job reports and their harness sources (`tests/lfs.py`,
+`tests/lfs_remote_contract.py`, `tests/lfs_read_amplification.py`,
+`tests/lfs_split_tx_races.py`, `tests/lfs_lock_policy.py`) to that same build
+receipt, so none can be produced by a different binary. These harnesses
 are real functional regressions over real API, PostgreSQL, HTTP and Git state,
 not scalability benchmarks.
 The manifest (`test-results/native-pr-gate.json`) also stores harness SHA-256
@@ -316,6 +318,7 @@ python3 tests/web_repository_pagination.py --binary target/debug/rootyard --repo
 python3 tests/worker_diagnostics.py --binary target/debug/rootyard --report test-results/worker-diagnostics.json
 python3 tests/lfs_read_amplification.py --binary target/debug/rootyard --report test-results/lfs-read-amplification.json
 python3 tests/lfs_split_tx_races.py --binary target/debug/rootyard --report test-results/lfs-split-tx-races.json
+python3 tests/lfs_lock_policy.py --binary target/debug/rootyard --report test-results/lfs-lock-policy.json
 ```
 
 The native host profile in this change was validated locally only: workflow
