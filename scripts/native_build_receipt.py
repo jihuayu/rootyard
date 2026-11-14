@@ -22,7 +22,9 @@ The module owns:
 * metadata-only toolchain probes (``cargo -vV``, ``rustc -vV`` and
   ``rustup which rustc``).  Cargo identity is always resolved from PATH, never
   from ``rustup which cargo``, so a CargoFork on PATH is not replaced by the
-  official rustup Cargo.  The full commit hash is copied from ``-vV``, never
+  official rustup Cargo.  A rustup ``rustc`` proxy is resolved to the actual
+  compiler with ``rustup which rustc`` and probed/hashed there; the PATH entry
+  is recorded separately.  The full commit hash is copied from ``-vV``, never
   inferred from a short version string;
 * receipt construction and version-dispatched validation.
 
@@ -772,13 +774,25 @@ def _pinned_channel(root):
     return None, None
 
 
+def _is_rustup_proxy(executable):
+    """Whether a PATH rustc entry resolves to the rustup multi-call binary."""
+    return Path(executable).resolve().name.lower() in ("rustup", "rustup.exe")
+
+
 def probe_toolchain(root, environ=None, which=None, run=None):
     """Producer metadata probe: Cargo/rustc/rustup identity, never a compile.
 
     Cargo is resolved from PATH only; ``rustup which cargo`` is deliberately not
-    used.  Cargo's full ``commit-hash`` is copied from ``-vV``.  The only
-    subprocesses issued are ``cargo -vV``, ``rustc -vV`` and (when rustup is on
-    PATH) ``rustup which rustc``.
+    used.  A PATH ``rustc`` that is a rustup proxy (a symlink resolving to the
+    rustup binary) is resolved with ``rustup which rustc`` before any identity
+    probe, so ``rustc -vV`` is executed by the actual compiler and never by
+    rustup under the wrong argv0.  A direct, non-proxy ``rustc`` is probed
+    in place.  Cargo's and rustc's full ``commit-hash`` values are copied from
+    ``-vV``; the resolved rustc release must match an exact version pin when
+    ``rust-toolchain.toml``/``rust-toolchain`` names one.
+
+    The only subprocesses issued are ``cargo -vV``, ``rustc -vV`` and
+    ``rustup which rustc`` (the latter when rustup is available or needed).
     """
     root = Path(root).resolve()
     env = os.environ if environ is None else environ
@@ -790,27 +804,77 @@ def probe_toolchain(root, environ=None, which=None, run=None):
     _require(bool(cargo_path), "toolchain", "cargo is not on PATH")
     cargo = _tool_identity(cargo_path, "toolchain", run, probe="cargo")
 
-    rustc_path = which("rustc", path=search_path)
-    _require(bool(rustc_path), "toolchain", "rustc is not on PATH")
-    rustc = _tool_identity(rustc_path, "toolchain", run, probe="rustc")
+    rustc_entry = which("rustc", path=search_path)
+    _require(bool(rustc_entry), "toolchain", "rustc is not on PATH")
+    rustc_proxy = _is_rustup_proxy(rustc_entry)
+
+    rustup_entry = which("rustup", path=search_path)
+    if rustc_proxy:
+        # The proxy itself resolves to the rustup binary that owns it.  Prefer
+        # that binary over an unrelated rustup that happens to be on PATH.
+        rustup_path = Path(rustc_entry).resolve()
+    elif rustup_entry:
+        rustup_path = Path(rustup_entry).resolve()
+    else:
+        rustup_path = None
 
     rustup = None
-    rustup_path = which("rustup", path=search_path)
-    if rustup_path:
-        rustup_path = Path(rustup_path).resolve()
+    resolved_rustc = None
+    rustc = None
+    if not rustc_proxy:
+        rustc = _tool_identity(rustc_entry, "toolchain", run, probe="rustc")
+        rustc["path_entry"] = os.path.abspath(str(rustc_entry))
+        rustc["proxy"] = False
+
+    if rustup_path is not None:
         _require(rustup_path.is_file(), "toolchain", f"rustup executable {rustup_path} is missing")
         rustup = {
             "executable": str(rustup_path),
             "executable_sha256": sha256_file(rustup_path),
         }
         process = run([str(rustup_path), "which", "rustc"])
-        if getattr(process, "returncode", 1) == 0 and getattr(process, "stdout", "").strip():
-            resolved = Path(process.stdout.strip()).resolve()
+        succeeded = getattr(process, "returncode", 1) == 0
+        output = getattr(process, "stdout", "").strip()
+        if rustc_proxy:
+            _require(
+                succeeded and bool(output),
+                "toolchain",
+                "rustc is a rustup proxy but rustup which rustc did not resolve "
+                f"an executable (status {getattr(process, 'returncode', 'unknown')})",
+            )
+        if succeeded and output:
+            resolved = Path(output).resolve()
             _require(resolved.is_file(), "toolchain", f"rustup resolved rustc {resolved} is missing")
             rustup["resolved_rustc"] = str(resolved)
             rustup["resolved_rustc_sha256"] = sha256_file(resolved)
+            resolved_rustc = resolved
+
+    if rustc_proxy:
+        _require(
+            resolved_rustc is not None,
+            "toolchain",
+            "rustc is a rustup proxy but no actual rustc executable was resolved",
+        )
+        rustc = _tool_identity(resolved_rustc, "toolchain", run, probe="rustc")
+        rustc["path_entry"] = os.path.abspath(str(rustc_entry))
+        rustc["proxy"] = True
+        _require(
+            rustc["version"].startswith("rustc "),
+            "toolchain",
+            "rustup which rustc did not resolve a rustc identity",
+        )
 
     channel, pin_source = _pinned_channel(root)
+    if rustc_proxy and channel:
+        pinned_release = re.match(r"^([0-9]+\.[0-9]+\.[0-9]+)(?:[-+].*)?$", channel)
+        if pinned_release:
+            _require(
+                rustc["release"] == pinned_release.group(1),
+                "toolchain",
+                f"rustup-selected rustc release {rustc['release']!r} does not match "
+                f"pinned channel {channel!r}",
+            )
+
     return {
         "cargo": cargo,
         "rustc": rustc,
@@ -1181,6 +1245,9 @@ def _validate_v2_toolchain(toolchain, label):
         _require_nonempty_str(identity.get("release"), label, f"toolchain.{name}.release")
         _require_commit(identity.get("commit_hash"), label, f"toolchain.{name}.commit_hash")
         _require_nonempty_str(identity.get("host"), label, f"toolchain.{name}.host")
+        if name == "rustc" and ("proxy" in identity or "path_entry" in identity):
+            _require_bool(identity.get("proxy"), label, "toolchain.rustc.proxy")
+            _require_absolute_path(identity.get("path_entry"), label, "toolchain.rustc.path_entry")
     rustup = toolchain.get("rustup")
     if rustup is not None:
         rustup = _require_mapping(rustup, label, "toolchain.rustup")

@@ -91,7 +91,11 @@ class ReceiptFixture(unittest.TestCase):
 
         return {
             "cargo": identity("cargo", "1.101.0", CARGO_FORK_COMMIT),
-            "rustc": identity("rustc", "1.99.1", RUSTC_COMMIT),
+            "rustc": dict(
+                identity("rustc", "1.99.1", RUSTC_COMMIT),
+                path_entry=str(self.root / "toolchain/rustc"),
+                proxy=False,
+            ),
             "rustup": {
                 "executable": str(self.root / "toolchain/rustup"),
                 "executable_sha256": receipts.sha256_file(self.root / "toolchain/rustup"),
@@ -414,6 +418,14 @@ class V2BindingTest(ReceiptFixture):
         triple = copy.deepcopy(payload)
         triple["target_triple"] = "x86_64-unknown-linux-gnu"
         self.assert_rejected(triple, "target_triple does not match")
+
+        proxy = copy.deepcopy(payload)
+        proxy["toolchain"]["rustc"]["proxy"] = "yes"
+        self.assert_rejected(proxy, "toolchain.rustc.proxy")
+
+        path_entry = copy.deepcopy(payload)
+        path_entry["toolchain"]["rustc"]["path_entry"] = "relative/rustc"
+        self.assert_rejected(path_entry, "absolute path")
 
         rustup = copy.deepcopy(payload)
         del rustup["toolchain"]["rustup"]["resolved_rustc_sha256"]
@@ -812,6 +824,9 @@ class ProducerHelperTest(ReceiptFixture):
         self.assertEqual(toolchain["cargo"]["commit_hash"], CARGO_FORK_COMMIT)
         self.assertEqual(toolchain["cargo"]["release"], "1.101.0")
         self.assertEqual(toolchain["rustc"]["commit_hash"], RUSTC_COMMIT)
+        self.assertIs(toolchain["rustc"]["proxy"], False)
+        self.assertEqual(toolchain["rustc"]["path_entry"],
+                         str((self.root / "toolchain/rustc").absolute()))
         self.assertEqual(toolchain["target_triple"], TARGET_TRIPLE)
         self.assertEqual(toolchain["pinned_channel"], "1.99.1")
         self.assertEqual(
@@ -903,6 +918,120 @@ class ProducerHelperTest(ReceiptFixture):
             with self.subTest(events=events):
                 with self.assertRaises(receipts.ReceiptError):
                     receipts.require_build_finished(events)
+
+
+class RustupProxyToolchainTest(ReceiptFixture):
+    """Realistic Linux layout: PATH rustc is a symlink to the rustup binary."""
+
+    def make_proxy(self, channel="1.99.1"):
+        self.write("rust-toolchain.toml", f'[toolchain]\nchannel = "{channel}"\n')
+        rustup = self.root / "toolchain/rustup"
+        proxy = self.root / "toolchain/rustc"
+        proxy.unlink()
+        proxy.symlink_to(rustup)
+        actual = self.root / "toolchain/actual/bin/rustc"
+        self.write("toolchain/actual/bin/rustc", b"fake-actual-rustc")
+        return proxy, rustup, actual
+
+    def fake_which(self, name, path=None):
+        self.assertEqual(path, "/test/path")
+        if name in ("cargo", "rustc", "rustup"):
+            return str(self.root / "toolchain" / name)
+        return None
+
+    def fake_run(self, actual, commands, *, release="1.99.1", rustup_returncode=0):
+        cargo = self.root / "toolchain/cargo"
+        rustup = self.root / "toolchain/rustup"
+
+        def run(command):
+            commands.append(list(command))
+            if command[0] == str(cargo) and command[1:] == ["-vV"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "cargo 1.101.0 (64a6ee6a 2026-01-01)\n"
+                        "release: 1.101.0\n"
+                        f"commit-hash: {CARGO_FORK_COMMIT}\n"
+                        f"host: {TARGET_TRIPLE}\n"
+                    ),
+                )
+            if command[0] == str(rustup) and command[1:] == ["which", "rustc"]:
+                if rustup_returncode != 0:
+                    return SimpleNamespace(returncode=rustup_returncode, stdout="")
+                return SimpleNamespace(returncode=0, stdout=str(actual) + "\n")
+            if Path(command[0]).resolve() == actual.resolve() and command[1:] == ["-vV"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        f"rustc {release} (58cf8f9c3 2025-01-01)\n"
+                        f"release: {release}\n"
+                        f"commit-hash: {RUSTC_COMMIT}\n"
+                        f"host: {TARGET_TRIPLE}\n"
+                    ),
+                )
+            raise AssertionError(f"unexpected toolchain probe: {command}")
+
+        return run
+
+    def test_proxy_rustc_is_resolved_and_probed_as_the_actual_compiler(self):
+        proxy, rustup, actual = self.make_proxy()
+        commands = []
+        toolchain = receipts.probe_toolchain(
+            self.root,
+            environ={"PATH": "/test/path"},
+            which=self.fake_which,
+            run=self.fake_run(actual, commands),
+        )
+
+        self.assertEqual(toolchain["rustc"]["executable"], str(actual.resolve()))
+        self.assertEqual(toolchain["rustc"]["executable_sha256"],
+                         receipts.sha256_file(actual))
+        self.assertIs(toolchain["rustc"]["proxy"], True)
+        self.assertEqual(toolchain["rustc"]["path_entry"], str(proxy.absolute()))
+        self.assertEqual(toolchain["rustc"]["version"].split()[0], "rustc")
+        self.assertEqual(toolchain["rustc"]["release"], "1.99.1")
+        self.assertEqual(toolchain["rustc"]["commit_hash"], RUSTC_COMMIT)
+        self.assertEqual(toolchain["rustup"]["executable"], str(rustup.resolve()))
+        self.assertEqual(toolchain["rustup"]["resolved_rustc"], str(actual.resolve()))
+        self.assertEqual(toolchain["rustup"]["resolved_rustc_sha256"],
+                         receipts.sha256_file(actual))
+        self.assertEqual(toolchain["cargo"]["commit_hash"], CARGO_FORK_COMMIT)
+        self.assertEqual(toolchain["target_triple"], TARGET_TRIPLE)
+        self.assertEqual(toolchain["pinned_channel"], "1.99.1")
+
+        self.assertIn([str(rustup.resolve()), "which", "rustc"], commands)
+        self.assertIn([str(actual.resolve()), "-vV"], commands)
+        self.assertNotIn([str(rustup.resolve()), "-vV"], commands)
+        self.assertFalse(
+            [command for command in commands if command[1:3] == ["which", "cargo"]]
+        )
+
+    def test_proxy_resolution_failure_never_probes_rustup_as_rustc(self):
+        proxy, rustup, actual = self.make_proxy()
+        commands = []
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.probe_toolchain(
+                self.root,
+                environ={"PATH": "/test/path"},
+                which=self.fake_which,
+                run=self.fake_run(actual, commands, rustup_returncode=1),
+            )
+        self.assertIn("rustup which rustc", str(caught.exception))
+        self.assertNotIn([str(rustup.resolve()), "-vV"], commands)
+        self.assertNotIn([str(actual.resolve()), "-vV"], commands)
+
+    def test_proxy_compiler_release_must_match_an_exact_pinned_channel(self):
+        proxy, rustup, actual = self.make_proxy(channel="1.98.0")
+        commands = []
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.probe_toolchain(
+                self.root,
+                environ={"PATH": "/test/path"},
+                which=self.fake_which,
+                run=self.fake_run(actual, commands),
+            )
+        self.assertIn("pinned channel", str(caught.exception))
+        self.assertIn([str(actual.resolve()), "-vV"], commands)
 
 
 if __name__ == "__main__":
