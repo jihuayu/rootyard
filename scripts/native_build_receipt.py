@@ -16,7 +16,9 @@ The module owns:
   SHA-256, including absent fixed candidates) extended with the production
   source closure, Cargo manifests, test support and a common config digest;
 * conservative in-repository Cargo-config checks and an environment-name guard
-  that never records environment values;
+  that never records environment values; scheduling is split out explicitly:
+  :func:`normalize_build_environment` turns ``CARGO_BUILD_JOBS`` into an
+  explicit ``--jobs`` argument and a guard-safe environment copy;
 * metadata-only toolchain probes (``cargo -vV``, ``rustc -vV`` and
   ``rustup which rustc``).  Cargo identity is always resolved from PATH, never
   from ``rustup which cargo``, so a CargoFork on PATH is not replaced by the
@@ -138,6 +140,7 @@ REJECTED_COMPILER_VARIABLES = (
 )
 REJECTED_VARIABLE_PREFIXES = ("CARGO_PROFILE_", "CARGO_BUILD_")
 ALLOWED_TARGET_DIR = "CARGO_TARGET_DIR"
+BUILD_JOBS_VARIABLE = "CARGO_BUILD_JOBS"
 
 TOML_KEY = re.compile(r'\s*(?:"([^"]*)"|([A-Za-z0-9_.\-]+))\s*=(.*)$')
 PATH_KEYS = (
@@ -476,6 +479,58 @@ def reject_passthrough_environment(environ=None):
             + ", ".join(found)
             + "; pass explicit build options so the recorded command is the build"
         )
+
+
+def _parse_build_jobs(value):
+    """Parse one CARGO_BUILD_JOBS value without retaining it in an error."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if re.fullmatch(r"[0-9]+", text) is None:
+        return None
+    jobs = int(text, 10)
+    return jobs if jobs > 0 else None
+
+
+def normalize_build_environment(environ=None):
+    """Extract a validated Cargo job budget from an inherited environment.
+
+    ``CARGO_BUILD_JOBS`` is the only scheduling variable this API normalizes.
+    When present it must be a positive decimal integer.  The value is removed
+    from a copy of ``environ`` and represented twice in the returned mapping:
+    as the explicit Cargo argv fragment ``["--jobs", "<n>"]`` and as
+    ``{"jobs": n}`` in ``build_options``.  A caller therefore appends
+    ``cargo_args`` to the exact Cargo command (so the job budget is recorded)
+    and passes ``environment`` to :func:`capture_bound_inputs` or
+    :func:`probe_toolchain`.
+
+    The remaining variable names still pass the conservative compiler/config
+    guard.  ``RUSTFLAGS``, ``CARGO_PROFILE_*``, ``CARGO_BUILD_TARGET`` and the
+    other rejected selectors fail closed; they are never dropped or ignored.
+    ``CARGO_TARGET_DIR`` remains allowed.  Error messages name the offending
+    variable and never include its value.
+    """
+    env = dict(os.environ if environ is None else environ)
+    jobs = None
+    if BUILD_JOBS_VARIABLE in env:
+        jobs = _parse_build_jobs(env.pop(BUILD_JOBS_VARIABLE))
+        if jobs is None:
+            raise ReceiptError(
+                BUILD_JOBS_VARIABLE
+                + " must be a positive decimal integer; remove it from the inherited "
+                "environment and pass an explicit --jobs value instead"
+            )
+    reject_passthrough_environment(env)
+    return {
+        "environment": env,
+        "jobs": jobs,
+        "cargo_args": ["--jobs", str(jobs)] if jobs is not None else [],
+        "build_options": {"jobs": jobs},
+    }
 
 
 # -- bound input inventory ----------------------------------------------------
@@ -1768,6 +1823,7 @@ __all__ = [
     "BATCH_KIND",
     "BOUND_INPUTS_DIGEST_ALGORITHM",
     "BOUND_ROLES",
+    "BUILD_JOBS_VARIABLE",
     "CARGO_CONFIG_FILES",
     "CONFIG_ROLES",
     "EXECUTABLE_KINDS",
@@ -1795,6 +1851,7 @@ __all__ = [
     "is_rejected_environment_name",
     "load_receipt",
     "make_receipt_v2",
+    "normalize_build_environment",
     "probe_toolchain",
     "reject_external_cargo_config",
     "reject_passthrough_environment",

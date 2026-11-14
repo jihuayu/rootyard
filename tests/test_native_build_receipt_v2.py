@@ -555,6 +555,77 @@ class V2BindingTest(ReceiptFixture):
             self.validate(self.v1_receipt())
 
 
+class BuildEnvironmentTest(ReceiptFixture):
+    def test_jobs_are_extracted_to_explicit_argv_and_options(self):
+        source = {
+            "PATH": "",
+            "CARGO_BUILD_JOBS": "2",
+            "CARGO_TARGET_DIR": "/shared/target",
+        }
+        normalized = receipts.normalize_build_environment(source)
+
+        self.assertEqual(normalized["jobs"], 2)
+        self.assertEqual(normalized["cargo_args"], ["--jobs", "2"])
+        self.assertEqual(normalized["build_options"], {"jobs": 2})
+        self.assertEqual(
+            normalized["environment"],
+            {"PATH": "", "CARGO_TARGET_DIR": "/shared/target"},
+        )
+        self.assertNotIn("CARGO_BUILD_JOBS", normalized["environment"])
+        self.assertEqual(source["CARGO_BUILD_JOBS"], "2")
+
+        captured = receipts.capture_bound_inputs(
+            self.root, environ=normalized["environment"]
+        )
+        self.assertEqual(captured["bound_inputs"], self.bound["bound_inputs"])
+        self.assertEqual(captured["source_inputs_sha256"],
+                         self.bound["source_inputs_sha256"])
+
+    def test_absent_jobs_adds_no_explicit_arguments(self):
+        normalized = receipts.normalize_build_environment({"PATH": ""})
+        self.assertIsNone(normalized["jobs"])
+        self.assertEqual(normalized["cargo_args"], [])
+        self.assertEqual(normalized["build_options"], {"jobs": None})
+
+    def test_invalid_jobs_fail_closed_without_echoing_the_value(self):
+        sentinel = "SENTINEL-JOBS-BUDGET"
+        for value in ("", "0", "-1", "+2", "2.0", "two", sentinel, "  ", True, 0, -2):
+            with self.subTest(value=value):
+                with self.assertRaises(receipts.ReceiptError) as caught:
+                    receipts.normalize_build_environment({"CARGO_BUILD_JOBS": value})
+                message = str(caught.exception)
+                self.assertIn("CARGO_BUILD_JOBS", message)
+                self.assertIn("positive decimal integer", message)
+                if isinstance(value, str) and value:
+                    self.assertNotIn(value, message)
+
+    def test_normalization_keeps_compiler_and_profile_guards(self):
+        sentinel = "SENTINEL-GUARD-VALUE"
+        for name in (
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_PROFILE_RELEASE_LTO",
+            "CARGO_BUILD_TARGET",
+            "RUSTC_WRAPPER",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(receipts.ReceiptError) as caught:
+                    receipts.normalize_build_environment(
+                        {"CARGO_BUILD_JOBS": "2", name: sentinel}
+                    )
+                message = str(caught.exception)
+                self.assertIn(name, message)
+                self.assertNotIn(sentinel, message)
+
+    def test_raw_jobs_environment_still_requires_normalization(self):
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.capture_bound_inputs(
+                self.root,
+                environ={"PATH": "", "CARGO_BUILD_JOBS": "2"},
+            )
+        self.assertIn("CARGO_BUILD_JOBS", str(caught.exception))
+
+
 class ProducerHelperTest(ReceiptFixture):
     def test_source_digest_is_the_exact_existing_algorithm(self):
         with mock.patch.object(build_native, "ROOT", self.root):
