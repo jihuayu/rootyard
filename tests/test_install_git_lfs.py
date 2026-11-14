@@ -368,6 +368,7 @@ class CandidateAndPrWorkflowWiringTest(unittest.TestCase):
             ("worker_diagnostics", "test-results/worker-diagnostics.json", "tests/worker_diagnostics.py"),
             ("lfs_read_amplification", "test-results/lfs-read-amplification.json", "tests/lfs_read_amplification.py"),
             ("lfs_split_tx_races", "test-results/lfs-split-tx-races.json", "tests/lfs_split_tx_races.py"),
+            ("lfs_lock_policy", "test-results/lfs-lock-policy.json", "tests/lfs_lock_policy.py"),
         ):
             self.assertIn(f"python3 {harness} --binary target/debug/rootyard --report {report_path}", text)
             self.assertIn(f"--report {report_key}={report_path}", text)
@@ -376,6 +377,9 @@ class CandidateAndPrWorkflowWiringTest(unittest.TestCase):
             self.assertIn(f"--harness {shared_lfs_harness}", text)
         self.assertIn("--require-case lfs_read_amplification=read_amplification_and_offline_remote", text)
         self.assertIn("--require-case lfs_split_tx_races=split_tx_races_reauth_and_repair_dedup", text)
+        self.assertIn("--require-case lfs_lock_policy=setup_repo", text)
+        self.assertIn("--require-case lfs_lock_policy=reject_hidden_earlier_commit", text)
+        self.assertIn("--require-case lfs_lock_policy=verify_body_cursor", text)
         self.assertIn("--harness scripts/build_native.py", text)
         self.assertIn("test-results/*-evidence/*.jsonl", text)
 
