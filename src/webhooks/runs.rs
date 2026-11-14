@@ -55,6 +55,18 @@ pub async fn claim(
         snapshot.get::<_,String>("head_oid").as_str()).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    // Preparation is slow and deliberately lock-free. Re-establish current
+    // issuer authority under the same policy fence used by revocation before
+    // minting the lease and its checkout capability.
+    crate::webhooks::trust::lock_policy_tx(&tx,repo).await?;
+    let current_hook=tx.query_opt("SELECT secret,active FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
+        &[&hook_id,&repo]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
+    let bearer=headers.get("authorization").and_then(|h|h.to_str().ok())
+        .and_then(|h|h.strip_prefix("Bearer ")).ok_or_else(Error::unauthorized)?;
+    if !current_hook.get::<_,bool>("active") ||
+        !constant_time_eq(current_hook.get::<_,String>("secret").as_bytes(),bearer.as_bytes()) {
+        return Err(Error::unauthorized());
+    }
     let row = tx.query_opt(
         "SELECT c.context,c.head_oid,c.base_oid,c.job_id,c.storage_generation,c.state,c.attempt,c.lease_generation \
          FROM ci_runs c JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
@@ -138,8 +150,18 @@ pub async fn heartbeat(
     if input.attempt<=0 || input.lease_generation<=0 || input.runner_id.is_empty() ||
         input.runner_id.len()>64 {return Err(Error::bad_request());}
     let (repo,_)=integration(&state,&owner,&name,hook_id,&headers).await?;
-    let client=state.pool.get().await.map_err(Error::internal)?;
-    let row=client.query_opt(
+    let mut client=state.pool.get().await.map_err(Error::internal)?;
+    let tx=client.transaction().await.map_err(Error::internal)?;
+    crate::webhooks::trust::lock_policy_tx(&tx,repo).await?;
+    let current_hook=tx.query_opt("SELECT secret,active FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
+        &[&hook_id,&repo]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
+    let bearer=headers.get("authorization").and_then(|h|h.to_str().ok())
+        .and_then(|h|h.strip_prefix("Bearer ")).ok_or_else(Error::unauthorized)?;
+    if !current_hook.get::<_,bool>("active") ||
+        !constant_time_eq(current_hook.get::<_,String>("secret").as_bytes(),bearer.as_bytes()) {
+        return Err(Error::unauthorized());
+    }
+    let row=tx.query_opt(
         "UPDATE ci_runs c SET lease_expires_unix=extract(epoch FROM clock_timestamp())::bigint+60, \
          updated_at=clock_timestamp() FROM forge_trusted_check_contexts b, forge_pulls p \
          WHERE c.id=$1 AND c.repository_id=$2 AND b.repository_id=c.repository_id \
@@ -151,6 +173,7 @@ pub async fn heartbeat(
          RETURNING c.lease_expires_unix",
         &[&run_id,&repo,&hook_id,&input.attempt,&input.lease_generation,&input.runner_id],
     ).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT,"CI run lease changed"))?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({
         "run_id":run_id,"attempt":input.attempt,"lease_generation":input.lease_generation,
         "lease_expires_unix":row.get::<_,i64>(0)}))).into_response())
