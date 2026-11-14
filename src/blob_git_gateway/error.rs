@@ -5,9 +5,11 @@
 //! literals so a transport error can never echo a credential or a client pack.
 //!
 //! A `401` carries no challenge when rendered. The challenge names the
-//! credential scheme of the route protocol that refused, so the JSON/API route
-//! boundary adds [`Challenge::Bearer`] and the Smart HTTP boundary adds
-//! [`Challenge::Basic`]; rendering an error alone never advertises either.
+//! credential scheme of the route protocol that refused, so the gateway-owned
+//! `/api/repos` route boundary adds [`Challenge::Bearer`] and the Smart HTTP
+//! boundary adds [`Challenge::Basic`]; rendering an error alone never advertises
+//! either. The merged shared `/api/tokens` and `/api/sessions` routes do not use
+//! this vocabulary and keep `crate::Error`'s pre-existing Basic challenge.
 use axum::{
     Json,
     http::{StatusCode, header},
@@ -77,9 +79,11 @@ pub(super) enum Challenge {
     /// The standard Smart HTTP Git challenge; a native Git client retries with
     /// the Basic credential it was configured with.
     Basic,
-    /// The JSON/API challenge. API tokens are preemptively sent as
-    /// `Authorization: Bearer`, so a Basic challenge (which a browser `fetch`
-    /// answers with an interactive auth prompt) is never sent here.
+    /// The gateway-owned `/api/repos` challenge. API tokens are preemptively
+    /// sent as `Authorization: Bearer`, so a Basic challenge (which a browser
+    /// `fetch` answers with an interactive auth prompt) is never sent here. The
+    /// separately merged token/session management routes are outside this
+    /// vocabulary and retain their application-level Basic challenge.
     Bearer,
 }
 

@@ -14,6 +14,12 @@
 //! while an older captured view is still being served; that is valid as long as
 //! the realm does not change. A revocation, membership removal, scope narrowing
 //! or backend re-binding aborts the stream instead.
+//!
+//! The `401` challenge is a transport decision downstream of this credential
+//! check, never an authorization grant. [`GatewayError`] itself renders no
+//! challenge. The gateway router adds Bearer only to its own `/api/repos` group
+//! and Basic to Smart HTTP; the merged shared `/api/tokens` and `/api/sessions`
+//! routes deliberately keep the shared application's existing Basic challenge.
 use std::sync::Arc;
 
 use axum::http::{HeaderMap, HeaderName, StatusCode, Uri};

@@ -21,11 +21,14 @@
 //! in the core and durable bytes in Blob, so the RAII deletion of a compute view
 //! can never lose an already acknowledged ref or byte.
 //!
-//! An unauthenticated request is challenged per protocol (#174): every JSON/API
-//! route in the `/api/repos` group advertises `Bearer realm="Rootyard"`, while
+//! An unauthenticated request is challenged per protocol (#174): the
+//! gateway-owned `/api/repos` group advertises `Bearer realm="Rootyard"`, while
 //! the Smart HTTP `/git` group keeps the Git
-//! `Basic realm="Rootyard", charset="UTF-8"` challenge. The challenge adds no
-//! cookie, session or browser-navigation behavior to either group.
+//! `Basic realm="Rootyard", charset="UTF-8"` challenge. The merged shared
+//! `/api/tokens` and `/api/sessions` routes are deliberately outside this new
+//! policy and keep the shared application's existing Basic challenge. The
+//! challenge adds no cookie, session or browser-navigation behavior to any
+//! route.
 mod api;
 mod browse;
 mod config;
@@ -74,7 +77,10 @@ use error::{Challenge, with_challenge};
 /// Token/session routes are merged here from the shared token module. They see
 /// only the PostgreSQL pool (`MetadataState` via `FromRef<Arc<BlobGitState>>`);
 /// the real token/session service and its token-scoped authorization are reused
-/// unchanged. The broad request deadline below covers their handler awaits too.
+/// unchanged. They are merged after and outside the two challenge groups below,
+/// so `/api/tokens` and `/api/sessions` deliberately keep the shared
+/// `crate::Error` Basic challenge (#174 boundary). The broad request deadline
+/// below covers their handler awaits too.
 pub fn router(state: Arc<BlobGitState>) -> Router {
     let api = Router::new()
         .route("/api/repos", post(api::create_repo).get(api::list_repos))
@@ -106,9 +112,12 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
         .with_state(state)
 }
 
-/// JSON/API route boundary: a bare `401` from any handler in this group asks
-/// for a Bearer token. A browser `fetch` must never enter the Basic auth prompt
-/// of the Git challenge; authority and member hiding are unchanged.
+/// Gateway-owned `/api/repos` route boundary: a bare `401` from any handler in
+/// this group asks for a Bearer token. A browser `fetch` must never enter the
+/// Basic auth prompt of the Git challenge; authority and member hiding are
+/// unchanged. The shared `/api/tokens` and `/api/sessions` routes are
+/// deliberately not in this group and keep their application-level Basic
+/// challenge.
 async fn api_challenge(request: Request, next: Next) -> Response {
     with_challenge(next.run(request).await, Challenge::Bearer)
 }
@@ -116,6 +125,8 @@ async fn api_challenge(request: Request, next: Next) -> Response {
 /// Smart HTTP route boundary: `info/refs`, `upload-pack` and `receive-pack`
 /// keep the standard Git Basic challenge, so real Git clients retry exactly as
 /// before. The LFS refusal in this group is a `501` and is never challenged.
+/// Only matched routes pass through a `route_layer`; unmatched `/api` or `/git`
+/// paths remain the router's `404` and are not challenged.
 async fn git_challenge(request: Request, next: Next) -> Response {
     with_challenge(next.run(request).await, Challenge::Basic)
 }
@@ -180,7 +191,7 @@ async fn metadata_ready(
     .map_err(|_| GatewayError::Timeout)?
 }
 
-/// Route-boundary regression for the `401` challenge (#174).
+/// Route-boundary regression for the gateway-local `401` challenge (#174).
 ///
 /// Each case starts the real [`router`] on an ephemeral loopback listener and
 /// drives it with an ordinary HTTP client, so route selection, the protocol
@@ -188,6 +199,12 @@ async fn metadata_ready(
 /// is the only live dependency: the pool points at a closed loopback port, and
 /// every request below is answered by the credential parser before PostgreSQL,
 /// Blob or native Git is needed.
+///
+/// The new policy is deliberately gateway-owned: `/api/repos` gets Bearer and
+/// matched Smart HTTP gets Basic. The merged shared `/api/tokens` and
+/// `/api/sessions` routes are asserted to keep their pre-existing Basic
+/// challenge, and unsupported/mismatched/unmatched routes are asserted to gain
+/// no challenge from this layer.
 #[cfg(test)]
 mod challenge_tests {
     use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -209,7 +226,7 @@ mod challenge_tests {
         body: &'static [u8],
     }
 
-    const API_ROUTES: [Route; 10] = [
+    const API_ROUTES: [Route; 12] = [
         Route { method: "GET", target: "/api/repos", content_type: None, body: b"" },
         Route {
             method: "POST",
@@ -235,6 +252,27 @@ mod challenge_tests {
             body: b"",
         },
         Route { method: "GET", target: "/api/repos/owner/name/tree/HEAD", content_type: None, body: b"" },
+        Route {
+            method: "GET",
+            target: "/api/repos/owner/name/blob/1111111111111111111111111111111111111111",
+            content_type: None,
+            body: b"",
+        },
+        Route {
+            method: "GET",
+            target: "/api/repos/owner/name/commits/1111111111111111111111111111111111111111",
+            content_type: None,
+            body: b"",
+        },
+    ];
+
+    /// Shared token/session management is merged by the gateway but is outside
+    /// the new gateway-owned policy: these routes keep the pre-existing
+    /// `crate::Error` Basic challenge and are asserted here so the boundary
+    /// cannot drift silently.
+    const SHARED_API_ROUTES: [Route; 2] = [
+        Route { method: "GET", target: "/api/tokens", content_type: None, body: b"" },
+        Route { method: "GET", target: "/api/sessions", content_type: None, body: b"" },
     ];
 
     const GIT_ROUTES: [Route; 4] = [
@@ -330,6 +368,7 @@ mod challenge_tests {
             let mut request = match route.method {
                 "GET" => client.get(url),
                 "POST" => client.post(url),
+                "DELETE" => client.delete(url),
                 method => panic!("unsupported test method {method}"),
             };
             if let Some(content_type) = route.content_type {
@@ -367,6 +406,14 @@ mod challenge_tests {
         headers.get_all(name).iter().map(|value| value.to_str().expect("response header is text").to_owned()).collect()
     }
 
+    fn assert_not_challenged(reply: &Reply, label: &str) {
+        assert!(reply.challenges.is_empty(), "{label} advertised an unexpected challenge: {:?}", reply.challenges);
+        assert!(reply.set_cookie.is_empty(), "{label} set a cookie");
+        assert!(reply.session.is_empty(), "{label} issued a repository session");
+        assert!(reply.location.is_none(), "{label} redirected a browser");
+        assert_ne!(reply.body, UNAUTHORIZED_BODY, "{label} returned the authentication refusal body");
+    }
+
     fn assert_refused(reply: &Reply, route: Route, challenge: &str) {
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{} {} was not refused", route.method, route.target);
         assert_eq!(
@@ -396,6 +443,27 @@ mod challenge_tests {
             for headers in rejected {
                 let reply = gateway.send(route, headers).await;
                 assert_refused(&reply, route, BEARER);
+            }
+        }
+    }
+
+    /// The shared token/session APIs are merged into this router but are not
+    /// part of the gateway's new Bearer policy. They keep the application's
+    /// existing Basic challenge; this checkpoint does not broaden
+    /// `crate::application::Error` or the shared auth policy.
+    #[tokio::test]
+    async fn shared_token_and_session_routes_keep_legacy_basic() {
+        let (state, _scratch) = offline_state();
+        let gateway = Gateway::start(&state).await;
+        let rejected: [&[(&str, &str)]; 3] = [
+            &[],
+            &[("authorization", "Bearer not-a-credential")],
+            &[("authorization", "Basic b3duZXI6bm90LWEtY3JlZGVudGlhbA==")],
+        ];
+        for route in SHARED_API_ROUTES {
+            for headers in rejected {
+                let reply = gateway.send(route, headers).await;
+                assert_refused(&reply, route, BASIC);
             }
         }
     }
@@ -433,6 +501,62 @@ mod challenge_tests {
         for route in [GIT_ROUTES[0], GIT_ROUTES[3]] {
             let reply = gateway.send(route, &headers).await;
             assert_refused(&reply, route, BASIC);
+        }
+    }
+
+    /// Routes the layer does not own must not gain a challenge: the explicit
+    /// merge/LFS `501`s, a real method mismatch (`405`), and unmatched API and
+    /// Git paths (`404`, which never enter a `route_layer`).
+    #[tokio::test]
+    async fn non_401_and_fallback_routes_get_no_new_challenge() {
+        let (state, _scratch) = offline_state();
+        let gateway = Gateway::start(&state).await;
+        let cases = [
+            (
+                Route {
+                    method: "POST",
+                    target: "/api/repos/owner/name/merges",
+                    content_type: Some("application/json"),
+                    body: b"{}",
+                },
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported merge",
+            ),
+            (
+                Route {
+                    method: "GET",
+                    target: "/git/owner/name.git/info/lfs/objects/batch",
+                    content_type: None,
+                    body: b"",
+                },
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported LFS",
+            ),
+            (
+                Route { method: "DELETE", target: "/api/repos", content_type: None, body: b"" },
+                StatusCode::METHOD_NOT_ALLOWED,
+                "matched API path with an unsupported method",
+            ),
+            (
+                Route { method: "GET", target: "/git/owner/name.git/git-upload-pack", content_type: None, body: b"" },
+                StatusCode::METHOD_NOT_ALLOWED,
+                "matched Git path with an unsupported method",
+            ),
+            (
+                Route { method: "GET", target: "/api/repos/owner/name/not-a-route", content_type: None, body: b"" },
+                StatusCode::NOT_FOUND,
+                "unmatched API path",
+            ),
+            (
+                Route { method: "GET", target: "/git/owner/name.git/not-a-route", content_type: None, body: b"" },
+                StatusCode::NOT_FOUND,
+                "unmatched Git path",
+            ),
+        ];
+        for (route, expected, label) in cases {
+            let reply = gateway.send(route, &[]).await;
+            assert_eq!(reply.status, expected, "{} {} was not {label}", route.method, route.target);
+            assert_not_challenged(&reply, label);
         }
     }
 
