@@ -167,6 +167,9 @@ INPUT_FILES = ("tests/blob_only_service.py", "tests/e2e.py", "tests/native_evide
                "tests/ops_provenance.py", "tests/owned_fuse_cleanup.py", "scripts/build_native.py")
 # Names whose values must never reach a report (checked before writing, not trusted).
 SENSITIVE_PATTERN = re.compile(r"BLOB|DATABASE|DSN|PASS|SECRET|TOKEN|KEY|CREDENTIAL", re.IGNORECASE)
+# Non-secret profile enums that check_blob_profile intentionally echoes in blob_profile.
+# Treating them as secrets would make a valid run refuse to write its own report.
+PUBLIC_BLOB_PROFILE_ENV = frozenset({"ROOTYARD_BLOB_DRIVER", "ROOTYARD_BLOB_SERVICE", "ROOTYARD_BLOB_DELETE"})
 CONNECTION_ESTABLISHED = "01"
 LISTEN = "0A"
 WILDCARD = ("0.0.0.0", "::")
@@ -1432,8 +1435,13 @@ def validate_service_admission(admission):
 
 
 def sensitive_values(env):
-    """Values a report must never contain: credentials and connection/endpoint material."""
-    values = [value for name, value in env.items() if value and SENSITIVE_PATTERN.search(name)]
+    """Values a report must never contain: credentials and private connection/endpoint material.
+
+    The public driver/service/delete-policy enums are reported as blob_profile
+    facts, so they are not secrets and must never trip the report scan.
+    """
+    values = [value for name, value in env.items()
+              if value and name not in PUBLIC_BLOB_PROFILE_ENV and SENSITIVE_PATTERN.search(name)]
     values.extend(serving.sensitive_values(env))
     return sorted({value for value in values if isinstance(value, str)})
 

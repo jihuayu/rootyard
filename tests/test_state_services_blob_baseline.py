@@ -1321,6 +1321,24 @@ class ReportValidationTest(unittest.TestCase):
             with self.subTest(marker=marker), self.assertRaises(baseline.BaselineError):
                 baseline.validate_no_secrets({**payload, "note": marker}, [])
 
+    def test_public_blob_profile_enums_are_not_treated_as_secrets(self):
+        env = {"ROOTYARD_BLOB_DRIVER": "opendal", "ROOTYARD_BLOB_SERVICE": "s3",
+               "ROOTYARD_BLOB_DELETE": "disabled",
+               "ROOTYARD_BLOB_ENDPOINT": "http://127.0.0.1:9000",
+               "ROOTYARD_BLOB_BUCKET": "private-bucket",
+               "ROOTYARD_BLOB_SECRET_ACCESS_KEY": "private-secret",
+               "ROOTYARD_TEST_DATABASE_URL": "postgresql://user:db-password@db.invalid:5432/rootyard"}
+        sensitive = baseline.sensitive_values(env)
+        for public in ("opendal", "s3", "disabled"):
+            self.assertNotIn(public, sensitive)
+        for private in ("http://127.0.0.1:9000", "private-bucket", "private-secret", "db-password"):
+            self.assertIn(private, sensitive)
+        payload = report_payload()
+        payload["blob_profile"]["delete_policy"] = "disabled"
+        self.assertTrue(baseline.validate_no_secrets(payload, sensitive))
+        with self.assertRaises(baseline.BaselineError):
+            baseline.validate_no_secrets({**payload, "note": "private-secret"}, sensitive)
+
     def test_report_labels_and_bounds(self):
         payload = report_payload()
         self.assertEqual(payload["status"], "passed")
