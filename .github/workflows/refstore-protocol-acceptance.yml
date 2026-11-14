@@ -21,6 +21,7 @@ on:
       - 'tests/serving_support/**'
       - 'tests/fixtures/**'
       - 'tests/blob_only_service.py'
+      - 'tests/blob_commit_unknown_service.py'
       - 'tests/blob_gateway_browse.py'
       - 'tests/blob_gateway_history.py'
       - 'tests/blob_provisioning_service.py'
@@ -204,6 +205,58 @@ jobs:
           fi
           python3 tests/blob_only_service.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --report test-results/refstore/standalone-http.json
+          # Same attested CLI, job-owned PostgreSQL 17 and owned Garage fixture.
+          # This is the fixed full three-case inventory; no --case selection.
+          # It claims only the standalone managed-PG/Blob path, not a Cancel/Commit
+          # race, power loss, automatic pending recommit or distributed authority.
+          python3 tests/blob_commit_unknown_service.py --binary "$binary" --git "$ROOTYARD_GIT" \
+            --report test-results/refstore/standalone-commit-unknown.json
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          expected = [
+              'receive_pack_commit_unknown_resolves_exact',
+              'exact_receive_post_replays_before_native_without_second_effect',
+              'registered_read_cycles_do_not_exhaust_retained_snapshot_quota',
+          ]
+          path = pathlib.Path('test-results/refstore/standalone-commit-unknown.json')
+          report = json.loads(path.read_text())
+          hex64 = re.compile(r'^[0-9a-f]{64}$')
+          assert report.get('kind') == 'rootyard/blob-only-native-acceptance', report.get('kind')
+          assert report.get('passed') is True, 'commit-unknown report did not pass'
+          assert report.get('measurement_kind') == 'native_execution', report.get('measurement_kind')
+          assert report.get('simulated_fields') is False, report.get('simulated_fields')
+          assert report.get('qualification_kind') == 'clean-candidate', report.get('qualification_kind')
+          assert report.get('inputs_unchanged') is True, report.get('binding_error')
+          assert report.get('source_head') == os.environ['GITHUB_SHA'], 'source_head is not GITHUB_SHA'
+          profile = report.get('native_profile')
+          assert isinstance(profile, dict) and profile.get('attested') is True, 'native profile is not attested'
+          assert profile.get('workspace_commit') == report.get('source_head'), 'native profile source differs'
+          assert profile.get('source_inputs_sha256') == report.get('source_inputs_sha256'), 'source input binding differs'
+          assert profile.get('binary_sha256') == report.get('binary_sha256'), 'binary binding differs'
+          assert profile.get('build_receipt_sha256') == report.get('build_receipt_sha256'), 'receipt binding differs'
+          for label in ('source_inputs_sha256', 'binary_sha256', 'build_receipt_sha256',
+                        'checkpoint_sha256', 'harness_sha256'):
+              value = report.get(label)
+              assert isinstance(value, str) and hex64.fullmatch(value), 'missing or malformed ' + label
+          cases = report.get('cases')
+          assert isinstance(cases, list) and len(cases) == 3, 'expected exactly three case records'
+          assert report.get('case_count') == report.get('expected_count') == 3, 'case counts are not exactly 3'
+          assert report.get('expected_cases') == expected, 'expected case inventory differs'
+          assert [case.get('name') for case in cases] == expected, 'executed case inventory/order differs'
+          assert len({case.get('name') for case in cases}) == 3, 'case names are not unique'
+          assert all(case.get('status') == 'passed' and not case.get('error') and not case.get('trace')
+                     for case in cases), 'a case is not a clean PASS'
+          assert report.get('skips') == 0 and report.get('pending_cases') == [], 'a case was skipped or pended'
+          hashes = report.get('harness_inputs_sha256')
+          assert isinstance(hashes, dict), 'transitive harness inputs are missing'
+          for name in ('blob_commit_unknown_service.py', 'blob_only_service.py', 'e2e.py',
+                       'native_evidence.py', 'ops_provenance.py', 'owned_fuse_cleanup.py'):
+              assert name in hashes and hex64.fullmatch(hashes[name]), 'missing input hash: ' + name
+          assert report.get('checkpoint_sha256') == hashes['blob_commit_unknown_service.py'], 'checkpoint hash differs'
+          assert report.get('harness_sha256') == hashes['blob_only_service.py'], 'shared harness hash differs'
+          assert report.get('harness_inputs', {}).get('input_hashes') == hashes, 'input closure differs'
+          print('standalone commit-unknown: 3/3 unique PASS, 0 skips, source/receipt/binary/inputs bound')
+          PY
           python3 tests/blob_gateway_browse.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --report test-results/refstore/standalone-browse.json
           python3 tests/blob_gateway_history.py --binary "$binary" --git "$ROOTYARD_GIT" \

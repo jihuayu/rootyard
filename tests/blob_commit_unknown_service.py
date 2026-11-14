@@ -75,6 +75,13 @@ LIMITATIONS = [item for item in blob.LIMITATIONS
 ]
 
 
+def input_hashes():
+    root = Path(__file__).resolve().parent
+    names = (Path(__file__).name, "blob_only_service.py", "e2e.py", "native_evidence.py",
+             "ops_provenance.py", "owned_fuse_cleanup.py")
+    return {name: blob.sha256_file(root / name) for name in names}
+
+
 class CheckpointProfile(blob.NativeProfile):
     def __init__(self, binary, git_flag, env):
         super().__init__(binary, git_flag, env)
@@ -923,7 +930,9 @@ def main(argv=None):
     parser.add_argument("--case", action="append", default=[])
     args = parser.parse_args(argv)
     env = os.environ.copy()
+    hashes = None
     try:
+        hashes = input_hashes()
         profile = CheckpointProfile(args.binary, args.git, env)
         blob_profile = blob.check_blob_profile(env)
         blob.need(env.get("ROOTYARD_TEST_DATABASE_URL"), "ROOTYARD_TEST_DATABASE_URL is required")
@@ -935,6 +944,7 @@ def main(argv=None):
             "preflight_failed": True, "error": str(error), "cases": [],
             "expected_cases": [], "skips": 0, "limitations": LIMITATIONS,
             "checkpoint_sha256": blob.sha256_file(Path(__file__)),
+            "harness_inputs_sha256": hashes or {},
         })
         print("preflight failed: " + str(error), file=sys.stderr)
         return 2
@@ -956,20 +966,35 @@ def main(argv=None):
             harness.results.append({"name": "cleanup", "status": "failed", "error": harness.redact(error)})
             success = False
         report = blob.build_report(harness, profile, blob_profile, selected, success)
-        checkpoint_sha = blob.sha256_file(Path(__file__))
-        checkpoint_unchanged = checkpoint_sha == profile.checkpoint_sha256
-        report["checkpoint_sha256"] = checkpoint_sha
+        hashes_now = input_hashes()
+        checkpoint_name = Path(__file__).name
+        report["checkpoint_sha256"] = hashes_now[checkpoint_name]
+        report["build_receipt_sha256"] = profile.receipt_sha256
+        report["harness_inputs_sha256"] = hashes_now
         report["harness_inputs"] = {
-            "blob_only_service_sha256": report["harness_sha256"],
-            "checkpoint_sha256": checkpoint_sha,
+            "blob_only_service_sha256": hashes_now["blob_only_service.py"],
+            "checkpoint_sha256": hashes_now[checkpoint_name],
+            "e2e_sha256": hashes_now["e2e.py"],
+            "native_evidence_sha256": hashes_now["native_evidence.py"],
+            "ops_provenance_sha256": hashes_now["ops_provenance.py"],
+            "owned_fuse_cleanup_sha256": hashes_now["owned_fuse_cleanup.py"],
+            "input_hashes": hashes_now,
         }
         report["limitations"] = LIMITATIONS
-        if not checkpoint_unchanged:
+        errors = []
+        if hashes_now != hashes:
+            errors.append("harness/helper source changed during native acceptance")
+        if hashes_now[checkpoint_name] != profile.checkpoint_sha256:
+            errors.append("checkpoint harness changed during native acceptance")
+        if blob.sha256_file(profile.binary) != profile.build["binary_sha256"]:
+            errors.append("executed binary changed during native acceptance")
+        if blob.sha256_file(profile.binary.with_suffix(".build.json")) != profile.receipt_sha256:
+            errors.append("build receipt changed during native acceptance")
+        if errors:
             report["inputs_unchanged"] = False
             report["passed"] = False
             prior = report.get("binding_error")
-            report["binding_error"] = ("checkpoint harness changed during native acceptance"
-                                       + ("; " + prior if prior else ""))
+            report["binding_error"] = "; ".join(errors + ([prior] if prior else []))
         blob.write_report(args.report, report)
         print(json.dumps(report, indent=2))
     return 0 if report["passed"] else 1
