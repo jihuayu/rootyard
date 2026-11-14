@@ -182,14 +182,21 @@ class LfsHarness(Harness):
         return body["lock"]
 
     def lfs_lock_audit_rows(self, path):
-        return self.sql(
-            "SELECT action || '|' || target_type || '|' || target_name || '|' || "
-            "actor_name || '|' || COALESCE(details->>'force','') || '|' || "
-            "COALESCE(details->>'id','') || '|' || tenant_id::text || '|' || "
-            "repository_id::text FROM repository_audit_log "
+        raw = self.sql(
+            "SELECT json_build_object("
+            "'actor_id', actor_id::text,"
+            "'actor_name', actor_name,"
+            "'action', action,"
+            "'target_type', target_type,"
+            "'target_name', target_name,"
+            "'details', details,"
+            "'tenant_id', tenant_id::text,"
+            "'repository_id', repository_id::text"
+            ")::text FROM repository_audit_log "
             f"WHERE repository_id='{self.repo['id']}' AND target_name='{path}' "
             "AND action IN ('lfs_lock.created','lfs_lock.removed') ORDER BY id"
-        ).splitlines()
+        )
+        return [json.loads(row) for row in raw.splitlines()]
 
     def lfs_lock_idempotency_rows(self, key):
         return int(self.sql(
@@ -665,7 +672,9 @@ class LfsHarness(Harness):
         mutation_path = "docs/mutation.bin"
         conflict_path = "docs/mutation-conflict.bin"
         mutation_key = "lfs-mutation-" + self.repo["id"]
-        tenant_id = self.alice["user_id"]
+        alice_actor_id = self.alice["user_id"]
+        bob_actor_id = self.bob["user_id"]
+        tenant_id = alice_actor_id
         repo_id = self.repo["id"]
         audit_count_sql = (
             f"SELECT count(*) FROM repository_audit_log WHERE repository_id='{repo_id}'"
@@ -678,10 +687,16 @@ class LfsHarness(Harness):
         first = json.loads(first_raw)["lock"]
         assert first["id"] and first["path"] == mutation_path
         assert first["owner"] == {"name": "alice"}
-        creation_audit = (
-            f"lfs_lock.created|lfs_lock|{mutation_path}|alice||{first['id']}|"
-            f"{tenant_id}|{repo_id}"
-        )
+        creation_audit = {
+            "actor_id": alice_actor_id,
+            "actor_name": "alice",
+            "action": "lfs_lock.created",
+            "target_type": "lfs_lock",
+            "target_name": mutation_path,
+            "details": {"id": first["id"]},
+            "tenant_id": tenant_id,
+            "repository_id": repo_id,
+        }
         assert self.lfs_lock_audit_rows(mutation_path) == [creation_audit]
         assert self.lfs_lock_idempotency_rows(mutation_key) == 1
         assert int(self.sql(audit_count_sql)) == audit_before + 1
@@ -711,10 +726,16 @@ class LfsHarness(Harness):
 
         removed = self.lfs_lock_unlock(source_locks, first["id"], self.alice)
         assert removed["id"] == first["id"]
-        owner_removal_audit = (
-            f"lfs_lock.removed|lfs_lock|{mutation_path}|alice|false|{first['id']}|"
-            f"{tenant_id}|{repo_id}"
-        )
+        owner_removal_audit = {
+            "actor_id": alice_actor_id,
+            "actor_name": "alice",
+            "action": "lfs_lock.removed",
+            "target_type": "lfs_lock",
+            "target_name": mutation_path,
+            "details": {"id": first["id"], "force": False},
+            "tenant_id": tenant_id,
+            "repository_id": repo_id,
+        }
         assert self.lfs_lock_audit_rows(mutation_path) == [
             creation_audit, owner_removal_audit
         ]
@@ -726,10 +747,16 @@ class LfsHarness(Harness):
             code=201, extra_headers={"Idempotency-Key": replacement_key})
         replacement = json.loads(replacement_raw)["lock"]
         assert replacement["id"] != first["id"]
-        replacement_create_audit = (
-            f"lfs_lock.created|lfs_lock|{mutation_path}|alice||{replacement['id']}|"
-            f"{tenant_id}|{repo_id}"
-        )
+        replacement_create_audit = {
+            "actor_id": alice_actor_id,
+            "actor_name": "alice",
+            "action": "lfs_lock.created",
+            "target_type": "lfs_lock",
+            "target_name": mutation_path,
+            "details": {"id": replacement["id"]},
+            "tenant_id": tenant_id,
+            "repository_id": repo_id,
+        }
         assert [
             lock["id"]
             for lock in self.lfs_lock_list(source_locks, self.alice, path=mutation_path)["locks"]
@@ -757,10 +784,16 @@ class LfsHarness(Harness):
         removed_replacement = self.lfs_lock_unlock(
             source_locks, replacement["id"], self.alice)
         assert removed_replacement["id"] == replacement["id"]
-        replacement_removal_audit = (
-            f"lfs_lock.removed|lfs_lock|{mutation_path}|alice|false|{replacement['id']}|"
-            f"{tenant_id}|{repo_id}"
-        )
+        replacement_removal_audit = {
+            "actor_id": alice_actor_id,
+            "actor_name": "alice",
+            "action": "lfs_lock.removed",
+            "target_type": "lfs_lock",
+            "target_name": mutation_path,
+            "details": {"id": replacement["id"], "force": False},
+            "tenant_id": tenant_id,
+            "repository_id": repo_id,
+        }
         assert self.lfs_lock_audit_rows(mutation_path) == [
             creation_audit, owner_removal_audit, replacement_create_audit,
             replacement_removal_audit,
@@ -780,8 +813,26 @@ class LfsHarness(Harness):
         forced = self.git("lfs", "unlock", "--force", "docs/design.bin", cwd=self.work, token=self.bob)
         assert b"Unlocked docs/design.bin" in forced.stdout
         assert self.lfs_lock_audit_rows("docs/design.bin") == [
-            f"lfs_lock.created|lfs_lock|docs/design.bin|alice||{design_id}|{tenant_id}|{repo_id}",
-            f"lfs_lock.removed|lfs_lock|docs/design.bin|bob|true|{design_id}|{tenant_id}|{repo_id}",
+            {
+                "actor_id": alice_actor_id,
+                "actor_name": "alice",
+                "action": "lfs_lock.created",
+                "target_type": "lfs_lock",
+                "target_name": "docs/design.bin",
+                "details": {"id": design_id},
+                "tenant_id": tenant_id,
+                "repository_id": repo_id,
+            },
+            {
+                "actor_id": bob_actor_id,
+                "actor_name": "bob",
+                "action": "lfs_lock.removed",
+                "target_type": "lfs_lock",
+                "target_name": "docs/design.bin",
+                "details": {"id": design_id, "force": True},
+                "tenant_id": tenant_id,
+                "repository_id": repo_id,
+            },
         ]
 
         def lock_attempt(_):
