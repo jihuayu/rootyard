@@ -1191,22 +1191,162 @@ jobs:
           export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
           lib="$evidence/session174-lib-tests"
           cli="$evidence/rootyard-cli"
-          # Build the libtest before the CLI. The case loop below only executes
-          # the relocated libtest, so it cannot overwrite the receipted CLI.
-          # Keep builder stdout off the atomically written <output>.build.json receipt path;
-          # the canonical receipt is copied from that path below.
+          artifact_store="$HOME/.cache/rootyard/native-artifacts"
+          # Build the libtest before the CLI. Both builders publish their frozen
+          # paths as readonly aliases of immutable snapshots under the shared
+          # store; the case loop only executes the relocated libtest.
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
           python3 scripts/build_native_test.py --lib --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$artifact_store" \
             --output "$lib" > "$evidence/session174-lib-tests.stdout.log"
           python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
-            > "$evidence/standalone-build.json"
-          cp --preserve=mode "$GITHUB_WORKSPACE/target/debug/rootyard" "$cli"
-          chmod 755 "$cli" "$lib"
+            --artifact-store "$artifact_store" \
+            --output "$cli" > "$evidence/standalone-build.json"
+          python3 - "$lib" "$cli" "$GITHUB_ENV" <<'PY'
+          import hashlib, json, os, pathlib, re, stat, sys
+
+          store = pathlib.Path(os.path.expanduser('~/.cache/rootyard/native-artifacts')).resolve()
+          lib, cli = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          github_env = pathlib.Path(sys.argv[3])
+          HEX64 = re.compile(r'^[0-9a-f]{64}$')
+          STORE_SCHEMA = 'rootyard/native-artifact-store/v1'
+
+
+          def fail(message):
+              raise SystemExit('immutable #174 metadata: ' + message)
+
+
+          def sha(path):
+              digest = hashlib.sha256()
+              with pathlib.Path(path).open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(1 << 20), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def readonly_file(path, label):
+              path = pathlib.Path(path)
+              if not path.is_absolute() or '..' in path.parts:
+                  fail(label + ' is not a safe absolute path: ' + str(path))
+              if path.is_symlink() or not path.is_file():
+                  fail(label + ' is not a regular non-symlink file: ' + str(path))
+              info = path.stat()
+              if not stat.S_ISREG(info.st_mode):
+                  fail(label + ' is not a regular file: ' + str(path))
+              if info.st_uid != os.geteuid():
+                  fail(label + ' is not owned by the current user: ' + str(path))
+              if info.st_mode & 0o222:
+                  fail(label + ' must be readonly: ' + str(path))
+              return path
+
+
+          def load(path, label):
+              try:
+                  payload = json.loads(pathlib.Path(path).read_text(encoding='utf-8'))
+              except (OSError, ValueError) as error:
+                  fail(label + ' is not readable JSON: ' + type(error).__name__)
+              if not isinstance(payload, dict):
+                  fail(label + ' is not a JSON object')
+              return payload
+
+
+          def require_alias(binary, label):
+              receipt = binary.with_suffix('.build.json')
+              readonly_file(binary, label + ' alias')
+              readonly_file(receipt, label + ' adjacent receipt alias')
+              payload = load(receipt, label + ' adjacent receipt alias')
+              record = payload.get('artifact_store')
+              if not isinstance(record, dict):
+                  fail(label + ' receipt has no artifact_store record')
+              if record.get('schema') != STORE_SCHEMA:
+                  fail(label + ' artifact_store schema is invalid')
+              root = pathlib.Path(record.get('root') or '')
+              if not root.is_absolute() or root.resolve() != store:
+                  fail(label + ' artifact_store root is not the shared store')
+              canonical_binary = readonly_file(record.get('binary'), label + ' canonical binary')
+              canonical_receipt = readonly_file(record.get('receipt'), label + ' canonical receipt')
+              build_receipt = readonly_file(
+                  record.get('build_receipt'), label + ' canonical build receipt')
+              objects = readonly_file(record.get('object'), label + ' content object')
+              for path, name in ((canonical_binary, 'binary'), (canonical_receipt, 'receipt'),
+                                 (build_receipt, 'build receipt'), (objects, 'object')):
+                  if store != path and store not in path.parents:
+                      fail(label + ' ' + name + ' is outside the shared store')
+              if canonical_receipt.name != canonical_binary.name + '.receipt.json':
+                  fail(label + ' canonical receipt is not adjacent to the binary')
+              if build_receipt.name != canonical_binary.name + '.build.json':
+                  fail(label + ' canonical build receipt is not adjacent to the binary')
+              if canonical_receipt.parent != canonical_binary.parent \
+                      or build_receipt.parent != canonical_binary.parent:
+                  fail(label + ' canonical receipts are not adjacent to the binary')
+              binary_sha = record.get('binary_sha256')
+              if not isinstance(binary_sha, str) or HEX64.fullmatch(binary_sha) is None:
+                  fail(label + ' artifact_store binary_sha256 is invalid')
+              if payload.get('binary_sha256') != binary_sha:
+                  fail(label + ' receipt binary_sha256 differs from the sealed record')
+              for path, name in ((canonical_binary, 'canonical binary'),
+                                 (objects, 'content object'), (binary, 'frozen alias')):
+                  if sha(path) != binary_sha:
+                      fail(label + ' ' + name + ' does not match the sealed digest')
+              if sha(build_receipt) != sha(receipt):
+                  fail(label + ' adjacent receipt bytes differ from the canonical build receipt')
+              output = record.get('output_alias')
+              if not isinstance(output, dict):
+                  fail(label + ' artifact_store has no output_alias record')
+              if pathlib.Path(output.get('path') or '').resolve() != binary.resolve():
+                  fail(label + ' output_alias path is not the frozen alias')
+              if pathlib.Path(output.get('receipt') or '').resolve() != receipt.resolve():
+                  fail(label + ' output_alias receipt is not adjacent to the frozen alias')
+              if output.get('method') not in ('hardlink', 'copy'):
+                  fail(label + ' output_alias method is invalid')
+              if not isinstance(output.get('same_inode_as_cas_object'), bool):
+                  fail(label + ' output_alias inode observation is invalid')
+              if output.get('overwrote_existing') is not False:
+                  fail(label + ' output_alias must not overwrite an existing path')
+              return record
+
+
+          lib_store = require_alias(lib, 'lib')
+          cli_store = require_alias(cli, 'CLI')
+          exported = {
+              'ROOTYARD_174_LIB_ALIAS': str(lib.resolve()),
+              'ROOTYARD_174_LIB_ALIAS_RECEIPT': str(lib.with_suffix('.build.json').resolve()),
+              'ROOTYARD_174_LIB_BIN': lib_store['binary'],
+              'ROOTYARD_174_LIB_RECEIPT': lib_store['build_receipt'],
+              'ROOTYARD_174_CLI_ALIAS': str(cli.resolve()),
+              'ROOTYARD_174_CLI_ALIAS_RECEIPT': str(cli.with_suffix('.build.json').resolve()),
+              'ROOTYARD_174_CLI_BIN': cli_store['binary'],
+              'ROOTYARD_174_CLI_RECEIPT': cli_store['build_receipt'],
+          }
+          for name, value in exported.items():
+              if '\n' in value or '\r' in value or '\x00' in value:
+                  fail(name + ' is not a single safe line')
+              if re.fullmatch(r'[A-Z][A-Z0-9_]*', name) is None:
+                  fail('unsafe environment name')
+          with github_env.open('a', encoding='utf-8') as stream:
+              for name, value in exported.items():
+                  stream.write(name + '=' + value + '\n')
+          PY
           if ! python3 - "$lib" "$cli" <<'PY' 2>&1 | tee "$evidence/preflight.log"
           # The owned database name arrives only through DATABASE_URL; it is never printed.
           import hashlib, json, os, pathlib, re, subprocess, sys
           sys.path.insert(0, str(pathlib.Path('scripts').resolve()))
           import native_build_receipt as receipts
           lib, cli = sys.argv[1:3]
+
+
+          def readonly_alias(path, label):
+              path = pathlib.Path(path)
+              if path.is_symlink() or not path.is_file():
+                  fail(label + ' is not a regular non-symlink alias')
+              info = path.stat()
+              if info.st_uid != os.geteuid():
+                  fail(label + ' is not owned by the current user')
+              if info.st_mode & 0o222:
+                  fail(label + ' must be readonly')
+              return str(path)
+
+
           workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
           evidence = pathlib.Path(lib).parent
           hex64 = re.compile(r'^[0-9a-f]{64}$')
@@ -1252,6 +1392,10 @@ jobs:
 
           def fail(message):
               raise SystemExit('session174 preflight: ' + message)
+
+
+          lib = readonly_alias(lib, 'lib alias')
+          cli = readonly_alias(cli, 'CLI alias')
 
 
           def sha(path):
@@ -1434,7 +1578,7 @@ jobs:
 
 
           test_receipt_path = pathlib.Path(lib).with_suffix('.build.json')
-          cli_receipt_path = workspace / 'target' / 'debug' / 'rootyard.build.json'
+          cli_receipt_path = pathlib.Path(cli).with_suffix('.build.json')
           try:
               test_receipt_bytes = test_receipt_path.read_bytes()
               cli_receipt_bytes = cli_receipt_path.read_bytes()
@@ -1641,6 +1785,18 @@ jobs:
               'rustc': {key: trusted['rustc'][key]
                         for key in ('release', 'commit_hash', 'host', 'version')},
           }
+
+
+          def store_evidence(payload):
+              record = payload.get('artifact_store')
+              if not isinstance(record, dict):
+                  return None
+              keys = ('schema', 'root', 'object', 'binary', 'receipt', 'build_receipt',
+                      'binary_sha256', 'config_key', 'build_id', 'method', 'reused',
+                      'copied_bytes', 'output_alias')
+              return {key: record.get(key) for key in keys}
+
+
           preflight = {
               'passed': True, 'head': head, 'source_inputs_sha256': source,
               'lib_test_support_inputs_sha256': support, 'rustc': test_rustc,
@@ -1662,6 +1818,10 @@ jobs:
               'lib_command': test_receipt['command'], 'cli_command': cli_receipt['command'],
               'lib_binary_sha256': test_receipt['binary_sha256'],
               'cli_binary_sha256': cli_receipt['binary_sha256'],
+              'lib_alias': str(pathlib.Path(lib).resolve()),
+              'cli_alias': str(pathlib.Path(cli).resolve()),
+              'lib_artifact_store': store_evidence(test_receipt),
+              'cli_artifact_store': store_evidence(cli_receipt),
               'lib_artifact': {'target': test_artifact['target'], 'kind': test_artifact['kind'],
                                'fresh': test_artifact['fresh']},
               'cli_artifact': {'target': cli_bin['target'], 'kind': cli_bin['kind'],

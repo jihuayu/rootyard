@@ -373,7 +373,7 @@ def make_preflight_fixture(root, block, schema="v2", jobs=None,
     target_cli.chmod(0o700)
     cli = evidence / "rootyard-cli"
     shutil.copyfile(target_cli, cli)
-    cli.chmod(0o700)
+    cli.chmod(0o555)
     lib = evidence / "session174-lib-tests"
     lib.write_text(
         "#!/usr/bin/env python3\n"
@@ -383,7 +383,7 @@ def make_preflight_fixture(root, block, schema="v2", jobs=None,
         "    for name in names:\n"
         "        print(name + ': test')\n"
     )
-    lib.chmod(0o700)
+    lib.chmod(0o555)
     (evidence / "fake-bin").mkdir()
     psql = evidence / "fake-bin/psql"
     psql.write_text("#!/bin/sh\nprintf 't\\n'\n")
@@ -503,7 +503,7 @@ def make_preflight_fixture(root, block, schema="v2", jobs=None,
             ],
         }
         receipts.atomic_write_json(lib.with_suffix(".build.json"), test_receipt)
-        receipts.atomic_write_json(target_cli.with_suffix(".build.json"), cli_receipt)
+        receipts.atomic_write_json(cli.with_suffix(".build.json"), cli_receipt)
     else:
         if features is None:
             features = {"enabled": [], "no_default_features": True}
@@ -578,7 +578,7 @@ def make_preflight_fixture(root, block, schema="v2", jobs=None,
             },
         )
         receipts.atomic_write_json(lib.with_suffix(".build.json"), test_receipt)
-        receipts.atomic_write_json(target_cli.with_suffix(".build.json"), cli_receipt)
+        receipts.atomic_write_json(cli.with_suffix(".build.json"), cli_receipt)
     return {
         "root": root,
         "evidence": evidence,
@@ -668,7 +668,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
         )
 
     def edit_preflight_receipt(self, fixture, key, mutate):
-        binary = fixture["lib"] if key == "lib" else fixture["target_cli"]
+        binary = fixture["lib"] if key == "lib" else fixture["cli"]
         path = binary.with_suffix(".build.json")
         payload = json.loads(path.read_text())
         mutate(payload)
@@ -751,6 +751,48 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
                       section)
         self.assertNotIn('cp target/debug/rootyard', section)
         self.assertNotIn('cp "$GITHUB_WORKSPACE/target/debug/rootyard', section)
+
+    def test_174_preparation_uses_the_shared_immutable_store(self):
+        start = self.source.index('"Exercise the #174 HTTP foundation cases')
+        end = self.source.index('"Drop only the run-owned #174 foundation database"')
+        section = self.source[start:end]
+        self.assertEqual(section.count(
+            'artifact_store="$HOME/.cache/rootyard/native-artifacts"'), 1)
+        self.assertEqual(section.count('--artifact-store "$artifact_store"'), 2)
+        self.assertIn('--output "$lib"', section)
+        self.assertIn('--output "$cli"', section)
+        self.assertIn('unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG', section)
+        self.assertNotIn('cp --preserve=mode', section)
+        self.assertNotIn('chmod 755 "$cli" "$lib"', section)
+        self.assertNotIn('target/debug', section)
+        self.assertIn("cli_receipt_path = pathlib.Path(cli).with_suffix('.build.json')",
+                      section)
+        self.assertNotIn("cli_receipt_path = workspace / 'target'", section)
+        self.assertIn("lib = readonly_alias(lib, 'lib alias')", section)
+        self.assertIn("cli = readonly_alias(cli, 'CLI alias')", section)
+        for name in (
+            "ROOTYARD_174_LIB_ALIAS",
+            "ROOTYARD_174_LIB_ALIAS_RECEIPT",
+            "ROOTYARD_174_LIB_BIN",
+            "ROOTYARD_174_LIB_RECEIPT",
+            "ROOTYARD_174_CLI_ALIAS",
+            "ROOTYARD_174_CLI_ALIAS_RECEIPT",
+            "ROOTYARD_174_CLI_BIN",
+            "ROOTYARD_174_CLI_RECEIPT",
+        ):
+            self.assertIn("'" + name + "'", section)
+        self.assertIn("'lib_artifact_store': store_evidence(test_receipt)", section)
+        self.assertIn("'cli_artifact_store': store_evidence(cli_receipt)", section)
+        # The strong #126 raw-bytes TOCTOU guard stays read-before-validate.
+        batch_read = self.batch_validator.index(
+            'test_receipt_bytes = pathlib.Path(test_receipt_path).read_bytes()')
+        batch_bound = self.batch_validator.index(
+            'test_validated.receipt_sha256 == sha256_bytes(test_receipt_bytes)')
+        self.assertLess(batch_read, batch_bound)
+        self.assertNotIn('json.loads(pathlib.Path(test_receipt_path)',
+                         self.batch_validator)
+        self.assertNotIn('json.loads(pathlib.Path(serving_receipt_path)',
+                         self.batch_validator)
 
     def test_validators_parse_and_use_the_shared_reader(self):
         self.assertEqual(len(self.validators), 2)
@@ -1173,7 +1215,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
                              "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b")
             self.assertEqual(preflight["toolchain"]["rustc"]["release"], "1.99.1")
             lib_receipt = fixture["lib"].with_suffix(".build.json")
-            cli_receipt = fixture["target_cli"].with_suffix(".build.json")
+            cli_receipt = fixture["cli"].with_suffix(".build.json")
             self.assertEqual(preflight["lib_receipt"]["path"], str(lib_receipt.resolve()))
             self.assertEqual(preflight["lib_receipt"]["sha256"], digest(lib_receipt))
             self.assertEqual(preflight["cli_receipt"]["path"], str(cli_receipt.resolve()))
@@ -1182,6 +1224,43 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             cli_copy = fixture["evidence"] / "rootyard-cli.build.json"
             self.assertEqual(cli_copy.read_bytes(), cli_receipt.read_bytes())
             self.assertEqual(digest(cli_copy), digest(cli_receipt))
+
+    def test_preflight_propagates_cas_store_to_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(temporary, self.preflight_validator)
+            injected = {}
+            for key, binary in (("lib", fixture["lib"]), ("cli", fixture["cli"])):
+                path = binary.with_suffix(".build.json")
+                payload = json.loads(path.read_text())
+                record = {
+                    'schema': 'rootyard/native-artifact-store/v1',
+                    'root': '/fixture/store',
+                    'binary': '/fixture/store/' + key,
+                    'receipt': '/fixture/store/' + key + '.receipt.json',
+                    'build_receipt': '/fixture/store/' + key + '.build.json',
+                    'binary_sha256': payload['binary_sha256'],
+                    'output_alias': {'path': str(binary)},
+                }
+                payload['artifact_store'] = record
+                path.write_text(json.dumps(payload))
+                injected[key] = record
+            preflight = self.assert_preflight_passes(fixture)
+            for key in ('lib', 'cli'):
+                evidence = preflight[key + '_artifact_store']
+                self.assertEqual(evidence['schema'], injected[key]['schema'])
+                self.assertEqual(evidence['root'], injected[key]['root'])
+                self.assertEqual(evidence['binary'], injected[key]['binary'])
+                self.assertEqual(evidence['receipt'], injected[key]['receipt'])
+                self.assertEqual(evidence['build_receipt'], injected[key]['build_receipt'])
+                self.assertEqual(evidence['binary_sha256'], injected[key]['binary_sha256'])
+            self.assertEqual(preflight['lib_alias'], str(fixture['lib'].resolve()))
+            self.assertEqual(preflight['cli_alias'], str(fixture['cli'].resolve()))
+
+    def test_preflight_rejects_writable_frozen_alias(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(temporary, self.preflight_validator)
+            fixture['lib'].chmod(0o755)
+            self.assert_preflight_fails(fixture, 'lib alias must be readonly')
 
     def test_preflight_validator_rejects_self_consistent_wrong_v2_artifact_sources(self):
         cases = (
@@ -1196,7 +1275,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
                 fixture = make_preflight_fixture(temporary, self.preflight_validator)
                 binary = fixture["lib"] if key == "lib" else fixture["cli"]
-                receipt_binary = fixture["lib"] if key == "lib" else fixture["target_cli"]
+                receipt_binary = fixture["lib"] if key == "lib" else fixture["cli"]
                 path = receipt_binary.with_suffix(".build.json")
                 payload = json.loads(path.read_text())
                 row = next(item for item in payload["cargo_artifacts"]
@@ -1244,7 +1323,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             self.assertEqual(preflight["lib_receipt"]["sha256"],
                              digest(fixture["lib"].with_suffix(".build.json")))
             self.assertEqual(preflight["cli_receipt"]["sha256"],
-                             digest(fixture["target_cli"].with_suffix(".build.json")))
+                             digest(fixture["cli"].with_suffix(".build.json")))
 
     def test_preflight_validator_accepts_fully_bound_v1(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1260,7 +1339,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             self.assertEqual(preflight["lib_receipt"]["sha256"],
                              digest(fixture["lib"].with_suffix(".build.json")))
             self.assertEqual(preflight["cli_receipt"]["sha256"],
-                             digest(fixture["target_cli"].with_suffix(".build.json")))
+                             digest(fixture["cli"].with_suffix(".build.json")))
 
     def test_preflight_validator_rejects_tampered_v2_contracts(self):
         def features(payload):
