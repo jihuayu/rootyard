@@ -322,7 +322,7 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         protocol = self.one(
             "SELECT repository_id::text || '|' || tenant_id::text || '|' || object_format || '|'"
             " || history_incarnation::text || '|' || authority_epoch::text || '|' || group_epoch::text"
-            " || '|' || decision_required::text FROM ref_store_core_protocol_repos"
+            " || '|' || (CASE WHEN decision_required THEN 't' ELSE 'f' END) FROM ref_store_core_protocol_repos"
             " WHERE repository_id=" + repository,
             "decision protocol realm")
         catalog_fields = catalog.split("|")
