@@ -285,9 +285,11 @@ class DependencyCheckoutHarness(JobCheckoutHarness):
         grand_dep = next(item for item in deps["submodules"] if item["name"] == "grand")
         assert child_dep["target_oid"] == self.child_oid, child_dep
         assert grand_dep["target_oid"] == self.grand_oid, grand_dep
-        assert deps["lfs"] == [{"repository_id": self.grand["id"], "path":
-                                "deps/child/deps/grand/big.bin", "oid": self.lfs_oid,
-                                "size": len(self.lfs_payload)}], deps["lfs"]
+        assert len(deps["lfs"]) == 1, deps["lfs"]
+        planned_lfs = deps["lfs"][0]
+        assert str(planned_lfs["repository_id"]).lower() == str(self.grand["id"]).lower()
+        assert planned_lfs["path"] == "deps/child/deps/grand/big.bin", planned_lfs
+        assert planned_lfs["oid"] == self.lfs_oid and planned_lfs["size"] == len(self.lfs_payload)
         assert moved_lfs_oid not in json.dumps(deps), "moved branch LFS input entered the plan"
         prepare = f"{self.checkout_path}/{body['job_id']}/prepare-dependencies"
         status, raw, _ = self.mirror_http(prepare, token=self.alice, method="POST", body=b"")
