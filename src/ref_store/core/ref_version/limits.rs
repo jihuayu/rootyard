@@ -1,18 +1,21 @@
 //! Frozen component bounds and checked integer adapters for the C1a codec.
 //!
 //! These are the existing protocol bounds, not new limits: 128 refs per
-//! operation and 8 new planned packs. Every integer that reaches the preimage
-//! is converted explicitly; no `as` cast is used. The byte writer performs a
-//! checked reserve for variable-length fields, so the preimage is bounded by
-//! the component caps without inventing a separate encoded-size limit.
+//! operation, 8 new planned packs and the verifier's 64 MiB aggregate planned
+//! artifact-byte bound. Every integer that reaches the preimage is converted
+//! explicitly; no `as` cast is used. The byte writer performs a checked reserve
+//! for variable-length fields, so the preimage is bounded by the component caps
+//! without inventing a separate encoded-size limit.
 use super::contract::RefVersionCodecError;
-use crate::ref_store::core::pack_commit::MAX_BATCH_NEW_PACKS;
+use crate::ref_store::core::pack_commit::{MAX_BATCH_NEW_PACKS, VERIFIER_MAX_TOTAL_BYTES};
 use crate::ref_store::core::types::MAX_REFS_PER_COMMIT;
 
 /// Existing per-commit ref batch bound.
 pub(super) const MAX_OPERATION_REFS: usize = MAX_REFS_PER_COMMIT;
 /// Existing per-commit new pack bound.
 pub(super) const MAX_OPERATION_PACKS: usize = MAX_BATCH_NEW_PACKS;
+/// Existing verifier aggregate bound for planned artifact bytes.
+pub(super) const MAX_OPERATION_PLANNED_BYTES: u64 = VERIFIER_MAX_TOTAL_BYTES;
 /// Exactly one `.pack` and one `.idx` per planned pack.
 pub(super) const ARTIFACTS_PER_PACK: u32 = 2;
 

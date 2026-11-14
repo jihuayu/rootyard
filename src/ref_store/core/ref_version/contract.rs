@@ -361,11 +361,15 @@ pub(crate) enum RefVersionCodecError {
     Capacity { field: &'static str, limit: usize, actual: usize },
     DuplicateRefName,
     DuplicatePackIdentity,
+    DuplicatePackId,
+    DuplicateRegistrationId,
     ObjectFormatMismatch { field: &'static str },
     ZeroObjectId { field: &'static str },
     InvalidRequestShape { reason: &'static str },
     InvalidContentDigest,
     LengthOverflow { field: &'static str },
+    PlannedBytesOverflow,
+    PlannedBytesExceeded { limit: u64, actual: u64 },
     RefNotInOperation,
     OperationDigestMismatch,
     NoMintForLegacyBase,
@@ -387,6 +391,10 @@ impl fmt::Display for RefVersionCodecError {
             }
             Self::DuplicateRefName => formatter.write_str("an operation must not repeat a ref name"),
             Self::DuplicatePackIdentity => formatter.write_str("an operation must not repeat a pack identity pair"),
+            Self::DuplicatePackId => formatter.write_str("an operation must not repeat a planned pack id"),
+            Self::DuplicateRegistrationId => {
+                formatter.write_str("an operation must not repeat a planned registration id")
+            }
             Self::ObjectFormatMismatch { field } => {
                 write!(formatter, "{field} does not match the realm object format")
             }
@@ -394,6 +402,10 @@ impl fmt::Display for RefVersionCodecError {
             Self::InvalidRequestShape { reason } => write!(formatter, "invalid request shape: {reason}"),
             Self::InvalidContentDigest => formatter.write_str("planned content digest is not a sha256 digest"),
             Self::LengthOverflow { field } => write!(formatter, "{field} length cannot be encoded"),
+            Self::PlannedBytesOverflow => formatter.write_str("planned artifact byte accounting overflowed"),
+            Self::PlannedBytesExceeded { limit, actual } => {
+                write!(formatter, "planned artifact bytes exceed the aggregate bound: {actual} > {limit}")
+            }
             Self::RefNotInOperation => formatter.write_str("the selected ref is not present in the operation input"),
             Self::OperationDigestMismatch => {
                 formatter.write_str("the supplied operation digest does not match the full operation input")

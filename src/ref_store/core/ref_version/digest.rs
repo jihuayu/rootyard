@@ -9,7 +9,8 @@ use super::contract::{
     RefVersionRealm, VersionId,
 };
 use super::limits::{
-    ARTIFACTS_PER_PACK, MAX_OPERATION_PACKS, MAX_OPERATION_REFS, count_u32, length_u64, nonnegative_u64, positive_u64,
+    ARTIFACTS_PER_PACK, MAX_OPERATION_PACKS, MAX_OPERATION_PLANNED_BYTES, MAX_OPERATION_REFS, count_u32, length_u64,
+    nonnegative_u64, positive_u64,
 };
 use crate::ref_store::core::contract::CommitMode;
 use crate::ref_store::core::pack_commit::{ContentDigest, PackArtifactRole, PlannedPack};
@@ -248,14 +249,34 @@ fn validate_packs(packs: &[PlannedPack]) -> Result<(), RefVersionCodecError> {
         return Err(RefVersionCodecError::Capacity { field: "packs", limit: MAX_OPERATION_PACKS, actual: packs.len() });
     }
     let mut identities = BTreeSet::new();
+    let mut pack_ids = BTreeSet::new();
+    let mut registration_ids = BTreeSet::new();
+    let mut total_bytes = 0_u64;
     for pack in packs {
         require_non_nil(pack.pack_id(), "pack_id")?;
         require_non_nil(pack.registration_id(), "registration_id")?;
         if !identities.insert((pack.pack_id(), pack.registration_id())) {
             return Err(RefVersionCodecError::DuplicatePackIdentity);
         }
-        content_digest_bytes(pack.artifact(PackArtifactRole::Pack).content())?;
-        content_digest_bytes(pack.artifact(PackArtifactRole::Idx).content())?;
+        if !pack_ids.insert(pack.pack_id()) {
+            return Err(RefVersionCodecError::DuplicatePackId);
+        }
+        if !registration_ids.insert(pack.registration_id()) {
+            return Err(RefVersionCodecError::DuplicateRegistrationId);
+        }
+        let mut pack_bytes = 0_u64;
+        for role in [PackArtifactRole::Pack, PackArtifactRole::Idx] {
+            let artifact = pack.artifact(role);
+            content_digest_bytes(artifact.content())?;
+            pack_bytes = pack_bytes.checked_add(artifact.length()).ok_or(RefVersionCodecError::PlannedBytesOverflow)?;
+        }
+        total_bytes = total_bytes.checked_add(pack_bytes).ok_or(RefVersionCodecError::PlannedBytesOverflow)?;
+    }
+    if total_bytes > MAX_OPERATION_PLANNED_BYTES {
+        return Err(RefVersionCodecError::PlannedBytesExceeded {
+            limit: MAX_OPERATION_PLANNED_BYTES,
+            actual: total_bytes,
+        });
     }
     Ok(())
 }
@@ -662,6 +683,46 @@ mod tests {
 
         let duplicate = input(uuid(4), vec![a_intent()], vec![pack_one(), pack_one()]);
         assert_eq!(digest(&duplicate), Err(RefVersionCodecError::DuplicatePackIdentity));
+    }
+
+    #[test]
+    fn pack_ids_and_registration_ids_are_unique_and_bytes_bounded() {
+        let reused_pack_id = input(
+            uuid(4),
+            vec![a_intent()],
+            vec![pack(0x99, 0xaa, 0xbb, 1, 0xcc, 1), pack(0x99, 0xdd, 0xee, 1, 0xff, 1)],
+        );
+        assert_eq!(digest(&reused_pack_id), Err(RefVersionCodecError::DuplicatePackId));
+
+        let reused_registration_id = input(
+            uuid(4),
+            vec![a_intent()],
+            vec![pack(0x99, 0xaa, 0xbb, 1, 0xcc, 1), pack(0x88, 0xaa, 0xee, 1, 0xff, 1)],
+        );
+        assert_eq!(digest(&reused_registration_id), Err(RefVersionCodecError::DuplicateRegistrationId));
+
+        let half = MAX_OPERATION_PLANNED_BYTES / 2;
+        let boundary = input(uuid(4), vec![a_intent()], vec![pack(0x99, 0xaa, 0xbb, half, 0xcc, half)]);
+        assert!(operation_digest(&boundary).is_ok());
+
+        let over_bound = input(uuid(4), vec![a_intent()], vec![pack(0x99, 0xaa, 0xbb, half, 0xcc, half + 1)]);
+        assert_eq!(
+            digest(&over_bound),
+            Err(RefVersionCodecError::PlannedBytesExceeded {
+                limit: MAX_OPERATION_PLANNED_BYTES,
+                actual: MAX_OPERATION_PLANNED_BYTES + 1,
+            })
+        );
+
+        let pair_overflow = input(uuid(4), vec![a_intent()], vec![pack(0x99, 0xaa, 0xbb, u64::MAX, 0xcc, 1)]);
+        assert_eq!(digest(&pair_overflow), Err(RefVersionCodecError::PlannedBytesOverflow));
+
+        let aggregate_overflow = input(
+            uuid(4),
+            vec![a_intent()],
+            vec![pack(0x99, 0xaa, 0xbb, u64::MAX - 1, 0xcc, 1), pack(0x88, 0xdd, 0xee, 1, 0xff, 1)],
+        );
+        assert_eq!(digest(&aggregate_overflow), Err(RefVersionCodecError::PlannedBytesOverflow));
     }
 
     #[test]
