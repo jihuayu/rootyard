@@ -366,10 +366,16 @@ class CandidateAndPrWorkflowWiringTest(unittest.TestCase):
             ("webhook_pr_sync", "test-results/webhook-pr-sync.json", "tests/webhook_pr_sync.py"),
             ("web_repository_pagination", "test-results/web-repository-pagination.json", "tests/web_repository_pagination.py"),
             ("worker_diagnostics", "test-results/worker-diagnostics.json", "tests/worker_diagnostics.py"),
+            ("lfs_read_amplification", "test-results/lfs-read-amplification.json", "tests/lfs_read_amplification.py"),
+            ("lfs_split_tx_races", "test-results/lfs-split-tx-races.json", "tests/lfs_split_tx_races.py"),
         ):
             self.assertIn(f"python3 {harness} --binary target/debug/rootyard --report {report_path}", text)
             self.assertIn(f"--report {report_key}={report_path}", text)
             self.assertIn(f"--harness {harness}", text)
+        for shared_lfs_harness in ("tests/lfs.py", "tests/lfs_remote_contract.py"):
+            self.assertIn(f"--harness {shared_lfs_harness}", text)
+        self.assertIn("--require-case lfs_read_amplification=read_amplification_and_offline_remote", text)
+        self.assertIn("--require-case lfs_split_tx_races=split_tx_races_reauth_and_repair_dedup", text)
         self.assertIn("--harness scripts/build_native.py", text)
         self.assertIn("test-results/*-evidence/*.jsonl", text)
 
