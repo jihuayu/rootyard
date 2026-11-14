@@ -66,6 +66,47 @@ class LabBinarySelectorTest(unittest.TestCase):
             environ={"ROOTYARD_WORKSPACE_LAB_BIN": str(environment)},
         )
 
+    def test_explicit_path_wins_over_empty_environment(self):
+        explicit = self.binary("explicit-lab")
+        binder = mock.Mock(return_value={"attested": True})
+        selected = lab_binary.resolve_lab_binary(
+            "ROOTYARD_VIEW_LAB_BIN",
+            explicit=explicit,
+            legacy=self.root / "legacy-lab",
+            environ={"ROOTYARD_VIEW_LAB_BIN": ""},
+            binder=binder,
+        )
+        self.assertEqual(selected.path, explicit)
+        self.assertFalse(selected.from_environment)
+        binder.assert_called_once()
+
+    def test_present_empty_or_whitespace_environment_never_uses_legacy(self):
+        legacy = self.binary("legacy-lab")
+        resolvers = (
+            lab_binary.resolve_lab_binary,
+            lab_binary.resolve_optional_lab_binary,
+        )
+        for value in (None, "", "   ", "\t\n"):
+            for resolver in resolvers:
+                with self.subTest(value=value, resolver=resolver.__name__):
+                    binder = mock.Mock(side_effect=AssertionError("binder must not run"))
+                    with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+                        with self.assertRaisesRegex(
+                            lab_binary.LabBinaryError,
+                            "present but empty or whitespace-only",
+                        ) as caught:
+                            resolver(
+                                "ROOTYARD_VIEW_LAB_BIN",
+                                legacy=legacy,
+                                environ={"ROOTYARD_VIEW_LAB_BIN": value},
+                                binder=binder,
+                            )
+                    self.assertIn("ROOTYARD_VIEW_LAB_BIN", str(caught.exception))
+                    self.assertIn("explicit native build preparation", str(caught.exception))
+                    binder.assert_not_called()
+                    run.assert_not_called()
+                    popen.assert_not_called()
+
     def test_legacy_prebuilt_is_used_only_when_environment_is_absent(self):
         legacy = self.binary("legacy-lab")
         binder = mock.Mock(return_value={"attested": True})

@@ -67,8 +67,17 @@ def _fail(env_name: str, purpose: str, detail: str) -> LabBinaryError:
     )
 
 
-def _env_value(env_name: str, environ: dict) -> str:
-    return str(environ.get(env_name) or "").strip()
+def _environment_path(raw, env_name: str, purpose: str) -> Path:
+    """Parse a present environment value; never treat blank text as absent."""
+    if raw is None or not str(raw).strip():
+        raise _fail(
+            env_name,
+            purpose,
+            f"{env_name} is present but empty or whitespace-only; refusing to "
+            "silently select the legacy fallback. Unset the variable to use the "
+            "legacy prebuilt or set it to an absolute canonical artifact",
+        )
+    return _absolute_environment_path(str(raw).strip(), env_name, purpose)
 
 
 def _legacy_path(legacy) -> Path | None:
@@ -117,9 +126,8 @@ def _selected_path(
 ) -> tuple[Path, bool]:
     if explicit is not None:
         return _explicit_path(explicit, env_name, purpose), False
-    raw = _env_value(env_name, environ)
-    if raw:
-        return _absolute_environment_path(raw, env_name, purpose), True
+    if env_name in environ:
+        return _environment_path(environ[env_name], env_name, purpose), True
     legacy_path = _legacy_path(legacy)
     if legacy_path is not None:
         return legacy_path, False
@@ -161,10 +169,11 @@ def resolve_lab_binary(
     """Return the one selected lab binary, source-bound by default.
 
     ``explicit`` (a caller-supplied ``binary_path``/``--binary``) always wins.
-    Otherwise the absolute environment value wins and ``legacy`` is used only
-    when that value is absent.  An environment value that is present but
-    missing, relative, symlinked or stale is a hard failure; it never falls
-    back to another artifact.
+    Otherwise a present environment key must contain a nonempty absolute path;
+    only an absent key permits ``legacy``.  A present-but-empty or whitespace
+    value is a hard failure before any legacy path or binder work, as are
+    missing, relative, symlinked or stale artifacts; there is no artifact
+    fallback after a configured environment failure.
     """
     environ = dict(os.environ if environ is None else environ)
     path, from_environment = _selected_path(
@@ -219,7 +228,7 @@ def resolve_optional_lab_binary(
     validated and source-bound; it is never silently ignored.
     """
     environ = dict(os.environ if environ is None else environ)
-    if explicit is not None or _env_value(env_name, environ):
+    if explicit is not None or env_name in environ:
         return resolve_lab_binary(
             env_name,
             legacy=legacy,
