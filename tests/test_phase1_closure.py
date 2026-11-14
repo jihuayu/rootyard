@@ -68,6 +68,8 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
                 "test-results/refstore-holds-fixture",
                 "--manifest-out",
                 "test-results/native-build-batch.json",
+                "--artifact-store",
+                "$HOME/.cache/rootyard/native-artifacts",
             ],
             "ci.yml must invoke the attested native batch build for all pando-lab binaries",
         )
@@ -103,30 +105,30 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         ci_text = CI_YML.read_text(encoding="utf-8")
 
         # Schema 030 alignment
-        self.assertIn("python3 tests/schema_contract.py --binary target/debug/rootyard", ci_text)
+        self.assertIn('python3 tests/schema_contract.py --binary "$ROOTYARD_BIN"', ci_text)
         self.assertNotIn("Verify schema-008 catalog", ci_text)
         self.assertIn("schema-030", ci_text)
 
         # Required Tier-1 E2E and backup harnesses with --binary and --report
         expected_commands = (
-            "python3 tests/pulls.py --binary target/debug/rootyard --report test-results/pulls.json",
-            "python3 tests/backup_pulls.py --binary target/debug/rootyard --report test-results/backup-pulls.json",
+            'python3 tests/pulls.py --binary "$ROOTYARD_BIN" --report test-results/pulls.json',
+            'python3 tests/backup_pulls.py --binary "$ROOTYARD_BIN" --report test-results/backup-pulls.json',
             'python3 tests/browse.py --mixed-refs --git "$(command -v git)" '
-            "--binary target/debug/rootyard --report test-results/browse.json",
-            "python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json",
-            "python3 tests/ci_mirror.py --binary target/debug/rootyard --report test-results/ci-mirror.json",
-            "python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json",
-            "python3 tests/workspace.py --binary target/debug/rootyard-workspace-lab --report test-results/workspace.json",
-            "python3 tests/webhooks.py --binary target/debug/rootyard --report test-results/webhooks.json",
+            '--binary "$ROOTYARD_BIN" --report test-results/browse.json',
+            'python3 tests/lfs.py --binary "$ROOTYARD_BIN" --report test-results/lfs.json',
+            'python3 tests/ci_mirror.py --binary "$ROOTYARD_BIN" --report test-results/ci-mirror.json',
+            'python3 tests/workspaces.py --binary "$ROOTYARD_WORKSPACE_LAB_BIN" --report test-results/workspaces.json',
+            'python3 tests/workspace.py --binary "$ROOTYARD_WORKSPACE_LAB_BIN" --report test-results/workspace.json',
+            'python3 tests/webhooks.py --binary "$ROOTYARD_BIN" --report test-results/webhooks.json',
         )
         for cmd in expected_commands:
             self.assertIn(cmd, ci_text, f"Missing CI step command in .github/workflows/ci.yml: {cmd}")
 
         # Real-service pagination harnesses and their evidence bindings
         pagination_commands = (
-            "python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json",
-            "python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json",
-            "python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json",
+            'python3 tests/repository_pagination.py --binary "$ROOTYARD_BIN" --report test-results/repository-pagination.json',
+            'python3 tests/organization_pagination.py --binary "$ROOTYARD_BIN" --report test-results/organization-pagination.json',
+            'python3 tests/web_detail_pagination.py --binary "$ROOTYARD_BIN" --report test-results/web-detail-pagination.json',
         )
         pagination_reports = (
             "--report repository_pagination=test-results/repository-pagination.json",
@@ -208,7 +210,7 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
 
         acceptance = step_block("Exercise native workspace autocapture acceptance")
         self.assertIn(
-            "python3 tests/workspace_capture_acceptance.py --binary target/debug/rootyard "
+            'python3 tests/workspace_capture_acceptance.py --binary "$ROOTYARD_BIN" '
             "--report test-results/workspace-capture.json",
             acceptance,
         )

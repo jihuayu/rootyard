@@ -271,6 +271,104 @@ class ManifestFixture:
         batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         return batch_path
 
+    def enable_v2_cas_batch_receipt(self, *, lib_fresh=True, bin_fresh=False):
+        """Build the producer's v2 CAS layout: immutable snapshot plus aliases."""
+        receipt = self.enable_v2_receipt(lib_fresh=lib_fresh, bin_fresh=bin_fresh)
+        original = self.binary
+        sha = digest(original)
+        commit = receipt["workspace_commit"]
+        config_key = "f" * 64
+        build_id = "cas-invocation"
+        store = self.root / "artifact-store"
+        object_path = store / "objects/sha256" / sha
+        object_path.parent.mkdir(parents=True, exist_ok=True)
+        object_path.write_bytes(original.read_bytes())
+        os.chmod(object_path, 0o555)
+        base = store / "snapshots" / commit / config_key / build_id
+        base.mkdir(parents=True, exist_ok=True)
+        binary = base / "rootyard"
+        binary.write_bytes(object_path.read_bytes())
+        os.chmod(binary, 0o555)
+        canonical_receipt = base / "rootyard.receipt.json"
+        build_receipt = base / "rootyard.build.json"
+        batch_path = self.root / "test-results/native-build-batch.json"
+        batch_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema": "rootyard/native-artifact-store/v1",
+            "root": str(store),
+            "kind": "bin",
+            "target": "rootyard",
+            "implicit": False,
+            "object": str(object_path),
+            "binary": str(binary),
+            "receipt": str(canonical_receipt),
+            "build_receipt": str(build_receipt),
+            "binary_sha256": sha,
+            "config_key": config_key,
+            "build_id": build_id,
+            "method": "copy",
+            "reused": False,
+            "copied_bytes": len(original.read_bytes()),
+            "output_alias": None,
+        }
+        receipt["artifact_store"] = record
+        receipt["relocated_artifact"] = True
+        receipt["original_artifact_sha256"] = sha
+        receipt["batch"] = {
+            "kind": "rootyard/native-build-batch",
+            "receipt_version": 2,
+            "binary": "rootyard",
+            "targets": [row["target"] for row in receipt["cargo_artifacts"]],
+            "bound_inputs_sha256": receipt["bound_inputs"]["digest"],
+            "manifest": str(batch_path.resolve()),
+        }
+        payload = (json.dumps(receipt, indent=2) + "\n").encode()
+        for path in (canonical_receipt, build_receipt):
+            path.write_bytes(payload)
+            os.chmod(path, 0o444)
+        manifest = {
+            "kind": "rootyard/native-build-batch",
+            "manifest_version": 2,
+            "status": "passed",
+            "source_commit": receipt["workspace_commit"],
+            "source_inputs_sha256": receipt["source_inputs_sha256"],
+            "toolchain": receipt["toolchain"],
+            "architecture": receipt["target_triple"],
+            "target_directory": receipt["target_dir"],
+            "bound_inputs": receipt["bound_inputs"],
+            "build": {
+                "command": receipt["command"],
+                "cargo_artifacts": receipt["cargo_artifacts"],
+            },
+            "artifacts": [
+                {
+                    "kind": "bin",
+                    "target": "rootyard",
+                    "artifact": str(binary),
+                    "original_artifact": str(original),
+                    "original_artifact_sha256": sha,
+                    "receipt": str(build_receipt),
+                    "fresh": bin_fresh,
+                    "implicit": False,
+                    "sha256": sha,
+                    "artifact_store": record,
+                }
+            ],
+            "artifact_store": {
+                "schema": "rootyard/native-artifact-store/v1",
+                "root": str(store),
+                "objects": [str(object_path)],
+                "sealed": [record],
+            },
+        }
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.cas_binary = binary
+        self.cas_receipt = build_receipt
+        self.batch_path = batch_path
+        self.binary = binary
+        self.receipt = build_receipt
+        return batch_path
+
     def report(self, name="web_sessions", passed=True, binary_sha=None, case_status="passed", **extra):
         path = self.root / f"test-results/{name}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -437,6 +535,67 @@ class TestJobManifest(unittest.TestCase):
         self.assertNotIn("clean", manifest)
         self.assertNotIn("fresh_false_artifacts", manifest["build"])
         self.assertNotIn("package_rebuilt", manifest)
+
+    def test_accepts_v2_cas_batch_receipt_with_immutable_paths(self):
+        batch_path = self.fixture.enable_v2_cas_batch_receipt(lib_fresh=True, bin_fresh=False)
+        job = json.loads(self.fixture.job().read_text(encoding="utf-8"))
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(job["binary"], str(self.fixture.cas_binary))
+        self.assertEqual(job["build_receipt"]["file"], str(self.fixture.cas_receipt))
+        self.assertEqual(
+            job["build_receipt"]["batch_manifest"]["file"], str(batch_path.resolve())
+        )
+        self.assertEqual(job["build_receipt"]["batch_manifest"]["target"], "rootyard")
+
+    def test_rejects_cas_consumed_binary_that_is_not_the_sealed_snapshot(self):
+        self.fixture.enable_v2_cas_batch_receipt()
+        copy = self.fixture.root / "elsewhere/rootyard"
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        copy.write_bytes(self.fixture.cas_binary.read_bytes())
+        self.fixture.binary = copy
+        self.fixture.job(expect=1)
+        self.assertIn(
+            "consumed binary is not the sealed canonical snapshot",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_cas_receipt_record_that_differs_from_the_manifest(self):
+        self.fixture.enable_v2_cas_batch_receipt()
+        receipt_path = self.fixture.cas_receipt
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        payload["artifact_store"]["target"] = "foreign"
+        os.chmod(receipt_path, 0o644)
+        receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(receipt_path, 0o444)
+        self.fixture.job(expect=1)
+        self.assertIn(
+            "receipt artifact_store does not match the sealed manifest record",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_cas_manifest_row_rewritten_to_mutable_target_path(self):
+        batch_path = self.fixture.enable_v2_cas_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["artifacts"][0]["artifact"] = str(
+            self.fixture.root / "target/debug/rootyard"
+        )
+        batch_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.fixture.job(expect=1)
+        self.assertIn(
+            "manifest artifact is not the sealed canonical snapshot",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_cas_manifest_without_a_sealed_record(self):
+        batch_path = self.fixture.enable_v2_cas_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        del manifest["artifacts"][0]["artifact_store"]
+        batch_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.fixture.job(expect=1)
+        self.assertIn(
+            "CAS artifacts entry must carry artifact_store",
+            self.fixture.last_process.stderr,
+        )
 
     def test_rejects_v2_manifest_freshness_not_matching_the_receipt(self):
         batch_path = self.fixture.enable_v2_batch_receipt(lib_fresh=True, bin_fresh=False)
@@ -707,6 +866,54 @@ class TestReleaseGate(unittest.TestCase):
             "browser": self.fixture.artifact_directory("browser", self.browser),
             "object-store": self.fixture.artifact_directory("object-store", self.store),
         }
+
+    def enable_v2_cas_batch_jobs(self):
+        self.fixture.enable_v2_cas_batch_receipt()
+        self.browser = self.fixture.job(
+            "browser.json",
+            reports={"browser_ui": self.fixture.report("browser_ui")},
+        )
+        self.store = self.fixture.job(
+            "object-store.json",
+            reports={
+                "lfs_hydration": self.fixture.report("lfs_hydration"),
+                "lfs_retention": self.fixture.report("lfs_retention"),
+            },
+            extra=(
+                "--fixture", "garage=garage 2.1.0",
+                "--fixture", "git_lfs=git-lfs/3.6.1",
+            ),
+        )
+        self.staged = {
+            "browser": self.fixture.artifact_directory("browser", self.browser),
+            "object-store": self.fixture.artifact_directory("object-store", self.store),
+        }
+
+    def test_release_accepts_v2_cas_jobs_with_immutable_paths(self):
+        self.enable_v2_cas_batch_jobs()
+        process, gate_path = self.release()
+        self.assertEqual(process.returncode, 0)
+        gate = json.loads(gate_path.read_text())
+        self.assertEqual(gate["status"], "passed")
+        self.assertIn("build:receipt", gate["jobs"]["browser"]["artifacts"])
+        self.assertIn("build:batch_manifest", gate["jobs"]["browser"]["artifacts"])
+
+    def test_release_rejects_cas_row_pointing_at_a_mutable_binary(self):
+        self.enable_v2_cas_batch_jobs()
+        batch_path = self.staged["browser"] / "native-build-batch.json"
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["artifacts"][0]["artifact"] = str(
+            self.fixture.root / "target/debug/rootyard"
+        )
+        batch_path.write_text(json.dumps(manifest), encoding="utf-8")
+        job = json.loads(self.browser.read_text(encoding="utf-8"))
+        job["build_receipt"]["batch_manifest"]["sha256"] = digest(batch_path)
+        self.browser.write_text(json.dumps(job), encoding="utf-8")
+        process, _ = self.release(expect=1)
+        self.assertIn(
+            "manifest artifact is not the sealed canonical snapshot",
+            process.stderr,
+        )
 
     def test_release_accepts_v2_batch_jobs_with_cache_hit_freshness(self):
         self.enable_v2_batch_jobs()

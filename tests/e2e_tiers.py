@@ -7935,6 +7935,7 @@ class Phase1ClosureAndDocsFixture:
             "--test", "ref_store_holds_backup_fixture",
             "--output", "test-results/refstore-holds-fixture",
             "--manifest-out", "test-results/native-build-batch.json",
+            "--artifact-store", "$HOME/.cache/rootyard/native-artifacts",
         ]
         if len(references) != 1:
             raise AssertionError(
@@ -7959,7 +7960,7 @@ class Phase1ClosureAndDocsFixture:
             "python3",
             "tests/pando_lab.py",
             "--binary",
-            "target/debug/rootyard-pando-lab",
+            "$ROOTYARD_PANDO_LAB_BIN",
         ]
         guard_tokens = ["test", "$(id -u)", "-ne", "0"]
         # Full-line YAML and shell comments are not executable and must never
@@ -15320,6 +15321,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
                 "--test", "ref_store_holds_backup_fixture",
                 "--output", "test-results/refstore-holds-fixture",
                 "--manifest-out", "test-results/native-build-batch.json",
+                "--artifact-store", "$HOME/.cache/rootyard/native-artifacts",
             ],
         )
 
@@ -15346,7 +15348,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         ]
         self.assertIn(["test", "$(id -u)", "-ne", "0"], live_commands)
         self.assertIn(
-            ["python3", "tests/pando_lab.py", "--binary", "target/debug/rootyard-pando-lab"],
+            ["python3", "tests/pando_lab.py", "--binary", "$ROOTYARD_PANDO_LAB_BIN"],
             live_commands,
         )
 
@@ -18508,6 +18510,8 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
             "test-results/refstore-holds-fixture",
             "--manifest-out",
             "test-results/native-build-batch.json",
+            "--artifact-store",
+            "$HOME/.cache/rootyard/native-artifacts",
         ]
         exact_command = " ".join(expected_tokens)
 
@@ -18679,7 +18683,7 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
         with self.assertRaisesRegex(AssertionError, "non-root guard"):
             Phase1ClosureAndDocsFixture.validate_ci_workflow(echo_guard)
         commented_pando = re.sub(
-            r"^(\s*)(python3\s+tests/pando_lab\.py\s+--binary\s+target/debug/rootyard-pando-lab[^\n]*)$",
+            r"^(\s*)(python3\s+tests/pando_lab\.py\s+--binary\s+\"?\$ROOTYARD_PANDO_LAB_BIN\"?[^\n]*)$",
             r"\1# \2",
             ci_text,
             count=1,

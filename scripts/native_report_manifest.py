@@ -42,6 +42,7 @@ JOB_KIND = "rootyard/native-acceptance-job-manifest"
 RELEASE_KIND = "rootyard/candidate-release-gate"
 FAILURE_KIND = "rootyard/native-acceptance-failure"
 BATCH_KIND = "rootyard/native-build-batch"
+STORE_SCHEMA = "rootyard/native-artifact-store/v1"
 SECRET_ENVIRONMENT = (
     "ROOTYARD_OBJECT_STORE_SECRET_KEY",
     "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
@@ -227,6 +228,146 @@ def _receipt_artifact_for(validated, target, kind):
     if len(rows) == 1:
         return rows[0]
     return None
+
+
+def _absolute_recorded(value, label, what):
+    require(isinstance(value, str) and value, f"{label}: {what} must be a nonempty path")
+    path = Path(value)
+    require(path.is_absolute(), f"{label}: {what} must be absolute")
+    require(".." not in path.parts, f"{label}: {what} must not traverse")
+    return path
+
+
+def _resolved_equal(left, right):
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _inside(path, root):
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _cas_sealed_record(manifest, entry, label):
+    """Bind one published CAS row to exactly one sealed store record."""
+    store = manifest.get("artifact_store")
+    require(isinstance(store, dict), f"{label}: CAS manifest must carry artifact_store")
+    require(
+        store.get("schema") == STORE_SCHEMA,
+        f"{label}: artifact_store schema is invalid",
+    )
+    root = _absolute_recorded(store.get("root"), label, "artifact_store.root")
+    sealed = store.get("sealed")
+    require(
+        isinstance(sealed, list) and sealed,
+        f"{label}: artifact_store.sealed must be a nonempty list",
+    )
+    require(
+        all(isinstance(item, dict) for item in sealed),
+        f"{label}: artifact_store.sealed entries must be objects",
+    )
+    record = entry.get("artifact_store")
+    require(isinstance(record, dict), f"{label}: CAS artifacts entry must carry artifact_store")
+    require(
+        sum(1 for item in sealed if item == record) == 1,
+        f"{label}: CAS artifacts entry is not exactly one sealed store record",
+    )
+    require(record.get("schema") == STORE_SCHEMA, f"{label}: sealed record schema is invalid")
+    require(record.get("root") == str(root), f"{label}: sealed record root is foreign")
+    require(
+        record.get("kind") == entry.get("kind"),
+        f"{label}: sealed record kind does not match the manifest row",
+    )
+    require(
+        record.get("target") == entry.get("target"),
+        f"{label}: sealed record target does not match the manifest row",
+    )
+    return root, record
+
+
+def _cas_bin_paths(manifest, entry, label):
+    """The exact canonical bin snapshot and adjacent receipt for one CAS row."""
+    root, record = _cas_sealed_record(manifest, entry, label)
+    require(record.get("kind") == "bin", f"{label}: sealed record is not a bin")
+    binary = _absolute_recorded(record.get("binary"), label, "sealed binary")
+    receipt = _absolute_recorded(record.get("receipt"), label, "sealed receipt")
+    build_receipt = _absolute_recorded(record.get("build_receipt"), label, "sealed build receipt")
+    for path, what in (
+        (binary, "sealed binary"),
+        (receipt, "sealed receipt"),
+        (build_receipt, "sealed build receipt"),
+    ):
+        require(_inside(path, root), f"{label}: {what} is outside the sealed store")
+    require(binary.name == entry.get("target"), f"{label}: sealed binary basename is not the target")
+    require(
+        receipt.name == binary.name + ".receipt.json",
+        f"{label}: sealed receipt basename is invalid",
+    )
+    require(
+        build_receipt.name == binary.name + ".build.json",
+        f"{label}: sealed build receipt basename is invalid",
+    )
+    require(
+        receipt.parent == binary.parent and build_receipt.parent == binary.parent,
+        f"{label}: sealed receipts are not adjacent to the canonical binary",
+    )
+    require(
+        _resolved_equal(entry.get("artifact"), binary),
+        f"{label}: manifest artifact is not the sealed canonical snapshot",
+    )
+    require(
+        _resolved_equal(entry.get("receipt"), build_receipt),
+        f"{label}: manifest receipt is not the sealed .build.json alias",
+    )
+    require(
+        entry.get("sha256") == record.get("binary_sha256"),
+        f"{label}: manifest artifact sha256 does not match the sealed digest",
+    )
+    return binary, build_receipt, record
+
+
+def _require_store_matches_receipt(record, validated, label):
+    """The validated receipt must carry exactly the manifest's sealed record."""
+    require(
+        validated.schema == "v2",
+        f"{label}: artifact_store is only valid on a v2 receipt",
+    )
+    receipt_store = validated.payload.get("artifact_store")
+    require(
+        isinstance(receipt_store, dict),
+        f"{label}: receipt does not carry an artifact_store record",
+    )
+    require(
+        receipt_store == record,
+        f"{label}: receipt artifact_store does not match the sealed manifest record",
+    )
+
+
+def _cas_bin_entry(manifest, binary_name, label):
+    artifacts = manifest.get("artifacts")
+    require(
+        isinstance(artifacts, list) and artifacts,
+        f"{label}: artifacts must be a nonempty list",
+    )
+    require(
+        all(isinstance(artifact, dict) for artifact in artifacts),
+        f"{label}: artifacts entries must be objects",
+    )
+    matched = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("kind") == "bin" and artifact.get("target") == binary_name
+    ]
+    require(
+        len(matched) == 1,
+        f"{label}: expected exactly one CAS bin entry for {binary_name}, got {len(matched)}",
+    )
+    return matched[0]
 
 
 def _require_v2_manifest_matches_receipt(rows, validated, label):
@@ -446,30 +587,50 @@ def verify_batch_receipt(receipt, validated, receipt_file, binary):
         "receipt.target_dir must be a nonempty absolute path",
     )
     target_dir = Path(target_dir_value)
-    expected_binary = target_dir / "debug" / batch["binary"]
-    expected_receipt = target_dir / "debug" / f'{batch["binary"]}.build.json'
+    if manifest.get("artifact_store") is None:
+        expected_binary = target_dir / "debug" / batch["binary"]
+        expected_receipt = target_dir / "debug" / f'{batch["binary"]}.build.json'
 
-    def resolves_to(entry_value, expected):
-        if not isinstance(entry_value, str) or not entry_value:
-            return False
-        try:
-            if not Path(entry_value).is_absolute():
+        def resolves_to(entry_value, expected):
+            if not isinstance(entry_value, str) or not entry_value:
                 return False
-            return Path(entry_value).resolve() == expected.resolve()
-        except (OSError, ValueError, RuntimeError):
-            return False
+            try:
+                if not Path(entry_value).is_absolute():
+                    return False
+                return Path(entry_value).resolve() == expected.resolve()
+            except (OSError, ValueError, RuntimeError):
+                return False
 
-    matched = [
-        artifact
-        for artifact in artifacts
-        if resolves_to(artifact.get("artifact"), expected_binary)
-        and resolves_to(artifact.get("receipt"), expected_receipt)
-    ]
-    require(
-        len(matched) == 1,
-        "batch receipt manifest must contain exactly one entry for the binary and receipt",
-    )
-    entry = matched[0]
+        matched = [
+            artifact
+            for artifact in artifacts
+            if resolves_to(artifact.get("artifact"), expected_binary)
+            and resolves_to(artifact.get("receipt"), expected_receipt)
+        ]
+        require(
+            len(matched) == 1,
+            "batch receipt manifest must contain exactly one entry for the binary and receipt",
+        )
+        entry = matched[0]
+    else:
+        entry = _cas_bin_entry(manifest, batch["binary"], "batch receipt manifest")
+        sealed_binary, sealed_receipt, record = _cas_bin_paths(
+            manifest, entry, "batch receipt manifest"
+        )
+        store_root = Path(manifest["artifact_store"]["root"])
+        require(
+            not _inside(store_root, target_dir) and not _inside(target_dir, store_root),
+            "batch receipt manifest artifact store must be disjoint from target_dir",
+        )
+        require(
+            _resolved_equal(binary, sealed_binary),
+            "batch receipt manifest consumed binary is not the sealed canonical snapshot",
+        )
+        require(
+            _resolved_equal(receipt_file, sealed_receipt),
+            "batch receipt manifest consumed receipt is not the sealed .build.json alias",
+        )
+        _require_store_matches_receipt(record, validated, "batch receipt manifest")
     require(entry.get("kind") == "bin", "batch receipt binary entry has an invalid kind")
     if validated.schema == "v1":
         require(
@@ -919,24 +1080,6 @@ def release_manifest(args):
                 isinstance(target_dir, str) and target_dir and Path(target_dir).is_absolute(),
                 f"{label}: target_dir must be a nonempty absolute path",
             )
-            expect_binary = Path(target_dir) / "debug" / binary_name
-            expect_receipt = Path(target_dir) / "debug" / f"{binary_name}.build.json"
-            try:
-                expected_binary_path = expect_binary.resolve()
-                expected_receipt_path = expect_receipt.resolve()
-            except (OSError, ValueError) as error:
-                raise ManifestError(f"{label}: cannot resolve the original batch artifact paths: {error}")
-
-            def original_path_matches(value):
-                if not isinstance(value, str) or not value:
-                    return False
-                path = Path(value)
-                if not path.is_absolute():
-                    return False
-                try:
-                    return Path(value).resolve()
-                except (OSError, ValueError):
-                    return None
 
             artifacts = manifest.get("artifacts")
             require(
@@ -947,18 +1090,65 @@ def release_manifest(args):
                 all(isinstance(artifact, dict) for artifact in artifacts),
                 f"{manifest_label}: artifacts entries must be objects",
             )
-            matched = [
-                artifact
-                for artifact in artifacts
-                if original_path_matches(artifact.get("artifact")) == expected_binary_path
-                and original_path_matches(artifact.get("receipt")) == expected_receipt_path
-            ]
-            require(
-                len(matched) == 1,
-                f"{manifest_label}: expected exactly one artifacts entry for {expect_binary} and {expect_receipt}, "
-                f"got {len(matched)}",
-            )
-            entry = matched[0]
+            if manifest.get("artifact_store") is None:
+                expect_binary = Path(target_dir) / "debug" / binary_name
+                expect_receipt = Path(target_dir) / "debug" / f"{binary_name}.build.json"
+                try:
+                    expected_binary_path = expect_binary.resolve()
+                    expected_receipt_path = expect_receipt.resolve()
+                except (OSError, ValueError) as error:
+                    raise ManifestError(f"{label}: cannot resolve the original batch artifact paths: {error}")
+
+                def original_path_matches(value):
+                    if not isinstance(value, str) or not value:
+                        return False
+                    path = Path(value)
+                    if not path.is_absolute():
+                        return False
+                    try:
+                        return Path(value).resolve()
+                    except (OSError, ValueError):
+                        return None
+
+                matched = [
+                    artifact
+                    for artifact in artifacts
+                    if original_path_matches(artifact.get("artifact")) == expected_binary_path
+                    and original_path_matches(artifact.get("receipt")) == expected_receipt_path
+                ]
+                require(
+                    len(matched) == 1,
+                    f"{manifest_label}: expected exactly one artifacts entry for {expect_binary} and {expect_receipt}, "
+                    f"got {len(matched)}",
+                )
+                entry = matched[0]
+            else:
+                entry = _cas_bin_entry(manifest, binary_name, manifest_label)
+                sealed_binary, sealed_receipt, record = _cas_bin_paths(
+                    manifest, entry, manifest_label
+                )
+                store_root = Path(manifest["artifact_store"]["root"])
+                target_path = Path(target_dir)
+                require(
+                    not _inside(store_root, target_path)
+                    and not _inside(target_path, store_root),
+                    f"{manifest_label}: artifact store must be disjoint from target_dir",
+                )
+                recorded_binary = _absolute_recorded(
+                    data.get("binary"), f"job manifest {name}", "binary"
+                )
+                recorded_receipt = _absolute_recorded(
+                    build_receipt.get("file"), label, "receipt file"
+                )
+                require(
+                    _resolved_equal(recorded_binary, sealed_binary),
+                    f"{manifest_label}: recorded binary is not the sealed canonical snapshot",
+                )
+                require(
+                    _resolved_equal(recorded_receipt, sealed_receipt),
+                    f"{manifest_label}: recorded receipt is not the sealed .build.json alias",
+                )
+                _require_store_matches_receipt(record, validated, manifest_label)
             require(
                 entry.get("kind") == "bin",
                 f"{manifest_label}: binary artifacts entry kind must be 'bin'",

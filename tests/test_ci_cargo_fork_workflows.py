@@ -42,6 +42,7 @@ PRESERVE = {
         "postgres:17",
         "scripts/install_ci_native_tools.sh install",
         "scripts/build_native_batch.py",
+        "scripts/export_native_artifacts.py",
         "python3 -m unittest discover -s tests -p 'test_*.py'",
         "test-results/native-pr-gate.json",
     ),
@@ -135,6 +136,55 @@ class CargoForkWorkflowTest(unittest.TestCase):
         self.assertLess(text.index(SETUP), text.index("Install pinned Playwright client"))
         self.assertLess(text.index(SETUP), text.index("Build the candidate binary once"))
         self.assertLess(text.rindex(SETUP), text.rindex("Build the candidate binary once"))
+
+    def test_ci_consumes_immutable_batch_artifacts(self) -> None:
+        text = self.workflow("ci.yml")
+        self.assertIn(
+            '--artifact-store "$HOME/.cache/rootyard/native-artifacts"', text
+        )
+        self.assertIn("scripts/export_native_artifacts.py", text)
+        self.assertIn("--manifest test-results/native-build-batch.json", text)
+        for variable in (
+            "ROOTYARD_BIN",
+            "ROOTYARD_WORKSPACE_LAB_BIN",
+            "ROOTYARD_VIEW_LAB_BIN",
+            "ROOTYARD_PANDO_LAB_BIN",
+            "ROOTYARD_BUILD_RECEIPT",
+            "ROOTYARD_SNAPSHOT_FIXTURE",
+            "ROOTYARD_HOLDS_FIXTURE",
+        ):
+            with self.subTest(variable=variable):
+                self.assertIn(f"${variable}", text)
+
+        batch = text.index("Build native bins and RefStore fixtures in one batch")
+        export = text.index("Export immutable native artifact paths")
+        self.assertLess(batch, export)
+        # The build step itself must use its literal --output paths; the exported
+        # immutable paths only exist after the export step.
+        self.assertNotIn("ROOTYARD_", text[batch:export])
+
+        later = text[export:]
+        for mutable in (
+            "target/debug/rootyard",
+            "target/debug/rootyard-workspace-lab",
+            "target/debug/rootyard-view-lab",
+            "target/debug/rootyard-pando-lab",
+        ):
+            with self.subTest(mutable=mutable):
+                self.assertNotIn(mutable, later)
+
+        manifest = text[text.index("python3 scripts/native_report_manifest.py --mode job"):]
+        manifest = manifest.split("\n      - name:", 1)[0]
+        self.assertIn('--build-receipt "$ROOTYARD_BUILD_RECEIPT"', manifest)
+        self.assertIn('--binary "$ROOTYARD_BIN"', manifest)
+        self.assertIn("test-results/native-pr-gate.json", manifest)
+
+        upload = text[text.index("name: e2e-report"):]
+        upload = upload.split("if-no-files-found:", 1)[0]
+        self.assertIn("${{ env.ROOTYARD_BUILD_RECEIPT }}", upload)
+        self.assertIn("${{ env.ROOTYARD_BATCH_MANIFEST }}", upload)
+        self.assertNotIn("target/", upload)
+        self.assertNotIn("native-artifacts", upload)
 
     def test_refcas_no_longer_uses_the_rustup_plus_toolchain_form(self) -> None:
         text = self.workflow("refcas-log.yml")

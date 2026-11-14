@@ -65,7 +65,8 @@ fixture integration-test executables, recording the batch in
 
 A final step, `scripts/native_report_manifest.py --mode job`, fails the job
 unless every report was produced by the exact binary whose SHA-256 appears in
-`target/debug/rootyard.build.json`, every declared case passed, the
+the immutable `.build.json` alias recorded by the v2 batch manifest (exported
+as `ROOTYARD_BUILD_RECEIPT`), every declared case passed, the
 `ci_webhook_regressions` log is non-empty and contains each expected phase
 marker, and the receipt's commit and compiled source-input digest were recorded.
 The manifest also binds the pagination, webhook reconciliation, worker
@@ -86,10 +87,11 @@ digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
 `git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
 the native tool provenance file. Injecting any of those defects turns the pull
 request red instead of leaving the regression to manual re-verification.
-The `e2e-report` artifact includes `target/debug/rootyard.build.json`,
+The `e2e-report` artifact includes the raw `rootyard.build.json` alias,
 `test-results/native-build-batch.json` and both `test-results/evidence/*.jsonl`
 and `test-results/*-evidence/*.jsonl`, so downloaded job manifests can be
-checked against the build receipt and batch manifest.
+checked against the immutable build receipt and batch manifest. It does not
+upload the artifact store or a target tree.
 
 ## Pinned CargoFork in formal Rust jobs
 
