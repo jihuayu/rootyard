@@ -216,7 +216,7 @@ def reacquire(path):
 class BuildPlanRefusalTest(unittest.TestCase):
     """A plan naming a known build command is refused before any run or suite."""
 
-    def test_known_build_command_is_refused_before_run_setup(self):
+    def assert_refused_before_run_setup(self, argv, fragment):
         with tempfile.TemporaryDirectory(prefix="rootyard-build-refusal-") as temporary:
             root = Path(temporary)
             lock_dir = root / "locks"
@@ -227,7 +227,7 @@ class BuildPlanRefusalTest(unittest.TestCase):
             plan = root / "plan.json"
             plan.write_text(json.dumps({"version": 1, "suites": [
                 {"id": "hidden-build", "phase": "smoke", "profile": "portable-service",
-                 "argv": ["cargo", "build", "--locked"], "timeout_seconds": 20,
+                 "argv": argv, "timeout_seconds": 20,
                  "resources": {RESOURCE: "exclusive"}},
                 {"id": "would-run", "phase": "smoke", "profile": "portable-service",
                  "argv": [sys.executable, str(suite_cli)], "timeout_seconds": 20,
@@ -242,10 +242,21 @@ class BuildPlanRefusalTest(unittest.TestCase):
                 capture_output=True, text=True, timeout=30)
             self.assertEqual(completed.returncode, 2, completed.stderr)
             self.assertIn("prebuilt-only", completed.stderr)
-            self.assertIn("cargo", completed.stderr)
+            self.assertIn(fragment, completed.stderr)
             self.assertFalse(marker.exists(), "a suite CLI started despite the plan refusal")
             self.assertFalse(run_dir.exists(), "the runner created a run directory before refusing")
             self.assertEqual(list(lock_dir.iterdir()), [])
+
+    def test_known_build_command_is_refused_before_run_setup(self):
+        self.assert_refused_before_run_setup(["cargo", "build", "--locked"], "cargo")
+
+    def test_nested_wrapper_build_command_is_refused_before_run_setup(self):
+        self.assert_refused_before_run_setup(
+            ["env", "-u", "CARGO_HOME", "timeout", "300", "cargo", "build", "--locked"], "cargo")
+
+    def test_ambiguous_wrapper_form_is_refused_before_run_setup(self):
+        self.assert_refused_before_run_setup(
+            ["env", "--split-string=cargo build"], "cannot peel safely")
 
 
 @unittest.skipUnless(LINUX, "the runner and its supervisor are Linux-only")

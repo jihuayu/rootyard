@@ -44,11 +44,13 @@ Plan shape (JSON)::
 ``{run_id}``, ``{suite_id}`` and ``{run_dir}`` are substituted in argv, suite
 environment and isolation values. Plans are operator-trusted, but validation
 refuses direct known compiler/builder commands (Cargo/rustc, the
-``build_native*.py`` helpers and ``check_redis_contract.py``, including simple
-``env``/Python wrappers) so an accidental hidden build or clean cannot ride in an
-acceptance suite. Run explicit build preparation outside the runner and pass
-only the prepared artifact. This is not a general shell sandbox: shell text,
-``python -c`` bodies and renamed wrappers are not interpreted. Sensitive
+``build_native*.py`` helpers and ``check_redis_contract.py``) behind a finite
+literal-argv wrapper set: ``env`` assignments and its supported operand options,
+and ``timeout`` options plus a duration. A recognized wrapper form that cannot be
+peeled safely is refused rather than guessed. Run explicit build preparation
+outside the runner and pass only the prepared artifact. This is not a general
+shell sandbox: shell text, ``env -S`` strings, ``python -c`` bodies and renamed
+wrappers are not interpreted. Sensitive
 credentials and credential URLs belong to the runner process environment, never
 to the plan. Validation only refuses URI-like values under sensitive top-level
 environment keys. Inherited sensitive values are redacted from the report, but
@@ -214,17 +216,97 @@ def _command_name(token):
     return name[:-4] if name.endswith(".exe") else name
 
 
+class _WrapperFormError(Exception):
+    """A supported finite wrapper has a form that cannot be peeled safely."""
+
+
+# Only these literal wrapper prefixes are interpreted. An option outside the
+# set is refused rather than guessed, because a wrong guess could walk past a
+# hidden builder. ``env -S`` strings and shell text are never interpreted.
+_ENV_FLAGS = frozenset({"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"})
+_ENV_OPERANDS = frozenset({"-u", "--unset", "-C", "--chdir"})
+_ENV_LONG_OPERANDS = frozenset({"--unset", "--chdir"})
+_ENV_ATTACHED = ("-u", "-C")
+_TIMEOUT_FLAGS = frozenset({"--preserve-status", "--foreground", "-v", "--verbose"})
+_TIMEOUT_OPERANDS = frozenset({"-s", "--signal", "-k", "--kill-after"})
+_TIMEOUT_LONG_OPERANDS = frozenset({"--signal", "--kill-after"})
+_TIMEOUT_ATTACHED = ("-s", "-k")
+_TIMEOUT_DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+_WRAPPER_DEPTH = 8
+
+
+def _operand_end(arguments, index, option):
+    if index + 1 >= len(arguments):
+        raise _WrapperFormError(f"{option} needs an operand")
+    return index + 2
+
+
 def _env_command(arguments):
-    """Strip ``env`` options and NAME=VALUE assignments; this is not shell parsing."""
+    """Peel the finite ``env`` prefix; this is literal argv, not shell parsing."""
+    index = 0
+    options = True
+    while index < len(arguments):
+        item = arguments[index]
+        if options and item == "--":
+            options = False  # assignments still precede the command
+            index += 1
+            continue
+        if options and item.startswith("-"):
+            if item in _ENV_FLAGS:
+                index += 1
+                continue
+            if item in _ENV_OPERANDS:
+                index = _operand_end(arguments, index, item)
+                continue
+            name, separator, value = item.partition("=")
+            if name in _ENV_LONG_OPERANDS:
+                if not separator or not value:
+                    raise _WrapperFormError(f"env option {item!r} needs a non-empty operand")
+                index += 1
+                continue
+            if any(item.startswith(option) and len(item) > len(option) for option in _ENV_ATTACHED):
+                index += 1  # -uNAME / -CDIR
+                continue
+            raise _WrapperFormError(f"env option {item!r} is outside the finite supported set")
+        if "=" in item:
+            index += 1  # NAME=VALUE assignment
+            continue
+        return arguments[index:]
+    return []
+
+
+def _timeout_command(arguments):
+    """Peel the finite ``timeout`` option/duration prefix; literal argv only."""
     index = 0
     while index < len(arguments):
         item = arguments[index]
         if item == "--":
-            return arguments[index + 1:]
-        if not item.startswith("-") and "=" not in item:
-            return arguments[index:]
-        index += 1
-    return []
+            index += 1
+            break
+        if not item.startswith("-"):
+            break
+        if item in _TIMEOUT_FLAGS:
+            index += 1
+            continue
+        if item in _TIMEOUT_OPERANDS:
+            index = _operand_end(arguments, index, item)
+            continue
+        name, separator, value = item.partition("=")
+        if name in _TIMEOUT_LONG_OPERANDS:
+            if not separator or not value:
+                raise _WrapperFormError(f"timeout option {item!r} needs a non-empty operand")
+            index += 1
+            continue
+        if any(item.startswith(option) and len(item) > len(option) for option in _TIMEOUT_ATTACHED):
+            index += 1  # -sSIGNAL / -kDURATION
+            continue
+        raise _WrapperFormError(f"timeout option {item!r} is outside the finite supported set")
+    if index >= len(arguments):
+        raise _WrapperFormError("timeout needs a duration before the command")
+    duration = arguments[index]
+    if not _TIMEOUT_DURATION.match(duration):
+        raise _WrapperFormError(f"timeout duration {duration!r} is not a finite duration")
+    return arguments[index + 1:]
 
 
 def _python_script(arguments):
@@ -246,9 +328,9 @@ def _python_script(arguments):
 
 
 def _known_build_command(argv):
-    """Name the direct builder a simple ``env``/Python wrapper would execute, if any."""
+    """Name the direct builder a finite ``env``/``timeout``/Python wrapper executes, if any."""
     words = list(argv)
-    for _ in range(3):
+    for _ in range(_WRAPPER_DEPTH):
         if not words:
             return None
         name = _command_name(words[0])
@@ -256,6 +338,9 @@ def _known_build_command(argv):
             return name
         if name == "env":
             words = _env_command(words[1:])
+            continue
+        if name == "timeout":
+            words = _timeout_command(words[1:])
             continue
         if PYTHON_EXECUTABLE.match(name):
             target = _python_script(words[1:])
@@ -267,11 +352,22 @@ def _known_build_command(argv):
             module = name[:-3] if name.endswith(".py") else name.replace("/", ".").rsplit(".", 1)[-1]
             return module + ".py" if module in BUILD_MODULES else None
         return None
-    return None
+    if not words:
+        return None
+    raise _WrapperFormError("wrapper nesting exceeds the finite supported depth")
 
 
 def reject_build_commands(suite_id, argv):
-    command = _known_build_command(argv)
+    try:
+        command = _known_build_command(argv)
+    except _WrapperFormError as error:
+        raise PlanError(
+            f"{suite_id}: argv uses a wrapper form the fixed prebuilt-only guard cannot peel safely "
+            f"({error}); acceptance plans are prebuilt-only. Keep suite argv literal, or run build or "
+            "clean preparation explicitly outside this runner and pass only the prepared artifact. "
+            "This guard is not a general shell sandbox: it does not interpret shell text or env -S "
+            "strings, and it does not protect against renamed wrappers."
+        ) from None
     require(
         command is None,
         f"{suite_id}: argv is a recognized build/clean command ({command}); acceptance plans are "

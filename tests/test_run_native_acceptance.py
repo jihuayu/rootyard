@@ -1058,6 +1058,80 @@ class PlanValidationTest(unittest.TestCase):
                 self.assertIn("prebuilt-only", str(caught.exception))
                 self.assertIn(command, str(caught.exception))
 
+    def test_env_and_timeout_wrappers_cannot_hide_a_builder(self):
+        def suite(argv):
+            return {"id": "wrapped-build", "phase": "smoke", "argv": argv, "timeout_seconds": 5,
+                    "resources": {"loopback:1": "exclusive"}}
+
+        for argv, command in (
+            (["env", "-u", "CARGO_HOME", "cargo", "build"], "cargo"),
+            (["env", "-uCARGO_HOME", "cargo", "build"], "cargo"),
+            (["env", "--unset", "CARGO_HOME", "cargo", "build"], "cargo"),
+            (["env", "--unset=CARGO_HOME", "cargo", "build"], "cargo"),
+            (["env", "-C", "subdir", "cargo", "build"], "cargo"),
+            (["env", "-Csubdir", "cargo", "clean"], "cargo"),
+            (["env", "--chdir", "subdir", "cargo", "build"], "cargo"),
+            (["env", "--chdir=subdir", "cargo", "build"], "cargo"),
+            (["env", "-i", "CARGO_HOME=/tmp", "rustc", "--version"], "rustc"),
+            (["env", "--", "CARGO_HOME=/tmp", "cargo", "build"], "cargo"),
+            (["timeout", "300", "cargo", "build"], "cargo"),
+            (["timeout", "1.5s", "/usr/local/cargo/bin/cargo", "clean"], "cargo"),
+            (["timeout", "-s", "KILL", "300", "cargo", "build"], "cargo"),
+            (["timeout", "-sKILL", "300", "cargo", "build"], "cargo"),
+            (["timeout", "--signal=TERM", "--kill-after=5s", "300", "cargo", "build"], "cargo"),
+            (["timeout", "--preserve-status", "--foreground", "300s", "rustc", "--version"], "rustc"),
+            (["timeout", "300", "python3", "scripts/build_native.py"], "build_native.py"),
+            (["env", "-u", "CARGO_HOME", "timeout", "300", "cargo", "build"], "cargo"),
+            (["timeout", "30s", "env", "--unset", "CARGO_HOME", "cargo", "build"], "cargo"),
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(acceptance.PlanError) as caught:
+                    acceptance.validate_plan({"suites": [suite(argv)]})
+                self.assertIn("prebuilt-only", str(caught.exception))
+                self.assertIn(command, str(caught.exception))
+
+    def test_ambiguous_or_invalid_wrapper_forms_are_refused(self):
+        def suite(argv):
+            return {"id": "ambiguous-wrapper", "phase": "smoke", "argv": argv, "timeout_seconds": 5,
+                    "resources": {"loopback:1": "exclusive"}}
+
+        for argv, fragment in (
+            (["env", "-u"], "needs an operand"),
+            (["env", "-C"], "needs an operand"),
+            (["env", "--unset=", "cargo", "build"], "non-empty operand"),
+            (["env", "--chdir=", "cargo", "build"], "non-empty operand"),
+            (["env", "-S", "cargo build"], "finite supported set"),
+            (["env", "--split-string=cargo build"], "finite supported set"),
+            (["env", "-x", "cargo", "build"], "finite supported set"),
+            (["timeout"], "needs a duration"),
+            (["timeout", "not-a-duration", "cargo", "build"], "not a finite duration"),
+            (["timeout", "-s"], "needs an operand"),
+            (["timeout", "--kill-after", "5s"], "needs a duration"),
+            (["timeout", "--bogus", "300", "cargo", "build"], "finite supported set"),
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(acceptance.PlanError) as caught:
+                    acceptance.validate_plan({"suites": [suite(argv)]})
+                self.assertIn("prebuilt-only", str(caught.exception))
+                self.assertIn(fragment, str(caught.exception))
+
+    def test_wrapped_prebuilt_runtime_is_accepted(self):
+        for argv in (
+            ["env", "-u", "CARGO_HOME", "target/debug/rootyard", "serve"],
+            ["env", "--unset=CARGO_HOME", "CARGO_HOME=/tmp", "target/debug/rootyard", "serve"],
+            ["env", "--", "CARGO_HOME=/tmp", "target/debug/rootyard", "serve"],
+            ["env", "-Csubdir", "timeout", "300", "target/debug/rootyard", "--version"],
+            ["env", "-i", "--", "target/debug/rootyard", "serve"],
+            ["timeout", "300", "target/debug/rootyard", "serve", "--cargo-cache", "shared"],
+            ["timeout", "-s", "TERM", "--preserve-status", "1.5s", sys.executable,
+             "tests/worker.py", "--binary", "target/debug/rootyard"],
+        ):
+            with self.subTest(argv=argv):
+                acceptance.validate_plan({"suites": [{
+                    "id": "a", "phase": "smoke", "argv": argv, "timeout_seconds": 5,
+                    "resources": {"loopback:1": "exclusive"},
+                }]})
+
     def test_prebuilt_argv_that_mentions_cargo_is_accepted(self):
         for argv in (
             ["target/debug/rootyard", "serve", "--cargo-cache", "shared"],
