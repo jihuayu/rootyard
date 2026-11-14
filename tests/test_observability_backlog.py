@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
-"""Native E2E regression for structured worker error correlation, redaction, and backlog metrics."""
+"""Native E2E regression for structured worker error correlation, redaction, and backlog metrics.
+
+A source-bound prebuilt ``target/debug/rootyard`` (or the binary under
+``CARGO_TARGET_DIR``) and its adjacent build receipt are required in every
+environment. Run the explicit native build preparation step first; this module
+never invokes Cargo or ``scripts/build_native.py``. A missing or stale artifact
+fails hard with that instruction. ``ROOTYARD_TEST_DATABASE_URL`` stays optional
+locally (an ephemeral PostgreSQL cluster starts) and is required in CI.
+"""
 from __future__ import annotations
 
 import argparse, hashlib, http.server, json, os, shutil, socket, subprocess, sys, tempfile, threading, time, unittest, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e  # noqa: E402
 import metrics as metrics_suite  # noqa: E402
-import native_evidence  # noqa: E402
+import source_bound_binary  # noqa: E402
 
 LFS_MIME = "application/vnd.git-lfs+json"
+PREBUILT_INSTRUCTION = (
+    "run the explicit native build preparation step for this checkout and point CARGO_TARGET_DIR "
+    "at its output; this acceptance test never invokes Cargo or scripts/build_native.py"
+)
 
 
 def _free_port() -> int:
@@ -102,6 +115,76 @@ def _scrape_metrics(port: int) -> tuple[int, str, dict[str, str]]:
         return resp.status, resp.read().decode("utf-8", "replace"), {k.lower(): v for k, v in resp.headers.items()}
 
 
+def _resolve_prebuilt_binary(environ, binder=None) -> tuple[Path, dict]:
+    """Require the prepared binary and bind it to this checkout before any E2E work."""
+    raw_target = Path(environ.get("CARGO_TARGET_DIR") or (ROOT / "target")).expanduser()
+    target_dir = (raw_target if raw_target.is_absolute() else ROOT / raw_target).resolve()
+    binary = (target_dir / "debug" / "rootyard").resolve()
+    if not (binary.is_file() and os.access(binary, os.X_OK)):
+        raise RuntimeError(
+            f"prebuilt rootyard binary is required at {binary}; no local build fallback exists. "
+            f"Please {PREBUILT_INSTRUCTION}"
+        )
+    binder = source_bound_binary.bind if binder is None else binder
+    try:
+        binding = binder(binary, environ=environ)
+    except Exception as error:
+        raise RuntimeError(
+            f"prebuilt rootyard binary {binary} is not bound to this checkout "
+            f"(source, contents or build receipt rejected: {error}). "
+            f"Please {PREBUILT_INSTRUCTION}; provenance is never rewritten by acceptance."
+        ) from error
+    return binary, binding
+
+
+class PrebuiltBinaryContractTest(unittest.TestCase):
+    """Offline regressions: acceptance never invokes a build callback or Cargo."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="obs80-prebuilt-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def _executable(self) -> Path:
+        debug = self.root / "debug"
+        debug.mkdir()
+        binary = debug / "rootyard"
+        binary.write_bytes(b"prebuilt fixture")
+        binary.chmod(0o755)
+        return binary
+
+    def test_missing_binary_fails_closed_without_running_a_build(self) -> None:
+        binder = mock.Mock(side_effect=AssertionError("binding must not run for a missing artifact"))
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "explicit native build preparation"):
+                _resolve_prebuilt_binary({"CARGO_TARGET_DIR": str(self.root)}, binder=binder)
+        binder.assert_not_called()
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_stale_receipt_fails_closed_without_running_a_build(self) -> None:
+        binary = self._executable()
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "explicit native build preparation") as caught:
+                _resolve_prebuilt_binary({"CARGO_TARGET_DIR": str(self.root)})
+        self.assertIn("build receipt rejected", str(caught.exception))
+        self.assertIn(str(binary.resolve()), str(caught.exception))
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_valid_binding_never_runs_a_build(self) -> None:
+        binary = self._executable()
+        binder = mock.Mock(return_value={"production_inputs_bound": True})
+        environment = {"CARGO_TARGET_DIR": str(self.root)}
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            path, binding = _resolve_prebuilt_binary(environment, binder=binder)
+        self.assertEqual(path, binary.resolve())
+        self.assertTrue(binding["production_inputs_bound"])
+        binder.assert_called_once_with(binary.resolve(), environ=environment)
+        run.assert_not_called()
+        popen.assert_not_called()
+
+
 class ObservabilityBacklogE2ETest(unittest.TestCase):
     binary: Path
     db_secret_sentinel: str = ""
@@ -109,56 +192,44 @@ class ObservabilityBacklogE2ETest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         in_ci = os.environ.get("GITHUB_ACTIONS") == "true"
-        raw_target = Path(os.environ.get("CARGO_TARGET_DIR") or (ROOT / "target")).expanduser()
-        target_dir = (raw_target if raw_target.is_absolute() else ROOT / raw_target).resolve()
-        cls.binary = (target_dir / "debug" / "rootyard").resolve()
+        cls.binary, cls.binding = _resolve_prebuilt_binary(os.environ)
         db_url = os.environ.get("ROOTYARD_TEST_DATABASE_URL")
-        if in_ci:
-            if not cls.binary.is_file() or not db_url:
-                raise RuntimeError("CI requires prebuilt target/debug/rootyard and ROOTYARD_TEST_DATABASE_URL")
+        if in_ci and not db_url:
+            raise RuntimeError(
+                "ROOTYARD_TEST_DATABASE_URL is required when GITHUB_ACTIONS=true; "
+                "refusing to silently skip the live observability backlog regression in CI"
+            )
+        if db_url:
             return
-        need_build = not cls.binary.is_file()
-        if not need_build:
-            try:
-                native_evidence.build_record(cls.binary)
-            except Exception:
-                need_build = True
-        if need_build:
-            build_env = {**os.environ, "CARGO_FORK_AUTO_UPDATE": "0"}
-            subprocess.run([sys.executable, str(ROOT / "scripts" / "build_native.py")],
-                           cwd=ROOT, env=build_env, check=True, timeout=240)
-        if not cls.binary.is_file():
-            raise RuntimeError(f"Failed to locate built binary at {cls.binary}")
-        if not db_url:
-            pg_root = Path(tempfile.mkdtemp(prefix="obs80-pg-"))
-            cls.addClassCleanup(shutil.rmtree, pg_root, True)
-            pgdata, sockdir, pglog = pg_root / "data", pg_root / "sock", pg_root / "postgres.log"
-            sockdir.mkdir(parents=True, exist_ok=True)
-            port = _free_port()
-            cls.db_secret_sentinel = "obs80-dbpass-" + uuid.uuid4().hex
-            subprocess.run(["initdb", "-D", str(pgdata), "-U", "postgres", "-A", "trust", "--no-instructions",
-                            "--encoding=UTF8", "--lc-collate=C", "--lc-ctype=C"],
-                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-            with (pgdata / "postgresql.conf").open("a", encoding="utf-8") as conf:
-                conf.write(f"\nlisten_addresses = '127.0.0.1'\nport = {port}\nunix_socket_directories = '{sockdir}'\n"
-                           "max_connections = 64\nfsync = off\nsynchronous_commit = off\n")
-            prev_db = os.environ.get("ROOTYARD_TEST_DATABASE_URL")
+        pg_root = Path(tempfile.mkdtemp(prefix="obs80-pg-"))
+        cls.addClassCleanup(shutil.rmtree, pg_root, True)
+        pgdata, sockdir, pglog = pg_root / "data", pg_root / "sock", pg_root / "postgres.log"
+        sockdir.mkdir(parents=True, exist_ok=True)
+        port = _free_port()
+        cls.db_secret_sentinel = "obs80-dbpass-" + uuid.uuid4().hex
+        subprocess.run(["initdb", "-D", str(pgdata), "-U", "postgres", "-A", "trust", "--no-instructions",
+                        "--encoding=UTF8", "--lc-collate=C", "--lc-ctype=C"],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        with (pgdata / "postgresql.conf").open("a", encoding="utf-8") as conf:
+            conf.write(f"\nlisten_addresses = '127.0.0.1'\nport = {port}\nunix_socket_directories = '{sockdir}'\n"
+                       "max_connections = 64\nfsync = off\nsynchronous_commit = off\n")
+        prev_db = os.environ.get("ROOTYARD_TEST_DATABASE_URL")
 
-            def _cleanup_pg() -> None:
-                if prev_db is None:
-                    os.environ.pop("ROOTYARD_TEST_DATABASE_URL", None)
-                else:
-                    os.environ["ROOTYARD_TEST_DATABASE_URL"] = prev_db
-                subprocess.run(["pg_ctl", "-D", str(pgdata), "-m", "immediate", "stop"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
+        def _cleanup_pg() -> None:
+            if prev_db is None:
+                os.environ.pop("ROOTYARD_TEST_DATABASE_URL", None)
+            else:
+                os.environ["ROOTYARD_TEST_DATABASE_URL"] = prev_db
+            subprocess.run(["pg_ctl", "-D", str(pgdata), "-m", "immediate", "stop"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
 
-            cls.addClassCleanup(_cleanup_pg)  # LIFO: stops PostgreSQL before shutil.rmtree(pg_root, True).
-            subprocess.run(["pg_ctl", "-D", str(pgdata), "-l", str(pglog), "-w", "start"],
-                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-            subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(port), "-U", "postgres", "-d", "postgres",
-                            "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE rootyard_obs80"],
-                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-            os.environ["ROOTYARD_TEST_DATABASE_URL"] = f"postgresql://postgres:{cls.db_secret_sentinel}@127.0.0.1:{port}/rootyard_obs80"
+        cls.addClassCleanup(_cleanup_pg)  # LIFO: stops PostgreSQL before shutil.rmtree(pg_root, True).
+        subprocess.run(["pg_ctl", "-D", str(pgdata), "-l", str(pglog), "-w", "start"],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(port), "-U", "postgres", "-d", "postgres",
+                        "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE rootyard_obs80"],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        os.environ["ROOTYARD_TEST_DATABASE_URL"] = f"postgresql://postgres:{cls.db_secret_sentinel}@127.0.0.1:{port}/rootyard_obs80"
 
     def _new_harness(self, **env_overrides: str) -> e2e.Harness:
         h = e2e.Harness(argparse.Namespace(binary=str(self.binary), keep=False))
