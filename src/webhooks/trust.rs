@@ -103,7 +103,7 @@ pub(crate) async fn lock_trusted_callback_run(tx:&tokio_postgres::Transaction<'_
          WHERE c.id=$1 AND c.repository_id=$2 FOR UPDATE OF c",
         &[run_id,&repo_id],
     ).await.map_err(Error::internal)?
-        .ok_or_else(||Error(StatusCode::CONFLICT,"CI run attempt or candidate changed"))?;
+        .ok_or(Error(StatusCode::CONFLICT,"CI run attempt or candidate changed"))?;
     let valid=row.get::<_,String>("context").as_str()==context
         && row.get::<_,String>("state").as_str()=="leased"
         && row.get::<_,Uuid>("job_id")==*job_id
