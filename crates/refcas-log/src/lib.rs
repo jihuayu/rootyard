@@ -310,6 +310,12 @@ fn stored_max(conn: &Connection) -> Res<Option<(i64, LogId<u64>)>> {
         .map(|entry| (entry.get_log_id().index as i64, *entry.get_log_id())))
 }
 
+/// Lowest stored row key, if any. Uses the integer primary-key index and reads no payload.
+fn stored_min(conn: &Connection) -> Res<Option<u64>> {
+    let min: Option<i64> = conn.query_row("SELECT min(idx) FROM log_entry", [], |r| r.get(0))?;
+    min.map(idx_from_i64).transpose()
+}
+
 /// Count and index bounds of stored rows (`count`, `min`, `max`), optionally restricted to
 /// `idx >= lower`. Uses one aggregate over the integer primary-key index, so its memory is O(1).
 fn row_bounds(conn: &Connection, lower: Option<i64>) -> Res<(u64, Option<u64>, Option<u64>)> {
@@ -465,6 +471,12 @@ fn read_rows(conn: &Connection, from: i64, to: i64, limited: bool) -> Res<(Vec<(
 /// stored. Whatever is returned must begin with `first` and have no internal gap, including a
 /// limited read stopped by its count or byte budget. Only a complete read must also reach
 /// `min(known, hi)`; past that end (and past `hi`) short reads and empty results stay valid.
+///
+/// Without a purge boundary, a request whose whole interval lies below the smallest stored row
+/// asks for no live index and returns empty, matching the allowed short read. If it starts below
+/// that row and overlaps retained data, it is refused as an unavailable prefix instead of silently
+/// shifting to the first stored row. That refusal does not claim the prefix was ever stored, so it
+/// neither invents an index-zero invariant nor turns a legal positive-first log into a loss.
 fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res<Vec<EntryOf>> {
     if hi.is_some_and(|h| h <= lo) {
         return Ok(Vec::new()); // empty range: never touches SQL
@@ -484,6 +496,19 @@ fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res
     let (rows, stop) = read_rows(conn, idx_to_i64(first)?, idx_to_i64(end)?, limited)?;
     // The head is required for every result, budget stops included.
     if rows.first().is_none_or(|(idx, _)| *idx != first) {
+        if purged.is_none() {
+            if let Some(min) = stored_min(conn)? {
+                // The requested interval ended before any stored row: there is no live index in it.
+                if end <= min {
+                    return Ok(Vec::new());
+                }
+                if min > first {
+                    return Err(E::Refused(format!(
+                        "log range starts at {first} below the retained first index {min} with no purge boundary; the unavailable prefix cannot be served"
+                    )));
+                }
+            }
+        }
         return Err(E::Refused(format!("log entry {first} is missing although it is stored")));
     }
     // No gap may follow either: a later row cannot stand in for a lost one.
@@ -918,6 +943,7 @@ mod tests {
     use super::*;
     use openraft::CommittedLeaderId;
     use openraft::EntryPayload;
+    use openraft::storage::RaftLogReaderExt as _;
 
     fn lid(term: u64, index: u64) -> LogId<u64> {
         LogId::new(CommittedLeaderId::new(term, 1), index)
@@ -1215,6 +1241,17 @@ mod tests {
         };
         msg.contains("refused: log entry ") && msg.contains(" is missing although it is stored")
     }
+    /// True only for the explicit below-retained-first refusal on an unpurged log.
+    fn is_unavailable_prefix(r: &Result<Vec<EntryOf>, StorageError<u64>>) -> bool {
+        let msg = match r {
+            Ok(_) => return false,
+            Err(StorageError::IO { source }) => source.to_string(),
+            Err(other) => panic!("unexpected error kind: {other:?}"),
+        };
+        msg.contains("refused: log range starts at ")
+            && msg.contains(" below the retained first index ")
+            && msg.contains(" no purge boundary; the unavailable prefix cannot be served")
+    }
     /// Adapter for the in-crate peers that return [`E`].
     fn missing_in_core(r: &Res<Vec<EntryOf>>) -> bool {
         is_missing(&r.as_ref().cloned().map_err(|e| ioerr(ErrorSubject::Logs, ErrorVerb::Read, e)))
@@ -1290,8 +1327,11 @@ mod tests {
         append_ok(&rt, &s, (0..10).map(|i| blank(1, i)).collect());
         delete_rows(dir.path(), "DELETE FROM log_entry WHERE idx IN (0, 4, 7)");
         let mut r = rt.block_on(s.get_log_reader());
-        assert!(is_missing(&rt.block_on(r.try_get_log_entries(0..2))), "bootstrap entry lost");
-        assert!(is_missing(&rt.block_on(r.try_get_log_entries(0..10))), "three holes");
+        // The deleted head is an unavailable prefix, not a row the reader may silently skip.
+        assert!(is_unavailable_prefix(&rt.block_on(r.try_get_log_entries(0..2))), "bootstrap entry lost");
+        assert!(is_unavailable_prefix(&rt.block_on(r.try_get_log_entries(0..10))), "prefix overlaps live rows");
+        assert!(rt.block_on(r.try_get_log_entries(0..1)).unwrap().is_empty(), "wholly below retained first");
+        assert!(is_missing(&rt.block_on(r.try_get_log_entries(1..10))), "internal holes remain detected");
         assert!(rt.block_on(r.try_get_log_entries(1..4)).unwrap().len() == 3, "hole-free range below the gap");
         assert_eq!(indices(&rt.block_on(r.try_get_log_entries(5..7)).unwrap()), vec![5, 6], "between holes");
         assert!(is_missing(&rt.block_on(r.try_get_log_entries(6..8))), "second hole");
@@ -1753,7 +1793,7 @@ mod tests {
         // No purge pins a lower bound, so deleting the first live row shifts the observable lower
         // bound to 1. Startup cannot distinguish that fresh-prefix loss from a legal positive first
         // index without a witness; this open is the documented limit, and the read-time head check
-        // below still refuses a request that starts at 0.
+        // below explicitly refuses an overlapping request that starts at 0.
         let mut s = open(&rt, dir.path());
         let mut r = rt.block_on(s.get_log_reader());
         // fcb's count-budget early return skipped the head check; the regression sees it returning.
@@ -1762,7 +1802,11 @@ mod tests {
             "probe: fcb no longer skips the head check at the count budget"
         );
         let got = rt.block_on(r.limited_get_log_entries(0, u64::MAX));
-        assert!(is_missing(&got), "lost head, later rows fill the budget: {got:?}");
+        assert!(is_unavailable_prefix(&got), "lost head, later rows fill the budget: {got:?}");
+        assert!(
+            rt.block_on(r.try_get_log_entries(0..1)).unwrap().is_empty(),
+            "single missing prefix index is a short read"
+        );
         drop(r);
         drop(s);
 
@@ -1946,9 +1990,10 @@ mod tests {
         let rt = rt();
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(&rt, dir.path());
-        // The pinned `RaftLogStorage`/`RaftLogReader` contract does not require a fresh retained
-        // store to begin at index 0. Index 0 is legal, not mandatory; only gap-free density from
-        // the observable first row is required.
+        // At the storage layer a dense retained slice may begin at a positive index; no index-zero
+        // invariant is invented. This is not an engine-startup claim: pinned 0.9.26
+        // `LogIdList::load_log_ids` probes index 0 when no purge boundary exists, and the next test
+        // pins the explicit unavailable-prefix refusal.
         append_ok(&rt, &s, (7..10).map(|i| blank(1, i)).collect());
         rt.block_on(s.save_committed(Some(lid(1, 8)))).unwrap();
         drop(s);
@@ -1962,5 +2007,44 @@ mod tests {
         assert_eq!(indices(&rt.block_on(s.try_get_log_entries(8..)).unwrap()), vec![8, 9]);
         assert!(rt.block_on(s.try_get_log_entries(5..5)).unwrap().is_empty(), "empty below-first range");
         assert!(rt.block_on(s.try_get_log_entries(10..12)).unwrap().is_empty(), "past the tail");
+    }
+
+    #[test]
+    fn positive_first_prefix_read_is_explicitly_unavailable() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (7..10).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 8)))).unwrap();
+        drop(s);
+
+        let mut s = open(&rt, dir.path());
+        let mut r = rt.block_on(s.get_log_reader());
+        // Wholly below the retained first row: no live index was requested, so this stays a valid
+        // short read, including the single-index extension used by `try_get_log_entry`.
+        assert!(rt.block_on(r.try_get_log_entries(0..1)).unwrap().is_empty());
+        assert!(rt.block_on(r.try_get_log_entries(5..7)).unwrap().is_empty());
+        assert_eq!(rt.block_on(r.try_get_log_entry(0)).unwrap(), None);
+        // Overlapping the retained row from below is refused instead of silently starting at 7 or
+        // claiming that the unavailable prefix was stored.
+        for got in [
+            rt.block_on(r.try_get_log_entries(0..8)),
+            rt.block_on(r.try_get_log_entries(0..10)),
+            rt.block_on(r.try_get_log_entries(..)),
+            rt.block_on(r.limited_get_log_entries(0, 10)),
+        ] {
+            assert!(is_unavailable_prefix(&got), "expected explicit unavailable-prefix refusal: {got:?}");
+        }
+        // Pinned 0.9.26 startup probes `get_log_id(0)` when `last_purged_log_id` is `None`; this
+        // store reproduces that probe as a refusal, so no stronger engine-level reader support is
+        // claimed for an unpurged positive-first log.
+        assert!(rt.block_on(r.get_log_id(0)).is_err());
+        drop(r);
+        // A persisted purge boundary supplies the lower bound; the positive-first live slice is
+        // then the normal engine-supported shape and requests below it are wholly purged.
+        rt.block_on(s.purge(lid(1, 6))).unwrap();
+        let mut r = rt.block_on(s.get_log_reader());
+        assert_eq!(indices(&rt.block_on(r.try_get_log_entries(0..10)).unwrap()), vec![7, 8, 9]);
+        assert!(rt.block_on(r.try_get_log_entries(0..7)).unwrap().is_empty(), "wholly purged below the boundary");
     }
 }
