@@ -312,6 +312,15 @@ impl BlobProfile {
         }
     }
 
+    /// Test-only: preserve every configured field while moving the endpoint to
+    /// an owned loopback fault gate. This is never compiled into production
+    /// builds and still validates the replacement as an origin URL.
+    #[cfg(test)]
+    pub(crate) fn with_test_endpoint(mut self, raw: &str) -> Result<Self, BlobError> {
+        self.endpoint = Some(parse_origin(raw)?);
+        Ok(self)
+    }
+
     /// Relative object path. `ROOTYARD_BLOB_ROOT` is applied exactly once by
     /// the operator builder root, never duplicated here. Sealed to the
     /// `blob_store` subtree with the raw operator.
