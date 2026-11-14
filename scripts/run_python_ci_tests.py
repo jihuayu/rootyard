@@ -73,6 +73,10 @@ def run(
     try:
         suite = discover(tests_dir)
         result = unittest.TextTestRunner(stream=output, verbosity=2).run(suite)
+        # Match unittest.main.TestProgram.runTests: an empty selection with no
+        # recorded skips exits 5, never 0, so an empty gate cannot go green.
+        if result.testsRun == 0 and len(result.skipped) == 0:
+            return 5
         return 0 if result.wasSuccessful() else 1
     finally:
         stop_timer()

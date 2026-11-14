@@ -176,6 +176,51 @@ class DiagnosticsRunnerTest(unittest.TestCase):
             check=False,
         )
 
+    def make_fake_repo(self) -> Path:
+        fake = self.tests / "fake_repo"
+        (fake / "scripts").mkdir(parents=True)
+        (fake / "tests").mkdir()
+        shutil.copyfile(
+            ROOT / "scripts" / "run_python_ci_tests.py",
+            fake / "scripts" / "run_python_ci_tests.py",
+        )
+        return fake
+
+    def run_cli_pair(
+        self, fake: Path
+    ) -> tuple[subprocess.CompletedProcess[str], subprocess.CompletedProcess[str]]:
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        old = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_*.py",
+                "-v",
+            ],
+            cwd=fake,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        new = subprocess.run(
+            [sys.executable, "scripts/run_python_ci_tests.py"],
+            cwd=fake,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        return old, new
+
     def test_discovery_selects_the_test_glob_in_unittest_order(self) -> None:
         self.write("test_runner_fixture_beta.py", """
             import unittest
@@ -265,13 +310,7 @@ class DiagnosticsRunnerTest(unittest.TestCase):
     def test_entrypoint_restores_repo_root_imports_and_matches_old_discovery(
         self,
     ) -> None:
-        fake = self.tests / "fake_repo"
-        (fake / "scripts").mkdir(parents=True)
-        (fake / "tests").mkdir()
-        shutil.copyfile(
-            ROOT / "scripts" / "run_python_ci_tests.py",
-            fake / "scripts" / "run_python_ci_tests.py",
-        )
+        fake = self.make_fake_repo()
         (fake / "tests" / "e2e.py").write_text(
             "class Harness:\n    marker = 'repo-root-import-ok'\n",
             encoding="utf-8",
@@ -301,36 +340,7 @@ class DiagnosticsRunnerTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
-        old = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                "tests",
-                "-p",
-                "test_*.py",
-                "-v",
-            ],
-            cwd=fake,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        new = subprocess.run(
-            [sys.executable, "scripts/run_python_ci_tests.py"],
-            cwd=fake,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        old, new = self.run_cli_pair(fake)
 
         self.assertEqual(old.returncode, 0, old.stderr)
         self.assertEqual(new.returncode, 0, new.stderr)
@@ -345,6 +355,43 @@ class DiagnosticsRunnerTest(unittest.TestCase):
                 "test_import_context_beta.Beta.test_beta",
             ],
         )
+
+    def test_empty_selection_matches_unittest_exit_five(self) -> None:
+        fake = self.make_fake_repo()
+        (fake / "tests" / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        old, new = self.run_cli_pair(fake)
+        self.assertEqual(old.returncode, 5, old.stderr)
+        self.assertEqual(new.returncode, old.returncode, new.stderr)
+        self.assertIn("Ran 0 tests", new.stderr)
+        self.assertIn("NO TESTS RAN", new.stderr)
+
+    def test_all_skipped_selection_matches_unittest_success(self) -> None:
+        fake = self.make_fake_repo()
+        (fake / "tests" / "test_skipped.py").write_text(
+            textwrap.dedent("""
+                import unittest
+
+                class MethodSkip(unittest.TestCase):
+                    @unittest.skip("fixture method skip")
+                    def test_method_skipped(self):
+                        pass
+
+                @unittest.skip("fixture class skip")
+                class ClassSkip(unittest.TestCase):
+                    def test_class_skipped(self):
+                        pass
+            """),
+            encoding="utf-8",
+        )
+
+        old, new = self.run_cli_pair(fake)
+        self.assertEqual(old.returncode, 0, old.stderr)
+        self.assertEqual(new.returncode, old.returncode, new.stderr)
+        self.assertEqual(new.returncode, 0)
+        self.assertIn("Ran 2 tests", new.stderr)
+        self.assertIn("skipped=2", new.stderr)
+        self.assertNotIn("NO TESTS RAN", new.stderr)
 
     def test_periodic_dump_reports_stacks_without_locals_and_stops_after_run(
         self,
