@@ -1,5 +1,7 @@
 //! Track 2B: Git LFS Batch API and verified streaming object transfers.
 pub mod handlers;
+mod batch_upload;
+mod handlers_batch;
 mod hydration;
 pub mod locks;
 pub mod models;
@@ -8,6 +10,7 @@ pub(crate) mod remote_metrics;
 pub mod storage;
 mod upload;
 mod verification;
+mod verification_limiter;
 pub const MIGRATION_020_SQL: &str = include_str!("lfs/020_lfs_objects.sql");
 
 mod routes;

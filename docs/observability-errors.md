@@ -37,9 +37,10 @@ best-effort stderr delivery, subject to the rate and queue limits below:
 * Selected background loops use a separate `"scope":"worker"` context with
   fixed `worker` and `phase` labels, a per-round server-generated
   `operation_id`, and optionally non-negative persisted `attempt`/`generation`.
-  See `docs/worker-diagnostics.md`. The operation scope takes precedence over a
-  request scope, but worker spawns are created through an explicit helper that
-  never copies request state; a plain spawn remains detached.
+  See [worker-diagnostics.md](worker-diagnostics.md). The operation scope takes
+  precedence over a request scope, but worker spawns are created through an
+  explicit helper that never copies request state; a plain spawn remains
+  detached.
 
 The middleware generates its own `X-Request-ID` UUID for every response and
 ignores any client-supplied value. It wraps the routed future, so all responses
@@ -81,31 +82,52 @@ The live entry points are:
   remains classifiable as `remote_store` with its fixed operation and status.
   The public LFS response remains the same bounded 5xx.
 
-An owned PostgreSQL drill now covers two real cases: a synthetic
-`BEFORE INSERT` trigger that raises SQLSTATE 23503 on one repository name, and a
-separate synthetic trigger whose `PERFORM pg_sleep(6)` is cancelled by the pool's
-`statement_timeout=5000` as SQLSTATE 57014. Both assert the fixed 503 body,
-`no-store`, the server `X-Request-ID`, one correlated structured event, and that
-tokens, URLs, query strings and header secrets do not reach the log.
+An owned PostgreSQL drill in `tests/worker_diagnostics.py` covers a synthetic
+`BEFORE INSERT` trigger raising SQLSTATE `23503` on one repository name and a
+trigger whose `PERFORM pg_sleep(6)` is cancelled by the pool's
+`statement_timeout=5000` as SQLSTATE `57014`, asserting the fixed `503` body,
+`no-store`, the server `X-Request-ID`, request/worker scope isolation, and log
+redaction; see [the attested native report](acceptance/round5-worker-diagnostics-evidence/native.json).
 
 The owned Garage drill in `tests/lfs_hydration_concurrency.py` gates a real
-backend GET, returns a controlled 502, captures the failed response
+backend GET, returns a controlled `502`, captures the failed response
 `X-Request-ID`, finds the matching structured event in the owned service log and
 asserts `kind:"remote_store"`, `remote_op:"get"`, `remote_status:502` and log
-privacy before a clean retry succeeds. It does not mock the Rust error.
+privacy before a clean retry succeeds.
 
-Still open: remote repair metrics and other metrics work, the 80-request
-full-backlog drill, and per-worker coverage beyond the bounded operation scope
-described in `docs/worker-diagnostics.md`. That document lists exactly which
-workers are wrapped, which are only unit-covered, and which remain entirely
-outside operation scope; it does not claim all issue-80 work is complete. The
-fault metrics on the private listener are unchanged. The storage maintenance
-57014 timeout and separate HTTP 23503 privacy drill passed natively; see
-[the attested native report](acceptance/round5-worker-diagnostics-evidence/native.json).
-Other newly scoped workers have no native fault evidence in that report. The
-acceptance reports remain the authority for what was actually run.
+`tests/test_observability_backlog.py` extends native E2E verification across:
 
-The private metric `rootyard_error_log_dropped_total` counts accepted records
-lost to a full/disconnected queue, writer startup failure, or incomplete stderr
-write. It excludes rate-limited faults and records still queued at process exit.
-Alert on increases when diagnosing missing logs; it does not count every error.
+* claimed-job `phase:"execute"` failures in `storage_lifecycle`, proving
+  persisted numeric `attempt` and `generation` (`repository_generation`) match
+  the claimed `storage_maintenance_jobs` row alongside `sqlstate`;
+* native PostgreSQL fault correlation (`23503` / `57014`) across the remaining
+  four operation-scoped loops (`webhooks_background`, `workspace_capture`,
+  `workspace_remote_gc`, and `durable_dispatch`), verifying zero tokens,
+  `Authorization` headers, `DATABASE_URL` credentials, webhook secrets,
+  object-store keys, URLs/queries, or trigger/user payloads reach stderr;
+* automatic discovery of overdue webhook deliveries, workspace capture lag /
+  unsampled baselines / expired leases, storage maintenance job queues / expired
+  running leases, LFS remote failures (`rootyard_lfs_remote_failures_total`) and
+  in-flight repair permits (`rootyard_lfs_remote_repair_backlog`), and
+  PostgreSQL statement-timeout scrape degradation (`503` with
+  `rootyard_postgres_up 0`, process-local counters preserved, and SQL-derived
+  gauges omitted) on the private `/metrics` listener (see [metrics.md](metrics.md)).
+
+## Explicit boundaries and operator runbook
+
+* Structured `rootyard_error` records remain best-effort non-durable operational
+  logs, subject to the 100-events/s monotonic window and 128-record non-blocking
+  queue; records still queued at process exit are not persisted.
+* `rootyard_error_log_dropped_total` counts accepted records lost to a
+  full/disconnected queue, writer startup failure, or incomplete stderr write
+  (excluding rate-limited storms and records queued at process exit).
+* Background loops outside `WorkerKind` (`session_gc`, the sharding controller
+  and pending-transition reconciliation, journal/provisioning recovery, metrics
+  scrape handlers, offline backup/restore commands, and the advisory wake
+  publisher) remain outside `"scope":"worker"`; see
+  [worker-diagnostics.md](worker-diagnostics.md).
+* Executable PromQL alerts, structured-log predicates, and step-by-step operator
+  troubleshooting across expected `4xx` rejections, transient dependency
+  failures, and internal consistency / worker backlog anomalies are defined in
+  [observability-alerts.md](observability-alerts.md) and verified against the
+  Rust implementation by `tests/test_observability_runbook.py`.
