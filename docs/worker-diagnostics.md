@@ -68,35 +68,51 @@ Real scopes are installed around:
 * `dispatch::worker`, around each durable delivery scan. The transport
   subscriber is spawned through the explicit operation-context helper.
 
-## Native drill
+## Native verification
 
 `tests/worker_diagnostics.py` reuses `tests/e2e.py` and starts the real service
-against a disposable owned PostgreSQL schema. It installs a synthetic trigger
-on `storage_maintenance_repo_state` whose INSERT executes `pg_sleep(6)`; the
+against a disposable owned PostgreSQL schema. It installs a synthetic trigger on
+`storage_maintenance_repo_state` whose `INSERT` executes `pg_sleep(6)`; the
 owned pool's `statement_timeout=5000` cancels the executing statement in
-PostgreSQL with SQLSTATE 57014. The test asserts that the worker emits a real
+PostgreSQL with SQLSTATE `57014`. The drill asserts that the worker emits a real
 `scope:"worker"`, `worker:"storage_lifecycle"`, `phase:"scan"` event with a
-server-generated `operation_id` and no request ID or route. A second trigger
-raises SQLSTATE 23503 for a real HTTP request; the test asserts that request
-event has `scope:"request"` and no worker/operation fields, and that the two
-correlation IDs differ. Trigger messages, tokens, URLs, query strings and
-headers are checked against the retained log.
+server-generated `operation_id` and no request ID or route, while a second
+trigger raising SQLSTATE `23503` on an HTTP request emits `scope:"request"` with
+distinct correlation IDs and zero leaked secrets.
 
-The drill's worker fault is a real database timeout, not a mocked Rust error.
-It does not claim that every covered worker was exercised natively.
+`tests/test_observability_backlog.py` natively exercises the remaining
+operation-scoped worker paths against the real `rootyard` binary and live
+PostgreSQL in isolated disposable schemas:
 
-## Still missing / not claimed
+* **Claimed-job `attempt` and `generation` correlation**: seeds a queued
+  `storage_maintenance_jobs` row, induces a real PostgreSQL `23503` fault inside
+  `storage_lifecycle` `phase:"execute"` after `jobs::claim`, and verifies the
+  emitted `scope:"worker"`, `worker:"storage_lifecycle"`, `phase:"execute"`
+  record carries exact numeric `attempt` and `generation`
+  (`repository_generation`) matching the claimed row alongside `sqlstate`.
+* **Remaining four scoped background loops**: injects real PostgreSQL `23503`
+  and `57014` faults into `webhooks_background` (`phase:"deliver"`),
+  `workspace_capture` (`phase:"reconcile"`), `workspace_remote_gc`
+  (`phase:"collect"`), and `durable_dispatch` (`phase:"dispatch"`), verifying
+  each worker's fixed `worker`, `phase`, `operation_id`, and `sqlstate` while
+  checking the entire stderr log for zero leaked tokens, `Authorization`
+  headers, `DATABASE_URL` credentials, webhook secrets, object-store keys,
+  URLs/queries, or trigger/user payloads.
 
-* Native fault injection for `webhooks_background`, `workspace_capture`,
-  `workspace_remote_gc` and `durable_dispatch`. Their scope wrapping has unit
-  coverage only.
-* A native claimed-job failure proving attempt/generation correlation; the
-  current native timeout happens before a job claim.
-* Session GC, the sharding controller and pending-transition reconciliation,
-  journal/provisioning recovery, metrics workers, backup/restore jobs and the
-  advisory wake publisher are outside worker operation scope.
-* Durable storage of events: these remain best-effort bounded logs, with the
-  existing queue/rate limits and possible loss at process exit.
+## Explicit boundaries (not claimed)
 
-This document records partial per-worker coverage. It is not a claim that all
-of issue 80 or all background workers are complete.
+* Browser `session_gc` (tracked via `rootyard_session_gc_cycles_total`,
+  `rootyard_session_gc_session_rows_deleted_total`,
+  `rootyard_session_gc_tokens_deleted_total`, and
+  `rootyard_session_gc_failures_total`), the sharding controller and
+  pending-transition reconciliation, journal/provisioning recovery loops,
+  metrics scrape handlers, offline backup/restore CLI commands, and the advisory
+  wake publisher (`dispatch::publisher`) remain outside `WorkerKind` operation
+  scope; errors there use `"scope":"detached"` or dedicated process counters.
+* Durable storage of diagnostic events is not claimed: `rootyard_error` records
+  remain best-effort bounded stderr logs subject to the 100-events/s window,
+  128-record non-blocking channel (`rootyard_error_log_dropped_total` on queue
+  or stderr write drop), and potential loss of queued items at process exit.
+  Authoritative backlog and recovery state always lives in PostgreSQL and is
+  surfaced on `/metrics` (see [observability-errors.md](observability-errors.md),
+  [metrics.md](metrics.md), and [observability-alerts.md](observability-alerts.md)).

@@ -24,19 +24,24 @@ use uuid::Uuid;
 
 use super::hydration;
 
+pub fn verification_deadline(state: &AppState) -> Instant {
+    Instant::now() + state.config.git_timeout
+}
+
 pub async fn publish_remote(
     state: &AppState,
     repo_id: Uuid,
     tenant_id: Uuid,
     oid: &str,
     size: u64,
+    deadline: Instant,
 ) -> Result<(), Error> {
     let Some(store) = hydration::remote_store(&state.storage.root).map_err(Error::internal)? else {
         return Ok(());
     };
     let key = ObjectKey::new(tenant_id, "lfs", oid).map_err(Error::internal)?;
     let path = object_path(&state.storage.root, repo_id, oid).map_err(Error::internal)?;
-    store.put_file(&key, &path, size, Instant::now() + state.config.git_timeout).await.map_err(|error| {
+    store.put_file(&key, &path, size, deadline).await.map_err(|error| {
         if error.downcast_ref::<crate::storage::remote_objects::RemoteStoreError>().is_some() {
             super::remote_metrics::counters().record_remote_failure();
         }
@@ -137,7 +142,7 @@ pub fn verify_object_integrity(data_root: &Path, repo_id: Uuid, oid: &str, expec
         repo_id,
         oid,
         expected_size,
-        StdInstant::now() + Duration::from_secs(24 * 60 * 60),
+        StdInstant::now() + Duration::from_secs(300),
     )
 }
 
@@ -248,7 +253,18 @@ pub async fn open_verified_download_stream(
     oid: &str,
     expected_size: u64,
 ) -> Result<Body, Error> {
-    let deadline = Instant::now() + state.config.git_timeout;
+    open_verified_download_stream_until(state, repo_id, tenant_id, oid, expected_size, verification_deadline(state))
+        .await
+}
+
+pub async fn open_verified_download_stream_until(
+    state: &AppState,
+    repo_id: Uuid,
+    tenant_id: Uuid,
+    oid: &str,
+    expected_size: u64,
+    deadline: Instant,
+) -> Result<Body, Error> {
     let path = object_path(&state.storage.root, repo_id, oid).map_err(Error::internal)?;
     let mut file = verification::open_verified_file(
         path.clone(),
