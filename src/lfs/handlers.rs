@@ -2,9 +2,9 @@
 use crate::{
     AppState, Error, auth,
     lfs::{
+        handlers_batch::{BatchContext, batch_download, batch_upload},
         models::{
-            self, BatchActionLink, BatchActions, BatchObjectError, BatchObjectResult, BatchObjectSpec, BatchRequest,
-            BatchResponse, LFS_MEDIA_TYPE,
+            self, BatchObjectError, BatchObjectResult, BatchObjectSpec, BatchRequest, BatchResponse, LFS_MEDIA_TYPE,
         },
         storage,
     },
@@ -18,6 +18,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, sync::Arc};
+use uuid::Uuid;
 
 /// Deduplicates multiple byte-for-byte identical `Authorization` headers while leaving
 /// distinct conflicting `Authorization` headers untouched so `auth::authenticate` rejects them.
@@ -49,7 +50,7 @@ fn lfs_error(status: StatusCode, message: &str) -> Response {
     lfs_json(status, serde_json::json!({ "message": message, "error": message }))
 }
 
-fn obj_error(oid: String, size: i64, code: u16, msg: &str) -> BatchObjectResult {
+pub(super) fn obj_error(oid: String, size: i64, code: u16, msg: &str) -> BatchObjectResult {
     BatchObjectResult {
         oid,
         size,
@@ -57,6 +58,28 @@ fn obj_error(oid: String, size: i64, code: u16, msg: &str) -> BatchObjectResult 
         actions: None,
         error: Some(BatchObjectError { code, message: msg.to_owned() }),
     }
+}
+
+pub(super) async fn reauthorize_repo(
+    state: &AppState,
+    actor: &crate::db::Identity,
+    owner: &str,
+    name: &str,
+    expected_repo_id: Uuid,
+    expected_tenant_id: Uuid,
+    min_role: auth::Role,
+    action: crate::token_scopes::RepoAction,
+    write: bool,
+) -> Result<(), Error> {
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let reauth = auth::authorize_repo_with_role(&tx, actor, owner, name, min_role, action).await?;
+    if reauth.repo_id != expected_repo_id || reauth.owner_id != expected_tenant_id {
+        return Err(Error(StatusCode::CONFLICT, "repository identity changed"));
+    }
+    auth::finish_tx(tx, actor, write).await?;
+    drop(client);
+    Ok(())
 }
 
 fn build_base_url(headers: &HeaderMap) -> String {
@@ -82,6 +105,7 @@ pub async fn batch(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
+    let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let name = models::normalize_repo_name(&repo_raw)?;
@@ -106,154 +130,21 @@ pub async fn batch(
         return Err(Error::bad_request());
     }
 
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(
-        &tx,
-        &actor,
-        &owner,
-        name,
-        if write { auth::Role::Write } else { auth::Role::Read },
-        if write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead },
-    )
-    .await?;
-    let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
-
     let base_url = build_base_url(&headers);
     let mut action_header = BTreeMap::new();
     if let Some(auth_val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
         action_header.insert("Authorization".to_owned(), auth_val.to_owned());
     }
-
-    let mut results = Vec::with_capacity(req.objects.len());
-    for spec in req.objects {
-        if !models::valid_lfs_oid(&spec.oid) || spec.size < 0 {
-            results.push(obj_error(spec.oid, spec.size, 422, "Invalid LFS object oid or size"));
-            continue;
-        }
-        if spec.size as u64 > state.config.max_request_bytes {
-            results.push(obj_error(spec.oid, spec.size, 413, "LFS object exceeds maximum request size"));
-            continue;
-        }
-
-        let row = tx
-            .query_opt(
-                "SELECT size, state FROM lfs_objects WHERE tenant_id = $1 AND repository_id = $2 AND oid = $3",
-                &[&tenant_id, &repo_id, &spec.oid],
-            )
-            .await
-            .map_err(Error::internal)?;
-        let object_href = format!("{base_url}/git/{owner}/{name}.git/info/lfs/objects/{}/{}", spec.oid, spec.size);
-        let verify_href = format!("{base_url}/git/{owner}/{name}.git/info/lfs/verify");
-
-        if write {
-            if let Some(r) = row {
-                let (existing_size, existing_state): (i64, String) = (r.get(0), r.get(1));
-                if existing_size != spec.size {
-                    results.push(obj_error(spec.oid, spec.size, 422, "Object size mismatch with existing record"));
-                    continue;
-                }
-                let on_disk = storage::ensure_readable(
-                    &state.storage.root,
-                    repo_id,
-                    tenant_id,
-                    &spec.oid,
-                    spec.size as u64,
-                    tokio::time::Instant::now() + state.config.git_timeout,
-                )
-                .await
-                .map_err(Error::internal)?;
-                if existing_state == "ready" && on_disk {
-                    // Explicit write-path repair hook: never touched by reads.
-                    storage::schedule_remote_repair(
-                        state.storage.root.clone(),
-                        repo_id,
-                        tenant_id,
-                        spec.oid.clone(),
-                        spec.size as u64,
-                        state.config.git_timeout,
-                    );
-                    results.push(BatchObjectResult {
-                        oid: spec.oid,
-                        size: spec.size,
-                        authenticated: Some(true),
-                        actions: None,
-                        error: None,
-                    });
-                    continue;
-                }
-                tx.execute(
-                    "UPDATE lfs_objects SET state = 'pending', updated_at = clock_timestamp() WHERE tenant_id = $1 AND repository_id = $2 AND oid = $3",
-                    &[&tenant_id, &repo_id, &spec.oid],
-                )
-                .await
-                .map_err(Error::internal)?;
-            } else {
-                tx.execute(
-                    "INSERT INTO lfs_objects (tenant_id, repository_id, oid, size, state) VALUES ($1, $2, $3, $4, 'pending')",
-                    &[&tenant_id, &repo_id, &spec.oid, &spec.size],
-                )
-                .await
-                .map_err(Error::internal)?;
-            }
-
-            let mut upload_header = action_header.clone();
-            upload_header.insert("Content-Type".to_owned(), "application/octet-stream".to_owned());
-            let mut verify_header = action_header.clone();
-            verify_header.insert("Content-Type".to_owned(), LFS_MEDIA_TYPE.to_owned());
-
-            results.push(BatchObjectResult {
-                oid: spec.oid,
-                size: spec.size,
-                authenticated: Some(true),
-                actions: Some(BatchActions {
-                    upload: Some(BatchActionLink { href: object_href, header: upload_header, expires_in: Some(3600) }),
-                    download: None,
-                    verify: Some(BatchActionLink { href: verify_href, header: verify_header, expires_in: Some(3600) }),
-                }),
-                error: None,
-            });
-        } else {
-            let ready_on_disk = if let Some(r) = row {
-                let (existing_size, existing_state): (i64, String) = (r.get(0), r.get(1));
-                existing_state == "ready"
-                    && existing_size == spec.size
-                    && storage::ensure_readable(
-                        &state.storage.root,
-                        repo_id,
-                        tenant_id,
-                        &spec.oid,
-                        spec.size as u64,
-                        tokio::time::Instant::now() + state.config.git_timeout,
-                    )
-                    .await
-                    .map_err(Error::internal)?
-            } else {
-                false
-            };
-            if ready_on_disk {
-                results.push(BatchObjectResult {
-                    oid: spec.oid,
-                    size: spec.size,
-                    authenticated: Some(true),
-                    actions: Some(BatchActions {
-                        upload: None,
-                        download: Some(BatchActionLink {
-                            href: object_href,
-                            header: action_header.clone(),
-                            expires_in: Some(3600),
-                        }),
-                        verify: None,
-                    }),
-                    error: None,
-                });
-            } else {
-                results.push(obj_error(spec.oid, spec.size, 404, "LFS object does not exist"));
-            }
-        }
-    }
-
-    auth::finish_tx(tx, &actor, write).await?;
+    let ctx = BatchContext {
+        state: &state,
+        actor: &actor,
+        owner: &owner,
+        name,
+        base_url: &base_url,
+        action_header: &action_header,
+        deadline,
+    };
+    let results = if write { batch_upload(&ctx, req.objects).await? } else { batch_download(&ctx, req.objects).await? };
     Ok(lfs_json(StatusCode::OK, BatchResponse { transfer: "basic", objects: results, hash_algo: "sha256" }))
 }
 
@@ -275,6 +166,7 @@ pub async fn verify_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
+    let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
@@ -286,20 +178,33 @@ pub async fn verify_object(
         return Ok(lfs_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid LFS object oid or size"));
     }
 
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
-    let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
-
-    let row = tx
-        .query_opt(
-            "SELECT size, state FROM lfs_objects WHERE tenant_id = $1 AND repository_id = $2 AND oid = $3",
-            &[&tenant_id, &repo_id, &spec.oid],
+    let (repo_id, tenant_id, db_size, db_state) = {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let access = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &owner,
+            name,
+            auth::Role::Write,
+            crate::token_scopes::RepoAction::ContentsWrite,
         )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    let (db_size, db_state): (i64, String) = (row.get(0), row.get(1));
+        .await?;
+        let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
+
+        let row = tx
+            .query_opt(
+                "SELECT size, state FROM lfs_objects WHERE tenant_id = $1 AND repository_id = $2 AND oid = $3",
+                &[&tenant_id, &repo_id, &spec.oid],
+            )
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(Error::not_found)?;
+        let (db_size, db_state): (i64, String) = (row.get(0), row.get(1));
+        auth::finish_tx(tx, &actor, false).await?;
+        drop(client);
+        (repo_id, tenant_id, db_size, db_state)
+    };
     if db_state != "ready" {
         return Err(Error::not_found());
     }
@@ -313,15 +218,26 @@ pub async fn verify_object(
         tenant_id,
         &spec.oid,
         spec.size as u64,
-        tokio::time::Instant::now() + state.config.git_timeout,
+        deadline,
     )
     .await
     .map_err(Error::internal)?;
+    reauthorize_repo(
+        &state,
+        &actor,
+        &owner,
+        name,
+        repo_id,
+        tenant_id,
+        auth::Role::Write,
+        crate::token_scopes::RepoAction::ContentsWrite,
+        true,
+    )
+    .await?;
     if !verified {
         return Ok(lfs_error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object integrity verification failed"));
     }
 
-    auth::finish_tx(tx, &actor, true).await?;
     Ok(lfs_json(StatusCode::OK, serde_json::json!({ "oid": spec.oid, "size": spec.size, "verified": true })))
 }
 
@@ -349,6 +265,7 @@ async fn download_inner(
     size_param: Option<i64>,
     headers: HeaderMap,
 ) -> Result<Response, Error> {
+    let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let name = models::normalize_repo_name(&repo_raw)?;
@@ -362,7 +279,15 @@ async fn download_inner(
     let (repo_id, tenant_id, expected_size) = {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
+        let access = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &owner,
+            name,
+            auth::Role::Read,
+            crate::token_scopes::RepoAction::ContentsRead,
+        )
+        .await?;
         let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
         let row = tx
             .query_opt(
@@ -377,10 +302,27 @@ async fn download_inner(
             return Err(Error::not_found());
         }
         auth::finish_tx(tx, &actor, false).await?;
+        drop(client);
         (repo_id, tenant_id, db_size as u64)
     };
 
-    let stream_body = storage::open_verified_download_stream(&state, repo_id, tenant_id, &oid, expected_size).await?;
+    let stream_body =
+        storage::open_verified_download_stream_until(&state, repo_id, tenant_id, &oid, expected_size, deadline).await?;
+    // Opening the stream may verify local bytes or hydrate from the object store.
+    // Re-authorize the exact token and repository generation after that slow work,
+    // with no database connection held across it, before any response body is sent.
+    reauthorize_repo(
+        &state,
+        &actor,
+        &owner,
+        name,
+        repo_id,
+        tenant_id,
+        auth::Role::Read,
+        crate::token_scopes::RepoAction::ContentsRead,
+        false,
+    )
+    .await?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")

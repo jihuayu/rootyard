@@ -1,0 +1,36 @@
+rule_files:
+  - rootyard-metrics.rules.yml
+evaluation_interval: 1m
+tests:
+  # One failed target in the Rootyard job alerts even while a healthy peer and
+  # an unrelated failed job are present.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="rootyard-metrics",instance="127.0.0.1:9108"}'
+        values: '1 1 1 1'
+      - series: 'up{job="rootyard-metrics",instance="127.0.0.1:9109"}'
+        values: '1 0 0 0'
+      - series: 'up{job="unrelated-metrics",instance="127.0.0.1:9200"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: RootyardMetricsScrapeFailed
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: rootyard-metrics
+              instance: 127.0.0.1:9109
+            exp_annotations:
+              summary: Rootyard metrics target has failed to scrape.
+              runbook: docs/observability-alerts.md
+  # A failed target in another job must not fire the Rootyard page.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="rootyard-metrics",instance="127.0.0.1:9108"}'
+        values: '1 1 1'
+      - series: 'up{job="unrelated-metrics",instance="127.0.0.1:9200"}'
+        values: '1 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: RootyardMetricsScrapeFailed
+        exp_alerts: []

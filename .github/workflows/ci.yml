@@ -139,6 +139,9 @@ jobs:
         run: python3 tests/ci_source_pins.py --binary target/debug/rootyard --report test-results/ci-source-pins.json
       - name: Exercise isolated job checkout authorization and object closure
         run: python3 tests/ci_job_checkouts.py --binary target/debug/rootyard --report test-results/ci-job-checkouts.json
+      - name: Exercise exact pinned dependency checkout and origin fallback boundaries
+        timeout-minutes: 20
+        run: python3 tests/ci_dependencies.py --binary target/debug/rootyard --report test-results/ci-dependencies.json
       - name: Build frozen schema007 binary for genuine legacy restore
         run: |
           legacy=08b10e9976c012343c48e4fd6a5981e0266b8c53
@@ -295,6 +298,16 @@ jobs:
       - name: Exercise structured worker-operation diagnostics isolation
         timeout-minutes: 5
         run: python3 tests/worker_diagnostics.py --binary target/debug/rootyard --report test-results/worker-diagnostics.json
+      - name: Exercise LFS read amplification, verification coalescing, and offline remote reads
+        timeout-minutes: 10
+        env:
+          ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
+        run: python3 tests/lfs_read_amplification.py --binary target/debug/rootyard --report test-results/lfs-read-amplification.json
+      - name: Exercise LFS split-transaction races, post-hydration re-authorization, and repair deduplication
+        timeout-minutes: 10
+        env:
+          ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
+        run: python3 tests/lfs_split_tx_races.py --binary target/debug/rootyard --report test-results/lfs-split-tx-races.json
       - name: Exercise sharded control-plane placement, lease/epoch fencing, and explicit refusal of unmeasured failover, rebalance and DR
         run: python3 tests/sharding.py --binary target/debug/rootyard --report test-results/sharding.json
       - name: Exercise shard marker transition crash/rollback and restart reconciliation
@@ -323,8 +336,14 @@ jobs:
             --report web_detail_pagination=test-results/web-detail-pagination.json \
             --report web_repository_pagination=test-results/web-repository-pagination.json \
             --report worker_diagnostics=test-results/worker-diagnostics.json \
+            --report lfs_read_amplification=test-results/lfs-read-amplification.json \
+            --report lfs_split_tx_races=test-results/lfs-split-tx-races.json \
             --report webhooks=test-results/webhooks.json \
             --report browse=test-results/browse.json \
+            --report ci_mirror=test-results/ci-mirror.json \
+            --report ci_source_pins=test-results/ci-source-pins.json \
+            --report ci_job_checkouts=test-results/ci-job-checkouts.json \
+            --report ci_dependencies=test-results/ci-dependencies.json \
             --report shard_marker_transitions=test-results/shard-marker-transitions.json \
             --require-case shard_marker_transitions=takeover-after-source-marker \
             --require-case shard_marker_transitions=fence-audit-rollback \
@@ -345,6 +364,10 @@ jobs:
             --log-marker "webhook_regressions=verified TLS and plaintext rejection: passed" \
             --log-marker "webhook_regressions=untrusted certificate rejected:" \
             --harness tests/web_sessions.py \
+            --harness tests/ci_dependencies.py \
+            --harness tests/ci_job_checkouts.py \
+            --harness tests/ci_source_pins.py \
+            --harness tests/ci_mirror.py \
             --harness tests/metrics.py \
             --harness tests/webhook_worker_recovery.py \
             --harness tests/webhook_fairness.py \
@@ -363,6 +386,10 @@ jobs:
             --harness tests/web_detail_pagination.py \
             --harness tests/web_repository_pagination.py \
             --harness tests/worker_diagnostics.py \
+            --harness tests/lfs.py \
+            --harness tests/lfs_remote_contract.py \
+            --harness tests/lfs_read_amplification.py \
+            --harness tests/lfs_split_tx_races.py \
             --harness tests/webhooks.py \
             --harness tests/webhook_pagination.py \
             --harness tests/webhook_pr_sync.py \
@@ -381,12 +408,26 @@ jobs:
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing \
+            --require-case lfs_read_amplification=read_amplification_and_offline_remote \
+            --require-case lfs_split_tx_races=split_tx_races_reauth_and_repair_dedup \
             --require-case browse=protected_writes_and_ref_ack_failure \
             --require-case browse=ref_transaction_settlement_recovery \
             --require-case browse=ref_transaction_crash_recovery \
             --require-case browse=ref_scale_complete_traversal \
             --require-case browse=mixed_protected_unprotected_atomic_push \
             --require-case browse=mixed_protected_unprotected_ref_transaction \
+            --require-case ci_mirror=sync_and_pinned_clone \
+            --require-case ci_source_pins=source_retention_before_first_sync \
+            --require-case ci_job_checkouts=setup_checkout \
+            --require-case ci_dependencies=missing_or_corrupt_dependency_blocks_ready \
+            --require-case ci_dependencies=prepared_mirror_nested_lfs_checkout \
+            --require-case ci_dependencies=unauthorized_dependency_source_is_rejected \
+            --require-case ci_dependencies=dependency_credentials_are_scope_bound \
+            --require-case ci_dependencies=moved_submodule_branch_keeps_pinned_gitlink \
+            --require-case ci_dependencies=cancellation_revokes_all_dependency_credentials \
+            --require-case ci_dependencies=integration_claim_prepares_exact_dependencies \
+            --require-case ci_dependencies=origin_fallback_dependency_credential_boundaries \
+            --require-case ci_dependencies=unsafe_gitmodules_url_receives_no_credentials \
             --fixture rust="$(rustc -V)" \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \
