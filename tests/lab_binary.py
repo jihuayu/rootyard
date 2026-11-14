@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import stat
 import sys
 
 TESTS = Path(__file__).resolve().parent
@@ -67,6 +68,37 @@ def _fail(env_name: str, purpose: str, detail: str) -> LabBinaryError:
     )
 
 
+def _require_no_symlink_components(path: Path, env_name: str, purpose: str) -> None:
+    """Reject an environment path that reaches the artifact through an alias.
+
+    ``resolve()`` equality is intentionally not the only check: walking each
+    existing component with ``lstat`` also catches a parent-directory symlink
+    on filesystems whose canonical spelling differs (notably macOS /var).
+    """
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            # A missing suffix is handled by the regular-executable check; it
+            # cannot hide an existing symlink component below this point.
+            return
+        except OSError as error:
+            raise _fail(
+                env_name,
+                purpose,
+                f"{env_name} path component {current} cannot be inspected: {error}",
+            ) from error
+        if stat.S_ISLNK(info.st_mode):
+            raise _fail(
+                env_name,
+                purpose,
+                f"{env_name} must name a canonical path with no symlink "
+                f"components or parent aliases; {current} is a symlink",
+            )
+
+
 def _environment_path(raw, env_name: str, purpose: str) -> Path:
     """Parse a present environment value; never treat blank text as absent."""
     if raw is None or not str(raw).strip():
@@ -77,7 +109,9 @@ def _environment_path(raw, env_name: str, purpose: str) -> Path:
             "silently select the legacy fallback. Unset the variable to use the "
             "legacy prebuilt or set it to an absolute canonical artifact",
         )
-    return _absolute_environment_path(str(raw).strip(), env_name, purpose)
+    path = _absolute_environment_path(str(raw).strip(), env_name, purpose)
+    _require_no_symlink_components(path, env_name, purpose)
+    return path
 
 
 def _legacy_path(legacy) -> Path | None:
@@ -114,6 +148,66 @@ def _explicit_path(raw, env_name: str, purpose: str) -> Path:
         # caller-supplied path is relative to the invoking process, not to PATH.
         path = (Path.cwd() / path).resolve()
     return path
+
+
+def _canonical_selected_path(path: Path, env_name: str, purpose: str) -> Path:
+    """Return the bound canonical file for explicit/legacy caller selections.
+
+    Explicit caller paths and the documented legacy fallback keep their
+    existing meaning, but execution and receipt lookup use the resolved target
+    rather than a mutable alias spelling.
+    """
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise _fail(
+            env_name,
+            purpose,
+            f"selected lab binary path {path} cannot be canonicalized: {error}",
+        ) from error
+
+
+def _legacy_candidate_present(legacy_path: Path, env_name: str, purpose: str) -> bool:
+    """True when a legacy candidate exists; dangling aliases are malformed."""
+    try:
+        legacy_path.lstat()
+    except FileNotFoundError:
+        # The final path is absent.  Walk existing parents only to distinguish
+        # a genuinely absent candidate from a dangling symlink component.
+        current = legacy_path.parent
+        while current != current.parent:
+            try:
+                current.lstat()
+            except FileNotFoundError:
+                current = current.parent
+                continue
+            except OSError as error:
+                raise _fail(
+                    env_name,
+                    purpose,
+                    f"legacy prebuilt path component {current} cannot be inspected: {error}",
+                ) from error
+            if current.is_symlink() and not current.exists():
+                raise _fail(
+                    env_name,
+                    purpose,
+                    f"legacy prebuilt path contains a dangling symlink component: {current}",
+                )
+            break
+        return False
+    except OSError as error:
+        raise _fail(
+            env_name,
+            purpose,
+            f"legacy prebuilt path {legacy_path} cannot be inspected: {error}",
+        ) from error
+    if legacy_path.is_symlink() and not legacy_path.exists():
+        raise _fail(
+            env_name,
+            purpose,
+            f"legacy prebuilt path is a dangling symlink: {legacy_path}",
+        )
+    return True
 
 
 def _selected_path(
@@ -183,6 +277,8 @@ def resolve_lab_binary(
         environ=environ,
         purpose=purpose,
     )
+    if not from_environment:
+        path = _canonical_selected_path(path, env_name, purpose)
     _require_regular_executable(path, env_name, purpose)
     binding = None
     if bind:
@@ -240,7 +336,7 @@ def resolve_optional_lab_binary(
             bind=bind,
         )
     legacy_path = _legacy_path(legacy)
-    if legacy_path is None or not legacy_path.exists():
+    if legacy_path is None or not _legacy_candidate_present(legacy_path, env_name, purpose):
         return None
     return resolve_lab_binary(
         env_name,

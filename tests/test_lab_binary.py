@@ -19,7 +19,9 @@ class LabBinarySelectorTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="rootyard-lab-binary-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # Resolve the macOS /var (and equivalent /tmp) meta-symlink once so
+        # positive fixtures are genuinely canonical component-by-component.
+        self.root = Path(self.temporary.name).resolve()
 
     def binary(self, name="rootyard-view-lab"):
         path = self.root / name
@@ -156,6 +158,55 @@ class LabBinarySelectorTest(unittest.TestCase):
             )
         binder.assert_not_called()
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_symlinked_parent_environment_alias_is_rejected_before_binding(self):
+        real_parent = self.root / "real-parent"
+        real_parent.mkdir()
+        canonical = real_parent / "rootyard-view-lab"
+        canonical.write_bytes(b"prebuilt lab fixture")
+        canonical.chmod(0o755)
+        alias_parent = self.root / "alias-parent"
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+        binder = mock.Mock(side_effect=AssertionError("binder must not run"))
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            with self.assertRaisesRegex(
+                lab_binary.LabBinaryError,
+                "no symlink components or parent aliases",
+            ) as caught:
+                lab_binary.resolve_lab_binary(
+                    "ROOTYARD_VIEW_LAB_BIN",
+                    environ={"ROOTYARD_VIEW_LAB_BIN": str(alias_parent / canonical.name)},
+                    binder=binder,
+                )
+        self.assertIn("alias-parent", str(caught.exception))
+        binder.assert_not_called()
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_explicit_caller_alias_is_canonicalized_before_binding(self):
+        real_parent = self.root / "real-parent-explicit"
+        real_parent.mkdir()
+        canonical = real_parent / "rootyard-view-lab"
+        canonical.write_bytes(b"prebuilt lab fixture")
+        canonical.chmod(0o755)
+        alias_parent = self.root / "alias-parent-explicit"
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+        binder = mock.Mock(return_value={"attested": True})
+        selected = lab_binary.resolve_lab_binary(
+            "ROOTYARD_VIEW_LAB_BIN",
+            explicit=alias_parent / canonical.name,
+            environ={},
+            binder=binder,
+        )
+        self.assertEqual(selected.path, canonical.resolve())
+        self.assertFalse(selected.from_environment)
+        binder.assert_called_once_with(
+            canonical.resolve(),
+            expected_commit=None,
+            environ={},
+        )
+
     def test_missing_environment_artifact_hardfails_with_preparation_instruction(self):
         missing = self.root / "missing-lab"
         binder = mock.Mock(side_effect=AssertionError("binder must not run"))
@@ -223,13 +274,47 @@ class LabBinarySelectorTest(unittest.TestCase):
         self.assertIsNone(selected)
 
     def test_optional_selector_still_hardfails_for_configured_missing_env(self):
-        with self.assertRaisesRegex(lab_binary.LabBinaryError, "missing or not executable"):
-            lab_binary.resolve_optional_lab_binary(
-                "ROOTYARD_PANDO_LAB_BIN",
-                legacy=self.binary("legacy-lab"),
-                environ={"ROOTYARD_PANDO_LAB_BIN": str(self.root / "absent-lab")},
-                binder=mock.Mock(side_effect=AssertionError("binder must not run")),
-            )
+        binder = mock.Mock(side_effect=AssertionError("binder must not run"))
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            with self.assertRaisesRegex(lab_binary.LabBinaryError, "missing or not executable"):
+                lab_binary.resolve_optional_lab_binary(
+                    "ROOTYARD_PANDO_LAB_BIN",
+                    legacy=self.binary("legacy-lab"),
+                    environ={"ROOTYARD_PANDO_LAB_BIN": str(self.root / "absent-lab")},
+                    binder=binder,
+                )
+        binder.assert_not_called()
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_optional_selector_rejects_dangling_legacy_alias_as_malformed(self):
+        dangling_final = self.root / "dangling-legacy"
+        dangling_final.symlink_to(self.root / "missing-legacy-target")
+        dangling_parent = self.root / "dangling-parent"
+        dangling_parent.symlink_to(self.root / "missing-parent-target", target_is_directory=True)
+        candidates = (
+            ("final", dangling_final),
+            ("parent", dangling_parent / "rootyard-pando-lab"),
+        )
+        for label, candidate in candidates:
+            with self.subTest(component=label):
+                binder = mock.Mock(side_effect=AssertionError("binder must not run"))
+                with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+                    with self.assertRaisesRegex(
+                        lab_binary.LabBinaryError,
+                        "dangling symlink",
+                    ) as caught:
+                        lab_binary.resolve_optional_lab_binary(
+                            "ROOTYARD_PANDO_LAB_BIN",
+                            legacy=candidate,
+                            environ={},
+                            binder=binder,
+                        )
+                self.assertIn("explicit native build preparation", str(caught.exception))
+                binder.assert_not_called()
+                run.assert_not_called()
+                popen.assert_not_called()
 
     def test_optional_selector_binds_present_legacy_prebuilt(self):
         legacy = self.binary("legacy-lab")
