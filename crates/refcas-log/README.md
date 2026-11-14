@@ -18,7 +18,7 @@ ID. `log_entry` stores the index and JSON for the native log ID and entry.
 Both tables store SHA-256 checksums over length-prefixed fields with separate
 metadata and entry domains. Reads verify checksums before decoding. Opening
 validates metadata, identity, the final entry, retained-index density from the
-correct lower bound through the tail, and, when not covered by the purge
+correct lower bound through the tail, and, when not validly covered by the purge
 boundary, the exact row named by the committed log ID; it does not decode every
 historical entry. SQLite `quick_check` remains optional. Unknown formats,
 corruption and identity mismatch cause errors without resetting the database.
@@ -95,18 +95,24 @@ startup cost is the price of refusing a store with an internal missing row befor
 a separate optional O(N) check.
 
 Opening also validates the optional committed log ID against the retained log.
-A committed row may be absent only when `committed.index <= purged.index`; that
-is the legitimate snapshot-style ordering in which persisted committed metadata
-lags an advancing purge boundary. Otherwise the row at the committed index must
-exist with the exact committed `LogId`, because only purge removes a committed
-row, append never rewrites one, and truncate refuses through it. Thus
+A committed row may be absent when the purge boundary strictly covers it: a
+boundary after `committed.index` is the legitimate snapshot-style ordering in
+which persisted committed metadata lags an advancing purge boundary. At the
+same index the boundary must name the exact committed `LogId`, because the index
+alone does not identify a Raft entry. Otherwise the row at the committed index
+must exist with the exact committed `LogId`, because only purge removes a
+committed row, append never rewrites one, and truncate refuses through it. Thus
 `committed Some + last None` with no purge boundary is known loss and is refused,
-as are a committed index ahead of the retained tail and a committed row that is
-missing or carries another `LogId`. `save_committed(Some(c))` applies the same
-check before writing and `append` validates the current state before extending,
-so a successful API write cannot create the refused state; `save_committed(None)`
-stays allowed. Deleting every `log_entry` row while retaining committed metadata
-is the regression that must fail `open`. Refusal is not a reset, migration, or a
+as are a committed index ahead of the retained tail, a committed row that is
+missing or carries another `LogId`, and a same-index purge boundary that carries
+another `LogId`. `save_committed(Some(c))` applies the same check before writing
+and `append` validates the current state before extending, so a successful API
+write cannot create the refused state; `save_committed(None)` stays allowed.
+`purge` also validates the already persisted witness and refuses a
+caller-supplied boundary that disagrees with the committed ID, a retained row,
+or the persisted boundary at the same index, before deleting rows or writing
+metadata. Deleting every `log_entry` row while retaining committed metadata is
+the regression that must fail `open`. Refusal is not a reset, migration, or a
 zero-loss claim: the database is left unchanged.
 
 The startup check cannot prove absence of loss without an independent witness.
@@ -126,9 +132,11 @@ depth and can still fail when a request's known lower bound intersects a lost
 row, but they do not repair or infer a missing witness.
 
 This checkpoint therefore establishes bounded startup refusal for internal holes,
-purge-successor gaps, and committed rows that no retained row or covering purge
-boundary can satisfy, not a whole-log physical-loss guarantee. A nontrivial
-independent witness would need its own format/API checkpoint; none is added here.
+purge-successor gaps, and committed rows that no retained row or valid covering
+purge boundary can satisfy, not a whole-log physical-loss guarantee. A boundary
+strictly after the commit remains valid lag; one at the same index is valid only
+with the full committed `LogId`. A nontrivial independent witness would need its
+own format/API checkpoint; none is added here.
 
 `purge` is inclusive and writes its `meta` boundary in the same transaction that
 deletes rows, so the only row a purge can leave at the boundary index is one
@@ -155,7 +163,7 @@ cargo clippy --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 cargo test --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 ```
 
-Twenty-seven unit tests in `src/lib.rs` cover restart, exact purge identity,
+Thirty unit tests in `src/lib.rs` cover restart, exact purge identity,
 replay, committed rewrite refusal, holes, truncation, snapshot-style purge,
 bounds, identity/lock refusal, and malformed or valid-JSON corruption. Startup
 contiguity regressions delete a middle live row in a still-valid SQLite database,
@@ -175,7 +183,13 @@ committed row and leaves a later suffix; open still refuses instead of treating
 the survivor as a legal positive-first start. Write/order tests require
 `save_committed` to reject a commit ahead of the tail or with no row/boundary,
 accept a commit covered by a purge boundary, and leave a purge-covered empty log
-reopenable. The older hole tests now delete rows behind a retained handle so the
+reopenable. Equal-index identity regressions save a committed ID, reject a purge
+whose same-index boundary carries another leader, and verify the raw rows and
+metadata are unchanged; they also reject the symmetric retained-row and
+persisted-boundary conflicts, and require `open` to refuse a checksum-valid
+same-index committed/purge mismatch from either side. A greater-index snapshot
+purge over an older committed witness remains accepted with the witness intact
+across reopen. The older hole tests now delete rows behind a retained handle so the
 read-time defense-in-depth checks still run, then require the corresponding fresh
 open to refuse; the fresh-prefix-to-tail deletion remains a successful open when
 no committed witness falls inside the lost prefix, and is explicitly documented
@@ -251,8 +265,8 @@ slice does not complete issues #149 or #115 and has no production routing.
 
 This checkpoint adds bounded startup refusal for a non-dense retained log,
 retains dense positive-first slices with explicit unavailable-prefix refusal,
-and refuses a committed log ID that no retained row or covering purge boundary
-can satisfy, all without changing the on-disk format. It does not implement
+and refuses a committed log ID that no retained row or valid purge boundary can
+satisfy, all without changing the on-disk format. It does not implement
 migration of already-corrupt stores, whole-log physical-loss detection,
 state-machine/snapshot or other independent witnesses, or the rest of #149. A
 refused database is left for operator investigation or restore; it is not

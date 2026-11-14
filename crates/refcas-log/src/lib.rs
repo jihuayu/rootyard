@@ -403,14 +403,17 @@ fn validate_density(conn: &Connection, purged: Option<&LogId<u64>>) -> Res<()> {
 
 /// Refuse committed metadata that the retained log cannot satisfy.
 ///
-/// A committed entry may be absent only when the exact persisted purge boundary covers it
-/// (`committed.index <= purged.index`). That ordering is legitimate: snapshot install can advance
-/// the purge boundary beyond a persisted committed value, and the state machine restores the newer
-/// committed point on startup. `purge` is the only supported operation that removes a committed
-/// row; `append` never rewrites one, and `truncate` refuses through it. So with no covering
-/// boundary, the row at the committed index must exist with the exact committed `LogId`. A missing
-/// row, a different `LogId`, a committed value ahead of the retained tail, or a commit with no
-/// retained row and no purge boundary is known loss, not a valid empty/partial log.
+/// A committed entry may be absent when the persisted purge boundary removed its row. A boundary
+/// strictly after the commit (`purged.index > committed.index`) is the legitimate snapshot-install
+/// ordering: the engine may advance purge beyond older persisted committed metadata, and the state
+/// machine restores the newer committed point on startup. At the *same* index the boundary must
+/// identify the same full `LogId`, because `LogId` includes the leader identity and one index names
+/// one Raft entry. A boundary below the commit does not cover it. `purge` is the only supported
+/// operation that removes a committed row; `append` never rewrites one, and `truncate` refuses
+/// through it. So without valid coverage, the row at the committed index must exist with the exact
+/// committed `LogId`. A missing row, a different `LogId`, a committed value ahead of the retained
+/// tail, or a commit with no retained row and no purge boundary is known loss, not a valid
+/// empty/partial log.
 fn validate_committed(
     conn: &Connection,
     committed: Option<&LogId<u64>>,
@@ -426,19 +429,25 @@ fn validate_committed(
     if c.index > l.index {
         return Err(E::Refused(format!("committed {c} is ahead of last log {l}")));
     }
-    // Purge is inclusive; a boundary at or above the commit legally removed that row. A commit
-    // below the boundary is the snapshot-style lagging-committed case.
-    if purged.is_some_and(|p| p.index >= c.index) {
-        return Ok(());
+    if let Some(p) = purged {
+        if p.index == c.index {
+            if p == c {
+                return Ok(());
+            }
+            return Err(E::Refused(format!("committed {c} conflicts with purge boundary {p} at the same index")));
+        }
+        if p.index > c.index {
+            return Ok(());
+        }
     }
     match read_row(conn, idx_to_i64(c.index)?)? {
         Some((stored, _)) if &stored == c => Ok(()),
         Some((stored, _)) => Err(E::Refused(format!(
             "committed {c} does not match stored log {stored} at its index and no purge boundary covers it"
         ))),
-        None => Err(E::Refused(format!(
-            "committed {c} is missing from the retained log and no purge boundary covers it"
-        ))),
+        None => {
+            Err(E::Refused(format!("committed {c} is missing from the retained log and no purge boundary covers it")))
+        }
     }
 }
 
@@ -665,8 +674,9 @@ impl Inner {
         // smallest stored row, never from an assumed index 0.
         validate_density(&conn, purged.as_ref())?;
         // A persisted commit is evidence that at least its row existed. It may be gone only under
-        // a covering purge boundary; otherwise the exact row must remain, so an all-row deletion
-        // with retained committed metadata is refused rather than mistaken for a fresh empty log.
+        // a valid covering purge boundary (a strictly later index, or the identical equal-index
+        // LogId); otherwise the exact row must remain, so an all-row deletion with retained
+        // committed metadata is refused rather than mistaken for a fresh empty log.
         validate_committed(&conn, committed.as_ref(), purged.as_ref(), last)?;
         Ok(Inner { _lock: lock, conn })
     }
@@ -716,7 +726,8 @@ fn append_entries(inner: &mut Inner, entries: Vec<EntryOf>) -> Res<()> {
     let committed: Option<LogId<u64>> = meta(&tx, K_COMMITTED)?;
     let purged = purged_boundary(&tx)?;
     // Do not extend a state whose persisted commit is already known lost. Valid purge orderings
-    // (a boundary covering the commit, or a commit inside the live log) pass this check.
+    // (a strictly later boundary, the identical equal-index boundary, or a commit inside the live
+    // log) pass this check.
     validate_committed(&tx, committed.as_ref(), purged.as_ref(), last)?;
     if let (Some(first), Some(prev)) = (entries.first(), last) {
         let i = first.get_log_id().index;
@@ -792,10 +803,40 @@ fn truncate_to(inner: &mut Inner, idx: u64) -> Res<()> {
 /// durable purge boundary. Compaction may remove committed logs and may advance past the local
 /// tail (snapshot install). The boundary only moves forward, so an older purge is absorbed but
 /// never makes a newer boundary older; when advancing, the caller's exact `LogId` is stored.
+///
+/// Before deleting anything, validate the committed witness already stored and the caller's
+/// boundary identity. A purge is evidence about one entry, so a different `LogId` at the same index
+/// as the commit, a retained row, or the persisted boundary is refused instead of deleting the
+/// conflicting evidence. A strictly later boundary still covers an older commit as the pinned
+/// snapshot-install ordering. All checks run on the transaction before any row or metadata write.
 fn purge_to(inner: &mut Inner, log_id: LogId<u64>) -> Res<()> {
     let idx = idx_to_i64(log_id.index)?;
     let tx = inner.tx()?;
     let stored: Option<LogId<u64>> = meta(&tx, K_PURGED)?;
+    let committed: Option<LogId<u64>> = meta(&tx, K_COMMITTED)?;
+    let last = read_last(&tx)?;
+    // Do not let a purge erase evidence that the already-persisted state is inconsistent. This is
+    // the same witness check open, append and save_committed(Some) perform.
+    validate_committed(&tx, committed.as_ref(), stored.as_ref(), last)?;
+    if let Some(c) = committed.as_ref()
+        && c.index == log_id.index
+        && *c != log_id
+    {
+        return Err(E::Refused(format!("purge boundary {log_id} conflicts with committed {c} at the same index")));
+    }
+    if let Some(p) = stored.as_ref()
+        && p.index == log_id.index
+        && *p != log_id
+    {
+        return Err(E::Refused(format!(
+            "purge boundary {log_id} conflicts with persisted boundary {p} at the same index"
+        )));
+    }
+    if let Some((row, _)) = read_row(&tx, idx)?
+        && row != log_id
+    {
+        return Err(E::Refused(format!("purge boundary {log_id} conflicts with retained log {row} at the same index")));
+    }
     if stored.as_ref().is_none_or(|p| p.index < log_id.index) {
         set_meta(&tx, K_PURGED, Some(&je(&log_id)?))?;
     }
@@ -1063,8 +1104,10 @@ mod tests {
             let mut s = open(&rt, dir.path());
             rt.block_on(s.save_vote(&Vote::new(3, 7))).unwrap();
             append_ok(&rt, &s, vec![blank(2, 0), normal(2, 1, b"a"), normal(2, 2, b"b")]);
+            // The purge boundary names the committed entry exactly: same index, same full LogId.
+            // A same-index boundary with another leader is a conflicting entry, not coverage.
             rt.block_on(s.save_committed(Some(lid(2, 1)))).unwrap();
-            let purge_at = LogId::new(CommittedLeaderId::new(2, 5), 1);
+            let purge_at = lid(2, 1);
             rt.block_on(s.purge(purge_at)).unwrap();
             assert_eq!(
                 state(&rt, &mut s),
@@ -1075,7 +1118,7 @@ mod tests {
         assert_eq!(rt.block_on(s.read_vote()).unwrap(), Some(Vote::new(3, 7)));
         assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(2, 1)));
         let st = state(&rt, &mut s);
-        assert_eq!(st.last_purged_log_id, Some(LogId::new(CommittedLeaderId::new(2, 5), 1)), "exact native LogId");
+        assert_eq!(st.last_purged_log_id, Some(lid(2, 1)), "exact native LogId");
         assert_eq!(st.last_log_id, Some(lid(2, 2)));
         assert_eq!(logs(&rt, &mut s, 0..10), vec![normal(2, 2, b"b")]);
     }
@@ -1509,17 +1552,37 @@ mod tests {
         assert!(rt.block_on(s.try_get_log_entries(0..6000)).unwrap().is_empty());
     }
 
-    /// Pins the purge boundary with a matching meta checksum (upsert).
-    fn set_purged(dir: &Path, boundary: LogId<u64>) {
-        let value = je(&boundary).unwrap();
-        let hash = checksum(&[b"meta", K_PURGED.as_bytes(), value.as_bytes()]);
+    /// Upserts a metadata value with its matching checksum, as a direct-SQL corruption would.
+    fn set_meta_value(dir: &Path, key: &str, value: &str) {
+        let hash = checksum(&[b"meta", key.as_bytes(), value.as_bytes()]);
         Connection::open(dir.join(DB_FILE))
             .unwrap()
             .execute(
                 "INSERT INTO meta(k, v, checksum) VALUES(?1, ?2, ?3) ON CONFLICT(k) DO UPDATE SET v=excluded.v, checksum=excluded.checksum",
-                (K_PURGED, &value, hash),
+                (key, value, hash),
             )
             .unwrap();
+    }
+    /// Pins the purge boundary with a matching meta checksum (upsert).
+    fn set_purged(dir: &Path, boundary: LogId<u64>) {
+        set_meta_value(dir, K_PURGED, &je(&boundary).unwrap());
+    }
+    /// Pins the committed log ID with a matching meta checksum (upsert).
+    fn set_committed(dir: &Path, committed: LogId<u64>) {
+        set_meta_value(dir, K_COMMITTED, &je(&committed).unwrap());
+    }
+    /// Raw rows and committed/purged metadata, for proving a refusal changed neither.
+    fn stored_state(dir: &Path) -> (Vec<i64>, Option<String>, Option<String>) {
+        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        let rows: Vec<i64> = conn
+            .prepare("SELECT idx FROM log_entry ORDER BY idx")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let get = |key: &str| conn.query_row("SELECT v FROM meta WHERE k=?1", [key], |r| r.get(0)).ok();
+        (rows, get(K_COMMITTED), get(K_PURGED))
     }
     /// Replaces a row's whole `LogId` (leader id included) with valid, checksum-consistent data.
     fn rewrite_row(dir: &Path, idx: u64, new_id: LogId<u64>) {
@@ -2112,8 +2175,7 @@ mod tests {
             let rows: i64 = conn.query_row("SELECT count(*) FROM log_entry", [], |r| r.get(0)).unwrap();
             let commits: i64 =
                 conn.query_row("SELECT count(*) FROM meta WHERE k=?1", [K_COMMITTED], |r| r.get(0)).unwrap();
-            let purges: i64 =
-                conn.query_row("SELECT count(*) FROM meta WHERE k=?1", [K_PURGED], |r| r.get(0)).unwrap();
+            let purges: i64 = conn.query_row("SELECT count(*) FROM meta WHERE k=?1", [K_PURGED], |r| r.get(0)).unwrap();
             let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap();
             assert_eq!((rows, commits, purges), (0, 1, 0), "valid SQLite kept committed metadata");
             assert_eq!(check, "ok");
@@ -2187,14 +2249,146 @@ mod tests {
         append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
         rt.block_on(s.save_committed(Some(lid(1, 4)))).unwrap();
         rt.block_on(s.purge(lid(1, 4))).unwrap();
+        // save_committed shares the identity rule: another LogId at the boundary index is refused
+        // and leaves the exact equal-index witness in place.
+        let err = rt
+            .block_on(s.save_committed(Some(LogId::new(CommittedLeaderId::new(2, 5), 4))))
+            .expect_err("save_committed accepted a conflicting same-index purge boundary");
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts with purge boundary") && msg.contains("at the same index"), "{msg}");
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 4)), "refused save kept the witness");
         drop(s);
         delete_rows(dir.path(), "DELETE FROM log_entry");
         let mut s = open(&rt, dir.path());
-        assert_eq!(
-            state(&rt, &mut s),
-            LogState { last_purged_log_id: Some(lid(1, 4)), last_log_id: Some(lid(1, 4)) }
-        );
+        assert_eq!(state(&rt, &mut s), LogState { last_purged_log_id: Some(lid(1, 4)), last_log_id: Some(lid(1, 4)) });
         assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 4)));
         assert!(rt.block_on(s.try_get_log_entries(0..10)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn purge_rejects_equal_index_identity_conflicts_without_mutation() {
+        let rt = rt();
+
+        // The committed entry pins its index. A same-index boundary with another leader must not
+        // delete the acknowledged row or record a boundary that could later excuse its absence.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, vec![blank(1, 0), normal(1, 1, b"a"), normal(1, 2, b"b")]);
+        rt.block_on(s.save_committed(Some(lid(1, 1)))).unwrap();
+        let before = stored_state(dir.path());
+        let err = rt
+            .block_on(s.purge(LogId::new(CommittedLeaderId::new(2, 5), 1)))
+            .expect_err("purge accepted a conflicting LogId at the committed index");
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts with committed") && msg.contains("at the same index"), "{msg}");
+        assert_eq!(stored_state(dir.path()), before, "refused purge mutated rows or metadata");
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 1)));
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (None, Some(lid(1, 2))));
+        assert_eq!(
+            logs(&rt, &mut s, 0..3),
+            vec![blank(1, 0), normal(1, 1, b"a"), normal(1, 2, b"b")],
+            "acknowledged rows remain readable"
+        );
+
+        // A retained row at the supplied boundary is also a hard identity conflict. The committed
+        // row is below it, so only the row check can reject this call.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, vec![blank(1, 0), normal(1, 1, b"a"), normal(1, 2, b"b")]);
+        rt.block_on(s.save_committed(Some(lid(1, 1)))).unwrap();
+        let before = stored_state(dir.path());
+        let err = rt
+            .block_on(s.purge(LogId::new(CommittedLeaderId::new(2, 5), 2)))
+            .expect_err("purge accepted a conflicting LogId at a retained row");
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts with retained log") && msg.contains("at the same index"), "{msg}");
+        assert_eq!(stored_state(dir.path()), before, "refused purge mutated rows or metadata");
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (None, Some(lid(1, 2))));
+        assert_eq!(logs(&rt, &mut s, 0..3).len(), 3);
+
+        // The already persisted boundary pins the same identity even after the row is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, vec![blank(1, 0), normal(1, 1, b"a")]);
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        let before = stored_state(dir.path());
+        let err = rt
+            .block_on(s.purge(LogId::new(CommittedLeaderId::new(2, 5), 1)))
+            .expect_err("purge accepted a conflicting LogId at the persisted boundary");
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts with persisted boundary") && msg.contains("at the same index"), "{msg}");
+        assert_eq!(stored_state(dir.path()), before, "refused purge mutated rows or metadata");
+    }
+
+    #[test]
+    fn open_refuses_equal_index_committed_purge_mismatch() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, vec![blank(1, 0), normal(1, 1, b"a"), normal(1, 2, b"b")]);
+        rt.block_on(s.save_committed(Some(lid(1, 1)))).unwrap();
+        rt.block_on(s.purge(lid(1, 1))).unwrap();
+        drop(s);
+        // The matching boundary and witness are valid before the database is corrupted.
+        let mut s = open(&rt, dir.path());
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 1)));
+        let st = state(&rt, &mut s);
+        assert_eq!((st.last_purged_log_id, st.last_log_id), (Some(lid(1, 1)), Some(lid(1, 2))));
+        drop(s);
+        let pristine = copy_fixture(dir.path());
+        let bad = LogId::new(CommittedLeaderId::new(2, 5), 1);
+
+        // A checksum-valid purge boundary with the committed index but another leader must not
+        // reopen: index-only coverage would report the acknowledged entry as legally purged.
+        set_purged(dir.path(), bad);
+        let before = stored_state(dir.path());
+        for check in [true, false] {
+            let err = match rt.block_on(PersistentLog::open(dir.path(), 7, check)) {
+                Ok(_) => panic!("startup accepted a conflicting same-index purge boundary"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("conflicts with purge boundary") && err.contains("at the same index"), "{err}");
+        }
+        assert_eq!(stored_state(dir.path()), before, "refused open mutated rows or metadata");
+
+        // The symmetric corruption, a conflicting committed witness at the boundary's index, is
+        // refused by the same full-identity rule.
+        set_committed(pristine.path(), bad);
+        let before = stored_state(pristine.path());
+        for check in [true, false] {
+            let err = match rt.block_on(PersistentLog::open(pristine.path(), 7, check)) {
+                Ok(_) => panic!("startup accepted a conflicting same-index committed log ID"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("conflicts with purge boundary") && err.contains("at the same index"), "{err}");
+        }
+        assert_eq!(stored_state(pristine.path()), before, "refused open mutated rows or metadata");
+    }
+
+    #[test]
+    fn greater_index_purge_accepts_older_committed_witness() {
+        let rt = rt();
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(&rt, dir.path());
+        append_ok(&rt, &s, (0..5).map(|i| blank(1, i)).collect());
+        rt.block_on(s.save_committed(Some(lid(1, 2)))).unwrap();
+        // Snapshot installation may advance purge past an older persisted committed witness.
+        let snap = LogId::new(CommittedLeaderId::new(5, 9), 7);
+        rt.block_on(s.purge(snap)).unwrap();
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 2)), "older witness retained");
+        assert_eq!(state(&rt, &mut s), LogState { last_purged_log_id: Some(snap), last_log_id: Some(snap) });
+        assert!(rt.block_on(s.try_get_log_entries(0..10)).unwrap().is_empty());
+        drop(s);
+        let mut s = open(&rt, dir.path());
+        assert_eq!(rt.block_on(s.read_committed()).unwrap(), Some(lid(1, 2)), "reopen keeps the witness");
+        assert_eq!(
+            state(&rt, &mut s),
+            LogState { last_purged_log_id: Some(snap), last_log_id: Some(snap) },
+            "greater-index snapshot lag remains accepted"
+        );
+        append_ok(&rt, &s, vec![blank(5, 8)]);
+        assert_eq!(state(&rt, &mut s).last_log_id, Some(lid(5, 8)));
     }
 }
