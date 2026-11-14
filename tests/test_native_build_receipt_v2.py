@@ -920,6 +920,116 @@ class ProducerHelperTest(ReceiptFixture):
                     receipts.require_build_finished(events)
 
 
+class ToolchainProbeEnvironmentTest(ReceiptFixture):
+    """Default probe subprocesses receive exactly the caller's environ."""
+
+    def fake_which(self, name, path=None):
+        self.assertEqual(path, "/test/path")
+        if name in ("cargo", "rustc", "rustup"):
+            return str(self.root / "toolchain" / name)
+        return None
+
+    def probe_result(self, command, *, release="1.99.1"):
+        executable = Path(command[0]).name
+        if executable == "cargo":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "cargo 1.101.0 (64a6ee6a 2026-01-01)\n"
+                    "release: 1.101.0\n"
+                    f"commit-hash: {CARGO_FORK_COMMIT}\n"
+                    "commit-date: 2026-01-01\n"
+                    f"host: {TARGET_TRIPLE}\n"
+                ),
+            )
+        if executable == "rustc":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"rustc {release} (deadbeef 2025-01-01)\n"
+                    f"release: {release}\n"
+                    f"commit-hash: {RUSTC_COMMIT}\n"
+                    "commit-date: 2025-01-01\n"
+                    f"host: {TARGET_TRIPLE}\n"
+                ),
+            )
+        if executable == "rustup":
+            return SimpleNamespace(
+                returncode=0, stdout=str(self.root / "toolchain/rustc") + "\n"
+            )
+        raise AssertionError(command)
+
+    def test_default_runner_receives_the_exact_supplied_normalized_environment(self):
+        supplied = {"PATH": "/test/path", "CARGO_TARGET_DIR": "/shared/target"}
+        ambient = {
+            "PATH": "/ambient/path",
+            "RUSTUP_TOOLCHAIN": "SENTINEL-AMBIENT-TOOLCHAIN",
+            "RUSTUP_HOME": "/ambient/rustup",
+        }
+        seen = []
+
+        def fake_run(command, **kwargs):
+            seen.append((list(command), kwargs))
+            return self.probe_result(command)
+
+        with mock.patch.object(receipts.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(receipts.os, "environ", ambient):
+            toolchain = receipts.probe_toolchain(
+                self.root, environ=supplied, which=self.fake_which
+            )
+
+        self.assertEqual(len(seen), 3)
+        for command, kwargs in seen:
+            self.assertEqual(kwargs["env"], supplied)
+            self.assertIsNot(kwargs["env"], receipts.os.environ)
+            self.assertNotIn("RUSTUP_TOOLCHAIN", kwargs["env"])
+            self.assertNotIn("CARGO_BUILD_JOBS", kwargs["env"])
+            self.assertEqual(kwargs["cwd"], self.root)
+            self.assertIn(command, (
+                [str(self.root / "toolchain/cargo"), "-vV"],
+                [str(self.root / "toolchain/rustc"), "-vV"],
+                [str(self.root / "toolchain/rustup"), "which", "rustc"],
+            ))
+        self.assertIs(toolchain["rustc"]["proxy"], False)
+
+    def test_probe_refuses_a_raw_jobs_environment_without_running_a_tool(self):
+        sentinel = {"PATH": "/test/path", "CARGO_BUILD_JOBS": "2"}
+        with mock.patch.object(receipts.subprocess, "run", side_effect=AssertionError("run")), \
+                mock.patch.object(receipts.shutil, "which", side_effect=AssertionError("which")):
+            with self.assertRaises(receipts.ReceiptError) as caught:
+                receipts.probe_toolchain(self.root, environ=sentinel)
+        self.assertIn("CARGO_BUILD_JOBS", str(caught.exception))
+
+    def test_direct_rustc_must_match_an_exact_pinned_channel(self):
+        toolchain = receipts.probe_toolchain(
+            self.root,
+            environ={"PATH": "/test/path"},
+            which=self.fake_which,
+            run=self.probe_result,
+        )
+        self.assertIs(toolchain["rustc"]["proxy"], False)
+        self.assertEqual(toolchain["rustc"]["release"], "1.99.1")
+
+        self.write("rust-toolchain.toml", '[toolchain]\nchannel = "1.98.0"\n')
+        with self.assertRaises(receipts.ReceiptError) as caught:
+            receipts.probe_toolchain(
+                self.root,
+                environ={"PATH": "/test/path"},
+                which=self.fake_which,
+                run=self.probe_result,
+            )
+        self.assertIn("pinned channel", str(caught.exception))
+
+        self.write("rust-toolchain.toml", '[toolchain]\nchannel = "stable"\n')
+        symbolic = receipts.probe_toolchain(
+            self.root,
+            environ={"PATH": "/test/path"},
+            which=self.fake_which,
+            run=self.probe_result,
+        )
+        self.assertEqual(symbolic["pinned_channel"], "stable")
+
+
 class RustupProxyToolchainTest(ReceiptFixture):
     """Realistic Linux layout: PATH rustc is a symlink to the rustup binary."""
 

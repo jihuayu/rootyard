@@ -793,11 +793,26 @@ def probe_toolchain(root, environ=None, which=None, run=None):
 
     The only subprocesses issued are ``cargo -vV``, ``rustc -vV`` and
     ``rustup which rustc`` (the latter when rustup is available or needed).
+    The default runner passes the caller-supplied ``environ`` mapping verbatim
+    as the subprocess environment, after the same name-only compiler/config
+    guard used by :func:`capture_bound_inputs`; it never merges or inherits the
+    process environment.  An exact version pin is checked against the rustc
+    that is actually selected, whether direct or rustup-proxied.
     """
     root = Path(root).resolve()
     env = os.environ if environ is None else environ
+    reject_passthrough_environment(env)
     which = which or shutil.which
-    run = run or (lambda command: subprocess.run(command, cwd=root, capture_output=True, text=True, check=False))
+    run = run or (
+        lambda command: subprocess.run(
+            command,
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    )
     search_path = env.get("PATH", "")
 
     cargo_path = which("cargo", path=search_path)
@@ -865,13 +880,13 @@ def probe_toolchain(root, environ=None, which=None, run=None):
         )
 
     channel, pin_source = _pinned_channel(root)
-    if rustc_proxy and channel:
+    if channel:
         pinned_release = re.match(r"^([0-9]+\.[0-9]+\.[0-9]+)(?:[-+].*)?$", channel)
         if pinned_release:
             _require(
                 rustc["release"] == pinned_release.group(1),
                 "toolchain",
-                f"rustup-selected rustc release {rustc['release']!r} does not match "
+                f"selected rustc release {rustc['release']!r} does not match "
                 f"pinned channel {channel!r}",
             )
 
