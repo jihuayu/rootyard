@@ -37,13 +37,13 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
-    task::JoinHandle,
+    task::{JoinError, JoinHandle, JoinSet},
     time::timeout,
 };
 use uuid::Uuid;
 
 use super::{
-    BlobBackendIdentity, BlobDeletePolicy, BlobError, BlobLocator, BlobProvider,
+    BlobBackendIdentity, BlobDeletePolicy, BlobError, BlobLocator, BlobProvider, BlobReceipt,
     budget::{LEASE_UNIT_BYTES, ResourceContext, ResourceLimits},
     config::BlobProfile,
     opendal::{BlobStore, MAX_RANGE_BYTES},
@@ -297,14 +297,14 @@ async fn real_provider_publish_verify_range_delete_contract() {
             Err(BlobError::DigestMismatch { .. })
         ));
         assert!(!bad_destination.exists());
-        raw.delete(&first.path()).await.unwrap_or_else(|e| panic!("fixture delete failed ({})", e.kind()));
+        assert!(fixture_delete(&raw, &first.path()).await, "fixture delete failed or timed out within its deadline");
         independent.verify(&second, deadline()).await.expect("late old-attempt delete must preserve the new attempt");
     })
     .catch_unwind()
     .await;
     let mut cleanup_ok = true;
     for key in owned_keys {
-        if raw.delete(&key).await.is_err() {
+        if !fixture_delete(&raw, &key).await {
             cleanup_ok = false;
         }
     }
@@ -357,16 +357,19 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
     let timeout_case_budget = (provider_wait / 2).min(Duration::from_secs(10));
     let mut owned_keys: Vec<String> = Vec::new();
     let mut contexts: Vec<Arc<ResourceContext>> = Vec::new();
+    let mut upload_tasks = UploadTasks::new();
+    let mut gates: Vec<RealProviderFaultGate> = Vec::new();
 
     let outcome = AssertUnwindSafe(async {
         // --- Absolute deadline while the real backend PUT has already answered.
-        let gate = RealProviderFaultGate::start(&endpoint).await;
+        let gate_index = gates.len();
+        gates.push(RealProviderFaultGate::start(&endpoint).await);
         let resources = Arc::new(ResourceContext::new(limits));
         contexts.push(Arc::clone(&resources));
         let real = BlobStore::open_with_resources(profile.clone(), Arc::clone(&resources))
             .expect("real provider must pass the startup capability gate");
         let proxied = BlobStore::open_with_resources(
-            profile.clone().with_test_endpoint(gate.endpoint()).expect("fault gate endpoint is a valid origin"),
+            profile.clone().with_test_endpoint(gates[gate_index].endpoint()).expect("fault gate endpoint is a valid origin"),
             Arc::clone(&resources),
         )
         .expect("proxied provider must pass the startup capability gate");
@@ -374,13 +377,14 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
         let timed_out_intent =
             proxied.new_upload(tenant, authority, 1, "cancel-contract", &digest, size).expect("timed-out intent");
         let timed_out = timed_out_intent.locator().clone();
-        owned_keys.push(timed_out.path());
+        let timed_out_key = timed_out.path();
+        owned_keys.push(timed_out_key.clone());
         let upload_deadline = Instant::now() + timeout_case_budget;
         let upload_source = source.clone();
-        let upload = tokio::spawn(async move {
+        let upload_index = upload_tasks.push(tokio::spawn(async move {
             proxied.put_file(timed_out_intent, &upload_source, upload_deadline).await
-        });
-        let observed = gate.wait_observation(Duration::from_secs(30)).await;
+        }));
+        let observed = gates[gate_index].wait_observation(Duration::from_secs(30)).await;
         assert_eq!(observed.method, GateMethod::Put, "the real backend must receive the signed S3 PUT");
         assert!(
             (200..300).contains(&observed.status),
@@ -391,12 +395,15 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
             observed.at < upload_deadline,
             "the real backend answered at or after the caller's absolute deadline; this run does not prove the request reached it before timeout"
         );
-        let result = timeout(Duration::from_secs(30), upload)
-            .await
-            .expect("timed-out upload did not settle")
-            .expect("timed-out upload task panicked");
+        let result = match upload_tasks.wait(upload_index, UPLOAD_JOIN_TIMEOUT).await {
+            TaskWait::Returned(result) => *result,
+            TaskWait::TimedOut => panic!("timed-out upload did not settle within its bounded join"),
+            TaskWait::Cancelled(_) => panic!("timed-out upload was cancelled unexpectedly"),
+            TaskWait::Panicked => panic!("timed-out upload task panicked"),
+            TaskWait::Missing => panic!("timed-out upload handle was missing"),
+        };
         assert!(
-            gate.is_holding(),
+            gates[gate_index].is_holding(),
             "the real backend response must still be withheld when the caller's deadline expires"
         );
         let error = match result {
@@ -410,10 +417,14 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
             Some(size),
             "the real backend PUT observed before the timeout must have committed"
         );
-        gate.release();
+        gates[gate_index].release();
         assert!(
             settle_bounded(&resources, Duration::from_secs(30)).await,
             "timed-out upload cleanup did not settle its owned capacity"
+        );
+        assert!(
+            gates[gate_index].quiesce(GATE_QUIESCE_TIMEOUT).await,
+            "fault gate did not quiesce before exact fixture cleanup"
         );
 
         // A fresh one-use attempt is not written by the timed-out attempt. The
@@ -431,9 +442,10 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
         );
         let fresh_receipt = real.put_file(fresh_intent, &source, deadline()).await.expect("fresh attempt publish");
         assert!(fresh_receipt.matches(&fresh));
-        raw.delete(&timed_out.path())
-            .await
-            .unwrap_or_else(|error| panic!("fixture late cleanup failed ({})", error.kind()));
+        assert!(
+            fixture_delete(&raw, &timed_out_key).await,
+            "fixture late cleanup failed or timed out within its bounded deadline"
+        );
         let fresh_reverified = real
             .verify(&fresh, deadline())
             .await
@@ -442,16 +454,16 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
         let delete_error = real.delete(&fresh, deadline()).await.expect_err("product delete must stay disabled");
         assert_no_private_details(&delete_error, &fresh, profile.bucket(), profile.root());
         real.verify(&fresh, deadline()).await.expect("disabled product delete must not remove the new attempt");
-        drop(gate);
 
         // --- Caller cancellation after the real backend PUT has already answered.
-        let gate = RealProviderFaultGate::start(&endpoint).await;
+        let gate_index = gates.len();
+        gates.push(RealProviderFaultGate::start(&endpoint).await);
         let resources = Arc::new(ResourceContext::new(limits));
         contexts.push(Arc::clone(&resources));
         let real = BlobStore::open_with_resources(profile.clone(), Arc::clone(&resources))
             .expect("real provider must pass the startup capability gate");
         let proxied = BlobStore::open_with_resources(
-            profile.clone().with_test_endpoint(gate.endpoint()).expect("fault gate endpoint is a valid origin"),
+            profile.clone().with_test_endpoint(gates[gate_index].endpoint()).expect("fault gate endpoint is a valid origin"),
             Arc::clone(&resources),
         )
         .expect("proxied provider must pass the startup capability gate");
@@ -459,34 +471,45 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
         let cancelled_intent =
             proxied.new_upload(tenant, authority, 1, "cancel-contract", &digest, size).expect("cancelled intent");
         let cancelled = cancelled_intent.locator().clone();
-        owned_keys.push(cancelled.path());
+        let cancelled_key = cancelled.path();
+        owned_keys.push(cancelled_key.clone());
         let upload_source = source.clone();
-        let upload = tokio::spawn(async move {
+        let upload_index = upload_tasks.push(tokio::spawn(async move {
             proxied.put_file(cancelled_intent, &upload_source, Instant::now() + Duration::from_secs(120)).await
-        });
-        let observed = gate.wait_observation(Duration::from_secs(30)).await;
+        }));
+        let observed = gates[gate_index].wait_observation(Duration::from_secs(30)).await;
         assert_eq!(observed.method, GateMethod::Put, "the real backend must receive the cancelled signed S3 PUT");
         assert!(
             (200..300).contains(&observed.status),
             "the real backend rejected the gated PUT with status {}",
             observed.status
         );
+        let cancel_at = Instant::now();
         assert!(
-            observed.at <= Instant::now(),
+            observed.at < cancel_at,
             "the real backend must answer before this caller is cancelled"
         );
-        upload.abort();
-        let join_error = match upload.await {
-            Ok(_) => panic!("an aborted caller must not return a publication"),
-            Err(error) => error,
+        upload_tasks.abort_at(upload_index);
+        let join_error = match upload_tasks.wait(upload_index, UPLOAD_JOIN_TIMEOUT).await {
+            TaskWait::Cancelled(join_error) => join_error,
+            TaskWait::Returned(_) => panic!("an aborted caller must not return a publication"),
+            TaskWait::TimedOut => panic!("aborted upload did not settle within its bounded join"),
+            TaskWait::Panicked => panic!("aborted upload task panicked"),
+            TaskWait::Missing => panic!("aborted upload handle was missing"),
         };
-        assert!(join_error.is_cancelled(), "the outer caller must be reported as cancelled");
-        assert!(gate.is_holding(), "the real backend response must still be withheld when the caller is cancelled");
+        assert!(
+            gates[gate_index].is_holding(),
+            "the real backend response must still be withheld when the caller is cancelled"
+        );
         assert_no_private_text(&join_error.to_string(), &cancelled, profile.bucket(), profile.root());
-        gate.release();
+        gates[gate_index].release();
         assert!(
             settle_bounded(&resources, Duration::from_secs(30)).await,
             "cancelled upload's late completion did not settle its owned capacity"
+        );
+        assert!(
+            gates[gate_index].quiesce(GATE_QUIESCE_TIMEOUT).await,
+            "cancelled fault gate did not quiesce before exact fixture cleanup"
         );
         assert_eq!(
             real.head(&cancelled, deadline()).await.unwrap(),
@@ -510,39 +533,157 @@ async fn real_provider_timeout_and_caller_cancel_isolate_late_completion() {
         let replacement_receipt =
             real.put_file(replacement_intent, &source, deadline()).await.expect("replacement attempt publish");
         assert!(replacement_receipt.matches(&replacement));
-        raw.delete(&cancelled.path())
-            .await
-            .unwrap_or_else(|error| panic!("fixture stale cleanup failed ({})", error.kind()));
+        assert!(
+            fixture_delete(&raw, &cancelled_key).await,
+            "fixture stale cleanup failed or timed out within its bounded deadline"
+        );
         let replacement_reverified = real
             .verify(&replacement, deadline())
             .await
             .expect("stale cleanup of the cancelled attempt must preserve the replacement attempt");
         assert!(replacement_reverified.matches(&replacement));
         assert_eq!(real.head(&replacement, deadline()).await.unwrap(), Some(size));
-        drop(gate);
     })
     .catch_unwind()
     .await;
 
-    // Gate drops release both held responses. Bound the late-task drain before
-    // exact cleanup so a failed assertion cannot leave an upload rewriting a key.
-    let mut settled = true;
+    // The public upload handles and fixture gates are owned outside the unwind
+    // boundary. Abort/join them and prove the private contexts settled before
+    // any exact-key delete. The production writer's inner task is detached from
+    // its caller, but its write/close/abort stages hold the upload slot and its
+    // read-back holds a reader slot: a fully settled context therefore has no
+    // stage left that can write. If that drain or the test outcome is not clean,
+    // deletion is refused and the disposable fixture is left to Root.
+    let mut outcome = Some(outcome);
+    let tasks_drained = upload_tasks.abort_and_join(UPLOAD_JOIN_TIMEOUT).await;
+    let mut gates_drained = true;
+    for gate in &mut gates {
+        if !gate.quiesce(GATE_QUIESCE_TIMEOUT).await {
+            gates_drained = false;
+        }
+    }
+    let mut contexts_settled = true;
     for resources in &contexts {
-        if !settle_bounded(resources, Duration::from_secs(30)).await {
-            settled = false;
+        if !settle_bounded(resources, CLEANUP_SETTLE_TIMEOUT).await {
+            contexts_settled = false;
         }
     }
-    let mut cleanup_ok = true;
-    for key in owned_keys {
-        if raw.delete(&key).await.is_err() {
-            cleanup_ok = false;
+    let drain_proven = tasks_drained && gates_drained && contexts_settled;
+    let outcome_ok = outcome.as_ref().is_some_and(|result| result.is_ok());
+    let mut delete_attempts = 0usize;
+    let mut delete_failures = 0usize;
+    if outcome_ok && drain_proven {
+        for key in &owned_keys {
+            delete_attempts += 1;
+            if !fixture_delete(&raw, key).await {
+                delete_failures += 1;
+            }
         }
     }
-    if let Err(error) = outcome {
+    if let Some(Err(error)) = outcome.take() {
+        eprintln!(
+            "blob cancellation cleanup report: outcome=failed drain_proven={drain_proven} tasks_drained={tasks_drained} gates_drained={gates_drained} contexts_settled={contexts_settled}; further per-key cleanup refused"
+        );
         std::panic::resume_unwind(error);
     }
-    assert!(settled, "late cancellation cleanup did not release its owned capacity");
-    assert!(cleanup_ok, "exact owned fixture cleanup failed");
+    assert!(
+        drain_proven,
+        "blob cancellation cleanup could not prove drain (tasks_drained={tasks_drained} gates_drained={gates_drained} contexts_settled={contexts_settled}); further per-key cleanup refused"
+    );
+    assert!(
+        delete_failures == 0,
+        "exact owned fixture cleanup failed or timed out ({delete_failures}/{delete_attempts} bounded deletes)"
+    );
+}
+
+struct UploadTasks {
+    slots: Vec<UploadSlot>,
+}
+
+struct UploadSlot {
+    handle: JoinHandle<Result<BlobReceipt, BlobError>>,
+    completed: bool,
+}
+
+enum TaskWait {
+    Returned(Box<Result<BlobReceipt, BlobError>>),
+    Cancelled(JoinError),
+    TimedOut,
+    Panicked,
+    Missing,
+}
+
+impl UploadTasks {
+    fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    fn push(&mut self, handle: JoinHandle<Result<BlobReceipt, BlobError>>) -> usize {
+        self.slots.push(UploadSlot { handle, completed: false });
+        self.slots.len() - 1
+    }
+
+    async fn wait(&mut self, index: usize, limit: Duration) -> TaskWait {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return TaskWait::Missing;
+        };
+        if slot.completed {
+            return TaskWait::Missing;
+        }
+        let outcome = timeout(limit, &mut slot.handle).await;
+        match outcome {
+            Ok(Ok(result)) => {
+                slot.completed = true;
+                TaskWait::Returned(Box::new(result))
+            }
+            Ok(Err(join_error)) => {
+                slot.completed = true;
+                if join_error.is_cancelled() { TaskWait::Cancelled(join_error) } else { TaskWait::Panicked }
+            }
+            Err(_) => TaskWait::TimedOut,
+        }
+    }
+
+    fn abort_at(&mut self, index: usize) {
+        if let Some(slot) = self.slots.get_mut(index) {
+            if !slot.completed {
+                slot.handle.abort();
+            }
+        }
+    }
+
+    async fn abort_and_join(&mut self, limit: Duration) -> bool {
+        for slot in &mut self.slots {
+            if !slot.completed {
+                slot.handle.abort();
+            }
+        }
+        let deadline = Instant::now() + limit;
+        let mut drained = true;
+        for slot in &mut self.slots {
+            if slot.completed {
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drained = false;
+                break;
+            }
+            let outcome = timeout(remaining, &mut slot.handle).await;
+            match outcome {
+                Ok(_) => slot.completed = true,
+                Err(_) => {
+                    drained = false;
+                    break;
+                }
+            }
+        }
+        drained
+    }
+}
+
+async fn fixture_delete(raw: &opendal::Operator, key: &str) -> bool {
+    matches!(timeout(FIXTURE_DELETE_TIMEOUT, raw.delete(key)).await, Ok(Ok(())))
 }
 
 /// Bounded owned pass-through gate for the real provider contract.
@@ -557,8 +698,10 @@ struct RealProviderFaultGate {
     endpoint: String,
     observed: watch::Receiver<Option<GateObservation>>,
     release: watch::Sender<bool>,
+    shutdown: watch::Sender<bool>,
     holding: Arc<AtomicBool>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+    quiesced: bool,
 }
 
 impl RealProviderFaultGate {
@@ -569,27 +712,60 @@ impl RealProviderFaultGate {
         let address = listener.local_addr().expect("fault gate local address");
         let (observed_tx, observed) = watch::channel::<Option<GateObservation>>(None);
         let (release_tx, release_rx) = watch::channel::<bool>(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel::<bool>(false);
         let holding = Arc::new(AtomicBool::new(false));
         let task_holding = Arc::clone(&holding);
         let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            let mut shutdown = shutdown_rx;
             let mut admitted = 0usize;
             loop {
-                let Ok((client, _)) = listener.accept().await else { break };
-                if admitted >= GATE_MAX_CONNECTIONS {
-                    drop(client);
-                    continue;
+                if *shutdown.borrow() {
+                    break;
                 }
-                admitted += 1;
-                let host = host.clone();
-                let observed = observed_tx.clone();
-                let release = release_rx.clone();
-                let holding = Arc::clone(&task_holding);
-                tokio::spawn(async move {
-                    let _ = proxy_connection(client, &host, port, observed, release, holding).await;
-                });
+                let mut stop = false;
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        match accepted {
+                            Ok((client, _)) => {
+                                if admitted >= GATE_MAX_CONNECTIONS {
+                                    drop(client);
+                                } else {
+                                    admitted += 1;
+                                    let host = host.clone();
+                                    let observed = observed_tx.clone();
+                                    let release = release_rx.clone();
+                                    let holding = Arc::clone(&task_holding);
+                                    let _ = connections.spawn(async move {
+                                        let _ = proxy_connection(client, &host, port, observed, release, holding).await;
+                                    });
+                                }
+                            }
+                            Err(_) => stop = true,
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() {
+                            stop = true;
+                        }
+                    }
+                }
+                if stop {
+                    break;
+                }
             }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
         });
-        Self { endpoint: format!("http://{address}"), observed, release: release_tx, holding, task }
+        Self {
+            endpoint: format!("http://{address}"),
+            observed,
+            release: release_tx,
+            shutdown: shutdown_tx,
+            holding,
+            task: Some(task),
+            quiesced: false,
+        }
     }
 
     fn endpoint(&self) -> &str {
@@ -617,12 +793,37 @@ impl RealProviderFaultGate {
     fn release(&self) {
         let _ = self.release.send(true);
     }
+
+    /// Stop accepting, abort every tracked connection and wait for the listener
+    /// task to drain them. A timeout or listener panic returns false; callers
+    /// must then refuse exact-key deletion because quiescence is unproven.
+    async fn quiesce(&mut self, limit: Duration) -> bool {
+        let _ = self.release.send(true);
+        let _ = self.shutdown.send(true);
+        let Some(mut task) = self.task.take() else {
+            return self.quiesced;
+        };
+        let outcome = timeout(limit, &mut task).await;
+        let drained = match outcome {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                task.abort();
+                false
+            }
+        };
+        self.quiesced = drained;
+        drained
+    }
 }
 
 impl Drop for RealProviderFaultGate {
     fn drop(&mut self) {
         let _ = self.release.send(true);
-        self.task.abort();
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -638,8 +839,9 @@ struct GateObservation {
     method: GateMethod,
     status: u16,
     /// When the real backend's final response arrived at the gate. The test
-    /// compares this with the caller's stop time so a backend that answered
-    /// only after the deadline cannot be reported as pre-cancellation evidence.
+    /// compares this with the absolute upload deadline (timeout path) or the
+    /// actual caller-abort instant, so a backend that answered only later
+    /// cannot be reported as pre-cancellation evidence.
     at: Instant,
 }
 
@@ -661,6 +863,10 @@ const GATE_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const GATE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const GATE_HOLD_TIMEOUT: Duration = Duration::from_secs(60);
 const GATE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(180);
+const GATE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
+const UPLOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+const CLEANUP_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const FIXTURE_DELETE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn gate_timeout(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, message)
@@ -873,17 +1079,28 @@ fn require_loopback_http_s3(profile: &BlobProfile) {
     );
 }
 
+/// The production writer's inner task is detached from its public caller, but
+/// every write/close/abort stage holds the upload slot and read-back holds a
+/// reader slot. A context that is clear for two consecutive polls therefore has
+/// no stage left that can publish another byte. This is the write-drain proof
+/// used before exact-key deletion; a timeout returns false and refuses cleanup.
 async fn settle_bounded(resources: &ResourceContext, limit: Duration) -> bool {
     let limits = resources.limits();
     timeout(limit, async {
+        let mut stable = 0u8;
         loop {
-            if resources.available_uploads() == limits.active_uploads()
+            let clear = resources.available_uploads() == limits.active_uploads()
                 && resources.available_readers() == limits.active_readers()
-                && resources.available_staging_bytes() == limits.staging_bytes()
-            {
-                return;
+                && resources.available_staging_bytes() == limits.staging_bytes();
+            if clear {
+                stable += 1;
+                if stable >= 2 {
+                    return;
+                }
+            } else {
+                stable = 0;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
