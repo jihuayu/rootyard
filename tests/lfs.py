@@ -131,6 +131,53 @@ class LfsHarness(Harness):
             assert status == code, f"POST {path}: expected {code}, got {status}: {body[:300]!r}"
         return json.loads(body)
 
+    def _lfs_lock_http(self, path, token, method="GET", body=None, code=200):
+        status, raw, headers = self.http(
+            self._rel_path(path),
+            token=token if token is not False else None,
+            method=method,
+            body=None if body is None else json.dumps(body).encode(),
+            content_type=None if body is None else LFS_MIME,
+            extra_headers={"Accept": LFS_MIME},
+        )
+        norm_headers = {k.lower(): v for k, v in headers.items()}
+        expected = code if isinstance(code, tuple) else (code,)
+        assert status in expected, (
+            f"{method} {path}: expected {code}, got {status}: {raw[:300]!r}"
+        )
+        assert norm_headers.get("cache-control") == "no-store", norm_headers
+        return status, raw, norm_headers
+
+    def _lfs_lock_json(self, path, token, method="GET", body=None, code=200):
+        _, raw, headers = self._lfs_lock_http(path, token, method, body, code)
+        assert LFS_MIME in headers.get("content-type", ""), headers
+        return json.loads(raw)
+
+    def lfs_lock_create(self, base, path, token):
+        body = self._lfs_lock_json(base, token, method="POST", body={"path": path}, code=201)
+        return body["lock"]
+
+    def lfs_lock_list(self, base, token, path=None, lock_id=None):
+        query = {}
+        if path is not None:
+            query["path"] = path
+        if lock_id is not None:
+            query["id"] = str(lock_id)
+        suffix = "?" + urllib.parse.urlencode(query) if query else ""
+        return self._lfs_lock_json(base + suffix, token)
+
+    def lfs_lock_verify(self, base, token):
+        return self._lfs_lock_json(base + "/verify", token, method="POST", body={})
+
+    def lfs_lock_unlock(self, base, lock_id, token, force=False):
+        body = self._lfs_lock_json(
+            f"{base}/{lock_id}/unlock",
+            token,
+            method="POST",
+            body={"force": force},
+        )
+        return body["lock"]
+
     def batch_upload_stream_verify_and_download(self):
         # 64 KiB payload exceeds the global 16 KiB DefaultBodyLimit on JSON routes
         self.payload = os.urandom(64 * 1024)
@@ -482,6 +529,80 @@ class LfsHarness(Harness):
                            method="POST", body={}, content_type=LFS_MIME)
         assert verify[0] == 200 and len(json.loads(verify[1])["ours"]) == 1
 
+        # Lock IDs, path filters and verify results are repository-scoped even
+        # when one actor administers both repositories. Alice can access
+        # alice/other, Bob owns bob/demo, and both repos may lock the same path.
+        source_locks = self.repo["clone_path"] + "/info/lfs/locks"
+        other_locks = self.other["clone_path"] + "/info/lfs/locks"
+        bob_locks = self.bob_repo["clone_path"] + "/info/lfs/locks"
+        cross_path = "docs/cross-repo.bin"
+        source_lock = self.lfs_lock_create(source_locks, cross_path, self.alice)
+        other_lock = self.lfs_lock_create(other_locks, cross_path, self.alice)
+        bob_lock = self.lfs_lock_create(bob_locks, cross_path, self.bob)
+        assert len({source_lock["id"], other_lock["id"], bob_lock["id"]}) == 3
+        scopes = (
+            (source_locks, self.alice, source_lock["id"], other_lock["id"]),
+            (other_locks, self.alice, other_lock["id"], source_lock["id"]),
+            (bob_locks, self.bob, bob_lock["id"], source_lock["id"]),
+        )
+        for base, token, own_id, foreign_id in scopes:
+            listed = self.lfs_lock_list(base, token, path=cross_path)
+            assert [lock["id"] for lock in listed["locks"]] == [own_id], listed
+            hidden = self.lfs_lock_list(base, token, lock_id=foreign_id)
+            assert hidden["locks"] == [], hidden
+            verified = self.lfs_lock_verify(base, token)
+            ours = [lock["id"] for lock in verified["ours"]]
+            visible = ours + [lock["id"] for lock in verified["theirs"]]
+            assert own_id in ours, verified
+            assert foreign_id not in visible, verified
+
+        # Force unlock through the wrong repository URL must hide the source
+        # lock (404, no path/ID echo), even when the caller owns the other repo.
+        for base, token in ((other_locks, self.alice), (bob_locks, self.bob)):
+            status, raw, _ = self._lfs_lock_http(
+                f"{base}/{source_lock['id']}/unlock",
+                token,
+                method="POST",
+                body={"force": True},
+                code=404,
+            )
+            assert cross_path.encode() not in raw, raw
+            assert source_lock["id"].encode() not in raw, raw
+
+        # Rejected cross-repository attempts must leave every lock intact.
+        for base, token, own_id in (
+            (source_locks, self.alice, source_lock["id"]),
+            (other_locks, self.alice, other_lock["id"]),
+            (bob_locks, self.bob, bob_lock["id"]),
+        ):
+            listed = self.lfs_lock_list(base, token, path=cross_path)
+            assert [lock["id"] for lock in listed["locks"]] == [own_id], listed
+
+        # The source owner can still unlock by path, and this removes only the
+        # source repository's same-path lock.
+        unlocked = self.git("lfs", "unlock", cross_path, cwd=self.work, token=self.alice)
+        assert b"Unlocked docs/cross-repo.bin" in unlocked.stdout
+        assert self.lfs_lock_list(source_locks, self.alice, path=cross_path)["locks"] == []
+        assert [
+            lock["id"]
+            for lock in self.lfs_lock_list(other_locks, self.alice, path=cross_path)["locks"]
+        ] == [other_lock["id"]]
+        assert [
+            lock["id"]
+            for lock in self.lfs_lock_list(bob_locks, self.bob, path=cross_path)["locks"]
+        ] == [bob_lock["id"]]
+
+        # Authorized owners in the other repositories retain positive unlock
+        # control over their own locks.
+        assert self.lfs_lock_unlock(
+            other_locks, other_lock["id"], self.alice
+        )["id"] == other_lock["id"]
+        assert self.lfs_lock_unlock(
+            bob_locks, bob_lock["id"], self.bob
+        )["id"] == bob_lock["id"]
+        assert self.lfs_lock_list(other_locks, self.alice, path=cross_path)["locks"] == []
+        assert self.lfs_lock_list(bob_locks, self.bob, path=cross_path)["locks"] == []
+
         self.expect("/api/repos/alice/demo/collaborators/bob", 201, token=self.alice,
                     method="PUT", body={"role": "write"})
         denied = self.git("lfs", "unlock", "docs/design.bin", cwd=self.work, token=self.bob, check=False)
@@ -502,6 +623,13 @@ class LfsHarness(Harness):
             statuses = list(executor.map(lock_attempt, range(8)))
         assert statuses.count(201) == 1 and statuses.count(409) == 7, statuses
         self.expect("/api/repos/alice/demo/collaborators/bob", 200, token=self.alice, method="DELETE")
+        return {
+            "same_path_locks_in_three_repositories": 3,
+            "cross_repository_force_unlock_denied": 2,
+            "cross_repository_id_path_verify_hidden": True,
+            "source_owner_unlock": True,
+            "other_repository_owner_unlock": True,
+        }
 
     def storage_layout_for_backup(self):
         # Verify volume layout invariants required by src/backup.rs::inventory
