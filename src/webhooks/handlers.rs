@@ -178,6 +178,7 @@ pub async fn update_webhook(
         if patch.expected_version.is_some_and(|exp| cur.version != exp) {
             return Err(Error(StatusCode::CONFLICT, "webhook version conflict"));
         }
+        let prior_contexts = cur.ci_contexts.clone();
 
         let next_url = match patch.url {
             Some(ref u) => { validate_webhook_url(u)?; u.clone() }
@@ -195,6 +196,8 @@ pub async fn update_webhook(
             Some(ref ctxs) => validate_ci_contexts(ctxs)?,
             None => cur.ci_contexts,
         };
+        let removed_contexts: Vec<String> = prior_contexts.into_iter()
+            .filter(|context| !next_contexts.contains(context)).collect();
         let next_auto_pin = patch.auto_ci_pin.unwrap_or(cur.auto_ci_pin);
         let next_active = patch.active.unwrap_or(cur.active);
         let next_max_attempts = patch.max_attempts.unwrap_or(cur.max_attempts);
@@ -211,6 +214,14 @@ pub async fn update_webhook(
             .await
             .map_err(Error::internal)?;
         let webhook = Webhook::row(&updated)?;
+        // A PATCH that drops contexts is a security boundary, not just a
+        // display change. Revoke this issuer's bindings and advance the run
+        // fencing under the policy lock held above so old evidence cannot be
+        // replayed or revived by a later bind.
+        if !removed_contexts.is_empty() {
+            crate::webhooks::trust::revoke_owned_contexts(
+                &tx, access.repo_id, hook_id, &removed_contexts).await?;
+        }
         finish(tx, &actor, true).await?;
         Ok(json(StatusCode::OK, webhook))
     })

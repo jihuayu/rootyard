@@ -425,6 +425,7 @@ async fn prepare_checkout(state: &AppState, claim: &ClaimedRun, dest: &PathBuf) 
 
 const AUTHORITY: &str = "FROM ci_runs c \
  JOIN forge_webhooks w ON w.id=$2 AND w.repository_id=c.repository_id AND w.active=true \
+   AND w.ci_contexts ? c.context \
  JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id AND b.context=c.context AND b.webhook_id=w.id AND b.active=true \
  JOIN forge_pulls p ON p.repository_id=c.repository_id AND p.number=c.pull_number AND p.state='open' \
    AND p.version=c.pull_version AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \

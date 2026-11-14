@@ -13,6 +13,10 @@ Current semantics intentionally covered:
 * revoking a trusted-context binding or disabling a webhook refuses a current
   lease report, and an exact old signed-callback replay is refused after the
   binding is revoked;
+* removing a context from an otherwise active webhook revokes that binding and
+  advances the run authority epoch, so claim/report/heartbeat and completed
+  evidence (including after an explicit re-bind) are refused for the removed
+  context;
 * rotating the webhook secret (the integration bearer credential) refuses the
   old secret for a current lease report and for replaying an old callback;
 * changing the PR head invalidates old report/callback replay and old evidence;
@@ -297,6 +301,247 @@ class TrustBoundaryHarness(WebhooksHarness):
         assert patched["version"] > current["version"], patched
         runs = self.wait_runs(repo, new_head, CONTEXTS)
         return patched, old_head, new_head, runs
+
+    def new_pull(self, repo, branch, marker):
+        """Create an independent PR on top of the fixture's feature head."""
+        work = self.work_dirs[repo]
+        self.git("checkout", "-B", branch, "feature", cwd=work)
+        (work / f"{branch}.txt").write_text(marker + "\n")
+        self.git("add", f"{branch}.txt", cwd=work)
+        self.git("commit", "-m", marker, cwd=work)
+        head = self.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
+        self.git(
+            "push", "origin", f"HEAD:refs/heads/{branch}", cwd=work, token=self.alice
+        )
+        pull = self.document(
+            self.pull_paths[repo],
+            201,
+            method="POST",
+            body={
+                "title": f"context scope {branch}",
+                "body": "context-removal regression candidate",
+                "head_ref": f"refs/heads/{branch}",
+                "base_ref": "refs/heads/main",
+            },
+        )
+        assert pull["head_oid"] == head, pull
+        runs = self.wait_runs(repo, head, ("ci/removed",))
+        return pull, runs["ci/removed"]
+
+    def context_removal_revokes_authority(self):
+        repo = "other"
+        hook = self.issuers[(repo, "ci/trusted")]
+        secret = hook["_secret"]
+        current = self.document(self.hook_path(repo, hook))
+        patched = self.document(
+            self.hook_path(repo, hook),
+            200,
+            method="PATCH",
+            body={
+                "expected_version": current["version"],
+                "ci_contexts": ["ci/trusted", "ci/removed"],
+            },
+        )
+        assert patched["ci_contexts"] == ["ci/trusted", "ci/removed"], patched
+        self.document(
+            self.bind_path(repo, hook),
+            200,
+            method="PUT",
+            body={"context": "ci/removed"},
+        )
+        rules = self.document(self.branch_paths[repo])["items"]
+        rule = next(r for r in rules if r["branch_ref"] == "refs/heads/main")
+        self.document(
+            self.branch_paths[repo],
+            200,
+            method="PUT",
+            body={
+                "branch_ref": "refs/heads/main",
+                "expected_version": rule["version"],
+                "required_approvals": 0,
+                "required_checks": ["ci/removed"],
+                "require_fast_forward": True,
+            },
+        )
+
+        # A positive merge proves the new context is accepted while current.
+        pr, _, head4, _ = self.advance(repo, "context removal v4")
+        run4 = self.wait_runs(repo, head4, ("ci/removed",))["ci/removed"]
+        claimed4 = self.claim(repo, hook, run4, "scope-removal-positive")
+        self.secrets.append(claimed4["checkout"]["token"])
+        body4 = self.report_body(claimed4)
+        first = self.integration(
+            self.run_path(repo, hook, run4, "report"), secret, body4, 200
+        )
+        assert first["replay"] is False, first
+        duplicate = self.integration(
+            self.run_path(repo, hook, run4, "report"), secret, body4, 200
+        )
+        assert duplicate["replay"] is True, duplicate
+        merged = self.document(
+            self.pull_path(repo) + "/merge",
+            200,
+            method="POST",
+            body={
+                "expected_version": pr["version"],
+                "expected_head_oid": head4,
+                "expected_base_oid": pr["base_oid"],
+            },
+        )
+        assert merged["state"] == "merged", merged
+        assert merged["merge_commit_oid"] == head4, merged
+
+        # PR A keeps completed evidence on an open candidate. PR B is leased
+        # before removal for report/heartbeat refusals; PR C stays queued for
+        # the post-removal claim refusal.
+        pull_a, run_a = self.new_pull(repo, "scope-report", "context removal report")
+        claimed_a = self.claim(repo, hook, run_a, "scope-removal-report")
+        self.secrets.append(claimed_a["checkout"]["token"])
+        body_a = self.report_body(claimed_a)
+        accepted = self.integration(
+            self.run_path(repo, hook, run_a, "report"), secret, body_a, 200
+        )
+        assert accepted["replay"] is False, accepted
+        duplicate_a = self.integration(
+            self.run_path(repo, hook, run_a, "report"), secret, body_a, 200
+        )
+        assert duplicate_a["replay"] is True, duplicate_a
+
+        pull_b, run_b = self.new_pull(repo, "scope-lease", "context removal lease")
+        claimed_b = self.claim(repo, hook, run_b, "scope-removal-lease")
+        self.secrets.append(claimed_b["checkout"]["token"])
+        heartbeat = {
+            "attempt": claimed_b["attempt"],
+            "lease_generation": claimed_b["lease_generation"],
+            "runner_id": "scope-removal-lease",
+        }
+        renewed = self.integration(
+            self.run_path(repo, hook, run_b, "heartbeat"), secret, heartbeat, 200
+        )
+        assert renewed["lease_generation"] == claimed_b["lease_generation"], renewed
+
+        pull_c, run_c = self.new_pull(repo, "scope-claim", "context removal claim")
+        assert run_c["state"] == "queued", run_c
+
+        current = self.document(self.hook_path(repo, hook))
+        removed = self.document(
+            self.hook_path(repo, hook),
+            200,
+            method="PATCH",
+            body={
+                "expected_version": current["version"],
+                "ci_contexts": ["ci/trusted"],
+            },
+        )
+        assert removed["ci_contexts"] == ["ci/trusted"], removed
+        binding = self.sql(
+            "SELECT active FROM forge_trusted_check_contexts "
+            f"WHERE repository_id={self.q(self.other['id'])} "
+            "AND context='ci/removed'"
+        )
+        assert binding == "f", binding
+        old_row = self.check_row(repo, head4, "ci/removed")
+        assert old_row["status"] == "completed", old_row
+        assert old_row["conclusion"] == "success", old_row
+
+        self.refuse(
+            self.run_path(repo, hook, run_c, "claim"),
+            secret,
+            {"runner_id": "scope-removal-claim"},
+            404,
+            "not found",
+        )
+        self.refuse(
+            self.run_path(repo, hook, run_b, "report"),
+            secret,
+            self.report_body(claimed_b),
+            404,
+            "not found",
+        )
+        self.refuse(
+            self.run_path(repo, hook, run_b, "heartbeat"),
+            secret,
+            heartbeat,
+            409,
+            "CI run lease changed",
+        )
+        self.refuse(
+            self.run_path(repo, hook, run_a, "report"),
+            secret,
+            body_a,
+            404,
+            "not found",
+        )
+        merge_a = {
+            "expected_version": pull_a["version"],
+            "expected_head_oid": pull_a["head_oid"],
+            "expected_base_oid": pull_a["base_oid"],
+        }
+        status, raw, _ = self.http(
+            self.pull_path(repo, pull_a["number"]) + "/merge",
+            token=self.alice,
+            method="POST",
+            body=merge_a,
+        )
+        assert status == 409, (status, raw[:300])
+        assert json.loads(raw)["error"] == (
+            "required check runs have not succeeded"
+        ), raw[:300]
+
+        # Re-binding the same context explicitly restores current authority but
+        # must not resurrect the completion recorded before removal.
+        current = self.document(self.hook_path(repo, hook))
+        readded = self.document(
+            self.hook_path(repo, hook),
+            200,
+            method="PATCH",
+            body={
+                "expected_version": current["version"],
+                "ci_contexts": ["ci/trusted", "ci/removed"],
+            },
+        )
+        assert readded["ci_contexts"] == ["ci/trusted", "ci/removed"], readded
+        self.document(
+            self.bind_path(repo, hook),
+            200,
+            method="PUT",
+            body={"context": "ci/removed"},
+        )
+        status, raw, _ = self.http(
+            self.pull_path(repo, pull_a["number"]) + "/merge",
+            token=self.alice,
+            method="POST",
+            body=merge_a,
+        )
+        assert status == 409, (status, raw[:300])
+        assert json.loads(raw)["error"] == (
+            "required check runs have not succeeded"
+        ), raw[:300]
+
+        # The new authority is usable: a fresh claim/report can unlock the
+        # queued candidate, proving the refusal above was not a permanent
+        # fixture break.
+        claimed_c = self.claim(repo, hook, run_c, "scope-removal-new-authority")
+        self.secrets.append(claimed_c["checkout"]["token"])
+        current_report = self.integration(
+            self.run_path(repo, hook, run_c, "report"),
+            secret,
+            self.report_body(claimed_c),
+            200,
+        )
+        assert current_report["replay"] is False, current_report
+        merged_c = self.document(
+            self.pull_path(repo, pull_c["number"]) + "/merge",
+            200,
+            method="POST",
+            body={
+                "expected_version": pull_c["version"],
+                "expected_head_oid": pull_c["head_oid"],
+                "expected_base_oid": pull_c["base_oid"],
+            },
+        )
+        assert merged_c["state"] == "merged", merged_c
+        assert merged_c["merge_commit_oid"] == pull_c["head_oid"], merged_c
 
     def positive_matrix(self):
         for repo in REPOSITORIES:
@@ -842,6 +1087,10 @@ def main():
         harness.case(
             "revoked registration, rotated secret and late attempt",
             harness.revocation_and_late_attempt_matrix,
+        )
+        harness.case(
+            "removed webhook context revokes claim/report/merge authority",
+            harness.context_removal_revokes_authority,
         )
         harness.case(
             "API principal token revocation remains management-only",

@@ -48,6 +48,8 @@ pub async fn claim(
         "SELECT c.head_oid,c.job_id,c.storage_generation FROM ci_runs c \
          JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
            AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
+         JOIN forge_webhooks w ON w.id=b.webhook_id AND w.repository_id=c.repository_id \
+           AND w.active=true AND w.ci_contexts ? c.context \
          WHERE c.id=$1 AND c.repository_id=$2 AND c.state IN ('queued','leased')",
         &[&run_id,&repo,&hook_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
@@ -71,6 +73,8 @@ pub async fn claim(
         "SELECT c.context,c.head_oid,c.base_oid,c.job_id,c.storage_generation,c.state,c.attempt,c.lease_generation \
          FROM ci_runs c JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
           AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
+         JOIN forge_webhooks w ON w.id=b.webhook_id AND w.repository_id=c.repository_id \
+          AND w.active=true AND w.ci_contexts ? c.context \
          JOIN forge_pulls p ON p.repository_id=c.repository_id AND p.number=c.pull_number \
          WHERE c.id=$1 AND c.repository_id=$2 AND p.state='open' \
            AND p.version=c.pull_version AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \
@@ -163,9 +167,11 @@ pub async fn heartbeat(
     }
     let row=tx.query_opt(
         "UPDATE ci_runs c SET lease_expires_unix=extract(epoch FROM clock_timestamp())::bigint+60, \
-         updated_at=clock_timestamp() FROM forge_trusted_check_contexts b, forge_pulls p \
+         updated_at=clock_timestamp() FROM forge_trusted_check_contexts b, forge_webhooks w, forge_pulls p \
          WHERE c.id=$1 AND c.repository_id=$2 AND b.repository_id=c.repository_id \
            AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
+           AND w.id=b.webhook_id AND w.repository_id=c.repository_id AND w.active=true \
+           AND w.ci_contexts ? c.context \
            AND p.repository_id=c.repository_id AND p.number=c.pull_number AND p.state='open' \
            AND p.version=c.pull_version AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \
            AND c.state='leased' AND c.attempt=$4 AND c.lease_generation=$5 \
@@ -206,6 +212,8 @@ pub async fn report(
           p.state AS live_state,c.pull_version \
          FROM ci_runs c JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
           AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
+         JOIN forge_webhooks w ON w.id=b.webhook_id AND w.repository_id=c.repository_id \
+          AND w.active=true AND w.ci_contexts ? c.context \
          JOIN forge_pulls p ON p.repository_id=c.repository_id AND p.number=c.pull_number \
          WHERE c.id=$1 AND c.repository_id=$2 FOR UPDATE OF c",
         &[&run_id,&repo,&hook_id],

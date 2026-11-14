@@ -195,7 +195,8 @@ pub(super) async fn read_policy_repo(
                     (tc.repository_id IS NOT NULL),
                     COALESCE(tc.active,false),
                     tc.webhook_id,
-                    (w.id IS NOT NULL AND w.active AND w.repository_id=fcr.repository_id),
+                    (w.id IS NOT NULL AND w.active AND w.repository_id=fcr.repository_id
+                     AND w.ci_contexts ? fcr.context),
                     fcr.issuer_webhook_id,
                     fcr.ci_base_oid,
                     EXISTS(SELECT 1 FROM ci_runs cr JOIN forge_pulls p
