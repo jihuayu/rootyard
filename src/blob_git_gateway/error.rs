@@ -3,6 +3,13 @@
 //! No variant carries provider text, Git argv/stderr, a locator, a token, a
 //! path or a SQL message. Every dynamic failure is collapsed into one of these
 //! literals so a transport error can never echo a credential or a client pack.
+//!
+//! A `401` carries no challenge when rendered. The challenge names the
+//! credential scheme of the route protocol that refused, so the gateway-owned
+//! `/api/repos` route boundary adds [`Challenge::Bearer`] and the Smart HTTP
+//! boundary adds [`Challenge::Basic`]; rendering an error alone never advertises
+//! either. The merged shared `/api/tokens` and `/api/sessions` routes do not use
+//! this vocabulary and keep `crate::Error`'s pre-existing Basic challenge.
 use axum::{
     Json,
     http::{StatusCode, header},
@@ -61,17 +68,54 @@ impl GatewayError {
     }
 }
 
+/// The credential scheme one protocol advertises on its `401`.
+///
+/// The variant is chosen by the route protocol, never by the failure: the same
+/// [`GatewayError::Unauthorized`] is a gateway JSON refusal on `/api/repos` and
+/// a Smart HTTP refusal on `/git`; only the latter may ask the client for Basic
+/// credentials. The merged shared `/api/tokens` and `/api/sessions` routes use
+/// `crate::Error` and keep its existing Basic challenge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Challenge {
+    /// The standard Smart HTTP Git challenge; a native Git client retries with
+    /// the Basic credential it was configured with.
+    Basic,
+    /// The gateway-owned `/api/repos` challenge. API tokens are preemptively
+    /// sent as `Authorization: Bearer`, so a Basic challenge (which a browser
+    /// `fetch` answers with an interactive auth prompt) is never sent here. The
+    /// separately merged token/session management routes are outside this
+    /// vocabulary and retain their application-level Basic challenge.
+    Bearer,
+}
+
+impl Challenge {
+    const fn value(self) -> &'static str {
+        match self {
+            Self::Basic => "Basic realm=\"Rootyard\", charset=\"UTF-8\"",
+            Self::Bearer => "Bearer realm=\"Rootyard\"",
+        }
+    }
+}
+
+/// Give `response` the `challenge` of its protocol when, and only when, it is a
+/// `401` that advertises no scheme yet.
+///
+/// The gateway handlers render no challenge, so a bare `401` is this route's
+/// own denial. A `401` that already names a scheme belongs to another authority
+/// (for example the shared sign-in helper) and is never rewritten or joined.
+/// Status, body and every other header are the response's own.
+pub(super) fn with_challenge(mut response: Response, challenge: Challenge) -> Response {
+    if response.status() == StatusCode::UNAUTHORIZED && !response.headers().contains_key(header::WWW_AUTHENTICATE) {
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static(challenge.value()));
+    }
+    response
+}
+
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
         let status = self.status();
         let mut response = (status, Json(serde_json::json!({"error": self.message()}))).into_response();
         response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
-        if status == StatusCode::UNAUTHORIZED {
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                header::HeaderValue::from_static("Basic realm=\"Rootyard\", charset=\"UTF-8\""),
-            );
-        }
         response
     }
 }
@@ -160,7 +204,7 @@ mod tests {
         response::IntoResponse,
     };
 
-    use super::GatewayError;
+    use super::{Challenge, GatewayError, with_challenge};
     use crate::{blob_git_gateway::snapshot, ref_store::RefStoreError};
 
     async fn render(error: GatewayError) -> (StatusCode, HeaderMap, String) {
@@ -261,5 +305,45 @@ mod tests {
         )
         .await;
         assert_eq!(GatewayError::from(error).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_refusal_renders_no_implicit_challenge() {
+        let (status, headers, body) = render(GatewayError::Unauthorized).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(headers.get(header::WWW_AUTHENTICATE), None);
+        assert_eq!(headers.get(header::CACHE_CONTROL).and_then(|value| value.to_str().ok()), Some("no-store"));
+        assert_eq!(body, r#"{"error":"valid credentials required"}"#);
+    }
+
+    #[tokio::test]
+    async fn the_route_boundary_fills_only_a_bare_unauthorized_response() {
+        for (challenge, expected) in [
+            (Challenge::Bearer, "Bearer realm=\"Rootyard\""),
+            (Challenge::Basic, "Basic realm=\"Rootyard\", charset=\"UTF-8\""),
+        ] {
+            let response = with_challenge(GatewayError::Unauthorized.into_response(), challenge);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE).and_then(|value| value.to_str().ok()),
+                Some(expected)
+            );
+        }
+
+        let mut existing = GatewayError::Unauthorized.into_response();
+        existing.headers_mut().append(header::WWW_AUTHENTICATE, "Negotiate".parse().expect("static challenge"));
+        let response = with_challenge(existing, Challenge::Bearer);
+        let values = response
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|value| value.to_str().expect("challenge is text"))
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["Negotiate"], "a foreign challenge is never rewritten or joined");
+
+        let response =
+            with_challenge(GatewayError::Forbidden("write permission required").into_response(), Challenge::Basic);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers().get(header::WWW_AUTHENTICATE), None);
     }
 }
