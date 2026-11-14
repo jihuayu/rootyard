@@ -25,6 +25,7 @@ for entry in (str(TESTS), str(SCRIPTS)):
         sys.path.insert(0, entry)
 
 import backup_refstore_build_receipts as binding  # noqa: E402
+import backup_refstore_holds141 as holds141  # noqa: E402
 import backup_refstore_snapshot140 as snapshot140  # noqa: E402
 import native_build_receipt as receipts  # noqa: E402
 
@@ -185,12 +186,13 @@ class RefStoreReceiptFixture(unittest.TestCase):
         return path
 
     # -- v2 helper --------------------------------------------------------
-    def helper_receipt(self, *, target=SNAPSHOT_TARGET, source=SNAPSHOT_SOURCE,
+    def helper_receipt(self, *, target=SNAPSHOT_TARGET, source=None,
                        fresh=True, output=None, original=None, manifest=None,
                        bound=None, toolchain=None, profile="test",
                        kind="rust-integration-test", relocated=True,
                        with_batch=True, with_selection=True):
-        source_path = self.root / source
+        if source is None:
+            source = SNAPSHOT_SOURCE if target == SNAPSHOT_TARGET else HOLDS_SOURCE
         output = Path(output or (self.snapshot_output if target == SNAPSHOT_TARGET
                                  else self.holds_output))
         original = Path(original or (self.snapshot_original if target == SNAPSHOT_TARGET
@@ -364,6 +366,19 @@ class RefStoreReceiptFixture(unittest.TestCase):
         return snapshot140.validate_snapshot_fixture_binary(
             self.snapshot_output, self.app_output, helper_receipt, app_receipt)
 
+    def validate_holds(self, helper_payload, app_payload, *, default_paths=False):
+        helper_receipt = self.write_receipt(
+            Path(str(self.holds_output) + ".build.json") if default_paths
+            else self.root / "receipts/holds.build.json", helper_payload)
+        app_receipt = self.write_receipt(
+            Path(str(self.app_output) + ".build.json") if default_paths
+            else self.root / "receipts/holds-application.build.json", app_payload)
+        if default_paths:
+            return holds141.validate_holds_fixture_binary(
+                self.holds_output, self.app_output)
+        return holds141.validate_holds_fixture_binary(
+            self.holds_output, self.app_output, helper_receipt, app_receipt)
+
 
 class Snapshot140ReceiptDispatchTest(RefStoreReceiptFixture):
     def test_v1_pair_preserves_legacy_report_fields(self):
@@ -472,6 +487,7 @@ class Snapshot140ReceiptDispatchTest(RefStoreReceiptFixture):
     def test_v2_rejects_wrong_helper_target_source_kind_and_tampered_fields(self):
         self.assert_snapshot_rejects(
             self.helper_receipt(target="ref_store_other_fixture",
+                                source=SNAPSHOT_SOURCE,
                                 output=self.snapshot_output,
                                 original=self.snapshot_original),
             self.app_receipt())
@@ -576,5 +592,172 @@ class Snapshot140ReceiptDispatchTest(RefStoreReceiptFixture):
                 mock.patch("os.system", side_effect=AssertionError("subprocess")):
             report = self.validate_snapshot(
                 self.helper_receipt(), self.app_receipt())
+        self.assertEqual(report["receipt_schema"], binding.RECEIPT_SCHEMA_V2)
+
+
+class Holds141ReceiptDispatchTest(RefStoreReceiptFixture):
+    def assert_holds_rejects(self, helper_payload, app_payload):
+        with self.assertRaises(AssertionError):
+            self.validate_holds(helper_payload, app_payload)
+
+    def test_v1_pair_preserves_legacy_report_fields(self):
+        report = self.validate_holds(
+            self.v1_helper_receipt(target=HOLDS_TARGET), self.v1_app_receipt())
+        self.assertEqual(report["package_rebuilt"], True)
+        self.assertIs(report["fresh"], False)
+        self.assertEqual(report["fresh_false_artifact"],
+                         {"target": HOLDS_TARGET, "kind": "test", "fresh": False})
+        self.assertEqual(report["build_kind"], "rust-integration-test")
+        self.assertNotIn("receipt_schema", report)
+        self.assertNotIn("cargo_artifacts", report)
+        self.assertEqual(report["source_inputs_sha256"],
+                         self.bound["source_inputs_sha256"])
+
+    def test_v1_missing_package_rebuilt_or_false_freshness_still_fails(self):
+        with self.assertRaises(AssertionError):
+            self.validate_holds(
+                self.v1_helper_receipt(target=HOLDS_TARGET, package_rebuilt=False),
+                self.v1_app_receipt())
+        with self.assertRaises(AssertionError):
+            self.validate_holds(
+                self.v1_helper_receipt(target=HOLDS_TARGET, fresh=True),
+                self.v1_app_receipt())
+
+    def test_v2_pair_accepts_literal_true_false_and_mixed_freshness(self):
+        cases = [
+            (True, True, False),
+            (False, False, True),
+            (True, False, True),
+            (False, True, False),
+        ]
+        for helper_fresh, lib_fresh, bin_fresh in cases:
+            with self.subTest(helper_fresh=helper_fresh,
+                              lib_fresh=lib_fresh, bin_fresh=bin_fresh):
+                report = self.validate_holds(
+                    self.helper_receipt(target=HOLDS_TARGET, fresh=helper_fresh),
+                    self.app_receipt(lib_fresh=lib_fresh, bin_fresh=bin_fresh))
+                self.assertEqual(report["receipt_schema"], binding.RECEIPT_SCHEMA_V2)
+                self.assertIs(report["fresh"], helper_fresh)
+                self.assertEqual(report["cargo_artifacts"][0]["fresh"], helper_fresh)
+                self.assertEqual(report["candidate_application_fresh"],
+                                 {"lib": lib_fresh, "bin": bin_fresh})
+                self.assertNotIn("package_rebuilt", report)
+                self.assertNotIn("fresh_false_artifact", report)
+                self.assertNotIn("candidate_application_package_rebuilt", report)
+
+    def test_v2_default_receipt_discovery_and_exact_selected_rows(self):
+        report = self.validate_holds(
+            self.helper_receipt(target=HOLDS_TARGET),
+            self.app_receipt(),
+            default_paths=True)
+        self.assertEqual(report["cargo_artifacts"][0]["target"], HOLDS_TARGET)
+        self.assertEqual(report["cargo_artifacts"][0]["kind"], "test")
+        self.assertEqual(report["candidate_application_cargo_artifacts"][0]["source"],
+                         binding.APP_LIB_SOURCE)
+        self.assertEqual(report["candidate_application_cargo_artifacts"][1]["source"],
+                         binding.APP_BIN_SOURCE)
+        self.assertTrue(report["same_batch_manifest"])
+
+    def test_v2_legit_cli_dev_receipt_is_accepted(self):
+        report = self.validate_holds(
+            self.helper_receipt(target=HOLDS_TARGET),
+            self.app_cli_receipt())
+        self.assertEqual(report["candidate_application_kind"], binding.APP_CLI_KIND)
+        self.assertEqual(report["candidate_application_profile"], "dev")
+        self.assertFalse(report["same_batch_manifest"])
+
+    def test_v2_rejects_wrong_helper_target_source_kind_and_tampered_fields(self):
+        self.assert_holds_rejects(
+            self.helper_receipt(target="ref_store_other_fixture",
+                                source=HOLDS_SOURCE,
+                                output=self.holds_output,
+                                original=self.holds_original),
+            self.app_receipt())
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET,
+                                source="tests/ref_store_other_fixture.rs"),
+            self.app_receipt())
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET,
+                                kind="native-build-batch-bin"),
+            self.app_receipt())
+        tampered_source = self.helper_receipt(target=HOLDS_TARGET)
+        tampered_source["integration_test_source_sha256"] = "0" * 64
+        self.assert_holds_rejects(tampered_source, self.app_receipt())
+        tampered_fresh = self.helper_receipt(target=HOLDS_TARGET)
+        tampered_fresh["cargo_artifacts"][0]["fresh"] = "false"
+        self.assert_holds_rejects(tampered_fresh, self.app_receipt())
+
+    def test_v2_rejects_wrong_application_target_source_and_digest(self):
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET),
+            self.app_receipt(bin_target="rootyard-pando-lab"))
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET),
+            self.app_receipt(bin_source="src/bin/rootyard-pando-lab.rs"))
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET),
+            self.app_receipt(
+                bin_executable=self.other_bin,
+                original_sha256=digest(self.app_binary),
+                extra_bins=[{
+                    "target": "rootyard-pando-lab",
+                    "source": "src/bin/rootyard-pando-lab.rs",
+                    "executable": self.app_binary,
+                }]))
+        tampered_binary = self.app_receipt()
+        tampered_binary["binary_sha256"] = "0" * 64
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET), tampered_binary)
+
+    def test_v2_rejects_unknown_mixed_implicit_and_stale_pairs(self):
+        helper = self.helper_receipt(target=HOLDS_TARGET)
+        app = self.app_receipt()
+        unknown = copy.deepcopy(app)
+        unknown["receipt_schema"] = "rootyard/native-build-receipt/v3"
+        self.assert_holds_rejects(helper, unknown)
+        self.assert_holds_rejects(helper, self.v1_app_receipt())
+        self.assert_holds_rejects(
+            self.v1_helper_receipt(target=HOLDS_TARGET), app)
+        self.assert_holds_rejects(helper, self.app_receipt(implicit=True))
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET,
+                                manifest=self.root / "stale-a/manifest.json"),
+            self.app_receipt(manifest=self.root / "stale-b/manifest.json"))
+
+    def test_v2_rejects_config_mismatch(self):
+        self.write(".cargo/config.toml", "[build]\njobs = 8\n")
+        different = self.capture()
+        self.assertNotEqual(different["config_digest"], self.bound["config_digest"])
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET),
+            self.app_receipt(bound=different))
+
+    def test_v2_rejects_toolchain_mismatch(self):
+        toolchain = copy.deepcopy(self.toolchain())
+        toolchain["rustc"]["commit_hash"] = "e" * 40
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET),
+            self.app_receipt(toolchain=toolchain))
+
+    def test_v2_rejects_wrong_features_and_selection_flags(self):
+        app = self.app_receipt()
+        app["features"]["enabled"] = ["other"]
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET), app)
+        app = self.app_receipt()
+        app["selection"]["strip_debuginfo"] = False
+        self.assert_holds_rejects(
+            self.helper_receipt(target=HOLDS_TARGET), app)
+        helper = self.helper_receipt(target=HOLDS_TARGET)
+        helper["selection"]["features"] = "other"
+        self.assert_holds_rejects(helper, self.app_receipt())
+
+    def test_v2_validation_never_starts_a_subprocess(self):
+        with mock.patch("subprocess.run", side_effect=AssertionError("subprocess")), \
+                mock.patch("subprocess.Popen", side_effect=AssertionError("subprocess")), \
+                mock.patch("os.system", side_effect=AssertionError("subprocess")):
+            report = self.validate_holds(
+                self.helper_receipt(target=HOLDS_TARGET), self.app_receipt())
         self.assertEqual(report["receipt_schema"], binding.RECEIPT_SCHEMA_V2)
 
