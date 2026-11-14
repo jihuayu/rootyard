@@ -629,7 +629,9 @@ class PandoMultiPackRepackAndReachabilityGcTests(unittest.TestCase):
 
 class PandoLabHarnessAndMainGatewayRoutingOfflineTests(unittest.TestCase):
     def test_pando_lab_harness_object_store_and_repack_methods_offline(self):
-        args = argparse.Namespace(binary="target/debug/rootyard-pando-lab", pg_share=None)
+        # Offline unit/mock path: Lab.__init__ only records this string.  cli/sql/http/git
+        # are replaced below, so no native runtime is selected or executed.
+        args = argparse.Namespace(binary="offline-mock-rootyard-pando-lab", pg_share=None)
         lab = Lab(args)
         try:
             lab.base = "http://127.0.0.1:59998"

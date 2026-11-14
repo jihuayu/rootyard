@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e_tiers  # noqa: E402
 from e2e_tiers import SchemaBoundaryIntegrationFixture  # noqa: E402
 import schema_baseline  # noqa: E402
+from lab_binary import resolve_optional_lab_binary  # noqa: E402
 from workspace import WorkspaceHarness  # noqa: E402
 
 
@@ -1573,8 +1574,17 @@ class TestTier5Track4PandoAndWorkspaceLabAdversarial(e2e_tiers.BaseRootyardTestC
         self.assertIn("is_loopback", pando_mod)
         self.assertIn("hostaddr", pando_mod)
 
-        pando_bin = ROOT / "target/debug/rootyard-pando-lab"
-        if pando_bin.is_file() and os.access(pando_bin, os.X_OK):
+        # The static source assertions above need no binary.  If a real Pando
+        # artifact is configured (ROOTYARD_PANDO_LAB_BIN) or a legacy local
+        # prebuilt exists, this one runtime probe consumes that exact artifact
+        # and its source binding; it is not a unit/mock path.
+        selected = resolve_optional_lab_binary(
+            "ROOTYARD_PANDO_LAB_BIN",
+            legacy=ROOT / "target/debug/rootyard-pando-lab",
+            purpose="Tier-5 Pando loopback/synthetic guard",
+        )
+        if selected is not None:
+            pando_bin = selected.path
             # Missing PANDO_SYNTHETIC_ONLY=1 -> must fail closed before opening any socket/store
             env_missing = {k: v for k, v in os.environ.items() if k != "PANDO_SYNTHETIC_ONLY"}
             res1 = subprocess.run([str(pando_bin), "gc"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env_missing)

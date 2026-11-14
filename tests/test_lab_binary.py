@@ -213,6 +213,27 @@ class LabSelectorSourceContractTest(unittest.TestCase):
         self.assertNotIn(".cargo/bin", text)
         self.assertIn("ROOTYARD_VIEW_LAB_BIN", text)
         self.assertIn("resolve_lab_binary", text)
+    def test_workspace_harness_defaults_to_environment_selection(self):
+        text = (Path(__file__).resolve().parent / "workspace.py").read_text(encoding="utf-8")
+        self.assertIn('"ROOTYARD_WORKSPACE_LAB_BIN"', text)
+        self.assertIn("def __init__(self, binary_path=None, reference_only=False)", text)
+        self.assertNotIn("cargo build", text)
+
+    def test_pando_runtime_selects_environment_and_offline_tests_stay_mocked(self):
+        tests = Path(__file__).resolve().parent
+        for name in ("test_tier5_adversarial.py", "test_pando_migration.py"):
+            with self.subTest(module=name):
+                text = (tests / name).read_text(encoding="utf-8")
+                self.assertNotIn("cargo build", text)
+        tier5 = (tests / "test_tier5_adversarial.py").read_text(encoding="utf-8")
+        self.assertIn("ROOTYARD_PANDO_LAB_BIN", tier5)
+        self.assertIn("resolve_optional_lab_binary", tier5)
+        migration = (tests / "test_pando_migration.py").read_text(encoding="utf-8")
+        self.assertIn('binary="offline-mock-rootyard-pando-lab"', migration)
+        self.assertNotIn('binary="target/debug/rootyard-pando-lab"', migration)
+        repack = (tests / "test_pando_repack_object_store.py").read_text(encoding="utf-8")
+        self.assertIn('binary="offline-mock-rootyard-pando-lab"', repack)
+        self.assertNotIn('binary="target/debug/rootyard-pando-lab"', repack)
 
 
 if __name__ == "__main__":
