@@ -156,6 +156,7 @@ class PrebuiltReceiptTest(unittest.TestCase):
         (self.root / "src").mkdir()
         (self.root / "tests" / "serving_support").mkdir(parents=True)
         (self.root / "tests" / "fixtures").mkdir()
+        (self.root / "experimental" / "pando").mkdir(parents=True)
         (self.root / "toolchain").mkdir()
         (self.root / "target" / "debug" / "deps").mkdir(parents=True)
         (self.root / "relocated").mkdir()
@@ -166,6 +167,9 @@ class PrebuiltReceiptTest(unittest.TestCase):
         (self.root / "tests" / "example.rs").write_text("#[test]\nfn one() {}\n")
         (self.root / "tests" / "serving_support" / "support.rs").write_text("pub fn s() {}\n")
         (self.root / "tests" / "fixtures" / "data.txt").write_text("fixture\n")
+        (self.root / "experimental" / "pando" / "schema.sql").write_text(
+            "CREATE SCHEMA IF NOT EXISTS pando_lab;\n"
+            "CREATE TABLE IF NOT EXISTS pando_lab.repositories (id uuid PRIMARY KEY);\n")
         (self.root / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.99.1"\n')
         for name in ("cargo", "rustc", "rustup"):
             (self.root / "toolchain" / name).write_bytes(("fake-" + name).encode())
