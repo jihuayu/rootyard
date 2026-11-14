@@ -22,38 +22,60 @@ data_root / repository_id / oid / promised_size /
 dev / ino / mtime seconds+nanoseconds / ctime seconds+nanoseconds / size / mode / nlink
 ```
 
-A same-length in-place tamper, truncate, or inode replacement therefore changes
-the identity and forces a fresh SHA-256 pass. The cache is a bounded,
-time-limited metadata cache (4,096 entries, 15 minutes); it never makes a
-missing, replaced, or unreadable path acceptable. Verification and the download
-body use one already-open descriptor, so a path cannot be swapped between the
-digest check and the response stream. Concurrent cache-miss readers of the
-same admitted identity share one digest pass (bounded by the eight blocking
-verification slots); followers wait under their own request deadlines and never
-open the path again, so they cannot hash a different inode or start a duplicate
-full-file pass. This coalescing is local-only and is not cold hydration: an
-absent or inadmissible local file still takes the explicit hydration path.
+An `O_NOFOLLOW` symlink swap is rejected at admission, and a same-length
+in-place tamper, corruption, truncation, or inode replacement either fails
+layout admission or changes the identity and forces a fresh SHA-256 pass that
+fails closed. The cache is a bounded, time-limited metadata cache
+(`MAX_CACHE_ENTRIES = 4,096`, `CACHE_TTL = 15 minutes`); it never makes a
+missing, replaced, symlinked, or unreadable path acceptable. Verification and
+the download body use one already-open descriptor, so a path cannot be swapped
+between the digest check and the response stream. Concurrent cache-miss readers
+of the same admitted identity share one digest pass; followers wait under their
+own deadlines and never open the path again, so they cannot hash a different
+inode or start a duplicate full-file pass. This coalescing is local-only and is
+not cold hydration: an absent or inadmissible local file still takes the
+explicit hydration path.
 
-The eight-slot verification limit applies to the asynchronous Batch/download
-entry points (`verify_local` and `open_verified_file`). Synchronous integrity
-checks used by CI dependency scans, mirror preparation and backup inventory
-share the identity cache and singleflight, but do not acquire this semaphore;
-their concurrency remains the responsibility of those calling jobs. This is
-not a process-wide eight-hash guarantee across all maintenance operations.
+The process-wide eight-slot FIFO verification limiter
+(`MAX_CONCURRENT_VERIFICATIONS = 8` in `src/lfs/verification_limiter.rs`) is
+shared across both asynchronous HTTP Batch/verify/download entry points
+(`verify_local` and `open_verified_file`) and synchronous `verify_path_blocking`
+callers (CI checkout dependency scans, mirror preparation, paired backup LFS
+inventory, and concurrent publication race fallback). Asynchronous callers wait
+in the shared FIFO ticket queue up to their request deadline before
+`tokio::task::spawn_blocking`, so excess HTTP requests never occupy
+blocking-pool threads while queued, and then move the owned permit into the
+blocking closure; synchronous callers wait on the same eight-slot FIFO queue via
+deadline-bounded condition variable waits. Every caller acquires its slot before
+registering in the singleflight table, so a `FlightLeader` never waits for a
+second slot while singleflight followers hold permits, and if a short-deadline
+leader times out first, a surviving follower with remaining deadline budget
+takes over on its already-open descriptor.
 
-Warm verified reads are local-only. They do not construct an object-store
-client, issue a remote HEAD/GET, or perform a synchronous remote repair. An
-unreachable or misconfigured endpoint cannot turn a verified local download
-into a 5xx; issue #71 is covered by the regression test
-`tests/lfs_read_amplification.py`. A cold miss (`local file absent, corrupt, or
-unverifiable`) is explicit: if the configured remote has no correct-size copy,
-batch download reports the object as unavailable and a direct GET fails with a
-service error rather than streaming partial bytes.
+Warm verified reads are local-only: steady-state `Batch -> GET` waves achieve
+`rchar / served_bytes ≈ 1.0` (one object read pass per served download, bounded
+`< 2.0` in `tests/lfs_read_amplification.py`, since `/proc/<pid>/io` `rchar`
+includes small HTTP and PostgreSQL socket reads) with `0` remote object-store
+requests, while cache-empty existing-local waves coalesce onto one digest pass
+across concurrent readers (`tests/lfs_read_amplification.py`,
+`tests/lfs_process_metrics.py`). `Batch`, `verify`, and `upload` pre-checks
+commit their short read transactions and release database pool connections
+before running local disk verification or remote hydration, then re-authorize
+against PostgreSQL before returning `200 OK` or scheduling deduplicated remote
+repairs (and roll back to run `ensure_readable` in at most three passes if a
+row transitions concurrently to `ready` before `Batch` upload reservation). Warm reads do not construct an object-store client, issue a remote HEAD/GET, or
+perform a synchronous remote repair; an unreachable or misconfigured endpoint
+cannot turn a verified local download into a 5xx (issue #71). A cold miss
+(`local file absent, corrupt, truncated, replaced, or symlinked`) is explicit:
+if the configured remote has no correct-size copy, batch download reports the
+object as unavailable and a direct GET fails closed rather than streaming
+partial or unverified bytes.
 
-Cold hydration is coalesced. Concurrent readers of the same
-`(data_root, repository, tenant, oid, size)` share one bounded single-flight
-fetch (maximum four hydrations in flight, maximum eight blocking verifications),
-wait with their own request deadlines, and each then streams through its own
+Cold hydration is coalesced: each remote-cold `Batch -> GET` wave issues
+`1 HEAD + 1 GET` against the object store for a given
+`(data_root, repository, tenant, oid, size)` key (maximum four hydrations in
+flight, maximum eight concurrent verifications), followers wait with their own
+request deadlines, and each reader then streams through its own
 identity-validated descriptor. A cancelled HTTP request does not abort the
 leader fetch into a partial publication: bytes are fetched into a unique
 `.tmp-<uuid>` staging file, digest/size verified, permissioned and synced, then
