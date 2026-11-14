@@ -6,18 +6,19 @@
 //! exposed.
 use super::contract::{
     BaseRequestSelector, OperationDigest, OperationDigestInput, RefVersionCodecError, RefVersionIntent, RefVersionKind,
-    RefVersionRealm,
+    RefVersionRealm, VersionId,
 };
 use super::limits::{
     ARTIFACTS_PER_PACK, MAX_OPERATION_PACKS, MAX_OPERATION_REFS, count_u32, length_u64, nonnegative_u64, positive_u64,
 };
 use crate::ref_store::core::contract::CommitMode;
 use crate::ref_store::core::pack_commit::{ContentDigest, PackArtifactRole, PlannedPack};
-use crate::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefPrecondition, RefTarget};
+use crate::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 const OPERATION_DOMAIN: &[u8] = b"ry-ref-version-operation-v1";
+const VERSION_ID_DOMAIN: &[u8] = b"ry-ref-version-id-v1";
 
 /// Canonical operation digest over the complete prospective mutation.
 ///
@@ -64,6 +65,73 @@ pub(crate) fn operation_digest(input: &OperationDigestInput) -> Result<Operation
         encode_pack(&mut writer, pack)?;
     }
     Ok(OperationDigest::from_canonical_hash(writer.finish()))
+}
+
+/// Candidate `VersionId` over the immutable realm/ref/operation identity.
+///
+/// This is not a registered version or a capability. `base_generation_from_authority`
+/// is the authority/store value for an exact present base; it is never a client
+/// generation field. Explicit absent derives generation 1. A present base uses a
+/// checked `base + 1`; a missing, zero or overflowing authority generation is a
+/// typed refusal. The legacy selector always returns
+/// [`RefVersionCodecError::NoMintForLegacyBase`], even when another input is
+/// invalid, so a legacy operation digest can never mint a candidate version id.
+/// `base_selector` must be the exact selector encoded in `operation_digest`;
+/// proving that, the base row and the current head is an authority check. The
+/// authority still must prove that a present base exists, is the exact current
+/// head of this ref/realm, and has the supplied generation.
+pub(crate) fn derive_candidate_version_id(
+    realm: &RefVersionRealm,
+    ref_name: &RefName,
+    base_selector: &BaseRequestSelector,
+    base_generation_from_authority: Option<u64>,
+    operation_id: uuid::Uuid,
+    operation_digest: OperationDigest,
+) -> Result<VersionId, RefVersionCodecError> {
+    if matches!(base_selector, BaseRequestSelector::LegacyNotSupplied) {
+        return Err(RefVersionCodecError::NoMintForLegacyBase);
+    }
+    let realm_numbers = validate_realm(realm)?;
+    require_non_nil(operation_id, "operation_id")?;
+    let generation = candidate_generation(base_selector, base_generation_from_authority)?;
+    let mut writer = CanonicalWriter::new();
+    writer.push_len_prefixed(VERSION_ID_DOMAIN)?;
+    writer.push_len_prefixed(realm.tenant_id().as_bytes())?;
+    writer.push_len_prefixed(realm.repository_id().as_bytes())?;
+    writer.push_len_prefixed(realm.history_incarnation().as_bytes())?;
+    writer.push_u8(realm.authority_kind().tag());
+    writer.push_u64(realm_numbers.authority_epoch);
+    writer.push_u64(realm_numbers.group_id);
+    writer.push_u64(realm_numbers.group_epoch);
+    writer.push_u8(format_tag(realm.object_format()));
+    writer.push_len_prefixed(ref_name.as_str().as_bytes())?;
+    writer.push_u64(generation);
+    writer.push_len_prefixed(operation_id.as_bytes())?;
+    writer.push_len_prefixed(operation_digest.as_bytes())?;
+    Ok(VersionId::from_canonical_hash(writer.finish()))
+}
+
+fn candidate_generation(
+    base_selector: &BaseRequestSelector,
+    base_generation_from_authority: Option<u64>,
+) -> Result<u64, RefVersionCodecError> {
+    match base_selector {
+        BaseRequestSelector::LegacyNotSupplied => Err(RefVersionCodecError::NoMintForLegacyBase),
+        BaseRequestSelector::ExplicitAbsent => {
+            if base_generation_from_authority.is_some() {
+                return Err(RefVersionCodecError::UnexpectedAuthorityBaseGeneration);
+            }
+            Ok(1)
+        }
+        BaseRequestSelector::Present(_) => {
+            let base_generation =
+                base_generation_from_authority.ok_or(RefVersionCodecError::MissingAuthorityBaseGeneration)?;
+            if base_generation == 0 {
+                return Err(RefVersionCodecError::ZeroAuthorityBaseGeneration);
+            }
+            base_generation.checked_add(1).ok_or(RefVersionCodecError::GenerationOverflow)
+        }
+    }
 }
 
 struct RealmNumbers {
@@ -226,13 +294,9 @@ fn encode_intent(writer: &mut CanonicalWriter, intent: &RefVersionIntent) -> Res
             push_oid(writer, *oid)?;
         }
     }
-    match intent.base() {
-        BaseRequestSelector::LegacyNotSupplied => writer.push_u8(0),
-        BaseRequestSelector::ExplicitAbsent => writer.push_u8(1),
-        BaseRequestSelector::Present(version_id) => {
-            writer.push_u8(2);
-            writer.push_len_prefixed(version_id.as_bytes())?;
-        }
+    writer.push_u8(intent.base().tag());
+    if let BaseRequestSelector::Present(version_id) = intent.base() {
+        writer.push_len_prefixed(version_id.as_bytes())?;
     }
     match intent.target() {
         RefTarget::Delete => writer.push_u8(0),
@@ -321,6 +385,10 @@ mod tests {
     const MAIN_THEN_TOPIC: &str = "743230794bca95d7af12496e4bc5478979ea351e71c048d4641760cb91a95006";
     const TOPIC_THEN_MAIN: &str = "a62fe0df7576ecfe9bc0ded542945ebebffe67d16f9189f8e03a2ba277e948c1";
     const PACK_ORDER: &str = "2cdb97121c1d8a5452d2af6cfbe6455a09b5485bba1e40d11d5b1ce2a4fbf779";
+    const A_VERSION_ID: &str = "3db387d1417cab677d130c02867b16043a47812808e99ab9049656728b6fb85d";
+    const B_VERSION_ID: &str = "548bcbd1983bdb5348d8224fab36c753d81c51a1a98f761f7db0b6dc473c6bdd";
+    const C_VERSION_ID: &str = "fac94dbd1da16187c13859bceb966afa85834b366dafcd419672bf9501ed2dc6";
+    const D_VERSION_ID: &str = "04e21d0353a3b9e4fb8e285547478c47a50dd90c5fba572c9953d98b97f8da7e";
 
     fn uuid(value: u128) -> Uuid {
         Uuid::from_u128(value)
@@ -474,6 +542,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_input_with_realm(
         realm: RefVersionRealm,
         owner_id: Uuid,
@@ -525,6 +594,39 @@ mod tests {
     fn legacy_base_is_digested_but_distinct() {
         assert_eq!(digest(&input(uuid(4), vec![legacy_intent()], vec![pack_one()])).unwrap(), LEGACY_DIGEST);
         assert_ne!(LEGACY_DIGEST, A_DIGEST);
+    }
+
+    #[test]
+    fn authority_tag_is_bound_and_nonzero_raft_group_is_valid() {
+        let raft_realm =
+            RefVersionRealm::new(uuid(1), uuid(2), uuid(3), AuthorityKind::Raft, 7, 4, 9, GitObjectFormat::Sha1);
+        let raft_input =
+            build_input_with_realm(raft_realm, uuid(5), uuid(6), uuid(4), 3, 41, vec![a_intent()], vec![pack_one()]);
+        let pg = digest(&input(uuid(4), vec![a_intent()], vec![pack_one()])).unwrap();
+        let raft = digest(&raft_input).unwrap();
+        assert_eq!(pg, A_DIGEST);
+        assert_ne!(raft, A_DIGEST);
+    }
+
+    #[test]
+    fn commit_mode_and_keep_head_are_bound() {
+        let accepted_keep = OperationDigestInput::new(
+            realm(),
+            uuid(5),
+            uuid(6),
+            IssuerLane::new("main").unwrap(),
+            3,
+            uuid(4),
+            41,
+            RequestDigest::from_bytes([0x55; 32]),
+            CommitMode::AcceptedSubset,
+            HeadUpdate::Keep,
+            vec![a_intent()],
+            RequestDigest::from_bytes([0x66; 32]),
+            vec![pack_one()],
+        );
+        let accepted = digest(&accepted_keep).unwrap();
+        assert_ne!(accepted, A_DIGEST);
     }
 
     #[test]
@@ -610,6 +712,24 @@ mod tests {
             Err(RefVersionCodecError::ObjectFormatMismatch { field: "target_oid" })
         );
 
+        let sha256_realm = realm_with(uuid(1), uuid(2), uuid(3), 7, 0, 9, GitObjectFormat::Sha256);
+        let sha256_input = build_input_with_realm(
+            sha256_realm,
+            uuid(5),
+            uuid(6),
+            uuid(4),
+            3,
+            41,
+            vec![main_intent(
+                RefVersionKind::Publish,
+                RefPrecondition::Present(GitOid::Sha256([0x44; 32])),
+                BaseRequestSelector::Present(version(0x22)),
+                RefTarget::Oid(GitOid::Sha256([0x33; 32])),
+            )],
+            vec![pack_one()],
+        );
+        assert!(operation_digest(&sha256_input).is_ok());
+
         let explicit_absent_with_old_oid = input(
             uuid(4),
             vec![main_intent(
@@ -693,6 +813,30 @@ mod tests {
         );
         assert_eq!(digest(&nil_tenant), Err(RefVersionCodecError::NilIdentifier { field: "tenant_id" }));
 
+        let nil_repository = build_input_with_realm(
+            realm_with(uuid(1), Uuid::nil(), uuid(3), 7, 0, 9, GitObjectFormat::Sha1),
+            uuid(5),
+            uuid(6),
+            uuid(4),
+            3,
+            41,
+            vec![a_intent()],
+            vec![pack_one()],
+        );
+        assert_eq!(digest(&nil_repository), Err(RefVersionCodecError::NilIdentifier { field: "repository_id" }));
+
+        let nil_history = build_input_with_realm(
+            realm_with(uuid(1), uuid(2), Uuid::nil(), 7, 0, 9, GitObjectFormat::Sha1),
+            uuid(5),
+            uuid(6),
+            uuid(4),
+            3,
+            41,
+            vec![a_intent()],
+            vec![pack_one()],
+        );
+        assert_eq!(digest(&nil_history), Err(RefVersionCodecError::NilIdentifier { field: "history_incarnation" }));
+
         let nil_owner =
             build_input_with_realm(realm(), Uuid::nil(), uuid(6), uuid(4), 3, 41, vec![a_intent()], vec![pack_one()]);
         assert_eq!(digest(&nil_owner), Err(RefVersionCodecError::NilIdentifier { field: "owner_id" }));
@@ -748,5 +892,197 @@ mod tests {
         let zero_revision =
             build_input_with_realm(realm(), uuid(5), uuid(6), uuid(4), 3, 0, vec![a_intent()], vec![pack_one()]);
         assert_eq!(digest(&zero_revision), Err(RefVersionCodecError::ZeroCounter { field: "expected_gate_revision" }));
+    }
+
+    #[test]
+    fn candidate_version_ids_match_contract_a_b_c_d_vectors() {
+        let a_operation = operation_digest(&input(uuid(4), vec![a_intent()], vec![pack_one()])).unwrap();
+        let a = derive_candidate_version_id(
+            &realm(),
+            &main_name(),
+            &BaseRequestSelector::Present(version(0x22)),
+            Some(1),
+            uuid(4),
+            a_operation,
+        )
+        .unwrap();
+        assert_eq!(a.as_hex(), A_VERSION_ID);
+
+        let b_operation = operation_digest(&input(uuid(4), vec![b_intent()], vec![pack_one()])).unwrap();
+        let b = derive_candidate_version_id(
+            &realm(),
+            &main_name(),
+            &BaseRequestSelector::Present(version(0x77)),
+            Some(1),
+            uuid(4),
+            b_operation,
+        )
+        .unwrap();
+        assert_eq!(b.as_hex(), B_VERSION_ID);
+        assert_ne!(a.as_hex(), b.as_hex());
+
+        let c_operation = operation_digest(&input(uuid(7), vec![c_intent()], vec![pack_one()])).unwrap();
+        let c = derive_candidate_version_id(
+            &realm(),
+            &main_name(),
+            &BaseRequestSelector::ExplicitAbsent,
+            None,
+            uuid(7),
+            c_operation,
+        )
+        .unwrap();
+        assert_eq!(c.as_hex(), C_VERSION_ID);
+
+        let d_operation = operation_digest(&input(uuid(8), vec![d_intent()], vec![pack_one()])).unwrap();
+        let d = derive_candidate_version_id(
+            &realm(),
+            &main_name(),
+            &BaseRequestSelector::Present(version(0x22)),
+            Some(1),
+            uuid(8),
+            d_operation,
+        )
+        .unwrap();
+        assert_eq!(d.as_hex(), D_VERSION_ID);
+
+        let a_retry = derive_candidate_version_id(
+            &realm(),
+            &main_name(),
+            &BaseRequestSelector::Present(version(0x22)),
+            Some(1),
+            uuid(4),
+            a_operation,
+        )
+        .unwrap();
+        assert_eq!(a_retry, a);
+    }
+
+    #[test]
+    fn legacy_base_never_mints_a_candidate_version_id() {
+        let legacy_operation = operation_digest(&input(uuid(4), vec![legacy_intent()], vec![pack_one()])).unwrap();
+        for base_generation in [None, Some(1_u64)] {
+            assert_eq!(
+                derive_candidate_version_id(
+                    &realm(),
+                    &main_name(),
+                    &BaseRequestSelector::LegacyNotSupplied,
+                    base_generation,
+                    uuid(4),
+                    legacy_operation,
+                ),
+                Err(RefVersionCodecError::NoMintForLegacyBase)
+            );
+        }
+        let nil_realm = realm_with(Uuid::nil(), uuid(2), uuid(3), 7, 0, 9, GitObjectFormat::Sha1);
+        assert_eq!(
+            derive_candidate_version_id(
+                &nil_realm,
+                &main_name(),
+                &BaseRequestSelector::LegacyNotSupplied,
+                None,
+                Uuid::nil(),
+                legacy_operation,
+            ),
+            Err(RefVersionCodecError::NoMintForLegacyBase)
+        );
+    }
+
+    #[test]
+    fn candidate_generation_is_derived_not_client_supplied() {
+        let a_operation = operation_digest(&input(uuid(4), vec![a_intent()], vec![pack_one()])).unwrap();
+        let present = BaseRequestSelector::Present(version(0x22));
+        assert_eq!(
+            derive_candidate_version_id(&realm(), &main_name(), &present, None, uuid(4), a_operation),
+            Err(RefVersionCodecError::MissingAuthorityBaseGeneration)
+        );
+        assert_eq!(
+            derive_candidate_version_id(&realm(), &main_name(), &present, Some(0), uuid(4), a_operation),
+            Err(RefVersionCodecError::ZeroAuthorityBaseGeneration)
+        );
+        assert_eq!(
+            derive_candidate_version_id(&realm(), &main_name(), &present, Some(u64::MAX), uuid(4), a_operation,),
+            Err(RefVersionCodecError::GenerationOverflow)
+        );
+        assert_eq!(
+            derive_candidate_version_id(
+                &realm(),
+                &main_name(),
+                &BaseRequestSelector::ExplicitAbsent,
+                Some(1),
+                uuid(7),
+                a_operation,
+            ),
+            Err(RefVersionCodecError::UnexpectedAuthorityBaseGeneration)
+        );
+        assert_eq!(
+            derive_candidate_version_id(&realm(), &main_name(), &present, Some(1), Uuid::nil(), a_operation),
+            Err(RefVersionCodecError::NilIdentifier { field: "operation_id" })
+        );
+        let negative_realm = realm_with(uuid(1), uuid(2), uuid(3), -1, 0, 9, GitObjectFormat::Sha1);
+        assert_eq!(
+            derive_candidate_version_id(&negative_realm, &main_name(), &present, Some(1), uuid(4), a_operation),
+            Err(RefVersionCodecError::NegativeCounter { field: "authority_epoch" })
+        );
+    }
+
+    #[test]
+    fn candidate_version_id_binds_realm_ref_operation_and_digest() {
+        let c_operation = operation_digest(&input(uuid(7), vec![c_intent()], vec![pack_one()])).unwrap();
+        let c = derive_candidate_version_id(
+            &realm(),
+            &main_name(),
+            &BaseRequestSelector::ExplicitAbsent,
+            None,
+            uuid(7),
+            c_operation,
+        )
+        .unwrap();
+        assert_eq!(c.as_hex(), C_VERSION_ID);
+
+        let other_tenant = realm_with(uuid(9), uuid(2), uuid(3), 7, 0, 9, GitObjectFormat::Sha1);
+        let tenant_changed = derive_candidate_version_id(
+            &other_tenant,
+            &main_name(),
+            &BaseRequestSelector::ExplicitAbsent,
+            None,
+            uuid(7),
+            c_operation,
+        )
+        .unwrap();
+        assert_ne!(tenant_changed.as_hex(), C_VERSION_ID);
+
+        let ref_changed = derive_candidate_version_id(
+            &realm(),
+            &topic_name(),
+            &BaseRequestSelector::ExplicitAbsent,
+            None,
+            uuid(7),
+            c_operation,
+        )
+        .unwrap();
+        assert_ne!(ref_changed.as_hex(), C_VERSION_ID);
+
+        let operation_changed = derive_candidate_version_id(
+            &realm(),
+            &main_name(),
+            &BaseRequestSelector::ExplicitAbsent,
+            None,
+            uuid(9),
+            c_operation,
+        )
+        .unwrap();
+        assert_ne!(operation_changed.as_hex(), C_VERSION_ID);
+
+        let digest_changed_operation = operation_digest(&input(uuid(7), vec![c_intent()], vec![pack_two()])).unwrap();
+        let digest_changed = derive_candidate_version_id(
+            &realm(),
+            &main_name(),
+            &BaseRequestSelector::ExplicitAbsent,
+            None,
+            uuid(7),
+            digest_changed_operation,
+        )
+        .unwrap();
+        assert_ne!(digest_changed.as_hex(), C_VERSION_ID);
     }
 }

@@ -8,7 +8,7 @@
 use crate::ref_store::contract::{IssuerLane, RequestDigest};
 use crate::ref_store::core::contract::CommitMode;
 use crate::ref_store::core::pack_commit::PlannedPack;
-use crate::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget};
+use crate::ref_store::core::types::{GitObjectFormat, HeadUpdate, RefName, RefPrecondition, RefTarget};
 use std::fmt;
 use uuid::Uuid;
 
@@ -302,6 +302,10 @@ impl OperationDigest {
         Self(bytes)
     }
 
+    pub(super) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     #[cfg(test)]
     pub(crate) fn as_hex(&self) -> String {
         hex::encode(self.0)
@@ -320,6 +324,10 @@ impl fmt::Debug for OperationDigest {
 pub(crate) struct VersionId([u8; 32]);
 
 impl VersionId {
+    pub(super) const fn from_canonical_hash(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Raw bytes for an internal preimage. This is still not a capability.
     pub(super) const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -328,6 +336,11 @@ impl VersionId {
     #[cfg(test)]
     pub(super) const fn from_test_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_hex(&self) -> String {
+        hex::encode(self.0)
     }
 }
 
@@ -352,6 +365,11 @@ pub(crate) enum RefVersionCodecError {
     InvalidRequestShape { reason: &'static str },
     InvalidContentDigest,
     LengthOverflow { field: &'static str },
+    NoMintForLegacyBase,
+    MissingAuthorityBaseGeneration,
+    UnexpectedAuthorityBaseGeneration,
+    ZeroAuthorityBaseGeneration,
+    GenerationOverflow,
 }
 
 impl fmt::Display for RefVersionCodecError {
@@ -372,6 +390,17 @@ impl fmt::Display for RefVersionCodecError {
             Self::InvalidRequestShape { reason } => write!(formatter, "invalid request shape: {reason}"),
             Self::InvalidContentDigest => formatter.write_str("planned content digest is not a sha256 digest"),
             Self::LengthOverflow { field } => write!(formatter, "{field} length cannot be encoded"),
+            Self::NoMintForLegacyBase => {
+                formatter.write_str("a legacy base selector cannot mint a candidate version id")
+            }
+            Self::MissingAuthorityBaseGeneration => {
+                formatter.write_str("a present base requires an authority base generation")
+            }
+            Self::UnexpectedAuthorityBaseGeneration => {
+                formatter.write_str("an explicit absent base must not carry an authority base generation")
+            }
+            Self::ZeroAuthorityBaseGeneration => formatter.write_str("an authority base generation must be positive"),
+            Self::GenerationOverflow => formatter.write_str("the candidate ref generation overflowed"),
         }
     }
 }
