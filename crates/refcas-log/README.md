@@ -84,7 +84,7 @@ cargo clippy --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 cargo test --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
 ```
 
-Twenty unit tests cover restart, exact purge identity, replay, committed
+Twenty-one unit tests cover restart, exact purge identity, replay, committed
 rewrite refusal, holes, truncation, snapshot-style purge, bounds, identity/lock
 refusal, and malformed or valid-JSON corruption. They delete rows directly in
 SQLite (after a passing `quick_check`) and reopen: an internal row, index 0 with
@@ -105,18 +105,51 @@ helpers and fail on it; the own-`LogId` leftover test passes there through the
 purge pin that shortens whole-range starts, and the grading probes inside it show
 that. Tests exercise the same durable helpers as the trait implementations.
 
-One integration test calls the public vote
-trait in a child process, waits for a persisted-vote acknowledgement, sends
-SIGKILL, and verifies that a fresh process reads the identical vote. Child
-ownership and deadlines bound the probe.
+Two integration tests use owned child processes. The vote test calls the public
+vote trait in a child, waits for a persisted-vote acknowledgement, sends SIGKILL,
+and verifies that a fresh process reads the identical vote. The log test calls
+openraft's public `RaftLogStorageExt::blocking_append`, the public path that
+constructs `LogFlushed`, invokes `RaftLogStorage::append`, and waits for that
+callback; `LogFlushed::new` itself is private in pinned openraft 0.9.26. The
+child writes exact native entries and log IDs, saves exact committed metadata,
+reads both back, and only then prints `ACK`. Thus the parent's SIGKILL cannot
+run on a merely queued append, and a storage `append` that returns without
+completing its callback cannot yield the ACK: the extension either waits for
+the callback or reports the dropped sender as an error, and the startup
+deadline bounds either outcome. After the acknowledgement the parent sends
+SIGKILL to its own writer and reaps it under a deadline. A fresh process opens
+the store and reads
+the exact contiguous entries, log IDs, committed metadata and checksum-verified
+rows; the parent then re-reads `log_entry` and `meta` directly to pin the stored
+SHA-256 values. Startup, output, wait, kill and reap are bounded, and `Drop`
+kills and reaps an owned child on every failure path.
+
+The log fixture is a fresh local temporary directory. On Linux the test reads
+`/proc/self/mountinfo`, records the mount device and filesystem type, fails on
+known network filesystem types, and requires the database file to stay on the
+fixture's device; other Unix hosts report that the mount check is unavailable.
+The test uses at most one writer and one reader child, never concurrently, with
+no socket, loopback server, peer process or state machine. It sends SIGKILL only
+to its own writer after the callback-backed acknowledgement and waits for the
+reader to exit normally.
 
 The dedicated workflow runs these checks independently of Rootyard's Cargo
-workspace. The SIGKILL test establishes only vote persistence across a process
-crash on the tested filesystem. It does not establish power-loss durability,
-quorum acknowledgements or Git acknowledgements.
+workspace. The SIGKILL tests establish only vote and acknowledged-log
+persistence across a process crash on the tested local filesystem. They do not
+establish power-loss durability, quorum or peer acknowledgements, Git
+acknowledgements, three-host behavior, state-machine/snapshot atomicity, or
+whole-#149 completion. Past-tail empty reads starting at `last_log_id.index + 1`
+remain valid: range ends are exclusive.
 
 ## Remaining scope
 
 State machine storage, snapshots, RPC, TLS, ReadIndex, complete openraft suite,
 Ref-CAS integration and multi-host qualification remain unimplemented. This
 slice does not complete issues #149 or #115 and has no production routing.
+
+A separate follow-up must decide whether to fail closed on a non-dense retained
+log during `open` and whether a fresh unpurged store must start at index 0: a
+middle-row delete can currently pass `open` and fail a later read, and the
+pinned OpenRaft storage contract and existing tests must be checked before
+changing first-index behavior. This checkpoint does not combine that contiguity
+change.
