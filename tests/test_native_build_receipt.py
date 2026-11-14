@@ -1,9 +1,10 @@
-"""Contract tests for scripts/build_native.py.
+"""Offline contract tests for the v2 explicit producer scripts/build_native.py.
 
-These tests never invoke Cargo. They exercise the build transaction against a
-temporary workspace/target directory and fake Cargo JSON event streams, then
-prove the receipt is bound to the rebuilt artifact, invalidated on every
-failure path, and installed atomically under the target-directory flock.
+These tests never invoke Cargo, rustc or rustup. They exercise the build
+transaction against a temporary workspace/target directory and fake Cargo JSON
+event streams, then prove the receipt is the shared v2 contract, freshness is
+copied literally and never forced, the previous receipt is invalidated on every
+failure path, and installation is atomic under the target-directory flock.
 """
 import argparse
 import fcntl
@@ -13,6 +14,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,6 +27,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import build_native  # noqa: E402
+import native_build_receipt as receipt  # noqa: E402
 
 
 class FakeProcess:
@@ -43,15 +46,20 @@ class FakeProcess:
         self.returncode = -9
 
 
-def _artifact(kind, fresh=False, executable=None, package_id='rootyard 0.1.0'):
+def _artifact(kind, fresh=False, executable=None, src_path=None,
+              package_id='rootyard 0.1.0', profile=None):
     event = {
         'reason': 'compiler-artifact',
         'package_id': package_id,
-        'target': {'name': 'rootyard', 'kind': [kind]},
+        'target': {'name': 'rootyard', 'kind': [kind], 'src_path': str(src_path)},
         'fresh': fresh,
+        'profile': profile or {
+            'opt_level': '0', 'debuginfo': 2, 'debug_assertions': True,
+            'overflow_checks': True, 'test': False,
+        },
     }
     if executable is not None:
-        event['executable'] = executable
+        event['executable'] = str(executable)
     return event
 
 
@@ -68,25 +76,48 @@ def _acquire_lock(target, acquired, queue):
         acquired.set()
 
 
+TOOLCHAIN_TRIPLE = 'x86_64-unknown-linux-gnu'
+CARGO_COMMIT = '64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+
+
 class BuildReceiptTest(unittest.TestCase):
     def setUp(self):
-        self.tempdir = Path(tempfile.mkdtemp(prefix='rootyard-build-receipt-'))
-        self.addCleanup(self._rmtree, self.tempdir)
+        self.tempdir = Path(tempfile.mkdtemp(prefix='rootyard-build-receipt-v2-'))
+        self.addCleanup(shutil.rmtree, self.tempdir, ignore_errors=True)
         self.root = self.tempdir.resolve()
         (self.root / 'src').mkdir()
+        (self.root / 'tests' / 'fixtures').mkdir(parents=True)
+        (self.root / '.cargo').mkdir()
+        (self.root / 'toolchain').mkdir()
         (self.root / 'Cargo.toml').write_text('[package]\nname = "rootyard"\n')
         (self.root / 'Cargo.lock').write_text('version = 3\n')
+        (self.root / 'build.rs').write_text('fn main() {}\n')
         (self.root / 'src' / 'main.rs').write_text('fn main() {}\n')
-        # Relative CARGO_TARGET_DIR exercises canonical_target() resolution.
+        (self.root / 'src' / 'lib.rs').write_text('pub fn hello() {}\n')
+        (self.root / 'tests' / 'example.rs').write_text('#[test]\nfn one() {}\n')
+        (self.root / 'tests' / 'fixtures' / 'data.txt').write_text('fixture\n')
+        (self.root / '.cargo' / 'config.toml').write_text('[build]\njobs = 4\n')
+        (self.root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "1.99.1"\n')
+        for name, content in (('cargo', b'fake-cargo'), ('rustc', b'fake-rustc'),
+                              ('rustup', b'fake-rustup')):
+            (self.root / 'toolchain' / name).write_bytes(content)
+        # A relative CARGO_TARGET_DIR exercises canonical_target() resolution.
         self.environment = mock.patch.dict(
-            os.environ, {'CARGO_TARGET_DIR': 'target'}, clear=False)
+            os.environ,
+            {'CARGO_TARGET_DIR': 'target',
+             'HOME': str(self.tempdir / 'home'),
+             'CARGO_HOME': str(self.tempdir / 'cargo-home')},
+            clear=True)
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        (self.tempdir / 'home').mkdir()
+        (self.tempdir / 'cargo-home').mkdir()
         patchers = [
             mock.patch.object(build_native, 'ROOT', self.root),
-            mock.patch.object(build_native.subprocess, 'run', self.fake_run),
-            mock.patch.object(build_native.subprocess, 'check_output',
-                              self.fake_check_output),
+            mock.patch.object(build_native, 'probe_toolchain', self.fake_toolchain),
+            mock.patch.object(build_native, 'git_state', self.fake_git),
+            mock.patch.object(build_native.subprocess, 'run', self.fail_run),
+            mock.patch.object(build_native.subprocess, 'check_output', self.fail_check_output),
         ]
         for patcher in patchers:
             patcher.start()
@@ -94,28 +125,61 @@ class BuildReceiptTest(unittest.TestCase):
         self.target = (self.root / 'target').resolve()
         self.binary = self.target / 'debug' / 'rootyard'
         self.receipt = self.binary.with_suffix('.build.json')
-        self.temporary = self.receipt.with_suffix('.tmp')
-        self.clean_calls = []
+        self.temporary = self.receipt.with_name('.' + self.receipt.name + '.tmp')
         self.popen_calls = []
         self.lock_violations = []
-        self.popen = None
-
-    @staticmethod
-    def _rmtree(path):
-        import shutil
-        shutil.rmtree(path, ignore_errors=True)
+        self.probe_sequences = None
+        self.git_sequences = None
 
     # -- fake subprocess surface -------------------------------------------
-    def fake_run(self, command, **kwargs):
-        self.clean_calls.append((list(command), kwargs))
-        return mock.Mock(returncode=0, args=command)
+    def fail_run(self, command, **kwargs):
+        raise AssertionError(f'unexpected subprocess.run: {command}')
 
-    def fake_check_output(self, command, **kwargs):
-        if command[0] == 'git' and command[1:3] == ['rev-parse', 'HEAD']:
-            return 'deadbeefcafe\n'
-        if command[0] == 'rustc' and command[1:] == ['--version']:
-            return 'rustc 1.80.0 (fake)\n'
-        raise AssertionError(f'unexpected check_output: {command}')
+    def fail_check_output(self, command, **kwargs):
+        raise AssertionError(f'unexpected subprocess.check_output: {command}')
+
+    def fake_toolchain(self, environment):
+        values = self.probe_sequences
+        if values is not None:
+            value = values.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+        def identity(name, release, commit_hash, proxy=None):
+            executable = self.root / 'toolchain' / name
+            result = {
+                'executable': str(executable),
+                'executable_sha256': receipt.sha256_file(executable),
+                'version': f'{name} {release} (fake 2026-01-01)',
+                'release': release,
+                'commit_hash': commit_hash,
+                'commit_date': '2026-01-01',
+                'host': TOOLCHAIN_TRIPLE,
+            }
+            if proxy is not None:
+                result['path_entry'] = str(executable)
+                result['proxy'] = proxy
+            return result
+        return {
+            'cargo': identity('cargo', '1.101.0', CARGO_COMMIT),
+            'rustc': identity('rustc', '1.99.1', 'd' * 40, proxy=False),
+            'rustup': {
+                'executable': str(self.root / 'toolchain/rustup'),
+                'executable_sha256': receipt.sha256_file(self.root / 'toolchain/rustup'),
+                'resolved_rustc': str(self.root / 'toolchain/rustc'),
+                'resolved_rustc_sha256': receipt.sha256_file(self.root / 'toolchain/rustc'),
+            },
+            'target_triple': TOOLCHAIN_TRIPLE,
+            'pinned_channel': '1.99.1',
+            'pin_source': 'rust-toolchain.toml',
+        }
+
+    def fake_git(self):
+        values = self.git_sequences
+        if values is not None:
+            return values.pop(0)
+        return {'head': 'a' * 40, 'commit': 'a' * 40,
+                'tree': 'b' * 40, 'status': ' M src/lib.rs\n'}
 
     def make_popen(self, events, returncode=0, binary_content=b'native-binary',
                    write_binary=True, mutate_source=False):
@@ -148,9 +212,6 @@ class BuildReceiptTest(unittest.TestCase):
     @staticmethod
     def args(features=None, bins=False, package_debug=None, no_default_features=False,
              strip_debuginfo=False):
-        # Every attribute run_build reads is set explicitly: an auto-created
-        # Mock attribute would be stringified into the recorded cargo command
-        # and still compare equal to itself.
         return argparse.Namespace(
             features=features,
             bins=bins,
@@ -159,19 +220,25 @@ class BuildReceiptTest(unittest.TestCase):
             strip_debuginfo=strip_debuginfo,
         )
 
-    def events(self, fresh=False, executable=None, kinds=('lib', 'bin')):
+    def events(self, fresh=False, executable=None, kinds=('lib', 'bin'), lib_fresh=None,
+               bin_fresh=None):
         executable = str(self.binary) if executable is None else executable
+        lib_fresh = fresh if lib_fresh is None else lib_fresh
+        bin_fresh = fresh if bin_fresh is None else bin_fresh
         result = []
         for kind in kinds:
             if kind == 'lib':
-                result.append(_artifact('lib', fresh=fresh))
+                result.append(_artifact('lib', fresh=lib_fresh,
+                                        src_path=self.root / 'src' / 'lib.rs'))
             else:
-                result.append(_artifact('bin', fresh=fresh, executable=executable))
+                result.append(_artifact('bin', fresh=bin_fresh, executable=executable,
+                                        src_path=self.root / 'src' / 'main.rs'))
+        result.append({'reason': 'build-finished', 'success': True})
         return result
 
     def build(self, events, args=None, **popen_kwargs):
-        self.popen = self.make_popen(events, **popen_kwargs)
-        with mock.patch.object(build_native.subprocess, 'Popen', self.popen):
+        popen = self.make_popen(events, **popen_kwargs)
+        with mock.patch.object(build_native.subprocess, 'Popen', popen):
             return build_native.run_build(self.args() if args is None else args)
 
     def assert_no_receipt(self):
@@ -183,47 +250,71 @@ class BuildReceiptTest(unittest.TestCase):
         self.receipt.write_text('{"stale": true}\n')
 
     # -- happy path ---------------------------------------------------------
-    def test_clean_build_fresh_false_lib_and_exact_bin_installs_receipt(self):
-        report = self.build(self.events())
+    def test_cache_hit_fresh_true_and_false_are_both_accepted_without_clean(self):
+        for lib_fresh, bin_fresh in ((True, True), (False, False), (True, False), (False, True)):
+            with self.subTest(lib=lib_fresh, bin=bin_fresh):
+                self.popen_calls = []
+                report = self.build(self.events(lib_fresh=lib_fresh, bin_fresh=bin_fresh))
+                self.assertEqual(self.lock_violations, [])
+                self.assertEqual(len(self.popen_calls), 1)
+                self.assertEqual([item['fresh'] for item in report['cargo_artifacts']],
+                                 [lib_fresh, bin_fresh])
+                receipt_on_disk = json.loads(self.receipt.read_text())
+                self.assertEqual(receipt_on_disk, report)
 
-        self.assertEqual([call[0] for call in self.clean_calls],
-                         [['cargo', 'clean', '--package', 'rootyard']])
-        self.assertEqual(self.lock_violations, [])
-        self.assertEqual(len(self.popen_calls), 1)
+    def test_exact_command_and_no_cargo_clean(self):
+        report = self.build(self.events())
         command, kwargs = self.popen_calls[0]
-        # Default profile: features, bins are explicit and the newer profile
-        # flags are absent, so the receipt command is exactly reproducible.
         self.assertEqual(command, [
             'cargo', 'build', '--locked', '--bin', 'rootyard',
             '--message-format=json-render-diagnostics',
         ])
         self.assertEqual(kwargs['cwd'], self.root)
+        self.assertNotIn('clean', command)
+        self.assertEqual(report['command'], command)
+        self.assertFalse([path for path in self.root.rglob('*') if path.name == 'clean'])
 
-        self.assertTrue(self.receipt.is_file())
-        self.assertFalse(self.temporary.exists(), 'temporary receipt was not replaced atomically')
-        receipt = json.loads(self.receipt.read_text())
-        self.assertEqual(receipt, report)
-        self.assertEqual(receipt['version'], 1)
-        self.assertEqual(receipt['target_dir'], str(self.target))
-        self.assertEqual(receipt['lock_file'], str(self.target / build_native.LOCK_NAME))
-        self.assertEqual(receipt['clean_command'],
-                         ['cargo', 'clean', '--package', 'rootyard'])
-        self.assertEqual(receipt['command'], command)
-        self.assertIs(receipt['package_rebuilt'], True)
-        self.assertIs(receipt['fresh_false_artifacts'][0]['fresh'], False)
-        self.assertEqual([item['kind'] for item in receipt['fresh_false_artifacts']],
-                         ['lib', 'bin'])
-        self.assertEqual(receipt['fresh_false_artifacts'][1]['executable'],
-                         str(self.binary.resolve()))
-        self.assertEqual(receipt['workspace_commit'], 'deadbeefcafe')
-        self.assertEqual(receipt['rustc'], 'rustc 1.80.0 (fake)')
-        self.assertEqual(receipt['binary_sha256'],
-                         hashlib.sha256(b'native-binary').hexdigest())
+    def test_v2_receipt_binds_source_config_test_lock_toolchain_command_profile(self):
+        report = self.build(self.events(lib_fresh=True, bin_fresh=False))
+        self.assertEqual(report['receipt_schema'], receipt.RECEIPT_SCHEMA_V2)
+        for banned in receipt.V2_BANNED_FIELDS:
+            self.assertNotIn(banned, report)
+        self.assertEqual(report['binary_sha256'], receipt.sha256_file(self.binary))
+        self.assertEqual(report['workspace_commit'], 'a' * 40)
+        self.assertEqual(report['git_head'], 'a' * 40)
+        self.assertEqual(report['working_tree'], {'tree': 'b' * 40, 'status': ' M src/lib.rs\n'})
+        self.assertEqual(report['source_inputs_sha256'],
+                         receipt.source_digest(self.root))
+        self.assertEqual(report['cargo_lock_sha256'],
+                         receipt.sha256_file(self.root / 'Cargo.lock'))
+        self.assertEqual(report['config_digest'],
+                         receipt.config_digest_from_entries(report['bound_input_inventory']))
+        self.assertEqual(report['command'], self.popen_calls[0][0])
+        self.assertEqual(report['profile'], 'dev')
+        self.assertEqual(report['target_triple'], TOOLCHAIN_TRIPLE)
+        self.assertEqual(report['target_dir'], str(self.target))
+        self.assertEqual(report['features'], {'enabled': [], 'no_default_features': False})
+        self.assertEqual(report['lock_file'], str(self.target / build_native.LOCK_NAME))
+        self.assertEqual(report['toolchain']['cargo']['commit_hash'], CARGO_COMMIT)
+        self.assertEqual(report['toolchain']['rustc']['proxy'], False)
+        self.assertEqual(report['toolchain']['rustc']['executable_sha256'],
+                         receipt.sha256_file(self.root / 'toolchain' / 'rustc'))
+        self.assertEqual([row['kind'] for row in report['cargo_artifacts']], ['lib', 'bin'])
+        self.assertEqual(report['cargo_artifacts'][1]['source'], 'src/main.rs')
+        self.assertEqual(report['cargo_artifacts'][1]['executable'], str(self.binary.resolve()))
+        self.assertEqual(report['cargo_artifacts'][1]['executable_sha256'],
+                         receipt.sha256_file(self.binary))
+        self.assertEqual(report['cargo_artifacts'][0]['executable_sha256']
+                         if 'executable_sha256' in report['cargo_artifacts'][0] else None, None)
+        self.assertEqual(report['kind'], 'native-binary')
+        self.assertEqual(report['build_options'], {'jobs': None})
+        self.assertIn({'path': 'tests/example.rs', 'role': 'integration_test_source',
+                       'present': True, 'sha256': receipt.sha256_file(self.root / 'tests' / 'example.rs')},
+                      report['bound_input_inventory'])
 
     def test_minimal_profile_flags_are_explicit_and_recorded_in_receipt(self):
         args = self.args(no_default_features=True, package_debug='1')
         report = self.build(self.events(), args=args)
-
         command, _ = self.popen_calls[0]
         self.assertEqual(command, [
             'cargo', 'build', '--locked', '--no-default-features',
@@ -231,19 +322,12 @@ class BuildReceiptTest(unittest.TestCase):
             '--bin', 'rootyard', '--message-format=json-render-diagnostics',
         ])
         self.assertEqual(report['command'], command)
-        receipt = json.loads(self.receipt.read_text())
-        self.assertEqual(receipt['command'], command)
-        self.assertEqual(receipt['binary_sha256'],
-                         hashlib.sha256(b'native-binary').hexdigest())
+        self.assertEqual(report['features'], {'enabled': [], 'no_default_features': True})
 
     def test_ci_profile_bins_pando_lab_and_strip_debuginfo_are_recorded_verbatim(self):
         args = self.args(bins=True, features='pando-lab', strip_debuginfo=True)
         report = self.build(self.events(), args=args)
-
         command, kwargs = self.popen_calls[0]
-        # The exact CI invocation (.github/workflows/ci.yml:
-        # `python3 scripts/build_native.py --features pando-lab --bins
-        # --strip-debuginfo`), including the quoted strip value untouched.
         self.assertEqual(command, [
             'cargo', 'build', '--locked', '--bins',
             '--features', 'pando-lab',
@@ -251,64 +335,105 @@ class BuildReceiptTest(unittest.TestCase):
             '--message-format=json-render-diagnostics',
         ])
         self.assertEqual(kwargs['cwd'], self.root)
-        self.assertLess(command.index('--bins'), command.index('--features'))
         self.assertEqual(report['command'], command)
-        receipt = json.loads(self.receipt.read_text())
-        self.assertEqual(receipt, report)
-        self.assertEqual(receipt['command'], command)
-        self.assertEqual(receipt['command'][receipt['command'].index('--config') + 1],
-                         'profile.dev.package.rootyard.strip="debuginfo"')
-        self.assertEqual([item['kind'] for item in receipt['fresh_false_artifacts']],
-                         ['lib', 'bin'])
-        self.assertEqual(receipt['binary_sha256'],
-                         hashlib.sha256(b'native-binary').hexdigest())
-        self.assertFalse(self.temporary.exists())
+        self.assertEqual(report['features'], {'enabled': ['pando-lab'], 'no_default_features': False})
+        self.assertEqual(report['cargo_artifacts'][0]['fresh'], False)
 
     def test_source_digest_is_unchanged_and_bound_to_the_receipt(self):
         before = build_native.source_digest()
         report = self.build(self.events())
-        # Nothing touched the sources: pre-build, recorded and post-build digests agree.
         self.assertEqual(report['source_inputs_sha256'], before)
         self.assertEqual(build_native.source_digest(), before)
         self.assertEqual(build_native.source_digest(), report['source_inputs_sha256'])
+
+    def test_jobs_are_explicit_argv_and_removed_from_the_cargo_environment(self):
+        os.environ['CARGO_BUILD_JOBS'] = '2'
+        try:
+            report = self.build(self.events())
+        finally:
+            os.environ.pop('CARGO_BUILD_JOBS', None)
+        command, kwargs = self.popen_calls[0]
+        self.assertEqual(command[-2:], ['--jobs', '2'])
+        self.assertNotIn('CARGO_BUILD_JOBS', kwargs['env'])
+        self.assertEqual(kwargs['env']['CARGO_TARGET_DIR'], 'target')
+        self.assertEqual(report['command'][-2:], ['--jobs', '2'])
+        self.assertEqual(report['build_options'], {'jobs': 2})
+
+    def test_rejected_environment_fails_before_cargo_or_a_receipt(self):
+        os.environ['RUSTFLAGS'] = '-C target-cpu=native'
+        try:
+            with self.assertRaises(build_native.BuildError) as caught:
+                build_native.run_build(self.args())
+        finally:
+            os.environ.pop('RUSTFLAGS', None)
+        self.assertIn('RUSTFLAGS', str(caught.exception))
+        self.assertEqual(self.popen_calls, [])
+        self.assert_no_receipt()
 
     def test_receipt_installed_atomically_over_previous_receipt(self):
         self.seed_stale_receipt()
         self.build(self.events())
         self.assertFalse(self.temporary.exists())
-        receipt = json.loads(self.receipt.read_text())
-        self.assertNotEqual(receipt, {'stale': True})
-        self.assertEqual(receipt['binary_sha256'],
-                         hashlib.sha256(b'native-binary').hexdigest())
+        stored = json.loads(self.receipt.read_text())
+        self.assertNotEqual(stored, {'stale': True})
+        self.assertEqual(stored['binary_sha256'], receipt.sha256_file(self.binary))
 
     # -- failure paths: no new receipt, previous receipt invalidated --------
-    def test_fresh_true_artifacts_are_rejected(self):
-        self.assert_failure(self.events(fresh=True),
-                            'Cargo reported a Fresh rootyard artifact')
+    def test_absent_or_non_boolean_freshness_is_rejected(self):
+        for value in (None, 0, 1, 'false', 'true', [], {}):
+            with self.subTest(value=value):
+                self.seed_stale_receipt()
+                events = self.events()
+                events[1]['fresh'] = value
+                with self.assertRaises(build_native.BuildError) as caught:
+                    self.build(events)
+                self.assertIn('non-boolean freshness', str(caught.exception))
+                self.assert_no_receipt()
+        self.seed_stale_receipt()
+        missing = self.events()
+        del missing[1]['fresh']
+        with self.assertRaises(build_native.BuildError):
+            self.build(missing)
+        self.assert_no_receipt()
 
     def test_missing_lib_artifact_is_rejected(self):
-        self.assert_failure(self.events(kinds=('bin',)),
-                            'did not report a rootyard lib')
+        self.assert_failure(self.events(kinds=('bin',)), 'did not report a rootyard lib')
 
     def test_missing_bin_artifact_is_rejected(self):
-        self.assert_failure(self.events(kinds=('lib',)),
-                            'did not report the rootyard binary')
+        self.assert_failure(self.events(kinds=('lib',)), 'did not report the rootyard binary')
 
     def test_binary_without_executable_path_is_rejected(self):
-        events = [_artifact('lib'), _artifact('bin')]
+        events = [_artifact('lib', src_path=self.root / 'src' / 'lib.rs'),
+                  _artifact('bin', src_path=self.root / 'src' / 'main.rs'),
+                  {'reason': 'build-finished', 'success': True}]
         self.assert_failure(events, 'has no executable path')
 
     def test_wrong_binary_executable_is_rejected(self):
         events = self.events(executable=str(self.root / 'elsewhere' / 'rootyard'))
         self.assert_failure(events, 'does not match')
 
+    def test_missing_binary_output_is_rejected(self):
+        self.assert_failure(self.events(), 'built binary is missing', write_binary=False)
+
     def test_source_change_during_build_is_rejected(self):
         self.assert_failure(self.events(), 'Source inputs changed during build',
                             mutate_source=True)
 
+    def test_toolchain_change_during_build_is_rejected(self):
+        before = self.fake_toolchain({})
+        after = json.loads(json.dumps(before))
+        after['cargo']['executable_sha256'] = '0' * 64
+        self.probe_sequences = [before, after]
+        self.assert_failure(self.events(), 'Toolchain identity changed')
+
+    def test_head_or_working_tree_change_during_build_is_rejected(self):
+        before = {'head': 'a' * 40, 'commit': 'a' * 40, 'tree': 'b' * 40, 'status': ''}
+        after = dict(before, status=' M src/lib.rs\n')
+        self.git_sequences = [before, after]
+        self.assert_failure(self.events(), 'HEAD or working-tree state changed')
+
     def test_cargo_error_is_rejected(self):
-        self.assert_failure(self.events(), 'cargo build failed with status 7',
-                            returncode=7)
+        self.assert_failure(self.events(), 'cargo build failed with status 7', returncode=7)
 
     def test_non_json_stdout_is_rejected(self):
         def popen(command, **kwargs):
@@ -349,7 +474,6 @@ class BuildReceiptTest(unittest.TestCase):
         try:
             self.assertTrue(held.wait(15), 'holder never acquired the build lock')
             contender.start()
-            # Blocking flock in the second process must not enter while held.
             self.assertFalse(acquired.wait(0.75),
                              'contender entered the lock while the holder had it')
         finally:
@@ -359,15 +483,11 @@ class BuildReceiptTest(unittest.TestCase):
         contender.join(15)
         self.assertEqual(holder.exitcode, 0)
         self.assertEqual(contender.exitcode, 0)
-
-        # Both children put exactly one timestamp before exiting.
         entries = [queue.get(timeout=5), queue.get(timeout=5)]
         stamps = dict(entries)
         self.assertIn('held', stamps)
         self.assertIn('acquired', stamps)
         self.assertGreater(stamps['acquired'], stamps['held'])
-
-        # The released lock is available again to this process.
         lock_path = self.target / build_native.LOCK_NAME
         fd = os.open(lock_path, os.O_RDWR)
         try:
