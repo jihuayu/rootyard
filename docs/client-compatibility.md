@@ -27,6 +27,12 @@ client failures and packet transcript are in `evidence/client-compatibility.json
 | Partial-clone filter | Explicitly unsupported | Capability not advertised; Git warning and full-object fallback verified, not counted as filtered success |
 | SSH | Unsupported | No SSH service endpoint |
 
+The lock/unlock row above is a historical observation for that dated matrix. The
+current repository-scoped lock contract, including stock `locks --verify`,
+forced-unlock authorization, one-winner semantics, persistence, and the
+lock-versus-push policy, is documented separately in [Git LFS locks](lfs-locks.md).
+That contract page is not a new execution result.
+
 Reproduce with a Java 21 runtime, Python and PostgreSQL tools:
 
 ```sh

@@ -2,10 +2,13 @@
 """Private-owner Pull Request, Review, Check Run, Branch Rule, and Atomic Merge contract."""
 import argparse
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import os
 from pathlib import Path
+import select
+import subprocess
 import sys
 import time
 import traceback
@@ -615,6 +618,488 @@ class PullsHarness(ForgeHarness):
                 )
             time.sleep(min(0.05, remaining))
 
+    @contextlib.contextmanager
+    def held_advisory_barrier(self, key: int):
+        """Hold one transaction-scoped advisory lock in an owned psql session.
+
+        The fixture session owns the only release point for
+        ``pg_advisory_xact_lock(key)``. Release is bounded: it COMMITs and reaps
+        psql, or terminates the owned backend and kills psql. If a race
+        assertion fails first, the context manager still releases the lock so a
+        parked service COMMIT cannot outlive this case or block later cases.
+        """
+        # Tag this fixture so the service-backend pollers cannot mistake it for
+        # the real creator. Read the pipe as bytes: a text wrapper can pull a
+        # second marker line out of the fd, making select() wait on an empty
+        # kernel buffer even though the PID is already buffered in Python.
+        env = {**self.env, "PGAPPNAME": "rootyard-fixture-barrier"}
+        proc = subprocess.Popen(
+            ["psql", "--dbname", self.db, "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        pid = None
+        released = False
+        pending = b""
+
+        def backend_gone() -> bool:
+            if pid is None:
+                return True
+            try:
+                return self.sql(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    f"WHERE pid={pid} "
+                    "AND application_name='rootyard-fixture-barrier'"
+                ) == "0"
+            except Exception:
+                return False
+
+        def await_backend_exit(seconds: float) -> bool:
+            deadline = time.monotonic() + seconds
+            while True:
+                if backend_gone():
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.005)
+
+        try:
+            proc.stdin.write(
+                f"BEGIN; SELECT 'barrier_ready', pg_advisory_xact_lock({key}); "
+                "SELECT 'ready|' || pg_backend_pid();\n".encode()
+            )
+            proc.stdin.flush()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and pid is None:
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    if line.strip().startswith(b"ready|"):
+                        pid = int(line.strip().split(b"|", 1)[1])
+                        break
+                if pid is not None:
+                    break
+                if proc.poll() is not None:
+                    break
+                ready, _, _ = select.select(
+                    [proc.stdout], [], [], max(0.0, deadline - time.monotonic())
+                )
+                if not ready:
+                    break
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                pending += chunk
+            assert pid is not None, "fixture advisory barrier did not become ready"
+
+            def release():
+                nonlocal released
+                if released:
+                    return
+                if proc.poll() is None:
+                    try:
+                        proc.stdin.write(b"COMMIT;\n\\q\n")
+                        proc.stdin.flush()
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                if proc.poll() is not None:
+                    # psql exit closes the session and releases the xact lock.
+                    released = True
+                    assert proc.returncode == 0, "fixture advisory barrier COMMIT failed"
+                    return
+                # Guaranteed release: terminate the backend, which drops the
+                # transaction-level advisory lock even if psql is wedged.
+                try:
+                    self.sql(f"SELECT pg_terminate_backend({pid})")
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                if await_backend_exit(5.0):
+                    released = True
+                    raise AssertionError(
+                        "fixture advisory barrier did not release cleanly"
+                    )
+                raise AssertionError(
+                    "fixture advisory barrier could not be released"
+                )
+
+            yield pid, release
+        finally:
+            terminate = False
+            if proc.poll() is None:
+                try:
+                    proc.stdin.write(b"COMMIT;\n\\q\n")
+                    proc.stdin.flush()
+                except Exception:
+                    terminate = True
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    terminate = True
+                if terminate and pid is not None:
+                    try:
+                        self.sql(f"SELECT pg_terminate_backend({pid})")
+                    except Exception:
+                        pass
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    await_backend_exit(5.0)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def wait_for_check_race_commit(self, fixture_pid: int, dispatch) -> int:
+        """Wait for one real service orchestration parked at deferred COMMIT.
+
+        The fixture advisory lock is held by ``fixture_pid``. The orchestration
+        insert is complete but uncommitted, so the row is invisible to a manual
+        GET while its unique key is already reserved. Only a backend belonging
+        to the real service and blocked by this fixture session counts; a
+        dispatch that finished without parking is a failed setup, not something
+        to retry.
+        """
+        query = (
+            "SELECT pid::text FROM pg_stat_activity "
+            "WHERE state='active' AND wait_event_type='Lock' "
+            "AND wait_event='advisory' AND application_name='rootyard' "
+            f"AND {fixture_pid} = ANY(pg_blocking_pids(pid)) "
+            f"AND pid <> {fixture_pid} ORDER BY pid"
+        )
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            rows = [row for row in self.sql(query).splitlines() if row]
+            if len(rows) > 1:
+                raise AssertionError(
+                    self.redact(
+                        "multiple service backends parked at the fixture "
+                        f"COMMIT barrier: {rows}"
+                    )
+                )
+            if rows:
+                return int(rows[0])
+            if dispatch.done():
+                status, body, _ = dispatch.result()
+                raise AssertionError(
+                    self.redact(
+                        "pull orchestration finished without parking at the "
+                        f"fixture COMMIT barrier: {status} {body[:200]!r}"
+                    )
+                )
+            time.sleep(0.01)
+        raise AssertionError(
+            "pull orchestration never parked at the fixture COMMIT barrier"
+        )
+
+    def wait_for_check_race_insert(self, manual, orchestration_pid: int) -> int:
+        """Wait until the manual HTTP transaction blocks in its check INSERT.
+
+        The statement carries the new ``ON CONFLICT ... DO NOTHING RETURNING``
+        shape, which distinguishes it from orchestration's queued insert. The
+        orchestration backend is already parked at deferred COMMIT, so the row
+        is uncommitted and the manual INSERT must wait on PostgreSQL's unique
+        key. A completed request without that wait never exercised the race.
+        """
+        query = (
+            "SELECT pid::text FROM pg_stat_activity "
+            "WHERE state='active' AND wait_event_type='Lock' "
+            "AND wait_event <> 'advisory' "
+            "AND query LIKE '%ON CONFLICT (tenant_id,repository_id,commit_oid,context) "
+            "DO NOTHING RETURNING%' "
+            f"AND {orchestration_pid} = ANY(pg_blocking_pids(pid)) "
+            f"AND pid <> {orchestration_pid} ORDER BY pid"
+        )
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            rows = [row for row in self.sql(query).splitlines() if row]
+            if len(rows) > 1:
+                raise AssertionError(
+                    "multiple manual check inserts waited on the "
+                    f"orchestration-owned unique key: {rows}"
+                )
+            if rows:
+                return int(rows[0])
+            if manual.done():
+                manual.result()  # Surface a generic 503 or any helper failure.
+                raise AssertionError(
+                    "manual check request completed without waiting on the "
+                    "orchestration-owned unique key"
+                )
+            time.sleep(0.005)
+        raise AssertionError(
+            "manual check request never blocked on the orchestration-owned unique key"
+        )
+
+    def advance_check_racing_orchestration(
+        self,
+        commit_oid: str,
+        context: str,
+        status: str,
+        conclusion,
+        output,
+        *,
+        expected_sequence: int,
+    ) -> dict:
+        """Race one real manual check transition against pull orchestration.
+
+        A fixture-owned deferred constraint trigger parks actual service
+        orchestration at COMMIT after it inserted the same
+        ``(tenant_id, repository_id, commit_oid, context)`` primary key. The
+        orchestration row is uncommitted, so ``advance_check`` reads no row and
+        its POST must wait on the unique index. Releasing the barrier commits the
+        queued winner; the manual request must reconcile it through the normal
+        attempt/sequence contract, never a generic unique-violation 503.
+
+        The existing ``advance_check`` status, error, commit, context, attempt,
+        conclusion, output and sequence assertions still apply; a 503 still
+        fails immediately. Only the fixture lock is synthetic.
+        """
+        dispatch_path = "/api/repos/alice/forge/webhooks/dispatch"
+        key_filter = (
+            f"tenant_id='{self.alice['user_id']}' "
+            f"AND repository_id='{self.repo['id']}' "
+            f"AND commit_oid='{commit_oid}' AND context='{context}'"
+        )
+        pr = self.document(self.pr1_path)
+        assert pr["head_oid"] == commit_oid, pr
+        marker_filter = (
+            f"repository_id='{self.repo['id']}' "
+            f"AND pull_number={pr['number']} AND pull_version={pr['version']}"
+        )
+        marker_sql = (
+            "SELECT count(*) FROM ci_pull_sync_progress "
+            f"WHERE {marker_filter} "
+            f"AND head_oid='{commit_oid}' AND base_oid='{pr['base_oid']}' "
+            "AND storage_generation=(SELECT storage_generation FROM repositories "
+            f"WHERE id='{self.repo['id']}')"
+        )
+        # The durable marker makes the always-on repair path skip this pull;
+        # the explicit dispatch is the deterministic orchestration trigger.
+        # If the marker is missing, one ordinary dispatch recreates it before
+        # the barrier is armed.
+        if self.sql(marker_sql) != "1":
+            self.document(dispatch_path, 200, method="POST", body={})
+            assert self.sql(marker_sql) == "1", "pull orchestration marker missing"
+        # Advisory locks are database-wide, not schema-scoped. A random key
+        # keeps parallel runs in the same test database from sharing a barrier.
+        race_key = uuid.uuid4().int & ((1 << 63) - 1)
+        try:
+            with self.held_advisory_barrier(race_key) as (
+                fixture_pid,
+                release_barrier,
+            ):
+                # Install the deferred trigger while the fixture already owns
+                # the advisory key. Every real insert from this point parks at
+                # COMMIT after reserving the unique key; an ON CONFLICT loser
+                # inserts no row and therefore cannot fake the parked creator
+                # the pollers below require.
+                self.sql(
+                    "SET lock_timeout='2000ms'; SET statement_timeout='5000ms';\n"
+                    f"""
+                    CREATE OR REPLACE FUNCTION fixture_check_creation_barrier()
+                    RETURNS trigger LANGUAGE plpgsql AS $fn$
+                    BEGIN
+                        IF NEW.tenant_id = '{self.alice['user_id']}'
+                           AND NEW.repository_id = '{self.repo['id']}'
+                           AND NEW.commit_oid = '{commit_oid}'
+                           AND NEW.context = '{context}' THEN
+                            -- Keep the parked service COMMIT finite if this
+                            -- fixture is ever abandoned, while leaving ample
+                            -- time for the manual INSERT to be observed.
+                            PERFORM set_config('lock_timeout', '30000ms', true);
+                            PERFORM set_config('statement_timeout', '35000ms', true);
+                            PERFORM pg_advisory_xact_lock({race_key});
+                        END IF;
+                        RETURN NEW;
+                    END
+                    $fn$
+                    """
+                )
+                self.sql(
+                    "SET lock_timeout='2000ms'; SET statement_timeout='5000ms'; "
+                    "DROP TRIGGER IF EXISTS fixture_check_creation_barrier "
+                    "ON forge_check_runs"
+                )
+                self.sql(
+                    "SET lock_timeout='2000ms'; SET statement_timeout='5000ms';\n"
+                    """
+                    CREATE CONSTRAINT TRIGGER fixture_check_creation_barrier
+                    AFTER INSERT ON forge_check_runs
+                    DEFERRABLE INITIALLY DEFERRED
+                    FOR EACH ROW
+                    EXECUTE FUNCTION fixture_check_creation_barrier()
+                    """
+                )
+                # Remove only the scheduler's exact queued placeholder so the
+                # manual request starts from an absent row. The durable marker
+                # above keeps the bounded repair path from re-queueing it; the
+                # explicit dispatch below is the intended orchestration writer.
+                queued = self.listed_check_row(commit_oid, context)
+                if queued is not None:
+                    assert (
+                        queued["status"] == "queued"
+                        and queued["attempt"] == 1
+                        and queued["sequence"] == 1
+                        and queued["conclusion"] is None
+                        and queued["output"] == AUTOMATIC_CHECK_OUTPUT
+                    ), queued
+                    self.sql(
+                        "SET lock_timeout='2000ms'; SET statement_timeout='5000ms'; "
+                        f"DELETE FROM forge_check_runs WHERE {key_filter}"
+                    )
+                assert self.listed_check_row(commit_oid, context) is None
+                parked = self.sql(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE state='active' AND wait_event_type='Lock' "
+                    "AND wait_event='advisory' AND application_name='rootyard' "
+                    f"AND {fixture_pid} = ANY(pg_blocking_pids(pid))"
+                )
+                assert parked == "0", "an unexpected service writer parked before dispatch"
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    try:
+                        dispatch = pool.submit(
+                            self.http,
+                            dispatch_path,
+                            token=self.alice,
+                            method="POST",
+                            body={},
+                        )
+                        orchestration_pid = self.wait_for_check_race_commit(
+                            fixture_pid, dispatch
+                        )
+                        manual = pool.submit(
+                            self.advance_check,
+                            commit_oid,
+                            context,
+                            status,
+                            conclusion,
+                            output,
+                            deadline_seconds=30.0,
+                        )
+                        manual_pid = self.wait_for_check_race_insert(
+                            manual, orchestration_pid
+                        )
+                        # The fixture owns the only release point. The real
+                        # manual transaction and service orchestration now
+                        # resolve on PostgreSQL's unique key.
+                        release_barrier()
+                        dispatch_status, dispatch_body, _ = dispatch.result(timeout=15)
+                        assert dispatch_status == 200, (
+                            dispatch_status,
+                            dispatch_body[:200],
+                        )
+                        summary = json.loads(dispatch_body)
+                        assert summary["orchestrated_pulls"] >= 1, summary
+                        run = manual.result(timeout=15)
+                    finally:
+                        # Never leave a parked service COMMIT holding the
+                        # executor open if an assertion above failed first.
+                        # release_barrier has its own terminate/kill fallback.
+                        try:
+                            release_barrier()
+                        except Exception:
+                            pass
+
+                assert manual_pid != orchestration_pid
+                assert self.sql(marker_sql) == "1", (
+                    "pull orchestration marker disappeared"
+                )
+                assert run["repository_id"] == self.repo["id"], run
+                assert run["commit_oid"] == commit_oid, run
+                assert run["context"] == context, run
+                assert run["status"] == status, run
+                assert run["conclusion"] == conclusion, run
+                assert run["output"] == output, run
+                assert run["attempt"] == 1, run
+                assert run["sequence"] == expected_sequence, run
+                persisted = self.sql(
+                    "SELECT commit_oid || '|' || context || '|' || attempt || '|' || "
+                    "sequence || '|' || status || '|' || COALESCE(conclusion, '') || "
+                    "'|' || output FROM forge_check_runs WHERE " + key_filter
+                )
+                assert persisted == (
+                    f"{commit_oid}|{context}|1|{expected_sequence}|{status}|"
+                    f"{conclusion or ''}|{output}"
+                ), persisted
+                # The manual reconcile moves only the monotonic payload. The
+                # scheduler insert owns no CI provenance yet, so all four
+                # provenance columns must still be NULL rather than rewritten.
+                provenance = self.sql(
+                    "SELECT concat_ws('|', "
+                    "COALESCE(issuer_webhook_id::text, 'NULL'), "
+                    "COALESCE(ci_run_id::text, 'NULL'), "
+                    "COALESCE(ci_base_oid, 'NULL'), "
+                    "COALESCE(ci_lease_generation::text, 'NULL')) "
+                    "FROM forge_check_runs WHERE " + key_filter
+                )
+                assert provenance == "NULL|NULL|NULL|NULL", provenance
+                # The same marker also proves the queued winner came from real
+                # pull orchestration for this exact candidate and context.
+                orchestration = self.sql(
+                    "SELECT state || '|' || head_oid || '|' || base_oid || '|' || "
+                    "context || '|' || pull_version::text FROM ci_runs WHERE "
+                    f"repository_id='{self.repo['id']}' "
+                    f"AND pull_number={pr['number']} "
+                    f"AND pull_version={pr['version']} AND context='{context}'"
+                )
+                assert orchestration == (
+                    f"queued|{commit_oid}|{pr['base_oid']}|{context}|{pr['version']}"
+                ), orchestration
+                candidate = self.document(self.pr1_path)
+                assert candidate["head_oid"] == commit_oid, candidate
+                assert candidate["base_oid"] == pr["base_oid"], candidate
+                assert candidate["version"] == pr["version"], candidate
+                assert self.listed_check_row(commit_oid, context) == run
+                return run
+        finally:
+            cleanup_error = None
+            try:
+                self.sql(
+                    "SET lock_timeout='2000ms'; SET statement_timeout='5000ms'; "
+                    "DROP TRIGGER IF EXISTS fixture_check_creation_barrier "
+                    "ON forge_check_runs"
+                )
+            except Exception as error:
+                cleanup_error = error
+            try:
+                self.sql(
+                    "SET lock_timeout='2000ms'; SET statement_timeout='5000ms'; "
+                    "DROP FUNCTION IF EXISTS fixture_check_creation_barrier()"
+                )
+            except Exception as error:
+                cleanup_error = cleanup_error or error
+            # Keep an earlier race failure as the primary report, but never
+            # silently leave the fixture trigger/function behind.
+            if cleanup_error is not None:
+                active = sys.exc_info()[1]
+                if active is None:
+                    raise cleanup_error
+                add_note = getattr(active, "add_note", None)
+                if add_note is not None:
+                    add_note(
+                        "fixture trigger cleanup also failed: "
+                        + self.redact(cleanup_error)
+                    )
+
     def ensure_migration_009(self):
         if self.sql("SELECT to_regclass('forge_pulls') IS NOT NULL") != "t":
             self.run(
@@ -1214,7 +1699,22 @@ class PullsHarness(ForgeHarness):
 
         # Add passing ci/test and failing ci/lint on feat2_oid -> merge still blocked.
         self.advance_check(self.feat2_oid, "ci/test", "completed", "success", "all passed")
-        self.advance_check(self.feat2_oid, "ci/lint", "completed", "failure", "1 failed")
+        # The first ci/lint transition is the exact absent-row race from verify
+        # run 43571388702. Keep the pull-version progress marker so the
+        # always-on repair path skips it, then trigger real dispatch
+        # orchestration and park its queued insert at deferred COMMIT. Let the
+        # real manual POST wait on the unique index, then release it. The
+        # helper must end on the committed manual payload (sequence 2 after the
+        # exact queued-row CAS conflict), not a generic 503.
+        raced = self.advance_check_racing_orchestration(
+            self.feat2_oid, "ci/lint", "completed", "failure", "1 failed",
+            expected_sequence=2,
+        )
+        assert raced["sequence"] == 2, raced
+        candidate = self.document(self.pr1_path)
+        assert candidate["head_oid"] == self.feat2_oid, candidate["head_oid"]
+        assert candidate["base_oid"] == self.base_oid, candidate["base_oid"]
+        assert candidate["version"] == 4, candidate["version"]
         self.document(
             self.pr1_path + "/merge",
             409,
