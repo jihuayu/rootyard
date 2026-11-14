@@ -1,0 +1,11 @@
+groups:
+  - name: rootyard-metrics
+    rules:
+      - alert: RootyardMetricsScrapeFailed
+        expr: up{job="rootyard-metrics"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: Rootyard metrics target has failed to scrape.
+          runbook: docs/observability-alerts.md
