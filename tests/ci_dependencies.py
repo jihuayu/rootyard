@@ -313,24 +313,45 @@ class DependencyCheckoutHarness(JobCheckoutHarness):
                     moved_lfs_excluded=True)
 
     def cancellation_revokes_all_dependency_credentials(self):
+        child_path = (f"/ci/{self.child_oid}/git/alice/child.git"
+                      "/info/refs?service=git-upload-pack")
+        grand_path = (f"/ci/{self.grand_oid}/git/alice/grand.git"
+                      "/info/refs?service=git-upload-pack")
+        origin_grand = (f"/ci/{self.grand_oid}/git/alice/grand.git/info/lfs/objects/"
+                        + self.lfs_oid)
+        second_credentials = {item["name"]: item
+                              for item in self.second_grant["submodule_credentials"]}
+        second_child = {"username": "alice",
+                        "token": second_credentials["child"]["token"]}
+        second_grand = {"username": "alice",
+                        "token": second_credentials["grand"]["token"]}
+        # The original second-grant credentials and exact planned endpoints
+        # must work before cancellation. Reuse these same credentials below;
+        # cancellation is not allowed to be masked by a reissued credential.
+        self.mirror_expect(child_path, 200, token=second_child)
+        self.mirror_expect(grand_path, 200, token=second_grand)
+        status, content, _ = self.mirror_http(origin_grand, token=second_grand)
+        assert status == 200 and content == self.lfs_payload, (status, len(content))
+        status, content, _ = self.http(origin_grand, token=second_grand)
+        assert status == 200 and content == self.lfs_payload, (status, len(content))
         self.transition(self.body["job_id"], "cancel")
         self.transition(self.second_body["job_id"], "cancel")
         child_token = {"username": "alice", "token": self.credentials["child"]["token"]}
         grand_token = {"username": "alice", "token": self.credentials["grand"]["token"]}
-        self.mirror_denied(
-            f"/ci/{self.child_oid}/git/alice/child.git/info/refs?service=git-upload-pack",
-            child_token)
-        self.mirror_denied(
-            f"/ci/{self.grand_oid}/git/alice/grand.git/info/refs?service=git-upload-pack",
-            grand_token)
-        origin_grand = (f"/ci/{self.grand_oid}/git/alice/grand.git/info/lfs/objects/"
-                        + self.lfs_oid)
-        status, raw, _ = self.http(origin_grand, token=grand_token)
-        assert status in (401, 403), (status, raw[:300])
+        for token in (child_token, second_child):
+            self.mirror_denied(child_path, token)
+        for token in (grand_token, second_grand):
+            self.mirror_denied(grand_path, token)
+        for token in (grand_token, second_grand):
+            status, raw, _ = self.http(origin_grand, token=token)
+            assert status in (401, 403), (status, raw[:300])
         self.issue(self.body, codes=409)
         self.issue(self.second_body, codes=409)
-        return dict(parent_cancellation_revokes_child_and_grand=True,
-                    origin_lfs_revoked=True, terminal_jobs_do_not_reissue=True)
+        return dict(first_and_second_parent_cancellation_revokes_dependencies=True,
+                    second_grant_mirror_and_origin_lfs_revoked=True,
+                    exact_pre_cancel_content_reused=True,
+                    terminal_jobs_do_not_reissue=True)
+
 
     def integration_claim_prepares_exact_dependencies(self):
         hook_secret = "nested-integration-secret-123456"
