@@ -126,10 +126,12 @@ the `cargo` on `PATH` to be the recorded fork, greps `cargo -vV` for
 `rustc -V` to remain `rustc 1.99.1`. If any check fails, no Cargo build or test
 runs.
 
-`actions/cache@v4` restores and saves only the fork executable. The fork keeps
-one shared compiler cache in `~/.cargo/targets` per runner/worktree; the
-workflows do not set a per-commit `CARGO_TARGET_DIR`, do not clone a whole
-`target` tree, and do not add a remote service or a new job. Explicit Rust
+`actions/cache@v4` restores and saves only the fork executable. Its key includes
+the job id so a binary built in the Debian trixie candidate container is never
+restored into an Ubuntu 22.04 host job (and vice versa). The fork keeps one
+shared compiler cache in `~/.cargo/targets` per runner/worktree; the workflows
+do not set a per-commit `CARGO_TARGET_DIR`, do not clone a whole `target` tree,
+and do not add a remote service or a new job. Explicit Rust
 checks stay separate from the prebuilt Python acceptance suites, and no Python
 harness invokes the install helper.
 

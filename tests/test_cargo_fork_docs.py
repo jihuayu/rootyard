@@ -68,6 +68,7 @@ class CargoForkDocumentationTest(unittest.TestCase):
             "rustup 1.99.1",
             "`rustc -V` to remain `rustc 1.99.1`",
             "`actions/cache@v4` restores and saves only the fork executable",
+            "Its key includes\nthe job id",
             "~/.cargo/targets",
             "do not set a per-commit `CARGO_TARGET_DIR`",
             "no Python\nharness invokes the install helper",

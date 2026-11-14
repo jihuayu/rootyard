@@ -21,7 +21,7 @@ RELEASE = "1.101.0"
 SETUP = "scripts/install_ci_cargo_fork.sh install"
 VERIFY = "scripts/install_ci_cargo_fork.sh verify"
 CACHE_KEY = (
-    "rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-"
+    "rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-"
     "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1"
 )
 
@@ -130,6 +130,8 @@ class CargoForkWorkflowTest(unittest.TestCase):
         self.assertEqual(text.count(SETUP), 2)
         self.assertEqual(text.count(VERIFY), 2)
         self.assertEqual(text.count("uses: actions/cache@v4"), 2)
+        self.assertIn("path: /tmp/rootyard-cargo-fork", text)
+        self.assertIn("--cache-dir /tmp/rootyard-cargo-fork", text)
         self.assertLess(text.index(SETUP), text.index("Install pinned Playwright client"))
         self.assertLess(text.index(SETUP), text.index("Build the candidate binary once"))
         self.assertLess(text.rindex(SETUP), text.rindex("Build the candidate binary once"))

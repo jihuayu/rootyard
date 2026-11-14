@@ -73,9 +73,10 @@ jobs:
         with:
           # Cache only the fork executable. The fork keeps one shared compiler
           # cache in ~/.cargo/targets per runner/worktree; do not add a
-          # per-commit CARGO_TARGET_DIR or clone a target tree here.
+          # per-commit CARGO_TARGET_DIR or clone a target tree here. The job id
+          # keeps a Debian trixie container binary out of an Ubuntu host cache.
           path: ${{ runner.temp }}/rootyard-cargo-fork
-          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
       - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
         run: |
           scripts/install_ci_cargo_fork.sh install \
