@@ -41,7 +41,6 @@ jobs:
       ROOTYARD_TEST_CGROUP_ROOT: /sys/fs/cgroup/rootyard-native-${{ github.run_id }}
       ROOTYARD_SANDBOX_MODE: cgroup
       ROOTYARD_SOURCE_COMMIT: ${{ github.sha }}
-      ROOTYARD_BINARY: ${{ github.workspace }}/target/debug/rootyard
       PYTHONPATH: ${{ github.workspace }}
       TMPDIR: /tmp
       PG_URL_BASE: postgresql://rootyard@127.0.0.1:5432
@@ -185,10 +184,49 @@ jobs:
           # records both source_commit and the binary sha256 that was built.
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
-          cargo build --locked --bin rootyard
+          python3 scripts/build_native.py \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            | tee "$RECEIPT_DIR/native-build.json"
+      - name: Export the canonical built binary and receipt
+        run: |
+          python3 - "$RECEIPT_DIR/native-build.json" "$GITHUB_ENV" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          build = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          store = build.get("artifact_store")
+          if not isinstance(store, dict):
+              raise SystemExit("build_native output has no artifact_store record")
+          exported = {}
+          for field, name in (
+              ("binary", "ROOTYARD_BINARY"),
+              ("build_receipt", "ROOTYARD_BUILD_RECEIPT"),
+          ):
+              value = store.get(field)
+              if not isinstance(value, str) or not value:
+                  raise SystemExit("artifact_store.%s is missing" % field)
+              if "\n" in value or "\r" in value or "\x00" in value:
+                  raise SystemExit("artifact_store.%s is not a single safe line" % field)
+              path = Path(value)
+              if not path.is_absolute() or path.is_symlink() or not path.is_file():
+                  raise SystemExit("artifact_store.%s is not an absolute regular file: %s" % (field, value))
+              exported[name] = str(path)
+          binary = Path(exported["ROOTYARD_BINARY"])
+          receipt = Path(exported["ROOTYARD_BUILD_RECEIPT"])
+          if receipt != Path(str(binary) + ".build.json"):
+              raise SystemExit("build receipt is not adjacent to the canonical binary")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as stream:
+              for name in sorted(exported):
+                  stream.write("%s=%s\n" % (name, exported[name]))
+          PY
+      - name: Verify the canonical built binary and copy its raw receipt
+        run: |
+          set -euo pipefail
           test -x "$ROOTYARD_BINARY"
           test "$("$ROOTYARD_BINARY" --rootyard-hook-self-check)" = rootyard-hook-v1
           sha256sum "$ROOTYARD_BINARY" | tee "$RECEIPT_DIR/binary.sha256"
+          cp -- "$ROOTYARD_BUILD_RECEIPT" "$RECEIPT_DIR/rootyard.build.json"
 
       - name: Run production sandbox unit tests
         timeout-minutes: 10
@@ -297,7 +335,8 @@ jobs:
               "status": status,
               "profile": os.environ.get("ROOTYARD_SANDBOX_MODE", "unset"),
               "source_commit": os.environ.get("ROOTYARD_SOURCE_COMMIT") or os.environ.get("GITHUB_SHA"),
-              "binary_sha256": digest(os.environ.get("ROOTYARD_BINARY", "target/debug/rootyard")),
+              "binary_sha256": digest(os.environ.get("ROOTYARD_BINARY"))
+              if os.environ.get("ROOTYARD_BINARY") else None,
               "test_file_sha256": digest("tests/test_sandbox_cgroup_native.py"),
               "workflow_file_sha256": digest(".github/workflows/native-kernel-acceptance.yml"),
               "cgroup_root": os.environ.get("ROOTYARD_TEST_CGROUP_ROOT"),

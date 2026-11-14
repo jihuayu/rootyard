@@ -33,7 +33,7 @@ FIRST_CARGO = {
     "redis-contract.yml": "cargo clippy --locked --all-targets --features state-redis",
     "pando-lab.yml": "cargo fmt --all",
     "refcas-log.yml": "cargo fmt --manifest-path",
-    "native-kernel-acceptance.yml": "cargo build --locked --bin rootyard",
+    "native-kernel-acceptance.yml": "python3 scripts/build_native.py",
     "candidate-release-acceptance.yml": "- name: Build the candidate binary once and record its receipt",
 }
 
@@ -72,6 +72,7 @@ PRESERVE = {
     "native-kernel-acceptance.yml": (
         "scripts/native_kernel_cgroup_setup.sh",
         "ROOTYARD_TEST_CGROUP_ROOT",
+        "python3 scripts/build_native.py",
         "cargo test --locked --lib sandbox",
         "ROOTYARD_NATIVE_RECEIPT",
     ),
@@ -171,6 +172,32 @@ class CargoForkWorkflowTest(unittest.TestCase):
             self.assertIn("test-results/candidate/", upload)
             self.assertNotIn("target/", upload)
             self.assertNotIn("native-artifacts", upload)
+
+    def test_native_kernel_uses_cas_producer_and_canonical_paths(self) -> None:
+        text = self.workflow("native-kernel-acceptance.yml")
+        self.assertEqual(text.count("python3 scripts/build_native.py"), 1)
+        self.assertIn('--artifact-store "$HOME/.cache/rootyard/native-artifacts"', text)
+        self.assertNotIn("cargo build --locked --bin rootyard", text)
+        self.assertNotIn("target/debug/rootyard", text)
+        self.assertNotIn("ROOTYARD_BINARY: ${{ github.workspace }}", text)
+        self.assertIn('python3 - "$RECEIPT_DIR/native-build.json" "$GITHUB_ENV"', text)
+        self.assertEqual(text.count('("binary", "ROOTYARD_BINARY")'), 1)
+        self.assertEqual(text.count('("build_receipt", "ROOTYARD_BUILD_RECEIPT")'), 1)
+        self.assertIn('"ROOTYARD_BINARY=$ROOTYARD_BINARY" \\', text)
+        self.assertIn("cargo test --locked --lib sandbox", text)
+        # The unchanged raw command had no feature, debug or strip selector;
+        # the CAS producer must not silently add one.
+        builder = text[text.index("python3 scripts/build_native.py"):]
+        builder = builder.split("\n      - name:", 1)[0]
+        for unexpected in ("--features", "--package-debug", "--strip-debuginfo",
+                           "--no-default-features"):
+            self.assertNotIn(unexpected, builder)
+        self.assertIn('"binary_sha256": digest(os.environ.get("ROOTYARD_BINARY"))', text)
+        self.assertNotIn('os.environ.get("ROOTYARD_BINARY",', text)
+        self.assertIn(
+            'cp -- "$ROOTYARD_BUILD_RECEIPT" "$RECEIPT_DIR/rootyard.build.json"',
+            text,
+        )
 
     def test_ci_consumes_immutable_batch_artifacts(self) -> None:
         text = self.workflow("ci.yml")
