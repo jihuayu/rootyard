@@ -51,24 +51,86 @@ fixture. Root can run the focused command:
 
     python3 tests/ci_trust_boundaries.py --binary target/debug/rootyard
 
-This file deliberately does not edit the shared CI workflow or
-tests/ci_runs_regressions.py, which is owned by a parallel task. Report
-source/binary binding and the CI gate are a separate integration checkpoint;
-do not treat a local syntax check as a native pass.
+With ``--report`` this file also writes a credential-free machine report.  A
+successful report is accepted only when exactly the eight named cases ran once,
+passed, and cleanup succeeded; it binds the executed binary to the adjacent
+original build receipt, the current production-source digest, HEAD, a clean
+worktree, and the explicit transitive Python/provenance input digests sampled
+before and after the run.  A failed run still writes ``passed=false`` with the
+redacted completed prefix and the failed case, but it never persists raw HTTP
+bodies, headers, SQL, environment, private configuration, or tracebacks.  The
+CI gate runs this matrix after the native batch build and binds the report into
+``scripts/native_report_manifest.py --mode job``; do not treat a local syntax
+check as a native pass.
 """
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import threading
 import time
 import urllib.parse
 
+import ops_provenance
+import source_bound_binary
 from webhooks import WebhooksHarness
 
 
 REPOSITORIES = ("forge", "other")
 CONTEXTS = ("ci/trusted", "ci/aux")
+CASE_NAMES = (
+    "trusted two-repository matrix setup",
+    "trusted positive report/callback flows",
+    "revoked trusted context cannot unlock merge",
+    "ordinary writer and cross-context/repository refusals",
+    "changed candidate invalidates prior evidence",
+    "revoked registration, rotated secret and late attempt",
+    "removed webhook context revokes claim/report/merge authority",
+    "API principal token revocation remains management-only",
+)
+CASE_METHODS = (
+    "configure",
+    "positive_matrix",
+    "revocation_blocks_merge",
+    "ordinary_writer_and_cross_scope_refusals",
+    "candidate_change_invalidates_evidence",
+    "revocation_and_late_attempt_matrix",
+    "context_removal_revokes_authority",
+    "api_principal_token_revocation",
+)
+# Inputs outside build_native.source_digest()'s production Rust tree.  The
+# report hashes every one before and after the run so a harness edit cannot
+# silently stand in for the reviewed matrix.
+PROVENANCE_INPUTS = (
+    "tests/ci_trust_boundaries.py",
+    "tests/webhooks.py",
+    "tests/pulls.py",
+    "tests/forge.py",
+    "tests/e2e.py",
+    "tests/schema_baseline.py",
+    "tests/webhook_tenant_matrix.py",
+    "tests/native_evidence.py",
+    "tests/owned_fuse_cleanup.py",
+    "tests/source_bound_binary.py",
+    "tests/ops_provenance.py",
+    "tests/test_ci_trust_boundaries_privacy.py",
+    "scripts/native_report_manifest.py",
+    "scripts/build_native.py",
+    "scripts/build_native_batch.py",
+    ".github/workflows/ci.yml",
+)
+REPORT_KIND = "rootyard/ci-trust-boundaries-report"
+ALLOWED_REPORT_CASES = frozenset(CASE_NAMES) | {"harness setup", "cleanup", "report binding"}
+
+
+class ReportError(RuntimeError):
+    """A report binding refusal with a fixed, credential-free code."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
 
 
 class TrustBoundaryHarness(WebhooksHarness):
@@ -1297,6 +1359,250 @@ class TrustBoundaryHarness(WebhooksHarness):
         self.document(self.hook_path("forge", hook), token=self.alice)
 
 
+def _binding_failure_code(error):
+    """Map a reviewed SourceBinding refusal to a fixed report code."""
+    message = str(error)
+    if "not an executable file" in message:
+        return "binary_missing"
+    if "no matching adjacent receipt" in message:
+        return "receipt_missing"
+    if "does not match this checkout's production source inputs" in message:
+        return "source_drift"
+    if "stale build receipt" in message:
+        return "stale_receipt"
+    if "build receipt rejected" in message or "build receipt is missing" in message:
+        return "receipt_invalid"
+    return "source_binding_failed"
+
+
+def _current_head():
+    try:
+        return source_bound_binary._git("rev-parse", "HEAD")
+    except Exception:
+        return None
+
+
+def _collate_inputs(digests):
+    digest = hashlib.sha256()
+    for name in sorted(digests):
+        digest.update(name.encode() + b"\0" + digests[name].encode() + b"\0")
+    return digest.hexdigest()
+
+
+def _digest_provenance_inputs():
+    digests = {}
+    for name in PROVENANCE_INPUTS:
+        path = source_bound_binary.ROOT / name
+        if not path.is_file():
+            raise ReportError("provenance_input_missing")
+        try:
+            digests[name] = ops_provenance.sha256_file(path)
+        except OSError:
+            raise ReportError("provenance_input_missing") from None
+    return digests
+
+
+def capture_provenance(binary, expected_commit=None):
+    """Bind ``binary`` to its original receipt, source, HEAD and harness bytes."""
+    try:
+        binding = source_bound_binary.bind(binary, expected_commit)
+    except source_bound_binary.SourceBindingError as error:
+        raise ReportError(_binding_failure_code(error)) from None
+    except Exception:
+        raise ReportError("source_binding_failed") from None
+    head = source_bound_binary._git("rev-parse", "HEAD")
+    status = source_bound_binary._git("status", "--porcelain")
+    if not head or status is None:
+        raise ReportError("git_state_unavailable")
+    if status:
+        raise ReportError("worktree_dirty")
+    receipt = Path(binary).resolve().with_suffix(".build.json")
+    if not receipt.is_file():
+        raise ReportError("receipt_missing")
+    try:
+        receipt_sha256 = ops_provenance.sha256_file(receipt)
+    except OSError:
+        raise ReportError("receipt_invalid") from None
+    inputs = _digest_provenance_inputs()
+    return {
+        "head": head,
+        "clean": True,
+        "binary_sha256": binding["binary_sha256"],
+        "source_inputs_sha256": binding["current_source_inputs_sha256"],
+        "receipt_sha256": receipt_sha256,
+        "receipt_workspace_commit": binding["workspace_commit"],
+        "receipt_source_inputs_sha256": binding["source_inputs_sha256"],
+        "inputs": inputs,
+        "inputs_sha256": _collate_inputs(inputs),
+    }
+
+
+def compare_provenance(start, end):
+    """Return a fixed drift code when the start/end snapshots differ."""
+    if start["head"] != end["head"]:
+        return "head_changed"
+    if start["binary_sha256"] != end["binary_sha256"]:
+        return "binary_changed"
+    if start["source_inputs_sha256"] != end["source_inputs_sha256"]:
+        return "source_changed"
+    if start["receipt_sha256"] != end["receipt_sha256"]:
+        return "receipt_changed"
+    if start["inputs"] != end["inputs"]:
+        return "harness_changed"
+    return None
+
+
+def _public_snapshot(snapshot):
+    if snapshot is None:
+        return None
+    return {
+        key: snapshot[key]
+        for key in (
+            "head",
+            "clean",
+            "binary_sha256",
+            "source_inputs_sha256",
+            "receipt_sha256",
+            "receipt_workspace_commit",
+            "inputs_sha256",
+        )
+    }
+
+
+def _safe_case(case):
+    """Keep only fixed, redacted case fields; never a message or traceback."""
+    name = case.get("name")
+    if name not in ALLOWED_REPORT_CASES:
+        name = "unknown case"
+    status = "passed" if case.get("status") == "passed" else "failed"
+    seconds = case.get("seconds")
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or seconds < 0:
+        seconds = 0.0
+    record = {"name": name, "status": status, "seconds": round(float(seconds), 4)}
+    if status == "failed":
+        error_type = case.get("error_type")
+        record["error_type"] = (
+            error_type
+            if isinstance(error_type, str) and error_type.isidentifier()
+            else "CaseFailure"
+        )
+        record["diagnostic"] = "case failed; see redacted runner diagnostics"
+    return record
+
+
+def _report_cases(harness, start_error, end_error, run_result):
+    raw = list(getattr(harness, "results", []) or []) if harness is not None else []
+    cases = [_safe_case(case) for case in raw]
+    if not cases:
+        error_type = "SourceBindingError" if start_error or end_error else "CaseFailure"
+        cases = [
+            {
+                "name": "report binding",
+                "status": "failed",
+                "seconds": 0.0,
+                "error_type": error_type,
+                "diagnostic": "provenance binding failed; see redacted runner diagnostics",
+            }
+        ]
+    return cases
+
+
+def build_report(start, end, run_result, harness, start_error=None, end_error=None):
+    """Build a credential-free report from snapshots and sanitized case rows."""
+    cases = _report_cases(harness, start_error, end_error, run_result)
+    cleanup_success = bool(run_result and run_result["cleanup_ok"])
+    drift = compare_provenance(start, end) if start is not None and end is not None else None
+    failure = run_result.get("failure") if run_result else None
+    stage = code = error_type = None
+    if start_error:
+        stage, code, error_type = "binding", start_error, "SourceBindingError"
+    elif end_error:
+        stage, code, error_type = "provenance", end_error, "SourceBindingError"
+    elif failure:
+        stage = failure.get("stage") or "cases"
+        code = {
+            "cases": "case_failed",
+            "setup": "setup_failed",
+            "cleanup": "cleanup_failed",
+        }.get(stage, "case_failed")
+        error_type = failure.get("type") or "CaseFailure"
+    elif drift:
+        stage, code, error_type = "provenance", drift, "ProvenanceDrift"
+    elif not run_result or not run_result["success"]:
+        stage, code, error_type = "cases", "case_failed", "CaseFailure"
+    elif not cleanup_success:
+        stage, code, error_type = "cleanup", "cleanup_failed", "CleanupFailure"
+    elif [case["name"] for case in cases] != list(CASE_NAMES) or any(
+        case["status"] != "passed" for case in cases
+    ):
+        stage, code, error_type = "cases", "case_set", "CaseSetMismatch"
+    passed = (
+        start_error is None
+        and end_error is None
+        and run_result is not None
+        and run_result["success"]
+        and cleanup_success
+        and drift is None
+        and len(cases) == len(CASE_NAMES)
+        and [case["name"] for case in cases] == list(CASE_NAMES)
+        and all(case["status"] == "passed" for case in cases)
+    )
+    if not passed and code is None:
+        stage, code, error_type = "report", "report_failed", "ReportFailure"
+    snapshot = start or end
+    provenance = {
+        "start": _public_snapshot(start),
+        "end": _public_snapshot(end),
+        "inputs": dict(snapshot["inputs"]) if snapshot is not None else None,
+        "inputs_sha256": snapshot["inputs_sha256"] if snapshot is not None else None,
+        "head_stable": bool(start and end and start["head"] == end["head"]),
+        "binary_stable": bool(start and end and start["binary_sha256"] == end["binary_sha256"]),
+        "source_stable": bool(
+            start and end and start["source_inputs_sha256"] == end["source_inputs_sha256"]
+        ),
+        "receipt_stable": bool(
+            start and end and start["receipt_sha256"] == end["receipt_sha256"]
+        ),
+        "inputs_stable": bool(start and end and start["inputs"] == end["inputs"]),
+    }
+    return {
+        "kind": REPORT_KIND,
+        "passed": passed,
+        "cases": cases,
+        "required_cases": list(CASE_NAMES),
+        "cleanup_success": cleanup_success,
+        "binary_sha256": start["binary_sha256"] if start is not None else None,
+        "source_head": (
+            start["head"] if start is not None else (end["head"] if end is not None else _current_head())
+        ),
+        "source_inputs_sha256": (
+            start["source_inputs_sha256"] if start is not None else None
+        ),
+        "build_receipt_sha256": start["receipt_sha256"] if start is not None else None,
+        "receipt_workspace_commit": (
+            start["receipt_workspace_commit"] if start is not None else None
+        ),
+        "provenance": provenance,
+        "failure": (
+            None
+            if code is None
+            else {"stage": stage, "code": code, "error_type": error_type}
+        ),
+    }
+
+
+def write_report(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+
+
+def bound_cases(harness):
+    return [(name, getattr(harness, method)) for name, method in zip(CASE_NAMES, CASE_METHODS)]
+
+
 def run_cases(harness, cases):
     """Run cases without letting an original exception escape redaction.
 
@@ -1310,8 +1616,12 @@ def run_cases(harness, cases):
         for name, fn in cases:
             harness.case(name, fn)
     except Exception as error:
+        failure_type = type(error).__name__
+        harness.case_failure_type = failure_type
+        if getattr(harness, "results", None) and harness.results[-1].get("status") == "failed":
+            harness.results[-1]["error_type"] = failure_type
         print(
-            harness.redact(f"{type(error).__name__}: {error}"),
+            harness.redact(f"{failure_type}: {error}"),
             file=sys.stderr,
             flush=True,
         )
@@ -1320,22 +1630,36 @@ def run_cases(harness, cases):
 
 
 def run_harness(harness, cases):
-    """Run setup, cases and cleanup behind one redaction boundary."""
+    """Run setup, cases and cleanup behind one redaction boundary.
+
+    Returns the success flag, the cleanup result and a fixed failure descriptor
+    used by the optional report.  Raw exception text is never returned.
+    """
     success = False
+    cleanup_ok = True
+    failure = None
     try:
         harness.setup()
         success = run_cases(harness, cases)
+        if not success:
+            failure = {
+                "stage": "cases",
+                "type": getattr(harness, "case_failure_type", "CaseFailure"),
+            }
     except Exception as error:
+        failure_type = type(error).__name__
         harness.results.append(
             {
                 "name": "harness setup",
                 "status": "failed",
                 "seconds": 0.0,
                 "error": harness.redact(error),
+                "error_type": failure_type,
             }
         )
+        failure = {"stage": "setup", "type": failure_type}
         print(
-            harness.redact(f"{type(error).__name__}: {error}"),
+            harness.redact(f"{failure_type}: {error}"),
             file=sys.stderr,
             flush=True,
         )
@@ -1343,59 +1667,85 @@ def run_harness(harness, cases):
         try:
             harness.cleanup()
         except Exception as error:
+            failure_type = type(error).__name__
+            cleanup_ok = False
             harness.results.append(
                 {
                     "name": "cleanup",
                     "status": "failed",
                     "seconds": 0.0,
                     "error": harness.redact(error),
+                    "error_type": failure_type,
                 }
             )
+            failure = {"stage": "cleanup", "type": failure_type}
             print(
-                harness.redact(f"cleanup failed: {type(error).__name__}: {error}"),
+                harness.redact(f"cleanup failed: {failure_type}: {error}"),
                 file=sys.stderr,
                 flush=True,
             )
             success = False
-    return success
+    return {
+        "success": success and cleanup_ok,
+        "cleanup_ok": cleanup_ok,
+        "failure": failure,
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="write a credential-free structured report bound to the binary receipt",
+    )
+    parser.add_argument(
+        "--expected-commit",
+        help="require the build receipt's workspace_commit to equal this commit",
+    )
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
-    harness = TrustBoundaryHarness(args)
-    cases = [
-        ("trusted two-repository matrix setup", harness.configure),
-        ("trusted positive report/callback flows", harness.positive_matrix),
-        (
-            "revoked trusted context cannot unlock merge",
-            harness.revocation_blocks_merge,
-        ),
-        (
-            "ordinary writer and cross-context/repository refusals",
-            harness.ordinary_writer_and_cross_scope_refusals,
-        ),
-        (
-            "changed candidate invalidates prior evidence",
-            harness.candidate_change_invalidates_evidence,
-        ),
-        (
-            "revoked registration, rotated secret and late attempt",
-            harness.revocation_and_late_attempt_matrix,
-        ),
-        (
-            "removed webhook context revokes claim/report/merge authority",
-            harness.context_removal_revokes_authority,
-        ),
-        (
-            "API principal token revocation remains management-only",
-            harness.api_principal_token_revocation,
-        ),
-    ]
-    return 0 if run_harness(harness, cases) else 1
+    if args.report is None:
+        harness = TrustBoundaryHarness(args)
+        result = run_harness(harness, bound_cases(harness))
+        return 0 if result["success"] else 1
+
+    start = None
+    start_error = None
+    try:
+        start = capture_provenance(args.binary, args.expected_commit)
+    except ReportError as error:
+        start_error = error.code
+    except Exception:
+        start_error = "source_binding_failed"
+    harness = None
+    result = None
+    if start_error is None:
+        harness = TrustBoundaryHarness(args)
+        result = run_harness(harness, bound_cases(harness))
+    end = None
+    end_error = None
+    if start is not None:
+        try:
+            end = capture_provenance(args.binary, args.expected_commit)
+        except ReportError as error:
+            end_error = error.code
+        except Exception:
+            end_error = "source_binding_failed"
+    report = build_report(start, end, result, harness, start_error, end_error)
+    try:
+        write_report(args.report, report)
+    except OSError:
+        print("ci trust boundaries: report write failed", file=sys.stderr, flush=True)
+        return 1
+    print(
+        f"ci trust boundaries: {'passed' if report['passed'] else 'failed'} "
+        f"({len(report['cases'])} cases)",
+        flush=True,
+    )
+    return 0 if report["passed"] else 1
 
 
 if __name__ == "__main__":
