@@ -8,7 +8,7 @@ import copy
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import sys
 import tempfile
@@ -852,6 +852,39 @@ class ProducerHelperTest(ReceiptFixture):
         self.assertEqual(
             receipts.source_digest_from_entries(self.bound["bound_input_inventory"]),
             receipts.source_digest(self.root),
+        )
+
+    def test_component_path_order_matches_historical_source_digest(self):
+        self.write("src/foo.rs", "pub fn foo() -> u8 { 1 }\n")
+        self.write("src/foo/bar.rs", "pub fn bar() -> u8 { 2 }\n")
+        entries = self.capture()["bound_input_inventory"]
+        production = [
+            entry for entry in entries
+            if entry["present"] and receipts._is_production_path(entry["path"])
+        ]
+        raw_paths = sorted(entry["path"] for entry in production)
+        component_paths = sorted(
+            raw_paths, key=lambda path: PurePosixPath(path).parts
+        )
+        self.assertNotEqual(raw_paths, component_paths)
+        self.assertIn("src/foo.rs", raw_paths)
+        self.assertIn("src/foo/bar.rs", component_paths)
+
+        content_sha256 = {entry["path"]: entry["sha256"] for entry in production}
+        raw_digest = hashlib.sha256()
+        for path in raw_paths:
+            raw_digest.update(path.encode() + b"\0")
+            raw_digest.update(bytes.fromhex(content_sha256[path]))
+
+        historical = receipts.source_digest(self.root)
+        self.assertNotEqual(raw_digest.hexdigest(), historical)
+        self.assertEqual(receipts.source_digest_from_entries(entries), historical)
+
+    def test_repository_inventory_matches_historical_source_digest(self):
+        entries, _ = receipts.bound_input_inventory(ROOT)
+        self.assertEqual(
+            receipts.source_digest_from_entries(entries),
+            receipts.source_digest(ROOT),
         )
 
     def test_inventory_has_roles_and_never_records_contents(self):

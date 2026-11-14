@@ -43,7 +43,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -354,10 +354,14 @@ def source_digest_from_entries(entries):
 
     No file needs to be present.  This is the same path/NUL/content-digest
     folding as :func:`source_digest`, restricted to the production closure that
-    the v2 inventory records.
+    the v2 inventory records.  Entries are ordered by POSIX path components,
+    matching the historical ``sorted(Path)`` production order instead of a raw
+    path-string sort.
     """
     digest = hashlib.sha256()
-    for entry in sorted(entries, key=lambda item: item["path"]):
+    for entry in sorted(
+        entries, key=lambda item: PurePosixPath(item["path"]).parts
+    ):
         if not entry["present"] or not _is_production_path(entry["path"]):
             continue
         digest.update(entry["path"].encode() + b"\0")
