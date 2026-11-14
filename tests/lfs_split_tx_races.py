@@ -352,24 +352,26 @@ class SplitTxRacesHarness(LfsHarness):
                 if self._final(oid_reauth).exists():
                     self._final(oid_reauth).unlink()
                 fixture.arm_get_gate(oid_reauth)
+                before_request = fixture.snapshot_oid(oid_reauth)
                 holder = {}
                 t = threading.Thread(target=lambda: holder.setdefault("res", req_fn()), daemon=True)
                 t.start()
                 assert fixture.get_entered.wait(timeout=15), "request never entered cold ensure_readable"
                 mutate_fn()
-                before_rel = fixture.snapshot_oid(oid_reauth)
+                before_release = fixture.snapshot_oid(oid_reauth)
                 fixture.get_release.set()
                 t.join(timeout=30)
                 assert not t.is_alive()
                 time.sleep(0.12)
-                delta = fixture.delta_oid(oid_reauth, before_rel)
+                request_delta = fixture.delta_oid(oid_reauth, before_request)
+                after_gate_delta = fixture.delta_oid(oid_reauth, before_release)
                 if cleanup_fn:
                     cleanup_fn()
-                return holder["res"], delta
+                return holder["res"], request_delta, after_gate_delta
 
             def run_inflight(req_fn, mutate_fn, cleanup_fn=None):
-                res, delta = run_inflight_full(req_fn, mutate_fn, cleanup_fn)
-                return res[0], delta
+                res, _, after_gate_delta = run_inflight_full(req_fn, mutate_fn, cleanup_fn)
+                return res[0], after_gate_delta
 
             def set_collab(role):
                 self.expect("/api/repos/alice/demo/collaborators/bob", (200, 201),
@@ -404,37 +406,39 @@ class SplitTxRacesHarness(LfsHarness):
             def get_object(token, size=None):
                 return self._raw_get(oid_reauth, token, size)
 
+            def denied_get(req_fn, mutate_fn, cleanup_fn=None):
+                (status, body), request_delta, _ = run_inflight_full(req_fn, mutate_fn, cleanup_fn)
+                assert reauth_payload not in body, "denied direct GET returned LFS object bytes"
+                assert request_delta["GET"] == 1, request_delta
+                return status, body
+
             rev_tok = self.account("create-token", "alice", "--read-only")
-            code, delta = run_inflight(
+            status, body = denied_get(
                 lambda: get_object(rev_tok),
                 lambda: self.sql(f"UPDATE tokens SET revoked=true WHERE id='{rev_tok['token_id']}'"),
             )
-            assert code == 401, code
-            assert delta["GET"] == 1, delta
+            assert status == 401, (status, body)
 
             expired_tok = self.account("create-token", "alice", "--read-only")
-            code, delta = run_inflight(
+            status, body = denied_get(
                 lambda: get_object(expired_tok, size_reauth),
                 lambda: self.sql(
                     f"UPDATE tokens SET expires_at=clock_timestamp() - interval '1 second' "
                     f"WHERE id='{expired_tok['token_id']}'"
                 ),
             )
-            assert code == 401, code
-            assert delta["GET"] == 1, delta
+            assert status == 401, (status, body)
 
             set_collab("read")
-            code, delta = run_inflight(lambda: get_object(self.bob), del_collab)
-            assert code == 404, code
-            assert delta["GET"] == 1, delta
+            status, body = denied_get(lambda: get_object(self.bob), del_collab)
+            assert status == 404, (status, body)
 
-            code, delta = run_inflight(
+            status, body = denied_get(
                 lambda: get_object(self.alice),
                 lambda: set_repo_state("recovering"),
                 lambda: set_repo_state("ready"),
             )
-            assert code == 409, code
-            assert delta["GET"] == 1, delta
+            assert status == 409, (status, body)
 
             replacement_id = str(uuid.uuid4())
 
@@ -449,21 +453,20 @@ class SplitTxRacesHarness(LfsHarness):
                 self.sql(f"DELETE FROM repositories WHERE id='{replacement_id}'")
                 self.sql(f"UPDATE repositories SET name='demo' WHERE id='{repo_id}'")
 
-            code, delta = run_inflight(
+            status, body = denied_get(
                 lambda: get_object(self.alice),
                 swap_repo_identity,
                 restore_repo_identity,
             )
-            assert code == 409, code
-            assert delta["GET"] == 1, delta
+            assert status == 409, (status, body)
 
-            (status, body), delta = run_inflight_full(
+            (status, body), request_delta, _ = run_inflight_full(
                 lambda: get_object(self.alice),
                 lambda: None,
             )
             assert status == 200, (status, body)
             assert body == reauth_payload
-            assert delta["GET"] == 1, delta
+            assert request_delta["GET"] == 1, request_delta
 
             # 2c–2e. Write split-TX endpoints: batch_upload dedup, verify_object, PUT upload dedup
             write_endpoints = [
