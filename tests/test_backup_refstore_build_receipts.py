@@ -184,6 +184,8 @@ class RefStoreReceiptFixture(unittest.TestCase):
     def write_receipt(self, path, payload):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            os.chmod(path, 0o644)
         path.write_text(json.dumps(payload, indent=2) + "\n")
         return path
 
@@ -450,12 +452,12 @@ class RefStoreReceiptFixture(unittest.TestCase):
         app_object = self.store_root / "objects/sha256" / app_sha
         helper_object.parent.mkdir(parents=True, exist_ok=True)
         app_object.parent.mkdir(parents=True, exist_ok=True)
-        helper_object.write_bytes(helper_binary.read_bytes())
-        app_object.write_bytes(app_binary.read_bytes())
+        self.write_bytes_any(helper_object, helper_binary.read_bytes())
+        self.write_bytes_any(app_object, app_binary.read_bytes())
         helper_canonical = helper_dir / helper_binary.name
         app_canonical = app_dir / "rootyard"
-        helper_canonical.write_bytes(helper_binary.read_bytes())
-        app_canonical.write_bytes(app_binary.read_bytes())
+        self.write_bytes_any(helper_canonical, helper_binary.read_bytes())
+        self.write_bytes_any(app_canonical, app_binary.read_bytes())
         helper_build = helper_dir / (helper_canonical.name + ".build.json")
         helper_canonical_receipt = helper_dir / (helper_canonical.name + ".receipt.json")
         app_build = app_dir / "rootyard.build.json"
@@ -507,10 +509,18 @@ class RefStoreReceiptFixture(unittest.TestCase):
     def finalize_cas(self, helper_record, app_record, helper_receipt, app_receipt):
         helper_bytes = Path(helper_receipt).read_bytes()
         app_bytes = Path(app_receipt).read_bytes()
-        Path(helper_record["build_receipt"]).write_bytes(helper_bytes)
-        Path(helper_record["receipt"]).write_bytes(helper_bytes)
-        Path(app_record["build_receipt"]).write_bytes(app_bytes)
-        Path(app_record["receipt"]).write_bytes(app_bytes)
+        self.write_bytes_any(helper_record["build_receipt"], helper_bytes)
+        self.write_bytes_any(helper_record["receipt"], helper_bytes)
+        self.write_bytes_any(app_record["build_receipt"], app_bytes)
+        self.write_bytes_any(app_record["receipt"], app_bytes)
+        for path in (helper_record["object"], helper_record["binary"],
+                     helper_record["output_alias"]["path"],
+                     app_record["object"], app_record["binary"]):
+            os.chmod(path, 0o555)
+        for path in (helper_record["receipt"], helper_record["build_receipt"],
+                     helper_record["output_alias"]["receipt"],
+                     app_record["receipt"], app_record["build_receipt"]):
+            os.chmod(path, 0o444)
 
     def cas_pair(self, target):
         helper_output = (self.snapshot_output if target == SNAPSHOT_TARGET
@@ -523,6 +533,59 @@ class RefStoreReceiptFixture(unittest.TestCase):
             relocated=True, output=app_record["binary"],
             artifact_store=app_record)
         return helper, app, helper_record, app_record
+
+    def rewrite_readonly(self, path, text):
+        path = Path(path)
+        os.chmod(path, 0o644)
+        path.write_text(text)
+        os.chmod(path, 0o444)
+
+    def write_bytes_any(self, path, data):
+        path = Path(path)
+        if path.exists():
+            os.chmod(path, 0o644)
+        path.write_bytes(data)
+        return path
+
+    def mutate_manifest_file(self, path, mutate):
+        payload = json.loads(Path(path).read_text())
+        mutate(payload)
+        Path(path).write_text(json.dumps(payload, indent=2) + "\n")
+        return payload
+
+    def mutate_cas_record(self, manifest_path, record, receipt_paths, mutate):
+        old = copy.deepcopy(record)
+        mutate(record)
+        manifest = json.loads(Path(manifest_path).read_text())
+        for row in manifest["artifacts"]:
+            if row.get("artifact_store") == old:
+                row["artifact_store"] = record
+        store = manifest["artifact_store"]
+        store["sealed"] = [record if item == old else item for item in store["sealed"]]
+        Path(manifest_path).write_text(json.dumps(manifest, indent=2) + "\n")
+        payload = json.loads(Path(receipt_paths[0]).read_text())
+        payload["artifact_store"] = record
+        text = json.dumps(payload, indent=2) + "\n"
+        for path in receipt_paths:
+            self.rewrite_readonly(path, text)
+
+    def cas_fixture(self):
+        target = self.pair()[0]["cargo_artifacts"][0]["target"]
+        helper, app, helper_record, app_record = self.cas_pair(target)
+        manifest = self.default_manifest(
+            helper, app, app_binary=Path(app_record["binary"]))
+        manifest_path = Path(helper["batch"]["manifest"])
+        helper_paths = [
+            Path(helper_record["output_alias"]["receipt"]),
+            Path(helper_record["receipt"]),
+            Path(helper_record["build_receipt"]),
+        ]
+        app_paths = [
+            Path(app_record["build_receipt"]),
+            Path(app_record["receipt"]),
+        ]
+        return (helper, app, helper_record, app_record, manifest,
+                manifest_path, helper_paths, app_paths)
 
     # -- v1 receipts ------------------------------------------------------
     def v1_helper_receipt(self, *, target=SNAPSHOT_TARGET, fresh=False,
@@ -645,7 +708,7 @@ class ExpectedSourceCommitCases:
         raise NotImplementedError
 
     def validate_cas_pair(self, helper_payload, app_payload, helper_record,
-                          app_record, manifest):
+                          app_record, manifest, mutate=None):
         raise NotImplementedError
 
     def default_manifest(self, helper_payload, app_payload, *, app_binary=None):
@@ -690,6 +753,96 @@ class ExpectedSourceCommitCases:
         self.assertEqual(report["batch_manifest_status"], "passed")
         self.assertEqual(report["candidate_application_sha256"],
                          digest(app_binary))
+
+    def test_v2_cas_missing_or_corrupt_object_fails(self):
+        for mode in ("missing", "corrupt"):
+            (helper, app, helper_record, app_record, manifest,
+             manifest_path, helper_paths, app_paths) = self.cas_fixture()
+
+            def mutate(helper_receipt, app_receipt, mode=mode,
+                       helper_record=helper_record):
+                obj = Path(helper_record["object"])
+                if mode == "missing":
+                    obj.unlink()
+                else:
+                    os.chmod(obj, 0o644)
+                    obj.write_bytes(b"corrupt-cas-object")
+                    os.chmod(obj, 0o444)
+
+            with self.subTest(mode=mode), self.assertRaisesRegex(AssertionError, "object"):
+                self.validate_cas_pair(
+                    helper, app, helper_record, app_record, manifest,
+                    mutate=mutate)
+
+    def test_v2_cas_unlisted_object_fails(self):
+        (helper, app, helper_record, app_record, manifest,
+         manifest_path, helper_paths, app_paths) = self.cas_fixture()
+
+        def mutate(helper_receipt, app_receipt):
+            self.mutate_manifest_file(
+                manifest_path,
+                lambda data: data["artifact_store"]["objects"].remove(
+                    helper_record["object"]))
+
+        with self.assertRaisesRegex(
+                AssertionError, "artifact_store.objects|selected CAS object"):
+            self.validate_cas_pair(
+                helper, app, helper_record, app_record, manifest,
+                mutate=mutate)
+
+    def test_v2_cas_mispoint_object_fails(self):
+        (helper, app, helper_record, app_record, manifest,
+         manifest_path, helper_paths, app_paths) = self.cas_fixture()
+        wrong = str(self.store_root / "objects/sha256" / ("f" * 64))
+
+        def mutate(helper_receipt, app_receipt):
+            def edit(data):
+                entry = next(
+                    row for row in data["artifacts"]
+                    if row.get("kind") == "test"
+                    and row.get("target") == helper_record["target"])
+                old = copy.deepcopy(entry["artifact_store"])
+                entry["artifact_store"]["object"] = wrong
+                data["artifact_store"]["sealed"] = [
+                    entry["artifact_store"] if item == old else item
+                    for item in data["artifact_store"]["sealed"]]
+                data["artifact_store"]["objects"].append(wrong)
+            self.mutate_manifest_file(manifest_path, edit)
+
+        with self.assertRaisesRegex(AssertionError, "object"):
+            self.validate_cas_pair(
+                helper, app, helper_record, app_record, manifest,
+                mutate=mutate)
+
+    def test_v2_cas_lying_inode_flag_fails(self):
+        (helper, app, helper_record, app_record, manifest,
+         manifest_path, helper_paths, app_paths) = self.cas_fixture()
+
+        def mutate(helper_receipt, app_receipt):
+            self.mutate_cas_record(
+                manifest_path, helper_record, helper_paths,
+                lambda record: record["output_alias"].__setitem__(
+                    "same_inode_as_cas_object", True))
+
+        with self.assertRaisesRegex(AssertionError, "same_inode"):
+            self.validate_cas_pair(
+                helper, app, helper_record, app_record, manifest,
+                mutate=mutate)
+
+    def test_v2_cas_lying_hardlink_method_fails(self):
+        (helper, app, helper_record, app_record, manifest,
+         manifest_path, helper_paths, app_paths) = self.cas_fixture()
+
+        def mutate(helper_receipt, app_receipt):
+            self.mutate_cas_record(
+                manifest_path, helper_record, helper_paths,
+                lambda record: record["output_alias"].__setitem__(
+                    "method", "hardlink"))
+
+        with self.assertRaisesRegex(AssertionError, "hardlink"):
+            self.validate_cas_pair(
+                helper, app, helper_record, app_record, manifest,
+                mutate=mutate)
 
     def test_v2_non_cas_manifest_rejects_relocated_bin_receipt(self):
         helper, app = self.pair()
@@ -927,12 +1080,16 @@ class Snapshot140ReceiptDispatchTest(ExpectedSourceCommitCases, RefStoreReceiptF
             helper_payload, app_payload, manifest=manifest, environ=environ)
 
     def validate_cas_pair(self, helper_payload, app_payload, helper_record,
-                          app_record, manifest):
+                          app_record, manifest, mutate=None):
+        def finalize(helper_receipt, app_receipt):
+            self.finalize_cas(
+                helper_record, app_record, helper_receipt, app_receipt)
+            if mutate is not None:
+                mutate(helper_receipt, app_receipt)
         return self.validate_snapshot(
             helper_payload, app_payload, manifest=manifest,
             app_binary=Path(app_record["binary"]),
-            finalize=lambda helper_receipt, app_receipt: self.finalize_cas(
-                helper_record, app_record, helper_receipt, app_receipt))
+            finalize=finalize)
 
     def test_v1_pair_preserves_legacy_report_fields(self):
         report = self.validate_snapshot(
@@ -1164,12 +1321,16 @@ class Holds141ReceiptDispatchTest(ExpectedSourceCommitCases, RefStoreReceiptFixt
             helper_payload, app_payload, manifest=manifest, environ=environ)
 
     def validate_cas_pair(self, helper_payload, app_payload, helper_record,
-                          app_record, manifest):
+                          app_record, manifest, mutate=None):
+        def finalize(helper_receipt, app_receipt):
+            self.finalize_cas(
+                helper_record, app_record, helper_receipt, app_receipt)
+            if mutate is not None:
+                mutate(helper_receipt, app_receipt)
         return self.validate_holds(
             helper_payload, app_payload, manifest=manifest,
             app_binary=Path(app_record["binary"]),
-            finalize=lambda helper_receipt, app_receipt: self.finalize_cas(
-                helper_record, app_record, helper_receipt, app_receipt))
+            finalize=finalize)
 
     def assert_holds_rejects(self, helper_payload, app_payload):
         with self.assertRaises(AssertionError):

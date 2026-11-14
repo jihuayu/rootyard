@@ -44,6 +44,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import export_native_artifacts as cas_exporter  # noqa: E402
 import native_build_receipt as native_receipts  # noqa: E402
 
 RECEIPT_SCHEMA_V2 = native_receipts.RECEIPT_SCHEMA_V2
@@ -405,73 +406,51 @@ def _check_manifest_entry(manifest, entry, kind, target, validated, receipt_row,
     sealed = store.get("sealed")
     _require(isinstance(sealed, list) and bool(sealed),
              label + " manifest artifact_store.sealed must be a nonempty list")
+    objects = store.get("objects")
+    _require(isinstance(objects, list) and bool(objects),
+             label + " manifest artifact_store.objects must be a nonempty list")
+    _require(all(isinstance(item, str) and bool(item) for item in objects),
+             label + " manifest artifact_store.objects entries must be nonempty strings")
     record = entry.get("artifact_store")
     _require(isinstance(record, dict),
              label + " CAS manifest artifact must carry artifact_store")
-    _require(sum(1 for item in sealed if item == record) == 1,
-             label + " CAS manifest artifact is not exactly one sealed record")
-    _require(record.get("schema") == STORE_SCHEMA,
-             label + " sealed record schema is invalid")
-    _require(_resolved_equal(record.get("root"), root),
-             label + " sealed record root is foreign")
-    _require(record.get("kind") == kind,
-             label + " sealed record kind does not match the manifest row")
-    _require(record.get("target") == target,
-             label + " sealed record target does not match the manifest row")
-    _require(record.get("binary_sha256") == entry.get("sha256"),
-             label + " sealed record digest does not match the manifest row")
-    _require(validated.payload.get("artifact_store") == record,
-             label + " receipt artifact_store does not match the sealed record")
-    canonical_binary = _absolute_manifest_path(record.get("binary"), label, "sealed binary")
-    canonical_receipt = _absolute_manifest_path(record.get("receipt"), label, "sealed receipt")
-    build_receipt = _absolute_manifest_path(record.get("build_receipt"),
-                                            label, "sealed build receipt")
-    for path, what in ((canonical_binary, "sealed binary"),
-                       (canonical_receipt, "sealed receipt"),
-                       (build_receipt, "sealed build receipt")):
-        _require(_inside(path, root), label + " " + what + " is outside the store")
-        _require(path.is_file(), label + " " + what + " is missing")
-    _require(sha256_file(canonical_binary) == record.get("binary_sha256"),
-             label + " sealed canonical binary digest does not match its record")
-    _require(sha256_file(canonical_receipt) == sha256_file(build_receipt),
-             label + " sealed receipt aliases are not the same bytes")
-    if kind == "bin":
-        _require(validated.payload.get("relocated_artifact") is True,
-                 label + " CAS bin receipt must be relocated")
-        _require(_resolved_equal(consumed_binary, canonical_binary),
-                 label + " consumed binary is not the sealed canonical snapshot")
-        _require(_resolved_equal(consumed_receipt, build_receipt),
-                 label + " consumed receipt is not the sealed .build.json alias")
-        _require(canonical_binary.name == target,
-                 label + " sealed bin basename is not the target")
+    _require(objects.count(record.get("object")) == 1,
+             label + " selected CAS object is not exactly one manifest "
+                     "artifact_store.objects entry")
+    try:
+        if kind == "bin":
+            cas_exporter.validate_bin(manifest, target, root, sealed, label)
+        else:
+            cas_exporter.validate_test(manifest, target, root, sealed, label)
+    except cas_exporter.ExportError as error:
+        raise AssertionError(label + " CAS artifact is invalid: " + str(error)) from error
+    object_path = Path(record["object"])
+    alias_stat = consumed_binary.stat()
+    object_stat = object_path.stat()
+    actual_same_inode = (
+        (alias_stat.st_dev, alias_stat.st_ino) ==
+        (object_stat.st_dev, object_stat.st_ino))
+    if kind == "test":
+        _require(Path(record["binary"]).name == Path(consumed_binary).name,
+                 label + " sealed test snapshot basename is not the output basename")
+        output_alias = record["output_alias"]
+        _require(output_alias.get("same_inode_as_cas_object") is actual_same_inode,
+                 label + " output alias same_inode claim does not match the actual "
+                         "alias/object relation")
+        canonical_stat = Path(record["binary"]).stat()
+        actual_alias_canonical = (
+            (alias_stat.st_dev, alias_stat.st_ino) ==
+            (canonical_stat.st_dev, canonical_stat.st_ino))
+        method = output_alias.get("method")
+        if method == "hardlink":
+            _require(actual_alias_canonical is True,
+                     label + " hardlink output alias is not the canonical snapshot inode")
+        else:
+            _require(actual_alias_canonical is False,
+                     label + " copy output alias shares the canonical snapshot inode")
+    else:
         _require(record.get("output_alias") is None,
                  label + " sealed bin record may not carry an output alias")
-    else:
-        _require(canonical_binary.name == consumed_binary.name,
-                 label + " sealed test snapshot basename is not the output basename")
-        _require(canonical_receipt.name == canonical_binary.name + ".receipt.json",
-                 label + " sealed test receipt basename is invalid")
-        _require(build_receipt.name == canonical_binary.name + ".build.json",
-                 label + " sealed test build receipt basename is invalid")
-        alias = record.get("output_alias")
-        _require(isinstance(alias, dict),
-                 label + " sealed test record must carry output_alias")
-        _require(_resolved_equal(alias.get("path"), consumed_binary),
-                 label + " test output alias path does not match the consumed binary")
-        _require(_resolved_equal(alias.get("receipt"), consumed_receipt),
-                 label + " test output alias receipt does not match the consumed receipt")
-        _require(alias.get("overwrote_existing") is False,
-                 label + " test output alias must not overwrite an existing path")
-        _require(isinstance(alias.get("same_inode_as_cas_object"), bool),
-                 label + " test output alias same_inode flag must be a boolean")
-        _require(alias.get("method") in ("hardlink", "copy"),
-                 label + " test output alias method is invalid")
-        _require(not _inside(consumed_binary, root),
-                 label + " test output alias must be outside the artifact store")
-        _require(not _inside(consumed_receipt, root),
-                 label + " test output receipt must be outside the artifact store")
-        _require(sha256_file(consumed_receipt) == sha256_file(build_receipt),
-                 label + " test output receipt is not the sealed receipt bytes")
 
 
 def _check_exporter_anchors(environ, manifest_path, raw_sha256, label):
