@@ -251,11 +251,30 @@ one-bracket-per-batch structure, the status accounting, the same-ref rejection
 diagnostic and the redirect refusal without external contact) without running
 any native workload.
 
+## Fresh-install Blob-only baseline evidence (2026-11-14)
+
+A separately root-run, credential-free baseline is checked in at
+[`evidence/state-services/blob-baseline-20261114/README.md`](../evidence/state-services/blob-baseline-20261114/README.md)
+with the exact report at
+[`report.json`](../evidence/state-services/blob-baseline-20261114/report.json)
+(sha256 `42788ad969397baa5beaf150a03a35f9c7098bd10bf6271773fe8d5037e9cc5d`).
+It was produced from root integration
+`ce1aaa3caccb6e9bca73cd960e4803aac8dfd862` and binary
+`66fdfba3b7c55d9ceb659afc86d806a74b1336e0c1ee63904f6f17c82ee06cb3`, not from
+this feature branch, and it is not a phase-metrics report. It covers one
+256 KiB seed repository, two concurrent read-only clones, restart/empty-scratch
+cold clone, and 250 ms PostgreSQL session sampling. It does not measure provider
+cold cache, exact lock waits, OpenDAL GET bytes/phases, request wire bytes,
+capacity, or SLOs, and it does not close #106. The evidence README records the
+required public-schema migration and the task-owned host-network runtime caveat.
+
 ## Status
 
 This module supplies phase instrumentation plus metric semantics only. #106
 remains open until the root-owned measurement of real whole push/cold/warm runs,
-frozen budgets and full coverage of the intended phases exist. Nothing here is a
+frozen budgets and full coverage of the intended phases exist. The separate
+2026-11-14 Blob-only baseline entry above is a baseline entry only; it does not
+freeze budgets, cover provider-cold/GET metrics, or close #106. Nothing here is a
 performance claim, and the legacy
 `evidence/state-services/w0-native-legacy-pando-v5.json` baseline is unchanged.
 
