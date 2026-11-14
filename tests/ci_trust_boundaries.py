@@ -25,6 +25,12 @@ webhook has no persisted creator-token binding in this schema, so an API-token
 revocation is not represented as revoking the webhook's independent secret.
 This harness does not claim that unsupported binding.
 
+Concurrency limitation: the claim/heartbeat, post-Git callback, and merge
+rechecks are serialized by the policy advisory fence, but this harness does not
+install a test-only pause inside checkout preparation or Git verification.
+It proves the end-state refusals and current code paths, not a specific
+overlapping interleaving.
+
 Required environment (same as the other native CI harnesses):
 ROOTYARD_TEST_DATABASE_URL, a trusted Git executable, and a Linux PostgreSQL 17
 fixture. Root can run the focused command:
@@ -40,6 +46,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import threading
 import time
 
 from webhooks import WebhooksHarness
@@ -337,6 +344,83 @@ class TrustBoundaryHarness(WebhooksHarness):
             assert row["ci_run_id"] == run["id"], row
             assert row["ci_base_oid"] == self.base_oids[repo], row
 
+    def wait_for_backend_lock(self, marker, deadline=10.0):
+        stop = time.monotonic() + deadline
+        while time.monotonic() < stop:
+            count = int(
+                self.sql(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname=current_database() AND state='active' "
+                    f"AND query LIKE {self.q('%' + marker + '%')} "
+                    "AND wait_event_type='Lock'"
+                )
+            )
+            if count >= 1:
+                return
+            time.sleep(0.05)
+        raise AssertionError(f"no backend reached the {marker!r} lock barrier")
+
+    def revocation_blocks_merge(self):
+        hook = self.issuers[("forge", "ci/trusted")]
+        pr = self.document(self.pull_path("forge"))
+        repo_id = self.repo["id"]
+        results = {}
+
+        def revoke():
+            results["revoke"] = self.http(
+                self.bind_path("forge", hook),
+                token=self.alice,
+                method="DELETE",
+                body={"context": "ci/trusted"},
+            )
+
+        def merge():
+            results["merge"] = self.http(
+                self.pull_path("forge") + "/merge",
+                token=self.alice,
+                method="POST",
+                body={
+                    "expected_version": pr["version"],
+                    "expected_head_oid": pr["head_oid"],
+                    "expected_base_oid": pr["base_oid"],
+                },
+            )
+
+        # Hold the binding row so the real revoke request acquires the policy
+        # fence, then waits on the row. A concurrent merge must wait on that
+        # fence rather than evaluating the still-visible active binding.
+        with self.held_transaction(
+            "SELECT 1 FROM forge_trusted_check_contexts "
+            f"WHERE repository_id={self.q(repo_id)} "
+            "AND context='ci/trusted' FOR UPDATE"
+        ):
+            revoker = threading.Thread(target=revoke)
+            revoker.start()
+            self.wait_for_backend_lock("UPDATE forge_trusted_check_contexts")
+            merger = threading.Thread(target=merge)
+            merger.start()
+            self.wait_for_backend_lock("pg_advisory_xact_lock")
+        revoker.join(timeout=15)
+        merger.join(timeout=15)
+        assert not revoker.is_alive(), "revocation did not finish"
+        assert not merger.is_alive(), "merge did not finish"
+        revoke_status, revoke_raw, _ = results["revoke"]
+        assert revoke_status == 200, (revoke_status, revoke_raw[:300])
+        status, raw, _ = results["merge"]
+        assert status == 409, (status, raw[:300])
+        assert json.loads(raw)["error"] == (
+            "required check runs have not succeeded"
+        ), raw[:300]
+        current = self.document(self.pull_path("forge"))
+        assert current["state"] == "open", current
+        assert current["head_oid"] == pr["head_oid"], current
+        self.document(
+            self.bind_path("forge", hook),
+            200,
+            method="PUT",
+            body={"context": "ci/trusted"},
+        )
+
     def ordinary_writer_and_cross_scope_refusals(self):
         protected_before = {
             (repo, context): self.check_row(repo, self.head_v1[repo], context)
@@ -600,6 +684,9 @@ class TrustBoundaryHarness(WebhooksHarness):
             409,
             "CI run attempt or candidate changed",
         )
+        late_callback = self.callback_body(run_b1, claimed_b1, "late-b1-callback")
+        error = self.signed_callback("other", b1, late_callback, 409)
+        assert error["error"] == "CI run attempt or candidate changed", error
         current_report = self.integration(
             self.run_path("other", b1, run_b1, "report"),
             b1["_secret"],
@@ -636,6 +723,32 @@ class TrustBoundaryHarness(WebhooksHarness):
             body={"expected_version": current["version"], "secret": rotated},
         )
         assert patched["version"] > current["version"], patched
+        self.refuse(
+            self.run_path("other", b2, run_b2, "claim"),
+            b2["_secret"],
+            {"runner_id": "rotated-old-claim"},
+            401,
+            "valid credentials required",
+        )
+        heartbeat = {
+            "attempt": claimed_b2["attempt"],
+            "lease_generation": claimed_b2["lease_generation"],
+            "runner_id": "rotated-secret",
+        }
+        self.refuse(
+            self.run_path("other", b2, run_b2, "heartbeat"),
+            b2["_secret"],
+            heartbeat,
+            401,
+            "valid credentials required",
+        )
+        renewed = self.integration(
+            self.run_path("other", b2, run_b2, "heartbeat"),
+            rotated,
+            heartbeat,
+            200,
+        )
+        assert renewed["lease_generation"] == claimed_b2["lease_generation"], renewed
         self.refuse(
             self.run_path("other", b2, run_b2, "report"),
             b2["_secret"],
@@ -706,6 +819,10 @@ def main():
         harness.setup()
         harness.case("trusted two-repository matrix setup", harness.configure)
         harness.case("trusted positive report/callback flows", harness.positive_matrix)
+        harness.case(
+            "revoked trusted context cannot unlock merge",
+            harness.revocation_blocks_merge,
+        )
         harness.case(
             "ordinary writer and cross-context/repository refusals",
             harness.ordinary_writer_and_cross_scope_refusals,
