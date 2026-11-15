@@ -482,7 +482,7 @@ jobs:
             --require-case ci_dependencies=integration_claim_prepares_exact_dependencies \
             --require-case ci_dependencies=origin_fallback_dependency_credential_boundaries \
             --require-case ci_dependencies=unsafe_gitmodules_url_receives_no_credentials \
-            --fixture rust="$(rustc -V)" \
+            --fixture-rust-from-receipt \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \
             --fixture bubblewrap="$(bwrap --version)" \

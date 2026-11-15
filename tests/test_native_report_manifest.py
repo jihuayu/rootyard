@@ -458,7 +458,7 @@ class ManifestFixture:
             )
         return process
 
-    def job(self, manifest_name="job.json", reports=None, log=None, extra=(), expect=0):
+    def job(self, manifest_name="job.json", reports=None, log=None, extra=(), expect=0, env=None):
         reports = reports if reports is not None else {"web_sessions": self.report()}
         log = log if log is not None else self.log()
         manifest = self.root / f"manifests/{manifest_name}"
@@ -479,7 +479,7 @@ class ManifestFixture:
             "--fixture", "postgres=postgres:17",
             *extra,
         ]
-        self.last_process = self.run(*arguments, expect=expect)
+        self.last_process = self.run(*arguments, expect=expect, env=env)
         return manifest
 
 
@@ -585,6 +585,98 @@ class TestJobManifest(unittest.TestCase):
         self.assertEqual(
             job["build_receipt"]["batch_manifest"]["file"], str(batch_path.resolve())
         )
+
+    def test_fixture_rust_from_receipt_records_full_v1_and_v2_versions_without_compilers(self):
+        # An empty PATH makes any accidental bare rustc/cargo probe fail; the
+        # fixture must come from the already-validated receipt instead.
+        v1_version = "rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ManifestFixture(temporary)
+            receipt = json.loads(fixture.receipt.read_text(encoding="utf-8"))
+            receipt["rustc"] = v1_version
+            fixture.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+            v1_job = json.loads(
+                fixture.job(
+                    extra=("--fixture-rust-from-receipt",),
+                    env={"PATH": ""},
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(v1_job["fixtures"]["rust"], v1_version)
+            self.assertEqual(v1_job["build_receipt"]["rustc"], v1_version)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ManifestFixture(temporary)
+            batch_path = fixture.enable_v2_cas_batch_receipt()
+            receipt = json.loads(fixture.receipt.read_text(encoding="utf-8"))
+            v2_version = receipt["toolchain"]["rustc"]["version"]
+            v2_job = json.loads(
+                fixture.job(
+                    extra=(
+                        "--fixture-rust-from-receipt",
+                        "--expect-batch-manifest-path", str(batch_path.resolve()),
+                        "--expect-batch-manifest-sha", digest(batch_path),
+                    ),
+                    env={"PATH": ""},
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(v2_job["fixtures"]["rust"], v2_version)
+            self.assertEqual(v2_job["build_receipt"]["rustc"], v2_version)
+            self.assertEqual(
+                v2_job["build_receipt"]["batch_manifest"]["file"],
+                str(batch_path.resolve()),
+            )
+            self.assertEqual(
+                v2_job["build_receipt"]["batch_manifest"]["sha256"],
+                digest(batch_path),
+            )
+
+    def test_fixture_rust_from_receipt_reuses_fixture_safety_checks(self):
+        receipt = json.loads(self.fixture.receipt.read_text(encoding="utf-8"))
+        receipt["rustc"] = "rustc 1.99.1\nnot-a-single-line"
+        self.fixture.receipt.write_text(
+            json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
+        )
+        self.fixture.job(
+            extra=("--fixture-rust-from-receipt",),
+            expect=1,
+        )
+        self.assertIn(
+            "fixture rust: value is not a single safe line",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_fixture_rust_from_receipt_rejects_an_explicit_rust_fixture(self):
+        self.fixture.job(
+            extra=(
+                "--fixture-rust-from-receipt",
+                "--fixture", "rust=rustc 1.99.1 (caller supplied)",
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "conflicts with an explicit --fixture rust=",
+            self.fixture.last_process.stderr,
+        )
+        failed = json.loads(
+            (self.fixture.root / "manifests/job.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(failed["status"], "failed")
+
+    def test_fixture_rust_from_receipt_is_rejected_in_release_mode(self):
+        manifest = self.fixture.root / "manifests/release.json"
+        process = self.fixture.run(
+            "--mode", "release",
+            "--manifest-out", manifest,
+            "--expect-commit", self.fixture.commit,
+            "--fixture-rust-from-receipt",
+            expect=1,
+        )
+        self.assertIn(
+            "--fixture-rust-from-receipt is only valid in job mode",
+            process.stderr,
+        )
+        failed = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(failed["status"], "failed")
 
     def test_workflow_job_mode_anchor_flags_reach_the_real_argument_parser(self):
         anchors = workflow_batch_manifest_anchor_arguments()

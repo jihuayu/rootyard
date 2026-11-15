@@ -524,6 +524,9 @@ class CargoForkWorkflowTest(unittest.TestCase):
             '--expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256"', manifest
         )
         self.assertIn("test-results/native-pr-gate.json", manifest)
+        self.assertIn("--fixture-rust-from-receipt", manifest)
+        self.assertNotIn("rustc -V", manifest)
+        self.assertNotIn("--fixture rust=", manifest)
 
         upload = text[text.index("name: e2e-report"):]
         upload = upload.split("if-no-files-found:", 1)[0]
@@ -531,6 +534,39 @@ class CargoForkWorkflowTest(unittest.TestCase):
         self.assertIn("${{ env.ROOTYARD_BATCH_MANIFEST }}", upload)
         self.assertNotIn("target/", upload)
         self.assertNotIn("native-artifacts", upload)
+
+    def test_binding_steps_derive_rust_fixture_from_the_validated_receipt(self) -> None:
+        ci = self.workflow("ci.yml")
+        manifest = ci[ci.index("python3 scripts/native_report_manifest.py --mode job"):]
+        manifest = manifest.split("\n      - name:", 1)[0]
+        self.assertIn("--fixture-rust-from-receipt", manifest)
+        self.assertNotIn("rustc", manifest)
+        self.assertNotIn("--fixture rust=", manifest)
+        # Explicit preparation/verification probes remain outside the binding.
+        self.assertIn("rustc -V | grep -Eq '^rustc 1\\.99\\.1 '", ci)
+
+        candidate = self.workflow("candidate-release-acceptance.yml")
+        for step_name in (
+            "Bind the browser report to the built binary",
+            "Bind object-store reports to the built binary",
+        ):
+            with self.subTest(step=step_name):
+                start = candidate.index(f"- name: {step_name}")
+                end = candidate.find("\n      - name:", start)
+                step = candidate[start:] if end == -1 else candidate[start:end]
+                self.assertIn("--fixture-rust-from-receipt", step)
+                self.assertIn("if: always()", step)
+                self.assertNotIn("rustc", step)
+                self.assertNotIn('--fixture "rust=', step)
+        self.assertEqual(2, candidate.count("--fixture-rust-from-receipt"))
+        # Earlier explicit toolchain prep and unrelated tool version collection
+        # remain untouched.
+        self.assertIn("rustc -V && cargo -V", candidate)
+        self.assertIn("rustc -V | grep -Eq '^rustc 1\\.99\\.1 '", candidate)
+        self.assertIn(
+            'postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL"',
+            candidate,
+        )
 
     def test_refcas_no_longer_uses_the_rustup_plus_toolchain_form(self) -> None:
         text = self.workflow("refcas-log.yml")

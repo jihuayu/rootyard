@@ -15,7 +15,9 @@ Two modes:
   the commit, the compiled source-input digest, the binary digest, the harness
   digests and the safe (credential-free) fixture versions.  An optional
   exporter-provided expected batch-manifest SHA-256 (and path) anchors the exact
-  raw bytes consumed and recorded as provenance.
+  raw bytes consumed and recorded as provenance.  The optional
+  ``--fixture-rust-from-receipt`` records the already-validated receipt's full
+  Rust version as the ``rust`` fixture without probing a compiler.
 * ``--mode release`` consumes job manifests, re-verifies their harness digests
   against the current checkout, requires one shared commit and one shared
   source-input digest, checks the candidate-scoped reports and pinned fixture
@@ -817,6 +819,12 @@ def job_manifest(args):
     require(harnesses, "at least one --harness is required to bind the executed test source")
 
     fixtures = pairs(args.fixture, "--fixture")
+    if getattr(args, "fixture_rust_from_receipt", False):
+        require(
+            "rust" not in fixtures,
+            "--fixture-rust-from-receipt conflicts with an explicit --fixture rust=...",
+        )
+        fixtures["rust"] = receipt_rustc(validated)
     for name, value in fixtures.items():
         require(value.strip(), f"fixture {name}: empty fixture version")
         require("\n" not in value and len(value) <= 300, f"fixture {name}: value is not a single safe line")
@@ -1326,6 +1334,11 @@ def main():
     parser.add_argument("--binary")
     parser.add_argument("--expect-batch-manifest-sha")
     parser.add_argument("--expect-batch-manifest-path")
+    parser.add_argument(
+        "--fixture-rust-from-receipt",
+        action="store_true",
+        help="record fixtures.rust from the validated build receipt without probing rustc",
+    )
     parser.add_argument("--report", action="append", default=[])
     parser.add_argument("--require-case", action="append", default=[])
     parser.add_argument("--log", action="append", default=[])
@@ -1351,6 +1364,10 @@ def main():
                 "reports": sorted(payload["reports"]),
             }
         else:
+            require(
+                not args.fixture_rust_from_receipt,
+                "--fixture-rust-from-receipt is only valid in job mode",
+            )
             require(
                 args.expect_batch_manifest_sha is None
                 and args.expect_batch_manifest_path is None,

@@ -204,7 +204,6 @@ jobs:
           chromium_version=$(/usr/bin/chromium --version 2>/dev/null || true)
           postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version' 2>/dev/null || true)
           postgres_client_version=$(psql --version 2>/dev/null || true)
-          rust_version=$(rustc -V 2>/dev/null || true)
           python3 scripts/native_report_manifest.py --mode job \
             --manifest-out test-results/candidate/browser/native-job-manifest.json \
             --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
@@ -222,7 +221,7 @@ jobs:
             --fixture "chromium_version=$chromium_version" \
             --fixture "browser_postgres_server_version=$postgres_server_version" \
             --fixture "browser_postgres_client_version=$postgres_client_version" \
-            --fixture "rust=$rust_version"
+            --fixture-rust-from-receipt
       - name: Upload browser candidate evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -451,7 +450,6 @@ jobs:
           git_lfs_sha256=$(cat "$RUNNER_TEMP/git-lfs-tarball.sha256" 2>/dev/null || true)
           postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version' 2>/dev/null || true)
           postgres_client_version=$(psql --version 2>/dev/null || true)
-          rust_version=$(rustc -V 2>/dev/null || true)
           python3 scripts/native_report_manifest.py --mode job \
             --manifest-out test-results/candidate/object-store/native-job-manifest.json \
             --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
@@ -485,7 +483,7 @@ jobs:
             --fixture "git_lfs_tarball_sha256=$git_lfs_sha256" \
             --fixture "object_store_postgres_server_version=$postgres_server_version" \
             --fixture "object_store_postgres_client_version=$postgres_client_version" \
-            --fixture "rust=$rust_version" \
+            --fixture-rust-from-receipt \
             "${extra_args[@]}"
       - name: Remove the owned fixture and private environment file
         if: always()
