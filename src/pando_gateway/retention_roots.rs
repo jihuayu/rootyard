@@ -80,9 +80,10 @@ pub async fn pin_recovery_root(
 
     let mut prepared =
         Box::pin(pitr_fence::begin_epoch_advance(pool, data_dir, remote, "pin_recovery_root", deadline)).await?;
+    let pending = prepared.pending().clone();
     let result: Result<RetentionRootSummary> = async {
         let tx = prepared.transaction().await?;
-        let committed = pitr_fence::commit_epoch_advance_in_tx(&*tx, prepared.pending()).await?;
+        let committed = pitr_fence::commit_epoch_advance_in_tx(&*tx, &pending).await?;
 
         let external_lsn: String = tx
             .query_one(

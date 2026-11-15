@@ -430,9 +430,10 @@ pub async fn advance_epoch(
     deadline: Instant,
 ) -> Result<AuthorityState> {
     let mut prepared = Box::pin(begin_epoch_advance(pool, data_dir, remote, operation, deadline)).await?;
+    let pending = prepared.pending().clone();
     let res: Result<AuthorityState> = async {
         let tx = prepared.transaction().await?;
-        let committed = commit_epoch_advance_in_tx(&*tx, prepared.pending()).await?;
+        let committed = commit_epoch_advance_in_tx(&*tx, &pending).await?;
         tx.commit().await?;
         Ok(committed)
     }
