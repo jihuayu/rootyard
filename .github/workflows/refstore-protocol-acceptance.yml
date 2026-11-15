@@ -10,6 +10,8 @@ on:
       - 'vendor/**'
       - 'rust-toolchain.toml'
       - 'migrations/**'
+      - 'tests/blob_store_w1c_contract.rs'
+      - 'tests/blob_store_w1c_native.py'
       - 'tests/ref_store_*.rs'
       - 'tests/retention_roots_support/**'
       - 'tests/format22_support/**'
@@ -1359,6 +1361,11 @@ jobs:
               'blob_git_gateway::session_http_acceptance::negative_tests::revoked_collaborator_session_is_refused_before_token_scoring',
               'blob_git_gateway::session_http_acceptance::negative_tests::missing_registered_pack_fails_closed_without_a_session',
               'blob_git_gateway::session_http_acceptance::negative_tests::keyring_loaded_gateway_issues_and_validates_sessions',
+              'blob_git_gateway::session_http_acceptance::browser_tests::browser_cookie_aliases_enforce_bound_and_reject_non_browser_routes',
+              'blob_git_gateway::session_http_acceptance::matrix_tests::corrupt_pack_bytes_and_missing_idx_fail_closed_with_and_without_session',
+              'blob_git_gateway::session_http_acceptance::matrix_tests::behind_bound_recovers_after_second_push_and_serves_historical_oid_reads',
+              'blob_git_gateway::session_http_acceptance::matrix_tests::keyring_rotation_accepts_previous_key_during_overlap_and_rejects_after_retirement',
+              'blob_git_gateway::session_http_acceptance::matrix_tests::restore_cluster_incarnation_rotation_and_oversized_session_header_fail_closed',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materialization',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::corrupting_a_registered_pack_after_capture_refuses_the_sealed_materialization',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
@@ -1917,6 +1924,11 @@ jobs:
               'blob_git_gateway::session_http_acceptance::negative_tests::revoked_collaborator_session_is_refused_before_token_scoring',
               'blob_git_gateway::session_http_acceptance::negative_tests::missing_registered_pack_fails_closed_without_a_session',
               'blob_git_gateway::session_http_acceptance::negative_tests::keyring_loaded_gateway_issues_and_validates_sessions',
+              'blob_git_gateway::session_http_acceptance::browser_tests::browser_cookie_aliases_enforce_bound_and_reject_non_browser_routes',
+              'blob_git_gateway::session_http_acceptance::matrix_tests::corrupt_pack_bytes_and_missing_idx_fail_closed_with_and_without_session',
+              'blob_git_gateway::session_http_acceptance::matrix_tests::behind_bound_recovers_after_second_push_and_serves_historical_oid_reads',
+              'blob_git_gateway::session_http_acceptance::matrix_tests::keyring_rotation_accepts_previous_key_during_overlap_and_rejects_after_retirement',
+              'blob_git_gateway::session_http_acceptance::matrix_tests::restore_cluster_incarnation_rotation_and_oversized_session_header_fail_closed',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materialization',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::corrupting_a_registered_pack_after_capture_refuses_the_sealed_materialization',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
@@ -2182,6 +2194,102 @@ jobs:
             "$evidence/preflight.json" "$evidence" "$upload" || status=1
           ls -la "$upload"
           exit "$status"
+      - name: "Build and exercise #109 blob_store_w1c_contract against PostgreSQL and Garage S3"
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          w1c_dir="$RUNNER_TEMP/refstore-w1c"
+          artifact_store="$HOME/.cache/rootyard/native-artifacts"
+          report_dir="test-results/refstore/blob-store-w1c"
+          rm -rf "$w1c_dir"
+          mkdir -p "$w1c_dir" "$report_dir"
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          git_status="$(git status --porcelain --untracked-files=normal)"
+          if [ -n "$git_status" ]; then
+            echo "worktree check failed: the worktree is not clean before building blob_store_w1c_contract" >&2
+            exit 1
+          fi
+          w1c_bin="$w1c_dir/blob_store_w1c_contract"
+          w1c_report="$w1c_dir/blob_store_w1c_contract-report.json"
+          python3 scripts/build_native_test.py --test blob_store_w1c_contract --features pando-lab \
+            --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$artifact_store" --output "$w1c_bin" > "$w1c_report"
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="w1c-pg-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          w1c_db="rootyard_run_w1c_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          if [ "${#w1c_db}" -gt 63 ]; then echo "w1c database name exceeds 63 bytes" >&2; exit 1; fi
+          preexisting="$(psql --host 127.0.0.1 --port 55432 --username rootyard --dbname postgres \
+            --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+            -v database="$w1c_db" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          if [ "$preexisting" != "0" ]; then
+            echo "owned w1c database already exists; refusing to adopt it" >&2
+            exit 1
+          fi
+          createdb --host 127.0.0.1 --port 55432 --username rootyard "$w1c_db"
+          export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$w1c_db"
+          export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
+          python3 tests/blob_store_w1c_native.py \
+            --build-receipt "$w1c_bin.build.json" \
+            --build-report "$w1c_report" \
+            --binary "$w1c_bin" \
+            --expected-store-root "$artifact_store" \
+            --receipt-copy "$report_dir/blob_store_w1c_contract.build.json" \
+            --canonical-path-out "$w1c_dir/w1c-exec.path" \
+            --report "$report_dir/acceptance.json" \
+            --summary-log "$report_dir/w1c-summary.log" \
+            --expected-commit "$GITHUB_SHA" \
+            --require-cas \
+            --require-ci-pins \
+            --require-package-debug-zero \
+            --require-strip-debuginfo
+          w1c_exec="$(cat "$w1c_dir/w1c-exec.path")"
+          python3 scripts/native_report_manifest.py --mode job \
+            --build-receipt "$report_dir/blob_store_w1c_contract.build.json" \
+            --binary "$w1c_exec" \
+            --expect-commit "$GITHUB_SHA" \
+            --report "w1c=$report_dir/acceptance.json" \
+            --require-case "w1c=pg_protected_uploader_preflight_preserves_unconsumed_holds" \
+            --require-case "w1c=pg_protected_uploader_consume_and_upload_encrypted_against_real_provider" \
+            --log "w1c-summary=$report_dir/w1c-summary.log" \
+            --log-marker "w1c-summary=w1c native acceptance: passed (2 cases)" \
+            --harness "tests/blob_store_w1c_native.py" \
+            --harness "tests/blob_store_w1c_contract.rs" \
+            --fixture-rust-from-receipt \
+            --fixture postgres=postgres:17 \
+            --fixture "garage=Garage v2.1.0 sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78e93ee8da7cf6a" \
+            --manifest-out test-results/refstore/w1c-native-job.json
+      - name: "Drop only the job-owned #109 w1c database"
+        if: always()
+        env:
+          PGOPTIONS: ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          w1c_db="rootyard_run_w1c_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          dropdb --host 127.0.0.1 --port 55432 --username rootyard --if-exists "$w1c_db"
+          absent="$(psql --host 127.0.0.1 --port 55432 --username rootyard --dbname postgres \
+            --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+            -v database="$w1c_db" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          test "$absent" = "0"
       - name: Stop only the job-owned Garage fixture
         if: always()
         run: |

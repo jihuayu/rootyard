@@ -179,6 +179,16 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
             }
             return json_reply(StatusCode::OK, &lifecycle::status(config, repo).await?);
         }
+        if tail == "kms" {
+            let db = config.db().await?;
+            if !permitted(&db, repo, principal, false).await? {
+                return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+            }
+            return json_reply(
+                StatusCode::OK,
+                &lifecycle::rotation::kms_status(config, repo).await?,
+            );
+        }
         if tail == "object-format" {
             let db = config.db().await?;
             if !permitted(&db, repo, principal, false).await? {
@@ -252,25 +262,8 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
     }
     if token.is_none() && parts.method == "POST" && tail == "lifecycle" {
         let db = config.db().await?;
-        if !permitted(&db, repo, principal, true).await? {
-            return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
-        }
-        let state_row = db
-            .query_opt(
-                "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
-                &[&repo],
-            )
-            .await?;
-        let Some(state_row) = state_row else {
-            return Ok(reply(StatusCode::NOT_FOUND, "unknown repository"));
-        };
-        let write_paused: bool = state_row.get(0);
-        let storage_backend: String = state_row.get(1);
-        if write_paused || storage_backend != "pando" {
-            return Ok(reply(
-                StatusCode::CONFLICT,
-                "repository writes paused or routed to gitfs",
-            ));
+        if let Some(err_resp) = check_writable_pando_repo(&db, repo, principal).await? {
+            return Ok(err_resp);
         }
         let raw_body = to_bytes(body, 64 * 1024).await?;
         let opts: lifecycle::LifecycleEvaluateOptions = if raw_body.is_empty() {
@@ -281,6 +274,22 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         return json_reply(
             StatusCode::OK,
             &lifecycle::evaluate_lifecycle(config, repo, &opts).await?,
+        );
+    }
+    if token.is_none() && parts.method == "POST" && tail == "kms/rotate" {
+        let db = config.db().await?;
+        if let Some(err_resp) = check_writable_pando_repo(&db, repo, principal).await? {
+            return Ok(err_resp);
+        }
+        let raw_body = to_bytes(body, 64 * 1024).await?;
+        let opts: lifecycle::rotation::KmsRotateOptions = if raw_body.is_empty() {
+            lifecycle::rotation::KmsRotateOptions::default()
+        } else {
+            serde_json::from_slice(&raw_body)?
+        };
+        return json_reply(
+            StatusCode::OK,
+            &lifecycle::rotation::rotate_kms_key_with_options(config, repo, &opts).await?,
         );
     }
     let service = match (parts.method.as_str(), tail.as_str()) {
@@ -450,4 +459,32 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         response = response.header("X-Pando-Operation", op.to_string());
     }
     Ok(response.body(Body::from(output.stdout[split + 4..].to_vec()))?)
+}
+
+async fn check_writable_pando_repo(
+    db: &tokio_postgres::Client,
+    repo: Uuid,
+    principal: &str,
+) -> Result<Option<Response<Body>>> {
+    if !permitted(db, repo, principal, true).await? {
+        return Ok(Some(reply(StatusCode::FORBIDDEN, "repository access denied")));
+    }
+    let Some(state_row) = db
+        .query_opt(
+            "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
+            &[&repo],
+        )
+        .await?
+    else {
+        return Ok(Some(reply(StatusCode::NOT_FOUND, "unknown repository")));
+    };
+    let write_paused: bool = state_row.get(0);
+    let storage_backend: String = state_row.get(1);
+    if write_paused || storage_backend != "pando" {
+        return Ok(Some(reply(
+            StatusCode::CONFLICT,
+            "repository writes paused or routed to gitfs",
+        )));
+    }
+    Ok(None)
 }

@@ -1,5 +1,7 @@
 //! Minimal serving lifecycle, with independent HTTP draining and worker stop.
 //! Storage adapters construct routes; this path opens no GitFS volume or external wake.
+//! Browser sign-in is enabled on the standalone service, so the shared bounded
+//! browser-session GC loop runs here under its own cancellation token.
 use anyhow::{Result, anyhow};
 use axum::response::IntoResponse;
 use deadpool_postgres::Pool;
@@ -91,11 +93,15 @@ async fn serve(
     let worker_stop = CancellationToken::new();
     let server_stop = CancellationToken::new();
     let mut worker = tokio::spawn(crate::dispatch::worker(
-        pool,
+        pool.clone(),
         crate::dispatch::Settings::standalone(),
         Arc::new(Notify::new()),
         worker_stop.clone(),
     ));
+    // The one shared browser-session GC loop. It needs only PostgreSQL and is
+    // stopped and awaited on every exit path below.
+    let session_gc_stop = CancellationToken::new();
+    let mut session_gc = tokio::spawn(crate::web::session_gc::run(pool, session_gc_stop.clone()));
     let serving =
         axum::serve(listener, router).with_graceful_shutdown(server_stop.clone().cancelled_owned()).into_future();
     tokio::pin!(serving);
@@ -130,6 +136,18 @@ async fn serve(
             Err(_) => Err(anyhow!("Blob service drain deadline exceeded")),
         },
     };
+    // Cancel and bounded-await the one GC task on every exit path, including a
+    // refused configuration (where it has already returned).
+    session_gc_stop.cancel();
+    if !session_gc.is_finished() {
+        match tokio::time::timeout(Duration::from_secs(5), &mut session_gc).await {
+            Ok(_) => {}
+            Err(_) => {
+                session_gc.abort();
+                let _ = session_gc.await;
+            }
+        }
+    }
     if !worker.is_finished() {
         match tokio::time::timeout(Duration::from_secs(5), &mut worker).await {
             Ok(_) => {}

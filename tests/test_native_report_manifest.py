@@ -414,6 +414,332 @@ class ManifestFixture:
         self.receipt = build_receipt
         return batch_path
 
+    def enable_v2_integration_test_batch_receipt(
+        self,
+        *,
+        cas=True,
+        use_alias=True,
+        include_output_alias=True,
+        output_name="ref_store_pack_snapshots",
+    ):
+        """Build a real v2 integration-test batch layout (CAS with alias/sealed or non-CAS)."""
+        self.enable_v2_receipt()
+        dev_profile = {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": True,
+            "overflow_checks": True,
+            "test": False,
+        }
+        test_profile = dict(dev_profile, test=True)
+        test_target = "ref_store_pack_snapshots"
+        test_source = self.root / "tests" / f"{test_target}.rs"
+        test_source.parent.mkdir(parents=True, exist_ok=True)
+        test_source.write_text("#[test]\nfn snapshots_ok() {}\n", encoding="utf-8")
+        deps_dir = self.root / "target/debug/deps"
+        deps_dir.mkdir(parents=True, exist_ok=True)
+        deps_binary = deps_dir / f"{test_target}-deadbeefcafebabe"
+        test_bytes = b"actual-rust-integration-test-binary"
+        deps_binary.write_bytes(test_bytes)
+        os.chmod(deps_binary, 0o555)
+
+        def event(name, kind, source, executable, profile):
+            target = {"name": name, "kind": [kind], "src_path": str(source)}
+            payload = {
+                "reason": "compiler-artifact",
+                "package_id": "rootyard 0.1.0",
+                "target": target,
+                "profile": profile,
+                "fresh": False,
+            }
+            if executable is not None:
+                payload["executable"] = str(executable)
+            return payload
+
+        lib_row = receipts.cargo_artifact_record(
+            event("rootyard", "lib", self.root / "src/lib.rs", None, dev_profile),
+            self.root,
+        )
+        bin_row = receipts.cargo_artifact_record(
+            event("rootyard", "bin", self.root / "src/main.rs", self.binary, dev_profile),
+            self.root,
+        )
+        test_row = receipts.cargo_artifact_record(
+            event(test_target, "test", test_source, deps_binary, test_profile),
+            self.root,
+        )
+        bound = receipts.capture_bound_inputs(self.root, environ={"PATH": ""})
+        target_dir = self.binary.parent.parent.resolve()
+        command = [
+            "cargo", "build", "--locked", "--profile", "test",
+            "--config", f'build.target-dir = "{target_dir}"',
+            "--bin", "rootyard",
+            "--test", test_target,
+            "--features", "pando-lab",
+            "--message-format=json-render-diagnostics",
+        ]
+        batch_path = self.root / "test-results/native-build-batch.json"
+        batch_path.parent.mkdir(parents=True, exist_ok=True)
+        bin_bytes = self.binary.read_bytes()
+        bin_sha = bin_row["executable_sha256"]
+        test_sha = test_row["executable_sha256"]
+        all_rows = [lib_row, bin_row, test_row]
+        batch_link = {
+            "kind": "rootyard/native-build-batch",
+            "receipt_version": 2,
+            "binary": output_name,
+            "targets": [row["target"] for row in all_rows],
+            "bound_inputs_sha256": bound["bound_inputs"]["digest"],
+            "manifest": str(batch_path.resolve()),
+        }
+
+        if cas:
+            store = self.root / "artifact-store"
+            objects = []
+            for item_sha, item_bytes in ((bin_sha, bin_bytes), (test_sha, test_bytes)):
+                obj = store / "objects/sha256" / item_sha
+                obj.parent.mkdir(parents=True, exist_ok=True)
+                obj.write_bytes(item_bytes)
+                os.chmod(obj, 0o555)
+                objects.append(obj)
+            bin_obj, test_obj = objects
+            bin_base = store / "snapshots" / self.commit / ("a" * 64) / "cas-invocation"
+            bin_base.mkdir(parents=True, exist_ok=True)
+            bin_canonical = bin_base / "rootyard"
+            bin_canonical.write_bytes(bin_bytes)
+            os.chmod(bin_canonical, 0o555)
+            bin_receipt_path = bin_base / "rootyard.receipt.json"
+            bin_build_path = bin_base / "rootyard.build.json"
+            bin_record = {
+                "schema": "rootyard/native-artifact-store/v1",
+                "root": str(store),
+                "kind": "bin",
+                "target": "rootyard",
+                "implicit": False,
+                "object": str(bin_obj),
+                "binary": str(bin_canonical),
+                "receipt": str(bin_receipt_path),
+                "build_receipt": str(bin_build_path),
+                "binary_sha256": bin_sha,
+                "config_key": "a" * 64,
+                "build_id": "cas-invocation",
+                "method": "copy",
+                "reused": False,
+                "copied_bytes": len(bin_bytes),
+                "output_alias": None,
+            }
+
+            test_base = store / "snapshots" / self.commit / ("b" * 64) / "cas-invocation"
+            test_base.mkdir(parents=True, exist_ok=True)
+            test_canonical = test_base / output_name
+            test_canonical.write_bytes(test_bytes)
+            os.chmod(test_canonical, 0o555)
+            test_receipt_path = test_base / f"{output_name}.receipt.json"
+            test_build_path = test_base / f"{output_name}.build.json"
+            alias_dir = self.root / "evidence"
+            alias_binary = alias_dir / output_name
+            alias_receipt = alias_dir / f"{output_name}.build.json"
+            if include_output_alias:
+                alias_dir.mkdir(parents=True, exist_ok=True)
+                alias_binary.write_bytes(test_bytes)
+                os.chmod(alias_binary, 0o555)
+                output_alias = {
+                    "path": str(alias_binary),
+                    "receipt": str(alias_receipt),
+                    "method": "copy",
+                    "same_inode_as_cas_object": False,
+                    "overwrote_existing": False,
+                }
+                entry_artifact = str(alias_binary)
+                entry_receipt = str(alias_receipt)
+            else:
+                output_alias = None
+                entry_artifact = str(test_canonical)
+                entry_receipt = str(test_build_path)
+
+            test_record = {
+                "schema": "rootyard/native-artifact-store/v1",
+                "root": str(store),
+                "kind": "test",
+                "target": test_target,
+                "implicit": False,
+                "object": str(test_obj),
+                "binary": str(test_canonical),
+                "receipt": str(test_receipt_path),
+                "build_receipt": str(test_build_path),
+                "binary_sha256": test_sha,
+                "config_key": "b" * 64,
+                "build_id": "cas-invocation",
+                "method": "copy",
+                "reused": False,
+                "copied_bytes": len(test_bytes),
+                "output_alias": output_alias,
+            }
+            payload = receipts.make_receipt_v2(
+                binary_path=test_canonical,
+                command=command,
+                profile="test",
+                artifacts=[test_row],
+                toolchain=self._v2_toolchain(),
+                bound_inputs=bound,
+                workspace_commit=self.commit,
+                target_dir=target_dir,
+                target_triple="x86_64-unknown-linux-gnu",
+                features="pando-lab",
+            )
+            payload.update(
+                {
+                    "kind": "rust-integration-test",
+                    "relocated_artifact": True,
+                    "original_artifact_sha256": test_sha,
+                    "integration_test_source": test_row["source"],
+                    "integration_test_source_sha256": test_row["source_sha256"],
+                    "batch": batch_link,
+                    "artifact_store": test_record,
+                }
+            )
+            encoded = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+            receipt_targets = [test_receipt_path, test_build_path]
+            if include_output_alias:
+                receipt_targets.append(alias_receipt)
+            for path in receipt_targets:
+                path.write_bytes(encoded)
+                os.chmod(path, 0o444)
+            manifest_artifacts = [
+                {
+                    "kind": "bin",
+                    "target": "rootyard",
+                    "artifact": str(bin_canonical),
+                    "original_artifact": str(self.binary),
+                    "original_artifact_sha256": bin_sha,
+                    "receipt": str(bin_build_path),
+                    "fresh": False,
+                    "implicit": False,
+                    "sha256": bin_sha,
+                    "package_id": bin_row["package_id"],
+                    "profile": bin_row["profile"],
+                    "source": bin_row["source"],
+                    "artifact_store": bin_record,
+                },
+                {
+                    "kind": "test",
+                    "target": test_target,
+                    "artifact": entry_artifact,
+                    "original_artifact": test_row["executable"],
+                    "original_artifact_sha256": test_sha,
+                    "receipt": entry_receipt,
+                    "fresh": False,
+                    "sha256": test_sha,
+                    "package_id": test_row["package_id"],
+                    "profile": test_row["profile"],
+                    "source": test_row["source"],
+                    "source_sha256": test_row["source_sha256"],
+                    "artifact_store": test_record,
+                },
+            ]
+            manifest_store = {
+                "schema": "rootyard/native-artifact-store/v1",
+                "root": str(store),
+                "objects": sorted({str(bin_obj), str(test_obj)}),
+                "sealed": [bin_record, test_record],
+            }
+            if use_alias and include_output_alias:
+                self.binary = alias_binary
+                self.receipt = alias_receipt
+            else:
+                self.binary = test_canonical
+                self.receipt = test_build_path
+            self.cas_binary = test_canonical
+            self.cas_receipt = test_build_path
+            self.cas_canonical_receipt = test_receipt_path
+        else:
+            alias_dir = self.root / "evidence"
+            alias_dir.mkdir(parents=True, exist_ok=True)
+            alias_binary = alias_dir / output_name
+            alias_receipt = alias_dir / f"{output_name}.build.json"
+            alias_binary.write_bytes(test_bytes)
+            payload = receipts.make_receipt_v2(
+                binary_path=alias_binary,
+                command=command,
+                profile="test",
+                artifacts=[test_row],
+                toolchain=self._v2_toolchain(),
+                bound_inputs=bound,
+                workspace_commit=self.commit,
+                target_dir=target_dir,
+                target_triple="x86_64-unknown-linux-gnu",
+                features="pando-lab",
+            )
+            payload.update(
+                {
+                    "kind": "rust-integration-test",
+                    "relocated_artifact": True,
+                    "original_artifact_sha256": test_sha,
+                    "integration_test_source": test_row["source"],
+                    "integration_test_source_sha256": test_row["source_sha256"],
+                    "batch": batch_link,
+                }
+            )
+            alias_receipt.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            manifest_artifacts = [
+                {
+                    "kind": "bin",
+                    "target": "rootyard",
+                    "artifact": str(self.root / "target/debug/rootyard"),
+                    "receipt": str(target_dir / "debug/rootyard.build.json"),
+                    "fresh": False,
+                    "implicit": False,
+                    "sha256": bin_sha,
+                    "package_id": bin_row["package_id"],
+                    "profile": bin_row["profile"],
+                    "source": bin_row["source"],
+                },
+                {
+                    "kind": "test",
+                    "target": test_target,
+                    "artifact": str(alias_binary),
+                    "original_artifact": test_row["executable"],
+                    "original_artifact_sha256": test_sha,
+                    "receipt": str(alias_receipt),
+                    "fresh": False,
+                    "sha256": test_sha,
+                    "package_id": test_row["package_id"],
+                    "profile": test_row["profile"],
+                    "source": test_row["source"],
+                    "source_sha256": test_row["source_sha256"],
+                },
+            ]
+            manifest_store = None
+            self.binary = alias_binary
+            self.receipt = alias_receipt
+
+        manifest = {
+            "kind": "rootyard/native-build-batch",
+            "manifest_version": 2,
+            "status": "passed",
+            "source_commit": payload["workspace_commit"],
+            "source_inputs_sha256": payload["source_inputs_sha256"],
+            "toolchain": payload["toolchain"],
+            "architecture": {
+                "target_triple": payload["target_triple"],
+                "host": payload["toolchain"]["rustc"]["host"],
+            },
+            "target_directory": payload["target_dir"],
+            "cargo_package_id": "rootyard 0.1.0",
+            "bound_inputs": payload["bound_inputs"],
+            "build": {
+                "command": payload["command"],
+                "cargo_artifacts": all_rows,
+            },
+            "artifacts": manifest_artifacts,
+        }
+        if manifest_store is not None:
+            manifest["artifact_store"] = manifest_store
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.batch_path = batch_path
+        self.source_inputs = payload["source_inputs_sha256"]
+        return batch_path
+
     def enable_v2_producer_batch_receipt(self):
         """Build the real v2 batch cohort a bin receipt describes: lib+5 bins+2 tests."""
         self.enable_v2_receipt()
@@ -832,6 +1158,158 @@ class TestJobManifest(unittest.TestCase):
             ).read_text(encoding="utf-8")
         )
         self.assertEqual(job["status"], "passed")
+
+    def test_accepts_v2_cas_integration_test_batch_via_output_alias(self):
+        batch_path = self.fixture.enable_v2_integration_test_batch_receipt(
+            cas=True, use_alias=True, include_output_alias=True
+        )
+        job = json.loads(
+            self.fixture.job(
+                extra=(
+                    "--expect-batch-manifest-path", str(batch_path.resolve()),
+                    "--expect-batch-manifest-sha", digest(batch_path),
+                )
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(job["binary"], str(self.fixture.binary))
+        self.assertEqual(job["build_receipt"]["file"], str(self.fixture.receipt))
+        self.assertEqual(
+            job["build_receipt"]["batch_manifest"]["target"],
+            "ref_store_pack_snapshots",
+        )
+
+    def test_accepts_v2_cas_integration_test_via_canonical_and_custom_alias(self):
+        batch_path = self.fixture.enable_v2_integration_test_batch_receipt(
+            cas=True,
+            use_alias=False,
+            include_output_alias=True,
+            output_name="cas-ref-store-pack-snapshots",
+        )
+        job = json.loads(
+            self.fixture.job(
+                extra=(
+                    "--expect-batch-manifest-path", str(batch_path.resolve()),
+                    "--expect-batch-manifest-sha", digest(batch_path),
+                )
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(
+            job["build_receipt"]["batch_manifest"]["target"],
+            "cas-ref-store-pack-snapshots",
+        )
+
+    def test_accepts_v2_cas_integration_test_without_output_alias_and_non_cas(self):
+        batch_path = self.fixture.enable_v2_integration_test_batch_receipt(
+            cas=True, use_alias=False, include_output_alias=False
+        )
+        job = json.loads(
+            self.fixture.job(
+                extra=(
+                    "--expect-batch-manifest-path", str(batch_path.resolve()),
+                    "--expect-batch-manifest-sha", digest(batch_path),
+                )
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(job["status"], "passed")
+        self.fixture.receipt = self.fixture.cas_canonical_receipt
+        canonical_job = json.loads(
+            self.fixture.job(
+                "job-canonical.json",
+                extra=(
+                    "--expect-batch-manifest-path", str(batch_path.resolve()),
+                    "--expect-batch-manifest-sha", digest(batch_path),
+                ),
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(canonical_job["status"], "passed")
+
+        with tempfile.TemporaryDirectory() as td:
+            non_cas_fixture = ManifestFixture(td)
+            non_cas_manifest = non_cas_fixture.enable_v2_integration_test_batch_receipt(
+                cas=False, use_alias=True
+            )
+            non_cas_job = json.loads(
+                non_cas_fixture.job(
+                    "job-non-cas.json",
+                    extra=(
+                        "--expect-batch-manifest-path", str(non_cas_manifest.resolve()),
+                        "--expect-batch-manifest-sha", digest(non_cas_manifest),
+                    ),
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(non_cas_job["status"], "passed")
+
+    def test_rejects_v2_cas_integration_test_tampered_kind_sha_source_and_path(self):
+        cases = (
+            (
+                "kind-disguised-as-bin",
+                lambda m: m["artifacts"][1].__setitem__("kind", "bin"),
+                "published bin artifacts do not match",
+            ),
+            (
+                "tampered-sha256",
+                lambda m: m["artifacts"][1].__setitem__("sha256", "0" * 64),
+                "does not match",
+            ),
+            (
+                "tampered-source-digest",
+                lambda m: m["artifacts"][1].__setitem__("source_sha256", "0" * 64),
+                "source_sha256 does not match",
+            ),
+            (
+                "mutable-target-artifact",
+                lambda m: m["artifacts"][1].__setitem__(
+                    "artifact", m["artifacts"][1]["original_artifact"]
+                ),
+                "manifest artifact is not the sealed output alias",
+            ),
+            (
+                "implicit-flag-true",
+                lambda m: m["artifacts"][1].__setitem__("implicit", True),
+                "test artifacts entry must not be implicit",
+            ),
+            (
+                "sealed-basename-mismatch",
+                lambda m: m["artifacts"][1]["artifact_store"].__setitem__(
+                    "binary",
+                    str(Path(m["artifacts"][1]["artifact_store"]["binary"]).with_name("other-name")),
+                ),
+                "is not exactly one sealed store record",
+            ),
+        )
+        for name, mutate, expected in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = ManifestFixture(td)
+                    batch_path = fixture.enable_v2_integration_test_batch_receipt(cas=True)
+                    manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+                    mutate(manifest)
+                    batch_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    fixture.job(expect=1)
+                    self.assertIn(expected, fixture.last_process.stderr)
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = ManifestFixture(td)
+            fixture.enable_v2_integration_test_batch_receipt(cas=True)
+            payload = json.loads(fixture.receipt.read_text(encoding="utf-8"))
+            payload["integration_test_source_sha256"] = "0" * 64
+            encoded = (json.dumps(payload) + "\n").encode("utf-8")
+            os.chmod(fixture.receipt, 0o644)
+            fixture.receipt.write_bytes(encoded)
+            fixture.job(expect=1)
+            self.assertIn(
+                "sealed compatibility receipt does not match consumed receipt",
+                fixture.last_process.stderr,
+            )
+            os.chmod(fixture.cas_receipt, 0o644)
+            fixture.cas_receipt.write_bytes(encoded)
+            fixture.job(expect=1)
+            self.assertIn(
+                "receipt integration_test_source_sha256 does not match",
+                fixture.last_process.stderr,
+            )
 
     def test_rejects_v2_batch_architecture_target_mismatch(self):
         batch_path = self.fixture.enable_v2_batch_receipt()
@@ -1832,6 +2310,48 @@ class TestReleaseGate(unittest.TestCase):
             "manifest artifact is not the sealed canonical snapshot",
             process.stderr,
         )
+
+    def test_release_accepts_and_guards_v2_cas_integration_test_jobs(self):
+        self.fixture.enable_v2_integration_test_batch_receipt(
+            cas=True,
+            use_alias=True,
+            include_output_alias=True,
+            output_name="cas-ref-store-pack-snapshots",
+        )
+        self.browser = self.fixture.job(
+            "browser.json",
+            reports={"browser_ui": self.fixture.report("browser_ui")},
+        )
+        self.store = self.fixture.job(
+            "object-store.json",
+            reports={
+                "lfs_hydration": self.fixture.report("lfs_hydration"),
+                "lfs_retention": self.fixture.report("lfs_retention"),
+            },
+            extra=(
+                "--fixture", "garage=garage 2.1.0",
+                "--fixture", "git_lfs=git-lfs/3.6.1",
+            ),
+        )
+        self.staged = {
+            "browser": self.fixture.artifact_directory("browser", self.browser),
+            "object-store": self.fixture.artifact_directory("object-store", self.store),
+        }
+        process, gate_path = self.release()
+        self.assertEqual(process.returncode, 0)
+        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        self.assertEqual(gate["status"], "passed")
+        self.assertIn("build:batch_manifest", gate["jobs"]["browser"]["artifacts"])
+
+        batch_path = self.staged["browser"] / "native-build-batch.json"
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["artifacts"][1]["artifact"] = manifest["artifacts"][1]["original_artifact"]
+        batch_path.write_text(json.dumps(manifest), encoding="utf-8")
+        job = json.loads(self.browser.read_text(encoding="utf-8"))
+        job["build_receipt"]["batch_manifest"]["sha256"] = digest(batch_path)
+        self.browser.write_text(json.dumps(job), encoding="utf-8")
+        rejected, _ = self.release(expect=1)
+        self.assertIn("manifest artifact is not the sealed output alias", rejected.stderr)
 
     def test_release_accepts_v2_batch_jobs_with_cache_hit_freshness(self):
         self.enable_v2_batch_jobs()

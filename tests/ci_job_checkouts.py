@@ -8,6 +8,7 @@ schema and storage. Set TMPDIR to a workspace directory on constrained hosts.
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import hashlib
 import http.client
 import json
@@ -18,6 +19,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 
 from ci_source_pins import SourcePinHarness
@@ -31,6 +33,7 @@ class JobCheckoutHarness(SourcePinHarness):
         self.audience = str(uuid.uuid4())
         self.env["ROOTYARD_CI_MIRROR_AUDIENCE"] = self.audience
         self.mirror_env["ROOTYARD_CI_MIRROR_AUDIENCE"] = self.audience
+        self.env["ROOTYARD_WEBHOOK_ALLOW_LOOPBACK"] = "true"
 
     def request_body(self, oid=None, job=None, **overrides):
         body = dict(job_id=job or str(uuid.uuid4()), target_oid=oid or self.second,
@@ -702,6 +705,549 @@ class JobCheckoutHarness(SourcePinHarness):
         self.mirror_expect(self.advertise(self.second), 200, token=self.job_token)
         return dict(prepared_view_does_not_bypass_live_sql=True, recovering_and_generation_fenced=True)
 
+    def _barrier_available(self):
+        repo = uuid.UUID(self.repo["id"])
+        output = self.sql(
+            "BEGIN; SELECT pg_try_advisory_xact_lock("
+            f"hashtextextended('rootyard-data-v1:{repo}', 0)); ROLLBACK"
+        )
+        return "t" in output.splitlines()
+
+    def _active_git_children(self, data_dir=None):
+        proc_dir = Path("/proc")
+        if not proc_dir.is_dir():
+            return []
+        dirs = [data_dir] if data_dir is not None else [self.env["ROOTYARD_DATA_DIR"], self.mirror_env["ROOTYARD_DATA_DIR"]]
+        markers = {f"ROOTYARD_DATA_DIR={item}".encode() for item in dirs}
+        server_pids = {
+            pid for pid in (
+                self.proc.pid if self.proc else None,
+                self.mirror_proc.pid if self.mirror_proc else None,
+            ) if pid is not None
+        }
+        found = []
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid in server_pids:
+                continue
+            try:
+                comm = (entry / "comm").read_text(errors="replace").strip()
+                if not comm.startswith("git"):
+                    continue
+                environ = (entry / "environ").read_bytes()
+            except OSError:
+                continue
+            if any(marker in environ for marker in markers):
+                found.append((pid, comm))
+        return found
+
+    def _wait_no_git_children(self, timeout=2.5, data_dir=None):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = self._active_git_children(data_dir=data_dir)
+            if not remaining:
+                return
+            time.sleep(0.05)
+        raise AssertionError(
+            f"Leaked Git subprocess(es) remained active: {self._active_git_children(data_dir=data_dir)}"
+        )
+
+    @contextlib.contextmanager
+    def _scoped_revocation_env(self, bound_ms="1200", extra_env=None, extra_mirror_env=None):
+        tracked_env = {}
+        tracked_mirror = {}
+        updates_env = {"ROOTYARD_TRANSFER_REVOCATION_BOUND_MS": bound_ms}
+        updates_env.update(extra_env or {})
+        updates_mirror = {"ROOTYARD_TRANSFER_REVOCATION_BOUND_MS": bound_ms}
+        updates_mirror.update(extra_mirror_env or {})
+        for key, value in updates_env.items():
+            tracked_env[key] = self.env.get(key)
+            self.env[key] = value
+        for key, value in updates_mirror.items():
+            tracked_mirror[key] = self.mirror_env.get(key)
+            self.mirror_env[key] = value
+        self.stop_mirror()
+        self.stop()
+        self.start()
+        self.start_mirror()
+        try:
+            yield
+        finally:
+            self.stop_mirror()
+            self.stop()
+            for key, old in tracked_env.items():
+                if old is None:
+                    self.env.pop(key, None)
+                else:
+                    self.env[key] = old
+            for key, old in tracked_mirror.items():
+                if old is None:
+                    self.mirror_env.pop(key, None)
+                else:
+                    self.mirror_env[key] = old
+            self.start()
+            self.start_mirror()
+
+    def _stream_git_until_revoked(
+        self,
+        base,
+        path,
+        token,
+        oid,
+        payload_bytes,
+        revoke,
+        *,
+        check_barrier=True,
+        pause_after_first=0.0,
+        start_barrier=None,
+    ):
+        def pkt(value):
+            return f"{len(value) + 4:04x}".encode() + value
+
+        url = urllib.parse.urlsplit(base)
+        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=15)
+        body = pkt(f"want {oid} side-band-64k\n".encode()) + b"0000" + pkt(b"done\n")
+        headers = {
+            "Authorization": "Bearer " + token["token"],
+            "Content-Type": "application/x-git-upload-pack-request",
+        }
+        try:
+            connection.request("POST", path + "/git-upload-pack", body=body, headers=headers)
+            response = connection.getresponse()
+            assert response.status == 200, (response.status, response.read(200))
+            first = response.read(4096)
+            assert first, "upload-pack returned no data before revocation"
+            if check_barrier:
+                assert not self._barrier_available(), "physical GC lock bypassed active Git stream"
+            if start_barrier is not None:
+                start_barrier.wait(timeout=15)
+            received = len(first)
+            started = time.monotonic()
+            custom_start = revoke()
+            if isinstance(custom_start, float):
+                started = custom_start
+            if pause_after_first > 0:
+                time.sleep(pause_after_first)
+            interrupted = False
+            while time.monotonic() - started < 6:
+                try:
+                    chunk = response.read(64 * 1024)
+                except (http.client.IncompleteRead, OSError):
+                    interrupted = True
+                    break
+                if not chunk:
+                    break
+                received += len(chunk)
+                if pause_after_first <= 0:
+                    time.sleep(0.02)
+            elapsed = time.monotonic() - started
+            assert interrupted or received < payload_bytes, (
+                f"Git transfer completed unrevoked ({received}/{payload_bytes} bytes)"
+            )
+            assert received < payload_bytes, f"entire pack escaped after revocation ({received}/{payload_bytes})"
+            assert elapsed < 5, f"bounded revocation took too long: {elapsed:.2f}s"
+            return {"received": received, "elapsed_seconds": round(elapsed, 3)}
+        finally:
+            connection.close()
+
+    def _stream_lfs_until_revoked(
+        self, base, path, token, expected_size, revoke, *, pause_after_first=1.5, start_barrier=None
+    ):
+        url = urllib.parse.urlsplit(base)
+        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=15)
+        try:
+            connection.request("GET", path, headers={"Authorization": "Bearer " + token["token"]})
+            response = connection.getresponse()
+            assert response.status == 200, (response.status, response.read(200))
+            assert int(response.getheader("Content-Length")) == expected_size
+            first = response.read(1024)
+            assert len(first) == 1024
+            if start_barrier is not None:
+                start_barrier.wait(timeout=15)
+            received = len(first)
+            started = time.monotonic()
+            custom_start = revoke()
+            if isinstance(custom_start, float):
+                started = custom_start
+            time.sleep(pause_after_first)
+            interrupted = False
+            while time.monotonic() - started < 6:
+                try:
+                    chunk = response.read(64 * 1024)
+                except (http.client.IncompleteRead, OSError):
+                    interrupted = True
+                    break
+                if not chunk:
+                    break
+                received += len(chunk)
+            elapsed = time.monotonic() - started
+            assert (interrupted or received < expected_size) and received < expected_size, (
+                f"LFS transfer escaped after revocation ({received}/{expected_size} bytes)"
+            )
+            assert elapsed < 5, f"LFS revocation took too long: {elapsed:.2f}s"
+            return {"received": received, "elapsed_seconds": round(elapsed, 3)}
+        finally:
+            connection.close()
+
+    def bounded_active_transfer_revocation(self):
+        lfs_bytes = os.urandom(16 * 1024 * 1024)
+        lfs_oid = hashlib.sha256(lfs_bytes).hexdigest()
+        self.expect(
+            f"/git/alice/demo.git/info/lfs/objects/{lfs_oid}/{len(lfs_bytes)}",
+            200,
+            token=self.alice,
+            method="PUT",
+            body=lfs_bytes,
+            content_type="application/octet-stream",
+        )
+        assert (
+            self.sql(
+                f"SELECT state FROM lfs_objects WHERE repository_id='{self.repo['id']}' AND oid='{lfs_oid}'"
+            )
+            == "ready"
+        )
+        pack_size = 24 * 1024 * 1024
+        self.git("checkout", "-b", "revocation-large-fixture", cwd=self.work)
+        try:
+            (self.work / "revocation-pack.bin").write_bytes(os.urandom(pack_size))
+            (self.work / "revocation-lfs.bin").write_text(
+                f"version https://git-lfs.github.com/spec/v1\noid sha256:{lfs_oid}\nsize {len(lfs_bytes)}\n"
+            )
+            self.git("add", "revocation-pack.bin", "revocation-lfs.bin", cwd=self.work)
+            self.git("commit", "-m", "bounded revocation large fixture", cwd=self.work)
+            rev_oid = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
+            self.git("push", "origin", "HEAD:refs/heads/revocation-large-fixture", cwd=self.work, token=self.alice)
+        finally:
+            self.git("checkout", "main", cwd=self.work)
+
+        results = {}
+        with self._scoped_revocation_env(bound_ms="1200"):
+            self.sync()
+            # 1. Human PAT revocation mid-stream + PG barrier & child cleanup
+            pat_revoked = self.account("create-token", "alice")
+            results["pat_revoked"] = self._stream_git_until_revoked(
+                self.base,
+                "/git/alice/demo.git",
+                pat_revoked,
+                rev_oid,
+                pack_size,
+                lambda: self.cli("revoke-token", pat_revoked["token_id"]),
+            )
+            self.expect(f"/git/alice/demo.git/info/refs?service=git-upload-pack", (401, 403), token=pat_revoked)
+            for _ in range(30):
+                if self._barrier_available():
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("physical GC lock remained held after PAT revocation")
+            self._wait_no_git_children()
+
+            # 2. Human PAT expiry mid-stream
+            pat_expired = self.account("create-token", "alice")
+            exp_id = str(uuid.UUID(pat_expired["token_id"]))
+            results["pat_expired"] = self._stream_git_until_revoked(
+                self.base,
+                "/git/alice/demo.git",
+                pat_expired,
+                rev_oid,
+                pack_size,
+                lambda: self.sql(f"UPDATE tokens SET expires_at=now()-interval '1 second' WHERE id='{exp_id}'"),
+            )
+            self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", 401, token=pat_expired)
+            self._wait_no_git_children()
+
+            # 3. Collaborator membership removal mid-stream on slow-consumer LFS + Git
+            self.expect(
+                "/api/repos/alice/demo/collaborators/bob",
+                (200, 201),
+                method="PUT",
+                token=self.alice,
+                body={"role": "read", "username": "bob"},
+            )
+            try:
+                results["member_removed_slow_lfs"] = self._stream_lfs_until_revoked(
+                    self.base,
+                    f"/git/alice/demo.git/info/lfs/objects/{lfs_oid}",
+                    self.bob,
+                    len(lfs_bytes),
+                    lambda: self.expect(
+                        "/api/repos/alice/demo/collaborators/bob",
+                        200,
+                        method="DELETE",
+                        token=self.alice,
+                    ),
+                    pause_after_first=1.6,
+                )
+                self.expect(f"/git/alice/demo.git/info/lfs/objects/{lfs_oid}", (403, 404), token=self.bob)
+                self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", (403, 404), token=self.bob)
+            finally:
+                self.http("/api/repos/alice/demo/collaborators/bob", method="DELETE", token=self.alice)
+            self._wait_no_git_children()
+
+            # 4. Repository storage_generation increment mid-stream
+            repo_id = self.repo["id"]
+            try:
+                results["generation_changed"] = self._stream_git_until_revoked(
+                    self.base,
+                    "/git/alice/demo.git",
+                    self.reader,
+                    rev_oid,
+                    pack_size,
+                    lambda: self.sql(f"UPDATE repositories SET storage_generation=2 WHERE id='{repo_id}'"),
+                )
+                self.mirror_expect(self.advertise(self.second), (401, 403, 409), token=self.job_token)
+                for _ in range(30):
+                    if self._barrier_available():
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError("physical GC lock remained held after storage_generation change")
+            finally:
+                self.sql(f"UPDATE repositories SET storage_generation=1 WHERE id='{repo_id}'")
+            self._wait_no_git_children()
+
+            # 5. Concurrent CI ryj_ job cancel + natural expiry across Git + slow-consumer mirror LFS
+            body_a, _, tok_a = self.new_grant(rev_oid)
+            body_a_job = body_a["job_id"]
+            self.mirror_expect(
+                f"/api/repos/alice/demo/ci-checkouts/{body_a_job}/prepare-dependencies",
+                200,
+                token=self.alice,
+                method="POST",
+                body=b"",
+            )
+            exp_b = int(time.time()) + 6
+            body_b, _, tok_b = self.new_grant(rev_oid, expires_unix=exp_b)
+            self.mirror_expect(
+                f"/api/repos/alice/demo/ci-checkouts/{body_b['job_id']}/prepare-dependencies",
+                200,
+                token=self.alice,
+                method="POST",
+                body=b"",
+            )
+            ci_git_path = self.path(rev_oid)
+            ci_lfs_path = f"/ci/{rev_oid}/git/alice/demo.git/info/lfs/objects/{lfs_oid}"
+            both_streaming = threading.Barrier(2)
+
+            def expire_b():
+                while time.time() <= exp_b + 0.35:
+                    time.sleep(0.05)
+                return time.monotonic()
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_a = pool.submit(
+                    self._stream_git_until_revoked,
+                    self.mirror_base,
+                    ci_git_path,
+                    tok_a,
+                    rev_oid,
+                    pack_size,
+                    lambda: self.transition(body_a_job, "cancel"),
+                    start_barrier=both_streaming,
+                )
+                fut_b = pool.submit(
+                    self._stream_lfs_until_revoked,
+                    self.mirror_base,
+                    ci_lfs_path,
+                    tok_b,
+                    len(lfs_bytes),
+                    expire_b,
+                    pause_after_first=1.6,
+                    start_barrier=both_streaming,
+                )
+                results["concurrent_job_cancel"] = fut_a.result(timeout=20)
+                results["concurrent_job_expired_lfs"] = fut_b.result(timeout=25)
+            self.mirror_expect(self.advertise(rev_oid), (401, 403), token=tok_a)
+            self.mirror_expect(ci_lfs_path, (401, 403), token=tok_b)
+            for _ in range(30):
+                if self._barrier_available():
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("physical GC lock remained held after concurrent job teardown")
+            self._wait_no_git_children()
+
+            # 6. Database / authority outage fails closed within bound without child leak
+            try:
+                results["db_outage_fail_closed"] = self._stream_git_until_revoked(
+                    self.base,
+                    "/git/alice/demo.git",
+                    self.reader,
+                    rev_oid,
+                    pack_size,
+                    lambda: self.sql("ALTER TABLE tokens RENAME TO checkout_revocation_outage_tokens"),
+                    check_barrier=False,
+                    pause_after_first=1.6,
+                )
+                self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", (500, 503), token=self.reader)
+                for _ in range(30):
+                    if self._barrier_available():
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError("physical GC lock remained held after DB outage teardown")
+            finally:
+                if self.sql("SELECT to_regclass('checkout_revocation_outage_tokens') IS NOT NULL") == "t":
+                    self.sql("ALTER TABLE checkout_revocation_outage_tokens RENAME TO tokens")
+            self._wait_no_git_children()
+            self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", 200, token=self.reader)
+        return results
+
+    def mirror_cannot_bypass_revocation_via_origin(self):
+        branch = "mirror-bypass-revocation-fixture"
+        self.git("checkout", "-b", branch, cwd=self.work)
+        try:
+            (self.work / "bypass-check.txt").write_text("origin credential non-bypass fixture\n")
+            self.git("add", "bypass-check.txt", cwd=self.work)
+            self.git("commit", "-m", "mirror origin bypass check commit", cwd=self.work)
+            bypass_oid = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
+            self.git("push", "origin", "HEAD:refs/heads/" + branch, cwd=self.work, token=self.alice)
+        finally:
+            self.git("checkout", "main", cwd=self.work)
+
+        hook_secret = "revocation-bypass-hook-secret-123456"
+        self.secrets.append(hook_secret)
+        hook = json.loads(
+            self.expect(
+                "/api/repos/alice/demo/webhooks",
+                201,
+                token=self.alice,
+                method="POST",
+                body={
+                    "url": "http://127.0.0.1:1/hook",
+                    "secret": hook_secret,
+                    "events": ["pull_request"],
+                    "ci_contexts": ["ci/bypass"],
+                    "auto_ci_pin": True,
+                },
+            )
+        )
+        hook_id = hook["id"]
+        self.expect(
+            f"/api/repos/alice/demo/integrations/{hook_id}/trusted-contexts",
+            200,
+            token=self.alice,
+            method="PUT",
+            body={"context": "ci/bypass"},
+        )
+        pr = json.loads(
+            self.expect(
+                "/api/repos/alice/demo/pulls",
+                201,
+                token=self.alice,
+                method="POST",
+                body={
+                    "title": "Mirror Origin Non-Bypass Check",
+                    "body": "integration claim revocation test",
+                    "head_ref": "refs/heads/" + branch,
+                    "base_ref": "refs/heads/main",
+                },
+            )
+        )
+        assert pr["head_oid"] == bypass_oid
+        run_id = self.sql(
+            f"SELECT id FROM ci_runs WHERE repository_id='{self.repo['id']}' "
+            f"AND context='ci/bypass' AND head_oid='{bypass_oid}'"
+        )
+        status, raw, _ = self.http(
+            f"/api/repos/alice/demo/integrations/{hook_id}/runs/{run_id}/claim",
+            method="POST",
+            body={"runner_id": "bypass-runner"},
+            extra_headers={"Authorization": "Bearer " + hook_secret},
+        )
+        assert status == 200, (status, raw[:300])
+        claim = json.loads(raw)
+        job_id = claim["checkout"]["plan"]["job_id"]
+        int_token = {"username": "alice", "token": claim["checkout"]["token"]}
+        self.secrets.append(int_token["token"])
+
+        real_git = shutil.which("git", path=self.env["PATH"])
+        entered = self.root / "origin-bypass-entered"
+        release = self.root / "origin-bypass-release"
+        pause_enabled = self.root / "origin-bypass-pause"
+        wrapper_dir = self.root / "origin-bypass-git-bin"
+        wrapper_dir.mkdir(exist_ok=True)
+        wrapper = wrapper_dir / "git"
+        wrapper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys, time\n"
+            "args = sys.argv[1:]\n"
+            f"if 'http-backend' in args and os.environ.get('REQUEST_METHOD') == 'POST' and pathlib.Path({repr(str(pause_enabled))}).exists():\n"
+            f"    pathlib.Path({repr(str(entered))}).touch()\n"
+            "    deadline = time.monotonic() + 15\n"
+            f"    while not pathlib.Path({repr(str(release))}).exists():\n"
+            "        if time.monotonic() > deadline: sys.exit(97)\n"
+            "        time.sleep(0.02)\n"
+            f"os.execv({repr(real_git)}, [{repr(real_git)}] + args)\n"
+        )
+        wrapper.chmod(0o700)
+        for p in (entered, release):
+            p.unlink(missing_ok=True)
+        pause_enabled.touch()
+
+        extra_env = {
+            "ROOTYARD_GIT": str(wrapper),
+            "PATH": str(wrapper_dir) + os.pathsep + self.env["PATH"],
+        }
+        extra_mirror = {"ROOTYARD_CI_MIRROR_SOURCE_TOKEN": self.alice["token"]}
+        prepare_path = f"/api/repos/alice/demo/ci-checkouts/{job_id}/prepare-dependencies"
+        try:
+            with self._scoped_revocation_env(bound_ms="1200", extra_env=extra_env, extra_mirror_env=extra_mirror):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(self.mirror_http, prepare_path, int_token, "POST", b"")
+                    deadline = time.monotonic() + 10
+                    while not entered.exists():
+                        assert not pending.done(), ("prepare-dependencies ended early", pending.result())
+                        assert time.monotonic() < deadline, "mirror did not reach paused origin fetch"
+                        time.sleep(0.02)
+                    started = time.monotonic()
+                    self.expect(f"/api/repos/alice/demo/webhooks/{hook_id}", 200, token=self.alice, method="DELETE")
+                    prep_status, prep_body, _ = pending.result(timeout=8)
+                    abort_elapsed = time.monotonic() - started
+                assert prep_status in (401, 403, 500, 502, 503), (prep_status, prep_body[:300])
+                assert abort_elapsed < 5, f"mirror prepare with source token exceeded bound: {abort_elapsed:.2f}s"
+                self._wait_no_git_children(data_dir=self.mirror_env["ROOTYARD_DATA_DIR"])
+
+                # Release primary stub and verify revoked job NEVER falls back to ROOTYARD_CI_MIRROR_SOURCE_TOKEN.
+                pause_enabled.unlink(missing_ok=True)
+                release.touch()
+                self._wait_no_git_children()
+
+                repo_mirror_dir = self.root / "mirror-data" / "repos" / self.repo["id"]
+                assert not (repo_mirror_dir / "job-views" / f"1-{bypass_oid}.git").exists()
+                assert not list(repo_mirror_dir.glob(".ci-*")), "stale temporary staging artifacts leaked"
+
+                entered.unlink(missing_ok=True)
+                release.unlink(missing_ok=True)
+                pause_enabled.touch()
+                retry_status, _, _ = self.mirror_http(prepare_path, int_token, method="POST", body=b"")
+                assert retry_status in (401, 403), retry_status
+                assert not entered.exists(), "revoked integration triggered origin fetch with mirror source token"
+                # A normal PAT (even one matching ROOTYARD_CI_MIRROR_SOURCE_TOKEN) cannot use
+                # integration-scoped CI checkout endpoints, and the unsynced commit remains
+                # absent on the mirror (`409`) without triggering an origin fetch.
+                self.mirror_expect(prepare_path, (401, 403), token=self.alice, method="POST", body=b"")
+                self.mirror_expect(
+                    self.path(bypass_oid) + "/info/lfs/objects/batch",
+                    (401, 403),
+                    token=self.alice,
+                    method="POST",
+                    body={"operation": "download", "objects": [{"oid": "0" * 64, "size": 1}]},
+                )
+                assert not entered.exists(), "source-token probe triggered origin fetch"
+                self.mirror_expect(self.advertise(bypass_oid), 409, token=self.alice)
+                self.mirror_expect(self.advertise(bypass_oid), (401, 403), token=int_token)
+        finally:
+            pause_enabled.unlink(missing_ok=True)
+            release.touch()
+        return {
+            "mirror_source_token_aborted_within_bound": round(abort_elapsed, 3),
+            "post_revocation_origin_not_contacted": True,
+            "broad_source_token_rejected_on_ci_route": True,
+        }
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -722,7 +1268,9 @@ def main():
                      "source_evidence_and_input_validation", "cancel_revoke_and_issuer_fences",
                      "live_database_and_repository_fences", "tampered_job_views_fail_closed",
                      "authorization_rechecked_after_closure", "issuer_revoked_during_source_verification",
-                     "deleted_source_ref_and_primary_offline"):
+                     "deleted_source_ref_and_primary_offline",
+                     "bounded_active_transfer_revocation",
+                     "mirror_cannot_bypass_revocation_via_origin"):
             harness.case(name, getattr(harness, name))
         success = True
     except Exception as error:
@@ -737,7 +1285,7 @@ def main():
                       binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                       limitations=["Isolated loopback services and synthetic fixtures, not production performance or power-loss validation.",
                                    "Database failures use renamed run-owned schema tables, not a database network outage.",
-                                   "Active-stream termination is tested separately with a throttled transfer."])
+                                   "Bounded active-transfer revocation uses throttled loopback transfers with a configured ROOTYARD_TRANSFER_REVOCATION_BOUND_MS."])
         if args.report:
             args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(json.dumps(report, indent=2) + "\n")

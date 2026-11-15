@@ -170,6 +170,22 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
                     }
                 }
             }
+            match tokio::time::timeout(
+                Duration::from_secs(15),
+                crate::events::process_ref_cas_projection_jobs(&pool, owner, settings.batch, settings.lease_seconds),
+            )
+            .await
+            {
+                Ok(Ok(done)) => count += done,
+                Ok(Err(error)) => {
+                    observability::observe_internal(&error);
+                    failed = true;
+                }
+                Err(_) => {
+                    observability::observe_timeout();
+                    failed = true;
+                }
+            }
             (count, failed)
         };
         let result = tokio::select! {biased;

@@ -1,5 +1,7 @@
 //! Durable organization namespaces and inherited repository roles.
+pub mod audit;
 pub mod handlers;
+pub mod teams;
 
 use crate::{
     Error, auth,
@@ -16,12 +18,18 @@ use uuid::Uuid;
 
 pub fn routes() -> Router<Arc<crate::AppState>> {
     Router::new()
-        .route("/api/orgs", post(handlers::create_organization))
+        .route("/api/orgs", get(audit::list_organizations).post(handlers::create_organization))
         .route("/api/orgs/{slug}", get(handlers::get_organization))
         .route("/api/repos/{owner}/{name}/transfer", post(handlers::transfer_ownership))
+        .route("/api/orgs/{slug}/audit", get(audit::list_audit_log))
         .route("/api/orgs/{slug}/members", get(handlers::list_members))
         .route("/api/orgs/{slug}/members/{username}", put(handlers::put_member).delete(handlers::delete_member))
         .route("/api/orgs/{slug}/teams", get(handlers::list_teams).post(handlers::create_team))
+        .route(
+            "/api/orgs/{slug}/teams/{team_slug}",
+            get(teams::get_team).patch(teams::patch_team).delete(teams::delete_team),
+        )
+        .route("/api/orgs/{slug}/teams/{team_slug}/members", get(teams::list_team_members))
         .route(
             "/api/orgs/{slug}/teams/{team_slug}/members/{username}",
             put(handlers::put_team_member).delete(handlers::delete_team_member),

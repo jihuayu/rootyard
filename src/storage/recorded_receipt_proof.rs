@@ -546,6 +546,7 @@ mod tests {
         let actor = crate::db::Identity {
             id: actor_id,
             token_id,
+            parent_token_id: None,
             username: "alice".into(),
             read_only: false,
             token_digest: digest,
@@ -771,6 +772,7 @@ mod tests {
         let reader = crate::db::Identity {
             id: reader_id,
             token_id: reader_token,
+            parent_token_id: None,
             username: "reader".into(),
             read_only: true,
             token_digest: Vec::new(),

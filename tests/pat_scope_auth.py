@@ -25,6 +25,8 @@ the route itself is absent by design (RBAC denies visibility before the scope
 gate), and 405/422 would fail the case.
 """
 import argparse
+import hashlib
+import http.client
 import json
 import sys
 import time
@@ -41,9 +43,8 @@ NOTES = [
     "Restricted authority is seeded by SQL (tokens.is_restricted + token_repository_scopes): no public issuer or CLI flag exists.",
     "Restricted discovery requires CURRENT RBAC visibility (owner, collaborator, repository team, organisation membership, organisation team) AND an exact repo_read grant. A scope grant alone never lists a repository or returns its metadata.",
     "organisation_team_members has a composite foreign key to organization_memberships, so any SQL-seeded organisation-team case also carries an organisation membership. The organisation-team predicate added to the restricted list query is parity with members/rbac.rs and web/session.rs (defence in depth); this harness cannot isolate it from the membership predicate, and does not claim to.",
-    "Restricted parent browser login IS covered: POST /web/login with a form-urlencoded username/token and Origin set to the service origin returns 403 and sets no cookie. Inherited browser-child grants for a restricted parent are unimplemented, so no child-session case exists.",
-    "NOT COVERED: token grant list/read API (no such reader is exercised; grants are seeded by SQL and repository ids come from the server).",
-    "NOT COVERED: Git CAS parent-token locking across a CAS publication; the scope API remains unreleased and this harness does not claim it released.",
+    "Restricted browser-child inheritance IS covered: POST /web/login with a restricted API token mints a scoped browser child session whose cookie narrows /web/repos discovery and /web/repos/{owner}/{name}, enforces 403 on token/session management routes, refuses /api/* cookies (401), and drops on live parent grant removal or revocation.",
+    "NOT COVERED: Git CAS browser-token support (fail-closed BrowserTokenUnsupported on browser tokens).",
 ]
 
 
@@ -241,19 +242,46 @@ def main():
             h.expect("/api/repos/alice/demo", 401, token=scoped)
             return "revoked -> 401"
 
-        # 7: a restricted parent must not be able to mint a browser session.
-        def case_restricted_browser_login_403():
+        # 7: a restricted parent mints a bounded browser child inheriting exact grants and parent liveness.
+        def case_restricted_browser_child_inheritance():
             token = h.account("create-token", "alice")
-            seed_restricted_token(h, token, [(demo_id, "repo_read")])
+            seed_restricted_token(h, token, [(demo_id, "repo_read"), (demo_id, "contents_read")])
             form = ("username=alice&token=" + urllib.parse.quote(token["token"], safe="")).encode()
-            status, payload, headers = h.http(
-                "/web/login", method="POST", body=form,
-                content_type="application/x-www-form-urlencoded",
-                extra_headers={"Origin": h.base},
+            conn = http.client.HTTPConnection("127.0.0.1", h.port, timeout=20)
+            conn.request(
+                "POST",
+                "/web/login",
+                body=form,
+                headers={"Content-Type": "application/x-www-form-urlencoded", "Origin": h.base},
             )
-            assert status == 403, f"/web/login restricted parent: expected 403, got {status}: {payload[:300]!r}"
-            assert not any(name.lower() == "set-cookie" for name in headers), f"restricted parent login set a cookie: {sorted(headers)}"
-            return "restricted parent browser login -> 403 and no Set-Cookie"
+            res = conn.getresponse()
+            payload = res.read()
+            raw_headers = res.getheaders()
+            status = res.status
+            conn.close()
+            assert status == 303, f"/web/login restricted parent: expected 303, got {status}: {payload[:300]!r}"
+            cookies = {}
+            for name, value in raw_headers:
+                if name.lower() == "set-cookie":
+                    k, _, v = value.split(";", 1)[0].partition("=")
+                    cookies[k] = v
+            assert cookies.get("rootyard_session", "").startswith("ryt_") and cookies.get("rootyard_csrf"), cookies
+            h.secrets.extend(cookies.values())
+            cookie = f"rootyard_session={cookies['rootyard_session']}; rootyard_csrf={cookies['rootyard_csrf']}"
+            listing = h.expect("/web/repos", 200, extra_headers={"Cookie": cookie}).decode("utf-8")
+            assert "/web/repos/alice/demo" in listing and "/web/repos/alice/otherrepo" not in listing, listing
+            h.expect("/web/repos/alice/demo", 200, extra_headers={"Cookie": cookie})
+            h.expect("/web/repos/alice/otherrepo", 403, extra_headers={"Cookie": cookie})
+            h.expect("/web/settings/tokens", 403, extra_headers={"Cookie": cookie})
+            h.expect("/web/settings/sessions", 403, extra_headers={"Cookie": cookie})
+            h.expect("/api/repos", 401, extra_headers={"Cookie": cookie})
+            h.sql("DELETE FROM token_repository_scopes "
+                  f"WHERE token_id = {quote(token['token_id'])} AND repository_id = {quote(demo_id)}")
+            bump_scope_version(h, token)
+            h.expect("/web/repos/alice/demo", 403, extra_headers={"Cookie": cookie})
+            h.cli("revoke-token", token["token_id"])
+            h.expect("/web/repos/alice/demo", 401, extra_headers={"Cookie": cookie})
+            return "restricted parent browser child inherits grants/narrowing/revocation; mgmt 403"
 
         # 6: legacy unrestricted tokens keep current RBAC read/write.
         def case_legacy_unrestricted():
@@ -277,7 +305,7 @@ def main():
             ("restricted.org_team_requires_rbac_and_grant", case_org_team_visibility),
             ("restricted.grant_deleted_403", case_grant_removal_revokes_access),
             ("restricted.revoked_401", case_revoked_token_401),
-            ("restricted.browser_login_403", case_restricted_browser_login_403),
+            ("restricted.browser_child_inheritance", case_restricted_browser_child_inheritance),
             ("legacy.unrestricted_read_write", case_legacy_unrestricted),
         ):
             run_case(h, name, fn)
@@ -295,23 +323,24 @@ def main():
             h.results.append(dict(name="cleanup", status="failed", error=h.redact(error),
                                   trace=h.redact(traceback.format_exc())[-2000:]))
             exit_code = 1
+        binary_path = Path(args.binary)
         report = dict(
             suite="pat_scope_auth",
             executed_native=bool(h.results),
+            passed=exit_code == 0,
             ok=exit_code == 0,
+            binary_sha256=hashlib.sha256(binary_path.read_bytes()).hexdigest() if binary_path.is_file() else "",
             # False only because the scope below is not exercised by this harness;
             # every case that did run asserts an exact status and shape.
             coverage_complete=False,
             untested_scope=[
-                "Browser-child inheritance for a restricted parent is unimplemented, so this harness covers login rejection only.",
-                "The Git HTTP publication path still authorises through a bare client, so the parent token is not locked FOR SHARE across the CAS.",
-                "Token grant list/read API is not covered; grants are seeded by SQL and ids come from the server.",
-                "Git CAS parent-token locking across a CAS publication is not covered; no scope issuance API is released.",
+                "Git CAS browser-token support remains fail-closed (BrowserTokenUnsupported); direct API publication locking is tested separately.",
+                "Token/session management endpoints are exercised end-to-end by tests/token_management.py.",
             ],
             cases=h.results,
             notes=NOTES,
             limitations=[
-                "Restricted tokens are seeded by SQL because no public issuer exists.",
+                "Some fixture tokens are SQL-seeded to test exact grant combinations alongside real API-created tokens.",
                 "Organisation-team visibility cannot be isolated from organisation membership because organization_team_members references organization_memberships.",
                 "Timings from a loopback single-process run are not a scalability benchmark.",
             ],

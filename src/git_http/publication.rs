@@ -331,8 +331,14 @@ mod tests {
         std::fs::create_dir_all(state.storage.repo_path(repo)).unwrap();
         let (op, active) =
             journal::begin_active(&state.storage.root, repo, actor_id, "alice".into(), token_id, 1).unwrap();
-        let actor =
-            Identity { id: actor_id, token_id, username: "alice".into(), read_only: false, token_digest: digest };
+        let actor = Identity {
+            id: actor_id,
+            token_id,
+            parent_token_id: None,
+            username: "alice".into(),
+            read_only: false,
+            token_digest: digest,
+        };
         let guard = Arc::new(
             crate::storage::ref_publication::acquire(
                 &pool,

@@ -224,7 +224,7 @@ async fn deliver_candidate(state: &AppState, candidate: Candidate, round_deadlin
     // timeout caps the statement; the outer timeout caps the whole page. Memory
     // follows OUTBOX_BACKFILL_LIMIT, not the repository's active hook count.
     let backfill_deadline = (Instant::now() + OUTBOX_BACKFILL_BUDGET).min(round_deadline);
-    let backfill_error = match tokio::time::timeout_at(
+    let mut backfill_error = match tokio::time::timeout_at(
         backfill_deadline,
         sync_outbox_events_bounded(state, tenant_id, repository_id, OUTBOX_BACKFILL_LIMIT, backfill_deadline),
     )
@@ -236,6 +236,24 @@ async fn deliver_candidate(state: &AppState, candidate: Candidate, round_deadlin
         // the next round, so it must not mark the repository failed.
         Err(_) => None,
     };
+    if Instant::now() < backfill_deadline {
+        let ref_cas_backfill = tokio::time::timeout_at(
+            backfill_deadline,
+            crate::ref_store::projector::sync_webhooks_bounded(
+                &state.pool,
+                tenant_id,
+                repository_id,
+                OUTBOX_BACKFILL_LIMIT,
+                backfill_deadline,
+            ),
+        )
+        .await;
+        if let Ok(Err(error)) = ref_cas_backfill
+            && backfill_error.is_none()
+        {
+            backfill_error = Some(error);
+        }
+    }
     let work_deadline = (Instant::now() + DELIVERY_REPOSITORY_BUDGET).min(round_deadline);
     let dispatched = dispatch_due_deliveries_until(
         state,

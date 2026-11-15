@@ -1,46 +1,47 @@
-//! Length-framed TCP JSON Raft transport and control RPC client for multi-process clusters.
+//! Length-framed mTLS JSON Raft peer transport and control RPC client for multi-process clusters.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, RwLock};
+use std::io;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
+use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest,
     VoteResponse,
 };
 use openraft::{BasicNode, LogId, Vote};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream as ClientTlsStream;
 
 use crate::fault::FaultSpec;
+use crate::mtls::{MtlsClient, node_dns_name};
 use crate::state_machine::StateMachineSummary;
 use crate::{E, LogTypeConfig, Res};
 
-/// Maximum TCP JSON RPC frame size (16 MiB).
-pub const MAX_RPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const CLIENT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Target store for dynamic fault injection in multi-process probes.
+/// Sub-store selector for RPC fault injection in multi-process cluster tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum FaultTarget {
     Log,
     StateMachine,
-    Both,
 }
 
-/// Wire request accepted by `raft-node` over TCP JSON framing.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Wire request accepted by `raft-node` over mTLS length-framed JSON.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum RpcRequest {
     Vote(VoteRequest<u64>),
     AppendEntries(AppendEntriesRequest<LogTypeConfig>),
     InstallSnapshot(InstallSnapshotRequest<LogTypeConfig>),
     UpdatePeers { peers: BTreeMap<u64, String> },
+    PartitionPeers { blocked: BTreeSet<u64> },
     Bootstrap { members: BTreeMap<u64, String> },
     AddLearner { node_id: u64, addr: String, blocking: bool },
     ChangeMembership { members: BTreeSet<u64>, retain: bool },
@@ -49,20 +50,22 @@ pub enum RpcRequest {
     TriggerPurge { upto: u64 },
     Metrics,
     KvGet { key: String },
+    EnsureReadIndex,
+    InspectReplicaKv { key: String },
     InjectFault { target: FaultTarget, spec: FaultSpec },
     ClearFaults,
     Shutdown,
 }
 
-/// Structured node health, replication, and state-machine metrics returned by `Metrics`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Runtime metrics and durable state summary snapshot returned by `RpcRequest::Metrics`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsReport {
     pub node_id: u64,
     pub running_ok: bool,
     pub fatal_error: Option<String>,
-    pub current_leader: Option<u64>,
     pub current_term: u64,
+    pub current_leader: Option<u64>,
     pub last_log_index: Option<u64>,
     pub last_applied: Option<LogId<u64>>,
     pub snapshot: Option<LogId<u64>>,
@@ -82,14 +85,21 @@ pub enum RpcResponse {
     Ok,
     ClientWrite { log_index: u64 },
     Metrics(Box<MetricsReport>),
-    KvValue { value: Option<String> },
+    KvValue { value: Option<String>, read_log_id: Option<LogId<u64>> },
+    ReadIndex { read_log_id: Option<LogId<u64>>, applied_count: u64, state_digest_hex: String },
     Error { message: String, forward_to_leader_id: Option<u64> },
 }
 
-/// Shared mutable node-id -> `host:port` directory used across process restarts.
+#[derive(Default)]
+struct PeerState {
+    addrs: BTreeMap<u64, String>,
+    blocked: BTreeSet<u64>,
+}
+
+/// Shared mutable node-id -> TCP address directory and partition blocklist updated when peers respawn.
 #[derive(Clone, Default)]
 pub struct PeerDirectory {
-    peers: Arc<RwLock<BTreeMap<u64, String>>>,
+    inner: Arc<RwLock<PeerState>>,
 }
 
 impl PeerDirectory {
@@ -98,109 +108,120 @@ impl PeerDirectory {
         Self::default()
     }
 
-    /// Replaces the tracked peer address map atomically.
-    pub fn set_all(&self, peers: BTreeMap<u64, String>) {
-        let mut guard = self.peers.write().expect("peer directory poisoned");
-        *guard = peers;
+    /// Replaces known peer addresses while preserving any active partition filters.
+    pub fn update(&self, peers: BTreeMap<u64, String>) {
+        let mut guard = self.inner.write().expect("peer directory poisoned");
+        guard.addrs = peers;
     }
 
-    /// Inserts or updates one peer's address.
-    pub fn upsert(&self, node_id: u64, addr: String) {
-        let mut guard = self.peers.write().expect("peer directory poisoned");
-        guard.insert(node_id, addr);
+    /// Upserts a single peer's address.
+    pub fn insert(&self, id: u64, addr: String) {
+        let mut guard = self.inner.write().expect("peer directory poisoned");
+        guard.addrs.insert(id, addr);
     }
 
-    /// Resolves `node_id` using the override table first, falling back to `default_addr`.
-    pub fn resolve(&self, node_id: u64, default_addr: &str) -> String {
-        let guard = self.peers.read().expect("peer directory poisoned");
-        guard.get(&node_id).cloned().unwrap_or_else(|| default_addr.to_owned())
+    /// Looks up the latest address for `id`.
+    pub fn get(&self, id: u64) -> Option<String> {
+        self.inner.read().expect("peer directory poisoned").addrs.get(&id).cloned()
+    }
+
+    /// Updates the set of peer node ids blocked by simulated network partition.
+    pub fn set_blocked(&self, blocked: BTreeSet<u64>) {
+        self.inner.write().expect("peer directory poisoned").blocked = blocked;
+    }
+
+    /// Returns true if traffic to/from peer `id` is currently severed by a partition rule.
+    pub fn is_blocked(&self, id: u64) -> bool {
+        self.inner.read().expect("peer directory poisoned").blocked.contains(&id)
     }
 }
 
-/// `RaftNetworkFactory` backed by blocking `TcpStream` JSON RPCs on Tokio's blocking pool.
+/// `RaftNetworkFactory` opening mTLS length-framed JSON connections per target peer.
 #[derive(Clone)]
-pub struct TcpJsonNetworkFactory {
+pub struct MtlsNetworkFactory {
     peers: PeerDirectory,
+    client: MtlsClient,
 }
 
-impl TcpJsonNetworkFactory {
-    /// Builds a factory resolving peer addresses through `peers`.
-    pub fn new(peers: PeerDirectory) -> Self {
-        Self { peers }
+impl MtlsNetworkFactory {
+    /// Builds an mTLS network factory backed by `peers` and node certificate identity `client`.
+    pub fn new(peers: PeerDirectory, client: MtlsClient) -> Self {
+        Self { peers, client }
     }
 }
 
-impl RaftNetworkFactory<LogTypeConfig> for TcpJsonNetworkFactory {
-    type Network = TcpPeerClient;
+impl RaftNetworkFactory<LogTypeConfig> for MtlsNetworkFactory {
+    type Network = MtlsPeerClient;
 
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
-        TcpPeerClient { target, node: node.clone(), peers: self.peers.clone(), cached: None }
+        MtlsPeerClient {
+            target,
+            fallback_addr: node.addr.clone(),
+            peers: self.peers.clone(),
+            client: self.client.clone(),
+            stream: None,
+        }
     }
 }
 
-/// Persistent connection client for one peer target.
-pub struct TcpPeerClient {
+/// Persistent per-target mTLS Raft RPC client implementing `RaftNetwork`.
+pub struct MtlsPeerClient {
     target: u64,
-    node: BasicNode,
+    fallback_addr: String,
     peers: PeerDirectory,
-    cached: Option<(String, TcpStream)>,
+    client: MtlsClient,
+    stream: Option<ClientTlsStream<TcpStream>>,
 }
 
-impl TcpPeerClient {
-    fn send_blocking(&mut self, req: RpcRequest, timeout: Duration) -> io::Result<RpcResponse> {
-        let addr = self.peers.resolve(self.target, &self.node.addr);
-        if let Some((cached_addr, stream)) = self.cached.as_mut() {
-            if cached_addr == &addr {
-                let _ = stream.set_read_timeout(Some(timeout));
-                let _ = stream.set_write_timeout(Some(timeout));
-                if let Ok(resp) = roundtrip_on_stream(stream, &req) {
+impl MtlsPeerClient {
+    async fn call_raft(&mut self, req: RpcRequest, timeout: Duration) -> io::Result<RpcResponse> {
+        if self.peers.is_blocked(self.target) {
+            self.stream = None;
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("peer {} isolated by network partition", self.target),
+            ));
+        }
+        let addr = self.peers.get(self.target).unwrap_or_else(|| self.fallback_addr.clone());
+        let deadline_fut = async {
+            if let Some(stream) = self.stream.as_mut() {
+                if let Ok(resp) = roundtrip_async(stream, &req).await {
                     return Ok(resp);
                 }
+                self.stream = None;
             }
-            self.cached = None;
+            let mut fresh = self.client.connect_peer(&addr, self.target).await?;
+            let resp = roundtrip_async(&mut fresh, &req).await?;
+            self.stream = Some(fresh);
+            Ok(resp)
+        };
+        match tokio::time::timeout(timeout, deadline_fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                self.stream = None;
+                Err(io::Error::new(io::ErrorKind::TimedOut, format!("mTLS Raft RPC to node {} timed out", self.target)))
+            }
         }
-        let mut stream = connect_stream(&addr, timeout)?;
-        let resp = roundtrip_on_stream(&mut stream, &req)?;
-        self.cached = Some((addr, stream));
-        Ok(resp)
-    }
-
-    async fn call_raft(&mut self, req: RpcRequest, timeout: Duration) -> io::Result<RpcResponse> {
-        let target = self.target;
-        let node = self.node.clone();
-        let peers = self.peers.clone();
-        let cached = self.cached.take();
-        let (res, next_cached) = tokio::task::spawn_blocking(move || {
-            let mut client = TcpPeerClient { target, node, peers, cached };
-            let out = client.send_blocking(req, timeout);
-            (out, client.cached)
-        })
-        .await
-        .map_err(|e| io::Error::other(format!("rpc join: {e}")))?;
-        self.cached = next_cached;
-        res
     }
 }
 
-impl RaftNetwork<LogTypeConfig> for TcpPeerClient {
+impl RaftNetwork<LogTypeConfig> for MtlsPeerClient {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<LogTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let timeout = option.hard_ttl().max(Duration::from_millis(1_500));
-        let resp = self
-            .call_raft(RpcRequest::AppendEntries(rpc), timeout)
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        match resp {
-            RpcResponse::AppendEntries(boxed) => match *boxed {
-                Ok(r) => Ok(r),
-                Err(e) => Err(RPCError::RemoteError(RemoteError::new_with_node(self.target, self.node.clone(), e))),
+        let timeout = option.hard_ttl().max(Duration::from_millis(50));
+        match self.call_raft(RpcRequest::AppendEntries(rpc), timeout).await {
+            Ok(RpcResponse::AppendEntries(boxed)) => match *boxed {
+                Ok(ok) => Ok(ok),
+                Err(err) => Err(RPCError::RemoteError(openraft::error::RemoteError::new(self.target, err))),
             },
-            other => Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(format!(
-                "unexpected response to AppendEntries: {other:?}"
-            ))))),
+            Ok(other) => Err(RPCError::Unreachable(Unreachable::new(&io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected AppendEntries response: {other:?}"),
+            )))),
+            Err(e) => Err(RPCError::Unreachable(Unreachable::new(&e))),
         }
     }
 
@@ -209,19 +230,17 @@ impl RaftNetwork<LogTypeConfig> for TcpPeerClient {
         rpc: InstallSnapshotRequest<LogTypeConfig>,
         option: RPCOption,
     ) -> Result<InstallSnapshotResponse<u64>, RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>> {
-        let timeout = option.hard_ttl().max(Duration::from_secs(5));
-        let resp = self
-            .call_raft(RpcRequest::InstallSnapshot(rpc), timeout)
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        match resp {
-            RpcResponse::InstallSnapshot(boxed) => match *boxed {
-                Ok(r) => Ok(r),
-                Err(e) => Err(RPCError::RemoteError(RemoteError::new_with_node(self.target, self.node.clone(), e))),
+        let timeout = option.hard_ttl().max(Duration::from_secs(2));
+        match self.call_raft(RpcRequest::InstallSnapshot(rpc), timeout).await {
+            Ok(RpcResponse::InstallSnapshot(boxed)) => match *boxed {
+                Ok(ok) => Ok(ok),
+                Err(err) => Err(RPCError::RemoteError(openraft::error::RemoteError::new(self.target, err))),
             },
-            other => Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(format!(
-                "unexpected response to InstallSnapshot: {other:?}"
-            ))))),
+            Ok(other) => Err(RPCError::Unreachable(Unreachable::new(&io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected InstallSnapshot response: {other:?}"),
+            )))),
+            Err(e) => Err(RPCError::Unreachable(Unreachable::new(&e))),
         }
     }
 
@@ -230,82 +249,121 @@ impl RaftNetwork<LogTypeConfig> for TcpPeerClient {
         rpc: VoteRequest<u64>,
         option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let timeout = option.hard_ttl().max(Duration::from_millis(1_500));
-        let resp = self
-            .call_raft(RpcRequest::Vote(rpc), timeout)
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        match resp {
-            RpcResponse::Vote(boxed) => match *boxed {
-                Ok(r) => Ok(r),
-                Err(e) => Err(RPCError::RemoteError(RemoteError::new_with_node(self.target, self.node.clone(), e))),
+        let timeout = option.hard_ttl().max(Duration::from_millis(50));
+        match self.call_raft(RpcRequest::Vote(rpc), timeout).await {
+            Ok(RpcResponse::Vote(boxed)) => match *boxed {
+                Ok(ok) => Ok(ok),
+                Err(err) => Err(RPCError::RemoteError(openraft::error::RemoteError::new(self.target, err))),
             },
-            other => Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(format!(
-                "unexpected response to Vote: {other:?}"
-            ))))),
+            Ok(other) => Err(RPCError::Unreachable(Unreachable::new(&io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected Vote response: {other:?}"),
+            )))),
+            Err(e) => Err(RPCError::Unreachable(Unreachable::new(&e))),
         }
     }
 }
 
-/// Sends a synchronous control or protocol RPC to `addr` for tests and management probes.
-pub fn send_rpc(addr: &str, req: &RpcRequest) -> Res<RpcResponse> {
-    let mut stream = connect_stream(addr, DEFAULT_RPC_TIMEOUT)?;
-    Ok(roundtrip_on_stream(&mut stream, req)?)
+/// Sends one async control/client RPC over a verified mTLS connection to `addr` (`raft-node-{node_id}.refcas.internal`).
+pub async fn send_rpc_async(
+    client: &MtlsClient,
+    addr: &str,
+    target_node_id: u64,
+    req: &RpcRequest,
+) -> Res<RpcResponse> {
+    let dns = node_dns_name(target_node_id);
+    send_rpc_named_async(client, addr, &dns, req).await
 }
 
-/// Connects a blocking `TcpStream` with bounded connect/read/write timeouts.
-fn connect_stream(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
-    let sock: SocketAddr =
-        addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad addr {addr}: {e}")))?;
-    let stream = TcpStream::connect_timeout(&sock, timeout)?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    Ok(stream)
+/// Sends one async control/client RPC over mTLS verifying server SAN `expected_dns`.
+pub async fn send_rpc_named_async(
+    client: &MtlsClient,
+    addr: &str,
+    expected_dns: &str,
+    req: &RpcRequest,
+) -> Res<RpcResponse> {
+    let fut = async {
+        let mut tls = client.connect_named(addr, expected_dns).await?;
+        let resp = roundtrip_async(&mut tls, req).await?;
+        let _ = tls.shutdown().await;
+        Ok::<_, io::Error>(resp)
+    };
+    tokio::time::timeout(CLIENT_RPC_TIMEOUT, fut)
+        .await
+        .map_err(|_| E::Io(io::Error::new(io::ErrorKind::TimedOut, format!("mTLS RPC to {addr} timed out"))))?
+        .map_err(E::Io)
 }
 
-fn roundtrip_on_stream(stream: &mut TcpStream, req: &RpcRequest) -> io::Result<RpcResponse> {
-    write_frame(stream, req)?;
-    read_frame(stream)?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed stream before reply"))
+/// Synchronous wrapper around `send_rpc_async` for non-async multi-process cluster test harnesses.
+pub fn send_rpc(client: &MtlsClient, addr: &str, target_node_id: u64, req: &RpcRequest) -> Res<RpcResponse> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(E::Refused("blocking send_rpc called from inside a Tokio runtime; use send_rpc_async".into()));
+    }
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let rt = RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build refcas cluster client runtime")
+    });
+    rt.block_on(send_rpc_async(client, addr, target_node_id, req))
 }
 
-/// Writes a 4-byte length-prefixed JSON frame.
-pub fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> io::Result<()> {
-    let payload = serde_json::to_vec(msg).map_err(|e| io::Error::other(format!("rpc encode: {e}")))?;
-    let len = u32::try_from(payload.len())
-        .ok()
-        .filter(|&n| (n as usize) <= MAX_RPC_FRAME_BYTES)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "rpc frame exceeds size ceiling"))?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(&payload)?;
-    stream.flush()?;
+async fn roundtrip_async<S>(stream: &mut S, req: &RpcRequest) -> io::Result<RpcResponse>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame_async(stream, req).await?;
+    read_frame_async(stream)
+        .await?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed mTLS connection before response"))
+}
+
+/// Writes a length-prefixed JSON frame (`<= 16 MiB`) asynchronously and flushes the stream.
+pub async fn write_frame_async<S, T>(stream: &mut S, value: &T) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame exceeds max length"));
+    }
+    let len = (payload.len() as u32).to_be_bytes();
+    stream.write_all(&len).await?;
+    stream.write_all(&payload).await?;
+    stream.flush().await?;
     Ok(())
 }
 
-/// Reads a bounded 4-byte length-prefixed JSON frame; returns `Ok(None)` on clean EOF.
-pub fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> io::Result<Option<T>> {
+/// Reads a length-prefixed JSON frame asynchronously; returns `Ok(None)` only on clean zero-byte EOF.
+pub async fn read_frame_async<S, T>(stream: &mut S) -> io::Result<Option<T>>
+where
+    S: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
     let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    let first = stream.read(&mut len_buf[..1]).await?;
+    if first == 0 {
+        return Ok(None);
     }
+    stream.read_exact(&mut len_buf[1..]).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_RPC_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid rpc frame length {len}")));
+    if len == 0 || len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid RPC frame length {len}")));
     }
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
-    serde_json::from_slice(&buf)
-        .map(Some)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("rpc decode: {e}")))
+    stream.read_exact(&mut buf).await?;
+    let value = serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(value))
 }
 
-/// Helper converting an RPC address/error response into a typed error for harnesses.
+/// Expects `RpcResponse::Ok`, turning any error variant into `E::Refused`.
 pub fn rpc_expect_ok(resp: RpcResponse) -> Res<()> {
     match resp {
         RpcResponse::Ok => Ok(()),
         RpcResponse::Error { message, .. } => Err(E::Refused(message)),
-        other => Err(E::Refused(format!("unexpected rpc response: {other:?}"))),
+        other => Err(E::Refused(format!("unexpected RPC response: {other:?}"))),
     }
 }

@@ -13,6 +13,9 @@ pub(super) async fn fence(client: &Client) -> Result<()> {
          UPDATE public.ci_mirror_nodes SET active=false,ready_oids='[]'::jsonb,heartbeat_unix=0;
          UPDATE public.forge_webhook_deliveries SET state='pending',lease_generation=lease_generation+1,
              next_attempt_unix=0 WHERE state='leased';
+         UPDATE public.ref_cas_projection_jobs SET state='queued',claim_generation=claim_generation+1,
+             lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp()
+             WHERE state='running';
          UPDATE public.workspaces SET lease_epoch=lease_epoch+1,
              lease_until=clock_timestamp()-interval '1 second' WHERE state='ready';
          UPDATE public.sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp()

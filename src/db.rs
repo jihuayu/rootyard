@@ -169,12 +169,13 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (146, include_str!("../migrations/146_ref_store_serving_reads.sql")),
     (147, include_str!("../migrations/147_ref_store_serving_operations.sql")),
     (148, include_str!("../migrations/148_pando_pitr_authority_fence.sql")),
+    (149, include_str!("../migrations/149_ref_cas_event_projection.sql")),
 ];
 
 pub const SCHEMA_VERSIONS: &[i32] = &[
     1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95,
     96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 121, 125, 126, 127, 128, 129, 130,
-    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148,
+    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149,
 ];
 
 /// Runtime roles use a read-only schema check. Migration/backup ownership is
@@ -276,9 +277,17 @@ pub async fn issue_token(pool: &Pool, username: &str, create_user: bool, read_on
 pub struct Identity {
     pub id: Uuid,
     pub token_id: Uuid,
+    pub parent_token_id: Option<Uuid>,
     pub username: String,
     pub read_only: bool,
     pub(crate) token_digest: Vec<u8>,
+}
+
+impl Identity {
+    /// Returns the token ID whose scope grants govern this identity (parent API token for browser sessions).
+    pub fn scope_token_id(&self) -> Uuid {
+        self.parent_token_id.unwrap_or(self.token_id)
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -340,5 +349,21 @@ mod tests {
             assert!(SCHEMA_VERSIONS[i] < version);
             assert!(!sql.trim().is_empty());
         }
+    }
+    #[test]
+    fn identity_scope_token_prefers_parent() {
+        let child = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        let direct = Identity {
+            id: Uuid::new_v4(),
+            token_id: child,
+            parent_token_id: None,
+            username: "alice".into(),
+            read_only: false,
+            token_digest: vec![],
+        };
+        let session = Identity { parent_token_id: Some(parent), ..direct.clone() };
+        assert_eq!(direct.scope_token_id(), child);
+        assert_eq!(session.scope_token_id(), parent);
     }
 }

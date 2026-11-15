@@ -29,9 +29,9 @@ const MAX_LIMIT: i64 = 1000;
 #[serde(deny_unknown_fields)]
 pub struct OrgListQuery {
     #[serde(default)]
-    cursor: Option<String>,
+    pub(crate) cursor: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    pub(crate) limit: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -41,7 +41,7 @@ struct OrgPage {
     next_cursor: Option<String>,
 }
 
-fn bad_cursor() -> Error {
+pub(crate) fn bad_cursor() -> Error {
     Error(StatusCode::BAD_REQUEST, "invalid pagination cursor")
 }
 
@@ -77,7 +77,7 @@ fn decode_team_cursor(raw: &str, actor: Uuid, org: Uuid) -> Result<(String, Uuid
     Ok((slug.clone(), id))
 }
 
-fn limit_of(query: &OrgListQuery) -> Result<i64, Error> {
+pub(crate) fn limit_of(query: &OrgListQuery) -> Result<i64, Error> {
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
     if !(1..=MAX_LIMIT).contains(&limit) {
         return Err(Error::bad_request());
@@ -85,7 +85,7 @@ fn limit_of(query: &OrgListQuery) -> Result<i64, Error> {
     Ok(limit)
 }
 
-fn page_response(
+pub(crate) fn page_response(
     items: Vec<Value>,
     more: bool,
     next_cursor: Option<String>,

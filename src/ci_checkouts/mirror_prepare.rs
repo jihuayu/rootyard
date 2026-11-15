@@ -1,5 +1,5 @@
 //! Explicit dependency materialization on a mirror using separately authorized sources.
-use crate::{AppState, Error, auth, ci_checkouts::{Plan,authority,dependencies}, db, lfs, members::models::Role, mirror};
+use crate::{AppState, Error, auth, ci_checkouts::{Plan,authority,dependencies}, db, git_http::revocation::{self, BoundedOutcome, RevocationBound}, lfs, members::models::Role, mirror};
 use axum::{Json,extract::{Path,State},http::{HeaderMap,StatusCode,header},response::{IntoResponse,Response}};
 use futures_util::StreamExt;
 use sha2::{Digest,Sha256};
@@ -7,12 +7,107 @@ use std::{os::unix::fs::OpenOptionsExt,sync::Arc,time::Duration};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+#[derive(Clone)]
+enum PrepareAuth {
+    Integration(authority::IntegrationScope),
+    UserJob { actor: db::Identity, root_repo_id: Uuid, job_id: Uuid },
+}
+
+pub(crate) async fn user_job_active(
+    state: &AppState,
+    actor: &db::Identity,
+    root_repo_id: Uuid,
+    target_repo_id: Uuid,
+    target_generation: i64,
+    job_id: Uuid,
+) -> Result<(), Error> {
+    auth::verify_active_transfer(
+        &state.pool,
+        actor,
+        target_repo_id,
+        target_generation,
+        crate::token_scopes::RepoAction::ContentsRead,
+        Role::Read,
+    )
+    .await?;
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client
+        .query_opt(
+            "SELECT 1 FROM ci_checkout_jobs WHERE repository_id=$1 AND job_id=$2 \
+             AND issuer_token_id=$3 AND NOT cancelled AND NOT revoked \
+             AND expires_unix>extract(epoch FROM clock_timestamp())",
+            &[&root_repo_id, &job_id, &actor.token_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    if row.is_none() {
+        return Err(Error::unauthorized());
+    }
+    Ok(())
+}
+
+impl PrepareAuth {
+    async fn verify(
+        &self,
+        state: &AppState,
+        target_repo_id: Uuid,
+        target_generation: i64,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        match tokio::time::timeout(timeout, async {
+            match self {
+                Self::Integration(scope) => scope.validate_source(state, target_repo_id).await,
+                Self::UserJob { actor, root_repo_id, job_id } => {
+                    user_job_active(state, actor, *root_repo_id, target_repo_id, target_generation, *job_id).await
+                }
+            }
+        })
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err(Error(StatusCode::SERVICE_UNAVAILABLE, "prepare authority check timed out")),
+        }
+    }
+}
+
+pub(crate) async fn verify_mirror_sync_authority(
+    state: &AppState,
+    owner: &str,
+    name: &str,
+    headers: &HeaderMap,
+    repo: &db::Repository,
+    scope: Option<&authority::IntegrationScope>,
+    user_job: Option<&(db::Identity, Uuid, Uuid)>,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let check = async {
+        if let Some(scope) = scope {
+            scope.validate_source(state, repo.id).await?;
+        } else {
+            let current = mirror::repository(state, headers, owner, name).await?;
+            if current.id != repo.id || current.storage_generation != repo.storage_generation {
+                return Err(Error(StatusCode::CONFLICT, "repository generation changed"));
+            }
+            if let Some((actor, root_repo_id, job_id)) = user_job {
+                user_job_active(state, actor, *root_repo_id, current.id, current.storage_generation, *job_id).await?;
+            }
+        }
+        Ok::<(), Error>(())
+    };
+    match tokio::time::timeout(timeout, check).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(std::io::Error::other(error.1)),
+        Err(_) => Err(std::io::Error::other("mirror sync authority check timed out")),
+    }
+}
+
 pub async fn prepare(
     State(state):State<Arc<AppState>>,
     Path((owner,name,job_id)):Path<(String,String,Uuid)>,headers:HeaderMap,
 ) -> Result<Response,Error>{
     let primary=state.mirror_primary.as_ref().ok_or_else(Error::not_found)?.clone();
-    let (plan,transport_headers,scope)=if let Ok((_,token))=auth::credentials_for(&headers,"ryj_") {
+    let bound = revocation::bound();
+    let (plan,transport_headers,prep_auth)=if let Ok((_,token))=auth::credentials_for(&headers,"ryj_") {
         let digest=db::digest(&token);
         let client=state.pool.get().await.map_err(Error::internal)?;
         let row=client.query_opt("SELECT plan FROM ci_integration_checkout_jobs WHERE \
@@ -36,7 +131,7 @@ pub async fn prepare(
         };
         let scope=authority::IntegrationScope{plan:plan.clone(),hook_id,token_digest};
         scope.validate_source(&state,plan.repository_id).await?;
-        (plan,transport,Some(scope))
+        (plan,transport,PrepareAuth::Integration(scope))
     } else {
         let actor=auth::authenticate(&state.pool,&headers).await?;
         let mut client=state.pool.get().await.map_err(Error::internal)?;
@@ -52,23 +147,33 @@ pub async fn prepare(
             auth::authorize_repo_with_role(&tx,&actor,&sub.owner,&sub.name,Role::Read,crate::token_scopes::RepoAction::ContentsRead).await?;
         }
         tx.commit().await.map_err(Error::internal)?;
-        (plan,headers.clone(),None)
+        let root_repo_id = plan.repository_id;
+        (plan,headers.clone(),PrepareAuth::UserJob { actor, root_repo_id, job_id })
     };
     if plan.dependencies.version!=1 {return Err(Error(StatusCode::CONFLICT,"dependency manifest missing"));}
     // All transport calls retain the caller's normal token only for the trusted
     // operator-configured primary and separately authorized Rootyard repositories.
-    if let Some(scope)=&scope {
-        mirror::sync::sync_scoped(state.clone(),owner.clone(),name.clone(),
-            transport_headers.clone(),scope.clone()).await?;
-    } else {
-        mirror::sync::sync(State(state.clone()),Path((owner.clone(),name.clone())),transport_headers.clone()).await?;
+    match &prep_auth {
+        PrepareAuth::Integration(scope) => {
+            mirror::sync::sync_scoped(state.clone(),owner.clone(),name.clone(),
+                transport_headers.clone(),scope.clone()).await?;
+        }
+        PrepareAuth::UserJob { actor, root_repo_id, job_id } => {
+            mirror::sync::sync_user_job(state.clone(),owner.clone(),name.clone(),
+                transport_headers.clone(),actor.clone(),*root_repo_id,*job_id).await?;
+        }
     }
     for sub in &plan.dependencies.submodules {
-        if let Some(scope)=&scope {
-            mirror::sync::sync_scoped(state.clone(),sub.owner.clone(),sub.name.clone(),
-                transport_headers.clone(),scope.clone()).await?;
-        } else {
-            mirror::sync::sync(State(state.clone()),Path((sub.owner.clone(),sub.name.clone())),transport_headers.clone()).await?;
+        prep_auth.verify(&state,sub.repository_id,sub.storage_generation,bound.reauth_timeout).await?;
+        match &prep_auth {
+            PrepareAuth::Integration(scope) => {
+                mirror::sync::sync_scoped(state.clone(),sub.owner.clone(),sub.name.clone(),
+                    transport_headers.clone(),scope.clone()).await?;
+            }
+            PrepareAuth::UserJob { actor, root_repo_id, job_id } => {
+                mirror::sync::sync_user_job(state.clone(),sub.owner.clone(),sub.name.clone(),
+                    transport_headers.clone(),actor.clone(),*root_repo_id,*job_id).await?;
+            }
         }
     }
     for dep in &plan.dependencies.lfs {
@@ -76,8 +181,8 @@ pub async fn prepare(
         let row=client.query_one(&format!("{} WHERE r.id=$1",db::REPO_SELECT),&[&dep.repository_id])
             .await.map_err(Error::internal)?;
         let repo=db::Repository::from_row(&row);
-        if let Some(scope)=&scope {scope.validate_source(&state,repo.id).await?;}
-        fetch_lfs(&state,&primary,&transport_headers,&repo,&dep.oid,dep.size,scope.as_ref()).await?;
+        prep_auth.verify(&state,repo.id,repo.storage_generation,bound.reauth_timeout).await?;
+        fetch_lfs(&state,&primary,&transport_headers,&repo,&dep.oid,dep.size,&prep_auth,bound).await?;
     }
     dependencies::verify_on_mirror(&state,&plan).await?;
     Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({
@@ -87,7 +192,7 @@ pub async fn prepare(
 }
 
 async fn fetch_lfs(state:&AppState,primary:&str,headers:&HeaderMap,repo:&db::Repository,
-    oid:&str,size:i64,scope:Option<&authority::IntegrationScope>)->Result<(),Error>{
+    oid:&str,size:i64,prep_auth:&PrepareAuth,bound:RevocationBound)->Result<(),Error>{
     if size<0 {return Err(Error::bad_request());}
     let root=state.storage.root.clone();
     let repo_id=repo.id;
@@ -98,10 +203,23 @@ async fn fetch_lfs(state:&AppState,primary:&str,headers:&HeaderMap,repo:&db::Rep
     if already {return Ok(());}
     let bearer=headers.get(header::AUTHORIZATION).ok_or_else(Error::unauthorized)?;
     let url=format!("{primary}/git/{}/{}/info/lfs/objects/{oid}",repo.owner,repo.name);
+    let transfer_timeout = state.config.git_timeout.max(Duration::from_secs(300));
+    let deadline = tokio::time::Instant::now() + transfer_timeout;
     let http=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(300)).build().map_err(Error::internal)?;
-    let response=http.get(url).header(header::AUTHORIZATION,bearer.to_str().map_err(|_|Error::unauthorized())?)
-        .send().await.map_err(Error::internal)?;
+        .timeout(transfer_timeout).build().map_err(Error::internal)?;
+    let auth_header = bearer.to_str().map_err(|_|Error::unauthorized())?;
+    let response = match revocation::await_with_reauth(
+        bound,
+        deadline,
+        http.get(url).header(header::AUTHORIZATION, auth_header).send(),
+        || prep_auth.verify(state, repo.id, repo.storage_generation, bound.reauth_timeout),
+    )
+    .await
+    {
+        BoundedOutcome::Ready(res) => res.map_err(Error::internal)?,
+        BoundedOutcome::Revoked(error) => return Err(error),
+        BoundedOutcome::TimedOut => return Err(Error::timeout()),
+    };
     if !response.status().is_success(){return Err(Error(StatusCode::CONFLICT,"LFS source unavailable"));}
     let dir=lfs::storage::ensure_repo_lfs_dir(&state.storage.root,repo.id).map_err(Error::internal)?;
     let target=lfs::storage::object_path(&state.storage.root,repo.id,oid).map_err(Error::internal)?;
@@ -110,9 +228,21 @@ async fn fetch_lfs(state:&AppState,primary:&str,headers:&HeaderMap,repo:&db::Rep
         .custom_flags(libc::O_NOFOLLOW).open(&stage).map_err(Error::internal)?;
     let mut file=tokio::fs::File::from_std(std_file);
     let mut stream=response.bytes_stream();let mut hash=Sha256::new();let mut count=0u64;
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + bound.check_interval, bound.check_interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result=async {
-        while let Some(chunk)=stream.next().await {
-            let chunk=chunk.map_err(Error::internal)?;
+        loop {
+            let chunk = tokio::select! {
+                next = stream.next() => match next {
+                    Some(chunk) => chunk.map_err(Error::internal)?,
+                    None => break,
+                },
+                _ = tick.tick() => {
+                    prep_auth.verify(state, repo.id, repo.storage_generation, bound.reauth_timeout).await?;
+                    continue;
+                }
+                _ = tokio::time::sleep_until(deadline) => return Err(Error::timeout()),
+            };
             count=count.checked_add(chunk.len() as u64).ok_or_else(Error::bad_request)?;
             if count>size as u64 {return Err(Error(StatusCode::CONFLICT,"LFS source exceeded declared size"));}
             hash.update(&chunk);file.write_all(&chunk).await.map_err(Error::internal)?;
@@ -125,10 +255,9 @@ async fn fetch_lfs(state:&AppState,primary:&str,headers:&HeaderMap,repo:&db::Rep
     }.await;
     drop(file);
     if let Err(error)=result {let _=std::fs::remove_file(&stage);return Err(error);}
-    if let Some(scope)=scope
-        && let Err(error)=scope.validate_source(state,repo.id).await {
-            let _=std::fs::remove_file(&stage);return Err(error);
-        }
+    if let Err(error)=prep_auth.verify(state,repo.id,repo.storage_generation,bound.reauth_timeout).await {
+        let _=std::fs::remove_file(&stage);return Err(error);
+    }
     std::fs::rename(&stage,&target).map_err(Error::internal)?;
     std::fs::File::open(&dir).and_then(|f|f.sync_all()).map_err(Error::internal)?;
     Ok(())

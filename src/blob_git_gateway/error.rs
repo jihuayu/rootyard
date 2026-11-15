@@ -3,6 +3,11 @@
 //! No variant carries provider text, Git argv/stderr, a locator, a token, a
 //! path or a SQL message. Every dynamic failure is collapsed into one of these
 //! literals so a transport error can never echo a credential or a client pack.
+//!
+//! A `401` carries no challenge on its own. The challenge names the credential
+//! scheme of the route that refused, so it is rendered explicitly by each
+//! handler ([`Challenge::Bearer`] for every JSON/API answer, [`Challenge::Basic`]
+//! for Smart HTTP); rendering an error alone never advertises either.
 use axum::{
     Json,
     http::{StatusCode, header},
@@ -61,17 +66,63 @@ impl GatewayError {
     }
 }
 
+/// The credential scheme one protocol advertises on its `401`.
+///
+/// The variant is chosen by the route protocol, never by the failure: the same
+/// [`GatewayError::Unauthorized`] is a Relay refusal on the JSON/API path and a
+/// Smart HTTP refusal on `/git`, and only the latter may ask the client for
+/// Basic credentials.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Challenge {
+    /// The standard Smart HTTP Git challenge; a native Git client retries with
+    /// the Basic credential it was configured with.
+    Basic,
+    /// The JSON/API challenge. API tokens are preemptively sent as
+    /// `Authorization: Bearer`, so a Basic challenge (which a browser `fetch`
+    /// answers with an interactive auth prompt) is never sent here.
+    Bearer,
+}
+
+impl Challenge {
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::Basic => "Basic realm=\"Rootyard\", charset=\"UTF-8\"",
+            Self::Bearer => "Bearer realm=\"Rootyard\"",
+        }
+    }
+}
+
+/// Give `response` the `challenge` of its protocol when, and only when, it is a
+/// `401` that advertises no scheme yet.
+pub(super) fn with_challenge(mut response: Response, challenge: Challenge) -> Response {
+    if response.status() == StatusCode::UNAUTHORIZED && !response.headers().contains_key(header::WWW_AUTHENTICATE) {
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static(challenge.value()));
+    }
+    response
+}
+
+fn challenged(error: GatewayError, challenge: Challenge) -> Response {
+    with_challenge(error.into_response(), challenge)
+}
+
+impl GatewayError {
+    /// The JSON/API refusal of every `/api` handler and `/web/blob/api` alias.
+    pub(super) fn api(self) -> Response {
+        challenged(self, Challenge::Bearer)
+    }
+
+    /// The Smart HTTP refusal of `info/refs`, `git-upload-pack` and
+    /// `git-receive-pack`.
+    pub(super) fn git(self) -> Response {
+        challenged(self, Challenge::Basic)
+    }
+}
+
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
         let status = self.status();
         let mut response = (status, Json(serde_json::json!({"error": self.message()}))).into_response();
         response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
-        if status == StatusCode::UNAUTHORIZED {
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                header::HeaderValue::from_static("Basic realm=\"Rootyard\", charset=\"UTF-8\""),
-            );
-        }
         response
     }
 }
@@ -153,113 +204,4 @@ impl From<crate::ref_store::core::pack_commit::PackCommitError> for GatewayError
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::{
-        body::to_bytes,
-        http::{HeaderMap, StatusCode, header},
-        response::IntoResponse,
-    };
-
-    use super::GatewayError;
-    use crate::{blob_git_gateway::snapshot, ref_store::RefStoreError};
-
-    async fn render(error: GatewayError) -> (StatusCode, HeaderMap, String) {
-        let response = error.into_response();
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = to_bytes(response.into_body(), 8 * 1024).await.expect("gateway body");
-        (status, headers, String::from_utf8(body.to_vec()).expect("gateway body is UTF-8"))
-    }
-
-    async fn assert_opaque_server_error(error: GatewayError, expected: StatusCode, expected_body: &str) {
-        let (status, headers, body) = render(error).await;
-        assert_eq!(status, expected);
-        assert!(status.is_server_error(), "a failed materialization must never be a client verdict");
-        assert_eq!(body, expected_body);
-        assert_eq!(headers.get(header::CACHE_CONTROL).and_then(|value| value.to_str().ok()), Some("no-store"));
-        assert!(headers.get("x-rootyard-session").is_none(), "a refused materialization must not issue a session");
-        assert!(!body.contains("s3://") && !body.contains("secret-key"), "provider details leaked: {body}");
-    }
-
-    #[tokio::test]
-    async fn missing_or_unreadable_pack_proof_is_an_opaque_service_unavailable() {
-        for reason in
-            ["native materialized read verification is unavailable", "materialized read PostgreSQL pool is unavailable"]
-        {
-            let direct = GatewayError::from(RefStoreError::Unsupported(reason));
-            assert_eq!(direct.status(), StatusCode::SERVICE_UNAVAILABLE, "{reason}");
-            let boundary = snapshot::materialize_error(RefStoreError::Unsupported(reason));
-            assert_eq!(boundary.status(), StatusCode::SERVICE_UNAVAILABLE, "{reason}");
-            assert_opaque_server_error(
-                boundary,
-                StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"error":"verified pack snapshot is unavailable"}"#,
-            )
-            .await;
-        }
-    }
-
-    #[tokio::test]
-    async fn post_capture_materializer_refusals_are_never_bad_requests() {
-        for reason in [
-            "materialized read metadata is not valid",
-            "unknown materialized pack id",
-            "materialized view exceeds its workspace bound",
-            "native materialized read verification is unavailable",
-        ] {
-            let mapped = snapshot::materialize_error(RefStoreError::Unsupported(reason));
-            assert!(mapped.status().is_server_error(), "{reason} mapped to {}", mapped.status());
-        }
-        for reason in ["materialized read metadata is not valid", "unknown materialized pack id"] {
-            assert_opaque_server_error(
-                snapshot::materialize_error(RefStoreError::Unsupported(reason)),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                r#"{"error":"verified pack snapshot could not be materialized"}"#,
-            )
-            .await;
-        }
-        // The ref-view capture keeps the explicit 400 for an uninitialized core
-        // gate (the production literal in `serving_read_sql.rs`); the
-        // post-capture boundary still fails closed with 500 if such a refusal
-        // ever reached it.
-        let uninitialized = "repository has no initialized core gate";
-        assert_eq!(GatewayError::from(RefStoreError::Unsupported(uninitialized)).status(), StatusCode::BAD_REQUEST);
-        assert_opaque_server_error(
-            snapshot::materialize_error(RefStoreError::Unsupported(uninitialized)),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            r#"{"error":"verified pack snapshot could not be materialized"}"#,
-        )
-        .await;
-
-        // A post-capture lookup can still observe either durable refusal.
-        // Neither may leak as a 404/409 after the refs were already sealed.
-        let missing = RefStoreError::RepositoryNotFound;
-        assert_eq!(GatewayError::from(missing.clone()).status(), StatusCode::NOT_FOUND);
-        assert_opaque_server_error(
-            snapshot::materialize_error(missing),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            r#"{"error":"verified pack snapshot could not be materialized"}"#,
-        )
-        .await;
-        let moved = RefStoreError::MetadataGateVersionMismatch;
-        assert_eq!(GatewayError::from(moved.clone()).status(), StatusCode::CONFLICT);
-        assert_opaque_server_error(
-            snapshot::materialize_error(moved),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            r#"{"error":"verified pack snapshot could not be materialized"}"#,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn database_errors_do_not_leak_provider_details() {
-        let error = RefStoreError::Database("s3://bucket/secret-key".into());
-        assert_opaque_server_error(
-            snapshot::materialize_error(error.clone()),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            r#"{"error":"metadata operation was refused"}"#,
-        )
-        .await;
-        assert_eq!(GatewayError::from(error).status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-}
+mod tests;

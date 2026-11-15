@@ -1,32 +1,8 @@
-//! Bounded, typed advisory cache/wake boundary.
-//!
-//! Nothing in this module is an authority. Cache misses, flushes, Redis
-//! outages, evictions, duplicate warmups and lost wake hints may only change
-//! latency or cause an origin read. They must never modify refs, tasks,
-//! authentication/authorization, roots, holds, hard quotas or durable
-//! PostgreSQL/RefStore state. Redis is independently enableable and does not
-//! require Raft.
-//!
-//! This module provides the available boundary; the serving process does not
-//! construct cache consumers yet. Dispatch continues to use local `Notify` and
-//! an optional mature RedisWake. Redis cache/wake compilation is gated by the
-//! optional `state-redis` feature and uses the mature `redis` async client;
-//! this module contains no hand-written RESP, TCP or TLS implementation.
+//! Core typed advisory cache key/value contracts, limits, and trait boundary.
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{fmt, future::Future, pin::Pin, time::Duration};
 use uuid::Uuid;
-
-pub mod memory;
-pub mod origin;
-
-#[cfg(feature = "state-redis")]
-pub mod redis;
-
-pub use memory::{CacheStats, MemoryCache};
-pub use origin::{OriginError, OriginGuard, SingleFlight, WarmupOutcome};
-#[cfg(feature = "state-redis")]
-pub use redis::{RedisCache, RedisWake};
 
 /// Boxed future used by the boundary so no async-trait framework is needed.
 pub type CacheTask<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -41,6 +17,16 @@ pub fn validate_wake_channel(channel: &str) -> Result<()> {
     ensure!(
         (1..=128).contains(&channel.len()) && channel.bytes().all(|c| c.is_ascii_alphanumeric() || b":_-".contains(&c)),
         "invalid wake channel"
+    );
+    Ok(())
+}
+
+/// Validate one lowercase ASCII cache scope token (`environment` or `authority`).
+pub fn validate_scope_token(label: &str, value: &str) -> Result<()> {
+    ensure!(
+        (1..=32).contains(&value.len())
+            && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b)),
+        "invalid cache {label}"
     );
     Ok(())
 }
@@ -120,11 +106,13 @@ impl CacheKind {
 }
 
 /// Explicit, validated key components. A key always carries environment,
-/// cache schema, history/authority incarnation, tenant security domain,
-/// repository, kind, business/version and a bounded opaque discriminator.
+/// authoritative backend/storage domain (`authority`), cache schema, history
+/// incarnation, tenant security domain, repository, kind, business/version and a
+/// bounded opaque discriminator.
 #[derive(Clone, Copy)]
 pub struct CacheKeyParts<'a> {
     pub environment: &'a str,
+    pub authority: &'a str,
     pub schema: u16,
     pub history_incarnation: Uuid,
     pub tenant: Uuid,
@@ -145,14 +133,8 @@ pub struct CacheKey {
 
 impl CacheKey {
     pub fn new(parts: CacheKeyParts<'_>) -> Result<Self> {
-        ensure!(
-            (1..=32).contains(&parts.environment.len())
-                && parts
-                    .environment
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b)),
-            "invalid cache environment"
-        );
+        validate_scope_token("environment", parts.environment)?;
+        validate_scope_token("authority", parts.authority)?;
         ensure!(parts.discriminator.len() <= 512, "cache discriminator too long");
         let digest = if parts.discriminator.is_empty() {
             "none".to_owned()
@@ -161,8 +143,9 @@ impl CacheKey {
             hex::encode(&digest[..8])
         };
         let encoded = format!(
-            "ry:cache:v1:{}:{}:{}:{}:{}:{}:{}:{}",
+            "ry:cache:v2:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             parts.environment,
+            parts.authority,
             parts.schema,
             parts.history_incarnation,
             parts.tenant,
@@ -383,7 +366,7 @@ pub trait AdvisoryCache: Send + Sync {
     fn delete<'a>(&'a self, key: &'a CacheKey) -> CacheTask<'a, Result<()>>;
 }
 
-fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
+pub(crate) fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
     let value = match std::env::var(name) {
         Ok(raw) => raw.parse().map_err(|_| anyhow::anyhow!("invalid {name}"))?,
         Err(_) => default,
@@ -399,6 +382,7 @@ mod tests {
     fn key(kind: CacheKind, version: u64, discriminator: &str) -> CacheKey {
         CacheKey::new(CacheKeyParts {
             environment: "standalone",
+            authority: "git-native",
             schema: 1,
             history_incarnation: Uuid::nil(),
             tenant: Uuid::from_u128(1),
@@ -414,25 +398,41 @@ mod tests {
     fn keys_are_typed_versioned_and_do_not_embed_raw_discriminators() {
         let value = key(CacheKind::TreeListing, 7, "Bearer super-secret-cookie");
         let text = value.as_str();
-        assert!(text.starts_with("ry:cache:v1:standalone:1:"));
+        assert!(text.starts_with("ry:cache:v2:standalone:git-native:1:"));
         assert!(text.contains(":tree-listing:7:"));
         assert!(!text.contains("super-secret"));
         assert!(!text.contains("Bearer"));
         assert_eq!(value.kind(), CacheKind::TreeListing);
         assert_eq!(value.version(), 7);
-        assert!(
-            CacheKey::new(CacheKeyParts {
-                environment: "Standalone",
-                schema: 1,
-                history_incarnation: Uuid::nil(),
-                tenant: Uuid::nil(),
-                repo: Uuid::nil(),
-                kind: CacheKind::TreeListing,
-                version: 1,
-                discriminator: "",
-            })
-            .is_err()
-        );
+        for (env, auth) in [("Standalone", "git-native"), ("standalone", "BadAuthority")] {
+            assert!(
+                CacheKey::new(CacheKeyParts {
+                    environment: env,
+                    authority: auth,
+                    schema: 1,
+                    history_incarnation: Uuid::nil(),
+                    tenant: Uuid::nil(),
+                    repo: Uuid::nil(),
+                    kind: CacheKind::TreeListing,
+                    version: 1,
+                    discriminator: "",
+                })
+                .is_err()
+            );
+        }
+        let blob_key = CacheKey::new(CacheKeyParts {
+            environment: "standalone",
+            authority: "blob-pack",
+            schema: 1,
+            history_incarnation: Uuid::nil(),
+            tenant: Uuid::from_u128(1),
+            repo: Uuid::from_u128(2),
+            kind: CacheKind::TreeListing,
+            version: 7,
+            discriminator: "Bearer super-secret-cookie",
+        })
+        .unwrap();
+        assert_ne!(value, blob_key);
     }
 
     #[test]

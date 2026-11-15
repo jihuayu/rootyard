@@ -180,15 +180,29 @@ pub(crate) async fn sync(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     // Keep cleanup and locks alive even if the HTTP caller disconnects.
-    tokio::spawn(async move { sync_snapshot(state, owner, name, headers, None).await })
+    tokio::spawn(async move { sync_snapshot(state, owner, name, headers, None, None).await })
         .await
         .map_err(Error::internal)?
 }
 
 pub(crate) async fn sync_scoped(state:Arc<AppState>,owner:String,name:String,
     headers:HeaderMap,scope:IntegrationScope)->Result<Response,Error>{
-    tokio::spawn(async move {sync_snapshot(state,owner,name,headers,Some(scope)).await})
+    tokio::spawn(async move {sync_snapshot(state,owner,name,headers,Some(scope),None).await})
         .await.map_err(Error::internal)?
+}
+
+pub(crate) async fn sync_user_job(
+    state: Arc<AppState>,
+    owner: String,
+    name: String,
+    headers: HeaderMap,
+    actor: db::Identity,
+    root_repo_id: Uuid,
+    job_id: Uuid,
+) -> Result<Response, Error> {
+    tokio::spawn(async move { sync_snapshot(state, owner, name, headers, None, Some((actor, root_repo_id, job_id))).await })
+        .await
+        .map_err(Error::internal)?
 }
 
 async fn sync_snapshot(
@@ -197,6 +211,7 @@ async fn sync_snapshot(
     name: String,
     headers: HeaderMap,
     scope: Option<IntegrationScope>,
+    user_job: Option<(db::Identity, Uuid, Uuid)>,
 ) -> Result<Response, Error> {
     let repo = repository(&state, &headers, &owner, &name).await?;
     if !crate::ci_pins::valid_format(&repo.object_format) {
@@ -263,7 +278,20 @@ async fn sync_snapshot(
             .args(["clone", "--mirror", "--no-local", "--template=", "--"])
             .arg(&url)
             .arg(&bare);
-        git_http::collect_git_output(command, 4096, state.config.git_timeout).await?;
+        let bound = git_http::revocation::bound();
+        git_http::revocation::collect_git_output_reauthorized(command, 4096, state.config.git_timeout, bound, || {
+            crate::ci_checkouts::mirror_prepare::verify_mirror_sync_authority(
+                &state,
+                &owner,
+                &name,
+                &headers,
+                &repo,
+                scope.as_ref(),
+                user_job.as_ref(),
+                bound.reauth_timeout,
+            )
+        })
+        .await?;
         let mut command = mirror_git(&state);
         command
             .arg("--git-dir")

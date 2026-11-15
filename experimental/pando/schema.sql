@@ -121,3 +121,45 @@ CREATE TABLE IF NOT EXISTS pando_lab.kms_envelopes (
  storage_tier TEXT NOT NULL DEFAULT 'hot' CHECK (storage_tier IN ('hot', 'cold_archive')),
  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
  PRIMARY KEY (repo, pack_id));
+ALTER TABLE pando_lab.kms_envelopes
+ ADD COLUMN IF NOT EXISTS encryption_mode TEXT NOT NULL DEFAULT 'authenticated-envelope-v1'
+  CHECK (encryption_mode IN ('authenticated-envelope-v1', 'synthetic-metadata-lab-only')),
+ ADD COLUMN IF NOT EXISTS envelope_id UUID,
+ ADD COLUMN IF NOT EXISTS nonce_prefix TEXT,
+ ADD COLUMN IF NOT EXISTS wrapped_key_json TEXT,
+ ADD COLUMN IF NOT EXISTS ciphertext_sha256 TEXT CHECK (ciphertext_sha256 IS NULL OR ciphertext_sha256 ~ '^[0-9a-f]{64}$'),
+ ADD COLUMN IF NOT EXISTS ciphertext_bytes BIGINT CHECK (ciphertext_bytes IS NULL OR ciphertext_bytes >= 0),
+ ADD COLUMN IF NOT EXISTS provider_kind TEXT NOT NULL DEFAULT 'local-file-key-provider';
+CREATE TABLE IF NOT EXISTS pando_lab.kms_keys (
+ repo UUID NOT NULL REFERENCES pando_lab.repositories(id) ON DELETE CASCADE,
+ key_id TEXT NOT NULL CHECK (length(btrim(key_id)) >= 3 AND length(key_id) <= 128),
+ key_version INTEGER NOT NULL CHECK (key_version >= 1),
+ key_sha256 TEXT NOT NULL CHECK (key_sha256 ~ '^[0-9a-f]{64}$'),
+ status TEXT NOT NULL CHECK (status IN ('active', 'retained', 'revoked')),
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ revoked_at TIMESTAMPTZ,
+ PRIMARY KEY (repo, key_id));
+CREATE TABLE IF NOT EXISTS pando_lab.kms_key_policies (
+ repo UUID PRIMARY KEY REFERENCES pando_lab.repositories(id) ON DELETE CASCADE,
+ active_key_id TEXT NOT NULL DEFAULT 'kms-local-default-v1' CHECK (length(btrim(active_key_id)) >= 3 AND length(active_key_id) <= 128),
+ active_key_version INTEGER NOT NULL DEFAULT 1 CHECK (active_key_version >= 1),
+ retain_previous_generations BOOLEAN NOT NULL DEFAULT TRUE,
+ min_readable_key_version INTEGER NOT NULL DEFAULT 1 CHECK (min_readable_key_version >= 1),
+ provider_revoked BOOLEAN NOT NULL DEFAULT FALSE,
+ encryption_mode TEXT NOT NULL DEFAULT 'authenticated-envelope-v1' CHECK (encryption_mode IN ('authenticated-envelope-v1', 'synthetic-metadata-lab-only')),
+ updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS pando_lab.kms_rotations (
+ id UUID PRIMARY KEY,
+ repo UUID NOT NULL REFERENCES pando_lab.repositories(id) ON DELETE CASCADE,
+ from_key_id TEXT NOT NULL CHECK (length(btrim(from_key_id)) >= 3 AND length(from_key_id) <= 128),
+ from_key_version INTEGER NOT NULL CHECK (from_key_version >= 1),
+ to_key_id TEXT NOT NULL CHECK (length(btrim(to_key_id)) >= 3 AND length(to_key_id) <= 128),
+ to_key_version INTEGER NOT NULL CHECK (to_key_version >= 1),
+ state TEXT NOT NULL CHECK (state IN ('IN_PROGRESS', 'COMPLETED', 'ABORTED')),
+ revoke_previous BOOLEAN NOT NULL DEFAULT FALSE,
+ total_packs INTEGER NOT NULL DEFAULT 0 CHECK (total_packs >= 0),
+ processed_packs INTEGER NOT NULL DEFAULT 0 CHECK (processed_packs >= 0),
+ failed_pack_id UUID,
+ checkpoint_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ updated_at TIMESTAMPTZ NOT NULL DEFAULT now());

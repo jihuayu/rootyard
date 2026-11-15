@@ -19,14 +19,14 @@ impl IntegrationScope {
             return Err(Error::unauthorized());
         }
         if repo_id==self.plan.repository_id {return Ok(());}
-        if !self.plan.dependencies.submodules.iter().any(|sub|sub.repository_id==repo_id){
+        let Some(sub) = self.plan.dependencies.submodules.iter().find(|sub|sub.repository_id==repo_id) else {
             return Err(Error::unauthorized());
-        }
+        };
         let client=state.pool.get().await.map_err(Error::internal)?;
         if client.query_opt("SELECT 1 FROM ci_integration_source_grants g \
             JOIN repositories r ON r.id=g.repository_id \
             WHERE g.issuer_webhook_id=$1 AND g.repository_id=$2 AND g.active=true \
-            AND r.state='ready'",&[&self.hook_id,&repo_id])
+            AND r.state='ready' AND r.storage_generation=$3",&[&self.hook_id,&repo_id,&sub.storage_generation])
             .await.map_err(Error::internal)?.is_none(){return Err(Error::unauthorized());}
         Ok(())
     }
@@ -148,7 +148,7 @@ pub(crate) async fn authenticate(
         plan.target_oid!=oid || plan.mirror_audience!=audience()? ||
         plan.dependencies.version!=1 {return Err(Error::unauthorized());}
     tx.commit().await.map_err(Error::internal)?;
-    let identity=db::Identity{id:actor_id,token_id:row.get(3),username:row.get("actor_name"),
+    let identity=db::Identity{id:actor_id,token_id:row.get(3),parent_token_id:None,username:row.get("actor_name"),
         read_only:true,token_digest:digest};
     let repo=db::Repository{id:repo_id,name:name.into(),owner:owner.into(),state:"ready".into(),
         clone_path:format!("/git/{owner}/{name}.git"),storage_backend:"gitfs".into(),
