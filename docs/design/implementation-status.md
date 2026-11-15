@@ -13,7 +13,7 @@
 | artifact holds / durable roots | 有持久账本和真实 PG/Blob/native Git 验收 | PR/CI/Workspace/LFS producers、GC 与完整恢复闭包 |
 | PG decisions / accepted-subset | PR #142 库增量验收通过 | HTTP/业务入口、浏览器与 Merge producer、远程 Raft 决策桥 |
 | Blob-only standalone（显式 `serve-blob`） | 候选：clone/push、tree/blob 与 refs/历史/compare 浏览、format22 配对备份/恢复有真实验收 | 默认部署替换、LFS/PR/Workspace/CI 接入、默认服务验收 |
-| Raft Ref-CAS distributed | 未交付；仅 PR #160 的独立实验 crate（见下） | 开源库选型、持久运行时、状态机、RPC、权限桥与 PG 投影 |
+| Raft Ref-CAS distributed | 实验与状态机库组件：PR #160 独立 `refcas-log`；#116 确定性 `RefCasStateMachine`（`src/ref_store/core/state_machine/`，含快照与 PG 契约同测） | 持久 Raft 运行时/RPC/TLS/ReadIndex、权限桥与 PG 投影（#117） |
 | 全新环境恢复与生产资格 | format22 同后端配对恢复有证据；组件恢复有旧证据 | 新架构 PG/Raft/Blob 一致恢复、独立故障域和容量成本验收 |
 | 默认服务与对外 Git 传输 | 默认 `serve` 仍是既有 GitFS/Pando 实现；对外 Git 只承诺 Smart HTTP（HTTPS 由入口代理终止），不实现 SSH | 默认入口切换后补齐其特征接入 |
 
