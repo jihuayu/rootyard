@@ -9,10 +9,13 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use rootyard_refcas_log::cluster::{FaultTarget, RpcRequest, RpcResponse, rpc_expect_ok, send_rpc};
-use rootyard_refcas_log::fault::FaultSpec;
+use rootyard_refcas_log::Res;
+use rootyard_refcas_log::cluster::{RpcRequest, RpcResponse, rpc_expect_ok, send_rpc};
 use rootyard_refcas_log::fixture::{DEFAULT_MIN_FREE_BYTES, qualify_store_dir};
+use rootyard_refcas_log::mtls::MtlsClient;
 use rootyard_refcas_log::state_machine::SmCommand;
+
+use super::tls_certs::ClusterPki;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +23,7 @@ struct ReadyBanner {
     node_id: u64,
     addr: String,
     fstype: Option<String>,
+    mtls: bool,
 }
 
 pub struct NodeConfig {
@@ -65,16 +69,24 @@ pub struct NodeProc {
     pub id: u64,
     pub dir: PathBuf,
     pub addr: String,
+    client: MtlsClient,
     child: OwnedChild,
 }
 
 impl NodeProc {
-    pub fn spawn(id: u64, dir: &Path, cfg: &NodeConfig) -> Self {
-        Self::spawn_with_ready_timeout(id, dir, cfg, Duration::from_secs(15))
+    pub fn spawn(pki: &ClusterPki, id: u64, dir: &Path, cfg: &NodeConfig) -> Self {
+        Self::spawn_with_ready_timeout(pki, id, dir, cfg, Duration::from_secs(15))
     }
 
-    pub fn spawn_with_ready_timeout(id: u64, dir: &Path, cfg: &NodeConfig, ready_timeout: Duration) -> Self {
+    pub fn spawn_with_ready_timeout(
+        pki: &ClusterPki,
+        id: u64,
+        dir: &Path,
+        cfg: &NodeConfig,
+        ready_timeout: Duration,
+    ) -> Self {
         qualify_store_dir(dir, true, DEFAULT_MIN_FREE_BYTES).expect("qualify node store dir");
+        let tls = pki.node_paths(id);
         let bin = env!("CARGO_BIN_EXE_raft-node");
         let spawned = Command::new(bin)
             .args([
@@ -82,6 +94,12 @@ impl NodeProc {
                 &id.to_string(),
                 "--dir",
                 &dir.to_string_lossy(),
+                "--tls-ca",
+                &tls.ca_cert.to_string_lossy(),
+                "--tls-cert",
+                &tls.cert.to_string_lossy(),
+                "--tls-key",
+                &tls.key.to_string_lossy(),
                 "--check-on-open",
                 "true",
                 "--heartbeat-ms",
@@ -115,10 +133,11 @@ impl NodeProc {
             .unwrap_or_else(|| panic!("node {id} did not print READY banner (got {trimmed:?})"));
         let banner: ReadyBanner = serde_json::from_str(json).expect("decode READY banner");
         assert_eq!(banner.node_id, id);
+        assert!(banner.mtls, "READY banner must confirm strict mTLS transport");
         if cfg!(target_os = "linux") {
             assert!(banner.fstype.is_some(), "linux READY banner must include fstype");
         }
-        Self { id, dir: dir.to_path_buf(), addr: banner.addr, child }
+        Self { id, dir: dir.to_path_buf(), addr: banner.addr, client: pki.client(), child }
     }
 
     pub fn kill_sigkill(mut self) -> ExitStatus {
@@ -135,15 +154,23 @@ impl NodeProc {
     }
 
     pub fn shutdown_graceful(mut self) {
-        let _ = send_rpc(&self.addr, &RpcRequest::Shutdown);
+        let _ = self.try_rpc(&RpcRequest::Shutdown);
         let status = reap_bounded(self.child.0.as_mut().expect("child live"), Duration::from_secs(10))
             .unwrap_or_else(|| panic!("node {} graceful shutdown timeout", self.id));
         self.child.take();
         assert!(status.success(), "graceful shutdown failed: {status}");
     }
 
+    pub fn try_rpc(&self, req: &RpcRequest) -> Res<RpcResponse> {
+        send_rpc(&self.client, &self.addr, self.id, req)
+    }
+
+    pub fn rpc(&self, req: &RpcRequest) -> RpcResponse {
+        self.try_rpc(req).expect("mTLS rpc")
+    }
+
     pub fn metrics(&self) -> NodeMetrics {
-        match send_rpc(&self.addr, &RpcRequest::Metrics).expect("metrics rpc") {
+        match self.rpc(&RpcRequest::Metrics) {
             RpcResponse::Metrics(m) => NodeMetrics {
                 node_id: m.node_id,
                 running_ok: m.running_ok,
@@ -159,20 +186,15 @@ impl NodeProc {
         }
     }
 
-    pub fn kv_get(&self, key: &str) -> Option<String> {
-        match send_rpc(&self.addr, &RpcRequest::KvGet { key: key.to_owned() }).expect("kv_get rpc") {
-            RpcResponse::KvValue { value } => value,
-            other => panic!("unexpected kv_get response: {other:?}"),
+    pub fn inspect_replica_kv(&self, key: &str) -> Option<String> {
+        match self.rpc(&RpcRequest::InspectReplicaKv { key: key.to_owned() }) {
+            RpcResponse::KvValue { value, .. } => value,
+            other => panic!("unexpected inspect_replica_kv response: {other:?}"),
         }
     }
 
-    pub fn inject_fault(&self, target: FaultTarget, spec: FaultSpec) {
-        let resp = send_rpc(&self.addr, &RpcRequest::InjectFault { target, spec }).expect("inject_fault rpc");
-        rpc_expect_ok(resp).expect("inject_fault ok");
-    }
-
     pub fn trigger_snapshot(&self) {
-        let resp = send_rpc(&self.addr, &RpcRequest::TriggerSnapshot).expect("trigger_snapshot");
+        let resp = self.rpc(&RpcRequest::TriggerSnapshot);
         rpc_expect_ok(resp).expect("trigger_snapshot ok");
     }
 }
@@ -189,47 +211,20 @@ pub struct NodeMetrics {
     pub applied_count: u64,
 }
 
-pub fn spawn_corrupt_expect_refused(id: u64, dir: &Path) -> String {
-    use std::io::Read;
-    let bin = env!("CARGO_BIN_EXE_raft-node");
-    let spawned = Command::new(bin)
-        .args(["--id", &id.to_string(), "--dir", &dir.to_string_lossy(), "--check-on-open", "true"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn corrupted raft-node");
-    let mut child = OwnedChild(Some(spawned));
-    let mut stderr_pipe = child.0.as_mut().expect("child live").stderr.take().expect("stderr piped");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    let status = reap_bounded(child.0.as_mut().expect("child live"), Duration::from_secs(10))
-        .expect("timed out waiting for corrupted raft-node refusal");
-    child.take();
-    assert!(!status.success(), "corrupted store MUST refuse startup for node {id}");
-    let stderr_buf = rx.recv_timeout(Duration::from_secs(2)).expect("timed out reading corrupted raft-node stderr");
-    let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
-    assert!(stderr.contains("ERR "), "expected explicit refusal on stderr, got: {stderr:?}");
-    stderr
-}
-
 pub fn peer_map(nodes: &[&NodeProc]) -> BTreeMap<u64, String> {
     nodes.iter().map(|n| (n.id, n.addr.clone())).collect()
 }
 
 pub fn broadcast_peers(nodes: &[&NodeProc], all_peers: &BTreeMap<u64, String>) {
     for n in nodes {
-        let resp = send_rpc(&n.addr, &RpcRequest::UpdatePeers { peers: all_peers.clone() }).expect("update_peers");
+        let resp = n.rpc(&RpcRequest::UpdatePeers { peers: all_peers.clone() });
         rpc_expect_ok(resp).expect("update_peers ok");
     }
 }
 
 pub fn bootstrap_cluster(nodes: &[&NodeProc]) {
     let peers = peer_map(nodes);
-    let resp = send_rpc(&nodes[0].addr, &RpcRequest::Bootstrap { members: peers }).expect("bootstrap");
+    let resp = nodes[0].rpc(&RpcRequest::Bootstrap { members: peers });
     rpc_expect_ok(resp).expect("bootstrap ok");
 }
 
@@ -237,7 +232,7 @@ pub fn wait_leader(nodes: &[&NodeProc], timeout: Duration) -> u64 {
     let deadline = Instant::now() + timeout;
     loop {
         for n in nodes {
-            if let Ok(RpcResponse::Metrics(m)) = send_rpc(&n.addr, &RpcRequest::Metrics)
+            if let Ok(RpcResponse::Metrics(m)) = n.try_rpc(&RpcRequest::Metrics)
                 && m.running_ok
                 && let Some(leader) = m.current_leader
                 && nodes.iter().any(|p| p.id == leader)
@@ -256,7 +251,7 @@ pub fn write_kv(nodes: &[&NodeProc], key: &str, value: &str) -> u64 {
     let mut target_idx = 0usize;
     loop {
         let node = nodes[target_idx % nodes.len()];
-        if let Ok(resp) = send_rpc(&node.addr, &RpcRequest::ClientWrite { payload: payload.clone() }) {
+        if let Ok(resp) = node.try_rpc(&RpcRequest::ClientWrite { payload: payload.clone() }) {
             match resp {
                 RpcResponse::ClientWrite { log_index } => return log_index,
                 RpcResponse::Error { forward_to_leader_id: Some(lid), .. } => {
@@ -281,13 +276,10 @@ pub fn add_learner_and_promote(nodes: &[&NodeProc], learner: &NodeProc, new_vote
     loop {
         let leader_id = wait_leader(nodes, Duration::from_secs(8));
         let leader = nodes.iter().find(|n| n.id == leader_id).unwrap();
-        let res = send_rpc(
-            &leader.addr,
-            &RpcRequest::AddLearner { node_id: learner.id, addr: learner.addr.clone(), blocking: true },
-        );
+        let res =
+            leader.try_rpc(&RpcRequest::AddLearner { node_id: learner.id, addr: learner.addr.clone(), blocking: true });
         if let Ok(RpcResponse::Ok) = res {
-            let chg =
-                send_rpc(&leader.addr, &RpcRequest::ChangeMembership { members: new_voters.clone(), retain: false });
+            let chg = leader.try_rpc(&RpcRequest::ChangeMembership { members: new_voters.clone(), retain: false });
             if let Ok(RpcResponse::Ok) = chg {
                 return;
             }
