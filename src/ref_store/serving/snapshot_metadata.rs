@@ -910,7 +910,7 @@ pub(super) async fn serving_admin_gate(
     // Current actor permission is checked before any serving-backend/gate/realm
     // or snapshot-specific refusal can surface. A non-admin must not learn a
     // target's shape from an earlier state-specific error path.
-    let Some((role, _, _)) = crate::members::rbac::resolve_effective_role(tx, repository_id, tenant_id, actor.id)
+    let Some((role, _, _)) = crate::members::rbac::resolve_effective_role(&**tx, repository_id, tenant_id, actor.id)
         .await
         .map_err(Error::internal)?
     else {
@@ -1009,7 +1009,7 @@ pub(super) async fn final_authority_with_cluster(
         .map_err(Error::internal)?
         .ok_or_else(Error::unauthorized)?;
     let _read_only: bool = live.get(0);
-    crate::token_scopes::authorize_repository_late(tx, actor.token_id, actor.id, repository_id, action, false)
+    crate::token_scopes::authorize_repository_late(&**tx, actor.token_id, actor.id, repository_id, action, false)
         .await
         .map_err(auth::scope_error)?;
     Ok((gate, cluster_incarnation))
