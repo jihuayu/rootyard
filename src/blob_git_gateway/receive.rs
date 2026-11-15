@@ -41,7 +41,20 @@ use crate::ref_store::{CommitMode, CommitRejectCode, RefCommitResult};
 
 const MAX_NEW_PACKS: usize = 8;
 
+/// Every refusal of this route is rendered with `GatewayError::git`, so the
+/// push endpoint keeps its Smart HTTP `Basic` challenge; only the success and
+/// `report-status` answers below are built directly.
 pub(super) async fn receive_pack(
+    state: State<Arc<BlobGitState>>,
+    path: AxumPath<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    receive_pack_authorized(state, path, uri, headers, body).await.unwrap_or_else(GatewayError::git)
+}
+
+async fn receive_pack_authorized(
     State(state): State<Arc<BlobGitState>>,
     AxumPath((owner, raw_name)): AxumPath<(String, String)>,
     uri: Uri,

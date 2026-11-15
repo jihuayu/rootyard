@@ -157,6 +157,15 @@ pub(crate) use crate::ref_store::serving::AuthorityKind;
 pub(crate) use codec::SessionTokenCodec;
 #[cfg(test)]
 pub(crate) use codec::presented as presented_for_test;
+
+/// The lower bound a presented token frame names, without authenticating it or
+/// loading any live realm. `None` means the value is not a well-formed frame;
+/// it is never a revision. Callers use it only to reject a whole-body answer
+/// that would move the browser backwards; the framework still decides admission.
+pub(crate) fn presented_bound(token: &str) -> Option<i64> {
+    codec::bound_of(token)
+}
+
 pub(crate) use codec::{MAX_LIFETIME_SECONDS, MIN_LIFETIME_SECONDS};
 /// Header-only extraction of a presented token; the gateway read session and
 /// the keyring rotation tests both present real header values.

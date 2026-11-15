@@ -395,6 +395,9 @@ fn the_gateway_entry_and_compare_agree_without_global_state() {
     assert_eq!(descriptor.repository_id, live.repository_id);
     let json = serde_json::to_string(&descriptor).expect("descriptor json");
     assert!(!json.contains(second.token()), "{json}");
+    assert_eq!(crate::blob_git_gateway::repo_session::presented_bound(second.token()), Some(3));
+    assert_eq!(crate::blob_git_gateway::repo_session::presented_bound("not-a-token"), None);
+    assert_eq!(crate::blob_git_gateway::repo_session::presented_bound("rs1.short.mac"), None);
 }
 
 #[cfg(test)]

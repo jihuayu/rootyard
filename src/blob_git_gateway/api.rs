@@ -1,6 +1,12 @@
 //! Small JSON API: create/list/get Blob-gateway repositories and resolve one
 //! persisted operation identifier. Creation goes through the shared provision
 //! authority; a name is never turned into a filesystem path here.
+//!
+//! Every handler below is the public entry point of a top-level `/api` route
+//! *and* is relayed unchanged by the `/web/blob/api` aliases. Both are therefore
+//! wrapped once here ([`GatewayError::api`]): an unauthorized answer advertises
+//! `Bearer`, never the Basic challenge a browser `fetch` would enter. The
+//! `*_authorized` function keeps the `Result` the handler work always had.
 use std::sync::Arc;
 
 use axum::{
@@ -70,6 +76,14 @@ impl RepositoryView {
 }
 
 pub(super) async fn create_repo(
+    state: State<Arc<BlobGitState>>,
+    headers: HeaderMap,
+    input: Json<CreateRepository>,
+) -> Response {
+    create_repo_authorized(state, headers, input).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn create_repo_authorized(
     State(state): State<Arc<BlobGitState>>,
     headers: HeaderMap,
     Json(input): Json<CreateRepository>,
@@ -94,6 +108,15 @@ pub(super) async fn create_repo(
 }
 
 pub(super) async fn list_repos(
+    state: State<Arc<BlobGitState>>,
+    query: Query<ListQuery>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    list_repos_authorized(state, query, uri, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn list_repos_authorized(
     State(state): State<Arc<BlobGitState>>,
     Query(query): Query<ListQuery>,
     uri: Uri,
@@ -233,6 +256,14 @@ fn decode_cursor(raw: &str, scope: &str) -> Result<(Option<String>, Option<Strin
 }
 
 pub(super) async fn get_repo(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    get_repo_authorized(state, path, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn get_repo_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -259,6 +290,14 @@ pub(super) struct OperationView {
 }
 
 pub(super) async fn get_operation(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    get_operation_authorized(state, path, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn get_operation_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name, operation)): Path<(String, String, String)>,
     headers: HeaderMap,
@@ -347,13 +386,13 @@ pub(super) async fn get_operation(
 
 /// Explicit refusal: the smart HTTP vertical does not implement an LFS media
 /// service. It never pretends an LFS batch succeeded.
-pub(super) async fn unsupported_lfs() -> Result<Response, GatewayError> {
-    Err(GatewayError::NotImplemented("Git LFS is not implemented by the Blob Git gateway"))
+pub(super) async fn unsupported_lfs() -> Response {
+    GatewayError::NotImplemented("Git LFS is not implemented by the Blob Git gateway").api()
 }
 
 /// Explicit refusal: merge production is a later extension.
-pub(super) async fn unsupported_merge() -> Result<Response, GatewayError> {
-    Err(GatewayError::NotImplemented("merge production is not implemented by the Blob Git gateway"))
+pub(super) async fn unsupported_merge() -> Response {
+    GatewayError::NotImplemented("merge production is not implemented by the Blob Git gateway").api()
 }
 
 fn strip_name(raw: &str) -> Result<&str, GatewayError> {
