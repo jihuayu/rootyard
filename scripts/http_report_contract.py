@@ -66,6 +66,8 @@ INPUT_PATHS = (
     "scripts/http_report_contract.py",
     "scripts/issue107_http_report_validator.py",
     "scripts/native_build_receipt.py",
+    "scripts/native_report_manifest.py",
+    ".github/workflows/refstore-protocol-acceptance.yml",
 )
 
 

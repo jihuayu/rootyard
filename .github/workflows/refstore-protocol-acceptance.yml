@@ -13,6 +13,18 @@ on:
       - 'tests/blob_store_w1c_contract.rs'
       - 'tests/blob_store_w1c_native.py'
       - 'tests/ref_store_*.rs'
+      - 'tests/refstore_roots_http.py'
+      - 'tests/refstore_snapshot_http.py'
+      - 'tests/refstore_root_browse_http.py'
+      - 'tests/refstore_cancel_scope_race.py'
+      - 'tests/test_root_blob_fault_gate.py'
+      - 'tests/test_root_browse_race_cleanup.py'
+      - 'tests/test_issue107_http_report_validator.py'
+      - 'tests/test_issue107_native11_runner.py'
+      - 'tests/test_issue107_hosted_wiring.py'
+      - 'tests/test_blob_commit_unknown_ci_wiring.py'
+      - 'tests/ref_store_core_support/**'
+      - 'tests/verifier_budgets_support/**'
       - 'tests/retention_roots_support/**'
       - 'tests/format22_support/**'
       - 'tests/decision_subset_support/**'
@@ -51,7 +63,7 @@ concurrency:
 jobs:
   native:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     services:
       postgres:
         image: postgres:17
@@ -423,6 +435,139 @@ jobs:
           python3 tests/backup_blob_serving147.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --format22-fixture "$fixture" \
             --report test-results/refstore/standalone-paired-backup.json
+      - name: "Build and run the fixed issue107 HTTP13 and native11 acceptance inventory"
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_DELETE=disabled
+          export ROOTYARD_BLOB_ROOT="issue107-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_TEST_GIT="$(command -v git)"
+          binary="${ROOTYARD_STANDALONE_BIN:?missing prebuilt standalone CLI}"
+          cli_receipt="${ROOTYARD_STANDALONE_RECEIPT:?missing prebuilt standalone receipt}"
+          artifact_store="${ROOTYARD_ARTIFACT_STORE:?missing immutable artifact store}"
+          test -x "$binary" && test -f "$cli_receipt"
+          native11_dir="$RUNNER_TEMP/issue107-native11"
+          http_dir="test-results/refstore/issue107-http"
+          native_evidence_dir="test-results/refstore/issue107-native11"
+          rm -rf "$native11_dir"
+          mkdir -p "$native11_dir" "$http_dir" "$native_evidence_dir"
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          targets=(
+            ref_store_operations
+            ref_store_core
+            ref_store_core_snapshot
+            ref_store_artifact_holds
+            ref_store_packs
+            ref_store_pack_snapshots
+            ref_store_serving
+            ref_store_serving_reads
+            ref_store_materialized_reads
+            ref_store_retention_roots
+            ref_store_decision_subset
+          )
+          for target in "${targets[@]}"; do
+            output="$native11_dir/$target"
+            build_report="$native11_dir/$target.build-report.json"
+            stderr_file="$RUNNER_TEMP/issue107-native11-$target.stderr"
+            if ! python3 scripts/build_native_test.py \
+                --test "$target" --features pando-lab \
+                --artifact-store "$artifact_store" --output "$output" \
+                > "$build_report" 2> "$stderr_file"; then
+              echo "issue107 native11 preparation failed: $target" >&2
+              rm -f "$stderr_file"
+              exit 1
+            fi
+            rm -f "$stderr_file"
+            test -x "$output"
+            test -f "$output.build.json"
+          done
+          cp "$native11_dir"/*.build.json "$native_evidence_dir"/
+          cp "$native11_dir"/*.build-report.json "$native_evidence_dir"/
+          python3 tests/refstore_roots_http.py --binary "$binary" --git "$ROOTYARD_TEST_GIT" \
+            --report "$http_dir/roots.json"
+          python3 tests/refstore_snapshot_http.py --binary "$binary" --git "$ROOTYARD_TEST_GIT" \
+            --report "$http_dir/snapshot.json"
+          python3 tests/refstore_root_browse_http.py --binary "$binary" --git "$ROOTYARD_TEST_GIT" \
+            --report "$http_dir/root-browse.json"
+          python3 tests/refstore_cancel_scope_race.py --binary "$binary" --git "$ROOTYARD_TEST_GIT" \
+            --report "$http_dir/cancel-scope-race.json"
+          python3 scripts/issue107_http_report_validator.py \
+            --source-head "$GITHUB_SHA" --source-root "$GITHUB_WORKSPACE" \
+            --cli-binary "$binary" --cli-receipt "$cli_receipt" \
+            --report "roots=$http_dir/roots.json" \
+            --report "snapshot=$http_dir/snapshot.json" \
+            --report "root-browse=$http_dir/root-browse.json" \
+            --report "cancel-scope-race=$http_dir/cancel-scope-race.json"
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/refstore/issue107-http-job.json \
+            --expect-commit "$GITHUB_SHA" \
+            --build-receipt "$cli_receipt" --binary "$binary" \
+            --report "roots=$http_dir/roots.json" \
+            --report "snapshot=$http_dir/snapshot.json" \
+            --report "root-browse=$http_dir/root-browse.json" \
+            --report "cancel-scope-race=$http_dir/cancel-scope-race.json" \
+            --require-case "roots=roots_http_metadata_create_release_and_intent" \
+            --require-case "snapshot=snapshot_http_create_read_replay_after_ref_advance" \
+            --require-case "snapshot=snapshot_http_renew_release_expiry_and_exact_replay" \
+            --require-case "snapshot=snapshot_http_authz_malformed_and_cross_repo_refusals" \
+            --require-case "snapshot=snapshot_http_historical_tree_blob_and_current_reachability" \
+            --require-case "snapshot=snapshot_http_historical_tree_blob_auth_and_state_refusals" \
+            --require-case "snapshot=snapshot_http_historical_blob_common_read_bound" \
+            --require-case "root-browse=roots_http_browse_selected_closures" \
+            --require-case "root-browse=roots_http_browse_sha256" \
+            --require-case "root-browse=roots_http_post_json_scope_revocation_fence" \
+            --require-case "root-browse=roots_http_registered_pack_get_refusal_no_fallback" \
+            --require-case "cancel-scope-race=narrow_first_scope_denial_leaves_cancel_state_unchanged" \
+            --require-case "cancel-scope-race=cancel_first_late_scope_holds_until_terminal_commit" \
+            --harness '.github/workflows/refstore-protocol-acceptance.yml' \
+            --harness scripts/issue107_http_report_validator.py \
+            --harness scripts/http_report_contract.py \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/native_build_receipt.py \
+            --harness tests/refstore_roots_http.py \
+            --harness tests/refstore_snapshot_http.py \
+            --harness tests/refstore_root_browse_http.py \
+            --harness tests/refstore_cancel_scope_race.py \
+            --harness tests/blob_commit_unknown_service.py \
+            --harness tests/blob_only_service.py \
+            --harness tests/e2e.py \
+            --harness tests/native_evidence.py \
+            --harness tests/ops_provenance.py \
+            --harness tests/owned_fuse_cleanup.py \
+            --harness tests/blob_gateway_support/root_blob_fault_gate.py \
+            --harness tests/test_root_blob_fault_gate.py \
+            --harness tests/test_root_browse_race_cleanup.py \
+            --harness tests/test_issue107_http_report_validator.py \
+            --fixture postgres=postgres:17 \
+            --fixture 'garage=Garage v2.1.0 sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78e93ee8da7cf6a' \
+            --fixture-rust-from-receipt
+          target_args=()
+          receipt_args=()
+          for target in "${targets[@]}"; do
+            target_args+=(--target "$target=$native11_dir/$target")
+            receipt_args+=(--receipt "$target=$native11_dir/$target.build.json")
+          done
+          python3 scripts/issue107_native11_runner.py \
+            --source-head "$GITHUB_SHA" --source-root "$GITHUB_WORKSPACE" \
+            "${target_args[@]}" "${receipt_args[@]}" \
+            --report test-results/refstore/issue107-native11.json
+          python3 - "$GITHUB_SHA" test-results/refstore/issue107-native11.json <<'PY'
+          import json, pathlib, sys
+          sys.path.insert(0, str(pathlib.Path('scripts').resolve()))
+          import issue107_native11_runner as runner
+          report = json.loads(pathlib.Path(sys.argv[2]).read_text())
+          print(runner.validate_report(report, sys.argv[1]))
+          PY
       - name: "Run the seeded format22 ledger-validation PostgreSQL tests"
         id: format22_pg_tests
         timeout-minutes: 20
