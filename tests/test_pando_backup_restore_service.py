@@ -59,7 +59,7 @@ class Ac2SpecBoundaryTest(ReceiptFixture):
         self.assertEqual(ac2.AC2_SPEC.mandatory_cases, ac2.AC2_MANDATORY_CASES)
         self.assertEqual(len(ac2.AC2_MANDATORY_CASES), 7)
         self.assertIn("rootyard/pando-backup-restore-service-acceptance", ac2.AC2_SPEC.kind)
-        self.assertIn("format-23", json.dumps(ac2.AC2_SPEC.topology))
+        self.assertIn(f"format {ac2.schema_baseline.CURRENT_BACKUP_FORMAT}", json.dumps(ac2.AC2_SPEC.topology))
 
     def test_missing_or_false_ac2_case_cannot_pass(self) -> None:
         for missing in (False, True):
@@ -68,7 +68,7 @@ class Ac2SpecBoundaryTest(ReceiptFixture):
                 if missing:
                     del results["active_pin_reissued_under_new_authority_and_closure_remains_readable"]
                 else:
-                    results["archive_format_23_pando_only_and_backup_verify_passed"] = False
+                    results["archive_current_pando_only_and_backup_verify_passed"] = False
                 report = self._run_bound(results, {"source_tree": "b" * 40})
                 self.assertFalse(report["passed"])
                 self.assertEqual(report["failure"]["code"], "mandatory_case_not_passed")
@@ -77,7 +77,7 @@ class Ac2SpecBoundaryTest(ReceiptFixture):
                 status = "missing" if missing else "failed"
                 self.assertIn(
                     {"name": "active_pin_reissued_under_new_authority_and_closure_remains_readable"
-                     if missing else "archive_format_23_pando_only_and_backup_verify_passed",
+                     if missing else "archive_current_pando_only_and_backup_verify_passed",
                      "status": status},
                     report["cases"],
                 )
@@ -85,7 +85,7 @@ class Ac2SpecBoundaryTest(ReceiptFixture):
     def test_all_ac2_cases_and_safe_extra_pass(self) -> None:
         extra = {
             "source_tree": "c" * 40,
-            "archive": {"format": 23, "backup_verify_passed": True},
+            "archive": {"format": ac2.schema_baseline.CURRENT_BACKUP_FORMAT, "backup_verify_passed": True},
             "authority": {"authority_rotated": True, "generation_reset": 1},
             "permissions": {"source": {"owner_read": True}, "restored": {"owner_write": True}},
             "cleanup": {"services_stopped": True, "proxy_stopped": True},
@@ -101,6 +101,20 @@ class Ac2SpecBoundaryTest(ReceiptFixture):
             self.assertIs(report[name], True)
         self.assertEqual(report["source_tree"], "c" * 40)
         self.assertEqual(json.loads(self.report_path.read_text(encoding="utf-8")), report)
+
+    def test_archive_contract_rejects_old_or_incomplete_metadata(self) -> None:
+        current = ac2.schema_baseline.CURRENT_BACKUP_FORMAT
+        schema = list(ac2.schema_baseline.SCHEMA_VERSIONS)
+        self.assertTrue(ac2._archive_contract_matches(
+            current, schema, complete=True, blob_artifacts=0, pando_only=True))
+        self.assertFalse(ac2._archive_contract_matches(
+            23, schema, complete=True, blob_artifacts=0, pando_only=True))
+        self.assertFalse(ac2._archive_contract_matches(
+            current, schema[:-1], complete=True, blob_artifacts=0, pando_only=True))
+        self.assertFalse(ac2._archive_contract_matches(
+            current, schema, complete=False, blob_artifacts=0, pando_only=True))
+        self.assertFalse(ac2._archive_contract_matches(
+            current, schema, complete=True, blob_artifacts=1, pando_only=False))
 
     def test_extra_report_cannot_override_core_fields(self) -> None:
         report = self._run_bound(extra={"passed": True, "cases": []})
@@ -120,6 +134,7 @@ class Ac2SpecBoundaryTest(ReceiptFixture):
         self.assertRegex(ac2._endpoint_hash(endpoint), r"^[0-9a-f]{64}$")
         self.assertEqual(ac2._endpoint_hash(endpoint), ac2._endpoint_hash(endpoint))
         self.assertIn(ac1.GARAGE_FIXTURE, ac2.HARNESS_FILES)
+        self.assertIn(ac2.ROOT / "tests/schema_baseline.py", ac2.HARNESS_FILES)
         self.assertEqual(len(ac2.AC2_MANDATORY_CASES), 7)
 
     def test_ac2_preflight_binds_exact_garage_pin(self) -> None:

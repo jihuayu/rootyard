@@ -3,8 +3,8 @@
 
 The source is a real prebuilt Rootyard service on an owned PostgreSQL 17
 fixture, real Garage and real Vault Transit.  It provisions a normal Pando
-repository, pins the serving closure, stops every writer, takes a format-23
-Pando-only offline archive through the shipped CLI, and restores it into a
+repository, pins the serving closure, stops every writer, takes a current
+Pando-only metadata offline archive through the shipped CLI, and restores it into a
 second fresh owned PG17 database/data directory.  The restored Pando authority,
 closure, pins, Git reads/writes and owner/read-only/revoked tokens are checked
 without manufacturing SQL authority state.
@@ -43,10 +43,11 @@ if str(ROOT / "scripts") not in sys.path:
 import native_build_receipt as receipts  # noqa: E402
 import pando_pitr_service as binding  # noqa: E402
 import pando_pitr_physical_service as ac1  # noqa: E402
+import schema_baseline  # noqa: E402
 from pando_pitr_physical_pg import PhysicalPitrFixture  # noqa: E402
 
 AC2_MANDATORY_CASES = (
-    "archive_format_23_pando_only_and_backup_verify_passed",
+    "archive_current_pando_only_and_backup_verify_passed",
     "restore_authority_rotated_once_and_restore_generation_incremented_once",
     "old_authority_claim_not_reused_and_new_closure_readable",
     "source_and_restored_permissions_preserved",
@@ -60,12 +61,16 @@ AC2_TOPOLOGY = {
     "target_pg": "second fresh owned PG17 primary fixture used only as an empty isolated restore database",
     "object_store": "real owned Garage fixture via supplied ROOTYARD_OBJECT_STORE_* environment",
     "vault": "real Vault Transit fixture via supplied ROOTYARD_KMS_VAULT_* environment",
-    "archive": "shipped offline format-23 Pando-only archive, backup-verify and isolated restore",
+    "archive": (
+        f"shipped offline current Pando-only metadata archive (format {schema_baseline.CURRENT_BACKUP_FORMAT}, "
+        f"schema {schema_baseline.CURRENT_SCHEMA_VERSION}), backup-verify and isolated restore"),
     "scope": "AC2 Pando archive/restore authority, closure, pin, auth and one bounded export-failure slice only",
 }
 AC2_LIMITATIONS = (
     "Requires an actual source/config-bound prebuilt Rootyard binary and Root-supplied real Garage/Vault fixtures.",
-    "Format 23 Pando-only archives are exercised; format-24 paired Blob/RefStore, #169 durability, RPO/RTO and cross-provider migration are out of scope.",
+    f"Current Pando-only metadata archive format {schema_baseline.CURRENT_BACKUP_FORMAT} "
+    f"(schema {schema_baseline.CURRENT_SCHEMA_VERSION}) is exercised; current paired Blob/RefStore "
+    f"layout {schema_baseline.CURRENT_BLOB_BACKUP_FORMAT}, #169 durability, RPO/RTO and cross-provider migration are out of scope.",
     "The failed export gate is a single bounded proxy failure for one known Pando object GET, not a fault matrix; the offline backup path has no pre-GET attestation gate and no such refusal is claimed.",
     "Reports contain only fixed booleans/counts/hashes; SQL bodies, locators, credentials, object bytes and raw process output are excluded.",
     "A successful run is AC2 source execution evidence only; Issue #77 remains open until all required actual regressions and original AC evidence pass.",
@@ -78,6 +83,7 @@ AC2_SPEC = binding.AcceptanceSpec(
 )
 HARNESS_FILES = tuple(dict.fromkeys((
     *ac1.HARNESS_FILES,
+    ROOT / "tests/schema_baseline.py",
     ROOT / "tests/pando_backup_restore_service.py",
     ROOT / "tests/test_pando_backup_restore_service.py",
 )))
@@ -243,6 +249,17 @@ def _source_archive_facts(archive: Path) -> dict:
         "complete": (archive / "COMPLETE").is_file(),
         "schema_versions": manifest.get("schema_versions"),
     }
+
+
+def _archive_contract_matches(format_value, schema_versions, *, complete: bool,
+                              blob_artifacts: int, pando_only: bool) -> bool:
+    return bool(
+        format_value == schema_baseline.CURRENT_BACKUP_FORMAT
+        and schema_versions == list(schema_baseline.SCHEMA_VERSIONS)
+        and complete is True
+        and blob_artifacts == 0
+        and pando_only is True
+    )
 
 
 def _permission_checks(binary: str, service, remote: str, token_owner: str,
@@ -475,21 +492,37 @@ def _run_ac2_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
         }
 
         archive = archive_parent / "archive-ok"
+        expected_format = schema_baseline.CURRENT_BACKUP_FORMAT
+        expected_schema_versions = list(schema_baseline.SCHEMA_VERSIONS)
         backup_result = ac1._cli(binary, ["backup", str(archive), "--offline"], source_env, timeout=600)
-        if backup_result.get("format") != 23 or backup_result.get("complete") is not True or backup_result.get("blob_artifacts", 0) != 0:
-            raise ac1.PhysicalFailure("archive", "format23_not_selected")
+        if (backup_result.get("format") != expected_format
+                or backup_result.get("complete") is not True
+                or backup_result.get("blob_artifacts", 0) != 0):
+            raise ac1.PhysicalFailure("archive", "current_format_not_selected")
         verified = ac1._cli(binary, ["backup-verify", str(archive)], source_env, timeout=300)
         if verified.get("checksums_verified") is not True:
             raise ac1.PhysicalFailure("archive", "verify_failed")
         archive_facts = _source_archive_facts(archive)
-        if archive_facts.get("format") != 23 or archive_facts.get("pando_only") is not True or archive_facts.get("complete") is not True:
-            raise ac1.PhysicalFailure("archive", "manifest_not_pando_only")
+        if not _archive_contract_matches(
+            archive_facts.get("format"), archive_facts.get("schema_versions"),
+            complete=archive_facts.get("complete"),
+            blob_artifacts=backup_result.get("blob_artifacts", 0),
+            pando_only=archive_facts.get("pando_only"),
+        ):
+            raise ac1.PhysicalFailure("archive", "current_manifest_contract_mismatch")
         if _source_state(source_fixture.primary_url, authority, repo_id) != state_before_export:
             raise ac1.PhysicalFailure("archive", "source_mutated_by_backup")
-        cases["archive_format_23_pando_only_and_backup_verify_passed"] = True
+        cases["archive_current_pando_only_and_backup_verify_passed"] = True
         cases["single_export_failure_not_published_then_fresh_path_retry_passed"] = True
+        actual_schema = archive_facts.get("schema_versions")
+        actual_schema_version = (
+            actual_schema[-1] if isinstance(actual_schema, list) and actual_schema else None)
         extra["archive"] = {
             "format": archive_facts["format"],
+            "expected_format": expected_format,
+            "expected_schema_version": schema_baseline.CURRENT_SCHEMA_VERSION,
+            "actual_schema_version": actual_schema_version,
+            "schema_versions_match": actual_schema == expected_schema_versions,
             "pando_only": archive_facts["pando_only"],
             "backup_verify_passed": True,
             "partials_retained_until_cleanup": len(partials),
