@@ -19,6 +19,14 @@ import traceback
 import unittest
 import uuid
 
+TESTS = Path(__file__).resolve().parent
+LAB_ROOT = TESTS.parent
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
+from lab_binary import resolve_lab_binary  # noqa: E402
+
+LEGACY_WORKSPACE_BINARY = LAB_ROOT / "target" / "debug" / "rootyard-workspace-lab"
+
 
 def require(condition, message):
     if not condition:
@@ -3416,11 +3424,16 @@ def _run_reference_cli(argv):
 
 
 class WorkspaceHarness:
-    def __init__(self, binary_path="target/debug/rootyard-workspace-lab", reference_only=False):
+    def __init__(self, binary_path=None, reference_only=False):
         self.root = Path(tempfile.mkdtemp(prefix="rootyard-workspace-inc-"))
-        self.requested_binary = Path(binary_path).expanduser().resolve()
         self.runtime = "reference_model" if reference_only else "native_rust"
+        self.binding = None
         if reference_only:
+            # The labeled Python reference model never resolves, binds or runs
+            # the native artifact; keep the historical explicit-path field.
+            self.requested_binary = Path(
+                binary_path or LEGACY_WORKSPACE_BINARY
+            ).expanduser().resolve()
             wrapper = self.root / "rootyard-workspace-lab-reference"
             wrapper.write_text(
                 "#!/bin/sh\n"
@@ -3430,8 +3443,17 @@ class WorkspaceHarness:
             self.binary_cmd = [str(wrapper)]
             self.binary_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         else:
-            require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
-                    f"native Rust workspace binary missing or not executable: {self.requested_binary}")
+            # An explicit binary_path always wins. Otherwise the exported
+            # immutable ROOTYARD_WORKSPACE_LAB_BIN is selected, with the local
+            # target/debug prebuilt used only as the historical fallback.
+            selected = resolve_lab_binary(
+                "ROOTYARD_WORKSPACE_LAB_BIN",
+                legacy=LEGACY_WORKSPACE_BINARY,
+                explicit=binary_path,
+                purpose="WorkspaceHarness native lab",
+            )
+            self.requested_binary = selected.path
+            self.binding = selected.binding
             with self.requested_binary.open("rb") as stream:
                 require(stream.read(4) == b"\x7fELF",
                         "workspace binary is not a native ELF executable")
@@ -4272,7 +4294,9 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--reference-cli":
         return _run_reference_cli(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default="target/debug/rootyard-workspace-lab")
+    parser.add_argument("--binary", default=None,
+                        help="explicit prebuilt; defaults to ROOTYARD_WORKSPACE_LAB_BIN "
+                             "or the legacy target/debug prebuilt")
     parser.add_argument("--reference-only", action="store_true", help="run the labeled Python reference model")
     parser.add_argument("--report", default=None)
     parser.add_argument("--keep", action="store_true")

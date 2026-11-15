@@ -6,26 +6,30 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lab_binary import resolve_lab_binary  # noqa: E402
+
+# Historical local prebuilt fallback only.  It is used only when
+# ROOTYARD_VIEW_LAB_BIN is absent and never causes a build, PATH injection or
+# Cargo discovery.
 BINARY = ROOT / "target" / "debug" / "rootyard-view-lab"
 
 
 class ViewLabDecompositionAndSemanticsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not BINARY.is_file():
-            env = dict(os.environ)
-            env["PATH"] = f"{Path.home() / '.cargo' / 'bin'}:{env.get('PATH', '')}"
-            subprocess.run(
-                ["cargo", "build", "--locked", "--bin", "rootyard-view-lab"],
-                cwd=ROOT,
-                env=env,
-                check=True,
-            )
+        selected = resolve_lab_binary(
+            "ROOTYARD_VIEW_LAB_BIN",
+            legacy=BINARY,
+            purpose="View lab decomposition/integration tests",
+        )
+        cls.binary = selected.path
+        cls.binding = selected.binding
         git_bin = shutil.which(os.environ.get("ROOTYARD_VIEW_GIT", "git"))
         assert git_bin is not None, "git executable required"
         cls.git_binary = str(Path(git_bin).resolve())
@@ -76,7 +80,7 @@ class ViewLabDecompositionAndSemanticsTest(unittest.TestCase):
 
     def lab(self, *args, check=True):
         return subprocess.run(
-            [os.fspath(BINARY), *[os.fspath(a) for a in args]],
+            [os.fspath(self.binary), *[os.fspath(a) for a in args]],
             env=self.env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -40,6 +40,32 @@ readable/writable, or if `unshare -Urnm` cannot create private mount and
 network namespaces with a mounted tmpfs. Nothing is skipped and no global
 subreaper, sysctl or AppArmor policy is changed.
 
+Before that batch, CI builds a relocated `rust-library-test` harness with
+`scripts/build_native_test.py --lib --features pando-lab --strip-debuginfo`
+against the existing shared native-artifact store, then runs the ignored
+PostgreSQL start-gate lock-order regression directly (no Cargo `--` separator)
+through `scripts/run_pg_start_gate.py`. That runner requires a non-empty
+`ROOTYARD_TEST_DATABASE_URL`, reads the receipt only through the shared
+`native_build_receipt` v1/v2 contract, refuses zero-test/ignored/failed output,
+and writes a credential-free one-case report. Historical v1 receipts keep their
+Fresh=false/rebuilt-package semantics; v2 receipts must select the `rootyard`
+`lib-test` artifact from `src/lib.rs` with the pinned 64a6 Cargo/Rust toolchain
+and report Cargo's actual true/false/mixed freshness. Acceptance recomputes the
+current HEAD, source, support and `Cargo.lock` digests, and keeps the receipt's
+recorded v2 snapshot separate from the current digest. A separate
+`native_report_manifest.py --mode job` manifest binds that report to the test
+binary receipt, because its digest intentionally differs from the server
+binary. The test build precedes the CLI batch: it clears the rootyard package
+and would otherwise invalidate the server receipt.
+
+After the batch, the eight-case trusted HTTP authority matrix runs against
+the exported canonical `$ROOTYARD_BIN` snapshot and writes `test-results/ci-trust-boundaries.json`.
+The final native manifest requires each exact case name and binds the report
+plus all sixteen transitive Python/provenance inputs. Raw Rust test output,
+new service logs and the relocated test binary are never uploaded; the new
+PG/HTTP outputs are safe JSON receipts, reports and manifests, while the
+existing artifact list is preserved.
+
 Cheap but real native security, tenancy and concurrency regressions run against
 a single `scripts/build_native_batch.py` invocation that builds `target/debug/rootyard`
 together with the feature-enabled Cargo metadata bins and both selected RefStore
@@ -65,7 +91,8 @@ fixture integration-test executables, recording the batch in
 
 A final step, `scripts/native_report_manifest.py --mode job`, fails the job
 unless every report was produced by the exact binary whose SHA-256 appears in
-`target/debug/rootyard.build.json`, every declared case passed, the
+the immutable `.build.json` alias recorded by the v2 batch manifest (exported
+as `ROOTYARD_BUILD_RECEIPT`), every declared case passed, the
 `ci_webhook_regressions` log is non-empty and contains each expected phase
 marker, and the receipt's commit and compiled source-input digest were recorded.
 The manifest also binds the pagination, webhook reconciliation, worker
@@ -86,10 +113,61 @@ digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
 `git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
 the native tool provenance file. Injecting any of those defects turns the pull
 request red instead of leaving the regression to manual re-verification.
-The `e2e-report` artifact includes `target/debug/rootyard.build.json`,
+The `e2e-report` artifact includes the raw `rootyard.build.json` alias,
 `test-results/native-build-batch.json` and both `test-results/evidence/*.jsonl`
 and `test-results/*-evidence/*.jsonl`, so downloaded job manifests can be
-checked against the build receipt and batch manifest.
+checked against the immutable build receipt and batch manifest. It does not
+upload the artifact store or a target tree.
+
+## Pinned CargoFork in formal Rust jobs
+
+This section documents the tool-selection contract now present in the workflows;
+it does not record a hosted workflow run. Every formal Rust job installs rustup
+1.99.1 and then calls the shared `scripts/install_ci_cargo_fork.sh` before any
+`cargo fmt`, `cargo clippy`, `cargo test` or model build:
+
+* `ci.yml` (`verify`)
+* `refstore-protocol-acceptance.yml` (`native`)
+* `redis-contract.yml` (`redis-contract`)
+* `pando-lab.yml` (`isolated-lab`)
+* `refcas-log.yml` (`log-storage`)
+* `native-kernel-acceptance.yml` (`native-kernel-cgroup`)
+* `candidate-release-acceptance.yml` (`browser-native` and
+  `object-store-native`)
+
+The helper pins `jihuayu/cargo` at full revision
+`64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b` (Cargo 1.101.0). It bootstraps only
+with rustup 1.99.1's own Cargo (`rustup run 1.99.1 cargo install --git ...
+--rev ... --locked`), never with `rustup which cargo` and never by using the
+selected `cargo` on `PATH` as the bootstrap compiler. It reuses a valid cache
+entry keyed by OS, architecture, full revision and the bootstrap Cargo commit,
+or adopts a valid fork passed with `--reuse`; a valid entry is not cleaned,
+forced or rebuilt. Reuse re-verifies the full `cargo -vV` release/commit/host
+and the binary SHA-256 against the recorded metadata. The helper records the
+resolved path, full version, revision and SHA in a `cargo-fork.json` file (under
+`test-results/...` where the job uploads that tree, and in the native-kernel
+receipt directory).
+
+Each job then runs a separate pre-Cargo `verify --require-path` step. It requires
+the `cargo` on `PATH` to be the recorded fork, greps `cargo -vV` for
+`release: 1.101.0` and
+`commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b`, and requires
+`rustc -V` to remain `rustc 1.99.1`. If any check fails, no Cargo build or test
+runs.
+
+`actions/cache@v4` restores and saves only the fork executable. Its key includes
+the job id so a binary built in the Debian trixie candidate container is never
+restored into an Ubuntu 22.04 host job (and vice versa). The fork keeps one
+shared compiler cache in `~/.cargo/targets` per runner/worktree; the workflows
+do not set a per-commit `CARGO_TARGET_DIR`, do not clone a whole `target` tree,
+and do not add a remote service or a new job. Explicit Rust
+checks stay separate from the prebuilt Python acceptance suites, and no Python
+harness invokes the install helper.
+
+The `CI` `container` job builds through `Dockerfile` with a pinned
+`rust:1.99.1` build stage and the same helper, then copies only
+`/build/target/release/rootyard` into `debian:trixie-slim`. The final runtime
+image contains no rustup, compiler or Cargo cache.
 
 ## 专项与完整 candidate 分层 (specialised suites vs. the complete gate)
 
@@ -213,7 +291,9 @@ and every job asserts `git rev-parse HEAD` equals it before building.
   `object_store_postgres_server_version` / `object_store_postgres_client_version`
   so Debian container vs. Ubuntu PGDG client strings do not collide in
   `release-gate`, while `rust` stays shared); the `rust:1-trixie` container tag
-  and apt packages are mutable inputs, not immutable pins.
+  and apt packages are mutable base inputs, not immutable pins. The job still
+  installs rustup 1.99.1 and the pinned CargoFork before building, so the base
+  image's Cargo is never the formal driver.
 * `object-store-native` starts an ephemeral, job-owned Garage container pinned
   by tag and digest (`dxflrs/garage:v2.1.0@sha256:4c9b34c1...`) and runs:
   * `tests/lfs_hydration_concurrency.py` — concurrent cold hydration through the
@@ -238,6 +318,28 @@ and every job asserts `git rev-parse HEAD` equals it before building.
   unavailable, unsigned, malformed, unsigned-tailed or ambiguous the step fails
   rather than installing an unverified binary. The installed `git-lfs/<version>`
   output and `$RUNNER_TEMP/bin/git-lfs` precedence on `PATH` are asserted.
+Both native jobs build their one candidate binary through the explicit v2 CAS
+producer:
+
+```bash
+python3 scripts/build_native.py \
+  --features pando-lab \
+  --package-debug 0 \
+  --strip-debuginfo \
+  --artifact-store "$HOME/.cache/rootyard/native-artifacts"
+```
+
+`--artifact-store` is a Python producer option and is never added to the
+recorded Cargo argv. The store is one per-runner root outside the workspace and
+`target/`. Each job validates the producer's own JSON output and exports the
+actual `artifact_store.binary` and `artifact_store.build_receipt` as
+`ROOTYARD_BINARY` and `ROOTYARD_BUILD_RECEIPT`; the self-check, every browser
+and LFS harness, and both job manifests consume those canonical paths. Only a
+byte-identical copy of the raw `.build.json` receipt is placed under
+`test-results/candidate/...` for download. No mutable `target/debug` binary is
+copied or uploaded, and neither the artifact store nor a target/dependency tree
+is an artifact.
+
 * `release-gate` downloads both job manifests and runs
   `scripts/native_report_manifest.py --mode release`. It requires the two jobs to
   share the dispatched commit and one compiled source-input digest, re-verifies

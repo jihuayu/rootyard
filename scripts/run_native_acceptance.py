@@ -42,14 +42,23 @@ Plan shape (JSON)::
 
 ``argv`` runs with ``shell=False`` under ``scripts/native_acceptance_supervisor.py``.
 ``{run_id}``, ``{suite_id}`` and ``{run_dir}`` are substituted in argv, suite
-environment and isolation values. Sensitive credentials and credential URLs
-belong to the runner process environment, never to the plan. Validation only
-refuses URI-like values under sensitive top-level environment keys. Inherited
-sensitive values are redacted from the report, but suite logs (mode 0600) may
-contain secrets and must stay private. ``--dry-run`` starts nothing and creates
-no run directory; a real run creates the run directory and report parent. The
-lock directory must already exist, and lock, run, log and report paths must
-resolve outside ``--verify-host`` (the plan file need not).
+environment and isolation values. Plans are operator-trusted, but validation
+refuses direct known compiler/builder commands (Cargo/rustc and the
+``build_native*.py`` helpers) behind a finite literal-argv wrapper set: ``env``
+assignments and its supported operand options, and ``timeout`` options plus a
+duration. A recognized wrapper form that cannot be
+peeled safely is refused rather than guessed. Run explicit build preparation
+outside the runner and pass only the prepared artifact. This is not a general
+shell sandbox: shell text, ``env -S`` strings, ``python -c`` bodies and renamed
+wrappers are not interpreted. Sensitive
+credentials and credential URLs belong to the runner process environment, never
+to the plan. Validation only refuses URI-like values under sensitive top-level
+environment keys. Inherited sensitive values are redacted from the report, but
+suite logs (mode 0600) may contain secrets and must stay private. ``--dry-run``
+starts nothing and creates no run directory; a real run creates the run
+directory and report parent. The lock directory must already exist, and lock,
+run, log and report paths must resolve outside ``--verify-host`` (the plan file
+need not).
 
 Owned-descendant lifecycle (Linux only): the runner passes suite argv to the
 supervisor. The Linux supervisor is a child subreaper, so orphaned descendants are reparented to it or to an intermediate descendant subreaper rather than to init, remaining within the supervisor's descendant tree. It builds a ``/proc`` parent-child
@@ -115,6 +124,14 @@ SELF_ENV = ("ROOTYARD_ACCEPTANCE_RUN_ID", "ROOTYARD_ACCEPTANCE_SUITE", "ROOTYARD
 LEASE_ENV_PREFIXES = ("ROOTYARD_OBJECT_STORE_", "ROOTYARD_BLOB_")
 SENSITIVE_ENV = re.compile(r"SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|API_KEY"
                            r"|DATABASE_URL|POSTGRES_URL", re.I)
+# Direct commands whose purpose is compiling or cleaning this checkout. This is
+# an accidental-build guard for operator-trusted plans, not a security boundary.
+BUILD_EXECUTABLES = frozenset({"cargo", "rustc", "cargo-clippy", "clippy-driver"})
+# check_redis_contract.py is a reviewed prebuilt-only consumer, not a producer: it
+# requires an explicit executable and receipt and is intentionally not listed.
+BUILD_SCRIPTS = frozenset({"build_native.py", "build_native_test.py", "build_native_batch.py"})
+BUILD_MODULES = frozenset(name[:-3] for name in BUILD_SCRIPTS)
+PYTHON_EXECUTABLE = re.compile(r"^(?:python|python3|python3\.\d+|pypy3?)(?:\.exe)?$", re.I)
 URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
 AUTH_HEADER = re.compile(r"(?i)((?:authorization|proxy-authorization)\s*:\s*)(?:basic|bearer|token)\s+\S+")
 SENSITIVE_ASSIGNMENT = re.compile(
@@ -195,6 +212,172 @@ def load_plan(path):
     return plan
 
 
+def _command_name(token):
+    name = Path(token).name.lower()
+    return name[:-4] if name.endswith(".exe") else name
+
+
+class _WrapperFormError(Exception):
+    """A supported finite wrapper has a form that cannot be peeled safely."""
+
+
+# Only these literal wrapper prefixes are interpreted. An option outside the
+# set is refused rather than guessed, because a wrong guess could walk past a
+# hidden builder. ``env -S`` strings and shell text are never interpreted.
+_ENV_FLAGS = frozenset({"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"})
+_ENV_OPERANDS = frozenset({"-u", "--unset", "-C", "--chdir"})
+_ENV_LONG_OPERANDS = frozenset({"--unset", "--chdir"})
+_ENV_ATTACHED = ("-u", "-C")
+_TIMEOUT_FLAGS = frozenset({"--preserve-status", "--foreground", "-v", "--verbose"})
+_TIMEOUT_OPERANDS = frozenset({"-s", "--signal", "-k", "--kill-after"})
+_TIMEOUT_LONG_OPERANDS = frozenset({"--signal", "--kill-after"})
+_TIMEOUT_ATTACHED = ("-s", "-k")
+_TIMEOUT_DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+_WRAPPER_DEPTH = 8
+
+
+def _operand_end(arguments, index, option):
+    if index + 1 >= len(arguments):
+        raise _WrapperFormError(f"{option} needs an operand")
+    return index + 2
+
+
+def _env_command(arguments):
+    """Peel the finite ``env`` prefix; this is literal argv, not shell parsing."""
+    index = 0
+    options = True
+    while index < len(arguments):
+        item = arguments[index]
+        if options and item == "--":
+            options = False  # assignments still precede the command
+            index += 1
+            continue
+        if options and item.startswith("-"):
+            if item in _ENV_FLAGS:
+                index += 1
+                continue
+            if item in _ENV_OPERANDS:
+                index = _operand_end(arguments, index, item)
+                continue
+            name, separator, value = item.partition("=")
+            if name in _ENV_LONG_OPERANDS:
+                if not separator or not value:
+                    raise _WrapperFormError(f"env option {item!r} needs a non-empty operand")
+                index += 1
+                continue
+            if any(item.startswith(option) and len(item) > len(option) for option in _ENV_ATTACHED):
+                index += 1  # -uNAME / -CDIR
+                continue
+            raise _WrapperFormError(f"env option {item!r} is outside the finite supported set")
+        if "=" in item:
+            index += 1  # NAME=VALUE assignment
+            continue
+        return arguments[index:]
+    return []
+
+
+def _timeout_command(arguments):
+    """Peel the finite ``timeout`` option/duration prefix; literal argv only."""
+    index = 0
+    while index < len(arguments):
+        item = arguments[index]
+        if item == "--":
+            index += 1
+            break
+        if not item.startswith("-"):
+            break
+        if item in _TIMEOUT_FLAGS:
+            index += 1
+            continue
+        if item in _TIMEOUT_OPERANDS:
+            index = _operand_end(arguments, index, item)
+            continue
+        name, separator, value = item.partition("=")
+        if name in _TIMEOUT_LONG_OPERANDS:
+            if not separator or not value:
+                raise _WrapperFormError(f"timeout option {item!r} needs a non-empty operand")
+            index += 1
+            continue
+        if any(item.startswith(option) and len(item) > len(option) for option in _TIMEOUT_ATTACHED):
+            index += 1  # -sSIGNAL / -kDURATION
+            continue
+        raise _WrapperFormError(f"timeout option {item!r} is outside the finite supported set")
+    if index >= len(arguments):
+        raise _WrapperFormError("timeout needs a duration before the command")
+    duration = arguments[index]
+    if not _TIMEOUT_DURATION.match(duration):
+        raise _WrapperFormError(f"timeout duration {duration!r} is not a finite duration")
+    return arguments[index + 1:]
+
+
+def _python_script(arguments):
+    """Return the script/module after interpreter options; ``-c`` is not interpreted."""
+    index = 0
+    while index < len(arguments):
+        item = arguments[index]
+        if item == "-m":
+            return arguments[index + 1] if index + 1 < len(arguments) else None
+        if item == "-c":
+            return None
+        if item in ("-W", "-X"):
+            index += 2
+        elif item.startswith("-"):
+            index += 1
+        else:
+            return item
+    return None
+
+
+def _known_build_command(argv):
+    """Name the direct builder a finite ``env``/``timeout``/Python wrapper executes, if any."""
+    words = list(argv)
+    for _ in range(_WRAPPER_DEPTH):
+        if not words:
+            return None
+        name = _command_name(words[0])
+        if name in BUILD_EXECUTABLES or name in BUILD_SCRIPTS:
+            return name
+        if name == "env":
+            words = _env_command(words[1:])
+            continue
+        if name == "timeout":
+            words = _timeout_command(words[1:])
+            continue
+        if PYTHON_EXECUTABLE.match(name):
+            target = _python_script(words[1:])
+            if not target:
+                return None
+            name = _command_name(target)
+            if name in BUILD_SCRIPTS:
+                return name
+            module = name[:-3] if name.endswith(".py") else name.replace("/", ".").rsplit(".", 1)[-1]
+            return module + ".py" if module in BUILD_MODULES else None
+        return None
+    if not words:
+        return None
+    raise _WrapperFormError("wrapper nesting exceeds the finite supported depth")
+
+
+def reject_build_commands(suite_id, argv):
+    try:
+        command = _known_build_command(argv)
+    except _WrapperFormError as error:
+        raise PlanError(
+            f"{suite_id}: argv uses a wrapper form the fixed prebuilt-only guard cannot peel safely "
+            f"({error}); acceptance plans are prebuilt-only. Keep suite argv literal, or run build or "
+            "clean preparation explicitly outside this runner and pass only the prepared artifact. "
+            "This guard is not a general shell sandbox: it does not interpret shell text or env -S "
+            "strings, and it does not protect against renamed wrappers."
+        ) from None
+    require(
+        command is None,
+        f"{suite_id}: argv is a recognized build/clean command ({command}); acceptance plans are "
+        "prebuilt-only. Run build or clean preparation explicitly outside this runner and pass only "
+        "the prepared artifact to the suite. This fixed guard stops accidental hidden builds; it is "
+        "not a general shell sandbox.",
+    )
+
+
 def validate_suite(suite, seen):
     require(isinstance(suite, dict), "every suite must be an object")
     suite_id = suite.get("id")
@@ -205,6 +388,7 @@ def validate_suite(suite, seen):
     argv = suite.get("argv")
     require(isinstance(argv, list) and argv and all(isinstance(item, str) and item for item in argv),
             f"{suite_id}: argv must be a non-empty array of strings")
+    reject_build_commands(suite_id, argv)
     timeout = suite.get("timeout_seconds")
     require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and 0 < timeout <= 86400,
             f"{suite_id}: timeout_seconds must be a positive number")

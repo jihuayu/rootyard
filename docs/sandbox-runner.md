@@ -242,15 +242,22 @@ runs when an operator dispatches it.
   receipt artifact, so a failing hosted run is diagnosable without a second
   guess.
 - Source equivalence: the checkout step uses `persist-credentials: false`, the
-  build step requires `git rev-parse HEAD == GITHUB_SHA` with a clean tree,
-  builds with `cargo build --locked --bin rootyard`, and the receipt records
-  both `source_commit` and `binary_sha256` (also written to
-  `binary.sha256`). The receipt therefore pins which source was compiled and
-  which binary ran; it never claims that a different commit produced an older
-  hash. This fix commit changes only workflow/test/script/docs files, so `src/`
-  and `Cargo.*` stay byte-identical to the qualified 4c28c39 tree and the
-  reported binary hash is directly comparable with the preserved 4c28c39
-  artifacts.
+  build step requires `git rev-parse HEAD == GITHUB_SHA` with a clean tree, and
+  builds through the explicit v2 CAS producer
+  `python3 scripts/build_native.py --artifact-store
+  "$HOME/.cache/rootyard/native-artifacts"`. The producer preserves the raw
+  command's default profile and features; no strip, debug or feature selector
+  is added. The step validates the producer's own JSON and exports the actual
+  `artifact_store.binary` and `artifact_store.build_receipt` as
+  `ROOTYARD_BINARY` and `ROOTYARD_BUILD_RECEIPT`; the self-check,
+  `binary.sha256`, supervisor handoff and fallback receipt all consume that
+  canonical absolute snapshot, and the raw builder receipt is copied
+  byte-for-byte into the receipt directory. The native receipt therefore pins
+  which source was compiled and which binary ran; it never claims that a
+  different commit produced an older hash. This fix commit changes only
+  workflow/test/script/docs files, so `src/` and `Cargo.*` stay byte-identical
+  to the qualified 4c28c39 tree and the reported binary hash is directly
+  comparable with the preserved 4c28c39 artifacts.
 - Setup (root, bounded): `scripts/native_kernel_cgroup_setup.sh setup
   "$GITHUB_RUN_ID" "$(id -u)" "$(id -g)"` provisions only
   `/sys/fs/cgroup/rootyard-native-<run-id>` and delegates it to the runner

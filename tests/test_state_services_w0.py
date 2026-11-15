@@ -10,6 +10,7 @@ import textwrap
 import time
 import unittest
 import zlib
+from contextlib import contextmanager
 from unittest import mock
 from pathlib import Path
 
@@ -133,6 +134,18 @@ def workload_with(**changes):
     if bounds:
         workload["bounds"].update(bounds)
     return workload
+
+
+@contextmanager
+def owned_tempdir(prefix):
+    """Private temp parent for one focused test's allocations and residue check."""
+    parent = tempfile.TemporaryDirectory(prefix=prefix)
+    try:
+        owned = Path(parent.name)
+        with mock.patch.object(tempfile, "tempdir", str(owned)):
+            yield owned
+    finally:
+        parent.cleanup()
 
 
 def fixture_root_names():
@@ -347,37 +360,81 @@ class TempAdmissionTest(unittest.TestCase):
         self.assertEqual(lines["grandchild"], str(tmpdir))
         self.assertTrue(Path(lines["made"]).is_relative_to(tmpdir), "mkdtemp must land in the owned TMPDIR")
 
-    def test_owned_temp_overflow_after_a_measured_push_is_truncated_and_cleaned(self):
-        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
-        script = textwrap.dedent(f"""
+    def overflow_script(self, workload):
+        return textwrap.dedent(f"""
             import os, tempfile
             tempfile.mkdtemp()
             with open(os.path.join(os.environ["TMPDIR"], "blob"), "wb") as handle:
                 handle.write(b"\\0" * {workload["bounds"]["max_temp_bytes"]})
             """)
-        before = set(os.listdir(tempfile.gettempdir()))
+
+    def run_overflow_fixture(self, workload, before_probe=None):
+        script = self.overflow_script(workload)
         original_run = baseline.Runner.run
 
         def push_then_overflow(run_self, command, **options):
             output = original_run(run_self, command, **options)
             if options.get("label") == "git push":
+                if before_probe is not None:
+                    before_probe()
                 # After the push time is taken and before its checkpoint.
                 run_self.run([sys.executable, "-c", script], label="temp probe")
             return output
 
         with mock.patch.object(baseline.Runner, "run", push_then_overflow):
-            metrics, truncated, budget = run_fixture(workload)
-        temp = metrics["runner.temp_bytes"]
-        self.assertTrue(truncated)
-        self.assertEqual(metrics["git.receive_pack.small_pack.latency_ms"]["n"], 1)
-        self.assertIn("git push: owned fixture tree holds", temp["stop_reason"])
-        self.assertIn("beyond max_temp_bytes", temp["stop_reason"])
-        # The peak is the real observed size, not clamped to the budget.
-        self.assertGreater(temp["peak_charged_bytes"], temp["budget_bytes"])
-        self.assertEqual(temp["peak_charged_bytes"], budget.peak)
-        self.assertNotIn("cleanup_error", temp)
-        self.assertEqual(set(os.listdir(tempfile.gettempdir())), before,
-                         "the overflowed fixture and its TMPDIR contents must be removed")
+            return run_fixture(workload)
+
+    def assert_owned_overflow_cleaned(self, owned, before, budget):
+        self.assertFalse(budget.root.exists(), "the overflowed fixture root must be removed")
+        self.assertEqual(set(os.listdir(owned)), before,
+                         "no owned temp parent residue after the overflow")
+
+    def test_owned_temp_overflow_after_a_measured_push_is_truncated_and_cleaned(self):
+        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
+        with owned_tempdir("rootyard-w0-overflow-") as owned:
+            before = set(os.listdir(owned))
+            metrics, truncated, budget = self.run_overflow_fixture(workload)
+            temp = metrics["runner.temp_bytes"]
+            self.assertTrue(truncated)
+            self.assertEqual(metrics["git.receive_pack.small_pack.latency_ms"]["n"], 1)
+            self.assertIn("git push: owned fixture tree holds", temp["stop_reason"])
+            self.assertIn("beyond max_temp_bytes", temp["stop_reason"])
+            # The peak is the real observed size, not clamped to the budget.
+            self.assertGreater(temp["peak_charged_bytes"], temp["budget_bytes"])
+            self.assertEqual(temp["peak_charged_bytes"], budget.peak)
+            self.assertNotIn("cleanup_error", temp)
+            self.assert_owned_overflow_cleaned(owned, before, budget)
+
+    def test_owned_temp_overflow_ignores_foreign_temp_churn(self):
+        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
+        # An unrelated host/worker temp directory may disappear during the run;
+        # only this test's owned parent is in scope.
+        unrelated = tempfile.TemporaryDirectory(prefix="rootyard-w0-unrelated-")
+        try:
+            with owned_tempdir("rootyard-w0-overflow-") as owned:
+                _metrics, truncated, budget = self.run_overflow_fixture(
+                    workload, before_probe=unrelated.cleanup)
+                self.assertTrue(truncated)
+                self.assert_owned_overflow_cleaned(owned, set(), budget)
+        finally:
+            unrelated.cleanup()
+
+    def test_owned_temp_overflow_fails_on_owned_residue(self):
+        workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
+        original_rmtree = baseline.shutil.rmtree
+
+        def leave_owned_residue(path, *args, **kwargs):
+            original_rmtree(path, *args, **kwargs)
+            residue = Path(tempfile.gettempdir()) / "rootyard-w0-overflow-owned-residue"
+            residue.mkdir(exist_ok=True)
+            (residue / "payload").write_bytes(b"owned residue")
+
+        with owned_tempdir("rootyard-w0-overflow-") as owned:
+            before = set(os.listdir(owned))
+            with mock.patch.object(baseline.shutil, "rmtree", leave_owned_residue):
+                with self.assertRaisesRegex(AssertionError, "no owned temp parent residue"):
+                    _metrics, _truncated, budget = self.run_overflow_fixture(workload)
+                    self.assert_owned_overflow_cleaned(owned, before, budget)
 
     def test_owned_temp_overflow_before_any_push_is_refused_and_caller_cleans(self):
         workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 1, "file_bytes": 0})
@@ -732,37 +789,81 @@ class ReportContractTest(unittest.TestCase):
 
     def assert_aborted_report(self, failure):
         workload = workload_with(git={"repo_count": 1, "pushes_per_repo": 2, "file_bytes": 64})
-        before = set(os.listdir(tempfile.gettempdir()))
-        with _AbortedRun(failure) as aborted:
-            status, report = self.run_main_in_process(workload)
-        self.assertEqual(status, 0)
-        self.assertIsNotNone(report, "an aborted run that started work must still write a report")
-        self.assertTrue(report["truncated"])
-        self.assertFalse(report["metrics"]["pg.round_trip.latency_ms"]["status"] == "measured")
-        budget = aborted.budget
-        self.assertIsNotNone(budget)
-        self.assertFalse(budget.root, "the owned root must be removed")
-        self.assertEqual(set(os.listdir(tempfile.gettempdir())), before, "no residue from the aborted run")
-        temp = report["metrics"]["runner.temp_bytes"]
-        limits = report["limits"]["temp_budget"]
-        for facts in (temp, limits):
-            self.assertEqual(facts["budget_bytes"], budget.budget)
-            self.assertEqual(facts["peak_charged_bytes"], budget.peak)
-            self.assertEqual(facts["checkpoints"], budget.checkpoints)
-            self.assertEqual(facts["returned_pushes_per_repo"], 1,
-                             "the effective push count survives an aborted run")
-        self.assertEqual(temp["cleaned"], True)
-        self.assertIn(str(failure), temp["stop_reason"])
-        self.assertEqual(limits["estimate_bytes"], budget.estimate)
-        self.assertEqual(temp["admission_estimate_bytes"], budget.estimate)
-        self.assertEqual(report["limits"]["admission"]["returned_pushes_per_repo"], 1)
-        self.assertNotIn("cleanup_error", temp)
+        # Own every temporary path this helper creates. main allocates its
+        # fixture root through tempfile.mkdtemp; redirecting tempfile.tempdir
+        # for the run keeps that root (and run_main_in_process's workload and
+        # report files) under this private parent instead of the shared system
+        # temp directory. The residue check therefore observes only paths this
+        # helper owns, not unrelated host or worker temp activity.
+        parent = tempfile.TemporaryDirectory(prefix="rootyard-w0-aborted-")
+        try:
+            owned = Path(parent.name)
+            before = set(os.listdir(owned))
+            with mock.patch.object(tempfile, "tempdir", str(owned)):
+                with _AbortedRun(failure) as aborted:
+                    status, report = self.run_main_in_process(workload)
+                self.assertEqual(status, 0)
+                self.assertIsNotNone(report, "an aborted run that started work must still write a report")
+                self.assertTrue(report["truncated"])
+                self.assertFalse(report["metrics"]["pg.round_trip.latency_ms"]["status"] == "measured")
+                budget = aborted.budget
+                self.assertIsNotNone(budget)
+                self.assertFalse(budget.root, "the owned root must be removed")
+                self.assertEqual(set(os.listdir(owned)), before,
+                                 "no residue from the aborted run in the owned temp parent")
+                temp = report["metrics"]["runner.temp_bytes"]
+                limits = report["limits"]["temp_budget"]
+                for facts in (temp, limits):
+                    self.assertEqual(facts["budget_bytes"], budget.budget)
+                    self.assertEqual(facts["peak_charged_bytes"], budget.peak)
+                    self.assertEqual(facts["checkpoints"], budget.checkpoints)
+                    self.assertEqual(facts["returned_pushes_per_repo"], 1,
+                                     "the effective push count survives an aborted run")
+                self.assertEqual(temp["cleaned"], True)
+                self.assertIn(str(failure), temp["stop_reason"])
+                self.assertEqual(limits["estimate_bytes"], budget.estimate)
+                self.assertEqual(temp["admission_estimate_bytes"], budget.estimate)
+                self.assertEqual(report["limits"]["admission"]["returned_pushes_per_repo"], 1)
+                self.assertNotIn("cleanup_error", temp)
+        finally:
+            parent.cleanup()
 
     def test_pre_first_push_budget_violation_still_reports_truncation_and_budget(self):
         self.assert_aborted_report(baseline.BudgetViolation("git commit: owned fixture tree holds 9 bytes"))
 
     def test_generic_limit_exceeded_still_reports_truncation_and_budget(self):
         self.assert_aborted_report(baseline.LimitExceeded("child ignored SIGKILL; aborting runner"))
+
+    def test_aborted_report_ignores_unrelated_system_temp_churn(self):
+        # An unrelated host/worker temp directory may disappear while the
+        # helper runs. Only the helper's own private parent is in scope.
+        unrelated = tempfile.TemporaryDirectory(prefix="rootyard-w0-unrelated-")
+        original_cleanup = baseline.TempBudget.cleanup
+
+        def cleanup_with_unrelated_churn(budget):
+            unrelated.cleanup()
+            return original_cleanup(budget)
+
+        try:
+            with mock.patch.object(baseline.TempBudget, "cleanup", cleanup_with_unrelated_churn):
+                self.assert_aborted_report(baseline.LimitExceeded("unrelated temp churn"))
+        finally:
+            unrelated.cleanup()
+
+    def test_aborted_report_fails_on_owned_temp_residue(self):
+        original_cleanup = baseline.TempBudget.cleanup
+
+        def cleanup_leaving_owned_residue(budget):
+            error = original_cleanup(budget)
+            owned_parent = Path(tempfile.gettempdir())
+            residue = owned_parent / "rootyard-w0-git-owned-residue"
+            residue.mkdir()
+            (residue / "payload").write_bytes(b"owned residue")
+            return error
+
+        with mock.patch.object(baseline.TempBudget, "cleanup", cleanup_leaving_owned_residue):
+            with self.assertRaisesRegex(AssertionError, "no residue from the aborted run"):
+                self.assert_aborted_report(baseline.LimitExceeded("owned residue must fail"))
 
     def test_redaction_and_scan_detect_secret_shapes(self):
         redacted = baseline.redact({"dsn": "a", "note": "see postgresql://u:pw@host/db", "nested": [{"password": "x"}]})

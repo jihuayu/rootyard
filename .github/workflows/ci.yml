@@ -68,6 +68,31 @@ jobs:
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
           rustup default 1.99.1
           rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          # Cache only the fork executable. The fork keeps one shared compiler
+          # cache in ~/.cargo/targets per runner/worktree; do not add a
+          # per-commit CARGO_TARGET_DIR or clone a target tree here. The job id
+          # keeps a Debian trixie container binary out of an Ubuntu host cache.
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/ci-cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
       - name: Test bounded Kafka download helper
         run: python3 -m unittest discover -s tests -p 'test_download_ci_kafka.py'
       - name: Prepare verified isolated Kafka distribution
@@ -99,6 +124,38 @@ jobs:
       - name: Verify PostgreSQL RefStore registry and metadata-core contracts
         timeout-minutes: 5
         run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds -- --ignored --test-threads=1
+      - name: Build relocated rootyard library test harness for the PostgreSQL start gate
+        timeout-minutes: 10
+        run: |
+          python3 scripts/build_native_test.py \
+            --lib \
+            --features pando-lab \
+            --strip-debuginfo \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            --output test-results/rootyard-lib-tests
+      - name: Verify managed PostgreSQL sandbox start-gate lock order
+        timeout-minutes: 10
+        run: |
+          python3 scripts/run_pg_start_gate.py \
+            --test-binary test-results/rootyard-lib-tests \
+            --build-receipt test-results/rootyard-lib-tests.build.json \
+            --report test-results/pg-start-gate.json \
+            --expected-commit "$GITHUB_SHA"
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/native-pg-start-gate.json \
+            --build-receipt test-results/rootyard-lib-tests.build.json \
+            --binary test-results/rootyard-lib-tests \
+            --expect-commit "$GITHUB_SHA" \
+            --report pg_start_gate=test-results/pg-start-gate.json \
+            --require-case pg_start_gate=sandbox::runner::tests::start_gate_serializes_context_removal_under_policy_fence \
+            --harness scripts/run_pg_start_gate.py \
+            --harness tests/test_pg_start_gate_runner.py \
+            --harness src/sandbox/runner.rs \
+            --harness scripts/build_native_test.py \
+            --harness scripts/build_native.py \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/native_build_receipt.py \
+            --harness .github/workflows/ci.yml
       - name: Build native bins and RefStore fixtures in one batch
         timeout-minutes: 10
         run: |
@@ -110,11 +167,28 @@ jobs:
             --output test-results/refstore-snapshot-fixture \
             --test ref_store_holds_backup_fixture \
             --output test-results/refstore-holds-fixture \
-            --manifest-out test-results/native-build-batch.json
+            --manifest-out test-results/native-build-batch.json \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts"
+      - name: Export immutable native artifact paths
+        run: |
+          python3 scripts/export_native_artifacts.py \
+            --manifest test-results/native-build-batch.json \
+            --github-env "$GITHUB_ENV" \
+            --bin rootyard=ROOTYARD_BIN \
+            --bin rootyard-workspace-lab=ROOTYARD_WORKSPACE_LAB_BIN \
+            --bin rootyard-view-lab=ROOTYARD_VIEW_LAB_BIN \
+            --bin rootyard-pando-lab=ROOTYARD_PANDO_LAB_BIN \
+            --bin rootyard-vfs-mount=ROOTYARD_VFS_MOUNT_BIN \
+            --bin-receipt rootyard=ROOTYARD_BUILD_RECEIPT \
+            --test ref_store_snapshot_backup_fixture=ROOTYARD_SNAPSHOT_FIXTURE \
+            --test ref_store_holds_backup_fixture=ROOTYARD_HOLDS_FIXTURE
+      - name: Exercise trusted CI HTTP authority boundaries
+        timeout-minutes: 10
+        run: python3 tests/ci_trust_boundaries.py --binary "$ROOTYARD_BIN" --report test-results/ci-trust-boundaries.json --expected-commit "$GITHUB_SHA"
       - name: Verify design documentation integrity
         run: python3 scripts/check_design_docs.py
       - name: Verify schema-030 catalog and dump round trip
-        run: python3 tests/schema_contract.py --binary target/debug/rootyard
+        run: python3 tests/schema_contract.py --binary "$ROOTYARD_BIN"
       - name: Verify end-to-end harness synchronization
         run: python3 -m unittest discover -s tests -p 'test_e2e_sync.py'
       - name: Reject missing executables and non-server stubs
@@ -126,22 +200,24 @@ jobs:
           test-results/ci-tools/client-venv/bin/pip install pygit2==1.19.0 cffi==2.1.1 pycparser==3.12
       - name: Exercise stock Git, JGit and libgit2 against the Rust service
         run: |
-          ROOTYARD_JGIT_CLASSPATH="$PWD/test-results/ci-tools/clients/jgit-libs/*" ROOTYARD_PYGIT2_PYTHON="$PWD/test-results/ci-tools/client-venv/bin/python" python3 tests/client_compatibility.py --binary target/debug/rootyard --report test-results/client-compatibility.json
+          ROOTYARD_JGIT_CLASSPATH="$PWD/test-results/ci-tools/clients/jgit-libs/*" ROOTYARD_PYGIT2_PYTHON="$PWD/test-results/ci-tools/client-venv/bin/python" python3 tests/client_compatibility.py --binary "$ROOTYARD_BIN" --report test-results/client-compatibility.json
       - name: Verify parallel track and schema baseline boundaries
         run: python3 -m unittest discover -s tests -p 'test_parallel_boundaries.py'
       - name: Run all Python unit and Tier-5 adversarial contract suites
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
+        # Full discovery stays unfiltered; the runner adds per-test progress and
+        # periodic stderr thread stacks without changing exit semantics.
+        run: python3 scripts/run_python_ci_tests.py
       - name: Exercise native Git end to end
-        run: python3 tests/e2e.py --binary target/debug/rootyard --report test-results/e2e.json
+        run: python3 tests/e2e.py --binary "$ROOTYARD_BIN" --report test-results/e2e.json
       - name: Exercise exact-commit CI read mirror
-        run: python3 tests/ci_mirror.py --binary target/debug/rootyard --report test-results/ci-mirror.json
+        run: python3 tests/ci_mirror.py --binary "$ROOTYARD_BIN" --report test-results/ci-mirror.json
       - name: Exercise exact-target source retention and mirror preparation
-        run: python3 tests/ci_source_pins.py --binary target/debug/rootyard --report test-results/ci-source-pins.json
+        run: python3 tests/ci_source_pins.py --binary "$ROOTYARD_BIN" --report test-results/ci-source-pins.json
       - name: Exercise isolated job checkout authorization and object closure
-        run: python3 tests/ci_job_checkouts.py --binary target/debug/rootyard --report test-results/ci-job-checkouts.json
+        run: python3 tests/ci_job_checkouts.py --binary "$ROOTYARD_BIN" --report test-results/ci-job-checkouts.json
       - name: Exercise exact pinned dependency checkout and origin fallback boundaries
         timeout-minutes: 20
-        run: python3 tests/ci_dependencies.py --binary target/debug/rootyard --report test-results/ci-dependencies.json
+        run: python3 tests/ci_dependencies.py --binary "$ROOTYARD_BIN" --report test-results/ci-dependencies.json
       - name: Build frozen schema007 binary for genuine legacy restore
         run: |
           legacy=08b10e9976c012343c48e4fd6a5981e0266b8c53
@@ -164,24 +240,27 @@ jobs:
           test "$(git_owned rev-parse --verify HEAD)" = "$legacy"
           (
             cd "$legacy_root/repo"
+            # Output uplift only: CargoFork keeps the shared compiler cache in
+            # ~/.cargo/targets and writes this frozen legacy binary here. Do not
+            # copy a target tree per commit.
             CARGO_TARGET_DIR="$workspace/target/legacy-build" cargo build --locked --manifest-path Cargo.toml --bin rootyard
           )
           cp "$workspace/target/legacy-build/debug/rootyard" "$workspace/target/rootyard-schema007"
       - name: Exercise checkout backup revocation and genuine schema007 restore
-        run: python3 tests/backup_ci_checkouts.py --binary target/debug/rootyard --legacy-binary target/rootyard-schema007 --report test-results/backup-ci-checkouts.json
+        run: python3 tests/backup_ci_checkouts.py --binary "$ROOTYARD_BIN" --legacy-binary target/rootyard-schema007 --report test-results/backup-ci-checkouts.json
       - name: Exercise source-pin paired backup and restore
-        run: python3 tests/backup_ci_pins.py --binary target/debug/rootyard --report test-results/backup-ci-pins.json
+        run: python3 tests/backup_ci_pins.py --binary "$ROOTYARD_BIN" --report test-results/backup-ci-pins.json
       - name: Exercise durable push recovery
-        run: python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
+        run: python3 tests/reliability.py --binary "$ROOTYARD_BIN" --report test-results/reliability.json
       - name: Exercise direct collaborator Git transport and write-endpoint authorization (#4)
         timeout-minutes: 15
-        run: python3 tests/collaborator_transport.py --binary target/debug/rootyard --report test-results/collaborator-transport.json
+        run: python3 tests/collaborator_transport.py --binary "$ROOTYARD_BIN" --report test-results/collaborator-transport.json
       - name: Recover native Git receipts after collaborator and organization withdrawal
-        run: python3 tests/recorded_membership_recovery.py --binary target/debug/rootyard --report test-results/recorded-membership-recovery.json
+        run: python3 tests/recorded_membership_recovery.py --binary "$ROOTYARD_BIN" --report test-results/recorded-membership-recovery.json
       - name: Recover native Git receipts after token revocation
-        run: python3 tests/recorded_recovery.py --binary target/debug/rootyard --report test-results/recorded-recovery.json
+        run: python3 tests/recorded_recovery.py --binary "$ROOTYARD_BIN" --report test-results/recorded-recovery.json
       - name: Exercise offline backup and fresh database restore
-        run: python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
+        run: python3 tests/backup.py --binary "$ROOTYARD_BIN" --report test-results/backup.json
       # Kept beside (not in place of) tests/backup.py: this drill covers the
       # audit-ID sequence across a format21 metadata-only backup and a fresh
       # database restore. It reuses the job's PostgreSQL 17 service URL, the
@@ -189,72 +268,72 @@ jobs:
       # when a dependency is missing; the report feeds the native manifest.
       - name: Restore the audit ID sequence through an offline backup and fresh database
         timeout-minutes: 10
-        run: python3 tests/backup_audit_sequence_legacy.py --binary target/debug/rootyard --report test-results/audit-sequence-backup.json
+        run: python3 tests/backup_audit_sequence_legacy.py --binary "$ROOTYARD_BIN" --report test-results/audit-sequence-backup.json
       - name: Restore populated PostgreSQL RefStore core metadata from the current backup format
         timeout-minutes: 10
-        run: python3 tests/backup_refstore_core139.py --binary target/debug/rootyard --report test-results/backup-refstore-core.json
+        run: python3 tests/backup_refstore_core139.py --binary "$ROOTYARD_BIN" --report test-results/backup-refstore-core.json
       - name: Restore populated PostgreSQL RefStore snapshot metadata from the current backup format
         timeout-minutes: 10
-        run: python3 tests/backup_refstore_snapshot140.py --binary target/debug/rootyard --snapshot-fixture-binary test-results/refstore-snapshot-fixture --report test-results/backup-refstore-snapshot.json
+        run: python3 tests/backup_refstore_snapshot140.py --binary "$ROOTYARD_BIN" --snapshot-fixture-binary "$ROOTYARD_SNAPSHOT_FIXTURE" --report test-results/backup-refstore-snapshot.json
       - name: Restore populated permanent artifact-hold metadata from the current backup format
         timeout-minutes: 10
-        run: python3 tests/backup_refstore_holds141.py --binary target/debug/rootyard --holds-fixture-binary test-results/refstore-holds-fixture --report test-results/backup-refstore-holds.json
+        run: python3 tests/backup_refstore_holds141.py --binary "$ROOTYARD_BIN" --holds-fixture-binary "$ROOTYARD_HOLDS_FIXTURE" --report test-results/backup-refstore-holds.json
       - name: Exercise restored schema-003 recovery protections
-        run: python3 tests/backup_recovery.py --binary target/debug/rootyard --report test-results/backup-recovery.json
+        run: python3 tests/backup_recovery.py --binary "$ROOTYARD_BIN" --report test-results/backup-recovery.json
       - name: Exercise independent workers after fresh restore
-        run: python3 tests/restored_workers.py --binary target/debug/rootyard --report test-results/restored-workers.json
+        run: python3 tests/restored_workers.py --binary "$ROOTYARD_BIN" --report test-results/restored-workers.json
       - name: Exercise explicit recovery and metrics
         run: |
-          python3 tests/recovery_ops.py --binary target/debug/rootyard --report test-results/recovery-ops.json
-          python3 tests/metrics.py --binary target/debug/rootyard --report test-results/metrics.json
+          python3 tests/recovery_ops.py --binary "$ROOTYARD_BIN" --report test-results/recovery-ops.json
+          python3 tests/metrics.py --binary "$ROOTYARD_BIN" --report test-results/metrics.json
       - name: Exercise cross-process delivery
-        run: ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server python3 tests/cross_process.py --binary target/debug/rootyard --report test-results/cross-process.json
+        run: ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server python3 tests/cross_process.py --binary "$ROOTYARD_BIN" --report test-results/cross-process.json
       - name: Exercise real Kafka advisory wakes
-        run: ROOTYARD_TEST_KAFKA_HOME="$GITHUB_WORKSPACE/test-results/ci-tools/kafka_2.13-4.4.0" python3 tests/kafka_wakes.py --binary target/debug/rootyard --report test-results/kafka.json
+        run: ROOTYARD_TEST_KAFKA_HOME="$GITHUB_WORKSPACE/test-results/ci-tools/kafka_2.13-4.4.0" python3 tests/kafka_wakes.py --binary "$ROOTYARD_BIN" --report test-results/kafka.json
       - name: Exercise restored legacy upgrade backup
-        run: python3 tests/backup_upgrade.py --binary target/debug/rootyard --report test-results/backup-upgrade.json
+        run: python3 tests/backup_upgrade.py --binary "$ROOTYARD_BIN" --report test-results/backup-upgrade.json
       - name: Exercise populated Forge backup and fresh restore
-        run: python3 tests/backup_forge.py --binary target/debug/rootyard --report test-results/backup-forge.json
+        run: python3 tests/backup_forge.py --binary "$ROOTYARD_BIN" --report test-results/backup-forge.json
       - name: Exercise private-owner Issue and comment API
-        run: python3 tests/forge.py --binary target/debug/rootyard --report test-results/forge.json
+        run: python3 tests/forge.py --binary "$ROOTYARD_BIN" --report test-results/forge.json
       - name: Exercise durable Issue and comment creation retries
-        run: python3 tests/forge_idempotency.py --binary target/debug/rootyard --report test-results/forge-idempotency.json
+        run: python3 tests/forge_idempotency.py --binary "$ROOTYARD_BIN" --report test-results/forge-idempotency.json
       - name: Exercise Issue state-filter keyset lists
-        run: python3 tests/forge_state_filter.py --binary target/debug/rootyard --report test-results/forge-state-filter.json
+        run: python3 tests/forge_state_filter.py --binary "$ROOTYARD_BIN" --report test-results/forge-state-filter.json
       - name: Exercise Pull Request, Review, Check Run, Branch Rule, and Atomic Merge API
-        run: python3 tests/pulls.py --binary target/debug/rootyard --report test-results/pulls.json
+        run: python3 tests/pulls.py --binary "$ROOTYARD_BIN" --report test-results/pulls.json
       - name: Exercise populated Pull Request paired backup and fresh restore
-        run: python3 tests/backup_pulls.py --binary target/debug/rootyard --report test-results/backup-pulls.json
+        run: python3 tests/backup_pulls.py --binary "$ROOTYARD_BIN" --report test-results/backup-pulls.json
       - name: Exercise repository read-only Browse API and atomic multi-ref CAS transactions
-        run: python3 tests/browse.py --mixed-refs --git "$(command -v git)" --binary target/debug/rootyard --report test-results/browse.json
+        run: python3 tests/browse.py --mixed-refs --git "$(command -v git)" --binary "$ROOTYARD_BIN" --report test-results/browse.json
       - name: Exercise repository pagination against real PostgreSQL
         timeout-minutes: 10
-        run: python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json
+        run: python3 tests/repository_pagination.py --binary "$ROOTYARD_BIN" --report test-results/repository-pagination.json
       - name: Exercise Git LFS Batch API, streaming object storage, and paired backup
-        run: python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json
+        run: python3 tests/lfs.py --binary "$ROOTYARD_BIN" --report test-results/lfs.json
       - name: Exercise local workspace semantics
-        run: python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json
+        run: python3 tests/workspaces.py --binary "$ROOTYARD_WORKSPACE_LAB_BIN" --report test-results/workspaces.json
       - name: Exercise workspace incremental sync, ignore rules, and read-only views
-        run: python3 tests/workspace.py --binary target/debug/rootyard-workspace-lab --report test-results/workspace.json
+        run: python3 tests/workspace.py --binary "$ROOTYARD_WORKSPACE_LAB_BIN" --report test-results/workspace.json
       - name: Exercise native workspace autocapture acceptance
         timeout-minutes: 20
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
           ROOTYARD_WORKSPACE_MOUNT_MODE: direct
-        run: python3 tests/workspace_capture_acceptance.py --binary target/debug/rootyard --report test-results/workspace-capture.json
+        run: python3 tests/workspace_capture_acceptance.py --binary "$ROOTYARD_BIN" --report test-results/workspace-capture.json
       - name: Exercise Namespace, Git View and cross-repository ChangeSet semantics
-        run: python3 tests/git_views.py --binary target/debug/rootyard-view-lab --report test-results/git-views.json
+        run: python3 tests/git_views.py --binary "$ROOTYARD_VIEW_LAB_BIN" --report test-results/git-views.json
       - name: Exercise Pando object store delta resolution, graph traversal, and differential export
         run: |
           test "$(id -u)" -ne 0
-          python3 tests/pando_lab.py --binary target/debug/rootyard-pando-lab
+          python3 tests/pando_lab.py --binary "$ROOTYARD_PANDO_LAB_BIN"
           mkdir -p test-results
           latest_pando=$(ls -td /tmp/rootyard-pando-lab-* 2>/dev/null | head -1 || true)
           test -n "$latest_pando"
           test -f "$latest_pando/results.json"
           cp "$latest_pando/results.json" test-results/pando-lab.json
       - name: Exercise external CI webhooks, HMAC-SHA256 delivery, and auto PR CI pins
-        run: python3 tests/webhooks.py --binary target/debug/rootyard --report test-results/webhooks.json
+        run: python3 tests/webhooks.py --binary "$ROOTYARD_BIN" --report test-results/webhooks.json
       - name: Exercise webhook batching, lease and TLS regressions
         timeout-minutes: 10
         env:
@@ -262,70 +341,72 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p test-results
-          python3 tests/ci_webhook_regressions.py --binary target/debug/rootyard 2>&1 | tee test-results/ci-webhook-regressions.log
+          python3 tests/ci_webhook_regressions.py --binary "$ROOTYARD_BIN" 2>&1 | tee test-results/ci-webhook-regressions.log
       - name: Exercise durable webhook worker recovery against real PostgreSQL
         timeout-minutes: 15
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
-        run: python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
+        run: python3 tests/webhook_worker_recovery.py --binary "$ROOTYARD_BIN" --report test-results/webhook-worker-recovery.json
       - name: Exercise webhook fairness
         timeout-minutes: 20
-        run: python3 tests/webhook_fairness.py --binary target/debug/rootyard --report test-results/webhook-fairness.json
+        run: python3 tests/webhook_fairness.py --binary "$ROOTYARD_BIN" --report test-results/webhook-fairness.json
       - name: Exercise webhook delivery sequence allocation and cursor pagination
         timeout-minutes: 5
-        run: python3 tests/webhook_pagination.py --binary target/debug/rootyard --report test-results/webhook-pagination.json
+        run: python3 tests/webhook_pagination.py --binary "$ROOTYARD_BIN" --report test-results/webhook-pagination.json
       - name: Exercise no-hook Pull Request ref reconciliation
         timeout-minutes: 10
-        run: python3 tests/webhook_pr_sync.py --binary target/debug/rootyard --report test-results/webhook-pr-sync.json
+        run: python3 tests/webhook_pr_sync.py --binary "$ROOTYARD_BIN" --report test-results/webhook-pr-sync.json
       - name: Exercise repository collaborators, teams, 5-role RBAC, and audit log
-        run: python3 tests/members.py --binary target/debug/rootyard --report test-results/members.json
+        run: python3 tests/members.py --binary "$ROOTYARD_BIN" --report test-results/members.json
       - name: Exercise organization and member pagination against real PostgreSQL
         timeout-minutes: 10
-        run: python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json
+        run: python3 tests/organization_pagination.py --binary "$ROOTYARD_BIN" --report test-results/organization-pagination.json
       - name: Exercise server-side HTML Web UI views, XSS sanitization, and PR/Issue workflows
-        run: python3 tests/web.py --binary target/debug/rootyard --report test-results/web.json
+        run: python3 tests/web.py --binary "$ROOTYARD_BIN" --report test-results/web.json
       - name: Exercise web detail pagination against real PostgreSQL
         timeout-minutes: 10
-        run: python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json
+        run: python3 tests/web_detail_pagination.py --binary "$ROOTYARD_BIN" --report test-results/web-detail-pagination.json
       - name: Exercise browser repository-discovery pagination against real PostgreSQL
         timeout-minutes: 5
-        run: python3 tests/web_repository_pagination.py --binary target/debug/rootyard --report test-results/web-repository-pagination.json
+        run: python3 tests/web_repository_pagination.py --binary "$ROOTYARD_BIN" --report test-results/web-repository-pagination.json
       - name: Exercise real browser sessions, CSRF, expiry and revocation
         timeout-minutes: 10
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
-        run: python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
+        run: python3 tests/web_sessions.py --binary "$ROOTYARD_BIN" --report test-results/web-sessions.json
       - name: Exercise structured worker-operation diagnostics isolation
         timeout-minutes: 5
-        run: python3 tests/worker_diagnostics.py --binary target/debug/rootyard --report test-results/worker-diagnostics.json
+        run: python3 tests/worker_diagnostics.py --binary "$ROOTYARD_BIN" --report test-results/worker-diagnostics.json
       - name: Exercise LFS read amplification, verification coalescing, and offline remote reads
         timeout-minutes: 10
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
-        run: python3 tests/lfs_read_amplification.py --binary target/debug/rootyard --report test-results/lfs-read-amplification.json
+        run: python3 tests/lfs_read_amplification.py --binary "$ROOTYARD_BIN" --report test-results/lfs-read-amplification.json
       - name: Exercise LFS split-transaction races, post-hydration re-authorization, and repair deduplication
         timeout-minutes: 10
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
-        run: python3 tests/lfs_split_tx_races.py --binary target/debug/rootyard --report test-results/lfs-split-tx-races.json
+        run: python3 tests/lfs_split_tx_races.py --binary "$ROOTYARD_BIN" --report test-results/lfs-split-tx-races.json
       - name: Exercise LFS locked-path ancestry, stock unlock, and verify body pagination
         timeout-minutes: 10
-        run: python3 tests/lfs_lock_policy.py --binary target/debug/rootyard --report test-results/lfs-lock-policy.json
+        run: python3 tests/lfs_lock_policy.py --binary "$ROOTYARD_BIN" --report test-results/lfs-lock-policy.json
       - name: Exercise sharded control-plane placement, lease/epoch fencing, and explicit refusal of unmeasured failover, rebalance and DR
-        run: python3 tests/sharding.py --binary target/debug/rootyard --report test-results/sharding.json
+        run: python3 tests/sharding.py --binary "$ROOTYARD_BIN" --report test-results/sharding.json
       - name: Exercise shard marker transition crash/rollback and restart reconciliation
         timeout-minutes: 20
-        run: python3 tests/cluster_migration_phases_native.py --binary target/debug/rootyard --transitions-only --report test-results/shard-marker-transitions.json
+        run: python3 tests/cluster_migration_phases_native.py --binary "$ROOTYARD_BIN" --transitions-only --report test-results/shard-marker-transitions.json
       - name: Exercise labelled simulation-only 1/2/4-node sharding benchmark metadata receipts
-        run: python3 tests/benchmark_tiers.py --binary target/debug/rootyard --report test-results/benchmark-tiers.json
+        run: python3 tests/benchmark_tiers.py --binary "$ROOTYARD_BIN" --report test-results/benchmark-tiers.json
       - name: Exercise explicitly labeled 4-tier reference models
         run: ROOTYARD_E2E_REQUIRE_M5=1 ROOTYARD_E2E_REQUIRE_P2=1 ROOTYARD_E2E_REQUIRE_P3=1 python3 tests/e2e_tiers.py --reference-only --tier all --report test-results/reference-tiers.json
       - name: Bind native regressions to the built binary and source inputs
         run: |
           python3 scripts/native_report_manifest.py --mode job \
             --manifest-out test-results/native-pr-gate.json \
-            --build-receipt target/debug/rootyard.build.json \
-            --binary target/debug/rootyard \
+            --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+            --binary "$ROOTYARD_BIN" \
+            --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
+            --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
             --report web_sessions=test-results/web-sessions.json \
             --report metrics=test-results/metrics.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
@@ -348,6 +429,7 @@ jobs:
             --report ci_source_pins=test-results/ci-source-pins.json \
             --report ci_job_checkouts=test-results/ci-job-checkouts.json \
             --report ci_dependencies=test-results/ci-dependencies.json \
+            --report ci_trust_boundaries=test-results/ci-trust-boundaries.json \
             --report shard_marker_transitions=test-results/shard-marker-transitions.json \
             --require-case shard_marker_transitions=takeover-after-source-marker \
             --require-case shard_marker_transitions=fence-audit-rollback \
@@ -406,6 +488,14 @@ jobs:
             --harness tests/mixed_ref_support.py \
             --harness tests/refusal_audit_sql.py \
             --harness scripts/build_native.py \
+            --harness tests/ci_trust_boundaries.py \
+            --harness tests/source_bound_binary.py \
+            --harness tests/ops_provenance.py \
+            --harness tests/test_ci_trust_boundaries_privacy.py \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/native_build_receipt.py \
+            --harness scripts/build_native_batch.py \
+            --harness .github/workflows/ci.yml \
             --fixture postgres=postgres:17 \
             --fixture workspace_mount_mode=direct \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix \
@@ -436,7 +526,15 @@ jobs:
             --require-case ci_dependencies=integration_claim_prepares_exact_dependencies \
             --require-case ci_dependencies=origin_fallback_dependency_credential_boundaries \
             --require-case ci_dependencies=unsafe_gitmodules_url_receives_no_credentials \
-            --fixture rust="$(rustc -V)" \
+            --require-case "ci_trust_boundaries=trusted two-repository matrix setup" \
+            --require-case "ci_trust_boundaries=trusted positive report/callback flows" \
+            --require-case "ci_trust_boundaries=revoked trusted context cannot unlock merge" \
+            --require-case "ci_trust_boundaries=ordinary writer and cross-context/repository refusals" \
+            --require-case "ci_trust_boundaries=changed candidate invalidates prior evidence" \
+            --require-case "ci_trust_boundaries=revoked registration, rotated secret and late attempt" \
+            --require-case "ci_trust_boundaries=removed webhook context revokes claim/report/merge authority" \
+            --require-case "ci_trust_boundaries=API principal token revocation remains management-only" \
+            --fixture-rust-from-receipt \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \
             --fixture bubblewrap="$(bwrap --version)" \
@@ -449,7 +547,8 @@ jobs:
           name: e2e-report
           path: |
             test-results/*.json
-            target/debug/rootyard.build.json
+            ${{ env.ROOTYARD_BUILD_RECEIPT }}
+            ${{ env.ROOTYARD_BATCH_MANIFEST }}
             test-results/ci-webhook-regressions.log
             test-results/evidence/*.jsonl
             test-results/*-evidence/*.jsonl

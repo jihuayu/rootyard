@@ -11,11 +11,13 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from tests.e2e import Harness
+from tests.runtime_binary import select_runtime_binary
 
 
 class NamespaceServiceTest(unittest.TestCase):
     def test_view_keeps_pinned_commit_after_source_branch_deleted(self):
-        h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+        binary,_=select_runtime_binary()
+        h=Harness(argparse.Namespace(binary=str(binary),keep=False))
         try:
             h.setup();h.api();h.roundtrip()
             h.git("switch","-c","ephemeral",h.second,cwd=h.work)
@@ -44,7 +46,8 @@ class NamespaceServiceTest(unittest.TestCase):
         finally:h.cleanup()
 
     def test_pinned_subdir_view_and_git_bundle(self):
-        h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+        binary,_=select_runtime_binary()
+        h=Harness(argparse.Namespace(binary=str(binary),keep=False))
         try:
             h.setup(); h.api(); h.roundtrip()
             (h.work/"pkg").mkdir()

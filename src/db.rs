@@ -15,7 +15,9 @@ pub fn pool(url: &str) -> Result<Pool> {
     let options =
         format!("{} -c statement_timeout=5000 -c lock_timeout=3000 -c timezone=UTC", cfg.get_options().unwrap_or(""));
     cfg.options(&options);
-    cfg.application_name("rootyard");
+    if cfg.get_application_name().is_none() {
+        cfg.application_name("rootyard");
+    }
     let options = ManagerConfig { recycling_method: RecyclingMethod::Fast };
     let manager = if cfg.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
         Manager::from_config(cfg, tls_connector()?, options)

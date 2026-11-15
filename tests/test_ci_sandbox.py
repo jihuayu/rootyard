@@ -8,14 +8,14 @@ import time
 import unittest
 import urllib.parse
 import uuid
-from pathlib import Path
 
 from tests.webhooks import WebhooksHarness
+from tests.runtime_binary import select_runtime_binary
 
 
 class CiSandboxTest(unittest.TestCase):
     def test_claimed_origin_checkout_build_and_cancel(self):
-        binary=Path(os.environ.get("ROOTYARD_BINARY","target/debug/rootyard")).resolve()
+        binary,_=select_runtime_binary()
         h=WebhooksHarness(argparse.Namespace(binary=str(binary),
             keep=os.environ.get("ROOTYARD_KEEP_TEST")=="1"))
         h.env["ROOTYARD_SANDBOX_MODE"]="dev"
@@ -187,7 +187,7 @@ class CiSandboxTest(unittest.TestCase):
             "storage_generation": value["storage_generation"]}
 
     def test_two_concurrent_claims_isolated_build_and_export(self):
-        binary = Path(os.environ.get("ROOTYARD_BINARY", "target/debug/rootyard")).resolve()
+        binary, _ = select_runtime_binary()
         h = WebhooksHarness(argparse.Namespace(binary=str(binary), keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
         h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"] = "4"
@@ -273,7 +273,7 @@ class CiSandboxTest(unittest.TestCase):
             h.cleanup()
 
     def test_fenced_retry_requires_new_attempt(self):
-        binary = Path(os.environ.get("ROOTYARD_BINARY", "target/debug/rootyard")).resolve()
+        binary, _ = select_runtime_binary()
         h = WebhooksHarness(argparse.Namespace(binary=str(binary), keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
         h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"] = "4"

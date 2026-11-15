@@ -37,6 +37,7 @@ const INTEGRATION_GRANT: &str = "FROM ci_integration_checkout_jobs i \
    AND c.lease_generation=i.lease_generation AND c.state='leased' \
    AND c.lease_expires_unix>extract(epoch FROM clock_timestamp()) \
  JOIN forge_webhooks w ON w.id=i.issuer_webhook_id AND w.repository_id=c.repository_id AND w.active=true \
+   AND w.ci_contexts ? c.context \
  JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
    AND b.context=c.context AND b.webhook_id=w.id AND b.active=true \
  JOIN forge_pulls p ON p.repository_id=c.repository_id AND p.number=c.pull_number \

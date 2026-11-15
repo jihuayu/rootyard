@@ -12,13 +12,14 @@ import time
 import unittest
 
 from tests.e2e import Harness
+from tests.runtime_binary import select_runtime_binary
 from tests.test_workspace_fuse_service import MOUNT_MODE
 
 
 @unittest.skipUnless(os.environ.get("ROOTYARD_OBJECT_STORE_ENDPOINT"),"live S3 fixture required")
 class WorkspaceHandoffTest(unittest.TestCase):
     def test_expired_host_reattach_from_remote_checkpoint(self):
-        binary=Path(os.environ.get("ROOTYARD_TEST_BINARY", "target/debug/rootyard")).resolve()
+        binary,_=select_runtime_binary()
         with tempfile.TemporaryDirectory(prefix="rootyard-handoff-wrapper-") as wrapper_dir:
             wrapper=Path(wrapper_dir)/"rootyard-userns"
             wrapper.write_text(f"#!/bin/sh\nexec unshare -Urm {shlex.quote(str(binary))} \"$@\"\n")
