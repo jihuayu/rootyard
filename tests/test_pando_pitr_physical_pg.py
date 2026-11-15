@@ -49,6 +49,7 @@ class FakePidfdApi:
         self.processes = processes
         self.opened = 0
         self.closed = 0
+        self.closed_pids: list[int] = []
         self.live: list[FakePidfd] = []
         self.before_open = None
         self.before_send = None
@@ -91,6 +92,7 @@ class FakePidfdApi:
             raise OSError("double close")
         fd.closed = True
         self.closed += 1
+        self.closed_pids.append(fd.pid)
         self.live.remove(fd)
 
 
@@ -555,6 +557,35 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertFalse(cleanup["scratch_removed"])
         self.assertTrue(fixture.root.is_dir())
         self.assertEqual(processes.signals, [])
+
+        fixture.owned = FakeProcesses().tracker()
+        self.assertTrue(fixture.cleanup()["passed"])
+
+    def test_anchor_fd_liveness_blocks_same_field_generation_replacement(self) -> None:
+        processes = FakeProcesses()
+        processes.add(1400, ppid=1, session=1400, pgrp=1400, starttime=140)
+        fixture = self.make_fixture(processes)
+        fixture.owned.remember_postmaster(1400, "cleanup")
+        processes.add(1401, ppid=42, session=1400, pgrp=1400, starttime=141)
+
+        def replace_anchor_with_same_fields() -> None:
+            # Old anchor fd remains pinned; the new numeric row is a different
+            # generation with identical PID/starttime/PPID/PGRP/SID/boot/UID.
+            processes.replace(1400, starttime=140, ppid=1, pgrp=1400, session=1400)
+
+        processes.pidfds.before_open = replace_anchor_with_same_fields
+        members = fixture.owned.members("cleanup")
+
+        self.assertNotIn(1401, members)
+        self.assertTrue(fixture.owned._unknown)
+        self.assertNotIn(1401, [fd.pid for fd in processes.pidfds.live])
+        self.assertEqual(processes.pidfds.closed_pids.count(1401), 1)
+        self.assertEqual(processes.signals, [])
+
+        cleanup = fixture.cleanup()
+        self.assertFalse(cleanup["passed"])
+        self.assertFalse(cleanup["scratch_removed"])
+        self.assertTrue(fixture.root.is_dir())
 
         fixture.owned = FakeProcesses().tracker()
         self.assertTrue(fixture.cleanup()["passed"])

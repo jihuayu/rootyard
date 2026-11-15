@@ -519,16 +519,22 @@ class _OwnedProcessSet:
         session_id: int,
         table: dict[int, dict],
         boot_id: str,
+        phase: str,
     ) -> bool:
         pinned = self._pins.get(anchor["pid"])
         current = table.get(anchor["pid"])
-        return bool(
+        if not (
             pinned is not None
             and current is not None
             and current["session"] == session_id
             and current["boot_id"] == boot_id
             and self._same_pinned_identity(current, pinned[1])
-        )
+        ):
+            return False
+        # The fresh /proc row can describe a same-tick replacement.  The
+        # retained anchor fd must still be live immediately before candidate
+        # authorization; a dead fd means the numeric row is not our anchor.
+        return self._pidfd_alive(pinned[0], phase)
 
     def members(self, phase: str) -> dict[int, dict]:
         table = self._table_provider(phase)
@@ -587,12 +593,17 @@ class _OwnedProcessSet:
                 if adopted is None:
                     continue
                 fresh = self._table_provider(phase)
-                if not any(
-                    self._anchor_current(anchor, session_id, fresh, boot_id)
-                    for anchor in anchors
-                ):
-                    # The anchor moved/died around the candidate pin.  Do not
-                    # signal a candidate that is no longer backed by our SID.
+                try:
+                    anchor_ok = any(
+                        self._anchor_current(anchor, session_id, fresh, boot_id, phase)
+                        for anchor in anchors
+                    )
+                except FixtureError:
+                    anchor_ok = False
+                if not anchor_ok:
+                    # The anchor moved/died/uncertain around the candidate pin.
+                    # Do not signal a candidate that is no longer backed by our
+                    # live SID; retain scratch through sticky unknown.
                     self._drop_pin(record["pid"], phase)
                     self._unknown = True
                     continue
