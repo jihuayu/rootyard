@@ -194,7 +194,7 @@ async fn late_scope_or_role_loss_after_prepare_rolls_back_create_and_reads_deny(
             serving_actor_with_scopes(&db.pool, verified.repo, &["contents_write"], "coord-late-scope-").await?;
         grant_collaborator(&db.pool, verified.repo, verified.tenant, late_scope.id, "admin").await?;
         let gate = GitGate::new(&git)?;
-        let release_guard = GateRelease(&gate);
+        let _release_guard = GateRelease(&gate);
         let gated = Arc::new(PgServingRetentionRoots::new(PgRetentionRoots::new(store.clone(), gate.binary())?));
         let input = create_input(&repository.owner, &repository.name, source.snapshot_id(), "coord-late-scope");
         let task_pool = db.pool.clone();
@@ -216,7 +216,7 @@ async fn late_scope_or_role_loss_after_prepare_rolls_back_create_and_reads_deny(
         // Role downgrade after native prepare has the same rollback contract.
         let downgraded = serving_collaborator(&db.pool, verified.repo, verified.tenant, "admin", "coord-role-").await?;
         let gate = GitGate::new(&git)?;
-        let release_guard = GateRelease(&gate);
+        let _release_guard = GateRelease(&gate);
         let gated = Arc::new(PgServingRetentionRoots::new(PgRetentionRoots::new(store.clone(), gate.binary())?));
         let input = create_input(&repository.owner, &repository.name, source.snapshot_id(), "coord-role");
         let task_pool = db.pool.clone();
@@ -242,7 +242,7 @@ async fn late_scope_or_role_loss_after_prepare_rolls_back_create_and_reads_deny(
         let reader = serving_actor_with_scopes(&db.pool, verified.repo, &["contents_read"], "coord-late-read-").await?;
         grant_collaborator(&db.pool, verified.repo, verified.tenant, reader.id, "admin").await?;
         let gate = GitGate::new(&git)?;
-        let release_guard = GateRelease(&gate);
+        let _release_guard = GateRelease(&gate);
         let gated = Arc::new(PgServingRetentionRoots::new(PgRetentionRoots::new(store.clone(), gate.binary())?));
         let request = read_input(&repository.owner, &repository.name, owner_receipt.root_id());
         let task_pool = db.pool.clone();
@@ -283,7 +283,7 @@ async fn release_before_register_fences_delayed_create_and_replays_without_sourc
         };
 
         let gate = GitGate::new(&git)?;
-        let release_guard = GateRelease(&gate);
+        let _release_guard = GateRelease(&gate);
         let gated = Arc::new(PgServingRetentionRoots::new(PgRetentionRoots::new(store.clone(), gate.binary())?));
         let task_pool = db.pool.clone();
         let task_actor = actor.clone();
