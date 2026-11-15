@@ -565,4 +565,75 @@ mod postgres_tests {
         tx.commit().await.unwrap();
         drop_schema(&admin, &schema).await;
     }
+
+    #[tokio::test]
+    #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and PostgreSQL schema creation permission"]
+    async fn browser_child_inherits_parent_scopes_and_live_mutations() {
+        let (schema, admin, mut client) = owned_schema().await;
+        let (actor, parent) = seed_token(&client, true).await;
+        let allowed = seed_repo(&client, actor, "allowed-web").await;
+        let denied = seed_repo(&client, actor, "denied-web").await;
+        let child = Uuid::new_v4();
+        let digest = vec![9_u8; 32];
+        client
+            .execute(
+                "INSERT INTO tokens(id, user_id, digest, kind, is_restricted) VALUES ($1, $2, $3, 'browser', true)",
+                &[&child, &actor, &digest],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO web_sessions(token_id, csrf_digest, expires_at) \
+                 VALUES ($1, $2, clock_timestamp() + interval '1 hour')",
+                &[&child, &digest],
+            )
+            .await
+            .unwrap();
+        let tx = client.transaction().await.unwrap();
+        grant_repository_for_test(&tx, parent, allowed, RepoAction::ContentsRead).await.unwrap();
+        grant_repository_for_test(&tx, parent, allowed, RepoAction::ContentsWrite).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let tx = client.transaction().await.unwrap();
+        assert_eq!(
+            authorize_repository_for_request_with_parent(&tx, child, actor, Some(parent), allowed, RepoAction::ContentsWrite, false).await,
+            Err(ScopeDenial::InvalidToken)
+        );
+        assert_eq!(
+            authorize_repository_for_request_with_parent(&tx, child, actor, Some(parent), allowed, RepoAction::ContentsWrite, true).await,
+            Ok(())
+        );
+        assert_eq!(
+            authorize_repository_for_request_with_parent(&tx, child, actor, Some(parent), denied, RepoAction::ContentsRead, true).await,
+            Err(ScopeDenial::Forbidden)
+        );
+        tx.commit().await.unwrap();
+
+        // Parent read_only flip and scope narrowing apply immediately to the live browser child.
+        client.execute("UPDATE tokens SET read_only = true WHERE id = $1", &[&parent]).await.unwrap();
+        assert_eq!(
+            authorize_repository_late_with_parent(&client, child, actor, Some(parent), allowed, RepoAction::ContentsWrite, true).await,
+            Err(ScopeDenial::Forbidden)
+        );
+        assert_eq!(
+            authorize_repository_late_with_parent(&client, child, actor, Some(parent), allowed, RepoAction::ContentsRead, true).await,
+            Ok(())
+        );
+        let tx = client.transaction().await.unwrap();
+        assert!(narrow_repository_scope(&tx, parent, actor, allowed, &[]).await.unwrap());
+        tx.commit().await.unwrap();
+        assert_eq!(
+            authorize_repository_late_with_parent(&client, child, actor, Some(parent), allowed, RepoAction::ContentsRead, true).await,
+            Err(ScopeDenial::Forbidden)
+        );
+
+        // Parent revocation invalidates the already-minted child immediately.
+        client.execute("UPDATE tokens SET revoked = true WHERE id = $1", &[&parent]).await.unwrap();
+        assert_eq!(
+            authorize_repository_late_with_parent(&client, child, actor, Some(parent), allowed, RepoAction::ContentsRead, true).await,
+            Err(ScopeDenial::InvalidToken)
+        );
+        drop_schema(&admin, &schema).await;
+    }
 }

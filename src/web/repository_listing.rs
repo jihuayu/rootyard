@@ -160,11 +160,12 @@ pub async fn discover(
         None => (None, None, None),
     };
     let limit = (PAGE_LIMIT + 1) as i64;
+    let scope_token_id = actor.scope_token_id();
     let rows = if restricted {
         tx.query(
             page_sql(true),
             &[
-                &actor.token_id,
+                &scope_token_id,
                 &cursor_slug,
                 &cursor_name,
                 &cursor_id,

@@ -34,9 +34,10 @@ use uuid::Uuid;
 type App = Arc<AppState>;
 type Res = Result<Response, Error>;
 
-/// Re-check that a cookie session's parent API token is still active and
-/// unrestricted. Browser children of a restricted/revoked parent must not be
-/// able to manage anything, even if the child token row itself looks live.
+/// Re-check that a cookie session and its parent API token are still live and
+/// unrestricted. Restricted or parent-restricted browser sessions are refused
+/// with `403 Forbidden`; missing, forged, expired, or revoked sessions return
+/// `401 Unauthorized`.
 pub async fn verify_browser_parent(state: &AppState, headers: &HeaderMap) -> Result<(), Error> {
     if headers.contains_key(header::AUTHORIZATION) {
         return Ok(());
@@ -50,14 +51,25 @@ pub async fn verify_browser_parent(state: &AppState, headers: &HeaderMap) -> Res
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_opt(
-            "SELECT 1 FROM tokens p WHERE p.id = $1 AND p.kind = 'api' \
-               AND p.is_restricted = false AND NOT p.revoked \
-               AND (p.expires_at IS NULL OR p.expires_at > clock_timestamp())",
-            &[&parent],
+            "SELECT (t.is_restricted OR p.is_restricted) \
+               FROM tokens t \
+               JOIN web_sessions s ON s.token_id = t.id \
+               JOIN tokens p ON p.id = $2 AND p.user_id = t.user_id AND p.kind = 'api' \
+              WHERE t.digest = $1 AND t.kind = 'browser' AND NOT t.revoked \
+                AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
+                AND NOT s.revoked AND s.expires_at > clock_timestamp() \
+                AND NOT p.revoked AND (p.expires_at IS NULL OR p.expires_at > clock_timestamp())",
+            &[&crate::db::digest(&secret), &parent],
         )
         .await
         .map_err(Error::internal)?;
-    row.map(|_| ()).ok_or_else(Error::unauthorized)
+    let Some(row) = row else {
+        return Err(Error::unauthorized());
+    };
+    if row.get::<_, bool>(0) {
+        return Err(Error(StatusCode::FORBIDDEN, "restricted tokens cannot manage tokens or sessions"));
+    }
+    Ok(())
 }
 
 async fn visible_repositories(state: &AppState, actor: &Identity) -> Result<Vec<(Uuid, String, String)>, Error> {

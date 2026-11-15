@@ -492,6 +492,7 @@ mod tests {
         Identity {
             id: Uuid::new_v4(),
             token_id: Uuid::new_v4(),
+            parent_token_id: None,
             username: username.to_owned(),
             read_only: false,
             token_digest: vec![0; 32],

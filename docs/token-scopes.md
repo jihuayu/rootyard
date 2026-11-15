@@ -1,16 +1,17 @@
 # Personal access token scopes (schema 137, backup format 13)
 
-> **Status:** the authorisation helpers, the discovery predicates, the common
-> repository/namespace action enforcement and the browser-login rejection are
-> wired in this private integration branch. The management API/UI and the
-> parent-owned Git publication token lock are integrated. Real HTTP/DB/Git
-> acceptance of their combined implementation is pending; no release is claimed.
-> Restricted parent tokens are refused browser login, so this path cannot widen
-> their scope. Restricted browser-child inheritance remains unsupported.
+> **Status:** the authorisation helpers, discovery predicates, common
+> repository/namespace action enforcement, self-service PAT management (`/api/tokens*`,
+> `/api/sessions*`, `/web/settings/*`), parent-owned Git publication token lock,
+> and bounded restricted browser-child inheritance are integrated on `main`.
+> Restricted API tokens can sign into `/web/login` to open bounded `browser`
+> sessions that inherit their parent's live `read_only`, `is_restricted`, expiry,
+> revocation, and grant set without widening, while management routes refuse
+> restricted browser children with `403 Forbidden` and Git CAS keeps rejecting
+> browser tokens fail-closed (`BrowserTokenUnsupported`).
 > The existing CLI still issues legacy unrestricted API tokens.
-> Schema 137 changes no token shape: it only narrows the historical Git
-> admission bypass in the membership trigger, and it has no new native evidence
-> of its own.
+> Schema 137 narrows the historical Git admission bypass in the membership
+> trigger.
 
 
 ## Integration provenance

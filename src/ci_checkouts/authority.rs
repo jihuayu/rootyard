@@ -148,7 +148,7 @@ pub(crate) async fn authenticate(
         plan.target_oid!=oid || plan.mirror_audience!=audience()? ||
         plan.dependencies.version!=1 {return Err(Error::unauthorized());}
     tx.commit().await.map_err(Error::internal)?;
-    let identity=db::Identity{id:actor_id,token_id:row.get(3),username:row.get("actor_name"),
+    let identity=db::Identity{id:actor_id,token_id:row.get(3),parent_token_id:None,username:row.get("actor_name"),
         read_only:true,token_digest:digest};
     let repo=db::Repository{id:repo_id,name:name.into(),owner:owner.into(),state:"ready".into(),
         clone_path:format!("/git/{owner}/{name}.git"),storage_backend:"gitfs".into(),

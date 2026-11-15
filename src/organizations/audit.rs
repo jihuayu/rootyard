@@ -60,6 +60,7 @@ pub async fn list_organizations(
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, false).await?;
     let restricted = auth::token_is_restricted(&tx, &actor).await?;
+    let scope_token_id = actor.scope_token_id();
     let cursor = match query.cursor.as_deref() {
         Some(raw) => Some(decode_org_cursor(raw, actor.id)?),
         None => None,
@@ -75,7 +76,7 @@ pub async fn list_organizations(
                      SELECT 1 FROM token_namespace_scopes s \
                       WHERE s.token_id = $3 AND s.organization_id = o.id AND s.action = 'org:read')) \
                  ORDER BY ns.slug, o.id LIMIT $4",
-                &[&actor.id, &restricted, &actor.token_id, &(limit + 1)],
+                &[&actor.id, &restricted, &scope_token_id, &(limit + 1)],
             )
             .await
         }
@@ -90,7 +91,7 @@ pub async fn list_organizations(
                       WHERE s.token_id = $3 AND s.organization_id = o.id AND s.action = 'org:read')) \
                    AND (ns.slug, o.id) > ($4, $5) \
                  ORDER BY ns.slug, o.id LIMIT $6",
-                &[&actor.id, &restricted, &actor.token_id, slug, id, &(limit + 1)],
+                &[&actor.id, &restricted, &scope_token_id, slug, id, &(limit + 1)],
             )
             .await
         }
