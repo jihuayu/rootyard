@@ -465,7 +465,7 @@ pub(super) async fn unsupported_merge() -> Result<Response, GatewayError> {
     Err(GatewayError::NotImplemented("merge production is not implemented by the Blob Git gateway"))
 }
 
-fn strip_name(raw: &str) -> Result<&str, GatewayError> {
+pub(super) fn strip_name(raw: &str) -> Result<&str, GatewayError> {
     let name = raw.strip_suffix(".git").unwrap_or(raw);
     if !db::valid_name(name) {
         return Err(GatewayError::NotFound);

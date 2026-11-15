@@ -39,6 +39,7 @@ mod serving;
 mod session;
 mod smart_http;
 mod snapshot;
+mod snapshot_metadata;
 mod state;
 
 #[cfg(test)]
@@ -80,6 +81,15 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
         .route("/api/repos/{owner}/{name}", get(api::get_repo))
         .route("/api/repos/{owner}/{name}/operations/{operation}", get(api::get_operation))
         .route("/api/repos/{owner}/{name}/operations/{operation}/cancel", post(api::cancel_operation))
+        .route("/api/repos/{owner}/{name}/snapshots", post(snapshot_metadata::create_snapshot))
+        .route(
+            "/api/repos/{owner}/{name}/snapshots/{snapshot}",
+            get(snapshot_metadata::read_snapshot).delete(snapshot_metadata::release_snapshot),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/snapshots/{snapshot}/renew",
+            post(snapshot_metadata::renew_snapshot),
+        )
         .route("/api/repos/{owner}/{name}/merges", post(api::unsupported_merge))
         .route("/api/repos/{owner}/{name}/tree", get(browse::tree))
         .route("/api/repos/{owner}/{name}/tree/{oid}", get(browse::tree_by_oid))
