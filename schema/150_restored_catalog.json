@@ -3280,7 +3280,7 @@
     },
     {
       "collation": null,
-      "default": "(clock_timestamp() + '90 days'::interval)",
+      "default": "(clock_timestamp() + make_interval(days => 90))",
       "generated": "",
       "identity": "",
       "name": "expires_at",

@@ -2,7 +2,9 @@
 -- idempotent in-app notifications, inline diff PR review comments, and comment
 -- edit/soft-delete/moderation audit history).
 -- All range predicates use explicit >= and <= (never BETWEEN) for pg_dump
--- catalog normalization invariance across fresh, restored, and upgraded schemas.
+-- catalog normalization invariance across fresh, restored, and upgraded schemas,
+-- and interval defaults use make_interval(...) for intervalstyle invariance across
+-- psql and rootyard backup/restore sessions.
 
 ALTER TABLE forge_issues
     ADD COLUMN IF NOT EXISTS label_version BIGINT NOT NULL DEFAULT 1,
@@ -248,7 +250,7 @@ CREATE TABLE forge_notifications (
     unread BOOLEAN NOT NULL DEFAULT true,
     read_at TIMESTAMPTZ,
     archived BOOLEAN NOT NULL DEFAULT false,
-    expires_at TIMESTAMPTZ NOT NULL DEFAULT (clock_timestamp() + interval '90 days'),
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT (clock_timestamp() + make_interval(days => 90)),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (recipient_id, delivery_key),
