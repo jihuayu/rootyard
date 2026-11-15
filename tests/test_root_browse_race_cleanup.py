@@ -77,6 +77,67 @@ class BlockerCleanupTests(unittest.TestCase):
         self.assertTrue(fake.stopped)
         self.assertIs(fake._root_scope_blocker, handle)
 
+    def test_startup_failure_retries_harness_retained_blocker(self):
+        fake = object.__new__(fixture.RootBrowseHttpHarness)
+        handle = BlockerHandle()
+        fake._root_scope_blocker = handle
+        fake._root_scope_unresolved = {
+            "reason": "owned blocker startup could not be reconciled",
+            "blocker": handle,
+            "blocker_unresolved": True,
+        }
+        fake._release_owned_blocker = mock.Mock(return_value=True)
+        released, remaining = fixture.RootBrowseHttpHarness._finalize_blocker_cleanup(
+            fake, None, "rootyard-test-blocker", 123, time.monotonic() + 1.0)
+        self.assertTrue(released)
+        self.assertIsNone(remaining)
+        fake._release_owned_blocker.assert_called_once()
+        self.assertIs(fake._release_owned_blocker.call_args.args[0], handle)
+        self.assertIsNone(fake._root_scope_unresolved)
+        self.assertIsNone(fake._root_scope_blocker)
+
+    def test_recovered_normal_release_clears_only_blocker_reason(self):
+        fake = object.__new__(fixture.RootBrowseHttpHarness)
+        handle = BlockerHandle()
+        fake._root_scope_blocker = handle
+        fake._root_scope_unresolved = {
+            "reason": "owned blocker release could not be proven",
+            "blocker": handle,
+            "blocker_unresolved": True,
+        }
+        fake._release_owned_blocker = mock.Mock(return_value=True)
+        released, remaining = fixture.RootBrowseHttpHarness._finalize_blocker_cleanup(
+            fake, handle, "rootyard-test-blocker", 123, time.monotonic() + 1.0)
+        self.assertTrue(released)
+        self.assertIsNone(remaining)
+        self.assertIsNone(fake._root_scope_unresolved)
+        fake.stop = mock.Mock()
+        with mock.patch.object(refstore_roots_http.RootsHttpHarness, "cleanup") as base_cleanup:
+            fixture.RootBrowseHttpHarness.cleanup(fake)
+            base_cleanup.assert_called_once_with()
+            fake.stop.assert_not_called()
+
+    def test_unrelated_unresolved_reason_keeps_preservation(self):
+        fake = object.__new__(fixture.RootBrowseHttpHarness)
+        handle = BlockerHandle()
+        fake._root_scope_blocker = handle
+        fake._root_scope_unresolved = {
+            "reason": "root request not settled",
+            "blocker": None,
+            "blocker_unresolved": False,
+        }
+        fake._release_owned_blocker = mock.Mock(return_value=True)
+        released, remaining = fixture.RootBrowseHttpHarness._finalize_blocker_cleanup(
+            fake, handle, "rootyard-test-blocker", 123, time.monotonic() + 1.0)
+        self.assertTrue(released)
+        self.assertIsNone(remaining)
+        self.assertEqual(fake._root_scope_unresolved["reason"], "root request not settled")
+        fake.stop = mock.Mock()
+        with mock.patch.object(refstore_roots_http.RootsHttpHarness, "cleanup") as base_cleanup:
+            fixture.RootBrowseHttpHarness.cleanup(fake)
+            fake.stop.assert_called_once()
+            base_cleanup.assert_not_called()
+
     def test_unresolved_cleanup_preserves_scratch_and_schema(self):
         fake = object.__new__(fixture.RootBrowseHttpHarness)
         fake._root_scope_unresolved = {"reason": "fixture blocker not reaped"}

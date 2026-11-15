@@ -387,6 +387,7 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
                 self._root_scope_unresolved = {
                     "reason": "owned blocker startup could not be reconciled",
                     "blocker": process,
+                    "blocker_unresolved": True,
                 }
             raise
 
@@ -465,6 +466,25 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
         remaining = max(0.1, deadline - time.monotonic())
         return future.result(timeout=remaining)
 
+    def _finalize_blocker_cleanup(self, local_blocker, application_name, key, deadline):
+        """Reconcile the local handle or the harness-retained startup handle.
+
+        Returns `(released, remaining_handle)`. Only a confirmed release clears
+        the blocker-specific unresolved marker; unrelated unresolved reasons are
+        left intact for the outer preservation boundary.
+        """
+        retained = local_blocker if local_blocker is not None else getattr(self, "_root_scope_blocker", None)
+        if retained is None:
+            return True, None
+        if self._release_owned_blocker(retained, application_name, key, deadline):
+            self._root_scope_blocker = None
+            existing = getattr(self, "_root_scope_unresolved", None)
+            if isinstance(existing, dict) and existing.get("blocker_unresolved") is True:
+                self._root_scope_unresolved = None
+            return True, None
+        self._root_scope_blocker = retained
+        return False, retained
+
     def cleanup(self):
         # Preserve both the run-owned random schema and scratch when any owned
         # blocker/request/server/trigger could not be proven stopped. A normal
@@ -537,6 +557,7 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
                 self._root_scope_unresolved = {
                     "reason": "owned blocker release could not be proven",
                     "blocker": blocker,
+                    "blocker_unresolved": True,
                 }
                 raise AssertionError("root scope fence cleanup unresolved")
             blocker = None
@@ -578,17 +599,19 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
                 gate_released = True
             except Exception:
                 cleanup_errors.append("wrapper gate release")
-            if blocker is not None:
-                try:
-                    if self._release_owned_blocker(blocker, application_name, key, cleanup_deadline):
-                        blocker = None
-                        blocker_released = True
-                    else:
-                        self._root_scope_blocker = blocker
-                        unresolved_reasons.append("owned blocker")
-                except Exception:
-                    self._root_scope_blocker = blocker
+            try:
+                released, retained = self._finalize_blocker_cleanup(
+                    blocker, application_name, key, cleanup_deadline)
+                if released:
+                    blocker = None
+                    blocker_released = True
+                else:
+                    blocker = retained
                     unresolved_reasons.append("owned blocker")
+            except Exception:
+                if blocker is not None:
+                    self._root_scope_blocker = blocker
+                unresolved_reasons.append("owned blocker")
             unfinished = []
             for label, future in (("root request", root_future), ("PATCH request", patch_future)):
                 if future is None:
