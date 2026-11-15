@@ -127,8 +127,10 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         # instead of a mutable target/debug artifact.
         export_command = "python3 scripts/export_native_artifacts.py"
         export_start = ci_text.index(export_command)
-        manifest_start = ci_text.index(
-            "python3 scripts/native_report_manifest.py --mode job"
+        manifest_start = ci_text.rindex(
+            "python3 scripts/native_report_manifest.py --mode job",
+            0,
+            ci_text.index("--manifest-out test-results/native-pr-gate.json"),
         )
         self.assertLess(export_start, manifest_start)
         export_step = ci_text[export_start:manifest_start]

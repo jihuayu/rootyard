@@ -26,7 +26,7 @@ LIB_BUILD = "python3 scripts/build_native_test.py"
 PG_RUN = "python3 scripts/run_pg_start_gate.py"
 BATCH = "python3 scripts/build_native_batch.py"
 HTTP = (
-    "python3 tests/ci_trust_boundaries.py --binary target/debug/rootyard "
+    'python3 tests/ci_trust_boundaries.py --binary "$ROOTYARD_BIN" '
     "--report test-results/ci-trust-boundaries.json "
     '--expected-commit "$GITHUB_SHA"'
 )
@@ -106,6 +106,7 @@ class Issue35CiWorkflowTest(unittest.TestCase):
             "--lib",
             "--features pando-lab",
             "--strip-debuginfo",
+            '--artifact-store "$HOME/.cache/rootyard/native-artifacts"',
             "--output test-results/rootyard-lib-tests",
         ):
             self.assertIn(token, step)
