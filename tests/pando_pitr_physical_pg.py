@@ -90,6 +90,37 @@ def _reap_process(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
+def _pidfd_api():
+    return (getattr(os, "pidfd_open", None), getattr(signal, "pidfd_send_signal", None))
+
+
+def _proc_available() -> bool:
+    return sys.platform.startswith("linux") and Path("/proc/self").is_dir()
+
+
+def _require_pidfd_support(phase: str = "platform") -> None:
+    """Refuse before any child/state is created when pidfds cannot pin identity."""
+    if not _proc_available():
+        raise FixtureError(phase, "pidfd_unavailable")
+    pidfd_open, pidfd_send_signal = _pidfd_api()
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        raise FixtureError(phase, "pidfd_unavailable")
+    try:
+        pidfd = pidfd_open(os.getpid(), 0)
+    except OSError:
+        raise FixtureError(phase, "pidfd_unavailable") from None
+    try:
+        try:
+            pidfd_send_signal(pidfd, 0)
+        except OSError:
+            raise FixtureError(phase, "pidfd_unavailable") from None
+    finally:
+        try:
+            os.close(pidfd)
+        except OSError:
+            raise FixtureError(phase, "pidfd_close_failed") from None
+
+
 def _run(
     argv: list[Path | str],
     *,
@@ -105,6 +136,8 @@ def _run(
     direct child being the only surviving process.
     """
     argv = [str(item) for item in argv]
+    if owned is not None:
+        _require_pidfd_support(phase)
     if owned is None:
         try:
             result = subprocess.run(
@@ -296,15 +329,16 @@ def _proc_table(phase: str) -> dict[int, dict]:
 
 
 class _OwnedProcessSet:
-    """Verified launch sessions plus captured descendant identities.
+    """Verified launch sessions and PIDFD-pinned owned processes.
 
     The model mirrors the repository's Linux process helpers
     (``deployment/local_cluster.py`` and
-    ``scripts/state_services_native_baseline.py``): a process is owned only when
-    its numeric PID still has the recorded kernel start time, and a recorded
-    session is scanned only while its boot identity matches.  PG's daemon may
-    reparent children, so closure is judged by all recorded identities and
-    occupied owned sessions, never by the postmaster PID alone.
+    ``scripts/native_acceptance_supervisor.py``): a process is owned only when
+    its numeric PID still has the recorded kernel start time and boot identity.
+    The PID is pinned with ``os.pidfd_open`` and every TERM/KILL is sent through
+    that pinned descriptor; a numeric PID is never used as a signal fallback
+    after the process was tracked.  Closing a pidfd after the old process dies
+    cannot make a later reused numeric PID receive the signal.
     """
 
     def __init__(
@@ -313,19 +347,73 @@ class _OwnedProcessSet:
         table_provider=None,
         boot_id_provider=None,
         record_provider=None,
-        signal_fn=None,
+        pidfd_api_provider=None,
+        pidfd_close_fn=None,
     ) -> None:
         self._records: dict[int, dict] = {}
         self._sessions: dict[int, str] = {}
+        self._pins: dict[int, tuple[object, dict]] = {}
         self._table_provider = table_provider or _proc_table
         self._boot_id_provider = boot_id_provider or _current_boot_id
         self._record_provider = record_provider or _process_record
-        self._signal_fn = signal_fn or os.kill
+        self._pidfd_api = pidfd_api_provider or _pidfd_api
+        self._pidfd_close = pidfd_close_fn or os.close
 
-    def _remember(self, record: dict) -> None:
+    @staticmethod
+    def _same_identity(left: dict, right: dict) -> bool:
+        return bool(
+            left["pid"] == right["pid"]
+            and left["starttime"] == right["starttime"]
+            and left["boot_id"] == right.get("boot_id", left["boot_id"])
+            and left["uid"] == right.get("uid", left["uid"])
+        )
+
+    def _close_fd(self, fd, phase: str) -> None:
+        try:
+            self._pidfd_close(fd)
+        except OSError:
+            raise FixtureError(phase, "pidfd_close_failed") from None
+
+    def _drop_pin(self, pid: int, phase: str) -> None:
+        pinned = self._pins.pop(pid, None)
+        if pinned is not None:
+            self._close_fd(pinned[0], phase)
+
+    def _pin(self, record: dict, phase: str):
+        """Open/revalidate a pidfd for one expected identity; never fall back."""
+        pidfd_open, _ = self._pidfd_api()
+        if not callable(pidfd_open):
+            raise FixtureError(phase, "pidfd_unavailable")
+        pinned = self._pins.get(record["pid"])
+        if pinned is not None:
+            fd, pinned_record = pinned
+            if self._same_identity(pinned_record, record):
+                return fd
+            self._drop_pin(record["pid"], phase)
+        try:
+            fd = pidfd_open(record["pid"], 0)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            raise FixtureError(phase, "pidfd_open_failed") from None
+        try:
+            current = self._record_provider(record["pid"], phase)
+        except FixtureError as error:
+            self._close_fd(fd, phase)
+            if error.code == "process_missing":
+                return None
+            raise
+        if not self._same_identity(current, record):
+            self._close_fd(fd, phase)
+            raise FixtureError(phase, "pidfd_identity_mismatch")
+        self._pins[record["pid"]] = (fd, current)
+        return fd
+
+    def _remember(self, record: dict, phase: str) -> None:
         self._records[record["pid"]] = record
         if record["session"] == record["pid"]:
             self._sessions[record["session"]] = record["boot_id"]
+        self._pin(record, phase)
 
     def record(self, pid: int, phase: str) -> dict:
         return self._record_provider(pid, phase)
@@ -337,6 +425,7 @@ class _OwnedProcessSet:
             current is not None
             and current["starttime"] == reference["starttime"]
             and current["boot_id"] == reference.get("boot_id", current["boot_id"])
+            and current["uid"] == os.getuid()
             and current["state"] not in ("Z", "X", "x")
         )
 
@@ -348,7 +437,7 @@ class _OwnedProcessSet:
             if error.code == "process_missing":
                 return
             raise
-        self._remember(record)
+        self._remember(record, phase)
         self.observe_tree(pid, phase)
 
     def observe_launch_done(self, pid: int, phase: str) -> None:
@@ -357,7 +446,7 @@ class _OwnedProcessSet:
 
     def remember_postmaster(self, pid: int, phase: str) -> dict:
         record = self._record_provider(pid, phase)
-        self._remember(record)
+        self._remember(record, phase)
         self.observe_tree(pid, phase)
         return record
 
@@ -380,11 +469,20 @@ class _OwnedProcessSet:
                     continue
                 if record["uid"] != os.getuid() or record["state"] in ("Z", "X", "x"):
                     continue
-                self._remember(record)
+                self._remember(record, phase)
 
     def members(self, phase: str) -> dict[int, dict]:
         table = self._table_provider(phase)
         boot_id = self._boot_id_provider(phase)
+        for pid, (_, pinned_record) in list(self._pins.items()):
+            current = table.get(pid)
+            if (
+                current is None
+                or current["starttime"] != pinned_record["starttime"]
+                or current["boot_id"] != pinned_record["boot_id"]
+                or current["state"] in ("Z", "X", "x")
+            ):
+                self._drop_pin(pid, phase)
         members = {}
         for pid, reference in self._records.items():
             current = table.get(pid)
@@ -425,40 +523,51 @@ class _OwnedProcessSet:
         return members
 
     def _signal_members(self, phase: str, signum: int) -> None:
-        table = self._table_provider(phase)
+        _, pidfd_send_signal = self._pidfd_api()
+        if not callable(pidfd_send_signal):
+            raise FixtureError(phase, "pidfd_unavailable")
         for pid, reference in self.members(phase).items():
-            current = table.get(pid)
-            if (
-                current is None
-                or current["starttime"] != reference["starttime"]
-                or current["state"] in ("Z", "X", "x")
-            ):
-                continue
-            if current["uid"] != os.getuid():
-                raise FixtureError(phase, "process_unowned")
+            fd = self._pin(reference, phase)
+            if fd is None:
+                continue  # exited before the stable handle was acquired
             try:
-                self._signal_fn(pid, signum)
+                pidfd_send_signal(fd, signum)
             except ProcessLookupError:
-                continue
+                self._drop_pin(pid, phase)
+                continue  # pinned process already gone
             except OSError:
-                raise FixtureError(phase, "signal_failed") from None
+                self._drop_pin(pid, phase)
+                raise FixtureError(phase, "pidfd_signal_failed") from None
 
     def terminate_all(self, phase: str, *, timeout: float = CLEANUP_TIMEOUT_SECONDS) -> None:
-        """SIGTERM then SIGKILL only verified owned members, bounded by timeout."""
+        """SIGTERM then SIGKILL only via verified owned pidfds, bounded by timeout."""
         self._signal_members(phase, signal.SIGTERM)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not self.members(phase):
+                self.close(phase)
                 return
             time.sleep(POLL_SECONDS)
         self._signal_members(phase, signal.SIGKILL)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not self.members(phase):
+                self.close(phase)
                 return
             time.sleep(POLL_SECONDS)
         if self.members(phase):
             raise FixtureError(phase, "owned_processes_survive")
+        self.close(phase)
+
+    def close(self, phase: str = "cleanup") -> None:
+        error = None
+        for pid in list(self._pins):
+            try:
+                self._drop_pin(pid, phase)
+            except FixtureError as failure:
+                error = error or failure
+        if error is not None:
+            raise error
 
 
 class PhysicalPitrFixture:
@@ -471,6 +580,7 @@ class PhysicalPitrFixture:
         scratch_parent: Path | None = None,
         tools: PgTools | None = None,
     ) -> None:
+        _require_pidfd_support("platform")
         self.tools = _validate_pg17_tools(pg_bin_dir) if tools is None else tools
         parent = Path(scratch_parent) if scratch_parent is not None else Path(tempfile.gettempdir())
         try:
@@ -1049,15 +1159,23 @@ class PhysicalPitrFixture:
                 stopped = False
                 status["errors"].append(f"{name}:{type(error).__name__}")
             status[f"{name}_stopped"] = stopped
+        owned_stopped = False
         try:
             self.owned.terminate_all("cleanup")
             owned_stopped = not self.owned.members("cleanup")
         except FixtureError as error:
-            owned_stopped = False
             status["errors"].append(f"owned:{error.code}")
         except Exception as error:
-            owned_stopped = False
             status["errors"].append(f"owned:{type(error).__name__}")
+        finally:
+            try:
+                self.owned.close("cleanup")
+            except FixtureError as error:
+                owned_stopped = False
+                status["errors"].append(f"owned:{error.code}")
+            except Exception as error:
+                owned_stopped = False
+                status["errors"].append(f"owned:{type(error).__name__}")
         status["owned_processes_stopped"] = owned_stopped
         if not owned_stopped:
             status["primary_stopped"] = False

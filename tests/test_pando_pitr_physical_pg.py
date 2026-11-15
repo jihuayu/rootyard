@@ -34,6 +34,55 @@ def completed(stdout: bytes = b"") -> SimpleNamespace:
     return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
 
 
+class FakePidfd:
+    def __init__(self, pid: int, starttime: int) -> None:
+        self.pid = pid
+        self.starttime = starttime
+        self.closed = False
+
+
+class FakePidfdApi:
+    """Stable-generation pidfd mock; sends only while the pinned process lives."""
+
+    def __init__(self, processes: "FakeProcesses") -> None:
+        self.processes = processes
+        self.opened = 0
+        self.closed = 0
+        self.live: list[FakePidfd] = []
+        self.before_open = None
+        self.before_send = None
+
+    def open(self, pid: int, flags: int) -> FakePidfd:
+        record = self.processes.records.get(pid)
+        if record is None:
+            raise ProcessLookupError(pid)
+        self.opened += 1
+        fd = FakePidfd(pid, record["starttime"])
+        self.live.append(fd)
+        if self.before_open is not None:
+            callback = self.before_open
+            self.before_open = None
+            callback()
+        return fd
+
+    def send(self, fd: FakePidfd, signum: int) -> None:
+        if self.before_send is not None:
+            callback = self.before_send
+            self.before_send = None
+            callback()
+        record = self.processes.records.get(fd.pid)
+        if fd.closed or record is None or record["starttime"] != fd.starttime:
+            raise ProcessLookupError(fd.pid)
+        self.processes.signal(fd.pid, signum)
+
+    def close(self, fd: FakePidfd) -> None:
+        if fd.closed:
+            raise OSError("double close")
+        fd.closed = True
+        self.closed += 1
+        self.live.remove(fd)
+
+
 class FakeProcesses:
     """In-memory /proc boundary; no host process is ever signalled."""
 
@@ -43,6 +92,7 @@ class FakeProcesses:
         self.boot_id = "boot-test"
         self.ignore_term: set[int] = set()
         self.ignore_kill: set[int] = set()
+        self.pidfds = FakePidfdApi(self)
         self._next_start = 1
 
     def add(self, pid: int, *, ppid: int = 1, session: int | None = None,
@@ -72,6 +122,15 @@ class FakeProcesses:
             raise physical.FixtureError(phase, "process_missing")
         return dict(self.records[pid])
 
+    def replace(self, pid: int, *, starttime: int, session: int | None = None,
+                pgrp: int | None = None) -> None:
+        record = self.records[pid]
+        record["starttime"] = starttime
+        if session is not None:
+            record["session"] = session
+        if pgrp is not None:
+            record["pgrp"] = pgrp
+
     def signal(self, pid: int, signum: int) -> None:
         self.signals.append((pid, signum))
         if signum == signal.SIGTERM and pid in self.ignore_term:
@@ -85,7 +144,8 @@ class FakeProcesses:
             table_provider=self.table,
             boot_id_provider=self.boot,
             record_provider=self.record,
-            signal_fn=self.signal,
+            pidfd_api_provider=lambda: (self.pidfds.open, self.pidfds.send),
+            pidfd_close_fn=self.pidfds.close,
         )
         terminate = tracker.terminate_all
 
@@ -94,6 +154,25 @@ class FakeProcesses:
 
         tracker.terminate_all = fast_terminate  # bounded test clock
         return tracker
+
+
+class PidfdPlatformTest(unittest.TestCase):
+    def test_unsupported_pidfd_api_fails_before_popen_or_scratch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="rootyard-pidfd-platform-") as temporary:
+            with mock.patch.object(physical, "_proc_available", return_value=True), \
+                    mock.patch.object(physical, "_pidfd_api", return_value=(None, None)), \
+                    mock.patch.object(physical.subprocess, "Popen") as popen, \
+                    mock.patch.object(physical.subprocess, "run") as run:
+                with self.assertRaises(physical.FixtureError) as caught:
+                    physical.PhysicalPitrFixture(
+                        Path("/unused"), tools=FAKE_TOOLS,
+                        scratch_parent=Path(temporary),
+                    )
+            self.assertEqual((caught.exception.phase, caught.exception.code),
+                             ("platform", "pidfd_unavailable"))
+            popen.assert_not_called()
+            run.assert_not_called()
+            self.assertEqual(list(Path(temporary).iterdir()), [])
 
 
 class ToolValidationTest(unittest.TestCase):
@@ -146,6 +225,11 @@ class ToolValidationTest(unittest.TestCase):
 
 
 class FixtureBoundaryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        support = mock.patch.object(physical, "_require_pidfd_support", return_value=None)
+        support.start()
+        self.addCleanup(support.stop)
+
     def make_fixture(self, processes: FakeProcesses | None = None) -> physical.PhysicalPitrFixture:
         fixture = physical.PhysicalPitrFixture(Path("/unused"), tools=FAKE_TOOLS)
         fixture.owned = (processes or FakeProcesses()).tracker()
@@ -308,6 +392,42 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertIn((501, signal.SIGKILL), processes.signals)
         self.assertNotIn(501, processes.records)
 
+    def test_pidfd_pins_old_process_when_numeric_pid_is_replaced_before_send(self) -> None:
+        processes = FakeProcesses()
+        processes.add(600, session=600, starttime=60)
+        tracker = processes.tracker()
+        tracker.remember_postmaster(600, "cleanup")
+
+        def replace_pid() -> None:
+            processes.replace(600, starttime=70, session=999, pgrp=999)
+
+        processes.pidfds.before_send = replace_pid
+        tracker.terminate_all("cleanup", timeout=0.2)
+
+        self.assertEqual(processes.signals, [])
+        self.assertEqual(tracker.members("cleanup"), {})
+        self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
+        self.assertEqual(processes.pidfds.live, [])
+
+    def test_pidfd_identity_mismatch_on_acquisition_denies_signal(self) -> None:
+        processes = FakeProcesses()
+        processes.add(700, session=700, starttime=80)
+        tracker = processes.tracker()
+        expected = processes.record(700, "test")
+
+        def replace_pid() -> None:
+            processes.replace(700, starttime=81, session=999, pgrp=999)
+
+        processes.pidfds.before_open = replace_pid
+        with self.assertRaises(physical.FixtureError) as caught:
+            tracker._pin(expected, "test")
+
+        self.assertEqual((caught.exception.phase, caught.exception.code),
+                         ("test", "pidfd_identity_mismatch"))
+        self.assertEqual(processes.signals, [])
+        self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
+        self.assertEqual(processes.pidfds.live, [])
+
     def test_partial_start_without_pidfile_requires_owned_child_absence(self) -> None:
         processes = FakeProcesses()
         processes.add(200, session=200, starttime=20)
@@ -325,6 +445,8 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertTrue(cleanup["owned_processes_stopped"])
         self.assertTrue(cleanup["scratch_removed"])
         self.assertIn((201, signal.SIGKILL), processes.signals)
+        self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
+        self.assertEqual(processes.pidfds.live, [])
         self.assertFalse(fixture.root.exists())
 
     def test_still_live_owned_child_denies_cleanup_and_retains_scratch(self) -> None:
@@ -408,6 +530,8 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertTrue(cleanup["owned_processes_stopped"])
         self.assertTrue(cleanup["scratch_removed"])
         self.assertIn((400, signal.SIGTERM), processes.signals)
+        self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
+        self.assertEqual(processes.pidfds.live, [])
         self.assertFalse(fixture.root.exists())
 
     @unittest.skipUnless(
