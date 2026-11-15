@@ -52,7 +52,7 @@ async fn slow_blob_downloads_do_not_starve_fast_native_git_slots() -> Result<()>
 
         let mut delays = Vec::with_capacity(3);
         for slow in &slow_commits {
-            delays.push(s3.add_get_delay(slow.tenant.to_string(), Duration::from_millis(800)));
+            delays.push(s3.add_get_delay(slow.tenant.to_string(), Duration::from_millis(1800)));
         }
 
         let m_before = verifier_metrics();
@@ -60,6 +60,7 @@ async fn slow_blob_downloads_do_not_starve_fast_native_git_slots() -> Result<()>
         let verifier = Arc::new(PackVerifier::new(store.clone(), git.clone())?);
         let materializer = Arc::new(PgPackSnapshotMaterializer::new(store.clone(), git.clone())?);
 
+        let slow_start = StdInstant::now();
         let mut slow_handles = Vec::with_capacity(3);
         for slow in slow_commits {
             let v = Arc::clone(&verifier);
@@ -101,15 +102,19 @@ async fn slow_blob_downloads_do_not_starve_fast_native_git_slots() -> Result<()>
             h.await.map_err(|e| anyhow!("fast task panicked: {e}"))??;
         }
         let fast_wall = fast_start.elapsed();
-        ensure!(
-            fast_wall < Duration::from_millis(950),
-            "fast native Git commits starved behind 800ms slow Blob downloads: fast_wall={fast_wall:?}"
-        );
+        let slow_still_running = slow_handles.iter().filter(|h| !h.is_finished()).count();
 
         for h in slow_handles {
             let proof = h.await.map_err(|e| anyhow!("slow task panicked: {e}"))??;
             ensure!(proof.verified_pairs() >= 1 && proof.verified_bytes() > 0);
         }
+        let slow_wall = slow_start.elapsed();
+        ensure!(
+            slow_still_running >= 1
+                && fast_wall < Duration::from_millis(2900)
+                && fast_wall + Duration::from_millis(500) < slow_wall,
+            "fast native Git commits starved behind 1800ms slow Blob downloads: fast_wall={fast_wall:?}, slow_wall={slow_wall:?}, slow_still_running={slow_still_running}"
+        );
         drop(delays);
 
         let m_after = verifier_metrics();
@@ -151,13 +156,14 @@ async fn maintenance_saturation_preserves_foreground_pg_commit_and_reclaim() -> 
 
         let mut guards = Vec::new();
         for m in &maint_commits {
-            guards.push(s3.add_get_delay(m.tenant.to_string(), Duration::from_millis(800)));
+            guards.push(s3.add_get_delay(m.tenant.to_string(), Duration::from_millis(1200)));
         }
-        guards.push(s3.add_get_delay(timeout_commit.tenant.to_string(), Duration::from_millis(800)));
+        guards.push(s3.add_get_delay(timeout_commit.tenant.to_string(), Duration::from_millis(1200)));
 
         let m_before = verifier_metrics();
         let verifier = Arc::new(PackVerifier::new(store.clone(), git.clone())?);
 
+        let maint_start = StdInstant::now();
         let mut maint_tasks = Vec::with_capacity(4);
         for m in maint_commits {
             let v = Arc::clone(&verifier);
@@ -176,19 +182,23 @@ async fn maintenance_saturation_preserves_foreground_pg_commit_and_reclaim() -> 
         verify_sha256_equal(&view.idx_bytes(fg_commit.pack_id, deadline()).await?, &fg_commit.idx_bytes, "fg idx")?;
         drop(view);
         let fg_elapsed = fg_start.elapsed();
-        ensure!(
-            fg_elapsed < Duration::from_millis(950),
-            "foreground commit + view blocked behind 800ms maintenance backlog: {fg_elapsed:?}"
-        );
+        let maint_still_running = maint_tasks.iter().filter(|h| !h.is_finished()).count();
 
         let tight_deadline = StdInstant::now() + Duration::from_millis(80);
         let timed_out = verifier.verify(&timeout_commit.plan, &timeout_commit.context, tight_deadline).await;
-        ensure!(timed_out.is_err(), "800ms download under 80ms unified deadline must fail closed");
+        ensure!(timed_out.is_err(), "1200ms download under 80ms unified deadline must fail closed");
 
         for h in maint_tasks {
             let proof = h.await.map_err(|e| anyhow!("maintenance verify panicked: {e}"))??;
             ensure!(proof.verified_pairs() >= 1 && proof.verified_bytes() > 0);
         }
+        let maint_wall = maint_start.elapsed();
+        ensure!(
+            maint_still_running >= 1
+                && fg_elapsed < Duration::from_millis(2200)
+                && fg_elapsed + Duration::from_millis(500) < maint_wall,
+            "foreground commit + view blocked behind 1200ms maintenance backlog: fg_elapsed={fg_elapsed:?}, maint_wall={maint_wall:?}, maint_still_running={maint_still_running}"
+        );
         drop(guards);
 
         let m_after = verifier_metrics();
