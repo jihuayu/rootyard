@@ -191,25 +191,50 @@ async fn run_backend(
     });
     let mut process = Process { child, input: Some(input), stderr, pid };
     let mut stdout = BufReader::with_capacity(16 * 1024, stdout);
-    let result = tokio::time::timeout_at(deadline, async {
-        let (status, content_type) = read_headers(&mut stdout).await?;
+    let bound = super::revocation::bound();
+    let result = async {
+        let (status, content_type) =
+            match super::revocation::await_with_reauth(bound, deadline, read_headers(&mut stdout), || async {
+                tokio::time::timeout(bound.reauth_timeout, ref_check(state, actor, repo, lease))
+                    .await
+                    .map_err(|_| {
+                        crate::Error(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Pando authority check timed out")
+                    })?
+                    .map_err(crate::Error::internal)
+            })
+            .await
+            {
+                super::revocation::BoundedOutcome::Ready(res) => res.map_err(io::Error::other)?,
+                super::revocation::BoundedOutcome::Revoked(err) => return Err(io::Error::other(err.1)),
+                super::revocation::BoundedOutcome::TimedOut => {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+                }
+            };
         let mut reply = Vec::new();
         let max_reply = state.config.max_output_bytes.min(MAX_RECEIVE_REPLY);
         let mut buf = [0u8; 32 * 1024];
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut tick = tokio::time::interval_at(Instant::now() + bound.check_interval, bound.check_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let check_bounded = || async {
+            tokio::time::timeout(bound.reauth_timeout, ref_check(state, actor, repo, lease))
+                .await
+                .map_err(|_| io::Error::other("Pando authority check timed out"))?
+        };
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
         loop {
             let n = tokio::select! {
                 value = stdout.read(&mut buf) => value?,
                 _ = tick.tick() => {
-                    ref_check(state,actor,repo,lease).await?;
+                    check_bounded().await?;
                     continue;
                 }
+                _ = &mut deadline_sleep => return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")),
             };
             if n == 0 {
                 break;
             }
-            ref_check(state, actor, repo, lease).await?;
+            check_bounded().await?;
             if reply.len() as u64 + n as u64 > max_reply {
                 return Err(io::Error::other("Pando receive response exceeded bound"));
             }
@@ -218,19 +243,29 @@ async fn run_backend(
         if let Some(input) = process.input.take() {
             input.await.map_err(io::Error::other)??;
         }
-        let exit = process.finish().await?;
+        let exit = match super::revocation::await_with_reauth(bound, deadline, process.finish(), || async {
+            check_bounded().await.map_err(crate::Error::internal)
+        })
+        .await
+        {
+            super::revocation::BoundedOutcome::Ready(res) => res?,
+            super::revocation::BoundedOutcome::Revoked(err) => return Err(io::Error::other(err.1)),
+            super::revocation::BoundedOutcome::TimedOut => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+            }
+        };
         if !exit.success() {
             return Err(io::Error::other("Pando native receive failed"));
         }
-        ref_check(state, actor, repo, lease).await?;
+        check_bounded().await?;
         Ok::<_, io::Error>((status, content_type, reply))
-    })
+    }
     .await;
-    process.stop().await;
+    process.stop_with_grace(bound.stop_grace).await;
     match result {
-        Ok(Ok(reply)) => Ok(reply),
-        Ok(Err(error)) => Err(Error::internal(error)),
-        Err(_) => Err(Error::timeout()),
+        Ok(reply) => Ok(reply),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(Error::timeout()),
+        Err(error) => Err(Error::internal(error)),
     }
 }
 

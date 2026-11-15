@@ -83,6 +83,7 @@ impl Config {
         let git = git.canonicalize().context("ROOTYARD_GIT must point to Git")?;
         let database_url = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
         let _pg: tokio_postgres::Config = database_url.parse().context("invalid DATABASE_URL")?;
+        let _ = crate::git_http::revocation::validate_env()?;
         Ok(Self {
             metrics_bind: env::var("ROOTYARD_METRICS_BIND")
                 .ok()

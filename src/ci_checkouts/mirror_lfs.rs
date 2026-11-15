@@ -1,12 +1,11 @@
 //! Git LFS Basic download for one immutable, authorized CI checkout manifest.
-use crate::{AppState,Error,auth,ci_checkouts::{self,dependencies},db,lfs::{models,storage}};
+use crate::{AppState,Error,auth,ci_checkouts::{self,dependencies},db,git_http::revocation,lfs::{models,storage}};
 use axum::{Json,body::Body,extract::{Path,State},http::{HeaderMap,StatusCode,header},response::{IntoResponse,Response}};
-use futures_util::StreamExt;
 use std::{io,sync::Arc,time::Duration};
 use uuid::Uuid;
 
-async fn authorized(state:&AppState,job:Uuid,digest:&[u8],repo:Uuid,generation:i64)->bool{
-    matches!(tokio::time::timeout(Duration::from_secs(1),
+async fn authorized(state:&AppState,job:Uuid,digest:&[u8],repo:Uuid,generation:i64,timeout:Duration)->bool{
+    matches!(tokio::time::timeout(timeout,
         ci_checkouts::still_authorized(state,job,digest,repo,generation)).await,Ok(Ok(true)))
 }
 
@@ -63,54 +62,26 @@ pub async fn download(
     let size=dep.size as u64;
     let (_,token)=auth::credentials_for(&headers,"ryj_")?;
     let digest=db::digest(&token);
-    if !authorized(&state,plan.job_id,&digest,repo.id,repo.storage_generation).await {
+    let bound=revocation::bound();
+    if !authorized(&state,plan.job_id,&digest,repo.id,repo.storage_generation,bound.reauth_timeout).await {
         return Err(Error::unauthorized());
     }
     let body=storage::open_verified_download_stream(&state,repo.id,plan.owner_id,&oid,size).await?;
-    let (sender,receiver)=tokio::sync::mpsc::channel::<Result<axum::body::Bytes,io::Error>>(8);
     let job=plan.job_id;let repo_id=repo.id;let generation=repo.storage_generation;
-    tokio::spawn(async move {
-        let mut source=body.into_data_stream();
-        let mut tick=tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut pending=None;
-        let mut failed=false;
-        loop {
-            if let Some(bytes)=pending.take() {
-                tokio::select! {
-                    _=tick.tick()=> {pending=Some(bytes);
-                        if !authorized(&state,job,&digest,repo_id,generation).await {failed=true;break;}}
-                    permit=sender.reserve()=>match permit {
-                        Ok(permit)=>{
-                            if !authorized(&state,job,&digest,repo_id,generation).await {failed=true;break;}
-                            permit.send(Ok(bytes));
-                        },Err(_)=>break,
-                    },
-                }
+    let check_state=state.clone();
+    let stream_body=revocation::stream_body_with_reauth(state,body,bound,move || {
+        let state=check_state.clone();let digest=digest.clone();
+        async move {
+            if authorized(&state,job,&digest,repo_id,generation,bound.reauth_timeout).await {
+                Ok(())
             } else {
-                tokio::select! {
-                    _=tick.tick()=>{
-                        if !authorized(&state,job,&digest,repo_id,generation).await {failed=true;break;}}
-                    _=sender.closed()=>break,
-                    next=source.next()=>match next {
-                        Some(Ok(bytes))=>pending=Some(bytes),
-                        Some(Err(_))=>{failed=true;break;},
-                        None=>break,
-                    },
-                }
+                Err(io::Error::other("CI LFS transfer authorization changed"))
             }
         }
-        if failed {
-            state.transfer_metrics.record_failure();
-            let _=sender.try_send(Err(io::Error::other("CI LFS transfer authorization changed")));
-        }
-    });
-    let stream=futures_util::stream::unfold(receiver,|mut receiver|async move {
-        receiver.recv().await.map(|item|(item,receiver))
     });
     Response::builder().status(StatusCode::OK)
         .header(header::CONTENT_TYPE,"application/octet-stream")
         .header(header::CACHE_CONTROL,"no-store")
         .header(header::CONTENT_LENGTH,size.to_string())
-        .body(Body::from_stream(stream)).map_err(Error::internal)
+        .body(stream_body).map_err(Error::internal)
 }

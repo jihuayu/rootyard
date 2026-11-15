@@ -28,6 +28,8 @@ mod protocol;
 pub(crate) mod publication;
 #[path = "git_http/receive.rs"]
 mod receive;
+#[path = "git_http/revocation.rs"]
+pub(crate) mod revocation;
 use process::Process;
 pub(crate) use process::{
     GitCommandFailed, StreamLimits, collect_git_output, collect_git_output_input, finish_group_child, group_quiescent,
@@ -42,34 +44,9 @@ async fn transfer_authorized(
     job_principal: Option<&crate::ci_checkouts::authority::CheckoutPrincipal>,
     repo: &Repository,
     write: bool,
+    reauth_timeout: std::time::Duration,
 ) -> io::Result<()> {
-    if let Some(plan) = job_plan {
-        let digest = match job_principal {
-            Some(crate::ci_checkouts::authority::CheckoutPrincipal::User(user)) => &user.token_digest,
-            Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { token_digest, .. }) => token_digest,
-            None => return Err(io::Error::other("missing checkout principal")),
-        };
-        match crate::ci_checkouts::still_authorized(state, plan.job_id, digest, repo.id, repo.storage_generation).await
-        {
-            Ok(true) => Ok(()),
-            _ => Err(io::Error::other("checkout authority revoked")),
-        }
-    } else {
-        let user = identity.ok_or_else(|| io::Error::other("missing Git actor"))?;
-        auth::verify_active(
-            &state.pool,
-            user,
-            repo.id,
-            if write {
-                crate::token_scopes::RepoAction::ContentsWrite
-            } else {
-                crate::token_scopes::RepoAction::ContentsRead
-            },
-            if write { auth::Role::Write } else { auth::Role::Read },
-        )
-        .await
-        .map_err(|_| io::Error::other("Git authority revoked"))
-    }
+    revocation::transfer_authorized(state, identity, job_plan, job_principal, repo, write, reauth_timeout).await
 }
 
 async fn backend_current(state: &AppState, repo: &Repository) -> Result<(), Error> {
@@ -246,10 +223,19 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         None
     };
     backend_current(&state, &repo).await?;
+    let bound = revocation::bound();
     if snapshot_lease.is_some() {
-        transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(), job_principal.as_ref(), &repo, write)
-            .await
-            .map_err(|_| Error::unauthorized())?;
+        transfer_authorized(
+            &state,
+            identity.as_ref(),
+            job_plan.as_ref(),
+            job_principal.as_ref(),
+            &repo,
+            write,
+            bound.reauth_timeout,
+        )
+        .await
+        .map_err(|_| Error::unauthorized())?;
     }
     if write_guard.is_some() {
         reliability::before_gitfs_push(&state, &repo).await?;
@@ -263,17 +249,36 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     let path = if let Some(snapshot) = &pando_snapshot {
         snapshot.path().to_owned()
     } else if let Some(oid) = pin_oid {
-        if job {
-            let plan = job_plan.as_ref().ok_or_else(Error::unauthorized)?;
-            if state.mirror_primary.is_some() {
-                crate::ci_checkouts::dependencies::verify_on_mirror(&state, plan).await?;
-                crate::mirror::job_path(&state, &repo, plan).await?
+        let pin_fut = async {
+            if job {
+                let plan = job_plan.as_ref().ok_or_else(Error::unauthorized)?;
+                if state.mirror_primary.is_some() {
+                    crate::ci_checkouts::dependencies::verify_on_mirror(&state, plan).await?;
+                    crate::mirror::job_path(&state, &repo, plan).await
+                } else {
+                    let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;
+                    lease.guard(crate::ci_checkouts::origin_job_path(&state, &repo, plan, lease)).await?
+                }
             } else {
-                let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;
-                lease.guard(crate::ci_checkouts::origin_job_path(&state, &repo, plan, lease)).await??
+                crate::mirror::pinned_path(&state, &repo, oid).await
             }
-        } else {
-            crate::mirror::pinned_path(&state, &repo, oid).await?
+        };
+        match revocation::await_with_reauth(bound, deadline, pin_fut, || {
+            revocation::verify_transfer_authority(
+                &state,
+                identity.as_ref(),
+                job_plan.as_ref(),
+                job_principal.as_ref(),
+                &repo,
+                write,
+                bound.reauth_timeout,
+            )
+        })
+        .await
+        {
+            revocation::BoundedOutcome::Ready(res) => res?,
+            revocation::BoundedOutcome::Revoked(error) => return Err(error),
+            revocation::BoundedOutcome::TimedOut => return Err(Error::timeout()),
         }
     } else {
         state.storage.verify_path(repo.id).map_err(Error::internal)?
@@ -417,17 +422,49 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         (None, None, None)
     };
     if let Some(plan) = &job_plan {
-        let (_, _, current) = crate::ci_checkouts::authority::authenticate_principal(
-            &state,
-            &parts.headers,
-            owner,
-            name,
-            pin_oid.unwrap(),
+        let (_, _, current) = match tokio::time::timeout(
+            bound.reauth_timeout,
+            crate::ci_checkouts::authority::authenticate_principal(
+                &state,
+                &parts.headers,
+                owner,
+                name,
+                pin_oid.unwrap(),
+            ),
         )
-        .await?;
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                if let Some(op) = &operation {
+                    let _ = journal::finish(op);
+                }
+                drop(active_guard);
+                let _ = reliability::complete(&state, operation).await;
+                return Err(Error::timeout());
+            }
+        };
         if &current != plan {
             return Err(Error::unauthorized());
         }
+    }
+    if let Err(error) = revocation::verify_transfer_authority(
+        &state,
+        identity.as_ref(),
+        job_plan.as_ref(),
+        job_principal.as_ref(),
+        &repo,
+        write,
+        bound.reauth_timeout,
+    )
+    .await
+    {
+        if let Some(op) = &operation {
+            let _ = journal::finish(op);
+        }
+        drop(active_guard);
+        let _ = reliability::complete(&state, operation).await;
+        return Err(error);
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -458,47 +495,86 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     });
     let mut process = Process { child, input: Some(input), stderr, pid };
     let mut stdout = BufReader::with_capacity(16 * 1024, stdout);
-    let headers = match tokio::time::timeout_at(deadline, read_headers(&mut stdout)).await {
-        Ok(Ok(headers)) => headers,
-        result => {
-            process.stop().await;
-            state.transfer_metrics.record_failure();
-            let _ = publication::settle(&state, operation, active_guard, coordinator).await;
-            return Err(match result {
-                Err(_) => Error::timeout(),
-                Ok(Err(error)) => Error::internal(error),
-                _ => unreachable!(),
-            });
+    let pre_stream_recheck = || async {
+        if let Some(guard) = &ref_guard {
+            guard.ensure_active().map_err(Error::internal)?;
         }
+        if let Some(lease) = &snapshot_lease {
+            lease.ensure_active().map_err(Error::internal)?;
+        }
+        revocation::verify_transfer_authority(
+            &state,
+            identity.as_ref(),
+            job_plan.as_ref(),
+            job_principal.as_ref(),
+            &repo,
+            write,
+            bound.reauth_timeout,
+        )
+        .await
     };
+    let headers =
+        match revocation::await_with_reauth(bound, deadline, read_headers(&mut stdout), pre_stream_recheck).await {
+            revocation::BoundedOutcome::Ready(Ok(headers)) => headers,
+            outcome => {
+                process.stop_with_grace(bound.stop_grace).await;
+                state.transfer_metrics.record_failure();
+                let _ = publication::settle(&state, operation, active_guard, coordinator).await;
+                return Err(match outcome {
+                    revocation::BoundedOutcome::TimedOut => Error::timeout(),
+                    revocation::BoundedOutcome::Ready(Err(error)) => Error::internal(error),
+                    revocation::BoundedOutcome::Revoked(error) => error,
+                    revocation::BoundedOutcome::Ready(Ok(_)) => unreachable!(),
+                });
+            }
+        };
     // A native upload-pack refusal is an ERR pkt-line followed by a nonzero
     // exit. Publishing a streaming 200 first is racy: an input BrokenPipe or
     // final body error can discard the queued ERR before HTTP flushes it.
     // Inspect just the first bounded packet for job RPCs before committing
     // headers. Never turn a failed/truncated PACK into a successful response.
     let prefix = if job && parts.method == Method::POST && headers.0.is_success() {
-        match tokio::time::timeout_at(deadline, job_response_prefix(&mut stdout, state.config.max_output_bytes)).await {
-            Ok(Ok((prefix, false))) => prefix,
-            result => {
-                process.stop().await;
+        match revocation::await_with_reauth(
+            bound,
+            deadline,
+            job_response_prefix(&mut stdout, state.config.max_output_bytes),
+            pre_stream_recheck,
+        )
+        .await
+        {
+            revocation::BoundedOutcome::Ready(Ok((prefix, false))) => prefix,
+            outcome => {
+                process.stop_with_grace(bound.stop_grace).await;
                 state.transfer_metrics.record_failure();
-                return Err(match result {
-                    Ok(Ok((_, true))) => Error(StatusCode::FORBIDDEN, "Git target request denied"),
-                    Err(_) => Error::timeout(),
-                    Ok(Err(error)) => Error::internal(error),
-                    _ => unreachable!(),
+                let _ = publication::settle(&state, operation, active_guard, coordinator).await;
+                return Err(match outcome {
+                    revocation::BoundedOutcome::Ready(Ok((_, true))) => {
+                        Error(StatusCode::FORBIDDEN, "Git target request denied")
+                    }
+                    revocation::BoundedOutcome::TimedOut => Error::timeout(),
+                    revocation::BoundedOutcome::Ready(Err(error)) => Error::internal(error),
+                    revocation::BoundedOutcome::Revoked(error) => error,
+                    revocation::BoundedOutcome::Ready(Ok(_)) => unreachable!(),
                 });
             }
         }
     } else {
         Vec::new()
     };
-    if let Err(error) =
-        transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(), job_principal.as_ref(), &repo, write).await
+    if let Err(error) = revocation::verify_transfer_authority(
+        &state,
+        identity.as_ref(),
+        job_plan.as_ref(),
+        job_principal.as_ref(),
+        &repo,
+        write,
+        bound.reauth_timeout,
+    )
+    .await
     {
-        process.stop().await;
+        process.stop_with_grace(bound.stop_grace).await;
         let _ = publication::settle(&state, operation, active_guard, coordinator).await;
-        return Err(Error::internal(error));
+        return Err(error);
     }
     // Reinsert the inspected bytes unchanged. Existing transfer accounting,
     // process-exit checks, input errors and deadlines still cover every byte.
@@ -529,7 +605,8 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let transfer = async {
             let mut total = 0u64;
             let mut buf = vec![0u8; 32 * 1024];
-            let mut recheck_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut recheck_tick =
+                tokio::time::interval_at(Instant::now() + bound.check_interval, bound.check_interval);
             recheck_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             transfer_authorized(
                 &state,
@@ -538,6 +615,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 job_principal.as_ref(),
                 &admitted_repo,
                 write,
+                bound.reauth_timeout,
             )
             .await?;
             if let Some(guard) = &ref_guard {
@@ -557,7 +635,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                         _ = recheck_tick.tick() => {
                             if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
                             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
-                                job_principal.as_ref(), &admitted_repo, write).await?;
+                                job_principal.as_ref(), &admitted_repo, write, bound.reauth_timeout).await?;
                             if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
                             continue;
                         }
@@ -569,7 +647,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                         _ = recheck_tick.tick() => {
                             if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
                             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
-                                job_principal.as_ref(), &admitted_repo, write).await?;
+                                job_principal.as_ref(), &admitted_repo, write, bound.reauth_timeout).await?;
                             if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
                             continue;
                         }
@@ -589,6 +667,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                     job_principal.as_ref(),
                     &admitted_repo,
                     write,
+                    bound.reauth_timeout,
                 )
                 .await?;
                 if let Some(guard) = &ref_guard {
@@ -607,7 +686,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                         _ = recheck_tick.tick() => {
                             if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
                             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
-                                job_principal.as_ref(), &admitted_repo, write).await?;
+                                job_principal.as_ref(), &admitted_repo, write, bound.reauth_timeout).await?;
                             if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
                         }
                     }
@@ -638,7 +717,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         if !matches!(tokio::time::timeout_at(deadline, transfer).await, Ok(Ok(()))) {
             producer_failed.store(true, std::sync::atomic::Ordering::Release);
         }
-        process.stop().await;
+        process.stop_with_grace(bound.stop_grace).await;
         // Drop is also a last-resort guard if this task itself is cancelled.
         drop(process);
         drop(pando_snapshot);
