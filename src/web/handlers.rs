@@ -57,7 +57,7 @@ type Res = Result<Response, Error>;
 // caller keeps its path.
 pub use super::session::{authenticate_web, normalize_web_headers};
 
-async fn load_header_ctx(tx: &Transaction<'_>, owner: &str, name: &str, actor: &Identity, access: RepoAccess) -> Result<RepoHeaderCtx, Error> {
+pub(in crate::web) async fn load_header_ctx(tx: &Transaction<'_>, owner: &str, name: &str, actor: &Identity, access: RepoAccess) -> Result<RepoHeaderCtx, Error> {
     let row = tx.query_one("SELECT storage_backend, storage_generation, state FROM repositories WHERE id = $1", &[&access.repo_id]).await.map_err(Error::internal)?;
     Ok(RepoHeaderCtx {
         owner: owner.to_owned(),

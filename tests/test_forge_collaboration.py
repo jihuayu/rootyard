@@ -124,19 +124,12 @@ class ForgeCollaborationContractTests(unittest.TestCase):
             for idx, line in enumerate(lines):
                 if "#[derive(" in line and "Deserialize" in line:
                     window = "\n".join(lines[max(0, idx - 3) : min(len(lines), idx + 3)])
-                    # Internal untagged deserializers inside functions also deserialize cleanly,
-                    # whereas API/query input structs and enums must reject unknown fields.
-                    if "pub struct " in window or "pub enum " in window:
-                        if "Serialize" in line and "Deserialize" in line and "RepoLabel" in window:
-                            continue
-                        if "enum IntOrStr" in window or "enum OptIntOrStr" in window:
-                            continue
-                        if "pub struct " in window and "Serialize" not in line:
-                            self.assertIn(
-                                "deny_unknown_fields",
-                                window,
-                                f"{rel}:{idx + 1} missing #[serde(deny_unknown_fields)]",
-                            )
+                    if "pub struct " in window:
+                        self.assertIn(
+                            "deny_unknown_fields",
+                            window,
+                            f"{rel}:{idx + 1} missing #[serde(deny_unknown_fields)]",
+                        )
 
     def test_web_and_ui_collaboration_route_parity_and_docs(self) -> None:
         collab = (ROOT / "src" / "web" / "collaboration.rs").read_text(encoding="utf-8")

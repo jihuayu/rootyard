@@ -7,7 +7,7 @@ use super::{
         render_labels_view, render_notifications_view, render_overview_collab_html,
         render_pull_collab_html, render_search_view,
     },
-    handlers::{authenticate_web, authorize_web_repo, normalize_web_headers},
+    handlers::{authenticate_web, normalize_web_headers},
     models::{CommentViewItem, IssueViewItem, OverviewViewData, PullDetailViewData, RepoHeaderCtx},
     templates::{self, html_response},
 };
@@ -292,22 +292,21 @@ async fn search_global_web(State(state): App, uri: Uri, Query(q): Query<WebSearc
 }
 
 async fn search_repo_web(State(state): App, Path((owner, name)): Path<(String, String)>, uri: Uri, Query(q): Query<WebSearchQuery>, headers: HeaderMap) -> Res {
-    let norm = normalize_web_headers(&headers);
-    let (actor, access, header_ctx) = authorize_web_repo(&state, &norm, &owner, &name, Role::Read, RepoAction::RepoRead).await?;
+    let (_norm, actor) = actions::auth_web_actor(&state, &headers).await?;
     let scope = q.scope.unwrap_or(SearchScope::All);
     let sort = q.sort.unwrap_or(SearchSort::Updated);
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let (access, header_ctx) = actions::authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Read, RepoAction::RepoRead).await?;
     let (hits, next_cursor) = if let Some(ref raw) = q.q
         && !raw.trim().is_empty()
     {
-        let mut client = state.pool.get().await.map_err(Error::internal)?;
-        let tx = client.transaction().await.map_err(Error::internal)?;
         let sq = SearchQuery { q: raw.clone(), scope: Some(scope), sort: Some(sort), cursor: q.cursor.clone(), limit: q.limit };
-        let res = execute_search(&tx, &actor, Some(access.repo_id), &sq).await?;
-        finish(tx, &actor, false).await?;
-        res
+        execute_search(&tx, &actor, Some(access.repo_id), &sq).await?
     } else {
         (Vec::new(), None)
     };
+    finish(tx, &actor, false).await?;
     Ok(html_response(
         StatusCode::OK,
         render_search_view(web_prefix(&uri), &actor.username, Some(&header_ctx), q.q.as_deref(), (scope.as_str(), sort.as_str()), &hits, next_cursor.as_deref()),
@@ -331,10 +330,10 @@ async fn notifications_web(State(state): App, uri: Uri, Query(q): Query<WebNotif
 }
 
 async fn labels_page_web(State(state): App, Path((owner, name)): Path<(String, String)>, uri: Uri, headers: HeaderMap) -> Res {
-    let norm = normalize_web_headers(&headers);
-    let (actor, _access, header_ctx) = authorize_web_repo(&state, &norm, &owner, &name, Role::Read, RepoAction::RepoRead).await?;
+    let (_norm, actor) = actions::auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let (_access, header_ctx) = actions::authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Read, RepoAction::RepoRead).await?;
     let html = render_labels_html_for(&tx, web_prefix(&uri), &header_ctx).await?;
     finish(tx, &actor, false).await?;
     Ok(html_response(StatusCode::OK, html))

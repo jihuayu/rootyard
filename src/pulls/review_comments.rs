@@ -42,6 +42,7 @@ pub(crate) const REVIEW_COMMENT_FIELDS: &str = concat!(
 );
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PullReviewComment {
     pub repository_id: Uuid,
     pub pull_number: i64,

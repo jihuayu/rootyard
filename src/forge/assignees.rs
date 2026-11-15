@@ -28,6 +28,7 @@ use uuid::Uuid;
 const MAX_ASSIGNEES: usize = 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AssigneeEntry {
     pub user_id: Uuid,
     pub username: String,

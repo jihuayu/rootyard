@@ -40,6 +40,7 @@ pub(crate) const REPO_VISIBILITY_SQL: &str = concat!(
 );
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Notification {
     pub id: Uuid,
     pub repository_id: Uuid,
@@ -129,18 +130,18 @@ pub(crate) fn sanitize_single_line(raw: &str, max_bytes: usize, fallback: &str) 
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
         return fallback.to_owned();
     }
     let mut end = 0;
-    for (idx, ch) in trimmed.char_indices() {
+    for (idx, ch) in collapsed.char_indices() {
         if idx + ch.len_utf8() > max_bytes {
             break;
         }
         end = idx + ch.len_utf8();
     }
-    trimmed[..end].to_owned()
+    collapsed[..end].trim_end().to_owned()
 }
 
 pub(crate) fn valid_iso_cursor_ts(raw: &str) -> bool {

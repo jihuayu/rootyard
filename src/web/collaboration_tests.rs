@@ -98,7 +98,9 @@ fn pct_encode_and_search_view_escape_untrusted_content() {
     assert!(html.contains(r#"href="/ui/search""#));
     assert!(html.contains(r#"q=a%20%26%20b&scope=issues&sort=number&cursor=next%2Bcur%3D1"#));
     assert!(!html.contains("<script>alert(1)</script>"));
-    assert!(!html.contains("onerror=alert(2)"));
+    assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!html.contains("<img src=x"));
+    assert!(html.contains("&lt;img src=x onerror=alert(2)&gt;"));
 }
 
 #[test]
@@ -127,6 +129,8 @@ fn notifications_and_pull_collab_render_outdated_and_role_gated_forms() {
     let n_html = render_notifications_view("/web", "alice", &[n], true, None);
     assert!(n_html.contains(r#"data-channel="in_app""#));
     assert!(!n_html.contains("<script>xss()</script>"));
+    assert!(n_html.contains("&lt;script&gt;xss()&lt;/script&gt;"));
+    assert!(n_html.contains("&lt;b&gt;Review&lt;/b&gt;"));
 
     let pull = PullRequest {
         repository_id: Uuid::nil(),

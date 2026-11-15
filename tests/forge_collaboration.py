@@ -2,9 +2,11 @@
 """Real PG 17 + Git + HTTP E2E + Backup/Restore suite for Issue #86 collaboration features."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import traceback
 import urllib.parse
@@ -15,7 +17,7 @@ from web_sessions import BrowserHarness
 
 
 class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
-    def run_all(self):
+    def prepare_fixtures(self):
         self.cli("migrate")
         self.alice = self.account("create-user", "alice")
         self.bob = self.account("create-user", "bob")
@@ -78,12 +80,18 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
         self.git("commit", "-m", "feat v1", cwd=work)
         self.git("push", "origin", "HEAD:refs/heads/feat", cwd=work, token=self.alice)
         head_v1 = self.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
+        self.work = work
+        self.base_oid = base_oid
+        self.head_v1 = head_v1
+        return {"work_repo_ready": True, "base_oid": base_oid, "head_v1": head_v1}
 
+    def run_all(self):
         results = {}
+        results["setup_fixtures"] = self.prepare_fixtures()
         results["subscriptions_and_notifications"] = self.exercise_subscriptions_and_notifications()
         results["labels_and_assignees"] = self.exercise_labels_and_assignees()
         results["inline_review_and_moderation"] = self.exercise_inline_review_and_moderation(
-            work, base_oid, head_v1
+            self.work, self.base_oid, self.head_v1
         )
         results["search_and_rbac"] = self.exercise_search_and_rbac()
         results["web_ui_and_csrf"] = self.exercise_web_ui()
@@ -613,18 +621,47 @@ def main():
     args.binary = str(Path(args.binary).resolve())
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
         parser.error("dedicated synthetic ROOTYARD_TEST_DATABASE_URL required")
+    for exe in ("git", "psql", "pg_dump", "pg_restore", args.binary):
+        if not shutil.which(exe):
+            parser.error("Required executable not found: " + exe)
     harness = ForgeCollaborationHarness(args)
+    passed = False
     try:
-        report = {"status": "passed", "suites": harness.run_all()}
+        for name, fn in [
+            ("setup_fixtures", harness.prepare_fixtures),
+            ("subscriptions_and_notifications", harness.exercise_subscriptions_and_notifications),
+            ("labels_and_assignees", harness.exercise_labels_and_assignees),
+            (
+                "inline_review_and_moderation",
+                lambda: harness.exercise_inline_review_and_moderation(
+                    harness.work, harness.base_oid, harness.head_v1
+                ),
+            ),
+            ("search_and_rbac", harness.exercise_search_and_rbac),
+            ("web_ui_and_csrf", harness.exercise_web_ui),
+            ("backup_and_restore", harness.exercise_backup_restore),
+        ]:
+            harness.case(name, fn)
+        passed = True
+    except Exception:
+        print(harness.redact(traceback.format_exc()), file=sys.stderr)
+    finally:
+        try:
+            harness.cleanup()
+        except Exception as exc:
+            harness.results.append(dict(name="cleanup", status="failed", error=harness.redact(exc)))
+            passed = False
+        report = {
+            "passed": passed,
+            "cases": harness.results,
+            "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+        }
         if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report, indent=2))
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
-    finally:
-        harness.cleanup()
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

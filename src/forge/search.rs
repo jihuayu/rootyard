@@ -229,8 +229,8 @@ pub(crate) async fn execute_search(
             "u.sort_ts DESC, u.owner ASC, u.repo ASC, u.kind ASC, u.number ASC, u.comment_number ASC",
         ),
         SearchSort::Number => (
-            "($5::text IS NULL OR (u.owner,u.repo,u.kind,u.number,u.comment_number) > ($6::text,$7::text,$8::text,$9::bigint,$10::bigint))",
-            "u.owner ASC, u.repo ASC, u.kind ASC, u.number ASC, u.comment_number ASC",
+            "($5::text IS NULL OR ((u.number < $9::bigint) OR (u.number = $9::bigint AND (u.owner,u.repo,u.kind,u.comment_number) > ($6::text,$7::text,$8::text,$10::bigint))))",
+            "u.number DESC, u.owner ASC, u.repo ASC, u.kind ASC, u.comment_number ASC",
         ),
     };
 
