@@ -30,6 +30,7 @@
 mod api;
 mod browse;
 mod browser_ui;
+mod retention_roots;
 mod config;
 mod error;
 mod history;
@@ -102,6 +103,15 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
         .route("/api/repos", post(api::create_repo).get(api::list_repos))
         .route("/api/repos/{owner}/{name}", get(api::get_repo))
         .route("/api/repos/{owner}/{name}/operations/{operation}", get(api::get_operation))
+        .route(
+            "/api/repos/{owner}/{name}/roots/release-intent",
+            post(retention_roots::release_root_intent),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/roots/{root}",
+            get(retention_roots::read_root).delete(retention_roots::release_root),
+        )
+        .route("/api/repos/{owner}/{name}/roots", post(retention_roots::create_root))
         .route("/api/repos/{owner}/{name}/operations/{operation}/cancel", post(api::cancel_operation))
         .route("/api/repos/{owner}/{name}/snapshots", post(snapshot_metadata::create_snapshot))
         .route(

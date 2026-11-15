@@ -5,6 +5,45 @@ This library increment builds on the registered-pack reads in
 retained roots, a publication-decision ledger and a separate per-repository
 protocol realm. It introduces no HTTP route or serving cutover. Existing
 repositories continue using their existing authority until explicitly provisioned.
+The only roots HTTP currently implemented is the separate metadata/intent
+transport described below; root tree/blob browsing has not been exposed.
+
+## Metadata and intent HTTP transport
+
+The opt-in serve-blob gateway exposes only these retention-root controls:
+
+```text
+POST   /api/repos/{owner}/{name}/roots
+GET    /api/repos/{owner}/{name}/roots/{root_id}
+DELETE /api/repos/{owner}/{name}/roots/{root_id}
+POST   /api/repos/{owner}/{name}/roots/release-intent
+```
+
+Create accepts an opaque create key, source snapshot UUID, bounded purpose and
+tagged `snapshot`/`oids` selector (at most 256 full OIDs). It has no client root
+id, digest, pin, scope, epoch, backend or native field. The response is 201 on
+first registration and 200 with `replayed=true` for an exact retry. Metadata GET
+returns only current root state, generation, purpose, selector kind, object
+format, HEAD and row counts. Receipts expose only action, root id, generation,
+replay flag, creation time, `receipt_only` and historical `receipt_state`; the
+stored receipt body/internal root rows are never serialized. No session/HWM or
+#174 proof is issued. Every response is bounded `application/json`, no-store
+and session-header-free, with API Bearer challenges on 401.
+
+DELETE releases an existing root by id. `POST .../release-intent` accepts the
+bounded original create intent plus a release key/reason and derives the root id
+server-side, so release-before-register needs no client root id. Existing and
+exact-release/intent replays remain source-pin independent after source release,
+expiry or source-snapshot loss where retained rows suffice. A changed source,
+selector or purpose under the same create key conflicts after current late write
+authorization and does not touch an existing root.
+
+All mutations require current Owner/Admin + ContentsWrite and metadata requires
+current Owner/Admin + ContentsRead in the coordinator; HTTP performs no SQL or
+authority derivation. An ambiguous retention-root COMMIT is reported as 503 and
+must be retried with the exact same key and body; no client retry may switch to a
+new idempotency key or claim failure. Root tree/blob browsing, post-encoding byte
+races and full HTTP/native/CI acceptance remain later work.
 
 ## Durable roots
 
