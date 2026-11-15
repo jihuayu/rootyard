@@ -96,6 +96,12 @@ Pending deliveries and lease owners/generations/deadlines are retained as record
 
 The backup records its stopped-writer boundary time. Work acknowledged **after** that boundary is outside the backup and can be lost if the primary volume is destroyed. The backup interval and actual failure determine RPO. RTO includes transfer, provisioning, import, integrity checks, startup review and the separately authorized traffic change, not just the command timer.
 
+For the separately reviewed real-provider Pando AC1 physical PITR/fencing and
+AC2 current-archive/restore qualification gates, exact commands, provider
+environment names and fixed 11 + 7 case inventories, see
+[Pando remote retention — real-provider qualification gates](pando-remote-retention.md#real-provider-qualification-gates-77).
+This does not change the offline backup/restore boundary above.
+
 `tests/backup.py` creates random databases and private Git trees on synthetic test servers, exercises real Git push/clone/fsck, verifies in-flight metadata writes at the barrier, rejects corrupt/unsafe sets, and restores into a fresh database/directory. Set `ROOTYARD_RESTORE_TEST_DATABASE_URL` to a separate disposable server to exercise a different PostgreSQL instance. It requires CREATEDB and the interrupted-import fault test requires the test administrator to lock a PostgreSQL catalog; never run it against production. It only drops databases it creates.
 
 ```sh
