@@ -123,7 +123,7 @@ jobs:
         run: cargo test --locked --features pando-lab --test outbox --test resolution_fences -- --ignored
       - name: Verify PostgreSQL RefStore registry and metadata-core contracts
         timeout-minutes: 5
-        run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds -- --ignored --test-threads=1
+        run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds --test ref_cas_event_projection -- --ignored --test-threads=1
       - name: Build relocated rootyard library test harness for the PostgreSQL start gate
         timeout-minutes: 10
         run: |

@@ -190,8 +190,8 @@ pub async fn run(options: &Options) -> Result<Value> {
     };
     let marker = json!({
         "kind": marker::KIND,
-        "format": 24,
-        "schema_version": 148,
+        "format": 26,
+        "schema_version": 149,
         "bound_repository_id": repo_id.to_string(),
         "empty_repository_id": empty.to_string(),
         "unrelated_repository_id": unrelated.to_string(),
