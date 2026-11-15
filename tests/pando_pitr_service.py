@@ -596,7 +596,7 @@ def run_suite(binary: str) -> dict:
         r_code, src_meta = src_svc_pando.http_json("/api/repos/alice/pitr-git-real", alice["token"])
         assert r_code == 200 and src_meta.get("storage_backend") == "pando", (r_code, src_meta)
         i_code, src_refs = src_svc_pando.http_raw_basic(
-            "/alice/pitr-git-real.git/info/refs?service=git-upload-pack",
+            f"{real_repo['clone_path']}/info/refs?service=git-upload-pack",
             "alice",
             alice["token"],
         )
@@ -779,7 +779,7 @@ def run_suite(binary: str) -> dict:
         m_code, clone_meta = clone_live_svc.http_json("/api/repos/alice/pitr-git-real", alice["token"])
         assert m_code == 200 and clone_meta.get("storage_backend") == "pando", (m_code, clone_meta)
         ref_code, clone_refs = clone_live_svc.http_raw_basic(
-            "/alice/pitr-git-real.git/info/refs?service=git-upload-pack",
+            f"{real_repo['clone_path']}/info/refs?service=git-upload-pack",
             "alice",
             alice["token"],
         )
