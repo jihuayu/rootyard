@@ -42,6 +42,12 @@ impl PgRetentionRoots {
         &self.engine
     }
 
+    /// The actual opened Blob backend identity used by this adapter's private
+    /// native engine. This is not a caller input and grants no capability.
+    pub(crate) fn backend_identity(&self) -> &crate::blob_store::BlobBackendIdentity {
+        self.engine.backend_identity()
+    }
+
     /// Phase 1: seal one existing durable pack snapshot as a root candidate.
     ///
     /// One call uses exactly one effective deadline for the pool wait, the T1 transaction, every verified Blob
@@ -175,7 +181,7 @@ impl PgRetentionRoots {
 }
 
 /// One absolute effective work deadline for the whole call (never restarted, never above 30 s).
-pub(super) fn effective_deadline(caller: Instant) -> Result<Instant, RootError> {
+pub(crate) fn effective_deadline(caller: Instant) -> Result<Instant, RootError> {
     let ceiling = Instant::now()
         + std::time::Duration::from_secs(crate::ref_store::core::pack_commit::contract::VERIFIER_DEADLINE_SECONDS);
     let deadline = caller.min(ceiling);

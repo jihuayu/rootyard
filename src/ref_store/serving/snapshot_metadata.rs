@@ -999,7 +999,7 @@ fn retained_cleanup_error() -> Error {
     Error(StatusCode::SERVICE_UNAVAILABLE, "retained snapshot metadata cleanup failed")
 }
 
-async fn serving_admin_gate(
+pub(super) async fn serving_admin_gate(
     tx: &Transaction<'_>,
     actor: &Identity,
     repository_id: Uuid,
@@ -1087,7 +1087,7 @@ async fn final_authority(
     .map(|(gate, _)| gate)
 }
 
-async fn final_authority_with_cluster(
+pub(super) async fn final_authority_with_cluster(
     tx: &Transaction<'_>,
     actor: &Identity,
     repository_id: Uuid,

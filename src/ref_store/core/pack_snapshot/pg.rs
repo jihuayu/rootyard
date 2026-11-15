@@ -496,6 +496,55 @@ impl PgPackSnapshot {
         backend_identity_hex: &str,
         deadline: Instant,
     ) -> Result<PackReadSnapshot, RefStoreError> {
+        self.read_serving_by_snapshot_inner(
+            tx,
+            repository_id,
+            tenant_id,
+            snapshot_id,
+            backend_identity_hex,
+            deadline,
+            true,
+        )
+        .await
+    }
+
+    /// Authorized stored A5 data for an original create intent used by
+    /// release-before-register. It verifies the stored snapshot/ref/pack rows and
+    /// current serving ready realm/backend, but deliberately does not require the
+    /// source pin to remain live. It never promotes an expired pin and performs no
+    /// Blob/native work.
+    pub(crate) async fn read_stored_serving_by_snapshot(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        tenant_id: Uuid,
+        snapshot_id: Uuid,
+        backend_identity_hex: &str,
+        deadline: Instant,
+    ) -> Result<PackReadSnapshot, RefStoreError> {
+        self.read_serving_by_snapshot_inner(
+            tx,
+            repository_id,
+            tenant_id,
+            snapshot_id,
+            backend_identity_hex,
+            deadline,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_serving_by_snapshot_inner(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        tenant_id: Uuid,
+        snapshot_id: Uuid,
+        backend_identity_hex: &str,
+        deadline: Instant,
+        require_pin_live: bool,
+    ) -> Result<PackReadSnapshot, RefStoreError> {
         pg::bound(tx, deadline).await?;
         let Some(header) = snapshot_sql::snapshot_header(tx, snapshot_id, repository_id).await? else {
             return Err(RefStoreError::MetadataSnapshotNotFound { snapshot_id });
@@ -514,11 +563,12 @@ impl PgPackSnapshot {
         pin.ensure_scope(&scope, snapshot_id)?;
         let reference =
             PackSnapshotRef::new(repository_id, tenant_id, snapshot_id, pin.pin_id, pin.generation)?;
-        self.read_checked(
+        self.read_checked_inner(
             tx,
             &reference,
             deadline,
             ScopeLane::Serving { backend_identity: backend_identity_hex },
+            require_pin_live,
         )
         .await
     }
@@ -553,6 +603,17 @@ impl PgPackSnapshot {
         deadline: Instant,
         lane: ScopeLane<'_>,
     ) -> Result<PackReadSnapshot, RefStoreError> {
+        self.read_checked_inner(tx, reference, deadline, lane, true).await
+    }
+
+    async fn read_checked_inner(
+        &self,
+        tx: &Transaction<'_>,
+        reference: &PackSnapshotRef,
+        deadline: Instant,
+        lane: ScopeLane<'_>,
+        require_pin_live: bool,
+    ) -> Result<PackReadSnapshot, RefStoreError> {
         pg::bound(tx, deadline).await?;
         let header = snapshot_sql::snapshot_header(tx, reference.snapshot_id(), reference.repository_id())
             .await?
@@ -573,7 +634,9 @@ impl PgPackSnapshot {
             .await?
             .ok_or(RefStoreError::MetadataPinNotFound { pin_id: reference.pin_id() })?;
         pin.ensure_scope(&scope, header.snapshot_id)?;
-        pin.ensure_live(reference.expected_generation())?;
+        if require_pin_live {
+            pin.ensure_live(reference.expected_generation())?;
+        }
 
         // Complete refs: `limit = 4096 + 1` proves overflow instead of truncating.
         let rows = snapshot_sql::page_refs(

@@ -69,6 +69,7 @@ use uuid::Uuid;
 
 mod authority;
 mod check_version;
+mod retention_roots;
 mod snapshot_metadata;
 
 pub(crate) use authority::AuthorityKind;
@@ -78,6 +79,11 @@ pub use snapshot_metadata::{
     ServingSnapshotRenew,
 };
 pub(crate) use snapshot_metadata::RetainedServingReadContext;
+pub use retention_roots::{
+    PgServingRetentionRoots, ServingRootCreate, ServingRootIntent, ServingRootRead, ServingRootRelease,
+    ServingRootReleaseTarget,
+};
+pub(crate) use retention_roots::ServingRetainedRootReadContext;
 pub use authority::lookup;
 pub(crate) use authority::lookup_in_tx;
 

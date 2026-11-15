@@ -94,6 +94,40 @@ impl PgRetentionRoots {
         }
     }
 
+    /// Last fresh DB-clock source-pin liveness check for a serving create. This
+    /// runs after the late token/auth check while the pin row is already held by
+    /// the serving register transaction; it never uses client time.
+    pub(crate) async fn recheck_serving_source_pin_live_in_tx(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        reference: &crate::ref_store::core::pack_snapshot::PackSnapshotRef,
+        deadline: Instant,
+    ) -> Result<(), RootError> {
+        before_deadline(deadline, async {
+            let pin = super::super::snapshot_sql::pin_for_share(
+                tx,
+                reference.pin_id(),
+                reference.repository_id(),
+            )
+            .await?
+            .ok_or(RootError::Store(
+                crate::ref_store::contract::RefStoreError::MetadataPinNotFound {
+                    pin_id: reference.pin_id(),
+                },
+            ))?;
+            if pin.repository_id != reference.repository_id()
+                || pin.pin_id != reference.pin_id()
+                || pin.snapshot_id != reference.snapshot_id()
+                || pin.tenant_id != reference.tenant_id()
+            {
+                return Err(RootError::RootSourceChanged("source pin identity changed"));
+            }
+            pin.ensure_live(reference.expected_generation()).map_err(RootError::from)?;
+            Ok::<_, RootError>(())
+        })
+        .await
+    }
+
     /// Crate-private seam for the future serving coordinator. The caller owns
     /// the already-bounded transaction and can perform its current
     /// Owner/Admin+ContentsWrite/token check after these root rows are staged

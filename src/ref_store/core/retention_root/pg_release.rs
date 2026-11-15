@@ -50,7 +50,7 @@ impl super::pg::PgRetentionRoots {
         }
     }
 
-    async fn release_in_tx(
+    pub(crate) async fn release_in_tx(
         &self,
         tx: &tokio_postgres::Transaction<'_>,
         request: &ReleaseRootRequest,
@@ -244,20 +244,7 @@ impl super::pg::PgRetentionRoots {
             drop(client);
             return Err(error);
         }
-        let read = before_deadline(deadline, async {
-            let head = super::sql::head_state(&tx, root.repository_id(), root.root_id()).await?;
-            let capture = super::sql_read::read_capture(&tx, root).await?;
-            Ok::<_, RootError>((head, capture))
-        })
-        .await;
-        let result = read.and_then(|(head, capture)| match capture {
-            Some(capture) => {
-                let state = head.map(|head| head.state).unwrap_or_else(|| "released".to_owned());
-                capture.binding_digest()?;
-                Ok(Some(RootRecord::new(state, capture)))
-            }
-            None => Ok(None),
-        });
+        let result = before_deadline(deadline, Self::root_record_in_tx(&tx, root)).await;
         let cleanup = rollback_reads(tx, deadline).await;
         drop(client);
         match (result, cleanup) {
@@ -265,6 +252,115 @@ impl super::pg::PgRetentionRoots {
             (Ok(_), Err(error)) => Err(error),
             (Ok(value), Ok(())) => Ok(value),
         }
+    }
+
+    /// Read one retained root record inside a caller-owned authorized
+    /// transaction. No source pin/snapshot, no lock, no new connection.
+    pub(crate) async fn root_record_in_tx(
+        tx: &tokio_postgres::Transaction<'_>,
+        root: RootRef,
+    ) -> Result<Option<RootRecord>, RootError> {
+        let head = super::sql::head_state(tx, root.repository_id(), root.root_id()).await?;
+        let capture = super::sql_read::read_capture(tx, root).await?;
+        match capture {
+            Some(capture) => {
+                let state = head.map(|head| head.state).unwrap_or_else(|| "released".to_owned());
+                capture.binding_digest()?;
+                Ok(Some(RootRecord::new(state, capture)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Exact create replay lookup over retained root/receipt rows. This must run
+    /// before any source pin/snapshot lookup and never requires the source pin.
+    pub(crate) async fn register_replay_in_tx(
+        tx: &tokio_postgres::Transaction<'_>,
+        scope: &super::scope::RootsScope,
+        root: RootRef,
+        request_id: uuid::Uuid,
+    ) -> Result<Option<(RootRecord, RootReceipt)>, RootError> {
+        let record = Self::root_record_in_tx(tx, root).await?;
+        let row = super::sql::lookup_receipt(tx, root.repository_id(), request_id).await?;
+        match record {
+            Some(record) => {
+                let row = row.ok_or_else(|| {
+                    RootError::Store(crate::ref_store::contract::RefStoreError::Database(
+                        "retained root has no successful register receipt".into(),
+                    ))
+                })?;
+                super::receipt::verify_scope(&row, scope)?;
+                if row.action != RootAction::Register
+                    || row.root_id != root.root_id()
+                    || row.generation != 1
+                {
+                    return Err(RootError::RootDigestConflict(
+                        "register replay resolved to a different root receipt",
+                    ));
+                }
+                let receipt = RootReceipt::from_row(row, true)?;
+                Ok(Some((record, receipt)))
+            }
+            None => {
+                if row.is_some() {
+                    return Err(RootError::Store(
+                        crate::ref_store::contract::RefStoreError::Database(
+                            "register receipt has no retained root capture".into(),
+                        ),
+                    ));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Exact release receipt lookup before any source-metadata read. Used by the
+    /// serving release-before-register path so an exact retry stays independent
+    /// of an expired/released source pin.
+    pub(crate) async fn release_replay_in_tx(
+        tx: &tokio_postgres::Transaction<'_>,
+        scope: &super::scope::RootsScope,
+        request_id: uuid::Uuid,
+        root_id: uuid::Uuid,
+        release_digest: crate::ref_store::contract::RequestDigest,
+        reason: &str,
+    ) -> Result<Option<RootReceipt>, RootError> {
+        let Some(row) = super::sql::lookup_receipt(tx, scope.repository_id(), request_id).await? else {
+            return Ok(None);
+        };
+        super::receipt::verify_scope(&row, scope)?;
+        if row.action != RootAction::Release || row.root_id != root_id || row.generation != 2 {
+            return Err(RootError::RootDigestConflict(
+                "release request id reused with a different root",
+            ));
+        }
+        let body = row.body.as_object().ok_or_else(|| {
+            RootError::Store(crate::ref_store::contract::RefStoreError::Database(
+                "stored release receipt body is not an object".into(),
+            ))
+        })?;
+        let stored_digest = body
+            .get("release_digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                RootError::Store(crate::ref_store::contract::RefStoreError::Database(
+                    "stored release receipt has no release digest".into(),
+                ))
+            })?;
+        let stored_reason = body
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                RootError::Store(crate::ref_store::contract::RefStoreError::Database(
+                    "stored release receipt has no reason".into(),
+                ))
+            })?;
+        if stored_digest != release_digest.as_hex() || stored_reason != reason {
+            return Err(RootError::RootDigestConflict(
+                "release request id reused with a different digest",
+            ));
+        }
+        Ok(Some(RootReceipt::from_row(row, true)?))
     }
 
     /// Exact historical receipt by request id under the complete trusted scope. No current gate/authority needed.

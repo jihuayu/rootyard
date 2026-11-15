@@ -9,7 +9,7 @@
 //! source snapshot under PostgreSQL locks and requires byte-for-byte agreement with the sealed values here.
 use super::error::RootError;
 use super::scope::RootsScope;
-use super::selector::{RootSelectorKind, native_refs};
+use super::selector::{RootSelector, RootSelectorKind, native_refs, resolve_oids};
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use crate::ref_store::core::pack_commit::{CapturedRef, RegisteredPack, packs_digest, refs_digest};
 use crate::ref_store::core::pack_snapshot::{PackReadSnapshot, PackSnapshotRef};
@@ -93,6 +93,44 @@ pub(super) fn source_read_digest(
             snapshot.materialization_digest().as_bytes(),
         ],
     )
+}
+
+/// Recompute the canonical register digest of an original create intent from
+/// already-authorized stored A5 metadata, without native Blob/Git work and
+/// without accepting a caller digest. This reuses the same `RootCandidate::seal`
+/// binding algorithm used by prepare/register; it is only for the narrow
+/// release-before-register path and never constructs a byte-read view.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expected_register_digest_from_snapshot(
+    scope: RootsScope,
+    reference: PackSnapshotRef,
+    root_id: Uuid,
+    operation_id: Uuid,
+    operation_digest: RequestDigest,
+    selector: &RootSelector,
+    snapshot: &PackReadSnapshot,
+) -> Result<RequestDigest, RootError> {
+    let oids = resolve_oids(
+        selector,
+        snapshot.scope().object_format(),
+        snapshot.refs(),
+        snapshot.head_oid_hex(),
+    )?;
+    let candidate = RootCandidate::seal(
+        SealRequest {
+            scope,
+            reference,
+            root_id,
+            operation_id,
+            operation_digest,
+            selector_kind: selector.kind(),
+            oids,
+            packs: snapshot.packs().to_vec(),
+            serving_cluster_incarnation: None,
+        },
+        snapshot,
+    )?;
+    Ok(candidate.register_digest())
 }
 
 /// Every caller-supplied identity of one sealed root candidate.
@@ -300,7 +338,7 @@ impl RootCandidate {
     }
 
     /// The serving prepare lane only. `None` is the unchanged LegacyFresh lane.
-    pub(super) fn serving_cluster_incarnation(&self) -> Option<Uuid> {
+    pub(crate) fn serving_cluster_incarnation(&self) -> Option<Uuid> {
         self.serving_cluster_incarnation
     }
 

@@ -66,6 +66,105 @@ pub async fn serving_actor(pool: &Pool, label: &str) -> Result<db::Identity> {
     Ok(identity)
 }
 
+/// A real writable identity with an initial restricted repository grant set.
+/// The token is issued through `db::issue_token`; only the missing public grant
+/// issuance path is represented by labeled initial scope metadata.
+pub async fn serving_actor_with_scopes(
+    pool: &Pool,
+    repo_id: Uuid,
+    actions: &[&str],
+    label: &str,
+) -> Result<db::Identity> {
+    let username = format!("{label}{}", Uuid::new_v4().simple());
+    let issued = db::issue_token(pool, &username, true, false).await?;
+    let token_id: Uuid = issued["token_id"].as_str().ok_or_else(|| anyhow!("issued token has no id"))?
+        .parse().map_err(|_| anyhow!("issued token id is invalid"))?;
+    let username = issued["username"].as_str().ok_or_else(|| anyhow!("issued token has no username"))?;
+    let secret = issued["token"].as_str().ok_or_else(|| anyhow!("issued token has no secret"))?;
+    let client = pool.get().await?;
+    client.execute("UPDATE tokens SET is_restricted=true WHERE id=$1", &[&token_id]).await?;
+    for action in actions {
+        client
+            .execute(
+                "INSERT INTO token_repository_scopes(token_id,repository_id,action) VALUES($1,$2,$3)",
+                &[&token_id, &repo_id, *action],
+            )
+            .await?;
+    }
+    drop(client);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Basic {encoded}")).map_err(|_| anyhow!("token header refused"))?,
+    );
+    rootyard::auth::authenticate(pool, &headers)
+        .await
+        .map_err(|error| anyhow!("real restricted token authentication failed: {}", error.1))
+}
+
+/// A real collaborator identity with an initial role metadata row. Role rows are
+/// fixture inputs because the public collaborator transport is outside this
+/// core-lane checkpoint.
+pub async fn grant_collaborator(
+    pool: &Pool,
+    repo_id: Uuid,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+) -> Result<()> {
+    pool.get()
+        .await?
+        .execute(
+            "INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role)
+             VALUES($1,$2,$3,$4)",
+            &[&repo_id, &tenant_id, &user_id, role],
+        )
+        .await?;
+    Ok(())
+}
+
+pub async fn serving_collaborator(
+    pool: &Pool,
+    repo_id: Uuid,
+    tenant_id: Uuid,
+    role: &str,
+    label: &str,
+) -> Result<db::Identity> {
+    let identity = serving_actor(pool, label).await?;
+    grant_collaborator(pool, repo_id, tenant_id, identity.id, role).await?;
+    Ok(identity)
+}
+
+pub async fn set_collaborator_role(pool: &Pool, repo_id: Uuid, user_id: Uuid, role: &str) -> Result<()> {
+    let changed = pool
+        .get()
+        .await?
+        .execute(
+            "UPDATE repository_collaborators SET role=$3,version=version+1,updated_at=clock_timestamp()
+             WHERE repository_id=$1 AND user_id=$2",
+            &[&repo_id, &user_id, &role],
+        )
+        .await?;
+    ensure!(changed == 1, "collaborator role update changed {changed} rows");
+    Ok(())
+}
+
+pub async fn revoke_scope(pool: &Pool, identity: &db::Identity, repo_id: Uuid) -> Result<()> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    let removed = rootyard::token_scopes::revoke_repository_scope(
+        &tx,
+        identity.token_id,
+        identity.id,
+        repo_id,
+    )
+    .await?;
+    ensure!(removed, "restricted token scope was not present");
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Provision one actual ready `pg_refstore` repository through the production
 /// serving path. No GitFS directory or forged ready row is created.
 pub async fn provision_serving(

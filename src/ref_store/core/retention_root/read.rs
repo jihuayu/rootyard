@@ -256,6 +256,49 @@ impl super::pg::PgRetentionRoots {
         }
     }
 
+    /// Final authorized serving-root state recheck on a caller-owned
+    /// transaction. It locks the current ready binding/gate and the exact active
+    /// root, proves the retained binding and original cluster anchor, but never
+    /// reads the source pin/snapshot. The caller performs token/late-scope auth
+    /// after this and before commit.
+    pub(crate) async fn validate_serving_root_state_in_tx(
+        tx: &tokio_postgres::Transaction<'_>,
+        root: RootRef,
+        expected_binding: RequestDigest,
+        expected_cluster_incarnation: uuid::Uuid,
+        backend_identity: &str,
+    ) -> Result<(), RootError> {
+        let initial = super::sql_read::read_capture(tx, root)
+            .await?
+            .ok_or(RootError::RootNotFound { repository_id: root.repository_id(), root_id: root.root_id() })?;
+        let scope = initial.scope()?;
+        let metadata_scope = serving_metadata_scope(&scope)?;
+        super::super::snapshot_sql::lock_scope_serving(tx, &metadata_scope, backend_identity, false).await?;
+        let head = super::sql::head_for_share(tx, root.repository_id(), root.root_id()).await?.ok_or(
+            RootError::RootReleased { repository_id: root.repository_id(), root_id: root.root_id(), generation: 2 },
+        )?;
+        if !head.is_active() {
+            return Err(RootError::RootReleased {
+                repository_id: root.repository_id(),
+                root_id: root.root_id(),
+                generation: head.last_generation,
+            });
+        }
+        if head.register_digest != initial.header.register_digest {
+            return Err(RootError::RootDigestConflict("root head register digest changed"));
+        }
+        let fresh = super::sql_read::read_capture(tx, root)
+            .await?
+            .ok_or(RootError::RootNotFound { repository_id: root.repository_id(), root_id: root.root_id() })?;
+        if fresh.binding_digest()? != expected_binding {
+            return Err(RootError::RootDigestConflict("retained root binding changed"));
+        }
+        if super::sql::cluster_incarnation_nowait(tx).await? != expected_cluster_incarnation {
+            return Err(RootError::RootRealmMismatch("cluster authority incarnation changed during root read"));
+        }
+        Ok(())
+    }
+
     /// T1 retained read: head state + complete capture + binding proof, in one short bounded transaction.
     async fn read_retained(
         &self,
