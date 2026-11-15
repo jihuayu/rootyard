@@ -108,8 +108,8 @@ def _expand_page_table(rs_path: str, prefixes: tuple[str, ...]) -> list[tuple[st
         # leading parameter "/{oid}"; nothing may consume owner or name.
         if tail and (not tail.startswith("/") or tail.split("/")[1] in ("{owner}", "{name}")):
             raise AssertionError(f"{rs_path}: page '{tail}' is not a repository page tail")
-            for prefix in prefixes:
-                expanded.append((prefix + "/repos/{owner}/{name}" + tail, list(page_methods)))
+        for prefix in prefixes:
+            expanded.append((prefix + "/repos/{owner}/{name}" + tail, list(page_methods)))
     return expanded
 
 
