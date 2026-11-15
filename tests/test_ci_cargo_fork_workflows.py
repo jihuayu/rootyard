@@ -511,7 +511,11 @@ class CargoForkWorkflowTest(unittest.TestCase):
             with self.subTest(mutable=mutable):
                 self.assertNotIn(mutable, later)
 
-        manifest = text[text.index("python3 scripts/native_report_manifest.py --mode job"):]
+        marker = "python3 scripts/native_report_manifest.py --mode job"
+        start = text.rindex(
+            marker, 0, text.index("--manifest-out test-results/native-pr-gate.json")
+        )
+        manifest = text[start:]
         manifest = manifest.split("\n      - name:", 1)[0]
         self.assertIn('--build-receipt "$ROOTYARD_BUILD_RECEIPT"', manifest)
         self.assertIn('--binary "$ROOTYARD_BIN"', manifest)
@@ -537,7 +541,11 @@ class CargoForkWorkflowTest(unittest.TestCase):
 
     def test_binding_steps_derive_rust_fixture_from_the_validated_receipt(self) -> None:
         ci = self.workflow("ci.yml")
-        manifest = ci[ci.index("python3 scripts/native_report_manifest.py --mode job"):]
+        marker = "python3 scripts/native_report_manifest.py --mode job"
+        start = ci.rindex(
+            marker, 0, ci.index("--manifest-out test-results/native-pr-gate.json")
+        )
+        manifest = ci[start:]
         manifest = manifest.split("\n      - name:", 1)[0]
         self.assertIn("--fixture-rust-from-receipt", manifest)
         self.assertNotIn("rustc", manifest)

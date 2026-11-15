@@ -40,6 +40,32 @@ readable/writable, or if `unshare -Urnm` cannot create private mount and
 network namespaces with a mounted tmpfs. Nothing is skipped and no global
 subreaper, sysctl or AppArmor policy is changed.
 
+Before that batch, CI builds a relocated `rust-library-test` harness with
+`scripts/build_native_test.py --lib --features pando-lab --strip-debuginfo`
+against the existing shared native-artifact store, then runs the ignored
+PostgreSQL start-gate lock-order regression directly (no Cargo `--` separator)
+through `scripts/run_pg_start_gate.py`. That runner requires a non-empty
+`ROOTYARD_TEST_DATABASE_URL`, reads the receipt only through the shared
+`native_build_receipt` v1/v2 contract, refuses zero-test/ignored/failed output,
+and writes a credential-free one-case report. Historical v1 receipts keep their
+Fresh=false/rebuilt-package semantics; v2 receipts must select the `rootyard`
+`lib-test` artifact from `src/lib.rs` with the pinned 64a6 Cargo/Rust toolchain
+and report Cargo's actual true/false/mixed freshness. Acceptance recomputes the
+current HEAD, source, support and `Cargo.lock` digests, and keeps the receipt's
+recorded v2 snapshot separate from the current digest. A separate
+`native_report_manifest.py --mode job` manifest binds that report to the test
+binary receipt, because its digest intentionally differs from the server
+binary. The test build precedes the CLI batch: it clears the rootyard package
+and would otherwise invalidate the server receipt.
+
+After the batch, the eight-case trusted HTTP authority matrix runs against
+the exported canonical `$ROOTYARD_BIN` snapshot and writes `test-results/ci-trust-boundaries.json`.
+The final native manifest requires each exact case name and binds the report
+plus all sixteen transitive Python/provenance inputs. Raw Rust test output,
+new service logs and the relocated test binary are never uploaded; the new
+PG/HTTP outputs are safe JSON receipts, reports and manifests, while the
+existing artifact list is preserved.
+
 Cheap but real native security, tenancy and concurrency regressions run against
 a single `scripts/build_native_batch.py` invocation that builds `target/debug/rootyard`
 together with the feature-enabled Cargo metadata bins and both selected RefStore

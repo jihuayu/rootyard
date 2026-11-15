@@ -259,6 +259,15 @@ pub(crate) async fn sync_outbox_events_bounded(
     }
 }
 
+fn trusted_callback_target(input:&CiCallbackInput)
+    ->Result<(Uuid,Uuid,String,i64,i64,i64),Error>{
+    let (Some(run_id),Some(job_id),Some(base_oid),Some(generation),Some(pull_number),Some(attempt)) =
+        (input.ci_run_id,input.ci_job_id,input.base_oid.clone(),input.lease_generation,
+         input.pull_number,input.attempt)
+        else { return Err(Error::bad_request()); };
+    Ok((run_id,job_id,base_oid,generation,pull_number,attempt))
+}
+
 /// HMAC-authenticated, idempotent CI callback ingestion. The HTTP admission and
 /// signature checks happen before the short callback transaction.
 #[rustfmt::skip]
@@ -340,6 +349,37 @@ pub(crate) async fn ci_callback(
         current_hook.get::<_,Value>("ci_contexts")!=hook_row.get::<_,Value>("ci_contexts") {
         return Err(Error::unauthorized());
     }
+
+    // The binding and candidate are checked before the idempotency cache so a
+    // revoked/rebound context or a changed candidate cannot replay an old 200.
+    let trusted_binding: Option<(Option<Uuid>,bool)> = tx.query_opt(
+        "SELECT webhook_id,active FROM forge_trusted_check_contexts WHERE repository_id=$1 AND context=$2",
+        &[&repo_id,&context],
+    ).await.map_err(Error::internal)?.map(|r| (r.get(0),r.get(1)));
+    let trusted_target = if let Some((expected_hook,active)) = trusted_binding {
+        if !active || expected_hook != Some(hook_id) || !hook_row.get::<_, Value>("ci_contexts")
+            .as_array().is_some_and(|a| a.iter().any(|v| v.as_str() == Some(context.as_str()))) {
+            return Err(Error(StatusCode::FORBIDDEN, "integration does not own this CI context"));
+        }
+        Some(trusted_callback_target(&input)?)
+    } else {
+        None
+    };
+    if let Some((run_id,job_id,base_oid,generation,pull_number,attempt)) = trusted_target.as_ref() {
+        let current: bool = tx.query_one(
+            "SELECT EXISTS(SELECT 1 FROM ci_runs c JOIN forge_pulls p \
+             ON p.repository_id=c.repository_id AND p.number=c.pull_number \
+             WHERE c.id=$1 AND c.repository_id=$2 AND c.context=$3 AND c.job_id=$4 \
+               AND c.head_oid=$5 AND c.base_oid=$6 AND c.pull_number=$7 \
+               AND c.state IN ('leased','completed') AND c.attempt=$8 AND c.lease_generation=$9 \
+               AND (c.state='completed' OR c.lease_expires_unix>extract(epoch FROM clock_timestamp())) \
+               AND p.state='open' AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \
+               AND p.version=c.pull_version)",
+            &[run_id,&repo_id,&context,job_id,&input.commit_oid,base_oid,pull_number,attempt,generation],
+        ).await.map_err(Error::internal)?.get(0);
+        if !current { return Err(Error(StatusCode::CONFLICT, "CI run attempt or candidate changed")); }
+    }
+
     if let Some(cb_row) = tx
         .query_opt("SELECT request_sha256, response FROM forge_webhook_callbacks WHERE repository_id=$1 AND event_id=$2 FOR UPDATE", &[&repo_id, &event_id])
         .await
@@ -353,18 +393,7 @@ pub(crate) async fn ci_callback(
         return Ok(crate::webhooks::models::json(StatusCode::OK, saved_resp));
     }
 
-    let trusted_binding: Option<(Option<Uuid>,bool)> = tx.query_opt(
-        "SELECT webhook_id,active FROM forge_trusted_check_contexts WHERE repository_id=$1 AND context=$2",
-        &[&repo_id,&context],
-    ).await.map_err(Error::internal)?.map(|r| (r.get(0),r.get(1)));
-    if let Some((expected_hook,active)) = trusted_binding {
-        if !active || expected_hook != Some(hook_id) || !hook_row.get::<_, Value>("ci_contexts")
-            .as_array().is_some_and(|a| a.iter().any(|v| v.as_str() == Some(context.as_str()))) {
-            return Err(Error(StatusCode::FORBIDDEN, "integration does not own this CI context"));
-        }
-        let (Some(run_id),Some(job_id),Some(base_oid),Some(generation),Some(pull_number),Some(attempt)) =
-            (input.ci_run_id,input.ci_job_id,input.base_oid.as_ref(),input.lease_generation,input.pull_number,input.attempt)
-            else { return Err(Error::bad_request()); };
+    if let Some((run_id,job_id,base_oid,generation,pull_number,attempt)) = trusted_target.as_ref() {
         let valid: bool = tx.query_one(
             "SELECT EXISTS(SELECT 1 FROM ci_runs c JOIN forge_pulls p \
              ON p.repository_id=c.repository_id AND p.number=c.pull_number \
@@ -374,7 +403,7 @@ pub(crate) async fn ci_callback(
                AND c.lease_expires_unix>extract(epoch FROM clock_timestamp()) \
                AND p.state='open' AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \
                AND p.version=c.pull_version)",
-            &[&run_id,&repo_id,&context,&job_id,&input.commit_oid,base_oid,&pull_number,&attempt,&generation],
+            &[run_id,&repo_id,&context,job_id,&input.commit_oid,base_oid,pull_number,attempt,generation],
         ).await.map_err(Error::internal)?.get(0);
         if !valid { return Err(Error(StatusCode::CONFLICT, "CI run attempt or candidate changed")); }
     }
@@ -387,12 +416,18 @@ pub(crate) async fn ci_callback(
     if !exists {
         return Err(Error(StatusCode::CONFLICT, "commit object not found"));
     }
+    // The Git check can outlive the lease observed above. Re-lock the exact run
+    // under the policy fence and require the same current attempt/candidate
+    // before any check or provenance write.
+    if let Some(target)=trusted_target.as_ref() {
+        crate::webhooks::trust::lock_trusted_callback_run(&tx,repo_id,&context,&input,target).await?;
+    }
 
     let check_run = upsert_callback_check_run(
         &tx, tenant_id, repo_id, &input.commit_oid, &context, &input.status,
         input.conclusion.as_ref(), input.attempt, input.sequence, &output,
     ).await?;
-    if trusted_binding.is_some() {
+    if let Some((_,_,_,generation,_,attempt))=trusted_target.as_ref() {
         tx.execute(
             "UPDATE forge_check_runs SET issuer_webhook_id=$5,ci_run_id=$6,ci_base_oid=$7,ci_lease_generation=$8 \
              WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 AND context=$4",
@@ -400,10 +435,14 @@ pub(crate) async fn ci_callback(
               &input.base_oid,&input.lease_generation],
         ).await.map_err(Error::internal)?;
         if input.status == "completed" {
-            tx.execute(
-                "UPDATE ci_runs SET state='completed',conclusion=$2,lease_expires_unix=0,updated_at=clock_timestamp() WHERE id=$1",
-                &[&input.ci_run_id,&input.conclusion],
+            let updated=tx.execute(
+                "UPDATE ci_runs SET state='completed',conclusion=$2,lease_expires_unix=0,updated_at=clock_timestamp() \
+                 WHERE id=$1 AND state='leased' AND attempt=$3 AND lease_generation=$4",
+                &[&input.ci_run_id,&input.conclusion,attempt,generation],
             ).await.map_err(Error::internal)?;
+            if updated != 1 {
+                return Err(Error(StatusCode::CONFLICT,"CI run attempt or candidate changed"));
+            }
         }
     }
 

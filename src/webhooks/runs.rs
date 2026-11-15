@@ -48,6 +48,8 @@ pub async fn claim(
         "SELECT c.head_oid,c.job_id,c.storage_generation FROM ci_runs c \
          JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
            AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
+         JOIN forge_webhooks w ON w.id=b.webhook_id AND w.repository_id=c.repository_id \
+           AND w.active=true AND w.ci_contexts ? c.context \
          WHERE c.id=$1 AND c.repository_id=$2 AND c.state IN ('queued','leased')",
         &[&run_id,&repo,&hook_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
@@ -55,10 +57,24 @@ pub async fn claim(
         snapshot.get::<_,String>("head_oid").as_str()).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    // Preparation is slow and deliberately lock-free. Re-establish current
+    // issuer authority under the same policy fence used by revocation before
+    // minting the lease and its checkout capability.
+    crate::webhooks::trust::lock_policy_tx(&tx,repo).await?;
+    let current_hook=tx.query_opt("SELECT secret,active FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
+        &[&hook_id,&repo]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
+    let bearer=headers.get("authorization").and_then(|h|h.to_str().ok())
+        .and_then(|h|h.strip_prefix("Bearer ")).ok_or_else(Error::unauthorized)?;
+    if !current_hook.get::<_,bool>("active") ||
+        !constant_time_eq(current_hook.get::<_,String>("secret").as_bytes(),bearer.as_bytes()) {
+        return Err(Error::unauthorized());
+    }
     let row = tx.query_opt(
         "SELECT c.context,c.head_oid,c.base_oid,c.job_id,c.storage_generation,c.state,c.attempt,c.lease_generation \
          FROM ci_runs c JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
           AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
+         JOIN forge_webhooks w ON w.id=b.webhook_id AND w.repository_id=c.repository_id \
+          AND w.active=true AND w.ci_contexts ? c.context \
          JOIN forge_pulls p ON p.repository_id=c.repository_id AND p.number=c.pull_number \
          WHERE c.id=$1 AND c.repository_id=$2 AND p.state='open' \
            AND p.version=c.pull_version AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \
@@ -138,12 +154,24 @@ pub async fn heartbeat(
     if input.attempt<=0 || input.lease_generation<=0 || input.runner_id.is_empty() ||
         input.runner_id.len()>64 {return Err(Error::bad_request());}
     let (repo,_)=integration(&state,&owner,&name,hook_id,&headers).await?;
-    let client=state.pool.get().await.map_err(Error::internal)?;
-    let row=client.query_opt(
+    let mut client=state.pool.get().await.map_err(Error::internal)?;
+    let tx=client.transaction().await.map_err(Error::internal)?;
+    crate::webhooks::trust::lock_policy_tx(&tx,repo).await?;
+    let current_hook=tx.query_opt("SELECT secret,active FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
+        &[&hook_id,&repo]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
+    let bearer=headers.get("authorization").and_then(|h|h.to_str().ok())
+        .and_then(|h|h.strip_prefix("Bearer ")).ok_or_else(Error::unauthorized)?;
+    if !current_hook.get::<_,bool>("active") ||
+        !constant_time_eq(current_hook.get::<_,String>("secret").as_bytes(),bearer.as_bytes()) {
+        return Err(Error::unauthorized());
+    }
+    let row=tx.query_opt(
         "UPDATE ci_runs c SET lease_expires_unix=extract(epoch FROM clock_timestamp())::bigint+60, \
-         updated_at=clock_timestamp() FROM forge_trusted_check_contexts b, forge_pulls p \
+         updated_at=clock_timestamp() FROM forge_trusted_check_contexts b, forge_webhooks w, forge_pulls p \
          WHERE c.id=$1 AND c.repository_id=$2 AND b.repository_id=c.repository_id \
            AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
+           AND w.id=b.webhook_id AND w.repository_id=c.repository_id AND w.active=true \
+           AND w.ci_contexts ? c.context \
            AND p.repository_id=c.repository_id AND p.number=c.pull_number AND p.state='open' \
            AND p.version=c.pull_version AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \
            AND c.state='leased' AND c.attempt=$4 AND c.lease_generation=$5 \
@@ -151,6 +179,7 @@ pub async fn heartbeat(
          RETURNING c.lease_expires_unix",
         &[&run_id,&repo,&hook_id,&input.attempt,&input.lease_generation,&input.runner_id],
     ).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT,"CI run lease changed"))?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({
         "run_id":run_id,"attempt":input.attempt,"lease_generation":input.lease_generation,
         "lease_expires_unix":row.get::<_,i64>(0)}))).into_response())
@@ -179,26 +208,36 @@ pub async fn report(
     }
     let row = tx.query_opt(
         "SELECT c.context,c.head_oid,c.base_oid,c.state,c.attempt,c.lease_generation,c.result_sha256, \
-          p.head_oid AS live_head,p.base_oid AS live_base,p.version AS live_version,c.pull_version \
+          p.head_oid AS live_head,p.base_oid AS live_base,p.version AS live_version, \
+          p.state AS live_state,c.pull_version \
          FROM ci_runs c JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
           AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
+         JOIN forge_webhooks w ON w.id=b.webhook_id AND w.repository_id=c.repository_id \
+          AND w.active=true AND w.ci_contexts ? c.context \
          JOIN forge_pulls p ON p.repository_id=c.repository_id AND p.number=c.pull_number \
          WHERE c.id=$1 AND c.repository_id=$2 FOR UPDATE OF c",
         &[&run_id,&repo,&hook_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let digest = sha256_hex(format!("{}\0{}",input.conclusion,input.output).as_bytes());
+    // Replays are idempotent only while the exact candidate still owns this
+    // run. A revoked context binding removes the row above (404); a changed
+    // head/base/version must not return a stale successful result.
+    let candidate_current = row.get::<_,String>("head_oid")==row.get::<_,String>("live_head") &&
+        row.get::<_,String>("base_oid")==row.get::<_,String>("live_base") &&
+        row.get::<_,i64>("pull_version")==row.get::<_,i64>("live_version") &&
+        row.get::<_,String>("live_state")=="open";
     if row.get::<_,String>("state")=="completed" &&
         row.get::<_,i64>("attempt")==input.attempt &&
         row.get::<_,i64>("lease_generation")==input.lease_generation &&
         row.get::<_,Option<String>>("result_sha256").as_deref()==Some(&digest) {
+        if !candidate_current {
+            return Err(Error(StatusCode::CONFLICT,"CI run attempt or candidate changed"));
+        }
         tx.commit().await.map_err(Error::internal)?;
         return Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"run_id":run_id,"replay":true}))).into_response());
     }
     if row.get::<_,String>("state")!="leased" || row.get::<_,i64>("attempt")!=input.attempt ||
-        row.get::<_,i64>("lease_generation")!=input.lease_generation ||
-        row.get::<_,String>("head_oid")!=row.get::<_,String>("live_head") ||
-        row.get::<_,String>("base_oid")!=row.get::<_,String>("live_base") ||
-        row.get::<_,i64>("pull_version")!=row.get::<_,i64>("live_version") {
+        row.get::<_,i64>("lease_generation")!=input.lease_generation || !candidate_current {
         return Err(Error(StatusCode::CONFLICT,"CI run attempt or candidate changed"));
     }
     let lease_valid: bool = tx.query_one(

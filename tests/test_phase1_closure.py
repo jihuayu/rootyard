@@ -127,8 +127,10 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         # instead of a mutable target/debug artifact.
         export_command = "python3 scripts/export_native_artifacts.py"
         export_start = ci_text.index(export_command)
-        manifest_start = ci_text.index(
-            "python3 scripts/native_report_manifest.py --mode job"
+        manifest_start = ci_text.rindex(
+            "python3 scripts/native_report_manifest.py --mode job",
+            0,
+            ci_text.index("--manifest-out test-results/native-pr-gate.json"),
         )
         self.assertLess(export_start, manifest_start)
         export_step = ci_text[export_start:manifest_start]
@@ -204,7 +206,14 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
             self.assertIn(binding, ci_text, f"Missing pagination wiring in .github/workflows/ci.yml: {binding}")
         # Webhook and Browse reports and their exact source inputs are part of
         # the native gate.
-        manifest_start = ci_text.index("python3 scripts/native_report_manifest.py --mode job")
+        # The PostgreSQL start-gate job manifest is separate and earlier;
+        # target the CLI job manifest by its unique output path.
+        manifest_marker = "--manifest-out test-results/native-pr-gate.json"
+        manifest_start = ci_text.rindex(
+            "python3 scripts/native_report_manifest.py --mode job",
+            0,
+            ci_text.index(manifest_marker),
+        )
         manifest_step = ci_text[manifest_start:].split("\n      - name:", 1)[0]
         for argument in (
             "--report webhooks=test-results/webhooks.json",

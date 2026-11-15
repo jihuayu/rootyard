@@ -425,6 +425,7 @@ async fn prepare_checkout(state: &AppState, claim: &ClaimedRun, dest: &PathBuf) 
 
 const AUTHORITY: &str = "FROM ci_runs c \
  JOIN forge_webhooks w ON w.id=$2 AND w.repository_id=c.repository_id AND w.active=true \
+   AND w.ci_contexts ? c.context \
  JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id AND b.context=c.context AND b.webhook_id=w.id AND b.active=true \
  JOIN forge_pulls p ON p.repository_id=c.repository_id AND p.number=c.pull_number AND p.state='open' \
    AND p.version=c.pull_version AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \
@@ -530,6 +531,9 @@ pub(super) async fn still_active(state: &AppState, claim: &ClaimedRun, job: Uuid
         .map_err(Error::internal)?
         .is_some())
 }
+/// Check the bound authority rows. The caller must already hold the shared
+/// repository policy fence, acquired before the sandbox job lock and before
+/// these row locks; this function only takes the row locks themselves.
 pub(super) async fn gate_authorized(
     tx: &deadpool_postgres::Transaction<'_>,
     claim: &ClaimedRun,
@@ -540,7 +544,7 @@ pub(super) async fn gate_authorized(
         FOR SHARE OF c,w,b,p,r,i"
     );
     let plan = serde_json::to_value(&claim.plan).map_err(Error::internal)?;
-    Ok(tx
+    let authorized = tx
         .query_opt(
             &sql,
             &[
@@ -557,9 +561,12 @@ pub(super) async fn gate_authorized(
                 &plan,
             ],
         )
-        .await
-        .map_err(Error::internal)?
-        .is_some())
+        .await;
+    #[cfg(test)]
+    if let Err(error) = &authorized {
+        crate::sandbox::gate_probe::observe_pg_error(crate::sandbox::gate_probe::GateStage::AuthoritySelect, error);
+    }
+    Ok(authorized.map_err(Error::internal)?.is_some())
 }
 async fn load_job(state: &AppState, claim: &ClaimedRun, id: Uuid) -> Result<CiJob, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;

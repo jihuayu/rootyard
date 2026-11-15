@@ -38,6 +38,14 @@ pub(crate) enum WindowRequest {
     },
 }
 
+/// A granted repository-wide publication window. The `PublicationGuard`'s owner
+/// PostgreSQL transaction holds `rootyard-publication-v1:<repository>` (the same
+/// exclusive advisory domain used by `webhooks::trust`) while this window is
+/// active and until that guard is dropped, in addition to the exact-ref locks.
+/// Policy-dependent writers such as merges must reuse this fence and must not
+/// call `lock_policy_tx` for the same repository from another session: the
+/// owner already holds that exclusive domain and a second acquisition would
+/// self-block.
 pub struct PublicationWindow<'a> {
     guard: &'a PublicationGuard,
     _local: OwnedMutexGuard<()>,

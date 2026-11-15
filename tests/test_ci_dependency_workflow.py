@@ -50,7 +50,10 @@ PRESERVED_BINDINGS = (
 
 
 def manifest_step(text):
-    start = text.index(MANIFEST_COMMAND)
+    # The PG start-gate job manifest is a separate, earlier manifest; target
+    # the CLI job manifest by its unique output path.
+    marker = "--manifest-out test-results/native-pr-gate.json"
+    start = text.rindex(MANIFEST_COMMAND, 0, text.index(marker))
     end = text.find("\n      - name:", start)
     return text[start:] if end == -1 else text[start:end]
 
@@ -59,6 +62,10 @@ class TestCiDependencyWorkflow(unittest.TestCase):
     def setUp(self):
         self.ci_text = CI_YML.read_text(encoding="utf-8")
         self.manifest = manifest_step(self.ci_text)
+        marker = "--manifest-out test-results/native-pr-gate.json"
+        self.manifest_start = self.ci_text.rindex(
+            MANIFEST_COMMAND, 0, self.ci_text.index(marker)
+        )
 
     def test_ci_executes_dependency_harness_before_the_manifest(self):
         command = ('python3 tests/ci_dependencies.py --binary "$ROOTYARD_BIN" '
@@ -66,7 +73,7 @@ class TestCiDependencyWorkflow(unittest.TestCase):
         self.assertEqual(self.ci_text.count(command), 1)
         self.assertLess(
             self.ci_text.index(command),
-            self.ci_text.index(MANIFEST_COMMAND),
+            self.manifest_start,
             "the dependency report must be produced before the manifest is written",
         )
 
@@ -79,7 +86,7 @@ class TestCiDependencyWorkflow(unittest.TestCase):
             )
             self.assertLess(
                 self.ci_text.index(command),
-                self.ci_text.index(MANIFEST_COMMAND),
+                self.manifest_start,
                 f"{script} report must exist before the native manifest runs",
             )
             binding = f"--report {name}={report}"

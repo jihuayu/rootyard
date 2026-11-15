@@ -61,6 +61,8 @@ pub(crate) async fn authorize_claimed_run(
          FROM ci_runs c \
          JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
            AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
+         JOIN forge_webhooks w ON w.id=b.webhook_id AND w.repository_id=c.repository_id \
+           AND w.active=true AND w.ci_contexts ? c.context \
          JOIN forge_pulls p ON p.repository_id=c.repository_id \
            AND p.number=c.pull_number AND p.state='open' \
            AND p.version=c.pull_version AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \

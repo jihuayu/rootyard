@@ -110,8 +110,14 @@ async fn merge_pull_inner(
             "Git capacity exhausted; retry later",
         )
     })?;
-    let _write_guard = publication.enter_window(&state.storage,
-        Instant::now()+state.config.git_timeout).await?;
+    // The publication owner session now holds both the exact base-ref advisory
+    // lock and the repository publication policy domain
+    // (`rootyard-publication-v1:<repo>`), the same exclusive domain used by
+    // trust bind/revoke and check writers. Both `publication` and `window` stay
+    // in scope until this function returns, so the fence covers policy
+    // evaluation, the native CAS, the final SQL commit and the response value
+    // constructed below.
+    let window = publication.enter_window(&state.storage, Instant::now() + state.config.git_timeout).await?;
     let _admission = storage::admission::acquire(
         &state.pool,
         repo.id,
@@ -144,7 +150,17 @@ async fn merge_pull_inner(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    // The policy domain was acquired by `enter_window` before this transaction
+    // and remains held by the publication owner session. Reacquiring it here
+    // with `lock_policy_tx` would use a different session and self-block on the
+    // same exclusive domain. Policy-before-authority ordering is preserved:
+    // the window was granted before this transaction took any authority locks.
+    window.ensure_active()?;
+    let admitted_repo_id = repo_id;
     let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::PullsWrite).await?.repo_id;
+    if repo_id != admitted_repo_id {
+        return Err(Error(StatusCode::CONFLICT, "repository changed"));
+    }
 
     let current_gen: i64 = tx
         .query_one(
@@ -219,6 +235,10 @@ async fn merge_pull_inner(
         &input.expected_head_oid,
     )
     .await?;
+    // The policy reads above ran under the owner-held domain fence. Recheck it
+    // before acting on the result so an owner that stopped heartbeating cannot
+    // let a concurrent bind/revoke commit behind a stale policy decision.
+    window.ensure_active()?;
     if !policy.allowed {
         return Err(Error(
             StatusCode::CONFLICT,
@@ -458,6 +478,10 @@ async fn merge_pull_inner(
     let merged_pull = PullRequest::row(&updated_row);
     let response_val = serde_json::to_value(&merged_pull).map_err(Error::internal)?;
     record_creation(&tx, tenant_id, repo_id, key.as_deref(), &response_val).await?;
+    // Final freshness check before the merge commit. The window remains held
+    // through response construction below, so a policy transition cannot
+    // interleave after this decision and before the committed response value.
+    window.ensure_active()?;
     finish(tx, &actor, true).await?;
     drop(client);
 
