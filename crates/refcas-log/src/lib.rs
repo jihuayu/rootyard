@@ -50,6 +50,11 @@ pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ENTRY_BYTES: usize = 1024 * 1024;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 
+pub mod cluster;
+pub mod fault;
+pub mod fixture;
+pub mod state_machine;
+
 // `Cursor` is required by the macro's default `SnapshotData`. Intentionally not documented.
 openraft::declare_raft_types!(
     pub LogTypeConfig:
@@ -92,16 +97,16 @@ impl From<rusqlite::Error> for E {
     }
 }
 
-type Res<T> = Result<T, E>;
+pub type Res<T> = Result<T, E>;
 
-fn ioerr(subject: ErrorSubject<u64>, verb: ErrorVerb, e: &E) -> StorageError<u64> {
+pub(crate) fn ioerr(subject: ErrorSubject<u64>, verb: ErrorVerb, e: &E) -> StorageError<u64> {
     StorageError::IO { source: openraft::StorageIOError::new(subject, verb, openraft::AnyError::error(e)) }
 }
 
-fn jd<T: DeserializeOwned>(s: &str) -> Res<T> {
+pub(crate) fn jd<T: DeserializeOwned>(s: &str) -> Res<T> {
     serde_json::from_str(s).map_err(|e| E::Codec(format!("decode: {e}")))
 }
-fn je<T: Serialize>(v: &T) -> Res<String> {
+pub(crate) fn je<T: Serialize>(v: &T) -> Res<String> {
     struct Writer(Vec<u8>);
     impl io::Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -131,7 +136,7 @@ const META_SCHEMA: &str = "CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL
 const ENTRY_SCHEMA: &str = "CREATE TABLE log_entry(idx INTEGER PRIMARY KEY, log_id TEXT NOT NULL, data TEXT NOT NULL, checksum BLOB NOT NULL CHECK(length(checksum)=32));";
 
 /// u64 index -> i64; refuses overflow (i64::MAX reserved as invalid).
-fn idx_to_i64(idx: u64) -> Res<i64> {
+pub(crate) fn idx_to_i64(idx: u64) -> Res<i64> {
     i64::try_from(idx)
         .ok()
         .filter(|v| *v >= 0 && *v < i64::MAX)
@@ -139,7 +144,7 @@ fn idx_to_i64(idx: u64) -> Res<i64> {
 }
 
 /// i64 stored index -> u64; refuses negatives.
-fn idx_from_i64(v: i64) -> Res<u64> {
+pub(crate) fn idx_from_i64(v: i64) -> Res<u64> {
     u64::try_from(v).map_err(|_| E::Codec(format!("negative stored log index {v}")))
 }
 
@@ -162,7 +167,7 @@ fn normalize_range<R: RangeBounds<u64>>(range: &R) -> Res<(u64, Option<u64>)> {
 
 // ---- metadata / row helpers, generic over `&Connection` (a `Transaction` derefs to it) ----
 
-fn checksum(parts: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn checksum(parts: &[&[u8]]) -> Vec<u8> {
     let mut digest = Sha256::new();
     for part in parts {
         digest.update((part.len() as u64).to_be_bytes());
@@ -173,7 +178,7 @@ fn checksum(parts: &[&[u8]]) -> Vec<u8> {
 fn entry_checksum(index: i64, log_id: &str, data: &str) -> Vec<u8> {
     checksum(&[b"entry", &index.to_be_bytes(), log_id.as_bytes(), data.as_bytes()])
 }
-fn get_meta(conn: &Connection, k: &str) -> Res<Option<String>> {
+pub(crate) fn get_meta(conn: &Connection, k: &str) -> Res<Option<String>> {
     let mut st = conn.prepare("SELECT v,checksum,length(v) FROM meta WHERE k=?1")?;
     let mut rows = st.query([k])?;
     let Some(row) = rows.next()? else { return Ok(None) };
@@ -187,10 +192,10 @@ fn get_meta(conn: &Connection, k: &str) -> Res<Option<String>> {
     }
     Ok(Some(value))
 }
-fn meta<T: DeserializeOwned>(conn: &Connection, k: &str) -> Res<Option<T>> {
+pub(crate) fn meta<T: DeserializeOwned>(conn: &Connection, k: &str) -> Res<Option<T>> {
     get_meta(conn, k)?.map(|value| jd(&value)).transpose()
 }
-fn set_meta(conn: &Connection, k: &str, v: Option<&str>) -> Res<()> {
+pub(crate) fn set_meta(conn: &Connection, k: &str, v: Option<&str>) -> Res<()> {
     if let Some(value) = v {
         let hash = checksum(&[b"meta", k.as_bytes(), value.as_bytes()]);
         conn.execute("INSERT INTO meta(k,v,checksum) VALUES(?1,?2,?3) ON CONFLICT(k) DO UPDATE SET v=excluded.v,checksum=excluded.checksum", (k,value,hash))?;
@@ -578,17 +583,20 @@ fn read_range(conn: &Connection, lo: u64, hi: Option<u64>, limited: bool) -> Res
 }
 
 /// Create the directory and take the process-exclusive directory lock.
-fn lock_dir(dir: &Path) -> Res<File> {
+pub(crate) fn lock_named_dir(dir: &Path, lock_file: &str, label: &str) -> Res<File> {
     std::fs::create_dir_all(dir)?;
     let dir = std::fs::canonicalize(dir)?;
-    let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(dir.join(LOCK_FILE))?;
-    lock.try_lock_exclusive()
-        .map_err(|e| E::Refused(format!("log directory is already locked by another process: {e}")))?;
+    let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(dir.join(lock_file))?;
+    lock.try_lock_exclusive().map_err(|e| E::Refused(format!("{label} is already locked by another process: {e}")))?;
     Ok(lock)
 }
 
+fn lock_dir(dir: &Path) -> Res<File> {
+    lock_named_dir(dir, LOCK_FILE, "log directory")
+}
+
 /// Set the required PRAGMAs and verify them.
-fn configure(conn: &Connection) -> Res<()> {
+pub(crate) fn configure(conn: &Connection) -> Res<()> {
     let mode = conn.pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))?;
     if !mode.eq_ignore_ascii_case("delete") {
         let mode = conn.pragma_update_and_check(None, "journal_mode", "DELETE", |r| r.get::<_, String>(0))?;
@@ -608,10 +616,11 @@ fn configure(conn: &Connection) -> Res<()> {
 struct Inner {
     _lock: File,
     conn: Connection,
+    fault: Arc<fault::FaultController>,
 }
 
 impl Inner {
-    fn open(dir: &Path, node_id: u64, check: bool) -> Res<Inner> {
+    fn open(dir: &Path, node_id: u64, check: bool, fault: Arc<fault::FaultController>) -> Res<Inner> {
         let lock = lock_dir(dir)?;
         let db_path = dir.join(DB_FILE);
         let existed = db_path.exists();
@@ -678,7 +687,7 @@ impl Inner {
         // LogId); otherwise the exact row must remain, so an all-row deletion with retained
         // committed metadata is refused rather than mistaken for a fresh empty log.
         validate_committed(&conn, committed.as_ref(), purged.as_ref(), last)?;
-        Ok(Inner { _lock: lock, conn })
+        Ok(Inner { _lock: lock, conn, fault })
     }
 
     fn tx(&mut self) -> Res<rusqlite::Transaction<'_>> {
@@ -721,6 +730,7 @@ fn validate_batch(entries: &[EntryOf]) -> Res<()> {
 /// Bounds and adjacency are validated here, before any transaction is opened.
 fn append_entries(inner: &mut Inner, entries: Vec<EntryOf>) -> Res<()> {
     validate_batch(&entries)?;
+    let fault = inner.fault.clone();
     let tx = inner.tx()?;
     let last = read_last(&tx)?;
     let committed: Option<LogId<u64>> = meta(&tx, K_COMMITTED)?;
@@ -778,6 +788,8 @@ fn append_entries(inner: &mut Inner, entries: Vec<EntryOf>) -> Res<()> {
             }
         }
     }
+    fault.check(fault::FaultPoint::LogAppendEnospc)?;
+    fault.check(fault::FaultPoint::LogAppendSync)?;
     tx.commit()?;
     Ok(())
 }
@@ -849,9 +861,9 @@ fn purge_to(inner: &mut Inner, log_id: LogId<u64>) -> Res<()> {
 ///
 /// The mutex is `Arc`-owned and locked *inside* the blocking task, so nothing borrows the
 /// store mutably across threads.
-async fn with_inner<R: Send + 'static>(
-    inner: Arc<Mutex<Inner>>,
-    f: impl FnOnce(&mut Inner) -> Res<R> + Send + 'static,
+pub(crate) async fn with_inner<T: Send + 'static, R: Send + 'static>(
+    inner: Arc<Mutex<T>>,
+    f: impl FnOnce(&mut T) -> Res<R> + Send + 'static,
 ) -> Res<R> {
     tokio::task::spawn_blocking(move || {
         let mut guard = inner.blocking_lock();
@@ -862,8 +874,10 @@ async fn with_inner<R: Send + 'static>(
 }
 
 /// Persistent Raft log store (Id: `LogId<u64>`, Entry: [`EntryOf`], Vote: `Vote<u64>`).
+#[derive(Clone)]
 pub struct PersistentLog {
     inner: Arc<Mutex<Inner>>,
+    fault: Arc<fault::FaultController>,
 }
 
 impl PersistentLog {
@@ -871,11 +885,41 @@ impl PersistentLog {
     /// Metadata and retained-log density are always validated. `check_on_open` additionally runs
     /// SQLite `quick_check`; it is not a switch for the density proof.
     pub async fn open(path: impl AsRef<Path>, node_id: u64, check_on_open: bool) -> Res<Self> {
+        Self::open_with_faults(path, node_id, check_on_open, fault::FaultController::noop()).await
+    }
+
+    /// Open (or create) the store with an attached fault-injection controller.
+    pub async fn open_with_faults(
+        path: impl AsRef<Path>,
+        node_id: u64,
+        check_on_open: bool,
+        fault: Arc<fault::FaultController>,
+    ) -> Res<Self> {
         let dir = path.as_ref().to_path_buf();
-        let inner = tokio::task::spawn_blocking(move || Inner::open(&dir, node_id, check_on_open))
+        let inner_fault = fault.clone();
+        let inner = tokio::task::spawn_blocking(move || Inner::open(&dir, node_id, check_on_open, inner_fault))
             .await
             .map_err(|e| E::Io(io::Error::other(format!("open task failed: {e}"))))??;
-        Ok(PersistentLog { inner: Arc::new(Mutex::new(inner)) })
+        Ok(PersistentLog { inner: Arc::new(Mutex::new(inner)), fault })
+    }
+
+    /// Returns the attached fault controller.
+    pub fn fault_controller(&self) -> &Arc<fault::FaultController> {
+        &self.fault
+    }
+
+    /// Limits SQLite page allocations on this connection (used to force real `SQLITE_FULL` in tests).
+    pub async fn set_max_page_count(&self, max_pages: u64) -> Res<u64> {
+        with_inner(self.inner.clone(), move |i| {
+            let capped = i.conn.pragma_update_and_check(None, "max_page_count", max_pages, |r| r.get::<_, u64>(0))?;
+            Ok(capped)
+        })
+        .await
+    }
+
+    /// Synchronously commits validated log entries directly for unit/fault-injection probes.
+    pub async fn append_durable(&self, entries: Vec<EntryOf>) -> Res<()> {
+        with_inner(self.inner.clone(), move |i| append_entries(i, entries)).await
     }
 }
 
@@ -915,8 +959,10 @@ impl RaftLogStorage<LogTypeConfig> for PersistentLog {
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let vote = *vote;
         with_inner(self.inner.clone(), move |i| {
+            let fault = i.fault.clone();
             let tx = i.tx()?;
             write_meta_vote(&tx, &vote)?;
+            fault.check(fault::FaultPoint::LogVoteSync)?;
             tx.commit()?;
             Ok(())
         })
