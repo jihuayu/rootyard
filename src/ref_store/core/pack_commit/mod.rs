@@ -47,7 +47,9 @@ mod registration;
 mod sql;
 mod usage;
 
-pub use artifact::{ArtifactLocator, ArtifactSetDigest, RegisteredArtifact, RegisteredPack, packs_digest};
+pub use artifact::{
+    ArtifactLocator, ArtifactSetDigest, RegisteredArtifact, RegisteredPack, pack_set_digest, packs_digest,
+};
 pub use authorized::{
     AuthorizedCancelOutcome, AuthorizedCancelReceipt, AuthorizedCommitError, AuthorizedCommitMode,
     AuthorizedCommitReceipt, AuthorizedSelection, PgAuthorizedCommit, PrepareOutcome, PreparedPublication,

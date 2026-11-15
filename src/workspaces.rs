@@ -7,6 +7,11 @@ pub mod capture;
 mod checkpoints;
 #[path = "workspaces/cleanup.rs"]
 mod cleanup;
+#[path = "workspaces/compat.rs"]
+mod compat;
+#[cfg(test)]
+#[path = "workspaces/compat_tests.rs"]
+mod compat_tests;
 #[path = "workspaces/events.rs"]
 mod events;
 #[path = "workspaces/files.rs"]

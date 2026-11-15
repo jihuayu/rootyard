@@ -1,7 +1,9 @@
-# Ref-version and pack-dependency causal contract (proposal for #180)
+# Ref-version and pack-dependency causal contract (#180)
 
-Status: **proposal only; no causal implementation exists.** This checkpoint does
-not close #180 and does not edit production, migrations, Cargo or workflows. It
+Status: **pure causal contract (C1) and A4 pack-set bridge (pure C3) landed in
+`src/ref_store/core/ref_version/` with `tests/ref_version_contract.rs`; does not
+close #180.** Schema migrations/PG SQL runtime (C2), snapshot/HTTP handlers
+(C4/C5 runtime), and Raft Ref-CAS state machine (C7) remain unimplemented. It
 extends the read/session boundary of #172/#174/#175 with a Git-data causal unit:
 a per-ref version whose exact object representation and server-proven
 dependencies are recorded by the authority. A session cursor, cache entry or
@@ -690,12 +692,16 @@ No false transaction is allowed:
 ## 7. Narrow implementation checkpoints
 
 Each checkpoint is independently reviewable and must leave the default Git path
-unchanged until its exit criteria pass. [CURRENT] C0 is this document only.
+unchanged until its exit criteria pass. **[CURRENT]** C0 (this spec), C1
+(`src/ref_store/core/ref_version/{mod,limits,contract,digest,reasons,pack_set,commit_set,record,terminal,closure,read_mode,retention,vector_tests}.rs`),
+and the pure C3 A4 bridge (`pack_commit::pack_set_digest` +
+`VerifiedClosurePack::from_registered`) are implemented in-crate without
+touching migrations or HTTP routes.
 
 | # | Scope | Likely files | Exit check |
 | --- | --- | --- | --- |
 | C0 | This contract and state diagram | `docs/ref-version-pack-contract.md`, design index | Docs/link checks pass; no production/migration/Cargo changes |
-| C1 | Pure identity/edge/limit types and canonical digests; no schema/route | `src/ref_store/core/ref_version/{mod,contract,digest,limits}.rs` | VersionId/OperationDigest/PackSetDigest/CommitSetId/record_digest/T and rejected/cancelled vectors fixed before C2/C7; no PG/Blob/native |
+| C1 | Pure identity/edge/limit types and canonical digests; no schema/route | `src/ref_store/core/ref_version/{mod,contract,digest,limits,reasons,pack_set,commit_set,record,terminal,closure,read_mode,retention}.rs` | VersionId/OperationDigest/PackSetDigest/CommitSetId/record_digest/T and rejected/cancelled vectors verified; no PG/Blob/native |
 | C2 | PG version/head/commit-set/edge tables and authoritative insert under the existing 138/gate lock prefix | next safe migration; `core/ref_version/pg*.rs`; existing `pack_commit/pg_commit.rs` extension point | Real-PG tests for CAS, atomic/subset, tombstone/ABA, replay/unknown; no read route |
 | C3 | Bind current A4 registered pack identities and verifier-selected OBJECT deps; prove dependency pinning through commit | `core/ref_version/*`, `pack_commit/{plan,closure,proof,artifact}.rs` extension points | Cross-tenant/missing/corrupt/depth/byte/cycle tests; no default serving change |
 | C4 | Strong snapshot records/binds version heads/deps without weakening the current fallback | `core/pack_snapshot/*` extension; current strong tests | Full-snapshot tests remain green; version IDs optional until enabled |
@@ -703,17 +709,21 @@ unchanged until its exit criteria pass. [CURRENT] C0 is this document only.
 | C6 | Root/pin/CI/PR/backup/compaction/unknown-operation protection for versions | roots/pins/backup extension points; no GC delete | Protector matrix and backup/restore tests; TTL cannot collect unknown |
 | C7 | Raft Ref-CAS state machine + shared contract suite; ReadIndex and projection lag | distributed authority crate/runtime; not root PG refs | Same shared tests pass on Raft; PG fallback/partition tests fail closed |
 
-C1-C7 are not implemented by this checkpoint. C2/C7 require Linux native/Postgres/
-real multi-host test execution by the root runner; macOS local work is limited to
-offline Python/docs checks. No performance claim is made by any checkpoint.
+C2 (PG DDL + `pg*.rs`), C4/C5 runtime serving/snapshot wiring, C6 DB/backup
+runtime hooks, and C7 (Raft Ref-CAS runtime) remain unimplemented by this
+increment. Real-PG/Raft integration tests require Linux CI / Postgres / native
+Git; local Windows cannot link the `fuser`-dependent root crate. No
+performance claim is made by any checkpoint.
 
-## 8. Concrete shared tests (not executed by this checkpoint)
+## 8. Concrete shared tests
 
-The tests must be written only with C1+; this document does not claim they exist
-or pass. All synthetic dependency/edge tests are pure. PG/Raft suites are
-ignored integration tests with explicit real dependencies.
+The pure contract suite (`tests/ref_version_contract.rs` with
+`tests/ref_version_contract_support/*`) and exact §2.5 byte-vector unit tests
+(`src/ref_store/core/ref_version/vector_tests.rs`) are implemented in this
+increment. PG (`tests/ref_version_pg.rs`) and Raft (`tests/ref_version_raft.rs`)
+suites remain unimplemented proposals for C2/C6/C7.
 
-Pure contract (`tests/ref_version_contract.rs` proposal): `version_id_binds_tenant_repo_history_authority_ref_operation`;
+Pure contract (`tests/ref_version_contract.rs` implemented): `version_id_binds_tenant_repo_history_authority_ref_operation`;
 `same_oid_new_generation_is_not_aba`; `tombstone_generation_survives_delete`;
 `client_supplied_dependency_is_not_authority`; `base_must_be_exact_current_head`;
 `dependency_cycle_self_same_commit_set_and_cross_realm_are_refused`;
@@ -763,9 +773,10 @@ partition, restore, lost ACK); §5 and C6 (roots/pins/CI/PR/backup/validation/
 compaction/unknown retention); §4 and C5 (cross-ref matrix, compatibility,
 errors); this status and §4/§9 (no causal-consistency claim).
 
-Non-claims: no causal implementation, no closed #180, no Raft runtime, no
-cross-PG/Raft/Blob transaction, no cross-request Smart HTTP pin, no physical GC,
-no production qualification, no performance result, and no assertion about
-OpenAI's unpublished implementation. The full strong snapshot remains the
-default safety fallback until the checkpoints above are implemented and
-independently accepted.
+Non-claims: C1 pure causal contract + pure C3 A4 bridge + C4/C5/C6 evaluator
+models only; no closed #180, no PG schema migration (C2), no HTTP route adapter
+(C5 runtime), no Raft runtime (C7), no cross-PG/Raft/Blob transaction, no
+cross-request Smart HTTP pin, no physical GC, no production qualification, no
+performance result, and no assertion about OpenAI's unpublished implementation.
+The full strong snapshot remains the default safety fallback until C2–C7
+runtime checkpoints are implemented and independently accepted.

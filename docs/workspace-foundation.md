@@ -120,25 +120,27 @@ Laboratory-only `ROOTYARD_WORKSPACE_TEST_FAILPOINT=before_publish` / `after_publ
 
 ## Support matrix: lab preflight versus production Workspace API
 
-This round adds one narrow thing: the `init` admission checks of the **local lab binary** now run before the store is opened, so a refused source cannot create a store directory, `.lock`, staging directory or destination UUID directory. It is an early-rejection boundary, not a new feature implementation.
+The **local lab binary** (`src/workspace_lab/core.rs`, `src/workspace_lab/preflight.rs`)
+runs `init` and checkpoint validation before opening or committing store state.
+The **hosted Workspace API** (`src/workspaces/compat.rs`, wired into `service.rs`,
+`files.rs`, `checkpoints.rs`, and `remote.rs`) enforces the explicit Phase 2 pre-mutation
+compatibility matrix documented in [workspace-runtime.md](workspace-runtime.md).
 
-| Area | Local lab binary (`rootyard-workspace-lab`), this stage | Production Workspace API, this stage |
+| Area | Local lab binary (`rootyard-workspace-lab`) | Production Workspace API (`src/workspaces/**`) |
 | --- | --- | --- |
-| Admission order | Argument checks, source/store overlap, repository validation, the mode-aware HEAD/index gitlink check, the managed `.gitattributes` filter check and the managed symlink check all run **before** `Store::open`; the same checks plus capture re-run afterwards because a source may change in between | No workspace-API admission preflight has been added. Nothing here is wired into HTTP, serving or database paths |
-| Repository object format | Independent **SHA-1** repositories only. SHA-256 is explicitly **rejected**; no SHA-256 support was added | No SHA-256 path exists. The raw-byte checkpoint of a repository is not a claim that a SHA-256 object chain is supported end to end |
-| Index formats | Index **v2/v3** with `TREE`/`REUC` extensions only. Split index, sparse index, skip-worktree, fsmonitor, untracked cache and unknown extensions are rejected | Not verified. A raw-byte checkpoint copies index bytes without validating or closing these formats |
-| Git shape | Independent native `.git` directory only. `.git` files, linked worktrees, shared worktree admin, submodules and gitlinks (mode `160000` in HEAD or the index, even with no `.gitmodules` file and no initialized `.git/modules`), external object alternates, shallow clones, grafts, replacement refs and custom hooks are rejected | Not covered. The API checkpoint is a byte-level capture, not a compatibility verdict for linked worktrees, submodules or alternates |
-| Filters and LFS | Any managed `.gitattributes` mentioning `filter`, and `.git/info/attributes` mentioning `filter`, are rejected (no clean/smudge/LFS execution). LFS is **not** implemented | No filter execution path is introduced; LFS content is not implemented or claimed |
-| Symlinks | Managed worktree symlinks must be relative, stay inside the repository and never target `.git`; the check now runs before the store exists. Link targets are read with `read_link`; no target content is opened and no external symlink is followed | Not verified by this stage |
-| Ignore semantics | `.gitignore` plus hierarchical `.rootyardignore` decide which untracked paths are managed; unmanaged attribute files and unmanaged escaping symlinks are deliberately **not** newly rejected | Not applicable yet |
-| Consistency and recovery | Local `local_complete` checkpoints under a caller `--quiescent` promise; local filesystem durability only; no write barrier, no remote recovery claim | The current API checkpoint stores raw bytes. That raw-byte checkpoint does **not** mean these states are closed, admission-checked or remotely recoverable, and the API does **not** inherit the lab rejection matrix above |
-| Feature enablement | Every unsupported shape stays explicitly refused | No submodule, LFS, linked-worktree or SHA-256 support is implemented or advertised |
+| Admission order | Argument checks, source/store overlap, repository validation, mode-aware HEAD/index gitlink check, `.gitattributes` filter check, and managed symlink check run **before** `Store::open`, and re-run on capture | `POST /api/workspaces` validates committed `HEAD`, `ls-tree` gitlinks, and `compat::validate_repo` before DB commit; `PUT /files`, `POST /git` (with `GitRollback`), `POST /checkpoints` (`compat::validate_raw`), `restore`/`fork`, and `remote::ensure_local` enforce compat before publishing |
+| Repository object format | Independent **SHA-1** repositories only (`sha256` explicitly **rejected**) | **SHA-1** only (`sha256` / `extensions.*` explicitly **rejected** `409`; `Planned extension`) |
+| Index formats | Index **v2/v3** with `TREE`/`REUC` extensions and `0x2000` (`intent-to-add`) only; `0o160000` gitlinks, `link`, `sdir`, `FSMN`, `UNTR`, and `skip-worktree` rejected | Shares `core::validate_index` (now also rejecting `0o160000` entry modes) plus `.git/sharedindex.*`, `.git/info/sparse-checkout`, and `.git/config.worktree` refusal (`409`) |
+| HEAD state | Branch and **detached HEAD** supported; **unborn HEAD** rejected | Branch (loose or `packed-refs`) and **detached HEAD** supported; **unborn HEAD** rejected (`409`) |
+| Git shape | Independent native `.git` directory only; `.git` files, linked worktrees, `.git/modules/*`, `160000` gitlinks, nested `.git` dirs/files, alternates, shallow clones, grafts, replace refs, and custom hooks rejected | Enforces the same fail-closed isolation (`409`) for linked worktrees, submodules/gitlinks, nested `.git` files/dirs, alternates, shallow clones, grafts, replace refs, and custom hooks |
+| Filters and LFS | Comments (`# ...`) and filenames containing `filter` allowed (`core::check_gitattributes`); any actual `filter` attribute in managed `.gitattributes` or `.git/info/attributes` rejected | Inert `filter=lfs` declarations in worktree `.gitattributes` preserved as raw pointers when no local filter driver exists; `.git/config` `filter.*`/`diff.*`/`merge.*`, `.git/info/attributes` filters, and custom `filter=` attributes rejected (`409`) |
+| Symlinks | Managed worktree symlinks must be relative, stay inside the repository, and never target `.git` | Merged `snapshot::Raw::validate` and `compat` reject `.git` symlinks, symlinked `.gitattributes`, and escaping/absolute worktree symlinks |
+| Consistency and recovery | Local `local_complete` checkpoints under `--quiescent` | Complete-closure local/S3 checkpoints, `GitRollback` / `DirCleanupGuard` atomicity on compat rejection, and `Origin::Lazy` metadata checks |
 
-Consequences for `#88`, which is not finished by this stage:
-
-- A **production API** admission preflight still has to be designed and accepted; the lab preflight only protects the lab CLI.
-- **SHA-256 end-to-end** (objects, index, manifests, remote CAS, restore) is still unimplemented; the lab keeps rejecting SHA-256 repositories.
-- Feature enablement stays **item by item**: submodule, LFS/filter, linked-worktree and sparse/split index support each need their own closure contract and evidence. This stage only refuses them earlier and defines the real compatibility boundary.
+Planned extensions (`#88` follow-ons) stay explicitly item-by-item without relaxing
+fail-closed checks: per-submodule `repository_id` authorization & multi-repo closure
+for submodules, scoped LFS object hydration for `workspaces`, and 32-byte OID
+manifest/index support for SHA-256.
 
 ## Safety and compatibility limits
 

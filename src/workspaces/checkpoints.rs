@@ -101,6 +101,7 @@ pub async fn create(
         super::mounts::with_frozen(id, || {
             let before_raw = super::snapshot::Raw::load(&source)?
                 .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
+            super::compat::validate_raw(&before_raw)?;
             let before = before_raw.digest().to_owned();
             if let Some(ref expected_fp) = stored_fp
                 && &before != expected_fp
@@ -326,6 +327,7 @@ async fn restore_inner(
             if abandoned.is_abandoned() {
                 return Err(Error::timeout());
             }
+            super::compat::validate_repo(&cp_repo)?;
             let mut pub_dir = copy_snapshot(&cp_repo, &lower_copy)?;
             pub_dir.attach_fence(fence);
             if abandoned.is_abandoned() {

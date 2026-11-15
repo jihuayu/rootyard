@@ -17,6 +17,7 @@ pub mod serving;
 pub(crate) mod tx;
 
 pub use core::artifact_hold;
+pub use core::ref_version;
 
 pub use contract::{
     BeginReceipt, CancelReceipt, Capabilities, CommitReceipt, IssuerLane, OperationIdentity, OperationLookup,

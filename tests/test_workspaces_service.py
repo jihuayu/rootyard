@@ -231,5 +231,137 @@ class WorkspaceServiceTest(unittest.TestCase):
         finally:
             h.cleanup()
 
+    def test_workspace_git_state_compatibility_and_detached_head(self):
+        binary, _ = select_runtime_binary()
+        h = Harness(argparse.Namespace(binary=str(binary), keep=False))
+        try:
+            h.setup(); h.api(); h.roundtrip()
+            h.create_repository({"name": "empty-ws"}, token=h.alice)
+            status, body, _ = h.http("/api/workspaces", token=h.alice, method="POST",
+                body={"owner": "alice", "repository": "empty-ws", "agent_id": "compat-empty"},
+                extra_headers={"Idempotency-Key": "compat-empty"})
+            self.assertEqual(status, 409, body)
+
+            h.create_repository({"name": "sha256-ws", "object_format": "sha256"}, token=h.alice)
+            s256_work = h.root / "sha256-seed"
+            h.git("init", "-q", "-b", "main", "--object-format=sha256", str(s256_work))
+            h.git("-C", str(s256_work), "config", "user.name", "Alice")
+            h.git("-C", str(s256_work), "config", "user.email", "alice@example.invalid")
+            (s256_work / "a.txt").write_text("sha256\n", encoding="utf-8")
+            h.git("-C", str(s256_work), "add", "a.txt")
+            h.git("-C", str(s256_work), "commit", "-q", "-m", "init")
+            h.git("-C", str(s256_work), "push", "-q", f"{h.base}/git/alice/sha256-ws.git", "HEAD:refs/heads/main", token=h.alice)
+            status, body, _ = h.http("/api/workspaces", token=h.alice, method="POST",
+                body={"owner": "alice", "repository": "sha256-ws", "agent_id": "compat-s256"},
+                extra_headers={"Idempotency-Key": "compat-s256"})
+            self.assertEqual(status, 409, body)
+
+            h.create_repository({"name": "sub-ws"}, token=h.alice)
+            sub_work = h.root / "sub-seed"
+            h.git("init", "-q", "-b", "main", str(sub_work))
+            h.git("-C", str(sub_work), "config", "user.name", "Alice")
+            h.git("-C", str(sub_work), "config", "user.email", "alice@example.invalid")
+            (sub_work / "a.txt").write_text("root\n", encoding="utf-8")
+            h.git("-C", str(sub_work), "add", "a.txt")
+            h.git("-C", str(sub_work), "commit", "-q", "-m", "init")
+            oid = h.git("rev-parse", "HEAD", cwd=sub_work).stdout.decode().strip()
+            h.git("update-index", "--add", "--cacheinfo", f"160000,{oid},vendor/lib", cwd=sub_work)
+            h.git("-C", str(sub_work), "commit", "-q", "-m", "gitlink")
+            h.git("-C", str(sub_work), "push", "-q", f"{h.base}/git/alice/sub-ws.git", "HEAD:refs/heads/main", token=h.alice)
+            status, body, _ = h.http("/api/workspaces", token=h.alice, method="POST",
+                body={"owner": "alice", "repository": "sub-ws", "agent_id": "compat-sub"},
+                extra_headers={"Idempotency-Key": "compat-sub"})
+            self.assertEqual(status, 409, body)
+            self.assertEqual(h.sql("SELECT count(*) FROM workspaces WHERE agent_id LIKE 'compat-%'"), "0")
+
+            ws = json.loads(h.expect("/api/workspaces", 201, token=h.alice, method="POST",
+                body={"owner": "alice", "repository": "demo", "agent_id": "compat-live", "base_oid": h.second},
+                extra_headers={"Idempotency-Key": "compat-live"}))
+            wid = ws["id"]
+            repo = h.root / "data/workspace-service/workspaces" / wid
+            h.git("checkout", "-q", "--detach", "HEAD", cwd=repo)
+            deadline = time.monotonic() + 8
+            while True:
+                current = json.loads(h.expect(f"/api/workspaces/{wid}", 200, token=h.alice))
+                if current["revision"] > 0:
+                    break
+                self.assertLess(time.monotonic(), deadline, "detached HEAD change was not captured")
+                time.sleep(0.1)
+            rev = current["revision"]
+            gen = current["git_generation"]
+
+            attrs = b"# allow filter comments\nsrc/filter_core.rs text eol=lf\n*.dat filter=lfs diff=lfs -text\n"
+            put_ok = json.loads(h.expect(f"/api/workspaces/{wid}/files?path=.gitattributes", 200, token=h.alice, method="PUT",
+                body={"content_base64": base64.b64encode(attrs).decode(), "expected_entry_version": 0,
+                      "expected_workspace_revision": rev, "lease_epoch": 1},
+                extra_headers={"Idempotency-Key": "compat-attr-ok"}))
+            rev = put_ok["workspace_revision"]
+
+            status, body, _ = h.http(f"/api/workspaces/{wid}/files?path=.gitattributes", token=h.alice, method="PUT",
+                body={"content_base64": base64.b64encode(b"*.txt filter=custom\n").decode(),
+                      "expected_entry_version": put_ok["entry_version"], "expected_workspace_revision": rev, "lease_epoch": 1},
+                extra_headers={"Idempotency-Key": "compat-attr-bad"})
+            self.assertEqual(status, 409, body)
+            self.assertIn("clean/smudge", body.decode())
+            self.assertEqual((repo / ".gitattributes").read_bytes(), attrs)
+
+            git_ok = json.loads(h.expect(f"/api/workspaces/{wid}/git", 200, token=h.alice, method="POST",
+                body={"action": "add", "paths": [".gitattributes"], "expected_git_generation": gen,
+                      "expected_workspace_revision": rev, "lease_epoch": 1},
+                extra_headers={"Idempotency-Key": "compat-git-add-attr"}))
+            rev = git_ok["workspace_revision"]
+            gen = git_ok["git_generation"]
+
+            cp = json.loads(h.expect(f"/api/workspaces/{wid}/checkpoints", 201, token=h.alice, method="POST",
+                body={"expected_workspace_revision": rev, "lease_epoch": 1},
+                extra_headers={"Idempotency-Key": "compat-cp-ok"}))
+            rev = cp["workspace_revision"]
+            restored = json.loads(h.expect(f"/api/checkpoints/{cp['checkpoint_id']}/restore", 201,
+                token=h.alice, method="POST", body={"agent_id": "compat-restored"},
+                extra_headers={"Idempotency-Key": "compat-restore-ok"}))
+            copy = h.root / "data/workspace-service/workspaces" / restored["id"]
+            self.assertEqual((copy / ".git/HEAD").read_text(encoding="utf-8").strip(), h.second)
+            self.assertEqual((copy / ".gitattributes").read_bytes(), attrs)
+
+            nested = repo / "nested"
+            h.git("init", "-q", "-b", "main", str(nested))
+            h.git("-C", str(nested), "config", "user.name", "Nested")
+            h.git("-C", str(nested), "config", "user.email", "nested@example.invalid")
+            (nested / "x.txt").write_text("sub\n", encoding="utf-8")
+            h.git("-C", str(nested), "add", "x.txt")
+            h.git("-C", str(nested), "commit", "-q", "-m", "nested")
+            for attempt in range(4):
+                cur = json.loads(h.expect(f"/api/workspaces/{wid}", 200, token=h.alice))
+                status, body, _ = h.http(f"/api/workspaces/{wid}/git", token=h.alice, method="POST",
+                    body={"action": "add", "paths": ["nested"],
+                          "expected_git_generation": cur["git_generation"],
+                          "expected_workspace_revision": cur["revision"], "lease_epoch": 1},
+                    extra_headers={"Idempotency-Key": f"compat-git-add-nested-{attempt}"})
+                self.assertEqual(status, 409, body)
+                if "submodules" in body.decode():
+                    break
+            else:
+                self.fail(f"expected submodules compat rejection, got {body!r}")
+            import shutil
+            shutil.rmtree(nested)
+
+            (repo / ".git/worktrees/wt1").mkdir(parents=True)
+            (repo / ".git/worktrees/wt1/gitdir").write_text("/tmp/wt1/.git\n", encoding="utf-8")
+            try:
+                for attempt in range(4):
+                    cur_rev = json.loads(h.expect(f"/api/workspaces/{wid}", 200, token=h.alice))["revision"]
+                    status, body, _ = h.http(f"/api/workspaces/{wid}/checkpoints", token=h.alice, method="POST",
+                        body={"expected_workspace_revision": cur_rev, "lease_epoch": 1},
+                        extra_headers={"Idempotency-Key": f"compat-cp-worktree-{attempt}"})
+                    self.assertEqual(status, 409, body)
+                    if "linked worktrees" in body.decode():
+                        break
+                else:
+                    self.fail(f"expected linked worktrees compat rejection, got {body!r}")
+            finally:
+                shutil.rmtree(repo / ".git/worktrees")
+        finally:
+            h.cleanup()
+
 
 if __name__ == "__main__": unittest.main()

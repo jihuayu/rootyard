@@ -213,3 +213,41 @@ jobs. In-service execution currently accepts `source=origin`; mirror-scheduled
 claims use the external runner because a trusted in-service mirror materializer
 is not present. The native CI test uses development namespace mode; production
 aggregate resource limits require a delegated cgroup v2 root.
+
+## Git-state compatibility matrix
+
+Three Git runtime surfaces exist in Rootyard with distinct security and closure
+contracts (`src/workspace_lab/core.rs`, `src/workspaces/compat.rs`, and
+`src/ci_checkouts/`):
+
+| Git state / feature | `workspace_lab/core` (lab CLI) | Hosted `workspaces` API (direct & FUSE) | `ci_checkouts` (#35 CI runner) |
+| --- | --- | --- | --- |
+| Committed SHA-1 worktrees (tracked, untracked, `.gitignore`, partial staging, `TREE`/`REUC`, `intent-to-add`, merge conflicts) | **Supported** | **Supported** | **Supported** (read-only pinned checkout) |
+| Detached HEAD (`HEAD` pointing to a commit OID) | **Supported** | **Supported** (preserved across checkpoint, restore, and fork) | **Supported** (pinned commit checkout) |
+| Unborn HEAD (0-commit repo or `--orphan` before first commit) | **Explicitly rejected** (`HEAD^{commit}` required) | **Explicitly rejected** (`409` at creation, checkpoint, restore, and `POST /git`) | **Explicitly rejected** |
+| Non-filter `.gitattributes` (`text`, `eol`, comments `# ...`, patterns containing `filter`) | **Supported** (`core::check_gitattributes`) | **Supported** (`core::check_gitattributes`) | **Supported** |
+| `.gitattributes` `filter=lfs` markers (no local driver) | **Explicitly rejected** (`filter` refused in preflight & capture) | **Supported as inert raw pointer** (stored/preserved byte-for-byte; no local filter execution; not auto-hydrated) | **Supported** (hydrates `ready` LFS objects under per-repo auth) |
+| Active clean/smudge/diff/merge drivers (`.git/config` `filter.*`/`diff.*`/`merge.*`, `.git/info/attributes` filters, custom `filter=<name>`) | **Explicitly rejected** | **Explicitly rejected** (`409` before disk/DB mutation; `Planned extension`: opt-in LFS hydration) | **Planned extension** (LFS pointer hydration only; custom arbitrary filter drivers stay disabled) |
+| Submodules & gitlinks (`160000` in HEAD/index, `.git/modules/*`, nested `.git` dir or pointer file) | **Explicitly rejected** | **Explicitly rejected** (`409`; `Planned extension` gated on per-submodule `repository_id` auth & multi-repo closure) | **Supported** (recursive pinned submodules up to depth 5 with per-source auth) |
+| Linked worktrees (`.git` `gitdir:` file, `commondir`, `gitdir`, `.git/worktrees/*`) | **Explicitly rejected** | **Explicitly rejected** (`409`; use `POST /api/workspaces/{id}/fork` instead) | **Explicitly rejected** |
+| Split index, sparse index/checkout, FSMonitor, untracked cache (`link`, `sdir`, `FSMN`, `UNTR`, `skip-worktree`, `sharedindex.*`, `info/sparse-checkout`, `config.worktree`, index v4) | **Explicitly rejected** (`DIRC` v2/v3 with `TREE`/`REUC` and `0x2000` only) | **Explicitly rejected** (`409` via shared `core::validate_index` and admin checks; `Planned extension`) | **Explicitly rejected** (fresh isolated checkout) |
+| External Git storage & escapes (`objects/info/alternates`, `http-alternates`, `shallow`, `info/grafts`, `refs/replace/*`, custom `.git/hooks/*`, `.git` symlinks, escaping worktree symlinks) | **Explicitly rejected** | **Explicitly rejected** (`409`; `.git` symlinks and escaping worktree symlinks refused) | **Explicitly rejected** (validated clean checkout) |
+| SHA-256 object format (`extensions.objectformat = sha256`) | **Explicitly rejected** | **Explicitly rejected** (`409`; `Planned extension` requiring 32-byte index/manifest OID support) | **Supported** |
+
+### Fail-closed enforcement boundaries
+
+In `src/workspaces/compat.rs`, every compatibility check runs off-thread inside Phase 2
+before PostgreSQL commits or filesystem/checkpoint publication:
+
+- `POST /api/workspaces`: verifies committed SHA-1 `HEAD`, checks `ls-tree -r -z --full-tree HEAD`
+  for `160000` gitlinks, and runs `compat::validate_repo` inside the creation `DirCleanupGuard`
+  before Phase 3 insert.
+- `PUT /api/workspaces/{id}/files`: validates `.gitattributes` updates (`allow_lfs = true`,
+  refusing custom clean/smudge filters with `409`) before modifying workspace files or DB revisions.
+- `POST /api/workspaces/{id}/git`: validates post-command `.git`/worktree state inside
+  `GitRollback`; rejected mutations roll back `.git/index` and loose objects before returning `409`.
+- `POST /api/workspaces/{id}/checkpoints`: validates frozen merged snapshots via
+  `compat::validate_raw` (respecting `Origin::Lazy` unhydrated worktree placeholders while always
+  verifying materialized `.git/` metadata and `Lower`/`Upper` `.gitattributes`) before staging.
+- `POST /api/checkpoints/{id}/restore`, `POST /api/workspaces/{id}/fork`, and `remote::ensure_local`:
+  run `compat::validate_repo` on materialized checkpoint trees prior to publishing local state.

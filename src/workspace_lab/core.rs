@@ -128,11 +128,100 @@ pub(crate) fn git_string(git: &OsStr, repo: &Path, args: &[&str]) -> Result<Stri
 }
 
 /// Conservative attribute contract shared by the init preflight and capture: any
-/// mention of a `filter` attribute is refused instead of being interpreted, so the
-/// two call sites cannot drift apart. Filter execution, LFS and SHA-256 stay out of scope.
+/// `filter` attribute is refused instead of being interpreted, while `#` comments
+/// and path patterns whose name happens to contain `filter` remain valid.
 pub(crate) fn ensure_no_filter_attributes(bytes: &[u8]) -> Result<()> {
-    ensure!(!bytes.windows(6).any(|x| x == b"filter"), "Git clean/smudge and LFS attributes are unsupported");
+    check_gitattributes(bytes, false)
+}
+
+/// Inspect `.gitattributes` or `.git/info/attributes` lines, refusing any `filter`
+/// attribute (or allowing only inert `filter=lfs` pointer markers when `allow_lfs`
+/// is true in hosted workspaces that forbid local filter drivers).
+pub(crate) fn check_gitattributes(bytes: &[u8], allow_lfs: bool) -> Result<()> {
+    ensure!(!bytes.contains(&0), "binary NUL byte in Git attributes is unsupported");
+    for raw in bytes.split(|&b| b == b'\n') {
+        let line = trim_ascii_ws(raw.strip_suffix(b"\r").unwrap_or(raw));
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        let (pattern, mut cursor) = split_attributes_pattern(line)?;
+        if let Some(macro_name) = pattern.strip_prefix(b"[attr]") {
+            ensure!(!macro_name.eq_ignore_ascii_case(b"filter"), "Git clean/smudge and LFS attributes are unsupported");
+        }
+        while !cursor.is_empty() {
+            cursor = trim_ascii_ws(cursor);
+            if cursor.is_empty() {
+                break;
+            }
+            let end = cursor.iter().position(|b| matches!(b, b' ' | b'\t')).unwrap_or(cursor.len());
+            let token = &cursor[..end];
+            cursor = &cursor[end..];
+            if is_disallowed_filter_attr(token, allow_lfs) {
+                bail!("Git clean/smudge and LFS attributes are unsupported");
+            }
+        }
+    }
     Ok(())
+}
+
+fn trim_ascii_ws(mut bytes: &[u8]) -> &[u8] {
+    while let Some(first) = bytes.first()
+        && matches!(first, b' ' | b'\t')
+    {
+        bytes = &bytes[1..];
+    }
+    while let Some(last) = bytes.last()
+        && matches!(last, b' ' | b'\t')
+    {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn split_attributes_pattern(line: &[u8]) -> Result<(&[u8], &[u8])> {
+    if let Some(rest) = line.strip_prefix(b"\"") {
+        let mut idx = 0;
+        let mut escaped = false;
+        while idx < rest.len() {
+            let b = rest[idx];
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                let after = &rest[idx + 1..];
+                ensure!(
+                    after.is_empty() || matches!(after.first(), Some(b' ' | b'\t')),
+                    "malformed quoted Git attributes pattern"
+                );
+                return Ok((&rest[..idx], after));
+            }
+            idx += 1;
+        }
+        bail!("unterminated quoted Git attributes pattern");
+    }
+    let mut escaped = false;
+    for (idx, &b) in line.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if matches!(b, b' ' | b'\t') {
+            return Ok((&line[..idx], &line[idx + 1..]));
+        }
+    }
+    Ok((line, &[]))
+}
+
+fn is_disallowed_filter_attr(token: &[u8], allow_lfs: bool) -> bool {
+    if allow_lfs {
+        if token == b"filter=lfs" || token == b"-filter" || token == b"!filter" {
+            return false;
+        }
+        return token == b"filter" || token.starts_with(b"filter=") || token.starts_with(b"!filter=");
+    }
+    let attr = token.strip_prefix(b"-").or_else(|| token.strip_prefix(b"!")).unwrap_or(token);
+    attr == b"filter" || attr.starts_with(b"filter=")
 }
 
 pub fn check_source_store_overlap(store_arg: &OsStr, source_arg: &OsStr) -> Result<()> {
@@ -541,6 +630,9 @@ pub(crate) fn validate_index(bytes: &[u8]) -> Result<()> {
     for _ in 0..count {
         let start = cursor;
         ensure!(cursor.checked_add(62).is_some_and(|n| n <= end), "truncated index entry");
+        let mode = u32::from_be_bytes(bytes[start + 24..start + 28].try_into()?);
+        ensure!((mode & 0o170000) != 0o160000, "submodules/gitlinks in index are unsupported");
+        ensure!(matches!(mode & 0o170000, 0o100000 | 0o120000), "unsupported native Git index entry mode");
         let flags = u16::from_be_bytes(bytes[cursor + 60..cursor + 62].try_into()?);
         cursor += 62;
         if flags & 0x4000 != 0 {
@@ -674,11 +766,11 @@ pub(crate) fn walk(root: &Path) -> Result<BTreeMap<PathBuf, fs::Metadata>> {
             let path = relative.join(child.file_name());
             relative_path(path.as_os_str().as_bytes())?;
             let meta = fs::symlink_metadata(child.path())?;
+            ensure!(
+                path.file_name() != Some(OsStr::new(".git")) || path == Path::new(".git"),
+                "nested Git repositories and linked worktree pointers unsupported"
+            );
             if meta.is_dir() {
-                ensure!(
-                    path.file_name() != Some(OsStr::new(".git")) || path == Path::new(".git"),
-                    "nested Git repositories unsupported"
-                );
                 visit(root, &path, output)?;
             } else {
                 ensure!(output.len() < MAX_ENTRIES, "file count limit exceeded");
@@ -867,5 +959,65 @@ pub(crate) fn publish(from: &Path, to: &Path) -> Result<()> {
 pub(crate) fn failpoint(point: &str) {
     if std::env::var("ROOTYARD_WORKSPACE_TEST_FAILPOINT").ok().as_deref() == Some(point) {
         std::process::exit(if point == "before_publish" { 86 } else { 87 });
+    }
+}
+
+#[cfg(test)]
+mod compat_core_tests {
+    use super::*;
+
+    fn synthetic_index(mode: u32, flags: u16, extended: Option<u16>, path: &[u8], ext: Option<&[u8; 4]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"DIRC");
+        out.extend_from_slice(&(if extended.is_some() { 3u32 } else { 2u32 }).to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(&[0u8; 24]);
+        out.extend_from_slice(&mode.to_be_bytes());
+        out.extend_from_slice(&[0u8; 32]);
+        out.extend_from_slice(&flags.to_be_bytes());
+        if let Some(ext_flags) = extended {
+            out.extend_from_slice(&ext_flags.to_be_bytes());
+        }
+        out.extend_from_slice(path);
+        out.push(0);
+        let padded = start + (out.len() - start).div_ceil(8) * 8;
+        out.resize(padded, 0);
+        if let Some(ext_name) = ext {
+            out.extend_from_slice(ext_name);
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
+        out.extend_from_slice(&[0u8; 20]);
+        out
+    }
+
+    #[test]
+    fn filter_attributes_allow_comments_and_filter_filenames() {
+        let safe = b"# do not configure filter drivers\nsrc/filter_core.rs text eol=lf\n\"dir/my filter.rs\" -diff\n";
+        ensure_no_filter_attributes(safe).expect("comments and filename patterns stay allowed");
+        check_gitattributes(safe, true).expect("hosted mode keeps safe comments and paths");
+        for rejected in [
+            &b"*.bin filter=lfs diff=lfs merge=lfs -text\n"[..],
+            &b"*.txt filter=test\n"[..],
+            &b"*.txt filter\n"[..],
+            &b"[attr]custom filter=lfs\n"[..],
+            &b"[attr]filter text\n"[..],
+            &b"*.txt -filter\n"[..],
+        ] {
+            assert!(ensure_no_filter_attributes(rejected).is_err());
+        }
+        assert!(check_gitattributes(b"*.bin filter=lfs diff=lfs merge=lfs -text\n", true).is_ok());
+        assert!(check_gitattributes(b"*.txt filter=test\n", true).is_err());
+        assert!(check_gitattributes(b"*.txt filter\n", true).is_err());
+    }
+
+    #[test]
+    fn validate_index_rejects_gitlink_and_sparse_split_while_allowing_ita() {
+        assert!(validate_index(&synthetic_index(0o100644, 5, None, b"a.txt", Some(b"TREE"))).is_ok());
+        assert!(validate_index(&synthetic_index(0o100644, 0x4005, Some(0x2000), b"a.txt", Some(b"REUC"))).is_ok());
+        assert!(validate_index(&synthetic_index(0o160000, 6, None, b"vendor", None)).is_err());
+        assert!(validate_index(&synthetic_index(0o100644, 0x4005, Some(0x4000), b"a.txt", None)).is_err());
+        assert!(validate_index(&synthetic_index(0o100644, 5, None, b"a.txt", Some(b"link"))).is_err());
+        assert!(validate_index(&synthetic_index(0o100644, 5, None, b"a.txt", Some(b"sdir"))).is_err());
     }
 }
