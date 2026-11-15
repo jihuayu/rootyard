@@ -452,6 +452,8 @@ class CiMirrorTrack3Test(unittest.TestCase):
                         "coalesced": coalesced,
                         "coalesced_waiters": waiters,
                         "duration_ms": 5,
+                        "classification": "ready",
+                        "waited_for_slot": False,
                     }
                 ).encode()
 

@@ -220,7 +220,7 @@ pub async fn failover(
         return Err(Error(StatusCode::CONFLICT, "CI run lease changed"));
     }
     let prev_source: Option<String> = row.get("source_url");
-    if let Some(ref f) = failed_norm.first()
+    if let Some(f) = failed_norm.first()
         && prev_source.as_deref() != Some(f.as_str())
     {
         return Err(Error(StatusCode::CONFLICT, "failed_source does not match active lease"));

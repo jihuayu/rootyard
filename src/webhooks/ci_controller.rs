@@ -431,7 +431,7 @@ pub(crate) async fn reconcile_runs(state: &Arc<AppState>) -> Result<(), Error> {
         .await
         .map_err(Error::internal)?;
     let mut wake_repos = BTreeSet::new();
-    for row in cancelled.into_iter().chain(reaped.into_iter()) {
+    for row in cancelled.into_iter().chain(reaped) {
         wake_repos.insert(row.get::<_, Uuid>(0));
     }
     for repo_id in wake_repos {

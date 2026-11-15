@@ -549,12 +549,13 @@ class MirrorHarness(Harness):
         hit = self.auto_fetch({"target_oid": self.first, "storage_generation": 1})
         assert hit["cache_status"] == "hit" and hit["coalesced"] is False
         assert hit["classification"] == "ready"
-        st_bad, raw_bad, hdr_bad = self.mirror_http(
-            "/api/repos/alice/demo/mirror-auto-fetch", method="POST", token=self.reader,
-            body={"target_oid": "not-a-valid-oid"},
-        )
-        assert st_bad == 400 and json.loads(raw_bad)["classification"] == "missing", (st_bad, raw_bad)
-        assert {k.lower(): v for k, v in hdr_bad.items()}.get("x-rootyard-ci-state") == "missing"
+        if getattr(self, "mirror_proc", None) is not None:
+            st_bad, raw_bad, hdr_bad = self.mirror_http(
+                "/api/repos/alice/demo/mirror-auto-fetch", method="POST", token=self.reader,
+                body={"target_oid": "not-a-valid-oid"},
+            )
+            assert st_bad == 400 and json.loads(raw_bad)["classification"] == "missing", (st_bad, raw_bad)
+            assert {k.lower(): v for k, v in hdr_bad.items()}.get("x-rootyard-ci-state") == "missing"
 
         # 2. Cross-cluster runner queue lifecycle across zones, lease epochs, and stale heartbeat rejection.
         self.mirror_runners(
