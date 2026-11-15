@@ -5,7 +5,7 @@ Scoped personal access token (PAT) management, browser settings, restricted brow
 * API token and browser session management is served under `/api/tokens*`, `/api/sessions*`, `/web/settings/tokens*`, and `/web/settings/sessions*`.
 * Restricted API tokens can sign into `/web/login` to mint bounded `browser` child sessions (`expires_at <= LEAST(12h, parent.expires_at)`) that inherit parent `read_only`, `is_restricted`, expiry, revocation, and scope grants live without widening authority; restricted browser children are refused `403` on token/session management routes while `/web/logout` remains available.
 * Git ref-admission / CAS publication stays fail-closed on browser tokens (`BrowserTokenUnsupported`), while direct `api` tokens retain the `FOR SHARE` publication lock.
-* Self-service token management, legacy->restricted `PATCH` narrowing, and restricted browser-child inheritance are verified continuously by `tests/token_management.py`, `tests/pat_scope_auth.py`, and `tests/web_repository_pagination.py` in CI (`verify` job + Step 90 manifest binding).
+* Self-service token management, legacy->restricted `PATCH` narrowing, and restricted browser-child inheritance are verified continuously by `tests/token_management.py`, `tests/pat_scope_auth.py`, and `tests/web_repository_pagination.py` in CI (`verify` job + `Bind native regressions to the built binary and source inputs`).
 
 ## API (Authorization header only)
 
@@ -100,8 +100,13 @@ mutations. Sessions are limited to the actor's own browser tokens.
   Origin match, and `X-CSRF-Token` header. **Ambient Basic** credentials are now
   rejected for web mutations (403) across all web/UI mutation routes; Bearer
   stays an explicit non-ambient credential. This closes the bypass where a
-  browser-supplied Basic header skipped Origin/CSRF. The browser parent must
-  also be an active, unrestricted API token.
+  browser-supplied Basic header skipped Origin/CSRF. For `/web/settings/tokens*` and
+  `/web/settings/sessions*`, `verify_browser_parent` and
+  `service::verify_issuer` additionally require both the browser session and its
+  parent API token to be active and unrestricted (`is_restricted = false`),
+  returning `403 Forbidden` otherwise (while `/web/logout` remains allowed `303`);
+  on repository and organisation browser routes, restricted browser children
+  inherit their parent's bounded permissions live without widening.
 * No internal implementation detail or release state is rendered on product
   pages. Repository/organisation selectors reuse the current bounded visibility
   queries (limit 100, no 1000-row hard truncation).
@@ -111,7 +116,3 @@ mutations. Sessions are limited to the actor's own browser tokens.
 * `tests/token_management.py --binary --report`, `tests/pat_scope_auth.py --binary --report`, and `tests/web_repository_pagination.py --binary --report` run in the CI `verify` job against a real compiled `rootyard` binary and PostgreSQL instance and are bound by `scripts/native_report_manifest.py`.
 * Together they verify create-once/digest-only/no-secret lists, owner `404`, restricted/read-only issuer `403`, `PATCH` subset narrowing + CAS `409` (including live legacy-to-restricted browser narrowing), atomic rotation, idempotent/live parent revocation, expiry bounds/time travel, keyset/actor cursors, cookie/CSRF/Origin enforcement, ambient Basic refusal (`403`), `/api/*` cookie refusal (`401`), `/web/logout` allowance (`303`), and restricted browser-child `403` on settings management.
 * SQL is used only through the existing Harness bootstrap channel for repository ids, digest verification, expiry time travel, and repository provisioning-state fixtures in `tests/token_management.py`; no restricted token, grant, or session is SQL-seeded there.
-* Not run here: Cargo build/test, the native suite, rustfmt (the binary is not
-  installed in the worker environment). `src/token_management/*` and
-  `src/web/tokens.rs` are the only files this change adds; legacy handlers were
-  not reformatted.

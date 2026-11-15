@@ -1,4 +1,4 @@
-# Personal access token scopes (schema 137, backup format 13)
+# Personal access token scopes
 
 > **Status:** the authorisation helpers, discovery predicates, common
 > repository/namespace action enforcement, self-service PAT management (`/api/tokens*`,
@@ -73,25 +73,37 @@ CHECK constrained to the fixed enum values in `RepoAction::as_str` /
 
 ## Authorisation helper
 
-`authorize_repository` / `authorize_namespace` take a real
-`tokio_postgres::Transaction` and re-read the token by `token_id` + `actor_id`
-inside that transaction: it must be unrevoked, unexpired and `kind = 'api'`,
-and is locked `FOR SHARE OF t` until the transaction ends. Expiry uses
-`clock_timestamp()`, not the transaction's fixed `now()`, so a request that
-started before expiry is rejected once the token expires. Invalid token → 401
-(`ScopeDenial::InvalidToken`); live token without a covering grant → 403
-(`ScopeDenial::Forbidden`). Errors never contain SQL text or credentials.
+`authorize_repository` / `authorize_namespace` (and the parent-aware
+`*_with_parent` variants in `src/token_scopes.rs` /
+`src/token_scopes/browser_parent.rs`) take a real `tokio_postgres::Transaction`
+and re-read the presented token inside that transaction:
+
+* Direct `api` tokens lock the presented row `FOR SHARE OF t` and require
+  `kind = 'api'`, unrevoked, and unexpired under `clock_timestamp()` (not the
+  transaction's fixed `now()`).
+* When `identity.parent_token_id` is `Some(parent_id)` (browser session child),
+  the `*_with_parent` entry points also join and lock the parent row
+  `FOR SHARE OF t, p`, requiring both child `t` (`kind = 'browser'`) and parent
+  `p` (`kind = 'api'`) to remain active and unexpired under `clock_timestamp()`,
+  and check repository/namespace grants and `read_only` (`t.read_only OR
+  p.read_only`) strictly against the bounded parent authority (`Identity::scope_token_id()`).
+* Invalid/expired/revoked credentials return `401` (`ScopeDenial::InvalidToken`);
+  a live token lacking a covering grant or write permission returns `403`
+  (`ScopeDenial::Forbidden`). Errors never contain SQL text or credentials.
 
 This helper is **not** an RBAC replacement. Callers must first check that the
 actor currently holds the required repository/org role; scopes only narrow.
 
 ## Discovery
 
-For a restricted token, `GET /api/repos` and `/web/repos` require **both** the
-current RBAC visibility predicate (owner, collaborator, repository team,
-organisation membership, organisation team) **and** an exact `repo_read` grant
-row for that repository. Other grants (`issues_read`, `contents_read`, …) never
-expose repository metadata or the overview page.
+For a restricted token (including a restricted browser-child session resolved via
+`Identity::scope_token_id()`), `GET /api/repos`, `/web/repos`,
+`GET /api/orgs/*`, and `/web/organizations/*` require **both** the current RBAC
+visibility predicate (owner, collaborator, repository team, organisation
+membership, organisation team) **and** an exact `repo_read` / `org:read` grant
+row on the effective scope token (`scope_token_id()`). Other grants
+(`issues_read`, `contents_read`, …) never expose repository metadata or the
+overview page.
 
 Caveat that must not be overstated: `organization_team_members` has a composite
 foreign key to `organization_memberships`, so every organisation-team membership
@@ -102,91 +114,84 @@ organisation-membership predicate, and this branch makes no such claim.
 
 ## Grant mutation protocol
 
-Any future grant writer must `SELECT ... FOR UPDATE` the same token row, mutate
-grants and increment `scope_version` in one transaction. `narrow_repository_scope`
-and `revoke_repository_scope` implement this and can only remove rows; they
-never insert or widen. Grant insertion (`grant_repository_for_test`,
-`grant_namespace_for_test`) is `#[cfg(test)]`-only and lives in
-`src/token_scopes/tests.rs`: the shared token-management service now issues and updates restricted tokens
-under a per-user management lock and token row lock; its native acceptance is pending.
+Any grant writer (`token_management::service` and the test/helper paths
+`narrow_repository_scope` / `revoke_repository_scope`) acquires a `SELECT ...
+FOR UPDATE` lock on the target token row, validates current RBAC roles and subsets,
+replaces/narrows grants, and increments `scope_version` in one transaction.
+Grant insertion helpers (`grant_repository_for_test`,
+`grant_namespace_for_test`) remain `#[cfg(test)]`-only in
+`src/token_scopes/tests.rs`. Self-service token management routes
+(`/api/tokens*`, `/api/sessions*`, `/web/settings/*`) acquire a per-user
+advisory transaction lock before locking issuer `FOR SHARE` and target `FOR
+UPDATE`, and are continuously exercised by `tests/token_management.py` in CI.
 
 ## Browser sessions
 
-* `POST /web/login` (form-urlencoded `username` + `token`, browser `Origin`
-  matching the service origin) still opens a session for an **unrestricted API
-  token**, exactly as before this change.
-* A **restricted** parent token is refused with `403` and no `Set-Cookie`: the
-  response is the login page, never a session. The insert that mints the browser
-  child token additionally requires `p.is_restricted = false`, so a restricted
-  parent cannot become a session by another path.
-* Browser child tokens are rejected by the scope helper itself (`kind = 'api'`
-  only), and `token_is_restricted` treats only non-restricted browser children
-  as live for scope purposes. Exact parent binding/inheritance for restricted
-  tokens remains unimplemented future work.
+* `POST /web/login` (form-urlencoded `username` + `token`, matching browser
+  `Origin`, TLS/loopback guard) accepts active `kind = 'api'` tokens — both
+  **unrestricted** and **restricted** — and rejects `kind = 'browser'` tokens
+  with `403` so browser children cannot mint chained sessions.
+* When minting a `kind = 'browser'` child in `src/web/session.rs`, `login` copies
+  `is_restricted = p.is_restricted`, clamps `read_only = ($4 OR p.read_only)`,
+  and caps `expires_at = LEAST(now + 12h, p.expires_at)`. No mutable grant rows
+  are duplicated onto the child token.
+* On every browser request, `validate_session`, `auth::authenticate`,
+  `auth::browser_parent`, and `token_scopes::{browser_parent, *_with_parent}`
+  join child `t` and parent `p` live (`FOR SHARE OF t, p`) so parent revocation,
+  expiry, rotation, RBAC role loss, `read_only` flip, `PATCH` narrowing, or
+  legacy unrestricted-to-restricted upgrade take effect immediately on already-minted
+  browser cookies without widening authority.
+* Restricted browser children are rejected with `403 Forbidden` on
+  `/web/settings/tokens*`, `/web/settings/sessions*`, `/api/tokens*`, and
+  `/api/sessions*` (via `verify_browser_parent` in `src/web/tokens.rs` and
+  `verify_issuer` in `src/token_management/service.rs`), while `/web/logout`
+  remains allowed (`303`) and `/api/*` continues rejecting browser cookies with `401`.
 
-## Publication boundary and remaining acceptance
+## Publication boundary and CI acceptance
 
 After slow quota checks, the Git coordinator asks the existing publication owner
-transaction to lock and verify the token before the grant marker or ACK. Lock
-order is exact-ref advisory, repository advisory, local writer, token FOR SHARE,
-then native CAS. No extra pooled connection is acquired. If publication locks
-first, revocation/narrowing waits until child quiescence and journal settlement;
-if revocation commits first, late authorization denies publication. Closed
-receivers are checked before and after authorization. Native barrier acceptance
-of this new boundary is still pending, as is the management HTTP/rotation/CSRF
-suite. CI and operator/trusted-check authority remain independent.
+transaction (`auth::authorize_publication_window`) to lock and verify the token
+via `lock_publication_tokens` / `authorize_repository_late_with_parent` before the
+grant marker or ACK, and re-verify via `recheck_publication_tokens` before CAS.
+Lock order is exact-ref advisory, repository advisory, local writer, token
+`FOR SHARE`, then native CAS. No extra pooled connection is acquired. Git-CAS
+continues rejecting non-`api` tokens fail-closed (`BrowserTokenUnsupported`),
+keeping browser sessions outside direct Git publication while direct `api` tokens
+retain full `FOR SHARE` revocation/narrowing fencing. If publication locks first,
+revocation/narrowing waits until child quiescence and journal settlement; if
+revocation commits first, late authorization denies publication. Closed receivers
+are checked before and after authorization.
+
+End-to-end HTTP, cookie/CSRF, revocation, legacy->restricted upgrade, discovery
+pagination, and restricted browser-child inheritance flows are continuously
+verified in CI (`verify` job + `Bind native regressions to the built binary and
+source inputs`) via `tests/pat_scope_auth.py`, `tests/token_management.py`, and
+`tests/web_repository_pagination.py`. CI and operator/trusted-check authority
+remain independent.
 
 ## Verification
 
-* Unit tests (`src/token_scopes/tests.rs`) cover stable action text, mutating
-  classification, empty-grant denial, per-repository exactness, read-only
-  intersection and display-name bounds.
-* Ignored PostgreSQL tests exercise the real path against a random owned schema
-  using `db::migrate_client` and real token/grant transactions (empty-grant
-  denial, other-repository denial, exact action allow, read-only write denial,
-  revoked/expired denial, grant rollback) plus two timing/locking regressions: an
-  expiry after the reader's transaction timestamp is still rejected by
-  `clock_timestamp()`, and a `FOR UPDATE` grant writer is observed blocked via
-  `pg_blocking_pids` until the reader commits. `FOR SHARE` is only meaningful
-  because those readers hold a real transaction until commit.
-* The Git-native publication fence harness is pending. Its initial psql
-  termination, row-lock evidence and marker/SIGSTOP race defects are being fixed
-  before execution; it is not accepted native evidence.
-* Foundation executable SHA256
-  `38ad0ba7c445db156514a5650c408b59ac8feaabec33001167b7980e1d38334e`
-  from source `6a72c41` passed twelve scope HTTP cases and actual-binary schema136
-  checks. These results predate management/CAS and do not validate those additions.
-* The schema137 membership-trigger tightening has no native or HTTP evidence
-  yet: no build, catalog generation or PostgreSQL acceptance run was performed
-  for it on this branch.
+* Unit and PostgreSQL integration tests in `src/token_scopes/tests.rs` cover
+  stable action text, mutating classification, empty-grant denial, per-repository
+  exactness, read-only intersection, `clock_timestamp()` expiry, `FOR SHARE`
+  vs `FOR UPDATE` blocking (`pg_blocking_pids`), display-name bounds,
+  `inherited_authority_narrows_to_parent_repo_and_read_only_flags`, and
+  `browser_child_inherits_parent_scopes_and_live_mutations`.
+* Native CI `verify` runs `tests/pat_scope_auth.py --binary --report`,
+  `tests/token_management.py --binary --report`, and
+  `tests/web_repository_pagination.py --binary --report` against a compiled
+  `rootyard` binary and PostgreSQL 17, binding reports with
+  `scripts/native_report_manifest.py` (including required cases
+  `pat_scope_auth=restricted.browser_child_inheritance`,
+  `token_management=sessions.restricted_browser_child_inheritance`, and
+  `token_management=sessions.legacy_upgrade_and_parent_rotation_live`).
 
-## Contract status
+## Historical provenance
 
-The historic **schema136 / format12 foundation** owns the frozen contract
-artefacts: `schema/136_catalog.sql` (the frozen 135 catalog projection query
-copied unchanged) and the three `schema/136_*_catalog.json` fixtures, generated
-from real PostgreSQL 17 databases with the reviewed SQL migration path
-(`tests/schema_contract.py --sql-migrate --write`). They describe schema 136 and
-stay as they are; they are not evidence about schema 137.
-
-The branch now carries **schema 137 / backup format 13**. Migration 137 changes
-no table shape — it only replaces a trigger function — so the schema137 catalog
-projection and fixtures must still be regenerated from real PostgreSQL 17
-databases by the coordinator after this SQL edit. Until that generation lands,
-no schema137 contract exists and nothing here claims one; equally, no new native
-build or acceptance pass is claimed for this change.
-
-The backup code uses format 13 / schema 137, keeps format 12 frozen at schema
-136 and format 11 frozen at schema 135, and accepts a genuine format12/schema136
-archive only with `--allow-legacy-schema136` (format11/schema135 only with
-`--allow-legacy-schema135`), upgrading it through the current migrations in the
-same restore session. The old format 4-10 contracts and their opt-ins are
-unchanged.
-
-That foundation executable also passed seven genuine format11/schema135 archive
-cases using previous executable SHA256
-`9faf71fd95691a358157be0442e2efc47b595a67d0aa3aa9d0404d5266c51a96`:
-strict opt-in, one new authority for two repositories, migrated scope defaults,
-revoked browser credentials, exact clone/fetch/fsck and intact source objects.
-The coordinator retains these attested reports. The combined management/CAS
-candidate still needs its own build receipt and native gates.
+Migrations `136_token_scopes.sql` and `137_historical_admission_projection.sql`
+originally landed alongside the earlier `schema 136 / format 12` and
+`schema 137 / format 13` milestones (sealed historical evidence snapshots live
+under `docs/acceptance/`). The active database schema (`schema 149`) and current
+backup/restore formats (`format 25` and `format 26`, including legacy upgrade
+flags) are documented in [operations.md](operations.md) and
+[backup-restore.md](backup-restore.md).

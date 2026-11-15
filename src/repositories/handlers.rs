@@ -172,7 +172,7 @@ pub(super) async fn list_repos(
             ),
             db::REPO_SELECT
         );
-        tx.query(&sql, &[&identity.token_id, &cursor.0, &cursor.1, &cursor.2, &(limit + 1), &identity.id])
+        tx.query(&sql, &[&identity.scope_token_id(), &cursor.0, &cursor.1, &cursor.2, &(limit + 1), &identity.id])
             .await
             .map_err(Error::internal)?
     } else {
