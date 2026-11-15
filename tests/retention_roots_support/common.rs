@@ -23,7 +23,7 @@ pub fn open_store() -> Result<BlobStore> {
 pub fn open_store_with_root(label: &str) -> Result<BlobStore> {
     let profile = BlobProfile::from_env()
         .map_err(|error| anyhow!("ROOTYARD_BLOB_* profile rejected: {error}"))?
-        .with_root(format!("fixture-{label}-{}", uuid::Uuid::new_v4().simple()))
+        .with_root(format!("fixture-{label}/{}", uuid::Uuid::new_v4().simple()))
         .map_err(|error| anyhow!("alternate Blob root rejected: {error}"))?;
     ensure!(profile.provider() == BlobProvider::S3, "ROOTYARD_BLOB_SERVICE must be s3 for this suite");
     BlobStore::open(profile).map_err(|error| anyhow!("alternate configured Blob store rejected: {error}"))
