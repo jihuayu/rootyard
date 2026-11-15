@@ -9,9 +9,13 @@ snapshot, root, receipt, grant or byte proof is fabricated.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
+import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -21,13 +25,15 @@ from refstore_roots_http import RootsHttpHarness  # noqa: E402
 
 ROOT_BROWSE_CASE = "roots_http_browse_selected_closures"
 ROOT_BROWSE_SHA256_CASE = "roots_http_browse_sha256"
+ROOT_SCOPE_FENCE_CASE = "roots_http_post_json_scope_revocation_fence"
 
 LIMITATIONS = [
     "Root-only real-service HTTP fixture; only py-compiled/static-inspected by the implementation worker.",
     "Repositories, source snapshots, roots, pins, receipts and packs come from real API/A3/A4/A5/Git/root paths; no SQL or fabricated authority rows are used.",
     "The fixture does not claim current native/HTTP/CI acceptance, Root byte session proof, hosted CI inventory or full issue107 closure.",
     "Current repository realm/backend/cluster rejection is not forced here: the real production gate mutation seam needed to hold and narrow all of those live authorities is outside this HTTP fixture. Existing coordinator fixtures cover source-level realm/backend/anchor checks, not this HTTP race.",
-    "The deterministic post-JSON ContentsRead-removal race is NOT included. The reusable Python harness has no trusted-Git executable pause seam that can stop only the terminal cat-file after materialization while a test-owned PostgreSQL transaction locks the real token row and observes final authorization waiting on that lock. The Rust GitGate is coordinator-local and does not provide this HTTP/token-lock choreography. Adding a production hook or a pre-T2 race would not prove the post-JSON fence; no substitute is claimed.",
+    "Stored A5 snapshot/ref/pack prune is not forced by this fixture; the ByIntent source-metadata-miss fallback remains coordinator/source coverage, not this HTTP race.",
+    "The post-JSON ContentsRead-removal case uses one test-only Python passthrough wrapper as the serve-blob ROOTYARD_GIT executor plus a run-owned deferred DELETE trigger/advisory blocker. The wrapper is not the production Git profile or binary receipt and is reported separately from the upstream stock Git hash. This is fixture timing, not a product pause hook or a broader fault matrix.",
 ]
 
 
@@ -253,6 +259,247 @@ class RootBrowseHttpHarness(RootsHttpHarness):
         return {"root": root, "explicit_tree": explicit}
 
 
+    @staticmethod
+    def _quote_ident(value):
+        return '"' + str(value).replace('"', '""') + '"'
+
+    def _scope_wrapper(self, race_dir, target_oid):
+        race_dir.mkdir(mode=0o700, exist_ok=False)
+        wrapper = race_dir / "trusted-git-passthrough.py"
+        marker = race_dir / "entered"
+        release = race_dir / "release"
+        upstream = str(Path(self.profile.git).resolve())
+        interpreter = str(Path(sys.executable).resolve())
+        source = f"""#!{interpreter}
+import os, sys, time
+UPSTREAM = {upstream!r}
+MARKER = {str(marker.resolve())!r}
+RELEASE = {str(release.resolve())!r}
+TARGET = {target_oid!r}
+if len(sys.argv) >= 4 and sys.argv[-3:] == ["cat-file", "blob", TARGET]:
+    try:
+        fd = os.open(MARKER, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+    except FileExistsError:
+        pass
+    deadline = time.monotonic() + 15.0
+    while not os.path.exists(RELEASE):
+        if time.monotonic() >= deadline:
+            os._exit(1)
+        time.sleep(0.02)
+os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
+"""
+        wrapper.write_text(source)
+        wrapper.chmod(0o700)
+        return wrapper, marker, release
+
+    def _create_scope_gate(self, function, trigger, target_token_id, repository_id, key):
+        schema = self._quote_ident(self.schema)
+        function_sql = schema + "." + self._quote_ident(function)
+        trigger_sql = self._quote_ident(trigger)
+        table = schema + ".token_repository_scopes"
+        self.sql(
+            "CREATE OR REPLACE FUNCTION " + function_sql + "() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            "BEGIN "
+            "IF OLD.token_id = '" + str(uuid.UUID(target_token_id)) + "'::uuid "
+            "AND OLD.repository_id = '" + str(uuid.UUID(repository_id)) + "'::uuid "
+            "AND OLD.action = 'contents_read' THEN "
+            "PERFORM pg_advisory_xact_lock(" + str(int(key)) + "); "
+            "END IF; "
+            "RETURN OLD; "
+            "END $$; "
+            "CREATE CONSTRAINT TRIGGER " + trigger_sql + " AFTER DELETE ON " + table + " "
+            "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION " + function_sql + "();")
+
+    def _drop_scope_gate(self, function, trigger):
+        schema = self._quote_ident(self.schema)
+        self.sql(
+            "SET lock_timeout='5s'; "
+            "DROP TRIGGER IF EXISTS " + self._quote_ident(trigger) + " ON " + schema + ".token_repository_scopes; "
+            "DROP FUNCTION IF EXISTS " + schema + "." + self._quote_ident(function) + "();")
+
+    def _owned_blocker_pid(self, application_name, key):
+        classid, objid = self._advisory_key_parts(key)
+        return self.sql(
+            "SELECT a.pid FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid "
+            "WHERE a.datname=current_database() AND a.application_name='"
+            + str(application_name).replace("'", "''") + "' AND l.locktype='advisory' AND l.granted "
+            "AND l.classid::bigint=" + str(classid) + " AND l.objid::bigint=" + str(objid)
+            + " AND l.objsubid=1 LIMIT 1")
+
+    def _release_owned_blocker(self, process, application_name, key):
+        pid = self._owned_blocker_pid(application_name, key)
+        if pid:
+            self.sql("SELECT pg_terminate_backend(" + str(int(pid)) + ")")
+        if process is not None and process.poll() is None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not self._owned_blocker_pid(application_name, key):
+                return
+            time.sleep(0.05)
+        raise AssertionError("owned fixture advisory blocker remained after backend termination")
+
+    def _touch_gate(self, path):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            pass
+
+    def _wait_until(self, predicate, deadline, message):
+        while time.monotonic() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.05)
+        raise AssertionError(message)
+
+    def _final_auth_waiting_on_patch(self, patch_pid):
+        return int(self.sql(
+            "SELECT count(*) FROM pg_stat_activity a "
+            "WHERE a.datname=current_database() AND a.state='active' "
+            "AND a.wait_event_type='Lock' "
+            "AND a.query LIKE '%SELECT t.read_only, t.is_restricted%' "
+            "AND a.query LIKE '%FOR SHARE OF t%' "
+            "AND " + str(int(patch_pid)) + " = ANY(pg_blocking_pids(a.pid))")) == 1
+
+    def _wait_future(self, future, deadline):
+        remaining = max(0.1, deadline - time.monotonic())
+        return future.result(timeout=remaining)
+
+    def roots_http_post_json_scope_revocation_fence(self):
+        repo, remote, work, _head = self.seed("roots-http-scope-fence")
+        head = self.commit_files(work, "root post-json fence", {"fence.txt": "post-json fence\n"})
+        pushed = self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice, check=False)
+        assert pushed.returncode == 0, blob.git_failure(pushed)
+        assert self.remote_refs(remote).get("refs/heads/main") == head
+        target_oid = self.git("rev-parse", "HEAD:fence.txt", cwd=work).stdout.decode().strip()
+        snapshot_id = self._create(repo, "roots-http-scope-snapshot", 300)[1]["snapshot_id"]
+        root_id = self._selector_root(repo, "roots-http-scope-root", snapshot_id, {"kind": "snapshot"})
+        target = self._issue_scoped(repo, "roots-http-scope-target", ["contents_read", "contents_write"])
+        fixture_hash = blob.sha256_file(Path(__file__).resolve())
+        upstream_hash = blob.sha256_file(Path(self.profile.git))
+        race_dir = self.root / ("root-scope-fence-" + uuid.uuid4().hex)
+        wrapper, marker, release = self._scope_wrapper(race_dir, target_oid)
+        wrapper_hash = blob.sha256_file(wrapper)
+        key = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+        if key == 0:
+            key = 1
+        application_name = "rootyard-root-scope-" + uuid.uuid4().hex
+        function = "rootyard_root_scope_gate_" + uuid.uuid4().hex
+        trigger = "rootyard_root_scope_trigger_" + uuid.uuid4().hex
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        blocker = None
+        trigger_created = False
+        gate_released = False
+        blocker_released = False
+        trigger_dropped = False
+        root_future = None
+        patch_future = None
+        deadline = time.monotonic() + 2.0
+        try:
+            self.stop()
+            self.start(overrides={"ROOTYARD_GIT": str(wrapper)}, label="root-scope-fence")
+            trigger_created = True
+            self._create_scope_gate(function, trigger, target["id"], repo["id"], key)
+            blocker = self._start_blocker(key, application_name)
+            self._wait_until(lambda: self._owned_blocker_pid(application_name, key),
+                             time.monotonic() + 10.0, "fixture advisory blocker did not hold the exact key")
+            deadline = time.monotonic() + 16.0
+            root_future = executor.submit(self._root_blob, repo, root_id, target_oid, token=target)
+            self._wait_until(lambda: marker.exists(), deadline, "terminal root-blob Git gate was not entered")
+            assert not root_future.done(), "root blob returned before the terminal Git gate"
+            patch_future = executor.submit(self._patch_scope, repo, target, ["contents_write"])
+            patch_pid = self._wait_until(lambda: self._waiting_commit_pid(key),
+                                         deadline, "PATCH COMMIT never waited on the scope-delete trigger")
+            assert not patch_future.done(), "PATCH returned before its deferred COMMIT fence"
+            self._touch_gate(release)
+            gate_released = True
+            self._wait_until(lambda: self._final_auth_waiting_on_patch(int(patch_pid)),
+                             deadline, "final root authorization did not wait on the PATCH token lock")
+            assert not patch_future.done(), "PATCH committed before final-auth observation"
+            assert not root_future.done(), "root blob returned before the final-auth fence"
+            observed_terminal_gate = True
+            observed_final_auth = True
+            self._release_owned_blocker(blocker, application_name, key)
+            blocker = None
+            blocker_released = True
+            patch_view = self._wait_future(patch_future, deadline)
+            get_status, get_data, _headers = self._wait_future(root_future, deadline)
+            assert get_status == 403, ("root blob was not denied after committed scope narrowing", get_status)
+            assert set(get_data) == {"error"}, get_data
+            assert "content" not in get_data and "content_base64" not in get_data and "items" not in get_data
+            grants = [grant for grant in patch_view.get("repository_grants", [])
+                      if str(grant.get("repository_id")) == str(repo["id"])]
+            assert len(grants) == 1, grants
+            actions = set(grants[0].get("actions", []))
+            assert actions == {"contents_write"}, actions
+            self._drop_scope_gate(function, trigger)
+            trigger_created = False
+            trigger_dropped = True
+            return {
+                "observed_terminal_gate": observed_terminal_gate,
+                "observed_final_auth_blocked_by_patch": observed_final_auth,
+                "patch_status": 200,
+                "get_status": get_status,
+                "error_only_response": True,
+                "test_only_wrapper_sha256": wrapper_hash,
+                "upstream_stock_git_sha256": upstream_hash,
+                "root_browse_fixture_sha256": fixture_hash,
+                "cleanup_gate_released": gate_released,
+                "cleanup_blocker_released": blocker_released,
+                "cleanup_trigger_dropped": trigger_dropped,
+            }
+        finally:
+            cleanup_errors = []
+            try:
+                self._touch_gate(release)
+                gate_released = True
+            except Exception as error:
+                cleanup_errors.append(error)
+            if blocker is not None:
+                try:
+                    self._release_owned_blocker(blocker, application_name, key)
+                    blocker_released = True
+                except Exception as error:
+                    cleanup_errors.append(error)
+                finally:
+                    blocker = None
+            if patch_future is not None and not patch_future.done():
+                try:
+                    self._wait_future(patch_future, deadline)
+                except Exception:
+                    pass
+            if root_future is not None and not root_future.done():
+                try:
+                    self._wait_future(root_future, deadline)
+                except Exception:
+                    pass
+            if (patch_future is not None and not patch_future.done()) or (
+                    root_future is not None and not root_future.done()):
+                try:
+                    self.stop(hard=True)
+                except Exception as error:
+                    cleanup_errors.append(error)
+            try:
+                executor.shutdown(wait=True)
+            except Exception as error:
+                cleanup_errors.append(error)
+            if trigger_created:
+                try:
+                    self._drop_scope_gate(function, trigger)
+                    trigger_dropped = True
+                except Exception as error:
+                    cleanup_errors.append(error)
+            if cleanup_errors:
+                raise cleanup_errors[0]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, help="absolute attested rootyard binary")
@@ -276,7 +523,7 @@ def main(argv=None):
         return 2
     args.binary = str(profile.binary)
     harness = RootBrowseHttpHarness(args, profile, blob_profile)
-    cases = [ROOT_BROWSE_CASE, ROOT_BROWSE_SHA256_CASE]
+    cases = [ROOT_BROWSE_CASE, ROOT_BROWSE_SHA256_CASE, ROOT_SCOPE_FENCE_CASE]
     success = False
     try:
         harness.prepare()
