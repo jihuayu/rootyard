@@ -2,10 +2,11 @@
 
 use anyhow::Result;
 use rootyard::ref_store::core::pack_commit::PackVerifier;
-use serde::Serialize;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LatencyStats {
     pub count: usize,
     pub min_ms: f64,
@@ -41,7 +42,8 @@ impl LatencyStats {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CohortMeasurement {
     pub total_ops: usize,
     pub wall_ms: f64,
@@ -60,6 +62,9 @@ pub struct CohortMeasurement {
     pub staging_reclaimed_bytes_delta: u64,
     pub download_in_flight_peak: u64,
     pub native_in_flight_peak: u64,
+    pub cohort_sampled_staging_bytes_peak: u64,
+    pub cohort_sampled_download_in_flight_peak: u64,
+    pub cohort_sampled_native_in_flight_peak: u64,
     pub s3_get_requests: u64,
     pub s3_get_bytes: u64,
     pub proc_vm_hwm_kib: Option<u64>,
@@ -79,6 +84,7 @@ pub struct ComparisonDeltas {
 pub struct EnvironmentInfo {
     pub os: &'static str,
     pub arch: &'static str,
+    pub binary_path: String,
     pub blob_backend: &'static str,
     pub postgres_source: &'static str,
     pub git_version: String,
@@ -88,8 +94,13 @@ pub struct EnvironmentInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchmarkReceipt {
     pub issue: &'static str,
+    pub baseline_kind: &'static str,
+    pub process_isolation: &'static str,
+    pub rss_measurement: &'static str,
+    pub peak_measurement: &'static str,
     pub workload: String,
     pub methodology: &'static str,
+    pub limitations: Vec<String>,
     pub environment: EnvironmentInfo,
     pub before_coupled: CohortMeasurement,
     pub after_separated: CohortMeasurement,
@@ -124,6 +135,17 @@ pub fn read_proc_vm_hwm_kib() -> Option<u64> {
     {
         None
     }
+}
+
+pub fn write_cohort_file(path: &Path, cohort: &CohortMeasurement) -> Result<()> {
+    let json = serde_json::to_string_pretty(cohort)?;
+    std::fs::write(path, format!("{json}\n"))?;
+    Ok(())
+}
+
+pub fn read_cohort_file(path: &Path) -> Result<CohortMeasurement> {
+    let raw = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&raw)?)
 }
 
 pub fn write_receipt(receipt: &BenchmarkReceipt) -> Result<PathBuf> {

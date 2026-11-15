@@ -1,5 +1,6 @@
 //! PostgreSQL (shared CI instance or ephemeral `initdb`/`pg_ctl`) + native Git pack helpers.
 
+use super::git_fixture::{GitRepo, incompressible_payload};
 use anyhow::{Result, anyhow, ensure};
 use deadpool_postgres::{Manager, Pool};
 use rootyard::blob_store::opendal::BlobStore;
@@ -24,13 +25,11 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant as StdInstant};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::OnceCell;
 use tokio::time::Instant as TokioInstant;
 use uuid::Uuid;
 
 const OP_SECONDS: u64 = 30;
-const GIT_SECONDS: u64 = 60;
 const HOLD_NAMESPACE: &str = "core-pack";
 
 pub fn deadline() -> TokioInstant {
@@ -167,6 +166,11 @@ async fn database_info() -> Result<&'static (String, &'static str)> {
         .await
 }
 
+pub async fn resolved_database() -> Result<(String, &'static str)> {
+    let (url, source) = database_info().await?;
+    Ok((url.clone(), *source))
+}
+
 pub struct Db {
     admin: Pool,
     pub pool: Pool,
@@ -201,8 +205,7 @@ impl Db {
         }
     }
 
-    async fn create_repo_and_gate(&self, format: GitObjectFormat) -> Result<(Uuid, Uuid, CoreGateVersion)> {
-        let tenant = Uuid::new_v4();
+    async fn create_repo_and_gate(&self, format: GitObjectFormat, tenant: Uuid) -> Result<(Uuid, CoreGateVersion)> {
         let repo = Uuid::new_v4();
         let client = self.pool.get().await?;
         client
@@ -221,106 +224,8 @@ impl Db {
         let init = CoreGateInit::new(repo, tenant, format, Uuid::new_v4(), 1, 1, RefName::branch("refs/heads/main")?)?;
         let mut client = self.pool.get().await?;
         let gate = PgRefStoreCore.initialize(&mut client, &init, deadline()).await?;
-        Ok((tenant, repo, gate.version()))
+        Ok((repo, gate.version()))
     }
-}
-
-struct GitRepo {
-    _root: tempfile::TempDir,
-    bare: PathBuf,
-    home: PathBuf,
-    template: PathBuf,
-    git: PathBuf,
-}
-
-impl GitRepo {
-    async fn new(git: PathBuf, format: GitObjectFormat) -> Result<Self> {
-        let root = tempfile::tempdir()?;
-        let home = root.path().join("home");
-        let template = root.path().join("template");
-        std::fs::create_dir_all(&home)?;
-        std::fs::create_dir_all(&template)?;
-        let repo = Self { bare: root.path().join("fixture.git"), home, template, git, _root: root };
-        let fmt = format!("--object-format={}", format.as_str());
-        let tmpl = format!("--template={}", repo.template.display());
-        repo.run(&["init", "--bare", "--quiet", &fmt, &tmpl], None).await?;
-        Ok(repo)
-    }
-
-    async fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
-        let with_repo = self.bare.is_dir();
-        let mut command = tokio::process::Command::new(&self.git);
-        command
-            .current_dir(self._root.path())
-            .env_clear()
-            .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", &self.home)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_ATTR_NOSYSTEM", "1")
-            .env("GIT_TEMPLATE_DIR", &self.template)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("LC_ALL", "C")
-            .env("GIT_AUTHOR_NAME", "Rootyard Verifier Bench")
-            .env("GIT_AUTHOR_EMAIL", "bench@rootyard.invalid")
-            .env("GIT_COMMITTER_NAME", "Rootyard Verifier Bench")
-            .env("GIT_COMMITTER_EMAIL", "bench@rootyard.invalid")
-            .arg("-c")
-            .arg("core.hooksPath=/dev/null")
-            .arg("-c")
-            .arg("gc.auto=0")
-            .arg("--no-replace-objects")
-            .args(args)
-            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if with_repo {
-            command.env("GIT_DIR", &self.bare);
-        }
-        let mut child = command.spawn()?;
-        if let Some(bytes) = stdin {
-            let mut pipe = child.stdin.take().ok_or_else(|| anyhow!("git stdin missing"))?;
-            pipe.write_all(bytes).await?;
-            drop(pipe);
-        }
-        let out = tokio::time::timeout(Duration::from_secs(GIT_SECONDS), child.wait_with_output()).await??;
-        ensure!(out.status.success(), "git `{:?}` failed: {}", args.first(), String::from_utf8_lossy(&out.stderr));
-        Ok(out.stdout)
-    }
-
-    async fn build_pack(&self, name: &str, content: &[u8]) -> Result<(String, PathBuf, PathBuf)> {
-        let blob =
-            String::from_utf8(self.run(&["hash-object", "-w", "--stdin"], Some(content)).await?)?.trim().to_owned();
-        let entry = format!("100644 blob {blob}\tpayload.bin\n");
-        let tree = String::from_utf8(self.run(&["mktree"], Some(entry.as_bytes())).await?)?.trim().to_owned();
-        let commit =
-            String::from_utf8(self.run(&["commit-tree", &tree, "-m", "fixture"], None).await?)?.trim().to_owned();
-        self.run(&["update-ref", "refs/heads/main", &commit], None).await?;
-        let pack_bytes = self.run(&["pack-objects", "--stdout", "--all"], None).await?;
-        let dir = self._root.path().join("artifacts");
-        std::fs::create_dir_all(&dir)?;
-        let pack = dir.join(format!("{name}.pack"));
-        std::fs::write(&pack, &pack_bytes)?;
-        self.run(&["index-pack", &pack.to_string_lossy()], None).await?;
-        let idx = dir.join(format!("{name}.idx"));
-        Ok((commit, pack, idx))
-    }
-}
-
-fn incompressible_payload(seed: u64, len: usize) -> Vec<u8> {
-    let mut state = seed | 1;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        out.extend_from_slice(&state.to_le_bytes());
-    }
-    out.truncate(len);
-    out
 }
 
 pub struct PreparedCommit {
@@ -345,8 +250,19 @@ pub async fn prepare_fresh_commit(
     seed: u64,
     payload_bytes: usize,
 ) -> Result<PreparedCommit> {
+    prepare_commit_with_tenant(db, store, git, seed, payload_bytes, Uuid::new_v4()).await
+}
+
+pub async fn prepare_commit_with_tenant(
+    db: &Db,
+    store: &BlobStore,
+    git: &Path,
+    seed: u64,
+    payload_bytes: usize,
+    tenant: Uuid,
+) -> Result<PreparedCommit> {
     let format = GitObjectFormat::Sha1;
-    let (tenant, repo, gate) = db.create_repo_and_gate(format).await?;
+    let (repo, gate) = db.create_repo_and_gate(format, tenant).await?;
     let fixture = GitRepo::new(git.to_path_buf(), format).await?;
     let payload = incompressible_payload(seed, payload_bytes);
     let (commit_oid, pack_path, idx_path) = fixture.build_pack("initial", &payload).await?;

@@ -15,6 +15,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+const DEFAULT_BUCKET: &str = "verifier-budget-bucket";
+const DEFAULT_REGION: &str = "garage";
+pub const SLOW_DELAY_KEY_TAG: &str = "5105de1a-";
+const SLOW_DELAY_TENANT_PREFIX: [u8; 4] = [0x51, 0x05, 0xde, 0x1a];
+
+pub fn tagged_tenant_uuid(slow_delay: bool) -> uuid::Uuid {
+    let mut bytes = *uuid::Uuid::new_v4().as_bytes();
+    if slow_delay {
+        bytes[..4].copy_from_slice(&SLOW_DELAY_TENANT_PREFIX);
+    } else if bytes[..4] == SLOW_DELAY_TENANT_PREFIX {
+        bytes[0] ^= 0xff;
+    }
+    uuid::Uuid::from_bytes(bytes)
+}
+
 #[derive(Default)]
 struct S3Stats {
     get_requests: AtomicU64,
@@ -109,13 +124,12 @@ impl LoopbackS3 {
                 })
                 .expect("spawn loopback S3 thread");
             ready_rx.recv().expect("wait for loopback S3 server startup");
-            Self {
-                endpoint: format!("http://127.0.0.1:{port}"),
-                bucket: "verifier-budget-bucket",
-                region: "garage",
-                state,
-            }
+            Self { endpoint: format!("http://127.0.0.1:{port}"), bucket: DEFAULT_BUCKET, region: DEFAULT_REGION, state }
         })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     pub fn add_get_delay(&self, key_substring: impl Into<String>, delay: Duration) -> DelayGuard {
@@ -134,35 +148,43 @@ impl LoopbackS3 {
     }
 
     pub fn open_blob_store(&self) -> Result<BlobStore> {
-        static BLOB_ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _lock = BLOB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env = EnvGuard::set(&[
-            ("ROOTYARD_BLOB_DRIVER", Some("opendal")),
-            ("ROOTYARD_BLOB_SERVICE", Some("s3")),
-            ("ROOTYARD_BLOB_BUCKET", Some(self.bucket)),
-            ("ROOTYARD_BLOB_ROOT", Some("verifier-budgets")),
-            ("ROOTYARD_BLOB_ENDPOINT", Some(&self.endpoint)),
-            ("ROOTYARD_BLOB_REGION", Some(self.region)),
-            ("ROOTYARD_BLOB_ACCESS_KEY_ID", Some("verifier-budget-ak")),
-            ("ROOTYARD_BLOB_SECRET_ACCESS_KEY", Some("verifier-budget-sk")),
-            ("ROOTYARD_BLOB_SESSION_TOKEN", None),
-            ("ROOTYARD_BLOB_ENCRYPTION_MODE", Some("provider-managed")),
-            ("ROOTYARD_BLOB_KEYRING_DIR", None),
-            ("ROOTYARD_BLOB_ACTIVE_UPLOADS", None),
-            ("ROOTYARD_BLOB_ACTIVE_READERS", None),
-            ("ROOTYARD_BLOB_STAGING_BYTES", None),
-            ("ROOTYARD_BLOB_MAX_OBJECT_BYTES", None),
-            ("ROOTYARD_BLOB_RANGE_FULL_GET_MAX_BYTES", None),
-            ("ROOTYARD_BLOB_TIMEOUT_MS", None),
-            ("ROOTYARD_BLOB_IO_TIMEOUT_MS", None),
-            ("ROOTYARD_BLOB_CONCURRENCY", None),
-            ("ROOTYARD_BLOB_RETRY_MAX_TIMES", None),
-            ("ROOTYARD_BLOB_DELETE", None),
-        ]);
-        let profile = BlobProfile::from_env().map_err(|e| anyhow!("loopback BlobProfile failed: {e}"))?;
-        let store = BlobStore::open(profile).map_err(|e| anyhow!("loopback BlobStore::open failed: {e}"))?;
-        Ok(store)
+        open_blob_store_for(&self.endpoint, self.bucket, self.region)
     }
+}
+
+pub fn open_blob_store_at(endpoint: &str) -> Result<BlobStore> {
+    open_blob_store_for(endpoint, DEFAULT_BUCKET, DEFAULT_REGION)
+}
+
+fn open_blob_store_for(endpoint: &str, bucket: &str, region: &str) -> Result<BlobStore> {
+    static BLOB_ENV_LOCK: Mutex<()> = Mutex::new(());
+    let _lock = BLOB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::set(&[
+        ("ROOTYARD_BLOB_DRIVER", Some("opendal")),
+        ("ROOTYARD_BLOB_SERVICE", Some("s3")),
+        ("ROOTYARD_BLOB_BUCKET", Some(bucket)),
+        ("ROOTYARD_BLOB_ROOT", Some("verifier-budgets")),
+        ("ROOTYARD_BLOB_ENDPOINT", Some(endpoint)),
+        ("ROOTYARD_BLOB_REGION", Some(region)),
+        ("ROOTYARD_BLOB_ACCESS_KEY_ID", Some("verifier-budget-ak")),
+        ("ROOTYARD_BLOB_SECRET_ACCESS_KEY", Some("verifier-budget-sk")),
+        ("ROOTYARD_BLOB_SESSION_TOKEN", None),
+        ("ROOTYARD_BLOB_ENCRYPTION_MODE", Some("provider-managed")),
+        ("ROOTYARD_BLOB_KEYRING_DIR", None),
+        ("ROOTYARD_BLOB_ACTIVE_UPLOADS", None),
+        ("ROOTYARD_BLOB_ACTIVE_READERS", None),
+        ("ROOTYARD_BLOB_STAGING_BYTES", None),
+        ("ROOTYARD_BLOB_MAX_OBJECT_BYTES", None),
+        ("ROOTYARD_BLOB_RANGE_FULL_GET_MAX_BYTES", None),
+        ("ROOTYARD_BLOB_TIMEOUT_MS", None),
+        ("ROOTYARD_BLOB_IO_TIMEOUT_MS", None),
+        ("ROOTYARD_BLOB_CONCURRENCY", None),
+        ("ROOTYARD_BLOB_RETRY_MAX_TIMES", None),
+        ("ROOTYARD_BLOB_DELETE", None),
+    ]);
+    let profile = BlobProfile::from_env().map_err(|e| anyhow!("loopback BlobProfile failed: {e}"))?;
+    let store = BlobStore::open(profile).map_err(|e| anyhow!("loopback BlobStore::open failed: {e}"))?;
+    Ok(store)
 }
 
 struct EnvGuard {
