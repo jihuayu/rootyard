@@ -48,7 +48,14 @@
 //!    object types and full object connectivity;
 //! 4. [`mint`] — bind the closure context digest and complete closure identity.
 mod binary;
+mod budget;
+mod budget_metrics;
+#[cfg(test)]
+mod budget_tests;
 mod download;
+mod handoff;
+#[cfg(test)]
+mod handoff_tests;
 mod lease;
 mod mint;
 mod pointer;
@@ -62,13 +69,14 @@ mod scratch;
 mod validate;
 mod view;
 
+pub(super) use budget::{AdmissionClass, NativePermit, ViewPermit, budgets};
 pub(crate) use publication::{PublicationFactsEngine, VerifiedPublicationFacts};
 pub(crate) use read::{NativeReadClosure, NativeReadEngine, NativeReadRequest};
 
 use super::super::closure::PackClosureContext;
 use super::super::contract::{
-    VERIFIER_DEADLINE_SECONDS, VERIFIER_MAX_CONCURRENT, VERIFIER_MAX_OBJECTS, VERIFIER_MAX_PAIRS,
-    VERIFIER_MAX_RESULT_REFS, VERIFIER_MAX_TOTAL_BYTES, VERIFIER_VIEW_MAX_CONCURRENT,
+    VERIFIER_DEADLINE_SECONDS, VERIFIER_MAX_OBJECTS, VERIFIER_MAX_PAIRS, VERIFIER_MAX_RESULT_REFS,
+    VERIFIER_MAX_TOTAL_BYTES,
 };
 use super::super::error::PackCommitError;
 use super::super::plan::PackCommitPlan;
@@ -78,27 +86,8 @@ use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::pack_commit::context::refs_digest;
 use crate::ref_store::core::types::RefUpdate;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-
-/// Process-wide native verification slot count. One `OnceLock` shared by every
-/// instance (and every verify call): a per-instance semaphore would multiply the
-/// bound. A4 and A5b share exactly this semaphore.
-static VERIFIER_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
-/// Process-wide materialized-view budget. Deliberately separate from native
-/// process permits: a long-lived public view keeps its workspace/budget but not
-/// a native permit.
-static VIEW_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
-fn slots() -> &'static Arc<Semaphore> {
-    VERIFIER_SLOTS.get_or_init(|| Arc::new(Semaphore::new(VERIFIER_MAX_CONCURRENT)))
-}
-
-fn view_slots() -> &'static Arc<Semaphore> {
-    VIEW_SLOTS.get_or_init(|| Arc::new(Semaphore::new(VERIFIER_VIEW_MAX_CONCURRENT)))
-}
 
 /// Fixed, caller-independent refusal reason.
 pub(super) fn refuse(reason: &'static str) -> PackCommitError {
@@ -149,10 +138,37 @@ impl PackVerifier {
         context: &PackClosureContext,
         deadline: Instant,
     ) -> Result<PackClosureProof, PackCommitError> {
+        self.verify_with_class(plan, context, AdmissionClass::Foreground, deadline).await
+    }
+
+    /// Background/maintenance entry point capped at <= 50% of download, staging,
+    /// and native Git slots so maintenance verification cannot starve foreground.
+    pub async fn verify_maintenance(
+        &self,
+        plan: &PackCommitPlan,
+        context: &PackClosureContext,
+        deadline: Instant,
+    ) -> Result<PackClosureProof, PackCommitError> {
+        self.verify_with_class(plan, context, AdmissionClass::Maintenance, deadline).await
+    }
+
+    /// Current monotonic resource-budget & transfer telemetry serialized for
+    /// benchmarks and observability checks.
+    pub fn budget_metrics_json() -> serde_json::Value {
+        serde_json::to_value(budget::metrics_snapshot()).unwrap_or(serde_json::Value::Null)
+    }
+
+    async fn verify_with_class(
+        &self,
+        plan: &PackCommitPlan,
+        context: &PackClosureContext,
+        class: AdmissionClass,
+        deadline: Instant,
+    ) -> Result<PackClosureProof, PackCommitError> {
         if context.selection_digest().is_some() {
             return Err(refuse("atomic verification cannot use a selected closure"));
         }
-        let (pairs, bytes) = self.execute(plan, context, deadline).await?;
+        let (pairs, bytes) = self.execute(plan, context, class, deadline).await?;
         mint::mint(plan, context, pairs, bytes)
     }
 
@@ -187,41 +203,48 @@ impl PackVerifier {
         if refs_digest(context.resulting_refs()) != *expected_resulting_refs_digest {
             return Err(refuse("closure context binds another resulting ref map"));
         }
-        let (pairs, bytes) = self.execute(plan, context, deadline).await?;
+        let (pairs, bytes) = self.execute(plan, context, AdmissionClass::Foreground, deadline).await?;
         mint::mint(plan, context, pairs, bytes)
     }
 
-    /// Shared bounded native closure run used by both verification paths.
+    /// Shared two-phase bounded closure run:
+    /// Phase 1 acquires staging + Blob download capacity without holding native CPU slots,
+    /// then releases the download slot before Phase 2 admits native Git execution.
     async fn execute(
         &self,
         plan: &PackCommitPlan,
         context: &PackClosureContext,
+        class: AdmissionClass,
         deadline: Instant,
     ) -> Result<(usize, u64), PackCommitError> {
         let deadline = arm(deadline)?;
         let checked = validate::check(plan, context)?;
         let registered = checked.old.iter().chain(checked.new.iter()).collect::<Vec<_>>();
         download::check_live_backend(&self.store, &registered)?;
-        // One owned lease binds the process-wide native slot to the private
-        // workspace. It is held for the whole call and shared with every child
-        // this call spawns: capacity and files are released only after the last
-        // child is confirmed stopped (see `lease::retain_until_stopped`).
-        let lease = lease::VerificationLease::new(acquire_slot(deadline).await?)?;
+        let planned_bytes = download::planned_pair_bytes(&registered)?;
+        let initial_staging = planned_bytes.saturating_mul(2);
+        let staging = budgets().reserve_staging(initial_staging, class, deadline).await?;
+        let download_permit = budgets().acquire_download(class, deadline).await?;
+        let lease = lease::VerificationLease::for_verification(staging, download_permit)?;
         let view = view::NativeView::create(&self.git, Arc::clone(&lease), checked.format)?;
+
+        let staged_pairs =
+            download::fetch_pairs_staged(&self.store, &registered, view.incoming(), &lease, deadline).await?;
+        lease.release_download();
+
+        let native_permit = acquire_slot_with_class(class, deadline).await?;
+        lease.admit_native(native_permit);
         view.init(deadline).await?;
-        let mut objects = 0u64;
         let mut indexed = std::collections::BTreeSet::new();
-        for (index, pack) in checked.old.iter().chain(checked.new.iter()).enumerate() {
-            let download::PairInput { pack: pack_copy, idx, sha256, objects: declared } =
-                download::fetch_pair(&self.store, pack, view.incoming(), index, &lease, deadline).await?;
-            objects = objects.checked_add(declared).ok_or_else(|| refuse("closure object count overflowed"))?;
-            if objects > VERIFIER_MAX_OBJECTS {
-                return Err(refuse("closure exceeds the verifier object bound"));
+        let mut cleaned_incoming = 0u64;
+        for pair in staged_pairs {
+            view.verify_registered_pair(&pair.idx, deadline).await?;
+            if indexed.insert(pair.sha256) {
+                view.index_pack(&pair.pack, deadline).await?;
             }
-            view.verify_registered_pair(&idx, deadline).await?;
-            if indexed.insert(sha256) {
-                view.index_pack(&pack_copy, deadline).await?;
-            }
+            download::remove_pair_files(&pair.pack, &pair.idx, &lease, deadline).await?;
+            cleaned_incoming = cleaned_incoming.saturating_add(pair.bytes);
+            lease.shrink_staging_to(initial_staging.saturating_sub(cleaned_incoming));
         }
         view.check_pack_directory(indexed.len())?;
         view.attest(&checked, deadline).await?;
@@ -245,21 +268,13 @@ fn arm(caller: Instant) -> Result<Instant, PackCommitError> {
     Ok(deadline)
 }
 
-/// Take one process-wide native verifier slot, or refuse at the deadline.
-async fn acquire_slot(deadline: Instant) -> Result<OwnedSemaphorePermit, PackCommitError> {
-    let semaphore = Arc::clone(slots());
-    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), semaphore.acquire_owned()).await {
-        Ok(Ok(permit)) => Ok(permit),
-        _ => Err(refuse("no verifier concurrency slot before the deadline")),
-    }
+async fn acquire_slot_with_class(class: AdmissionClass, deadline: Instant) -> Result<NativePermit, PackCommitError> {
+    budgets().acquire_native(class, deadline).await
 }
 
-/// Take one materialized-view budget slot. A5b calls this **before** native
-/// admission; the budget stays owned by the public view.
-async fn acquire_view_budget(deadline: Instant) -> Result<OwnedSemaphorePermit, PackCommitError> {
-    let semaphore = Arc::clone(view_slots());
-    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), semaphore.acquire_owned()).await {
-        Ok(Ok(permit)) => Ok(permit),
-        _ => Err(refuse("no materialized-view budget before the deadline")),
-    }
+async fn acquire_view_budget_with_class(
+    class: AdmissionClass,
+    deadline: Instant,
+) -> Result<ViewPermit, PackCommitError> {
+    budgets().acquire_view(class, deadline).await
 }

@@ -21,21 +21,19 @@
 //! bounds, the deadline and any native failure. Per-ref facts (not global yet):
 //! missing NEW target OID, non-commit branch target, non-fast-forward ancestry
 //! and LFS byte failures.
+use super::budget::budgets;
 use super::download;
 use super::lease::VerificationLease;
-use super::publication_support::{
-    check_workspace, facts_digest, membership_rows, old_ref_map, pair_bytes, preflight_workspace,
-};
+use super::publication_support::{check_workspace, facts_digest, membership_rows, old_ref_map, preflight_workspace};
 use super::view::NativeView;
-use super::{acquire_slot, acquire_view_budget, arm, refuse};
+use super::{AdmissionClass, acquire_slot_with_class, acquire_view_budget_with_class, arm, refuse};
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::CommitMode;
 use crate::ref_store::contract::{OperationIdentity, RequestDigest};
 use crate::ref_store::core::pack_commit::artifact::{RegisteredPack, packs_digest};
 use crate::ref_store::core::pack_commit::context::{CapturedRef, MembershipDigest, PackCommitBaseline};
 use crate::ref_store::core::pack_commit::contract::{
-    MAX_ACTIVE_MEMBERSHIPS, MAX_BATCH_NEW_PACKS, PackArtifactRole, VERIFIER_MAX_OBJECTS, VERIFIER_MAX_PAIRS,
-    VERIFIER_MAX_TOTAL_BYTES,
+    MAX_ACTIVE_MEMBERSHIPS, MAX_BATCH_NEW_PACKS, PackArtifactRole, VERIFIER_MAX_PAIRS, VERIFIER_MAX_TOTAL_BYTES,
 };
 use crate::ref_store::core::pack_commit::error::{PackCommitError, PackCommitRejectCode, PackCommitRejection};
 use crate::ref_store::core::pack_commit::facts::LfsByteWitness;
@@ -262,35 +260,44 @@ impl PublicationFactsEngine {
         registered.extend(request.old.iter());
         registered.extend(request.new.iter());
         download::check_live_backend(&self.store, &registered)?;
-        // View budget first, then the owned workspace, then native admission.
-        let lease = VerificationLease::with_view_budget(acquire_view_budget(deadline).await?)?;
-        let native = acquire_slot(deadline).await?;
-        lease.admit_native(native);
+        let planned_bytes = download::planned_pair_bytes(&registered)?;
+        if planned_bytes > VERIFIER_MAX_TOTAL_BYTES {
+            return Err(refuse("publication facts exceed the verifier artifact-byte bound"));
+        }
+        let initial_staging = planned_bytes.saturating_mul(2);
+        let class = AdmissionClass::Foreground;
+        // Phase 1: view budget, staging reservation, and download slot (no native Git CPU slot yet).
+        let view_budget = acquire_view_budget_with_class(class, deadline).await?;
+        let staging = budgets().reserve_staging(initial_staging, class, deadline).await?;
+        let download_permit = budgets().acquire_download(class, deadline).await?;
+        let lease = VerificationLease::with_view_budget(view_budget, staging, download_permit)?;
         let view = NativeView::create(&self.git, Arc::clone(&lease), request.format)?;
+        check_workspace(&lease, deadline).await?;
+        preflight_workspace(&lease, initial_staging, deadline).await?;
+        let staged_pairs =
+            download::fetch_pairs_staged(&self.store, &registered, view.incoming(), &lease, deadline).await?;
+        lease.release_download();
+        check_workspace(&lease, deadline).await?;
+
+        // Phase 2: native Git CPU admission strictly around verification and probes.
+        let native = acquire_slot_with_class(class, deadline).await?;
+        lease.admit_native(native);
         view.init(deadline).await?;
         check_workspace(&lease, deadline).await?;
 
         let mut indexed = BTreeSet::new();
-        let mut objects = 0u64;
         let mut bytes = 0u64;
-        for (index, pack) in request.old.iter().chain(request.new.iter()).enumerate() {
-            let pair = pair_bytes(pack)?;
-            bytes = bytes.checked_add(pair).ok_or_else(|| refuse("publication artifact bytes overflowed"))?;
-            if bytes > VERIFIER_MAX_TOTAL_BYTES {
-                return Err(refuse("publication facts exceed the verifier artifact-byte bound"));
+        let mut cleaned_incoming = 0u64;
+        for staged in staged_pairs {
+            bytes = bytes.checked_add(staged.bytes).ok_or_else(|| refuse("publication artifact bytes overflowed"))?;
+            view.verify_registered_pair(&staged.idx, deadline).await?;
+            if indexed.insert(staged.sha256) {
+                preflight_workspace(&lease, staged.bytes, deadline).await?;
+                view.index_pack(&staged.pack, deadline).await?;
             }
-            preflight_workspace(&lease, pair.saturating_mul(2), deadline).await?;
-            let download::PairInput { pack: pack_copy, idx, sha256, objects: declared } =
-                download::fetch_pair(&self.store, pack, view.incoming(), index, &lease, deadline).await?;
-            objects = objects.checked_add(declared).ok_or_else(|| refuse("publication object count overflowed"))?;
-            if objects > VERIFIER_MAX_OBJECTS {
-                return Err(refuse("publication facts exceed the verifier object bound"));
-            }
-            view.verify_registered_pair(&idx, deadline).await?;
-            if indexed.insert(sha256) {
-                preflight_workspace(&lease, pair, deadline).await?;
-                view.index_pack(&pack_copy, deadline).await?;
-            }
+            download::remove_pair_files(&staged.pack, &staged.idx, &lease, deadline).await?;
+            cleaned_incoming = cleaned_incoming.saturating_add(staged.bytes);
+            lease.shrink_staging_to(initial_staging.saturating_sub(cleaned_incoming));
             check_workspace(&lease, deadline).await?;
         }
         view.check_pack_directory(indexed.len())?;
