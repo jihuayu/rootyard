@@ -22,9 +22,11 @@ Acceptance is fail-closed:
   bound inventory all match the receipt.  The recorded Cargo argv is parsed
   without a shell: its feature/no-default/all-features selection must match
   the validated ``pando-lab`` default metadata, and an explicit ``--target``
-  must match the recorded native compiler host/target.  Actual v2 ``fresh``
-  booleans are reported literally (true, false or mixed), never forced to
-  false;
+  must match the recorded native compiler host/target.  The default ``cargo
+  test`` profile remains accepted; an explicit ``--profile`` must denote the
+  CI ``test`` profile, while ``--release``, dev/release/other/empty/malformed
+  or duplicate profile selectors are refused.  Actual v2 ``fresh`` booleans
+  are reported literally (true, false or mixed), never forced to false;
 * the receipt's recorded v2 source snapshot is reported separately from the
   digest recomputed from this checkout, so it is never forged into "current";
 * the direct process is bounded, and the parsed output must contain exactly one
@@ -177,7 +179,6 @@ _VALUE_OPTIONS = frozenset(
         "--manifest-path",
         "--package",
         "--exclude",
-        "--profile",
     }
 )
 _BOOLEAN_OPTIONS = frozenset(
@@ -185,7 +186,6 @@ _BOOLEAN_OPTIONS = frozenset(
         "--locked",
         "--lib",
         "--no-run",
-        "--release",
         "--offline",
         "--frozen",
         "--quiet",
@@ -226,6 +226,7 @@ def _parse_command_selection(command):
     """
     features = []
     targets = []
+    profiles = []
     no_default = False
     all_features = False
     index = 1
@@ -260,6 +261,24 @@ def _parse_command_selection(command):
             continue
         if token.startswith("--all-features="):
             raise GateError("receipt", "receipt_command")
+        if token == "--release":
+            profiles.append("release")
+            index += 1
+            continue
+        if token.startswith("--release="):
+            raise GateError("receipt", "receipt_command")
+        if token == "--profile":
+            _need(index + 1 < len(command), "receipt", "receipt_command")
+            _need(bool(command[index + 1]), "receipt", "receipt_command")
+            profiles.append(command[index + 1])
+            index += 2
+            continue
+        if token.startswith("--profile="):
+            value = token[len("--profile=") :]
+            _need(bool(value), "receipt", "receipt_command")
+            profiles.append(value)
+            index += 1
+            continue
         if token == "--target":
             _need(index + 1 < len(command), "receipt", "receipt_command")
             _need(bool(command[index + 1]), "receipt", "receipt_command")
@@ -310,13 +329,18 @@ def _parse_command_selection(command):
     return {
         "features": features,
         "targets": targets,
+        "profiles": profiles,
         "no_default_features": no_default,
         "all_features": all_features,
     }
 
 
 def _validate_command_selection(
-    command, declared_features, declared_no_default, expected_target=None
+    command,
+    declared_features,
+    declared_no_default,
+    expected_target=None,
+    expected_profile="test",
 ):
     """Bind argv selectors to the receipt metadata that names the artifact."""
     parsed = _parse_command_selection(command)
@@ -328,6 +352,13 @@ def _validate_command_selection(
         "receipt_command",
     )
     _need(set(parsed["features"]) == set(declared), "receipt", "receipt_command")
+    _need(len(parsed["profiles"]) <= 1, "receipt", "receipt_command")
+    if parsed["profiles"]:
+        _need(
+            parsed["profiles"][0] == expected_profile,
+            "receipt",
+            "receipt_command",
+        )
     targets = set(parsed["targets"])
     _need(len(targets) <= 1, "receipt", "receipt_command")
     if targets:

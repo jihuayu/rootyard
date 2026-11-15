@@ -818,6 +818,54 @@ class GateRunnerTest(unittest.TestCase):
                 )
                 self.assertEqual(code, 0, report["failure"])
 
+    def test_load_receipt_binds_command_profile_to_test_profile(self):
+        # The actual producer omits --profile, which is the cargo test profile.
+        self.write_v2_receipt(fresh=False)
+        validated = gate.load_receipt(self.receipt, self.binary, self.head)
+        self.assertEqual(validated.payload["profile"], "test")
+
+        # An explicit profile is accepted only when it spells the test profile.
+        for selection in (("--profile", "test"), ("--profile=test",)):
+            payload = self.write_v2_receipt(
+                fresh=False,
+                command=self.producer_command(("--features", "pando-lab", *selection)),
+            )
+            self.assertEqual(payload["profile"], "test")
+            validated = gate.load_receipt(self.receipt, self.binary, self.head)
+            self.assertEqual(validated.payload["profile"], "test")
+
+        negative = {
+            "release": ("--release",),
+            "profile-dev": ("--profile", "dev"),
+            "profile-equals-dev": ("--profile=dev",),
+            "profile-empty": ("--profile=",),
+            "profile-other": ("--profile", "bench"),
+            "profile-malformed": ("--profile=test=extra",),
+            "profile-duplicate": ("--profile", "test", "--profile", "test"),
+            "profile-contradictory-release": (
+                "--release",
+                "--profile",
+                "test",
+            ),
+        }
+        for name, selection in negative.items():
+            with self.subTest(name=name):
+                payload = self.write_v2_receipt(
+                    fresh=False,
+                    command=self.producer_command(
+                        ("--features", "pando-lab", *selection)
+                    ),
+                )
+                # The metadata and selected artifact still claim the test profile.
+                self.assertEqual(payload["profile"], "test")
+                self.assertIs(payload["cargo_artifacts"][0]["profile"]["test"], True)
+                with self.assertRaises(gate.GateError) as raised:
+                    gate.load_receipt(self.receipt, self.binary, self.head)
+                self.assertEqual(
+                    (raised.exception.stage, raised.exception.code),
+                    ("receipt", "receipt_command"),
+                )
+
 
 def report_support(bound):
     digest = hashlib.sha256()
