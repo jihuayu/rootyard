@@ -1,7 +1,8 @@
+use super::super::provider::PandoKmsProvider;
 use super::*;
-use crate::lifecycle::provider::PandoKmsProvider;
 use rootyard::blob_store::key_provider::{KeyId, KeyProviderCapabilities, KeyProviderError};
 
+#[derive(Debug)]
 struct PlaintextFallbackProvider(KeyId);
 
 impl KeyProvider for PlaintextFallbackProvider {
@@ -14,7 +15,7 @@ impl KeyProvider for PlaintextFallbackProvider {
         _data_key: &[u8; DATA_KEY_BYTES],
         _context: &WrapContext,
     ) -> std::result::Result<WrappedKey, KeyProviderError> {
-        Err(KeyProviderError::Unsupported("dummy"))
+        Err(KeyProviderError::KeyRing("dummy"))
     }
 
     fn unwrap_data_key(
@@ -22,7 +23,7 @@ impl KeyProvider for PlaintextFallbackProvider {
         _wrapped: &WrappedKey,
         _context: &WrapContext,
     ) -> std::result::Result<DataKey, KeyProviderError> {
-        Err(KeyProviderError::Unsupported("dummy"))
+        Err(KeyProviderError::KeyRing("dummy"))
     }
 
     fn capabilities(&self) -> KeyProviderCapabilities {

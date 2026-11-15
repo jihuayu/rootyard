@@ -5,7 +5,7 @@ use super::{
     rotate_kms_key, valid_cipher_suite, valid_encryption_mode, valid_kms_key_id,
     verify_envelope_record, write_envelope_file,
 };
-use crate::{Config, Pack, object_store, repack};
+use super::super::{Config, Pack, object_store, repack};
 use anyhow::{Context, Result, ensure};
 use tokio_postgres::Client;
 use uuid::Uuid;

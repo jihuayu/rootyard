@@ -2,7 +2,7 @@ use super::{
     ENVELOPE_SCHEMA, KmsEnvelopeRecord, crypto, provider, valid_cipher_suite,
     valid_encryption_mode, valid_kms_key_id, valid_sha256_hex, valid_storage_tier,
 };
-use crate::{Pack, delta};
+use super::super::{Pack, delta};
 use anyhow::{Context, Result, ensure};
 use rootyard::blob_store::key_provider::WrappedKey;
 use std::{

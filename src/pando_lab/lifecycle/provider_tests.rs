@@ -1,7 +1,7 @@
-use super::*;
-use crate::lifecycle::crypto::{
+use super::super::crypto::{
     OpenSealedRequest, open_sealed_pack_bytes, rewrap_pack_dek, seal_pack_bytes, sha256_hex,
 };
+use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 #[test]

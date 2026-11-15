@@ -3,7 +3,7 @@ use super::{
     provider::{KmsKeyPolicy, ManagedKeyStatus},
     rotation::KmsRotationCheckpoint,
 };
-use crate::Pack;
+use super::super::Pack;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{

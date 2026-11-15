@@ -6,7 +6,7 @@ use super::{
         verify_pack_ciphertext_open,
     },
 };
-use crate::{Config, object_store};
+use super::super::{Config, object_store};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

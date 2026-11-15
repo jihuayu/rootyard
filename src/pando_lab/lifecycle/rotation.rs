@@ -1,23 +1,19 @@
+use super::super::{Config, Pack, object_store};
 use super::{
     DEFAULT_CIPHER_SUITE, DEFAULT_KMS_KEY_ID, ENVELOPE_SCHEMA, KmsEnvelopeRecord,
-    KmsRotationReport, envelope_file_path, load_repo_packs, read_and_verify_envelope_file,
-    valid_kms_key_id, write_envelope_file,
-    db::{load_file_checkpoint, persist_checkpoint},
+    KmsRotationReport,
+    db::{load_envelope_from_db, load_file_checkpoint, persist_checkpoint},
+    envelope_file_path, load_repo_packs, read_and_verify_envelope_file, valid_kms_key_id,
+    write_envelope_file,
 };
-use crate::object_store;
-use crate::{Config, Pack};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
-pub use super::cli::{
-    KmsStatusReport, KmsVerifyReport, kms_status, run_kms_cli, verify_repo_encryption,
-};
-pub use super::db::{
-    load_envelope_from_db, sync_kms_policy_to_db, upsert_envelope_in_db,
-};
+pub use super::cli::{kms_status, run_kms_cli};
+pub use super::db::{sync_kms_policy_to_db, upsert_envelope_in_db};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

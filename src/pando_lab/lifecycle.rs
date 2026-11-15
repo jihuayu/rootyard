@@ -11,8 +11,8 @@ pub mod provider;
 pub mod rotation;
 
 pub use envelopes::{
-    build_authenticated_envelope_record, build_envelope_record, compute_envelope_mac,
-    envelope_file_path, read_and_verify_envelope_file, verify_envelope_record, write_envelope_file,
+    build_authenticated_envelope_record, build_envelope_record, envelope_file_path,
+    read_and_verify_envelope_file, verify_envelope_record, write_envelope_file,
 };
 pub(crate) use eval::load_repo_packs;
 
@@ -166,7 +166,9 @@ pub struct LifecycleStatusReport {
 
 pub fn valid_kms_key_id(key_id: &str) -> bool {
     let t = key_id.trim();
-    t.len() >= 3 && t.len() <= 128 && KeyId::parse(t).is_ok()
+    t.len() >= 3
+        && t.len() <= 128
+        && rootyard::blob_store::key_provider::KeyId::parse(t).is_ok()
 }
 pub fn valid_cipher_suite(suite: &str) -> bool {
     matches!(
