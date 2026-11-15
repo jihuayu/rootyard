@@ -2,12 +2,12 @@
 //!
 //! The HTTP server and owned Git jobs are drained before this module runs. The
 //! only remaining helper producer is the background capture worker, plus scan
-//! jobs that may have outlived their caller's scan deadline. Capture must stop
-//! before the helper fences and unmounts, but a blind `await` can wait forever
-//! on a parked scan, so the producer join and scan drain share one absolute
-//! deadline. On timeout the producer is aborted and the helper teardown is
-//! still attempted; any failed part is returned instead of being reported as a
-//! clean shutdown.
+//! jobs that may have outlived their caller's scan deadline. Capture is asked
+//! to stop and its release is awaited within one total absolute grace; a
+//! reserved slice of that grace is used to confirm an abort request before the
+//! helper fences and unmounts. A blind `await` can wait forever on a parked
+//! scan, so a confirmation timeout still runs the helper backstop, returns an
+//! error, and never claims that the producer was drained.
 use super::scan;
 use anyhow::{Result, anyhow};
 use std::{future::Future, time::Duration};
@@ -18,6 +18,11 @@ use tokio_util::sync::CancellationToken;
 /// cancellation and finish its already-admitted pages.
 const CAPTURE_SCAN_MARGIN: Duration = Duration::from_secs(5);
 
+/// Slice of the total capture grace reserved for confirming that an abort
+/// request actually released the task. The slice is capped and never more than
+/// half the total, so a small test/config grace still leaves a strict split.
+const ABORT_CONFIRMATION_LIMIT: Duration = Duration::from_secs(1);
+
 /// One bounded capture drain budget. The helper has its own pre-existing
 /// fence/unmount/join and child-process grace; this value never makes that path
 /// unbounded.
@@ -25,14 +30,22 @@ pub fn capture_shutdown_grace() -> Duration {
     scan::timeout().saturating_add(CAPTURE_SCAN_MARGIN)
 }
 
-/// Cancel and drain the capture producer and accepted scans within one absolute
-/// deadline, then unconditionally attempt helper teardown with its existing
-/// bounded fence/unmount/join and child-process grace.
+/// Cancel the capture producer, await its release and drain accepted scans with
+/// every wait bounded by one absolute deadline, then unconditionally attempt
+/// helper teardown with its existing bounded fence/unmount/join and
+/// child-process grace.
+///
+/// The total grace is not extended: a reserved confirmation slice is taken from
+/// inside it. If capture does not release before the earlier cooperative
+/// deadline, abort is requested and the same `JoinHandle` is awaited only until
+/// the original final deadline. A cancellation join after that abort is
+/// expected completion; a later deadline miss is a distinct failure and is
+/// never reported as a drained producer.
 ///
 /// The helper future is polled even when capture or scan drain fails, because
 /// its fence/unmount/join path owns the last safe cleanup attempt. A failure in
-/// either part makes the returned result an error; a helper failure is retained
-/// alongside a capture/scan failure.
+/// any part makes the returned result an error; helper failures are retained
+/// alongside capture/scan failures.
 pub async fn stop_capture_before_helper<H>(
     stop: CancellationToken,
     mut capture: JoinHandle<()>,
@@ -43,31 +56,55 @@ where
     H: Future<Output = Result<()>>,
 {
     stop.cancel();
-    let deadline = tokio::time::Instant::now() + grace;
+    let started = tokio::time::Instant::now();
+    let final_deadline = started + grace;
+    let abort_confirmation = ABORT_CONFIRMATION_LIMIT.min(grace / 2);
+    let capture_deadline = started + (grace - abort_confirmation);
     let mut failures = Vec::new();
+    let mut abort_requested = false;
 
-    match tokio::time::timeout_at(deadline, &mut capture).await {
+    match tokio::time::timeout_at(capture_deadline, &mut capture).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             failures.push(format!("workspace capture worker did not finish cleanly during shutdown ({error})"));
         }
         Err(_) => {
-            // Do not let a wedged producer race helper teardown. Abort is
-            // bounded and non-blocking; an OS scan already inside the pool is
-            // still observed by `scan::wait_idle_until` and the helper fence.
+            // The earlier deadline expired. Requesting abort is not proof the
+            // task released; confirm the actual JoinHandle before helper
+            // teardown, but only inside the original total grace.
+            abort_requested = true;
             capture.abort();
-            failures.push(format!("workspace capture worker did not stop within {}ms", grace.as_millis()));
+            failures.push("workspace capture worker did not stop before the abort-confirmation window".to_owned());
         }
     }
 
-    // This uses the same absolute deadline as the capture join. A timed-out
-    // scan caller does not clear its marker until `with_frozen` really returns.
-    if !scan::wait_idle_until(deadline).await {
+    if abort_requested {
+        // A confirmation miss can leave the request pending. Helper teardown is
+        // then only a backstop, not evidence that producer-before-helper held.
+        match tokio::time::timeout_at(final_deadline, &mut capture).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_cancelled() => {}
+            Ok(Err(error)) => {
+                failures.push(format!("workspace capture worker did not release cleanly after abort ({error})"));
+            }
+            Err(_) => {
+                failures.push(format!(
+                    "workspace capture worker abort was requested but its JoinHandle did not complete within the final {}ms grace; producer-before-helper ordering is not claimed",
+                    grace.as_millis()
+                ));
+            }
+        }
+    }
+
+    // This uses the same original final deadline. A timed-out scan caller does
+    // not clear its marker until `with_frozen` really returns.
+    if !scan::wait_idle_until(final_deadline).await {
         failures.push(format!("workspace scan workers did not drain within {}ms", grace.as_millis()));
     }
 
-    // Keep helper teardown unconditional: if the producer drain failed, this is
-    // the fence/unmount/join backstop that releases the helper and its mounts.
+    // Keep helper teardown unconditional: if capture release or scan drain was
+    // not confirmed, this is the fence/unmount/join backstop that releases the
+    // helper and its mounts. Any unconfirmed drain remains in `failures`.
     if let Err(error) = helper.await {
         failures.push(format!("workspace FUSE helper shutdown failed: {error:#}"));
     }
@@ -134,20 +171,28 @@ mod tests {
     async fn bounded_capture_abort_still_runs_helper_and_reports_both_failures() {
         let stop = CancellationToken::new();
         let capture_dropped = Arc::new(AtomicBool::new(false));
+        let (capture_started_tx, capture_started_rx) = tokio::sync::oneshot::channel();
         let capture = {
             let capture_dropped = capture_dropped.clone();
             tokio::spawn(async move {
                 let _drop = DropSignal(capture_dropped);
+                let _ = capture_started_tx.send(());
                 std::future::pending::<()>().await;
             })
         };
+        capture_started_rx.await.expect("capture task did not enter its shutdown wait");
 
         let helper_ran = Arc::new(AtomicBool::new(false));
         let helper_seen = helper_ran.clone();
+        let helper_dropped = capture_dropped.clone();
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
-            stop_capture_before_helper(stop, capture, Duration::from_millis(25), async move {
+            stop_capture_before_helper(stop, capture, Duration::from_millis(200), async move {
                 helper_seen.store(true, Ordering::Release);
+                assert!(
+                    helper_dropped.load(Ordering::Acquire),
+                    "helper teardown began before the aborted capture task actually released"
+                );
                 Err(anyhow::anyhow!("fixture helper failure"))
             }),
         )
@@ -157,13 +202,7 @@ mod tests {
 
         assert!(helper_ran.load(Ordering::Acquire), "helper teardown was skipped after a failed drain");
         assert!(error.contains("capture worker did not stop"), "missing capture failure: {error}");
+        assert!(!error.contains("after abort"), "expected abort cancellation was not treated as completion: {error}");
         assert!(error.contains("fixture helper failure"), "missing helper failure: {error}");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !capture_dropped.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("aborted capture task did not drop");
     }
 }

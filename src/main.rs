@@ -354,10 +354,10 @@ async fn run() -> Result<()> {
             .await?;
             rootyard::workspaces::drain_git_jobs(git_shutdown_grace).await;
             // Capture is the only remaining helper producer after HTTP and Git
-            // drain. Stop and drain it before helper teardown, but share one
-            // bounded deadline so a parked scan cannot hang shutdown. Helper
-            // fence/unmount/join still runs on timeout, and any failed part is
-            // returned instead of being reported as a clean shutdown.
+            // drain. Request its stop and await confirmed release within one
+            // bounded grace before helper teardown. If confirmation times out,
+            // helper fence/unmount/join still runs as the backstop and the
+            // shutdown returns an error instead of claiming a drained producer.
             rootyard::workspaces::stop_capture_before_helper(
                 workspace_capture_stop,
                 workspace_capture_task,
