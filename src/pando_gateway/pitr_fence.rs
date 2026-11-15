@@ -15,7 +15,6 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_postgres::GenericClient;
-use uuid::Uuid;
 
 pub use pitr_markers::{
     clear_claim_file_best_effort, ensure_deployment_id, read_deployment_id_if_present, read_volume_id,
@@ -369,7 +368,7 @@ pub async fn advance_epoch(
     let pending = begin_epoch_advance(pool, data_dir, remote, operation, deadline).await?;
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    let committed = commit_epoch_advance_in_tx(&tx, &pending).await?;
+    let committed = commit_epoch_advance_in_tx(&*tx, &pending).await?;
     tx.commit().await?;
     clear_claim_file_best_effort(data_dir, pending.authority_id);
     Ok(committed)

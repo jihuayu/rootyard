@@ -149,6 +149,17 @@ impl RemoteStoreError {
             _ => None,
         }
     }
+
+    pub(crate) fn is_not_found(&self) -> bool {
+        match &self.failure {
+            #[cfg(test)]
+            RemoteFailure::Http(status) => *status == 404,
+            RemoteFailure::HttpTyped { status, kind, .. } => *status == 404 || *kind == RemoteSdkKind::NotFound,
+            RemoteFailure::TransportTyped { kind, .. } => *kind == RemoteSdkKind::NotFound,
+            RemoteFailure::Sdk(kind) => *kind == RemoteSdkKind::NotFound,
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for RemoteStoreError {

@@ -81,7 +81,7 @@ pub async fn pin_recovery_root(
     let prepared = pitr_fence::begin_epoch_advance(pool, data_dir, remote, "pin_recovery_root", deadline).await?;
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    let committed = pitr_fence::commit_epoch_advance_in_tx(&tx, &prepared).await?;
+    let committed = pitr_fence::commit_epoch_advance_in_tx(&*tx, &prepared).await?;
 
     let external_lsn: String = tx
         .query_one(

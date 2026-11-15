@@ -10,20 +10,20 @@ use crate::storage::{
     remote_errors::RemoteOp,
     remote_objects::RemoteObjectStore,
     remote_provider::{LegacyS3Store, READ_CHUNK, UPLOAD_CHUNK, tokio_deadline},
-    remote_provider_errors::{deadline_error, object_error, observe},
+    remote_provider_errors::{deadline_error, object_error, observe, observe_body_poll},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use futures_util::TryStreamExt;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
 };
 use tokio::time::Instant;
-use url::{Host, Url};
 use uuid::Uuid;
 
 const MAX_AUTHORITY_PROOF_BYTES: usize = 16 * 1024;
@@ -91,11 +91,7 @@ pub enum AuthorityCreateOutcome {
 pub(crate) fn s3_backend_identity(endpoint: &Url, region: &str, bucket: &str) -> Result<String> {
     let scheme = endpoint.scheme().to_ascii_lowercase();
     ensure!(matches!(scheme.as_str(), "http" | "https"), "unsupported object store scheme");
-    let host = match endpoint.host().context("object store endpoint missing host")? {
-        Host::Domain(domain) => domain.to_ascii_lowercase(),
-        Host::Ipv4(addr) => addr.to_string(),
-        Host::Ipv6(addr) => format!("[{addr}]"),
-    };
+    let host = endpoint.host_str().context("object store endpoint missing host")?.to_ascii_lowercase();
     let port_suffix = match (scheme.as_str(), endpoint.port_or_known_default()) {
         ("http", Some(80)) | ("https", Some(443)) | (_, None) => String::new(),
         (_, Some(port)) => format!(":{port}"),
@@ -285,28 +281,21 @@ fn local_put_proof_if_absent(root: &Path, key: &str, payload: &[u8]) -> Result<b
 }
 
 async fn s3_read_proof_if_exists(store: &LegacyS3Store, key: &str, deadline: Instant) -> Result<Option<Vec<u8>>> {
-    let reader =
-        match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Get, store.operator().reader(key)))
-            .await
-        {
-            Ok(Ok(reader)) => reader,
-            Ok(Err(failure)) if failure.is_not_found() => return Ok(None),
-            Ok(Err(failure)) => return Err(object_error(BlobError::Remote(failure.into_error()))),
-            Err(_) => return Err(object_error(deadline_error(RemoteOp::Get))),
-        };
-    let mut stream =
-        match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Get, reader.into_bytes_stream(..)))
-            .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(failure)) if failure.is_not_found() => return Ok(None),
-            Ok(Err(failure)) => return Err(object_error(BlobError::Remote(failure.into_error()))),
-            Err(_) => return Err(object_error(deadline_error(RemoteOp::Get))),
-        };
+    let mut stream = match store.read_stream(key, deadline).await {
+        Ok(stream) => stream,
+        Err(BlobError::Remote(remote)) if remote.is_not_found() => return Ok(None),
+        Err(error) => return Err(object_error(error)),
+    };
     let mut out = Vec::new();
     loop {
-        let next = match tokio::time::timeout_at(tokio_deadline(deadline), stream.try_next()).await {
+        let next = match tokio::time::timeout_at(
+            tokio_deadline(deadline),
+            observe_body_poll(RemoteOp::Get, stream.try_next()),
+        )
+        .await
+        {
             Ok(Ok(item)) => item,
+            Ok(Err(BlobError::Remote(remote))) if remote.is_not_found() => return Ok(None),
             Ok(Err(error)) => return Err(object_error(error)),
             Err(_) => return Err(object_error(deadline_error(RemoteOp::Get))),
         };

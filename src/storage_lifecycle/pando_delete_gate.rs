@@ -6,7 +6,7 @@ use crate::{
     storage::remote_objects::{ObjectKey, RemoteObjectStore},
 };
 use anyhow::{Result, bail, ensure};
-use std::{env, sync::Arc};
+use std::env;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -50,7 +50,7 @@ pub fn validate_startup_env() -> Result<()> {
 /// When `ROOTYARD_PANDO_REMOTE_DELETE=true`, performs full local + external
 /// bucket proof verification and refuses (plus latches PG fence on mismatch)
 /// before enqueuing any destructive work.
-pub async fn check_scheduler_gate(state: &Arc<AppState>, deadline: Instant) -> Result<DeleteGateDecision> {
+pub async fn check_scheduler_gate(state: &AppState, deadline: Instant) -> Result<DeleteGateDecision> {
     if !remote_delete_env_enabled()? {
         return Ok(DeleteGateDecision::Disabled { reason: "ROOTYARD_PANDO_REMOTE_DELETE is not enabled" });
     }
@@ -71,7 +71,7 @@ pub async fn check_scheduler_gate(state: &Arc<AppState>, deadline: Instant) -> R
 /// in both the object store (`If-None-Match: *`) and PostgreSQL before any
 /// `pando_tombstone_delete` job may issue a remote delete.
 pub async fn enter_fenced_delete_execution(
-    state: &Arc<AppState>,
+    state: &AppState,
     remote: &RemoteObjectStore,
     deadline: Instant,
 ) -> Result<AuthorityState> {
