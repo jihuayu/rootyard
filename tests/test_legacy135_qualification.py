@@ -488,6 +488,36 @@ class ProviderOwnershipTest(unittest.TestCase):
             self.assertIsNone(fixture.host_url)
             self.assertTrue(path.exists())
 
+    def test_vault_pin_is_the_multiarch_index_for_both_target_platforms(self):
+        # Static Root registry fixture: the digest is the manifest-list index,
+        # not either platform manifest.  This proves the fixture contract only,
+        # not a runtime pull or execution.
+        registry = {
+            "manifest_list_digest": (
+                "sha256:dfa48c2fa2b0099ccb47681ec5c4804bf5aec9d6879ecfee07ad4b92a5427ad6"),
+            "previous_single_platform_manifest": (
+                "sha256:44fa1e5a57d0bcf7fb163159872263b79a575e5dbfefd5b9bde1b7e4aada2f32"),
+            "platforms": {
+                "linux/386": (
+                    "sha256:119eabcfff236b021949176e81410bc035cf9056ed81b6b9a60a3669493078c3"),
+                "linux/amd64": (
+                    "sha256:18c03dcc5589b1a67eb3c7bd74d6982747f0d835a285516b87e3992f085de5a4"),
+                "linux/arm64": (
+                    "sha256:44fa1e5a57d0bcf7fb163159872263b79a575e5dbfefd5b9bde1b7e4aada2f32"),
+            },
+        }
+        self.assertEqual(
+            gate.VAULT_IMAGE,
+            "hashicorp/vault@" + registry["manifest_list_digest"])
+        self.assertIn("linux/amd64", registry["platforms"])
+        self.assertIn("linux/arm64", registry["platforms"])
+        self.assertNotEqual(
+            gate.VAULT_IMAGE,
+            "hashicorp/vault@" +
+            registry["previous_single_platform_manifest"])
+        self.assertNotIn(":2.2.2", gate.VAULT_IMAGE)
+        self.assertEqual(gate.VAULT_VERSION, "2.2.2")
+
     def test_safe_provider_record_excludes_locator_and_tokens(self):
         fixture = gate.VaultFixture("/tmp/state", runner=FakeRunner([]))
         fixture.container_id = "a" * 64

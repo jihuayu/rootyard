@@ -51,7 +51,7 @@ from schema_baseline import CURRENT_BACKUP_FORMAT, CURRENT_SCHEMA_VERSION  # noq
 
 VAULT_IMAGE = (
     "hashicorp/vault@sha256:"
-    "44fa1e5a57d0bcf7fb163159872263b79a575e5dbfefd5b9bde1b7e4aada2f32"
+    "dfa48c2fa2b0099ccb47681ec5c4804bf5aec9d6879ecfee07ad4b92a5427ad6"
 )
 VAULT_VERSION = "2.2.2"
 VAULT_KIND = "owned-legacy135-vault"
