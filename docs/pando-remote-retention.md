@@ -66,6 +66,34 @@ deployment sharing the same bucket:
   `status`, `verify`, `isolate --confirm-shared-bucket`, `pin-recovery-point`,
   and `release-recovery-point`.
 
+## Live-service acceptance harness (#77)
+
+CI runs the prebuilt candidate through the existing reporting boundary:
+
+```sh
+python3 tests/pando_pitr_service.py \
+  --binary "$ROOTYARD_BIN" \
+  --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+  --expect-commit "$GITHUB_SHA" \
+  --report test-results/pando-pitr-service.json
+```
+
+The harness refuses to run unless the shared v2 receipt reader revalidates the
+exact checkout, bound source/config/toolchain inputs, receipt bytes, binary
+digest and expected commit. It revalidates the same closure after the suite and
+only reports `passed: true` when all seven mandatory cases passed and the
+binary, receipt and owned harness hashes/identities are unchanged. The CI
+native manifest binds that report and those seven case names.
+
+Scope is deliberately narrow: actual Rootyard and stock Git run against actual
+PostgreSQL, while object storage and Vault Transit are **in-process loopback
+HTTP fixtures** (`TrackingLoopbackS3` / `TrackingLoopbackVaultTransit`).
+Recovery is a logical `pg_dump`/`pg_restore` metadata clone plus a simulated
+epoch rollback; the seeded Pando metadata and receipts are synthetic fixtures.
+This is not a real external Garage/S3, Vault, physical PostgreSQL WAL/PITR,
+cloud or hardware qualification, and the suite's best-effort cleanup is not
+asserted.
+
 ## Supported backup contract
 
 Paired Rootyard archives and isolated cloned authorities are the supported Pando
