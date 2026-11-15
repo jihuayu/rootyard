@@ -34,6 +34,7 @@ pub use core::{
     PackMembershipDescriptor, PgRefStoreCore, PinReleaseReason, REPO_MAX_LOGICAL_BYTES, REPO_MAX_RECEIPTS,
     REPO_MAX_SNAPSHOT_REFS, REPO_MAX_SNAPSHOTS, ReadMetadataSnapshotPageRequest, RefCommitResult, RefName,
     RefPrecondition, RefPrefix, RefTarget, RefUpdate, ReleaseMetadataPinRequest, RenewMetadataPinRequest,
+    RootPurpose, RootSelector,
     TENANT_MAX_LOGICAL_BYTES, TENANT_MAX_RECEIPTS, TENANT_MAX_SNAPSHOT_REFS, TENANT_MAX_SNAPSHOTS, TerminalKind,
     VersionCheck,
 };

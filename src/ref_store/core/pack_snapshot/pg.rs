@@ -44,7 +44,7 @@ use super::ServingSnapshotIdentity;
 use super::contract as pack_contract;
 use super::read_snapshot::{PackReadSnapshot, ReadSnapshotParts};
 use super::receipt::{PackSnapshotOutcome, PackSnapshotReceipt, StoredPackSnapshot};
-use super::request::{CreatePackSnapshotRequest, PackSnapshotRef};
+use super::request::{CreatePackSnapshotRequest, PackSnapshotExpectation, PackSnapshotRef};
 use super::sql;
 use super::usage::{self, PackUsageDelta};
 use crate::ref_store::contract::{MetadataMutationAction, RefStoreError, RequestDigest};
@@ -52,6 +52,7 @@ use crate::ref_store::pg;
 use crate::ref_store::tx::{begin_bounded, commit_bounded};
 use tokio::time::Instant;
 use tokio_postgres::{Client, Transaction};
+use uuid::Uuid;
 
 /// Stateless PostgreSQL adapter for the A5a pack snapshot slice.
 #[derive(Clone, Copy, Debug, Default)]

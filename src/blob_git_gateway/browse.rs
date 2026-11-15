@@ -33,7 +33,7 @@ use axum::{
 use base64::Engine;
 use tokio::time::Instant;
 
-use super::{error::GatewayError, native, snapshot::ComputedView, state::BlobGitState};
+use super::{error::GatewayError, native, state::BlobGitState};
 use crate::browse::models::{
     self, BlobByOidQuery, BlobQuery, BlobResponse, TreeByOidQuery, TreeEntry, TreeQuery, TreeResponse,
 };
