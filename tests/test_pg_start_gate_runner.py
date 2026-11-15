@@ -192,7 +192,32 @@ class GateRunnerTest(unittest.TestCase):
             "pin_source": "rust-toolchain.toml",
         }
 
-    def write_v2_receipt(self, fresh=False, lib_fresh=None):
+    def producer_command(self, selection=("--features", "pando-lab")):
+        """The current scripts/build_native_test.py --lib argv shape."""
+        return [
+            "cargo",
+            "--config",
+            "profile.dev.package.rootyard.debug=0",
+            "--config",
+            "profile.test.package.rootyard.debug=0",
+            "--config",
+            'profile.dev.package.rootyard.strip="debuginfo"',
+            "--config",
+            'profile.test.package.rootyard.strip="debuginfo"',
+            "test",
+            "--locked",
+            *selection,
+            "--lib",
+            "--no-run",
+            "--message-format=json-render-diagnostics",
+            "--jobs",
+            "6",
+        ]
+
+    def rewrite_v2_receipt(self, payload):
+        self.receipt.write_text(json.dumps(payload, indent=2) + "\n")
+
+    def write_v2_receipt(self, fresh=False, lib_fresh=None, command=None):
         self.write_v2_toolchain()
         bound = receipts.capture_bound_inputs(self.root, environ={"PATH": ""})
         self.v2_bound = bound
@@ -237,16 +262,7 @@ class GateRunnerTest(unittest.TestCase):
             support.update(bytes.fromhex(entry["sha256"]))
         payload = receipts.make_receipt_v2(
             binary_path=self.binary,
-            command=[
-                "cargo",
-                "test",
-                "--locked",
-                "--features",
-                "pando-lab",
-                "--lib",
-                "--no-run",
-                "--message-format=json-render-diagnostics",
-            ],
+            command=list(command) if command is not None else self.producer_command(),
             profile="test",
             artifacts=artifacts,
             toolchain=self.write_v2_toolchain(),
@@ -605,6 +621,13 @@ class GateRunnerTest(unittest.TestCase):
                 "receipt_invalid",
             ),
             (
+                "compiler_host",
+                lambda payload: payload["toolchain"]["rustc"].__setitem__(
+                    "host", "x86_64-unknown-linux-gnu"
+                ),
+                "receipt_invalid",
+            ),
+            (
                 "features",
                 lambda payload: payload["features"].__setitem__("enabled", []),
                 "receipt_invalid",
@@ -712,6 +735,88 @@ class GateRunnerTest(unittest.TestCase):
         data = json.loads(manifest.read_text())
         self.assertEqual(data["status"], "passed")
         self.assertEqual(data["build_receipt"]["receipt_schema"], "v2")
+
+    def test_v2_command_feature_selection_is_bound_to_declared_metadata(self):
+        # The exact current producer argv shape is accepted with consistent
+        # metadata and source/HEAD.
+        bound = self.write_v2_receipt(fresh=False)
+        code, stdout, stderr, report = self.run_gate(
+            source=bound["source_inputs_sha256"], support=report_support(bound)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(report["receipt"]["features"]["enabled"], ["pando-lab"])
+
+        # The reported review bypass: only the argv --features value changes;
+        # declared metadata, source, HEAD, artifact and toolchain stay valid.
+        payload = self.write_v2_receipt(fresh=False)
+        payload["command"] = self.producer_command(("--features", "wrong-feature"))
+        self.argv_log.unlink(missing_ok=True)
+        self.rewrite_v2_receipt(payload)
+        code, stdout, stderr, report = self.run_gate(
+            source=payload["source_inputs_sha256"], support=report_support(bound)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            report["failure"], {"stage": "receipt", "code": "receipt_command"}
+        )
+        self.assertIsNone(self.argv_lines())
+
+        negative = {
+            "missing": (),
+            "extra": ("--features", "pando-lab,extra"),
+            "all-features": ("--all-features",),
+            "no-default-mismatch": (
+                "--no-default-features",
+                "--features",
+                "pando-lab",
+            ),
+            "target-mismatch": (
+                "--features",
+                "pando-lab",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+            ),
+        }
+        for name, selection in negative.items():
+            with self.subTest(name=name):
+                payload = self.write_v2_receipt(fresh=False)
+                payload["command"] = self.producer_command(selection)
+                self.rewrite_v2_receipt(payload)
+                self.argv_log.unlink(missing_ok=True)
+                code, stdout, stderr, report = self.run_gate(
+                    source=payload["source_inputs_sha256"],
+                    support=report_support(bound),
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    report["failure"],
+                    {"stage": "receipt", "code": "receipt_command"},
+                )
+                self.assertIsNone(self.argv_lines())
+                self.assert_report_has_no_secret(report, stdout, stderr)
+
+        positive = {
+            "equals": ("--features=pando-lab",),
+            "short-space": ("-F", "pando-lab"),
+            "short-attached": ("-Fpando-lab",),
+            "explicit-equal-target": (
+                "--features",
+                "pando-lab",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+            ),
+        }
+        for name, selection in positive.items():
+            with self.subTest(name=name):
+                payload = self.write_v2_receipt(
+                    fresh=False, command=self.producer_command(selection)
+                )
+                self.rewrite_v2_receipt(payload)
+                code, stdout, stderr, report = self.run_gate(
+                    source=payload["source_inputs_sha256"],
+                    support=report_support(bound),
+                )
+                self.assertEqual(code, 0, report["failure"])
 
 
 def report_support(bound):

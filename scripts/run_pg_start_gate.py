@@ -19,8 +19,12 @@ Acceptance is fail-closed:
   ``rootyard`` from ``src/lib.rs`` with the CI ``test`` profile and
   ``pando-lab`` features, the pinned full Cargo/Rust toolchain, and a clean
   current HEAD whose source, lib-test support, ``Cargo.lock`` and complete
-  bound inventory all match the receipt.  Actual v2 ``fresh`` booleans are
-  reported literally (true, false or mixed), never forced to false;
+  bound inventory all match the receipt.  The recorded Cargo argv is parsed
+  without a shell: its feature/no-default/all-features selection must match
+  the validated ``pando-lab`` default metadata, and an explicit ``--target``
+  must match the recorded native compiler host/target.  Actual v2 ``fresh``
+  booleans are reported literally (true, false or mixed), never forced to
+  false;
 * the receipt's recorded v2 source snapshot is reported separately from the
   digest recomputed from this checkout, so it is never forged into "current";
 * the direct process is bounded, and the parsed output must contain exactly one
@@ -164,6 +168,176 @@ def _validate_command(command):
     )
 
 
+_VALUE_OPTIONS = frozenset(
+    {
+        "--config",
+        "--message-format",
+        "--jobs",
+        "--target-dir",
+        "--manifest-path",
+        "--package",
+        "--exclude",
+        "--profile",
+    }
+)
+_BOOLEAN_OPTIONS = frozenset(
+    {
+        "--locked",
+        "--lib",
+        "--no-run",
+        "--release",
+        "--offline",
+        "--frozen",
+        "--quiet",
+        "--verbose",
+        "--workspace",
+        "--all",
+        "--bins",
+        "--tests",
+        "--benches",
+        "--examples",
+        "--no-fail-fast",
+        "--keep-going",
+    }
+)
+_SHORT_VALUE_OPTIONS = frozenset({"-j", "-p", "-Z"})
+_SHORT_BOOLEAN_OPTIONS = frozenset({"-q", "-v"})
+
+
+def _feature_names(value):
+    if not isinstance(value, str):
+        return None
+    names = [part for part in re.split(r"[,\s]+", value.strip()) if part]
+    return names or None
+
+
+def _append_feature_names(target, value):
+    names = _feature_names(value)
+    _need(names is not None, "receipt", "receipt_command")
+    target.extend(names)
+
+
+def _parse_command_selection(command):
+    """Parse only the Cargo feature/target selectors from the recorded argv.
+
+    This is pure list parsing.  It never evaluates a shell, imports a compiler,
+    or consults PATH.  Unknown options fail closed because an unmodelled
+    value-taking option could otherwise consume the feature flag as its value.
+    """
+    features = []
+    targets = []
+    no_default = False
+    all_features = False
+    index = 1
+    while index < len(command):
+        token = command[index]
+        _need(token != "--", "receipt", "receipt_command")
+        if token in ("--features", "-F"):
+            _need(index + 1 < len(command), "receipt", "receipt_command")
+            _append_feature_names(features, command[index + 1])
+            index += 2
+            continue
+        if token.startswith("--features="):
+            _append_feature_names(features, token[len("--features=") :])
+            index += 1
+            continue
+        if token.startswith("-F") and token != "-F":
+            value = token[2:]
+            if value.startswith("="):
+                value = value[1:]
+            _append_feature_names(features, value)
+            index += 1
+            continue
+        if token == "--no-default-features":
+            no_default = True
+            index += 1
+            continue
+        if token.startswith("--no-default-features="):
+            raise GateError("receipt", "receipt_command")
+        if token == "--all-features":
+            all_features = True
+            index += 1
+            continue
+        if token.startswith("--all-features="):
+            raise GateError("receipt", "receipt_command")
+        if token == "--target":
+            _need(index + 1 < len(command), "receipt", "receipt_command")
+            _need(bool(command[index + 1]), "receipt", "receipt_command")
+            targets.append(command[index + 1])
+            index += 2
+            continue
+        if token.startswith("--target="):
+            value = token[len("--target=") :]
+            _need(bool(value), "receipt", "receipt_command")
+            targets.append(value)
+            index += 1
+            continue
+        if token in _VALUE_OPTIONS:
+            _need(index + 1 < len(command), "receipt", "receipt_command")
+            index += 2
+            continue
+        if token.startswith("--"):
+            name, separator, value = token.partition("=")
+            if name in _VALUE_OPTIONS:
+                _need(bool(separator) and bool(value), "receipt", "receipt_command")
+                index += 1
+                continue
+            _need(
+                not separator and token in _BOOLEAN_OPTIONS,
+                "receipt",
+                "receipt_command",
+            )
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            short = token[:2]
+            if short in _SHORT_VALUE_OPTIONS:
+                if len(token) > 2:
+                    value = token[2:]
+                    if value.startswith("="):
+                        value = value[1:]
+                    _need(bool(value), "receipt", "receipt_command")
+                    index += 1
+                    continue
+                _need(index + 1 < len(command), "receipt", "receipt_command")
+                index += 2
+                continue
+            _need(token in _SHORT_BOOLEAN_OPTIONS, "receipt", "receipt_command")
+            index += 1
+            continue
+        _need(token == "test", "receipt", "receipt_command")
+        index += 1
+    return {
+        "features": features,
+        "targets": targets,
+        "no_default_features": no_default,
+        "all_features": all_features,
+    }
+
+
+def _validate_command_selection(
+    command, declared_features, declared_no_default, expected_target=None
+):
+    """Bind argv selectors to the receipt metadata that names the artifact."""
+    parsed = _parse_command_selection(command)
+    declared = sorted(declared_features)
+    _need(not parsed["all_features"], "receipt", "receipt_command")
+    _need(
+        parsed["no_default_features"] is bool(declared_no_default),
+        "receipt",
+        "receipt_command",
+    )
+    _need(set(parsed["features"]) == set(declared), "receipt", "receipt_command")
+    targets = set(parsed["targets"])
+    _need(len(targets) <= 1, "receipt", "receipt_command")
+    if targets:
+        _need(
+            expected_target is not None and targets == {expected_target},
+            "receipt",
+            "receipt_command",
+        )
+
+
 def _sha256(value):
     return isinstance(value, str) and _SHA256.fullmatch(value) is not None
 
@@ -195,6 +369,9 @@ def _validate_legacy_v1_library(payload):
         "receipt_fresh_artifact",
     )
     _validate_command(payload.get("command"))
+    _validate_command_selection(
+        payload["command"], ("pando-lab",), False, expected_target=None
+    )
     _need(
         isinstance(payload.get("rustc"), str) and payload["rustc"].strip(),
         "receipt",
@@ -230,6 +407,12 @@ def _validate_v2_library(validated):
         "receipt",
         "receipt_invalid",
     )
+    _validate_command_selection(
+        payload["command"],
+        features["enabled"],
+        features["no_default_features"],
+        expected_target=payload.get("target_triple"),
+    )
     _need(payload.get("profile") == "test", "receipt", "receipt_invalid")
     executable_rows = [
         row
@@ -262,7 +445,8 @@ def _validate_v2_library(validated):
         and cargo.get("commit_hash") == CARGO_FORK_COMMIT
         and cargo.get("release") == CARGO_FORK_RELEASE
         and isinstance(rustc, dict)
-        and rustc.get("release") == RUSTC_RELEASE,
+        and rustc.get("release") == RUSTC_RELEASE
+        and rustc.get("host") == payload.get("target_triple"),
         "receipt",
         "receipt_invalid",
     )
