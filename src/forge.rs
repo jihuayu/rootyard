@@ -4,7 +4,7 @@ pub(crate) mod assignees;
 #[path = "forge/backend.rs"]
 mod backend;
 #[path = "forge/comments.rs"]
-mod comments;
+pub(crate) mod comments;
 #[path = "forge/handlers.rs"]
 pub(crate) mod handlers;
 #[path = "forge/label_targets.rs"]
