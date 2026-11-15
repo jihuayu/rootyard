@@ -158,8 +158,9 @@ class ReceiptTests(unittest.TestCase):
             "integration_test_source": "tests/ref_store_operations.rs",
             "profile": "test",
             "features": {"enabled": ["pando-lab"], "no_default_features": False},
-            "command": ["cargo", "test", "--test", "ref_store_operations",
-                        "--features", "pando-lab", "--message-format=json-render-diagnostics"],
+            "command": ["cargo", "rustc", "--locked", "--profile", "test",
+                        "--test", "ref_store_operations", "--features", "pando-lab",
+                        "--message-format=json-render-diagnostics"],
         }
 
     def tearDown(self):
@@ -243,13 +244,14 @@ class ReceiptTests(unittest.TestCase):
                                          self.root, HEAD)
         self.assertEqual(raised.exception.code, "wrong_target_features")
         bad_command = list(self.payload["command"])
-        bad_command.remove("ref_store_operations")
+        test_index = bad_command.index("--test")
+        del bad_command[test_index:test_index + 2]
         with mock.patch.object(runner.receipts, "load_receipt",
                                return_value=self.fake_receipt(command=bad_command)):
             with self.assertRaises(runner.RunnerError) as raised:
                 runner._receipt_identity("ref_store_operations", self.binary, self.receipt,
                                          self.root, HEAD)
-        self.assertEqual(raised.exception.code, "command_target_mismatch")
+        self.assertEqual(raised.exception.code, "command_test_target_mismatch")
         wrong_artifact = self.fake_receipt()
         wrong_artifact.artifacts = [{"target": "other", "kind": "test"}]
         with mock.patch.object(runner.receipts, "load_receipt", return_value=wrong_artifact):
@@ -257,6 +259,81 @@ class ReceiptTests(unittest.TestCase):
                 runner._receipt_identity("ref_store_operations", self.binary, self.receipt,
                                          self.root, HEAD)
         self.assertEqual(raised.exception.code, "target_artifact_mismatch")
+
+
+class CommandSemanticsTests(unittest.TestCase):
+    def assert_command(self, command, code=None):
+        cfg = inventory.TARGETS["ref_store_operations"]
+        if code is None:
+            runner.validate_target_build_command(command, "ref_store_operations", cfg)
+        else:
+            with self.assertRaises(runner.RunnerError) as raised:
+                runner.validate_target_build_command(command, "ref_store_operations", cfg)
+            self.assertEqual(raised.exception.code, code)
+
+    def test_real_producer_and_canonical_test_argv_are_positive(self):
+        positives = [
+            ["cargo", "rustc", "--locked", "--profile", "test",
+             "--test", "ref_store_operations", "--features", "pando-lab",
+             "--message-format=json-render-diagnostics"],
+            ["cargo", "--config", "profile.dev.package.rootyard.debug=0",
+             "--config", "profile.test.package.rootyard.debug=0",
+             "rustc", "--locked", "--profile", "test", "--test", "ref_store_operations",
+             "--features", "pando-lab", "--message-format=json-render-diagnostics"],
+            ["/trusted/bin/cargo", "build", "--locked", "--profile", "test",
+             "--config", "build.target-dir = \"/tmp/target\"", "--test", "ref_store_operations",
+             "--features", "pando-lab", "--jobs", "2", "--bin", "rootyard"],
+            ["cargo", "test", "--no-run", "--test", "ref_store_operations",
+             "--features", "pando-lab"],
+            ["cargo", "test", "--no-run", "--test=ref_store_operations",
+             "--features=pando-lab", "--locked", "--offline"],
+        ]
+        for command in positives:
+            with self.subTest(command=command):
+                self.assert_command(command)
+
+    def test_review_mutants_and_ambiguous_argv_are_rejected(self):
+        base = ["cargo", "rustc", "--locked", "--profile", "test",
+                "--test", "ref_store_operations", "--features", "pando-lab",
+                "--message-format=json-render-diagnostics"]
+        cases = [
+            (base + ["--release"], "command_release_forbidden"),
+            (base + ["--profile", "dev"], "command_ambiguous_flag"),
+            (["cargo", "rustc", "--locked", "--profile", "dev", "--test",
+              "ref_store_operations", "--features", "pando-lab"], "command_profile_mismatch"),
+            (base + ["--all-features"], "command_all_features_forbidden"),
+            (base + ["--features", "pando-lab,extra"], "command_ambiguous_flag"),
+            (["cargo", "rustc", "--locked", "--profile", "test", "--test",
+              "ref_store_operations", "--features", "other"], "command_features_mismatch"),
+            (base + ["--no-default-features"], "command_no_default_forbidden"),
+            (["cargo", "check", "--locked", "--profile", "test", "--test",
+              "ref_store_operations", "--features", "pando-lab"], "command_not_test_build"),
+            (["cargo", "test", "--test", "ref_store_operations",
+              "--features", "pando-lab"], "command_no_run_required"),
+            (["cargo", "build", "--locked", "--test", "ref_store_operations",
+              "--features", "pando-lab"], "command_profile_mismatch"),
+            (base + ["--no-run"], "command_no_run_unsupported"),
+            (["cargo", "rustc", "--locked", "--profile", "test", "--test", "other",
+              "--features", "pando-lab"], "command_test_target_mismatch"),
+            (["cargo", "rustc", "--locked", "--profile", "test", "--test",
+              "ref_store_operations", "--test", "ref_store_operations",
+              "--features", "pando-lab"], "command_ambiguous_flag"),
+            (base + ["--unsupported"], "command_unsupported_flag"),
+            (["cargo", "rustc", "--locked", "--profile", "test", "--test",
+              "ref_store_operations", "--features", "pando-lab,"], "command_features_invalid"),
+            (base + ["--message-format", "json"], "command_ambiguous_flag"),
+        ]
+        for command, code in cases:
+            with self.subTest(code=code, command=command):
+                self.assert_command(command, code)
+
+    def test_receipt_command_mutation_is_rejected(self):
+        command = ["cargo", "rustc", "--locked", "--profile", "dev", "--test",
+                   "ref_store_operations", "--features", "pando-lab"]
+        cfg = inventory.TARGETS["ref_store_operations"]
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_target_build_command(command, "ref_store_operations", cfg)
+        self.assertEqual(raised.exception.code, "command_profile_mismatch")
 
 
 class InputClosureTests(unittest.TestCase):

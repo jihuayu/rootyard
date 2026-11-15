@@ -94,6 +94,127 @@ def _required_environment(target):
     _require(not missing, "missing_required_environment")
 
 
+def validate_target_build_command(command, target, cfg):
+    """Validate the narrow Cargo argv forms emitted by the native preparers.
+
+    Supported positive producers are build_native_test (`cargo rustc --locked
+    --profile test --test TARGET ...`), build_native_batch (`cargo build
+    --locked --profile test ... --test TARGET ...`) and a canonical
+    `cargo test --no-run --test TARGET ...`. Cargo may be an absolute trusted
+    executable. Only the emitted flag vocabulary is accepted; duplicate or
+    contradictory forms fail closed.
+    """
+    _require(isinstance(command, list) and bool(command)
+             and all(isinstance(arg, str) and bool(arg) for arg in command),
+             "command_invalid_argv")
+    _require(Path(command[0]).name in ("cargo", "cargo.exe"), "command_cargo_missing")
+    command_index = 1
+    subcommand = None
+    seen = set()
+    test_targets = []
+    features = None
+    profile = None
+    no_default_features = False
+    all_features = False
+    release = False
+    no_run = False
+
+    def value_at(index, token, name):
+        flag, separator, inline = token.partition("=")
+        _require(flag == name, "command_unsupported_flag")
+        if separator:
+            return inline, index + 1
+        _require(index + 1 < len(command) and not command[index + 1].startswith("--"),
+                 "command_missing_value")
+        return command[index + 1], index + 2
+
+    while command_index < len(command):
+        token = command[command_index]
+        name, separator, inline = token.partition("=")
+        if subcommand is None:
+            if not separator and token in ("rustc", "build", "test"):
+                subcommand = token
+                command_index += 1
+                continue
+            if name == "--config":
+                value, command_index = value_at(command_index, token, "--config")
+                _require(bool(value), "command_missing_value")
+                continue
+            _fail("command_not_test_build")
+
+        if name in ("--config",):
+            value, command_index = value_at(command_index, token, "--config")
+            _require(bool(value), "command_missing_value")
+            continue
+        if name in ("--locked", "--offline"):
+            _require(not separator, "command_ambiguous_flag")
+            _require(name not in seen, "command_ambiguous_flag")
+            seen.add(name)
+            command_index += 1
+            continue
+        if name in ("--release", "--all-features", "--no-default-features", "--no-run"):
+            _require(not separator, "command_ambiguous_flag")
+            _require(name not in seen, "command_ambiguous_flag")
+            seen.add(name)
+            if name == "--release":
+                release = True
+            elif name == "--all-features":
+                all_features = True
+            elif name == "--no-default-features":
+                no_default_features = True
+            else:
+                no_run = True
+            command_index += 1
+            continue
+        if name in ("--test", "--features", "--profile", "--message-format", "--bin", "--jobs"):
+            value, command_index = value_at(command_index, token, name)
+            _require(bool(value), "command_missing_value")
+            if name == "--test":
+                _require(not test_targets, "command_ambiguous_flag")
+                test_targets.append(value)
+            elif name == "--features":
+                _require(features is None, "command_ambiguous_flag")
+                features = value
+            elif name == "--profile":
+                _require(profile is None, "command_ambiguous_flag")
+                profile = value
+            elif name == "--jobs":
+                _require(name not in seen, "command_ambiguous_flag")
+                _require(re.fullmatch(r"[1-9][0-9]*", value) is not None, "command_jobs_invalid")
+                seen.add(name)
+            elif name == "--message-format":
+                _require(name not in seen, "command_ambiguous_flag")
+                seen.add(name)
+            elif name == "--bin":
+                # A batch may build dependency binaries alongside the selected test.
+                pass
+            continue
+        _fail("command_unsupported_flag")
+
+    _require(subcommand in ("rustc", "build", "test"), "command_not_test_build")
+    if subcommand == "test":
+        _require(no_run, "command_no_run_required")
+    else:
+        _require(not no_run, "command_no_run_unsupported")
+    _require(not release, "command_release_forbidden")
+    if profile is not None:
+        _require(profile == "test", "command_profile_mismatch")
+    elif subcommand != "test":
+        _fail("command_profile_mismatch")
+    _require(not all_features, "command_all_features_forbidden")
+    if cfg["no_default_features"] is False:
+        _require(not no_default_features, "command_no_default_forbidden")
+    _require(len(test_targets) == 1, "command_test_target_mismatch")
+    _require(test_targets[0] == target, "command_test_target_mismatch")
+    _require(features is not None, "command_missing_features")
+    parsed = features.split(",")
+    _require(parsed and all(part and part == part.strip() for part in parsed),
+             "command_features_invalid")
+    _require(len(parsed) == len(set(parsed)), "command_features_invalid")
+    _require(set(parsed) == set(cfg["features"]), "command_features_mismatch")
+    return command
+
+
 def _receipt_identity(target, binary, receipt, source_root, source_head):
     cfg = inventory.TARGETS[target]
     _require(Path(receipt).resolve() == Path(binary).with_suffix(".build.json").resolve(),
@@ -124,8 +245,7 @@ def _receipt_identity(target, binary, receipt, source_root, source_head):
     _require(features.get("no_default_features") is cfg["no_default_features"],
              "wrong_target_default_features")
     command = payload.get("command")
-    _require(isinstance(command, list), "invalid_target_command")
-    _require(target in command and "--test" in command, "command_target_mismatch")
+    validate_target_build_command(command, target, cfg)
     artifacts = [row for row in validated.artifacts
                  if isinstance(row, dict) and row.get("target") == target
                  and row.get("kind") == "test"]
