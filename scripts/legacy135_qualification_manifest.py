@@ -194,6 +194,18 @@ def collect(args):
 
     candidate_receipt = receipt_identity(args.candidate_receipt, "candidate")
     producer_receipt = receipt_identity(args.producer_receipt, "producer")
+    candidate_receipt_sha = candidate.get("receipt_sha256")
+    producer_receipt_sha = producer.get("receipt_sha256")
+    require(isinstance(candidate_receipt_sha, str) and
+            SHA256.fullmatch(candidate_receipt_sha) is not None,
+            "candidate_qualification_receipt_sha_invalid")
+    require(isinstance(producer_receipt_sha, str) and
+            SHA256.fullmatch(producer_receipt_sha) is not None,
+            "producer_qualification_receipt_sha_invalid")
+    require(candidate_receipt["sha256"] == candidate_receipt_sha,
+            "candidate_receipt_digest_mismatch")
+    require(producer_receipt["sha256"] == producer_receipt_sha,
+            "producer_receipt_digest_mismatch")
     require(candidate_receipt["sha256"] != producer_receipt["sha256"],
             "receipt_roles_reused")
     require(candidate_receipt["path"] != producer_receipt["path"],

@@ -106,15 +106,19 @@ class CollectorTest(unittest.TestCase):
         qualification_value = (qualification() if qualification_value is None
                                else qualification_value)
         provider_value = provider() if provider_value is None else provider_value
-        qualification_value["provider"] = provider_value
-        self.qualification.write_text(json.dumps(qualification_value))
-        self.provider_report.write_text(json.dumps(provider_value))
         candidate_path = candidate_path or self.candidate_receipt
         producer_path = producer_path or self.producer_receipt
         candidate_path.write_text(json.dumps(
             candidate_receipt() if candidate_value is None else candidate_value))
         producer_path.write_text(json.dumps(
             producer_receipt() if producer_value is None else producer_value))
+        qualification_value["provider"] = provider_value
+        qualification_value["candidate"]["receipt_sha256"] = (
+            collector.sha256_file(candidate_path))
+        qualification_value["producer"]["receipt_sha256"] = (
+            collector.sha256_file(producer_path))
+        self.qualification.write_text(json.dumps(qualification_value))
+        self.provider_report.write_text(json.dumps(provider_value))
 
     def args(self, candidate_path=None, producer_path=None):
         return argparse.Namespace(
@@ -144,6 +148,12 @@ class CollectorTest(unittest.TestCase):
                          list(collector.CASE_NAMES))
         self.assertEqual(manifest["candidate"]["binary_sha256"], CANDIDATE_SHA)
         self.assertEqual(manifest["producer"]["binary_sha256"], PRODUCER_SHA)
+        self.assertEqual(
+            manifest["candidate"]["receipt_sha256"],
+            collector.sha256_file(self.candidate_receipt))
+        self.assertEqual(
+            manifest["producer"]["receipt_sha256"],
+            collector.sha256_file(self.producer_receipt))
         self.assertTrue(manifest["receipts_role_separated"])
         self.assertFalse(manifest["raw_logs_uploaded"])
         self.assertFalse(manifest["archive_bytes_uploaded"])
@@ -172,6 +182,44 @@ class CollectorTest(unittest.TestCase):
         fmt = qualification()
         fmt["target"]["format"] = 20
         self.reject("target_format_invalid", qualification_value=fmt)
+
+    def test_mutated_candidate_receipt_bytes_are_rejected(self):
+        self.write()
+        changed = candidate_receipt()
+        changed["note"] = "changed receipt bytes"
+        self.candidate_receipt.write_text(json.dumps(changed))
+        with self.assertRaises(collector.CollectorError) as caught:
+            collector.collect(self.args())
+        self.assertEqual(caught.exception.code,
+                         "candidate_receipt_digest_mismatch")
+
+    def test_mutated_producer_receipt_bytes_are_rejected(self):
+        self.write()
+        changed = producer_receipt()
+        changed["note"] = "changed receipt bytes"
+        self.producer_receipt.write_text(json.dumps(changed))
+        with self.assertRaises(collector.CollectorError) as caught:
+            collector.collect(self.args())
+        self.assertEqual(caught.exception.code,
+                         "producer_receipt_digest_mismatch")
+
+    def test_qualification_receipt_digests_are_mandatory_sha256(self):
+        for role, code in (
+            ("candidate", "candidate_qualification_receipt_sha_invalid"),
+            ("producer", "producer_qualification_receipt_sha_invalid"),
+        ):
+            for value in (None, "not-a-sha256"):
+                with self.subTest(role=role, value=value):
+                    self.write()
+                    payload = json.loads(self.qualification.read_text())
+                    if value is None:
+                        payload[role].pop("receipt_sha256")
+                    else:
+                        payload[role]["receipt_sha256"] = value
+                    self.qualification.write_text(json.dumps(payload))
+                    with self.assertRaises(collector.CollectorError) as caught:
+                        collector.collect(self.args())
+                    self.assertEqual(caught.exception.code, code)
 
     def test_candidate_and_producer_receipts_must_stay_role_separated(self):
         wrong_candidate = candidate_receipt()
