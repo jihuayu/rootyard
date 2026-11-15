@@ -90,7 +90,7 @@ pub async fn serving_actor_with_scopes(
         client
             .execute(
                 "INSERT INTO token_repository_scopes(token_id,repository_id,action) VALUES($1,$2,$3)",
-                &[&token_id, &repo_id, *action],
+                &[&token_id, &repo_id, action],
             )
             .await?;
     }
@@ -115,7 +115,7 @@ pub async fn grant_collaborator(pool: &Pool, repo_id: Uuid, tenant_id: Uuid, use
         .execute(
             "INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role)
              VALUES($1,$2,$3,$4)",
-            &[&repo_id, &tenant_id, &user_id, role],
+            &[&repo_id, &tenant_id, &user_id, &role],
         )
         .await?;
     Ok(())
