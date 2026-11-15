@@ -11,11 +11,18 @@ Acceptance is fail-closed:
 
 * ``ROOTYARD_TEST_DATABASE_URL`` must be non-empty, because the Rust case
   otherwise returns success without exercising PostgreSQL;
-* the adjacent original receipt must be a genuine Fresh=false
-  ``rust-library-test`` with a relocated artifact, a rebuilt package, exactly
-  one ``lib-test`` Fresh=false artifact for ``rootyard``, the library-test
-  command shape, and digests matching the current binary, production source,
-  lib-test support inputs, ``Cargo.lock`` and clean HEAD;
+* the adjacent original receipt is read only through the shared
+  ``native_build_receipt`` v1/v2 reader.  Historical v1 receipts keep their
+  exact legacy semantics: a rebuilt package, one Fresh=false ``rootyard``
+  ``lib-test`` artifact, the library-test command shape and matching digests.
+  v2 receipts instead require the selected ``lib-test`` artifact to be
+  ``rootyard`` from ``src/lib.rs`` with the CI ``test`` profile and
+  ``pando-lab`` features, the pinned full Cargo/Rust toolchain, and a clean
+  current HEAD whose source, lib-test support, ``Cargo.lock`` and complete
+  bound inventory all match the receipt.  Actual v2 ``fresh`` booleans are
+  reported literally (true, false or mixed), never forced to false;
+* the receipt's recorded v2 source snapshot is reported separately from the
+  digest recomputed from this checkout, so it is never forged into "current";
 * the direct process is bounded, and the parsed output must contain exactly one
   passed case with the exact libtest name, zero failed and zero ignored.  An
   exit status of zero with zero executed tests is refused;
@@ -29,6 +36,7 @@ commit.  Because this digest differs from the CLI server binary, callers bind it
 with a separate ``scripts/native_report_manifest.py --mode job`` manifest.
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -37,8 +45,18 @@ import re
 import subprocess
 import sys
 
-from build_native import ROOT, source_digest
-from build_native_test import git_state, lib_test_support_digest, sha256_file
+import native_build_receipt as receipt_contract
+
+# Shared-reader entry points are module attributes so focused tests can replace
+# the environment probes with deterministic fixtures without a builder import.
+git_state = receipt_contract.git_state
+source_digest = receipt_contract.source_digest
+sha256_file = receipt_contract.sha256_file
+
+ROOT = Path(__file__).resolve().parents[1]
+CARGO_FORK_COMMIT = "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"
+CARGO_FORK_RELEASE = "1.101.0"
+RUSTC_RELEASE = "1.99.1"
 
 CASE = "sandbox::runner::tests::start_gate_serializes_context_removal_under_policy_fence"
 REPORT_KIND = "rootyard/pg-start-gate-report"
@@ -146,30 +164,22 @@ def _validate_command(command):
     )
 
 
-def load_receipt(receipt_path, binary, expected_commit=None):
-    """Read and validate the original rust-library-test receipt without rewriting it."""
-    receipt_path = Path(receipt_path)
-    binary = Path(binary)
-    _need(
-        receipt_path.is_file() and not receipt_path.is_symlink(),
-        "receipt",
-        "receipt_missing",
-    )
-    _need(
-        binary.is_file() and os.access(binary, os.X_OK) and not binary.is_symlink(),
-        "receipt",
-        "binary_missing",
-    )
-    try:
-        data = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raise GateError("receipt", "receipt_invalid") from None
-    _need(isinstance(data, dict), "receipt", "receipt_invalid")
-    _need(data.get("kind") == "rust-library-test", "receipt", "receipt_kind")
-    _need(data.get("relocated_artifact") is True, "receipt", "receipt_not_relocated")
-    _need(data.get("package_rebuilt") is True, "receipt", "receipt_not_rebuilt")
-    _need(data.get("fresh") is False, "receipt", "receipt_fresh_artifact")
-    artifacts = data.get("fresh_false_artifacts")
+def _sha256(value):
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
+def _validate_legacy_v1_library(payload):
+    """Keep the exact issue-#35 v1 library-test semantics.
+
+    v1 receipts are historical evidence: they must still say the package was
+    rebuilt from a non-fresh Cargo artifact and carry the original relocated
+    executable digest.  No v2 rule is ever applied to them.
+    """
+    _need(payload.get("kind") == "rust-library-test", "receipt", "receipt_kind")
+    _need(payload.get("relocated_artifact") is True, "receipt", "receipt_not_relocated")
+    _need(payload.get("package_rebuilt") is True, "receipt", "receipt_not_rebuilt")
+    _need(payload.get("fresh") is False, "receipt", "receipt_fresh_artifact")
+    artifacts = payload.get("fresh_false_artifacts")
     _need(
         isinstance(artifacts, list) and len(artifacts) == 1,
         "receipt",
@@ -184,24 +194,18 @@ def load_receipt(receipt_path, binary, expected_commit=None):
         "receipt",
         "receipt_fresh_artifact",
     )
-    _validate_command(data.get("command"))
+    _validate_command(payload.get("command"))
     _need(
-        isinstance(data.get("rustc"), str) and data["rustc"].strip(),
+        isinstance(payload.get("rustc"), str) and payload["rustc"].strip(),
         "receipt",
         "receipt_invalid",
     )
     _need(
-        isinstance(data.get("workspace_commit"), str)
-        and _COMMIT.fullmatch(data["workspace_commit"]) is not None,
+        isinstance(payload.get("workspace_commit"), str)
+        and _COMMIT.fullmatch(payload["workspace_commit"]) is not None,
         "receipt",
         "receipt_invalid",
     )
-    if expected_commit:
-        _need(
-            data["workspace_commit"] == expected_commit,
-            "receipt",
-            "stale_receipt",
-        )
     for field in (
         "source_inputs_sha256",
         "lib_test_support_inputs_sha256",
@@ -209,64 +213,185 @@ def load_receipt(receipt_path, binary, expected_commit=None):
         "binary_sha256",
         "original_artifact_sha256",
     ):
-        _need(
-            isinstance(data.get(field), str)
-            and _SHA256.fullmatch(data[field]) is not None,
-            "receipt",
-            "receipt_invalid",
-        )
-    actual_binary = sha256_file(binary)
+        _need(_sha256(payload.get(field)), "receipt", "receipt_invalid")
+
+
+def _validate_v2_library(validated):
+    """Bind the shared v2 reader to the exact selected lib-test artifact."""
+    payload = validated.payload
+    _need(payload.get("kind") == "rust-library-test", "receipt", "receipt_kind")
+    _need(payload.get("relocated_artifact") is True, "receipt", "receipt_not_relocated")
+    _validate_command(payload.get("command"))
+    features = payload.get("features")
     _need(
-        data["binary_sha256"] == actual_binary
-        and data["original_artifact_sha256"] == actual_binary,
+        isinstance(features, dict)
+        and features.get("enabled") == ["pando-lab"]
+        and features.get("no_default_features") is False,
         "receipt",
-        "binary_mismatch",
+        "receipt_invalid",
     )
-    return {
-        "kind": data["kind"],
-        "binary_sha256": actual_binary,
-        "original_artifact_sha256": data["original_artifact_sha256"],
-        "workspace_commit": data["workspace_commit"],
-        "source_inputs_sha256": data["source_inputs_sha256"],
-        "lib_test_support_inputs_sha256": data["lib_test_support_inputs_sha256"],
-        "cargo_lock_sha256": data["cargo_lock_sha256"],
-        "command": list(data["command"]),
-        "rustc": data["rustc"],
-        "fresh_false_artifacts": [
-            {"target": "rootyard", "kind": "lib-test", "fresh": False}
-        ],
-    }
+    _need(payload.get("profile") == "test", "receipt", "receipt_invalid")
+    executable_rows = [
+        row
+        for row in validated.artifacts
+        if row.get("kind") in receipt_contract.EXECUTABLE_KINDS
+    ]
+    _need(len(executable_rows) == 1, "receipt", "receipt_invalid")
+    artifact = executable_rows[0]
+    _need(
+        artifact.get("kind") == "lib-test"
+        and artifact.get("target") == "rootyard"
+        and artifact.get("source") == "src/lib.rs"
+        and artifact.get("profile", {}).get("test") is True,
+        "receipt",
+        "receipt_invalid",
+    )
+    _need(
+        all(row.get("kind") == "lib" for row in validated.artifacts if row is not artifact),
+        "receipt",
+        "receipt_invalid",
+    )
+    _need(_sha256(payload.get("lib_test_support_inputs_sha256")), "receipt", "receipt_invalid")
+    _need(_sha256(payload.get("cargo_lock_sha256")), "receipt", "receipt_invalid")
+    toolchain = validated.toolchain
+    _need(toolchain is not None, "receipt", "receipt_invalid")
+    cargo = toolchain.get("cargo")
+    rustc = toolchain.get("rustc")
+    _need(
+        isinstance(cargo, dict)
+        and cargo.get("commit_hash") == CARGO_FORK_COMMIT
+        and cargo.get("release") == CARGO_FORK_RELEASE
+        and isinstance(rustc, dict)
+        and rustc.get("release") == RUSTC_RELEASE,
+        "receipt",
+        "receipt_invalid",
+    )
+
+
+def load_receipt(receipt_path, binary, expected_commit=None):
+    """Read the receipt through the shared v1/v2 reader without rewriting it."""
+    receipt_path = Path(receipt_path)
+    binary = Path(binary)
+    _need(
+        receipt_path.is_file() and not receipt_path.is_symlink(),
+        "receipt",
+        "receipt_missing",
+    )
+    _need(
+        binary.is_file() and os.access(binary, os.X_OK) and not binary.is_symlink(),
+        "receipt",
+        "binary_missing",
+    )
+    try:
+        raw = receipt_path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError):
+        raise GateError("receipt", "receipt_invalid") from None
+    _need(isinstance(payload, dict), "receipt", "receipt_invalid")
+    schema_v2 = "receipt_schema" in payload
+    actual_binary = sha256_file(binary)
+    if not schema_v2:
+        _validate_legacy_v1_library(payload)
+        if expected_commit:
+            _need(payload["workspace_commit"] == expected_commit, "receipt", "stale_receipt")
+        _need(
+            payload["binary_sha256"] == actual_binary
+            and payload["original_artifact_sha256"] == actual_binary,
+            "receipt",
+            "binary_mismatch",
+        )
+    else:
+        _need(_sha256(payload.get("binary_sha256")), "receipt", "receipt_invalid")
+        _need(payload["binary_sha256"] == actual_binary, "receipt", "binary_mismatch")
+        if expected_commit:
+            _need(payload.get("workspace_commit") == expected_commit, "receipt", "stale_receipt")
+    try:
+        validated = receipt_contract.validate_receipt(
+            payload,
+            source_root=None,
+            receipt_path=receipt_path,
+            receipt_sha256=receipt_contract.sha256_bytes(raw),
+            binary_path=binary,
+            expected_commit=expected_commit,
+            verify_source_files=False,
+        )
+    except receipt_contract.ReceiptError:
+        raise GateError("receipt", "receipt_invalid") from None
+    if schema_v2:
+        _validate_v2_library(validated)
+    else:
+        _need(validated.schema == "v1", "receipt", "receipt_invalid")
+    return validated
+
+
+def _support_digest():
+    """The exact test-support digest over the shared v2 bound inventory."""
+    entries, _blobs = receipt_contract.bound_input_inventory(ROOT)
+    digest = hashlib.sha256()
+    for entry in sorted(
+        (item for item in entries if item["role"] == "test_support" and item["present"]),
+        key=lambda item: item["path"],
+    ):
+        digest.update(entry["path"].encode() + b"\0")
+        digest.update(bytes.fromhex(entry["sha256"]))
+    return digest.hexdigest()
+
+
+def lib_test_support_digest():
+    return _support_digest()
 
 
 def current_state(receipt, receipt_path, binary, expected_commit=None):
-    """Revalidate the receipt against the current checkout and return safe hashes."""
+    """Revalidate the receipt against the current checkout and return safe hashes.
+
+    For v2 the report keeps the receipt's recorded source snapshot separate from
+    the digest recomputed from this checkout.  The two are compared as a strict
+    freshness guard, but the recorded value is never relabelled as "current".
+    """
     try:
-        head, status = git_state()
+        state = git_state(ROOT)
     except Exception:
         raise GateError("source", "git_unavailable") from None
+    head = state.get("head") if isinstance(state, dict) else None
+    status = state.get("status") if isinstance(state, dict) else None
     _need(isinstance(head, str) and bool(head) and status is not None, "source", "git_unavailable")
     _need(not status.strip(), "source", "worktree_dirty")
     if expected_commit:
         _need(head == expected_commit, "source", "stale_receipt")
-    _need(head == receipt["workspace_commit"], "source", "stale_receipt")
+    _need(head == receipt.workspace_commit, "source", "stale_receipt")
+    payload = receipt.payload
     try:
-        source = source_digest()
+        source = source_digest(ROOT)
         support = lib_test_support_digest()
         cargo_lock = sha256_file(Path(ROOT) / "Cargo.lock")
         binary_digest = sha256_file(binary)
         receipt_digest = sha256_file(receipt_path)
     except Exception:
         raise GateError("source", "source_unavailable") from None
-    _need(source == receipt["source_inputs_sha256"], "source", "source_drift")
-    _need(support == receipt["lib_test_support_inputs_sha256"], "source", "support_drift")
-    _need(cargo_lock == receipt["cargo_lock_sha256"], "source", "cargo_lock_drift")
-    _need(binary_digest == receipt["binary_sha256"], "source", "binary_mismatch")
+    _need(source == receipt.source_inputs_sha256, "source", "source_drift")
+    _need(support == payload["lib_test_support_inputs_sha256"], "source", "support_drift")
+    _need(cargo_lock == payload["cargo_lock_sha256"], "source", "cargo_lock_drift")
+    _need(binary_digest == receipt.binary_sha256, "source", "binary_mismatch")
+    bound_inputs_digest = None
+    if receipt.schema == "v2":
+        try:
+            entries, blobs = receipt_contract.bound_input_inventory(ROOT)
+            summary = receipt_contract.bound_inputs_summary(entries, blobs)
+            current_config = receipt_contract.config_digest(entries, blobs)
+        except Exception:
+            raise GateError("source", "source_unavailable") from None
+        _need(summary == payload.get("bound_inputs"), "source", "source_drift")
+        _need(current_config == receipt.config_digest, "source", "source_drift")
+        bound_inputs_digest = summary["digest"]
     return {
+        "schema": receipt.schema,
         "head": head,
         "binary_sha256": binary_digest,
         "source_inputs_sha256": source,
+        "receipt_source_inputs_sha256": receipt.source_inputs_sha256,
         "lib_test_support_inputs_sha256": support,
         "cargo_lock_sha256": cargo_lock,
+        "bound_inputs_digest": bound_inputs_digest,
         "receipt_sha256": receipt_digest,
     }
 
@@ -325,6 +450,10 @@ def compare_immutable(start, end):
         "cargo_lock": start["cargo_lock_sha256"] == end["cargo_lock_sha256"],
         "receipt": start["receipt_sha256"] == end["receipt_sha256"],
         "head": start["head"] == end["head"],
+        "schema": start["schema"] == end["schema"],
+        "receipt_source": start["receipt_source_inputs_sha256"]
+        == end["receipt_source_inputs_sha256"],
+        "bound_inputs": start.get("bound_inputs_digest") == end.get("bound_inputs_digest"),
     }
     if not all(checks.values()):
         raise GateError("immutable", "immutable_drift")
@@ -337,28 +466,87 @@ def _public_snapshot(snapshot):
     return {
         key: snapshot[key]
         for key in (
+            "schema",
             "head",
             "binary_sha256",
             "source_inputs_sha256",
+            "receipt_source_inputs_sha256",
             "lib_test_support_inputs_sha256",
             "cargo_lock_sha256",
+            "bound_inputs_digest",
             "receipt_sha256",
         )
     }
 
 
+def _fresh_rollup(rows):
+    if not rows:
+        return None
+    values = {row["fresh"] for row in rows}
+    if values == {True}:
+        return True
+    if values == {False}:
+        return False
+    return "mixed"
+
+
 def _receipt_summary(receipt):
     if receipt is None:
         return None
-    return {
-        "kind": receipt["kind"],
-        "fresh": False,
-        "relocated_artifact": True,
-        "package_rebuilt": True,
-        "fresh_false_artifacts": list(receipt["fresh_false_artifacts"]),
-        "command": list(receipt["command"]),
-        "rustc": receipt["rustc"],
+    payload = receipt.payload
+    summary = {
+        "schema": receipt.schema,
+        "kind": payload.get("kind"),
+        "relocated_artifact": payload.get("relocated_artifact"),
+        "command": list(payload["command"]),
     }
+    if receipt.schema == "v1":
+        summary.update(
+            {
+                "fresh": False,
+                "package_rebuilt": True,
+                "fresh_false_artifacts": [
+                    {
+                        "target": row["target"],
+                        "kind": row["kind"],
+                        "fresh": row["fresh"],
+                    }
+                    for row in payload["fresh_false_artifacts"]
+                ],
+                "rustc": payload["rustc"],
+            }
+        )
+    else:
+        artifacts = [
+            {
+                "target": row["target"],
+                "kind": row["kind"],
+                "fresh": row["fresh"],
+                "source": row["source"],
+            }
+            for row in receipt.artifacts
+        ]
+        toolchain = receipt.toolchain or {}
+        summary.update(
+            {
+                "fresh": _fresh_rollup(artifacts),
+                "cargo_artifacts": artifacts,
+                "features": dict(payload.get("features") or {}),
+                "profile": payload.get("profile"),
+                "target_triple": payload.get("target_triple"),
+                "toolchain": {
+                    "cargo": {
+                        key: toolchain.get("cargo", {}).get(key)
+                        for key in ("release", "commit_hash")
+                    },
+                    "rustc": {
+                        key: toolchain.get("rustc", {}).get(key)
+                        for key in ("release", "commit_hash")
+                    },
+                },
+            }
+        )
+    return summary
 
 
 def _test_record(command, timeout, result):
@@ -408,6 +596,12 @@ def build_report(
         "source_inputs_sha256": (
             snapshot["source_inputs_sha256"] if snapshot is not None else None
         ),
+        "receipt_schema": (
+            snapshot["schema"] if snapshot is not None else None
+        ),
+        "receipt_source_inputs_sha256": (
+            snapshot["receipt_source_inputs_sha256"] if snapshot is not None else None
+        ),
         "lib_test_support_inputs_sha256": (
             snapshot["lib_test_support_inputs_sha256"] if snapshot is not None else None
         ),
@@ -418,7 +612,7 @@ def build_report(
             snapshot["receipt_sha256"] if snapshot is not None else None
         ),
         "receipt_workspace_commit": (
-            receipt["workspace_commit"] if receipt is not None else None
+            receipt.workspace_commit if receipt is not None else None
         ),
         "receipt": _receipt_summary(receipt),
         "start": _public_snapshot(start),
@@ -439,7 +633,8 @@ def _safe_binary_digest(binary):
 
 def _safe_head():
     try:
-        head, _ = git_state()
+        state = git_state(ROOT)
+        head = state.get("head") if isinstance(state, dict) else None
         return head if isinstance(head, str) and head else None
     except Exception:
         return None

@@ -35,7 +35,8 @@ def workflow_batch_manifest_anchor_arguments():
     """Extract the job-mode collector's anchor flags from the real CI command."""
     text = CI_YML.read_text(encoding="utf-8")
     marker = "python3 scripts/native_report_manifest.py --mode job"
-    start = text.index(marker)
+    anchor = "--manifest-out test-results/native-pr-gate.json"
+    start = text.rindex(marker, 0, text.index(anchor))
     end = text.find("\n      - name:", start)
     command = text[start:] if end == -1 else text[start:end]
     tokens = shlex.split(command.replace("\\\n", " "))

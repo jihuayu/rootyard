@@ -75,6 +75,8 @@ def claimed_checkout_assertion():
 
 def snapshot(**overrides):
     value = {
+        "schema": "v1",
+        "source_binding": "v1_current_source",
         "head": "a" * 40,
         "clean": True,
         "binary_sha256": "b" * 64,
@@ -82,6 +84,7 @@ def snapshot(**overrides):
         "receipt_sha256": "d" * 64,
         "receipt_workspace_commit": "a" * 40,
         "receipt_source_inputs_sha256": "c" * 64,
+        "source_snapshot_matches_current": True,
         "inputs": {
             "tests/ci_trust_boundaries.py": "e" * 64,
             "scripts/build_native.py": "f" * 64,
@@ -382,6 +385,66 @@ class ReportBindingMappingTest(unittest.TestCase):
                     with self.assertRaises(module.ReportError) as raised:
                         module.capture_provenance("rootyard")
                 self.assertEqual(raised.exception.code, code)
+
+
+    def test_capture_provenance_dispatches_v1_and_v2_identities_without_faking_current(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "rootyard"
+            binary.write_bytes(b"binary")
+            receipt = Path(directory) / "rootyard.build.json"
+            receipt.write_bytes(b"receipt")
+            v1_binding = {
+                "schema": "v1",
+                "binary_sha256": "b" * 64,
+                "current_source_inputs_sha256": "c" * 64,
+                "source_inputs_sha256": "c" * 64,
+                "workspace_commit": "a" * 40,
+            }
+            v2_binding = {
+                "schema": "v2",
+                "binary_sha256": "b" * 64,
+                "source_inputs_sha256": "c" * 64,
+                "workspace_commit": "a" * 40,
+            }
+
+            def git_output(*args):
+                return "a" * 40 if args[:2] == ("rev-parse", "HEAD") else ""
+
+            with mock.patch.object(
+                module.source_bound_binary, "bind", return_value=v1_binding
+            ), mock.patch.object(
+                module.source_bound_binary, "_git", side_effect=git_output
+            ), mock.patch.object(
+                module, "_digest_provenance_inputs", return_value={"x": "y"}
+            ):
+                v1 = module.capture_provenance(str(binary))
+            self.assertEqual(v1["schema"], "v1")
+            self.assertEqual(v1["source_binding"], "v1_current_source")
+            self.assertEqual(v1["source_inputs_sha256"], "c" * 64)
+
+            with mock.patch.object(
+                module.source_bound_binary, "bind", return_value=v2_binding
+            ), mock.patch.object(
+                module.source_bound_binary, "_git", side_effect=git_output
+            ), mock.patch.object(
+                module.source_bound_binary,
+                "production_source_digest",
+                return_value="e" * 64,
+            ), mock.patch.object(
+                module, "_digest_provenance_inputs", return_value={"x": "y"}
+            ):
+                v2 = module.capture_provenance(str(binary))
+                self.assertEqual(v2["schema"], "v2")
+                self.assertEqual(v2["source_binding"], "v2_recorded_snapshot")
+                self.assertEqual(v2["source_inputs_sha256"], "e" * 64)
+                self.assertEqual(v2["receipt_source_inputs_sha256"], "c" * 64)
+                self.assertFalse(v2["source_snapshot_matches_current"])
+                with self.assertRaises(module.ReportError) as raised:
+                    module.capture_provenance(str(binary), expected_commit="a" * 40)
+                self.assertEqual(raised.exception.code, "source_drift")
 
 
 if __name__ == "__main__":

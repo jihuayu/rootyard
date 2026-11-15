@@ -25,6 +25,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+import native_build_receipt as receipts  # noqa: E402
 import run_pg_start_gate as gate  # noqa: E402
 
 CASE = gate.CASE
@@ -60,8 +61,21 @@ class GateRunnerTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "repo"
         self.root.mkdir()
-        (self.root / "Cargo.lock").write_text("lock\n")
+        for relative, content in (
+            ("Cargo.toml", '[package]\nname = "rootyard"\n'),
+            ("Cargo.lock", "lock\n"),
+            ("build.rs", "fn main() {}\n"),
+            ("src/lib.rs", "pub fn gate() {}\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.1"\n'),
+            ("experimental/pando/schema.sql", "create table pando_gate();\n"),
+            ("tests/fixtures/gate.txt", "support\n"),
+        ):
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
         self.lock_digest = hashlib.sha256(b"lock\n").hexdigest()
+        self.v2_bound = None
         self.head = "a" * 40
         self.source = "b" * 64
         self.support = "c" * 64
@@ -138,7 +152,119 @@ class GateRunnerTest(unittest.TestCase):
         data.update(overrides)
         self.receipt.write_text(json.dumps(data, indent=2) + "\n")
 
-    def run_gate(self, extra=None, env=None):
+    def write_v2_toolchain(self):
+        toolchain_dir = self.root / "toolchain"
+        toolchain_dir.mkdir(exist_ok=True)
+        for name in ("cargo", "rustc", "rustup"):
+            (toolchain_dir / name).write_bytes(("fake-" + name).encode())
+
+        def identity(name, release, commit_hash):
+            executable = toolchain_dir / name
+            return {
+                "executable": str(executable),
+                "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+                "version": f"{name} {release} (fixture 2026-01-01)",
+                "release": release,
+                "commit_hash": commit_hash,
+                "commit_date": "2026-01-01",
+                "host": "aarch64-unknown-linux-gnu",
+            }
+
+        return {
+            "cargo": identity("cargo", "1.101.0", gate.CARGO_FORK_COMMIT),
+            "rustc": dict(
+                identity("rustc", "1.99.1", "d" * 40),
+                path_entry=str(toolchain_dir / "rustc"),
+                proxy=False,
+            ),
+            "rustup": {
+                "executable": str(toolchain_dir / "rustup"),
+                "executable_sha256": hashlib.sha256(
+                    (toolchain_dir / "rustup").read_bytes()
+                ).hexdigest(),
+                "resolved_rustc": str(toolchain_dir / "rustc"),
+                "resolved_rustc_sha256": hashlib.sha256(
+                    (toolchain_dir / "rustc").read_bytes()
+                ).hexdigest(),
+            },
+            "target_triple": "aarch64-unknown-linux-gnu",
+            "pinned_channel": "1.99.1",
+            "pin_source": "rust-toolchain.toml",
+        }
+
+    def write_v2_receipt(self, fresh=False, lib_fresh=None):
+        self.write_v2_toolchain()
+        bound = receipts.capture_bound_inputs(self.root, environ={"PATH": ""})
+        self.v2_bound = bound
+
+        def artifact(kind, source, executable, artifact_fresh):
+            event = {
+                "reason": "compiler-artifact",
+                "package_id": "rootyard 0.1.0",
+                "target": {
+                    "name": "rootyard",
+                    "kind": ["lib"],
+                    "src_path": str(source),
+                },
+                "profile": {
+                    "opt_level": "0",
+                    "debuginfo": 2,
+                    "debug_assertions": True,
+                    "overflow_checks": True,
+                    "test": kind == "lib-test",
+                },
+                "fresh": artifact_fresh,
+            }
+            if executable is not None:
+                event["executable"] = str(executable)
+            return receipts.cargo_artifact_record(event, self.root, kind=kind)
+
+        artifacts = [
+            artifact("lib-test", self.root / "src/lib.rs", self.binary, fresh)
+        ]
+        if lib_fresh is not None:
+            artifacts.insert(
+                0,
+                artifact("lib", self.root / "src/lib.rs", None, lib_fresh),
+            )
+        support = hashlib.sha256()
+        for entry in sorted(
+            (item for item in bound["bound_input_inventory"]
+             if item["role"] == "test_support" and item["present"]),
+            key=lambda item: item["path"],
+        ):
+            support.update(entry["path"].encode() + b"\0")
+            support.update(bytes.fromhex(entry["sha256"]))
+        payload = receipts.make_receipt_v2(
+            binary_path=self.binary,
+            command=[
+                "cargo",
+                "test",
+                "--locked",
+                "--features",
+                "pando-lab",
+                "--lib",
+                "--no-run",
+                "--message-format=json-render-diagnostics",
+            ],
+            profile="test",
+            artifacts=artifacts,
+            toolchain=self.write_v2_toolchain(),
+            bound_inputs=bound,
+            workspace_commit=self.head,
+            target_dir=self.root / "target",
+            features="pando-lab",
+            extra={
+                "kind": "rust-library-test",
+                "relocated_artifact": True,
+                "original_artifact_sha256": self.binary_digest(),
+                "lib_test_support_inputs_sha256": support.hexdigest(),
+            },
+        )
+        self.receipt.write_text(json.dumps(payload, indent=2) + "\n")
+        return payload
+
+    def run_gate(self, extra=None, env=None, source=None, support=None):
         argv = [
             "--test-binary",
             str(self.binary),
@@ -164,14 +290,20 @@ class GateRunnerTest(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(gate, "ROOT", self.root))
             stack.enter_context(
-                mock.patch.object(gate, "git_state", return_value=(self.head, ""))
+                mock.patch.object(
+                gate, "git_state", return_value={"head": self.head, "status": "", "clean": True}
             )
-            stack.enter_context(
-                mock.patch.object(gate, "source_digest", return_value=self.source)
             )
             stack.enter_context(
                 mock.patch.object(
-                    gate, "lib_test_support_digest", return_value=self.support
+                    gate, "source_digest",
+                    return_value=self.source if source is None else source,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    gate, "lib_test_support_digest",
+                    return_value=self.support if support is None else support,
                 )
             )
             stack.enter_context(mock.patch.dict(os.environ, environment, clear=False))
@@ -397,6 +529,196 @@ class GateRunnerTest(unittest.TestCase):
         self.assertEqual(data["binary_sha256"], report["binary_sha256"])
         self.assertEqual(data["source_commit"], self.head)
         self.assertEqual(data["reports"]["pg_start_gate"]["case_names"], [CASE])
+
+
+
+    def test_v2_receipt_executes_and_records_actual_true_false_and_mixed(self):
+        bound = self.write_v2_receipt(fresh=False)
+        code, stdout, stderr, report = self.run_gate(
+            source=bound["source_inputs_sha256"],
+            support=report_support(bound),
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["receipt_schema"], "v2")
+        self.assertEqual(report["source_inputs_sha256"], bound["source_inputs_sha256"])
+        self.assertEqual(
+            report["receipt_source_inputs_sha256"], bound["source_inputs_sha256"]
+        )
+        self.assertFalse(report["receipt"]["fresh"])
+        self.assertEqual(report["receipt"]["cargo_artifacts"][0]["fresh"], False)
+        self.assertEqual(
+            report["receipt"]["toolchain"]["cargo"]["commit_hash"],
+            gate.CARGO_FORK_COMMIT,
+        )
+
+        bound = self.write_v2_receipt(fresh=True)
+        code, stdout, stderr, report = self.run_gate(
+            source=bound["source_inputs_sha256"],
+            support=report_support(bound),
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(report["receipt"]["fresh"])
+        self.assertEqual(report["receipt"]["cargo_artifacts"][0]["fresh"], True)
+
+        bound = self.write_v2_receipt(fresh=True, lib_fresh=False)
+        code, stdout, stderr, report = self.run_gate(
+            source=bound["source_inputs_sha256"],
+            support=report_support(bound),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(report["receipt"]["fresh"], "mixed")
+        self.assertEqual(
+            [row["fresh"] for row in report["receipt"]["cargo_artifacts"]],
+            [False, True],
+        )
+        self.assert_report_has_no_secret(report, stdout, stderr)
+
+    def test_v2_identity_refusals_are_typed_and_safe(self):
+        cases = (
+            ("kind", lambda payload: payload.__setitem__("kind", "rust-integration-test"), "receipt_kind"),
+            (
+                "target",
+                lambda payload: payload["cargo_artifacts"][0].__setitem__("target", "other"),
+                "receipt_invalid",
+            ),
+            (
+                "source",
+                lambda payload: payload["cargo_artifacts"][0].__setitem__(
+                    "source", "src/main.rs"
+                ),
+                "receipt_invalid",
+            ),
+            (
+                "toolchain",
+                lambda payload: payload["toolchain"]["cargo"].__setitem__(
+                    "commit_hash", "e" * 40
+                ),
+                "receipt_invalid",
+            ),
+            (
+                "features",
+                lambda payload: payload["features"].__setitem__("enabled", []),
+                "receipt_invalid",
+            ),
+            (
+                "profile",
+                lambda payload: payload.__setitem__("profile", "dev"),
+                "receipt_invalid",
+            ),
+            (
+                "freshness",
+                lambda payload: payload["cargo_artifacts"][0].__setitem__(
+                    "fresh", "true"
+                ),
+                "receipt_invalid",
+            ),
+        )
+        for name, mutate, code_name in cases:
+            with self.subTest(name=name):
+                payload = self.write_v2_receipt(fresh=False)
+                mutate(payload)
+                self.receipt.write_text(json.dumps(payload, indent=2) + "\n")
+                code, stdout, stderr, report = self.run_gate(
+                    source=payload["source_inputs_sha256"],
+                    support=report_support(self.v2_bound),
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    report["failure"], {"stage": "receipt", "code": code_name}
+                )
+                self.assertIsNone(self.argv_lines())
+                self.assert_report_has_no_secret(report, stdout, stderr)
+
+    def test_v2_source_support_lock_and_config_drift_are_refused(self):
+        bound = self.write_v2_receipt(fresh=False)
+        code, stdout, stderr, report = self.run_gate(
+            source="d" * 64, support=report_support(bound)
+        )
+        self.assertEqual(report["failure"], {"stage": "source", "code": "source_drift"})
+        code, stdout, stderr, report = self.run_gate(
+            source=bound["source_inputs_sha256"], support="d" * 64
+        )
+        self.assertEqual(report["failure"], {"stage": "source", "code": "support_drift"})
+
+        original = gate.sha256_file
+
+        def fake_digest(path):
+            if Path(path).name == "Cargo.lock":
+                return "d" * 64
+            return original(path)
+
+        with mock.patch.object(gate, "sha256_file", side_effect=fake_digest):
+            code, stdout, stderr, report = self.run_gate(
+                source=bound["source_inputs_sha256"], support=report_support(bound)
+            )
+        self.assertEqual(
+            report["failure"], {"stage": "source", "code": "cargo_lock_drift"}
+        )
+
+        (self.root / "src/lib.rs").write_text("pub fn changed() {}\n")
+        code, stdout, stderr, report = self.run_gate(
+            source=bound["source_inputs_sha256"], support=report_support(bound)
+        )
+        self.assertEqual(report["failure"], {"stage": "source", "code": "source_drift"})
+
+    def test_v2_report_is_accepted_by_an_independent_job_manifest(self):
+        bound = self.write_v2_receipt(fresh=False)
+        code, stdout, stderr, report = self.run_gate(
+            source=bound["source_inputs_sha256"], support=report_support(bound)
+        )
+        self.assertEqual(code, 0)
+
+        manifest = self.root / "native-pg-start-gate-v2.json"
+        command = [
+            sys.executable,
+            str(ROOT / "scripts/native_report_manifest.py"),
+            "--mode",
+            "job",
+            "--manifest-out",
+            str(manifest),
+            "--build-receipt",
+            str(self.receipt),
+            "--binary",
+            str(self.binary),
+            "--expect-commit",
+            self.head,
+            "--report",
+            f"pg_start_gate={self.report}",
+            "--require-case",
+            f"pg_start_gate={CASE}",
+            "--harness",
+            str(ROOT / "scripts/run_pg_start_gate.py"),
+            "--harness",
+            str(ROOT / "scripts/native_build_receipt.py"),
+        ]
+        process = subprocess.run(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        data = json.loads(manifest.read_text())
+        self.assertEqual(data["status"], "passed")
+        self.assertEqual(data["build_receipt"]["receipt_schema"], "v2")
+
+
+def report_support(bound):
+    digest = hashlib.sha256()
+    for entry in sorted(
+        (
+            item
+            for item in bound["bound_input_inventory"]
+            if item["role"] == "test_support" and item["present"]
+        ),
+        key=lambda item: item["path"],
+    ):
+        digest.update(entry["path"].encode() + b"\0")
+        digest.update(bytes.fromhex(entry["sha256"]))
+    return digest.hexdigest()
 
 
 if __name__ == "__main__":

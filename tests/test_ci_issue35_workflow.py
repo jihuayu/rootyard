@@ -204,6 +204,7 @@ class Issue35CiWorkflowTest(unittest.TestCase):
                 "tests/ops_provenance.py",
                 "tests/test_ci_trust_boundaries_privacy.py",
                 "scripts/native_report_manifest.py",
+                "scripts/native_build_receipt.py",
                 "scripts/build_native.py",
                 "scripts/build_native_batch.py",
                 ".github/workflows/ci.yml",

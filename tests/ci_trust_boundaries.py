@@ -117,6 +117,7 @@ PROVENANCE_INPUTS = (
     "tests/ops_provenance.py",
     "tests/test_ci_trust_boundaries_privacy.py",
     "scripts/native_report_manifest.py",
+    "scripts/native_build_receipt.py",
     "scripts/build_native.py",
     "scripts/build_native_batch.py",
     ".github/workflows/ci.yml",
@@ -1416,6 +1417,8 @@ def capture_provenance(binary, expected_commit=None):
         raise ReportError("git_state_unavailable")
     if status:
         raise ReportError("worktree_dirty")
+    if expected_commit is not None and head != expected_commit:
+        raise ReportError("stale_receipt")
     receipt = Path(binary).resolve().with_suffix(".build.json")
     if not receipt.is_file():
         raise ReportError("receipt_missing")
@@ -1423,15 +1426,40 @@ def capture_provenance(binary, expected_commit=None):
         receipt_sha256 = ops_provenance.sha256_file(receipt)
     except OSError:
         raise ReportError("receipt_invalid") from None
+    schema = binding.get("schema")
+    if schema == "v2":
+        # A v2 receipt records an immutable source snapshot.  Record the
+        # digest recomputed from this checkout separately; never relabel the
+        # receipt's snapshot as the current digest.
+        try:
+            current_source_inputs = source_bound_binary.production_source_digest()
+        except Exception:
+            raise ReportError("source_unavailable") from None
+        receipt_source_inputs = binding["source_inputs_sha256"]
+        if expected_commit is not None and current_source_inputs != receipt_source_inputs:
+            raise ReportError("source_drift")
+        source_inputs = current_source_inputs
+        source_binding = "v2_recorded_snapshot"
+    elif schema == "v1":
+        source_inputs = binding["current_source_inputs_sha256"]
+        receipt_source_inputs = binding["source_inputs_sha256"]
+        source_binding = "v1_current_source"
+    else:
+        raise ReportError("source_binding_failed")
     inputs = _digest_provenance_inputs()
     return {
+        "schema": schema,
+        "source_binding": source_binding,
         "head": head,
         "clean": True,
         "binary_sha256": binding["binary_sha256"],
-        "source_inputs_sha256": binding["current_source_inputs_sha256"],
+        "source_inputs_sha256": source_inputs,
         "receipt_sha256": receipt_sha256,
         "receipt_workspace_commit": binding["workspace_commit"],
-        "receipt_source_inputs_sha256": binding["source_inputs_sha256"],
+        "receipt_source_inputs_sha256": receipt_source_inputs,
+        "source_snapshot_matches_current": (
+            source_inputs == receipt_source_inputs
+        ),
         "inputs": inputs,
         "inputs_sha256": _collate_inputs(inputs),
     }
@@ -1458,12 +1486,16 @@ def _public_snapshot(snapshot):
     return {
         key: snapshot[key]
         for key in (
+            "schema",
+            "source_binding",
             "head",
             "clean",
             "binary_sha256",
             "source_inputs_sha256",
             "receipt_sha256",
             "receipt_workspace_commit",
+            "receipt_source_inputs_sha256",
+            "source_snapshot_matches_current",
             "inputs_sha256",
         )
     }
@@ -1577,6 +1609,13 @@ def build_report(start, end, run_result, harness, start_error=None, end_error=No
         ),
         "source_inputs_sha256": (
             start["source_inputs_sha256"] if start is not None else None
+        ),
+        "receipt_schema": start["schema"] if start is not None else None,
+        "source_binding": (
+            start["source_binding"] if start is not None else None
+        ),
+        "receipt_source_inputs_sha256": (
+            start["receipt_source_inputs_sha256"] if start is not None else None
         ),
         "build_receipt_sha256": start["receipt_sha256"] if start is not None else None,
         "receipt_workspace_commit": (

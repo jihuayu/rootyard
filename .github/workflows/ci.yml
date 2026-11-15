@@ -153,6 +153,7 @@ jobs:
             --harness scripts/build_native_test.py \
             --harness scripts/build_native.py \
             --harness scripts/native_report_manifest.py \
+            --harness scripts/native_build_receipt.py \
             --harness .github/workflows/ci.yml
       - name: Build native bins and RefStore fixtures in one batch
         timeout-minutes: 10
@@ -491,6 +492,7 @@ jobs:
             --harness tests/ops_provenance.py \
             --harness tests/test_ci_trust_boundaries_privacy.py \
             --harness scripts/native_report_manifest.py \
+            --harness scripts/native_build_receipt.py \
             --harness scripts/build_native_batch.py \
             --harness .github/workflows/ci.yml \
             --fixture postgres=postgres:17 \
