@@ -25939,7 +25939,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    INSERT INTO namespaces (id, slug, kind, user_id) VALUES (NEW.id, NEW.username, 'user', NEW.id);\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    INSERT INTO namespaces (id, slug, kind, user_id) VALUES (NEW.id, NEW.username, 'user', NEW.id);\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -25956,7 +25956,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nDECLARE intent JSONB;\r\nBEGIN\r\n    SELECT o.evidence->'intent' INTO intent FROM git_operations o\r\n    WHERE o.id=NEW.operation_id AND o.repository_id=NEW.repository_id\r\n      AND o.service_principal_id IS NOT NULL;\r\n    IF FOUND THEN\r\n        IF NEW.ref_name IS DISTINCT FROM (intent->>'retention_ref') OR\r\n           NEW.new_oid IS DISTINCT FROM (intent->>'target_oid') OR\r\n           NEW.ref_name IS DISTINCT FROM ('refs/rootyard-ci/jobs/' || (intent->>'job_id')) OR\r\n           NEW.storage_generation::text IS DISTINCT FROM (intent->>'storage_generation') THEN\r\n            RAISE EXCEPTION 'CI service operation ref differs from exact intent' USING ERRCODE='23514';\r\n        END IF;\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nDECLARE intent JSONB;\nBEGIN\n    SELECT o.evidence->'intent' INTO intent FROM git_operations o\n    WHERE o.id=NEW.operation_id AND o.repository_id=NEW.repository_id\n      AND o.service_principal_id IS NOT NULL;\n    IF FOUND THEN\n        IF NEW.ref_name IS DISTINCT FROM (intent->>'retention_ref') OR\n           NEW.new_oid IS DISTINCT FROM (intent->>'target_oid') OR\n           NEW.ref_name IS DISTINCT FROM ('refs/rootyard-ci/jobs/' || (intent->>'job_id')) OR\n           NEW.storage_generation::text IS DISTINCT FROM (intent->>'storage_generation') THEN\n            RAISE EXCEPTION 'CI service operation ref differs from exact intent' USING ERRCODE='23514';\n        END IF;\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -25973,7 +25973,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nDECLARE actor_user_id UUID; repo_owner_id UUID; repo_generation BIGINT; projected BOOLEAN := false;\r\nBEGIN\r\n    IF TG_TABLE_NAME='git_operations' THEN\r\n      IF NEW.service_principal_id IS NOT NULL THEN\r\n        IF NEW.actor_id IS NOT NULL OR NEW.token_id IS NOT NULL OR\r\n           NEW.actor_name IS DISTINCT FROM 'ci-scheduler' OR\r\n           NEW.outcome NOT IN ('unknown','recorded') OR\r\n           (NEW.evidence->>'kind') IS DISTINCT FROM 'observed_immutable_ci_root' OR\r\n           (NEW.evidence->'intent'->>'repository_id') IS DISTINCT FROM NEW.repository_id::text OR\r\n           (NEW.evidence->'intent'->>'storage_generation') IS DISTINCT FROM NEW.storage_generation::text OR\r\n           NOT COALESCE((NEW.evidence->'intent'->>'job_id') COLLATE \"C\" ~\r\n             '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',false) OR\r\n           NOT COALESCE((NEW.evidence->'intent'->>'target_oid') COLLATE \"C\" ~\r\n             '^([0-9a-f]{40}|[0-9a-f]{64})$',false) OR\r\n           (NEW.evidence->'intent'->>'retention_ref') IS DISTINCT FROM\r\n             ('refs/rootyard-ci/jobs/' || (NEW.evidence->'intent'->>'job_id')) OR\r\n           NOT EXISTS(SELECT 1 FROM ci_service_principals s\r\n               JOIN repositories r ON r.id=s.repository_id\r\n               WHERE s.id=NEW.service_principal_id AND s.repository_id=NEW.repository_id\r\n               AND s.kind='ci-pin' AND s.active AND r.state='ready'\r\n               AND r.storage_generation=NEW.storage_generation\r\n               AND (NEW.evidence->'intent'->>'owner_id')=r.owner_id::text\r\n               AND (s.issuer_webhook_id IS NULL OR EXISTS(\r\n                   SELECT 1 FROM forge_webhooks w JOIN forge_trusted_check_contexts b\r\n                     ON b.webhook_id=w.id AND b.repository_id=w.repository_id AND b.active\r\n                   WHERE w.id=s.issuer_webhook_id AND w.repository_id=s.repository_id AND w.active)))\r\n        THEN RAISE EXCEPTION 'invalid CI service principal operation' USING ERRCODE='23514';\r\n        END IF;\r\n        RETURN NEW;\r\n      END IF;\r\n      actor_user_id:=NEW.actor_id;\r\n    ELSE\r\n      actor_user_id:=NEW.author_id;\r\n    END IF;\r\n    SELECT owner_id,storage_generation INTO repo_owner_id,repo_generation FROM repositories WHERE id=NEW.repository_id;\r\n    IF repo_owner_id IS NULL THEN\r\n        RAISE EXCEPTION 'repository does not exist' USING ERRCODE='23503';\r\n    END IF;\r\n    IF TG_TABLE_NAME='git_operations' THEN\r\n      IF TG_OP='INSERT' THEN\r\n        projected := EXISTS (\r\n          SELECT 1 FROM git_ref_admissions a\r\n          WHERE a.writer_id=NEW.id AND a.repository_id=NEW.repository_id\r\n            AND a.actor_id=NEW.actor_id AND a.token_id=NEW.token_id\r\n            AND ((a.state='COMMITTED' AND NEW.outcome IN ('unknown','recorded'))\r\n              OR (a.state='ABORTED' AND NEW.outcome IN ('unknown','no_ref_changes'))))\r\n          AND (\r\n            (EXISTS (SELECT 1 FROM git_operations o WHERE o.id=NEW.id)\r\n             AND EXISTS (\r\n               SELECT 1 FROM git_operations o\r\n               WHERE o.id=NEW.id AND o.repository_id=NEW.repository_id\r\n                 AND o.actor_id IS NOT DISTINCT FROM NEW.actor_id\r\n                 AND o.token_id IS NOT DISTINCT FROM NEW.token_id\r\n                 AND o.service_principal_id IS NOT DISTINCT FROM NEW.service_principal_id\r\n                 AND o.actor_name=NEW.actor_name AND o.sequence=NEW.sequence\r\n                 AND o.storage_generation=NEW.storage_generation))\r\n            OR (NOT EXISTS (SELECT 1 FROM git_operations o WHERE o.id=NEW.id)\r\n                AND NEW.storage_generation=repo_generation));\r\n      ELSE\r\n        projected := OLD.id=NEW.id\r\n          AND OLD.repository_id=NEW.repository_id\r\n          AND OLD.actor_id IS NOT DISTINCT FROM NEW.actor_id\r\n          AND OLD.token_id IS NOT DISTINCT FROM NEW.token_id\r\n          AND OLD.service_principal_id IS NOT DISTINCT FROM NEW.service_principal_id\r\n          AND OLD.actor_name=NEW.actor_name\r\n          AND OLD.sequence=NEW.sequence\r\n          AND OLD.storage_generation=NEW.storage_generation\r\n          AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at\r\n          AND (OLD.outcome='unknown'\r\n            OR (OLD.outcome=NEW.outcome\r\n                AND NEW.evidence IS NOT DISTINCT FROM OLD.evidence\r\n                AND NEW.settled_at IS NOT DISTINCT FROM OLD.settled_at))\r\n          AND EXISTS (\r\n            SELECT 1 FROM git_ref_admissions a\r\n            WHERE a.writer_id=NEW.id AND a.repository_id=NEW.repository_id\r\n              AND a.actor_id=NEW.actor_id AND a.token_id=NEW.token_id\r\n              AND ((a.state='COMMITTED' AND NEW.outcome IN ('unknown','recorded'))\r\n                OR (a.state='ABORTED' AND NEW.outcome IN ('unknown','no_ref_changes'))));\r\n      END IF;\r\n      IF projected THEN RETURN NEW; END IF;\r\n    END IF;\r\n    IF EXISTS (SELECT 1 FROM namespaces WHERE id=repo_owner_id AND user_id=actor_user_id)\r\n       OR EXISTS (SELECT 1 FROM organization_memberships\r\n                  WHERE organization_id=repo_owner_id AND user_id=actor_user_id)\r\n       OR EXISTS (SELECT 1 FROM repository_collaborators\r\n                  WHERE repository_id=NEW.repository_id AND user_id=actor_user_id)\r\n       OR EXISTS (SELECT 1 FROM repository_team_members\r\n                  WHERE repository_id=NEW.repository_id AND user_id=actor_user_id)\r\n    THEN RETURN NEW; END IF;\r\n    RAISE EXCEPTION 'actor is not a member or collaborator of repository' USING ERRCODE='23514';\r\nEND ",
+      "source": "\nDECLARE actor_user_id UUID; repo_owner_id UUID; repo_generation BIGINT; projected BOOLEAN := false;\nBEGIN\n    IF TG_TABLE_NAME='git_operations' THEN\n      IF NEW.service_principal_id IS NOT NULL THEN\n        IF NEW.actor_id IS NOT NULL OR NEW.token_id IS NOT NULL OR\n           NEW.actor_name IS DISTINCT FROM 'ci-scheduler' OR\n           NEW.outcome NOT IN ('unknown','recorded') OR\n           (NEW.evidence->>'kind') IS DISTINCT FROM 'observed_immutable_ci_root' OR\n           (NEW.evidence->'intent'->>'repository_id') IS DISTINCT FROM NEW.repository_id::text OR\n           (NEW.evidence->'intent'->>'storage_generation') IS DISTINCT FROM NEW.storage_generation::text OR\n           NOT COALESCE((NEW.evidence->'intent'->>'job_id') COLLATE \"C\" ~\n             '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',false) OR\n           NOT COALESCE((NEW.evidence->'intent'->>'target_oid') COLLATE \"C\" ~\n             '^([0-9a-f]{40}|[0-9a-f]{64})$',false) OR\n           (NEW.evidence->'intent'->>'retention_ref') IS DISTINCT FROM\n             ('refs/rootyard-ci/jobs/' || (NEW.evidence->'intent'->>'job_id')) OR\n           NOT EXISTS(SELECT 1 FROM ci_service_principals s\n               JOIN repositories r ON r.id=s.repository_id\n               WHERE s.id=NEW.service_principal_id AND s.repository_id=NEW.repository_id\n               AND s.kind='ci-pin' AND s.active AND r.state='ready'\n               AND r.storage_generation=NEW.storage_generation\n               AND (NEW.evidence->'intent'->>'owner_id')=r.owner_id::text\n               AND (s.issuer_webhook_id IS NULL OR EXISTS(\n                   SELECT 1 FROM forge_webhooks w JOIN forge_trusted_check_contexts b\n                     ON b.webhook_id=w.id AND b.repository_id=w.repository_id AND b.active\n                   WHERE w.id=s.issuer_webhook_id AND w.repository_id=s.repository_id AND w.active)))\n        THEN RAISE EXCEPTION 'invalid CI service principal operation' USING ERRCODE='23514';\n        END IF;\n        RETURN NEW;\n      END IF;\n      actor_user_id:=NEW.actor_id;\n    ELSE\n      actor_user_id:=NEW.author_id;\n    END IF;\n    SELECT owner_id,storage_generation INTO repo_owner_id,repo_generation FROM repositories WHERE id=NEW.repository_id;\n    IF repo_owner_id IS NULL THEN\n        RAISE EXCEPTION 'repository does not exist' USING ERRCODE='23503';\n    END IF;\n    IF TG_TABLE_NAME='git_operations' THEN\n      IF TG_OP='INSERT' THEN\n        projected := EXISTS (\n          SELECT 1 FROM git_ref_admissions a\n          WHERE a.writer_id=NEW.id AND a.repository_id=NEW.repository_id\n            AND a.actor_id=NEW.actor_id AND a.token_id=NEW.token_id\n            AND ((a.state='COMMITTED' AND NEW.outcome IN ('unknown','recorded'))\n              OR (a.state='ABORTED' AND NEW.outcome IN ('unknown','no_ref_changes'))))\n          AND (\n            (EXISTS (SELECT 1 FROM git_operations o WHERE o.id=NEW.id)\n             AND EXISTS (\n               SELECT 1 FROM git_operations o\n               WHERE o.id=NEW.id AND o.repository_id=NEW.repository_id\n                 AND o.actor_id IS NOT DISTINCT FROM NEW.actor_id\n                 AND o.token_id IS NOT DISTINCT FROM NEW.token_id\n                 AND o.service_principal_id IS NOT DISTINCT FROM NEW.service_principal_id\n                 AND o.actor_name=NEW.actor_name AND o.sequence=NEW.sequence\n                 AND o.storage_generation=NEW.storage_generation))\n            OR (NOT EXISTS (SELECT 1 FROM git_operations o WHERE o.id=NEW.id)\n                AND NEW.storage_generation=repo_generation));\n      ELSE\n        projected := OLD.id=NEW.id\n          AND OLD.repository_id=NEW.repository_id\n          AND OLD.actor_id IS NOT DISTINCT FROM NEW.actor_id\n          AND OLD.token_id IS NOT DISTINCT FROM NEW.token_id\n          AND OLD.service_principal_id IS NOT DISTINCT FROM NEW.service_principal_id\n          AND OLD.actor_name=NEW.actor_name\n          AND OLD.sequence=NEW.sequence\n          AND OLD.storage_generation=NEW.storage_generation\n          AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at\n          AND (OLD.outcome='unknown'\n            OR (OLD.outcome=NEW.outcome\n                AND NEW.evidence IS NOT DISTINCT FROM OLD.evidence\n                AND NEW.settled_at IS NOT DISTINCT FROM OLD.settled_at))\n          AND EXISTS (\n            SELECT 1 FROM git_ref_admissions a\n            WHERE a.writer_id=NEW.id AND a.repository_id=NEW.repository_id\n              AND a.actor_id=NEW.actor_id AND a.token_id=NEW.token_id\n              AND ((a.state='COMMITTED' AND NEW.outcome IN ('unknown','recorded'))\n                OR (a.state='ABORTED' AND NEW.outcome IN ('unknown','no_ref_changes'))));\n      END IF;\n      IF projected THEN RETURN NEW; END IF;\n    END IF;\n    IF EXISTS (SELECT 1 FROM namespaces WHERE id=repo_owner_id AND user_id=actor_user_id)\n       OR EXISTS (SELECT 1 FROM organization_memberships\n                  WHERE organization_id=repo_owner_id AND user_id=actor_user_id)\n       OR EXISTS (SELECT 1 FROM repository_collaborators\n                  WHERE repository_id=NEW.repository_id AND user_id=actor_user_id)\n       OR EXISTS (SELECT 1 FROM repository_team_members\n                  WHERE repository_id=NEW.repository_id AND user_id=actor_user_id)\n    THEN RETURN NEW; END IF;\n    RAISE EXCEPTION 'actor is not a member or collaborator of repository' USING ERRCODE='23514';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -25990,7 +25990,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nDECLARE expected_length INTEGER;\r\nBEGIN\r\n    SELECT CASE object_format WHEN 'sha256' THEN 64 ELSE 40 END INTO expected_length\r\n      FROM repositories WHERE id = NEW.repository_id;\r\n    IF expected_length IS NULL THEN\r\n        RAISE EXCEPTION 'repository object format missing';\r\n    END IF;\r\n    IF TG_TABLE_NAME = 'forge_pulls' THEN\r\n        IF length(NEW.head_oid) <> expected_length OR length(NEW.base_oid) <> expected_length\r\n           OR (NEW.merge_commit_oid IS NOT NULL AND length(NEW.merge_commit_oid) <> expected_length) THEN\r\n            RAISE EXCEPTION 'pull object format differs from repository';\r\n        END IF;\r\n    ELSIF length(NEW.commit_oid) <> expected_length THEN\r\n        RAISE EXCEPTION 'commit object format differs from repository';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nDECLARE expected_length INTEGER;\nBEGIN\n    SELECT CASE object_format WHEN 'sha256' THEN 64 ELSE 40 END INTO expected_length\n      FROM repositories WHERE id = NEW.repository_id;\n    IF expected_length IS NULL THEN\n        RAISE EXCEPTION 'repository object format missing';\n    END IF;\n    IF TG_TABLE_NAME = 'forge_pulls' THEN\n        IF length(NEW.head_oid) <> expected_length OR length(NEW.base_oid) <> expected_length\n           OR (NEW.merge_commit_oid IS NOT NULL AND length(NEW.merge_commit_oid) <> expected_length) THEN\n            RAISE EXCEPTION 'pull object format differs from repository';\n        END IF;\n    ELSIF length(NEW.commit_oid) <> expected_length THEN\n        RAISE EXCEPTION 'commit object format differs from repository';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26007,7 +26007,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF TG_OP <> 'UPDATE' THEN\r\n        RAISE EXCEPTION 'CI checkout jobs and cancellation tombstones are permanent';\r\n    END IF;\r\n    IF ROW(NEW.repository_id, NEW.job_id, NEW.owner_id, NEW.plan,\r\n           NEW.issuer_token_id, NEW.credential_digest, NEW.expires_unix, NEW.created_at)\r\n       IS DISTINCT FROM\r\n       ROW(OLD.repository_id, OLD.job_id, OLD.owner_id, OLD.plan,\r\n           OLD.issuer_token_id, OLD.credential_digest, OLD.expires_unix, OLD.created_at)\r\n       OR (OLD.cancelled AND NOT NEW.cancelled)\r\n       OR (OLD.revoked AND NOT NEW.revoked) THEN\r\n        RAISE EXCEPTION 'CI checkout authority is immutable except monotonic cancellation/revocation';\r\n    END IF;\r\n    RETURN NEW;\r\nEND;\r\n",
+      "source": "\nBEGIN\n    IF TG_OP <> 'UPDATE' THEN\n        RAISE EXCEPTION 'CI checkout jobs and cancellation tombstones are permanent';\n    END IF;\n    IF ROW(NEW.repository_id, NEW.job_id, NEW.owner_id, NEW.plan,\n           NEW.issuer_token_id, NEW.credential_digest, NEW.expires_unix, NEW.created_at)\n       IS DISTINCT FROM\n       ROW(OLD.repository_id, OLD.job_id, OLD.owner_id, OLD.plan,\n           OLD.issuer_token_id, OLD.credential_digest, OLD.expires_unix, OLD.created_at)\n       OR (OLD.cancelled AND NOT NEW.cancelled)\n       OR (OLD.revoked AND NOT NEW.revoked) THEN\n        RAISE EXCEPTION 'CI checkout authority is immutable except monotonic cancellation/revocation';\n    END IF;\n    RETURN NEW;\nEND;\n",
       "strict": false,
       "volatility": "v"
     },
@@ -26024,7 +26024,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF OLD.role='admin' AND (TG_OP='DELETE' OR NEW.role<>'admin') THEN\r\n        PERFORM 1 FROM organizations WHERE id=OLD.organization_id FOR UPDATE;\r\n        IF NOT EXISTS (SELECT 1 FROM organization_memberships\r\n                       WHERE organization_id=OLD.organization_id AND user_id<>OLD.user_id AND role='admin') THEN\r\n            RAISE EXCEPTION 'cannot remove last organization administrator' USING ERRCODE='23514';\r\n        END IF;\r\n    END IF;\r\n    IF TG_OP='DELETE' THEN RETURN OLD; END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF OLD.role='admin' AND (TG_OP='DELETE' OR NEW.role<>'admin') THEN\n        PERFORM 1 FROM organizations WHERE id=OLD.organization_id FOR UPDATE;\n        IF NOT EXISTS (SELECT 1 FROM organization_memberships\n                       WHERE organization_id=OLD.organization_id AND user_id<>OLD.user_id AND role='admin') THEN\n            RAISE EXCEPTION 'cannot remove last organization administrator' USING ERRCODE='23514';\n        END IF;\n    END IF;\n    IF TG_OP='DELETE' THEN RETURN OLD; END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26041,7 +26041,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF NEW.repository_id <> OLD.repository_id\r\n       OR NEW.tenant_id <> OLD.tenant_id\r\n       OR NEW.object_format <> OLD.object_format\r\n       OR NEW.history_incarnation <> OLD.history_incarnation\r\n       OR NEW.authority_epoch <> OLD.authority_epoch\r\n       OR NEW.group_epoch <> OLD.group_epoch THEN\r\n        RAISE EXCEPTION 'ref_store_core_protocol_repos realm is immutable';\r\n    END IF;\r\n    IF OLD.decision_required AND NOT NEW.decision_required THEN\r\n        RAISE EXCEPTION 'decision_required is a one-way fence';\r\n    END IF;\r\n    IF NEW.roots_revision < OLD.roots_revision THEN\r\n        RAISE EXCEPTION 'roots_revision must be monotone';\r\n    END IF;\r\n    NEW.created_at := OLD.created_at;\r\n    NEW.updated_at := clock_timestamp();\r\n    RETURN NEW;\r\nEND;\r\n",
+      "source": "\nBEGIN\n    IF NEW.repository_id <> OLD.repository_id\n       OR NEW.tenant_id <> OLD.tenant_id\n       OR NEW.object_format <> OLD.object_format\n       OR NEW.history_incarnation <> OLD.history_incarnation\n       OR NEW.authority_epoch <> OLD.authority_epoch\n       OR NEW.group_epoch <> OLD.group_epoch THEN\n        RAISE EXCEPTION 'ref_store_core_protocol_repos realm is immutable';\n    END IF;\n    IF OLD.decision_required AND NOT NEW.decision_required THEN\n        RAISE EXCEPTION 'decision_required is a one-way fence';\n    END IF;\n    IF NEW.roots_revision < OLD.roots_revision THEN\n        RAISE EXCEPTION 'roots_revision must be monotone';\n    END IF;\n    NEW.created_at := OLD.created_at;\n    NEW.updated_at := clock_timestamp();\n    RETURN NEW;\nEND;\n",
       "strict": false,
       "volatility": "v"
     },
@@ -26058,7 +26058,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF TG_OP = 'DELETE' THEN\r\n        RAISE EXCEPTION 'a root id is never deleted or reused';\r\n    END IF;\r\n    IF TG_OP = 'INSERT' THEN\r\n        IF NOT ((NEW.state = 'active' AND NEW.last_generation = 1)\r\n             OR (NEW.state = 'released' AND NEW.last_generation = 2)) THEN\r\n            RAISE EXCEPTION 'root head must start active/1 or released/2';\r\n        END IF;\r\n        NEW.created_at := clock_timestamp();\r\n        NEW.updated_at := NEW.created_at;\r\n        RETURN NEW;\r\n    END IF;\r\n    IF NEW.repository_id <> OLD.repository_id\r\n       OR NEW.root_id <> OLD.root_id\r\n       OR NEW.tenant_id <> OLD.tenant_id\r\n       OR NEW.owner_id <> OLD.owner_id\r\n       OR NEW.purpose <> OLD.purpose\r\n       OR NEW.business_intent_digest <> OLD.business_intent_digest\r\n       OR NEW.register_digest <> OLD.register_digest THEN\r\n        RAISE EXCEPTION 'root head identity is immutable';\r\n    END IF;\r\n    IF NOT (OLD.state = 'active' AND OLD.last_generation = 1\r\n            AND NEW.state = 'released' AND NEW.last_generation = 2) THEN\r\n        RAISE EXCEPTION 'a root head only moves active/1 -> released/2';\r\n    END IF;\r\n    NEW.created_at := OLD.created_at;\r\n    NEW.updated_at := clock_timestamp();\r\n    RETURN NEW;\r\nEND;\r\n",
+      "source": "\nBEGIN\n    IF TG_OP = 'DELETE' THEN\n        RAISE EXCEPTION 'a root id is never deleted or reused';\n    END IF;\n    IF TG_OP = 'INSERT' THEN\n        IF NOT ((NEW.state = 'active' AND NEW.last_generation = 1)\n             OR (NEW.state = 'released' AND NEW.last_generation = 2)) THEN\n            RAISE EXCEPTION 'root head must start active/1 or released/2';\n        END IF;\n        NEW.created_at := clock_timestamp();\n        NEW.updated_at := NEW.created_at;\n        RETURN NEW;\n    END IF;\n    IF NEW.repository_id <> OLD.repository_id\n       OR NEW.root_id <> OLD.root_id\n       OR NEW.tenant_id <> OLD.tenant_id\n       OR NEW.owner_id <> OLD.owner_id\n       OR NEW.purpose <> OLD.purpose\n       OR NEW.business_intent_digest <> OLD.business_intent_digest\n       OR NEW.register_digest <> OLD.register_digest THEN\n        RAISE EXCEPTION 'root head identity is immutable';\n    END IF;\n    IF NOT (OLD.state = 'active' AND OLD.last_generation = 1\n            AND NEW.state = 'released' AND NEW.last_generation = 2) THEN\n        RAISE EXCEPTION 'a root head only moves active/1 -> released/2';\n    END IF;\n    NEW.created_at := OLD.created_at;\n    NEW.updated_at := clock_timestamp();\n    RETURN NEW;\nEND;\n",
       "strict": false,
       "volatility": "v"
     },
@@ -26109,7 +26109,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF TG_OP = 'DELETE' THEN\r\n        RAISE EXCEPTION 'roots quota counters are retained and cannot be deleted';\r\n    END IF;\r\n    IF NEW.roots < OLD.roots\r\n       OR NEW.root_oid_refs < OLD.root_oid_refs\r\n       OR NEW.pack_bindings < OLD.pack_bindings\r\n       OR NEW.receipts < OLD.receipts\r\n       OR NEW.logical_bytes < OLD.logical_bytes THEN\r\n        RAISE EXCEPTION 'roots quota counters are monotone';\r\n    END IF;\r\n    NEW.updated_at := clock_timestamp();\r\n    RETURN NEW;\r\nEND;\r\n",
+      "source": "\nBEGIN\n    IF TG_OP = 'DELETE' THEN\n        RAISE EXCEPTION 'roots quota counters are retained and cannot be deleted';\n    END IF;\n    IF NEW.roots < OLD.roots\n       OR NEW.root_oid_refs < OLD.root_oid_refs\n       OR NEW.pack_bindings < OLD.pack_bindings\n       OR NEW.receipts < OLD.receipts\n       OR NEW.logical_bytes < OLD.logical_bytes THEN\n        RAISE EXCEPTION 'roots quota counters are monotone';\n    END IF;\n    NEW.updated_at := clock_timestamp();\n    RETURN NEW;\nEND;\n",
       "strict": false,
       "volatility": "v"
     },
@@ -26126,7 +26126,7 @@
       "result": "TABLE(pack_id uuid, registration_id uuid, artifact_set_digest text)",
       "rows": 1000,
       "security_definer": false,
-      "source": "\r\n    SELECT p.pack_id, p.registration_id, p.artifact_set_digest\r\n    FROM ref_store_core_serving_read_packs p\r\n    JOIN ref_store_core_serving_reads r ON r.pin_id = p.pin_id\r\n    WHERE r.repository_id = p_repository_id\r\n      AND r.expires_at > clock_timestamp()\r\n    ORDER BY p.pack_id\r\n",
+      "source": "\n    SELECT p.pack_id, p.registration_id, p.artifact_set_digest\n    FROM ref_store_core_serving_read_packs p\n    JOIN ref_store_core_serving_reads r ON r.pin_id = p.pin_id\n    WHERE r.repository_id = p_repository_id\n      AND r.expires_at > clock_timestamp()\n    ORDER BY p.pack_id\n",
       "strict": false,
       "volatility": "s"
     },
@@ -26143,7 +26143,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF NEW.hold_count < OLD.hold_count\r\n        OR NEW.declared_bytes < OLD.declared_bytes\r\n        OR NEW.logical_bytes < OLD.logical_bytes\r\n        OR NEW.receipt_count < OLD.receipt_count THEN\r\n        RAISE EXCEPTION 'artifact hold retained admission counters cannot decrease';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF NEW.hold_count < OLD.hold_count\n        OR NEW.declared_bytes < OLD.declared_bytes\n        OR NEW.logical_bytes < OLD.logical_bytes\n        OR NEW.receipt_count < OLD.receipt_count THEN\n        RAISE EXCEPTION 'artifact hold retained admission counters cannot decrease';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26160,7 +26160,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'artifact hold ledger row is immutable';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'artifact hold ledger row is immutable';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26177,7 +26177,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'artifact hold ledger rows are permanent and cannot be deleted';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'artifact hold ledger rows are permanent and cannot be deleted';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26194,7 +26194,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'artifact hold ledger and quota rows are permanent and cannot be truncated';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'artifact hold ledger and quota rows are permanent and cannot be truncated';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26211,7 +26211,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF NEW.shard_id <> OLD.shard_id THEN\r\n        RAISE EXCEPTION 'artifact hold shard identity is immutable';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF NEW.shard_id <> OLD.shard_id THEN\n        RAISE EXCEPTION 'artifact hold shard identity is immutable';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26228,7 +26228,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF TG_TABLE_NAME = 'artifact_hold_repo_usage' THEN\r\n        IF NEW.repository_id <> OLD.repository_id OR NEW.tenant_id <> OLD.tenant_id THEN\r\n            RAISE EXCEPTION 'artifact hold repository usage identity is immutable';\r\n        END IF;\r\n    ELSIF NEW.tenant_id <> OLD.tenant_id THEN\r\n        RAISE EXCEPTION 'artifact hold tenant usage identity is immutable';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF TG_TABLE_NAME = 'artifact_hold_repo_usage' THEN\n        IF NEW.repository_id <> OLD.repository_id OR NEW.tenant_id <> OLD.tenant_id THEN\n            RAISE EXCEPTION 'artifact hold repository usage identity is immutable';\n        END IF;\n    ELSIF NEW.tenant_id <> OLD.tenant_id THEN\n        RAISE EXCEPTION 'artifact hold tenant usage identity is immutable';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26245,7 +26245,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n IF EXISTS(SELECT 1 FROM operation_resolutions WHERE operation_id=OLD.id) AND (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD) THEN\r\n  RAISE EXCEPTION 'resolved unknown operation history is immutable';\r\n END IF;\r\n IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;\r\nEND ",
+      "source": "\nBEGIN\n IF EXISTS(SELECT 1 FROM operation_resolutions WHERE operation_id=OLD.id) AND (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD) THEN\n  RAISE EXCEPTION 'resolved unknown operation history is immutable';\n END IF;\n IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26262,7 +26262,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN RAISE EXCEPTION 'recovery resolution records are immutable'; END ",
+      "source": "\nBEGIN RAISE EXCEPTION 'recovery resolution records are immutable'; END ",
       "strict": false,
       "volatility": "v"
     },
@@ -26279,7 +26279,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n IF (NEW.state,NEW.recovery_reason,NEW.storage_generation) IS DISTINCT FROM (OLD.state,OLD.recovery_reason,OLD.storage_generation) THEN\r\n  NEW.incident_revision := OLD.incident_revision+1;\r\n ELSE NEW.incident_revision := OLD.incident_revision;\r\n END IF;\r\n RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n IF (NEW.state,NEW.recovery_reason,NEW.storage_generation) IS DISTINCT FROM (OLD.state,OLD.recovery_reason,OLD.storage_generation) THEN\n  NEW.incident_revision := OLD.incident_revision+1;\n ELSE NEW.incident_revision := OLD.incident_revision;\n END IF;\n RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26296,7 +26296,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n IF EXISTS(SELECT 1 FROM operation_resolutions WHERE operation_id=NEW.operation_id) THEN RAISE EXCEPTION 'resolved unknown operation cannot publish events'; END IF;\r\n RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n IF EXISTS(SELECT 1 FROM operation_resolutions WHERE operation_id=NEW.operation_id) THEN RAISE EXCEPTION 'resolved unknown operation cannot publish events'; END IF;\n RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26313,7 +26313,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (SELECT 1 FROM ref_store_serving_repositories s WHERE s.repository_id = NEW.repository_id) THEN\r\n        RAISE EXCEPTION 'repository has a pg_refstore serving authority; % would be a second write authority', TG_TABLE_NAME;\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (SELECT 1 FROM ref_store_serving_repositories s WHERE s.repository_id = NEW.repository_id) THEN\n        RAISE EXCEPTION 'repository has a pg_refstore serving authority; % would be a second write authority', TG_TABLE_NAME;\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26330,7 +26330,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    -- TG_OP-safe: OLD is only valid for UPDATE/DELETE, NEW only for\r\n    -- INSERT/UPDATE, so every branch below reads exactly one of them.\r\n    IF TG_OP = 'INSERT' THEN\r\n        -- Readiness is only ever published by the provisioning transaction\r\n        -- after the matching gate/protocol/serving rows exist. A direct\r\n        -- INSERT of a ready pg_refstore row is always refused.\r\n        IF NEW.storage_backend = 'pg_refstore' AND NEW.state = 'ready' THEN\r\n            RAISE EXCEPTION 'a pg_refstore repository cannot be inserted ready; provisioning publishes readiness';\r\n        END IF;\r\n        RETURN NEW;\r\n    END IF;\r\n    IF TG_OP = 'DELETE' THEN\r\n        RETURN OLD;\r\n    END IF;\r\n    IF (OLD.storage_backend = 'pg_refstore' OR NEW.storage_backend = 'pg_refstore')\r\n       AND OLD.storage_backend <> NEW.storage_backend THEN\r\n        RAISE EXCEPTION 'the pg_refstore backend binding is immutable';\r\n    END IF;\r\n    IF OLD.storage_backend = 'pg_refstore' THEN\r\n        IF NEW.id <> OLD.id OR NEW.owner_id <> OLD.owner_id OR NEW.name <> OLD.name\r\n           OR NEW.object_format <> OLD.object_format THEN\r\n            RAISE EXCEPTION 'a pg_refstore repository identity (id/owner/name/object format) is immutable';\r\n        END IF;\r\n        IF OLD.state = 'ready' AND NEW.state <> 'ready' THEN\r\n            RAISE EXCEPTION 'a ready pg_refstore repository cannot leave ready';\r\n        END IF;\r\n    END IF;\r\n    IF NEW.storage_backend = 'pg_refstore' AND NEW.state = 'ready' AND OLD.state <> 'ready' THEN\r\n        IF NOT EXISTS (\r\n            SELECT 1 FROM ref_store_serving_repositories s\r\n            WHERE s.repository_id = NEW.id AND s.owner_id = NEW.owner_id\r\n              AND s.name = NEW.name AND s.object_format = NEW.object_format\r\n              AND s.state = 'ready'\r\n        ) THEN\r\n            RAISE EXCEPTION 'a pg_refstore repository cannot become ready before its serving binding is ready';\r\n        END IF;\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    -- TG_OP-safe: OLD is only valid for UPDATE/DELETE, NEW only for\n    -- INSERT/UPDATE, so every branch below reads exactly one of them.\n    IF TG_OP = 'INSERT' THEN\n        -- Readiness is only ever published by the provisioning transaction\n        -- after the matching gate/protocol/serving rows exist. A direct\n        -- INSERT of a ready pg_refstore row is always refused.\n        IF NEW.storage_backend = 'pg_refstore' AND NEW.state = 'ready' THEN\n            RAISE EXCEPTION 'a pg_refstore repository cannot be inserted ready; provisioning publishes readiness';\n        END IF;\n        RETURN NEW;\n    END IF;\n    IF TG_OP = 'DELETE' THEN\n        RETURN OLD;\n    END IF;\n    IF (OLD.storage_backend = 'pg_refstore' OR NEW.storage_backend = 'pg_refstore')\n       AND OLD.storage_backend <> NEW.storage_backend THEN\n        RAISE EXCEPTION 'the pg_refstore backend binding is immutable';\n    END IF;\n    IF OLD.storage_backend = 'pg_refstore' THEN\n        IF NEW.id <> OLD.id OR NEW.owner_id <> OLD.owner_id OR NEW.name <> OLD.name\n           OR NEW.object_format <> OLD.object_format THEN\n            RAISE EXCEPTION 'a pg_refstore repository identity (id/owner/name/object format) is immutable';\n        END IF;\n        IF OLD.state = 'ready' AND NEW.state <> 'ready' THEN\n            RAISE EXCEPTION 'a ready pg_refstore repository cannot leave ready';\n        END IF;\n    END IF;\n    IF NEW.storage_backend = 'pg_refstore' AND NEW.state = 'ready' AND OLD.state <> 'ready' THEN\n        IF NOT EXISTS (\n            SELECT 1 FROM ref_store_serving_repositories s\n            WHERE s.repository_id = NEW.id AND s.owner_id = NEW.owner_id\n              AND s.name = NEW.name AND s.object_format = NEW.object_format\n              AND s.state = 'ready'\n        ) THEN\n            RAISE EXCEPTION 'a pg_refstore repository cannot become ready before its serving binding is ready';\n        END IF;\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26349,7 +26349,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": true,
-      "source": "\r\nDECLARE current_generation bigint;\r\nBEGIN\r\n    EXECUTE format('SELECT storage_generation FROM %I.repositories WHERE id=$1 FOR SHARE', TG_TABLE_SCHEMA)\r\n        INTO STRICT current_generation USING NEW.repository_id;\r\n    IF NEW.storage_generation IS DISTINCT FROM current_generation THEN\r\n        RAISE EXCEPTION 'stale projection storage generation';\r\n    END IF;\r\n    RETURN NEW;\r\nEND;\r\n",
+      "source": "\nDECLARE current_generation bigint;\nBEGIN\n    EXECUTE format('SELECT storage_generation FROM %I.repositories WHERE id=$1 FOR SHARE', TG_TABLE_SCHEMA)\n        INTO STRICT current_generation USING NEW.repository_id;\n    IF NEW.storage_generation IS DISTINCT FROM current_generation THEN\n        RAISE EXCEPTION 'stale projection storage generation';\n    END IF;\n    RETURN NEW;\nEND;\n",
       "strict": false,
       "volatility": "v"
     },
@@ -26366,7 +26366,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF (NEW.repository_id, NEW.operation_id, NEW.request_digest, NEW.actor_id, NEW.reason,\r\n        NEW.created_at)\r\n       IS DISTINCT FROM\r\n       (OLD.repository_id, OLD.operation_id, OLD.request_digest, OLD.actor_id, OLD.reason,\r\n        OLD.created_at)\r\n    THEN\r\n        RAISE EXCEPTION 'publication decision cancellation is immutable';\r\n    END IF;\r\n    IF OLD.decision_id IS NOT NULL THEN\r\n        RAISE EXCEPTION 'publication decision cancellation decision id is already bound';\r\n    END IF;\r\n    IF NEW.decision_id IS NULL THEN\r\n        RAISE EXCEPTION 'publication decision cancellation update must bind a decision id';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF (NEW.repository_id, NEW.operation_id, NEW.request_digest, NEW.actor_id, NEW.reason,\n        NEW.created_at)\n       IS DISTINCT FROM\n       (OLD.repository_id, OLD.operation_id, OLD.request_digest, OLD.actor_id, OLD.reason,\n        OLD.created_at)\n    THEN\n        RAISE EXCEPTION 'publication decision cancellation is immutable';\n    END IF;\n    IF OLD.decision_id IS NOT NULL THEN\n        RAISE EXCEPTION 'publication decision cancellation decision id is already bound';\n    END IF;\n    IF NEW.decision_id IS NULL THEN\n        RAISE EXCEPTION 'publication decision cancellation update must bind a decision id';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26400,7 +26400,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF (NEW.decision_id, NEW.repository_id, NEW.tenant_id, NEW.owner_id, NEW.actor_id,\r\n        NEW.token_id, NEW.token_digest, NEW.operation_id, NEW.issuer_id, NEW.lane,\r\n        NEW.sequence, NEW.mode, NEW.object_format, NEW.history_incarnation,\r\n        NEW.authority_epoch, NEW.group_epoch, NEW.base_revision, NEW.base_gate_digest,\r\n        NEW.command_digest, NEW.refs_digest, NEW.selected_refs_digest,\r\n        NEW.selection_digest, NEW.policy_digest, NEW.facts_digest, NEW.authz_digest,\r\n        NEW.dependencies_digest, NEW.packs_digest, NEW.hold_receipts_digest,\r\n        NEW.captured_oid_digest, NEW.not_after_millis, NEW.created_db_millis,\r\n        NEW.action, NEW.merge_pull_number, NEW.merge_version, NEW.merge_head_oid, NEW.merge_base_oid)\r\n       IS DISTINCT FROM\r\n       (OLD.decision_id, OLD.repository_id, OLD.tenant_id, OLD.owner_id, OLD.actor_id,\r\n        OLD.token_id, OLD.token_digest, OLD.operation_id, OLD.issuer_id, OLD.lane,\r\n        OLD.sequence, OLD.mode, OLD.object_format, OLD.history_incarnation,\r\n        OLD.authority_epoch, OLD.group_epoch, OLD.base_revision, OLD.base_gate_digest,\r\n        OLD.command_digest, OLD.refs_digest, OLD.selected_refs_digest,\r\n        OLD.selection_digest, OLD.policy_digest, OLD.facts_digest, OLD.authz_digest,\r\n        OLD.dependencies_digest, OLD.packs_digest, OLD.hold_receipts_digest,\r\n        OLD.captured_oid_digest, OLD.not_after_millis, OLD.created_db_millis,\r\n        OLD.action, OLD.merge_pull_number, OLD.merge_version, OLD.merge_head_oid, OLD.merge_base_oid)\r\n    THEN\r\n        RAISE EXCEPTION 'publication decision identity and digests are immutable';\r\n    END IF;\r\n    IF OLD.state <> 'OPEN' THEN\r\n        RAISE EXCEPTION 'publication decision terminal state is immutable';\r\n    END IF;\r\n    IF NEW.state = 'OPEN' THEN\r\n        RAISE EXCEPTION 'publication decision update must become terminal';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF (NEW.decision_id, NEW.repository_id, NEW.tenant_id, NEW.owner_id, NEW.actor_id,\n        NEW.token_id, NEW.token_digest, NEW.operation_id, NEW.issuer_id, NEW.lane,\n        NEW.sequence, NEW.mode, NEW.object_format, NEW.history_incarnation,\n        NEW.authority_epoch, NEW.group_epoch, NEW.base_revision, NEW.base_gate_digest,\n        NEW.command_digest, NEW.refs_digest, NEW.selected_refs_digest,\n        NEW.selection_digest, NEW.policy_digest, NEW.facts_digest, NEW.authz_digest,\n        NEW.dependencies_digest, NEW.packs_digest, NEW.hold_receipts_digest,\n        NEW.captured_oid_digest, NEW.not_after_millis, NEW.created_db_millis,\n        NEW.action, NEW.merge_pull_number, NEW.merge_version, NEW.merge_head_oid, NEW.merge_base_oid)\n       IS DISTINCT FROM\n       (OLD.decision_id, OLD.repository_id, OLD.tenant_id, OLD.owner_id, OLD.actor_id,\n        OLD.token_id, OLD.token_digest, OLD.operation_id, OLD.issuer_id, OLD.lane,\n        OLD.sequence, OLD.mode, OLD.object_format, OLD.history_incarnation,\n        OLD.authority_epoch, OLD.group_epoch, OLD.base_revision, OLD.base_gate_digest,\n        OLD.command_digest, OLD.refs_digest, OLD.selected_refs_digest,\n        OLD.selection_digest, OLD.policy_digest, OLD.facts_digest, OLD.authz_digest,\n        OLD.dependencies_digest, OLD.packs_digest, OLD.hold_receipts_digest,\n        OLD.captured_oid_digest, OLD.not_after_millis, OLD.created_db_millis,\n        OLD.action, OLD.merge_pull_number, OLD.merge_version, OLD.merge_head_oid, OLD.merge_base_oid)\n    THEN\n        RAISE EXCEPTION 'publication decision identity and digests are immutable';\n    END IF;\n    IF OLD.state <> 'OPEN' THEN\n        RAISE EXCEPTION 'publication decision terminal state is immutable';\n    END IF;\n    IF NEW.state = 'OPEN' THEN\n        RAISE EXCEPTION 'publication decision update must become terminal';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26434,7 +26434,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF TG_OP = 'DELETE' THEN\r\n        RAISE EXCEPTION 'publication decision scopes are never deleted';\r\n    END IF;\r\n    IF NEW.scope_kind <> OLD.scope_kind OR NEW.scope_id <> OLD.scope_id THEN\r\n        RAISE EXCEPTION 'publication decision scope identity is immutable';\r\n    END IF;\r\n    IF NEW.version < OLD.version THEN\r\n        RAISE EXCEPTION 'publication decision scope version is monotone';\r\n    END IF;\r\n    IF OLD.state = 'CLOSING' AND NEW.state <> 'CLOSING' THEN\r\n        RAISE EXCEPTION 'publication decision scope state is one-way';\r\n    END IF;\r\n    IF OLD.change_id IS NOT NULL AND NEW.change_id IS DISTINCT FROM OLD.change_id THEN\r\n        RAISE EXCEPTION 'publication decision scope change id is immutable';\r\n    END IF;\r\n    NEW.updated_at := clock_timestamp();\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF TG_OP = 'DELETE' THEN\n        RAISE EXCEPTION 'publication decision scopes are never deleted';\n    END IF;\n    IF NEW.scope_kind <> OLD.scope_kind OR NEW.scope_id <> OLD.scope_id THEN\n        RAISE EXCEPTION 'publication decision scope identity is immutable';\n    END IF;\n    IF NEW.version < OLD.version THEN\n        RAISE EXCEPTION 'publication decision scope version is monotone';\n    END IF;\n    IF OLD.state = 'CLOSING' AND NEW.state <> 'CLOSING' THEN\n        RAISE EXCEPTION 'publication decision scope state is one-way';\n    END IF;\n    IF OLD.change_id IS NOT NULL AND NEW.change_id IS DISTINCT FROM OLD.change_id THEN\n        RAISE EXCEPTION 'publication decision scope change id is immutable';\n    END IF;\n    NEW.updated_at := clock_timestamp();\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26451,7 +26451,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF NEW.decisions < OLD.decisions OR NEW.ref_verdicts < OLD.ref_verdicts\r\n       OR NEW.logical_bytes < OLD.logical_bytes\r\n    THEN\r\n        RAISE EXCEPTION 'publication decision usage counters never decrease';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF NEW.decisions < OLD.decisions OR NEW.ref_verdicts < OLD.ref_verdicts\n       OR NEW.logical_bytes < OLD.logical_bytes\n    THEN\n        RAISE EXCEPTION 'publication decision usage counters never decrease';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26485,7 +26485,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'ref-store cancellation tombstone is immutable';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'ref-store cancellation tombstone is immutable';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26502,7 +26502,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'ref-store core event is immutable';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'ref-store core event is immutable';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26519,7 +26519,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF OLD.pack_mode = 'pack_verified' AND NEW.pack_mode <> 'pack_verified' THEN\r\n        RAISE EXCEPTION 'ref-store core pack mode is one-way and cannot be downgraded';\r\n    END IF;\r\n    IF OLD.pack_mode = 'metadata_only' AND NEW.pack_mode = 'pack_verified'\r\n       AND NEW.revision <= OLD.revision THEN\r\n        RAISE EXCEPTION 'pack mode activation must happen inside a revision increment';\r\n    END IF;\r\n    IF NEW.pack_mode <> OLD.pack_mode AND NEW.revision = OLD.revision THEN\r\n        RAISE EXCEPTION 'pack mode cannot change without a gate revision increment';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF OLD.pack_mode = 'pack_verified' AND NEW.pack_mode <> 'pack_verified' THEN\n        RAISE EXCEPTION 'ref-store core pack mode is one-way and cannot be downgraded';\n    END IF;\n    IF OLD.pack_mode = 'metadata_only' AND NEW.pack_mode = 'pack_verified'\n       AND NEW.revision <= OLD.revision THEN\n        RAISE EXCEPTION 'pack mode activation must happen inside a revision increment';\n    END IF;\n    IF NEW.pack_mode <> OLD.pack_mode AND NEW.revision = OLD.revision THEN\n        RAISE EXCEPTION 'pack mode cannot change without a gate revision increment';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26536,7 +26536,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'ref-store core pack ledger is immutable';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'ref-store core pack ledger is immutable';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26553,7 +26553,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nDECLARE\r\n    counter_keys CONSTANT text[] := ARRAY[\r\n        'snapshot_count','snapshot_ref_count','binding_count','pin_count','history_count','receipt_count',\r\n        'logical_bytes'\r\n    ];\r\n    old_identity jsonb := to_jsonb(OLD);\r\n    new_identity jsonb := to_jsonb(NEW);\r\nBEGIN\r\n    old_identity := old_identity - counter_keys;\r\n    new_identity := new_identity - counter_keys;\r\n    IF new_identity <> old_identity THEN\r\n        RAISE EXCEPTION 'pack snapshot usage row identity is immutable';\r\n    END IF;\r\n    IF NEW.snapshot_count < OLD.snapshot_count\r\n       OR NEW.snapshot_ref_count < OLD.snapshot_ref_count\r\n       OR NEW.binding_count < OLD.binding_count\r\n       OR NEW.pin_count < OLD.pin_count\r\n       OR NEW.history_count < OLD.history_count\r\n       OR NEW.receipt_count < OLD.receipt_count\r\n       OR NEW.logical_bytes < OLD.logical_bytes THEN\r\n        RAISE EXCEPTION 'pack snapshot usage counters are monotone and cannot be refunded';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nDECLARE\n    counter_keys CONSTANT text[] := ARRAY[\n        'snapshot_count','snapshot_ref_count','binding_count','pin_count','history_count','receipt_count',\n        'logical_bytes'\n    ];\n    old_identity jsonb := to_jsonb(OLD);\n    new_identity jsonb := to_jsonb(NEW);\nBEGIN\n    old_identity := old_identity - counter_keys;\n    new_identity := new_identity - counter_keys;\n    IF new_identity <> old_identity THEN\n        RAISE EXCEPTION 'pack snapshot usage row identity is immutable';\n    END IF;\n    IF NEW.snapshot_count < OLD.snapshot_count\n       OR NEW.snapshot_ref_count < OLD.snapshot_ref_count\n       OR NEW.binding_count < OLD.binding_count\n       OR NEW.pin_count < OLD.pin_count\n       OR NEW.history_count < OLD.history_count\n       OR NEW.receipt_count < OLD.receipt_count\n       OR NEW.logical_bytes < OLD.logical_bytes THEN\n        RAISE EXCEPTION 'pack snapshot usage counters are monotone and cannot be refunded';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26570,7 +26570,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF NEW.tenant_id <> OLD.tenant_id THEN\r\n        RAISE EXCEPTION 'pack usage tenant is immutable';\r\n    END IF;\r\n    IF NEW.registration_count < OLD.registration_count\r\n       OR NEW.artifact_count < OLD.artifact_count\r\n       OR NEW.membership_count < OLD.membership_count\r\n       OR NEW.logical_bytes < OLD.logical_bytes\r\n       OR NEW.receipt_count < OLD.receipt_count THEN\r\n        RAISE EXCEPTION 'pack usage counters are monotone and cannot be refunded';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF NEW.tenant_id <> OLD.tenant_id THEN\n        RAISE EXCEPTION 'pack usage tenant is immutable';\n    END IF;\n    IF NEW.registration_count < OLD.registration_count\n       OR NEW.artifact_count < OLD.artifact_count\n       OR NEW.membership_count < OLD.membership_count\n       OR NEW.logical_bytes < OLD.logical_bytes\n       OR NEW.receipt_count < OLD.receipt_count THEN\n        RAISE EXCEPTION 'pack usage counters are monotone and cannot be refunded';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26587,7 +26587,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\r\n        RAISE EXCEPTION 'ref-store core pin cannot be deleted while its repository exists';\r\n    END IF;\r\n    RETURN OLD;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\n        RAISE EXCEPTION 'ref-store core pin cannot be deleted while its repository exists';\n    END IF;\n    RETURN OLD;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26604,7 +26604,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF OLD.state = 'released' THEN\r\n        RAISE EXCEPTION 'ref-store core pin % is released and terminal', OLD.pin_id;\r\n    END IF;\r\n    IF NEW.pin_id <> OLD.pin_id\r\n        OR NEW.repository_id <> OLD.repository_id\r\n        OR NEW.tenant_id <> OLD.tenant_id\r\n        OR NEW.snapshot_id <> OLD.snapshot_id\r\n        OR NEW.owner_id <> OLD.owner_id\r\n        OR NEW.purpose <> OLD.purpose\r\n        OR NEW.create_request_id <> OLD.create_request_id\r\n        OR NEW.create_digest <> OLD.create_digest\r\n        OR NEW.created_at <> OLD.created_at THEN\r\n        RAISE EXCEPTION 'ref-store core pin identity is immutable';\r\n    END IF;\r\n\r\n    IF NEW.state = 'active' THEN\r\n        -- The only live update is a renewal of a still-live pin: exactly one\r\n        -- generation advance, the old lease still live, the new lease in the\r\n        -- future but no farther than the 3600-second contract maximum, and\r\n        -- monotone renewal/update timestamps. Microsecond differences between\r\n        -- the adapter's separate clock_timestamp() calls are expected, so the\r\n        -- comparisons use ordering, never equality. Release fields stay empty.\r\n        -- This also blocks direct DML that would resurrect an expired active\r\n        -- pin; an expired pin may still take the exact release branch below.\r\n        IF NEW.generation <> OLD.generation + 1\r\n            OR OLD.expires_at <= clock_timestamp()\r\n            OR NEW.expires_at <= clock_timestamp()\r\n            OR NEW.expires_at > clock_timestamp() + interval '3600 seconds'\r\n            OR NEW.renewed_at IS NULL\r\n            OR (OLD.renewed_at IS NOT NULL AND NEW.renewed_at < OLD.renewed_at)\r\n            OR NEW.updated_at < OLD.updated_at\r\n            OR NEW.released_at IS NOT NULL\r\n            OR NEW.release_request_id IS NOT NULL\r\n            OR NEW.release_reason IS NOT NULL THEN\r\n            RAISE EXCEPTION 'ref-store core pin active update is not a valid renewal';\r\n        END IF;\r\n        RETURN NEW;\r\n    END IF;\r\n\r\n    IF NEW.state = 'released' THEN\r\n        -- The only terminal transition is an exact release of the current\r\n        -- generation: the generation and lease timestamps are unchanged and\r\n        -- only the release fields are set.\r\n        IF NEW.generation <> OLD.generation\r\n            OR NEW.expires_at <> OLD.expires_at\r\n            OR NEW.renewed_at IS DISTINCT FROM OLD.renewed_at\r\n            OR NEW.updated_at < OLD.updated_at\r\n            OR NEW.released_at IS NULL\r\n            OR NEW.release_request_id IS NULL\r\n            OR NEW.release_reason IS NULL\r\n            OR NEW.released_at < OLD.created_at THEN\r\n            RAISE EXCEPTION 'ref-store core pin release transition is invalid';\r\n        END IF;\r\n        RETURN NEW;\r\n    END IF;\r\n\r\n    RAISE EXCEPTION 'ref-store core pin state % is not a supported transition', NEW.state;\r\nEND ",
+      "source": "\nBEGIN\n    IF OLD.state = 'released' THEN\n        RAISE EXCEPTION 'ref-store core pin % is released and terminal', OLD.pin_id;\n    END IF;\n    IF NEW.pin_id <> OLD.pin_id\n        OR NEW.repository_id <> OLD.repository_id\n        OR NEW.tenant_id <> OLD.tenant_id\n        OR NEW.snapshot_id <> OLD.snapshot_id\n        OR NEW.owner_id <> OLD.owner_id\n        OR NEW.purpose <> OLD.purpose\n        OR NEW.create_request_id <> OLD.create_request_id\n        OR NEW.create_digest <> OLD.create_digest\n        OR NEW.created_at <> OLD.created_at THEN\n        RAISE EXCEPTION 'ref-store core pin identity is immutable';\n    END IF;\n\n    IF NEW.state = 'active' THEN\n        -- The only live update is a renewal of a still-live pin: exactly one\n        -- generation advance, the old lease still live, the new lease in the\n        -- future but no farther than the 3600-second contract maximum, and\n        -- monotone renewal/update timestamps. Microsecond differences between\n        -- the adapter's separate clock_timestamp() calls are expected, so the\n        -- comparisons use ordering, never equality. Release fields stay empty.\n        -- This also blocks direct DML that would resurrect an expired active\n        -- pin; an expired pin may still take the exact release branch below.\n        IF NEW.generation <> OLD.generation + 1\n            OR OLD.expires_at <= clock_timestamp()\n            OR NEW.expires_at <= clock_timestamp()\n            OR NEW.expires_at > clock_timestamp() + interval '3600 seconds'\n            OR NEW.renewed_at IS NULL\n            OR (OLD.renewed_at IS NOT NULL AND NEW.renewed_at < OLD.renewed_at)\n            OR NEW.updated_at < OLD.updated_at\n            OR NEW.released_at IS NOT NULL\n            OR NEW.release_request_id IS NOT NULL\n            OR NEW.release_reason IS NOT NULL THEN\n            RAISE EXCEPTION 'ref-store core pin active update is not a valid renewal';\n        END IF;\n        RETURN NEW;\n    END IF;\n\n    IF NEW.state = 'released' THEN\n        -- The only terminal transition is an exact release of the current\n        -- generation: the generation and lease timestamps are unchanged and\n        -- only the release fields are set.\n        IF NEW.generation <> OLD.generation\n            OR NEW.expires_at <> OLD.expires_at\n            OR NEW.renewed_at IS DISTINCT FROM OLD.renewed_at\n            OR NEW.updated_at < OLD.updated_at\n            OR NEW.released_at IS NULL\n            OR NEW.release_request_id IS NULL\n            OR NEW.release_reason IS NULL\n            OR NEW.released_at < OLD.created_at THEN\n            RAISE EXCEPTION 'ref-store core pin release transition is invalid';\n        END IF;\n        RETURN NEW;\n    END IF;\n\n    RAISE EXCEPTION 'ref-store core pin state % is not a supported transition', NEW.state;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26621,7 +26621,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\r\n        RAISE EXCEPTION 'ref-store core receipt cannot be deleted while its repository exists';\r\n    END IF;\r\n    RETURN OLD;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\n        RAISE EXCEPTION 'ref-store core receipt cannot be deleted while its repository exists';\n    END IF;\n    RETURN OLD;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26638,7 +26638,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'ref-store core mutation receipt is immutable';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'ref-store core mutation receipt is immutable';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26655,7 +26655,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\r\n        RAISE EXCEPTION 'ref-store core repository usage cannot be deleted while its repository exists';\r\n    END IF;\r\n    RETURN OLD;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\n        RAISE EXCEPTION 'ref-store core repository usage cannot be deleted while its repository exists';\n    END IF;\n    RETURN OLD;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26672,7 +26672,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF NEW.repository_id <> OLD.repository_id OR NEW.tenant_id <> OLD.tenant_id THEN\r\n        RAISE EXCEPTION 'ref-store core repository usage identity is immutable';\r\n    END IF;\r\n    IF NEW.snapshot_count < OLD.snapshot_count\r\n        OR NEW.snapshot_ref_count < OLD.snapshot_ref_count\r\n        OR NEW.logical_bytes < OLD.logical_bytes\r\n        OR NEW.receipt_count < OLD.receipt_count THEN\r\n        RAISE EXCEPTION 'ref-store core retained repository usage cannot decrease';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF NEW.repository_id <> OLD.repository_id OR NEW.tenant_id <> OLD.tenant_id THEN\n        RAISE EXCEPTION 'ref-store core repository usage identity is immutable';\n    END IF;\n    IF NEW.snapshot_count < OLD.snapshot_count\n        OR NEW.snapshot_ref_count < OLD.snapshot_ref_count\n        OR NEW.logical_bytes < OLD.logical_bytes\n        OR NEW.receipt_count < OLD.receipt_count THEN\n        RAISE EXCEPTION 'ref-store core retained repository usage cannot decrease';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26689,7 +26689,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (SELECT 1 FROM ref_store_core_serving_reads WHERE pin_id = OLD.pin_id) THEN\r\n        RAISE EXCEPTION 'ref-store core serving read child rows may only be deleted by their header cascade';\r\n    END IF;\r\n    RETURN OLD;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (SELECT 1 FROM ref_store_core_serving_reads WHERE pin_id = OLD.pin_id) THEN\n        RAISE EXCEPTION 'ref-store core serving read child rows may only be deleted by their header cascade';\n    END IF;\n    RETURN OLD;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26706,7 +26706,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\r\n        RAISE EXCEPTION 'ref-store core snapshot cannot be deleted while its repository exists';\r\n    END IF;\r\n    RETURN OLD;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\n        RAISE EXCEPTION 'ref-store core snapshot cannot be deleted while its repository exists';\n    END IF;\n    RETURN OLD;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26723,7 +26723,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'ref-store core metadata snapshot is immutable';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'ref-store core metadata snapshot is immutable';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26740,7 +26740,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\r\n        RAISE EXCEPTION 'ref-store core pack snapshot binding cannot be deleted while its repository exists';\r\n    END IF;\r\n    RETURN OLD;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (SELECT 1 FROM repositories WHERE id = OLD.repository_id) THEN\n        RAISE EXCEPTION 'ref-store core pack snapshot binding cannot be deleted while its repository exists';\n    END IF;\n    RETURN OLD;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26757,7 +26757,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'ref-store core pack snapshot binding is immutable';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'ref-store core pack snapshot binding is immutable';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26774,7 +26774,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (\r\n        SELECT 1\r\n        FROM ref_store_core_snapshots s\r\n        JOIN repositories r ON r.id = s.repository_id\r\n        WHERE s.snapshot_id = OLD.snapshot_id\r\n    ) THEN\r\n        RAISE EXCEPTION 'ref-store core snapshot refs cannot be deleted while their snapshot and repository exist';\r\n    END IF;\r\n    RETURN OLD;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (\n        SELECT 1\n        FROM ref_store_core_snapshots s\n        JOIN repositories r ON r.id = s.repository_id\n        WHERE s.snapshot_id = OLD.snapshot_id\n    ) THEN\n        RAISE EXCEPTION 'ref-store core snapshot refs cannot be deleted while their snapshot and repository exist';\n    END IF;\n    RETURN OLD;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26791,7 +26791,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (SELECT 1 FROM users WHERE id = OLD.tenant_id) THEN\r\n        RAISE EXCEPTION 'ref-store core tenant usage cannot be deleted while its tenant exists';\r\n    END IF;\r\n    RETURN OLD;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (SELECT 1 FROM users WHERE id = OLD.tenant_id) THEN\n        RAISE EXCEPTION 'ref-store core tenant usage cannot be deleted while its tenant exists';\n    END IF;\n    RETURN OLD;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26808,7 +26808,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF NEW.tenant_id <> OLD.tenant_id THEN\r\n        RAISE EXCEPTION 'ref-store core tenant usage identity is immutable';\r\n    END IF;\r\n    IF NEW.snapshot_count < OLD.snapshot_count\r\n        OR NEW.snapshot_ref_count < OLD.snapshot_ref_count\r\n        OR NEW.logical_bytes < OLD.logical_bytes\r\n        OR NEW.receipt_count < OLD.receipt_count THEN\r\n        RAISE EXCEPTION 'ref-store core retained tenant usage cannot decrease';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF NEW.tenant_id <> OLD.tenant_id THEN\n        RAISE EXCEPTION 'ref-store core tenant usage identity is immutable';\n    END IF;\n    IF NEW.snapshot_count < OLD.snapshot_count\n        OR NEW.snapshot_ref_count < OLD.snapshot_ref_count\n        OR NEW.logical_bytes < OLD.logical_bytes\n        OR NEW.receipt_count < OLD.receipt_count THEN\n        RAISE EXCEPTION 'ref-store core retained tenant usage cannot decrease';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26825,7 +26825,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF (NEW.repository_id, NEW.issuer_id, NEW.lane, NEW.sequence,\r\n        NEW.operation_id, NEW.request_digest)\r\n       IS DISTINCT FROM\r\n       (OLD.repository_id, OLD.issuer_id, OLD.lane, OLD.sequence,\r\n        OLD.operation_id, OLD.request_digest)\r\n    THEN\r\n        RAISE EXCEPTION 'ref-store operation identity is immutable';\r\n    END IF;\r\n    IF OLD.state <> 'pending' THEN\r\n        RAISE EXCEPTION 'ref-store terminal operation result is immutable';\r\n    END IF;\r\n    IF NEW.state = 'pending' THEN\r\n        RAISE EXCEPTION 'ref-store pending operation update must become terminal';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF (NEW.repository_id, NEW.issuer_id, NEW.lane, NEW.sequence,\n        NEW.operation_id, NEW.request_digest)\n       IS DISTINCT FROM\n       (OLD.repository_id, OLD.issuer_id, OLD.lane, OLD.sequence,\n        OLD.operation_id, OLD.request_digest)\n    THEN\n        RAISE EXCEPTION 'ref-store operation identity is immutable';\n    END IF;\n    IF OLD.state <> 'pending' THEN\n        RAISE EXCEPTION 'ref-store terminal operation result is immutable';\n    END IF;\n    IF NEW.state = 'pending' THEN\n        RAISE EXCEPTION 'ref-store pending operation update must become terminal';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26842,7 +26842,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nDECLARE\r\n    parent_issuer UUID;\r\n    parent_digest TEXT;\r\n    parent_state TEXT;\r\nBEGIN\r\n    SELECT o.issuer_id, o.request_digest, o.state\r\n      INTO parent_issuer, parent_digest, parent_state\r\n      FROM ref_store_operations o\r\n     WHERE o.repository_id = NEW.repository_id AND o.operation_id = NEW.operation_id;\r\n    IF NOT FOUND THEN\r\n        RAISE EXCEPTION 'serving producer binding requires its migration-138 operation';\r\n    END IF;\r\n    IF NEW.issuer_id <> parent_issuer THEN\r\n        RAISE EXCEPTION 'serving producer binding issuer differs from its operation';\r\n    END IF;\r\n    IF parent_state <> 'pending' THEN\r\n        RAISE EXCEPTION 'serving producer binding requires a pending operation';\r\n    END IF;\r\n    IF NEW.plan_parent_digest <> parent_digest THEN\r\n        RAISE EXCEPTION 'serving producer binding parent digest differs from the operation request digest';\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nDECLARE\n    parent_issuer UUID;\n    parent_digest TEXT;\n    parent_state TEXT;\nBEGIN\n    SELECT o.issuer_id, o.request_digest, o.state\n      INTO parent_issuer, parent_digest, parent_state\n      FROM ref_store_operations o\n     WHERE o.repository_id = NEW.repository_id AND o.operation_id = NEW.operation_id;\n    IF NOT FOUND THEN\n        RAISE EXCEPTION 'serving producer binding requires its migration-138 operation';\n    END IF;\n    IF NEW.issuer_id <> parent_issuer THEN\n        RAISE EXCEPTION 'serving producer binding issuer differs from its operation';\n    END IF;\n    IF parent_state <> 'pending' THEN\n        RAISE EXCEPTION 'serving producer binding requires a pending operation';\n    END IF;\n    IF NEW.plan_parent_digest <> parent_digest THEN\n        RAISE EXCEPTION 'serving producer binding parent digest differs from the operation request digest';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26859,7 +26859,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF EXISTS (\r\n        SELECT 1 FROM ref_store_operations o\r\n         WHERE o.repository_id = OLD.repository_id AND o.operation_id = OLD.operation_id\r\n    ) THEN\r\n        RAISE EXCEPTION 'serving producer binding may only be deleted by its operation cascade';\r\n    END IF;\r\n    RETURN OLD;\r\nEND ",
+      "source": "\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM ref_store_operations o\n         WHERE o.repository_id = OLD.repository_id AND o.operation_id = OLD.operation_id\n    ) THEN\n        RAISE EXCEPTION 'serving producer binding may only be deleted by its operation cascade';\n    END IF;\n    RETURN OLD;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26876,7 +26876,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    RAISE EXCEPTION 'ref-store serving producer binding is immutable';\r\nEND ",
+      "source": "\nBEGIN\n    RAISE EXCEPTION 'ref-store serving producer binding is immutable';\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26893,7 +26893,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nDECLARE repo_id UUID;\r\nBEGIN\r\n    IF TG_TABLE_NAME = 'workspace_view_history' THEN\r\n        IF TG_OP = 'DELETE' THEN\r\n            SELECT v.repository_id INTO repo_id\r\n            FROM workspace_views v WHERE v.id = OLD.view_id;\r\n        ELSE\r\n            SELECT v.repository_id INTO repo_id\r\n            FROM workspace_views v WHERE v.id = NEW.view_id;\r\n        END IF;\r\n    ELSIF TG_TABLE_NAME = 'sandbox_jobs' THEN\r\n        -- A sandbox job reaches its repository through either a workspace or a\r\n        -- CI run; the table itself has no repository_id column.\r\n        IF TG_OP = 'DELETE' THEN\r\n            SELECT COALESCE(\r\n                (SELECT repository_id FROM workspaces WHERE id = OLD.workspace_id),\r\n                (SELECT repository_id FROM ci_runs WHERE id = OLD.ci_run_id)\r\n            ) INTO repo_id;\r\n        ELSE\r\n            SELECT COALESCE(\r\n                (SELECT repository_id FROM workspaces WHERE id = NEW.workspace_id),\r\n                (SELECT repository_id FROM ci_runs WHERE id = NEW.ci_run_id)\r\n            ) INTO repo_id;\r\n        END IF;\r\n    ELSIF TG_OP = 'DELETE' THEN\r\n        repo_id := OLD.repository_id;\r\n    ELSE\r\n        repo_id := NEW.repository_id;\r\n    END IF;\r\n    IF repo_id IS NOT NULL AND EXISTS (\r\n        SELECT 1 FROM repositories r\r\n        WHERE r.id = repo_id AND r.gc_owner IS NOT NULL\r\n          AND r.gc_lease_until > clock_timestamp()\r\n    ) THEN\r\n        RAISE EXCEPTION 'repository retention roots are fenced by physical GC'\r\n            USING ERRCODE = '55006';\r\n    END IF;\r\n    IF TG_OP = 'DELETE' THEN\r\n        RETURN OLD;\r\n    END IF;\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nDECLARE repo_id UUID;\nBEGIN\n    IF TG_TABLE_NAME = 'workspace_view_history' THEN\n        IF TG_OP = 'DELETE' THEN\n            SELECT v.repository_id INTO repo_id\n            FROM workspace_views v WHERE v.id = OLD.view_id;\n        ELSE\n            SELECT v.repository_id INTO repo_id\n            FROM workspace_views v WHERE v.id = NEW.view_id;\n        END IF;\n    ELSIF TG_TABLE_NAME = 'sandbox_jobs' THEN\n        -- A sandbox job reaches its repository through either a workspace or a\n        -- CI run; the table itself has no repository_id column.\n        IF TG_OP = 'DELETE' THEN\n            SELECT COALESCE(\n                (SELECT repository_id FROM workspaces WHERE id = OLD.workspace_id),\n                (SELECT repository_id FROM ci_runs WHERE id = OLD.ci_run_id)\n            ) INTO repo_id;\n        ELSE\n            SELECT COALESCE(\n                (SELECT repository_id FROM workspaces WHERE id = NEW.workspace_id),\n                (SELECT repository_id FROM ci_runs WHERE id = NEW.ci_run_id)\n            ) INTO repo_id;\n        END IF;\n    ELSIF TG_OP = 'DELETE' THEN\n        repo_id := OLD.repository_id;\n    ELSE\n        repo_id := NEW.repository_id;\n    END IF;\n    IF repo_id IS NOT NULL AND EXISTS (\n        SELECT 1 FROM repositories r\n        WHERE r.id = repo_id AND r.gc_owner IS NOT NULL\n          AND r.gc_lease_until > clock_timestamp()\n    ) THEN\n        RAISE EXCEPTION 'repository retention roots are fenced by physical GC'\n            USING ERRCODE = '55006';\n    END IF;\n    IF TG_OP = 'DELETE' THEN\n        RETURN OLD;\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26910,7 +26910,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\r\nBEGIN\r\n    IF TG_OP = 'DELETE' THEN\r\n        RAISE EXCEPTION 'the ref-store serving binding is durable authority and cannot be deleted';\r\n    END IF;\r\n    IF TG_OP = 'UPDATE' THEN\r\n        IF (NEW.repository_id, NEW.owner_id, NEW.name, NEW.object_format,\r\n            NEW.history_incarnation, NEW.authority_epoch, NEW.group_epoch,\r\n            NEW.backend_identity, NEW.created_at)\r\n           IS DISTINCT FROM\r\n           (OLD.repository_id, OLD.owner_id, OLD.name, OLD.object_format,\r\n            OLD.history_incarnation, OLD.authority_epoch, OLD.group_epoch,\r\n            OLD.backend_identity, OLD.created_at)\r\n        THEN\r\n            RAISE EXCEPTION 'the ref-store serving binding identity is immutable';\r\n        END IF;\r\n        IF OLD.state = 'ready' AND NEW.state <> 'ready' THEN\r\n            RAISE EXCEPTION 'a ready ref-store serving binding is irreversible';\r\n        END IF;\r\n        IF OLD.state = 'pending' AND NEW.state NOT IN ('pending', 'ready') THEN\r\n            RAISE EXCEPTION 'the ref-store serving binding only moves pending -> ready';\r\n        END IF;\r\n    END IF;\r\n    -- Every binding row (pending or ready, insert or update) must name the\r\n    -- exact durable repository row: id, owner namespace, name and object format.\r\n    IF NOT EXISTS (\r\n        SELECT 1 FROM repositories r\r\n        WHERE r.id = NEW.repository_id AND r.owner_id = NEW.owner_id\r\n          AND r.name = NEW.name AND r.object_format = NEW.object_format\r\n          AND r.storage_backend = 'pg_refstore' AND r.transition_state = 'stable'\r\n          AND (NEW.state = 'ready' OR r.state = 'provisioning')\r\n    ) THEN\r\n        RAISE EXCEPTION 'a serving binding must name the exact stable pg_refstore repository; pending requires provisioning';\r\n    END IF;\r\n    IF NEW.state = 'ready' THEN\r\n        IF NOT EXISTS (\r\n            SELECT 1 FROM repositories r\r\n            WHERE r.id = NEW.repository_id AND r.owner_id = NEW.owner_id\r\n              AND r.name = NEW.name AND r.object_format = NEW.object_format\r\n              AND r.storage_backend = 'pg_refstore' AND r.transition_state = 'stable'\r\n        ) THEN\r\n            RAISE EXCEPTION 'a serving binding needs the exact stable pg_refstore repository row/name/format';\r\n        END IF;\r\n        IF NOT EXISTS (\r\n            SELECT 1 FROM ref_store_core_gates g\r\n            WHERE g.repository_id = NEW.repository_id\r\n              AND g.tenant_id = NEW.owner_id\r\n              AND g.object_format = NEW.object_format\r\n              AND g.history_incarnation = NEW.history_incarnation\r\n              AND g.authority_epoch = NEW.authority_epoch\r\n              AND g.group_epoch = NEW.group_epoch\r\n        ) THEN\r\n            RAISE EXCEPTION 'a ready serving binding needs the exact matching core gate';\r\n        END IF;\r\n        IF NOT EXISTS (\r\n            SELECT 1 FROM ref_store_core_protocol_repos p\r\n            WHERE p.repository_id = NEW.repository_id\r\n              AND p.tenant_id = NEW.owner_id\r\n              AND p.object_format = NEW.object_format\r\n              AND p.history_incarnation = NEW.history_incarnation\r\n              AND p.authority_epoch = NEW.authority_epoch\r\n              AND p.group_epoch = NEW.group_epoch\r\n              AND p.decision_required\r\n        ) THEN\r\n            RAISE EXCEPTION 'a ready serving binding needs the exact matching protocol realm';\r\n        END IF;\r\n    END IF;\r\n    NEW.updated_at := clock_timestamp();\r\n    RETURN NEW;\r\nEND ",
+      "source": "\nBEGIN\n    IF TG_OP = 'DELETE' THEN\n        RAISE EXCEPTION 'the ref-store serving binding is durable authority and cannot be deleted';\n    END IF;\n    IF TG_OP = 'UPDATE' THEN\n        IF (NEW.repository_id, NEW.owner_id, NEW.name, NEW.object_format,\n            NEW.history_incarnation, NEW.authority_epoch, NEW.group_epoch,\n            NEW.backend_identity, NEW.created_at)\n           IS DISTINCT FROM\n           (OLD.repository_id, OLD.owner_id, OLD.name, OLD.object_format,\n            OLD.history_incarnation, OLD.authority_epoch, OLD.group_epoch,\n            OLD.backend_identity, OLD.created_at)\n        THEN\n            RAISE EXCEPTION 'the ref-store serving binding identity is immutable';\n        END IF;\n        IF OLD.state = 'ready' AND NEW.state <> 'ready' THEN\n            RAISE EXCEPTION 'a ready ref-store serving binding is irreversible';\n        END IF;\n        IF OLD.state = 'pending' AND NEW.state NOT IN ('pending', 'ready') THEN\n            RAISE EXCEPTION 'the ref-store serving binding only moves pending -> ready';\n        END IF;\n    END IF;\n    -- Every binding row (pending or ready, insert or update) must name the\n    -- exact durable repository row: id, owner namespace, name and object format.\n    IF NOT EXISTS (\n        SELECT 1 FROM repositories r\n        WHERE r.id = NEW.repository_id AND r.owner_id = NEW.owner_id\n          AND r.name = NEW.name AND r.object_format = NEW.object_format\n          AND r.storage_backend = 'pg_refstore' AND r.transition_state = 'stable'\n          AND (NEW.state = 'ready' OR r.state = 'provisioning')\n    ) THEN\n        RAISE EXCEPTION 'a serving binding must name the exact stable pg_refstore repository; pending requires provisioning';\n    END IF;\n    IF NEW.state = 'ready' THEN\n        IF NOT EXISTS (\n            SELECT 1 FROM repositories r\n            WHERE r.id = NEW.repository_id AND r.owner_id = NEW.owner_id\n              AND r.name = NEW.name AND r.object_format = NEW.object_format\n              AND r.storage_backend = 'pg_refstore' AND r.transition_state = 'stable'\n        ) THEN\n            RAISE EXCEPTION 'a serving binding needs the exact stable pg_refstore repository row/name/format';\n        END IF;\n        IF NOT EXISTS (\n            SELECT 1 FROM ref_store_core_gates g\n            WHERE g.repository_id = NEW.repository_id\n              AND g.tenant_id = NEW.owner_id\n              AND g.object_format = NEW.object_format\n              AND g.history_incarnation = NEW.history_incarnation\n              AND g.authority_epoch = NEW.authority_epoch\n              AND g.group_epoch = NEW.group_epoch\n        ) THEN\n            RAISE EXCEPTION 'a ready serving binding needs the exact matching core gate';\n        END IF;\n        IF NOT EXISTS (\n            SELECT 1 FROM ref_store_core_protocol_repos p\n            WHERE p.repository_id = NEW.repository_id\n              AND p.tenant_id = NEW.owner_id\n              AND p.object_format = NEW.object_format\n              AND p.history_incarnation = NEW.history_incarnation\n              AND p.authority_epoch = NEW.authority_epoch\n              AND p.group_epoch = NEW.group_epoch\n              AND p.decision_required\n        ) THEN\n            RAISE EXCEPTION 'a ready serving binding needs the exact matching protocol realm';\n        END IF;\n    END IF;\n    NEW.updated_at := clock_timestamp();\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -26929,7 +26929,7 @@
       "result": "bigint",
       "rows": 0,
       "security_definer": true,
-      "source": "\r\nDECLARE generation bigint;\r\nBEGIN\r\n    IF NOT has_table_privilege(session_user, format('%I.event_deliveries', app_schema), 'UPDATE') THEN\r\n        RAISE EXCEPTION 'repository delivery lock requires event delivery role'\r\n            USING ERRCODE = '42501';\r\n    END IF;\r\n    EXECUTE format('SELECT storage_generation FROM %I.repositories WHERE id=$1 FOR SHARE', app_schema)\r\n        INTO STRICT generation USING repo_uuid;\r\n    RETURN generation;\r\nEND;\r\n",
+      "source": "\nDECLARE generation bigint;\nBEGIN\n    IF NOT has_table_privilege(session_user, format('%I.event_deliveries', app_schema), 'UPDATE') THEN\n        RAISE EXCEPTION 'repository delivery lock requires event delivery role'\n            USING ERRCODE = '42501';\n    END IF;\n    EXECUTE format('SELECT storage_generation FROM %I.repositories WHERE id=$1 FOR SHARE', app_schema)\n        INTO STRICT generation USING repo_uuid;\n    RETURN generation;\nEND;\n",
       "strict": false,
       "volatility": "v"
     }
