@@ -1,43 +1,52 @@
-//! Pure canonical identity codec for the proposed ref-version contract (C1a).
+//! Verifiable causal ref-version and immutable pack-dependency contract
+//! (`docs/ref-version-pack-contract.md` §2-§5, §8).
 //!
-//! This module is crate-private and unwired. It implements the canonical
-//! [`OperationDigest`](contract::OperationDigest) preimage from
-//! `docs/ref-version-pack-contract.md` §2.6 and the candidate
-//! [`VersionId`](contract::VersionId) preimage from §2.1. It deliberately does
-//! not create a version record, register or retain a pack, authorize a
-//! mutation, or return any capability.
-//!
-//! An `OperationDigest` or `VersionId` returned here is only a deterministic
-//! value. It does not prove that a request is authorized, that a version was
-//! committed or registered, that a record exists, that objects or dependencies
-//! are present, or that any data is safe to collect. Candidate derivation takes
-//! the complete operation input and recomputes its digest before selecting one
-//! ref, so realm, operation id, ref name and base selector cannot be rebound
-//! independently. The legacy base shape is digestible for replay separation,
-//! but a candidate `VersionId` is never minted for a selected legacy ref; an
-//! eligible sibling ref in the same operation is still derived per ref. A caller
-//! cannot supply a client generation: explicit absent derives generation 1 and a
-//! present base uses the supplied authority base generation plus one, checked for
-//! overflow.
-//!
-//! No Cargo dependency, legacy v1 digest, PostgreSQL schema, runtime path,
-//! Blob/native Git code or Raft authority is changed by this checkpoint.
-//!
-//! C1a is intentionally unwired: no crate caller exists until the later C1b/C2
-//! checkpoints. Its complete vocabulary is exercised by inline pure tests; the
-//! module-level allowance keeps an unwired staging module warning-free without
-//! weakening any runtime path.
-#![allow(dead_code)]
-
+//! Pure domain modules: canonical operation/version/pack-set/record/commit-set/
+//! terminal codecs, closed §2.5.2 reason table, bounded dependency DAG closure
+//! verifier, explicit read-mode / session-bound evaluator and retention protector
+//! matrix. No PostgreSQL DDL, HTTP routes, background GC or Raft apply runtime
+//! lives in this module.
+mod closure;
+mod commit_set;
 mod contract;
 mod digest;
 mod limits;
+mod pack_set;
+mod read_mode;
+mod reasons;
+mod record;
+mod retention;
+mod terminal;
+#[cfg(test)]
+mod vector_tests;
 
-// These are the C1b/C2 entry points; C1a itself has no crate caller yet.
-#[allow(unused_imports)]
-pub(crate) use contract::{
+pub use closure::{
+    CausalClosureError, CausalVersionLookup, CausalVersionNode, ClosureDigest, VerifiedDependencyClosure, VersionGraph,
+    VersionLookupEntry, select_verifier_dependencies, verify_dependency_closure,
+};
+pub use commit_set::{CommitSetHead, CommitSetId, CommitSetInput, CommitSetVersionEntry, compute_commit_set_id};
+pub use contract::{
     AuthorityKind, BaseRequestSelector, OperationDigest, OperationDigestInput, RefVersionCodecError, RefVersionIntent,
     RefVersionKind, RefVersionRealm, VersionId,
 };
-#[allow(unused_imports)]
-pub(crate) use digest::{derive_candidate_version_id, operation_digest};
+pub use digest::{derive_candidate_version_id, operation_digest};
+pub use limits::{
+    MAX_CLOSURE_ARTIFACTS, MAX_CLOSURE_PACKS, MAX_CLOSURE_VERIFIED_BYTES, MAX_COMMIT_SET_REFS, MAX_OBJECT_DEP_DEPTH,
+    MAX_OBJECT_DEPS_PER_VERSION, MAX_OBJECT_DEPS_TOTAL, MAX_OPERATION_PACKS, MAX_OPERATION_PLANNED_BYTES,
+    MAX_OPERATION_REFS, MAX_REASON_BYTES, MAX_VERSION_REFS,
+};
+pub use pack_set::{PackSetDigest, PackSetEntry, VerifiedClosurePack, compute_pack_set_digest};
+pub use read_mode::{
+    CausalReadError, CausalReadOptions, CausalReadReceipt, ReadConsumer, ReadModeKind, ReadTarget, StrongSnapshotState,
+    verify_causal_read,
+};
+pub use reasons::{CausalRejectCode, is_valid_reason_syntax};
+pub use record::{
+    BaseCoherenceError, RecordDigest, RefHead, VersionRecord, VersionRecordInput, ensure_immutable_record,
+    verify_base_coherence,
+};
+pub use retention::{RetentionDecision, RetentionProtector, evaluate_pack_retention};
+pub use terminal::{
+    EncodedTerminal, TerminalDigest, VersionResultEntry, VersionResultOutcome, VersionTerminalInput,
+    VersionTerminalKind, encode_terminal, encode_terminal_with_commit_set,
+};

@@ -26,7 +26,7 @@ const VERSION_ID_DOMAIN: &[u8] = b"ry-ref-version-id-v1";
 /// Returns a deterministic value only. It does not check live authority, object
 /// existence, authorization, gate freshness or base-row coherence, and it does
 /// not register or retain anything.
-pub(crate) fn operation_digest(input: &OperationDigestInput) -> Result<OperationDigest, RefVersionCodecError> {
+pub fn operation_digest(input: &OperationDigestInput) -> Result<OperationDigest, RefVersionCodecError> {
     let realm_numbers = validate_input(input)?;
     let realm = input.realm();
     let mut writer = CanonicalWriter::new();
@@ -83,7 +83,7 @@ pub(crate) fn operation_digest(input: &OperationDigestInput) -> Result<Operation
 /// checked `base + 1`; a missing, zero or overflowing authority generation is a
 /// typed refusal. The authority still must prove that a present base exists, is
 /// the exact current head of this ref/realm, and has the supplied generation.
-pub(crate) fn derive_candidate_version_id(
+pub fn derive_candidate_version_id(
     input: &OperationDigestInput,
     expected_operation_digest: OperationDigest,
     ref_name: &RefName,
@@ -138,10 +138,10 @@ fn candidate_generation(
     }
 }
 
-struct RealmNumbers {
-    authority_epoch: u64,
-    group_id: u64,
-    group_epoch: u64,
+pub(super) struct RealmNumbers {
+    pub(super) authority_epoch: u64,
+    pub(super) group_id: u64,
+    pub(super) group_epoch: u64,
 }
 
 fn validate_input(input: &OperationDigestInput) -> Result<RealmNumbers, RefVersionCodecError> {
@@ -161,7 +161,7 @@ fn validate_input(input: &OperationDigestInput) -> Result<RealmNumbers, RefVersi
     Ok(realm_numbers)
 }
 
-fn validate_realm(realm: &RefVersionRealm) -> Result<RealmNumbers, RefVersionCodecError> {
+pub(super) fn validate_realm(realm: &RefVersionRealm) -> Result<RealmNumbers, RefVersionCodecError> {
     require_non_nil(realm.tenant_id(), "tenant_id")?;
     require_non_nil(realm.repository_id(), "repository_id")?;
     require_non_nil(realm.history_incarnation(), "history_incarnation")?;
@@ -281,7 +281,7 @@ fn validate_packs(packs: &[PlannedPack]) -> Result<(), RefVersionCodecError> {
     Ok(())
 }
 
-fn ensure_present_oid(
+pub(super) fn ensure_present_oid(
     object_format: GitObjectFormat,
     oid: GitOid,
     field: &'static str,
@@ -302,11 +302,11 @@ fn oid_is_zero(oid: GitOid) -> bool {
     }
 }
 
-fn require_non_nil(value: uuid::Uuid, field: &'static str) -> Result<(), RefVersionCodecError> {
+pub(super) fn require_non_nil(value: uuid::Uuid, field: &'static str) -> Result<(), RefVersionCodecError> {
     if value.is_nil() { Err(RefVersionCodecError::NilIdentifier { field }) } else { Ok(()) }
 }
 
-fn format_tag(format: GitObjectFormat) -> u8 {
+pub(super) fn format_tag(format: GitObjectFormat) -> u8 {
     match format {
         GitObjectFormat::Sha1 => 1,
         GitObjectFormat::Sha256 => 2,
@@ -357,7 +357,7 @@ fn encode_pack(writer: &mut CanonicalWriter, pack: &PlannedPack) -> Result<(), R
     Ok(())
 }
 
-fn push_oid(writer: &mut CanonicalWriter, oid: GitOid) -> Result<(), RefVersionCodecError> {
+pub(super) fn push_oid(writer: &mut CanonicalWriter, oid: GitOid) -> Result<(), RefVersionCodecError> {
     match oid {
         GitOid::Sha1(bytes) => writer.push_len_prefixed(&bytes),
         GitOid::Sha256(bytes) => writer.push_len_prefixed(&bytes),
@@ -369,39 +369,47 @@ fn content_digest_bytes(content: &ContentDigest) -> Result<[u8; 32], RefVersionC
     decoded.try_into().map_err(|_| RefVersionCodecError::InvalidContentDigest)
 }
 
-struct CanonicalWriter {
+pub(super) struct CanonicalWriter {
     bytes: Vec<u8>,
 }
 
 impl CanonicalWriter {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self { bytes: Vec::new() }
     }
 
-    fn push_u8(&mut self, value: u8) {
+    pub(super) fn push_u8(&mut self, value: u8) {
         self.bytes.push(value);
     }
 
-    fn push_u32(&mut self, value: u32) {
+    pub(super) fn push_u32(&mut self, value: u32) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
-    fn push_u64(&mut self, value: u64) {
+    pub(super) fn push_u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
-    fn push_len_prefixed(&mut self, value: &[u8]) -> Result<(), RefVersionCodecError> {
+    pub(super) fn push_len_prefixed(&mut self, value: &[u8]) -> Result<(), RefVersionCodecError> {
         self.push_u64(length_u64(value.len(), "field_length")?);
         self.bytes.try_reserve(value.len()).map_err(|_| RefVersionCodecError::LengthOverflow { field: "preimage" })?;
         self.bytes.extend_from_slice(value);
         Ok(())
     }
 
-    fn finish(self) -> [u8; 32] {
-        let mut hash = Sha256::new();
-        hash.update(&self.bytes);
-        hash.finalize().into()
+    pub(super) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
+
+    pub(super) fn finish(self) -> [u8; 32] {
+        hash_sha256(&self.bytes)
+    }
+}
+
+pub(super) fn hash_sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    hash.finalize().into()
 }
 
 #[cfg(test)]
