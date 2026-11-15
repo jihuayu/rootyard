@@ -1164,8 +1164,6 @@ async fn commit_metadata_bounded(
     }
     match timeout_at(deadline, tx.commit()).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) | Err(_) => {
-            Err(RefStoreError::CommitUnknown { repository_id, operation_id: None })
-        }
+        Ok(Err(_)) | Err(_) => Err(RefStoreError::CommitUnknown { repository_id, operation_id: None }),
     }
 }
