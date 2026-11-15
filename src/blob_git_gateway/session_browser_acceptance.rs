@@ -158,7 +158,7 @@ async fn browse(
     let name = format!("browser-{}", &Uuid::new_v4().simple().to_string()[..12]);
     create_repository(&client, address, &owner, &name).await?;
     provision_decision_realm(db, store.backend_identity(), &owner, &name).await?;
-    let (oid, live) = push_twice(db, store.backend_identity(), git, run, address, &owner, &name).await?;
+    let (oid, live) = push_fixture(db, store.backend_identity(), git, run, address, &owner, &name).await?;
 
     // The script and its inputs: mode-0600 files inside private directories.
     let script = run.path("browser.py");
@@ -260,9 +260,9 @@ async fn provision_decision_realm(db: &Db, backend: &BlobBackendIdentity, owner:
     Ok(())
 }
 
-/// A real clone and two real pushes through the child's Smart HTTP routes,
+/// A real clone and bounded real pushes through the child's Smart HTTP routes,
 /// returning the pushed OID and the live gate revision after them.
-async fn push_twice(
+async fn push_fixture(
     db: &Db,
     backend: &BlobBackendIdentity,
     git: &Git,
@@ -295,8 +295,16 @@ async fn push_twice(
     for idx in 1..=54 {
         git.ok(&checkout, &["branch", &format!("z-page-{idx:02}")]).await?;
     }
-    let second = git.run(&checkout, &["push", "--quiet", "origin", "--all"]).await?;
+    let second = git.run(&checkout, &["push", "--quiet", "origin", &branch]).await?;
     ensure!(second.success, "the second real push through the CLI child was refused");
+    let page_refs: Vec<String> = (1..=54).map(|idx| format!("refs/heads/z-page-{idx:02}")).collect();
+    // Each push stays well below the 64 KiB worst-case PackCommitTerminal budget (<= 52 refs).
+    for chunk in page_refs.chunks(27) {
+        let mut args = vec!["push", "--quiet", "origin"];
+        args.extend(chunk.iter().map(String::as_str));
+        let batch = git.run(&checkout, &args).await?;
+        ensure!(batch.success, "paginated branch push through the CLI child was refused");
+    }
     ensure!(git.text(&checkout, &["rev-parse", "HEAD"]).await? == oid, "the pushed commit is not the local HEAD");
     let live = live_revision(db, backend, owner, name).await?;
     ensure!(first_revision > 0 && live > first_revision && live > 1, "the live gate revision did not advance");

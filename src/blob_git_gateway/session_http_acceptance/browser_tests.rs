@@ -269,8 +269,16 @@ async fn pagination_case(db: &Db) -> Result<()> {
     for idx in 1..=54 {
         gateway.git.ok(&checkout, &["branch", &format!("z-ref-{idx:02}")]).await?;
     }
-    let pushed = gateway.git.run(&checkout, &["push", "--quiet", "origin", "--all"]).await?;
-    ensure!(pushed.success, "multi-page fixture Smart HTTP push was refused");
+    let main_push = gateway.git.run(&checkout, &["push", "--quiet", "origin", "HEAD:refs/heads/main"]).await?;
+    ensure!(main_push.success, "multi-page main Smart HTTP push was refused");
+    let page_refs: Vec<String> = (1..=54).map(|idx| format!("refs/heads/z-ref-{idx:02}")).collect();
+    // Each push stays well below the 64 KiB worst-case PackCommitTerminal budget (<= 52 refs).
+    for chunk in page_refs.chunks(27) {
+        let mut args = vec!["push", "--quiet", "origin"];
+        args.extend(chunk.iter().map(String::as_str));
+        let pushed = gateway.git.run(&checkout, &args).await?;
+        ensure!(pushed.success, "multi-page fixture Smart HTTP push was refused");
+    }
     let live = support::live_realm(db, &gateway, &owner, &name, false).await?;
 
     let form_body = form_encode(&[("username", &owner.username), ("token", &owner.token), ("return_to", "/web/blob")]);
