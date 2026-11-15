@@ -407,7 +407,7 @@ async fn commit_isolated_authority_locked(
     tx.commit().await?;
 
     pitr_fence::clear_claim_file_best_effort(data_dir, plan.previous_id);
-    Box::pin(pitr_fence::verify_or_attest_locked(client, data_dir, remote, deadline, "isolate_authority")).await
+    Box::pin(pitr_fence::verify_or_attest_locked(&***client, data_dir, remote, deadline, "isolate_authority")).await
 }
 
 /// Mint a new authority for a cloned/restored database, preserving all live

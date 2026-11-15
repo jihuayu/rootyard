@@ -10,11 +10,11 @@ use crate::pando_gateway::{pitr_lock::AuthorityLockGuard, pitr_markers, pitr_pro
 use crate::storage::remote_authority::AuthorityCreateOutcome;
 use crate::storage::remote_objects::RemoteObjectStore;
 use anyhow::{Context, Result, bail, ensure};
-use deadpool_postgres::{Object, Pool};
+use deadpool_postgres::{Pool, Transaction};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
-use tokio_postgres::{GenericClient, Transaction};
+use tokio_postgres::{Client, GenericClient};
 use uuid::Uuid;
 
 pub use pitr_markers::{
@@ -203,14 +203,14 @@ pub async fn verify_or_attest(
 }
 
 pub(super) async fn verify_or_attest_locked(
-    client: &Object,
+    client: &Client,
     data_dir: &Path,
     remote: &RemoteObjectStore,
     deadline: Instant,
     operation: &str,
 ) -> Result<AuthorityState> {
     let backend_identity = remote.backend_identity()?;
-    let (mut state, runtime) = verify_local_or_latch_fence_with_client(&**client, data_dir, backend_identity).await?;
+    let (mut state, runtime) = verify_local_or_latch_fence_with_client(client, data_dir, backend_identity).await?;
 
     if state.attested_at.is_none() {
         let claim = match pitr_markers::read_claim_file(data_dir, state.authority_id)? {
@@ -249,7 +249,7 @@ pub(super) async fn verify_or_attest_locked(
             AuthorityCreateOutcome::AlreadyExists(_) => {
                 clear_claim_file_best_effort(data_dir, state.authority_id);
                 let reason = "external authority epoch 1 already claimed by another deployment";
-                latch_fence_with_client(&**client, reason).await;
+                latch_fence_with_client(client, reason).await;
                 bail!("{reason}");
             }
         }
@@ -278,7 +278,7 @@ pub(super) async fn verify_or_attest_locked(
             .await?;
         clear_claim_file_best_effort(data_dir, state.authority_id);
         ensure!(changed == 1, "authority state changed concurrently during initial attestation");
-        return load_authority_state(&**client).await;
+        return load_authority_state(client).await;
     }
 
     let next_epoch = state.authority_epoch.checked_add(1).context("authority epoch overflow")?;
@@ -302,7 +302,7 @@ pub(super) async fn verify_or_attest_locked(
             .await?;
         clear_claim_file_best_effort(data_dir, state.authority_id);
         ensure!(changed == 1, "authority epoch changed concurrently during claim recovery");
-        state = load_authority_state(&**client).await?;
+        state = load_authority_state(client).await?;
     }
 
     let expected_nonce = state.proof_nonce.context("attested authority missing proof_nonce")?;
@@ -317,7 +317,7 @@ pub(super) async fn verify_or_attest_locked(
             ) => {}
         _ => {
             let reason = "external authority epoch proof missing or mismatched in object store";
-            latch_fence_with_client(&**client, reason).await;
+            latch_fence_with_client(client, reason).await;
             bail!("{reason}");
         }
     }
@@ -325,7 +325,7 @@ pub(super) async fn verify_or_attest_locked(
     let successor = state.authority_epoch.checked_add(1).context("authority epoch overflow")?;
     if Box::pin(remote.authority_proof_exists(state.authority_id, successor, deadline)).await? {
         let reason = "external object-store epoch is ahead of database (PITR rollback or split-brain clone detected)";
-        latch_fence_with_client(&**client, reason).await;
+        latch_fence_with_client(client, reason).await;
         bail!("{reason}");
     }
 
@@ -365,8 +365,7 @@ pub async fn begin_epoch_advance(
     let lock = AuthorityLockGuard::acquire(pool, deadline).await?;
     let prepared: Result<PendingEpochAdvance> = async {
         let state = Box::pin(verify_or_attest_locked(lock.client(), data_dir, remote, deadline, operation)).await?;
-        let runtime =
-            gather_runtime_identity_with_client(&**lock.client(), data_dir, remote.backend_identity()?).await?;
+        let runtime = gather_runtime_identity_with_client(lock.client(), data_dir, remote.backend_identity()?).await?;
         let next_epoch = state.authority_epoch.checked_add(1).context("authority epoch overflow")?;
         let claim = pitr_markers::new_claim_file(
             state.authority_id,
@@ -388,7 +387,7 @@ pub async fn begin_epoch_advance(
             Ok(AuthorityCreateOutcome::AlreadyExists(_)) => {
                 clear_claim_file_best_effort(data_dir, state.authority_id);
                 let reason = "next external authority epoch already claimed (PITR rollback or concurrent clone)";
-                latch_fence_with_client(&**lock.client(), reason).await;
+                latch_fence_with_client(lock.client(), reason).await;
                 bail!("{reason}");
             }
             Err(error) => {
