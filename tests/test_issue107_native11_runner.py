@@ -337,6 +337,67 @@ class BatchCommandTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "batch_command_target_set_mismatch")
 
 
+class ConfigOverrideTests(unittest.TestCase):
+    def command(self, configs, *, target_dir=False, extra=None):
+        command = ["cargo"]
+        for value in configs:
+            command += ["--config", value]
+        command += ["rustc", "--locked", "--profile", "test", "--test", "ref_store_operations",
+                    "--features", "pando-lab"]
+        if target_dir:
+            command += ["--config", 'build.target-dir = "/tmp/rootyard-target"']
+        if extra:
+            command += ["--config", extra]
+        return command
+
+    def test_actual_preparer_configs_are_accepted(self):
+        configs = [
+            "profile.dev.package.rootyard.debug=0",
+            "profile.test.package.rootyard.debug=0",
+            'profile.dev.package.rootyard.strip="debuginfo"',
+            'profile.test.package.rootyard.strip="debuginfo"',
+        ]
+        runner.validate_target_build_command(
+            self.command(configs), "ref_store_operations",
+            inventory.TARGETS["ref_store_operations"])
+        runner.validate_target_build_command(
+            self.command(configs[:2], target_dir=True), "ref_store_operations",
+            inventory.TARGETS["ref_store_operations"])
+
+    def test_unsupported_or_malformed_configs_are_rejected(self):
+        cases = [
+            ("profile.test.package.rootyard.opt-level=3", "command_config_unsupported"),
+            ('build.rustflags = ["-Ctarget-cpu=native"]', "command_config_unsupported"),
+            ("/tmp/custom-cargo.toml", "command_config_unsupported"),
+            ("profile.test.package.rootyard.debug=9", "command_config_unsupported"),
+            ("profile.test.package.rootyard.strip=debuginfo", "command_config_unsupported"),
+            ('build.target-dir = "relative/target"', "command_config_path"),
+        ]
+        for value, code in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(runner.RunnerError) as raised:
+                    runner.validate_target_build_command(
+                        self.command([], extra=value), "ref_store_operations",
+                        inventory.TARGETS["ref_store_operations"])
+                self.assertEqual(raised.exception.code, code)
+
+    def test_duplicate_conflicting_known_configs_are_rejected(self):
+        configs = ["profile.dev.package.rootyard.debug=0",
+                   "profile.dev.package.rootyard.debug=1"]
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_target_build_command(
+                self.command(configs), "ref_store_operations",
+                inventory.TARGETS["ref_store_operations"])
+        self.assertEqual(raised.exception.code, "command_config_duplicate")
+        configs = ['build.target-dir = "/tmp/one"',
+                   'build.target-dir = "/tmp/two"']
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_target_build_command(
+                self.command(configs), "ref_store_operations",
+                inventory.TARGETS["ref_store_operations"])
+        self.assertEqual(raised.exception.code, "command_config_duplicate")
+
+
 class CommandSemanticsTests(unittest.TestCase):
     def assert_command(self, command, code=None):
         cfg = inventory.TARGETS["ref_store_operations"]

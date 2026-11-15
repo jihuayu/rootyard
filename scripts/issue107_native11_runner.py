@@ -94,6 +94,29 @@ def _required_environment(target):
     _require(not missing, "missing_required_environment")
 
 
+_CONFIG_DEBUG = re.compile(r"profile\.(dev|test)\.package\.rootyard\.debug=(0|1|2)")
+_CONFIG_STRIP = re.compile(r'profile\.(dev|test)\.package\.rootyard\.strip="debuginfo"')
+_CONFIG_TARGET_DIR = re.compile(r'build\.target-dir\s*=\s*"([^"\n\r\x00]+)"')
+
+
+def _validate_config_override(value, seen):
+    """Narrow allowlist for the inline TOML configs emitted by the preparers."""
+    _require(isinstance(value, str) and bool(value.strip()), "command_config_value")
+    target_dir = _CONFIG_TARGET_DIR.fullmatch(value)
+    if target_dir is not None:
+        path = target_dir.group(1)
+        _require(path and Path(path).is_absolute(), "command_config_path")
+        key = "build.target-dir"
+    elif _CONFIG_DEBUG.fullmatch(value) is not None:
+        key = value.split("=", 1)[0]
+    elif _CONFIG_STRIP.fullmatch(value) is not None:
+        key = value.split("=", 1)[0]
+    else:
+        _fail("command_config_unsupported")
+    _require(key not in seen, "command_config_duplicate")
+    seen.add(key)
+
+
 def validate_target_build_command(command, target, cfg):
     """Validate the narrow Cargo argv forms emitted by the native preparers.
 
@@ -118,6 +141,7 @@ def validate_target_build_command(command, target, cfg):
     all_features = False
     release = False
     no_run = False
+    config_keys = set()
 
     def value_at(index, token, name):
         flag, separator, inline = token.partition("=")
@@ -139,12 +163,14 @@ def validate_target_build_command(command, target, cfg):
             if name == "--config":
                 value, command_index = value_at(command_index, token, "--config")
                 _require(bool(value), "command_missing_value")
+                _validate_config_override(value, config_keys)
                 continue
             _fail("command_not_test_build")
 
         if name in ("--config",):
             value, command_index = value_at(command_index, token, "--config")
             _require(bool(value), "command_missing_value")
+            _validate_config_override(value, config_keys)
             continue
         if name in ("--locked", "--offline"):
             _require(not separator, "command_ambiguous_flag")
