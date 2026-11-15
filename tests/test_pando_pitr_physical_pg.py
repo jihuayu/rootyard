@@ -463,8 +463,8 @@ class FixtureBoundaryTest(unittest.TestCase):
         processes.add(501, ppid=500, session=500, pgrp=500, starttime=51)
         processes.ignore_term.add(501)
         fixture = self.make_fixture(processes)
+        fixture.primary_identity = fixture.owned.remember_postmaster(500, "test")
         fixture.primary_data.mkdir(mode=0o700)
-        fixture.primary_identity = postmaster
         (fixture.primary_data / "postmaster.pid").write_text(
             f"500\n{fixture.primary_data}\n0\n{fixture.primary_port}\n"
             f"{fixture.socket_dir}\n127.0.0.1\n0\nready\n",
@@ -604,6 +604,78 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertNotIn((1102, signal.SIGTERM), processes.signals)
         self.assertNotIn((1102, signal.SIGKILL), processes.signals)
         self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
+
+    def test_second_known_cluster_after_global_stop_is_not_unknown(self) -> None:
+        processes = FakeProcesses()
+        processes.add(1500, ppid=1, session=1500, starttime=150)
+        processes.add(1600, ppid=1, session=1600, starttime=160)
+        fixture = self.make_fixture(processes)
+        fixture.primary_identity = fixture.owned.remember_postmaster(1500, "test")
+        fixture.restored_identity = fixture.owned.remember_postmaster(1600, "test")
+        fixture.primary_data.mkdir(mode=0o700)
+        fixture.restored_data.mkdir(mode=0o700)
+        for pid, data_dir, port in (
+            (1500, fixture.primary_data, fixture.primary_port),
+            (1600, fixture.restored_data, fixture.restored_port),
+        ):
+            (data_dir / "postmaster.pid").write_text(
+                f"{pid}\n{data_dir}\n0\n{port}\n"
+                f"{fixture.socket_dir}\n127.0.0.1\n0\nready\n",
+                encoding="ascii",
+            )
+        opened = processes.pidfds.opened
+
+        def fake_run(argv, *, phase, timeout=physical.COMMAND_TIMEOUT_SECONDS, owned=None):
+            if Path(argv[0]).name == "pg_ctl" and "stop" in argv:
+                # The first stop's global terminate_all stops both clusters.
+                for pid, data_dir in (
+                    (1500, fixture.primary_data),
+                    (1600, fixture.restored_data),
+                ):
+                    processes.records.pop(pid, None)
+                    (data_dir / "postmaster.pid").unlink(missing_ok=True)
+                return completed()
+            raise AssertionError("unexpected command")
+
+        with mock.patch.object(physical, "_run", side_effect=fake_run):
+            cleanup = fixture.cleanup()
+
+        self.assertTrue(cleanup["passed"])
+        self.assertTrue(cleanup["owned_processes_stopped"])
+        self.assertTrue(cleanup["scratch_removed"])
+        self.assertFalse(fixture.root.exists())
+        self.assertEqual(processes.pidfds.opened, opened)  # no re-adoption/reopen
+        self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
+        self.assertFalse(fixture.owned._unknown)
+
+    def test_stale_known_pid_with_closed_pin_is_not_freshly_adopted(self) -> None:
+        processes = FakeProcesses()
+        processes.add(1700, ppid=1, session=1700, starttime=170)
+        fixture = self.make_fixture(processes)
+        fixture.primary_identity = fixture.owned.remember_postmaster(1700, "test")
+        fixture.primary_data.mkdir(mode=0o700)
+        pid_file = fixture.primary_data / "postmaster.pid"
+        pid_file.write_text(
+            f"1700\n{fixture.primary_data}\n0\n{fixture.primary_port}\n"
+            f"{fixture.socket_dir}\n127.0.0.1\n0\nready\n",
+            encoding="ascii",
+        )
+        processes.records.pop(1700)
+        fixture.owned.members("cleanup")  # old pin dies; no live members remain
+        opened = processes.pidfds.opened
+        processes.add(1700, ppid=1, session=1700, pgrp=1700, starttime=170)
+
+        stopped = fixture._stop_cluster(
+            fixture.primary_data, fixture.primary_identity,
+            fixture.primary_port, "cleanup",
+        )
+
+        self.assertTrue(stopped)
+        self.assertIn(1700, processes.records)  # replacement was not signalled
+        self.assertEqual(processes.signals, [])
+        self.assertEqual(processes.pidfds.opened, opened)
+        self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
+        self.assertFalse(fixture.owned._unknown)
 
     def test_pinned_identity_uncertainty_retains_scratch(self) -> None:
         processes = FakeProcesses()

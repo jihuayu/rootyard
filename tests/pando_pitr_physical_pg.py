@@ -458,6 +458,15 @@ class _OwnedProcessSet:
             and current["state"] not in ("Z", "X", "x")
         )
 
+    def pin_live(self, pid: int, phase: str) -> bool:
+        pinned = self._pins.get(pid)
+        if pinned is None:
+            return False
+        if not self._pidfd_alive(pinned[0], phase):
+            self._drop_pin(pid, phase)
+            return False
+        return True
+
     def remember_launch(self, pid: int, phase: str) -> None:
         try:
             record = self._record_provider(pid, phase)
@@ -1195,29 +1204,28 @@ class PhysicalPitrFixture:
                 if error.code != "process_missing":
                     raise
                 observed = None
-            if observed is not None:
-                if reference is not None and (
-                    observed["pid"] != reference["pid"]
-                    or observed["starttime"] != reference["starttime"]
-                ):
+            if observed is None:
+                pid = None
+            elif reference is not None:
+                if not self.owned._same_pinned_identity(observed, reference):
                     raise FixtureError(phase, "pid_identity_mismatch")
-                if reference is None and _process_cwd(pid, phase) != data_dir.resolve():
+                # A known cluster may already have been stopped by an earlier
+                # global terminate_all in this cleanup.  Never re-adopt its
+                # numeric PID or reopen a closed pin; only an existing live pin
+                # may authorize a pg_ctl stop.
+                if not self.owned.pin_live(pid, phase):
+                    pid = None
+            else:
+                if _process_cwd(pid, phase) != data_dir.resolve():
                     raise FixtureError(phase, "pid_identity_mismatch")
-                reference = reference or observed
+                reference = observed
                 self.owned.remember_postmaster(pid, phase)
-            else:
-                pid = None
         elif reference is not None:
-            try:
-                self.owned.remember_postmaster(reference["pid"], phase)
-            except FixtureError as error:
-                if error.code != "process_missing":
-                    raise
-                reference = None
-            if reference is not None and self.owned.is_alive(reference, phase):
-                pid = reference["pid"]
-            else:
-                pid = None
+            # The PID file is gone and this is an already-known cluster.  The
+            # retained pin/global owned closure, if any, decides its fate; a
+            # numeric PID must not be re-adopted merely to observe expected
+            # absence after a prior global stop.
+            pid = None
         if pid is not None:
             try:
                 _run(
