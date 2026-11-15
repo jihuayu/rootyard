@@ -95,6 +95,9 @@ Selector semantics are strict:
   `refs/heads/rootyard-retained-unborn`. No captured refs, captured HEAD or
   current refs are installed. Therefore default/`HEAD` tree reads return 404;
   clients must supply a selected/reachable full OID or the exact synthetic ref.
+  A direct no-path blob request still requires a full non-zero OID; the
+  synthetic-ref alternative is for tree and path-based blob reads, matching the
+  ordinary Browse input contract.
 - The entire reachable closure of the selected objects is browsable, including
   descendant trees/blobs, commit history and annotated-tag peeling. Objects
   present in the same verified packs but outside that closure are 404.

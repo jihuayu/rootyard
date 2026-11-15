@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::{
     MAX_CAPTURE_BYTES, bad_input, blob_read_ceiling, captured_revision, memory_budget, parse_tree, reachable,
-    require_type, resolve, root_oid, run, validate_spec, validate_tree_after,
+    require_type, resolve, root_oid, run, validate_tree_after,
 };
 use super::super::{
     api::strip_name,
@@ -32,7 +32,7 @@ use super::super::{
     retention_roots::root_facade,
 };
 use crate::browse::models::{
-    BlobByOidQuery, BlobResponse, TreeQuery, TreeResponse, normalize_rel_path, validate_limit,
+    self, BlobByOidQuery, BlobResponse, TreeQuery, TreeResponse, normalize_rel_path, validate_limit,
 };
 use crate::ref_store::serving::{
     PgServingRetentionRoots, ServingRetainedRootReadContext, ServingRootRead,
@@ -59,7 +59,7 @@ async fn tree_authorized(
     let limit = validate_limit(query.limit).map_err(bad_input)?;
     let after = validate_tree_after(query.after.as_deref())?.map(str::to_owned);
     let spec = query.oid.as_deref().unwrap_or("HEAD").to_owned();
-    validate_spec(&spec)?;
+    validate_root_spec(&spec)?;
 
     let identity = authenticate(&state, &headers).await?;
     let deadline = state.deadline();
@@ -126,7 +126,8 @@ async fn blob_authorized(
     let name = strip_name(&raw_name)?;
     let root_id = parse_root_id(&root)?;
     let path = normalize_rel_path(query.path.as_deref()).map_err(bad_input)?;
-    validate_spec(&oid)?;
+    validate_root_spec(&oid)?;
+    direct_blob_guard(&path, &oid)?;
 
     let identity = authenticate(&state, &headers).await?;
     let deadline = state.deadline();
@@ -208,6 +209,34 @@ async fn finish_root<T: Serialize>(
     Ok(super::session::body_response_with_workspace(bytes, slot, lease, workspace, None))
 }
 
+/// Root Browse accepts ordinary public revision forms and exactly one private
+/// namespace: the literal synthetic selected-OID refs installed by the retained
+/// root view. Membership is still checked against the actual retained refs by
+/// `captured_revision`; this function only prevents arbitrary private refs,
+/// short IDs, zero IDs, uppercase/non-canonical hex and traversal suffixes from
+/// reaching native resolution.
+fn validate_root_spec(spec: &str) -> Result<(), GatewayError> {
+    if models::valid_revision_spec(spec) {
+        return Ok(());
+    }
+    if let Some(oid) = spec.strip_prefix(snapshot::RETAINED_ROOT_OID_REF_PREFIX)
+        && models::valid_non_zero_oid(oid)
+    {
+        return Ok(());
+    }
+    Err(GatewayError::BadRequest("invalid repository revision"))
+}
+
+/// Direct no-path blob reads retain the ordinary Browse contract: the path
+/// segment must itself be a full non-zero object id. Synthetic refs are allowed
+/// for tree and path-based blob selectors, never as a direct no-path blob.
+fn direct_blob_guard(path: &str, oid: &str) -> Result<(), GatewayError> {
+    if path.is_empty() && !models::valid_non_zero_oid(oid) {
+        return Err(GatewayError::BadRequest("a file path or full blob object identifier is required"));
+    }
+    Ok(())
+}
+
 fn parse_root_id(raw: &str) -> Result<Uuid, GatewayError> {
     let root_id = Uuid::parse_str(raw).map_err(|_| GatewayError::BadRequest("invalid root id"))?;
     if root_id.is_nil() {
@@ -230,5 +259,60 @@ fn root_serving_error(error: crate::Error) -> GatewayError {
             GatewayError::Unavailable("retention root content is temporarily unavailable")
         }
         _ => GatewayError::Internal("retention root content could not be materialized"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_spec_accepts_only_public_forms_and_exact_synthetic_oids() {
+        for spec in [
+            "HEAD".to_owned(),
+            "main".to_owned(),
+            "refs/heads/main".to_owned(),
+            "refs/tags/v1".to_owned(),
+            "a".repeat(40),
+            "b".repeat(64),
+            format!("refs/roots/oid/{}", "c".repeat(40)),
+            format!("refs/roots/oid/{}", "d".repeat(64)),
+        ] {
+            assert!(validate_root_spec(&spec).is_ok(), "root spec rejected: {spec}");
+        }
+        for spec in [
+            "refs/roots/oid/".to_owned(),
+            format!("refs/roots/oid/{}", "a".repeat(39)),
+            format!("refs/roots/oid/{}", "a".repeat(41)),
+            format!("refs/roots/oid/{}", "a".repeat(63)),
+            format!("refs/roots/oid/{}", "A".repeat(40)),
+            format!("refs/roots/oid/{}", "0".repeat(40)),
+            format!("refs/roots/oid/{}", "0".repeat(64)),
+            "refs/private/selected".to_owned(),
+            format!("refs/roots/oid/{}/child", "a".repeat(40)),
+            format!("refs/roots/oid/{}..", "a".repeat(40)),
+        ] {
+            assert!(validate_root_spec(&spec).is_err(), "root spec accepted: {spec}");
+        }
+    }
+
+    #[test]
+    fn direct_blob_guard_requires_full_oid_without_a_path() {
+        let message = "a file path or full blob object identifier is required";
+        for spec in [
+            "HEAD".to_owned(),
+            "main".to_owned(),
+            "refs/heads/main".to_owned(),
+            format!("refs/roots/oid/{}", "a".repeat(40)),
+        ] {
+            assert_eq!(
+                direct_blob_guard("", &spec),
+                Err(GatewayError::BadRequest(message)),
+                "direct revision was accepted: {spec}"
+            );
+            assert!(direct_blob_guard("a.txt", &spec).is_ok(), "path revision was refused: {spec}");
+        }
+        assert!(direct_blob_guard("", &"a".repeat(40)).is_ok());
+        assert!(direct_blob_guard("", &"b".repeat(64)).is_ok());
     }
 }

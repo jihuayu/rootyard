@@ -133,8 +133,34 @@ class RootBrowseHttpHarness(RootsHttpHarness):
         assert self._tree_item(selected_tree, "dir")["kind"] == "tree"
         status, descendant_blob = self._root_blob(repo, tree_root, tree_oid, path="dir/b.txt")
         assert status == 200 and descendant_blob["content"] == "beta\n", (status, descendant_blob)
-        status, synthetic = self._root_tree(repo, tree_root, oid="refs/roots/oid/" + tree_oid)
+        synthetic_ref = "refs/roots/oid/" + tree_oid
+        status, synthetic = self._root_tree(repo, tree_root, oid=synthetic_ref)
         assert status == 200 and synthetic["tree_oid"] == tree_oid, (status, synthetic)
+        status, synthetic_path = self._root_blob(repo, tree_root, synthetic_ref, path="a.txt")
+        assert status == 200 and synthetic_path["content"] == "alpha\n", (status, synthetic_path)
+        unknown_synthetic = "refs/roots/oid/" + ("f" * len(tree_oid))
+        status, unknown = self._root_tree(repo, tree_root, oid=unknown_synthetic)
+        assert status == 404, ("unknown synthetic ref used a native fallback", status)
+        self._assert_no_content(status, unknown)
+        wrong_format = "refs/roots/oid/" + ("a" * 64)
+        status, wrong = self._root_tree(repo, tree_root, oid=wrong_format)
+        assert status == 404, ("wrong-format synthetic ref matched installed SHA1 refs", status)
+        self._assert_no_content(status, wrong)
+        for rejected in [
+            "refs/roots/oid/",
+            "refs/roots/oid/" + "a" * 39,
+            "refs/roots/oid/" + "0" * 40,
+            "refs/roots/oid/" + "A" * 40,
+            "refs/private/selected",
+            "refs/roots/oid/" + tree_oid + "/child",
+        ]:
+            status, data = self._root_tree(repo, tree_root, oid=rejected, token=self.bob)
+            assert status == 400, ("private/malformed root spec reached auth/materialization", rejected, status)
+            self._assert_no_content(status, data)
+        for direct in ["HEAD", "refs/heads/main", "refs/roots/oid/" + tree_oid]:
+            status, data = self._root_blob(repo, snapshot_root, direct, token=self.bob)
+            assert status == 400, ("direct no-path revision was not rejected", direct, status)
+            self._assert_no_content(status, data)
         status, unselected_head = self._root_tree(repo, tree_root, oid=head)
         assert status == 404, ("unselected captured HEAD was reachable", status)
         self._assert_no_content(status, unselected_head)
@@ -221,6 +247,9 @@ class RootBrowseHttpHarness(RootsHttpHarness):
         assert status == 404, ("sha256 explicit root invented HEAD", status)
         status, explicit_tree = self._root_tree(repo, explicit, oid=tree_oid)
         assert status == 200 and explicit_tree["tree_oid"] == tree_oid, (status, explicit_tree)
+        synthetic_ref = "refs/roots/oid/" + tree_oid
+        status, synthetic_tree = self._root_tree(repo, explicit, oid=synthetic_ref)
+        assert status == 200 and synthetic_tree["tree_oid"] == tree_oid, (status, synthetic_tree)
         return {"root": root, "explicit_tree": explicit}
 
 
