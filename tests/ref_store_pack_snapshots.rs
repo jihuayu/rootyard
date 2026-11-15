@@ -185,6 +185,38 @@ impl Db {
         drop(client);
         Ok((tenant, repo))
     }
+    /// Initial fixture-only business/role/token metadata: the authenticated
+    /// owner of a repository created directly in its legal initial
+    /// `provisioning` state. This is not a production failed-provision or token
+    /// API transport proof.
+    async fn initial_provisioning_owner(&self) -> Result<(Uuid, Uuid, db::Identity, String)> {
+        let (tenant, repo) = self.business(GitObjectFormat::Sha1).await?;
+        let client = self.pool.get().await?;
+        let username: String = client.query_one("SELECT username FROM users WHERE id=$1", &[&tenant]).await?.get(0);
+        let name: String = client.query_one("SELECT name FROM repositories WHERE id=$1", &[&repo]).await?.get(0);
+        let token = format!("ryt_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_id = Uuid::new_v4();
+        let digest = db::digest(&token);
+        client
+            .execute(
+                "INSERT INTO tokens(id,user_id,digest,read_only,kind,is_restricted)
+                 VALUES($1,$2,$3,false,'api',false)",
+                &[&token_id, &tenant, &digest],
+            )
+            .await?;
+        drop(client);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}"))?);
+        let identity = auth::authenticate(&self.pool, &headers)
+            .await
+            .map_err(|error| anyhow!("initial provisioning token authentication failed: {}", error.1))?;
+        ensure!(
+            identity.id == tenant && identity.username.as_str() == username && identity.token_id == token_id,
+            "initial provisioning owner identity differs"
+        );
+        Ok((tenant, repo, identity, name))
+    }
+
     /// One real serving-ready `pg_refstore` repository plus its authenticated
     /// owner and the Blob backend identity actually opened by this process.
     async fn serving_business(
@@ -1119,6 +1151,25 @@ async fn wait_for_backend_blocked_by(pool: &Pool, blocker_pid: i32) -> Result<i3
             return Err(anyhow!("read backend never blocked on the fixture pin lock"));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+struct RowLock {
+    client: deadpool_postgres::Client,
+}
+
+impl RowLock {
+    async fn release(mut self) -> Result<()> {
+        self.client.batch_execute("ROLLBACK").await?;
+        Ok(())
+    }
+}
+
+async fn release_row_lock(lock: Option<RowLock>) -> Result<()> {
+    let Some(lock) = lock else { return Ok(()) };
+    match tokio::time::timeout(Duration::from_secs(5), lock.release()).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("fixture row-lock release timed out")),
     }
 }
 
@@ -3757,16 +3808,17 @@ async fn serving_check_version_refusals_are_exact_and_state_unchanged() -> Resul
         );
 
         // A real second serving repository owned by another actor is foreign to
-        // this actor. Its state is changed only for the later not-ready case.
+        // this actor.
         let (_other_tenant, other_repo, other_actor, other_backend) =
             db.serving_business("serving-check-other", &store).await?;
+        let other_baseline = metadata_ledger_snapshot(&db.pool, other_repo, other_actor.id).await?;
         let error = check_version(
             &db.pool,
             &actor.identity,
             &other_actor.username,
             "serving-check-other",
             None,
-            &backend,
+            &other_backend,
             deadline(),
         )
         .await
@@ -3776,6 +3828,10 @@ async fn serving_check_version_refusals_are_exact_and_state_unchanged() -> Resul
             "foreign-repository refusal changed: {} {}",
             error.0,
             error.1
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, other_repo, other_actor.id).await? == other_baseline,
+            "foreign-repository refusal changed the other repository state"
         );
 
         // Different actually-opened Blob backend for the authorized repo.
@@ -3799,21 +3855,20 @@ async fn serving_check_version_refusals_are_exact_and_state_unchanged() -> Resul
             error.1
         );
 
-        // Fixture-owned not-ready state on the second real serving repo. The
-        // check must preserve the exact readiness refusal, not fake Unknown.
-        db.pool
-            .get()
-            .await?
-            .execute("UPDATE repositories SET state='provisioning' WHERE id=$1", &[&other_repo])
-            .await?;
-        let other_baseline = metadata_ledger_snapshot(&db.pool, other_repo, other_actor.id).await?;
+        // A repository is created directly in its legal initial provisioning
+        // state with an authenticated owner/token. No ready repository is
+        // transitioned and no migration guard is bypassed. The check must
+        // preserve the exact readiness refusal, not fake Unknown.
+        let (notready_tenant, notready_repo, notready_actor, notready_name) =
+            db.initial_provisioning_owner().await?;
+        let notready_baseline = metadata_ledger_snapshot(&db.pool, notready_repo, notready_tenant).await?;
         let error = check_version(
             &db.pool,
-            &other_actor.identity,
-            &other_actor.username,
-            "serving-check-other",
+            &notready_actor,
+            &notready_actor.username,
+            &notready_name,
             None,
-            &other_backend,
+            &backend,
             deadline(),
         )
         .await
@@ -3825,14 +3880,125 @@ async fn serving_check_version_refusals_are_exact_and_state_unchanged() -> Resul
             error.1
         );
         ensure!(
-            metadata_ledger_snapshot(&db.pool, other_repo, other_actor.id).await? == other_baseline,
-            "not-ready version observation changed the other repository state"
+            metadata_ledger_snapshot(&db.pool, notready_repo, notready_tenant).await? == notready_baseline,
+            "not-ready version observation changed the initial provisioning repository state"
         );
         ensure!(
             metadata_ledger_snapshot(&db.pool, repo, tenant).await? == baseline,
             "serving CheckVersion refusals changed the authorized repository state"
         );
         Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_check_version_absolute_deadline_bounds_two_sequential_auth_lock_waits() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let (_tenant, repo, actor, backend) = db.serving_business("serving-check-deadline", &store).await?;
+        let owner = actor.username.clone();
+
+        // Blocker A owns the first auth statement's token/user row. lookup_in_tx
+        // initially sets PostgreSQL statement/lock timeout from the remaining
+        // absolute deadline once, then runs this statement.
+        let mut first_client = db.pool.get().await?;
+        first_client.batch_execute("BEGIN").await?;
+        first_client
+            .query_opt(
+                "SELECT t.id FROM tokens t JOIN users u ON u.id=t.user_id
+                  WHERE t.id=$1 AND t.user_id=$2 AND u.username=$3 FOR UPDATE OF t,u",
+                &[&actor.token_id, &actor.id, &actor.username],
+            )
+            .await?
+            .ok_or_else(|| anyhow!("fixture token/user row is missing"))?;
+        let first_pid: i32 = first_client.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+
+        // Blocker B owns the later repository row, a distinct sequential auth
+        // statement. It stays held while the facade must time out.
+        let mut second_client = db.pool.get().await?;
+        second_client.batch_execute("BEGIN").await?;
+        second_client
+            .query_opt("SELECT id FROM repositories WHERE id=$1 FOR UPDATE", &[&repo])
+            .await?
+            .ok_or_else(|| anyhow!("fixture repository row is missing"))?;
+        let second_pid: i32 = second_client.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+
+        let started = TokioInstant::now();
+        let absolute = started + Duration::from_secs(5);
+        let pool = db.pool.clone();
+        let actor_identity = actor.identity.clone();
+        let backend_identity = backend.clone();
+        let owner = owner.clone();
+        let mut task = Some(tokio::spawn(async move {
+            check_version(
+                &pool,
+                &actor_identity,
+                &owner,
+                "serving-check-deadline",
+                None,
+                &backend_identity,
+                absolute,
+            )
+            .await
+        }));
+        let mut first = Some(RowLock { client: first_client });
+        let mut second = Some(RowLock { client: second_client });
+
+        let attempted: Result<()> = async {
+            let first_backend = wait_for_backend_blocked_by(&db.pool, first_pid).await?;
+            tokio::time::sleep(Duration::from_millis(3_200)).await;
+            ensure!(
+                started.elapsed() >= Duration::from_millis(3_000),
+                "first auth lock did not consume a substantial part of the absolute deadline"
+            );
+            ensure!(started.elapsed() < absolute, "first auth lock consumed the whole deadline");
+            release_row_lock(first.take()).await?;
+
+            let second_backend = wait_for_backend_blocked_by(&db.pool, second_pid).await?;
+            ensure!(
+                first_backend == second_backend,
+                "the same CheckVersion backend did not move from the token wait to the repository wait"
+            );
+            ensure!(
+                TokioInstant::now() < absolute,
+                "second auth lock was only observed after the absolute deadline"
+            );
+
+            // lookup_in_tx set its per-statement timeout at entry. Releasing the
+            // first wait after ~3.2s of a 5s absolute deadline means the later
+            // repository statement's inherited bound would not expire until
+            // ~8.2s. The fixed facade must return around 5s (plus its 1s cleanup
+            // budget) while B remains held; the old unwrapped lookup would still
+            // be blocked here.
+            let joined =
+                tokio::time::timeout_at(absolute + Duration::from_secs(2), task.as_mut().expect("task"))
+                .await
+                .map_err(|_| anyhow!("CheckVersion did not return within the bounded deadline grace"))??;
+            let error = joined.expect_err("CheckVersion returned an observation after the absolute deadline");
+            ensure!(
+                error.0 == axum::http::StatusCode::GATEWAY_TIMEOUT
+                    || error.0 == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "CheckVersion deadline refusal was not opaque: {} {}",
+                error.0,
+                error.1
+            );
+            ensure!(second.is_some(), "repository blocker was released before the timeout result");
+            Ok(())
+        }
+        .await;
+
+        // Bounded cleanup of every owned task/lock/client, on success or error.
+        if let Some(task) = task.take() {
+            task.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        }
+        let _ = release_row_lock(first.take()).await;
+        let _ = release_row_lock(second.take()).await;
+        attempted
     }
     .await;
     db.finish(outcome).await
