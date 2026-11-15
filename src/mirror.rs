@@ -4,6 +4,7 @@ pub mod auto_origin;
 pub mod eviction;
 pub mod limiter;
 pub mod observability;
+pub mod orchestration;
 pub mod sync;
 pub mod views;
 pub mod job_views;

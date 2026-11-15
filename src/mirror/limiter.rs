@@ -4,15 +4,19 @@ use anyhow::{Context, Result, ensure};
 use axum::http::StatusCode;
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 pub const DEFAULT_MAX_CONCURRENT_SYNCS: usize = 4;
 pub const DEFAULT_MAX_CONCURRENT_CLOSURES: usize = 4;
 pub const DEFAULT_SYNC_COOLDOWN_MS: u64 = 0;
+pub const DEFAULT_SYNC_QUEUE_LIMIT: usize = 32;
 
 static REGISTRY: LazyLock<Mutex<HashMap<Uuid, Arc<MirrorLimiter>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -30,12 +34,15 @@ pub struct MirrorLimiter {
     sync_semaphore: Arc<Semaphore>,
     closure_semaphore: Arc<Semaphore>,
     repo_slots: Arc<Mutex<HashMap<Uuid, RepoSyncSlot>>>,
+    sync_wait_notify: Arc<Notify>,
+    sync_waiters: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
 pub struct SyncPermit {
     repo_id: Uuid,
     repo_slots: Arc<Mutex<HashMap<Uuid, RepoSyncSlot>>>,
+    sync_wait_notify: Arc<Notify>,
     _permit: OwnedSemaphorePermit,
     completed: bool,
 }
@@ -55,6 +62,7 @@ impl Drop for SyncPermit {
                     slot.last_completed = Some(Instant::now());
                 }
             }
+        self.sync_wait_notify.notify_waiters();
     }
 }
 
@@ -73,6 +81,8 @@ impl MirrorLimiter {
             sync_semaphore: Arc::new(Semaphore::new(syncs)),
             closure_semaphore: Arc::new(Semaphore::new(closures)),
             repo_slots: Arc::new(Mutex::new(HashMap::new())),
+            sync_wait_notify: Arc::new(Notify::new()),
+            sync_waiters: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -148,9 +158,89 @@ impl MirrorLimiter {
         Ok(SyncPermit {
             repo_id,
             repo_slots: self.repo_slots.clone(),
+            sync_wait_notify: self.sync_wait_notify.clone(),
             _permit: permit,
             completed: false,
         })
+    }
+
+    pub async fn wait_for_sync_slot(
+        &self,
+        state: &AppState,
+        repo_id: Uuid,
+        wait_ms: u64,
+    ) -> Result<bool, Error> {
+        let bounded = wait_ms.min(10_000);
+        if bounded == 0 {
+            return Ok(false);
+        }
+        let queue_limit = std::env::var("ROOTYARD_MIRROR_SYNC_QUEUE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SYNC_QUEUE_LIMIT)
+            .clamp(1, 256);
+        let mut cur = self.sync_waiters.load(Ordering::Relaxed);
+        loop {
+            if cur >= queue_limit {
+                observability::for_state(state).record_rate_limited();
+                return Err(Error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "mirror sync queue overloaded",
+                ));
+            }
+            if self
+                .sync_waiters
+                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            cur = self.sync_waiters.load(Ordering::Relaxed);
+        }
+        struct WaiterDrop(Arc<AtomicUsize>);
+        impl Drop for WaiterDrop {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _guard = WaiterDrop(self.sync_waiters.clone());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(bounded);
+        let mut waited = false;
+        loop {
+            let notified = self.sync_wait_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (ready, cooldown_wait) = {
+                let slots = self.repo_slots.lock().expect("repo_slots mutex poisoned");
+                let slot = slots.get(&repo_id);
+                let in_flight = slot.is_some_and(|s| s.in_flight);
+                let cooldown_left = if self.sync_cooldown > Duration::ZERO {
+                    slot.and_then(|s| s.last_completed)
+                        .and_then(|t| self.sync_cooldown.checked_sub(t.elapsed()))
+                } else {
+                    None
+                };
+                let ready = !in_flight
+                    && cooldown_left.is_none()
+                    && self.sync_semaphore.available_permits() > 0;
+                (ready, cooldown_left)
+            };
+            if ready {
+                return Ok(waited);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(waited);
+            }
+            waited = true;
+            let step = cooldown_wait
+                .unwrap_or(Duration::from_millis(200))
+                .min(Duration::from_millis(250));
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until((now + step).min(deadline)) => {}
+            }
+        }
     }
 
     pub fn try_acquire_sync(&self, state: &AppState, repo_id: Uuid) -> Result<SyncPermit, Error> {

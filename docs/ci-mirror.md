@@ -544,3 +544,42 @@ And scrape fixed-cardinality Prometheus metrics (`Cache-Control: no-store`) from
 `rootyard_mirror_pins`, `rootyard_mirror_job_views`, and
 `rootyard_mirror_active_leases`).
 
+## Durable multi-mirror orchestration, failover, and bounded bursts
+
+When multiple read mirrors register via `POST /api/repos/{owner}/{name}/ci-mirrors/{mirror_id}/heartbeat`,
+the primary validates the mirror URL (requiring HTTPS outside loopback and
+rejecting credentials, queries, paths, or origin-spoof `"origin"` targets) and
+requires `audience` to equal the configured `ROOTYARD_CI_MIRROR_AUDIENCE`. Operators
+and controllers can inspect registered mirrors and origin fallback headroom via:
+
+```http
+GET /api/repos/{owner}/{name}/ci-mirrors?target_oid=<optional-oid>
+```
+
+The scheduler and `POST .../integrations/{hook_id}/runs/{run_id}/claim` enforce:
+
+- **Audience-matched load-balanced selection**: only active, recently
+  heartbeating mirrors matching `storage_generation`, `ROOTYARD_CI_MIRROR_AUDIENCE`,
+  exact `target_oid` readiness, and spare `capacity` are eligible, ordered by
+  fewest active `leased` runs and largest capacity headroom.
+- **Explicit deterministic state classification**: `inspect`, `claim`,
+  `failover`, and `mirror-auto-fetch` classify outcomes as `ready`, `waiting`,
+  `denied`, `missing`, or `overloaded` in both the JSON `classification` field
+  and the `X-Rootyard-CI-State` response header.
+- **Coalesced prewarming & bounded waiting**: on PR sync (`on_pull_synchronized`),
+  background reconciliation (`reconcile_runs`), and unready `claim`, the primary
+  coalesces singleflight `mirror-auto-fetch` prewarm requests (configured via
+  `ROOTYARD_CI_MIRROR_SOURCE_TOKEN`). Callers may pass optional
+  `wait_for_ready_ms` (bounded by `ROOTYARD_CI_CHECKOUT_WAIT_QUEUE`, default `64`)
+  on `claim` or `wait_ms` (bounded by `ROOTYARD_MIRROR_SYNC_QUEUE_LIMIT`, default
+  `32`) on `mirror-auto-fetch` to wait cleanly under burst contention.
+- **Mid-job failover & durable lease reconciliation**: runners holding an active
+  fenced `(attempt, lease_generation, runner_id)` lease may call
+  `POST .../integrations/{hook_id}/runs/{run_id}/failover` (with optional
+  `failed_source`, `exclude_sources`, or `requeue_only: true`) to rotate to another
+  ready mirror or origin fallback with incremented `(attempt, lease_generation)`
+  and freshly minted checkout credentials. Closed/drifted PR runs are cancelled
+  and expired leases are reaped back to `queued` automatically without shifting
+  the target commit OID.
+
+

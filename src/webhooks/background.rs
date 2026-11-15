@@ -163,6 +163,13 @@ async fn scan_round(
         .await;
         summary.merge(outcome);
     }
+    if !stop.is_cancelled() && window.work_open(Instant::now()) {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::webhooks::ci_controller::reconcile_runs(state),
+        )
+        .await;
+    }
     if stop.is_cancelled() {
         return Ok(summary);
     }

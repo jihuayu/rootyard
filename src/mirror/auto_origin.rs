@@ -2,8 +2,8 @@
 use crate::{
     AppState, Error, db,
     mirror::{
-        Snapshot,
-        sync::{self, atomic_file, private_directory, read_regular},
+        Snapshot, orchestration,
+        sync::{atomic_file, private_directory, read_regular},
         views,
     },
     storage::Storage,
@@ -37,6 +37,8 @@ static RUNNER_QUEUE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub struct AutoFetchRequest {
     pub target_oid: String, pub job_id: Option<String>,
     pub storage_generation: Option<i64>, pub force_refresh: Option<bool>,
+    #[serde(default)] pub wait_ms: Option<u64>,
+    #[serde(default)] pub mirror_id: Option<String>,
 }
 
 #[rustfmt::skip]
@@ -46,6 +48,7 @@ pub struct AutoFetchResponse {
     pub repository_id: Uuid, pub storage_generation: i64, pub target_oid: String,
     pub snapshot_id: Uuid, pub cache_status: String, pub coalesced: bool,
     pub coalesced_waiters: usize, pub duration_ms: u64,
+    #[serde(default)] pub classification: String, #[serde(default)] pub waited_for_slot: bool,
 }
 
 #[rustfmt::skip]
@@ -133,14 +136,26 @@ fn json_no_store(body: impl Serialize) -> Response {
 pub async fn auto_fetch(
     State(state): App, Path((owner, name)): RepoPath, headers: HeaderMap, Json(req): Json<AutoFetchRequest>,
 ) -> ApiResult {
+    match auto_fetch_inner(state, owner, name, headers, req).await {
+        Ok(resp) => Ok(resp),
+        Err(err) => Ok(orchestration::error_response(err)),
+    }
+}
+
+#[rustfmt::skip]
+async fn auto_fetch_inner(
+    state: Arc<AppState>, owner: String, name: String, headers: HeaderMap, req: AutoFetchRequest,
+) -> ApiResult {
     let t0 = Instant::now();
     if !crate::ci_pins::valid_oid(&req.target_oid)
         || req.target_oid.bytes().all(|b| b == b'0')
         || req.storage_generation.is_some_and(|g| g <= 0)
+        || req.wait_ms.is_some_and(|w| w > 60_000)
         || req.job_id.as_ref().is_some_and(|id| !valid_runner_id(id))
     {
         return Err(Error::bad_request());
     }
+    orchestration::validate_mirror_id_opt(req.mirror_id.as_deref())?;
     let repo = crate::mirror::repository(&state, &headers, &owner, &name).await?;
     if !crate::ci_pins::valid_format(&repo.object_format)
         || !crate::ci_pins::valid_oid_for_format(&req.target_oid, &repo.object_format)
@@ -153,6 +168,7 @@ pub async fn auto_fetch(
     let force = req.force_refresh.unwrap_or(false);
     let pin_meta = pinned_path(&state.storage, repo.id, repo.storage_generation, &req.target_oid);
     let cached = !force && pin_meta.is_file() && views::pinned_path(&state, &repo, &req.target_oid).await.is_ok();
+    let mut waited_for_slot = false;
     let (status, w) = if cached && read_pin_snap(&state.storage, &repo, &req.target_oid).is_ok() {
         ("hit", 0)
     } else {
@@ -175,26 +191,19 @@ pub async fn auto_fetch(
             views::pinned_path(&state, &repo, &req.target_oid).await?;
             "coalesced_wait"
         } else {
+            let wait_ms = req.wait_ms.unwrap_or(0);
             let res = async {
-                // Verify active source pins (refs/rootyard-ci/jobs/*) or mirror snapshot
                 let _pins = crate::ci_pins::active_pinned_oids(&state, repo.id, repo.storage_generation).await;
-                if force && pin_meta.exists() {
-                    let _ = std::fs::remove_file(&pin_meta);
-                }
+                if force && pin_meta.exists() { let _ = std::fs::remove_file(&pin_meta); }
                 if force || views::pinned_path(&state, &repo, &req.target_oid).await.is_err() {
-                    sync::sync(State(state.clone()), Path((owner.clone(), name.clone())), headers.clone()).await?;
-                    if force && pin_meta.exists() {
-                        let _ = std::fs::remove_file(&pin_meta);
-                    }
+                    waited_for_slot = orchestration::sync_with_wait(&state, &owner, &name, &headers, repo.id, wait_ms).await?;
+                    if force && pin_meta.exists() { let _ = std::fs::remove_file(&pin_meta); }
                     views::pinned_path(&state, &repo, &req.target_oid).await?;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 Ok::<(), Error>(())
-            }
-            .await;
-            if let Some(notify) = fmap.lock().expect("inflight").remove(&key) {
-                notify.notify_waiters();
-            }
+            }.await;
+            if let Some(notify) = fmap.lock().expect("inflight").remove(&key) { notify.notify_waiters(); }
             res?;
             "miss_fetched"
         };
@@ -206,12 +215,14 @@ pub async fn auto_fetch(
         (st, if st == "coalesced_wait" { waiters.max(1) } else { waiters })
     };
     let snap = read_pin_snap(&state.storage, &repo, &req.target_oid)?;
-    Ok(json_no_store(AutoFetchResponse {
-        repository_id: repo.id, storage_generation: repo.storage_generation,
-        target_oid: req.target_oid, snapshot_id: snap.snapshot, cache_status: status.into(),
-        coalesced: status == "coalesced_wait" || w > 0, coalesced_waiters: w,
-        duration_ms: t0.elapsed().as_millis() as u64,
-    }))
+    orchestration::publish_ready_oid(&state, &repo, &req.target_oid, req.mirror_id.as_deref()).await;
+    let class = orchestration::classify_auto_fetch_status(status, waited_for_slot);
+    Ok(orchestration::attach_state_header(json_no_store(AutoFetchResponse {
+        repository_id: repo.id, storage_generation: repo.storage_generation, target_oid: req.target_oid,
+        snapshot_id: snap.snapshot, cache_status: status.into(), coalesced: status == "coalesced_wait" || w > 0,
+        coalesced_waiters: w, duration_ms: t0.elapsed().as_millis() as u64,
+        classification: class.as_str().into(), waited_for_slot,
+    }), class))
 }
 
 #[rustfmt::skip]

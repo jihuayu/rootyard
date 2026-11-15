@@ -1,20 +1,162 @@
 //! Thin external runner adapter for immutable CI candidates and fenced attempts.
-use crate::{AppState, Error, ci_checkouts, pulls::models::context_valid, webhooks::signing::{constant_time_eq, sha256_hex}};
-use axum::{Json, extract::{Path,State}, http::{HeaderMap,StatusCode,header}, response::{IntoResponse,Response}};
+use crate::{
+    AppState, Error, ci_checkouts,
+    pulls::models::context_valid,
+    webhooks::{
+        ci_classification::{
+            CheckoutStateClass, ClassificationInput, classified_error, classified_response,
+            classify_checkout_state, error_with_classification,
+        },
+        ci_controller,
+        signing::{constant_time_eq, sha256_hex},
+    },
+};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use serde::Deserialize;
-use std::sync::Arc;
+use serde_json::json;
+use std::{collections::BTreeSet, sync::Arc};
+use deadpool_postgres::Transaction;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ClaimInput { pub runner_id: String }
+pub struct ClaimInput {
+    pub runner_id: String,
+    #[serde(default)]
+    pub wait_for_ready_ms: Option<u64>,
+    #[serde(default)]
+    pub prefer_mirror: Option<bool>,
+    #[serde(default)]
+    pub exclude_sources: Option<Vec<String>>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReportInput { pub attempt: i64, pub lease_generation: i64,
-    pub conclusion: String, pub output: String }
+pub struct ReportInput {
+    pub attempt: i64,
+    pub lease_generation: i64,
+    pub conclusion: String,
+    pub output: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HeartbeatInput { pub attempt:i64, pub lease_generation:i64, pub runner_id:String }
+pub struct HeartbeatInput {
+    pub attempt: i64,
+    pub lease_generation: i64,
+    pub runner_id: String,
+}
+
+pub(crate) fn valid_runner_id(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
+pub(crate) fn normalize_excluded(raw: Option<Vec<String>>, extra: Option<&str>) -> Result<Vec<String>, Error> {
+    let mut set = BTreeSet::new();
+    for item in raw.into_iter().flatten() {
+        if set.len() >= 32 || item.len() > 512 {
+            return Err(Error::bad_request());
+        }
+        if item.eq_ignore_ascii_case("origin") {
+            set.insert("origin".to_owned());
+        } else {
+            set.insert(ci_controller::validate_mirror_url(&item)?);
+        }
+    }
+    if let Some(s) = extra {
+        if s.eq_ignore_ascii_case("origin") {
+            set.insert("origin".to_owned());
+        } else if let Ok(norm) = ci_controller::validate_mirror_url(s) {
+            set.insert(norm);
+        } else {
+            set.insert(s.to_owned());
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
+pub(crate) async fn verify_hook_tx(tx: &Transaction<'_>, hook_id: Uuid, repo: Uuid, headers: &HeaderMap) -> Result<(), Error> {
+    let current_hook = tx
+        .query_opt(
+            "SELECT secret,active FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
+            &[&hook_id, &repo],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::unauthorized)?;
+    let bearer = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .ok_or_else(Error::unauthorized)?;
+    if !current_hook.get::<_, bool>("active")
+        || !constant_time_eq(current_hook.get::<_, String>("secret").as_bytes(), bearer.as_bytes())
+    {
+        return Err(Error::unauthorized());
+    }
+    Ok(())
+}
+
+pub(crate) async fn choose_checkout_source(
+    tx: &Transaction<'_>,
+    repo: Uuid,
+    generation: i64,
+    audience: Uuid,
+    head: &str,
+    excluded: &[String],
+    prefer_mirror: bool,
+    wait_requested: bool,
+) -> Result<Result<String, Response>, Error> {
+    if let Some(mirror) = ci_controller::select_ready_mirror(&**tx, repo, generation, audience, head, excluded).await? {
+        return Ok(Ok(mirror));
+    }
+    let summary = ci_controller::probe_availability(&**tx, repo, generation, audience, head, excluded).await?;
+    let (global, per_repo) = ci_controller::origin_fallback_limits();
+    let allow_origin = !prefer_mirror && !excluded.iter().any(|s| s == "origin");
+    let class = classify_checkout_state(ClassificationInput {
+        trusted_bound: true,
+        candidate_valid: true,
+        ready_available_mirrors: summary.ready_available_mirrors,
+        ready_total_mirrors: summary.ready_total_mirrors,
+        healthy_unready_mirrors: summary.healthy_unready_mirrors,
+        origin_global_active: summary.origin_budget.global_active,
+        origin_global_limit: global,
+        origin_per_repo_active: summary.origin_budget.per_repo_active,
+        origin_per_repo_limit: per_repo,
+        allow_origin,
+        wait_requested,
+    });
+    if prefer_mirror || global <= 0 || per_repo <= 0 {
+        let (status, msg) = match class {
+            CheckoutStateClass::Waiting => (StatusCode::ACCEPTED, "waiting for ready mirror"),
+            CheckoutStateClass::Overloaded => (StatusCode::TOO_MANY_REQUESTS, "all ready mirrors at capacity"),
+            _ => (StatusCode::TOO_MANY_REQUESTS, "no ready mirror"),
+        };
+        return Ok(Err(classified_error(
+            status,
+            msg,
+            class,
+            json!({ "availability": summary, "retry_after_ms": 250 }),
+        )));
+    }
+    if excluded.iter().any(|s| s == "origin")
+        || summary.origin_budget.global_active >= global
+        || summary.origin_budget.per_repo_active >= per_repo
+    {
+        return Ok(Err(classified_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "origin fallback budget exhausted",
+            class,
+            json!({ "availability": summary }),
+        )));
+    }
+    Ok(Ok("origin".to_owned()))
+}
 
 pub(crate) async fn integration(state: &AppState, owner: &str, name: &str, hook_id: Uuid,
     headers: &HeaderMap) -> Result<(Uuid,Uuid),Error> {
@@ -39,35 +181,94 @@ pub async fn claim(
     Path((owner,name,hook_id,run_id)): Path<(String,String,Uuid,Uuid)>,
     headers: HeaderMap, Json(input): Json<ClaimInput>,
 ) -> Result<Response,Error> {
-    if input.runner_id.is_empty() || input.runner_id.len()>64 ||
-        !input.runner_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+    if !valid_runner_id(&input.runner_id) || input.wait_for_ready_ms.is_some_and(|w| w > 60_000) {
         return Err(Error::bad_request());
     }
-    let (repo,_) = integration(&state,&owner,&name,hook_id,&headers).await?;
-    let snapshot=state.pool.get().await.map_err(Error::internal)?.query_opt(
+    let excluded = normalize_excluded(input.exclude_sources, None)?;
+    let prefer_mirror = input.prefer_mirror.unwrap_or(false);
+    let wait_ms = input.wait_for_ready_ms.unwrap_or(0);
+    let (repo, _) = match integration(&state, &owner, &name, hook_id, &headers).await {
+        Ok(ids) => ids,
+        Err(err) => return Ok(error_with_classification(err)),
+    };
+    let snapshot = state.pool.get().await.map_err(Error::internal)?.query_opt(
         "SELECT c.head_oid,c.job_id,c.storage_generation FROM ci_runs c \
          JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
            AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
          JOIN forge_webhooks w ON w.id=b.webhook_id AND w.repository_id=c.repository_id \
            AND w.active=true AND w.ci_contexts ? c.context \
          WHERE c.id=$1 AND c.repository_id=$2 AND c.state IN ('queued','leased')",
-        &[&run_id,&repo,&hook_id],
+        &[&run_id, &repo, &hook_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    let prepared=ci_checkouts::integration::prepare(&state,hook_id,repo,snapshot.get("job_id"),
-        snapshot.get::<_,String>("head_oid").as_str()).await?;
+    let snap_head: String = snapshot.get("head_oid");
+    let snap_gen: i64 = snapshot.get("storage_generation");
+    let audience = ci_checkouts::audience()?;
+    let mut prewarm_triggered = false;
+    {
+        let client = state.pool.get().await.map_err(Error::internal)?;
+        let summary = ci_controller::probe_availability(&**client, repo, snap_gen, audience, &snap_head, &excluded).await?;
+        drop(client);
+        if summary.ready_available_mirrors == 0 && summary.healthy_unready_mirrors > 0 {
+            let _ = ci_controller::trigger_coalesced_prewarm(
+                state.pool.clone(),
+                repo,
+                audience,
+                snap_head.clone(),
+                excluded.clone(),
+            );
+            prewarm_triggered = true;
+        }
+    }
+    if wait_ms > 0 {
+        let ready = ci_controller::wait_for_checkout_slot(
+            &state,
+            repo,
+            snap_gen,
+            audience,
+            &snap_head,
+            &excluded,
+            prefer_mirror,
+            wait_ms,
+        ).await?;
+        if !ready {
+            let client = state.pool.get().await.map_err(Error::internal)?;
+            let summary = ci_controller::probe_availability(&**client, repo, snap_gen, audience, &snap_head, &excluded).await?;
+            let (global, per_repo) = ci_controller::origin_fallback_limits();
+            let class = classify_checkout_state(ClassificationInput {
+                trusted_bound: true,
+                candidate_valid: true,
+                ready_available_mirrors: summary.ready_available_mirrors,
+                ready_total_mirrors: summary.ready_total_mirrors,
+                healthy_unready_mirrors: summary.healthy_unready_mirrors,
+                origin_global_active: summary.origin_budget.global_active,
+                origin_global_limit: global,
+                origin_per_repo_active: summary.origin_budget.per_repo_active,
+                origin_per_repo_limit: per_repo,
+                allow_origin: !prefer_mirror && !excluded.iter().any(|s| s == "origin"),
+                wait_requested: true,
+            });
+            let (status, msg) = match class {
+                CheckoutStateClass::Waiting => (StatusCode::ACCEPTED, "waiting for ready mirror or checkout slot"),
+                CheckoutStateClass::Overloaded => (StatusCode::TOO_MANY_REQUESTS, "origin fallback budget exhausted"),
+                _ => (StatusCode::TOO_MANY_REQUESTS, "no ready mirror"),
+            };
+            return Ok(classified_error(
+                status,
+                msg,
+                class,
+                json!({ "availability": summary, "prewarm_triggered": prewarm_triggered, "retry_after_ms": 250 }),
+            ));
+        }
+    }
+    let prepared = ci_checkouts::integration::prepare(&state, hook_id, repo, snapshot.get("job_id"), &snap_head).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     // Preparation is slow and deliberately lock-free. Re-establish current
     // issuer authority under the same policy fence used by revocation before
     // minting the lease and its checkout capability.
-    crate::webhooks::trust::lock_policy_tx(&tx,repo).await?;
-    let current_hook=tx.query_opt("SELECT secret,active FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
-        &[&hook_id,&repo]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
-    let bearer=headers.get("authorization").and_then(|h|h.to_str().ok())
-        .and_then(|h|h.strip_prefix("Bearer ")).ok_or_else(Error::unauthorized)?;
-    if !current_hook.get::<_,bool>("active") ||
-        !constant_time_eq(current_hook.get::<_,String>("secret").as_bytes(),bearer.as_bytes()) {
-        return Err(Error::unauthorized());
+    crate::webhooks::trust::lock_policy_tx(&tx, repo).await?;
+    if let Err(err) = verify_hook_tx(&tx, hook_id, repo, &headers).await {
+        return Ok(error_with_classification(err));
     }
     let row = tx.query_opt(
         "SELECT c.context,c.head_oid,c.base_oid,c.job_id,c.storage_generation,c.state,c.attempt,c.lease_generation \
@@ -96,36 +297,22 @@ pub async fn claim(
     let base: String = row.get("base_oid");
     let generation: i64 = row.get("storage_generation");
     let job_id: Uuid = row.get("job_id");
-    if head!=snapshot.get::<_,String>("head_oid") || job_id!=snapshot.get::<_,Uuid>("job_id") ||
-        generation!=snapshot.get::<_,i64>("storage_generation") {
+    if head != snap_head || job_id != snapshot.get::<_, Uuid>("job_id") || generation != snap_gen {
         return Err(Error(StatusCode::CONFLICT,"CI candidate changed during checkout preparation"));
     }
-    tx.execute("SELECT pg_advisory_xact_lock(1062026)",&[]).await.map_err(Error::internal)?;
-    // A mirror is eligible only with a fresh heartbeat and exact target readiness.
-    let mirror = tx.query_opt(
-        "SELECT m.url FROM ci_mirror_nodes m WHERE m.repository_id=$1 AND m.storage_generation=$2 \
-         AND m.active=true AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())-30 \
-         AND m.ready_oids ? $3 AND (SELECT count(*) FROM ci_runs c \
-             WHERE c.source_url=m.url AND c.state='leased' AND \
-             c.lease_expires_unix>extract(epoch FROM clock_timestamp()))<m.capacity \
-         ORDER BY m.heartbeat_unix DESC LIMIT 1",
-        &[&repo,&generation,&head],
-    ).await.map_err(Error::internal)?;
-    let source = if let Some(mirror)=mirror { mirror.get::<_,String>(0) } else {
-        let global: i64 = std::env::var("ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL").ok()
-            .and_then(|v| v.parse().ok()).unwrap_or(4);
-        let per_repo: i64 = std::env::var("ROOTYARD_CI_ORIGIN_FALLBACK_PER_REPO").ok()
-            .and_then(|v| v.parse().ok()).unwrap_or(2);
-        if global<=0 || per_repo<=0 { return Err(Error(StatusCode::TOO_MANY_REQUESTS,"no ready mirror")); }
-        let count = tx.query_one(
-            "SELECT count(*) AS global, count(*) FILTER(WHERE repository_id=$1) AS repo \
-             FROM ci_runs WHERE state='leased' AND source_url='origin' \
-             AND lease_expires_unix>extract(epoch FROM clock_timestamp())", &[&repo],
-        ).await.map_err(Error::internal)?;
-        if count.get::<_,i64>("global")>=global || count.get::<_,i64>("repo")>=per_repo {
-            return Err(Error(StatusCode::TOO_MANY_REQUESTS,"origin fallback budget exhausted"));
+    tx.execute("SELECT pg_advisory_xact_lock(1062026)", &[]).await.map_err(Error::internal)?;
+    let source = match choose_checkout_source(
+        &tx, repo, generation, audience, &head, &excluded, prefer_mirror, input.wait_for_ready_ms.is_some(),
+    ).await? {
+        Ok(src) => src,
+        Err(resp) => {
+            if !prewarm_triggered {
+                let _ = ci_controller::trigger_coalesced_prewarm(
+                    state.pool.clone(), repo, audience, head.clone(), excluded.clone(),
+                );
+            }
+            return Ok(resp);
         }
-        "origin".to_owned()
     };
     let updated = tx.query_one(
         "UPDATE ci_runs SET state='leased',attempt=attempt+1,lease_generation=lease_generation+1, \
@@ -140,10 +327,18 @@ pub async fn claim(
     let checkout=ci_checkouts::integration::persist(&tx,prepared,hook_id,run_id,
         attempt,lease_generation,expires_unix+3600).await?;
     tx.commit().await.map_err(Error::internal)?;
-    Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"run_id":run_id,"job_id":job_id,
-        "head_oid":head,"base_oid":base,"storage_generation":generation,"source":source,
-        "attempt":updated.get::<_,i64>(0),"lease_generation":updated.get::<_,i64>(1),
-        "lease_expires_unix":expires_unix,"checkout":checkout}))).into_response())
+    Ok(classified_response(
+        StatusCode::OK,
+        CheckoutStateClass::Ready,
+        json!({
+            "run_id": run_id, "job_id": job_id, "head_oid": head, "base_oid": base,
+            "storage_generation": generation, "source": source,
+            "attempt": attempt, "lease_generation": lease_generation,
+            "lease_expires_unix": expires_unix, "checkout": checkout,
+            "classification": CheckoutStateClass::Ready.as_str(),
+            "prewarm_triggered": prewarm_triggered
+        }),
+    ))
 }
 
 pub async fn heartbeat(
@@ -151,20 +346,14 @@ pub async fn heartbeat(
     Path((owner,name,hook_id,run_id)):Path<(String,String,Uuid,Uuid)>,
     headers:HeaderMap,Json(input):Json<HeartbeatInput>,
 )->Result<Response,Error>{
-    if input.attempt<=0 || input.lease_generation<=0 || input.runner_id.is_empty() ||
-        input.runner_id.len()>64 {return Err(Error::bad_request());}
+    if input.attempt<=0 || input.lease_generation<=0 || !valid_runner_id(&input.runner_id) {
+        return Err(Error::bad_request());
+    }
     let (repo,_)=integration(&state,&owner,&name,hook_id,&headers).await?;
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
     crate::webhooks::trust::lock_policy_tx(&tx,repo).await?;
-    let current_hook=tx.query_opt("SELECT secret,active FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
-        &[&hook_id,&repo]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
-    let bearer=headers.get("authorization").and_then(|h|h.to_str().ok())
-        .and_then(|h|h.strip_prefix("Bearer ")).ok_or_else(Error::unauthorized)?;
-    if !current_hook.get::<_,bool>("active") ||
-        !constant_time_eq(current_hook.get::<_,String>("secret").as_bytes(),bearer.as_bytes()) {
-        return Err(Error::unauthorized());
-    }
+    verify_hook_tx(&tx, hook_id, repo, &headers).await?;
     let row=tx.query_opt(
         "UPDATE ci_runs c SET lease_expires_unix=extract(epoch FROM clock_timestamp())::bigint+60, \
          updated_at=clock_timestamp() FROM forge_trusted_check_contexts b, forge_webhooks w, forge_pulls p \
@@ -198,14 +387,7 @@ pub async fn report(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     crate::webhooks::trust::lock_policy_tx(&tx,repo).await?;
-    let current_hook=tx.query_opt("SELECT secret,active FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
-        &[&hook_id,&repo]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
-    let bearer=headers.get("authorization").and_then(|h|h.to_str().ok())
-        .and_then(|h|h.strip_prefix("Bearer ")).ok_or_else(Error::unauthorized)?;
-    if !current_hook.get::<_,bool>("active") ||
-        !constant_time_eq(current_hook.get::<_,String>("secret").as_bytes(),bearer.as_bytes()) {
-        return Err(Error::unauthorized());
-    }
+    verify_hook_tx(&tx, hook_id, repo, &headers).await?;
     let row = tx.query_opt(
         "SELECT c.context,c.head_oid,c.base_oid,c.state,c.attempt,c.lease_generation,c.result_sha256, \
           p.head_oid AS live_head,p.base_oid AS live_base,p.version AS live_version, \
@@ -266,5 +448,6 @@ pub async fn report(
         &[&run_id,&input.conclusion,&digest],
     ).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
+    ci_controller::notify_slot_released(repo);
     Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"run_id":run_id,"replay":false}))).into_response())
 }

@@ -566,6 +566,41 @@ class CiMirrorTrack3Test(unittest.TestCase):
         self.assertTrue(coalesced_resp["coalesced"])
         self.assertGreaterEqual(coalesced_resp["coalesced_waiters"], 1)
 
+    def test_mirror_orchestration_burst_queue_and_classification_contracts(self):
+        orch_path = ROOT / "src" / "mirror" / "orchestration.rs"
+        limiter_path = ROOT / "src" / "mirror" / "limiter.rs"
+        auto_path = ROOT / "src" / "mirror" / "auto_origin.rs"
+        mirror_rs = (ROOT / "src" / "mirror.rs").read_text(encoding="utf-8")
+
+        self.assertIn("pub mod orchestration;", mirror_rs)
+        self.assertLess(len(mirror_rs.splitlines()), 140)
+        self.assertTrue(orch_path.is_file())
+
+        orch_src = orch_path.read_text(encoding="utf-8")
+        self.assertLess(len(orch_src.splitlines()), 450)
+        for tok in (
+            "MirrorStateClass",
+            "classify_auto_fetch_status",
+            "classify_auto_fetch_error",
+            "publish_ready_oid",
+            "sync_with_wait",
+            "x-rootyard-ci-state",
+        ):
+            self.assertIn(tok, orch_src, f"mirror/orchestration.rs missing {tok}")
+
+        limiter_src = limiter_path.read_text(encoding="utf-8")
+        self.assertIn("wait_for_sync_slot", limiter_src)
+        self.assertIn("ROOTYARD_MIRROR_SYNC_QUEUE_LIMIT", limiter_src)
+
+        auto_src = auto_path.read_text(encoding="utf-8")
+        self.assertLess(len(auto_src.splitlines()), 450)
+        self.assertGreaterEqual(auto_src.count("#[serde(deny_unknown_fields)]"), 7)
+        for tok in ("wait_ms", "mirror_id", "classification", "waited_for_slot"):
+            self.assertIn(tok, auto_src, f"auto_origin.rs missing {tok}")
+
+        doc_src = (ROOT / "docs" / "ci-mirror.md").read_text(encoding="utf-8")
+        self.assertIn("Durable multi-mirror orchestration, failover, and bounded bursts", doc_src)
+
 
 if __name__ == "__main__":
     unittest.main()
