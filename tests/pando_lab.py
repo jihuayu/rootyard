@@ -944,13 +944,14 @@ class Lab:
         self.git('push', self.url(enc_repo), 'HEAD:refs/heads/main', principal='alice', cwd=wt)
         rows1 = self.rows(f"SELECT pack_id::text, pack_sha256 FROM pando_lab.manifests WHERE repo='{enc_repo}' ORDER BY pack_id")
         assert len(rows1) == 1, rows1
-        p1, p1_sha = rows1[0]
+        p1, p1_sha = rows1[0]['pack_id'], rows1[0]['pack_sha256']
         self.cli('object-store-put', enc_repo, p1, '--cipher-suite', 'CHACHA20-POLY1305-SHA256')
 
         self.commit(wt, 'ROOTYARD_ISSUE21_SECRET_BETA_002')
         self.git('push', self.url(enc_repo), 'HEAD:refs/heads/main', principal='alice', cwd=wt)
         rows2 = self.rows(f"SELECT pack_id::text, pack_sha256 FROM pando_lab.manifests WHERE repo='{enc_repo}' ORDER BY pack_id")
-        p2, p2_sha = [r for r in rows2 if r[0] != p1][0]
+        p2_row = [r for r in rows2 if r['pack_id'] != p1][0]
+        p2, p2_sha = p2_row['pack_id'], p2_row['pack_sha256']
         self.cli('object-store-put', enc_repo, p2)
 
         man_dir = self.store / 'manifests' / enc_repo
@@ -989,10 +990,14 @@ class Lab:
 
         tampered = bytearray(c1_bytes)
         tampered[-20] ^= 0x55
-        c1_path.write_bytes(bytes(tampered))
-        assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
-        assert self.run([self.binary, 'object-store-get', enc_repo, p1], check=False).returncode != 0
-        c1_path.write_bytes(c1_bytes)
+        c1_path.chmod(0o644)
+        try:
+            c1_path.write_bytes(bytes(tampered))
+            assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
+            assert self.run([self.binary, 'object-store-get', enc_repo, p1], check=False).returncode != 0
+        finally:
+            c1_path.write_bytes(c1_bytes)
+            c1_path.chmod(0o444)
 
         env_p1_path = self.store / 'object_store' / 'envelopes' / enc_repo / f'{p1}.json'
         env_p1_orig = env_p1_path.read_bytes()
@@ -1016,7 +1021,8 @@ class Lab:
         self.commit(wt, 'ROOTYARD_ISSUE21_CONCURRENT_GAMMA_003')
         self.git('push', self.url(enc_repo), 'HEAD:refs/heads/main', principal='alice', cwd=wt)
         rows3 = self.rows(f"SELECT pack_id::text, pack_sha256 FROM pando_lab.manifests WHERE repo='{enc_repo}' ORDER BY pack_id")
-        p3, p3_sha = [r for r in rows3 if r[0] not in (p1, p2)][0]
+        p3_row = [r for r in rows3 if r['pack_id'] not in (p1, p2)][0]
+        p3, p3_sha = p3_row['pack_id'], p3_row['pack_sha256']
         self.cli('object-store-put', enc_repo, p3)
         self.cli('lifecycle-evaluate', enc_repo, '--max-packs', '8', '--cold-evict-local')
         p3_env = json.loads((self.store / 'object_store' / 'envelopes' / enc_repo / f'{p3}.json').read_text())
