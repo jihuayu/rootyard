@@ -930,6 +930,159 @@ class Lab:
             'cross_format_rejected': True,
         }
 
+    def authenticated_pack_encryption_and_kms_rotation(self):
+        import hashlib
+        import uuid
+
+        enc_repo = str(uuid.uuid4())
+        self.cli('create-repo', enc_repo, 'alice')
+        self.sql(f"INSERT INTO pando_lab.acl(repo,principal,write_allowed) VALUES ('{enc_repo}','reader',false)")
+        wt = self.root / 'enc-work'
+        self.git('init', '--initial-branch=main', str(wt))
+        self.git('config', 'core.compression', '0', cwd=wt)
+        self.commit(wt, 'ROOTYARD_ISSUE21_SECRET_ALPHA_001')
+        self.git('push', self.url(enc_repo), 'HEAD:refs/heads/main', principal='alice', cwd=wt)
+        rows1 = self.rows(f"SELECT pack_id::text, pack_sha256 FROM pando_lab.manifests WHERE repo='{enc_repo}' ORDER BY pack_id")
+        assert len(rows1) == 1, rows1
+        p1, p1_sha = rows1[0]
+        self.cli('object-store-put', enc_repo, p1, '--cipher-suite', 'CHACHA20-POLY1305-SHA256')
+
+        self.commit(wt, 'ROOTYARD_ISSUE21_SECRET_BETA_002')
+        self.git('push', self.url(enc_repo), 'HEAD:refs/heads/main', principal='alice', cwd=wt)
+        rows2 = self.rows(f"SELECT pack_id::text, pack_sha256 FROM pando_lab.manifests WHERE repo='{enc_repo}' ORDER BY pack_id")
+        p2, p2_sha = [r for r in rows2 if r[0] != p1][0]
+        self.cli('object-store-put', enc_repo, p2)
+
+        man_dir = self.store / 'manifests' / enc_repo
+        m1 = json.loads((man_dir / f'{p1}.json').read_text())
+        m2 = json.loads((man_dir / f'{p2}.json').read_text())
+        assert m1['encryption_mode'] == 'authenticated-envelope-v1', m1
+        assert m1['cipher_suite'] == 'CHACHA20-POLY1305-SHA256', m1
+        assert m2['cipher_suite'] == 'AES-256-GCM-HMAC-SHA256', m2
+
+        c1_path = self.store / m1['pack_key']
+        c2_path = self.store / m2['pack_key']
+        c1_bytes, c2_bytes = c1_path.read_bytes(), c2_path.read_bytes()
+        assert c1_bytes.startswith(b'PANDOENC') and not c1_bytes.startswith(b'PACK')
+        assert c2_bytes.startswith(b'PANDOENC') and not c2_bytes.startswith(b'PACK')
+        assert b'ROOTYARD_ISSUE21_SECRET_ALPHA_001' not in c1_bytes
+        assert b'ROOTYARD_ISSUE21_SECRET_BETA_002' not in c2_bytes
+
+        evict_rep = json.loads(self.cli('lifecycle-evaluate', enc_repo, '--max-packs', '8', '--cold-evict-local'))
+        assert evict_rep['authenticated_encryption'] is True and evict_rep['local_packs_evicted'] == 2, evict_rep
+        local_p1 = self.store / 'objects' / enc_repo / f'{p1}.pack'
+        assert not local_p1.exists() and not (self.store / 'objects' / enc_repo / f'{p2}.pack').exists()
+
+        get1 = json.loads(self.cli('object-store-get', enc_repo, p1))
+        assert get1['rehydrated_from_object_store'] is True
+        assert hashlib.sha256(local_p1.read_bytes()).hexdigest() == p1_sha
+        clone_ok = self.clone('enc-clone-initial', repo=enc_repo)
+        assert (clone_ok / 'data.txt').read_text().strip() == 'ROOTYARD_ISSUE21_SECRET_BETA_002'
+
+        wrong_repo = str(uuid.uuid4())
+        self.cli('create-repo', wrong_repo, 'alice')
+        self.cli('kms-status', wrong_repo)
+        wrong_env = {**self.env, 'PANDO_KMS_KEYRING_DIR': str(self.store / 'kms' / wrong_repo)}
+        assert self.run([self.binary, 'kms-verify', enc_repo], check=False, env=wrong_env).returncode != 0
+        local_p1.unlink()
+        assert self.run([self.binary, 'object-store-get', enc_repo, p1], check=False, env=wrong_env).returncode != 0
+
+        tampered = bytearray(c1_bytes)
+        tampered[-20] ^= 0x55
+        c1_path.write_bytes(bytes(tampered))
+        assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
+        assert self.run([self.binary, 'object-store-get', enc_repo, p1], check=False).returncode != 0
+        c1_path.write_bytes(c1_bytes)
+
+        env_p1_path = self.store / 'object_store' / 'envelopes' / enc_repo / f'{p1}.json'
+        env_p1_orig = env_p1_path.read_bytes()
+        bad_env = json.loads(env_p1_orig.decode())
+        bad_env['envelope_mac'] = '0' * 64
+        env_p1_path.write_text(json.dumps(bad_env))
+        assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
+        env_p1_path.write_bytes(env_p1_orig)
+        assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 2
+
+        c1_sha = hashlib.sha256(c1_bytes).hexdigest()
+        c2_sha = hashlib.sha256(c2_bytes).hexdigest()
+        fail_rot = self.run([self.binary, 'kms-rotate', enc_repo, 'kms-rot-v2', '--fail-after-packs', '1'], check=False)
+        assert fail_rot.returncode != 0, fail_rot.stdout + fail_rot.stderr
+        st_mid = json.loads(self.cli('kms-status', enc_repo))
+        assert st_mid['policy']['active_key_id'] == 'kms-rot-v2'
+        assert st_mid['active_rotation']['state'] == 'IN_PROGRESS'
+        assert len(st_mid['active_rotation']['completed_pack_ids']) == 1
+        assert st_mid['active_rotation']['failed_pack_id'] is not None
+
+        self.commit(wt, 'ROOTYARD_ISSUE21_CONCURRENT_GAMMA_003')
+        self.git('push', self.url(enc_repo), 'HEAD:refs/heads/main', principal='alice', cwd=wt)
+        rows3 = self.rows(f"SELECT pack_id::text, pack_sha256 FROM pando_lab.manifests WHERE repo='{enc_repo}' ORDER BY pack_id")
+        p3, p3_sha = [r for r in rows3 if r[0] not in (p1, p2)][0]
+        self.cli('object-store-put', enc_repo, p3)
+        self.cli('lifecycle-evaluate', enc_repo, '--max-packs', '8', '--cold-evict-local')
+        p3_env = json.loads((self.store / 'object_store' / 'envelopes' / enc_repo / f'{p3}.json').read_text())
+        assert p3_env['key_id'] == 'kms-rot-v2', p3_env
+
+        ver_mid = json.loads(self.cli('kms-verify', enc_repo))
+        assert ver_mid['verified'] is True and ver_mid['packs_verified'] == 3, ver_mid
+        clone_mid = self.clone('enc-clone-mid', repo=enc_repo)
+        assert (clone_mid / 'data.txt').read_text().strip() == 'ROOTYARD_ISSUE21_CONCURRENT_GAMMA_003'
+        assert 'ROOTYARD_ISSUE21_SECRET_ALPHA_001' in self.git('show', 'HEAD~2:data.txt', cwd=clone_mid).stdout
+
+        resumed = json.loads(self.cli('kms-rotate', enc_repo, '--resume'))
+        assert resumed['new_key_id'] == 'kms-rot-v2' and resumed['envelopes_rewrapped'] == 3, resumed
+        st_done = json.loads(self.cli('kms-status', enc_repo))
+        assert st_done['active_rotation']['state'] == 'COMPLETED'
+        assert hashlib.sha256(c1_path.read_bytes()).hexdigest() == c1_sha
+        assert hashlib.sha256(c2_path.read_bytes()).hexdigest() == c2_sha
+        assert hashlib.sha256(c2_bytes).hexdigest() == c2_sha and len(p2_sha) == 64 and len(p3_sha) == 64
+
+        self.cli('kms-revoke-provider', enc_repo)
+        assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
+        if local_p1.exists():
+            local_p1.unlink()
+        assert self.run([self.binary, 'object-store-get', enc_repo, p1], check=False).returncode != 0
+        assert self.run([self.binary, 'kms-rotate', enc_repo, 'kms-rot-v3'], check=False).returncode != 0
+        self.cli('kms-grant-provider', enc_repo)
+        assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 3
+
+        code_kms, _, raw_kms = self.http(f'/repos/{enc_repo}.git/kms', principal='reader')
+        assert code_kms == 200 and json.loads(raw_kms.decode())['policy']['active_key_id'] == 'kms-rot-v2'
+        code_rot, _, raw_rot = self.http(
+            f'/repos/{enc_repo}.git/kms/rotate',
+            principal='alice',
+            method='POST',
+            body=json.dumps({'target_key_id': 'kms-rot-v3'}).encode(),
+        )
+        assert code_rot == 200 and json.loads(raw_rot.decode())['new_key_id'] == 'kms-rot-v3', (code_rot, raw_rot)
+
+        self.cli('kms-revoke-key', enc_repo, 'kms-local-default-v1')
+        assert not (self.store / 'kms' / enc_repo / 'kms-local-default-v1.key').exists()
+        assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 3
+        clone_fin = self.clone('enc-clone-final', repo=enc_repo)
+        assert (clone_fin / 'data.txt').read_text().strip() == 'ROOTYARD_ISSUE21_CONCURRENT_GAMMA_003'
+
+        self.cli('kms-policy', enc_repo, '--min-readable-version', '99')
+        assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
+        self.cli('kms-policy', enc_repo, '--min-readable-version', '3')
+        assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 3
+
+        syn_repo = str(uuid.uuid4())
+        self.cli('create-repo', syn_repo, 'alice')
+        syn_wt = self.root / 'syn-work'
+        self.git('init', '--initial-branch=main', str(syn_wt))
+        self.commit(syn_wt, 'synthetic-mode-label-check')
+        self.git('push', self.url(syn_repo), 'HEAD:refs/heads/main', principal='alice', cwd=syn_wt)
+        self.cli('kms-status', syn_repo)
+        syn_eval = json.loads(self.cli('lifecycle-evaluate', syn_repo, '--encryption-mode', 'synthetic-metadata-lab-only'))
+        assert syn_eval['encryption_mode'] == 'synthetic-metadata-lab-only' and syn_eval['authenticated_encryption'] is False
+        assert self.run([self.binary, 'kms-verify', syn_repo], check=False).returncode != 0
+
+        return {
+            'packs_verified': 3,
+            'active_key_id': 'kms-rot-v3',
+            'synthetic_mode_rejected': True,
+        }
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -948,6 +1101,7 @@ def main():
             'online_migration_state_machine', 'post_switchover_rollback_with_new_commits',
             'object_store_cas_and_cache_recovery', 'multi_pack_repack_and_pinned_gc',
             'object_format_and_compat_matrix',
+            'authenticated_pack_encryption_and_kms_rotation',
         ):
             lab.check(name, getattr(lab, name))
         lab.results['passed'] = True

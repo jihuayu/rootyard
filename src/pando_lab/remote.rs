@@ -75,7 +75,7 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
         "Pando bucket differs from configured object-store bucket");
     let (pack, idx) = local_paths(config, repo, pack_id);
     let object_count = pack_object_count(config, &pack).await?;
-    let (pack_sha256, pack_bytes, pack_chunks) = scan(&pack, opts.chunk_size).await?;
+    let (pack_sha256, pack_bytes, _plain_chunks) = scan(&pack, opts.chunk_size).await?;
     let (idx_sha256, idx_bytes, idx_chunks) = scan(&idx, opts.chunk_size).await?;
     if let Some(expected) = &opts.expected_pack_sha256 {
         ensure!(expected == &pack_sha256, "expected pack SHA-256 mismatch");
@@ -83,10 +83,30 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
     if let Some(expected) = opts.expected_pack_bytes {
         ensure!(expected == pack_bytes, "expected pack byte length mismatch");
     }
+    let suite = opts.cipher_suite.as_deref().unwrap_or(lifecycle::DEFAULT_CIPHER_SUITE);
+    let kms_dir = lifecycle::provider::resolve_kms_dir(&config.root, repo);
+    let provider = lifecycle::provider::PandoKmsProvider::open_or_init(&kms_dir, lifecycle::DEFAULT_KMS_KEY_ID)?;
+    let active_key = provider.active_entry()?;
+    let plain_bytes = fs::read(&pack).await?;
+    let sealed = lifecycle::crypto::seal_pack_bytes(&provider, repo, pack_id, &idx_sha256, suite, active_key.key_version, &plain_bytes)?;
+    let env = lifecycle::build_authenticated_envelope_record(
+        repo,
+        &Pack { id: pack_id, pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone() },
+        &sealed,
+        "hot",
+    )?;
     let store = remote_store(config)?;
-    let pack_key = key(repo, "pando-pack", &pack_sha256)?;
+    let pack_key = key(repo, "pando-pack", &sealed.ciphertext_sha256)?;
     let idx_key = key(repo, "pando-index", &idx_sha256)?;
-    store.put_file(&pack_key, &pack, pack_bytes, deadline()).await?;
+    let enc_temp = config.root.join(format!(".pando-enc-{}", Uuid::new_v4()));
+    let enc_res = async {
+        fs::write(&enc_temp, &sealed.ciphertext).await?;
+        let (_cs, _cl, enc_chunks) = scan(&enc_temp, opts.chunk_size).await?;
+        store.put_file(&pack_key, &enc_temp, sealed.ciphertext_bytes, deadline()).await?;
+        Ok::<Vec<ChunkPartReceipt>, anyhow::Error>(enc_chunks)
+    }.await;
+    let _ = fs::remove_file(&enc_temp).await;
+    let pack_chunks = enc_res?;
     store.put_file(&idx_key, &idx, idx_bytes, deadline()).await?;
     let mut manifest = CasPackManifest {
         schema: object_store::MANIFEST_SCHEMA.into(), bucket: opts.bucket.clone(),
@@ -96,6 +116,10 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
         pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone(),
         pack_bytes, idx_bytes, object_count, chunk_size: opts.chunk_size,
         pack_chunks, idx_chunks, manifest_sha256: String::new(),
+        encryption_mode: Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE.into()),
+        ciphertext_sha256: Some(sealed.ciphertext_sha256.clone()),
+        ciphertext_bytes: Some(sealed.ciphertext_bytes),
+        cipher_suite: Some(sealed.cipher_suite.clone()),
     };
     manifest.manifest_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&manifest)?));
     let bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -120,6 +144,9 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
             &[&repo,&pack_id]).await?;
         ensure!(row.get::<_, serde_json::Value>(0) == value,
             "immutable Pando manifest collision");
+        lifecycle::write_envelope_file(&config.root, &env)?;
+        lifecycle::rotation::sync_kms_policy_to_db(&client, repo, provider.policy()).await?;
+        lifecycle::rotation::upsert_envelope_in_db(&client, &env).await?;
         Ok::<(), anyhow::Error>(())
     }.await;
     let _ = fs::remove_file(&temp).await;
@@ -148,6 +175,10 @@ pub(super) async fn get(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<Ob
         && manifest.pack_id == pack_id && manifest.backend == object_store::BACKEND_KIND
         && manifest.manifest_sha256 == hex::encode(Sha256::digest(serde_json::to_vec(&unsigned)?)),
         "Pando remote manifest identity or digest mismatch");
+    ensure!(manifest.encryption_mode.as_deref() == Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE),
+        "remote Pando manifest lacks authenticated encryption mode");
+    let cipher_sha = manifest.ciphertext_sha256.as_deref().context("missing remote ciphertext_sha256")?;
+    let cipher_bytes = manifest.ciphertext_bytes.context("missing remote ciphertext_bytes")?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     let manifest_digest = hex::encode(Sha256::digest(&manifest_bytes));
     let manifest_key = key(repo, "pando-manifest", &manifest_digest)?;
@@ -163,7 +194,7 @@ pub(super) async fn get(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<Ob
     let _ = fs::remove_file(&temp).await;
     verified?;
     let (pack, idx) = local_paths(config, repo, pack_id);
-    let pack_key = key(repo, "pando-pack", &manifest.pack_sha256)?;
+    let pack_key = key(repo, "pando-pack", cipher_sha)?;
     let idx_key = key(repo, "pando-index", &manifest.idx_sha256)?;
     ensure!(manifest.pack_key == pack_key.path() && manifest.idx_key == idx_key.path(),
         "Pando remote artifact key mismatch");
@@ -171,7 +202,18 @@ pub(super) async fn get(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<Ob
         scan(&pack, manifest.chunk_size).await.ok().is_some_and(|x| x.0 == manifest.pack_sha256 && x.1 == manifest.pack_bytes) &&
         scan(&idx, manifest.chunk_size).await.ok().is_some_and(|x| x.0 == manifest.idx_sha256 && x.1 == manifest.idx_bytes);
     if !cache_hit {
-        store.get_to_file(&pack_key, &pack, manifest.pack_bytes, deadline()).await?;
+        let pack_obj = Pack { id: pack_id, pack_sha256: manifest.pack_sha256.clone(), idx_sha256: manifest.idx_sha256.clone() };
+        let env = lifecycle::read_and_verify_envelope_file(&config.root, repo, pack_id)?;
+        let cipher_tmp = config.root.join(format!(".pando-dec-{}", Uuid::new_v4()));
+        let dec_res = async {
+            store.get_to_file(&pack_key, &cipher_tmp, cipher_bytes, deadline()).await?;
+            let c_bytes = fs::read(&cipher_tmp).await?;
+            lifecycle::rotation::verify_and_decrypt_pack_bytes(&config.root, repo, &pack_obj, &env, &c_bytes)
+        }.await;
+        let _ = fs::remove_file(&cipher_tmp).await;
+        let plain = dec_res?;
+        if let Some(parent) = pack.parent() { fs::create_dir_all(parent).await?; }
+        fs::write(&pack, &plain).await?;
         store.get_to_file(&idx_key, &idx, manifest.idx_bytes, deadline()).await?;
     }
     ensure!(pack_object_count(config, &pack).await? == manifest.object_count,
