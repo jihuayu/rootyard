@@ -5,3 +5,4 @@ pub mod bench_runner;
 mod git_fixture;
 pub mod pg_git;
 pub mod s3;
+pub mod worker_exec;

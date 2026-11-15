@@ -12,14 +12,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::sync::Mutex;
 use verifier_budgets_support::bench::{metric_delta, metric_u64, verifier_metrics};
-use verifier_budgets_support::bench_runner::{
-    ENV_BENCH_PHASE, execute_isolated_benchmark, run_benchmark_worker, run_hang_cleanup_probe,
-};
+use verifier_budgets_support::bench_runner::{execute_isolated_benchmark, run_benchmark_worker};
 use verifier_budgets_support::pg_git::{
     Db, commit_and_pin_snapshot, deadline, git_binary, pin_committed_snapshot, prepare_fresh_commit, resolved_database,
     std_deadline,
 };
 use verifier_budgets_support::s3::LoopbackS3;
+use verifier_budgets_support::worker_exec::{
+    ENV_BENCH_PHASE, run_hang_cleanup_probe, run_hang_cleanup_probe_with_reap_failure,
+};
 
 static SUITE_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -238,11 +239,50 @@ async fn timed_out_isolated_worker_cleans_up_owned_pg_schema() -> Result<()> {
     )
     .await;
     let err = res.expect_err("hanging isolated probe worker must time out");
-    ensure!(err.to_string().contains("timed out"), "expected timeout error, got: {err:#}");
+    let text = format!("{err:#}");
+    ensure!(text.contains("timed out"), "expected timeout error, got: {text}");
+    ensure!(text.contains("child_reaped=true"), "expected confirmed child exit/reap, got: {text}");
+    ensure!(!text.contains("cleanup-not-complete"), "unexpected unconfirmed cleanup error: {text}");
     ensure!(marker.is_file(), "probe worker did not migrate `{schema}` before timeout kill");
     ensure!(
         !Db::schema_exists(&pg_url, &schema).await?,
         "owned schema `{schema}` leaked after timed-out isolated child termination"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_reap_preserves_owned_schema_with_cleanup_not_complete_error() -> Result<()> {
+    let _serial = SUITE_LOCK.lock().await;
+    let (pg_url, _) = resolved_database().await?;
+    let exe = std::env::current_exe()?;
+    let temp = tempfile::tempdir()?;
+    let schema = Db::fresh_schema_name();
+    let marker = temp.path().join("migrated.marker");
+
+    let res = run_hang_cleanup_probe_with_reap_failure(
+        &exe,
+        &pg_url,
+        &temp.path().join("unused.json"),
+        &schema,
+        &marker,
+        Duration::from_secs(8),
+    )
+    .await;
+    let err = res.expect_err("simulated reap failure probe must fail");
+    let text = format!("{err:#}");
+    ensure!(text.contains("cleanup-not-complete"), "expected cleanup-not-complete error, got: {text}");
+    ensure!(text.contains(&schema), "expected preserved owned schema `{schema}` in error: {text}");
+    ensure!(marker.is_file(), "probe worker did not migrate `{schema}` before timeout");
+    ensure!(
+        Db::schema_exists(&pg_url, &schema).await?,
+        "owned schema `{schema}` must NOT be dropped when child exit/reap is unconfirmed"
+    );
+
+    Db::drop_owned_schema(&pg_url, &schema).await?;
+    ensure!(
+        !Db::schema_exists(&pg_url, &schema).await?,
+        "final test-harness drop_owned_schema failed to remove `{schema}`"
     );
     Ok(())
 }
