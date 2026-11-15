@@ -145,7 +145,7 @@ impl Raw {
         let lazy_baseline = baseline.is_some();
         let base = match baseline {
             Some(entries) => entries,
-            None => core::inventory(&layout.lower).map_err(Error::internal)?,
+            None => core::inventory(&layout.lower).map_err(super::compat::map_walk_error)?,
         };
         let mut lower = BTreeMap::new();
         for entry in base {
@@ -160,7 +160,7 @@ impl Raw {
         let mut upper = BTreeMap::new();
         let mut upper_dirs = BTreeSet::new();
         if layout.merge_upper && directory(&layout.upper)? {
-            for entry in core::inventory(&layout.upper).map_err(Error::internal)? {
+            for entry in core::inventory(&layout.upper).map_err(super::compat::map_walk_error)? {
                 let path = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
                 if internal(&path) {
                     continue;
@@ -304,7 +304,7 @@ pub(super) fn fingerprint(path: &Path) -> Result<String, Error> {
     if let Some(raw) = Raw::load(path)? {
         return Ok(raw.digest);
     }
-    hash_entries(&core::inventory(path).map_err(Error::internal)?)
+    hash_entries(&core::inventory(path).map_err(super::compat::map_walk_error)?)
 }
 
 fn hash_entries(entries: &[core::Entry]) -> Result<String, Error> {

@@ -1,6 +1,6 @@
 use super::compat::{
-    is_gitattributes_path, validate_config_bytes, validate_gitattributes_bytes, validate_head_bytes, validate_raw,
-    validate_repo, validate_tree_listing_no_gitlinks,
+    CONFLICT_SUBMODULE, is_gitattributes_path, map_walk_error, validate_config_bytes, validate_gitattributes_bytes,
+    validate_head_bytes, validate_raw, validate_repo, validate_tree_listing_no_gitlinks,
 };
 use super::snapshot::{Origin, Raw};
 use crate::workspace_lab::core;
@@ -142,6 +142,10 @@ fn submodules_gitlinks_and_nested_git_are_rejected() {
     let with_nested_pointer = make_valid_repo();
     write(with_nested_pointer.path(), "vendor/.git", b"gitdir: ../.git/modules/vendor\n");
     assert_eq!(validate_repo(with_nested_pointer.path()).unwrap_err().0, StatusCode::CONFLICT);
+
+    let mapped = map_walk_error(anyhow::anyhow!("nested Git repositories and linked worktree pointers unsupported"));
+    assert_eq!(mapped.0, StatusCode::CONFLICT);
+    assert_eq!(mapped.1, CONFLICT_SUBMODULE);
 }
 
 #[test]

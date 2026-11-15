@@ -185,7 +185,7 @@ pub(super) fn validate_raw(raw: &super::snapshot::Raw) -> Result<(), Error> {
     Ok(())
 }
 
-fn map_walk_error(err: anyhow::Error) -> Error {
+pub(super) fn map_walk_error(err: anyhow::Error) -> Error {
     let text = err.to_string();
     if text.contains("nested Git repositories") {
         Error(StatusCode::CONFLICT, CONFLICT_SUBMODULE)
