@@ -61,6 +61,7 @@ class PhysicalSpecBoundaryTest(ReceiptFixture):
         self.assertIn("rootyard/pando-pitr-physical-service-acceptance",
                       physical.PHYSICAL_SPEC.kind)
         self.assertIn("real owned Garage", json.dumps(physical.PHYSICAL_SPEC.topology))
+        self.assertIn(physical.GARAGE_FIXTURE, physical.HARNESS_FILES)
 
     def test_missing_or_false_physical_case_cannot_pass(self) -> None:
         for missing in (False, True):
@@ -135,6 +136,39 @@ class PhysicalSpecBoundaryTest(ReceiptFixture):
             physical.preflight_providers(base)
         self.assertEqual((wrong.exception.stage, wrong.exception.code),
                          ("providers", "vault_image_pin_mismatch"))
+
+        garage_pin = physical._owned_garage_pin()
+        valid = dict(base, ROOTYARD_VAULT_IMAGE_DIGEST=physical.VAULT_IMAGE_PIN,
+                     ROOTYARD_GARAGE_IMAGE_DIGEST=garage_pin)
+        config, metadata = physical.preflight_providers(valid)
+        self.assertEqual(config.garage_image, garage_pin)
+        self.assertEqual(metadata["garage_image_digest"], garage_pin)
+        self.assertEqual(metadata["vault_image_digest"], physical.VAULT_IMAGE_PIN)
+        full = dict(valid, ROOTYARD_GARAGE_IMAGE_DIGEST="dxflrs/garage:v2.1.0@" + garage_pin)
+        full_config, full_metadata = physical.preflight_providers(full)
+        self.assertEqual(full_config.garage_image, garage_pin)
+        self.assertEqual(full_metadata["garage_image_digest"], garage_pin)
+
+        other = dict(valid, ROOTYARD_GARAGE_IMAGE_DIGEST="garage@sha256:" + "3" * 64)
+        with self.assertRaises(physical.PhysicalFailure) as garage_wrong:
+            physical.preflight_providers(other)
+        self.assertEqual((garage_wrong.exception.stage, garage_wrong.exception.code),
+                         ("providers", "garage_image_pin_mismatch"))
+
+    def test_exact_authority_id_epoch_metadata_required(self) -> None:
+        pre = {"authority_id": "authority-a", "authority_epoch": 4,
+               "generation": 2, "restore_generation": 1}
+        self.assertTrue(physical._authority_metadata_matches(pre, dict(pre)))
+        for field, value in (
+            ("authority_id", "authority-b"),
+            ("authority_epoch", 3),
+            ("authority_epoch", 5),
+            ("generation", 1),
+            ("restore_generation", 0),
+        ):
+            with self.subTest(field=field, value=value):
+                restored = dict(pre, **{field: value})
+                self.assertFalse(physical._authority_metadata_matches(pre, restored))
 
     def test_no_provider_physical_suite_does_not_launch(self) -> None:
         with mock.patch.object(physical, "PhysicalPitrFixture") as fixture:

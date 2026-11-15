@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -65,13 +65,13 @@ PHYSICAL_TOPOLOGY = {
     "postgres": "owned PG17 physical base backup, named restore point, WAL archive and isolated promoted restore",
     "object_store": "real owned Garage fixture via supplied ROOTYARD_OBJECT_STORE_* environment",
     "vault": "real Vault Transit fixture via supplied ROOTYARD_KMS_VAULT_* environment",
-    "clone_transport": "pass-through loopback proxy forwarding genuine Garage/SigV4 requests; counts methods only",
+    "provider_transport": "one pass-through loopback proxy used for source attest/probe, clone/isolate/readback and DELETE counting; forwards genuine Garage/SigV4 requests",
     "scope": "AC1 physical PITR/fencing/isolate slice only; not AC2 backup/restore lifecycle or a full service qualification",
 }
 PHYSICAL_LIMITATIONS = (
     "Requires an actual prebuilt Rootyard binary/build receipt and Root-supplied real Garage/Vault fixtures.",
     "No loopback S3/Vault test double, synthetic Pando manifest, SQL-created authority success or logical clone is accepted.",
-    "The report records hashes/booleans/counts only; locator strings, credentials, SQL bodies, object bytes and raw process output are excluded.",
+    "The report records safe hashes/booleans/counts plus bounded non-secret PostgreSQL version/timeline/system identifiers, LSN and authority epochs; locator strings, credentials, SQL bodies, object bytes and raw process output are excluded.",
     "Existing signed/pass-through S3 helpers used for the known-key probe are HTTP loopback; TLS Garage transport is outside this harness.",
     "A successful run is AC1 source execution evidence only; AC2 backup/restore, permission/lease/generation matrix and full Issue #77 closure remain open.",
 )
@@ -82,6 +82,7 @@ PHYSICAL_SPEC = binding.AcceptanceSpec(
     limitations=PHYSICAL_LIMITATIONS,
 )
 VAULT_IMAGE_PIN = "hashicorp/vault@sha256:44fa1e5a57d0bcf7fb163159872263b79a575e5dbfefd5b9bde1b7e4aada2f32"
+GARAGE_FIXTURE = ROOT / "scripts/owned_garage_fixture.sh"
 REQUIRED_PROVIDER_ENV = (
     "ROOTYARD_OBJECT_STORE_ENDPOINT",
     "ROOTYARD_OBJECT_STORE_BUCKET",
@@ -97,7 +98,6 @@ REQUIRED_PROVIDER_ENV = (
 MAX_SELECTED_OBJECTS = 128
 MAX_SELECTED_OBJECT_BYTES = 64 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 1800.0
-IMAGE_DIGEST_RE = re.compile(r"sha256:([0-9a-f]{64})$")
 HARNESS_FILES = (
     ROOT / "tests/pando_pitr_physical_service.py",
     ROOT / "tests/test_pando_pitr_physical_service.py",
@@ -113,6 +113,7 @@ HARNESS_FILES = (
     ROOT / "tests/owned_fuse_cleanup.py",
     ROOT / "tests/workspace_remote_delete_policy.py",
     ROOT / "scripts/native_build_receipt.py",
+    ROOT / "scripts/owned_garage_fixture.sh",
 )
 
 
@@ -145,11 +146,22 @@ def _missing_environment(environ: dict[str, str]) -> list[str]:
     return [name for name in REQUIRED_PROVIDER_ENV if not environ.get(name)]
 
 
-def _image_digest(value: str, stage: str) -> str:
-    match = IMAGE_DIGEST_RE.search(value.strip())
+def _owned_garage_pin() -> str:
+    try:
+        text = GARAGE_FIXTURE.read_text(encoding="utf-8")
+    except OSError:
+        raise PhysicalFailure("providers", "garage_pin_source_missing") from None
+    match = re.search(r'^expected_digest="(sha256:[0-9a-f]{64})"$', text, re.MULTILINE)
     if match is None:
-        raise PhysicalFailure(stage, "image_digest_invalid")
-    return "sha256:" + match.group(1)
+        raise PhysicalFailure("providers", "garage_pin_source_invalid")
+    return match.group(1)
+
+
+def _garage_image_pin(value: str) -> str:
+    pin = _owned_garage_pin()
+    if value.strip() not in (pin, "dxflrs/garage:v2.1.0@" + pin):
+        raise PhysicalFailure("providers", "garage_image_pin_mismatch")
+    return pin
 
 
 def preflight_providers(environ: dict[str, str] | None = None) -> tuple[_ProviderConfig, dict]:
@@ -183,8 +195,7 @@ def preflight_providers(environ: dict[str, str] | None = None) -> tuple[_Provide
     if vault_image not in (VAULT_IMAGE_PIN, "sha256:" + known_vault_digest):
         raise PhysicalFailure("providers", "vault_image_pin_mismatch")
     vault_image = VAULT_IMAGE_PIN
-    garage_image = environ["ROOTYARD_GARAGE_IMAGE_DIGEST"].strip()
-    garage_image = _image_digest(garage_image, "providers")
+    garage_image = _garage_image_pin(environ["ROOTYARD_GARAGE_IMAGE_DIGEST"])
     config = _ProviderConfig(
         endpoint=environ["ROOTYARD_OBJECT_STORE_ENDPOINT"],
         bucket=environ["ROOTYARD_OBJECT_STORE_BUCKET"],
@@ -201,6 +212,7 @@ def preflight_providers(environ: dict[str, str] | None = None) -> tuple[_Provide
     )
     metadata = {
         "garage_image_digest": garage_image,
+        "garage_pin_source": "scripts/owned_garage_fixture.sh",
         "vault_image_digest": vault_image,
         "garage_environment_present": True,
         "vault_environment_present": True,
@@ -607,6 +619,35 @@ def _map_fence_reason(reason: str | None) -> str:
     return "unknown"
 
 
+def _status_backend_identity(status: dict) -> tuple[str | None, str | None]:
+    authority = status.get("authority") if isinstance(status, dict) else None
+    local = status.get("local") if isinstance(status, dict) else None
+    proof = authority.get("backend_identity") if isinstance(authority, dict) else None
+    current = local.get("backend_identity") if isinstance(local, dict) else None
+    return (
+        proof if isinstance(proof, str) and proof else None,
+        current if isinstance(current, str) and current else None,
+    )
+
+
+def _same_backend_identity(status: dict, expected: str) -> bool:
+    proof, current = _status_backend_identity(status)
+    return bool(proof and current and proof == current and proof == expected)
+
+
+def _identity_hash(value: str | None) -> str | None:
+    return hashlib.sha256(value.encode()).hexdigest() if isinstance(value, str) and value else None
+
+
+def _authority_metadata_matches(pre_point: dict, restored: dict) -> bool:
+    return bool(
+        restored.get("authority_id") == pre_point.get("authority_id")
+        and restored.get("authority_epoch") == pre_point.get("authority_epoch")
+        and restored.get("generation") == pre_point.get("generation")
+        and restored.get("restore_generation") == pre_point.get("restore_generation")
+    )
+
+
 def _physical_metadata(fixture: PhysicalPitrFixture) -> dict:
     primary = fixture.primary_url
     restored = fixture.restored_url
@@ -640,6 +681,10 @@ def _run_physical_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
         for tool in ("psql", "git"):
             if not shutil.which(tool):
                 raise PhysicalFailure("precondition", "required_cli_missing")
+        proxy = CountingProxy(*_s3_endpoint(config.endpoint)[:2])
+        proxy.start()
+        proxy_endpoint = f"http://127.0.0.1:{proxy.port}"
+        provider_config = replace(config, endpoint=proxy_endpoint)
         private_root = Path(tempfile.mkdtemp(prefix="rootyard-ac1-physical-service-"))
         private_root.chmod(0o700)
         source_data = private_root / "source-data"
@@ -651,6 +696,7 @@ def _run_physical_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
 
         base_env = dict(environ)
         base_env.update({
+            "ROOTYARD_OBJECT_STORE_ENDPOINT": proxy_endpoint,
             "DATABASE_URL": fixture.primary_url,
             "ROOTYARD_DATA_DIR": str(source_data),
             "ROOTYARD_PANDO_REMOTE_DELETE": "false",
@@ -768,9 +814,17 @@ def _run_physical_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
         if not pin_one.get("external_lsn") or int(pin_one.get("manifest_count", 0)) < 1:
             raise PhysicalFailure("pin", "summary_missing")
         status_before_point = _cli(binary, ["pando-authority", "status"], base_env)
-        epoch_before_point = int(status_before_point["authority"]["authority_epoch"])
+        pre_point_authority = status_before_point["authority"]
+        pre_point_id = pre_point_authority["authority_id"]
+        epoch_before_point = int(pre_point_authority["authority_epoch"])
+        source_proof, source_local = _status_backend_identity(status_before_point)
+        if not source_proof or source_proof != source_local:
+            raise PhysicalFailure("identity", "source_backend_identity_mismatch")
+        if status_before_point.get("remote_delete_env_enabled") is not False:
+            raise PhysicalFailure("providers", "source_remote_delete_not_disabled")
+        source_backend_hash = _identity_hash(source_proof)
         rows_after_pin = _artifact_rows(fixture.primary_url, authority, owner_id, repo_id)
-        probe = _ArtifactProbe(config)
+        probe = _ArtifactProbe(provider_config)
         before_probe = (
             _probe_artifacts(probe, rows_after_pin["live"], "live")
             + _probe_artifacts(probe, rows_after_pin["pinned"], "pinned")
@@ -791,6 +845,12 @@ def _run_physical_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
         archive = fixture.force_wal_archive()
         status_after = _cli(binary, ["pando-authority", "status"], base_env)
         epoch_after = int(status_after["authority"]["authority_epoch"])
+        source_epoch_advanced = epoch_after > epoch_before_point
+        source_current_proof_present = (
+            status_after.get("external_bucket", {}).get("current_epoch_proof_present") is True
+        )
+        if not _same_backend_identity(status_after, source_proof):
+            raise PhysicalFailure("identity", "source_after_backend_mismatch")
         _cli(binary, ["pando-authority", "verify"], base_env)
         source_probe = source.health()
         extra["physical_pg"].update({
@@ -799,17 +859,63 @@ def _run_physical_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
             "source_authority_epoch_before": epoch_before,
             "source_authority_epoch_before_restore_point": epoch_before_point,
             "source_authority_epoch_after": epoch_after,
-            "source_epoch_advanced": epoch_after > epoch_before_point,
+            "source_epoch_advanced": source_epoch_advanced,
+            "source_current_epoch_proof_present": source_current_proof_present,
             "source_healthy_after_advance": source_probe,
         })
-        cases["source_external_authority_advanced_after_restore_point"] = epoch_after > epoch_before_point
-        if not cases["source_external_authority_advanced_after_restore_point"]:
+        if not source_epoch_advanced:
             raise PhysicalFailure("authority", "epoch_not_advanced")
+        if not source_current_proof_present:
+            raise PhysicalFailure("authority", "source_external_proof_missing")
         if not source_probe:
-            cases["source_external_authority_advanced_after_restore_point"] = False
             raise PhysicalFailure("source", "health_after_advance_failed")
 
         fixture.restore_to_point()
+        _marker_copy(source_data, clone_data)
+        clone_env = {
+            **base_env,
+            "DATABASE_URL": fixture.restored_url,
+            "ROOTYARD_DATA_DIR": str(clone_data),
+            "ROOTYARD_PANDO_REMOTE_DELETE": "true",
+            "ROOTYARD_STORAGE_MAINTENANCE": "true",
+        }
+        clone_control_env = {**clone_env, "ROOTYARD_STORAGE_MAINTENANCE": "false"}
+        restored_status = _cli(binary, ["pando-authority", "status"], clone_control_env)
+        restored_authority = restored_status["authority"]
+        restored_id = restored_authority["authority_id"]
+        restored_epoch = int(restored_authority["authority_epoch"])
+        restored_metadata_matches = _authority_metadata_matches(
+            pre_point_authority, restored_authority)
+        restored_successor_proof = (
+            restored_status.get("external_bucket", {}).get("successor_epoch_proof_present") is True
+        )
+        restored_backend_ok = _same_backend_identity(restored_status, source_proof)
+        restored_delete_enabled = restored_status.get("remote_delete_env_enabled") is True
+        if not restored_metadata_matches:
+            raise PhysicalFailure("restore", "restored_authority_metadata_mismatch")
+        if not restored_successor_proof:
+            raise PhysicalFailure("authority", "restored_successor_proof_missing")
+        if not restored_backend_ok or not restored_delete_enabled:
+            raise PhysicalFailure("identity", "restored_backend_or_delete_env_mismatch")
+        authority_observation = {
+            "pre_point_epoch": epoch_before_point,
+            "source_epoch_after": epoch_after,
+            "source_epoch_advanced_after_point": source_epoch_advanced,
+            "source_current_epoch_proof_present": source_current_proof_present,
+            "restored_epoch": restored_epoch,
+            "restored_authority_matches_pre_point": restored_metadata_matches,
+            "restored_successor_epoch_proof_present": restored_successor_proof,
+            "source_authority_id_sha256": _identity_hash(pre_point_id),
+            "restored_authority_id_sha256": _identity_hash(restored_id),
+        }
+        extra["authority_observation"] = authority_observation
+        extra["endpoint_identity"] = {
+            "single_pass_through_proxy_started_before_source": True,
+            "source_proof_matches_local": True,
+            "source_after_advance_matches_source": True,
+            "restored_pre_start_matches_source": restored_backend_ok,
+            "backend_identity_sha256": source_backend_hash,
+        }
         physical_pg = _physical_metadata(fixture)
         restored_recovery = _sql_scalar(fixture.restored_url, "SELECT pg_is_in_recovery()", 30)
         physical_pg["restored_promoted"] = restored_recovery == "f"
@@ -821,22 +927,26 @@ def _run_physical_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
             restore_lsn and restored_recovery == "f"
             and physical_pg["restored_endpoint_is_new"]
             and physical_pg["restored_timeline_differs"]
+            and restored_metadata_matches
+        )
+        cases["source_external_authority_advanced_after_restore_point"] = bool(
+            source_epoch_advanced and source_current_proof_present
+            and restored_successor_proof
         )
         if not cases["physical_restore_to_named_target"]:
             raise PhysicalFailure("restore", "named_target_not_verified")
-        _marker_copy(source_data, clone_data)
-        clone = _Service(binary, {
-            **base_env,
-            "DATABASE_URL": fixture.restored_url,
-            "ROOTYARD_DATA_DIR": str(clone_data),
-            "ROOTYARD_PANDO_REMOTE_DELETE": "true",
-            "ROOTYARD_STORAGE_MAINTENANCE": "true",
-        })
+        if not cases["source_external_authority_advanced_after_restore_point"]:
+            raise PhysicalFailure("authority", "external_successor_not_advanced")
+        clone = _Service(binary, clone_env)
         services.append(clone)
-        proxy = CountingProxy(*_s3_endpoint(config.endpoint)[:2])
-        proxy.start()
-        clone.env["ROOTYARD_OBJECT_STORE_ENDPOINT"] = f"http://127.0.0.1:{proxy.port}"
+        delete_baseline = proxy.method_counts.get("DELETE", 0)
         clone.start()
+        clone_runtime_status = _cli(binary, ["pando-authority", "status"], clone_control_env)
+        if not _same_backend_identity(clone_runtime_status, source_proof):
+            raise PhysicalFailure("identity", "clone_runtime_backend_mismatch")
+        if clone_runtime_status.get("remote_delete_env_enabled") is not True:
+            raise PhysicalFailure("providers", "clone_remote_delete_not_enabled")
+        extra["endpoint_identity"]["clone_runtime_matches_source"] = True
         fence_row = _wait_until(
             lambda: _sql_json(
                 fixture.restored_url,
@@ -850,15 +960,41 @@ def _run_physical_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
         clone_candidates = _artifact_rows(fixture.restored_url, authority, owner_id, repo_id)["candidate"]
         if not clone_candidates:
             raise PhysicalFailure("clone", "due_candidate_missing")
-        if proxy.method_counts.get("DELETE", 0) != 0:
+        clone_delete_total = proxy.method_counts.get("DELETE", 0)
+        clone_delete_delta = clone_delete_total - delete_baseline
+        gc_delete_job_count = _sql_int(
+            fixture.restored_url,
+            "SELECT count(*) FROM storage_maintenance_jobs "
+            f"WHERE repository_id='{repo_id}' AND kind='pando_tombstone_delete'", 30)
+        if clone_delete_delta != 0:
             raise PhysicalFailure("clone", "delete_attempted")
+        if gc_delete_job_count != 0:
+            raise PhysicalFailure("clone", "gc_job_enqueued")
         cases["due_unpinned_candidate_observed_before_clone_gc"] = True
         cases["stale_clone_fenced_before_remote_delete"] = True
         cases["remote_delete_method_count_zero"] = True
         extra["clone_fence"] = {
             "fence_reason_category": _map_fence_reason(fence_row.get("remote_delete_fence_reason")),
             "due_candidate_count": len(clone_candidates),
-            "delete_method_count": proxy.method_counts.get("DELETE", 0),
+            "delete_baseline": delete_baseline,
+            "delete_method_count_total": clone_delete_total,
+            "delete_method_count_delta": clone_delete_delta,
+        }
+        extra["fence_evidence"] = {
+            "phase": "startup/admission_refusal",
+            "worker_not_executed": True,
+            "deletion_enabled": True,
+            "restored_remote_delete_fenced": True,
+            "due_candidate_count": len(clone_candidates),
+            "delete_method_count_delta_clone_window": clone_delete_delta,
+            "gc_delete_job_count": gc_delete_job_count,
+            "no_gc_job_enqueued": True,
+            "restored_authority_matches_pre_point": restored_metadata_matches,
+            "source_epoch_advanced_after_point": source_epoch_advanced,
+            "source_current_epoch_proof_present": source_current_proof_present,
+            "restored_successor_epoch_proof_present": restored_successor_proof,
+            "backend_identity_matches_source": True,
+            "optional_last_scan_required": False,
         }
         _cli(binary, ["pando-authority", "verify"], base_env)
         if not source.health():
@@ -882,30 +1018,54 @@ def _run_physical_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
             raise PhysicalFailure("source", "health_after_source_push_failed")
         cases["source_verify_after_clone_gc"] = True
 
+        pre_isolate_status = _cli(binary, ["pando-authority", "status"], clone_control_env)
+        pre_isolate_id = pre_isolate_status["authority"]["authority_id"]
+        if pre_isolate_id != restored_id:
+            raise PhysicalFailure("isolate", "pre_isolate_authority_changed")
+        if not _same_backend_identity(pre_isolate_status, source_proof):
+            raise PhysicalFailure("identity", "pre_isolate_backend_mismatch")
         clone.stop()
-        isolated = _cli(binary, ["pando-authority", "isolate", "--confirm-shared-bucket"], {
-            **base_env,
-            "DATABASE_URL": fixture.restored_url,
-            "ROOTYARD_DATA_DIR": str(clone_data),
-            "ROOTYARD_PANDO_REMOTE_DELETE": "true",
-            "ROOTYARD_STORAGE_MAINTENANCE": "false",
-        })
-        if not isolated.get("authority_id"):
-            raise PhysicalFailure("isolate", "summary_missing")
+        isolated = _cli(binary, ["pando-authority", "isolate", "--confirm-shared-bucket"], clone_control_env)
+        isolated_id = isolated.get("authority_id")
+        if not isinstance(isolated_id, str) or not isolated_id or isolated_id == pre_isolate_id:
+            raise PhysicalFailure("isolate", "authority_not_rotated")
+        post_isolate_status = _cli(binary, ["pando-authority", "status"], clone_control_env)
+        post_isolate_id = post_isolate_status["authority"]["authority_id"]
+        if post_isolate_id != isolated_id or post_isolate_id == pre_isolate_id:
+            raise PhysicalFailure("isolate", "status_id_mismatch")
+        if not _same_backend_identity(post_isolate_status, source_proof):
+            raise PhysicalFailure("identity", "isolate_backend_mismatch")
+        extra["isolation"] = {
+            "restored_pre_isolate_id_sha256": _identity_hash(pre_isolate_id),
+            "isolate_reported_id_sha256": _identity_hash(isolated_id),
+            "post_isolate_status_id_sha256": _identity_hash(post_isolate_id),
+            "authority_id_changed": post_isolate_id != pre_isolate_id,
+            "isolate_report_matches_status": isolated_id == post_isolate_id,
+            "pre_isolate_epoch": int(pre_isolate_status["authority"]["authority_epoch"]),
+            "post_isolate_epoch": int(post_isolate_status["authority"]["authority_epoch"]),
+            "pre_isolate_matches_restored": pre_isolate_id == restored_id,
+            "pre_isolate_backend_matches_source": True,
+            "backend_identity_matches_source": True,
+        }
+        extra["endpoint_identity"]["isolate_matches_source"] = True
         cases["clone_isolate_succeeded"] = True
         shutil.rmtree(clone_data / "pando-cache", ignore_errors=True)
         if (clone_data / "pando-cache").exists():
             raise PhysicalFailure("isolate", "cache_remove_failed")
         cases["clone_cache_wiped"] = True
-        clone = _Service(binary, {
-            **base_env,
-            "DATABASE_URL": fixture.restored_url,
-            "ROOTYARD_DATA_DIR": str(clone_data),
-            "ROOTYARD_PANDO_REMOTE_DELETE": "true",
-            "ROOTYARD_STORAGE_MAINTENANCE": "false",
-        })
+        clone = _Service(binary, clone_control_env)
         services.append(clone)
         clone.start()
+        post_start_status = _cli(binary, ["pando-authority", "status"], clone_control_env)
+        post_start_id = post_start_status["authority"]["authority_id"]
+        if post_start_id != isolated_id:
+            raise PhysicalFailure("isolate", "cold_cache_status_id_mismatch")
+        if not _same_backend_identity(post_start_status, source_proof):
+            raise PhysicalFailure("identity", "cold_cache_backend_mismatch")
+        extra["isolation"]["cold_cache_status_id_sha256"] = _identity_hash(post_start_id)
+        extra["isolation"]["cold_cache_status_matches"] = True
+        extra["isolation"]["cold_cache_epoch"] = int(post_start_status["authority"]["authority_epoch"])
+        extra["endpoint_identity"]["cold_cache_matches_source"] = True
         clone_remote = clone.base_url + repo["clone_path"]
         checkout = private_root / "clone-read"
         _git_clone(clone_remote, token, base_env, checkout)
@@ -923,8 +1083,13 @@ def _run_physical_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
             cases["source_verify_after_clone_gc"] = False
             raise PhysicalFailure("source", "health_after_isolate_failed")
         final_delete_count = proxy.method_counts.get("DELETE", 0)
-        extra["remote_delete_method_count_final"] = final_delete_count
-        if final_delete_count != 0:
+        final_delete_delta = final_delete_count - delete_baseline
+        extra["remote_delete_method_count_final"] = {
+            "baseline": delete_baseline,
+            "total": final_delete_count,
+            "delta": final_delete_delta,
+        }
+        if final_delete_delta != 0:
             cases["remote_delete_method_count_zero"] = False
             raise PhysicalFailure("clone", "remote_delete_observed")
         cases["source_verify_after_clone_gc"] = True
