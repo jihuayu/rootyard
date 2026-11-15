@@ -403,9 +403,12 @@ async fn drain_worker(state: &Arc<AppState>, policy: &Policy) -> Result<()> {
 }
 
 async fn clone_schema_metadata(admin: &Pool, src: &str, dst: &str) -> Result<()> {
-    let client = admin.get().await?;
+    let mut client = admin.get().await?;
+    let tx = client.transaction().await?;
     let sql = format!(
-        "INSERT INTO {dst}.users SELECT * FROM {src}.users; \
+        "SET LOCAL search_path TO {dst}; \
+         INSERT INTO {dst}.users SELECT * FROM {src}.users; \
+         INSERT INTO {dst}.namespaces SELECT * FROM {src}.namespaces ON CONFLICT (id) DO NOTHING; \
          INSERT INTO {dst}.repositories SELECT * FROM {src}.repositories; \
          INSERT INTO {dst}.pando_repository_states SELECT * FROM {src}.pando_repository_states; \
          INSERT INTO {dst}.pando_pack_manifests SELECT * FROM {src}.pando_pack_manifests; \
@@ -431,7 +434,8 @@ async fn clone_schema_metadata(admin: &Pool, src: &str, dst: &str) -> Result<()>
          INSERT INTO {dst}.pando_retention_roots SELECT * FROM {src}.pando_retention_roots; \
          INSERT INTO {dst}.pando_retention_root_manifests SELECT * FROM {src}.pando_retention_root_manifests;"
     );
-    client.batch_execute(&sql).await?;
+    tx.batch_execute(&sql).await?;
+    tx.commit().await?;
     Ok(())
 }
 
