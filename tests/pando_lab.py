@@ -1065,6 +1065,12 @@ class Lab:
         assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
         self.cli('kms-policy', enc_repo, '--min-readable-version', '3')
         assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 3
+        assert self.run([self.binary, 'kms-rotate', enc_repo, 'kms-rot-v2'], check=False).returncode != 0
+        assert self.run(
+            [self.binary, 'lifecycle-evaluate', enc_repo, '--encryption-mode', 'synthetic-metadata-lab-only'],
+            check=False,
+        ).returncode != 0
+        assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 3
 
         syn_repo = str(uuid.uuid4())
         self.cli('create-repo', syn_repo, 'alice')

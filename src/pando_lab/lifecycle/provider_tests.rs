@@ -116,6 +116,23 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
     let prov_min_v2 = PandoKmsProvider::open_existing(&kms_dir).unwrap();
     assert!(prov_min_v2.ensure_key_readable("kms-local-default-v1", 1).is_err());
     assert!(prov_min_v2.ensure_key_readable("kms-rot-v2", 2).is_ok());
+    assert!(open_sealed_pack_bytes(
+        &prov_min_v2,
+        &OpenSealedRequest {
+            repo,
+            pack_id: pack1,
+            expected_plaintext_sha256: &sealed1.plaintext_sha256,
+            expected_idx_sha256: &idx_sha,
+            expected_cipher_suite: "AES-256-GCM-HMAC-SHA256",
+            expected_envelope_id: Some(sealed1.envelope_id),
+            expected_nonce_prefix: Some(&sealed1.nonce_prefix_hex),
+            wrapped_key_json: &sealed1.wrapped_key_json,
+        },
+        &sealed1.ciphertext,
+    )
+    .is_err());
+    assert!(prepare_rotation_target_key(&kms_dir, "kms-local-default-v1", "kms-local-default-v1").is_err());
+    assert!(prepare_rotation_target_key(&kms_dir, "kms-rot-v2", "kms-local-default-v1").is_ok());
 
     revoke_key_in_dir(&kms_dir, "kms-local-default-v1").unwrap();
     assert!(!kms_dir.join("kms-local-default-v1.key").exists());

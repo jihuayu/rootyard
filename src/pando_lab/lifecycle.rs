@@ -344,8 +344,11 @@ mod tests {
         let (repo, pack_id) = (Uuid::new_v4(), Uuid::new_v4());
         let dir = objects_root.join(repo.to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        let mut pack_bytes = Vec::from(&b"PACK\x00\x00\x00\x02\x00\x00\x00\x01\x34"[..]);
-        pack_bytes.extend_from_slice(&delta::compress_zlib_stored(b"rootyard-secret-pack-payload"));
+        let payload = b"rootyard-secret-pack-payload";
+        let mut pack_bytes = Vec::from(&b"PACK\x00\x00\x00\x02\x00\x00\x00\x01"[..]);
+        pack_bytes.push(0x80 | 0x30 | ((payload.len() & 0x0f) as u8));
+        pack_bytes.push((payload.len() >> 4) as u8);
+        pack_bytes.extend_from_slice(&delta::compress_zlib_stored(payload));
         let tr = delta::sha1_digest(&pack_bytes);
         pack_bytes.extend_from_slice(&tr);
         let idx_bytes = b"idx-cold-tier-test".to_vec();

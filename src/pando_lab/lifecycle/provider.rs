@@ -396,11 +396,17 @@ pub fn prepare_rotation_target_key(
 
     if let Some(existing) = policy.keys.iter().find(|entry| entry.key_id == target) {
         ensure!(existing.status != ManagedKeyStatus::Revoked, "KMS key '{target}' is revoked");
-        if policy.active_key_id == target && existing.status == ManagedKeyStatus::Active {
-            save_policy_and_keyring(&canonical, &policy)?;
-            return Ok((policy.clone(), policy.active_key_version));
-        }
+        ensure!(
+            policy.active_key_id == target && existing.status == ManagedKeyStatus::Active,
+            "cannot reuse retained KMS key '{target}' as rotation target; rotation requires a distinct fresh key_id"
+        );
+        save_policy_and_keyring(&canonical, &policy)?;
+        return Ok((policy.clone(), policy.active_key_version));
     }
+    ensure!(
+        !key_file_path(&canonical, &target).exists(),
+        "key material already exists on disk for unregistered KMS key '{target}'"
+    );
 
     let new_ver = policy.keys.iter().map(|e| e.key_version).max().unwrap_or(policy.active_key_version) + 1;
     for entry in &mut policy.keys {
@@ -408,13 +414,7 @@ pub fn prepare_rotation_target_key(
             entry.status = ManagedKeyStatus::Retained;
         }
     }
-    if let Some(entry) = policy.keys.iter_mut().find(|entry| entry.key_id == target) {
-        ensure!(key_file_path(&canonical, &target).is_file(), "key file missing for KMS key '{target}'");
-        entry.status = ManagedKeyStatus::Active;
-        entry.key_version = new_ver;
-    } else {
-        policy.keys.push(create_key_entry(&canonical, &target, new_ver)?);
-    }
+    policy.keys.push(create_key_entry(&canonical, &target, new_ver)?);
     policy.active_key_id = target;
     policy.active_key_version = new_ver;
     save_policy_and_keyring(&canonical, &policy)?;

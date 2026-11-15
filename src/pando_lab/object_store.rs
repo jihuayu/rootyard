@@ -534,8 +534,11 @@ mod tests {
         let (repo, pack_id) = (Uuid::new_v4(), Uuid::new_v4());
         let dir = objects_root.join(repo.to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        let mut pack = Vec::from(&b"PACK\x00\x00\x00\x02\x00\x00\x00\x01\x34"[..]);
-        pack.extend_from_slice(&delta::compress_zlib_stored(b"test-secret-payload"));
+        let payload = b"test-secret-payload";
+        let mut pack = Vec::from(&b"PACK\x00\x00\x00\x02\x00\x00\x00\x01"[..]);
+        pack.push(0x80 | 0x30 | ((payload.len() & 0x0f) as u8));
+        pack.push((payload.len() >> 4) as u8);
+        pack.extend_from_slice(&delta::compress_zlib_stored(payload));
         let tr = delta::sha1_digest(&pack);
         pack.extend_from_slice(&tr);
         std::fs::write(dir.join(format!("{pack_id}.pack")), &pack).unwrap();

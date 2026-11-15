@@ -1,12 +1,13 @@
 use super::{
-    DEFAULT_CIPHER_SUITE, LifecycleEvaluateOptions, LifecycleEvaluationReport, LifecyclePolicy,
-    LifecycleStatusReport, build_envelope_record, compute_fragmentation_metrics, crypto, db,
-    envelope_file_path, evict_cold_pack_local, provider, read_and_verify_envelope_file,
-    rotate_kms_key, valid_cipher_suite, valid_encryption_mode, valid_kms_key_id,
-    verify_envelope_record, write_envelope_file,
+    DEFAULT_CIPHER_SUITE, KmsEnvelopeRecord, LifecycleEvaluateOptions, LifecycleEvaluationReport,
+    LifecyclePolicy, LifecycleStatusReport, build_envelope_record, compute_fragmentation_metrics,
+    crypto, db, envelope_file_path, evict_cold_pack_local, provider,
+    read_and_verify_envelope_file, rotate_kms_key, valid_cipher_suite, valid_encryption_mode,
+    valid_kms_key_id, verify_envelope_record, write_envelope_file,
 };
 use super::super::{Config, Pack, object_store, repack};
 use anyhow::{Context, Result, ensure};
+use std::path::Path;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -23,6 +24,45 @@ pub(crate) async fn load_repo_packs(c: &Client, repo: Uuid) -> Result<Vec<Pack>>
         idx_sha256: r.get(2),
     })
     .collect())
+}
+
+async fn ensure_no_authenticated_envelope(
+    c: &Client,
+    root: &Path,
+    s_root: &Path,
+    repo: Uuid,
+    pack: &Pack,
+) -> Result<()> {
+    let disk = envelope_file_path(root, repo, pack.id);
+    if disk.is_file() {
+        let existing: KmsEnvelopeRecord = serde_json::from_slice(&std::fs::read(&disk)?)?;
+        ensure!(
+            !crypto::is_authenticated_mode(&existing.encryption_mode),
+            "refusing to overwrite authenticated disk envelope for pack {} with {}",
+            pack.id,
+            crypto::SYNTHETIC_METADATA_MODE
+        );
+    }
+    if let Some(db_env) = db::load_envelope_from_db(c, repo, pack).await? {
+        ensure!(
+            !crypto::is_authenticated_mode(&db_env.encryption_mode),
+            "refusing to overwrite authenticated DB envelope for pack {} with {}",
+            pack.id,
+            crypto::SYNTHETIC_METADATA_MODE
+        );
+    }
+    let manifest_path = s_root.join(object_store::manifest_key(repo, pack.id));
+    if manifest_path.is_file() {
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let manifest_mode = manifest.get("encryption_mode").and_then(|v| v.as_str());
+        ensure!(
+            !manifest_mode.is_some_and(crypto::is_authenticated_mode),
+            "refusing to downgrade authenticated object-store pack {} to {}",
+            pack.id,
+            crypto::SYNTHETIC_METADATA_MODE
+        );
+    }
+    Ok(())
 }
 
 pub(super) async fn evaluate_lifecycle_inner(
@@ -164,6 +204,7 @@ pub(super) async fn evaluate_lifecycle_inner(
                 object_store::put_pack_and_seal_with_suite(config, repo, pack.id, suite, tier).await?
             }
         } else {
+            ensure_no_authenticated_envelope(&c, &config.root, &s_root, repo, pack).await?;
             let syn =
                 build_envelope_record(repo, pack, &policy.kms_key_id, policy.kms_key_version, suite, tier)?;
             db::upsert_envelope_in_db(&c, &syn).await?;
