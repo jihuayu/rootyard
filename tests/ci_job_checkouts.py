@@ -825,7 +825,7 @@ class JobCheckoutHarness(SourcePinHarness):
             received = len(first)
             started = time.monotonic()
             custom_start = revoke()
-            if custom_start is not None:
+            if isinstance(custom_start, float):
                 started = custom_start
             if pause_after_first > 0:
                 time.sleep(pause_after_first)
@@ -868,7 +868,7 @@ class JobCheckoutHarness(SourcePinHarness):
             received = len(first)
             started = time.monotonic()
             custom_start = revoke()
-            if custom_start is not None:
+            if isinstance(custom_start, float):
                 started = custom_start
             time.sleep(pause_after_first)
             interrupted = False

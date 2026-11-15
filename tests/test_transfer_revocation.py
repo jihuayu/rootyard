@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """Contract and structural tests for Issue #37 bounded active transfer revocation."""
 import ast
+import http.client
+import os
 from pathlib import Path
+import sys
+import time
+import types
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "tests") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tests"))
 
 
 class TestTransferRevocationContract(unittest.TestCase):
@@ -149,6 +157,70 @@ class TestTransferRevocationContract(unittest.TestCase):
             "expires_at",
         ):
             self.assertIn(expected, standalone_src)
+
+    def test_harness_stream_helpers_handle_non_float_and_float_revoke_returns(self):
+        extra = {}
+        if not hasattr(os, "O_DIRECTORY") and "owned_fuse_cleanup" not in sys.modules:
+            extra["owned_fuse_cleanup"] = types.ModuleType("owned_fuse_cleanup")
+        with mock.patch.dict(sys.modules, extra):
+            import ci_job_checkouts  # noqa: E402
+
+        class FakeResponse:
+            def __init__(self, *, content_length=None):
+                self.status = 200
+                self._content_length = content_length
+                self._calls = 0
+
+            def getheader(self, name):
+                if name == "Content-Length":
+                    return str(self._content_length)
+                return None
+
+            def read(self, _amt=None):
+                self._calls += 1
+                if self._calls == 1:
+                    return b"x" * 4096 if self._content_length is None else b"x" * 1024
+                if self._calls == 2:
+                    return b"y" * 128
+                raise http.client.IncompleteRead(b"")
+
+        class FakeConn:
+            def __init__(self, content_length=None):
+                self._content_length = content_length
+                self.closed = False
+
+            def request(self, *_args, **_kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse(content_length=self._content_length)
+
+            def close(self):
+                self.closed = True
+
+        class DummyHarness:
+            _barrier_available = lambda self: False  # noqa: E731
+            _stream_git_until_revoked = ci_job_checkouts.JobCheckoutHarness._stream_git_until_revoked
+            _stream_lfs_until_revoked = ci_job_checkouts.JobCheckoutHarness._stream_lfs_until_revoked
+
+        dummy = DummyHarness()
+        token = {"token": "ryt_dummy"}
+        for revoke_fn in (
+            lambda: "cli stdout",
+            lambda: b"http body",
+            lambda: None,
+            lambda: time.monotonic(),
+        ):
+            with mock.patch("http.client.HTTPConnection", return_value=FakeConn()):
+                git_res = dummy._stream_git_until_revoked(
+                    "http://127.0.0.1:9", "/git/a/b.git", token, "0" * 40, 1024 * 1024, revoke_fn
+                )
+                self.assertLess(git_res["elapsed_seconds"], 5.0)
+            with mock.patch("http.client.HTTPConnection", return_value=FakeConn(content_length=1024 * 1024)):
+                lfs_res = dummy._stream_lfs_until_revoked(
+                    "http://127.0.0.1:9", "/lfs/obj", token, 1024 * 1024, revoke_fn, pause_after_first=0.0
+                )
+                self.assertLess(lfs_res["elapsed_seconds"], 5.0)
 
 
 if __name__ == "__main__":
