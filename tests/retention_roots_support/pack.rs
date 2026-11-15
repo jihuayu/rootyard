@@ -206,24 +206,7 @@ pub async fn verify_new(
     verify_new_in_repo(db, store, git, format, tenant, repo, gate).await
 }
 
-/// Actual provision + A3/A4/native verified first commit on a ready
-/// `pg_refstore` repository. The caller gets the production Identity and
-/// repository metadata for the serving snapshot coordinator.
-pub async fn verify_new_serving(
-    db: &Db,
-    store: &BlobStore,
-    git: &std::path::Path,
-    name: &str,
-) -> Result<(Verified, Identity, Repository)> {
-    let actor = super::db::serving_actor(&db.pool, "roots-serving-owner-").await?;
-    let repository = super::db::provision_serving(&db.pool, &actor, store, name).await?;
-    let tenant = actor.id;
-    let gate = super::db::gate_version(&db.pool, repository.id, tenant).await?;
-    let verified = verify_new_in_repo(db, store, git, GitObjectFormat::Sha1, tenant, repository.id, gate).await?;
-    Ok((verified, actor, repository))
-}
-
-async fn verify_new_in_repo(
+pub(super) async fn verify_new_in_repo(
     db: &Db,
     store: &BlobStore,
     git: &std::path::Path,

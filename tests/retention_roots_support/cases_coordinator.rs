@@ -24,7 +24,8 @@ use crate::retention_roots_support::db::{
     serving_collaborator, set_collaborator_role, wait_pin_expired,
 };
 use crate::retention_roots_support::git::{GateRelease, GitGate, git_binary, stock_git_accepts_view};
-use crate::retention_roots_support::pack::{create_serving_snapshot, verify_new_serving};
+use crate::retention_roots_support::pack::create_serving_snapshot;
+use crate::retention_roots_support::serving::verify_new_serving;
 use crate::retention_roots_support::roots;
 
 const ROOT_ID_DOMAIN: &str = "serving-root-id-v1";

@@ -20,7 +20,8 @@ use crate::retention_roots_support::db::{
 use crate::retention_roots_support::git::{
     GateRelease, GitGate, assert_pack_identity, git_binary, stock_git_accepts_view,
 };
-use crate::retention_roots_support::pack::{create_serving_snapshot, verify_new_serving};
+use crate::retention_roots_support::pack::create_serving_snapshot;
+use crate::retention_roots_support::serving::verify_new_serving;
 use crate::retention_roots_support::roots;
 
 /// The serving lane anchors the process-wide public cluster row, so these
