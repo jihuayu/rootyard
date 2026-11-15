@@ -93,6 +93,19 @@ impl VerificationLease {
         }))
     }
 
+    /// Test-only constructor matching `view.rs` tests with a raw native permit.
+    #[cfg(test)]
+    pub(super) fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Result<Arc<Self>, PackCommitError> {
+        let root = TempRoot::create()?;
+        Ok(Arc::new(Self {
+            root,
+            staging: Mutex::new(None),
+            download: Mutex::new(None),
+            _view_budget: None,
+            native: Mutex::new(Some(NativePermit::from_test_permit(permit))),
+        }))
+    }
+
     /// Test-only empty lease for unit cases that never run a native child (an
     /// owned workspace with no native permit and no view budget).
     #[cfg(test)]

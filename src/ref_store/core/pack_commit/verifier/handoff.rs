@@ -266,7 +266,8 @@ pub(super) mod test_handoff {
             HandoffMethod::Reflink
         } else {
             budgets().record_handoff_fallback();
-            stream_copy_bounded(&mut src_file, &mut dest_file, expected_len, deadline)?
+            stream_copy_bounded(&mut src_file, &mut dest_file, expected_len, deadline)?;
+            HandoffMethod::StreamingCopy
         };
         dest_file.sync_all().map_err(|_| refuse("handoff temporary file could not be synced"))?;
         #[cfg(unix)]

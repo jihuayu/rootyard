@@ -6,11 +6,11 @@
 //! `View -> Staging -> Download -> (release Download) -> Native`.
 //! Maintenance callers acquire a <= 50% sub-cap permit before entering each
 //! global pool, guaranteeing maintenance saturation cannot starve foreground.
-use super::super::contract::{VERIFIER_MAX_CONCURRENT, VERIFIER_VIEW_MAX_CONCURRENT};
-use super::super::error::PackCommitError;
 pub(crate) use super::budget_metrics::VerifierMetricsSnapshot;
 use super::budget_metrics::{GlobalCounters, SlotCounters, StagingCounters, build_snapshot};
 use super::refuse;
+use crate::ref_store::core::pack_commit::contract::{VERIFIER_MAX_CONCURRENT, VERIFIER_VIEW_MAX_CONCURRENT};
+use crate::ref_store::core::pack_commit::error::PackCommitError;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -98,6 +98,13 @@ pub(crate) struct DownloadPermit(SlotPermit);
 pub(crate) struct ViewPermit(SlotPermit);
 #[derive(Debug)]
 pub(crate) struct NativePermit(SlotPermit);
+
+#[cfg(test)]
+impl NativePermit {
+    pub(super) fn from_test_permit(permit: OwnedSemaphorePermit) -> Self {
+        Self(SlotPermit { _global: permit, _maintenance: None, counters: Arc::new(SlotCounters::default()) })
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct StagingReservation {
