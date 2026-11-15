@@ -84,7 +84,7 @@ pub struct CausalVersionNode {
 pub enum VersionLookupEntry {
     Missing,
     Retired,
-    Active(CausalVersionNode),
+    Active(Box<CausalVersionNode>),
 }
 
 /// Abstract read interface for committed causal version nodes (PG, Raft or contract graph).
@@ -104,7 +104,7 @@ impl VersionGraph {
     }
 
     pub fn insert_active(&mut self, node: CausalVersionNode) {
-        self.nodes.insert(node.record.version_id(), VersionLookupEntry::Active(node));
+        self.nodes.insert(node.record.version_id(), VersionLookupEntry::Active(Box::new(node)));
     }
 
     /// Key explicitly by an external `VersionId` (used to inject mismatched-ID corruption fixtures).
@@ -263,7 +263,7 @@ pub fn verify_dependency_closure(
     let root_node = match lookup.lookup_version(root_id) {
         VersionLookupEntry::Missing => return Err(CausalClosureError::VersionNotFound),
         VersionLookupEntry::Retired => return Err(CausalClosureError::VersionRetired),
-        VersionLookupEntry::Active(node) => node,
+        VersionLookupEntry::Active(node) => *node,
     };
     validate_node(&root_node, root_id, expected_realm, true)?;
     let mut acc = ClosureAccumulator::new();
@@ -357,7 +357,7 @@ fn visit_dependencies(
             VersionLookupEntry::Missing | VersionLookupEntry::Retired => {
                 return Err(CausalClosureError::DependencyMissing);
             }
-            VersionLookupEntry::Active(node) => node,
+            VersionLookupEntry::Active(node) => *node,
         };
         validate_node(&dep_node, dep_id, expected_realm, false)?;
         if dep_node.record.authority_seq() >= parent.record.authority_seq() {

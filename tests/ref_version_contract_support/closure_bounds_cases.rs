@@ -156,15 +156,19 @@ fn depth_fanout_edges_packs_bytes_bounds_are_exact_and_fail_closed() {
         903,
     );
     let byte_dep_vid = byte_dep.record.version_id();
-    let byte_ok = mint_publish(
-        &realm,
-        "refs/heads/b2",
-        oid(0x62),
-        2,
-        vec![byte_dep_vid],
-        vec![closure_pack(realm.tenant_id(), 951, "s3", &backend, rem)],
-        904,
-    );
+    let retired_base = mint_publish(&realm, "refs/heads/b2", oid(0x60), 1, vec![], vec![], 903);
+    let byte_ok = mint_node(MintSpec {
+        realm: &realm,
+        ref_name: "refs/heads/b2",
+        kind: RefVersionKind::Publish,
+        precondition: RefPrecondition::Present(oid(0x60)),
+        base_record: Some(&retired_base.record),
+        target: RefTarget::Oid(oid(0x62)),
+        authority_seq: 2,
+        object_deps: vec![byte_dep_vid],
+        own_packs: vec![closure_pack(realm.tenant_id(), 951, "s3", &backend, rem)],
+        op_seed: 904,
+    });
     let byte_ok_vid = byte_ok.record.version_id();
     let byte_over = mint_node(MintSpec {
         realm: &realm,
@@ -180,6 +184,7 @@ fn depth_fanout_edges_packs_bytes_bounds_are_exact_and_fail_closed() {
     });
     let byte_over_vid = byte_over.record.version_id();
     let mut bgraph = VersionGraph::new();
+    bgraph.mark_retired(retired_base.record.version_id());
     bgraph.insert_active(byte_dep);
     bgraph.insert_active(byte_ok);
     bgraph.insert_active(byte_over);

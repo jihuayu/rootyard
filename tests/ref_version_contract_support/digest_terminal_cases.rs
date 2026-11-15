@@ -140,7 +140,7 @@ fn version_id_record_binding_is_immutable() {
     let other = mint_publish(&realm, "refs/heads/other", oid(0x78), 5, vec![], vec![], 1301);
     let mut g = VersionGraph::new();
     let forged_key = other.record.version_id();
-    g.insert_entry_at(forged_key, VersionLookupEntry::Active(node));
+    g.insert_entry_at(forged_key, VersionLookupEntry::Active(Box::new(node)));
     assert_eq!(verify_dependency_closure(&g, &realm, &forged_key), Err(CausalClosureError::DependencyCorrupt));
 }
 
