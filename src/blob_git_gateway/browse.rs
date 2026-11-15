@@ -43,6 +43,7 @@ const MAX_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
 
 mod session;
 pub(super) mod retained;
+pub(super) mod roots;
 
 pub(super) use session::{BrowseSession, finalize};
 

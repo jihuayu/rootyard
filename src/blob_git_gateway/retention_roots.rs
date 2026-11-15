@@ -343,7 +343,7 @@ impl RootMetadataView {
     }
 }
 
-fn root_facade(state: &BlobGitState) -> Result<PgServingRetentionRoots, GatewayError> {
+pub(crate) fn root_facade(state: &BlobGitState) -> Result<PgServingRetentionRoots, GatewayError> {
     let roots = PgRetentionRoots::new(state.store().clone(), state.git_binary().to_path_buf())
         .map_err(|_| GatewayError::Internal("retention root engine unavailable"))?;
     Ok(PgServingRetentionRoots::new(roots))

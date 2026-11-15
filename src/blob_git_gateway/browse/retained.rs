@@ -29,7 +29,7 @@ use crate::browse::models::{BlobByOidQuery, BlobResponse, TreeQuery, TreeRespons
 use crate::ref_store::core::pack_snapshot::PgPackSnapshotMaterializer;
 use crate::ref_store::serving::{PgServingSnapshotMetadata, RetainedServingReadContext, ServingSnapshotRead};
 
-pub(super) async fn tree(
+pub(crate) async fn tree(
     state: State<Arc<BlobGitState>>,
     path: Path<(String, String, String)>,
     query: Query<TreeQuery>,
@@ -103,7 +103,7 @@ async fn tree_authorized(
     .await
 }
 
-pub(super) async fn blob(
+pub(crate) async fn blob(
     state: State<Arc<BlobGitState>>,
     path: Path<(String, String, String, String)>,
     query: Query<BlobByOidQuery>,

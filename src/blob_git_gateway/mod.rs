@@ -108,6 +108,14 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
             post(retention_roots::release_root_intent),
         )
         .route(
+            "/api/repos/{owner}/{name}/roots/{root}/tree",
+            get(browse::roots::tree),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/roots/{root}/blob/{oid}",
+            get(browse::roots::blob),
+        )
+        .route(
             "/api/repos/{owner}/{name}/roots/{root}",
             get(retention_roots::read_root).delete(retention_roots::release_root),
         )

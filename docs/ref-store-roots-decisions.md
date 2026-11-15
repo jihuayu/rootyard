@@ -3,10 +3,11 @@
 This library increment builds on the registered-pack reads in
 [materialized reads](ref-store-materialized-reads.md). Migration 144 adds
 retained roots, a publication-decision ledger and a separate per-repository
-protocol realm. It introduces no HTTP route or serving cutover. Existing
+protocol realm. It introduces no serving cutover. Existing
 repositories continue using their existing authority until explicitly provisioned.
-The only roots HTTP currently implemented is the separate metadata/intent
-transport described below; root tree/blob browsing has not been exposed.
+The roots HTTP surface is limited to the metadata/intent transport and the
+authorized tree/blob browsing described below; no root tree writes, current
+refs fallback or #174 session/proof is exposed.
 
 ## Metadata and intent HTTP transport
 
@@ -42,8 +43,8 @@ All mutations require current Owner/Admin + ContentsWrite and metadata requires
 current Owner/Admin + ContentsRead in the coordinator; HTTP performs no SQL or
 authority derivation. An ambiguous retention-root COMMIT is reported as 503 and
 must be retried with the exact same key and body; no client retry may switch to a
-new idempotency key or claim failure. Root tree/blob browsing, post-encoding byte
-races and full HTTP/native/CI acceptance remain later work.
+new idempotency key or claim failure. Post-encoding byte races and full
+HTTP/native/CI acceptance remain later work.
 
 ## Durable roots
 
@@ -65,6 +66,43 @@ bound to the expected register digest and blocks delayed registration.
 Whole-repository deletion preserves historical root metadata and locators but
 removes the live gate needed for a new byte view. This is retention metadata;
 it adds neither a physical GC consumer nor an automatic Blob deletion path.
+
+## Root tree/blob browsing
+
+```text
+GET /api/repos/{owner}/{name}/roots/{root_id}/tree
+GET /api/repos/{owner}/{name}/roots/{root_id}/blob/{oid}
+```
+
+Both routes require current Owner/Admin + ContentsRead through the serving
+coordinator. The coordinator materializes the retained root's exact verified
+pack/index bytes, and the gateway copies them into a private disposable Git
+view for bounded Browse parsing. The retained context remains alive through the
+copy, native reads and full JSON encoding; after encoding, one final bounded
+transaction rechecks current authorization, root activity, binding, opened
+Blob backend, ready realm and the original cluster anchor before any body is
+served. PostgreSQL is not held across pack/native/file/JSON work. Successful
+and refused responses are bounded no-store JSON and never issue a
+`X-Rootyard-Session`; refusals use the fixed API error vocabulary and a single
+Bearer challenge.
+
+Selector semantics are strict:
+
+- A **snapshot** root installs its stored captured refs and HEAD exactly.
+- An **explicit ObjectIds** root installs only
+  `refs/roots/oid/<full-selected-oid>` for the root's stored selected OIDs, and
+  sets HEAD to the unborn private
+  `refs/heads/rootyard-retained-unborn`. No captured refs, captured HEAD or
+  current refs are installed. Therefore default/`HEAD` tree reads return 404;
+  clients must supply a selected/reachable full OID or the exact synthetic ref.
+- The entire reachable closure of the selected objects is browsable, including
+  descendant trees/blobs, commit history and annotated-tag peeling. Objects
+  present in the same verified packs but outside that closure are 404.
+
+SHA-1 and SHA-256 roots use the same object-format-sized pack trailer/index
+checksum naming and bounded path/pagination/blob ceilings. No current GitFS or
+Pando authority is consulted, and no session, HWM or #174 proof is produced.
+Native/HTTP/CI and full #107 qualification remain pending.
 
 ## Publication decisions
 
