@@ -378,6 +378,20 @@ impl PgPackSnapshot {
         })
     }
 
+    /// Take the existing metadata request advisory key inside the
+    /// caller-owned transaction before any target/pin read or final authority
+    /// check. Same-key attempts serialize here; the later create/renew/release
+    /// adapter reacquires the same transaction-scoped key as a no-op.
+    pub(crate) async fn serving_request_lock(
+        &self,
+        tx: &Transaction<'_>,
+        request_id: Uuid,
+        deadline: Instant,
+    ) -> Result<(), RefStoreError> {
+        pg::bound(tx, deadline).await?;
+        snapshot_sql::advisory_request_lock(tx, request_id).await
+    }
+
     /// Serving create inside a caller-owned transaction. The coordinator owns
     /// the commit and the final late token check; this method only reuses the
     /// exact A5a SQL/receipt/quota/history path with the serving lane.

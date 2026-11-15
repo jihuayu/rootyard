@@ -133,15 +133,18 @@ impl PgServingSnapshotMetadata {
 
         let mut client = acquire(pool, deadline).await?;
         let tx = begin_owned(&mut client, deadline).await?;
-        let staged = async {
+        let core = async {
+            // Request advisory first, then the lock-free replay pre-read and
+            // the existing create adapter. This is the frozen request -> quota
+            // -> repository/gate -> pin -> receipt direction.
+            PgPackSnapshot.serving_request_lock(&tx, request_id, deadline).await?;
             let expected = match PgPackSnapshot
                 .serving_create_expectation(&tx, &scope, request_id, pin_id, snapshot_id, deadline)
-                .await
-                .map_err(map_metadata_error)?
+                .await?
             {
                 Some(expected) => expected,
                 None => PackSnapshotExpectation::new(preflight.gate.revision(), *preflight.gate.digest())
-                    .map_err(map_metadata_error)?,
+                    .map_err(|_| request_construction_error())?,
             };
             let request = CreatePackSnapshotRequest::new(
                 scope,
@@ -151,43 +154,63 @@ impl PgServingSnapshotMetadata {
                 input.lease_seconds,
                 expected,
             )
-            .map_err(map_metadata_error)?;
-            let outcome = PgPackSnapshot
+            .map_err(|_| request_construction_error())?;
+            PgPackSnapshot
                 .create_serving_checked(&tx, &request, backend.as_hex(), deadline)
                 .await
-                .map_err(map_metadata_error)?;
-            final_authority(
-                &tx,
-                actor,
-                repository_id,
-                scope.tenant_id(),
-                &preflight.repository.name,
-                RepoAction::ContentsWrite,
-                backend,
-                Some(&scope),
-                true,
-                deadline,
-            )
-            .await?;
-            Ok::<PackSnapshotOutcome, Error>(outcome)
         }
         .await;
-        match staged {
+        match core {
             Ok(outcome) => {
-                let committed = commit_bounded(tx, deadline, repository_id, None).await;
-                crate::ref_store::core::metadata_commit_result(
-                    committed,
+                match final_authority(
+                    &tx,
+                    actor,
                     repository_id,
-                    request_id,
-                    pin_id,
-                    MetadataMutationAction::Create,
+                    scope.tenant_id(),
+                    &preflight.repository.name,
+                    RepoAction::ContentsWrite,
+                    backend,
+                    Some(&scope),
+                    true,
+                    deadline,
                 )
-                .map_err(map_metadata_error)?;
-                Ok(outcome)
+                .await
+                {
+                    Ok(_) => {
+                        let committed = commit_bounded(tx, deadline, repository_id, None).await;
+                        crate::ref_store::core::metadata_commit_result(
+                            committed,
+                            repository_id,
+                            request_id,
+                            pin_id,
+                            MetadataMutationAction::Create,
+                        )
+                        .map_err(map_metadata_error)?;
+                        Ok(outcome)
+                    }
+                    Err(error) => {
+                        rollback_bounded(tx).await;
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
+                let surface = authorize_failure(
+                    &tx,
+                    actor,
+                    repository_id,
+                    scope.tenant_id(),
+                    &preflight.repository.name,
+                    RepoAction::ContentsWrite,
+                    backend,
+                    Some(&scope),
+                    true,
+                    error,
+                    deadline,
+                )
+                .await;
                 rollback_bounded(tx).await;
-                Err(error)
+                Err(surface)
             }
         }
     }
@@ -210,9 +233,10 @@ impl PgServingSnapshotMetadata {
         let tenant_id = preflight.gate.tenant_id();
         let mut client = acquire(pool, deadline).await?;
         let tx = begin_owned(&mut client, deadline).await?;
-        let staged = async {
-            // Deny a non-admin reader before any stored snapshot row is read;
-            // this is an early in-transaction filter, not final authority.
+        let result = async {
+            // Current Admin is checked before any target-sensitive row read.
+            // The final late ContentsRead check follows the pin/gate locks and
+            // also runs on semantic read errors before their state is surfaced.
             serving_admin_gate(
                 &tx,
                 actor,
@@ -225,10 +249,7 @@ impl PgServingSnapshotMetadata {
                 deadline,
             )
             .await?;
-            // Pin/gate locks come first; the late token check follows while the
-            // pin FOR SHARE is still held, preserving repository/gate -> pin ->
-            // token order and avoiding a read/release inversion.
-            let value = PgPackSnapshot
+            let value = match PgPackSnapshot
                 .read_serving_by_snapshot(
                     &tx,
                     repository_id,
@@ -238,7 +259,25 @@ impl PgServingSnapshotMetadata {
                     deadline,
                 )
                 .await
-                .map_err(map_metadata_error)?;
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(authorize_failure(
+                        &tx,
+                        actor,
+                        repository_id,
+                        tenant_id,
+                        &preflight.repository.name,
+                        RepoAction::ContentsRead,
+                        backend,
+                        None,
+                        false,
+                        error,
+                        deadline,
+                    )
+                    .await);
+                }
+            };
             final_authority(
                 &tx,
                 actor,
@@ -256,7 +295,7 @@ impl PgServingSnapshotMetadata {
         }
         .await;
         rollback_bounded(tx).await;
-        staged
+        result
     }
 
     /// Renew the stored pin at its exact generation. The stored scope and pin
@@ -277,6 +316,7 @@ impl PgServingSnapshotMetadata {
         let preflight = preflight(pool, actor, &input.owner, &input.name, true, backend, deadline).await?;
         let repository_id = preflight.repository.id;
         let tenant_id = preflight.gate.tenant_id();
+        let current_scope = scope_from_gate(&preflight.gate)?;
         let request_id = derived_uuid(
             RENEW_REQUEST_DOMAIN,
             repository_id,
@@ -287,57 +327,79 @@ impl PgServingSnapshotMetadata {
 
         let mut client = acquire(pool, deadline).await?;
         let tx = begin_owned(&mut client, deadline).await?;
-        let staged = async {
-            let identity = PgPackSnapshot
+        let core = async {
+            PgPackSnapshot.serving_request_lock(&tx, request_id, deadline).await?;
+            let Some(identity) = PgPackSnapshot
                 .serving_snapshot_identity(&tx, repository_id, tenant_id, input.snapshot_id, deadline)
-                .await
-                .map_err(map_metadata_error)?
-                .ok_or_else(Error::not_found)?;
-            let scope = identity.scope;
+                .await?
+            else {
+                return Err(RefStoreError::MetadataSnapshotNotFound { snapshot_id: input.snapshot_id });
+            };
             let request = RenewMetadataPinRequest::new(
-                scope,
+                identity.scope,
                 request_id,
                 identity.pin_id,
                 input.expected_generation,
                 input.lease_seconds,
             )
-            .map_err(map_metadata_error)?;
+            .map_err(|_| request_construction_error())?;
             let outcome = PgRefStoreCore
                 .renew_serving_checked(&tx, &request, backend.as_hex(), deadline)
-                .await
-                .map_err(map_metadata_error)?;
-            final_authority(
-                &tx,
-                actor,
-                repository_id,
-                tenant_id,
-                &preflight.repository.name,
-                RepoAction::ContentsWrite,
-                backend,
-                Some(&scope),
-                false,
-                deadline,
-            )
-            .await?;
-            Ok::<(MetadataPinOutcome, Uuid), Error>((outcome, identity.pin_id))
+                .await?;
+            Ok::<(MetadataPinOutcome, Uuid), RefStoreError>((outcome, identity.pin_id))
         }
         .await;
-        match staged {
+        match core {
             Ok((outcome, pin_id)) => {
-                let committed = commit_bounded(tx, deadline, repository_id, None).await;
-                crate::ref_store::core::metadata_commit_result(
-                    committed,
+                match final_authority(
+                    &tx,
+                    actor,
                     repository_id,
-                    request_id,
-                    pin_id,
-                    MetadataMutationAction::Renew,
+                    tenant_id,
+                    &preflight.repository.name,
+                    RepoAction::ContentsWrite,
+                    backend,
+                    Some(&current_scope),
+                    false,
+                    deadline,
                 )
-                .map_err(map_metadata_error)?;
-                Ok(outcome)
+                .await
+                {
+                    Ok(_) => {
+                        let committed = commit_bounded(tx, deadline, repository_id, None).await;
+                        crate::ref_store::core::metadata_commit_result(
+                            committed,
+                            repository_id,
+                            request_id,
+                            pin_id,
+                            MetadataMutationAction::Renew,
+                        )
+                        .map_err(map_metadata_error)?;
+                        Ok(outcome)
+                    }
+                    Err(error) => {
+                        rollback_bounded(tx).await;
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
+                let surface = authorize_failure(
+                    &tx,
+                    actor,
+                    repository_id,
+                    tenant_id,
+                    &preflight.repository.name,
+                    RepoAction::ContentsWrite,
+                    backend,
+                    Some(&current_scope),
+                    false,
+                    error,
+                    deadline,
+                )
+                .await;
                 rollback_bounded(tx).await;
-                Err(error)
+                Err(surface)
             }
         }
     }
@@ -359,6 +421,7 @@ impl PgServingSnapshotMetadata {
         let preflight = preflight(pool, actor, &input.owner, &input.name, true, backend, deadline).await?;
         let repository_id = preflight.repository.id;
         let tenant_id = preflight.gate.tenant_id();
+        let current_scope = scope_from_gate(&preflight.gate)?;
         let request_id = derived_uuid(
             RELEASE_REQUEST_DOMAIN,
             repository_id,
@@ -369,57 +432,79 @@ impl PgServingSnapshotMetadata {
 
         let mut client = acquire(pool, deadline).await?;
         let tx = begin_owned(&mut client, deadline).await?;
-        let staged = async {
-            let identity = PgPackSnapshot
+        let core = async {
+            PgPackSnapshot.serving_request_lock(&tx, request_id, deadline).await?;
+            let Some(identity) = PgPackSnapshot
                 .serving_snapshot_identity(&tx, repository_id, tenant_id, input.snapshot_id, deadline)
-                .await
-                .map_err(map_metadata_error)?
-                .ok_or_else(Error::not_found)?;
-            let scope = identity.scope;
+                .await?
+            else {
+                return Err(RefStoreError::MetadataSnapshotNotFound { snapshot_id: input.snapshot_id });
+            };
             let request = ReleaseMetadataPinRequest::new(
-                scope,
+                identity.scope,
                 request_id,
                 identity.pin_id,
                 input.expected_generation,
                 input.reason,
             )
-            .map_err(map_metadata_error)?;
+            .map_err(|_| request_construction_error())?;
             let outcome = PgRefStoreCore
                 .release_serving_checked(&tx, &request, backend.as_hex(), deadline)
-                .await
-                .map_err(map_metadata_error)?;
-            final_authority(
-                &tx,
-                actor,
-                repository_id,
-                tenant_id,
-                &preflight.repository.name,
-                RepoAction::ContentsWrite,
-                backend,
-                Some(&scope),
-                false,
-                deadline,
-            )
-            .await?;
-            Ok::<(MetadataPinOutcome, Uuid), Error>((outcome, identity.pin_id))
+                .await?;
+            Ok::<(MetadataPinOutcome, Uuid), RefStoreError>((outcome, identity.pin_id))
         }
         .await;
-        match staged {
+        match core {
             Ok((outcome, pin_id)) => {
-                let committed = commit_bounded(tx, deadline, repository_id, None).await;
-                crate::ref_store::core::metadata_commit_result(
-                    committed,
+                match final_authority(
+                    &tx,
+                    actor,
                     repository_id,
-                    request_id,
-                    pin_id,
-                    MetadataMutationAction::Release,
+                    tenant_id,
+                    &preflight.repository.name,
+                    RepoAction::ContentsWrite,
+                    backend,
+                    Some(&current_scope),
+                    false,
+                    deadline,
                 )
-                .map_err(map_metadata_error)?;
-                Ok(outcome)
+                .await
+                {
+                    Ok(_) => {
+                        let committed = commit_bounded(tx, deadline, repository_id, None).await;
+                        crate::ref_store::core::metadata_commit_result(
+                            committed,
+                            repository_id,
+                            request_id,
+                            pin_id,
+                            MetadataMutationAction::Release,
+                        )
+                        .map_err(map_metadata_error)?;
+                        Ok(outcome)
+                    }
+                    Err(error) => {
+                        rollback_bounded(tx).await;
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
+                let surface = authorize_failure(
+                    &tx,
+                    actor,
+                    repository_id,
+                    tenant_id,
+                    &preflight.repository.name,
+                    RepoAction::ContentsWrite,
+                    backend,
+                    Some(&current_scope),
+                    false,
+                    error,
+                    deadline,
+                )
+                .await;
                 rollback_bounded(tx).await;
-                Err(error)
+                Err(surface)
             }
         }
     }
@@ -456,6 +541,19 @@ async fn serving_admin_gate(
     if locked.owner_id() != tenant_id || locked.name() != name {
         return Err(Error::not_found());
     }
+    // Current actor permission is checked before any serving-backend/gate/realm
+    // or snapshot-specific refusal can surface. A non-admin must not learn a
+    // target's shape from an earlier state-specific error path.
+    let Some((role, _, _)) =
+        crate::members::rbac::resolve_effective_role(tx, repository_id, tenant_id, actor.id)
+            .await
+            .map_err(Error::internal)?
+    else {
+        return Err(Error::not_found());
+    };
+    if role < Role::Admin {
+        return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
+    }
     let binding = locked
         .require_serving(tenant_id, backend.as_hex())
         .map_err(map_scope_refusal)?;
@@ -480,16 +578,6 @@ async fn serving_admin_gate(
         {
             return Err(Error(StatusCode::CONFLICT, "repository realm changed; retry the same request"));
         }
-    }
-    let Some((role, _, _)) =
-        crate::members::rbac::resolve_effective_role(tx, repository_id, tenant_id, actor.id)
-            .await
-            .map_err(Error::internal)?
-    else {
-        return Err(Error::not_found());
-    };
-    if role < Role::Admin {
-        return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
     Ok(gate)
 }
@@ -541,6 +629,52 @@ async fn final_authority(
     .await
     .map_err(auth::scope_error)?;
     Ok(gate)
+}
+
+fn request_construction_error() -> RefStoreError {
+    RefStoreError::Database("snapshot metadata request could not be constructed".into())
+}
+
+/// Run the required current Admin + same-final-transaction late scope check
+/// before surfacing a target-sensitive semantic failure. Authorized callers keep
+/// the original error semantics; denied callers get the authorization error, so
+/// target existence/generation/release/replay state is not an oracle.
+#[allow(clippy::too_many_arguments)]
+async fn authorize_failure(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    name: &str,
+    action: RepoAction,
+    backend: &BlobBackendIdentity,
+    expected_scope: Option<&MetadataSnapshotScope>,
+    gate_for_update: bool,
+    error: RefStoreError,
+    deadline: Instant,
+) -> Error {
+    // Always attempt the authoritative final check. A healthy transaction runs
+    // current Admin + late scope and then returns the original authorized
+    // semantic error; an aborted/deadline/unavailable transaction makes this
+    // check fail closed with the opaque shared mapping instead of echoing an old
+    // target-specific error.
+    match final_authority(
+        tx,
+        actor,
+        repository_id,
+        tenant_id,
+        name,
+        action,
+        backend,
+        expected_scope,
+        gate_for_update,
+        deadline,
+    )
+    .await
+    {
+        Ok(_) => map_metadata_error(error),
+        Err(auth_error) => auth_error,
+    }
 }
 
 fn scope_from_gate(gate: &CoreGate) -> Result<MetadataSnapshotScope, Error> {

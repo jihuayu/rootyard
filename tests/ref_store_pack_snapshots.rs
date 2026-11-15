@@ -277,6 +277,57 @@ impl Db {
         Ok((identity, token_id))
     }
 
+    /// Initial fixture-only role metadata: one non-owner collaborator with the
+    /// requested real role and an unrestricted API token. This is not a
+    /// production collaborator/token API proof.
+    async fn collaborator(&self, repository_id: Uuid, tenant_id: Uuid, role: &str) -> Result<db::Identity> {
+        let user_id = Uuid::new_v4();
+        let username = format!("col{}", &user_id.simple().to_string()[..12]);
+        let token = format!("ryt_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_id = Uuid::new_v4();
+        let digest = db::digest(&token);
+        let client = self.pool.get().await?;
+        client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&user_id, &username]).await?;
+        client
+            .execute(
+                "INSERT INTO tokens(id,user_id,digest,read_only,kind,is_restricted)
+                 VALUES($1,$2,$3,false,'api',false)",
+                &[&token_id, &user_id, &digest],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role)
+                 VALUES($1,$2,$3,$4)",
+                &[&repository_id, &tenant_id, &user_id, &role],
+            )
+            .await?;
+        drop(client);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}"))?);
+        let identity = auth::authenticate(&self.pool, &headers)
+            .await
+            .map_err(|error| anyhow!("collaborator token authentication failed: {}", error.1))?;
+        ensure!(identity.id == user_id && identity.token_id == token_id, "collaborator identity differs");
+        Ok(identity)
+    }
+
+    async fn set_collaborator_role(&self, repository_id: Uuid, user_id: Uuid, role: &str) -> Result<()> {
+        let changed = self
+            .pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE repository_collaborators
+                    SET role=$3,version=version+1,updated_at=clock_timestamp()
+                  WHERE repository_id=$1 AND user_id=$2",
+                &[&repository_id, &user_id, &role],
+            )
+            .await?;
+        ensure!(changed == 1, "collaborator role fixture did not update exactly one row");
+        Ok(())
+    }
+
     async fn gate(&self, repo: Uuid, tenant: Uuid, format: GitObjectFormat) -> Result<CoreGateVersion> {
         let init = CoreGateInit::new(repo, tenant, format, Uuid::new_v4(), 1, 1, RefName::branch("refs/heads/main")?)?;
         let mut client = self.pool.get().await?;
@@ -920,6 +971,110 @@ async fn snapshot_counts(pool: &Pool, repo: Uuid) -> Result<(i64, i64, i64, i64,
     ).await?;
     Ok((row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
 }
+async fn a2_tenant_usage(pool: &Pool, tenant: Uuid) -> Result<[i64; 4]> {
+    let row = pool.get().await?.query_opt(
+        "SELECT snapshot_count,snapshot_ref_count,logical_bytes,receipt_count FROM ref_store_core_tenant_usage WHERE tenant_id=$1",
+        &[&tenant],
+    ).await?;
+    Ok(row.map(|r| [r.get(0), r.get(1), r.get(2), r.get(3)]).unwrap_or([0; 4]))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MetadataLedgerSnapshot {
+    refs: String,
+    gate: String,
+    events: String,
+    snapshots: String,
+    pins: String,
+    receipts: String,
+    history: String,
+    counts: (i64, i64, i64, i64, i64),
+    pack_usage: Option<[i64; 7]>,
+    pack_tenant_usage: Option<[i64; 7]>,
+    a2_repo_usage: [i64; 4],
+    a2_tenant_usage: [i64; 4],
+}
+
+/// Exact target/event/ref/ledger rows and both quota families, used to prove a
+/// denied call wrote or charged nothing.
+async fn metadata_ledger_snapshot(pool: &Pool, repo: Uuid, tenant: Uuid) -> Result<MetadataLedgerSnapshot> {
+    let row = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT
+               (SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.ref_name),'[]'::jsonb)::text
+                  FROM ref_store_core_refs r WHERE r.repository_id=$1),
+               (SELECT coalesce(jsonb_agg(to_jsonb(g) ORDER BY g.repository_id),'[]'::jsonb)::text
+                  FROM ref_store_core_gates g WHERE g.repository_id=$1),
+               (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.event_id),'[]'::jsonb)::text
+                  FROM ref_store_core_events e WHERE e.repository_id=$1),
+               (SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY s.snapshot_id),'[]'::jsonb)::text
+                  FROM ref_store_core_snapshots s WHERE s.repository_id=$1),
+               (SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.pin_id),'[]'::jsonb)::text
+                  FROM ref_store_core_pins p WHERE p.repository_id=$1),
+               (SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.request_id),'[]'::jsonb)::text
+                  FROM ref_store_core_receipts c WHERE c.repository_id=$1),
+               (SELECT coalesce(jsonb_agg(to_jsonb(h) ORDER BY h.request_id),'[]'::jsonb)::text
+                  FROM ref_store_core_pack_snapshot_history h WHERE h.repository_id=$1)",
+            &[&repo],
+        )
+        .await?;
+    Ok(MetadataLedgerSnapshot {
+        refs: row.get(0),
+        gate: row.get(1),
+        events: row.get(2),
+        snapshots: row.get(3),
+        pins: row.get(4),
+        receipts: row.get(5),
+        history: row.get(6),
+        counts: snapshot_counts(pool, repo).await?,
+        pack_usage: pack_usage(pool, repo).await?,
+        pack_tenant_usage: pack_tenant_usage(pool, tenant).await?,
+        a2_repo_usage: a2_usage(pool, repo).await?,
+        a2_tenant_usage: a2_tenant_usage(pool, tenant).await?,
+    })
+}
+
+fn expect_forbidden<T>(label: &str, result: Result<T, rootyard::Error>) -> Result<()> {
+    match result {
+        Err(error)
+            if error.0 == axum::http::StatusCode::FORBIDDEN
+                && error.1 == "insufficient repository role" => Ok(()),
+        Err(error) => Err(anyhow!(
+            "{label}: expected the common 403 role denial, got {} {}",
+            error.0,
+            error.1
+        )),
+        Ok(_) => Err(anyhow!("{label}: unexpectedly succeeded")),
+    }
+}
+
+async fn wait_for_backend_blocked_by(pool: &Pool, blocker_pid: i32) -> Result<i32> {
+    let until = StdInstant::now() + Duration::from_secs(10);
+    loop {
+        let row = pool
+            .get()
+            .await?
+            .query_opt(
+                "SELECT pid FROM pg_stat_activity
+                  WHERE datname=current_database() AND state='active'
+                    AND wait_event_type='Lock'
+                    AND $1 = ANY(pg_blocking_pids(pid)) AND pid <> $1
+                  LIMIT 1",
+                &[&blocker_pid],
+            )
+            .await?;
+        if let Some(row) = row {
+            return Ok(row.get(0));
+        }
+        if StdInstant::now() >= until {
+            return Err(anyhow!("read backend never blocked on the fixture pin lock"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn membership_joined(pool: &Pool, repo: Uuid, pack_id: Uuid) -> Result<i64> {
     Ok(pool
         .get()
@@ -2915,6 +3070,448 @@ async fn serving_metadata_late_scope_denial_rolls_back_all_rows_and_counters() -
             .await?
             .get(0);
         ensure!(grants == 1, "late scope denial did not roll back the narrowed grant");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_metadata_nonadmin_error_outcomes_are_masked_and_unchanged() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-oracle", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let owner = actor.username.clone();
+        let name = "serving-oracle".to_string();
+
+        let existing = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "oracle-existing".into(),
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        let snapshot_existing = existing.receipt.snapshot_id();
+
+        let released = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "oracle-released".into(),
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        let snapshot_released = released.receipt.snapshot_id();
+        PgServingSnapshotMetadata
+            .release(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRelease {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    snapshot_id: snapshot_released,
+                    idempotency_key: "oracle-release".into(),
+                    expected_generation: 1,
+                    reason: PinReleaseReason::ClientDone,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+
+        let expired = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "oracle-expired".into(),
+                    lease_seconds: 1,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        let snapshot_expired = expired.receipt.snapshot_id();
+        let pin_expired = expired.receipt.pin_id();
+        db.pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE ref_store_core_pins SET expires_at=clock_timestamp()-interval '1 second'
+                  WHERE pin_id=$1 AND repository_id=$2",
+                &[&pin_expired, &repo],
+            )
+            .await?;
+
+        // Initial fixture-only role metadata: a real non-owner write collaborator
+        // with an unrestricted API token. Not a production collaborator API proof.
+        let write_actor = db.collaborator(repo, tenant, "write").await?;
+        let baseline = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        let missing = Uuid::new_v4();
+
+        expect_forbidden(
+            "write create fresh",
+            PgServingSnapshotMetadata
+                .create(
+                    &db.pool,
+                    &write_actor,
+                    ServingSnapshotCreate {
+                        owner: owner.clone(),
+                        name: name.clone(),
+                        idempotency_key: "write-fresh".into(),
+                        lease_seconds: 300,
+                    },
+                    &backend,
+                    deadline(),
+                )
+                .await,
+        )?;
+        expect_forbidden(
+            "write read existing",
+            PgServingSnapshotMetadata
+                .read(
+                    &db.pool,
+                    &write_actor,
+                    ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: snapshot_existing },
+                    &backend,
+                    deadline(),
+                )
+                .await,
+        )?;
+        expect_forbidden(
+            "write read missing",
+            PgServingSnapshotMetadata
+                .read(
+                    &db.pool,
+                    &write_actor,
+                    ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: missing },
+                    &backend,
+                    deadline(),
+                )
+                .await,
+        )?;
+        for (label, snapshot_id, generation, key) in [
+            ("write renew existing", snapshot_existing, 1, "write-renew-existing"),
+            ("write renew missing", missing, 1, "write-renew-missing"),
+            ("write renew stale", snapshot_existing, 99, "write-renew-stale"),
+            ("write renew released", snapshot_released, 1, "write-renew-released"),
+            ("write renew expired", snapshot_expired, 1, "write-renew-expired"),
+        ] {
+            expect_forbidden(
+                label,
+                PgServingSnapshotMetadata
+                    .renew(
+                        &db.pool,
+                        &write_actor,
+                        ServingSnapshotRenew {
+                            owner: owner.clone(),
+                            name: name.clone(),
+                            snapshot_id,
+                            idempotency_key: key.into(),
+                            expected_generation: generation,
+                            lease_seconds: 120,
+                        },
+                        &backend,
+                        deadline(),
+                    )
+                    .await,
+            )?;
+        }
+        expect_forbidden(
+            "write release existing",
+            PgServingSnapshotMetadata
+                .release(
+                    &db.pool,
+                    &write_actor,
+                    ServingSnapshotRelease {
+                        owner: owner.clone(),
+                        name: name.clone(),
+                        snapshot_id: snapshot_existing,
+                        idempotency_key: "write-release".into(),
+                        expected_generation: 1,
+                        reason: PinReleaseReason::ClientDone,
+                    },
+                    &backend,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == baseline,
+            "non-admin metadata denials changed snapshot/pin/receipt/history/quota/ref/event state"
+        );
+
+        // Authorized owner semantics remain the original typed outcomes.
+        let owner_read = PgServingSnapshotMetadata
+            .read(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: snapshot_existing },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        ensure!(owner_read.snapshot_id() == snapshot_existing, "owner read changed snapshot");
+        match PgServingSnapshotMetadata
+            .read(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: missing },
+                &backend,
+                deadline(),
+            )
+            .await
+        {
+            Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {}
+            other => return Err(anyhow!("authorized missing read changed semantics: {other:?}")),
+        }
+        match PgServingSnapshotMetadata
+            .renew(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRenew {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    snapshot_id: snapshot_existing,
+                    idempotency_key: "owner-stale".into(),
+                    expected_generation: 99,
+                    lease_seconds: 120,
+                },
+                &backend,
+                deadline(),
+            )
+            .await
+        {
+            Err(error) if error.0 == axum::http::StatusCode::CONFLICT => {}
+            other => return Err(anyhow!("authorized stale renew changed semantics: {other:?}")),
+        }
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == baseline,
+            "authorized owner semantic failures changed durable state"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_metadata_downgraded_admin_replay_and_conflict_are_masked() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-downgrade", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let owner = actor.username.clone();
+        let name = "serving-downgrade".to_string();
+
+        // Initial fixture-only role metadata: an actual admin collaborator, so a
+        // successful snapshot/replay key exists before the downgrade.
+        let admin = db.collaborator(repo, tenant, "admin").await?;
+        let create = ServingSnapshotCreate {
+            owner: owner.clone(),
+            name: name.clone(),
+            idempotency_key: "downgraded-key".into(),
+            lease_seconds: 300,
+        };
+        let first =
+            PgServingSnapshotMetadata.create(&db.pool, &admin, create.clone(), &backend, deadline()).await?;
+        ensure!(!first.replayed, "admin fixture create replayed");
+        let baseline = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        db.set_collaborator_role(repo, admin.id, "write").await?;
+
+        expect_forbidden(
+            "downgraded exact replay",
+            PgServingSnapshotMetadata.create(&db.pool, &admin, create.clone(), &backend, deadline()).await,
+        )?;
+        expect_forbidden(
+            "downgraded changed lease",
+            PgServingSnapshotMetadata
+                .create(
+                    &db.pool,
+                    &admin,
+                    ServingSnapshotCreate { lease_seconds: 301, ..create.clone() },
+                    &backend,
+                    deadline(),
+                )
+                .await,
+        )?;
+        expect_forbidden(
+            "downgraded fresh key",
+            PgServingSnapshotMetadata
+                .create(
+                    &db.pool,
+                    &admin,
+                    ServingSnapshotCreate { idempotency_key: "downgraded-fresh".into(), ..create },
+                    &backend,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == baseline,
+            "downgraded metadata denials changed durable state"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_metadata_late_read_scope_denial_masks_expired_state() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-late-read", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let owner = actor.username.clone();
+        let name = "serving-late-read".to_string();
+        let expired = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "late-read-expired".into(),
+                    lease_seconds: 1,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        let snapshot_id = expired.receipt.snapshot_id();
+        let pin_id = expired.receipt.pin_id();
+        db.pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE ref_store_core_pins SET expires_at=clock_timestamp()-interval '1 second'
+                  WHERE pin_id=$1 AND repository_id=$2",
+                &[&pin_id, &repo],
+            )
+            .await?;
+
+        // Initial fixture-only token metadata, not a production token API or
+        // scope-PATCH race proof. The late narrowing below is a real committed
+        // token-scope transaction after the read preflight has passed.
+        let (restricted, token_id) = db.restricted_identity(repo, actor.id, &actor.username).await?;
+        let read_grants: i64 = db
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT count(*) FROM token_repository_scopes
+                  WHERE token_id=$1 AND repository_id=$2 AND action='contents_read'",
+                &[&token_id, &repo],
+            )
+            .await?
+            .get(0);
+        ensure!(read_grants == 1, "restricted read grant fixture is missing");
+        let baseline = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+
+        // Owned barrier: hold the exact pin row FOR UPDATE on a distinct
+        // connection. The read's preflight does not touch this pin; its later
+        // FOR SHARE read is observed blocked before scope narrowing commits.
+        let barrier = db.pool.get().await?;
+        barrier.batch_execute("BEGIN").await?;
+        let barrier_pid: i32 = barrier.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        barrier
+            .query_one(
+                "SELECT pin_id FROM ref_store_core_pins WHERE pin_id=$1 AND repository_id=$2 FOR UPDATE",
+                &[&pin_id, &repo],
+            )
+            .await?;
+
+        let read_pool = db.pool.clone();
+        let read_identity = restricted.clone();
+        let read_backend = backend.clone();
+        let read_input = ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id };
+        let read_task = tokio::spawn(async move {
+            PgServingSnapshotMetadata
+                .read(&read_pool, &read_identity, read_input, &read_backend, deadline())
+                .await
+        });
+
+        let blocked = async {
+            let _read_pid = wait_for_backend_blocked_by(&db.pool, barrier_pid).await?;
+            let narrow = db.pool.get().await?;
+            narrow.batch_execute("BEGIN").await?;
+            narrow
+                .execute(
+                    "DELETE FROM token_repository_scopes
+                      WHERE token_id=$1 AND repository_id=$2 AND action='contents_read'",
+                    &[&token_id, &repo],
+                )
+                .await?;
+            narrow
+                .execute("UPDATE tokens SET scope_version=scope_version+1 WHERE id=$1", &[&token_id])
+                .await?;
+            narrow.batch_execute("COMMIT").await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(error) = barrier.batch_execute("ROLLBACK").await {
+            read_task.abort();
+            return Err(anyhow!("fixture pin barrier rollback failed: {error}"));
+        }
+        if let Err(error) = blocked {
+            read_task.abort();
+            return Err(error);
+        }
+        let result = tokio::time::timeout(Duration::from_secs(20), read_task)
+            .await
+            .map_err(|_| anyhow!("late-scope read did not settle after the pin barrier released"))?
+            .map_err(|error| anyhow!("late-scope read task failed: {error}"))?;
+        let error = result.expect_err("late ContentsRead narrowing must deny the read");
+        ensure!(
+            error.0 == axum::http::StatusCode::FORBIDDEN
+                && error.1 == "token scope does not permit this action",
+            "late read denial was not the common late-scope 403: {} {}",
+            error.0,
+            error.1
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == baseline,
+            "late denied read changed snapshot/pin/receipt/history/quota/ref/event state"
+        );
+        let remaining: i64 = db
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT count(*) FROM token_repository_scopes
+                  WHERE token_id=$1 AND repository_id=$2 AND action='contents_read'",
+                &[&token_id, &repo],
+            )
+            .await?
+            .get(0);
+        ensure!(remaining == 0, "late narrowing did not commit the removed read grant");
         Ok::<(), anyhow::Error>(())
     }
     .await;
