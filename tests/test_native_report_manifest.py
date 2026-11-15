@@ -64,6 +64,18 @@ WORKSPACE_CAPTURE_REQUIRED_CASES = (
     "__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing",
 )
 
+V2_PRODUCER_BINS = (
+    "rootyard",
+    "rootyard-pando-lab",
+    "rootyard-vfs-mount",
+    "rootyard-view-lab",
+    "rootyard-workspace-lab",
+)
+V2_PRODUCER_TESTS = (
+    "ref_store_snapshot_backup_fixture",
+    "ref_store_holds_backup_fixture",
+)
+
 
 class ManifestFixture:
     """Ephemeral build receipt, binary, report and log in a temporary tree."""
@@ -253,6 +265,7 @@ class ManifestFixture:
 
     def enable_v2_batch_receipt(self, *, lib_fresh=True, bin_fresh=False):
         receipt = self.enable_v2_receipt(lib_fresh=lib_fresh, bin_fresh=bin_fresh)
+        receipt["kind"] = "native-build-batch-bin"
         architecture = {
             "target_triple": receipt["target_triple"],
             "host": receipt["toolchain"]["rustc"]["host"],
@@ -300,6 +313,7 @@ class ManifestFixture:
     def enable_v2_cas_batch_receipt(self, *, lib_fresh=True, bin_fresh=False):
         """Build the producer's v2 CAS layout: immutable snapshot plus aliases."""
         receipt = self.enable_v2_receipt(lib_fresh=lib_fresh, bin_fresh=bin_fresh)
+        receipt["kind"] = "native-build-batch-bin"
         architecture = {
             "target_triple": receipt["target_triple"],
             "host": receipt["toolchain"]["rustc"]["host"],
@@ -397,6 +411,160 @@ class ManifestFixture:
         self.batch_path = batch_path
         self.binary = binary
         self.receipt = build_receipt
+        return batch_path
+
+    def enable_v2_producer_batch_receipt(self):
+        """Build the real v2 batch cohort a bin receipt describes: lib+5 bins+2 tests."""
+        self.enable_v2_receipt()
+        dev_profile = {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": True,
+            "overflow_checks": True,
+            "test": False,
+        }
+        test_profile = dict(dev_profile, test=True)
+
+        def event(name, kind, source, executable, profile):
+            target = {"name": name, "kind": [kind], "src_path": str(source)}
+            payload = {
+                "reason": "compiler-artifact",
+                "package_id": "rootyard 0.1.0",
+                "target": target,
+                "profile": profile,
+                "fresh": False,
+            }
+            if executable is not None:
+                payload["executable"] = str(executable)
+            return payload
+
+        lib = receipts.cargo_artifact_record(
+            event("rootyard", "lib", self.root / "src/lib.rs", None, dev_profile),
+            self.root,
+        )
+        bin_rows = []
+        for name in V2_PRODUCER_BINS:
+            if name == "rootyard":
+                source = self.root / "src/main.rs"
+                executable = self.binary
+            else:
+                source = self.root / "src/bin" / f"{name}.rs"
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("fn main() {}\n")
+                executable = self.root / "target/debug" / name
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_bytes(f"producer-bin-{name}".encode())
+            bin_rows.append(
+                receipts.cargo_artifact_record(
+                    event(name, "bin", source, executable, dev_profile), self.root
+                )
+            )
+
+        test_rows = []
+        for name in V2_PRODUCER_TESTS:
+            source = self.root / "tests" / f"{name}.rs"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("#[test]\nfn executes() {}\n")
+            executable = self.root / "target/debug" / name
+            executable.write_bytes(f"producer-test-{name}".encode())
+            test_rows.append(
+                receipts.cargo_artifact_record(
+                    event(name, "test", source, executable, test_profile), self.root
+                )
+            )
+
+        app_rows = [lib] + bin_rows
+        batch_rows = app_rows + test_rows
+        bound = receipts.capture_bound_inputs(self.root, environ={"PATH": ""})
+        payload = receipts.make_receipt_v2(
+            binary_path=self.binary,
+            command=["cargo", "build", "--locked", "--profile", "test", "--features", "pando-lab"],
+            profile="test",
+            artifacts=app_rows,
+            toolchain=self._v2_toolchain(),
+            bound_inputs=bound,
+            workspace_commit=self.commit,
+            target_dir=self.binary.parent.parent,
+            target_triple="x86_64-unknown-linux-gnu",
+            features="pando-lab",
+        )
+        self.source_inputs = payload["source_inputs_sha256"]
+        batch_path = self.root / "test-results/native-build-batch.json"
+        batch_path.parent.mkdir(parents=True, exist_ok=True)
+        payload["kind"] = "native-build-batch-bin"
+        payload["batch"] = {
+            "kind": "rootyard/native-build-batch",
+            "receipt_version": 2,
+            "binary": "rootyard",
+            "targets": [row["target"] for row in app_rows],
+            "bound_inputs_sha256": payload["bound_inputs"]["digest"],
+            "manifest": str(batch_path.resolve()),
+        }
+        self.receipt.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        target_dir = Path(payload["target_dir"])
+        artifacts = []
+        for row in bin_rows:
+            artifacts.append(
+                {
+                    "kind": "bin",
+                    "target": row["target"],
+                    "artifact": row["executable"],
+                    "receipt": str(
+                        self.receipt
+                        if row["target"] == "rootyard"
+                        else target_dir / "debug" / f"{row['target']}.build.json"
+                    ),
+                    "fresh": row["fresh"],
+                    "sha256": row["executable_sha256"],
+                    "package_id": row["package_id"],
+                    "profile": row["profile"],
+                    "source": row["source"],
+                    "implicit": False,
+                }
+            )
+        for row in test_rows:
+            artifacts.append(
+                {
+                    "kind": "test",
+                    "target": row["target"],
+                    "artifact": row["executable"],
+                    "original_artifact": row["executable"],
+                    "original_artifact_sha256": row["executable_sha256"],
+                    "receipt": str(target_dir / "debug" / f"{row['target']}.build.json"),
+                    "fresh": row["fresh"],
+                    "sha256": row["executable_sha256"],
+                    "package_id": row["package_id"],
+                    "profile": row["profile"],
+                    "source": row["source"],
+                    "source_sha256": row["source_sha256"],
+                }
+            )
+        manifest = {
+            "kind": "rootyard/native-build-batch",
+            "manifest_version": 2,
+            "status": "passed",
+            "source_commit": payload["workspace_commit"],
+            "source_inputs_sha256": payload["source_inputs_sha256"],
+            "toolchain": payload["toolchain"],
+            "target_triple": payload["target_triple"],
+            "architecture": {
+                "target_triple": payload["target_triple"],
+                "host": payload["toolchain"]["rustc"]["host"],
+            },
+            "target_directory": payload["target_dir"],
+            "cargo_package_id": "rootyard 0.1.0",
+            "bound_inputs": payload["bound_inputs"],
+            "build": {
+                "command": payload["command"],
+                "cargo_artifacts": batch_rows,
+            },
+            "artifacts": artifacts,
+        }
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.batch_path = batch_path
+        self.producer_app_rows = app_rows
+        self.producer_batch_rows = batch_rows
         return batch_path
 
     def report(self, name="web_sessions", passed=True, binary_sha=None, case_status="passed", **extra):
@@ -665,6 +833,156 @@ class TestJobManifest(unittest.TestCase):
         self.assertEqual(set(manifest["architecture"]), {"target_triple"})
         job = json.loads(self.fixture.job().read_text(encoding="utf-8"))
         self.assertEqual(job["status"], "passed")
+
+    def test_accepts_v2_bin_receipt_with_producer_test_cohort(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        receipt = json.loads(self.fixture.receipt.read_text(encoding="utf-8"))
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            receipt["batch"]["targets"],
+            [row["target"] for row in self.fixture.producer_app_rows],
+        )
+        self.assertEqual(
+            [row["target"] for row in manifest["build"]["cargo_artifacts"]],
+            [row["target"] for row in self.fixture.producer_batch_rows],
+        )
+        self.assertEqual(len(receipt["batch"]["targets"]), 6)
+        self.assertEqual(len(manifest["build"]["cargo_artifacts"]), 8)
+        job = json.loads(
+            self.fixture.job(
+                extra=(
+                    "--expect-batch-manifest-path", str(batch_path.resolve()),
+                    "--expect-batch-manifest-sha", digest(batch_path),
+                )
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(job["status"], "passed")
+
+    def test_rejects_v2_bin_receipt_cohort_wrong_order(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        rows = manifest["build"]["cargo_artifacts"]
+        rows[1], rows[2] = rows[2], rows[1]
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "do not match receipt-kind lib/bin cohort",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_bin_receipt_cohort_wrong_kind(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["build"]["cargo_artifacts"][0]["kind"] = "lib-test"
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "bin receipt cohort must begin with the lib artifact",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_bin_receipt_cohort_foreign_target(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["build"]["cargo_artifacts"][1]["target"] = "rootyard-foreign"
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "do not match receipt-kind lib/bin cohort",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_bin_receipt_unrequested_extra_bin_row(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        extra_row = dict(manifest["build"]["cargo_artifacts"][1])
+        extra_row["target"] = "rootyard-unrequested"
+        manifest["build"]["cargo_artifacts"].insert(-2, extra_row)
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "do not match receipt-kind lib/bin cohort",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_bin_receipt_unrequested_extra_bin_artifact(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        extra_entry = dict(manifest["artifacts"][0])
+        extra_entry["target"] = "rootyard-unrequested"
+        manifest["artifacts"].append(extra_entry)
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "published bin artifacts do not match the batch bin cohort",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_bin_receipt_unrequested_extra_test_row(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        extra_row = dict(manifest["build"]["cargo_artifacts"][-1])
+        extra_row["target"] = "foreign_extra_test"
+        manifest["build"]["cargo_artifacts"].append(extra_row)
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "published test artifacts do not match the batch test cohort",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_test_row_that_differs_from_published_artifact(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["build"]["cargo_artifacts"][-1]["source_sha256"] = "0" * 64
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "source_sha256 does not match the build row",
+            self.fixture.last_process.stderr,
+        )
 
     def test_fixture_rust_from_receipt_records_full_v1_and_v2_versions_without_compilers(self):
         # An empty PATH makes any accidental bare rustc/cargo probe fail; the

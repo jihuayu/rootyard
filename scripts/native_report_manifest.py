@@ -397,6 +397,172 @@ def _require_v2_manifest_matches_receipt(rows, validated, label):
                 )
 
 
+def _published_artifact_for(manifest, kind, target, label):
+    artifacts = manifest.get("artifacts")
+    require(
+        isinstance(artifacts, list) and artifacts,
+        f"{label}: artifacts must be a nonempty list",
+    )
+    require(
+        all(isinstance(artifact, dict) for artifact in artifacts),
+        f"{label}: artifacts entries must be objects",
+    )
+    matches = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("kind") == kind and artifact.get("target") == target
+    ]
+    require(
+        len(matches) == 1,
+        f"{label}: expected exactly one published ({kind}, {target}) artifact",
+    )
+    return matches[0]
+
+
+def _require_published_artifact_matches_row(entry, row, label):
+    identity = f"({row['kind']}, {row['target']})"
+    require(
+        entry.get("fresh") is row.get("fresh"),
+        f"{label}: published artifact {identity} freshness does not match the build row",
+    )
+    for field in ("package_id", "profile", "source", "source_sha256"):
+        if field in entry:
+            require(
+                entry.get(field) == row.get(field),
+                f"{label}: published artifact {identity} {field} does not match the build row",
+            )
+    require(
+        entry.get("sha256") == row.get("executable_sha256"),
+        f"{label}: published artifact {identity} digest does not match the build row",
+    )
+    if "original_artifact" in entry:
+        require(
+            _resolved_equal(entry.get("original_artifact"), row.get("executable")),
+            f"{label}: published artifact {identity} original path does not match the build row",
+        )
+        require(
+            entry.get("original_artifact_sha256") == row.get("executable_sha256"),
+            f"{label}: published artifact {identity} original digest does not match the build row",
+        )
+    else:
+        require(
+            _resolved_equal(entry.get("artifact"), row.get("executable")),
+            f"{label}: published artifact {identity} path does not match the build row",
+        )
+
+
+def _require_v2_batch_scope(manifest, batch_targets, artifact_rows, typed_targets,
+                            receipt, validated, label):
+    """Match a v2 receipt's batch link to the producer cohort it actually built.
+
+    A batch bin receipt names the lib and every selected/implicit bin.  The same
+    one-command batch manifest also appends the selected integration tests, so
+    those extra test rows must form a suffix and remain bound to the manifest's
+    published test artifacts.  A test receipt names the full lib/bin/test
+    cohort and binds its own test row to the validated receipt.
+    """
+    test_rows = [row for row in artifact_rows if row["kind"] == "test"]
+    non_test_rows = [row for row in artifact_rows if row["kind"] != "test"]
+    receipt_kind = receipt.get("kind")
+    if receipt_kind == "rust-integration-test":
+        require(
+            all(row["kind"] == "test" for row in validated.artifacts),
+            f"{label}: test receipt selected a non-test artifact",
+        )
+        require(
+            batch_targets == [target for kind, target in typed_targets],
+            f"{label}: test receipt batch targets {batch_targets!r} do not match "
+            f"build artifact targets {[target for kind, target in typed_targets]!r}",
+        )
+    else:
+        if receipt_kind == "native-build-batch-bin":
+            require(
+                all(row["kind"] in ("lib", "bin") for row in validated.artifacts),
+                f"{label}: bin receipt selected a non-lib/bin artifact",
+            )
+        require(
+            artifact_rows == non_test_rows + test_rows,
+            f"{label}: test artifacts must follow the receipt's lib/bin cohort",
+        )
+        require(
+            non_test_rows and non_test_rows[0]["kind"] == "lib",
+            f"{label}: bin receipt cohort must begin with the lib artifact",
+        )
+        require(
+            all(row["kind"] == "bin" for row in non_test_rows[1:]),
+            f"{label}: bin receipt cohort may contain only lib/bin artifacts",
+        )
+        require(
+            batch_targets == [row["target"] for row in non_test_rows],
+            f"{label}: batch targets {batch_targets!r} do not match "
+            f"receipt-kind lib/bin cohort {[row['target'] for row in non_test_rows]!r}",
+        )
+
+    receipt_targets = {(row["kind"], row["target"]) for row in validated.artifacts}
+    own_rows = [
+        row for row in artifact_rows
+        if (row["kind"], row["target"]) in receipt_targets
+    ]
+    require(
+        len(own_rows) == len(validated.artifacts),
+        f"{label}: not every artifact selected by the receipt is present in the batch manifest",
+    )
+    require(
+        [(row["kind"], row["target"]) for row in own_rows]
+        == [(row["kind"], row["target"]) for row in validated.artifacts],
+        f"{label}: receipt artifact order does not match the batch manifest cohort",
+    )
+    _require_v2_manifest_matches_receipt(own_rows, validated, label)
+
+    published = [
+        artifact
+        for artifact in manifest.get("artifacts") or []
+        if isinstance(artifact, dict)
+    ]
+    published_bins = [
+        artifact for artifact in published if artifact.get("kind") == "bin"
+    ]
+    bin_rows = [row for row in artifact_rows if row["kind"] == "bin"]
+    require(
+        [(artifact.get("kind"), artifact.get("target")) for artifact in published_bins]
+        == [(row["kind"], row["target"]) for row in bin_rows],
+        f"{label}: published bin artifacts do not match the batch bin cohort",
+    )
+    for row, entry in zip(bin_rows, published_bins):
+        _require_published_artifact_matches_row(entry, row, label)
+
+    published_tests = [
+        artifact for artifact in published if artifact.get("kind") == "test"
+    ]
+    require(
+        [(artifact.get("kind"), artifact.get("target")) for artifact in published_tests]
+        == [("test", row["target"]) for row in test_rows],
+        f"{label}: published test artifacts do not match the batch test cohort",
+    )
+    for row, entry in zip(test_rows, published_tests):
+        _require_published_artifact_matches_row(entry, row, label)
+
+    extras = [
+        row for row in artifact_rows
+        if (row["kind"], row["target"]) not in receipt_targets
+    ]
+    for row in extras:
+        if row["kind"] == "test":
+            continue
+        if row["kind"] == "lib":
+            require(
+                sum(1 for item in artifact_rows if item["kind"] == "lib") == 1,
+                f"{label}: manifest must record exactly one lib artifact",
+            )
+            require(
+                row.get("package_id") == manifest.get("cargo_package_id"),
+                f"{label}: extra lib artifact package_id does not match the manifest",
+            )
+            continue
+        entry = _published_artifact_for(manifest, row["kind"], row["target"], label)
+        _require_published_artifact_matches_row(entry, row, label)
+
+
 def load_receipt(path, binary_override):
     file = Path(path)
     require(file.is_file(), f"build receipt is missing: {file}")
@@ -609,13 +775,15 @@ def verify_batch_receipt(receipt, validated, receipt_file, binary,
     artifact_rows, typed_targets = _manifest_artifact_rows(
         manifest, manifest_build, validated.schema, "batch receipt manifest"
     )
-    require(
-        targets == [target for kind, target in typed_targets],
-        "targets must match typed_targets order",
-    )
     if validated.schema == "v2":
-        _require_v2_manifest_matches_receipt(
-            artifact_rows, validated, "batch receipt manifest"
+        _require_v2_batch_scope(
+            manifest, targets, artifact_rows, typed_targets,
+            receipt, validated, "batch receipt manifest",
+        )
+    else:
+        require(
+            targets == [target for kind, target in typed_targets],
+            "targets must match typed_targets order",
         )
 
     artifacts = manifest.get("artifacts")
@@ -1126,19 +1294,21 @@ def release_manifest(args):
             artifact_rows, typed_targets = _manifest_artifact_rows(
                 manifest, manifest_build, validated.schema, manifest_label
             )
-            require(
-                batch_targets == [target for kind, target in typed_targets],
-                f"{manifest_label}: batch targets {batch_targets!r} do not match "
-                f"build artifact targets {[target for kind, target in typed_targets]!r}",
-            )
+            if validated.schema == "v2":
+                _require_v2_batch_scope(
+                    manifest, batch_targets, artifact_rows, typed_targets,
+                    receipt, validated, manifest_label,
+                )
+            else:
+                require(
+                    batch_targets == [target for kind, target in typed_targets],
+                    f"{manifest_label}: batch targets {batch_targets!r} do not match "
+                    f"build artifact targets {[target for kind, target in typed_targets]!r}",
+                )
             require(
                 ("bin", binary_name) in typed_targets,
                 f"{manifest_label}: no (bin, {binary_name}) target recorded",
             )
-            if validated.schema == "v2":
-                _require_v2_manifest_matches_receipt(
-                    artifact_rows, validated, manifest_label
-                )
 
             target_dir = receipt.get("target_dir")
             require(
