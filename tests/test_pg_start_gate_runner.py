@@ -356,6 +356,14 @@ class GateRunnerTest(unittest.TestCase):
         self.assertEqual(report["start"], report["end"])
         self.assert_report_has_no_secret(report, stdout, stderr)
 
+    def test_runner_reads_only_the_shared_receipt_contract(self):
+        source = Path(gate.__file__).read_text(encoding="utf-8")
+        self.assertIn("import native_build_receipt", source)
+        self.assertNotIn("import build_native\n", source)
+        self.assertNotIn("from build_native", source)
+        self.assertNotIn("from build_native_test", source)
+        self.assertNotIn("import build_native_test", source)
+
     def test_missing_database_url_is_refused_before_the_binary_runs(self):
         code, stdout, stderr, report = self.run_gate(
             env={"ROOTYARD_TEST_DATABASE_URL": ""}
