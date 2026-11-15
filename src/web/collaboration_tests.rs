@@ -186,7 +186,7 @@ fn notifications_and_pull_collab_render_outdated_and_role_gated_forms() {
     let maintain_html = render_pull_collab_html(
         &sample_header(Role::Maintain),
         &pull,
-        &[review.clone()],
+        std::slice::from_ref(&review),
         &[],
         &[],
         None,
