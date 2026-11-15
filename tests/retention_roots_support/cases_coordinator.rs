@@ -342,3 +342,89 @@ async fn release_before_register_fences_delayed_create_and_replays_without_sourc
     .await;
     db.finish(outcome).await
 }
+
+#[tokio::test]
+#[ignore = "requires real PG/S3/Git and the integrated roots/serving modules"]
+async fn concurrent_exact_create_replay_is_source_pin_independent() -> Result<()> {
+    let db = Db::setup().await?;
+    let store = open_store()?;
+    let git = git_binary()?;
+    let outcome = async {
+        let (verified, actor, repository) =
+            verify_new_serving(&db, &store, &git, "coord-concurrent-replay").await?;
+        let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
+        let input = create_input(
+            &repository.owner,
+            &repository.name,
+            source.snapshot_id,
+            "coord-concurrent-replay",
+        );
+
+        // B misses the early retained-replay lookup, reads the live source, then
+        // pauses in actual native prepare with no PostgreSQL transaction held.
+        let gate = GitGate::new(&git)?;
+        let release_guard = GateRelease(&gate);
+        let paused_facade =
+            Arc::new(PgServingRetentionRoots::new(PgRetentionRoots::new(store.clone(), gate.binary())?));
+        let paused_pool = db.new_pool(1)?;
+        let task_pool = paused_pool.clone();
+        let task_actor = actor.clone();
+        let task_input = input.clone();
+        let task = tokio::spawn(async move {
+            paused_facade.create(&task_pool, &task_actor, task_input, deadline()).await
+        });
+        gate.wait_ready().await?;
+        // B's T1 transaction/client is gone while native is paused: the same
+        // max-size-one pool can still hand out its only connection.
+        let observer = timeout(Duration::from_secs(2), paused_pool.get())
+            .await
+            .map_err(|_| anyhow::anyhow!("concurrent replay kept a PG client across native IO"))??;
+        drop(observer);
+
+        // A uses the normal trusted Git adapter/facade and completes the SAME
+        // canonical key/intent while B is paused.
+        let normal = PgServingRetentionRoots::new(adapter(&store, &git)?);
+        let first = normal.create(&db.pool, &actor, input.clone(), deadline()).await?;
+        ensure!(!first.replayed(), "normal concurrent winner was unexpectedly replayed");
+        let root_id = first.root_id();
+        let created_at = first.created_at_unix_micros();
+        let request_digest = first.request_digest();
+        let counts = root_counts(&db.pool, verified.repo).await?;
+        let usage = repo_usage(&db.pool, verified.repo).await?;
+
+        // Release the original source pin through the real serving path before B
+        // resumes. B's core register must resolve the exact existing receipt
+        // before any source-liveness check.
+        roots::release_serving_source(
+            &PgServingSnapshotMetadata,
+            &db.pool,
+            &actor,
+            &store,
+            &repository,
+            &source,
+            deadline(),
+        )
+        .await?;
+        gate.release()?;
+        let result = timeout(Duration::from_secs(30), task)
+            .await
+            .map_err(|_| anyhow::anyhow!("paused concurrent create did not finish"))??;
+        let replay = result.expect("concurrent exact create replay was rejected");
+        ensure!(replay.replayed(), "concurrent loser did not return an exact replay receipt");
+        ensure!(replay.root_id() == root_id, "concurrent replay returned another root");
+        ensure!(replay.created_at_unix_micros() == created_at, "concurrent replay returned another receipt body");
+        ensure!(replay.request_digest() == request_digest, "concurrent replay request digest differs");
+        ensure!(
+            root_counts(&db.pool, verified.repo).await? == counts,
+            "concurrent exact replay rewrote root rows"
+        );
+        ensure!(
+            repo_usage(&db.pool, verified.repo).await? == usage,
+            "concurrent exact replay charged usage"
+        );
+        drop(release_guard);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}

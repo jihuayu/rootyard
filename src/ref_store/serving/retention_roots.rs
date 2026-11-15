@@ -255,10 +255,17 @@ impl PgServingRetentionRoots {
                 deadline,
             )
             .await?;
-            self.roots
-                .recheck_serving_source_pin_live_in_tx(&tx, &reference, deadline)
-                .await
-                .map_err(map_root_error)?;
+            // A concurrent same-key create may have committed while this
+            // request was in native prepare. The core returned its exact
+            // receipt/replay before source liveness; the replay is source-pin
+            // independent and must not be rejected by the last fresh check.
+            // Fresh registrations still require the final exact pin check.
+            if !receipt.replayed() {
+                self.roots
+                    .recheck_serving_source_pin_live_in_tx(&tx, &reference, deadline)
+                    .await
+                    .map_err(map_root_error)?;
+            }
             Ok::<RootReceipt, Error>(receipt)
         })
         .await;
