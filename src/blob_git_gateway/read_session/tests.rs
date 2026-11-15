@@ -113,9 +113,17 @@ fn the_bound_is_scored_against_the_captured_revision() {
         answer(Some(id(4)), Some(&tokens), &presented, &live, 9),
         Err(GatewayError::Unavailable(BEHIND_MESSAGE))
     );
-    let foreign = live_realm(&serving(5, id(8)), id(8)).expect("realm");
+    assert_eq!(answer(Some(id(4)), Some(&tokens), &HeaderMap::new(), &live, 10), Ok(()));
+}
+
+#[test]
+fn the_capture_must_keep_the_authorized_cluster_incarnation() {
+    let live = serving(5, id(4));
+    let issued = tokens().issue_for_test(&live_realm(&live, id(4)).expect("realm"), 5).expect("issue");
+    let foreign = live_realm(&live, id(8)).expect("realm");
+    let presented = header(issued.token());
     assert_eq!(
-        tokens.verify(&presented_for_test(&presented).expect("presented"), &foreign, 5).map_err(|e| e.for_repo()),
+        tokens().verify(&presented_for_test(&presented).expect("presented"), &foreign, 5).map_err(|e| e.for_repo()),
         Err(SessionTokenError::Realm.for_repo())
     );
     let wrong_gateway = SessionTokenCodec::new([(0u8, Zeroizing::new([9u8; 32]))], 0, &backend(), 120).expect("codec");
@@ -127,7 +135,7 @@ fn the_bound_is_scored_against_the_captured_revision() {
         SessionTokens::new(wrong_gateway)
             .verify(&presented_for_test(&header(wrong_sig.token())).expect("presented"), &foreign, 5)
             .map_err(|e| e.for_repo()),
-        Err(SessionTokenError::Realm.for_repo())
+        Err(SessionTokenError::Invalid.for_repo())
     );
     assert_eq!(GatewayError::Unavailable(AUTHORITY_CHANGED).status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }

@@ -222,8 +222,8 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once("\n}\n"))
             .map(|(body, _)| body)
             .expect("the middleware body");
-        assert!(middleware.contains("Err(response) => return session_challenge(*response, &path)"));
-        assert_eq!(middleware.matches("session_challenge(*response, &path)").count(), 2);
+        assert!(middleware.contains("Err(response) => return challenge::session_challenge(*response, &path)"));
+        assert_eq!(middleware.matches("challenge::session_challenge(*response, &path)").count(), 3);
         assert!(middleware.contains("login_redirect(&path, query.as_deref(), &headers)"));
         assert!(!middleware.contains("WWW_AUTHENTICATE"), "the middleware never writes the header itself");
     }
