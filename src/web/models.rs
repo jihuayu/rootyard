@@ -24,8 +24,12 @@ use uuid::Uuid;
 
 pub const ISSUE_FIELDS: &str =
     "repository_id,number,author_id,title,body,state,version,created_at::text,updated_at::text";
-pub const COMMENT_FIELDS: &str =
-    "repository_id,issue_number,number,author_id,body,version,created_at::text,updated_at::text";
+pub const COMMENT_FIELDS: &str = concat!(
+    "repository_id,issue_number,number,author_id,",
+    "CASE WHEN moderation_state='hidden' THEN '[hidden by moderator]' ",
+    "WHEN moderation_state='deleted' THEN '[deleted]' ELSE body END AS body,",
+    "version,created_at::text,updated_at::text"
+);
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

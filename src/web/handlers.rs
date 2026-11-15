@@ -176,7 +176,7 @@ pub async fn repo_overview(State(state): App, Path((owner, name)): RepoPath, hea
         Ok::<_,Error>((head,branches,tags,latest_commit,tree,readme_html))
     }).await?;
     let data = OverviewViewData { header: header_ctx, head, branches, tags, latest_commit, tree, readme_html, open_issues, open_pulls };
-    Ok(html_response(StatusCode::OK, templates::render_repo_overview(&data)))
+    Ok(html_response(StatusCode::OK, super::collaboration::render_repo_overview(&state, &actor, &data).await?))
 }
 
 pub async fn tree_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<WebTreeQuery>, headers: HeaderMap) -> Res {
@@ -298,8 +298,8 @@ pub async fn create_issue_web(State(state): App, Path((owner, name)): RepoPath, 
             if let Some(saved) = creation_replay(&tx, tenant_id, repo, key, &req).await? {
                 let issue: WebIssue = serde_json::from_value(saved).map_err(Error::internal)?;
                 finish(tx, &actor, true).await?;
-                let item = IssueViewItem { issue, author_username: actor.username, comment_count: 0 };
-                return Ok(html_response(StatusCode::CREATED, templates::render_issue_detail_view(&header_ctx, &item, &[])));
+                let item = IssueViewItem { issue, author_username: actor.username.clone(), comment_count: 0 };
+                return Ok(html_response(StatusCode::CREATED, super::collaboration::render_issue_detail(&state, &actor, &header_ctx, &item, &[]).await?));
             }
         }
         tx.execute("INSERT INTO forge_issue_counters (tenant_id,repository_id) VALUES($1,$2) ON CONFLICT DO NOTHING", &[&tenant_id, &repo]).await.map_err(Error::internal)?;
@@ -309,9 +309,10 @@ pub async fn create_issue_web(State(state): App, Path((owner, name)): RepoPath, 
         let val = serde_json::to_value(&issue).map_err(Error::internal)?;
         record_creation(&tx, tenant_id, repo, key, &val).await?;
         audit::record_audit_event(&tx, tenant_id, repo, &actor, "issue.created", "issue", &number.to_string(), sjson!({"title": issue.title})).await?;
+        super::collaboration::on_web_issue_created(&tx, tenant_id, repo, actor.id, number, &issue.title, &issue.body).await?;
         finish(tx, &actor, true).await?;
-        let item = IssueViewItem { issue, author_username: actor.username, comment_count: 0 };
-        Ok(html_response(StatusCode::CREATED, templates::render_issue_detail_view(&header_ctx, &item, &[])))
+        let item = IssueViewItem { issue, author_username: actor.username.clone(), comment_count: 0 };
+        Ok(html_response(StatusCode::CREATED, super::collaboration::render_issue_detail(&state, &actor, &header_ctx, &item, &[]).await?))
     }))
     .await
     .map_err(Error::internal)?
@@ -347,10 +348,10 @@ async fn load_issue_and_comments(tx: &Transaction<'_>, tenant_id: Uuid, repo_id:
 
 /// Mutation re-render of the first comment page. The probe cursor is attached
 /// exactly like the GET view so the 200/201 HTML can reach the next page.
-fn render_issue_page(header: &RepoHeaderCtx, actor_id: Uuid, item: &IssueViewItem, comments: &[CommentViewItem], next_after: Option<i64>) -> String {
-    let pager = DetailPager::new(actor_id, header.repository_id, item.issue.number, Kind::IssueComments);
-    let html = templates::render_issue_detail_view(header, item, comments);
-    templates::attach_next_page_nav(html, pager.next_cursor(next_after).as_deref(), "Older comments")
+async fn render_issue_page(state: &Arc<AppState>, actor: &Identity, header: &RepoHeaderCtx, item: &IssueViewItem, comments: &[CommentViewItem], next_after: Option<i64>) -> Result<String, Error> {
+    let pager = DetailPager::new(actor.id, header.repository_id, item.issue.number, Kind::IssueComments);
+    let html = super::collaboration::render_issue_detail(state, actor, header, item, comments).await?;
+    Ok(templates::attach_next_page_nav(html, pager.next_cursor(next_after).as_deref(), "Older comments"))
 }
 
 pub async fn issue_detail_view(State(state): App, Path((owner, name, number)): NumPath, Query(page): Query<DetailPageQuery>, headers: HeaderMap) -> Res {
@@ -362,9 +363,7 @@ pub async fn issue_detail_view(State(state): App, Path((owner, name, number)): N
     let tx = client.transaction().await.map_err(Error::internal)?;
     let (item, comments, next_after) = load_issue_and_comments_after(&tx, access.owner_id, access.repo_id, number, after).await?;
     finish(tx, &actor, false).await?;
-    let html = templates::render_issue_detail_view(&header_ctx, &item, &comments);
-    let body = templates::attach_next_page_nav(html, pager.next_cursor(next_after).as_deref(), "Older comments");
-    Ok(html_response(StatusCode::OK, body))
+    Ok(html_response(StatusCode::OK, render_issue_page(&state, &actor, &header_ctx, &item, &comments, next_after).await?))
 }
 
 pub async fn update_issue_web(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap, Json(input): Json<WebIssuePatch>) -> Res {
@@ -383,7 +382,7 @@ pub async fn update_issue_web(State(state): App, Path((owner, name, number)): Nu
     tx.query_opt(&upd, &[&tenant_id, &repo, &number, &input.expected_version, &input.title, &input.body, &input.state]).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT, "issue version conflict"))?;
     let (item, comments, next_after) = load_issue_and_comments(&tx, tenant_id, repo, number).await?;
     finish(tx, &actor, true).await?;
-    Ok(html_response(StatusCode::OK, render_issue_page(&header_ctx, actor.id, &item, &comments, next_after)))
+    Ok(html_response(StatusCode::OK, render_issue_page(&state, &actor, &header_ctx, &item, &comments, next_after).await?))
 }
 
 pub async fn create_issue_comment_web(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap, Json(input): Json<WebNewComment>) -> Res {
@@ -403,7 +402,7 @@ pub async fn create_issue_comment_web(State(state): App, Path((owner, name, numb
         if creation_replay(&tx, tenant_id, repo, key, &req).await?.is_some() {
             let (item, comments, next_after) = load_issue_and_comments(&tx, tenant_id, repo, number).await?;
             finish(tx, &actor, true).await?;
-            return Ok(html_response(StatusCode::CREATED, render_issue_page(&header_ctx, actor.id, &item, &comments, next_after)));
+            return Ok(html_response(StatusCode::CREATED, render_issue_page(&state, &actor, &header_ctx, &item, &comments, next_after).await?));
         }
     }
     let next_row = tx.query_opt("UPDATE forge_issues SET next_comment_number=next_comment_number+1 WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 RETURNING next_comment_number-1", &[&tenant_id, &repo, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
@@ -411,9 +410,10 @@ pub async fn create_issue_comment_web(State(state): App, Path((owner, name, numb
     let row = tx.query_one(&format!("INSERT INTO forge_issue_comments (tenant_id,repository_id,issue_number,number,author_id,body) VALUES($1,$2,$3,$4,$5,$6) RETURNING {COMMENT_FIELDS}"), &[&tenant_id, &repo, &number, &comment_number, &actor.id, &input.body]).await.map_err(Error::internal)?;
     let comment = serde_json::to_value(WebComment::from_row(&row)).map_err(Error::internal)?;
     record_creation(&tx, tenant_id, repo, key, &comment).await?;
+    super::collaboration::on_web_comment_created(&tx, tenant_id, repo, actor.id, number, comment_number, &input.body).await?;
     let (item, comments, next_after) = load_issue_and_comments(&tx, tenant_id, repo, number).await?;
     finish(tx, &actor, true).await?;
-    Ok(html_response(StatusCode::CREATED, render_issue_page(&header_ctx, actor.id, &item, &comments, next_after)))
+    Ok(html_response(StatusCode::CREATED, render_issue_page(&state, &actor, &header_ctx, &item, &comments, next_after).await?))
 }
 
 pub async fn pulls_list_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<WebPullFilterQuery>, headers: HeaderMap) -> Res {
@@ -448,7 +448,7 @@ async fn render_pull_detail_for_number(state: &Arc<AppState>, owner: &str, name:
     let rq = format!("SELECT {REVIEW_FIELDS} FROM forge_pull_reviews WHERE tenant_id=$1 AND repository_id=$2 AND pull_number=$3 AND number>$4 ORDER BY number ASC LIMIT $5");
     let r_rows = tx.query(&rq, &[&access.owner_id, &access.repo_id, &number, &review_after, &detail_pagination::FETCH_LIMIT]).await.map_err(Error::internal)?;
     let page_len = detail_pagination::PAGE_SIZE as usize;
-    let reviews: Vec<_> = r_rows.iter().take(page_len).map(PullReview::row).collect();
+    let reviews: Vec<_> = r_rows.iter().take(page_len).map(|r| PullReview::row_for_pull(r, &pull.head_oid)).collect();
     let next_reviews = if r_rows.len() > page_len { reviews.last().map(|r| r.number) } else { None };
     let checks = query_commit_checks(&tx, access.owner_id, access.repo_id, &pull.head_oid, 0, 50).await?;
     let policy = rules::evaluate_branch_policy(&tx, access.owner_id, access.repo_id, pull.number, &pull.base_ref, &pull.head_oid).await?;
@@ -468,7 +468,7 @@ async fn render_pull_detail_for_number(state: &Arc<AppState>, owner: &str, name:
     let fast_forward = merge_base_oid.as_deref() == Some(pull.base_oid.as_str());
     let diff = PullDiffResponse { pull_number: pull.number, base_ref: pull.base_ref.clone(), head_ref: pull.head_ref.clone(), base_oid: pull.base_oid.clone(), head_oid: pull.head_oid.clone(), merge_base_oid, fast_forward, diff: String::from_utf8_lossy(&diff_raw).into_owned() };
     let view_data = PullDetailViewData { pull, author_username, reviews, checks, policy, diff, disallow_self_approval: disallow_self, can_approve, can_merge };
-    let html = templates::render_pull_detail_view(&header_ctx, &view_data);
+    let html = super::collaboration::render_pull_detail(state, &actor, &header_ctx, &view_data).await?;
     let body = templates::attach_next_page_nav(html, pager.next_cursor(next_reviews).as_deref(), "Older reviews");
     Ok(html_response(status, body))
 }
