@@ -1,6 +1,6 @@
 //! Durable CI run reconciliation, multi-mirror selection, coalesced prewarming,
 //! and bounded checkout burst waiting.
-use super::ci_classification::{AvailabilitySummary, MirrorNodeStatus, OriginBudgetStatus};
+use super::ci_classification::{AvailabilitySummary, CheckoutTarget, MirrorNodeStatus, OriginBudgetStatus};
 use crate::{AppState, Error, webhooks::models::validate_webhook_url_with_policy};
 use axum::http::StatusCode;
 use serde_json::json;
@@ -335,11 +335,7 @@ pub(crate) fn trigger_coalesced_prewarm(
 
 pub(crate) async fn wait_for_checkout_slot(
     state: &AppState,
-    repo_id: Uuid,
-    storage_generation: i64,
-    audience: Uuid,
-    head_oid: &str,
-    excluded: &[String],
+    target: CheckoutTarget<'_>,
     prefer_mirror: bool,
     wait_ms: u64,
 ) -> Result<bool, Error> {
@@ -351,8 +347,8 @@ pub(crate) async fn wait_for_checkout_slot(
         return Err(Error(StatusCode::TOO_MANY_REQUESTS, "CI checkout wait queue overloaded"));
     };
     let deadline = tokio::time::Instant::now() + Duration::from_millis(bounded);
-    let r_notify = ready_notify_for(&(repo_id, storage_generation, head_oid.to_owned()));
-    let s_notify = slot_notify_for(repo_id);
+    let r_notify = ready_notify_for(&(target.repo_id, target.storage_generation, target.head_oid.to_owned()));
+    let s_notify = slot_notify_for(target.repo_id);
     let g_notify = GLOBAL_SLOT_NOTIFY.clone();
 
     loop {
@@ -367,7 +363,15 @@ pub(crate) async fn wait_for_checkout_slot(
         global_fut.as_mut().enable();
 
         let client = state.pool.get().await.map_err(Error::internal)?;
-        let summary = probe_availability(&**client, repo_id, storage_generation, audience, head_oid, excluded).await?;
+        let summary = probe_availability(
+            &**client,
+            target.repo_id,
+            target.storage_generation,
+            target.audience,
+            target.head_oid,
+            target.excluded,
+        )
+        .await?;
         drop(client);
 
         let origin_ready = !prefer_mirror

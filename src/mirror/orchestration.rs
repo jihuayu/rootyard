@@ -6,6 +6,7 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,13 +72,12 @@ pub(crate) fn error_response(err: Error) -> Response {
         "classification".into(),
         serde_json::Value::String(class.as_str().into()),
     );
-    let resp = (
+    (
         err.0,
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         axum::Json(serde_json::Value::Object(obj)),
     )
-        .into_response_fallback(class);
-    resp
+        .into_response_fallback(class)
 }
 
 trait IntoClassifiedFallback {
@@ -207,7 +207,7 @@ pub(crate) async fn sync_with_wait(
                     return Err(err);
                 }
                 crate::mirror::limiter::for_state(state)
-                    .wait_for_sync_slot(repo_id, rem)
+                    .wait_for_sync_slot(state, repo_id, rem)
                     .await?;
                 waited = true;
             }

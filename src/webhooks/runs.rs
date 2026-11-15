@@ -4,8 +4,8 @@ use crate::{
     pulls::models::context_valid,
     webhooks::{
         ci_classification::{
-            CheckoutStateClass, ClassificationInput, classified_error, classified_response,
-            classify_checkout_state, error_with_classification,
+            CheckoutStateClass, CheckoutTarget, ClassificationInput, classified_error,
+            classified_response, classify_checkout_state, error_with_classification,
         },
         ci_controller,
         signing::{constant_time_eq, sha256_hex},
@@ -104,20 +104,33 @@ pub(crate) async fn verify_hook_tx(tx: &Transaction<'_>, hook_id: Uuid, repo: Uu
 
 pub(crate) async fn choose_checkout_source(
     tx: &Transaction<'_>,
-    repo: Uuid,
-    generation: i64,
-    audience: Uuid,
-    head: &str,
-    excluded: &[String],
+    target: CheckoutTarget<'_>,
     prefer_mirror: bool,
     wait_requested: bool,
 ) -> Result<Result<String, Response>, Error> {
-    if let Some(mirror) = ci_controller::select_ready_mirror(&**tx, repo, generation, audience, head, excluded).await? {
+    if let Some(mirror) = ci_controller::select_ready_mirror(
+        &**tx,
+        target.repo_id,
+        target.storage_generation,
+        target.audience,
+        target.head_oid,
+        target.excluded,
+    )
+    .await?
+    {
         return Ok(Ok(mirror));
     }
-    let summary = ci_controller::probe_availability(&**tx, repo, generation, audience, head, excluded).await?;
+    let summary = ci_controller::probe_availability(
+        &**tx,
+        target.repo_id,
+        target.storage_generation,
+        target.audience,
+        target.head_oid,
+        target.excluded,
+    )
+    .await?;
     let (global, per_repo) = ci_controller::origin_fallback_limits();
-    let allow_origin = !prefer_mirror && !excluded.iter().any(|s| s == "origin");
+    let allow_origin = !prefer_mirror && !target.excluded.iter().any(|s| s == "origin");
     let class = classify_checkout_state(ClassificationInput {
         trusted_bound: true,
         candidate_valid: true,
@@ -144,7 +157,7 @@ pub(crate) async fn choose_checkout_source(
             json!({ "availability": summary, "retry_after_ms": 250 }),
         )));
     }
-    if excluded.iter().any(|s| s == "origin")
+    if target.excluded.iter().any(|s| s == "origin")
         || summary.origin_budget.global_active >= global
         || summary.origin_budget.per_repo_active >= per_repo
     {
@@ -219,17 +232,15 @@ pub async fn claim(
             prewarm_triggered = true;
         }
     }
+    let target = CheckoutTarget {
+        repo_id: repo,
+        storage_generation: snap_gen,
+        audience,
+        head_oid: &snap_head,
+        excluded: &excluded,
+    };
     if wait_ms > 0 {
-        let ready = ci_controller::wait_for_checkout_slot(
-            &state,
-            repo,
-            snap_gen,
-            audience,
-            &snap_head,
-            &excluded,
-            prefer_mirror,
-            wait_ms,
-        ).await?;
+        let ready = ci_controller::wait_for_checkout_slot(&state, target, prefer_mirror, wait_ms).await?;
         if !ready {
             let client = state.pool.get().await.map_err(Error::internal)?;
             let summary = ci_controller::probe_availability(&**client, repo, snap_gen, audience, &snap_head, &excluded).await?;
@@ -302,7 +313,16 @@ pub async fn claim(
     }
     tx.execute("SELECT pg_advisory_xact_lock(1062026)", &[]).await.map_err(Error::internal)?;
     let source = match choose_checkout_source(
-        &tx, repo, generation, audience, &head, &excluded, prefer_mirror, input.wait_for_ready_ms.is_some(),
+        &tx,
+        CheckoutTarget {
+            repo_id: repo,
+            storage_generation: generation,
+            audience,
+            head_oid: &head,
+            excluded: &excluded,
+        },
+        prefer_mirror,
+        input.wait_for_ready_ms.is_some(),
     ).await? {
         Ok(src) => src,
         Err(resp) => {

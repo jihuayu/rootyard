@@ -3,8 +3,8 @@ use crate::{
     AppState, Error, ci_checkouts,
     webhooks::{
         ci_classification::{
-            CheckoutStateClass, ClassificationInput, classified_response, classify_checkout_state,
-            error_with_classification,
+            CheckoutStateClass, CheckoutTarget, ClassificationInput, classified_response,
+            classify_checkout_state, error_with_classification,
         },
         ci_controller, runs,
     },
@@ -265,7 +265,16 @@ pub async fn failover(
     tx.execute("SELECT pg_advisory_xact_lock(1062026)", &[]).await.map_err(Error::internal)?;
     let prefer_mirror = input.prefer_mirror.unwrap_or(false);
     let next_source = match runs::choose_checkout_source(
-        &tx, repo, generation, audience, &head, &excluded, prefer_mirror, false,
+        &tx,
+        CheckoutTarget {
+            repo_id: repo,
+            storage_generation: generation,
+            audience,
+            head_oid: &head,
+            excluded: &excluded,
+        },
+        prefer_mirror,
+        false,
     )
     .await?
     {

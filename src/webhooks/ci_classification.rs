@@ -42,6 +42,15 @@ pub struct AvailabilitySummary {
     pub origin_budget: OriginBudgetStatus,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CheckoutTarget<'a> {
+    pub repo_id: Uuid,
+    pub storage_generation: i64,
+    pub audience: Uuid,
+    pub head_oid: &'a str,
+    pub excluded: &'a [String],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckoutStateClass {
