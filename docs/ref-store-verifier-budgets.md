@@ -41,32 +41,36 @@ Both `PackVerifier` (`verifier/mod.rs`), `verify_publication_artifacts` (`verifi
 
 ## 5. Before vs. After Benchmark Receipt
 
-Measured against real CI PostgreSQL (`ROOTYARD_TEST_DATABASE_URL`, PostgreSQL 17), loopback HTTP S3 via OpenDAL (`loopback_http_s3_via_opendal`), and stock Git (`git version 2.56.1`) on `linux / x86_64` (`ubuntu-22.04`) during `CI / verify` run `43709781296` (`job/132798616334`, artifact `e2e-report` -> `test-results/verifier-budget-bench.json`):
+Measured in two fresh OS child processes (`ROOTYARD_VB_PHASE=before|after`, `process_isolation: fresh_child_process_per_cohort_via_current_exe`) against shared CI PostgreSQL (`ROOTYARD_TEST_DATABASE_URL`, PostgreSQL 17), loopback HTTP S3 via OpenDAL (`loopback_http_s3_via_opendal`), and stock Git (`git version 2.56.1`) on `linux / x86_64` during `CI / verify` run `43721396986` (`job/132833958616`, Step 16 `cargo test --locked --all-targets --features pando-lab` **`5 passed; 0 failed; 1 ignored` in `55.63s`**, artifact `e2e-report` `14165141497` -> `test-results/verifier-budget-bench.json`; note run `43721396986` later exited `139` in Step 31 from an unrelated CPython 3.12 `faulthandler` segfault, while `isolated-lab` run `43721396964` / `job/132833958576` passed `5 passed; 0 failed; 1 ignored` in `58.20s`):
 
-- **PR / Source Commit**: PR `#251` head `5658890f9b81f9cd64c51acc0e30b6810a03035f` (CI pull-request merge `GITHUB_SHA` `c8bb6b1bfa937a1f0865e37f64f36835af8c331c`)
-- **Workload**: `3 slow (400ms GET delay, ~192KiB pack) + 4 fast (0ms GET delay, ~128KiB pack) per phase` (`7` ops/phase, `15ms` slow head-start ahead of fast ops in both phases)
-- **Methodology**: `before_coupled` wraps `PackVerifier::verify + commit` in an outer `Semaphore(2)` spanning both Blob GET and native Git (mirroring pre-#176 single 2-slot pool coupling); `after_separated` runs uncoupled `DOWNLOAD_SLOTS=4` and `VERIFIER_SLOTS=2` via `tests/ref_store_verifier_budgets.rs` (`verifier_budget_before_vs_after_pg_s3_git_benchmark`).
+- **PR / Source Commit**: PR `#251` head `7f987d46a1ad58086b8989b1e8810baf66b783ec` (CI merge `source_commit`: `cd062754d7038c53573dfe05814850d87f7d947b`)
+- **Child Binary (`environment.binary_path`)**: `/home/runner/.cargo/targets/rootyard-ec2a3e00/debug/build/rootyard/0ce2649f55afce04/out/ref_store_verifier_budgets-19562c04fb46a672`
+- **Baseline & Measurement Kinds**: `baseline_kind = simulated_coupled_semaphore_2_on_current_binary`; `rss_measurement = per_child_process_proc_self_status_VmHWM_kib`; `peak_measurement = fresh_child_process_budget_registry_peak_plus_5ms_cohort_gauge_sampler`
+- **Workload**: `3 slow (400ms GET delay via 5105de1a- tag, ~192KiB pack) + 4 fast (0ms GET delay, ~128KiB pack) per isolated cohort` (`7` ops/cohort, `15ms` slow head-start ahead of fast ops in both phases)
+- **Methodology & Limitations**: `before_coupled` wraps `PackVerifier::verify + commit` in a simulated external `Semaphore(2)` across Blob GET + native Git inside its own child process; `after_separated` runs uncoupled `DOWNLOAD_SLOTS=4` and `VERIFIER_SLOTS=2` in a separate child process via `tests/ref_store_verifier_budgets.rs` (`verifier_budget_before_vs_after_pg_s3_git_benchmark`). Explicit limitations: `before_coupled` is a simulated `Semaphore(2)` harness on the current binary rather than a checkout of pre-#176 `main`, and blob storage uses in-process `loopback_http_s3_via_opendal` with synthetic `400ms` GET delay on slow-tagged objects rather than a networked Garage S3 cluster.
 
 | Metric | Before (Coupled `Semaphore(2)`) | After (Separated Budgets) | Delta / Ratio |
 | :--- | ---: | ---: | :--- |
-| Total Wall Time (`7` ops) | `4349.505 ms` | `2283.419 ms` | **`1.905x` faster** (`1.904821x`) |
-| Throughput | `1.609 ops/s` | `3.066 ops/s` | `+90.5%` |
-| Fast Ops Latency (`n=4`) Min | `2323.584 ms` | `139.598 ms` | `16.64x` lower |
-| Fast Ops Latency (`n=4`) P50 | `2600.362 ms` | `248.994 ms` | `10.44x` faster |
-| Fast Ops Latency (`n=4`) P95 / P99 / Max | `2735.173 ms` | `262.584 ms` | **`10.42x` faster** (`10.416373x`) |
-| Fast Ops Latency (`n=4`) Mean | `2530.136 ms` | `201.999 ms` | `12.53x` faster |
-| Slow Ops Latency (`n=3`) P50 / P95 / Mean | `2201.150 / 4349.366 / 2914.644 ms` | `2177.570 / 2283.278 / 2212.480 ms` | Tail `-47.5%` |
+| Total Wall Time (`7` ops) | `4632.331 ms` | `2464.400 ms` | **`1.880x` faster** (`wall_speedup: 1.879700`) |
+| Throughput | `1.511 ops/s` | `2.840 ops/s` | `+88.0%` (`+87.97%`) |
+| Fast Ops Latency (`n=4`) Min | `2425.978 ms` | `174.219 ms` | `13.925x` lower |
+| Fast Ops Latency (`n=4`) P50 | `2758.635 ms` | `286.316 ms` | `9.635x` faster |
+| Fast Ops Latency (`n=4`) P95 / P99 / Max | `2923.696 ms` | `313.941 ms` | **`9.313x` faster** (`fast_p95_ratio: 9.312884`) |
+| Fast Ops Latency (`n=4`) Mean | `2674.849 ms` | `245.482 ms` | `10.896x` faster |
+| Slow Ops Latency (`n=3`) P50 / P95 / Mean | `2277.708 / 4632.144 / 3058.361 ms` | `2376.955 / 2464.216 / 2401.883 ms` | Tail `-46.8%` |
+| All Ops Latency (`n=7`) P50 / P95 / Mean | `2591.088 / 4632.144 / 2839.211 ms` | `313.941 / 2464.216 / 1169.654 ms` | Tail `-46.8%` |
 | Peak Active Ops (`in-flight`) | `2` | `7` | All `7` ops admitted without coupled head-of-line stall |
-| Download / Native Slots In-Flight Peak | `3 / 2` | `4 / 2` | Download pool saturated independently |
-| Download Queue Wait Total | `8 us` | `108,475 us` | `+108,467 us` |
-| Native Queue Wait Total | `19 us` | `260,390 us` | `+260,371 us` |
-| Verifier `blob_get_requests` / S3 `GET`s | `14 / 31` (`1,124,096 B`) | `14 / 31` (`1,124,102 B`) | Equivalent transfer volume (`6 B` pack/UUID framing delta) |
-| Staging Reserved Peak | `1,310,720 B` | `2,686,976 B` | `+1,376,256 B` (`4` concurrent downloads vs `2`) |
-| Staging Reclaimed Bytes Delta | `1,114,112 B` | `1,114,112 B` | `100%` temp pair staging reclaimed post-index |
-| Process `VmHWM` (`/proc/self/status`) | `34,040 KiB` | `34,552 KiB` | `+512 KiB` (`+1.5%`) under `3.5x` peak task concurrency |
+| Download / Native Peak (`BudgetRegistry` & `5ms` sampler) | `2 / 2` (`sampled: 2 / 2`) | `4 / 2` (`sampled: 4 / 2`) | Download pool saturated independently |
+| Download Queue Wait Total | `8 us` | `202,509 us` | `+202,501 us` (`download_wait_delta_micros`) |
+| Native Queue Wait Total | `18 us` | `207,218 us` | `+207,200 us` (`native_wait_delta_micros`) |
+| View Queue Wait Total | `0 us` | `0 us` | Uncontended |
+| Verifier `blob_get_requests` / Parent `s3_get_requests` | `14` (`1,124,099 B`) / `62` (`2,248,198 B`) | `14` (`1,124,104 B`) / `62` (`2,248,208 B`) | Equivalent transfer volume (`+5 B` / `+10 B` pack/UUID framing delta) |
+| Staging Reserved Peak (`BudgetRegistry` / `5ms` sampler) | `917,504 B` (`sampled: 917,504 B`) | `2,686,976 B` (`sampled: 2,686,976 B`) | `+1,769,472 B` (`4` concurrent downloads vs `2`) |
+| Staging Reclaimed Bytes Delta | `1,114,112 B` | `1,114,112 B` | `100%` (`reclaimed_bytes_after: 1,114,112 B`) |
+| Per-Child `VmHWM` (`/proc/self/status`) | `26,192 KiB` | `26,192 KiB` | `0 KiB` delta under `3.5x` peak task concurrency |
 
 ### Neutral / Trade-off Observations & Test Coverage
 
-- **Expected queue-wait & staging-peak increase**: `before_coupled` held fast tasks behind the external `Semaphore(2)` before touching `BudgetRegistry`, keeping internal pool wait near zero (`8 us` / `19 us`) while pushing end-to-end fast latency to `2.74 s`. Under `after_separated`, all `7` concurrent operations enter `DOWNLOAD_SLOTS=4` and `VERIFIER_SLOTS=2` directly, cleanly shifting queuing from coupled head-of-line stalls into bounded download (`108.5 ms` cumulative wait) and native CPU (`260.4 ms` cumulative wait) pools and raising peak transient staging (`1.31 MiB` -> `2.69 MiB`) while reclaiming all `1,114,112 B` immediately after indexing.
-- **Additional live integration tests (`tests/ref_store_verifier_budgets.rs`)**: Both `isolated-lab` (`43709781287`, `21.48s`) and `CI / verify` (`43709781296`, `17.61s`) passed `3 passed; 0 failed; 1 ignored` (`slow_blob_downloads_do_not_starve_fast_native_git_slots`, `maintenance_saturation_preserves_foreground_pg_commit_and_reclaim`, and `verifier_budget_before_vs_after_pg_s3_git_benchmark`), while `real_garage_s3_and_pg_verifier_budgets_smoke` remains `#[ignore = "requires real PG + Garage S3 + stock Git"]` for dedicated Garage clusters.
+- **Expected queue-wait & staging-peak increase**: `before_coupled` held fast tasks behind the external `Semaphore(2)` before touching `BudgetRegistry`, keeping internal pool wait near zero (`8 us` / `18 us`) while pushing end-to-end fast latency to `2.92 s`. Under `after_separated`, all `7` concurrent operations enter `DOWNLOAD_SLOTS=4` and `VERIFIER_SLOTS=2` directly, cleanly shifting queuing from coupled head-of-line stalls into bounded download (`202.5 ms` cumulative wait) and native CPU (`207.2 ms` cumulative wait) pools and raising peak transient staging (`917,504 B` -> `2,686,976 B`) while reclaiming `1,114,112 B` immediately after indexing with zero per-child `VmHWM` increase (`26,192 KiB` in both isolated cohorts).
+- **Live integration & isolation regression coverage (`tests/ref_store_verifier_budgets.rs`)**: Both `CI / verify` (`43721396986`, Step 16 `55.63s`) and `isolated-lab` (`43721396964`, `58.20s`) ran `6` tests and passed **`5 passed; 0 failed; 1 ignored`** (`slow_blob_downloads_do_not_starve_fast_native_git_slots`, `maintenance_saturation_preserves_foreground_pg_commit_and_reclaim`, `timed_out_isolated_worker_cleans_up_owned_pg_schema`, `failed_reap_preserves_owned_schema_with_cleanup_not_complete_error`, and `verifier_budget_before_vs_after_pg_s3_git_benchmark`), while `real_garage_s3_and_pg_verifier_budgets_smoke` remains `#[ignore = "requires real PG + Garage S3 + stock Git"]` for dedicated Garage clusters.
 
