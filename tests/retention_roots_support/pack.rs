@@ -313,6 +313,12 @@ pub struct SourceSnapshot {
     pub read: PackReadSnapshot,
 }
 
+impl SourceSnapshot {
+    pub fn snapshot_id(&self) -> Uuid {
+        self.snapshot_id
+    }
+}
+
 /// Create and read a real serving-lane pack snapshot through the production
 /// serving snapshot coordinator. The returned SourceSnapshot is a genuine A5
 /// pinned source for the roots fixture.
