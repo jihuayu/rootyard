@@ -29,30 +29,71 @@ become deletion candidates:
   generation onto a fresh path, so a stale deleter can only remove abandoned
   bytes and never a newly acknowledged object.
 
+## External bucket authority proofs & PITR fencing (#77)
+
+Starting with `schema 148`, `pando_storage_authorities` and an external
+write-once proof object under the shared bucket fence metadata-only
+`pg_dump` / PostgreSQL PITR clones from deleting objects belonging to another
+deployment sharing the same bucket:
+
+- At runtime attestation (`serve` startup when remote delete or Pando state is
+  active, `prepare`, `pando-transition cutover`, `pando_repack`,
+  `pando_tombstone_delete`, and `rootyard pando-authority verify`), Rootyard
+  binds the active `authority_id` and `authority_epoch` to the deployment's
+  stable identity tuple:
+  - local `.volume-id` and `.pando-deployment-id` markers in `ROOTYARD_DATA_DIR`,
+  - PostgreSQL system coordinates (`system_identifier`, `database_oid`,
+    `schema_oid` of `pando_storage_authorities`, and `pg_timeline_id`),
+  - canonical sanitized `backend_identity`, and a fresh `proof_nonce`.
+- External proof records live at
+  `pando-authorities/<authority_id>/epochs/<epoch:020>.json` and are written with
+  write-once CAS (`If-None-Match: *` on S3, `create_new` + `hard_link` locally).
+  Neither Pando artifact GC nor tombstone pruning may delete keys under
+  `pando-authorities/`.
+- Every destructive `pando_tombstone_delete` run strictly validates
+  `ROOTYARD_PANDO_REMOTE_DELETE` (`true`, `false`, or unset — invalid values fail
+  closed), verifies local + PG + external epoch proof consistency and checks
+  that `epoch + 1` is absent in the bucket, then atomically advances
+  `authority_epoch` (`E -> E + 1`) via CAS before issuing any remote `DELETE`.
+- Any deployment identity mismatch, missing proof, or pre-existing successor
+  epoch `E + 1` (clone/PITR rollback) fails closed, latches
+  `remote_delete_fenced = true` in `pando_storage_authorities`, blocks Pando
+  pack publication, and performs zero remote object deletions.
+- `pando_retention_roots` and `pando_retention_root_manifests` record durable
+  backup/PITR retention pins (`backup_snapshot`, `pitr_recovery_point`,
+  `manual_pin`); active non-expired roots block artifact retirement and deletion.
+- Operators inspect and manage authorities via `rootyard pando-authority`:
+  `status`, `verify`, `isolate --confirm-shared-bucket`, `pin-recovery-point`,
+  and `release-recovery-point`.
+
 ## Supported backup contract
 
-Paired Rootyard archives are the supported Pando backup authority. A restore
-rotates the storage authority exactly once for the whole database before
-importing every serving repository closure, so a restored database sharing the
-same bucket never inherits the source installation's deletable namespace.
+Paired Rootyard archives and isolated cloned authorities are the supported Pando
+recovery paths. An offline `rootyard restore` calls `reset_authority`,
+incrementing `restore_generation`, generating a fresh `authority_id`, clearing
+prior attestation/fence fields, and clearing source retention roots before
+re-importing the archive's Pando closure, so the restored deployment never
+inherits the source's deletable authority namespace.
 
-Arbitrary metadata-only PostgreSQL PITR snapshots or external base backups are
-**not** a supported backup authority for Pando remote GC. Such a copy retains
-the source `authority_id` and registry rows, so it is **not detected** and the
-deleter does **not** fail closed for it: starting that copy against the shared
-bucket would let it treat the source installation's live, non-serving artifacts
-as its own. Never run an out-of-band metadata copy against the shared bucket.
-Operators must retain a paired Rootyard archive (the only path that rotates the
-authority once for the whole restored database), or re-register/pin the
-required closure, before enabling destructive Pando deletion.
+Out-of-band metadata-only PostgreSQL PITR / basebackup / `pg_dump` clones that
+retain the source `authority_id` are detected fail-closed: remote deletion is
+refused and `remote_delete_fenced` latches `true` before any shared bucket
+object can be touched. To bring an intentional replacement clone online against a
+shared bucket without deleting historical source objects, operators must first
+pin recovery points as needed and explicitly rotate to a fresh isolated
+authority via `rootyard pando-authority isolate --confirm-shared-bucket`.
 
 ## Explicit exclusions
 
 - Pre-132 PackManifest v1 objects at tenant-only keys are never registered and
   are permanently protected.
 - Uploaded-but-unlinked staged objects (crash/publish retry) are protected.
-- Objects under another authority (foreign/restored deployment) are protected.
+- Objects under another authority (foreign/restored/isolated deployment) are
+  protected.
+- External authority proofs under `pando-authorities/` and objects linked to
+  active non-expired `pando_retention_roots` are protected.
 - S3 `LIST` is never used as a retention authority.
 
 Destructive deletion additionally requires `ROOTYARD_PANDO_REMOTE_DELETE=true`;
-without it, marking and dry-run evidence still run and no bytes are removed.
+without it (or when set to `false`), marking and proofs remain active and no
+bytes are removed. Any value other than `true` or `false` fails closed.

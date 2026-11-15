@@ -87,11 +87,30 @@ class BackupRecoveryHarness(BackupHarness):
         assert new_pando[0]['authority_id'] != old_pando[0]['authority_id']
         assert uuid.UUID(new_pando[0]['authority_id']).version == 4
         assert new_pando[0]['generation'] == 1
+        assert new_pando[0]['restore_generation'] == old_pando[0]['restore_generation'] + 1
+        assert new_pando[0]['authority_epoch'] == 1
+        assert new_pando[0]['remote_delete_fenced'] is False
+        assert new_pando[0]['remote_delete_fence_reason'] is None
+        for attr_field in (
+            'deployment_id', 'volume_id', 'db_system_identifier',
+            'db_database_oid', 'db_schema_oid', 'pg_timeline_id',
+            'backend_identity', 'proof_nonce', 'attested_at',
+        ):
+            assert new_pando[0][attr_field] is None, f"Restored authority kept {attr_field}"
         assert new_pando[0]['created_at'] > old_pando[0]['created_at']
         assert new_pando[0]['rotated_at'] >= new_pando[0]['created_at']
-        for table in ('pando_remote_artifacts', 'pando_manifest_artifacts', 'pando_publication_fences'):
+        for table in (
+            'pando_remote_artifacts', 'pando_manifest_artifacts', 'pando_publication_fences',
+            'pando_retention_roots', 'pando_retention_root_manifests',
+        ):
             assert expected[table] == restored[table] == [], 'Unexpected populated Pando fixture: ' + table
-        for field in ('authority_id', 'generation', 'created_at', 'rotated_at'):
+        for field in (
+            'authority_id', 'generation', 'restore_generation', 'authority_epoch',
+            'deployment_id', 'volume_id', 'db_system_identifier', 'db_database_oid',
+            'db_schema_oid', 'pg_timeline_id', 'backend_identity', 'proof_nonce',
+            'remote_delete_fenced', 'remote_delete_fence_reason', 'attested_at',
+            'created_at', 'rotated_at',
+        ):
             old_pando[0][field] = new_pando[0][field]
         different = [table for table in set(expected) | set(restored)
                      if expected.get(table) != restored.get(table)]

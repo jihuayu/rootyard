@@ -22,7 +22,8 @@ use uuid::Uuid;
 /// Run one bounded claim with a fresh operation context for external callers.
 pub async fn run_once(state: &Arc<AppState>, policy: &Policy, owner: Uuid) -> Result<Option<JobOutcome>> {
     let operation = OperationContext::new(WorkerKind::StorageLifecycle);
-    observability::worker::run(&operation, Phase::Claim, run_once_scoped(state, policy, owner, &operation)).await
+    observability::worker::run(&operation, Phase::Claim, Box::pin(run_once_scoped(state, policy, owner, &operation)))
+        .await
 }
 
 pub(crate) async fn run_once_scoped(
@@ -51,7 +52,7 @@ pub(crate) async fn run_once_scoped(
     let job_operation =
         operation.clone().with_attempt(Some(i64::from(job.attempt))).with_generation(Some(job.repository_generation));
     observability::worker::run(&job_operation, Phase::Execute, async {
-        match run_claimed(state, policy, &job).await {
+        match Box::pin(run_claimed(state, policy, &job)).await {
             Ok(outcome) => Ok(Some(outcome)),
             Err(error) => {
                 observability::observe_internal(&error);

@@ -300,8 +300,8 @@ pub async fn execute(
             lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
             Ok(json!({"cache_files_removed":removed,"remote_deleted":false}))
         }
-        "pando_unreachable_mark" => mark_unreachable(state, repo, job, lease, policy, cancel).await,
-        "pando_tombstone_delete" => delete_tombstones(state, repo, job, lease, policy, cancel).await,
+        "pando_unreachable_mark" => Box::pin(mark_unreachable(state, repo, job, lease, policy, cancel)).await,
+        "pando_tombstone_delete" => Box::pin(delete_tombstones(state, repo, job, lease, policy, cancel)).await,
         _ => bail!("unsupported Pando maintenance job kind"),
     }
 }
@@ -321,7 +321,12 @@ const RETAINED_LINK: &str = "EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
        OR EXISTS (SELECT 1 FROM pando_publication_fences p \
                   WHERE p.authority_id=a.authority_id AND p.tenant_id=a.tenant_id \
                     AND p.namespace=a.namespace AND p.sha256=a.sha256 \
-                    AND p.lease_until>clock_timestamp())))";
+                    AND p.lease_until>clock_timestamp()) \
+       OR EXISTS (SELECT 1 FROM pando_retention_root_manifests rm \
+                  JOIN pando_retention_roots rr ON rr.id=rm.root_id \
+                    AND rr.authority_id=rm.authority_id AND rr.tenant_id=rm.tenant_id \
+                  WHERE rm.manifest_id=m.id AND rr.authority_id=a.authority_id \
+                    AND rr.state='active' AND (rr.retain_until IS NULL OR rr.retain_until>clock_timestamp()))))";
 
 async fn mark_unreachable(
     state: &std::sync::Arc<AppState>,
@@ -405,7 +410,7 @@ async fn delete_tombstones(
     let authority = crate::pando_gateway::retention::authority(&**client).await?;
     let tenant = job.tenant_id;
     let counts = crate::pando_gateway::retention::counts(&**client, tenant).await?;
-    let enabled = std::env::var("ROOTYARD_PANDO_REMOTE_DELETE").ok().as_deref() == Some("true");
+    let enabled = super::pando_delete_gate::remote_delete_env_enabled()?;
     if !enabled {
         return Ok(json!({
             "remote_deleted": false,
@@ -416,6 +421,18 @@ async fn delete_tombstones(
             "deleted": counts.deleted
         }));
     }
+    let remote =
+        crate::storage::remote_objects::RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
+    let deadline = Instant::now() + MAINTENANCE_DEADLINE;
+    let verified = Box::pin(crate::pando_gateway::pitr_fence::verify_or_attest(
+        &state.pool,
+        &state.storage.root,
+        &remote,
+        deadline,
+        "attest",
+    ))
+    .await?;
+    ensure!(verified.authority_id == authority.id && !verified.remote_delete_fenced, "Pando authority fenced");
     let linked = "EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
         WHERE l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id \
           AND l.namespace=a.namespace AND l.sha256=a.sha256 AND l.repository_id=$3)";
@@ -436,9 +453,17 @@ async fn delete_tombstones(
     );
     let claimed =
         client.query(&claim, &[&authority.id, &tenant, &repo.id, &job.lease_owner, &policy.lease_seconds]).await?;
-    let remote =
-        crate::storage::remote_objects::RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
-    let deadline = Instant::now() + MAINTENANCE_DEADLINE;
+    let current_authority = if !claimed.is_empty() {
+        let advanced =
+            Box::pin(super::pando_delete_gate::enter_fenced_delete_execution(state, &remote, deadline)).await?;
+        ensure!(
+            advanced.authority_id == authority.id && !advanced.remote_delete_fenced,
+            "Pando authority fenced before delete"
+        );
+        advanced.authority_id
+    } else {
+        verified.authority_id
+    };
     let mut deleted = 0usize;
     let mut fenced = 0usize;
     let mut retryable = 0usize;
@@ -451,15 +476,17 @@ async fn delete_tombstones(
         let generation: i64 = row.get(3);
         let remote_path: String = row.get(4);
         let claim_generation: i64 = row.get(5);
-        let key = match crate::storage::remote_objects::ObjectKey::scoped(
-            tenant,
+        let key = match super::pando_delete_gate::validate_scoped_delete_target(
+            current_authority,
             authority.id,
+            tenant,
             generation,
             &namespace,
             &sha256,
+            &remote_path,
         ) {
-            Ok(key) if key.path() == remote_path => key,
-            _ => {
+            Ok(key) => key,
+            Err(_) => {
                 fenced += 1;
                 continue;
             }
@@ -467,7 +494,8 @@ async fn delete_tombstones(
         let still = format!(
             "SELECT 1 FROM pando_remote_artifacts a WHERE a.authority_id=$1 AND a.tenant_id=$2 \
                AND a.namespace=$3 AND a.sha256=$4 AND a.state='deleting' AND a.claimed_by=$5 \
-               AND a.claim_generation=$6 AND a.remote_path=$7 AND NOT {RETAINED_LINK}"
+               AND a.claim_generation=$6 AND a.remote_path=$7 AND NOT {RETAINED_LINK} \
+               AND NOT (SELECT remote_delete_fenced FROM pando_storage_authorities WHERE singleton)"
         );
         let current = client
             .query_opt(
@@ -482,7 +510,7 @@ async fn delete_tombstones(
         if lease.ensure_active().is_err() {
             break;
         }
-        if let Err(error) = remote.delete(&key, deadline).await {
+        if let Err(error) = Box::pin(remote.delete(&key, deadline)).await {
             let _ = client
                 .execute(
                     "UPDATE pando_remote_artifacts SET state='retired',claimed_by=NULL,lease_until=NULL, \
@@ -585,6 +613,16 @@ async fn repack(
     ensure!(packed == all, "Pando compaction did not preserve the complete object set");
     verify_candidate(state, &snapshot, repo, &pack, &index, lease, deadline).await?;
     let store = PackStore::from_env(state.storage.root.join("pando-pack-work"), state.config.git.clone())?;
+    let remote =
+        crate::storage::remote_objects::RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
+    Box::pin(crate::pando_gateway::pitr_fence::verify_or_attest(
+        &state.pool,
+        &state.storage.root,
+        &remote,
+        deadline,
+        "attest",
+    ))
+    .await?;
     let manifest = lease
         .guard(Box::pin(store.publish(
             &state.pool,

@@ -6,7 +6,7 @@
 //! service. `fs`, `memory` and unknown services are rejected by name: the new
 //! profile never silently degrades to node-local or in-process storage.
 
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use reqwest::Url;
 use sha2::{Digest, Sha256};
@@ -17,6 +17,8 @@ use super::{
         DEFAULT_ACTIVE_READERS, DEFAULT_ACTIVE_UPLOADS, DEFAULT_STAGING_BYTES, LEASE_UNIT_BYTES, MAX_ACTIVE_SLOTS,
         MAX_STAGING_BYTES, ResourceLimits,
     },
+    encryption_config::BlobEncryptionConfig,
+    key_provider::KeyProvider,
 };
 
 pub const DEFAULT_OBJECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -92,6 +94,7 @@ pub struct BlobProfile {
     range_full_get_max_bytes: u64,
     abort_timeout: Duration,
     delete_policy: BlobDeletePolicy,
+    encryption: BlobEncryptionConfig,
     /// Shared upload/reader/staging capacities for the whole process.
     resources: ResourceLimits,
 }
@@ -114,6 +117,7 @@ impl fmt::Debug for BlobProfile {
             .field("resources", &self.resources)
             .field("abort_timeout", &self.abort_timeout)
             .field("delete_policy", &self.delete_policy)
+            .field("encryption", &self.encryption)
             .finish()
     }
 }
@@ -211,6 +215,7 @@ impl BlobProfile {
                 "blob range full-get ceiling exceeds the staging budget; such a range could never be staged".into(),
             ));
         }
+        let encryption = BlobEncryptionConfig::from_env()?;
         Ok(Self {
             provider,
             bucket,
@@ -231,6 +236,7 @@ impl BlobProfile {
             abort_timeout: duration_ms("ROOTYARD_BLOB_ABORT_TIMEOUT_MS", DEFAULT_ABORT_TIMEOUT)?,
             max_object_bytes,
             delete_policy: BlobDeletePolicy::parse(&env_optional("ROOTYARD_BLOB_DELETE")?.unwrap_or_default())?,
+            encryption,
             resources,
         })
     }
@@ -288,6 +294,16 @@ impl BlobProfile {
     pub fn delete_policy(&self) -> BlobDeletePolicy {
         self.delete_policy
     }
+    pub fn encryption(&self) -> &BlobEncryptionConfig {
+        &self.encryption
+    }
+    pub fn with_encryption(mut self, encryption: BlobEncryptionConfig) -> Self {
+        self.encryption = encryption;
+        self
+    }
+    pub fn open_key_provider(&self) -> Result<Option<Arc<dyn KeyProvider>>, BlobError> {
+        self.encryption.open_key_provider()
+    }
     /// Process-wide upload/reader/staging capacities requested by this profile.
     /// `BlobStore::open` registers them once per process and rejects conflicts.
     pub fn resource_limits(&self) -> ResourceLimits {
@@ -319,6 +335,7 @@ impl BlobProfile {
             range_full_get_max_bytes: resources.staging_bytes().min(DEFAULT_RANGE_FULL_GET_MAX_BYTES),
             abort_timeout: Duration::from_millis(100),
             delete_policy: BlobDeletePolicy::Disabled,
+            encryption: BlobEncryptionConfig::implicit_provider_managed(),
             resources,
         }
     }
@@ -344,7 +361,7 @@ fn env_required(name: &str) -> Result<String, BlobError> {
     env_optional(name)?.ok_or_else(|| BlobError::Config(format!("{name} is required for the standalone blob profile")))
 }
 
-fn env_optional(name: &str) -> Result<Option<String>, BlobError> {
+pub(super) fn env_optional(name: &str) -> Result<Option<String>, BlobError> {
     match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),

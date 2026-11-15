@@ -209,6 +209,9 @@ pub async fn stage(
             "Pando new pack lacks changed ref closure"
         );
         let store = PackStore::from_env(state.storage.root.join("pando-pack-work"), state.config.git.clone())?;
+        let remote =
+            crate::storage::remote_objects::RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
+        super::pitr_fence::verify_or_attest(&state.pool, &state.storage.root, &remote, deadline, "attest").await?;
         let manifest = lease
             .guard(Box::pin(store.publish(
                 &state.pool,

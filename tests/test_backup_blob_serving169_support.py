@@ -971,14 +971,15 @@ def positive_inputs(producer=None):
     roots = [{"root_id": str(uuid.uuid4()), "state": "active", "owner_id": producer},
              {"root_id": str(uuid.uuid4()), "state": "released", "owner_id": producer}]
     versions = list(schema_baseline.SCHEMA_VERSIONS)
-    expected = {"format": 22, "schema_versions": versions, "schema_baseline": list(versions),
+    expected = {"format": schema_baseline.CURRENT_BLOB_BACKUP_FORMAT, "schema_versions": versions,
+                "schema_baseline": list(versions),
                 "registered_packs": registrations,
                 "artifacts": len(artifacts), "roots": roots, "repos": repos, "producer": producer,
                 "registration_scopes": {row["registration_id"]: (row["repository_id"], row["pack_id"])
                                         for row in artifacts},
                 "serving_read": serving_read_marker(repos[0]["id"], tenant)}
     carry = {table: {"rows": 2, "sha256": "00" * 32} for table in support._CARRY_TABLES}
-    manifest = {"format": 22, "schema_versions": list(versions),
+    manifest = {"format": schema_baseline.CURRENT_BLOB_BACKUP_FORMAT, "schema_versions": list(versions),
                 "repositories": [{"id": repo["id"], "backend": "pg_refstore"} for repo in repos],
                 # `closure_of` and the file entries are both derived from the
                 # archived `length`, never from an A4 column.
@@ -1605,18 +1606,22 @@ class Format22ManifestTest(unittest.TestCase):
 
     def test_not_format22_is_refused(self):
         manifest, expected = positive_inputs()
-        manifest["format"] = 21
-        with self.assertRaisesRegex(AssertionError, "not format22"):
+        manifest["format"] = schema_baseline.CURRENT_BACKUP_FORMAT
+        with self.assertRaisesRegex(AssertionError, f"not format{schema_baseline.CURRENT_BLOB_BACKUP_FORMAT}"):
             support.format22_manifest_checks(manifest, expected)
 
     def test_realistic_full_ordered_schema_vector_is_accepted(self):
-        # Format22 returns every applied migration, not just its maximum: the
-        # realistic archive carries the complete ascending baseline ending at 147.
+        # Current paired backups return every applied migration, not just its maximum.
         versions = list(schema_baseline.SCHEMA_VERSIONS)
         self.assertGreater(len(versions), 1)
         self.assertEqual(versions, sorted(set(versions)))
-        self.assertEqual(versions[-1], 147)
-        self.assertEqual(support.expected_schema_versions(versions, schema_baseline.SCHEMA_VERSIONS, 147), versions)
+        self.assertEqual(versions[-1], schema_baseline.CURRENT_SCHEMA_VERSION)
+        self.assertEqual(
+            support.expected_schema_versions(
+                versions, schema_baseline.SCHEMA_VERSIONS, schema_baseline.CURRENT_SCHEMA_VERSION
+            ),
+            versions,
+        )
         manifest, expected = positive_inputs()
         self.assertEqual(manifest["schema_versions"], versions)
         support.format22_manifest_checks(manifest, expected)
@@ -1624,11 +1629,11 @@ class Format22ManifestTest(unittest.TestCase):
     def test_missing_reordered_or_extra_schema_versions_are_refused(self):
         manifest, expected = positive_inputs()
         versions = list(schema_baseline.SCHEMA_VERSIONS)
-        for bad in ([147],                 # only the maximum (the old wrong assumption)
+        for bad in ([versions[-1]],                 # only the maximum (the old wrong assumption)
                     versions[:-1],         # drop the current version
                     versions[1:],          # drop the first migration
                     versions[0:1] + versions[2:],  # drop a middle migration
-                    versions[:-1] + [146, 147],    # duplicate an entry
+                    versions[:-1] + [versions[-2], versions[-1]],    # duplicate an entry
                     [versions[1], versions[0]] + versions[2:],  # first two swapped
                     versions[:-1] + [versions[-1] + 1],  # an unknown extra max version
                     versions + [versions[-1] + 1]):  # an extra appended version
@@ -1641,14 +1646,15 @@ class Format22ManifestTest(unittest.TestCase):
         # The oracle must be an independent full vector ending at the supported
         # current version, never a self-derived or malformed expectation.
         baseline = list(schema_baseline.SCHEMA_VERSIONS)
-        for bad in ([147], [], [1, 2, 3], [147, 146], [146, 147, 148], [1, 1, 2, 147],
-                    baseline[:-1], baseline[1:], baseline + [148]):
+        current = schema_baseline.CURRENT_SCHEMA_VERSION
+        for bad in ([current], [], [1, 2, 3], [current, current - 1], [current - 1, current, current + 1],
+                    [1, 1, 2, current], baseline[:-1], baseline[1:], baseline + [current + 1]):
             with self.assertRaises(AssertionError, msg=str(bad)):
-                support.expected_schema_versions(bad, baseline, 147)
+                support.expected_schema_versions(bad, baseline, current)
         with self.assertRaises(AssertionError):
-            support.expected_schema_versions(baseline, baseline, 148)
+            support.expected_schema_versions(baseline, baseline, current + 1)
         with self.assertRaises(TypeError):
-            support.expected_schema_versions(None, baseline, 147)
+            support.expected_schema_versions(None, baseline, current)
 
 
 class Format22RestoredServingReadTest(unittest.TestCase):
@@ -1705,7 +1711,7 @@ class NativeFixtureContractTest(unittest.TestCase):
         tenant = str(uuid.uuid4())
         producer = producer or str(uuid.uuid4())
         repositories = [ready_repo(str(uuid.uuid4()), tenant), ready_repo(str(uuid.uuid4()), tenant)]
-        return {"kind": support.MARKER_KIND, "format": 22,
+        return {"kind": support.MARKER_KIND, "format": schema_baseline.CURRENT_BLOB_BACKUP_FORMAT,
                 "repositories": repositories,
                 "bound_repository_id": repositories[0]["id"],
                 "tenant_id": tenant,

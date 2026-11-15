@@ -621,8 +621,8 @@ class Drill(BlobOnlyHarness):
                     process.wait(timeout=10)
         assert self.advisory_holds(self.source_db) == 0, "backup did not release its exclusive barrier"
         manifest = json.loads(self.backup.joinpath("manifest.json").read_text())
-        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 22
-        assert manifest["schema_versions"] == SCHEMA_VERSIONS and max(SCHEMA_VERSIONS) == 147
+        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 24
+        assert manifest["schema_versions"] == SCHEMA_VERSIONS and max(SCHEMA_VERSIONS) == CURRENT_SCHEMA_VERSION
         assert len(manifest["repositories"]) == 2
         assert manifest["blob_closure"]["artifacts"] == self.closure_rows["count"]
         assert len(manifest["blob_artifacts"]) == manifest["blob_closure"]["artifacts"]
@@ -1259,11 +1259,11 @@ class Drill(BlobOnlyHarness):
         registration_scopes = {str(row["registration_id"]): (str(markers["bound_repository_id"]), str(row["pack_id"]))
                                for row in markers["registrations"]}
         detail = format22_manifest_checks(manifest, {
-            "format": 22, "schema_versions": SCHEMA_VERSIONS, "schema_baseline": SCHEMA_VERSIONS,
+            "format": CURRENT_BACKUP_FORMAT, "schema_versions": SCHEMA_VERSIONS, "schema_baseline": SCHEMA_VERSIONS,
             "registered_packs": registrations, "registration_scopes": registration_scopes,
             "artifacts": len(registrations) * 2, "roots": markers["roots"], "repos": markers["repositories"],
             "producer": markers["producer_owner_id"], "serving_read": markers["serving_read"]})
-        assert result["format"] == 22 and result["blob_artifacts"] == detail["closure_artifacts"], result
+        assert result["format"] == CURRENT_BACKUP_FORMAT and result["blob_artifacts"] == detail["closure_artifacts"], result
         self.format22 = {"directory": self.root / "format22-forward", "manifest": manifest, "detail": detail}
         return detail
 
@@ -1310,7 +1310,7 @@ class Drill(BlobOnlyHarness):
         self.format22_target = self.new_database(self.restore_admin)
         archive = self.format22_archive()
         restore = self.format22_restore()
-        return {"format": 22, "archive": archive, "restore": restore}
+        return {"format": CURRENT_BACKUP_FORMAT, "archive": archive, "restore": restore}
 
 
     def cleanup(self):

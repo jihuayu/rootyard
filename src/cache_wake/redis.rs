@@ -731,6 +731,7 @@ mod tests {
     fn test_key(kind: CacheKind, version: u64, discriminator: &str) -> CacheKey {
         CacheKey::new(CacheKeyParts {
             environment: "standalone",
+            authority: "git-native",
             schema: 1,
             history_incarnation: Uuid::nil(),
             tenant: Uuid::from_u128(11),

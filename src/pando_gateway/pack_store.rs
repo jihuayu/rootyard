@@ -268,6 +268,7 @@ impl PackStore {
             let (cipher_slot, pack_envelope_slot, index_cipher_slot, index_envelope_slot) = {
                 let mut client = timed_result(Phase::PoolCheckout, pool.get()).await?;
                 let tx = client.transaction().await?;
+                super::pitr_fence::ensure_not_fenced(&*tx).await?;
                 let (cipher, envelope) = retention::reserve_pair(
                     &*tx,
                     tenant_id,
@@ -296,6 +297,7 @@ impl PackStore {
                 .await?;
             let mut client = timed_result(Phase::PoolCheckout, pool.get()).await?;
             let tx = client.transaction().await?;
+            super::pitr_fence::ensure_not_fenced(&*tx).await?;
             let authority = retention::authority(&*tx).await?;
             let active = retention::activate(
                 &*tx,
