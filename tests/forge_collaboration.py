@@ -524,6 +524,62 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
             for h in pat_hits["items"]
         )
 
+        # A restricted parent PAT can sign in a browser child; live parent grants
+        # must drive both the search result filter and the notification inbox.
+        browser_pat = json.loads(
+            self.expect(
+                "/api/tokens",
+                201,
+                token=self.bob,
+                method="POST",
+                body={
+                    "display_name": "browser-scope-inheritance",
+                    "expires_in_days": 1,
+                    "read_only": True,
+                    "repository_grants": [
+                        {
+                            "repository_id": self.demo["id"],
+                            "actions": ["repo_read", "issues_read", "pulls_read"],
+                        }
+                    ],
+                    "namespace_grants": [],
+                },
+            )
+        )
+        self.secrets.append(browser_pat["secret"])
+        browser_cookies, _, _ = self.sign_in(username="bob", token=browser_pat["secret"])
+        browser_headers = {"Cookie": self.cookie_header(browser_cookies)}
+        status, page, _ = self.request("/web/search?q=needle&scope=all", headers=browser_headers)
+        assert status == 200
+        assert b'data-hit-count="0"' not in page
+        assert b'data-hit-kind="issue"' in page and b'data-hit-kind="pull"' in page
+        assert b'data-hit-owner="alice"' in page and b'data-hit-owner="collab-org"' not in page
+        status, page, _ = self.request("/web/notifications", headers=browser_headers)
+        assert status == 200
+        assert b'data-notification-count="0"' not in page
+        assert b"/issues/" in page and b"/pulls/1" in page
+        narrowed = json.loads(
+            self.expect(
+                f"/api/tokens/{browser_pat['id']}",
+                200,
+                token=self.bob,
+                method="PATCH",
+                body={
+                    "expected_scope_version": browser_pat["scope_version"],
+                    "repository_grants": [],
+                    "namespace_grants": [],
+                },
+            )
+        )
+        assert narrowed["scope_version"] == browser_pat["scope_version"] + 1
+        assert narrowed["repository_grants"] == [] and narrowed["namespace_grants"] == []
+        status, page, _ = self.request("/web/search?q=needle&scope=all", headers=browser_headers)
+        assert status == 200 and b'data-hit-count="0"' in page
+        status, page, _ = self.request("/web/notifications", headers=browser_headers)
+        assert status == 200 and b'data-notification-count="0"' in page
+        status, _, _ = self.request("/web/repos/alice/demo/search?q=needle", headers=browser_headers)
+        assert status == 403, status
+
         # Live permission revocation immediately hides search hits AND notifications for Carol
         before_carol = json.loads(self.expect("/api/search?q=needle&scope=all", 200, token=self.carol))
         assert before_carol["items"]
