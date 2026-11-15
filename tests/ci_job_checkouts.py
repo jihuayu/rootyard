@@ -33,6 +33,7 @@ class JobCheckoutHarness(SourcePinHarness):
         self.audience = str(uuid.uuid4())
         self.env["ROOTYARD_CI_MIRROR_AUDIENCE"] = self.audience
         self.mirror_env["ROOTYARD_CI_MIRROR_AUDIENCE"] = self.audience
+        self.env["ROOTYARD_WEBHOOK_ALLOW_LOOPBACK"] = "true"
 
     def request_body(self, oid=None, job=None, **overrides):
         body = dict(job_id=job or str(uuid.uuid4()), target_oid=oid or self.second,
