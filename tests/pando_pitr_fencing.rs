@@ -450,7 +450,15 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
         admin.get().await?.batch_execute(&format!("CREATE SCHEMA {s}")).await?;
     }
 
+    let admin_task = admin.clone();
+    let schema_a_task = schema_a.clone();
+    let schema_b_task = schema_b.clone();
+    let schema_c_task = schema_c.clone();
     let result = tokio::spawn(async move {
+        let admin = admin_task;
+        let schema_a = schema_a_task;
+        let schema_b = schema_b_task;
+        let schema_c = schema_c_task;
         let s3 = LoopbackS3::start().await?;
         let tmp = TempDir::new()?;
         let data_a = tmp.path().join("data-a");
