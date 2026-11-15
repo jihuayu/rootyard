@@ -22,12 +22,22 @@
 //!   row, a forged `storage_backend` string or a stored hex value is never
 //!   authority.
 //!
+//! * [`check_version`] is the narrow internal CheckVersion service boundary.
+//!   One owned read-only transaction runs the authorized serving lookup above
+//!   and then the owning core `check_version_in_tx`, returning the existing
+//!   `Unknown`/`Unchanged`/`Changed` gate observation. It has no REST route,
+//!   grants no write authority and mints no token/HWM/byte-closure proof.
+//!
 //! The durable binding names the exact row (id, owner, name, object format,
 //! history, both epochs, opened Blob digest). Migration-145 triggers and the
 //! shared locked predicate both enforce it; every pool checkout is deadline
 //! bounded (`max_size = 1` is supported) and released before a post-commit read.
 //!
-//! Both entry points are internal trusted-caller APIs: the backend identity is
+//! Durable snapshot and retention-root HTTP resources remain separate later
+//! work. These internal service facades alone do not close #107 and are not a
+//! foundation-only PR.
+//!
+//! These entry points are internal trusted-caller APIs: the backend identity is
 //! passed by the engine from the store it actually opened and is never accepted
 //! from HTTP. [`crate::blob_store::BlobBackendIdentity`] has private
 //! constructors outside the `blob_store` subtree, so an HTTP layer cannot mint
@@ -58,9 +68,11 @@ use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 mod authority;
+mod check_version;
 mod snapshot_metadata;
 
 pub(crate) use authority::AuthorityKind;
+pub use check_version::check_version;
 pub use snapshot_metadata::{
     PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead, ServingSnapshotRelease,
     ServingSnapshotRenew,

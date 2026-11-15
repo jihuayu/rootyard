@@ -36,7 +36,7 @@ use rootyard::ref_store::core::{
 };
 use rootyard::ref_store::serving::{
     PgServingSnapshotMetadata, ProvisionRequest, ServingSnapshotCreate, ServingSnapshotRead,
-    ServingSnapshotRelease, ServingSnapshotRenew, provision,
+    ServingSnapshotRelease, ServingSnapshotRenew, check_version, provision,
 };
 use rootyard::ref_store::{
     CoreGateInit, CoreGateVersion, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataMutationAction,
@@ -244,6 +244,26 @@ impl Db {
         user_id: Uuid,
         username: &str,
     ) -> Result<(db::Identity, Uuid)> {
+        self.restricted_identity_with(
+            repository_id,
+            user_id,
+            username,
+            &["contents_read", "contents_write"],
+            false,
+        )
+        .await
+    }
+
+    /// Initial fixture-only restricted token metadata. Not a production token
+    /// API or scope-PATCH transport proof.
+    async fn restricted_identity_with(
+        &self,
+        repository_id: Uuid,
+        user_id: Uuid,
+        username: &str,
+        actions: &[&str],
+        read_only: bool,
+    ) -> Result<(db::Identity, Uuid)> {
         let token = format!("ryt_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let token_id = Uuid::new_v4();
         let digest = db::digest(&token);
@@ -251,16 +271,16 @@ impl Db {
         client
             .execute(
                 "INSERT INTO tokens(id,user_id,digest,read_only,kind,is_restricted)
-                 VALUES($1,$2,$3,false,'api',true)",
-                &[&token_id, &user_id, &digest],
+                 VALUES($1,$2,$3,$4,'api',true)",
+                &[&token_id, &user_id, &digest, &read_only],
             )
             .await?;
-        for action in ["contents_read", "contents_write"] {
+        for action in actions {
             client
                 .execute(
                     "INSERT INTO token_repository_scopes(token_id,repository_id,action)
                      VALUES($1,$2,$3)",
-                    &[&token_id, &repository_id, &action],
+                    &[&token_id, &repository_id, action],
                 )
                 .await?;
         }
@@ -275,6 +295,33 @@ impl Db {
             "restricted identity differs"
         );
         Ok((identity, token_id))
+    }
+
+    /// Initial fixture-only authenticated non-member with no repository role and
+    /// no token grants. Not a production token API proof.
+    async fn outsider(&self) -> Result<db::Identity> {
+        let user_id = Uuid::new_v4();
+        let username = format!("out{}", &user_id.simple().to_string()[..12]);
+        let token = format!("ryt_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_id = Uuid::new_v4();
+        let digest = db::digest(&token);
+        let client = self.pool.get().await?;
+        client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&user_id, &username]).await?;
+        client
+            .execute(
+                "INSERT INTO tokens(id,user_id,digest,read_only,kind,is_restricted)
+                 VALUES($1,$2,$3,false,'api',false)",
+                &[&token_id, &user_id, &digest],
+            )
+            .await?;
+        drop(client);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}"))?);
+        let identity = auth::authenticate(&self.pool, &headers)
+            .await
+            .map_err(|error| anyhow!("outsider token authentication failed: {}", error.1))?;
+        ensure!(identity.id == user_id && identity.token_id == token_id, "outsider identity differs");
+        Ok(identity)
     }
 
     /// Initial fixture-only role metadata: one non-owner collaborator with the
@@ -3512,6 +3559,279 @@ async fn serving_metadata_late_read_scope_denial_masks_expired_state() -> Result
             .await?
             .get(0);
         ensure!(remaining == 0, "late narrowing did not commit the removed read grant");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_check_version_observes_current_gate_without_state_change() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-check", &store).await?;
+        let mut verified =
+            serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let initial = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+
+        let changed = check_version(
+            &db.pool,
+            &actor.identity,
+            &actor.username,
+            "serving-check",
+            None,
+            &backend,
+            deadline(),
+        )
+        .await?;
+        let v0 = match changed {
+            VersionCheck::Changed(version) => version,
+            other => return Err(anyhow!("initial serving check was not Changed: {other:?}")),
+        };
+        ensure!(v0.repository_id() == repo && v0.tenant_id() == tenant, "initial gate identity differs");
+        ensure!(
+            v0 == gate_version(&db.pool, repo, tenant).await?,
+            "initial serving check differs from the owning core gate"
+        );
+        match check_version(
+            &db.pool,
+            &actor.identity,
+            &actor.username,
+            "serving-check",
+            Some(&v0),
+            &backend,
+            deadline(),
+        )
+        .await?
+        {
+            VersionCheck::Unchanged(version) => ensure!(version == v0, "same-known gate changed"),
+            other => return Err(anyhow!("same-known serving check was not Unchanged: {other:?}")),
+        }
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == initial,
+            "serving version observations changed core metadata state"
+        );
+
+        // Initial fixture-only restricted token metadata: read-only token with
+        // exactly ContentsRead. It must accept this non-mutating observation.
+        let (reader, _) = db
+            .restricted_identity_with(repo, actor.id, &actor.username, &["contents_read"], true)
+            .await?;
+        match check_version(
+            &db.pool,
+            &reader,
+            &actor.username,
+            "serving-check",
+            Some(&v0),
+            &backend,
+            deadline(),
+        )
+        .await?
+        {
+            VersionCheck::Unchanged(version) => ensure!(version == v0, "read-only token gate changed"),
+            other => return Err(anyhow!("read-only ContentsRead check was not Unchanged: {other:?}")),
+        }
+
+        // Single-connection pool: the facade owns exactly one checkout for
+        // BEGIN/auth/core read/rollback, with no post-read re-checkout.
+        let small = db.new_pool(1)?;
+        match check_version(
+            &small,
+            &actor.identity,
+            &actor.username,
+            "serving-check",
+            Some(&v0),
+            &backend,
+            deadline(),
+        )
+        .await?
+        {
+            VersionCheck::Unchanged(version) => ensure!(version == v0, "single-pool gate changed"),
+            other => return Err(anyhow!("single-pool check was not Unchanged: {other:?}")),
+        }
+        drop(small);
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == initial,
+            "read-only/single-pool serving checks changed core metadata state"
+        );
+
+        // A real decision-gated serving ref publication advances the owning gate.
+        serving_advance(&db, &store, &git, &mut verified, &actor.identity, 2, b"serving check advance\n")
+            .await?;
+        let after_advance = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        let v1 = match check_version(
+            &db.pool,
+            &actor.identity,
+            &actor.username,
+            "serving-check",
+            Some(&v0),
+            &backend,
+            deadline(),
+        )
+        .await?
+        {
+            VersionCheck::Changed(version) => version,
+            other => return Err(anyhow!("advanced serving check was not Changed: {other:?}")),
+        };
+        ensure!(v1.revision() > v0.revision(), "advanced gate revision did not move");
+        ensure!(v1 == gate_version(&db.pool, repo, tenant).await?, "advanced serving check differs from core");
+        match check_version(
+            &db.pool,
+            &actor.identity,
+            &actor.username,
+            "serving-check",
+            Some(&v1),
+            &backend,
+            deadline(),
+        )
+        .await?
+        {
+            VersionCheck::Unchanged(version) => ensure!(version == v1, "post-advance same-known gate changed"),
+            other => return Err(anyhow!("post-advance same-known check was not Unchanged: {other:?}")),
+        }
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == after_advance,
+            "post-advance version observations changed core metadata state"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_check_version_refusals_are_exact_and_state_unchanged() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-check-refusals", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let baseline = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+
+        // Initial fixture-only token metadata: write-only ContentsWrite scope.
+        let (write_only, _) = db
+            .restricted_identity_with(repo, actor.id, &actor.username, &["contents_write"], false)
+            .await?;
+        let error = check_version(
+            &db.pool,
+            &write_only,
+            &actor.username,
+            "serving-check-refusals",
+            None,
+            &backend,
+            deadline(),
+        )
+        .await
+        .expect_err("write-only scope must not perform a read observation");
+        ensure!(
+            error.0 == axum::http::StatusCode::FORBIDDEN
+                && error.1 == "token scope does not permit this action",
+            "write-only refusal changed: {} {}",
+            error.0,
+            error.1
+        );
+
+        // Initial fixture-only authenticated non-member with no role/grant.
+        let outsider = db.outsider().await?;
+        let error = check_version(
+            &db.pool,
+            &outsider,
+            &actor.username,
+            "serving-check-refusals",
+            None,
+            &backend,
+            deadline(),
+        )
+        .await
+        .expect_err("non-member must not observe a repository gate");
+        ensure!(
+            error.0 == axum::http::StatusCode::NOT_FOUND && error.1 == "not found",
+            "non-member refusal changed: {} {}",
+            error.0,
+            error.1
+        );
+
+        // A real second serving repository owned by another actor is foreign to
+        // this actor. Its state is changed only for the later not-ready case.
+        let (_other_tenant, other_repo, other_actor, other_backend) =
+            db.serving_business("serving-check-other", &store).await?;
+        let error = check_version(
+            &db.pool,
+            &actor.identity,
+            &other_actor.username,
+            "serving-check-other",
+            None,
+            &backend,
+            deadline(),
+        )
+        .await
+        .expect_err("foreign repository must not be observable");
+        ensure!(
+            error.0 == axum::http::StatusCode::NOT_FOUND && error.1 == "not found",
+            "foreign-repository refusal changed: {} {}",
+            error.0,
+            error.1
+        );
+
+        // Different actually-opened Blob backend for the authorized repo.
+        let wrong_backend = serving_support::backend_identity("serving-check-wrong")?;
+        let error = check_version(
+            &db.pool,
+            &actor.identity,
+            &actor.username,
+            "serving-check-refusals",
+            None,
+            &wrong_backend,
+            deadline(),
+        )
+        .await
+        .expect_err("wrong opened Blob backend must be refused");
+        ensure!(
+            error.0 == axum::http::StatusCode::CONFLICT
+                && error.1 == "repository is bound to a different Blob backend",
+            "backend refusal changed: {} {}",
+            error.0,
+            error.1
+        );
+
+        // Fixture-owned not-ready state on the second real serving repo. The
+        // check must preserve the exact readiness refusal, not fake Unknown.
+        db.pool
+            .get()
+            .await?
+            .execute("UPDATE repositories SET state='provisioning' WHERE id=$1", &[&other_repo])
+            .await?;
+        let other_baseline = metadata_ledger_snapshot(&db.pool, other_repo, other_actor.id).await?;
+        let error = check_version(
+            &db.pool,
+            &other_actor.identity,
+            &other_actor.username,
+            "serving-check-other",
+            None,
+            &other_backend,
+            deadline(),
+        )
+        .await
+        .expect_err("not-ready repository must be refused");
+        ensure!(
+            error.0 == axum::http::StatusCode::CONFLICT && error.1 == "repository is not ready",
+            "not-ready refusal changed: {} {}",
+            error.0,
+            error.1
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, other_repo, other_actor.id).await? == other_baseline,
+            "not-ready version observation changed the other repository state"
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == baseline,
+            "serving CheckVersion refusals changed the authorized repository state"
+        );
         Ok::<(), anyhow::Error>(())
     }
     .await;
