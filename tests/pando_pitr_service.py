@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from dataclasses import dataclass
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -57,6 +58,18 @@ TOPOLOGY = {
     "recovery": "logical pg_dump/pg_restore metadata clone plus simulated epoch rollback; not physical PostgreSQL WAL/PITR",
     "qualification": "functional local acceptance only; not cloud, hardware, external-provider or production qualification",
 }
+
+
+@dataclass(frozen=True)
+class AcceptanceSpec:
+    """One internal acceptance report contract; defaults preserve the old cases."""
+
+    kind: str
+    mandatory_cases: tuple[str, ...]
+    topology: dict
+    limitations: tuple[str, ...]
+
+
 LIMITATIONS = [
     "No real external Garage/S3 or Vault service is exercised.",
     "No physical PostgreSQL WAL, backup, PITR, host/disk failure, RPO/RTO, cloud or hardware qualification is claimed.",
@@ -64,6 +77,13 @@ LIMITATIONS = [
     "Suite cleanup is best-effort and is not asserted; cleanup_passed is intentionally not reported.",
     "CI run identifiers and comments are not evidence by themselves; only the bound source, binary, receipt and executed cases are reported.",
 ]
+
+DEFAULT_ACCEPTANCE_SPEC = AcceptanceSpec(
+    kind="rootyard/pando-pitr-service-acceptance",
+    mandatory_cases=MANDATORY_CASES,
+    topology=TOPOLOGY,
+    limitations=tuple(LIMITATIONS),
+)
 
 
 class _DaemonHTTPServer(ThreadingHTTPServer):
@@ -1116,9 +1136,9 @@ def _postflight(
     return current
 
 
-def _case_records(results: dict) -> list[dict]:
+def _case_records(results: dict, cases: tuple[str, ...] = MANDATORY_CASES) -> list[dict]:
     records = []
-    for name in MANDATORY_CASES:
+    for name in cases:
         if results.get(name) is True:
             status = "passed"
         elif name in results:
@@ -1168,12 +1188,13 @@ def _build_report(
     passed: bool,
     failure: dict | None,
     elapsed: float,
+    spec: AcceptanceSpec = DEFAULT_ACCEPTANCE_SPEC,
 ) -> dict:
-    cases = _case_records(results)
+    cases = _case_records(results, spec.mandatory_cases)
     start_binary = start["binary"] if start else None
     start_receipt = start["receipt"] if start else None
     report = {
-        "kind": "rootyard/pando-pitr-service-acceptance",
+        "kind": spec.kind,
         "passed": bool(passed),
         "source_commit": expect_commit,
         "source_head": start["source_head"] if start else None,
@@ -1186,22 +1207,54 @@ def _build_report(
         "build_receipt_sha256": start_receipt["sha256"] if start_receipt else None,
         "toolchain": _toolchain_summary(validated) if validated is not None else None,
         "cases": cases,
-        "expected_cases": list(MANDATORY_CASES),
+        "expected_cases": list(spec.mandatory_cases),
         "case_count": len(cases),
         "provenance_unchanged": bool(start is not None and start == end),
         "provenance": {
             "before": _public_snapshot(start),
             "after": _public_snapshot(end),
         },
-        "topology": dict(TOPOLOGY),
-        "limitations": list(LIMITATIONS),
+        "topology": dict(spec.topology),
+        "limitations": list(spec.limitations),
         "duration_seconds": round(elapsed, 3),
     }
-    for name in MANDATORY_CASES:
+    for name in spec.mandatory_cases:
         report[name] = results.get(name) is True
     if failure is not None:
         report["failure"] = dict(failure)
     return report
+
+
+def _validated_spec(spec: AcceptanceSpec) -> AcceptanceSpec:
+    if not isinstance(spec, AcceptanceSpec):
+        raise EvidenceError("report", "spec_invalid")
+    cases = spec.mandatory_cases
+    if (
+        not isinstance(cases, tuple)
+        or not cases
+        or any(not isinstance(name, str) or not name for name in cases)
+        or len(set(cases)) != len(cases)
+    ):
+        raise EvidenceError("report", "spec_invalid")
+    if not isinstance(spec.kind, str) or not spec.kind:
+        raise EvidenceError("report", "spec_invalid")
+    if not isinstance(spec.topology, dict):
+        raise EvidenceError("report", "spec_invalid")
+    if not isinstance(spec.limitations, tuple) or any(
+        not isinstance(item, str) or not item for item in spec.limitations
+    ):
+        raise EvidenceError("report", "spec_invalid")
+    return spec
+
+
+def _merge_report_extra(report: dict, extra: dict) -> None:
+    if not isinstance(extra, dict):
+        raise EvidenceError("report", "extra_invalid")
+    reserved = set(report) | {"failure", "failure_traceback"}
+    for key, value in extra.items():
+        if not isinstance(key, str) or not key or key in reserved:
+            raise EvidenceError("report", "extra_invalid")
+        report[key] = value
 
 
 def run_acceptance(
@@ -1214,9 +1267,12 @@ def run_acceptance(
     source_root: Path = ROOT,
     harness_files: list[Path] | None = None,
     suite=None,
+    spec: AcceptanceSpec | None = None,
+    extra_report: dict | None = None,
 ) -> dict:
     """Run the live suite only after binding it to exact, unchanged evidence."""
     suite = run_suite if suite is None else suite
+    spec = _validated_spec(DEFAULT_ACCEPTANCE_SPEC if spec is None else spec)
     harness_files = (
         [ROOT / name for name in OWNED_HARNESS_FILES]
         if harness_files is None
@@ -1253,7 +1309,7 @@ def run_acceptance(
             raise EvidenceError("suite", "deadline_exceeded")
         if results.get("passed") is not True:
             failure = {"phase": "suite", "code": "suite_not_passed"}
-        elif any(case["status"] != "passed" for case in _case_records(results)):
+        elif any(case["status"] != "passed" for case in _case_records(results, spec.mandatory_cases)):
             failure = {"phase": "suite", "code": "mandatory_case_not_passed"}
         passed = failure is None and start == end
     except EvidenceError as error:
@@ -1278,7 +1334,18 @@ def run_acceptance(
         passed=passed,
         failure=failure,
         elapsed=elapsed,
+        spec=spec,
     )
+    if extra_report is not None:
+        try:
+            _merge_report_extra(report, extra_report)
+        except EvidenceError as error:
+            report["passed"] = False
+            report["failure"] = {
+                "phase": error.phase,
+                "code": error.code,
+                "exception_class": error.__class__.__name__,
+            }
     if report_path is not None:
         receipts.atomic_write_json(report_path, report)
     return report
