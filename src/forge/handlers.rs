@@ -91,6 +91,8 @@ struct Issue {
     body: String,
     state: String,
     version: i64,
+    label_version: i64,
+    assignee_version: i64,
     created_at: String,
     updated_at: String,
 }
@@ -104,6 +106,8 @@ impl Issue {
             body: row.get("body"),
             state: row.get("state"),
             version: row.get("version"),
+            label_version: row.get("label_version"),
+            assignee_version: row.get("assignee_version"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         }
@@ -117,27 +121,37 @@ pub(super) struct Comment {
     author_id: Uuid,
     body: String,
     version: i64,
+    edited_at: Option<String>,
+    deleted_at: Option<String>,
+    moderation_state: String,
+    moderation_reason: String,
     created_at: String,
     updated_at: String,
 }
 impl Comment {
     pub(super) fn row(row: &Row) -> Self {
+        let moderation_state: String = row.get("moderation_state");
+        let raw_body: String = row.get("body");
         Self {
             repository_id: row.get("repository_id"),
             issue_number: row.get("issue_number"),
             number: row.get("number"),
             author_id: row.get("author_id"),
-            body: row.get("body"),
+            body: super::moderation::display_comment_body(&raw_body, &moderation_state),
             version: row.get("version"),
+            edited_at: row.get("edited_at"),
+            deleted_at: row.get("deleted_at"),
+            moderation_state,
+            moderation_reason: row.get("moderation_reason"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         }
     }
 }
 const ISSUE_FIELDS: &str =
-    "repository_id,number,author_id,title,body,state,version,created_at::text,updated_at::text";
+    "repository_id,number,author_id,title,body,state,version,label_version,assignee_version,created_at::text,updated_at::text";
 pub(super) const COMMENT_FIELDS: &str =
-    "repository_id,issue_number,number,author_id,body,version,created_at::text,updated_at::text";
+    "repository_id,issue_number,number,author_id,body,version,edited_at::text,deleted_at::text,moderation_state,moderation_reason,created_at::text,updated_at::text";
 
 pub(super) fn json(status: StatusCode, value: impl Serialize) -> Response {
     (status, [(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
@@ -253,6 +267,24 @@ pub async fn create_issue(
     let row = tx.query_one(&format!("INSERT INTO forge_issues (tenant_id,repository_id,number,author_id,title,body) VALUES($1,$2,$3,$4,$5,$6) RETURNING {ISSUE_FIELDS}"), &[&tenant_id, &repo, &number, &actor.id, &input.title, &input.body]).await.map_err(Error::internal)?;
     let issue = serde_json::to_value(Issue::row(&row)).map_err(Error::internal)?;
     record_creation(&tx, tenant_id, repo, key, &issue).await?;
+    super::notifications::emit_repo_notifications(
+        &tx,
+        super::notifications::NotifySpec {
+            tenant_id,
+            repository_id: repo,
+            actor_id: actor.id,
+            target_type: "issue",
+            target_number: number,
+            thread_type: "issue",
+            thread_number: number,
+            event_kind: "issue_opened",
+            delivery_key: &format!("issue:{repo}:{number}:opened"),
+            title: &format!("Issue #{number}: {}", input.title),
+            body_excerpt: &input.body,
+            extra_recipients: &[],
+        },
+    )
+    .await?;
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::CREATED, issue))
 }
