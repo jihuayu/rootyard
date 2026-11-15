@@ -6,7 +6,6 @@
 use super::*;
 use crate::pando_gateway::{prepare, publish, snapshot};
 use axum::http::request::Parts;
-use std::time::Duration;
 
 const MAX_RECEIVE_REPLY: u64 = 8 * 1024 * 1024;
 
@@ -42,7 +41,9 @@ pub(super) async fn execute(
         .map_err(|_| Error::timeout())?;
     let snapshot = Box::pin(snapshot::materialize(&state, &repo, &snapshot_lease, deadline)).await?;
     drop(read_guard);
-    transfer_authorized(&state, Some(&actor), None, None, &repo, true).await.map_err(Error::internal)?;
+    transfer_authorized(&state, Some(&actor), None, None, &repo, true, super::revocation::bound().reauth_timeout)
+        .await
+        .map_err(Error::internal)?;
     ref_guard.ensure_active()?;
     crate::sharding::fencing::check_before_push(&state, &repo).await?;
     let (status, content_type, reply) = ref_guard
@@ -87,7 +88,9 @@ pub(super) async fn execute(
     }
     ref_guard.ensure_active()?;
     snapshot_lease.ensure_active()?;
-    transfer_authorized(&state, Some(&actor), None, None, &repo, true).await.map_err(Error::internal)?;
+    transfer_authorized(&state, Some(&actor), None, None, &repo, true, super::revocation::bound().reauth_timeout)
+        .await
+        .map_err(Error::internal)?;
     state.transfer_metrics.record_success();
     receive_response(status, content_type, reply)
 }
@@ -276,5 +279,5 @@ async fn ref_check(
     lease: &storage::read_leases::Lease,
 ) -> io::Result<()> {
     lease.ensure_active().map_err(|_| io::Error::other("Pando read lease lost"))?;
-    transfer_authorized(state, Some(actor), None, None, repo, true).await
+    transfer_authorized(state, Some(actor), None, None, repo, true, super::revocation::bound().reauth_timeout).await
 }
