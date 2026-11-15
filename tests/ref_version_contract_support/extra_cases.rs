@@ -47,14 +47,14 @@ fn registered_pack_bridge_builds_causal_pack_set_digest_and_closure_pack() {
     assert_eq!(closure_p1.verified_bytes(), 4096 + 128);
     assert_eq!(closure_p1.artifact_count(), 2);
 
-    let sha_p = ContentDigest::parse(&"1".repeat(64)).unwrap();
-    let sha_i = ContentDigest::parse(&"2".repeat(64)).unwrap();
+    let sha_p = ContentDigest::parse("1".repeat(64)).unwrap();
+    let sha_i = ContentDigest::parse("2".repeat(64)).unwrap();
     let loc_p = ArtifactLocator::new(tenant_id, authority_id, 1, uid(501), "core-pack", sha_p.clone(), 512).unwrap();
     let loc_i = ArtifactLocator::new(tenant_id, authority_id, 1, uid(502), "core-pack", sha_i.clone(), 128).unwrap();
     let art_p =
-        RegisteredArtifact::new(PackArtifactRole::Pack, 0, uid(601), loc_p, "s3", &"a".repeat(64), sha_p, 512).unwrap();
+        RegisteredArtifact::new(PackArtifactRole::Pack, 0, uid(601), loc_p, "s3", "a".repeat(64), sha_p, 512).unwrap();
     let art_i =
-        RegisteredArtifact::new(PackArtifactRole::Idx, 1, uid(602), loc_i, "fs", &"b".repeat(64), sha_i, 128).unwrap();
+        RegisteredArtifact::new(PackArtifactRole::Idx, 1, uid(602), loc_i, "fs", "b".repeat(64), sha_i, 128).unwrap();
     let mixed_arts = vec![art_p, art_i];
     let mixed_digest = ArtifactSetDigest::of(&mixed_arts);
     let bad_pack = RegisteredPack::new(uid(701), uid(702), mixed_digest, mixed_arts, None).unwrap();

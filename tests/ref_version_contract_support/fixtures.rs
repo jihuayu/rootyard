@@ -32,8 +32,8 @@ pub fn default_realm() -> RefVersionRealm {
 }
 
 pub fn planned_pack(seed: u64, length: u64) -> PlannedPack {
-    let pack_digest = ContentDigest::parse(&format!("{:064x}", seed * 2 + 1)).unwrap();
-    let idx_digest = ContentDigest::parse(&format!("{:064x}", seed * 2 + 2)).unwrap();
+    let pack_digest = ContentDigest::parse(format!("{:064x}", seed * 2 + 1)).unwrap();
+    let idx_digest = ContentDigest::parse(format!("{:064x}", seed * 2 + 2)).unwrap();
     let pack = PlannedArtifact::new(PackArtifactRole::Pack, pack_digest, length).unwrap();
     let idx = PlannedArtifact::new(PackArtifactRole::Idx, idx_digest, 128).unwrap();
     PlannedPack::new(uid(0x1000 + u128::from(seed)), uid(0x2000 + u128::from(seed)), pack, idx).unwrap()
@@ -48,8 +48,8 @@ pub fn registered_pack(
     length: u64,
     joined_revision: Option<i64>,
 ) -> RegisteredPack {
-    let sha_pack = ContentDigest::parse(&format!("{:064x}", seed * 2 + 1)).unwrap();
-    let sha_idx = ContentDigest::parse(&format!("{:064x}", seed * 2 + 2)).unwrap();
+    let sha_pack = ContentDigest::parse(format!("{:064x}", seed * 2 + 1)).unwrap();
+    let sha_idx = ContentDigest::parse(format!("{:064x}", seed * 2 + 2)).unwrap();
     let loc_pack = ArtifactLocator::new(
         tenant_id,
         authority_id,
