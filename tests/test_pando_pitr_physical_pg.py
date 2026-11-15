@@ -2,7 +2,8 @@
 
 These tests never start PostgreSQL, open a database socket, read a server log or
 claim physical qualification.  They exercise fixed failure mapping, recovery
-configuration, containment checks and the opt-in self-check report boundary.
+configuration, containment checks, owned-descendant closure and the opt-in
+self-check report boundary.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -19,6 +21,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pando_pitr_physical_pg as physical  # noqa: E402
 
+REAL_OWNED = physical._OwnedProcessSet
 FAKE_TOOLS = physical.PgTools(
     initdb=Path("/opt/pg17/bin/initdb"),
     pg_ctl=Path("/opt/pg17/bin/pg_ctl"),
@@ -29,6 +32,68 @@ FAKE_TOOLS = physical.PgTools(
 
 def completed(stdout: bytes = b"") -> SimpleNamespace:
     return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+
+class FakeProcesses:
+    """In-memory /proc boundary; no host process is ever signalled."""
+
+    def __init__(self) -> None:
+        self.records: dict[int, dict] = {}
+        self.signals: list[tuple[int, int]] = []
+        self.boot_id = "boot-test"
+        self.ignore_term: set[int] = set()
+        self.ignore_kill: set[int] = set()
+        self._next_start = 1
+
+    def add(self, pid: int, *, ppid: int = 1, session: int | None = None,
+            pgrp: int | None = None, starttime: int | None = None) -> dict:
+        record = {
+            "pid": pid,
+            "state": "S",
+            "ppid": ppid,
+            "pgrp": pgrp if pgrp is not None else pid,
+            "session": session if session is not None else pid,
+            "starttime": starttime if starttime is not None else self._next_start,
+            "uid": os.getuid(),
+            "boot_id": self.boot_id,
+        }
+        self._next_start = max(self._next_start + 1, record["starttime"] + 1)
+        self.records[pid] = record
+        return record
+
+    def table(self, phase: str) -> dict[int, dict]:
+        return {pid: dict(record) for pid, record in self.records.items()}
+
+    def boot(self, phase: str) -> str:
+        return self.boot_id
+
+    def record(self, pid: int, phase: str) -> dict:
+        if pid not in self.records:
+            raise physical.FixtureError(phase, "process_missing")
+        return dict(self.records[pid])
+
+    def signal(self, pid: int, signum: int) -> None:
+        self.signals.append((pid, signum))
+        if signum == signal.SIGTERM and pid in self.ignore_term:
+            return
+        if signum == signal.SIGKILL and pid in self.ignore_kill:
+            return
+        self.records.pop(pid, None)
+
+    def tracker(self) -> physical._OwnedProcessSet:
+        tracker = REAL_OWNED(
+            table_provider=self.table,
+            boot_id_provider=self.boot,
+            record_provider=self.record,
+            signal_fn=self.signal,
+        )
+        terminate = tracker.terminate_all
+
+        def fast_terminate(phase: str, *, timeout: float = 0.2) -> None:
+            terminate(phase, timeout=timeout)
+
+        tracker.terminate_all = fast_terminate  # bounded test clock
+        return tracker
 
 
 class ToolValidationTest(unittest.TestCase):
@@ -81,8 +146,9 @@ class ToolValidationTest(unittest.TestCase):
 
 
 class FixtureBoundaryTest(unittest.TestCase):
-    def make_fixture(self) -> physical.PhysicalPitrFixture:
+    def make_fixture(self, processes: FakeProcesses | None = None) -> physical.PhysicalPitrFixture:
         fixture = physical.PhysicalPitrFixture(Path("/unused"), tools=FAKE_TOOLS)
+        fixture.owned = (processes or FakeProcesses()).tracker()
         self.addCleanup(fixture.cleanup)
         return fixture
 
@@ -105,7 +171,9 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertTrue((fixture.restored_data / "recovery.signal").is_file())
 
     def test_failed_start_reports_no_pass_and_cleans_owned_scratch(self) -> None:
-        def fake_run(argv, *, phase, timeout=physical.COMMAND_TIMEOUT_SECONDS):
+        processes = FakeProcesses()
+
+        def fake_run(argv, *, phase, timeout=physical.COMMAND_TIMEOUT_SECONDS, owned=None):
             if Path(argv[0]).name == "initdb":
                 data = Path(argv[argv.index("-D") + 1])
                 data.mkdir(parents=True)
@@ -118,6 +186,7 @@ class FixtureBoundaryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="rootyard-physical-test-") as temporary:
             with mock.patch.object(physical, "_validate_pg17_tools", return_value=FAKE_TOOLS), \
+                    mock.patch.object(physical, "_OwnedProcessSet", new=lambda: processes.tracker()), \
                     mock.patch.object(physical, "_run", side_effect=fake_run):
                 report = physical.run_self_check(Path("/unused"), Path(temporary))
             self.assertFalse(report["passed"])
@@ -125,14 +194,16 @@ class FixtureBoundaryTest(unittest.TestCase):
                              {"phase": "start", "code": "command_failed",
                               "exception_class": "FixtureError"})
             self.assertTrue(report["cleanup"]["passed"])
+            self.assertTrue(report["cleanup"]["owned_processes_stopped"])
             self.assertTrue(report["cleanup"]["scratch_removed"])
             self.assertEqual(list(Path(temporary).iterdir()), [])
             self.assertNotIn("postgresql://", json.dumps(report))
 
     def test_failed_basebackup_reports_no_pass_and_stops_primary(self) -> None:
-        state = {"alive": True}
+        processes = FakeProcesses()
+        processes.add(424242, session=424242)
 
-        def fake_run(argv, *, phase, timeout=physical.COMMAND_TIMEOUT_SECONDS):
+        def fake_run(argv, *, phase, timeout=physical.COMMAND_TIMEOUT_SECONDS, owned=None):
             name = Path(argv[0]).name
             if name == "initdb":
                 data = Path(argv[argv.index("-D") + 1])
@@ -141,8 +212,6 @@ class FixtureBoundaryTest(unittest.TestCase):
                 (data / "postgresql.conf").write_text("", encoding="utf-8")
                 return completed()
             if name == "pg_ctl":
-                if "stop" in argv:
-                    state["alive"] = False
                 return completed()
             if name == "psql":
                 if "SHOW server_version_num" in argv:
@@ -152,22 +221,20 @@ class FixtureBoundaryTest(unittest.TestCase):
                 raise physical.FixtureError("basebackup", "command_failed")
             raise AssertionError("unexpected command")
 
-        def fake_identity(pid, phase):
-            return {"pid": pid, "starttime": 7,
-                    "state": "S" if state["alive"] else "Z"}
-
         with tempfile.TemporaryDirectory(prefix="rootyard-physical-test-") as temporary:
             with mock.patch.object(physical, "_validate_pg17_tools", return_value=FAKE_TOOLS), \
+                    mock.patch.object(physical, "_OwnedProcessSet", new=lambda: processes.tracker()), \
                     mock.patch.object(physical.PhysicalPitrFixture, "_read_postmaster_pid",
                                       return_value=424242), \
-                    mock.patch.object(physical, "_process_identity", side_effect=fake_identity), \
                     mock.patch.object(physical, "_run", side_effect=fake_run):
                 report = physical.run_self_check(Path("/unused"), Path(temporary))
             self.assertFalse(report["passed"])
             self.assertEqual(report["failure"]["phase"], "basebackup")
             self.assertEqual(report["failure"]["code"], "command_failed")
             self.assertTrue(report["cleanup"]["primary_stopped"])
+            self.assertTrue(report["cleanup"]["owned_processes_stopped"])
             self.assertTrue(report["cleanup"]["scratch_removed"])
+            self.assertIn((424242, signal.SIGTERM), processes.signals)
             self.assertEqual(list(Path(temporary).iterdir()), [])
             self.assertNotIn("postmaster.pid", json.dumps(report))
 
@@ -182,7 +249,7 @@ class FixtureBoundaryTest(unittest.TestCase):
         fixture.restore_point_lsn = "0/16B6C50"
         fixture.archive_count = 1
 
-        def fail_start(argv, *, phase, timeout=physical.COMMAND_TIMEOUT_SECONDS):
+        def fail_start(argv, *, phase, timeout=physical.COMMAND_TIMEOUT_SECONDS, owned=None):
             raise physical.FixtureError("restore", "command_failed")
 
         with mock.patch.object(physical, "_run", side_effect=fail_start):
@@ -194,6 +261,94 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertTrue(cleanup["passed"])
         self.assertTrue(cleanup["primary_stopped"])
         self.assertTrue(cleanup["restored_stopped"])
+        self.assertTrue(cleanup["owned_processes_stopped"])
+
+    def test_postmaster_exit_with_verified_session_child_is_killed(self) -> None:
+        processes = FakeProcesses()
+        processes.add(100, session=100, starttime=10)
+        processes.add(101, ppid=100, session=100, pgrp=100, starttime=11)
+        processes.ignore_term.add(101)
+        tracker = processes.tracker()
+        tracker.remember_postmaster(100, "cleanup")
+        processes.records.pop(100)
+
+        self.assertEqual(set(tracker.members("cleanup")), {101})
+        tracker.terminate_all("cleanup", timeout=0.2)
+
+        self.assertIn((101, signal.SIGTERM), processes.signals)
+        self.assertIn((101, signal.SIGKILL), processes.signals)
+        self.assertEqual(tracker.members("cleanup"), {})
+
+    def test_stop_failure_with_postmaster_exit_kills_surviving_child(self) -> None:
+        processes = FakeProcesses()
+        postmaster = processes.add(500, session=500, starttime=50)
+        processes.add(501, ppid=500, session=500, pgrp=500, starttime=51)
+        processes.ignore_term.add(501)
+        fixture = self.make_fixture(processes)
+        fixture.primary_data.mkdir(mode=0o700)
+        fixture.primary_identity = postmaster
+        (fixture.primary_data / "postmaster.pid").write_text(
+            f"500\n{fixture.primary_data}\n0\n{fixture.primary_port}\n"
+            f"{fixture.socket_dir}\n127.0.0.1\n0\nready\n",
+            encoding="ascii",
+        )
+
+        def failed_stop(argv, *, phase, timeout=physical.COMMAND_TIMEOUT_SECONDS, owned=None):
+            processes.records.pop(500, None)  # postmaster exited, child survives
+            raise physical.FixtureError(phase, "command_failed")
+
+        with mock.patch.object(physical, "_run", side_effect=failed_stop):
+            stopped = fixture._stop_cluster(
+                fixture.primary_data, fixture.primary_identity,
+                fixture.primary_port, "cleanup",
+            )
+
+        self.assertTrue(stopped)
+        self.assertIn((501, signal.SIGTERM), processes.signals)
+        self.assertIn((501, signal.SIGKILL), processes.signals)
+        self.assertNotIn(501, processes.records)
+
+    def test_partial_start_without_pidfile_requires_owned_child_absence(self) -> None:
+        processes = FakeProcesses()
+        processes.add(200, session=200, starttime=20)
+        processes.add(201, ppid=200, session=200, pgrp=200, starttime=21)
+        processes.ignore_term.add(201)
+        fixture = self.make_fixture(processes)
+        fixture.owned.remember_launch(200, "start")
+        processes.records.pop(200)
+        fixture.primary_data.mkdir(mode=0o700)
+
+        cleanup = fixture.cleanup()
+
+        self.assertTrue(cleanup["passed"])
+        self.assertTrue(cleanup["primary_stopped"])
+        self.assertTrue(cleanup["owned_processes_stopped"])
+        self.assertTrue(cleanup["scratch_removed"])
+        self.assertIn((201, signal.SIGKILL), processes.signals)
+        self.assertFalse(fixture.root.exists())
+
+    def test_still_live_owned_child_denies_cleanup_and_retains_scratch(self) -> None:
+        processes = FakeProcesses()
+        processes.add(300, session=300, starttime=30)
+        processes.add(301, ppid=300, session=300, pgrp=300, starttime=31)
+        processes.ignore_term.add(301)
+        processes.ignore_kill.add(301)
+        fixture = self.make_fixture(processes)
+        fixture.owned.remember_launch(300, "start")
+        processes.records.pop(300)
+        fixture.primary_data.mkdir(mode=0o700)
+
+        cleanup = fixture.cleanup()
+
+        self.assertFalse(cleanup["passed"])
+        self.assertFalse(cleanup["primary_stopped"])
+        self.assertFalse(cleanup["owned_processes_stopped"])
+        self.assertFalse(cleanup["scratch_removed"])
+        self.assertIn("owned:owned_processes_survive", cleanup["errors"])
+        self.assertTrue(fixture.root.is_dir())
+
+        processes.records.pop(301, None)
+        self.assertTrue(fixture.cleanup()["passed"])
 
     def test_cleanup_refuses_containment_break_and_does_not_remove_scratch(self) -> None:
         fixture = self.make_fixture()
@@ -216,8 +371,10 @@ class FixtureBoundaryTest(unittest.TestCase):
         fixture.primary_data.unlink()
         self.assertTrue(fixture.cleanup()["passed"])
 
-    def test_pid_identity_mismatch_is_not_stopped_or_removed(self) -> None:
-        fixture = self.make_fixture()
+    def test_identity_mismatch_cannot_kill_foreign_or_remove_scratch(self) -> None:
+        processes = FakeProcesses()
+        processes.add(os.getpid(), starttime=100)
+        fixture = self.make_fixture(processes)
         fixture.primary_data.mkdir(mode=0o700)
         pid_file = fixture.primary_data / "postmaster.pid"
         pid_file.write_text(
@@ -226,20 +383,54 @@ class FixtureBoundaryTest(unittest.TestCase):
             encoding="ascii",
         )
         fixture.primary_identity = {"pid": os.getpid(), "starttime": 99, "state": "S"}
-        observed = {"pid": os.getpid(), "starttime": 100, "state": "S"}
 
-        with mock.patch.object(physical, "_process_identity", return_value=observed):
-            cleanup = fixture.cleanup()
+        cleanup = fixture.cleanup()
         self.assertFalse(cleanup["passed"])
         self.assertFalse(cleanup["primary_stopped"])
         self.assertFalse(cleanup["scratch_removed"])
         self.assertIn("primary:pid_identity_mismatch", cleanup["errors"])
+        self.assertEqual(processes.signals, [])
         self.assertTrue(fixture.root.is_dir())
 
         pid_file.unlink()
         fixture.primary_identity = None
         self.assertTrue(fixture.cleanup()["passed"])
 
+    def test_normal_cleanup_stops_verified_postmaster_and_removes_scratch(self) -> None:
+        processes = FakeProcesses()
+        processes.add(400, session=400, starttime=40)
+        fixture = self.make_fixture(processes)
+        fixture.owned.remember_postmaster(400, "cleanup")
+
+        cleanup = fixture.cleanup()
+
+        self.assertTrue(cleanup["passed"])
+        self.assertTrue(cleanup["owned_processes_stopped"])
+        self.assertTrue(cleanup["scratch_removed"])
+        self.assertIn((400, signal.SIGTERM), processes.signals)
+        self.assertFalse(fixture.root.exists())
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and Path("/proc").is_dir(),
+        "owned /proc process boundary is Linux-only",
+    )
+    def test_run_timeout_records_and_cleans_owned_python_descendant(self) -> None:
+        script = (
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "time.sleep(60)\n"
+        )
+        tracker = REAL_OWNED()
+        with self.assertRaises(physical.FixtureError) as caught:
+            physical._run(
+                [sys.executable, "-c", script],
+                phase="owned-run",
+                timeout=0.5,
+                owned=tracker,
+            )
+        self.assertEqual((caught.exception.phase, caught.exception.code),
+                         ("owned-run", "timeout"))
+        self.assertEqual(tracker.members("owned-run"), {})
 
     def test_entrypoint_requires_opt_in_and_reports_failure_without_urls(self) -> None:
         report_path = Path(tempfile.mkdtemp(prefix="rootyard-physical-report-")) / "report.json"
@@ -249,7 +440,8 @@ class FixtureBoundaryTest(unittest.TestCase):
             "failure": {"phase": "start", "code": "command_failed",
                         "exception_class": "FixtureError"},
             "cleanup": {"attempted": True, "passed": True, "primary_stopped": True,
-                        "restored_stopped": True, "scratch_removed": True, "errors": []},
+                        "restored_stopped": True, "owned_processes_stopped": True,
+                        "scratch_removed": True, "errors": []},
             "topology": physical.TOPOLOGY,
             "limitations": physical.LIMITATIONS,
         }
@@ -269,6 +461,7 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
         report_path.unlink()
         report_path.parent.rmdir()
+
 
 if __name__ == "__main__":
     unittest.main()

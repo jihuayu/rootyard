@@ -9,8 +9,10 @@ advancement and any external proof.  The opt-in self-check invoked by this file
 uses only plain marker SQL; it never claims Pando, service, GC, provider or
 production qualification.
 
-Every command, wait and cleanup phase is bounded.  Subprocess output is kept in
-memory and never included in an error or report.  The fixture never reuses,
+Every command, wait and cleanup phase is bounded.  Cleanup records owned launch
+sessions, postmaster identity and captured descendants, and removes the scratch
+tree only after every verified owned process is gone.  Subprocess output is kept
+in memory and never included in an error or report.  The fixture never reuses,
 stops or changes permissions on a pre-existing cluster or data directory.
 """
 from __future__ import annotations
@@ -74,22 +76,93 @@ class PgTools:
     pg_basebackup: Path
 
 
-def _run(argv: list[Path | str], *, phase: str, timeout: float = COMMAND_TIMEOUT_SECONDS):
-    """Run one bounded argv without a shell; never expose captured output."""
-    argv = [str(item) for item in argv]
+def _reap_process(process: subprocess.Popen[bytes]) -> None:
     try:
-        result = subprocess.run(
+        process.communicate(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.communicate(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _run(
+    argv: list[Path | str],
+    *,
+    phase: str,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+    owned=None,
+):
+    """Run one bounded argv without a shell; never expose captured output.
+
+    When ``owned`` is supplied, the command is launched as an owned session
+    leader and its live descendants are recorded while it runs.  A timeout is
+    bounded and kills only verified owned members; it never relies on the
+    direct child being the only surviving process.
+    """
+    argv = [str(item) for item in argv]
+    if owned is None:
+        try:
+            result = subprocess.run(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise FixtureError(phase, "timeout") from None
+        except OSError:
+            raise FixtureError(phase, "exec_failed") from None
+        if result.returncode != 0:
+            raise FixtureError(phase, "command_failed")
+        return result
+    try:
+        process = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        raise FixtureError(phase, "timeout") from None
     except OSError:
         raise FixtureError(phase, "exec_failed") from None
-    if result.returncode != 0:
+    try:
+        owned.remember_launch(process.pid, phase)
+    except Exception:
+        _reap_process(process)
+        raise
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            try:
+                owned.observe_tree(process.pid, phase)
+            except Exception:
+                _reap_process(process)
+                raise
+            try:
+                owned.terminate_all(phase, timeout=5.0)
+            except FixtureError:
+                pass
+            _reap_process(process)
+            owned.observe_launch_done(process.pid, phase)
+            raise FixtureError(phase, "timeout")
+        try:
+            stdout, stderr = process.communicate(timeout=min(POLL_SECONDS, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            try:
+                owned.observe_tree(process.pid, phase)
+            except Exception:
+                _reap_process(process)
+                raise
+    owned.observe_launch_done(process.pid, phase)
+    result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    if process.returncode != 0:
         raise FixtureError(phase, "command_failed")
     return result
 
@@ -139,13 +212,18 @@ def _conf_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _process_identity(pid: int, phase: str) -> dict:
-    """Return (pid, kernel start time, state) for one owned PID.
+def _current_boot_id(phase: str) -> str:
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        raise FixtureError(phase, "proc_unavailable") from None
+    if not boot_id:
+        raise FixtureError(phase, "proc_invalid")
+    return boot_id
 
-    A replay of the same numeric PID after restart is rejected by the start-time
-    comparison.  Linux ``/proc`` is required because a weaker check is not
-    sufficient to stop a process safely.
-    """
+
+def _proc_stat(pid: int, phase: str) -> dict:
+    """Read one /proc stat row without granting ownership by itself."""
     if not isinstance(pid, int) or pid <= 1:
         raise FixtureError(phase, "pid_invalid")
     try:
@@ -155,26 +233,232 @@ def _process_identity(pid: int, phase: str) -> dict:
         raise FixtureError(phase, "process_missing") from None
     except OSError:
         raise FixtureError(phase, "proc_unavailable") from None
-    if owner != os.getuid():
-        raise FixtureError(phase, "process_unowned")
     tail = raw.rpartition(")")[2].split()
     if len(tail) <= 19:
         raise FixtureError(phase, "proc_invalid")
     try:
-        starttime = int(tail[19])
-    except ValueError:
+        return {
+            "pid": pid,
+            "state": tail[0],
+            "ppid": int(tail[1]),
+            "pgrp": int(tail[2]),
+            "session": int(tail[3]),
+            "starttime": int(tail[19]),
+            "uid": owner,
+        }
+    except (IndexError, ValueError):
         raise FixtureError(phase, "proc_invalid") from None
-    return {"pid": pid, "starttime": starttime, "state": tail[0]}
 
 
-def _pid_alive(pid: int, reference: dict, phase: str) -> bool:
+def _process_record(pid: int, phase: str) -> dict:
+    """Full owned PID, start-time, group, session and boot identity."""
+    record = _proc_stat(pid, phase)
+    if record["uid"] != os.getuid():
+        raise FixtureError(phase, "process_unowned")
+    record["boot_id"] = _current_boot_id(phase)
+    return record
+
+
+def _process_cwd(pid: int, phase: str) -> Path:
     try:
-        current = _process_identity(pid, phase)
-    except FixtureError as error:
-        if error.code in ("process_missing", "process_unowned"):
-            return False
-        raise
-    return current["starttime"] == reference["starttime"] and current["state"] != "Z"
+        return Path(f"/proc/{pid}/cwd").resolve(strict=True)
+    except FileNotFoundError:
+        raise FixtureError(phase, "process_missing") from None
+    except OSError:
+        raise FixtureError(phase, "proc_unavailable") from None
+
+
+def _proc_table(phase: str) -> dict[int, dict]:
+    """Snapshot every readable /proc stat row with the current boot identity.
+
+    The scan deliberately keeps foreign rows too; session/ownership checks are
+    performed by the owned-process set before any signal.  An unreadable /proc
+    census fails closed rather than approximating absence.
+    """
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        raise FixtureError(phase, "proc_unavailable") from None
+    boot_id = _current_boot_id(phase)
+    table = {}
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            record = _proc_stat(int(name), phase)
+        except FixtureError as error:
+            if error.code == "process_missing":
+                continue
+            raise
+        record["boot_id"] = boot_id
+        table[record["pid"]] = record
+    return table
+
+
+class _OwnedProcessSet:
+    """Verified launch sessions plus captured descendant identities.
+
+    The model mirrors the repository's Linux process helpers
+    (``deployment/local_cluster.py`` and
+    ``scripts/state_services_native_baseline.py``): a process is owned only when
+    its numeric PID still has the recorded kernel start time, and a recorded
+    session is scanned only while its boot identity matches.  PG's daemon may
+    reparent children, so closure is judged by all recorded identities and
+    occupied owned sessions, never by the postmaster PID alone.
+    """
+
+    def __init__(
+        self,
+        *,
+        table_provider=None,
+        boot_id_provider=None,
+        record_provider=None,
+        signal_fn=None,
+    ) -> None:
+        self._records: dict[int, dict] = {}
+        self._sessions: dict[int, str] = {}
+        self._table_provider = table_provider or _proc_table
+        self._boot_id_provider = boot_id_provider or _current_boot_id
+        self._record_provider = record_provider or _process_record
+        self._signal_fn = signal_fn or os.kill
+
+    def _remember(self, record: dict) -> None:
+        self._records[record["pid"]] = record
+        if record["session"] == record["pid"]:
+            self._sessions[record["session"]] = record["boot_id"]
+
+    def record(self, pid: int, phase: str) -> dict:
+        return self._record_provider(pid, phase)
+
+    def is_alive(self, reference: dict, phase: str) -> bool:
+        table = self._table_provider(phase)
+        current = table.get(reference["pid"])
+        return bool(
+            current is not None
+            and current["starttime"] == reference["starttime"]
+            and current["boot_id"] == reference.get("boot_id", current["boot_id"])
+            and current["state"] not in ("Z", "X", "x")
+        )
+
+    def remember_launch(self, pid: int, phase: str) -> None:
+        self._sessions[pid] = self._boot_id_provider(phase)
+        try:
+            record = self._record_provider(pid, phase)
+        except FixtureError as error:
+            if error.code == "process_missing":
+                return
+            raise
+        self._remember(record)
+        self.observe_tree(pid, phase)
+
+    def observe_launch_done(self, pid: int, phase: str) -> None:
+        # The session anchor remains until an empty scan proves it safe to drop.
+        self.observe_tree(pid, phase)
+
+    def remember_postmaster(self, pid: int, phase: str) -> dict:
+        record = self._record_provider(pid, phase)
+        self._remember(record)
+        self.observe_tree(pid, phase)
+        return record
+
+    def observe_tree(self, pid: int, phase: str) -> None:
+        table = self._table_provider(phase)
+        children: dict[int, list[int]] = {}
+        for record in table.values():
+            children.setdefault(record["ppid"], []).append(record["pid"])
+        frontier = [pid]
+        seen = set()
+        while frontier:
+            parent = frontier.pop()
+            for child in children.get(parent, ()):
+                if child in seen:
+                    continue
+                seen.add(child)
+                frontier.append(child)
+                record = table.get(child)
+                if record is None:
+                    continue
+                if record["uid"] != os.getuid() or record["state"] in ("Z", "X", "x"):
+                    continue
+                self._remember(record)
+
+    def members(self, phase: str) -> dict[int, dict]:
+        table = self._table_provider(phase)
+        boot_id = self._boot_id_provider(phase)
+        members = {}
+        for pid, reference in self._records.items():
+            current = table.get(pid)
+            if (
+                current is not None
+                and current["starttime"] == reference["starttime"]
+                and current["boot_id"] == reference.get("boot_id", boot_id)
+                and current["state"] not in ("Z", "X", "x")
+            ):
+                members[pid] = current
+        for session_id, recorded_boot in list(self._sessions.items()):
+            if recorded_boot != boot_id:
+                raise FixtureError(phase, "session_boot_mismatch")
+            found = [
+                record for record in table.values()
+                if record["session"] == session_id
+                and record["state"] not in ("Z", "X", "x")
+            ]
+            for record in found:
+                if record["uid"] != os.getuid():
+                    raise FixtureError(phase, "session_unowned")
+                members[record["pid"]] = record
+            if not found:
+                # An empty session anchor must not survive into possible PID reuse.
+                self._sessions.pop(session_id, None)
+        changed = True
+        while changed:
+            changed = False
+            parents = set(members)
+            for record in table.values():
+                if record["pid"] in members or record["state"] in ("Z", "X", "x"):
+                    continue
+                if record["ppid"] in parents:
+                    if record["uid"] != os.getuid():
+                        raise FixtureError(phase, "owned_descendant_unowned")
+                    members[record["pid"]] = record
+                    changed = True
+        return members
+
+    def _signal_members(self, phase: str, signum: int) -> None:
+        table = self._table_provider(phase)
+        for pid, reference in self.members(phase).items():
+            current = table.get(pid)
+            if (
+                current is None
+                or current["starttime"] != reference["starttime"]
+                or current["state"] in ("Z", "X", "x")
+            ):
+                continue
+            if current["uid"] != os.getuid():
+                raise FixtureError(phase, "process_unowned")
+            try:
+                self._signal_fn(pid, signum)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                raise FixtureError(phase, "signal_failed") from None
+
+    def terminate_all(self, phase: str, *, timeout: float = CLEANUP_TIMEOUT_SECONDS) -> None:
+        """SIGTERM then SIGKILL only verified owned members, bounded by timeout."""
+        self._signal_members(phase, signal.SIGTERM)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.members(phase):
+                return
+            time.sleep(POLL_SECONDS)
+        self._signal_members(phase, signal.SIGKILL)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.members(phase):
+                return
+            time.sleep(POLL_SECONDS)
+        if self.members(phase):
+            raise FixtureError(phase, "owned_processes_survive")
 
 
 class PhysicalPitrFixture:
@@ -212,6 +496,7 @@ class PhysicalPitrFixture:
             self.primary_port = _free_loopback_port()
             self.restored_port = _free_loopback_port(exclude={self.primary_port})
             self.database = DB_NAME_PREFIX + uuid.uuid4().hex[:10]
+            self.owned = _OwnedProcessSet()
             self.primary_identity: dict | None = None
             self.restored_identity: dict | None = None
             self.restore_point_name: str | None = None
@@ -348,6 +633,7 @@ class PhysicalPitrFixture:
             ],
             phase=phase,
             timeout=START_TIMEOUT_SECONDS + 10.0,
+            owned=self.owned,
         )
 
     def _sql(self, query: str, *, phase: str, port: int, database: str | None = None) -> str:
@@ -371,6 +657,7 @@ class PhysicalPitrFixture:
                 query,
             ],
             phase=phase,
+            owned=self.owned,
         )
         try:
             return result.stdout.decode("utf-8").strip()
@@ -391,12 +678,13 @@ class PhysicalPitrFixture:
                 self.primary_data,
             ],
             phase="initdb",
+            owned=self.owned,
         )
         self._assert_owned(self.primary_data, self.root, "initdb", "primary_data_unowned", kind="dir")
         self._write_primary_config()
         self._start_pg(self.primary_data, self.primary_log, "start")
         pid = self._read_postmaster_pid(self.primary_data, self.primary_port, "start")
-        self.primary_identity = _process_identity(pid, "start")
+        self.primary_identity = self.owned.remember_postmaster(pid, "start")
         version_num = self._sql(
             "SHOW server_version_num",
             phase="start",
@@ -439,6 +727,7 @@ class PhysicalPitrFixture:
             ],
             phase="basebackup",
             timeout=COMMAND_TIMEOUT_SECONDS,
+            owned=self.owned,
         )
         self._assert_owned(self.base_backup_dir, self.root, "basebackup", "basebackup_unowned", kind="dir")
         self.base_backup_ready = True
@@ -539,7 +828,7 @@ class PhysicalPitrFixture:
         self._prepare_recovery(self.restore_point_name)
         self._start_pg(self.restored_data, self.restored_log, "restore")
         pid = self._read_postmaster_pid(self.restored_data, self.restored_port, "restore")
-        self.restored_identity = _process_identity(pid, "restore")
+        self.restored_identity = self.owned.remember_postmaster(pid, "restore")
         deadline = time.monotonic() + RESTORE_WAIT_SECONDS
         while time.monotonic() < deadline:
             try:
@@ -660,66 +949,73 @@ class PhysicalPitrFixture:
         }
 
     def _stop_cluster(self, data_dir: Path, identity: dict | None, port: int, phase: str) -> bool:
-        if not data_dir.exists() and not data_dir.is_symlink():
+        if data_dir.exists() or data_dir.is_symlink():
+            self._assert_owned(data_dir, self.root, phase, "cleanup_containment", kind="dir")
+        elif identity is None:
+            # No cluster was ever created here.  Final cleanup still verifies
+            # the global owned set before removing the scratch root.
             return True
-        self._assert_owned(data_dir, self.root, phase, "cleanup_containment", kind="dir")
         pid_file = data_dir / "postmaster.pid"
         reference = identity
         pid: int | None = None
-        if pid_file.exists() or pid_file.is_symlink():
+        if data_dir.exists() and (pid_file.exists() or pid_file.is_symlink()):
             pid = self._read_postmaster_pid(data_dir, port, phase)
             try:
-                observed = _process_identity(pid, phase)
+                observed = self.owned.record(pid, phase)
             except FixtureError as error:
-                if error.code == "process_missing":
-                    return True
-                raise
-            if reference is not None and (
-                observed["pid"] != reference["pid"] or observed["starttime"] != reference["starttime"]
-            ):
-                raise FixtureError(phase, "pid_identity_mismatch")
-            reference = reference or observed
+                if error.code != "process_missing":
+                    raise
+                observed = None
+            if observed is not None:
+                if reference is not None and (
+                    observed["pid"] != reference["pid"]
+                    or observed["starttime"] != reference["starttime"]
+                ):
+                    raise FixtureError(phase, "pid_identity_mismatch")
+                if reference is None and _process_cwd(pid, phase) != data_dir.resolve():
+                    raise FixtureError(phase, "pid_identity_mismatch")
+                reference = reference or observed
+                self.owned.remember_postmaster(pid, phase)
+            else:
+                pid = None
         elif reference is not None:
-            if _pid_alive(reference["pid"], reference, phase):
+            try:
+                self.owned.remember_postmaster(reference["pid"], phase)
+            except FixtureError as error:
+                if error.code != "process_missing":
+                    raise
+                reference = None
+            if reference is not None and self.owned.is_alive(reference, phase):
                 pid = reference["pid"]
             else:
-                return True
-        if pid is None:
-            return True
-        try:
-            _run(
-                [
-                    self.tools.pg_ctl,
-                    "-D",
-                    data_dir,
-                    "-m",
-                    "immediate",
-                    "-w",
-                    "-t",
-                    str(int(CLEANUP_TIMEOUT_SECONDS)),
-                    "stop",
-                ],
-                phase=phase,
-                timeout=CLEANUP_TIMEOUT_SECONDS + 5.0,
-            )
-        except FixtureError:
-            pass
-        if not _pid_alive(pid, reference, phase):
-            return True
-        if reference is None:
-            raise FixtureError(phase, "pid_identity_unavailable")
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return True
-        except OSError:
-            raise FixtureError(phase, "kill_failed") from None
-        deadline = time.monotonic() + CLEANUP_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            if not _pid_alive(pid, reference, phase):
-                return True
-            time.sleep(POLL_SECONDS)
-        raise FixtureError(phase, "stop_timeout")
+                pid = None
+        if pid is not None:
+            try:
+                _run(
+                    [
+                        self.tools.pg_ctl,
+                        "-D",
+                        data_dir,
+                        "-m",
+                        "immediate",
+                        "-w",
+                        "-t",
+                        str(int(CLEANUP_TIMEOUT_SECONDS)),
+                        "stop",
+                    ],
+                    phase=phase,
+                    timeout=CLEANUP_TIMEOUT_SECONDS + 5.0,
+                    owned=self.owned,
+                )
+            except FixtureError:
+                pass
+        # A missing PID file, failed pg_ctl stop or disappeared postmaster is not
+        # proof: every captured descendant and occupied owned session must be
+        # absent before this cluster is reported stopped.
+        self.owned.terminate_all(phase)
+        if self.owned.members(phase):
+            raise FixtureError(phase, "owned_processes_survive")
+        return True
 
     def _remove_root(self, phase: str) -> bool:
         if not self.root.exists() and not self.root.is_symlink():
@@ -736,6 +1032,7 @@ class PhysicalPitrFixture:
             "attempted": True,
             "primary_stopped": None,
             "restored_stopped": None,
+            "owned_processes_stopped": None,
             "scratch_removed": False,
             "errors": [],
         }
@@ -752,7 +1049,20 @@ class PhysicalPitrFixture:
                 stopped = False
                 status["errors"].append(f"{name}:{type(error).__name__}")
             status[f"{name}_stopped"] = stopped
-        if status["primary_stopped"] and status["restored_stopped"]:
+        try:
+            self.owned.terminate_all("cleanup")
+            owned_stopped = not self.owned.members("cleanup")
+        except FixtureError as error:
+            owned_stopped = False
+            status["errors"].append(f"owned:{error.code}")
+        except Exception as error:
+            owned_stopped = False
+            status["errors"].append(f"owned:{type(error).__name__}")
+        status["owned_processes_stopped"] = owned_stopped
+        if not owned_stopped:
+            status["primary_stopped"] = False
+            status["restored_stopped"] = False
+        if status["primary_stopped"] and status["restored_stopped"] and owned_stopped:
             try:
                 status["scratch_removed"] = self._remove_root("cleanup")
             except FixtureError as error:
@@ -762,6 +1072,7 @@ class PhysicalPitrFixture:
         status["passed"] = bool(
             status["primary_stopped"]
             and status["restored_stopped"]
+            and status["owned_processes_stopped"]
             and status["scratch_removed"]
             and not status["errors"]
         )
