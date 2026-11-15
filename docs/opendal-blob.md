@@ -123,8 +123,81 @@ remains the active one; the new serving profile stays disabled and has no
 serving route. In the default production build the writer is the legacy
 `RemoteObjectStore` path; the v1 profile enables no remote delete and no
 persistent hold, legal-hold, root-retirement or storage-membership model, so no
-hold dependency is satisfied by this layer alone. The sealed v1 raw write has no
-production caller until `blob_store::protected` is wired. Serving-mode
-switch, KeyProvider replacement, durable roots/holds and GC remain
-#109/#110/#112-#123 work. Azure stays compile-only and conditional create is
-unqualified.
+hold dependency is satisfied by this layer alone. Wait-free `KeyProvider`
+envelope primitives, closure read-back proof, and disposable scratch views for
+#109 are implemented inside `blob_store` (see below), while `RefStore` serving
+wiring, storage-membership, durable roots/holds, and GC remain #107/#113-#123/#144
+work. Azure stays compile-only and conditional create is unqualified.
+
+## W1-C Encryption Policy, Closure Read-Back & Disposable Views (#109 `blob_store` slice)
+
+The module entry point is `src/blob_store.rs` (`< 100` lines, zero `mod.rs`),
+with core types in `src/blob_store/types.rs`. Three additional building blocks
+landed inside `blob_store` without altering the sealed `put_file` /
+`ProtectedUploader` grant boundary:
+
+1. **Explicit encryption policy & authenticated `KeyProvider` envelopes**
+   (`encryption_config`, `envelope`, `encrypted_transfer`):
+   * `BlobProfile::from_env` parses `ROOTYARD_BLOB_ENCRYPTION_MODE` (`provider-managed`
+     or `local-envelope` with clean absolute `ROOTYARD_BLOB_KEYRING_DIR`), rejecting
+     `vault`, `vault-transit`, `plaintext`, `none`, empty strings, or dangling
+     keyring paths fail-closed (both unset defaults to implicit `provider-managed`
+     for W1-B compatibility unless `from_env_strict` / `require_explicit` is called).
+   * Under explicit `local-envelope` mode, raw plaintext uploads
+     (`BlobStore::put_file`, `ProtectedUploader::consume_and_upload`) are
+     refused before any PostgreSQL pool checkout, hold consumption, source
+     open, or provider IO. Conversely, all `local-envelope` upload, decrypt,
+     and closure paths (`BlobStore::put_ciphertext_file`,
+     `BlobStore::put_encrypted_file`, `BlobStore::get_decrypted_to_file`,
+     `BlobStore::verify_encrypted_blob`, `BlobStore::verify_closure` with
+     `LocalEnvelope`, and `ProtectedUploader::consume_and_upload_encrypted`)
+     require explicit `local-envelope` configuration and fail closed before
+     PostgreSQL checkout or provider IO under both `unset` and explicit
+     `provider-managed` profiles.
+   * `ProtectedUploader::consume_and_upload_encrypted` validates store
+     encryption policy, `KeyProvider` capabilities, physical backend binding,
+     and sorted hold-to-`PreparedCiphertext` scope/digest/length alignment
+     *before* checking out a PostgreSQL connection or consuming any hold.
+   * `BlobStore::put_encrypted_file` remains `pub(super)` to `blob_store` (via
+     the ciphertext-only `put_ciphertext_file` writer). Public read paths
+     (`BlobStore::get_decrypted_to_file`, `BlobStore::verify_encrypted_blob`)
+     enforce explicit `local-envelope` policy, perform single-stream verified
+     provider read-back + `BlobReceipt` minting against `backend_identity()`,
+     and authenticate & decrypt chunked AES-256-GCM ciphertext via a replaceable
+     `Arc<dyn KeyProvider>` (failing closed on missing/retired old keys, wrong
+     keys, tampered metadata, or altered chunks).
+2. **Full closure read-back proof** (`closure`):
+   * `BlobClosureSpec` groups owner scope `(tenant_id, authority_id, generation)`,
+     explicit `BlobClosureEncryption`, and closure artifact entries (`Pack`,
+     `PackIndex`, `Manifest`, `LfsObject`, `Checkpoint`, `Archive`), with
+     `require_git_pack_pair()` rejecting incomplete pack closures.
+   * `BlobStore::verify_closure` produces an unforgeable `BlobClosureProof` (no
+     `Deserialize`, no public mint) only after enforcing matching explicit/non-local
+     encryption policy before IO and proving every artifact passes full provider
+     read-back (and full single-read chunked AEAD decryption + key unwrap when
+     in `local-envelope` mode) and backend-identity verification before `deadline`.
+3. **Isolated, TTL-bounded disposable Git views** (`disposable_view`):
+   * `DisposableViewRoot` + `TempViewLease` isolate temporary local Git views in
+     private `0o700` directories staged atomically via `.staging-*` before rename
+     with `0o600` synced `lease.json` (`#[serde(deny_unknown_fields)]`),
+     `O_NOFOLLOW` descriptor/symlink checks, path-traversal guards, active view
+     count and byte budgets, fail-closed `Expired` checks on TTL expiry, RAII
+     drop cleanup, and `sweep_expired()` reclamation for expired or corrupt /
+     lease-less orphaned `rv1-*` view directories.
+   * Non-ignored unit and public contract tests live in
+     `src/blob_store/envelope_tests.rs`,
+     `src/blob_store/policy_matrix_tests.rs`,
+     `src/blob_store/closure_view_tests.rs`, and `tests/blob_store_w1c_contract.rs`
+     (executed on every PR in `ci.yml` `verify` and `pando-lab.yml` `isolated-lab`),
+     exercising full compute-directory wipe, three-mode zero-IO policy
+     enforcement, corrupt/expired view reclamation, and fresh-store/keyring
+     recovery.
+   * The `#[ignore]` PostgreSQL + controlled Garage S3 contracts in
+     `tests/blob_store_w1c_contract.rs`
+     (`pg_protected_uploader_preflight_preserves_unconsumed_holds` and
+     `pg_protected_uploader_consume_and_upload_encrypted_against_real_provider`)
+     are opt-in in raw `cargo test`, and are explicitly built via
+     `scripts/build_native_test.py --test blob_store_w1c_contract` (verified
+     against their adjacent `<binary>.build.json` receipt) and executed with
+     `--ignored --test-threads=1` in `.github/workflows/refstore-protocol-acceptance.yml`
+     (`native`) against `postgres:17` and the job-owned Garage S3 fixture.

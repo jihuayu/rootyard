@@ -1,10 +1,12 @@
-# Local-envelope KeyProvider component (#109 increment)
+# Local-envelope KeyProvider & Envelope Integration (#109 `blob_store` slice)
 
-Status: this is an independent component in `src/blob_store/key_provider.rs`. It
-is **not** wired into serving, Blob publication, LFS, Workspace, backup, schema,
-runtime selection or any request path. The legacy
-`storage::encrypted_objects::Envelope` format, Vault Transit callsites and
-`PackStore` byte format are unchanged. No serving default has been selected.
+Status: `KeyProvider` (`src/blob_store/key_provider.rs`) is now wired into the
+standalone `blob_store` configuration and authenticated envelope pipeline
+(`encryption_config`, `envelope`, `encrypted_transfer`, and `closure`). The
+legacy `storage::encrypted_objects::Envelope` format, Vault Transit callsites,
+`PackStore` byte format, and downstream `src/ref_store/**` wiring (#107 / #144)
+remain separate and unchanged. Vault is not a required dependency for the
+standalone Blob profile.
 
 ## Contract
 
@@ -82,33 +84,55 @@ rename does not alter it, and there is no reload/generation/deletion API.
   96-bit nonce from ring `SystemRandom` on every wrap. Wrapping and unwrapping
   are synchronous CPU-only calls; the only file IO is `load`.
 
-## Backup and rotation
+## Backup, rotation and authenticated Blob envelopes
 
-Backup manifests may record `key_id` and wrapped metadata, never the KEK or the
-keyring files. A restore needs the same key ids provisioned out of band; if a
-referenced id is missing, unwrap fails closed. The keyring must be backed up
-separately from the data backup, with access controls at least as strong as the
-original.
+Backup manifests and closure records may persist `EnvelopeMetadata` (bounded
+JSON, `#[serde(deny_unknown_fields)]`, recording `schema`, `cipher`, `envelope_id`,
+4-byte `nonce_prefix`, 64 KiB `chunk_bytes`, owner scope, plaintext/ciphertext
+SHA-256 and length, and `WrappedKey`), never the KEK or plaintext DEK.
 
-Rotation adds a new key id, updates `current`, and keeps old ids loaded. Existing
-objects remain readable with their old key id. `rewrap_data_key` changes wrapped
-metadata only; this increment does not persist rewrap receipts or switch object
-references, so a caller must do that before retiring anything. Old ids should be
-retained until every reference is rewrapped and every dependent backup has
-expired. This component provides no automated deletion and makes no claim of a
-complete backup integration.
+Envelope sealing and opening (`src/blob_store/envelope.rs` + `envelope/io.rs`):
+
+* Explicit encryption policy (`src/blob_store/encryption_config.rs`) selects
+  `ROOTYARD_BLOB_ENCRYPTION_MODE=provider-managed` or `local-envelope` (with
+  clean absolute `ROOTYARD_BLOB_KEYRING_DIR`), rejecting `vault`, `vault-transit`,
+  `plaintext`, `none`, empty values, or partial keyring configuration fail-closed.
+* Two-phase sealing (`prepare_file_envelope` -> `PreparedCiphertext::bind_and_wrap`)
+  encrypts regular files into `0o600` staging files using fresh random 32-byte
+  AES-256-GCM DEKs and 4-byte nonce prefixes concatenated with big-endian 8-byte
+  chunk indices. Every chunk binds `envelope_id`, owner scope, `plaintext_sha256`,
+  `plaintext_length`, `chunk_bytes`, `chunk_index`, and `is_final` in AAD; empty
+  files still emit one authenticated 16-byte final tag chunk.
+* Once `BlobStore::new_upload` allocates the immutable `attempt_id`, `bind_and_wrap`
+  wraps the DEK with `WrapContext::new(tenant_id, authority_id, generation, attempt_id, namespace, plaintext_sha256)`
+  and zeroizes the in-memory plaintext DEK immediately.
+* `KeyProvider` capability gates fail closed if `local_envelope == false` or
+  `plaintext_fallback == true`.
+* Rotation adds a new key id (`current`), retains old versions temporarily, and
+  calls `rewrap_envelope_metadata` (`KeyProvider::rewrap_data_key`) to rotate
+  non-secret `EnvelopeMetadata` without rewriting immutable ciphertext blobs.
+  Once old key ids are retired from the keyring, un-rewrapped `EnvelopeMetadata`
+  fails closed with `MissingKey`.
 
 ## Verification
 
-Local contract tests, no Vault and no provider service:
+Contract and unit test targets (run in Linux CI; Vault and external object
+providers are not required for the in-memory OpenDAL tests):
 
 ```text
 cargo test --test key_provider_contract
+cargo test --test blob_store_w1c_contract
+cargo test --lib blob_store::envelope_tests
+cargo test --lib blob_store::policy_matrix_tests
 ```
 
-They cover roundtrip, nonce variance, tampered ciphertext/nonce/AAD/version/key
-id, wrong and missing keys, old-read/new-write/rewrap with an unchanged DEK,
-malformed key-file length/mode/symlink/FIFO, keyring directory/manifest policy,
-Debug/JSON redaction and a length-delimiting collision construction. They do not
-qualify a cloud KMS, full backup/restore, serving integration, all-content Blob
-storage or destructive GC.
+They cover roundtrip, empty and multi-chunk encryption, replaceable
+`KeyProvider` adapters, plaintext-fallback rejection, three-mode encryption
+policy enforcement (`unset`, explicit `provider-managed`, explicit
+`local-envelope`) with zero provider IO on refused calls, `ProtectedUploader`
+pre-consume hold-to-prepared validation, nonce variance, tampered
+ciphertext/chunk-order/truncation/trailing-bytes/metadata/nonce/AAD/version/key
+id, wrong and retired/missing keys, old-read/new-write/rewrap with unchanged
+ciphertext, malformed key-file length/mode/symlink/FIFO, keyring directory
+policy, and Debug/JSON redaction. Downstream serving, `RefStore` commit wiring
+(#107/#144), cloud KMS adapters, and destructive GC remain outside this layer.

@@ -1,91 +1,12 @@
-//! Unified immutable Blob layer for design §4.1/§12/§17 (work package W1-B).
-//!
-//! This module owns only the provider-independent contract: a versioned, strong
-//! typed locator, a verified receipt and the explicit delete policy. The
-//! OpenDAL-backed driver lives in [`opendal`]; callers never see a provider
-//! path, an HTTP signature, an ETag-as-digest shortcut or a `LIST` inventory.
-//!
-//! Two object layouts coexist deliberately:
-//!
-//! * `legacy` paths (`tenants/<tenant>/<namespace>/<sha256>` and the
-//!   authority-scoped `tenants/<tenant>/authorities/<id>/g<n>/...` form) are the
-//!   pre-OpenDAL layout used by LFS, Workspace, backups and the Pando PG
-//!   retention path. The adapter in `crate::storage::remote_objects` keeps them
-//!   byte-for-byte readable; readers and manifests must not silently change.
-//! * `v1` paths below are the new standalone Blob profile. They always bind
-//!   tenant, storage authority, authority generation and a unique attempt id so
-//!   a cancelled publication attempt can never collide with, or overwrite, a
-//!   later attempt for the same content digest.
-//!
-//! This file intentionally contains no destructive-GC or hold-ledger logic:
-//! remote deletion for the new profile stays disabled until the persistent
-//! hold/root protocols (#113/#114) are reviewed and enabled explicitly.
-//!
-//! The write boundary is deliberately narrow. The raw single-object publish
-//! (`opendal::BlobStore::put_file`) is `pub(super)`: only this `blob_store`
-//! subtree can reach it, and its production caller is the protected uploader
-//! (`blob_store::protected`), which may publish only after it consumed an opaque
-//! grant. There is no feature-gated raw-write hook: every feature combination,
-//! including `pando-lab`, exposes only the protected path. Producer, runtime and
-//! service routes must never call the raw writer directly.
-//!
-//! Every upload intent is bound at mint time to the immutable
-//! [`BlobBackendIdentity`] of the store that created it, and the sealed writer
-//! refuses a foreign intent before any source or provider IO. The identity is a
-//! non-secret digest of the actually opened profile (provider, endpoint,
-//! bucket, root, region and stable account identity) and never of the caller's
-//! logical authority scope, so a grant for one physical backend cannot publish
-//! into another.
-//!
-//! Receipts are minted in the private `transfer::receipt` module. The public
-//! [`BlobReceipt`] surface is read-only (getters, `clone`, metadata `matches`)
-//! and the constructor is `pub(super)` to `transfer`, so another `blob_store`
-//! child, adapter or service handler cannot forge acknowledgement of
-//! provider-held bytes.
-//!
-//! Claimed state: the default production profile still writes through the
-//! legacy `RemoteObjectStore` path; the standalone v1 profile has no serving
-//! route, no remote delete ([`BlobDeletePolicy::Disabled`] is the only policy),
-//! no persistent hold ledger and no storage-membership model. Nothing here
-//! enables deletion or claims a production serving path.
-
-pub(crate) mod archive;
-mod backend_identity;
-pub mod budget;
-pub mod config;
-pub mod key_provider;
-pub mod opendal;
-pub mod protected;
-pub mod readback;
-pub mod transfer;
-pub mod upload;
-
-/// Deterministic, non-secret physical backend identity of an opened store.
-/// Read-only data: the only constructors are private to the `blob_store`
-/// subtree (profile-derived for real stores, a fresh realm for `cfg(test)`
-/// memory operators), so stored hex can be compared but never turned back into
-/// a proof or an upload capability.
-pub use backend_identity::BlobBackendIdentity;
-/// Read-only verified receipt. It is defined in the private `transfer::receipt`
-/// module, so the only constructor stays reachable from the transfer verifier
-/// alone; the public surface here is the read-only type, its getters, `clone`,
-/// metadata-only [`BlobReceipt::matches`] and `backend_identity`.
-pub use transfer::BlobReceipt;
-
-#[cfg(test)]
-mod budget_tests;
-#[cfg(test)]
-mod lifecycle_tests;
-#[cfg(test)]
-mod provider_contract_tests;
-#[cfg(test)]
-pub(crate) mod test_support;
+//! Core provider-independent types for the standalone immutable Blob layer.
 
 use std::fmt;
 
 use uuid::Uuid;
 
-/// Schema of [`BlobLocator`]/[`BlobReceipt`]. Bump only with a migration.
+use super::BlobBackendIdentity;
+
+/// Schema of [`BlobLocator`]/[`crate::blob_store::BlobReceipt`]. Bump only with a migration.
 pub const BLOB_LOCATOR_SCHEMA: u32 = 1;
 pub const MAX_NAMESPACE_BYTES: usize = 48;
 /// Explicit ceiling; providers enforce their own lower limits at startup.
@@ -160,8 +81,8 @@ pub struct BlobLocator {
     generation: i64,
     attempt_id: Uuid,
     namespace: String,
-    sha256: String,
-    length: u64,
+    pub(super) sha256: String,
+    pub(super) length: u64,
 }
 
 impl BlobLocator {
@@ -252,7 +173,7 @@ impl fmt::Debug for BlobLocator {
 
 /// Single-use publication capability for exactly one fresh attempt.
 ///
-/// Only [`opendal::BlobStore::new_upload`] mints one, and it always
+/// Only [`super::opendal::BlobStore::new_upload`] mints one, and it always
 /// allocates a random attempt id inside the byte layer. Callers cannot supply an
 /// attempt id, clone the intent, deserialize it or turn a readable
 /// [`BlobLocator`] back into write authority. A locator reconstructed from
@@ -278,10 +199,10 @@ impl fmt::Debug for BlobLocator {
 /// }
 /// ```
 pub struct UploadIntent {
-    locator: BlobLocator,
+    pub(super) locator: BlobLocator,
     /// Physical backend of the store that minted this intent. Cloned from the
     /// store's immutable identity, never supplied or influenced by a caller.
-    backend_identity: BlobBackendIdentity,
+    pub(super) backend_identity: BlobBackendIdentity,
 }
 
 impl UploadIntent {
@@ -299,10 +220,10 @@ impl UploadIntent {
         &self.backend_identity
     }
 
-    /// Module-private mint point; `BlobStore::new_upload` is the only caller.
+    /// Subtree-private mint point; `BlobStore::new_upload` is the caller.
     /// It clones the store's own immutable identity, so a caller cannot choose
     /// the backend a grant will target.
-    fn new(locator: BlobLocator, backend_identity: BlobBackendIdentity) -> Self {
+    pub(super) fn new(locator: BlobLocator, backend_identity: BlobBackendIdentity) -> Self {
         Self { locator, backend_identity }
     }
 }
