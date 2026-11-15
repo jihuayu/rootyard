@@ -56,9 +56,13 @@ class CollaboratorTransportHarness(collaborator_contract.prerequisite,
             "(read/write/admin) on alice/demo; organization teams are other suites.",
             "Git refs, git_operations and outbox_events are authoritative; Git HTTP status is observed.",
             "No object store, kernel fault, power loss or production connection is exercised.",
-            "source_commit is the mounted checkout's HEAD, read by tests/source_bound_binary.py; "
-            "the executed binary binds to the current production input bytes via its real build "
-            "receipt, not to an ancestor relation with the receipt's commit.",
+            "source_commit names the executed binary's receipt identity, read by "
+            "tests/source_bound_binary.py: a v1 receipt must match the mounted checkout's "
+            "current production bytes and clean production paths, so source_commit is that "
+            "HEAD; a v2 receipt is accepted from its recorded snapshot/config/toolchain/input "
+            "binding, so source_commit is the receipt's workspace_commit and the mutable "
+            "checkout HEAD is reported separately as current_head. No ancestor relation or "
+            "current-byte equivalence is claimed for a v2 snapshot.",
         ]
         self.users = {}
         self.member_mutations = 0

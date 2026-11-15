@@ -25,6 +25,7 @@ import time
 import unittest
 
 from tests.e2e import Harness
+from tests.runtime_binary import select_runtime_binary
 
 LEGACY_BACKEND = "fuse"
 HELPER_BACKEND = "fuse-helper"
@@ -44,7 +45,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
     backend = MOUNT_MODE
 
     def test_live_editor_capture_checkpoint_and_remount(self):
-        binary=Path(os.environ.get("ROOTYARD_TEST_BINARY", "target/debug/rootyard")).resolve()
+        binary, _ = select_runtime_binary()
         self.assertTrue(binary.is_file())
         with tempfile.TemporaryDirectory(prefix="rootyard-userns-wrapper-") as wrapper_dir:
             wrapper=Path(wrapper_dir)/"rootyard-userns"

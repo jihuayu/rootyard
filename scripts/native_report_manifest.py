@@ -13,7 +13,11 @@ Two modes:
 * ``--mode job`` validates one ``scripts/build_native.py`` receipt plus the
   reports and logs produced by that job, and writes a job manifest containing
   the commit, the compiled source-input digest, the binary digest, the harness
-  digests and the safe (credential-free) fixture versions.
+  digests and the safe (credential-free) fixture versions.  An optional
+  exporter-provided expected batch-manifest SHA-256 (and path) anchors the exact
+  raw bytes consumed and recorded as provenance.  The optional
+  ``--fixture-rust-from-receipt`` records the already-validated receipt's full
+  Rust version as the ``rust`` fixture without probing a compiler.
 * ``--mode release`` consumes job manifests, re-verifies their harness digests
   against the current checkout, requires one shared commit and one shared
   source-input digest, checks the candidate-scoped reports and pinned fixture
@@ -28,14 +32,22 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import native_build_receipt as receipts  # noqa: E402
+
 REQUIRED_RECEIPT_FIELDS = ("binary_sha256", "source_inputs_sha256", "workspace_commit", "rustc", "command")
+V2_MANIFEST_ARTIFACT_KEYS = ("cargo_artifacts", "artifacts")
 JOB_KIND = "rootyard/native-acceptance-job-manifest"
 RELEASE_KIND = "rootyard/candidate-release-gate"
 FAILURE_KIND = "rootyard/native-acceptance-failure"
 BATCH_KIND = "rootyard/native-build-batch"
+STORE_SCHEMA = "rootyard/native-artifact-store/v1"
 SECRET_ENVIRONMENT = (
     "ROOTYARD_OBJECT_STORE_SECRET_KEY",
     "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
@@ -129,6 +141,512 @@ def read_text(path, label):
     return file.read_text(errors="replace")
 
 
+def receipt_rustc(validated):
+    """The toolchain string a job manifest records for either receipt schema."""
+    if validated.schema == "v2":
+        return validated.toolchain["rustc"]["version"]
+    return validated.payload.get("rustc")
+
+
+def _manifest_artifact_rows(manifest, manifest_build, schema, label):
+    """Return the manifest's selected artifact rows, version-dispatched.
+
+    Legacy v1 manifests keep the historical ``fresh_false_artifacts`` shape and
+    strict false values.  V2 manifests carry the actual Cargo freshness values
+    under ``cargo_artifacts`` (``artifacts`` is accepted only as the producer's
+    documented alias); every row must still use a JSON boolean.
+    """
+    if schema == "v1":
+        rows = manifest_build.get("fresh_false_artifacts")
+        require(
+            isinstance(rows, list) and rows,
+            f"{label}: build.fresh_false_artifacts must be a nonempty list",
+        )
+        require(
+            all(isinstance(item, dict) for item in rows),
+            f"{label}: build.fresh_false_artifacts entries must be objects",
+        )
+        require(
+            all(item.get("kind") in ("lib", "bin") for item in rows),
+            f"{label}: build.fresh_false_artifacts kind must be 'lib' or 'bin'",
+        )
+        require(
+            all(
+                isinstance(item.get("target"), str) and item.get("target")
+                for item in rows
+            ),
+            f"{label}: build.fresh_false_artifacts target must be a nonempty string",
+        )
+        require(
+            all(item.get("fresh") is False for item in rows),
+            f"{label}: build.fresh_false_artifacts fresh must be exactly false",
+        )
+    else:
+        rows = None
+        for key in V2_MANIFEST_ARTIFACT_KEYS:
+            candidate = manifest_build.get(key)
+            if isinstance(candidate, list):
+                rows = candidate
+                break
+        if rows is None:
+            for key in V2_MANIFEST_ARTIFACT_KEYS:
+                candidate = manifest.get(key)
+                if isinstance(candidate, list):
+                    rows = candidate
+                    break
+        require(
+            isinstance(rows, list) and rows,
+            f"{label}: v2 build must record a nonempty cargo_artifacts list",
+        )
+        require(
+            all(isinstance(item, dict) for item in rows),
+            f"{label}: v2 cargo_artifacts entries must be objects",
+        )
+        require(
+            all(item.get("kind") in receipts.ARTIFACT_KINDS for item in rows),
+            f"{label}: v2 cargo_artifacts kind is invalid",
+        )
+        require(
+            all(
+                isinstance(item.get("target"), str) and item.get("target")
+                for item in rows
+            ),
+            f"{label}: v2 cargo_artifacts target must be a nonempty string",
+        )
+        require(
+            all(isinstance(item.get("fresh"), bool) for item in rows),
+            f"{label}: v2 cargo_artifacts fresh must be a JSON boolean",
+        )
+    typed = [(item.get("kind"), item.get("target")) for item in rows]
+    require(
+        len(typed) == len(set(typed)),
+        f"{label}: duplicate (kind, target) pair in build artifacts",
+    )
+    return rows, typed
+
+
+def _receipt_artifact_for(validated, target, kind):
+    rows = [
+        row for row in validated.artifacts
+        if row.get("target") == target and row.get("kind") == kind
+    ]
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+def _absolute_recorded(value, label, what):
+    require(isinstance(value, str) and value, f"{label}: {what} must be a nonempty path")
+    path = Path(value)
+    require(path.is_absolute(), f"{label}: {what} must be absolute")
+    require(".." not in path.parts, f"{label}: {what} must not traverse")
+    return path
+
+
+def _resolved_equal(left, right):
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _inside(path, root):
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _cas_sealed_record(manifest, entry, label):
+    """Bind one published CAS row to exactly one sealed store record."""
+    store = manifest.get("artifact_store")
+    require(isinstance(store, dict), f"{label}: CAS manifest must carry artifact_store")
+    require(
+        store.get("schema") == STORE_SCHEMA,
+        f"{label}: artifact_store schema is invalid",
+    )
+    root = _absolute_recorded(store.get("root"), label, "artifact_store.root")
+    sealed = store.get("sealed")
+    require(
+        isinstance(sealed, list) and sealed,
+        f"{label}: artifact_store.sealed must be a nonempty list",
+    )
+    require(
+        all(isinstance(item, dict) for item in sealed),
+        f"{label}: artifact_store.sealed entries must be objects",
+    )
+    record = entry.get("artifact_store")
+    require(isinstance(record, dict), f"{label}: CAS artifacts entry must carry artifact_store")
+    require(
+        sum(1 for item in sealed if item == record) == 1,
+        f"{label}: CAS artifacts entry is not exactly one sealed store record",
+    )
+    require(record.get("schema") == STORE_SCHEMA, f"{label}: sealed record schema is invalid")
+    require(record.get("root") == str(root), f"{label}: sealed record root is foreign")
+    require(
+        record.get("kind") == entry.get("kind"),
+        f"{label}: sealed record kind does not match the manifest row",
+    )
+    require(
+        record.get("target") == entry.get("target"),
+        f"{label}: sealed record target does not match the manifest row",
+    )
+    return root, record
+
+
+def _cas_bin_paths(manifest, entry, label):
+    """The exact canonical bin snapshot and adjacent receipt for one CAS row."""
+    root, record = _cas_sealed_record(manifest, entry, label)
+    require(record.get("kind") == "bin", f"{label}: sealed record is not a bin")
+    binary = _absolute_recorded(record.get("binary"), label, "sealed binary")
+    receipt = _absolute_recorded(record.get("receipt"), label, "sealed receipt")
+    build_receipt = _absolute_recorded(record.get("build_receipt"), label, "sealed build receipt")
+    for path, what in (
+        (binary, "sealed binary"),
+        (receipt, "sealed receipt"),
+        (build_receipt, "sealed build receipt"),
+    ):
+        require(_inside(path, root), f"{label}: {what} is outside the sealed store")
+    require(binary.name == entry.get("target"), f"{label}: sealed binary basename is not the target")
+    require(
+        receipt.name == binary.name + ".receipt.json",
+        f"{label}: sealed receipt basename is invalid",
+    )
+    require(
+        build_receipt.name == binary.name + ".build.json",
+        f"{label}: sealed build receipt basename is invalid",
+    )
+    require(
+        receipt.parent == binary.parent and build_receipt.parent == binary.parent,
+        f"{label}: sealed receipts are not adjacent to the canonical binary",
+    )
+    require(
+        _resolved_equal(entry.get("artifact"), binary),
+        f"{label}: manifest artifact is not the sealed canonical snapshot",
+    )
+    require(
+        _resolved_equal(entry.get("receipt"), build_receipt),
+        f"{label}: manifest receipt is not the sealed .build.json alias",
+    )
+    require(
+        entry.get("sha256") == record.get("binary_sha256"),
+        f"{label}: manifest artifact sha256 does not match the sealed digest",
+    )
+    return binary, build_receipt, record
+
+
+def _require_store_matches_receipt(record, validated, label):
+    """The validated receipt must carry exactly the manifest's sealed record."""
+    require(
+        validated.schema == "v2",
+        f"{label}: artifact_store is only valid on a v2 receipt",
+    )
+    receipt_store = validated.payload.get("artifact_store")
+    require(
+        isinstance(receipt_store, dict),
+        f"{label}: receipt does not carry an artifact_store record",
+    )
+    require(
+        receipt_store == record,
+        f"{label}: receipt artifact_store does not match the sealed manifest record",
+    )
+
+
+def _cas_bin_entry(manifest, binary_name, label):
+    artifacts = manifest.get("artifacts")
+    require(
+        isinstance(artifacts, list) and artifacts,
+        f"{label}: artifacts must be a nonempty list",
+    )
+    require(
+        all(isinstance(artifact, dict) for artifact in artifacts),
+        f"{label}: artifacts entries must be objects",
+    )
+    matched = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("kind") == "bin" and artifact.get("target") == binary_name
+    ]
+    require(
+        len(matched) == 1,
+        f"{label}: expected exactly one CAS bin entry for {binary_name}, got {len(matched)}",
+    )
+    return matched[0]
+
+
+def _require_v2_manifest_matches_receipt(rows, validated, label):
+    """Cross-check manifest artifact fields against the validated receipt."""
+    for row in rows:
+        recorded = _receipt_artifact_for(validated, row["target"], row["kind"])
+        require(
+            recorded is not None,
+            f"{label}: manifest artifact ({row['kind']}, {row['target']}) is not selected by the receipt",
+        )
+        require(
+            row["fresh"] is recorded["fresh"],
+            f"{label}: manifest artifact ({row['kind']}, {row['target']}) freshness "
+            "does not match the receipt",
+        )
+        for field in ("package_id", "profile", "source", "source_sha256",
+                      "executable", "executable_sha256"):
+            if field in row:
+                require(
+                    row.get(field) == recorded.get(field),
+                    f"{label}: manifest artifact ({row['kind']}, {row['target']}) "
+                    f"{field} does not match the receipt",
+                )
+
+
+def _published_artifact_for(manifest, kind, target, label):
+    artifacts = manifest.get("artifacts")
+    require(
+        isinstance(artifacts, list) and artifacts,
+        f"{label}: artifacts must be a nonempty list",
+    )
+    require(
+        all(isinstance(artifact, dict) for artifact in artifacts),
+        f"{label}: artifacts entries must be objects",
+    )
+    matches = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("kind") == kind and artifact.get("target") == target
+    ]
+    require(
+        len(matches) == 1,
+        f"{label}: expected exactly one published ({kind}, {target}) artifact",
+    )
+    return matches[0]
+
+
+def _require_published_artifact_matches_row(entry, row, label, required_fields=()):
+    identity = f"({row['kind']}, {row['target']})"
+    require(
+        entry.get("fresh") is row.get("fresh"),
+        f"{label}: published artifact {identity} freshness does not match the build row",
+    )
+    for field in ("package_id", "profile", "source", "source_sha256"):
+        require(
+            field not in required_fields or field in entry,
+            f"{label}: published artifact {identity} {field} is required",
+        )
+        if field in entry:
+            require(
+                entry.get(field) == row.get(field),
+                f"{label}: published artifact {identity} {field} does not match the build row",
+            )
+    require(
+        entry.get("sha256") == row.get("executable_sha256"),
+        f"{label}: published artifact {identity} digest does not match the build row",
+    )
+    if "original_artifact" in entry:
+        require(
+            _resolved_equal(entry.get("original_artifact"), row.get("executable")),
+            f"{label}: published artifact {identity} original path does not match the build row",
+        )
+        require(
+            entry.get("original_artifact_sha256") == row.get("executable_sha256"),
+            f"{label}: published artifact {identity} original digest does not match the build row",
+        )
+    else:
+        require(
+            _resolved_equal(entry.get("artifact"), row.get("executable")),
+            f"{label}: published artifact {identity} path does not match the build row",
+        )
+
+
+def _recorded_test_targets(command, label):
+    """The exact ordered ``--test`` requests in the already-bound build command."""
+    require(
+        isinstance(command, (list, tuple)) and command,
+        f"{label}: recorded build command must be a nonempty list of strings",
+    )
+    requested = []
+    index = 0
+    while index < len(command):
+        token = command[index]
+        if token == "--test":
+            require(
+                index + 1 < len(command),
+                f"{label}: recorded --test has no target",
+            )
+            target = command[index + 1]
+            require(
+                isinstance(target, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,127}", target) is not None,
+                f"{label}: recorded --test target is malformed: {target!r}",
+            )
+            require(
+                target not in requested,
+                f"{label}: recorded --test repeats {target!r}",
+            )
+            requested.append(target)
+            index += 2
+            continue
+        require(
+            not token.startswith("--test"),
+            f"{label}: unsupported or malformed recorded --test flag {token!r}",
+        )
+        index += 1
+    return requested
+
+
+def _require_v2_batch_scope(manifest, batch_targets, artifact_rows, typed_targets,
+                            receipt, validated, label):
+    """Match a v2 receipt's batch link to the producer cohort it actually built.
+
+    A batch bin receipt names the lib and every selected/implicit bin.  The same
+    one-command batch manifest also appends the selected integration tests, so
+    those extra test rows must form a suffix, match the recorded ordered
+    ``--test`` requests, revalidate against the shared v2 artifact schema, and
+    bind their package and source digest to the validated receipt.  A test
+    receipt names the full lib/bin/test cohort and binds its own test row to the
+    validated receipt.
+    """
+    test_rows = [row for row in artifact_rows if row["kind"] == "test"]
+    non_test_rows = [row for row in artifact_rows if row["kind"] != "test"]
+    if test_rows:
+        try:
+            test_rows = receipts._validate_v2_artifacts(test_rows, label)
+        except receipts.ReceiptError as error:
+            raise ManifestError(str(error)) from None
+        package_ids = {row.get("package_id") for row in validated.artifacts}
+        require(
+            len(package_ids) == 1,
+            f"{label}: validated receipt does not record exactly one package identity",
+        )
+        package_id = next(iter(package_ids))
+        entries_by_path = {
+            entry["path"]: entry
+            for entry in validated.payload.get("bound_input_inventory", [])
+        }
+        for row in test_rows:
+            require(
+                row["package_id"] == package_id,
+                f"{label}: test artifact package_id {row['package_id']!r} "
+                f"does not match validated receipt package {package_id!r}",
+            )
+            bound_entry = entries_by_path.get(row["source"])
+            require(
+                bound_entry is not None and bound_entry.get("present") is True,
+                f"{label}: test artifact source {row['source']} "
+                "is not present in the validated receipt inventory",
+            )
+            require(
+                bound_entry.get("sha256") == row["source_sha256"],
+                f"{label}: test artifact source {row['source']} "
+                "hash does not match the validated receipt inventory",
+            )
+    requested_tests = _recorded_test_targets(receipt.get("command"), label)
+    require(
+        [row["target"] for row in test_rows] == requested_tests,
+        f"{label}: test artifact targets {[row['target'] for row in test_rows]!r} "
+        f"do not match recorded --test order {requested_tests!r}",
+    )
+    receipt_kind = receipt.get("kind")
+    if receipt_kind == "rust-integration-test":
+        require(
+            all(row["kind"] == "test" for row in validated.artifacts),
+            f"{label}: test receipt selected a non-test artifact",
+        )
+        require(
+            batch_targets == [target for kind, target in typed_targets],
+            f"{label}: test receipt batch targets {batch_targets!r} do not match "
+            f"build artifact targets {[target for kind, target in typed_targets]!r}",
+        )
+    else:
+        if receipt_kind == "native-build-batch-bin":
+            require(
+                all(row["kind"] in ("lib", "bin") for row in validated.artifacts),
+                f"{label}: bin receipt selected a non-lib/bin artifact",
+            )
+        require(
+            artifact_rows == non_test_rows + test_rows,
+            f"{label}: test artifacts must follow the receipt's lib/bin cohort",
+        )
+        require(
+            non_test_rows and non_test_rows[0]["kind"] == "lib",
+            f"{label}: bin receipt cohort must begin with the lib artifact",
+        )
+        require(
+            all(row["kind"] == "bin" for row in non_test_rows[1:]),
+            f"{label}: bin receipt cohort may contain only lib/bin artifacts",
+        )
+        require(
+            batch_targets == [row["target"] for row in non_test_rows],
+            f"{label}: batch targets {batch_targets!r} do not match "
+            f"receipt-kind lib/bin cohort {[row['target'] for row in non_test_rows]!r}",
+        )
+
+    receipt_targets = {(row["kind"], row["target"]) for row in validated.artifacts}
+    own_rows = [
+        row for row in artifact_rows
+        if (row["kind"], row["target"]) in receipt_targets
+    ]
+    require(
+        len(own_rows) == len(validated.artifacts),
+        f"{label}: not every artifact selected by the receipt is present in the batch manifest",
+    )
+    require(
+        [(row["kind"], row["target"]) for row in own_rows]
+        == [(row["kind"], row["target"]) for row in validated.artifacts],
+        f"{label}: receipt artifact order does not match the batch manifest cohort",
+    )
+    _require_v2_manifest_matches_receipt(own_rows, validated, label)
+
+    published = [
+        artifact
+        for artifact in manifest.get("artifacts") or []
+        if isinstance(artifact, dict)
+    ]
+    published_bins = [
+        artifact for artifact in published if artifact.get("kind") == "bin"
+    ]
+    bin_rows = [row for row in artifact_rows if row["kind"] == "bin"]
+    require(
+        [(artifact.get("kind"), artifact.get("target")) for artifact in published_bins]
+        == [(row["kind"], row["target"]) for row in bin_rows],
+        f"{label}: published bin artifacts do not match the batch bin cohort",
+    )
+    for row, entry in zip(bin_rows, published_bins):
+        _require_published_artifact_matches_row(entry, row, label)
+
+    published_tests = [
+        artifact for artifact in published if artifact.get("kind") == "test"
+    ]
+    require(
+        [(artifact.get("kind"), artifact.get("target")) for artifact in published_tests]
+        == [("test", row["target"]) for row in test_rows],
+        f"{label}: published test artifacts do not match the batch test cohort",
+    )
+    for row, entry in zip(test_rows, published_tests):
+        _require_published_artifact_matches_row(
+            entry, row, label,
+            required_fields=("package_id", "profile", "source", "source_sha256"),
+        )
+
+    extras = [
+        row for row in artifact_rows
+        if (row["kind"], row["target"]) not in receipt_targets
+    ]
+    for row in extras:
+        if row["kind"] == "test":
+            continue
+        if row["kind"] == "lib":
+            require(
+                sum(1 for item in artifact_rows if item["kind"] == "lib") == 1,
+                f"{label}: manifest must record exactly one lib artifact",
+            )
+            require(
+                row.get("package_id") == manifest.get("cargo_package_id"),
+                f"{label}: extra lib artifact package_id does not match the manifest",
+            )
+            continue
+        entry = _published_artifact_for(manifest, row["kind"], row["target"], label)
+        _require_published_artifact_matches_row(entry, row, label)
+
+
 def load_receipt(path, binary_override):
     file = Path(path)
     require(file.is_file(), f"build receipt is missing: {file}")
@@ -136,20 +654,56 @@ def load_receipt(path, binary_override):
         receipt = json.loads(file.read_text())
     except json.JSONDecodeError as error:
         raise ManifestError(f"build receipt is not JSON: {error}")
-    for field in REQUIRED_RECEIPT_FIELDS:
-        require(receipt.get(field), f"build receipt is missing {field}")
     binary = Path(binary_override) if binary_override else Path(str(file)[: -len(".build.json")])
     require(binary.is_file(), f"built binary is missing: {binary}")
     actual = digest(binary)
+    try:
+        validated = receipts.validate_receipt(
+            receipt,
+            receipt_path=file,
+            binary_path=binary,
+            verify_source_files=False,
+        )
+    except receipts.ReceiptError as error:
+        raise ManifestError(str(error)) from None
+    if validated.schema == "v1":
+        for field in REQUIRED_RECEIPT_FIELDS:
+            require(receipt.get(field), f"build receipt is missing {field}")
     require(
-        actual == receipt["binary_sha256"],
-        f"binary digest {actual} does not match the build receipt {receipt['binary_sha256']}",
+        actual == validated.binary_sha256,
+        f"binary digest {actual} does not match the build receipt {validated.binary_sha256}",
     )
-    return receipt, file, binary
+    return receipt, validated, file, binary
 
 
-def verify_batch_receipt(receipt, receipt_file, binary):
+def verify_batch_receipt(receipt, validated, receipt_file, binary,
+                         expected_manifest_sha=None, expected_manifest_path=None):
+    """Validate the batch link and bind the exact manifest bytes consumed.
+
+    ``expected_manifest_sha`` and ``expected_manifest_path`` are optional
+    exporter-provided trust anchors.  When supplied, the SHA-256 is compared
+    against the same raw byte buffer that is parsed and later recorded as the
+    job manifest provenance, so a later re-read cannot hide a rewrite.
+    """
+    if expected_manifest_sha is not None:
+        require(
+            isinstance(expected_manifest_sha, str)
+            and len(expected_manifest_sha) == 64
+            and expected_manifest_sha == expected_manifest_sha.lower()
+            and all(char in "0123456789abcdef" for char in expected_manifest_sha),
+            "expected batch manifest SHA-256 must be 64 lowercase hexadecimal characters",
+        )
+    if expected_manifest_path is not None:
+        expected_path = _absolute_recorded(
+            expected_manifest_path, "expected batch manifest", "path"
+        )
+    else:
+        expected_path = None
     if not isinstance(receipt, dict) or "batch" not in receipt:
+        require(
+            expected_manifest_sha is None and expected_path is None,
+            "an explicit batch manifest anchor was supplied but the build receipt has no batch link",
+        )
         return None
     batch = receipt["batch"]
     require(isinstance(batch, dict), "batch receipt must be an object")
@@ -184,6 +738,11 @@ def verify_batch_receipt(receipt, receipt_file, binary):
         manifest_path.is_symlink() is False,
         "batch receipt manifest must not be a symlink",
     )
+    if expected_path is not None:
+        require(
+            _resolved_equal(manifest_path, expected_path),
+            "batch receipt manifest path does not match the exporter-provided path",
+        )
     targets = batch.get("targets")
     require(
         isinstance(targets, list) and targets,
@@ -195,8 +754,19 @@ def verify_batch_receipt(receipt, receipt_file, binary):
     )
 
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
+        raw = manifest_path.read_bytes()
+    except OSError as error:
+        raise ManifestError(f"batch receipt manifest cannot be read: {error}") from error
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    if expected_manifest_sha is not None:
+        require(
+            raw_sha256 == expected_manifest_sha,
+            "batch receipt manifest SHA-256 does not match the exporter-validated SHA-256",
+        )
+
+    try:
+        manifest = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as error:
         raise ManifestError("batch receipt manifest is not valid JSON") from error
     require(isinstance(manifest, dict), "batch receipt manifest must be an object")
     require(
@@ -215,11 +785,17 @@ def verify_batch_receipt(receipt, receipt_file, binary):
         "batch receipt manifest version does not match the batch receipt",
     )
 
+    architecture = receipt.get("architecture")
+    if validated.schema == "v2":
+        architecture = {
+            "target_triple": validated.toolchain["target_triple"],
+            "host": validated.toolchain["rustc"]["host"],
+        }
     for field, receipt_value in (
         ("source_commit", receipt.get("workspace_commit")),
         ("source_inputs_sha256", receipt.get("source_inputs_sha256")),
         ("toolchain", receipt.get("toolchain")),
-        ("architecture", receipt.get("architecture")),
+        ("architecture", architecture),
         ("target_directory", receipt.get("target_dir")),
     ):
         require(
@@ -261,57 +837,38 @@ def verify_batch_receipt(receipt, receipt_file, binary):
         "batch receipt manifest bound_inputs digest does not match the receipt",
     )
 
-    clean = manifest.get("clean")
-    require(
-        isinstance(clean, dict),
-        "batch receipt manifest clean must be an object",
-    )
-    require(
-        isinstance(clean.get("commands"), int)
-        and not isinstance(clean.get("commands"), bool)
-        and clean.get("commands") == 1,
-        "batch receipt manifest clean.commands must be exactly 1",
-    )
-    require(
-        isinstance(manifest_build.get("commands"), int)
-        and not isinstance(manifest_build.get("commands"), bool)
-        and manifest_build.get("commands") == 1,
-        "batch receipt manifest build.commands must be exactly 1",
-    )
+    if validated.schema == "v1":
+        clean = manifest.get("clean")
+        require(
+            isinstance(clean, dict),
+            "batch receipt manifest clean must be an object",
+        )
+        require(
+            isinstance(clean.get("commands"), int)
+            and not isinstance(clean.get("commands"), bool)
+            and clean.get("commands") == 1,
+            "batch receipt manifest clean.commands must be exactly 1",
+        )
+        require(
+            isinstance(manifest_build.get("commands"), int)
+            and not isinstance(manifest_build.get("commands"), bool)
+            and manifest_build.get("commands") == 1,
+            "batch receipt manifest build.commands must be exactly 1",
+        )
 
-    fresh_false_artifacts = manifest_build.get("fresh_false_artifacts")
-    require(
-        isinstance(fresh_false_artifacts, list) and len(fresh_false_artifacts) > 0,
-        "fresh_false_artifacts must be a non-empty list",
+    artifact_rows, typed_targets = _manifest_artifact_rows(
+        manifest, manifest_build, validated.schema, "batch receipt manifest"
     )
-    require(
-        all(isinstance(item, dict) for item in fresh_false_artifacts),
-        "fresh_false_artifacts items must be dicts",
-    )
-    require(
-        all(item.get("kind") in ("lib", "bin") for item in fresh_false_artifacts),
-        "fresh_false_artifacts kind must be lib or bin",
-    )
-    require(
-        all(
-            isinstance(item.get("target"), str) and item.get("target") != ""
-            for item in fresh_false_artifacts
-        ),
-        "fresh_false_artifacts target must be a non-empty string",
-    )
-    require(
-        all(item.get("fresh") is False for item in fresh_false_artifacts),
-        "fresh_false_artifacts fresh must be exactly False",
-    )
-    typed_targets = [(item.get("kind"), item.get("target")) for item in fresh_false_artifacts]
-    require(
-        len(typed_targets) == len(set(typed_targets)),
-        "Duplicate (kind, target) pair detected in fresh_false_artifacts",
-    )
-    require(
-        targets == [target for kind, target in typed_targets],
-        "targets must match typed_targets order",
-    )
+    if validated.schema == "v2":
+        _require_v2_batch_scope(
+            manifest, targets, artifact_rows, typed_targets,
+            receipt, validated, "batch receipt manifest",
+        )
+    else:
+        require(
+            targets == [target for kind, target in typed_targets],
+            "targets must match typed_targets order",
+        )
 
     artifacts = manifest.get("artifacts")
     require(
@@ -331,35 +888,72 @@ def verify_batch_receipt(receipt, receipt_file, binary):
         "receipt.target_dir must be a nonempty absolute path",
     )
     target_dir = Path(target_dir_value)
-    expected_binary = target_dir / "debug" / batch["binary"]
-    expected_receipt = target_dir / "debug" / f'{batch["binary"]}.build.json'
+    if manifest.get("artifact_store") is None:
+        expected_binary = target_dir / "debug" / batch["binary"]
+        expected_receipt = target_dir / "debug" / f'{batch["binary"]}.build.json'
 
-    def resolves_to(entry_value, expected):
-        if not isinstance(entry_value, str) or not entry_value:
-            return False
-        try:
-            if not Path(entry_value).is_absolute():
+        def resolves_to(entry_value, expected):
+            if not isinstance(entry_value, str) or not entry_value:
                 return False
-            return Path(entry_value).resolve() == expected.resolve()
-        except (OSError, ValueError, RuntimeError):
-            return False
+            try:
+                if not Path(entry_value).is_absolute():
+                    return False
+                return Path(entry_value).resolve() == expected.resolve()
+            except (OSError, ValueError, RuntimeError):
+                return False
 
-    matched = [
-        artifact
-        for artifact in artifacts
-        if resolves_to(artifact.get("artifact"), expected_binary)
-        and resolves_to(artifact.get("receipt"), expected_receipt)
-    ]
-    require(
-        len(matched) == 1,
-        "batch receipt manifest must contain exactly one entry for the binary and receipt",
-    )
-    entry = matched[0]
+        matched = [
+            artifact
+            for artifact in artifacts
+            if resolves_to(artifact.get("artifact"), expected_binary)
+            and resolves_to(artifact.get("receipt"), expected_receipt)
+        ]
+        require(
+            len(matched) == 1,
+            "batch receipt manifest must contain exactly one entry for the binary and receipt",
+        )
+        entry = matched[0]
+    else:
+        entry = _cas_bin_entry(manifest, batch["binary"], "batch receipt manifest")
+        sealed_binary, sealed_receipt, record = _cas_bin_paths(
+            manifest, entry, "batch receipt manifest"
+        )
+        store_root = Path(manifest["artifact_store"]["root"])
+        require(
+            not _inside(store_root, target_dir) and not _inside(target_dir, store_root),
+            "batch receipt manifest artifact store must be disjoint from target_dir",
+        )
+        require(
+            _resolved_equal(binary, sealed_binary),
+            "batch receipt manifest consumed binary is not the sealed canonical snapshot",
+        )
+        require(
+            _resolved_equal(receipt_file, sealed_receipt),
+            "batch receipt manifest consumed receipt is not the sealed .build.json alias",
+        )
+        _require_store_matches_receipt(record, validated, "batch receipt manifest")
     require(entry.get("kind") == "bin", "batch receipt binary entry has an invalid kind")
-    require(
-        entry.get("fresh") is False,
-        "batch receipt binary entry must not be fresh",
-    )
+    if validated.schema == "v1":
+        require(
+            entry.get("fresh") is False,
+            "batch receipt binary entry must not be fresh",
+        )
+    else:
+        require(
+            isinstance(entry.get("fresh"), bool),
+            "batch receipt binary entry fresh must be a JSON boolean",
+        )
+        selected = _receipt_artifact_for(
+            validated, entry.get("target"), entry.get("kind")
+        )
+        require(
+            selected is not None,
+            "batch receipt binary entry is not selected by the receipt",
+        )
+        require(
+            entry.get("fresh") is selected["fresh"],
+            "batch receipt binary entry freshness does not match the receipt",
+        )
     require(
         entry.get("implicit") is False,
         "batch receipt binary entry must not be implicit",
@@ -379,14 +973,21 @@ def verify_batch_receipt(receipt, receipt_file, binary):
 
     return {
         "file": str(manifest_path.resolve()),
-        "sha256": digest(manifest_path),
+        "sha256": raw_sha256,
         "target": entry["target"],
     }
 
 
 def job_manifest(args):
-    receipt, receipt_file, binary = load_receipt(args.build_receipt, args.binary)
-    batch_manifest = verify_batch_receipt(receipt, receipt_file, binary)
+    receipt, validated, receipt_file, binary = load_receipt(args.build_receipt, args.binary)
+    batch_manifest = verify_batch_receipt(
+        receipt,
+        validated,
+        receipt_file,
+        binary,
+        expected_manifest_sha=args.expect_batch_manifest_sha,
+        expected_manifest_path=args.expect_batch_manifest_path,
+    )
     commit = args.expect_commit or receipt["workspace_commit"]
     require(
         commit == receipt["workspace_commit"],
@@ -473,6 +1074,12 @@ def job_manifest(args):
     require(harnesses, "at least one --harness is required to bind the executed test source")
 
     fixtures = pairs(args.fixture, "--fixture")
+    if getattr(args, "fixture_rust_from_receipt", False):
+        require(
+            "rust" not in fixtures,
+            "--fixture-rust-from-receipt conflicts with an explicit --fixture rust=...",
+        )
+        fixtures["rust"] = receipt_rustc(validated)
     for name, value in fixtures.items():
         require(value.strip(), f"fixture {name}: empty fixture version")
         require("\n" not in value and len(value) <= 300, f"fixture {name}: value is not a single safe line")
@@ -490,7 +1097,8 @@ def job_manifest(args):
         "build_receipt": {
             "file": str(receipt_file),
             "sha256": digest(receipt_file),
-            "rustc": receipt["rustc"],
+            "rustc": receipt_rustc(validated),
+            "receipt_schema": validated.schema,
             **({"batch_manifest": batch_manifest} if batch_manifest is not None else {}),
         },
         "build_command": receipt["command"],
@@ -559,6 +1167,14 @@ def release_manifest(args):
         except (OSError, ValueError) as error:
             raise ManifestError(f"{label}: not valid JSON: {error}")
         require(isinstance(receipt, dict), f"{label}: not a JSON object")
+        try:
+            validated = receipts.validate_receipt(
+                receipt,
+                receipt_path=downloaded_receipt,
+                verify_source_files=False,
+            )
+        except receipts.ReceiptError as error:
+            raise ManifestError(f"{label}: {error}") from None
         require(
             receipt.get("workspace_commit") == data.get("source_commit"),
             f"{label}: workspace_commit does not match the job source commit",
@@ -576,7 +1192,7 @@ def release_manifest(args):
             f"{label}: build receipt rustc must be a nonempty string",
         )
         require(
-            receipt.get("rustc") == build_receipt.get("rustc"),
+            receipt_rustc(validated) == build_receipt.get("rustc"),
             f"{label}: rustc does not match the job build receipt",
         )
         verified["build:receipt"] = {"file": downloaded_receipt.name, "sha256": receipt_sha256}
@@ -709,15 +1325,21 @@ def release_manifest(args):
                 and manifest_version == batch_version,
                 f"{manifest_label}: manifest_version must equal batch receipt_version",
             )
-            for manifest_field, receipt_field in (
-                ("source_commit", "workspace_commit"),
-                ("source_inputs_sha256", "source_inputs_sha256"),
-                ("toolchain", "toolchain"),
-                ("architecture", "architecture"),
-                ("target_directory", "target_dir"),
+            architecture = receipt.get("architecture")
+            if validated.schema == "v2":
+                architecture = {
+                    "target_triple": validated.toolchain["target_triple"],
+                    "host": validated.toolchain["rustc"]["host"],
+                }
+            for manifest_field, receipt_field, receipt_value in (
+                ("source_commit", "workspace_commit", receipt.get("workspace_commit")),
+                ("source_inputs_sha256", "source_inputs_sha256", receipt.get("source_inputs_sha256")),
+                ("toolchain", "toolchain", receipt.get("toolchain")),
+                ("architecture", "architecture", architecture),
+                ("target_directory", "target_dir", receipt.get("target_dir")),
             ):
                 require(
-                    manifest.get(manifest_field) == receipt.get(receipt_field),
+                    manifest.get(manifest_field) == receipt_value,
                     f"{manifest_label}: {manifest_field} does not match receipt {receipt_field}",
                 )
             manifest_build = manifest.get("build")
@@ -737,58 +1359,39 @@ def release_manifest(args):
                 manifest_bound_digest == receipt_bound.get("digest"),
                 f"{manifest_label}: bound_inputs digest does not match the receipt",
             )
-            manifest_clean = manifest.get("clean")
-            require(isinstance(manifest_clean, dict), f"{manifest_label}: clean must be an object")
-            require(
-                isinstance(manifest_clean.get("commands"), int)
-                and not isinstance(manifest_clean.get("commands"), bool)
-                and manifest_clean.get("commands") == 1,
-                f"{manifest_label}: clean.commands must be exactly 1",
-            )
-            require(
-                isinstance(manifest_build.get("commands"), int)
-                and not isinstance(manifest_build.get("commands"), bool)
-                and manifest_build.get("commands") == 1,
-                f"{manifest_label}: build.commands must be exactly 1",
-            )
+            if validated.schema == "v1":
+                manifest_clean = manifest.get("clean")
+                require(isinstance(manifest_clean, dict), f"{manifest_label}: clean must be an object")
+                require(
+                    isinstance(manifest_clean.get("commands"), int)
+                    and not isinstance(manifest_clean.get("commands"), bool)
+                    and manifest_clean.get("commands") == 1,
+                    f"{manifest_label}: clean.commands must be exactly 1",
+                )
+                require(
+                    isinstance(manifest_build.get("commands"), int)
+                    and not isinstance(manifest_build.get("commands"), bool)
+                    and manifest_build.get("commands") == 1,
+                    f"{manifest_label}: build.commands must be exactly 1",
+                )
 
-            fresh_false_artifacts = manifest_build.get("fresh_false_artifacts")
-            require(
-                isinstance(fresh_false_artifacts, list) and fresh_false_artifacts,
-                f"{manifest_label}: build.fresh_false_artifacts must be a nonempty list",
+            artifact_rows, typed_targets = _manifest_artifact_rows(
+                manifest, manifest_build, validated.schema, manifest_label
             )
-            require(
-                all(isinstance(item, dict) for item in fresh_false_artifacts),
-                f"{manifest_label}: build.fresh_false_artifacts entries must be objects",
-            )
-            require(
-                all(item.get("kind") in ("lib", "bin") for item in fresh_false_artifacts),
-                f"{manifest_label}: build.fresh_false_artifacts kind must be 'lib' or 'bin'",
-            )
-            require(
-                all(
-                    isinstance(item.get("target"), str) and item.get("target")
-                    for item in fresh_false_artifacts
-                ),
-                f"{manifest_label}: build.fresh_false_artifacts target must be a nonempty string",
-            )
-            require(
-                all(item.get("fresh") is False for item in fresh_false_artifacts),
-                f"{manifest_label}: build.fresh_false_artifacts fresh must be exactly false",
-            )
-            typed_targets = [(item.get("kind"), item.get("target")) for item in fresh_false_artifacts]
-            require(
-                len(typed_targets) == len(set(typed_targets)),
-                f"{manifest_label}: duplicate (kind, target) pair in build.fresh_false_artifacts",
-            )
-            require(
-                batch_targets == [target for kind, target in typed_targets],
-                f"{manifest_label}: batch targets {batch_targets!r} do not match "
-                f"fresh_false_artifacts targets {[target for kind, target in typed_targets]!r}",
-            )
+            if validated.schema == "v2":
+                _require_v2_batch_scope(
+                    manifest, batch_targets, artifact_rows, typed_targets,
+                    receipt, validated, manifest_label,
+                )
+            else:
+                require(
+                    batch_targets == [target for kind, target in typed_targets],
+                    f"{manifest_label}: batch targets {batch_targets!r} do not match "
+                    f"build artifact targets {[target for kind, target in typed_targets]!r}",
+                )
             require(
                 ("bin", binary_name) in typed_targets,
-                f"{manifest_label}: no fresh-false (bin, {binary_name}) target recorded",
+                f"{manifest_label}: no (bin, {binary_name}) target recorded",
             )
 
             target_dir = receipt.get("target_dir")
@@ -796,24 +1399,6 @@ def release_manifest(args):
                 isinstance(target_dir, str) and target_dir and Path(target_dir).is_absolute(),
                 f"{label}: target_dir must be a nonempty absolute path",
             )
-            expect_binary = Path(target_dir) / "debug" / binary_name
-            expect_receipt = Path(target_dir) / "debug" / f"{binary_name}.build.json"
-            try:
-                expected_binary_path = expect_binary.resolve()
-                expected_receipt_path = expect_receipt.resolve()
-            except (OSError, ValueError) as error:
-                raise ManifestError(f"{label}: cannot resolve the original batch artifact paths: {error}")
-
-            def original_path_matches(value):
-                if not isinstance(value, str) or not value:
-                    return False
-                path = Path(value)
-                if not path.is_absolute():
-                    return False
-                try:
-                    return Path(value).resolve()
-                except (OSError, ValueError):
-                    return None
 
             artifacts = manifest.get("artifacts")
             require(
@@ -824,18 +1409,65 @@ def release_manifest(args):
                 all(isinstance(artifact, dict) for artifact in artifacts),
                 f"{manifest_label}: artifacts entries must be objects",
             )
-            matched = [
-                artifact
-                for artifact in artifacts
-                if original_path_matches(artifact.get("artifact")) == expected_binary_path
-                and original_path_matches(artifact.get("receipt")) == expected_receipt_path
-            ]
-            require(
-                len(matched) == 1,
-                f"{manifest_label}: expected exactly one artifacts entry for {expect_binary} and {expect_receipt}, "
-                f"got {len(matched)}",
-            )
-            entry = matched[0]
+            if manifest.get("artifact_store") is None:
+                expect_binary = Path(target_dir) / "debug" / binary_name
+                expect_receipt = Path(target_dir) / "debug" / f"{binary_name}.build.json"
+                try:
+                    expected_binary_path = expect_binary.resolve()
+                    expected_receipt_path = expect_receipt.resolve()
+                except (OSError, ValueError) as error:
+                    raise ManifestError(f"{label}: cannot resolve the original batch artifact paths: {error}")
+
+                def original_path_matches(value):
+                    if not isinstance(value, str) or not value:
+                        return False
+                    path = Path(value)
+                    if not path.is_absolute():
+                        return False
+                    try:
+                        return Path(value).resolve()
+                    except (OSError, ValueError):
+                        return None
+
+                matched = [
+                    artifact
+                    for artifact in artifacts
+                    if original_path_matches(artifact.get("artifact")) == expected_binary_path
+                    and original_path_matches(artifact.get("receipt")) == expected_receipt_path
+                ]
+                require(
+                    len(matched) == 1,
+                    f"{manifest_label}: expected exactly one artifacts entry for {expect_binary} and {expect_receipt}, "
+                    f"got {len(matched)}",
+                )
+                entry = matched[0]
+            else:
+                entry = _cas_bin_entry(manifest, binary_name, manifest_label)
+                sealed_binary, sealed_receipt, record = _cas_bin_paths(
+                    manifest, entry, manifest_label
+                )
+                store_root = Path(manifest["artifact_store"]["root"])
+                target_path = Path(target_dir)
+                require(
+                    not _inside(store_root, target_path)
+                    and not _inside(target_path, store_root),
+                    f"{manifest_label}: artifact store must be disjoint from target_dir",
+                )
+                recorded_binary = _absolute_recorded(
+                    data.get("binary"), f"job manifest {name}", "binary"
+                )
+                recorded_receipt = _absolute_recorded(
+                    build_receipt.get("file"), label, "receipt file"
+                )
+                require(
+                    _resolved_equal(recorded_binary, sealed_binary),
+                    f"{manifest_label}: recorded binary is not the sealed canonical snapshot",
+                )
+                require(
+                    _resolved_equal(recorded_receipt, sealed_receipt),
+                    f"{manifest_label}: recorded receipt is not the sealed .build.json alias",
+                )
+                _require_store_matches_receipt(record, validated, manifest_label)
             require(
                 entry.get("kind") == "bin",
                 f"{manifest_label}: binary artifacts entry kind must be 'bin'",
@@ -845,10 +1477,27 @@ def release_manifest(args):
                 f"{manifest_label}: binary artifacts entry target {entry.get('target')!r} "
                 f"does not match binary {binary_name!r}",
             )
-            require(
-                entry.get("fresh") is False,
-                f"{manifest_label}: binary artifacts entry fresh must be exactly false",
-            )
+            if validated.schema == "v1":
+                require(
+                    entry.get("fresh") is False,
+                    f"{manifest_label}: binary artifacts entry fresh must be exactly false",
+                )
+            else:
+                require(
+                    isinstance(entry.get("fresh"), bool),
+                    f"{manifest_label}: binary artifacts entry fresh must be a JSON boolean",
+                )
+                selected = _receipt_artifact_for(
+                    validated, entry.get("target"), entry.get("kind")
+                )
+                require(
+                    selected is not None,
+                    f"{manifest_label}: binary artifacts entry is not selected by the receipt",
+                )
+                require(
+                    entry.get("fresh") is selected["fresh"],
+                    f"{manifest_label}: binary artifacts entry freshness does not match the receipt",
+                )
             require(
                 entry.get("implicit") is False,
                 f"{manifest_label}: binary artifacts entry implicit must be exactly false",
@@ -943,6 +1592,13 @@ def main():
     parser.add_argument("--expect-commit", default=os.environ.get("GITHUB_SHA"))
     parser.add_argument("--build-receipt")
     parser.add_argument("--binary")
+    parser.add_argument("--expect-batch-manifest-sha")
+    parser.add_argument("--expect-batch-manifest-path")
+    parser.add_argument(
+        "--fixture-rust-from-receipt",
+        action="store_true",
+        help="record fixtures.rust from the validated build receipt without probing rustc",
+    )
     parser.add_argument("--report", action="append", default=[])
     parser.add_argument("--require-case", action="append", default=[])
     parser.add_argument("--log", action="append", default=[])
@@ -968,6 +1624,15 @@ def main():
                 "reports": sorted(payload["reports"]),
             }
         else:
+            require(
+                not args.fixture_rust_from_receipt,
+                "--fixture-rust-from-receipt is only valid in job mode",
+            )
+            require(
+                args.expect_batch_manifest_sha is None
+                and args.expect_batch_manifest_path is None,
+                "--expect-batch-manifest-sha/--expect-batch-manifest-path are only valid in job mode",
+            )
             payload = release_manifest(args)
             summary = {
                 "status": payload["status"],

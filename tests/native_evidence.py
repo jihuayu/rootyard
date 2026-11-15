@@ -3,7 +3,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import time
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+import native_build_receipt as receipts  # noqa: E402
 
 
 def record(harness, event, **fields):
@@ -17,16 +24,44 @@ def record(harness, event, **fields):
         output.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
+def load_validated(binary, expected_commit=None):
+    """Read the adjacent receipt through the shared v1/v2 reader.
+
+    This is a metadata-only operation: it never invokes Cargo, rustc, rustup or
+    a builder.  The supplied binary is hashed in place, so a copied or
+    content-addressed snapshot remains valid when its mutable original changes,
+    provided the receipt and the copied bytes still describe the same SHA-256.
+    """
+    path = Path(binary).resolve()
+    receipt = path.with_suffix(".build.json")
+    if not receipt.exists():
+        return None
+    if not receipt.is_file() or receipt.is_symlink():
+        raise RuntimeError("build receipt is not a regular file")
+    return receipts.load_receipt(
+        receipt,
+        binary_path=path,
+        expected_commit=expected_commit,
+        verify_source_files=False,
+    )
+
+
 def build_record(binary):
     binary = Path(binary).resolve()
-    receipt = binary.with_suffix('.build.json')
-    if not receipt.exists():
+    validated = load_validated(binary)
+    if validated is None:
         return {"attested": False, "reason": "no build receipt; source revision is not inferred"}
-    data = json.loads(receipt.read_text())
+    data = validated.payload
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    if data.get("binary_sha256") != digest:
+    if validated.binary_sha256 != digest:
         raise RuntimeError("build receipt does not match executed binary")
-    return {"attested": True, **data}
+    return {
+        "attested": True,
+        "validated_schema": validated.schema,
+        "receipt_sha256": validated.receipt_sha256,
+        "receipt_binary_sha256": validated.binary_sha256,
+        **data,
+    }
 
 
 def started(harness):

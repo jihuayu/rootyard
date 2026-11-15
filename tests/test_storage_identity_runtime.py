@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Per-PR live Rust storage_lifecycle worker fence regression (#90).
 
-Runs under ``python3 -m unittest discover -s tests -p 'test_*.py'`` after CI
-builds ``target/debug/rootyard``. When ``GITHUB_ACTIONS=true``, missing
-``ROOTYARD_TEST_DATABASE_URL`` or missing ``target/debug/rootyard`` fails hard
-rather than skipping. Locally, unset configuration builds ``rootyard`` and
-starts an ephemeral PostgreSQL cluster under ``TMPDIR``.
+A source-bound prebuilt ``target/debug/rootyard`` (or an artifact selected by
+``ROOTYARD_BIN``, ``ROOTYARD_TEST_BINARY`` or the legacy ``ROOTYARD_BINARY``)
+and its adjacent build receipt are required in every environment. Run the
+explicit native build preparation step first; this module never invokes Cargo
+or ``scripts/build_native.py``. A missing or stale artifact fails hard instead
+of compiling. In CI (``GITHUB_ACTIONS=true``) ``ROOTYARD_TEST_DATABASE_URL`` is
+also required; locally, unset configuration starts an ephemeral PostgreSQL
+cluster under ``TMPDIR``.
 """
 import base64
 import json
@@ -19,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +30,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import schema_baseline  # noqa: E402
+import runtime_binary  # noqa: E402
 from test_storage_identity_fks import (  # noqa: E402
     JOBS_OWNER_FK,
     psql_exec,
@@ -36,19 +41,82 @@ from test_storage_identity_fks import (  # noqa: E402
 
 DEFAULT_BINARY = schema_baseline.ROOT / "target" / "debug" / "rootyard"
 FENCE_DIAGNOSTIC = "maintenance claim or repository generation changed"
+PREBUILT_INSTRUCTION = (
+    "run the explicit native build preparation step and set ROOTYARD_BIN "
+    "(legacy ROOTYARD_TEST_BINARY/ROOTYARD_BINARY are also accepted), or leave "
+    "the documented target/debug/rootyard, before this runtime acceptance; "
+    "this test never invokes Cargo or build_native.py"
+)
 
 
-def resolve_binary_path(environ, default_binary, build_local):
-    raw = (environ.get("ROOTYARD_TEST_BINARY") or "").strip()
-    candidate = Path(raw) if raw else Path(default_binary)
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        return candidate.resolve()
-    if environ.get("GITHUB_ACTIONS") == "true":
-        raise RuntimeError(
-            f"Executable rootyard binary is required when GITHUB_ACTIONS=true ({candidate}); "
-            "refusing to silently skip runtime worker regression in CI"
-        )
-    return build_local(candidate)
+def resolve_binary_path(environ, default_binary):
+    return runtime_binary.select_runtime_binary_path(
+        environ, default_binary=default_binary,
+        instruction=PREBUILT_INSTRUCTION)
+
+
+def source_bound_prebuilt_binary(environ, default_binary, binder=None):
+    """Require a prebuilt binary whose receipt and production inputs match this checkout."""
+    path = resolve_binary_path(environ, default_binary)
+    binding = runtime_binary.bind_runtime_binary(
+        path, environ, binder=binder, instruction=PREBUILT_INSTRUCTION)
+    return path, binding
+
+
+class PrebuiltBinaryContractTest(unittest.TestCase):
+    """Offline regressions: acceptance never invokes a build callback or Cargo."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="rootyard-fk90-prebuilt-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def _executable(self, name="rootyard"):
+        binary = self.root / name
+        binary.write_bytes(b"prebuilt fixture")
+        binary.chmod(0o755)
+        return binary
+
+    def test_missing_binary_fails_closed_without_running_a_build(self):
+        missing = self.root / "missing-rootyard"
+        binder = mock.Mock(side_effect=AssertionError("binding must not run for a missing artifact"))
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "explicit native build preparation"):
+                source_bound_prebuilt_binary({"ROOTYARD_TEST_BINARY": str(missing)}, missing, binder=binder)
+        binder.assert_not_called()
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_stale_receipt_fails_closed_without_running_a_build(self):
+        binary = self._executable()
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "explicit native build preparation") as caught:
+                source_bound_prebuilt_binary({"ROOTYARD_TEST_BINARY": str(binary)}, binary)
+        self.assertIn("build receipt rejected", str(caught.exception))
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_valid_binding_never_runs_a_build(self):
+        binary = self._executable()
+        binder = mock.Mock(return_value={"production_inputs_bound": True})
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            path, binding = source_bound_prebuilt_binary(
+                {"ROOTYARD_TEST_BINARY": str(binary)}, binary, binder=binder
+            )
+        self.assertEqual(path, binary.resolve())
+        self.assertTrue(binding["production_inputs_bound"])
+        binder.assert_called_once_with(binary.resolve(), environ={"ROOTYARD_TEST_BINARY": str(binary)})
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_ci_requires_explicit_database_url_and_prebuilt_binary(self):
+        with self.assertRaisesRegex(RuntimeError, "GITHUB_ACTIONS=true"):
+            resolve_database_url({"GITHUB_ACTIONS": "true"}, lambda: self.fail("started PG in CI"))
+        with self.assertRaisesRegex(RuntimeError, "explicit native build preparation"):
+            resolve_binary_path(
+                {"GITHUB_ACTIONS": "true"},
+                Path("/nonexistent/rootyard-missing-90"),
+            )
 
 
 class StorageIdentityRuntimeTest(unittest.TestCase):
@@ -60,27 +128,13 @@ class StorageIdentityRuntimeTest(unittest.TestCase):
         for tool in ("psql", "git"):
             if not shutil.which(tool):
                 raise RuntimeError(f"{tool} is required for live storage_lifecycle regression")
-        cls.binary = resolve_binary_path(os.environ, DEFAULT_BINARY, cls._build_binary)
+        cls.binary, cls.binding = source_bound_prebuilt_binary(os.environ, DEFAULT_BINARY)
         cls.base_db = resolve_database_url(
             os.environ,
             lambda: start_ephemeral_pg(cls.addClassCleanup, prefix="rootyard-fk90-rt-pg-"),
         )
         if cls._sql(cls.base_db, "SELECT 1") != "1":
             raise RuntimeError("PostgreSQL connectivity check failed")
-
-    @classmethod
-    def _build_binary(cls, target_path):
-        if not shutil.which("cargo"):
-            raise RuntimeError("target/debug/rootyard is missing and cargo is unavailable")
-        subprocess.run(
-            ["cargo", "build", "--locked", "--bin", "rootyard"],
-            cwd=schema_baseline.ROOT,
-            check=True,
-            timeout=300,
-        )
-        if not (target_path.is_file() and os.access(target_path, os.X_OK)):
-            raise RuntimeError(f"cargo build succeeded but {target_path} is not executable")
-        return target_path.resolve()
 
     @staticmethod
     def _stop_server(holder):
@@ -192,16 +246,6 @@ class StorageIdentityRuntimeTest(unittest.TestCase):
                 return
             time.sleep(0.1)
         self.fail(f"Query did not reach {expected!r}: {self._sql(db_url, query)!r}")
-
-    def test_ci_requires_explicit_database_url_and_prebuilt_binary(self):
-        with self.assertRaisesRegex(RuntimeError, "GITHUB_ACTIONS=true"):
-            resolve_database_url({"GITHUB_ACTIONS": "true"}, lambda: self.fail("started PG in CI"))
-        with self.assertRaisesRegex(RuntimeError, "GITHUB_ACTIONS=true"):
-            resolve_binary_path(
-                {"GITHUB_ACTIONS": "true"},
-                Path("/nonexistent/rootyard-missing-90"),
-                lambda _: self.fail("ran cargo build in CI"),
-            )
 
     def test_live_worker_fences_and_valid_progression_for_gitfs_and_pando(self):
         schema = "rootyard_fk90_rt_" + uuid.uuid4().hex

@@ -22,10 +22,33 @@ jobs:
         with:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/refcas/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
       - name: Check formatting
-        run: cargo +1.99.1 fmt --manifest-path crates/refcas-log/Cargo.toml --all -- --check
+        run: cargo fmt --manifest-path crates/refcas-log/Cargo.toml --all -- --check
       - name: Check all targets
-        run: cargo +1.99.1 clippy --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets -- -D warnings
       - name: Exercise log invariants and process crash recovery
-        run: cargo +1.99.1 test --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
+        run: cargo test --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets

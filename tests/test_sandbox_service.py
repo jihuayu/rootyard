@@ -8,12 +8,12 @@ import unittest
 from pathlib import Path
 
 from tests.e2e import Harness
-
-BINARY = os.environ.get("ROOTYARD_BINARY", "target/debug/rootyard")
+from tests.runtime_binary import select_runtime_binary
 
 
 def harness(extra_env=None):
-    h = Harness(argparse.Namespace(binary=BINARY, keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
+    binary, _ = select_runtime_binary()
+    h = Harness(argparse.Namespace(binary=str(binary), keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
     h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
     h.env.update(extra_env or {})
     return h

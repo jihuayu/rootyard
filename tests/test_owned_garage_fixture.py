@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/owned_garage_fixture.sh"
@@ -25,6 +26,28 @@ PINNED_IMAGE = (
     "4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a"
 )
 EXPECTED_DIGEST = "sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a"
+OBJECT_STORE_ENV_KEYS = (
+    "ROOTYARD_OBJECT_STORE_ENDPOINT",
+    "ROOTYARD_OBJECT_STORE_BUCKET",
+    "ROOTYARD_OBJECT_STORE_REGION",
+    "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+    "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+    "ROOTYARD_OBJECT_STORE_SESSION_TOKEN",
+)
+
+
+def isolated_environment():
+    """Copy the runner environment without inherited object-store settings.
+
+    ``owned_object_store_env.py`` correctly refuses an inherited endpoint,
+    bucket or credential so a real fixture can never silently reuse somebody
+    else's object store.  The stub-docker unit tests must therefore start from
+    a hermetic environment instead of weakening that production guard.
+    """
+    env = os.environ.copy()
+    for name in OBJECT_STORE_ENV_KEYS:
+        env.pop(name, None)
+    return env
 
 
 class FixtureGuardTest(unittest.TestCase):
@@ -96,7 +119,7 @@ esac
 """
         )
         docker.chmod(0o755)
-        self.env = os.environ.copy()
+        self.env = isolated_environment()
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env["PATH"]
         self.env["STUB_DOCKER_LOG"] = str(self.log)
         self.env["STUB_STATUS_COUNTER"] = str(self.root / "status.count")
@@ -108,6 +131,14 @@ esac
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_inherited_object_store_settings_are_stripped_from_mock_env(self):
+        placeholder = {
+            name: "inherited-placeholder" for name in OBJECT_STORE_ENV_KEYS
+        }
+        with mock.patch.dict(os.environ, placeholder):
+            env = isolated_environment()
+        self.assertFalse(set(OBJECT_STORE_ENV_KEYS) & set(env))
 
     def sentinel(self, directory, *, cid=None, nonce=None, kind="rootyard-owned-garage-fixture",
                  output_env="", name="owned-name"):

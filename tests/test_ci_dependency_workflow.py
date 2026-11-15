@@ -61,7 +61,7 @@ class TestCiDependencyWorkflow(unittest.TestCase):
         self.manifest = manifest_step(self.ci_text)
 
     def test_ci_executes_dependency_harness_before_the_manifest(self):
-        command = ("python3 tests/ci_dependencies.py --binary target/debug/rootyard "
+        command = ('python3 tests/ci_dependencies.py --binary "$ROOTYARD_BIN" '
                    "--report " + REPORT_PATH)
         self.assertEqual(self.ci_text.count(command), 1)
         self.assertLess(
@@ -72,7 +72,7 @@ class TestCiDependencyWorkflow(unittest.TestCase):
 
     def test_each_transitive_report_is_executed_and_bound(self):
         for name, script, report in REPORTS:
-            command = f"python3 {script} --binary target/debug/rootyard --report {report}"
+            command = f'python3 {script} --binary "$ROOTYARD_BIN" --report {report}'
             self.assertEqual(
                 self.ci_text.count(command), 1,
                 f"CI must execute {script} with its report exactly once",

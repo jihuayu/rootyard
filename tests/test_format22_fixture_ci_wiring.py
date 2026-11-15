@@ -441,7 +441,7 @@ class WorkflowWiringTest(unittest.TestCase):
                          f"expected one standalone product build between the fixture build and the "
                          f"paired drill: {product_builders}")
         self.assertLess(fixture_index, product_builders[0][0],
-                        "build_native_test.py clears the rootyard package before the product build")
+                        "the fixture and product builders must remain distinct explicit producers")
         self.assertIn(f"--test {FIXTURE}", fixture_line)
         self.assertIn(f"--features {FIXTURE_FEATURES}", fixture_line)
         for replaced_profile in (f"--features {FIXTURE_FEATURE} ", f"--features {EXISTING_FEATURE} "):
@@ -462,9 +462,13 @@ class WorkflowWiringTest(unittest.TestCase):
         # to this contract.
         drill_index, drill = self._find_command("tests/backup_blob_serving147.py")
         binary_lines = [index for index, line in enumerate(self.lines)
-                        if line.strip() == 'binary="$GITHUB_WORKSPACE/target/debug/rootyard"']
+                        if line.strip() == 'binary="$standalone_dir/rootyard"']
         self.assertEqual(len([index for index in binary_lines if index < drill_index]), 1,
-                         "the paired drill needs exactly one product binary assignment before it")
+                         "the paired drill needs exactly one immutable product alias assignment before it")
+        product_index, product = self._find_command("scripts/build_native.py")
+        self.assertLess(product_index, drill_index)
+        self.assertIn('--artifact-store "$artifact_store"', product)
+        self.assertIn('--output "$standalone_dir/rootyard"', product)
         self.assertEqual(len(re.findall(
             r'^\s+fixture="\$fixture_dir/' + FIXTURE + r'"$', self.text, re.MULTILINE)), 1)
         self.assertIn('--format22-fixture "$fixture"', drill)
@@ -576,10 +580,10 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertLess(seed, pg_index, "the fixture must be seeded before the pg_tests suite runs")
 
     def test_ci_discovers_the_issue169_tests_and_runs_the_native_drill(self) -> None:
-        # ci.yml's full unittest discovery is what executes the static #169
-        # contracts (this module and the digest/corruption plan tests).
+        # ci.yml's full unittest discovery runner is what executes the static
+        # #169 contracts (this module and the digest/corruption plan tests).
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", ci)
+        self.assertIn("python3 scripts/run_python_ci_tests.py", ci)
         self.assertTrue((ROOT / "tests" / "test_backup_blob_serving169_support.py").is_file())
         # The native drill (all six PG corruption negatives plus the format22
         # positive) is a command in the RefStore acceptance workflow, fed the

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Unit, structural, SQL contract, and behavioral tests for Track 3 (M3: F13, F14, F15)."""
+"""Unit, structural, SQL contract, and behavioral tests for Track 3 (M3: F13, F14, F15).
+
+The Rust ``mirror``/``ci_pins``/``ci_checkouts`` unit tests run in the explicit
+Cargo test preparation step (``cargo test --all-targets --features pando-lab``),
+not through a Python-unittest subprocess or an ambient Cargo discovery path.
+"""
 import json
-import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 import unittest
@@ -350,26 +353,6 @@ class CiMirrorTrack3Test(unittest.TestCase):
             "## Concurrent sync rate limiting and mirror observability",
         ):
             self.assertIn(section, text, f"Missing section in docs/ci-mirror.md: {section}")
-
-    def test_optional_cargo_when_available(self):
-        search_path = os.environ.get("PATH", "")
-        for extra in ("/root/.cargo/bin", str(Path.home() / ".cargo" / "bin"), "/usr/local/cargo/bin"):
-            if extra not in search_path:
-                search_path = f"{extra}:{search_path}"
-        cargo = shutil.which("cargo", path=search_path)
-        if not cargo:
-            return
-        env = os.environ.copy()
-        env["PATH"] = search_path
-        for target in ("mirror", "ci_pins", "ci_checkouts"):
-            proc = subprocess.run(
-                [cargo, "test", "--locked", "--features", "pando-lab", "--lib", target],
-                cwd=ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
 
     def test_m18_auto_origin_source_and_serde_contracts(self):
         mirror_rs_path = ROOT / "src" / "mirror.rs"
