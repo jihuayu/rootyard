@@ -44,6 +44,7 @@ LIMITATIONS = [
     "Exact rows/counters are compared through the run-owned schema. No kernel, power-loss, distributed or scalability claim is made.",
     "The historical tree/blob cases exercise the retained snapshot HTTP content surface; they do not claim a session/HWM, root materialization, hosted inventory or full issue107 acceptance.",
     "The HTTP fixture has no deterministic production seam between complete content encoding and the final read-scope fence; late-scope removal is covered by the coordinator source/real-PG fixtures, not a live HTTP race here.",
+    "Ordinary current Browse may carry a legitimate optional X-Rootyard-Session header when a session keyring is configured. Only retained snapshot metadata/content/mutation responses assert header absence; no ordinary proof/header absence is claimed.",
 ]
 
 
@@ -65,10 +66,17 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
         return ("/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/"
                 + urllib.parse.quote(repo["name"], safe="") + "/snapshots" + suffix)
 
-    def _request(self, method, path, token, body=None):
+    def _request(self, method, path, token, body=None, assert_no_session=True):
+        """Bound the response policy. Ordinary current Browse may legitimately
+        emit X-Rootyard-Session when the optional session keyring is enabled;
+        only those callers pass assert_no_session=False. Every retained
+        snapshot metadata/content/mutation response keeps the strict absence
+        assertion, including denials.
+        """
         status, raw, headers = self.http(path, token=token, method=method, body=body)
         assert blob.header_value(headers, "cache-control") == "no-store", (status, headers)
-        assert blob.header_value(headers, "x-rootyard-session") is None, headers
+        if assert_no_session:
+            assert blob.header_value(headers, "x-rootyard-session") is None, headers
         return status, (json.loads(raw) if raw else None), headers
 
     def _create(self, repo, key, lease, token=None):
@@ -133,11 +141,14 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
                              token or self.alice)
 
     def _current_tree(self, repo, token=None):
+        # Optional session-keyring configuration may legitimately issue a
+        # current-Browse session; retained snapshot routes must never do so.
         return self._request("GET", self._query_path(self._repo_path(repo, "/tree"), {"oid": "HEAD"}),
-                             token or self.alice)
+                             token or self.alice, assert_no_session=False)
 
     def _current_blob(self, repo, oid, token=None):
-        return self._request("GET", self._repo_path(repo, "/blob/" + str(oid)), token or self.alice)
+        return self._request("GET", self._repo_path(repo, "/blob/" + str(oid)), token or self.alice,
+                             assert_no_session=False)
 
     @staticmethod
     def _tree_item(tree, name):
