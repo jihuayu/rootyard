@@ -67,7 +67,7 @@ class NativeCiProfileTest(unittest.TestCase):
             )
         # No native case may be skipped or removed to make the job pass.
         self.assertNotIn("continue-on-error", text)
-        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", text)
+        self.assertIn("python3 scripts/run_python_ci_tests.py", text)
         self.assertIn("python3 tests/e2e.py", text)
         self.assertIn("python3 tests/lfs.py", text)
 

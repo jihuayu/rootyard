@@ -8,6 +8,7 @@ import shutil
 import unittest
 
 from tests.e2e import Harness
+from tests.runtime_binary import select_runtime_binary
 
 
 @unittest.skipUnless(os.environ.get("ROOTYARD_OBJECT_STORE_ENDPOINT"),"live S3 test requires Garage or MinIO")
@@ -18,7 +19,8 @@ class WorkspaceRemoteTest(unittest.TestCase):
         # a PITR-safety proof, and the flag must never be enabled for the whole
         # suite (the default policy case lives in
         # tests/workspace_remote_delete_policy.py).
-        h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+        binary,_=select_runtime_binary()
+        h=Harness(argparse.Namespace(binary=str(binary),keep=False))
         h.env["ROOTYARD_WORKSPACE_UNSAFE_REMOTE_DELETE"]="true"
         try:
             h.setup();h.api();h.roundtrip()
@@ -63,7 +65,8 @@ class WorkspaceRemoteTest(unittest.TestCase):
         finally:h.cleanup()
 
     def test_commit_retry_and_restore_without_source_volume(self):
-        h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+        binary,_=select_runtime_binary()
+        h=Harness(argparse.Namespace(binary=str(binary),keep=False))
         try:
             h.setup();h.api();h.roundtrip()
             ws=json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",

@@ -7,6 +7,15 @@ offline backup cases (synthetic source, barrier/snapshot, corrupt inputs,
 barrier failure, interrupted restore, post-backup write exclusion and a fresh
 authenticated restore/clone/fsck) are mandatory with zero skips.
 
+The helper and candidate application receipts are validated by schema: a
+historical v1 receipt keeps the original ``package_rebuilt=True`` and single
+``fresh=False`` test-artifact requirements, while a v2 receipt uses the pure
+shared reader, selects the exact ``(test, ref_store_holds_backup_fixture)`` and
+rootyard lib/bin rows, binds the relocated executable/source digests, the test
+profile, the ``pando-lab`` flags, the lock file, target and toolchain, and
+requires the same batch/source/config closure.  V2 freshness is Cargo's literal
+boolean and is never forced false.
+
 The schema141 artifact-hold tables remain populated by the real typed
 ``PgArtifactHoldStore`` in ``tests/ref_store_holds_backup_fixture.rs``:
 one acquired batch is consumed (durable receipts), and a second acquired batch
@@ -40,6 +49,7 @@ from pathlib import Path
 import sys
 import uuid
 
+from backup_refstore_build_receipts import receipt_pair_schema, validate_v2_pair
 from backup_refstore_core139 import BackupRefStoreCore139Harness, uuid_literal
 from schema_baseline import A5_PACK_SNAPSHOT_TABLES, CURRENT_BACKUP_FORMAT, SCHEMA_VERSIONS
 
@@ -58,6 +68,7 @@ HELPER_TEST = "artifact_hold_backup_metadata_fixture"
 HELPER_TARGET = "ref_store_holds_backup_fixture"
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_SOURCE = ROOT / "tests" / "ref_store_holds_backup_fixture.rs"
+HELPER_SOURCE_RELATIVE = "tests/ref_store_holds_backup_fixture.rs"
 
 
 def catalog_tables(version):
@@ -118,11 +129,41 @@ def candidate_receipt(path):
             return option
     raise AssertionError("no build receipt next to " + str(path) + " (expected " + str(path) + ".build.json)")
 
-def validate_holds_fixture_binary(helper, app_binary, helper_receipt=None, app_receipt=None):
-    """Bind the selected helper executable to its real integration-test build."""
+def validate_holds_fixture_binary(helper, app_binary, helper_receipt=None,
+                                  app_receipt=None, environ=None):
+    """Bind the selected helper executable to its schema-appropriate build.
+
+    A historical v1 receipt keeps the original ``package_rebuilt=True`` and
+    single ``fresh=False`` test-artifact requirements.  A v2 receipt is
+    dispatched to the pure shared reader, which selects the exact
+    ``rust-integration-test``/``test`` row, the integration-test source path and
+    digest, the relocated executable digest, the test profile, the
+    ``pando-lab`` flags and the batch link.  In both cases the candidate
+    application receipt must bind its own binary; a v2 pair must also select the
+    exact rootyard lib/bin rows and share the source, config, toolchain and
+    batch closure.  For v2, an explicit ``ROOTYARD_EXPECTED_SOURCE_COMMIT``
+    (else ``GITHUB_SHA``) is also passed to the shared reader for both
+    receipts, so a stale build fails closed; the v1 path keeps its historical
+    receipt checks and adds no expected-source-commit constraint, and no
+    checkout-HEAD probe is made.  V2 freshness is the literal Cargo boolean,
+    never a fabricated ``fresh=False`` claim.
+    """
     helper = Path(helper)
     assert helper.is_file(), "artifact-hold fixture binary is missing: " + str(helper)
     receipt_path = Path(helper_receipt) if helper_receipt else candidate_receipt(helper)
+    app_receipt_path = Path(app_receipt) if app_receipt else candidate_receipt(Path(app_binary))
+    if receipt_pair_schema(receipt_path, app_receipt_path, "artifact-hold fixture") == "v2":
+        return validate_v2_pair(
+            helper=helper,
+            app_binary=app_binary,
+            helper_target=HELPER_TARGET,
+            helper_source=HELPER_SOURCE,
+            helper_source_relative=HELPER_SOURCE_RELATIVE,
+            helper_receipt=receipt_path,
+            app_receipt=app_receipt_path,
+            label="artifact-hold fixture",
+            environ=environ,
+        )
     receipt = load_receipt(receipt_path, "artifact-hold fixture build receipt")
     actual = sha256_file(helper)
     recorded = receipt_field(receipt, ("binary_sha256", "artifact_sha256", "sha256"), "binary sha256")
@@ -154,7 +195,6 @@ def validate_holds_fixture_binary(helper, app_binary, helper_receipt=None, app_r
     source_inputs = receipt_field(receipt, ("source_inputs_sha256", "source_inputs"), "source_inputs_sha256")
     assert isinstance(source_inputs, str) and len(source_inputs) == 64, (
         "artifact-hold fixture receipt has no source-input digest")
-    app_receipt_path = Path(app_receipt) if app_receipt else candidate_receipt(Path(app_binary))
     app = load_receipt(app_receipt_path, "candidate application build receipt")
     app_actual = sha256_file(Path(app_binary))
     app_recorded = receipt_field(app, ("binary_sha256", "artifact_sha256", "sha256"), "candidate binary sha256")
@@ -422,7 +462,8 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
         self.holds_helper = validate_holds_fixture_binary(
             self.args.holds_fixture_binary, self.args.binary,
             getattr(self.args, "holds_fixture_receipt", None),
-            getattr(self.args, "candidate_receipt", None))
+            getattr(self.args, "candidate_receipt", None),
+            environ=self.env)
         result = super().seed_core_fixture()
         marker = self.run_holds_fixture("seed")
         self.assert_binary_binding("seed")

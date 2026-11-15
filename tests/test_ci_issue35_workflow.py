@@ -221,7 +221,7 @@ class Issue35CiWorkflowTest(unittest.TestCase):
     def test_upload_keeps_safe_json_and_excludes_the_pg_binary_and_raw_log(self):
         upload = self.text[self.text.index("Upload end-to-end report"):]
         self.assertIn("test-results/*.json", upload)
-        self.assertIn("target/debug/rootyard.build.json", upload)
+        self.assertIn("${{ env.ROOTYARD_BUILD_RECEIPT }}", upload)
         self.assertNotIn("test-results/rootyard-lib-tests\n", upload)
         self.assertNotIn("pg-start-gate.log", upload)
         self.assertNotIn("pg-start-gate.stdout", upload)

@@ -6,11 +6,13 @@ import time
 import unittest
 
 from tests.e2e import Harness
+from tests.runtime_binary import select_runtime_binary
 
 
 class WorkspaceServiceTest(unittest.TestCase):
     def test_conflicted_native_index_round_trips_through_checkpoint(self):
-        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        binary, _ = select_runtime_binary()
+        h = Harness(argparse.Namespace(binary=str(binary), keep=False))
         try:
             h.setup(); h.api(); h.roundtrip()
             ws=json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",
@@ -58,7 +60,8 @@ class WorkspaceServiceTest(unittest.TestCase):
         finally:h.cleanup()
 
     def test_create_edit_checkpoint_fork_restore_restart(self):
-        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        binary, _ = select_runtime_binary()
+        h = Harness(argparse.Namespace(binary=str(binary), keep=False))
         try:
             h.setup()
             h.api()
@@ -146,7 +149,8 @@ class WorkspaceServiceTest(unittest.TestCase):
         the revision, change the working-tree, index, or HEAD bytes, or append
         an event.
         """
-        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        binary, _ = select_runtime_binary()
+        h = Harness(argparse.Namespace(binary=str(binary), keep=False))
         try:
             h.setup(); h.api(); h.roundtrip()
             ws = json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",

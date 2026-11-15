@@ -14,6 +14,7 @@ Verifies:
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 from pathlib import Path
 import re
@@ -26,6 +27,9 @@ import schema_baseline  # noqa: E402
 from e2e_tiers import Phase1ClosureAndDocsFixture  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+import native_build_receipt as receipt_contract  # noqa: E402
+
 CI_YML = ROOT / ".github/workflows/ci.yml"
 IMPL_STATUS_MD = ROOT / "docs/design/implementation-status.md"
 DOCS_README_MD = ROOT / "docs/README.md"
@@ -68,26 +72,84 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
                 "test-results/refstore-holds-fixture",
                 "--manifest-out",
                 "test-results/native-build-batch.json",
+                "--artifact-store",
+                "$HOME/.cache/rootyard/native-artifacts",
             ],
             "ci.yml must invoke the attested native batch build for all pando-lab binaries",
         )
+        # The standalone producer is the shared v2 contract: it copies Cargo's
+        # reported freshness truthfully (either boolean), never forces a clean
+        # or rebuilt claim, and records source/config/toolchain/content
+        # provenance across the transaction.
         build_script = (ROOT / "scripts/build_native.py").read_text(encoding="utf-8")
         for required in (
             "command = ['cargo', 'build', '--locked']",
-            "['--bins'] if args.bins",
-            "command += ['--features', args.features]",
-            "with build_lock(target)",
-            "['cargo', 'clean', '--package', DEFAULT_BIN]",
-            "artifacts = fresh_artifacts(events, binary)",
-            "'package_rebuilt': True",
-            "before = source_digest()",
-            "after = source_digest()",
-            "if before != after:",
-            "'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest()",
-            "'source_inputs_sha256': before",
-            "temporary.replace(receipt)",
+            "fresh = event.get('fresh')",
+            "if fresh is not True and fresh is not False:",
+            "receipt.make_receipt_v2(",
+            "bound_before = capture_bound_inputs(environment)",
+            "bound_after = capture_bound_inputs(environment)",
+            "if bound_before != bound_after:",
+            "toolchain_before = probe_toolchain(environment)",
+            "toolchain_after = probe_toolchain(environment)",
+            "if toolchain_before != toolchain_after:",
+            "git_before = git_state()",
+            "git_after = git_state()",
+            "if git_before != git_after:",
+            "bound_inputs=bound_after",
+            "toolchain=toolchain_after",
+            "workspace_commit=git_after['commit']",
+            "lock_file=lock_path",
+            "git_head=git_after['head']",
+            "working_tree={'tree': git_after['tree'], 'status': git_after['status']}",
         ):
             self.assertIn(required, build_script, f"native build wrapper lost {required}")
+        for obsolete in (
+            "['cargo', 'clean'",
+            "'package_rebuilt':",
+            "'fresh_false_artifacts':",
+        ):
+            self.assertNotIn(
+                obsolete, build_script,
+                f"v2 native build wrapper must not force {obsolete}",
+            )
+        for banned in ("package_rebuilt", "clean_command", "fresh_false_artifacts", "fresh"):
+            self.assertIn(banned, receipt_contract.V2_BANNED_FIELDS)
+        parameters = inspect.signature(receipt_contract.make_receipt_v2).parameters
+        for field in (
+            "binary_path", "command", "artifacts", "toolchain", "bound_inputs",
+            "workspace_commit", "target_dir", "features", "lock_file",
+        ):
+            self.assertIn(field, parameters)
+
+        # The workflow exports the batch's immutable paths once and every later
+        # consumer, including the final report step, binds those exact bytes
+        # instead of a mutable target/debug artifact.
+        export_command = "python3 scripts/export_native_artifacts.py"
+        export_start = ci_text.index(export_command)
+        manifest_start = ci_text.index(
+            "python3 scripts/native_report_manifest.py --mode job"
+        )
+        self.assertLess(export_start, manifest_start)
+        export_step = ci_text[export_start:manifest_start]
+        for binding in (
+            "--bin rootyard=ROOTYARD_BIN",
+            "--bin-receipt rootyard=ROOTYARD_BUILD_RECEIPT",
+            "--test ref_store_snapshot_backup_fixture=ROOTYARD_SNAPSHOT_FIXTURE",
+            "--test ref_store_holds_backup_fixture=ROOTYARD_HOLDS_FIXTURE",
+        ):
+            self.assertIn(binding, export_step)
+        later = ci_text[export_start:]
+        for mutable in (
+            "target/debug/rootyard",
+            "target/debug/rootyard-workspace-lab",
+            "target/debug/rootyard-view-lab",
+            "target/debug/rootyard-pando-lab",
+        ):
+            self.assertNotIn(mutable, later)
+        manifest_step = ci_text[manifest_start:].split("\n      - name:", 1)[0]
+        self.assertIn('--binary "$ROOTYARD_BIN"', manifest_step)
+        self.assertIn('--build-receipt "$ROOTYARD_BUILD_RECEIPT"', manifest_step)
         self.assertRegex(
             ci_text,
             r"cargo\s+clippy\s+--locked\s+--all-targets\s+--features\s+pando-lab\b",
@@ -103,30 +165,30 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         ci_text = CI_YML.read_text(encoding="utf-8")
 
         # Schema 030 alignment
-        self.assertIn("python3 tests/schema_contract.py --binary target/debug/rootyard", ci_text)
+        self.assertIn('python3 tests/schema_contract.py --binary "$ROOTYARD_BIN"', ci_text)
         self.assertNotIn("Verify schema-008 catalog", ci_text)
         self.assertIn("schema-030", ci_text)
 
         # Required Tier-1 E2E and backup harnesses with --binary and --report
         expected_commands = (
-            "python3 tests/pulls.py --binary target/debug/rootyard --report test-results/pulls.json",
-            "python3 tests/backup_pulls.py --binary target/debug/rootyard --report test-results/backup-pulls.json",
+            'python3 tests/pulls.py --binary "$ROOTYARD_BIN" --report test-results/pulls.json',
+            'python3 tests/backup_pulls.py --binary "$ROOTYARD_BIN" --report test-results/backup-pulls.json',
             'python3 tests/browse.py --mixed-refs --git "$(command -v git)" '
-            "--binary target/debug/rootyard --report test-results/browse.json",
-            "python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json",
-            "python3 tests/ci_mirror.py --binary target/debug/rootyard --report test-results/ci-mirror.json",
-            "python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json",
-            "python3 tests/workspace.py --binary target/debug/rootyard-workspace-lab --report test-results/workspace.json",
-            "python3 tests/webhooks.py --binary target/debug/rootyard --report test-results/webhooks.json",
+            '--binary "$ROOTYARD_BIN" --report test-results/browse.json',
+            'python3 tests/lfs.py --binary "$ROOTYARD_BIN" --report test-results/lfs.json',
+            'python3 tests/ci_mirror.py --binary "$ROOTYARD_BIN" --report test-results/ci-mirror.json',
+            'python3 tests/workspaces.py --binary "$ROOTYARD_WORKSPACE_LAB_BIN" --report test-results/workspaces.json',
+            'python3 tests/workspace.py --binary "$ROOTYARD_WORKSPACE_LAB_BIN" --report test-results/workspace.json',
+            'python3 tests/webhooks.py --binary "$ROOTYARD_BIN" --report test-results/webhooks.json',
         )
         for cmd in expected_commands:
             self.assertIn(cmd, ci_text, f"Missing CI step command in .github/workflows/ci.yml: {cmd}")
 
         # Real-service pagination harnesses and their evidence bindings
         pagination_commands = (
-            "python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json",
-            "python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json",
-            "python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json",
+            'python3 tests/repository_pagination.py --binary "$ROOTYARD_BIN" --report test-results/repository-pagination.json',
+            'python3 tests/organization_pagination.py --binary "$ROOTYARD_BIN" --report test-results/organization-pagination.json',
+            'python3 tests/web_detail_pagination.py --binary "$ROOTYARD_BIN" --report test-results/web-detail-pagination.json',
         )
         pagination_reports = (
             "--report repository_pagination=test-results/repository-pagination.json",
@@ -195,10 +257,10 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
 
         self.assertIn("python3 scripts/check_design_docs.py", ci_text)
         self.assertIn("python3 tests/e2e_tiers.py", ci_text)
-        self.assertRegex(
+        self.assertIn(
+            "python3 scripts/run_python_ci_tests.py",
             ci_text,
-            r"python3\s+-m\s+unittest\s+discover\s+-s\s+tests\s+-p\s+['\"]test_\*\.py['\"]",
-            "ci.yml must run full unittest discovery over tests/test_*.py",
+            "ci.yml must run full tests/test_*.py discovery via the diagnostics runner",
         )
 
     def test_ci_workspace_autocapture_acceptance_wiring(self) -> None:
@@ -215,7 +277,7 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
 
         acceptance = step_block("Exercise native workspace autocapture acceptance")
         self.assertIn(
-            "python3 tests/workspace_capture_acceptance.py --binary target/debug/rootyard "
+            'python3 tests/workspace_capture_acceptance.py --binary "$ROOTYARD_BIN" '
             "--report test-results/workspace-capture.json",
             acceptance,
         )

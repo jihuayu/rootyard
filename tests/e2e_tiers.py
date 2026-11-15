@@ -7943,6 +7943,7 @@ class Phase1ClosureAndDocsFixture:
             "--test", "ref_store_holds_backup_fixture",
             "--output", "test-results/refstore-holds-fixture",
             "--manifest-out", "test-results/native-build-batch.json",
+            "--artifact-store", "$HOME/.cache/rootyard/native-artifacts",
         ]
         if len(matches) != 1:
             raise AssertionError(
@@ -7967,7 +7968,7 @@ class Phase1ClosureAndDocsFixture:
             "python3",
             "tests/pando_lab.py",
             "--binary",
-            "target/debug/rootyard-pando-lab",
+            "$ROOTYARD_PANDO_LAB_BIN",
         ]
         guard_tokens = ["test", "$(id -u)", "-ne", "0"]
         # Full-line YAML and shell comments are not executable and must never
@@ -8027,8 +8028,8 @@ class Phase1ClosureAndDocsFixture:
             raise AssertionError("CI workflow missing Verify schema-030 catalog step")
         if "python3 scripts/check_design_docs.py" not in text:
             raise AssertionError("CI workflow missing check_design_docs.py step")
-        if "python3 -m unittest discover -s tests -p 'test_*.py'" not in text:
-            raise AssertionError("CI workflow missing full unittest discover -s tests -p 'test_*.py'")
+        if "python3 scripts/run_python_ci_tests.py" not in text:
+            raise AssertionError("CI workflow missing full tests/test_*.py discovery runner")
 
         for suite_rel in cls.REQUIRED_CI_SUITES:
             if suite_rel not in text:
@@ -15328,6 +15329,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
                 "--test", "ref_store_holds_backup_fixture",
                 "--output", "test-results/refstore-holds-fixture",
                 "--manifest-out", "test-results/native-build-batch.json",
+                "--artifact-store", "$HOME/.cache/rootyard/native-artifacts",
             ],
         )
 
@@ -15336,7 +15338,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         self.assertIn("Verify schema-030 catalog and dump round trip", ci_text)
         self.assertNotIn("Verify schema-008 catalog", ci_text)
         self.assertIn("python3 scripts/check_design_docs.py", ci_text)
-        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", ci_text)
+        self.assertIn("python3 scripts/run_python_ci_tests.py", ci_text)
 
     def test_t1_f20_04_ci_workflow_wires_all_phase1_black_box_and_4tier_e2e_suites(self) -> None:
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -15354,7 +15356,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         ]
         self.assertIn(["test", "$(id -u)", "-ne", "0"], live_commands)
         self.assertIn(
-            ["python3", "tests/pando_lab.py", "--binary", "target/debug/rootyard-pando-lab"],
+            ["python3", "tests/pando_lab.py", "--binary", "$ROOTYARD_PANDO_LAB_BIN"],
             live_commands,
         )
 
@@ -18516,6 +18518,8 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
             "test-results/refstore-holds-fixture",
             "--manifest-out",
             "test-results/native-build-batch.json",
+            "--artifact-store",
+            "$HOME/.cache/rootyard/native-artifacts",
         ]
         exact_command = " ".join(expected_tokens)
 
@@ -18687,7 +18691,7 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
         with self.assertRaisesRegex(AssertionError, "non-root guard"):
             Phase1ClosureAndDocsFixture.validate_ci_workflow(echo_guard)
         commented_pando = re.sub(
-            r"^(\s*)(python3\s+tests/pando_lab\.py\s+--binary\s+target/debug/rootyard-pando-lab[^\n]*)$",
+            r"^(\s*)(python3\s+tests/pando_lab\.py\s+--binary\s+\"?\$ROOTYARD_PANDO_LAB_BIN\"?[^\n]*)$",
             r"\1# \2",
             ci_text,
             count=1,

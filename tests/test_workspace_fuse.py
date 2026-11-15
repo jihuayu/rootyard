@@ -10,6 +10,12 @@ import tempfile
 import time
 import unittest
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lab_binary import resolve_lab_binary  # noqa: E402
+
+LEGACY_VFS_MOUNT = ROOT / "target" / "debug" / "rootyard-vfs-mount"
+
 
 class FuseMountTest(unittest.TestCase):
     def test_moved_symlink_cannot_escape_mount(self):
@@ -20,8 +26,11 @@ class FuseMountTest(unittest.TestCase):
                 env=env,capture_output=True,text=True,timeout=30)
             self.assertEqual(child.returncode,0,child.stdout+child.stderr)
             return
-        binary=Path("target/debug/rootyard-vfs-mount").resolve()
-        self.assertTrue(binary.is_file())
+        binary=resolve_lab_binary(
+            "ROOTYARD_VFS_MOUNT_BIN",
+            legacy=LEGACY_VFS_MOUNT,
+            purpose="Kernel FUSE mount tests",
+        ).path
         with tempfile.TemporaryDirectory(prefix="rootyard-fuse-escape-") as root:
             root=Path(root);lower=root/"lower";upper=root/"upper";mount=root/"mount"
             lower.mkdir();upper.mkdir();mount.mkdir()
@@ -76,8 +85,11 @@ class FuseMountTest(unittest.TestCase):
                 env=env,capture_output=True,text=True,timeout=30)
             self.assertEqual(child.returncode,0,child.stdout+child.stderr)
             return
-        binary=Path("target/debug/rootyard-vfs-mount").resolve()
-        self.assertTrue(binary.is_file())
+        binary=resolve_lab_binary(
+            "ROOTYARD_VFS_MOUNT_BIN",
+            legacy=LEGACY_VFS_MOUNT,
+            purpose="Kernel FUSE mount tests",
+        ).path
         with tempfile.TemporaryDirectory(prefix="rootyard-fuse-") as root:
             root=Path(root);lower=root/"lower";upper=root/"upper";mount=root/"mount"
             lower.mkdir();upper.mkdir();mount.mkdir()

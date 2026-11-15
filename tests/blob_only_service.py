@@ -70,27 +70,41 @@ class NativeProfile:
             need(Path(declared).resolve(strict=True) == self.binary,
                  "ROOTYARD_BINARY disagrees with --binary; refusing to ignore --binary")
         try:
-            build = native_evidence.build_record(self.binary)
+            validated = native_evidence.load_validated(self.binary)
         except Exception as error:
             raise ProfileError("build receipt rejected: " + str(error)) from None
-        need(build.get("attested") is True, "an adjacent <binary>.build.json receipt is required")
-        need(all(build.get(field) for field in ("binary_sha256", "source_inputs_sha256", "workspace_commit", "rustc", "command")), "build receipt is incomplete")
-        need(build["binary_sha256"] == sha256_file(self.binary), "build receipt binary_sha256 does not match the executed binary")
-        need(len(str(build["source_inputs_sha256"])) == 64, "source_inputs_sha256 is not a SHA-256")
+        need(validated is not None, "an adjacent <binary>.build.json receipt is required")
+        build = validated.payload
         expected = env.get("ROOTYARD_EXPECTED_SOURCE_COMMIT") or env.get("GITHUB_SHA")
         if expected:
-            need(build["workspace_commit"] == expected, "stale build receipt: workspace_commit mismatch")
+            need(validated.workspace_commit == expected, "stale build receipt: workspace_commit mismatch")
         candidate = Path(__file__).resolve().parents[1]
-        spec = importlib.util.spec_from_file_location("blob_serving_source_binding", candidate / "scripts/build_native.py")
-        binding = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(binding)
-        self.source_digest = binding.source_digest
-        need(self.source_digest() == build["source_inputs_sha256"], "executed binary does not match current candidate source inputs")
-        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=candidate, text=True).strip()
-        need(head == build["workspace_commit"], "executed binary receipt does not match current candidate commit")
+        if validated.schema == "v2":
+            # A copied/CAS snapshot is self-bound by its inventory.  Do not
+            # require the mutable original executable, source tree or the
+            # historical compiler to still exist on this acceptance host.
+            need(validated.toolchain is not None, "v2 build receipt has no toolchain metadata")
+            need(len(str(validated.source_inputs_sha256)) == 64, "source_inputs_sha256 is not a SHA-256")
+            need(validated.binary_sha256 == sha256_file(self.binary), "build receipt binary_sha256 does not match the executed binary")
+            self.source_digest = lambda: validated.source_inputs_sha256
+            self.rustc = validated.toolchain["rustc"]["version"]
+        else:
+            need(all(build.get(field) for field in ("binary_sha256", "source_inputs_sha256", "workspace_commit", "rustc", "command")), "build receipt is incomplete")
+            need(build["binary_sha256"] == sha256_file(self.binary), "build receipt binary_sha256 does not match the executed binary")
+            need(len(str(build["source_inputs_sha256"])) == 64, "source_inputs_sha256 is not a SHA-256")
+            spec = importlib.util.spec_from_file_location("blob_serving_source_binding", candidate / "scripts/build_native.py")
+            binding = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(binding)
+            self.source_digest = binding.source_digest
+            need(self.source_digest() == build["source_inputs_sha256"], "executed binary does not match current candidate source inputs")
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=candidate, text=True).strip()
+            need(head == build["workspace_commit"], "executed binary receipt does not match current candidate commit")
+            self.rustc = build["rustc"]
         self.working_tree_clean = not subprocess.check_output(["git", "status", "--porcelain"], cwd=candidate, text=True).strip()
         self.build = build
-        self.receipt_sha256 = sha256_file(self.binary.with_suffix(".build.json"))
+        self.schema = validated.schema
+        self.config_digest = validated.config_digest
+        self.receipt_sha256 = validated.receipt_sha256
         self.git = resolve_git(git_flag, env)
         self.git_sha256 = sha256_file(self.git)
         self.harness_sha256 = sha256_file(Path(__file__))
@@ -752,7 +766,7 @@ def build_report(harness, profile, blob_profile, expected, success):
         "kind": "rootyard/blob-only-native-acceptance", "passed": bool(success and not binding_error), "measurement_kind": "native_execution", "simulated_fields": False,
         "source_head": profile.build["workspace_commit"], "source_inputs_sha256": profile.build["source_inputs_sha256"],
         "binary_sha256": profile.build["binary_sha256"], "harness_sha256": profile.harness_sha256, "git_sha256": profile.git_sha256,
-        "native_profile": {"attested": True, "binary_sha256": profile.build["binary_sha256"], "source_inputs_sha256": profile.build["source_inputs_sha256"], "workspace_commit": profile.build["workspace_commit"], "rustc": profile.build["rustc"], "build_receipt_sha256": profile.receipt_sha256, "git_sha256": profile.git_sha256, "harness_sha256": profile.harness_sha256},
+        "native_profile": {"attested": True, "receipt_schema": profile.schema, "binary_sha256": profile.build["binary_sha256"], "source_inputs_sha256": profile.build["source_inputs_sha256"], "config_digest": profile.config_digest, "workspace_commit": profile.build["workspace_commit"], "rustc": profile.rustc, "build_receipt_sha256": profile.receipt_sha256, "git_sha256": profile.git_sha256, "harness_sha256": profile.harness_sha256},
         "blob_profile": blob_profile, "expected_cases": list(expected), "case_count": len(harness.results), "expected_count": len(expected), "skips": 0, "pending_cases": [], "cases": harness.results,
         "limitations": LIMITATIONS,
         "runtime": {"git_version": harness.run([str(profile.git), "--version"]).stdout.decode().strip(), "tool_versions": ops_provenance.tool_versions()},

@@ -152,14 +152,19 @@ class prerequisite:
         return {"sys.platform": sys.platform, "machine": os.uname().machine}
 
     def source_binding(self):
-        """Bind the executed binary to the current production inputs via its build receipt.
+        """Bind the executed binary to its receipt, dispatching on the receipt schema.
 
-        ``tests/source_bound_binary.py`` compares the receipt's production input
-        digest with ``scripts/build_native.source_digest()`` and the receipt with
-        the binary, and records the receipt's source commit next to the current
-        HEAD. An ancestor relation between them is deliberately not required: the
-        baseline is built just before the checkout's own tests-only commits, and
-        identical production bytes are the binding that matters.
+        v1 receipts remain current-production-byte receipts: the recorded
+        production digest must equal this checkout's production digest, the
+        production paths must be clean, and the reported source commit is the
+        checkout HEAD whose bytes were just measured. v2 receipts are
+        recorded-snapshot receipts: the validated source, config, toolchain and
+        input binding is the artifact's identity, so the reported source commit
+        is the receipt's ``workspace_commit``. A v2 receipt must also match an
+        explicit ``ROOTYARD_EXPECTED_SOURCE_COMMIT``, else a present
+        ``GITHUB_SHA``; v1 deliberately keeps its historical explicit-only
+        filter. The mutable checkout HEAD is exposed separately and is never
+        substituted for the recorded snapshot.
         """
         from source_bound_binary import SourceBindingError, bind
         env = getattr(self, "env", {})
@@ -168,17 +173,54 @@ class prerequisite:
             evidence = bind(self.args.binary, environ=environ)
         except SourceBindingError as error:
             raise AssertionError("required dependency missing: source binding failed: " + str(error))
-        assert evidence["source_inputs_sha256"] == evidence["current_source_inputs_sha256"]
-        assert not evidence["current_head_production_dirty"], (
-            "production inputs differ from HEAD: " + ", ".join(evidence["current_head_production_dirty"]))
-        return {"source_commit": evidence["current_head"],
-                "binary_source_commit": evidence["workspace_commit"],
-                "source_inputs_sha256": evidence["source_inputs_sha256"],
-                "binary_sha256": evidence["binary_sha256"],
-                "rustc": evidence["receipt_toolchain"]["rustc"],
-                "build_command": evidence["receipt_toolchain"]["command"],
-                "harness": {"file": str(Path(__file__).relative_to(PACKAGE_ROOT)),
-                            "sha256": sha256_file(Path(__file__)),
-                            "modules": [str(Path(p).relative_to(PACKAGE_ROOT)) for p in
-                                        getattr(self, "case_module_files", ())]},
-                "identity": "owned e2e schema"}
+        schema = evidence.get("schema")
+        if schema not in ("v1", "v2"):
+            raise AssertionError(
+                "required dependency missing: unsupported source binding schema " + repr(schema))
+        report = {
+            "schema": schema,
+            "binary_source_commit": evidence["workspace_commit"],
+            "current_head": evidence["current_head"],
+            "head_differs_from_receipt": evidence["head_differs_from_receipt"],
+            "current_head_production_dirty": evidence["current_head_production_dirty"],
+            "source_inputs_sha256": evidence["source_inputs_sha256"],
+            "binary_sha256": evidence["binary_sha256"],
+            "expected_commit": evidence["expected_commit"],
+            "receipt_sha256": evidence["receipt_sha256"],
+            "receipt_immutable": evidence["receipt_immutable"],
+            "receipt_toolchain": evidence["receipt_toolchain"],
+            "rustc": evidence["receipt_toolchain"]["rustc"],
+            "build_command": evidence["receipt_toolchain"]["command"],
+            "harness": {"file": str(Path(__file__).relative_to(PACKAGE_ROOT)),
+                        "sha256": sha256_file(Path(__file__)),
+                        "modules": [str(Path(p).relative_to(PACKAGE_ROOT)) for p in
+                                    getattr(self, "case_module_files", ())]},
+            "identity": "owned e2e schema",
+        }
+        if schema == "v1":
+            current_digest = evidence["current_source_inputs_sha256"]
+            assert evidence["source_inputs_sha256"] == current_digest, (
+                "v1 receipt source digest differs from this checkout's production source inputs")
+            assert not evidence["current_head_production_dirty"], (
+                "production inputs differ from HEAD: " + ", ".join(evidence["current_head_production_dirty"]))
+            report.update(source_commit=evidence["current_head"],
+                          source_identity="current production bytes",
+                          current_source_inputs_sha256=current_digest)
+        else:
+            assert evidence["source_snapshot_bound"] is True, (
+                "v2 receipt did not validate its recorded source snapshot")
+            assert evidence["production_inputs_bound"] is True, (
+                "v2 receipt did not validate its production inputs")
+            expected = (env.get("ROOTYARD_EXPECTED_SOURCE_COMMIT")
+                        or env.get("GITHUB_SHA"))
+            if expected and evidence["workspace_commit"] != expected:
+                raise AssertionError(
+                    "stale build receipt: workspace_commit differs from the expected source commit")
+            report.update(source_commit=evidence["workspace_commit"],
+                          source_identity="recorded source snapshot",
+                          expected_commit=expected,
+                          config_digest=evidence["config_digest"],
+                          cargo_lock_sha256=evidence["cargo_lock_sha256"],
+                          source_snapshot_bound=evidence["source_snapshot_bound"],
+                          production_inputs_bound=evidence["production_inputs_bound"])
+        return report

@@ -14,6 +14,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tests.e2e import Harness
+from tests.runtime_binary import select_runtime_binary
 
 MAX_FIXTURE_BODY = 32 * 1024 * 1024
 
@@ -157,9 +158,10 @@ class BulkheadHarness(Harness):
 
 
 def new_harness(require_s3: bool = False) -> BulkheadHarness:
+    binary, _ = select_runtime_binary()
     return BulkheadHarness(
         argparse.Namespace(
-            binary="target/debug/rootyard",
+            binary=str(binary),
             keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1",
         ),
         require_s3=require_s3,
