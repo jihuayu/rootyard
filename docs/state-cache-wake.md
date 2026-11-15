@@ -1,11 +1,10 @@
 # Bounded advisory state cache and wake boundary
 
-Status: bounded increment implemented in `src/cache_wake/`. This work does **not**
-claim that every consumer in issue 111 is cache-integrated (#110 consumer wiring
-remains pending), and it does not move any authority into Redis. The cache
-boundary is available and `MemoryCache::from_env` / `RedisCache::connect_from_env`
-are explicit startup helpers; the serving process does not yet construct a cache
-consumer.
+Status: runtime `ServingCache` (`src/cache_wake.rs`, `src/cache_wake/{types,breaker,serving,memory,origin,redis}.rs`)
+and `src/browse/` serving consumers (`src/browse/{cache,cache_models,handlers}.rs`) are
+wired for Issue #111 (keeping #111 open for remaining #110 `blob_git_gateway` /
+`standalone` consumers). Redis remains optional and strictly non-authoritative:
+standalone Memory mode runs by default with zero Redis runtime dependency.
 
 ## Authority boundary
 
@@ -30,8 +29,16 @@ CAS or fence. Redis is independently enableable and does not require Raft.
 Every key is built by `CacheKey::new` and contains:
 
 ```text
-ry:cache:v1:{environment}:{schema}:{history_incarnation}:{tenant}:{repo}:{kind}:{version}:{digest}
+ry:cache:v2:{environment}:{authority}:{schema}:{history_incarnation}:{tenant}:{repo}:{kind}:{version}:{digest}
 ```
+
+Both `environment` (from `ROOTYARD_CACHE_ENVIRONMENT`, default `"serving"`) and
+`authority` (`gitfs`, `pando`, `git-native`) are validated lowercase ASCII
+scope tokens. In `src/browse/cache.rs`, `history_incarnation` hashes the
+volume ID, repository ID, authority, `object_format`, and `backend_transition_epoch`,
+while `version` carries PostgreSQL `storage_generation`. Any backend switch,
+format transition, or generation bump moves keys to a disjoint namespace without
+depending on Redis `DEL` or key scans.
 
 `digest` is a truncated SHA-256 of an opaque discriminator, so raw tokens,
 cookies, signed URLs and query text are not key material. Values carry a magic
@@ -58,6 +65,8 @@ durable PG/Ref-CAS reservation.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `ROOTYARD_CACHE_BACKEND` | `memory` | `memory` (default, no Redis dependency) or `redis` (`state-redis` required) |
+| `ROOTYARD_CACHE_ENVIRONMENT` | `serving` | Optional validated scope token isolating environment namespaces |
 | `ROOTYARD_CACHE_MAX_ENTRIES` | `4096` | Memory entry cap (Memory only) |
 | `ROOTYARD_CACHE_MAX_BYTES` | `67108864` | Memory byte cap, key + encoded value (Memory only) |
 | `ROOTYARD_CACHE_MAX_VALUE_BYTES` | `1048576` | Per-value cap for Memory and Redis |
@@ -138,10 +147,29 @@ aggregate logical count, a process-level hard quota, or a guarantee that the
 operator will not change configuration between checks. Do not share the instance
 with non-evictable or authoritative data.
 
-The cache adapter is intentionally not wired into every read path yet. Consumers
-must opt in and retain their PG/RefStore authority checks; this document does not
-claim complete issue-111 consumer integration and explicitly leaves #110 consumer
-wiring pending.
+## Serving runtime (`ServingCache`) and `src/browse/` integration
+
+`ServingCache` (`src/cache_wake/serving.rs`) wraps `MemoryCache` (default) or
+optional `RedisCache` (`ROOTYARD_CACHE_BACKEND=redis` with `state-redis`):
+
+1. **Startup contract**: invalid backend names, `ROOTYARD_CACHE_BACKEND=redis`
+   without `state-redis`, invalid/plaintext remote URLs, or missing/unsafe
+   Redis `CONFIG` (`maxmemory` / `noeviction`) fail startup closed. Standalone
+   callers use `ServingCache::standalone_memory()` with zero Redis dependency.
+2. **Runtime degrade & recovery**: runtime Redis errors, timeouts, `FLUSHALL`,
+   corrupt JSON payloads (`#[serde(deny_unknown_fields)]`), or an open advisory
+   half-open breaker (`src/cache_wake/breaker.rs`) degrade cleanly to origin
+   loads (`OriginGuard` + `SingleFlight`, never letting client `404`/`400`
+   responses trip the origin breaker) and recover automatically once Redis
+   returns after cooldown.
+3. **Authz-first & origin-verified browse reads**: `src/browse/handlers.rs` and
+   `src/browse/cache.rs` authorize every request against PostgreSQL (`authorize_repo_with_role`
+   + active token/scope checks) *before* touching `ServingCache`. `list_refs`
+   verifies `RefSnapshotHint` against origin; mutable branch/`HEAD` lookups for
+   `get_tree` / `get_blob` resolve their authoritative tip OID at origin before
+   keying immutable `TreeListing` / `GitObjectPreview` entries.
+
+Standalone `#110` (`blob_git_gateway` / `standalone`) consumer wiring remains pending.
 
 ## Wake compatibility and configuration
 
@@ -206,9 +234,9 @@ executable, fixture version and case counts in
 `evidence/state-services/cache-wake/redis-contract.json`.
 
 HA/Sentinel/Cluster, PG failover, production performance, least-privilege
-production ACLs and complete serving-cache consumer wiring (#110) remain
-unverified. This increment does not complete #111 or make Redis a hard quota or
-authority. The default build still needs no Redis.
+production ACLs and #110 (`blob_git_gateway`/`standalone`) consumer wiring remain
+pending. This increment keeps #111 open for remaining #110 consumers and never
+makes Redis a hard quota or authority. The default build still needs no Redis.
 
 The full ignored real-Redis suite includes destructive FLUSHALL and CONFIG SET
 checks. Run it only against a disposable, task-owned instance and explicitly set
