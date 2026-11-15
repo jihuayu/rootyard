@@ -134,10 +134,7 @@ async fn handle_s3(
     body: Bytes,
 ) -> Response {
     let raw = uri.path().trim_start_matches('/').to_owned();
-    let (bucket, key) = match raw.split_once('/') {
-        Some((b, k)) => (b, k),
-        None => (raw.as_str(), ""),
-    };
+    let (bucket, key) = raw.split_once('/').unwrap_or((raw.as_str(), ""));
     if bucket.is_empty() {
         return s3_response(
             StatusCode::OK,
@@ -525,12 +522,13 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
         let m_drop = seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "drop").await?;
 
         // Serving pack_ids initially has [m_keep, m_pinned]. m_drop is orphaned/unlinked.
+        let initial_packs: &[Uuid] = &[m_keep.id, m_pinned.id];
         pool_a
             .get()
             .await?
             .execute(
                 "UPDATE pando_repository_states SET pack_ids=$2 WHERE repository_id=$1",
-                &[&repo, &vec![m_keep.id, m_pinned.id]],
+                &[&repo, &initial_packs],
             )
             .await?;
 
@@ -601,10 +599,11 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
         ensure!(pin.manifest_count == 2, "expected m_keep and m_pinned captured in retention root");
         ensure!(pitr_fence::load_authority_state(&**pool_a.get().await?).await?.authority_epoch == 2);
 
+        let remaining_packs: &[Uuid] = &[m_keep.id];
         pool_a
             .get()
             .await?
-            .execute("UPDATE pando_repository_states SET pack_ids=$2 WHERE repository_id=$1", &[&repo, &vec![m_keep.id]])
+            .execute("UPDATE pando_repository_states SET pack_ids=$2 WHERE repository_id=$1", &[&repo, &remaining_packs])
             .await?;
 
         scheduler::schedule_once(&state_a, &policy).await?;

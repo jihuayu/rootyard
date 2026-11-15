@@ -248,31 +248,27 @@ pub async fn verify_or_attest(
     }
 
     let next_epoch = state.authority_epoch.checked_add(1).context("authority epoch overflow")?;
-    if let Some(claim) = pitr_markers::read_claim_file(data_dir, state.authority_id)? {
-        if claim.target_epoch == next_epoch
-            && claim.deployment_id == runtime.deployment_id
-            && claim.volume_id == runtime.volume_id
-            && claim.backend_identity == runtime.backend_identity
-        {
-            if let Some(next_proof) = remote.read_authority_proof(state.authority_id, next_epoch, deadline).await? {
-                if pitr_proof_model::proof_matches_runtime(&next_proof, &state, &runtime, next_epoch, claim.proof_nonce)
-                {
-                    let client = pool.get().await?;
-                    let changed = client
-                        .execute(
-                            "UPDATE pando_storage_authorities \
-                             SET authority_epoch = $1, proof_nonce = $2, rotated_at = clock_timestamp() \
-                             WHERE singleton AND authority_id = $3 AND authority_epoch = $4 \
-                               AND NOT remote_delete_fenced",
-                            &[&next_epoch, &claim.proof_nonce, &state.authority_id, &state.authority_epoch],
-                        )
-                        .await?;
-                    clear_claim_file_best_effort(data_dir, state.authority_id);
-                    ensure!(changed == 1, "authority epoch changed concurrently during claim recovery");
-                    state = load_authority_state(&**client).await?;
-                }
-            }
-        }
+    if let Some(claim) = pitr_markers::read_claim_file(data_dir, state.authority_id)?
+        && claim.target_epoch == next_epoch
+        && claim.deployment_id == runtime.deployment_id
+        && claim.volume_id == runtime.volume_id
+        && claim.backend_identity == runtime.backend_identity
+        && let Some(next_proof) = remote.read_authority_proof(state.authority_id, next_epoch, deadline).await?
+        && pitr_proof_model::proof_matches_runtime(&next_proof, &state, &runtime, next_epoch, claim.proof_nonce)
+    {
+        let client = pool.get().await?;
+        let changed = client
+            .execute(
+                "UPDATE pando_storage_authorities \
+                 SET authority_epoch = $1, proof_nonce = $2, rotated_at = clock_timestamp() \
+                 WHERE singleton AND authority_id = $3 AND authority_epoch = $4 \
+                   AND NOT remote_delete_fenced",
+                &[&next_epoch, &claim.proof_nonce, &state.authority_id, &state.authority_epoch],
+            )
+            .await?;
+        clear_claim_file_best_effort(data_dir, state.authority_id);
+        ensure!(changed == 1, "authority epoch changed concurrently during claim recovery");
+        state = load_authority_state(&**client).await?;
     }
 
     let expected_nonce = state.proof_nonce.context("attested authority missing proof_nonce")?;

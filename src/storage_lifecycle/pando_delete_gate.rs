@@ -12,19 +12,11 @@ use uuid::Uuid;
 
 pub const ENV_PANDO_REMOTE_DELETE: &str = "ROOTYARD_PANDO_REMOTE_DELETE";
 
-/// Additional reachability guard preserving artifacts referenced by active,
-/// non-expired backup/PITR retention roots (#77).
-pub(crate) const RETENTION_ROOT_RETAINED_SQL: &str = "EXISTS (SELECT 1 FROM pando_retention_root_manifests rm \
-    JOIN pando_retention_roots rr ON rr.id = rm.root_id \
-      AND rr.authority_id = rm.authority_id AND rr.tenant_id = rm.tenant_id \
-    WHERE rm.manifest_id = m.id AND rr.authority_id = a.authority_id \
-      AND rr.state = 'active' AND (rr.retain_until IS NULL OR rr.retain_until > clock_timestamp()))";
-
 #[derive(Clone, Debug)]
 pub enum DeleteGateDecision {
     Disabled { reason: &'static str },
     Fenced { reason: String },
-    Allowed(AuthorityState),
+    Allowed(Box<AuthorityState>),
 }
 
 /// Strictly parse `ROOTYARD_PANDO_REMOTE_DELETE`: unset or `"false"` keeps
@@ -62,7 +54,7 @@ pub async fn check_scheduler_gate(state: &AppState, deadline: Instant) -> Result
         }
     };
     match pitr_fence::verify_or_attest(&state.pool, &state.storage.root, &remote, deadline, "attest").await {
-        Ok(authority) => Ok(DeleteGateDecision::Allowed(authority)),
+        Ok(authority) => Ok(DeleteGateDecision::Allowed(Box::new(authority))),
         Err(error) => Ok(DeleteGateDecision::Fenced { reason: error.to_string() }),
     }
 }
