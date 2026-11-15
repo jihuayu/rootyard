@@ -166,7 +166,11 @@ pub(super) fn mark_hold_consumed(
             replayed: true,
         });
     }
+    let mut provided = BTreeSet::new();
     for hold_id in &cmd.hold_ids {
+        if !provided.insert(*hold_id) {
+            return Err(StateMachineError::InvalidInput("duplicate hold_id in consume batch".into()));
+        }
         let hold = state.holds.get(hold_id).ok_or(StateMachineError::HoldNotFound { hold_id: *hold_id })?;
         if hold.repository_id != cmd.repository_id || hold.tenant_id != cmd.tenant_id {
             return Err(StateMachineError::HoldScopeMismatch { hold_id: *hold_id });
@@ -177,6 +181,20 @@ pub(super) fn mark_hold_consumed(
         if hold.state != SmHoldState::Active {
             return Err(StateMachineError::HoldNotActive { hold_id: *hold_id, state: hold.state });
         }
+    }
+    let batch = state
+        .hold_batches
+        .get(&cmd.request_id)
+        .ok_or_else(|| StateMachineError::InvalidInput("hold batch not found for consume".into()))?;
+    if batch.repository_id != cmd.repository_id
+        || batch.tenant_id != cmd.tenant_id
+        || batch.consume_request_id != cmd.consume_request_id
+    {
+        return Err(StateMachineError::InvalidInput("hold batch scope or consume_request_id mismatch".into()));
+    }
+    let expected: BTreeSet<Uuid> = batch.artifacts.iter().map(|spec| spec.hold_id).collect();
+    if provided != expected {
+        return Err(StateMachineError::InvalidInput("consume hold_ids must match complete acquire batch".into()));
     }
     for hold_id in &cmd.hold_ids {
         if let Some(hold) = state.holds.get_mut(hold_id) {
