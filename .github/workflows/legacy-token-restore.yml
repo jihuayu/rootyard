@@ -1,0 +1,243 @@
+name: Legacy token restore qualification
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/legacy-token-restore.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'migrations/**'
+      - 'schema/**'
+      - 'src/**'
+      - 'tests/backup.py'
+      - 'tests/backup_legacy132_sessions.py'
+      - 'tests/backup_legacy135_scopes.py'
+      - 'tests/e2e.py'
+      - 'tests/native_evidence.py'
+      - 'tests/owned_fuse_cleanup.py'
+      - 'tests/schema_baseline.py'
+      - 'tests/legacy135_qualification.py'
+      - 'tests/test_legacy135_qualification.py'
+      - 'tests/test_prepare_legacy135_producer.py'
+      - 'tests/test_legacy135_hosted_qualification.py'
+      - 'scripts/prepare_legacy135_producer.py'
+      - 'scripts/legacy135_qualification_manifest.py'
+      - 'scripts/build_native.py'
+      - 'scripts/native_build_receipt.py'
+      - 'scripts/native_artifact_store.py'
+      - 'scripts/install_ci_native_tools.sh'
+      - 'scripts/install_ci_cargo_fork.sh'
+      - 'scripts/owned_garage_fixture.sh'
+      - 'scripts/owned_object_store_env.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: legacy-token-restore-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  legacy-token-restore:
+    # Dedicated scoped gate: the existing 75-minute verify job is unchanged.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 50
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_legacy135
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_legacy135"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_legacy135
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      LEGACY135_SOURCE_SHA: 560e96f41f1d4670bfb5d2459af7af459eca4823
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify focused qualification contracts
+        timeout-minutes: 5
+        run: |
+          python3 -m unittest -v \
+            tests.test_legacy135_qualification \
+            tests.test_prepare_legacy135_producer \
+            tests.test_legacy135_hosted_qualification
+      - name: Install the reviewed native tool profile
+        timeout-minutes: 20
+        run: |
+          scripts/install_ci_native_tools.sh install \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/legacy135/native-tools.json
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+      - name: Verify the native tool profile
+        timeout-minutes: 5
+        run: |
+          echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
+          scripts/install_ci_native_tools.sh preflight \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/legacy135/native-tools.json
+      - name: Install pinned Rust 1.99.1
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/legacy135/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Start the job-owned Garage S3 fixture
+        timeout-minutes: 12
+        run: |
+          scripts/owned_garage_fixture.sh start \
+            --directory "$RUNNER_TEMP/legacy135-garage" \
+            --output-env "$RUNNER_TEMP/legacy135-object-store.env" \
+            --bucket-prefix rootyard-legacy135 --region garage
+      - name: Build the independent sealed current candidate
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          artifact_store="$HOME/.cache/rootyard/native-artifacts"
+          candidate_dir="$RUNNER_TEMP/legacy135-candidate"
+          mkdir -p "$candidate_dir" test-results
+          python3 scripts/build_native.py \
+            --features pando-lab \
+            --artifact-store "$artifact_store" \
+            --output "$candidate_dir/rootyard" \
+            > test-results/legacy135-candidate-build.json
+          cp "$candidate_dir/rootyard.build.json" test-results/legacy135-candidate.build.json
+      - name: Prepare the frozen schema135 producer from exact 560 source
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          python3 scripts/prepare_legacy135_producer.py \
+            --source-commit "$LEGACY135_SOURCE_SHA" \
+            --source-dir "$RUNNER_TEMP/legacy135-producer/source" \
+            --candidate-source-root "$GITHUB_WORKSPACE" \
+            --cargo-target-dir "$RUNNER_TEMP/legacy135-producer/target" \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            --output-dir "$RUNNER_TEMP/legacy135-producer" \
+            --report test-results/legacy135-producer-prep.json \
+            --build-timeout 1200
+          python3 - "$GITHUB_ENV" "$RUNNER_TEMP/legacy135-producer/source" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          prep = json.loads(pathlib.Path(
+              "test-results/legacy135-producer-prep.json").read_text())
+          expected = "560e96f41f1d4670bfb5d2459af7af459eca4823"
+          assert prep["passed"] is True
+          assert prep["source"]["commit"] == expected
+          assert prep["source"]["format"] == 11
+          assert prep["source"]["schema"] == 135
+          assert prep["source"]["schema136_absent"] is True
+          binary = pathlib.Path(prep["binary"]["path"])
+          receipt = pathlib.Path(prep["binary"]["receipt"])
+          source = pathlib.Path(sys.argv[2]).resolve()
+          assert binary.is_absolute() and binary.is_file()
+          assert receipt.is_absolute() and receipt.is_file()
+          assert source.is_absolute() and source.is_dir()
+          assert re.fullmatch(r"[0-9a-f]{64}", prep["binary"]["sha256"])
+          assert re.fullmatch(r"[0-9a-f]{64}", prep["binary"]["receipt_sha256"])
+          lines = [
+              "LEGACY135_PRODUCER_BIN=" + str(binary),
+              "LEGACY135_PRODUCER_RECEIPT=" + str(receipt),
+              "LEGACY135_PRODUCER_SOURCE=" + str(source),
+              "LEGACY135_PRODUCER_SHA256=" + prep["binary"]["sha256"],
+          ]
+          with pathlib.Path(sys.argv[1]).open("a", encoding="utf-8") as stream:
+              stream.write("\n".join(lines) + "\n")
+          PY
+          cp "$(python3 -c 'import json;print(json.load(open("test-results/legacy135-producer-prep.json"))["binary"]["receipt"])')" \
+            test-results/legacy135-producer.build.json
+      - name: Run the focused legacy135 seven-case qualification
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/legacy135-object-store.env"
+          set +a
+          candidate_dir="$RUNNER_TEMP/legacy135-candidate"
+          candidate_sha="$(sha256sum "$candidate_dir/rootyard" | awk '{print $1}')"
+          python3 tests/legacy135_qualification.py \
+            --candidate-binary "$candidate_dir/rootyard" \
+            --candidate-receipt "$candidate_dir/rootyard.build.json" \
+            --candidate-source-root "$GITHUB_WORKSPACE" \
+            --expected-candidate-commit "$GITHUB_SHA" \
+            --expected-candidate-sha256 "$candidate_sha" \
+            --producer-binary "$LEGACY135_PRODUCER_BIN" \
+            --producer-receipt "$LEGACY135_PRODUCER_RECEIPT" \
+            --producer-source-root "$LEGACY135_PRODUCER_SOURCE" \
+            --expected-producer-commit "$LEGACY135_SOURCE_SHA" \
+            --expected-producer-sha256 "$LEGACY135_PRODUCER_SHA256" \
+            --vault-state "$RUNNER_TEMP/legacy135-vault-state.json" \
+            --report test-results/legacy135-qualification.json \
+            --provider-report test-results/legacy135-provider.json \
+            --workflow-path "$GITHUB_WORKSPACE/.github/workflows/legacy-token-restore.yml" \
+            --collector-path "$GITHUB_WORKSPACE/scripts/legacy135_qualification_manifest.py"
+      - name: Collect the safe hosted qualification manifest
+        run: |
+          python3 scripts/legacy135_qualification_manifest.py \
+            --qualification test-results/legacy135-qualification.json \
+            --provider-report test-results/legacy135-provider.json \
+            --candidate-receipt "$RUNNER_TEMP/legacy135-candidate/rootyard.build.json" \
+            --producer-receipt "$LEGACY135_PRODUCER_RECEIPT" \
+            --expected-candidate-commit "$GITHUB_SHA" \
+            --expected-producer-commit "$LEGACY135_SOURCE_SHA" \
+            --workflow .github/workflows/legacy-token-restore.yml \
+            --wrapper tests/legacy135_qualification.py \
+            --output test-results/legacy135-hosted-manifest.json
+      - name: Clean up the exact owned Vault runtime
+        if: always()
+        run: |
+          python3 tests/legacy135_qualification.py \
+            --cleanup-owned-state "$RUNNER_TEMP/legacy135-vault-state.json"
+      - name: Stop the job-owned Garage fixture
+        if: always()
+        run: |
+          scripts/owned_garage_fixture.sh stop --directory "$RUNNER_TEMP/legacy135-garage"
+      - name: Upload safe legacy135 qualification metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy135-qualification
+          path: |
+            test-results/legacy135-qualification.json
+            test-results/legacy135-provider.json
+            test-results/legacy135-producer-prep.json
+            test-results/legacy135-producer.build.json
+            test-results/legacy135-candidate-build.json
+            test-results/legacy135-candidate.build.json
+            test-results/legacy135-hosted-manifest.json
+          if-no-files-found: ignore
