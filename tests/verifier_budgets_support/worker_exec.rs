@@ -15,6 +15,7 @@ pub(super) const ENV_BENCH_S3_ENDPOINT: &str = "ROOTYARD_VB_S3_ENDPOINT";
 pub(super) const ENV_BENCH_SCHEMA: &str = "ROOTYARD_VB_SCHEMA";
 pub(super) const ENV_BENCH_PROBE_MARKER: &str = "ROOTYARD_VB_PROBE_MARKER";
 
+#[derive(Clone, Copy)]
 enum ReapAction {
     TerminateAndReap,
     SimulateUnconfirmedExit(&'static str),
