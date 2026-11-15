@@ -34,27 +34,65 @@ class Result:
 
 
 class FakeRunner:
-    def __init__(self, results):
+    def __init__(self, results, on_call=None):
         self.results = list(results)
         self.calls = []
+        self.on_call = on_call
 
     def run(self, argv, **kwargs):
         self.calls.append(list(argv))
+        if self.on_call is not None:
+            self.on_call(list(argv))
         if not self.results:
             raise AssertionError("unexpected docker call")
-        return self.results.pop(0)
+        item = self.results.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
-def owned_state(cid="a" * 64, nonce="b" * 12, uid=None):
+def owned_state(cid="a" * 64, nonce="b" * 12, uid=None, phase="created"):
     return {
+        "schema": gate.OWNERSHIP_SCHEMA,
+        "phase": phase,
         "kind": gate.VAULT_KIND,
         "goal": gate.VAULT_GOAL,
         "nonce": nonce,
         "uid": os.getuid() if uid is None else uid,
-        "container_id": cid,
-        "container_name": "rootyard-legacy135-vault-" + nonce,
+        "container_id": cid if phase == "created" else None,
+        "container_name": gate.expected_container_name(nonce),
         "image": gate.VAULT_IMAGE,
     }
+
+
+def image_result():
+    return Result(0, (json.dumps([gate.VAULT_IMAGE]) + "\n").encode())
+
+
+def inspect_results(state, image=None, label_values=None):
+    cid = state["container_id"]
+    return [
+        Result(0, (cid + "\n").encode()),
+        Result(0, ((image or state["image"]) + "\n").encode()),
+        Result(0, json.dumps(label_values or labels(state)).encode()),
+    ]
+
+
+def ps_result(state, cid=None):
+    cid = cid or state["container_id"]
+    return Result(0, (cid + "\t" + state["container_name"] + "\n").encode())
+
+
+def fixture_for(path, runner, nonce=None):
+    value = gate.VaultFixture(
+        path, runner=runner, token_factory=lambda _: "root-token",
+        sleep=lambda _: None)
+    if nonce is not None:
+        value.nonce = nonce
+        value.container_name = gate.expected_container_name(nonce)
+        value.key_name = "rootyard-legacy135-" + nonce
+        value.policy_name = "rootyard-legacy135-service-" + nonce
+    return value
 
 
 def labels(state):
@@ -218,11 +256,7 @@ class BindingAndCaptureTest(unittest.TestCase):
 class ProviderOwnershipTest(unittest.TestCase):
     def test_cleanup_removes_only_the_exact_labelled_container(self):
         state = owned_state()
-        runner = FakeRunner([
-            Result(0, (state["container_id"] + "\n").encode()),
-            Result(0, json.dumps(labels(state)).encode()),
-            Result(0),
-        ])
+        runner = FakeRunner(inspect_results(state) + [Result(0)])
         self.assertEqual(gate.remove_owned_container(runner, state), "stopped")
         self.assertEqual(runner.calls[-1],
                          ["docker", "rm", "-f", "--", state["container_id"]])
@@ -239,10 +273,7 @@ class ProviderOwnershipTest(unittest.TestCase):
         state = owned_state()
         wrong = labels(state)
         wrong["rootyard.fixture.nonce"] = "c" * 12
-        runner = FakeRunner([
-            Result(0, (state["container_id"] + "\n").encode()),
-            Result(0, json.dumps(wrong).encode()),
-        ])
+        runner = FakeRunner(inspect_results(state, label_values=wrong))
         with self.assertRaises(gate.QualificationError) as caught:
             gate.remove_owned_container(runner, state)
         self.assertEqual(caught.exception.code, "vault_cleanup_label_mismatch")
@@ -256,6 +287,164 @@ class ProviderOwnershipTest(unittest.TestCase):
                 gate.cleanup_owned_state(state)
             self.assertEqual(caught.exception.code, "vault_state_invalid")
             self.assertTrue(state.exists())
+
+    def test_intent_is_persisted_before_docker_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state.json"
+            phase_at_run = {}
+
+            def watch(argv):
+                if argv[:2] == ["docker", "run"]:
+                    persisted = json.loads(state.read_text())
+                    phase_at_run.update(persisted)
+
+            runner = FakeRunner([
+                image_result(),
+                Result(1),
+                Result(0, b""),
+            ], on_call=watch)
+            fixture = gate.VaultFixture(
+                state, runner=runner, token_factory=lambda _: "root-token",
+                sleep=lambda _: None)
+            with self.assertRaises(gate.QualificationError) as caught:
+                fixture.start()
+            self.assertEqual(caught.exception.code, "vault_start_failed")
+            self.assertEqual(phase_at_run["phase"], "intent")
+            self.assertIsNone(phase_at_run["container_id"])
+            self.assertTrue(state.exists())
+            self.assertEqual(gate.cleanup_owned_state(
+                state, runner=FakeRunner([Result(0, b"")])), 0)
+            self.assertFalse(state.exists())
+
+    def test_create_then_timeout_reconciles_and_cleanup_removes_exact_id(self):
+        state = owned_state(nonce="123456789abc")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            runner = FakeRunner([
+                image_result(),
+                gate.QualificationError("docker_process_failed"),
+                ps_result(state),
+                *inspect_results(state),
+            ])
+            fixture = fixture_for(path, runner, state["nonce"])
+            with self.assertRaises(gate.QualificationError) as caught:
+                fixture.start()
+            self.assertEqual(caught.exception.code, "docker_process_failed")
+            persisted = json.loads(path.read_text())
+            self.assertEqual(persisted["phase"], "created")
+            self.assertEqual(persisted["container_id"], state["container_id"])
+            cleanup = FakeRunner(inspect_results(state) + [Result(0)])
+            self.assertEqual(gate.cleanup_owned_state(path, runner=cleanup), 0)
+            self.assertEqual(cleanup.calls[-1],
+                             ["docker", "rm", "-f", "--", state["container_id"]])
+            self.assertFalse(path.exists())
+
+    def test_create_then_nonzero_reconciles_and_cleanup_removes_exact_id(self):
+        state = owned_state(nonce="123456789abd")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            runner = FakeRunner([
+                image_result(),
+                Result(1),
+                ps_result(state),
+                *inspect_results(state),
+            ])
+            fixture = fixture_for(path, runner, state["nonce"])
+            with self.assertRaises(gate.QualificationError) as caught:
+                fixture.start()
+            self.assertEqual(caught.exception.code, "vault_start_failed")
+            self.assertEqual(json.loads(path.read_text())["container_id"],
+                             state["container_id"])
+            cleanup = FakeRunner(inspect_results(state) + [Result(0)])
+            self.assertEqual(gate.cleanup_owned_state(path, runner=cleanup), 0)
+            self.assertEqual(cleanup.calls[-1],
+                             ["docker", "rm", "-f", "--", state["container_id"]])
+
+    def test_malformed_id_reconciles_and_cleanup_removes_exact_id(self):
+        state = owned_state(nonce="123456789abe")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            runner = FakeRunner([
+                image_result(),
+                Result(0, b"not-a-container-id\n"),
+                ps_result(state),
+                *inspect_results(state),
+            ])
+            fixture = fixture_for(path, runner, state["nonce"])
+            with self.assertRaises(gate.QualificationError) as caught:
+                fixture.start()
+            self.assertEqual(caught.exception.code, "vault_container_id_invalid")
+            self.assertEqual(json.loads(path.read_text())["container_id"],
+                             state["container_id"])
+            cleanup = FakeRunner(inspect_results(state) + [Result(0)])
+            self.assertEqual(gate.cleanup_owned_state(path, runner=cleanup), 0)
+
+    def test_mismatched_ownership_fails_closed_and_preserves_state(self):
+        state = owned_state(nonce="123456789abf")
+        wrong_image = "hashicorp/vault:latest"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            runner = FakeRunner([
+                image_result(),
+                Result(0, (state["container_id"] + "\n").encode()),
+                *inspect_results(state, image=wrong_image),
+                ps_result(state),
+                *inspect_results(state, image=wrong_image),
+            ])
+            fixture = fixture_for(path, runner, state["nonce"])
+            with self.assertRaises(gate.QualificationError) as caught:
+                fixture.start()
+            self.assertEqual(caught.exception.code,
+                             "vault_ownership_image_mismatch")
+            self.assertTrue(path.exists())
+            cleanup = FakeRunner([
+                ps_result(state),
+                *inspect_results(state, image=wrong_image),
+            ])
+            with self.assertRaises(gate.QualificationError) as cleanup_error:
+                gate.cleanup_owned_state(path, runner=cleanup)
+            self.assertEqual(cleanup_error.exception.code,
+                             "vault_cleanup_image_mismatch")
+            self.assertTrue(path.exists())
+
+    def test_zero_container_is_honest_no_resource(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            runner = FakeRunner([
+                image_result(),
+                Result(1),
+                Result(0, b""),
+            ])
+            fixture = gate.VaultFixture(
+                path, runner=runner, token_factory=lambda _: "root-token",
+                sleep=lambda _: None)
+            with self.assertRaises(gate.QualificationError):
+                fixture.start()
+            self.assertEqual(json.loads(path.read_text())["phase"], "intent")
+            self.assertEqual(gate.cleanup_owned_state(
+                path, runner=FakeRunner([Result(0, b"")])), 0)
+            self.assertFalse(path.exists())
+
+    def test_daemon_uncertainty_preserves_intent_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            runner = FakeRunner([
+                image_result(),
+                Result(1),
+                Result(1, b"", b"daemon unavailable"),
+            ])
+            fixture = gate.VaultFixture(
+                path, runner=runner, token_factory=lambda _: "root-token",
+                sleep=lambda _: None)
+            with self.assertRaises(gate.QualificationError):
+                fixture.start()
+            self.assertEqual(json.loads(path.read_text())["phase"], "intent")
+            with self.assertRaises(gate.QualificationError) as caught:
+                gate.cleanup_owned_state(
+                    path, runner=FakeRunner([Result(1, b"", b"uncertain")]))
+            self.assertEqual(caught.exception.code,
+                             "vault_cleanup_name_query_failed")
+            self.assertTrue(path.exists())
 
     def test_safe_provider_record_excludes_locator_and_tokens(self):
         fixture = gate.VaultFixture("/tmp/state", runner=FakeRunner([]))

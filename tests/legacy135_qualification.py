@@ -65,6 +65,8 @@ FROZEN_SOURCE_FORMAT = 11
 FROZEN_SOURCE_SCHEMA = 135
 QUALIFICATION_SCHEMA = "rootyard/issue82-legacy135-qualification/v1"
 PROVIDER_SCHEMA = "rootyard/issue82-legacy135-provider/v1"
+OWNERSHIP_SCHEMA = "rootyard/issue82-legacy135-vault-ownership/v1"
+CONTAINER_NAME_PREFIX = "rootyard-legacy135-vault-"
 OBJECT_STORE_ENV = (
     "ROOTYARD_OBJECT_STORE_ENDPOINT",
     "ROOTYARD_OBJECT_STORE_BUCKET",
@@ -443,9 +445,17 @@ def service_policy(key_name):
     return "\n".join(lines) + "\n"
 
 
+def expected_container_name(nonce):
+    return CONTAINER_NAME_PREFIX + nonce
+
+
 def _validate_state(state):
+    """Validate the public ownership record; never treat ambiguity as clean."""
     if not isinstance(state, dict):
         raise QualificationError("vault_state_invalid")
+    schema = state.get("schema")
+    if schema is not None and schema != OWNERSHIP_SCHEMA:
+        raise QualificationError("vault_state_schema_invalid")
     if state.get("kind") != VAULT_KIND or state.get("goal") != VAULT_GOAL:
         raise QualificationError("vault_state_kind_mismatch")
     nonce = state.get("nonce")
@@ -453,13 +463,24 @@ def _validate_state(state):
         raise QualificationError("vault_state_nonce_invalid")
     if state.get("uid") != os.getuid():
         raise QualificationError("vault_state_uid_mismatch")
+    name = state.get("container_name")
+    if name != expected_container_name(nonce):
+        raise QualificationError("vault_state_name_mismatch")
+    image = state.get("image")
+    if image != VAULT_IMAGE:
+        raise QualificationError("vault_state_image_mismatch")
+    phase = state.get("phase")
     container_id = state.get("container_id")
-    if not isinstance(container_id, str) or CONTAINER_ID.fullmatch(container_id) is None:
+    if phase is None:
+        phase = "created" if container_id else "intent"
+    if phase not in ("intent", "created"):
+        raise QualificationError("vault_state_phase_invalid")
+    if phase == "intent":
+        if container_id is not None:
+            raise QualificationError("vault_state_container_invalid")
+    elif not isinstance(container_id, str) or CONTAINER_ID.fullmatch(container_id) is None:
         raise QualificationError("vault_state_container_invalid")
-    for field in ("container_name", "image"):
-        if not isinstance(state.get(field), str) or not state.get(field):
-            raise QualificationError("vault_state_field_missing")
-    return state
+    return dict(state, phase=phase)
 
 
 class DockerRunner:
@@ -484,6 +505,98 @@ class DockerRunner:
             raise QualificationError("docker_process_failed") from None
 
 
+def _inspect_owned_container(runner, state, container_id, prefix):
+    """Verify full ID, pinned image and all ownership labels."""
+    id_result = runner.run([
+        "docker", "inspect", "--type", "container", "--format", "{{.Id}}",
+        container_id])
+    if id_result.returncode != 0:
+        raise QualificationError(prefix + "_unverified")
+    actual = id_result.stdout.decode(errors="replace").strip()
+    if actual != container_id:
+        raise QualificationError(prefix + "_id_mismatch")
+    image_result = runner.run([
+        "docker", "inspect", "--type", "container",
+        "--format", "{{.Config.Image}}", container_id])
+    if image_result.returncode != 0:
+        raise QualificationError(prefix + "_unverified")
+    image = image_result.stdout.decode(errors="replace").strip()
+    if image != state["image"]:
+        raise QualificationError(prefix + "_image_mismatch")
+    labels_result = runner.run([
+        "docker", "inspect", "--type", "container",
+        "--format", "{{json .Config.Labels}}", container_id])
+    if labels_result.returncode != 0:
+        raise QualificationError(prefix + "_labels_unreadable")
+    try:
+        labels = json.loads(labels_result.stdout.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise QualificationError(prefix + "_labels_invalid") from None
+    if not isinstance(labels, dict):
+        raise QualificationError(prefix + "_labels_invalid")
+    expected = {
+        "rootyard.fixture.kind": state["kind"],
+        "rootyard.fixture.nonce": state["nonce"],
+        "rootyard.fixture.goal": state["goal"],
+        "rootyard.fixture.uid": str(state["uid"]),
+    }
+    if any(labels.get(key) != value for key, value in expected.items()):
+        raise QualificationError(prefix + "_label_mismatch")
+    return container_id
+
+
+def _find_owned_container_by_name(runner, state, prefix):
+    """Reconcile only the exact nonce-derived name, never a prefix."""
+    state = _validate_state(state)
+    name = state["container_name"]
+    result = runner.run([
+        "docker", "ps", "-a", "--no-trunc",
+        "--filter", "name=^/" + name + "$",
+        "--format", "{{.ID}}\t{{.Names}}",
+    ])
+    if result.returncode != 0:
+        raise QualificationError(prefix + "_name_query_failed")
+    rows = []
+    for line in result.stdout.decode(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "\t" not in line:
+            raise QualificationError(prefix + "_name_query_invalid")
+        container_id, actual_name = line.split("\t", 1)
+        if actual_name != name:
+            raise QualificationError(prefix + "_name_ambiguous")
+        rows.append(container_id)
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise QualificationError(prefix + "_name_ambiguous")
+    container_id = rows[0]
+    if CONTAINER_ID.fullmatch(container_id) is None:
+        raise QualificationError(prefix + "_container_id_invalid")
+    return _inspect_owned_container(runner, state, container_id, prefix)
+
+
+def _resolve_owned_container(runner, state, prefix):
+    """Resolve a recorded ID or exact name to one verified owned container."""
+    state = _validate_state(state)
+    recorded = state.get("container_id")
+    if recorded:
+        try:
+            return _inspect_owned_container(runner, state, recorded, prefix)
+        except QualificationError as error:
+            if error.code != prefix + "_unverified":
+                raise
+            # Only an unreadable/absent ID falls back to exact-name recovery.
+            # Identity/image/label mismatch remains fail-closed.
+    found = _find_owned_container_by_name(runner, state, prefix)
+    if found is None:
+        return None
+    if recorded and found != recorded:
+        raise QualificationError(prefix + "_id_mismatch")
+    return found
+
+
 class VaultFixture:
     """One exact-owned ephemeral Vault Transit provider."""
 
@@ -495,7 +608,7 @@ class VaultFixture:
         self.token_factory = token_factory or secrets.token_urlsafe
         self.sleep = sleep or time.sleep
         self.nonce = secrets.token_hex(6)
-        self.container_name = "rootyard-legacy135-vault-" + self.nonce
+        self.container_name = expected_container_name(self.nonce)
         self.key_name = "rootyard-legacy135-" + self.nonce
         self.policy_name = "rootyard-legacy135-service-" + self.nonce
         self.container_id = None
@@ -504,9 +617,15 @@ class VaultFixture:
         self.service_token = None
         self.version = None
         self.prepared = False
+        self.state_written = False
+        self.phase = None
+        self.reconciliation = "not_needed"
 
-    def safe_state(self):
+    def safe_state(self, phase=None):
         return {
+            "schema": OWNERSHIP_SCHEMA,
+            "phase": phase or self.phase or (
+                "created" if self.container_id else "intent"),
             "kind": VAULT_KIND,
             "goal": VAULT_GOAL,
             "nonce": self.nonce,
@@ -516,16 +635,21 @@ class VaultFixture:
             "image": self.image,
         }
 
-    def write_state(self):
+    def write_state(self, phase):
+        state = self.safe_state(phase)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_name(self.state_path.name + ".tmp")
-        temporary.write_text(json.dumps(self.safe_state(), indent=2, sort_keys=True) + "\n")
+        temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
         os.chmod(temporary, 0o600)
         os.replace(temporary, self.state_path)
+        self.state_written = True
+        self.phase = phase
 
     def remove_state(self):
         with contextlib.suppress(FileNotFoundError):
             self.state_path.unlink()
+        self.state_written = False
+        self.phase = None
 
     def _image_digests(self):
         result = self.runner.run(
@@ -577,6 +701,26 @@ class VaultFixture:
                 value.get("sealed") is False and
                 value.get("version") == VAULT_VERSION)
 
+    def reconcile_creation(self):
+        """Recover only this invocation's exact-named container, or stay unresolved."""
+        self.container_id = None
+        try:
+            found = _find_owned_container_by_name(
+                self.runner, self.safe_state("intent"), "vault_ownership")
+        except QualificationError:
+            self.reconciliation = "unresolved"
+            return
+        if found is None:
+            self.reconciliation = "no_resource"
+            return
+        self.container_id = found
+        try:
+            self.write_state("created")
+        except OSError:
+            self.reconciliation = "state_write_failed"
+            return
+        self.reconciliation = "recorded"
+
     def start(self):
         self.ensure_image()
         root_token = self.token_factory(40)
@@ -596,14 +740,34 @@ class VaultFixture:
             "-e", "VAULT_DEV_LISTEN_ADDRESS",
             self.image, "server", "-dev",
         ]
-        result = self.runner.run(command, env=environment)
+        try:
+            self.write_state("intent")
+        except OSError:
+            raise QualificationError("vault_state_write_failed") from None
+        try:
+            result = self.runner.run(command, env=environment)
+        except QualificationError:
+            self.reconcile_creation()
+            raise
         if result.returncode != 0:
+            self.reconcile_creation()
             raise QualificationError("vault_start_failed")
         container_id = result.stdout.decode(errors="replace").strip()
         if CONTAINER_ID.fullmatch(container_id) is None:
+            self.reconcile_creation()
             raise QualificationError("vault_container_id_invalid")
+        try:
+            _inspect_owned_container(
+                self.runner, self.safe_state("intent"), container_id,
+                "vault_ownership")
+        except QualificationError:
+            self.reconcile_creation()
+            raise
         self.container_id = container_id
-        self.write_state()
+        try:
+            self.write_state("created")
+        except OSError:
+            raise QualificationError("vault_state_write_failed") from None
         ports = self.runner.run(
             ["docker", "port", self.container_name, "8200/tcp"])
         if ports.returncode != 0:
@@ -697,63 +861,49 @@ class VaultFixture:
             "vault_version": self.version,
             "transit_round_trip": self.prepared,
             "service_policy_scoped": self.prepared,
-            "owned_container": self.container_id is not None,
+            "owned_container": (self.container_id is not None or
+                                self.state_written),
+            "ownership_recorded": self.state_written,
+            "reconciliation": self.reconciliation,
             "raw_logs_persisted": False,
             "credential_file_written": False,
             "cleanup": cleanup,
         }
 
     def stop(self):
-        state = _validate_state(self.safe_state())
+        state = _validate_state(self.safe_state(
+            "created" if self.container_id else "intent"))
         remove_owned_container(self.runner, state)
         self.remove_state()
         return "stopped"
 
 
 def remove_owned_container(runner, state):
-    """Remove exactly the labelled container in ``state``; never a broad purge."""
+    """Remove exactly the verified owned container; never a broad purge."""
     state = _validate_state(state)
-    container_id = state["container_id"]
-    result = runner.run(
-        ["docker", "inspect", "--type", "container", "--format", "{{.Id}}", container_id])
-    if result.returncode != 0:
-        raise QualificationError("vault_cleanup_unverified")
-    actual = result.stdout.decode(errors="replace").strip()
-    if actual != container_id:
-        raise QualificationError("vault_cleanup_id_mismatch")
-    labels_result = runner.run(
-        ["docker", "inspect", "--type", "container", "--format", "{{json .Config.Labels}}", container_id])
-    if labels_result.returncode != 0:
-        raise QualificationError("vault_cleanup_labels_unreadable")
-    try:
-        labels = json.loads(labels_result.stdout.decode())
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise QualificationError("vault_cleanup_labels_invalid") from None
-    if not isinstance(labels, dict):
-        raise QualificationError("vault_cleanup_labels_invalid")
-    expected = {
-        "rootyard.fixture.kind": state["kind"],
-        "rootyard.fixture.nonce": state["nonce"],
-        "rootyard.fixture.goal": state["goal"],
-        "rootyard.fixture.uid": str(state["uid"]),
-    }
-    if any(labels.get(key) != value for key, value in expected.items()):
-        raise QualificationError("vault_cleanup_label_mismatch")
+    container_id = _resolve_owned_container(runner, state, "vault_cleanup")
+    if container_id is None:
+        return "absent"
     remove = runner.run(["docker", "rm", "-f", "--", container_id])
     if remove.returncode != 0:
         raise QualificationError("vault_cleanup_failed")
     return "stopped"
 
 
-def cleanup_owned_state(state_path):
+def cleanup_owned_state(state_path, runner=None):
+    """Remove exact owned state; absence means launch never started."""
     path = Path(state_path)
     if not path.exists():
+        # start() persists the intent record before docker run.  A created
+        # container therefore always has a state file; absence is the honest
+        # zero-container case (or a verified prior cleanup), never an
+        # ambiguous creation.
         return 0
     try:
         state = json.loads(path.read_text())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise QualificationError("vault_state_invalid") from None
-    remove_owned_container(DockerRunner(), state)
+    remove_owned_container(runner or DockerRunner(), state)
     path.unlink()
     return 0
 
@@ -865,7 +1015,9 @@ def run_qualification(args):
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
         report = _failure_report(error)
-        if provider is not None and (provider_started or provider.container_id is not None):
+        if provider is not None and (
+                provider_started or provider.container_id is not None or
+                provider.state_written):
             report["provider"] = provider.safe_record("deferred")
             if provider_path:
                 try:
