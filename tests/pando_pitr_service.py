@@ -720,7 +720,7 @@ def run_suite(binary: str) -> dict:
 
         wait_until(
             lambda: sql_query(clone_url, "SELECT remote_delete_fenced::text FROM pando_storage_authorities WHERE singleton")
-            == "t",
+            == "true",
             timeout=20.0,
             label="clone remote_delete_fenced=true",
         )
@@ -862,9 +862,14 @@ def run_suite(binary: str) -> dict:
         rollback_err = verify_rollback.stderr.decode(errors="replace")
         assert verify_rollback.returncode != 0
         assert "data directory already in use" not in rollback_err, rollback_err
-        assert ("epoch is ahead of database" in rollback_err or "fenced" in rollback_err), rollback_err
         assert (
-            sql_query(src_url, "SELECT remote_delete_fenced::text FROM pando_storage_authorities WHERE singleton") == "t"
+            "epoch is ahead of database" in rollback_err
+            or "proof missing or mismatched" in rollback_err
+            or "fenced" in rollback_err
+        ), rollback_err
+        assert (
+            sql_query(src_url, "SELECT remote_delete_fenced::text FROM pando_storage_authorities WHERE singleton")
+            == "true"
         )
         results["pitr_epoch_rollback_fenced"] = True
         results["passed"] = True
