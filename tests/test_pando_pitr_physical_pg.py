@@ -35,9 +35,10 @@ def completed(stdout: bytes = b"") -> SimpleNamespace:
 
 
 class FakePidfd:
-    def __init__(self, pid: int, starttime: int) -> None:
+    def __init__(self, pid: int, starttime: int, generation: int) -> None:
         self.pid = pid
         self.starttime = starttime
+        self.generation = generation
         self.closed = False
 
 
@@ -61,7 +62,7 @@ class FakePidfdApi:
         if record is None:
             raise ProcessLookupError(pid)
         self.opened += 1
-        fd = FakePidfd(pid, record["starttime"])
+        fd = FakePidfd(pid, record["starttime"], record["generation"])
         self.live.append(fd)
         if self.before_open is not None:
             callback = self.before_open
@@ -70,14 +71,20 @@ class FakePidfdApi:
         return fd
 
     def send(self, fd: FakePidfd, signum: int) -> None:
-        if self.before_send is not None:
+        if signum != 0 and self.before_send is not None:
             callback = self.before_send
             self.before_send = None
             callback()
         record = self.processes.records.get(fd.pid)
-        if fd.closed or record is None or record["starttime"] != fd.starttime:
+        if (
+            fd.closed
+            or record is None
+            or record["starttime"] != fd.starttime
+            or record["generation"] != fd.generation
+        ):
             raise ProcessLookupError(fd.pid)
-        self.processes.signal(fd.pid, signum)
+        if signum != 0:
+            self.processes.signal(fd.pid, signum)
 
     def close(self, fd: FakePidfd) -> None:
         if fd.closed:
@@ -98,6 +105,7 @@ class FakeProcesses:
         self.ignore_kill: set[int] = set()
         self.pidfds = FakePidfdApi(self)
         self._next_start = 1
+        self._next_generation = 1
 
     def add(self, pid: int, *, ppid: int = 1, session: int | None = None,
             pgrp: int | None = None, starttime: int | None = None) -> dict:
@@ -110,7 +118,9 @@ class FakeProcesses:
             "starttime": starttime if starttime is not None else self._next_start,
             "uid": os.getuid(),
             "boot_id": self.boot_id,
+            "generation": self._next_generation,
         }
+        self._next_generation += 1
         self._next_start = max(self._next_start + 1, record["starttime"] + 1)
         self.records[pid] = record
         return record
@@ -129,6 +139,8 @@ class FakeProcesses:
     def replace(self, pid: int, *, starttime: int, session: int | None = None,
                 pgrp: int | None = None, ppid: int | None = None) -> None:
         record = self.records[pid]
+        record["generation"] = self._next_generation
+        self._next_generation += 1
         record["starttime"] = starttime
         if session is not None:
             record["session"] = session
@@ -144,6 +156,17 @@ class FakeProcesses:
         if signum == signal.SIGKILL and pid in self.ignore_kill:
             return
         self.records.pop(pid, None)
+
+    def relocate(self, pid: int, *, session: int | None = None,
+                 pgrp: int | None = None, ppid: int | None = None) -> None:
+        """Mutable location change for the same process generation (setsid/reparent)."""
+        record = self.records[pid]
+        if session is not None:
+            record["session"] = session
+        if pgrp is not None:
+            record["pgrp"] = pgrp
+        if ppid is not None:
+            record["ppid"] = ppid
 
     def tracker(self) -> physical._OwnedProcessSet:
         tracker = REAL_OWNED(
@@ -471,6 +494,89 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertEqual(tracker.members("cleanup"), {})
         self.assertEqual(processes.signals, [])
         self.assertEqual(processes.pidfds.live, [])
+
+    def test_pinned_child_setsid_after_leader_exit_stays_owned_via_original_fd(self) -> None:
+        processes = FakeProcesses()
+        processes.add(1000, ppid=1, session=1000, starttime=100)
+        processes.add(1001, ppid=1000, session=1000, pgrp=1000, starttime=101)
+        tracker = processes.tracker()
+        tracker.remember_postmaster(1000, "cleanup")
+        opened = processes.pidfds.opened
+
+        processes.records.pop(1000)
+        processes.relocate(1001, ppid=1, pgrp=1001, session=1001)
+        self.assertIn(1001, tracker.members("cleanup"))
+        self.assertNotIn(1000, tracker._sessions)
+        self.assertIn(1001, tracker._sessions)
+
+        tracker.terminate_all("cleanup", timeout=0.2)
+
+        self.assertIn((1001, signal.SIGTERM), processes.signals)
+        self.assertNotIn(1000, processes.records)
+        self.assertEqual(processes.pidfds.opened, opened)
+        self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
+        self.assertEqual(processes.pidfds.live, [])
+
+    def test_moved_pinned_child_does_not_adopt_old_sid_foreign_replacement(self) -> None:
+        processes = FakeProcesses()
+        processes.add(1100, ppid=1, session=1100, starttime=110)
+        processes.add(1101, ppid=1100, session=1100, pgrp=1100, starttime=111)
+        tracker = processes.tracker()
+        tracker.remember_postmaster(1100, "cleanup")
+
+        processes.records.pop(1100)
+        processes.relocate(1101, ppid=1, pgrp=1101, session=1101)
+        processes.add(1102, ppid=1, session=1100, pgrp=1100, starttime=112)
+
+        members = tracker.members("cleanup")
+        self.assertIn(1101, members)
+        self.assertNotIn(1102, members)
+        with self.assertRaises(physical.FixtureError) as caught:
+            tracker.terminate_all("cleanup", timeout=0.2)
+
+        self.assertEqual((caught.exception.phase, caught.exception.code),
+                         ("cleanup", "owned_process_unknown"))
+        self.assertIn((1101, signal.SIGTERM), processes.signals)
+        self.assertNotIn((1102, signal.SIGTERM), processes.signals)
+        self.assertNotIn((1102, signal.SIGKILL), processes.signals)
+        self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
+
+    def test_pinned_identity_uncertainty_retains_scratch(self) -> None:
+        processes = FakeProcesses()
+        processes.add(1200, ppid=1, session=1200, starttime=120)
+        fixture = self.make_fixture(processes)
+        fixture.owned.remember_postmaster(1200, "cleanup")
+
+        processes.replace(1200, starttime=120, session=1200)
+        cleanup = fixture.cleanup()
+
+        self.assertFalse(cleanup["passed"])
+        self.assertFalse(cleanup["owned_processes_stopped"])
+        self.assertFalse(cleanup["scratch_removed"])
+        self.assertTrue(fixture.root.is_dir())
+        self.assertEqual(processes.signals, [])
+
+        fixture.owned = FakeProcesses().tracker()
+        self.assertTrue(fixture.cleanup()["passed"])
+
+    def test_session_member_adoption_revalidates_live_anchor_around_pin(self) -> None:
+        processes = FakeProcesses()
+        processes.add(1300, ppid=1, session=1300, starttime=130)
+        fixture = self.make_fixture(processes)
+        fixture.owned.remember_postmaster(1300, "cleanup")
+        processes.add(1301, ppid=42, session=1300, pgrp=1300, starttime=131)
+
+        def move_anchor() -> None:
+            processes.relocate(1300, ppid=1, pgrp=2000, session=2000)
+
+        processes.pidfds.before_open = move_anchor
+        members = fixture.owned.members("cleanup")
+
+        self.assertIn(1300, members)
+        self.assertNotIn(1301, members)
+        self.assertTrue(fixture.owned._unknown)
+        self.assertEqual(processes.signals, [])
+        self.assertNotIn(1301, processes.pidfds.live)
 
     def test_partial_start_without_pidfile_requires_owned_child_absence(self) -> None:
         processes = FakeProcesses()

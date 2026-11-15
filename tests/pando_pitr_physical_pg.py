@@ -371,14 +371,13 @@ class _OwnedProcessSet:
 
     @staticmethod
     def _same_pinned_identity(current: dict, pinned: dict) -> bool:
-        # Reparenting changes PPID after a leader exits; that alone must not
-        # lose an already-pinned survivor.  Session/group/tick/boot/UID remain
-        # generation checks.
+        # A retained pidfd is the generation authority.  PPID, process group
+        # and session are mutable location: PostgreSQL children call setsid()
+        # and reparent normally, so location must be refreshed, not treated as
+        # a new generation.
         return bool(
             current["pid"] == pinned["pid"]
             and current["starttime"] == pinned["starttime"]
-            and current["pgrp"] == pinned["pgrp"]
-            and current["session"] == pinned["session"]
             and current["boot_id"] == pinned["boot_id"]
             and current["uid"] == pinned["uid"]
             and current["state"] not in ("Z", "X", "x")
@@ -502,21 +501,63 @@ class _OwnedProcessSet:
                     continue
                 self._adopt(record, phase, missing_unknown=False)
 
+    def _pidfd_alive(self, fd, phase: str) -> bool:
+        _, pidfd_send_signal = self._pidfd_api()
+        if not callable(pidfd_send_signal):
+            raise FixtureError(phase, "pidfd_unavailable")
+        try:
+            pidfd_send_signal(fd, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            raise FixtureError(phase, "pidfd_liveness_failed") from None
+        return True
+
+    def _anchor_current(
+        self,
+        anchor: dict,
+        session_id: int,
+        table: dict[int, dict],
+        boot_id: str,
+    ) -> bool:
+        pinned = self._pins.get(anchor["pid"])
+        current = table.get(anchor["pid"])
+        return bool(
+            pinned is not None
+            and current is not None
+            and current["session"] == session_id
+            and current["boot_id"] == boot_id
+            and self._same_pinned_identity(current, pinned[1])
+        )
+
     def members(self, phase: str) -> dict[int, dict]:
         table = self._table_provider(phase)
         boot_id = self._boot_id_provider(phase)
         live: dict[int, dict] = {}
-        for pid, (_, pinned) in list(self._pins.items()):
+        current_matched: dict[int, dict] = {}
+        for pid, (fd, pinned) in list(self._pins.items()):
             current = table.get(pid)
-            if current is None or not self._same_pinned_identity(current, pinned):
+            if current is not None and current["state"] in ("Z", "X", "x"):
                 self._drop_pin(pid, phase)
                 continue
+            if not self._pidfd_alive(fd, phase):
+                self._drop_pin(pid, phase)
+                continue
+            if current is None or not self._same_pinned_identity(current, pinned):
+                # The stable fd is live, so the retained generation must not be
+                # dropped.  Without a matching current row we cannot refresh
+                # mutable location; keep the pin for a fd-only signal and
+                # retain scratch.
+                self._unknown = True
+                live[pid] = pinned
+                continue
             live[pid] = current
-        live_sessions = {record["session"] for record in live.values()}
+            current_matched[pid] = current
+        current_sessions = {record["session"] for record in current_matched.values()}
         for session_id, recorded_boot in list(self._sessions.items()):
             if recorded_boot != boot_id:
                 raise FixtureError(phase, "session_boot_mismatch")
-            if session_id in live_sessions:
+            if session_id in current_sessions:
                 continue
             self._sessions.pop(session_id, None)
             if any(
@@ -525,10 +566,16 @@ class _OwnedProcessSet:
                 and record["state"] not in ("Z", "X", "x")
                 for record in table.values()
             ):
-                # A live session member without any pinned owner cannot be
-                # adopted solely from a reused numeric SID.
                 self._unknown = True
+        for session_id in current_sessions:
+            self._sessions[session_id] = boot_id
         for session_id in list(self._sessions):
+            anchors = [
+                record for record in current_matched.values()
+                if record["session"] == session_id
+            ]
+            if not anchors:
+                continue
             for record in table.values():
                 if record["session"] != session_id or record["state"] in ("Z", "X", "x"):
                     continue
@@ -537,13 +584,26 @@ class _OwnedProcessSet:
                 if record["pid"] in live:
                     continue
                 adopted = self._adopt(record, phase, missing_unknown=False)
-                if adopted is not None:
-                    live[record["pid"]] = adopted
-                    live_sessions.add(session_id)
+                if adopted is None:
+                    continue
+                fresh = self._table_provider(phase)
+                if not any(
+                    self._anchor_current(anchor, session_id, fresh, boot_id)
+                    for anchor in anchors
+                ):
+                    # The anchor moved/died around the candidate pin.  Do not
+                    # signal a candidate that is no longer backed by our SID.
+                    self._drop_pin(record["pid"], phase)
+                    self._unknown = True
+                    continue
+                live[record["pid"]] = adopted
+                current_matched[record["pid"]] = adopted
+                if adopted["session"] not in current_sessions:
+                    self._sessions[adopted["session"]] = boot_id
         changed = True
         while changed:
             changed = False
-            parents = set(live)
+            parents = set(current_matched)
             for record in table.values():
                 if record["pid"] in live or record["state"] in ("Z", "X", "x"):
                     continue
@@ -554,6 +614,7 @@ class _OwnedProcessSet:
                 adopted = self._adopt(record, phase, missing_unknown=False)
                 if adopted is not None:
                     live[record["pid"]] = adopted
+                    current_matched[record["pid"]] = adopted
                     changed = True
         return live
 
