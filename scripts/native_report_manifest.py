@@ -536,8 +536,11 @@ def verify_batch_receipt(receipt, validated, receipt_file, binary,
     )
 
     architecture = receipt.get("architecture")
-    if architecture is None and validated.schema == "v2":
-        architecture = receipt.get("target_triple")
+    if validated.schema == "v2":
+        architecture = {
+            "target_triple": validated.toolchain["target_triple"],
+            "host": validated.toolchain["rustc"]["host"],
+        }
     for field, receipt_value in (
         ("source_commit", receipt.get("workspace_commit")),
         ("source_inputs_sha256", receipt.get("source_inputs_sha256")),
@@ -1071,8 +1074,11 @@ def release_manifest(args):
                 f"{manifest_label}: manifest_version must equal batch receipt_version",
             )
             architecture = receipt.get("architecture")
-            if architecture is None and validated.schema == "v2":
-                architecture = receipt.get("target_triple")
+            if validated.schema == "v2":
+                architecture = {
+                    "target_triple": validated.toolchain["target_triple"],
+                    "host": validated.toolchain["rustc"]["host"],
+                }
             for manifest_field, receipt_field, receipt_value in (
                 ("source_commit", "workspace_commit", receipt.get("workspace_commit")),
                 ("source_inputs_sha256", "source_inputs_sha256", receipt.get("source_inputs_sha256")),

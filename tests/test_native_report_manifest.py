@@ -253,6 +253,10 @@ class ManifestFixture:
 
     def enable_v2_batch_receipt(self, *, lib_fresh=True, bin_fresh=False):
         receipt = self.enable_v2_receipt(lib_fresh=lib_fresh, bin_fresh=bin_fresh)
+        architecture = {
+            "target_triple": receipt["target_triple"],
+            "host": receipt["toolchain"]["rustc"]["host"],
+        }
         batch_path = self.root / "test-results/native-build-batch.json"
         batch_path.parent.mkdir(parents=True, exist_ok=True)
         receipt["batch"] = {
@@ -271,7 +275,7 @@ class ManifestFixture:
             "source_commit": receipt["workspace_commit"],
             "source_inputs_sha256": receipt["source_inputs_sha256"],
             "toolchain": receipt["toolchain"],
-            "architecture": receipt["target_triple"],
+            "architecture": architecture,
             "target_directory": receipt["target_dir"],
             "bound_inputs": receipt["bound_inputs"],
             "build": {
@@ -296,6 +300,10 @@ class ManifestFixture:
     def enable_v2_cas_batch_receipt(self, *, lib_fresh=True, bin_fresh=False):
         """Build the producer's v2 CAS layout: immutable snapshot plus aliases."""
         receipt = self.enable_v2_receipt(lib_fresh=lib_fresh, bin_fresh=bin_fresh)
+        architecture = {
+            "target_triple": receipt["target_triple"],
+            "host": receipt["toolchain"]["rustc"]["host"],
+        }
         original = self.binary
         sha = digest(original)
         commit = receipt["workspace_commit"]
@@ -355,7 +363,7 @@ class ManifestFixture:
             "source_commit": receipt["workspace_commit"],
             "source_inputs_sha256": receipt["source_inputs_sha256"],
             "toolchain": receipt["toolchain"],
-            "architecture": receipt["target_triple"],
+            "architecture": architecture,
             "target_directory": receipt["target_dir"],
             "bound_inputs": receipt["bound_inputs"],
             "build": {
@@ -585,6 +593,78 @@ class TestJobManifest(unittest.TestCase):
         self.assertEqual(
             job["build_receipt"]["batch_manifest"]["file"], str(batch_path.resolve())
         )
+
+    def test_accepts_v2_producer_architecture_dictionary_with_target_and_host(self):
+        batch_path = self.fixture.enable_v2_cas_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        receipt = json.loads(self.fixture.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["architecture"],
+            {
+                "target_triple": receipt["target_triple"],
+                "host": receipt["toolchain"]["rustc"]["host"],
+            },
+        )
+        job = json.loads(
+            self.fixture.job(
+                extra=(
+                    "--expect-batch-manifest-path", str(batch_path.resolve()),
+                    "--expect-batch-manifest-sha", digest(batch_path),
+                )
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(job["status"], "passed")
+
+    def test_rejects_v2_batch_architecture_target_mismatch(self):
+        batch_path = self.fixture.enable_v2_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["architecture"]["target_triple"] = "aarch64-unknown-linux-gnu"
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "batch receipt manifest does not match the receipt",
+            self.fixture.last_process.stderr,
+        )
+        failed = json.loads(
+            (self.fixture.root / "manifests/job.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(failed["status"], "failed")
+
+    def test_rejects_v2_batch_architecture_host_mismatch(self):
+        batch_path = self.fixture.enable_v2_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        manifest["architecture"]["host"] = "aarch64-unknown-linux-gnu"
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "batch receipt manifest does not match the receipt",
+            self.fixture.last_process.stderr,
+        )
+        failed = json.loads(
+            (self.fixture.root / "manifests/job.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(failed["status"], "failed")
+
+    def test_accepts_historical_v1_batch_architecture_shape(self):
+        batch_path = self.fixture.enable_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        receipt = json.loads(self.fixture.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["architecture"], receipt["architecture"])
+        self.assertEqual(set(manifest["architecture"]), {"target_triple"})
+        job = json.loads(self.fixture.job().read_text(encoding="utf-8"))
+        self.assertEqual(job["status"], "passed")
 
     def test_fixture_rust_from_receipt_records_full_v1_and_v2_versions_without_compilers(self):
         # An empty PATH makes any accidental bare rustc/cargo probe fail; the
