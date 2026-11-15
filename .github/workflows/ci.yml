@@ -332,6 +332,9 @@ jobs:
           test -n "$latest_pando"
           test -f "$latest_pando/results.json"
           cp "$latest_pando/results.json" test-results/pando-lab.json
+      - name: Exercise live Pando PITR fencing, retention roots, and pg_dump clone safety
+        timeout-minutes: 10
+        run: python3 tests/pando_pitr_service.py --binary "$ROOTYARD_BIN" --report test-results/pando-pitr-service.json
       - name: Exercise external CI webhooks, HMAC-SHA256 delivery, and auto PR CI pins
         run: python3 tests/webhooks.py --binary "$ROOTYARD_BIN" --report test-results/webhooks.json
       - name: Exercise webhook batching, lease and TLS regressions

@@ -300,8 +300,8 @@ pub async fn execute(
             lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
             Ok(json!({"cache_files_removed":removed,"remote_deleted":false}))
         }
-        "pando_unreachable_mark" => mark_unreachable(state, repo, job, lease, policy, cancel).await,
-        "pando_tombstone_delete" => delete_tombstones(state, repo, job, lease, policy, cancel).await,
+        "pando_unreachable_mark" => Box::pin(mark_unreachable(state, repo, job, lease, policy, cancel)).await,
+        "pando_tombstone_delete" => Box::pin(delete_tombstones(state, repo, job, lease, policy, cancel)).await,
         _ => bail!("unsupported Pando maintenance job kind"),
     }
 }
@@ -454,7 +454,8 @@ async fn delete_tombstones(
     let claimed =
         client.query(&claim, &[&authority.id, &tenant, &repo.id, &job.lease_owner, &policy.lease_seconds]).await?;
     let current_authority = if !claimed.is_empty() {
-        let advanced = super::pando_delete_gate::enter_fenced_delete_execution(state, &remote, deadline).await?;
+        let advanced =
+            Box::pin(super::pando_delete_gate::enter_fenced_delete_execution(state, &remote, deadline)).await?;
         ensure!(
             advanced.authority_id == authority.id && !advanced.remote_delete_fenced,
             "Pando authority fenced before delete"

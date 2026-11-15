@@ -562,15 +562,27 @@ def run_suite(binary: str) -> dict:
             label="clone remote_delete_fenced=true",
         )
         wait_until(
-            lambda: sql_query(
-                clone_url,
-                f"SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id='{repo_id}' "
-                "AND kind='pando_tombstone_delete' AND state='failed'",
+            lambda: int(
+                sql_query(
+                    clone_url,
+                    f"SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id='{repo_id}' "
+                    "AND kind='pando_tombstone_delete' AND state='failed'",
+                )
             )
-            == "1",
+            >= 1,
             timeout=20.0,
             label="clone pando_tombstone_delete fail closed",
         )
+        assert (
+            int(
+                sql_query(
+                    clone_url,
+                    f"SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id='{repo_id}' "
+                    "AND kind='pando_tombstone_delete' AND state='succeeded'",
+                )
+            )
+            == 1
+        ), "clone executed a new succeeding pando_tombstone_delete job"
         assert s3.take_deletes() == [], "metadata clone issued DELETE against shared bucket"
         assert s3.contains(prod_keys[0]), "metadata clone deleted live production object"
         verify_clone = run_cmd([binary, "pando-authority", "verify"], env=clone_env, check=False)

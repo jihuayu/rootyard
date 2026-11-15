@@ -393,7 +393,7 @@ async fn seed_manifest(
 
 async fn drain_worker(state: &Arc<AppState>, policy: &Policy) -> Result<()> {
     for _ in 0..32 {
-        match worker::run_once(state, policy, Uuid::new_v4()).await? {
+        match Box::pin(worker::run_once(state, policy, Uuid::new_v4())).await? {
             Some(_) => {}
             None => return Ok(()),
         }
@@ -434,6 +434,250 @@ async fn clone_schema_metadata(admin: &Pool, src: &str, dst: &str) -> Result<()>
     Ok(())
 }
 
+struct PrimaryRefs<'a> {
+    pool: &'a Pool,
+    state: &'a Arc<AppState>,
+    policy: &'a Policy,
+    remote: &'a RemoteObjectStore,
+    s3: &'a LoopbackS3,
+    owner: Uuid,
+    repo: Uuid,
+}
+
+async fn verify_retention_roots_and_pruning(
+    primary: &PrimaryRefs<'_>,
+    m_keep: &SeededManifest,
+    m_pinned: &SeededManifest,
+    m_drop: &SeededManifest,
+    legacy_key: &ObjectKey,
+    foreign_key: &ObjectKey,
+) -> Result<()> {
+    let pool_a = primary.pool;
+    let state_a = primary.state;
+    let policy = primary.policy;
+    let remote = primary.remote;
+    let s3 = primary.s3;
+    let owner = primary.owner;
+    let repo = primary.repo;
+    // Pin a PITR recovery root while m_pinned is live (advances epoch 1 -> 2),
+    // then drop m_pinned from pando_repository_states.pack_ids and prove retention root preserves it.
+    let pin = Box::pin(retention_roots::pin_recovery_root(
+        pool_a,
+        &state_a.storage.root,
+        remote,
+        owner,
+        Some(repo),
+        RetentionRootKind::PitrRecoveryPoint,
+        Some("pre-gc-checkpoint"),
+        Some(3600),
+        &[],
+        deadline(),
+    ))
+    .await?;
+    ensure!(pin.manifest_count == 2, "expected m_keep and m_pinned captured in retention root");
+    ensure!(pitr_fence::load_authority_state(&**pool_a.get().await?).await?.authority_epoch == 2);
+
+    let remaining_packs: &[Uuid] = &[m_keep.id];
+    pool_a
+        .get()
+        .await?
+        .execute("UPDATE pando_repository_states SET pack_ids=$2 WHERE repository_id=$1", &[&repo, &remaining_packs])
+        .await?;
+
+    Box::pin(scheduler::schedule_once(state_a, policy)).await?;
+    drain_worker(state_a, policy).await?;
+
+    // Force m_drop's retired rows past tombstone grace and verify remote delete advances epoch 2 -> 3
+    // while keeping m_keep, m_pinned, legacy_key, and foreign_key intact.
+    pool_a
+        .get()
+        .await?
+        .execute(
+            "UPDATE pando_remote_artifacts SET delete_after=clock_timestamp()-interval '10 seconds' WHERE state='retired'",
+            &[],
+        )
+        .await?;
+    pool_a.get().await?.execute("UPDATE storage_maintenance_repo_state SET last_scan_at=NULL", &[]).await?;
+    s3.take_deletes();
+    Box::pin(scheduler::schedule_once(state_a, policy)).await?;
+    drain_worker(state_a, policy).await?;
+
+    let post_del_epoch = pitr_fence::load_authority_state(&**pool_a.get().await?).await?.authority_epoch;
+    ensure!(post_del_epoch == 3, "expected epoch advance 2 -> 3 on real remote deletion");
+    let deleted_keys = s3.take_deletes();
+    ensure!(deleted_keys.len() == 4, "expected only m_drop's 4 artifacts deleted, got {deleted_keys:?}");
+    for k in [&m_drop.pack_cipher_key, &m_drop.pack_env_key, &m_drop.idx_cipher_key, &m_drop.idx_env_key] {
+        ensure!(!s3.contains(&k.path()), "expected dropped object {} removed", k.path());
+    }
+    for k in [&m_keep.pack_cipher_key, &m_pinned.pack_cipher_key, &m_pinned.idx_env_key, legacy_key, foreign_key] {
+        ensure!(s3.contains(&k.path()), "retained object {} was deleted unexpectedly", k.path());
+    }
+
+    // Release recovery root -> m_pinned becomes eligible, retires, and deletes after grace.
+    ensure!(retention_roots::release_recovery_root(pool_a, pin.id).await?);
+    pool_a.get().await?.execute("UPDATE storage_maintenance_repo_state SET last_scan_at=NULL", &[]).await?;
+    Box::pin(scheduler::schedule_once(state_a, policy)).await?;
+    drain_worker(state_a, policy).await?;
+    pool_a
+        .get()
+        .await?
+        .execute(
+            "UPDATE pando_remote_artifacts SET delete_after=clock_timestamp()-interval '10 seconds' WHERE state='retired'",
+            &[],
+        )
+        .await?;
+    pool_a.get().await?.execute("UPDATE storage_maintenance_repo_state SET last_scan_at=NULL", &[]).await?;
+    Box::pin(scheduler::schedule_once(state_a, policy)).await?;
+    drain_worker(state_a, policy).await?;
+    ensure!(pitr_fence::load_authority_state(&**pool_a.get().await?).await?.authority_epoch == 4);
+    ensure!(!s3.contains(&m_pinned.pack_cipher_key.path()), "expected released pin pack removed");
+    ensure!(s3.contains(&m_keep.pack_cipher_key.path()), "m_keep must remain preserved");
+    ensure!(s3.contains(&legacy_key.path()), "legacy v1 object must stay preserved");
+    ensure!(s3.contains(&foreign_key.path()), "foreign authority object must stay preserved");
+    Ok(())
+}
+
+async fn verify_clone_fencing_and_isolate(
+    primary: &PrimaryRefs<'_>,
+    admin: &Pool,
+    db_url: &str,
+    schemas: (&str, &str),
+    dirs: (&Path, PathBuf, &Path),
+    pool_b: &Pool,
+    auth_a: &pitr_fence::AuthorityState,
+) -> Result<SeededManifest> {
+    let (schema_a, schema_b) = schemas;
+    let (data_a, data_b, work_dir) = dirs;
+    // Out-of-band PG metadata clone sharing the SAME bucket (and even identical
+    // copied local markers) MUST detect mismatched schema/cluster coordinates,
+    // latch remote_delete_fenced=true, and issue ZERO S3 DELETEs.
+    let m_protected = Box::pin(seed_manifest(
+        primary.pool,
+        primary.remote,
+        work_dir,
+        primary.repo,
+        primary.owner,
+        auth_a.authority_id,
+        "protected",
+    ))
+    .await?;
+    clone_schema_metadata(admin, schema_a, schema_b).await?;
+    pool_b
+        .get()
+        .await?
+        .execute(
+            "UPDATE pando_remote_artifacts SET state='retired', delete_after=clock_timestamp()-interval '60 seconds' \
+             WHERE sha256=$1",
+            &[&m_protected.pack_cipher_key.sha256],
+        )
+        .await?;
+    let state_b = app_state(test_config(db_url.to_owned(), data_b.clone()), pool_b.clone())?;
+    std::fs::copy(data_a.join(".volume-id"), data_b.join(".volume-id"))?;
+    std::fs::copy(data_a.join(".pando-deployment-id"), data_b.join(".pando-deployment-id"))?;
+
+    primary.s3.take_deletes();
+    let sched_decision = Box::pin(pando_delete_gate::check_scheduler_gate(&state_b, deadline())).await?;
+    ensure!(
+        matches!(sched_decision, DeleteGateDecision::Fenced { .. }),
+        "expected scheduler gate to fence PG schema clone"
+    );
+    let auth_b = pitr_fence::load_authority_state(&**pool_b.get().await?).await?;
+    ensure!(auth_b.remote_delete_fenced, "clone authority row must latch remote_delete_fenced=true");
+    jobs::enqueue(pool_b, primary.repo, primary.owner, 1, "pando_tombstone_delete").await?;
+    drain_worker(&state_b, primary.policy).await?;
+    let clone_job_state: String = pool_b
+        .get()
+        .await?
+        .query_one("SELECT state FROM storage_maintenance_jobs WHERE kind='pando_tombstone_delete' ORDER BY created_at DESC LIMIT 1", &[])
+        .await?
+        .get(0);
+    ensure!(clone_job_state == "failed", "fenced delete job must fail closed, got {clone_job_state}");
+    ensure!(primary.s3.take_deletes().is_empty(), "fenced clone issued remote DELETE");
+    ensure!(primary.s3.contains(&m_protected.pack_cipher_key.path()), "clone damaged shared production object");
+    ensure!(
+        pitr_fence::ensure_not_fenced(&**pool_b.get().await?).await.is_err(),
+        "fenced clone must refuse new mutations"
+    );
+
+    // Explicit isolate_cloned_authority mints a fresh authority_id, bumps restore_generation,
+    // clears remote_delete_fenced, and never deletes old authority objects.
+    let isolated =
+        Box::pin(pitr_fence::isolate_cloned_authority(pool_b, &state_b.storage.root, primary.remote, deadline()))
+            .await?;
+    ensure!(isolated.authority_id != auth_a.authority_id);
+    ensure!(isolated.restore_generation == auth_a.restore_generation + 1);
+    ensure!(isolated.authority_epoch == 1 && !isolated.remote_delete_fenced);
+    ensure!(
+        primary.s3.contains(&format!("pando-authorities/{}/epochs/00000000000000000001.json", isolated.authority_id))
+    );
+    ensure!(primary.s3.contains(&m_protected.pack_cipher_key.path()));
+    Ok(m_protected)
+}
+
+async fn verify_pitr_rollback_and_split_brain(
+    primary: &PrimaryRefs<'_>,
+    db_url: &str,
+    data_c: PathBuf,
+    pool_c: &Pool,
+    m_protected: &SeededManifest,
+) -> Result<()> {
+    // Simulate PostgreSQL PITR rollback on primary schema_a (epoch rewound behind external epoch 4 proof).
+    primary
+        .pool
+        .get()
+        .await?
+        .execute("UPDATE pando_storage_authorities SET authority_epoch = authority_epoch - 1 WHERE singleton", &[])
+        .await?;
+    primary
+        .pool
+        .get()
+        .await?
+        .execute(
+            "UPDATE pando_remote_artifacts SET state='retired', delete_after=clock_timestamp()-interval '60 seconds' \
+             WHERE sha256=$1",
+            &[&m_protected.pack_cipher_key.sha256],
+        )
+        .await?;
+    primary.s3.take_deletes();
+    let rollback_gate = Box::pin(pando_delete_gate::check_scheduler_gate(primary.state, deadline())).await?;
+    ensure!(matches!(rollback_gate, DeleteGateDecision::Fenced { .. }), "PITR epoch rollback must fence");
+    ensure!(pitr_fence::load_authority_state(&**primary.pool.get().await?).await?.remote_delete_fenced);
+    jobs::enqueue(primary.pool, primary.repo, primary.owner, 1, "pando_tombstone_delete").await?;
+    drain_worker(primary.state, primary.policy).await?;
+    ensure!(primary.s3.take_deletes().is_empty(), "PITR-rolled-back DB issued remote DELETE");
+    ensure!(primary.s3.contains(&m_protected.pack_cipher_key.path()));
+
+    // Split-brain epoch-1 creation race fails closed on S3 If-None-Match 412 conflict.
+    let state_c = app_state(test_config(db_url.to_owned(), data_c), pool_c.clone())?;
+    let auth_c_initial = pitr_fence::load_authority_state(&**pool_c.get().await?).await?;
+    let rival_proof = AuthorityEpochProof {
+        version: PROOF_VERSION,
+        authority_id: auth_c_initial.authority_id,
+        epoch: 1,
+        restore_generation: 0,
+        generation: 1,
+        deployment_id: Uuid::new_v4(),
+        volume_id: Uuid::new_v4(),
+        db_system_identifier: "9999999999999999".into(),
+        db_database_oid: 12345,
+        db_schema_oid: 2200,
+        pg_timeline_id: 1,
+        backend_identity: primary.remote.backend_identity()?,
+        proof_nonce: Uuid::new_v4(),
+        operation: "attest".into(),
+    };
+    primary.s3.insert_raw(
+        &format!("pando-authorities/{}/epochs/00000000000000000001.json", auth_c_initial.authority_id),
+        serde_json::to_vec(&rival_proof)?,
+    );
+    let split_res =
+        Box::pin(pitr_fence::verify_or_attest(pool_c, &state_c.storage.root, primary.remote, deadline(), "attest"))
+            .await;
+    ensure!(split_res.is_err(), "pre-claimed epoch-1 object must fence split-brain runtime");
+    ensure!(pitr_fence::load_authority_state(&**pool_c.get().await?).await?.remote_delete_fenced);
+    Ok(())
+}
+
 #[tokio::test]
 async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
     let Some(db_url) = std::env::var("ROOTYARD_TEST_DATABASE_URL").ok().filter(|v| !v.is_empty()) else {
@@ -454,7 +698,7 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
     let schema_a_task = schema_a.clone();
     let schema_b_task = schema_b.clone();
     let schema_c_task = schema_c.clone();
-    let result = tokio::spawn(async move {
+    let result = tokio::spawn(Box::pin(async move {
         let admin = admin_task;
         let schema_a = schema_a_task;
         let schema_b = schema_b_task;
@@ -496,13 +740,12 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
         let remote = RemoteObjectStore::from_env(work_dir.clone())?;
 
         // 2. Startup check writes external epoch-1 proof and binds PG + local volume coordinates.
-        pitr_fence::startup_check(&pool_a, &state_a.storage.root).await?;
+        Box::pin(pitr_fence::startup_check(&pool_a, &state_a.storage.root)).await?;
         let auth_a = pitr_fence::load_authority_state(&**pool_a.get().await?).await?;
         ensure!(auth_a.attested_at.is_some(), "expected attested authority after startup_check");
         ensure!(auth_a.authority_epoch == 1 && auth_a.restore_generation == 0 && !auth_a.remote_delete_fenced);
         ensure!(s3.contains(&format!("pando-authorities/{}/epochs/00000000000000000001.json", auth_a.authority_id)));
 
-        // Legacy v1 key + foreign authority key + direct delete-target gate refusal checks.
         let owner = Uuid::new_v4();
         let repo = Uuid::new_v4();
         let slug = format!("u{}", &owner.simple().to_string()[..12]);
@@ -525,22 +768,17 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
                 .await?;
         }
 
-        let m_keep = seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "keep").await?;
-        let m_pinned = seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "pin").await?;
-        let m_drop = seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "drop").await?;
+        let m_keep = Box::pin(seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "keep")).await?;
+        let m_pinned = Box::pin(seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "pin")).await?;
+        let m_drop = Box::pin(seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "drop")).await?;
 
-        // Serving pack_ids initially has [m_keep, m_pinned]. m_drop is orphaned/unlinked.
         let initial_packs: &[Uuid] = &[m_keep.id, m_pinned.id];
         pool_a
             .get()
             .await?
-            .execute(
-                "UPDATE pando_repository_states SET pack_ids=$2 WHERE repository_id=$1",
-                &[&repo, &initial_packs],
-            )
+            .execute("UPDATE pando_repository_states SET pack_ids=$2 WHERE repository_id=$1", &[&repo, &initial_packs])
             .await?;
 
-        // Legacy unregistered key and foreign-authority key in shared bucket.
         let legacy_bytes = b"legacy-v1-unregistered-bytes";
         let legacy_sha = hex::encode(Sha256::digest(legacy_bytes));
         let legacy_file = work_dir.join("legacy.bin");
@@ -551,7 +789,6 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
         let foreign_key = ObjectKey::scoped(owner, foreign_auth, 1, "pando-cipher", &legacy_sha)?;
         s3.insert_raw(&foreign_key.path(), legacy_bytes.to_vec());
 
-        // Guard rejects legacy key, foreign authority key, and authority-proof path.
         ensure!(
             pando_delete_gate::validate_scoped_delete_target(
                 auth_a.authority_id,
@@ -589,198 +826,40 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
             .is_err()
         );
 
-        // 3. Pin a PITR recovery root while m_pinned is live (advances epoch 1 -> 2),
-        // then drop m_pinned from pando_repository_states.pack_ids and prove retention root preserves it.
-        let pin = retention_roots::pin_recovery_root(
-            &pool_a,
-            &state_a.storage.root,
-            &remote,
+        let primary = PrimaryRefs {
+            pool: &pool_a,
+            state: &state_a,
+            policy: &policy,
+            remote: &remote,
+            s3: &s3,
             owner,
-            Some(repo),
-            RetentionRootKind::PitrRecoveryPoint,
-            Some("pre-gc-checkpoint"),
-            Some(3600),
-            &[],
-            deadline(),
-        )
-        .await?;
-        ensure!(pin.manifest_count == 2, "expected m_keep and m_pinned captured in retention root");
-        ensure!(pitr_fence::load_authority_state(&**pool_a.get().await?).await?.authority_epoch == 2);
-
-        let remaining_packs: &[Uuid] = &[m_keep.id];
-        pool_a
-            .get()
-            .await?
-            .execute("UPDATE pando_repository_states SET pack_ids=$2 WHERE repository_id=$1", &[&repo, &remaining_packs])
-            .await?;
-
-        scheduler::schedule_once(&state_a, &policy).await?;
-        drain_worker(&state_a, &policy).await?;
-
-        // Force m_drop's retired rows past tombstone grace and verify remote delete advances epoch 2 -> 3
-        // while keeping m_keep, m_pinned, legacy_key, and foreign_key intact.
-        pool_a
-            .get()
-            .await?
-            .execute(
-                "UPDATE pando_remote_artifacts SET delete_after=clock_timestamp()-interval '10 seconds' WHERE state='retired'",
-                &[],
-            )
-            .await?;
-        pool_a.get().await?.execute("UPDATE storage_maintenance_repo_state SET last_scan_at=NULL", &[]).await?;
-        s3.take_deletes();
-        scheduler::schedule_once(&state_a, &policy).await?;
-        drain_worker(&state_a, &policy).await?;
-
-        let post_del_epoch = pitr_fence::load_authority_state(&**pool_a.get().await?).await?.authority_epoch;
-        ensure!(post_del_epoch == 3, "expected epoch advance 2 -> 3 on real remote deletion");
-        let deleted_keys = s3.take_deletes();
-        ensure!(deleted_keys.len() == 4, "expected only m_drop's 4 artifacts deleted, got {deleted_keys:?}");
-        for k in [&m_drop.pack_cipher_key, &m_drop.pack_env_key, &m_drop.idx_cipher_key, &m_drop.idx_env_key] {
-            ensure!(!s3.contains(&k.path()), "expected dropped object {} removed", k.path());
-        }
-        for k in [
-            &m_keep.pack_cipher_key,
-            &m_pinned.pack_cipher_key,
-            &m_pinned.idx_env_key,
+            repo,
+        };
+        Box::pin(verify_retention_roots_and_pruning(
+            &primary,
+            &m_keep,
+            &m_pinned,
+            &m_drop,
             &legacy_key,
             &foreign_key,
-        ] {
-            ensure!(s3.contains(&k.path()), "retained object {} was deleted unexpectedly", k.path());
-        }
+        ))
+        .await?;
 
-        // Release recovery root -> m_pinned becomes eligible, retires, and deletes after grace.
-        ensure!(retention_roots::release_recovery_root(&pool_a, pin.id).await?);
-        pool_a.get().await?.execute("UPDATE storage_maintenance_repo_state SET last_scan_at=NULL", &[]).await?;
-        scheduler::schedule_once(&state_a, &policy).await?;
-        drain_worker(&state_a, &policy).await?;
-        pool_a
-            .get()
-            .await?
-            .execute(
-                "UPDATE pando_remote_artifacts SET delete_after=clock_timestamp()-interval '10 seconds' WHERE state='retired'",
-                &[],
-            )
-            .await?;
-        pool_a.get().await?.execute("UPDATE storage_maintenance_repo_state SET last_scan_at=NULL", &[]).await?;
-        scheduler::schedule_once(&state_a, &policy).await?;
-        drain_worker(&state_a, &policy).await?;
-        ensure!(pitr_fence::load_authority_state(&**pool_a.get().await?).await?.authority_epoch == 4);
-        ensure!(!s3.contains(&m_pinned.pack_cipher_key.path()), "expected released pin pack removed");
-        ensure!(s3.contains(&m_keep.pack_cipher_key.path()), "m_keep must remain preserved");
-        ensure!(s3.contains(&legacy_key.path()), "legacy v1 object must stay preserved");
-        ensure!(s3.contains(&foreign_key.path()), "foreign authority object must stay preserved");
+        let m_protected = Box::pin(verify_clone_fencing_and_isolate(
+            &primary,
+            &admin,
+            &db_url,
+            (&schema_a, &schema_b),
+            (&data_a, data_b, &work_dir),
+            &pool_b,
+            &auth_a,
+        ))
+        .await?;
 
-        // 4. Out-of-band PG metadata clone sharing the SAME bucket (and even identical
-        // copied local markers) MUST detect mismatched schema/cluster coordinates,
-        // latch remote_delete_fenced=true, and issue ZERO S3 DELETEs.
-        let m_protected = seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "protected").await?;
-        clone_schema_metadata(&admin, &schema_a, &schema_b).await?;
-        // Force a due retired row in cloned schema_b pointing to m_protected's live S3 object.
-        pool_b
-            .get()
-            .await?
-            .execute(
-                "UPDATE pando_remote_artifacts SET state='retired', delete_after=clock_timestamp()-interval '60 seconds' \
-                 WHERE sha256=$1",
-                &[&m_protected.pack_cipher_key.sha256],
-            )
-            .await?;
-        let state_b = app_state(test_config(db_url.clone(), data_b.clone()), pool_b.clone())?;
-        // Copy exact .volume-id and .pando-deployment-id to prove schema_oid mismatch alone fences clones.
-        std::fs::copy(data_a.join(".volume-id"), data_b.join(".volume-id"))?;
-        std::fs::copy(data_a.join(".pando-deployment-id"), data_b.join(".pando-deployment-id"))?;
-
-        s3.take_deletes();
-        let sched_decision = pando_delete_gate::check_scheduler_gate(&state_b, deadline()).await?;
-        ensure!(
-            matches!(sched_decision, DeleteGateDecision::Fenced { .. }),
-            "expected scheduler gate to fence PG schema clone"
-        );
-        let auth_b = pitr_fence::load_authority_state(&**pool_b.get().await?).await?;
-        ensure!(auth_b.remote_delete_fenced, "clone authority row must latch remote_delete_fenced=true");
-        // Even direct delete job execution in cloned schema_b fails closed with 0 S3 deletes.
-        jobs::enqueue(&pool_b, repo, owner, 1, "pando_tombstone_delete").await?;
-        drain_worker(&state_b, &policy).await?;
-        let clone_job_state: String = pool_b
-            .get()
-            .await?
-            .query_one("SELECT state FROM storage_maintenance_jobs WHERE kind='pando_tombstone_delete' ORDER BY created_at DESC LIMIT 1", &[])
-            .await?
-            .get(0);
-        ensure!(clone_job_state == "failed", "fenced delete job must fail closed, got {clone_job_state}");
-        ensure!(s3.take_deletes().is_empty(), "fenced clone issued remote DELETE");
-        ensure!(s3.contains(&m_protected.pack_cipher_key.path()), "clone damaged shared production object");
-        ensure!(
-            pitr_fence::ensure_not_fenced(&**pool_b.get().await?).await.is_err(),
-            "fenced clone must refuse new mutations"
-        );
-
-        // 5. Explicit isolate_cloned_authority mints a fresh authority_id, bumps restore_generation,
-        // clears remote_delete_fenced, and never deletes old authority objects.
-        let isolated = pitr_fence::isolate_cloned_authority(&pool_b, &state_b.storage.root, &remote, deadline()).await?;
-        ensure!(isolated.authority_id != auth_a.authority_id);
-        ensure!(isolated.restore_generation == auth_a.restore_generation + 1);
-        ensure!(isolated.authority_epoch == 1 && !isolated.remote_delete_fenced);
-        ensure!(s3.contains(&format!("pando-authorities/{}/epochs/00000000000000000001.json", isolated.authority_id)));
-        ensure!(s3.contains(&m_protected.pack_cipher_key.path()));
-
-        // 6. Simulate PostgreSQL PITR rollback on primary schema_a (epoch rewound behind external epoch 4 proof).
-        pool_a
-            .get()
-            .await?
-            .execute(
-                "UPDATE pando_storage_authorities SET authority_epoch = authority_epoch - 1 WHERE singleton",
-                &[],
-            )
-            .await?;
-        pool_a
-            .get()
-            .await?
-            .execute(
-                "UPDATE pando_remote_artifacts SET state='retired', delete_after=clock_timestamp()-interval '60 seconds' \
-                 WHERE sha256=$1",
-                &[&m_protected.pack_cipher_key.sha256],
-            )
-            .await?;
-        s3.take_deletes();
-        let rollback_gate = pando_delete_gate::check_scheduler_gate(&state_a, deadline()).await?;
-        ensure!(matches!(rollback_gate, DeleteGateDecision::Fenced { .. }), "PITR epoch rollback must fence");
-        ensure!(pitr_fence::load_authority_state(&**pool_a.get().await?).await?.remote_delete_fenced);
-        jobs::enqueue(&pool_a, repo, owner, 1, "pando_tombstone_delete").await?;
-        drain_worker(&state_a, &policy).await?;
-        ensure!(s3.take_deletes().is_empty(), "PITR-rolled-back DB issued remote DELETE");
-        ensure!(s3.contains(&m_protected.pack_cipher_key.path()));
-
-        // 7. Split-brain epoch-1 creation race fails closed on S3 If-None-Match 412 conflict.
-        let state_c = app_state(test_config(db_url.clone(), data_c.clone()), pool_c.clone())?;
-        let auth_c_initial = pitr_fence::load_authority_state(&**pool_c.get().await?).await?;
-        let rival_proof = AuthorityEpochProof {
-            version: PROOF_VERSION,
-            authority_id: auth_c_initial.authority_id,
-            epoch: 1,
-            restore_generation: 0,
-            generation: 1,
-            deployment_id: Uuid::new_v4(),
-            volume_id: Uuid::new_v4(),
-            db_system_identifier: "9999999999999999".into(),
-            db_database_oid: 12345,
-            db_schema_oid: 2200,
-            pg_timeline_id: 1,
-            backend_identity: remote.backend_identity()?,
-            proof_nonce: Uuid::new_v4(),
-            operation: "attest".into(),
-        };
-        s3.insert_raw(
-            &format!("pando-authorities/{}/epochs/00000000000000000001.json", auth_c_initial.authority_id),
-            serde_json::to_vec(&rival_proof)?,
-        );
-        let split_res = pitr_fence::verify_or_attest(&pool_c, &state_c.storage.root, &remote, deadline(), "attest").await;
-        ensure!(split_res.is_err(), "pre-claimed epoch-1 object must fence split-brain runtime");
-        ensure!(pitr_fence::load_authority_state(&**pool_c.get().await?).await?.remote_delete_fenced);
+        Box::pin(verify_pitr_rollback_and_split_brain(&primary, &db_url, data_c, &pool_c, &m_protected)).await?;
 
         Ok::<(), anyhow::Error>(())
-    })
+    }))
     .await
     .context("pando_pitr_fencing test task panicked");
 
