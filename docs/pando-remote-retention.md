@@ -106,16 +106,20 @@ identity list before returning a passing report; a report whose source, binary,
 receipt or harness bytes change is not a pass.
 
 Use generic public placeholders below; substitute paths on the qualification
-host. Provider credentials, DSNs, tokens and locator paths are runtime
+host. Run these commands from the final clean source tree that matches the
+receipt and binary, and derive the task-specific source variable from that
+tree's HEAD. Provider credentials, DSNs, tokens and locator paths are runtime
 environment data and are never command-line arguments or report artifacts. Do
 not place secrets in argv, shell history, the JSON report or captured
 diagnostics.
 
 ```sh
+ROOTYARD_QUALIFICATION_SHA="$(git rev-parse HEAD)"
+
 python3 tests/pando_pitr_physical_service.py \
   --binary /srv/rootyard/bin/rootyard \
   --build-receipt /srv/rootyard/evidence/rootyard.build-receipt.json \
-  --expect-commit <final-40-hex-source-sha> \
+  --expect-commit "$ROOTYARD_QUALIFICATION_SHA" \
   --pg-bin /opt/postgresql/17/bin \
   --report /srv/rootyard/evidence/pando-pitr-physical.json \
   --timeout 1800
@@ -123,7 +127,7 @@ python3 tests/pando_pitr_physical_service.py \
 python3 tests/pando_backup_restore_service.py \
   --binary /srv/rootyard/bin/rootyard \
   --build-receipt /srv/rootyard/evidence/rootyard.build-receipt.json \
-  --expect-commit <final-40-hex-source-sha> \
+  --expect-commit "$ROOTYARD_QUALIFICATION_SHA" \
   --pg-bin /opt/postgresql/17/bin \
   --report /srv/rootyard/evidence/pando-backup-restore.json \
   --timeout 1800
