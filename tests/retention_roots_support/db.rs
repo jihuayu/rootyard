@@ -4,8 +4,12 @@
 //! frozen 139/142/143 row shapes) and real pools only. Missing configuration is
 //! a hard failure; no test may skip itself when PG is absent.
 use anyhow::{Result, anyhow, ensure};
+use axum::http::{HeaderMap, HeaderValue, header};
+use base64::Engine as _;
 use deadpool_postgres::{Manager, Pool};
+use rootyard::blob_store::opendal::BlobStore;
 use rootyard::db;
+use rootyard::ref_store::serving::{ProvisionRequest, provision};
 use rootyard::ref_store::core::PgRefStoreCore;
 use rootyard::ref_store::{CoreGateInit, CoreGateVersion, GitObjectFormat, RefName, VersionCheck};
 use std::time::Duration;
@@ -41,6 +45,52 @@ pub fn pool_for(url: &str, schema: &str, max: usize, extra: Option<&str>) -> Res
         .build()?)
 }
 
+/// One real writable API identity created through the production token path.
+/// The secret is used only to authenticate the returned Identity and is never
+/// printed or retained by the fixture.
+pub async fn serving_actor(pool: &Pool, label: &str) -> Result<db::Identity> {
+    let username = format!("{label}{}", Uuid::new_v4().simple());
+    let issued = db::issue_token(pool, &username, true, false).await?;
+    let username = issued["username"].as_str().ok_or_else(|| anyhow!("issued token has no username"))?;
+    let secret = issued["token"].as_str().ok_or_else(|| anyhow!("issued token has no secret"))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Basic {encoded}")).map_err(|_| anyhow!("token header refused"))?,
+    );
+    let identity = rootyard::auth::authenticate(pool, &headers)
+        .await
+        .map_err(|error| anyhow!("real token authentication failed: {}", error.1))?;
+    ensure!(!identity.read_only && identity.username == username, "issued serving identity differs");
+    Ok(identity)
+}
+
+/// Provision one actual ready `pg_refstore` repository through the production
+/// serving path. No GitFS directory or forged ready row is created.
+pub async fn provision_serving(
+    pool: &Pool,
+    actor: &db::Identity,
+    store: &BlobStore,
+    name: &str,
+) -> Result<db::Repository> {
+    let receipt = provision(
+        pool,
+        actor,
+        ProvisionRequest { owner: None, name: name.to_owned(), object_format: GitObjectFormat::Sha1 },
+        store.backend_identity(),
+        deadline(),
+    )
+    .await
+    .map_err(|error| anyhow!("serving provision failed: {error}"))?;
+    ensure!(receipt.created, "serving provision unexpectedly replayed");
+    ensure!(
+        receipt.repository.storage_backend == "pg_refstore" && receipt.repository.state == "ready",
+        "provisioned repository is not ready pg_refstore"
+    );
+    Ok(receipt.repository)
+}
+
 pub struct Db {
     admin: Pool,
     pub pool: Pool,
@@ -74,6 +124,19 @@ impl Db {
         let pool = pool_for(&url, &schema, 16, None)?;
         db::migrate(&pool).await?;
         let client = pool.get().await?;
+        // The serving lane reads the production `public.cluster_authority` row.
+        // The random fixture schema owns all other tables, so ensure this one
+        // production-shaped singleton exists without replacing any existing row.
+        client
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS public.cluster_authority (
+                     singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+                     incarnation UUID NOT NULL DEFAULT gen_random_uuid(),
+                     rotated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+                 );
+                 INSERT INTO public.cluster_authority(singleton) VALUES(true) ON CONFLICT DO NOTHING;",
+            )
+            .await?;
         let installed: bool = client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=144)
@@ -207,6 +270,46 @@ impl Db {
         let mut client = self.pool.get().await?;
         Ok(PgRefStoreCore.initialize(&mut client, &init, deadline()).await?.version())
     }
+}
+
+pub async fn cluster_incarnation(pool: &Pool) -> Result<Uuid> {
+    Ok(pool
+        .get()
+        .await?
+        .query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
+        .await?
+        .get(0))
+}
+
+pub async fn set_cluster_incarnation(pool: &Pool, incarnation: Uuid) -> Result<()> {
+    let changed = pool
+        .get()
+        .await?
+        .execute(
+            "UPDATE public.cluster_authority SET incarnation=$1, rotated_at=clock_timestamp()
+             WHERE singleton=true",
+            &[&incarnation],
+        )
+        .await?;
+    ensure!(changed == 1, "cluster authority restore changed {changed} rows");
+    Ok(())
+}
+
+/// Rotate the real cluster authority row inside this fixture schema. This is a
+/// test-only SQL mutation of the dedicated cluster fixture, not a product path.
+pub async fn rotate_cluster(pool: &Pool) -> Result<Uuid> {
+    let row = pool
+        .get()
+        .await?
+        .query_one(
+            "UPDATE public.cluster_authority SET incarnation=gen_random_uuid(), rotated_at=clock_timestamp()
+             WHERE singleton=true RETURNING incarnation",
+            &[],
+        )
+        .await?;
+    let incarnation: Uuid = row.get(0);
+    ensure!(!incarnation.is_nil(), "rotated cluster incarnation is nil");
+    Ok(incarnation)
 }
 
 pub async fn gate_version(pool: &Pool, repo: Uuid, tenant: Uuid) -> Result<CoreGateVersion> {

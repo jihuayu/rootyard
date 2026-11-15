@@ -12,6 +12,7 @@
 //! | release (or fence a not-yet-registered root) one-way | [`PgRetentionRoots::release`] |
 //! | historical metadata / receipt reads (data only) | [`PgRetentionRoots::get`] / [`PgRetentionRoots::query_receipt`] |
 //! | native byte read requiring current authority + active root at T2 | [`PgRetentionRoots::materialize`] |
+//! | serving-lane seal/register/read bound to the actual opened ready backend | [`PgRetentionRoots::prepare_serving`] / [`PgRetentionRoots::register_serving`] / [`PgRetentionRoots::materialize_serving`] |
 //!
 //! ## Guarantees
 //!

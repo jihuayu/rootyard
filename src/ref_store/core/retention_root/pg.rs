@@ -53,10 +53,40 @@ impl PgRetentionRoots {
         request: PrepareRootRequest,
         deadline: Instant,
     ) -> Result<RootCandidate, RootError> {
+        self.prepare_with_lane(pool, request, deadline, false).await
+    }
+
+    /// Serving-lane Phase 1: seal one existing ready serving snapshot using the
+    /// actual opened Blob backend identity. The T1 read uses
+    /// `ScopeLane::Serving`, captures the current cluster incarnation after the
+    /// source pin/refs locks, and returns the same opaque candidate with that
+    /// ephemeral anchor. LegacyFresh prepare is unchanged.
+    pub async fn prepare_serving(
+        &self,
+        pool: &Pool,
+        request: PrepareRootRequest,
+        deadline: Instant,
+    ) -> Result<RootCandidate, RootError> {
+        self.prepare_with_lane(pool, request, deadline, true).await
+    }
+
+    async fn prepare_with_lane(
+        &self,
+        pool: &Pool,
+        request: PrepareRootRequest,
+        deadline: Instant,
+        serving: bool,
+    ) -> Result<RootCandidate, RootError> {
         request.validate()?;
         let deadline = effective_deadline(deadline)?;
         let reference = *request.reference();
-        let sealed = capture_t1(pool, &reference, deadline).await?;
+        let backend_identity = self.engine.backend_identity().as_hex().to_owned();
+        let lane = if serving {
+            super::super::snapshot_sql::ScopeLane::Serving { backend_identity: &backend_identity }
+        } else {
+            super::super::snapshot_sql::ScopeLane::LegacyFresh
+        };
+        let (sealed, serving_cluster_incarnation) = capture_t1(pool, &reference, deadline, lane, serving).await?;
         if sealed.pack_count() <= 0 || !sealed.complete_registered_pack_membership() {
             return Err(RootError::RootSourceChanged("source snapshot has no complete pack membership"));
         }
@@ -130,11 +160,15 @@ impl PgRetentionRoots {
                 selector_kind: request.selector().kind(),
                 oids,
                 packs: sealed.packs().to_vec(),
+                serving_cluster_incarnation,
             },
             &sealed,
         )?;
         if candidate.binding_digest() != binding {
             return Err(RootError::RootDigestConflict("sealed candidate binding differs from the native binding"));
+        }
+        if serving {
+            candidate.verify_serving_backend(&backend_identity)?;
         }
         Ok(candidate)
     }
@@ -200,7 +234,9 @@ async fn capture_t1(
     pool: &Pool,
     reference: &PackSnapshotRef,
     deadline: Instant,
-) -> Result<PackReadSnapshot, RootError> {
+    lane: super::super::snapshot_sql::ScopeLane<'_>,
+    serving: bool,
+) -> Result<(PackReadSnapshot, Option<Uuid>), RootError> {
     let mut client = pooled_client(pool, deadline).await?;
     let tx = begin_bounded(&mut client, deadline).await?;
     if let Err(error) = bound_tx(&tx, deadline).await {
@@ -208,18 +244,21 @@ async fn capture_t1(
         drop(client);
         return Err(error);
     }
-    let read = pg::before_deadline(deadline, PgPackSnapshot.read_checked(
-        &tx,
-        reference,
-        deadline,
-        super::super::snapshot_sql::ScopeLane::LegacyFresh,
-    )).await;
+    let read = pg::before_deadline(deadline, async {
+        let snapshot = PgPackSnapshot.read_checked(&tx, reference, deadline, lane).await?;
+        // Cluster is deliberately read after the source snapshot/pin/ref locks
+        // in this same short transaction. No preflight cluster read and no
+        // reverse pin/root -> cluster order.
+        let cluster = if serving { Some(super::sql::cluster_incarnation_nowait(&tx).await?) } else { None };
+        Ok::<_, RootError>((snapshot, cluster))
+    })
+    .await;
     let cleanup = rollback_reads(tx, deadline).await;
     drop(client);
     match (read, cleanup) {
-        (Err(error), _) => Err(error.into()),
+        (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-        (Ok(snapshot), Ok(())) => Ok(snapshot),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 

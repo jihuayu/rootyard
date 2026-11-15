@@ -3,11 +3,17 @@
 //! only come from the real `PgRetentionRoots::prepare` path.
 use anyhow::Result;
 use deadpool_postgres::Pool;
+use rootyard::blob_store::opendal::BlobStore;
+use rootyard::db::{Identity, Repository};
 use rootyard::ref_store::core::pack_snapshot::PackSnapshotRef;
 use rootyard::ref_store::core::retention_root::{
     PgRetentionRoots, PrepareRootRequest, RegisterRootRequest, ReleaseRootRequest, RootCandidate, RootReadAuthority,
-    RootReadRequest, RootReceipt, RootReceiptQuery, RootRef, RootSelector, RootsScope,
+    RootReadRequest, RootReadView, RootReceipt, RootReceiptQuery, RootRef, RootSelector, RootsScope,
 };
+use rootyard::ref_store::serving::{
+    PgServingSnapshotMetadata, ServingSnapshotRelease,
+};
+use rootyard::ref_store::PinReleaseReason;
 use rootyard::ref_store::{CoreGateVersion, RequestDigest};
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -15,6 +21,15 @@ use uuid::Uuid;
 use super::pack::SourceSnapshot;
 
 pub fn scope(repo: Uuid, tenant: Uuid, gate: &CoreGateVersion) -> Result<RootsScope> {
+    scope_with_history(repo, tenant, gate, gate.history_incarnation())
+}
+
+pub fn scope_with_history(
+    repo: Uuid,
+    tenant: Uuid,
+    gate: &CoreGateVersion,
+    history_incarnation: Uuid,
+) -> Result<RootsScope> {
     let intent = RequestDigest::from_bytes([0x42; 32]);
     Ok(RootsScope::new(
         repo,
@@ -23,7 +38,7 @@ pub fn scope(repo: Uuid, tenant: Uuid, gate: &CoreGateVersion) -> Result<RootsSc
         rootyard::ref_store::core::retention_root::RootPurpose::Ci,
         &intent.as_hex(),
         gate.object_format(),
-        gate.history_incarnation(),
+        history_incarnation,
         gate.authority_epoch(),
         gate.group_epoch(),
     )?)
@@ -80,6 +95,80 @@ pub async fn register(
     deadline: Instant,
 ) -> Result<RootReceipt, rootyard::ref_store::core::retention_root::RootError> {
     adapter.register(pool, RegisterRootRequest::new(candidate, request_id)?, deadline).await
+}
+
+pub async fn prepare_serving(
+    adapter: &PgRetentionRoots,
+    pool: &Pool,
+    scope: RootsScope,
+    source: &SourceSnapshot,
+    root_id: Uuid,
+    operation_id: Uuid,
+    selector: RootSelector,
+    request_id: Uuid,
+    deadline: Instant,
+) -> Result<RootCandidate, rootyard::ref_store::core::retention_root::RootError> {
+    let request = PrepareRootRequest::new(
+        scope,
+        reference(source).map_err(|_| {
+            rootyard::ref_store::core::retention_root::RootError::RootSourceChanged(
+                "fixture serving snapshot reference invalid",
+            )
+        })?,
+        root_id,
+        operation_id,
+        selector,
+        request_id,
+    )?;
+    adapter.prepare_serving(pool, request, deadline).await
+}
+
+pub async fn register_serving(
+    adapter: &PgRetentionRoots,
+    pool: &Pool,
+    candidate: RootCandidate,
+    request_id: Uuid,
+    deadline: Instant,
+) -> Result<RootReceipt, rootyard::ref_store::core::retention_root::RootError> {
+    adapter.register_serving(pool, RegisterRootRequest::new(candidate, request_id)?, deadline).await
+}
+
+pub async fn materialize_serving(
+    adapter: &PgRetentionRoots,
+    pool: &Pool,
+    root_id: Uuid,
+    repository_id: Uuid,
+    deadline: Instant,
+) -> Result<RootReadView, rootyard::ref_store::core::retention_root::RootError> {
+    adapter.materialize_serving(pool, RootRef::new(repository_id, root_id, 1)?, deadline).await
+}
+
+pub async fn release_serving_source(
+    adapter: &PgServingSnapshotMetadata,
+    pool: &Pool,
+    actor: &Identity,
+    store: &BlobStore,
+    repository: &Repository,
+    source: &SourceSnapshot,
+    deadline: Instant,
+) -> Result<(), rootyard::Error> {
+    adapter
+        .release(
+            pool,
+            actor,
+            ServingSnapshotRelease {
+                owner: repository.owner.clone(),
+                name: repository.name.clone(),
+                snapshot_id: source.snapshot_id,
+                idempotency_key: format!("roots-release-source-{}", Uuid::new_v4().simple()),
+                expected_generation: 1,
+                reason: PinReleaseReason::ClientDone,
+            },
+            store.backend_identity(),
+            deadline,
+        )
+        .await?;
+    Ok(())
 }
 
 pub async fn release(

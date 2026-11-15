@@ -13,6 +13,8 @@
 
 #[path = "retention_roots_support/cases_extra.rs"]
 mod cases_extra;
+#[path = "retention_roots_support/cases_serving.rs"]
+mod cases_serving;
 #[path = "retention_roots_support/cases_tail.rs"]
 mod cases_tail;
 mod retention_roots_support;

@@ -163,6 +163,12 @@ impl NativeReadEngine {
         Ok(Self { store, git })
     }
 
+    /// The actual opened Blob backend identity used by this engine. Callers use
+    /// this for an internal serving-lane predicate; it is not a capability.
+    pub(crate) fn backend_identity(&self) -> &crate::blob_store::BlobBackendIdentity {
+        self.store.backend_identity()
+    }
+
     pub(crate) async fn materialize(
         &self,
         request: &NativeReadRequest<'_>,
