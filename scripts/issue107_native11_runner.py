@@ -170,7 +170,7 @@ def validate_target_build_command(command, target, cfg):
             value, command_index = value_at(command_index, token, name)
             _require(bool(value), "command_missing_value")
             if name == "--test":
-                _require(not test_targets, "command_ambiguous_flag")
+                _require(value not in test_targets, "command_ambiguous_flag")
                 test_targets.append(value)
             elif name == "--features":
                 _require(features is None, "command_ambiguous_flag")
@@ -204,15 +204,22 @@ def validate_target_build_command(command, target, cfg):
     _require(not all_features, "command_all_features_forbidden")
     if cfg["no_default_features"] is False:
         _require(not no_default_features, "command_no_default_forbidden")
-    _require(len(test_targets) == 1, "command_test_target_mismatch")
-    _require(test_targets[0] == target, "command_test_target_mismatch")
+    if len(test_targets) == 1:
+        _require(test_targets[0] == target, "command_test_target_mismatch")
+    else:
+        expected_targets = set(inventory.TARGET_ORDER)
+        _require(len(test_targets) == len(expected_targets)
+                 and len(test_targets) == len(set(test_targets))
+                 and set(test_targets) == expected_targets
+                 and target in test_targets,
+                 "command_test_target_set_mismatch")
     _require(features is not None, "command_missing_features")
     parsed = features.split(",")
     _require(parsed and all(part and part == part.strip() for part in parsed),
              "command_features_invalid")
     _require(len(parsed) == len(set(parsed)), "command_features_invalid")
     _require(set(parsed) == set(cfg["features"]), "command_features_mismatch")
-    return command
+    return {"subcommand": subcommand, "test_targets": tuple(test_targets)}
 
 
 def _receipt_identity(target, binary, receipt, source_root, source_head):
@@ -245,7 +252,7 @@ def _receipt_identity(target, binary, receipt, source_root, source_head):
     _require(features.get("no_default_features") is cfg["no_default_features"],
              "wrong_target_default_features")
     command = payload.get("command")
-    validate_target_build_command(command, target, cfg)
+    command_shape = validate_target_build_command(command, target, cfg)
     artifacts = [row for row in validated.artifacts
                  if isinstance(row, dict) and row.get("target") == target
                  and row.get("kind") == "test"]
@@ -262,6 +269,7 @@ def _receipt_identity(target, binary, receipt, source_root, source_head):
         "profile": payload.get("profile"),
         "test_count": len(cfg["cases"]),
         "required_env": list(cfg["required_env"]),
+        "command_test_targets": list(command_shape["test_targets"]),
     }
 
 
@@ -370,6 +378,22 @@ def _run_one(binary, name, remaining, case_seconds=DEFAULT_CASE_SECONDS):
     parse_case_result(output, name)
 
 
+def validate_batch_command_consistency(identities):
+    """A shared batch invocation must be recorded unchanged on all 11 receipts."""
+    rows = list(identities.values()) if isinstance(identities, dict) else list(identities)
+    multi = [row for row in rows if len(row.get("command_test_targets", [])) > 1]
+    if not multi:
+        return
+    _require(len(multi) == len(inventory.TARGET_ORDER), "batch_command_inconsistent")
+    expected = set(inventory.TARGET_ORDER)
+    for row in rows:
+        selectors = tuple(row.get("command_test_targets") or ())
+        _require(len(selectors) == len(expected) and len(selectors) == len(set(selectors))
+                 and set(selectors) == expected, "batch_command_target_set_mismatch")
+    _require(len({tuple(row["command_test_targets"]) for row in rows}) == 1,
+             "batch_command_inconsistent")
+
+
 def run_acceptance(source_head, source_root, targets, receipts_by_name,
                    report_path=None, overall_seconds=DEFAULT_OVERALL_SECONDS,
                    case_seconds=DEFAULT_CASE_SECONDS):
@@ -408,6 +432,7 @@ def run_acceptance(source_head, source_root, targets, receipts_by_name,
                      "target_receipt_missing")
             identities[target] = _receipt_identity(
                 target, binary, receipt, source_root, source_head)
+        validate_batch_command_consistency(identities)
         for target in inventory.TARGET_ORDER:
             remaining = deadline - time.monotonic()
             _require(remaining > 0, "overall_timeout")

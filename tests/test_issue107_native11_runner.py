@@ -251,7 +251,7 @@ class ReceiptTests(unittest.TestCase):
             with self.assertRaises(runner.RunnerError) as raised:
                 runner._receipt_identity("ref_store_operations", self.binary, self.receipt,
                                          self.root, HEAD)
-        self.assertEqual(raised.exception.code, "command_test_target_mismatch")
+        self.assertEqual(raised.exception.code, "command_test_target_set_mismatch")
         wrong_artifact = self.fake_receipt()
         wrong_artifact.artifacts = [{"target": "other", "kind": "test"}]
         with mock.patch.object(runner.receipts, "load_receipt", return_value=wrong_artifact):
@@ -259,6 +259,82 @@ class ReceiptTests(unittest.TestCase):
                 runner._receipt_identity("ref_store_operations", self.binary, self.receipt,
                                          self.root, HEAD)
         self.assertEqual(raised.exception.code, "target_artifact_mismatch")
+
+
+def batch_command(targets, *, reverse=False, extra=None):
+    selected = list(reversed(targets)) if reverse else list(targets)
+    command = [
+        "cargo", "build", "--locked", "--profile", "test",
+        "--config", "profile.dev.package.rootyard.debug=0",
+        "--config", "profile.test.package.rootyard.debug=0",
+        "--config", "profile.dev.package.rootyard.strip=\"debuginfo\"",
+        "--config", "profile.test.package.rootyard.strip=\"debuginfo\"",
+        "--config", "build.target-dir = \"/tmp/rootyard-target\"",
+        "--bin", "rootyard",
+    ]
+    for target in selected:
+        command += ["--test", target]
+    if extra:
+        command += ["--test", extra]
+    command += ["--features", "pando-lab", "--message-format=json-render-diagnostics"]
+    return command
+
+
+class BatchCommandTests(unittest.TestCase):
+    def test_complete_fixed11_batch_is_accepted_for_every_target(self):
+        command = batch_command(inventory.TARGET_ORDER)
+        for target in inventory.TARGET_ORDER:
+            result = runner.validate_target_build_command(
+                command, target, inventory.TARGETS[target])
+            self.assertEqual(tuple(result["test_targets"]), tuple(inventory.TARGET_ORDER))
+
+    def test_batch_selector_order_is_not_semantically_required(self):
+        command = batch_command(inventory.TARGET_ORDER, reverse=True)
+        for target in inventory.TARGET_ORDER:
+            runner.validate_target_build_command(
+                command, target, inventory.TARGETS[target])
+
+    def test_partial_extra_duplicate_and_wrong_target_sets_are_rejected(self):
+        partial = batch_command(inventory.TARGET_ORDER[:5])
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_target_build_command(partial, inventory.TARGET_ORDER[0],
+                                                  inventory.TARGETS[inventory.TARGET_ORDER[0]])
+        self.assertEqual(raised.exception.code, "command_test_target_set_mismatch")
+        extra = batch_command(inventory.TARGET_ORDER, extra="not_a_fixed_target")
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_target_build_command(extra, inventory.TARGET_ORDER[0],
+                                                  inventory.TARGETS[inventory.TARGET_ORDER[0]])
+        self.assertEqual(raised.exception.code, "command_test_target_set_mismatch")
+        duplicate = batch_command(inventory.TARGET_ORDER, extra=inventory.TARGET_ORDER[0])
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_target_build_command(duplicate, inventory.TARGET_ORDER[0],
+                                                  inventory.TARGETS[inventory.TARGET_ORDER[0]])
+        self.assertEqual(raised.exception.code, "command_ambiguous_flag")
+
+    def test_cross_receipt_batch_command_consistency(self):
+        targets = list(inventory.TARGET_ORDER)
+        command = batch_command(targets)
+        rows = {
+            target: {"target": target, "command_test_targets": list(targets)}
+            for target in targets
+        }
+        runner.validate_batch_command_consistency(rows)
+        changed = copy.deepcopy(rows)
+        changed[targets[0]]["command_test_targets"] = list(reversed(targets))
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_batch_command_consistency(changed)
+        self.assertEqual(raised.exception.code, "batch_command_inconsistent")
+        mixed = copy.deepcopy(rows)
+        mixed[targets[0]]["command_test_targets"] = [targets[0]]
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_batch_command_consistency(mixed)
+        self.assertEqual(raised.exception.code, "batch_command_inconsistent")
+        partial = copy.deepcopy(rows)
+        for row in partial.values():
+            row["command_test_targets"] = list(targets[:5])
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_batch_command_consistency(partial)
+        self.assertEqual(raised.exception.code, "batch_command_target_set_mismatch")
 
 
 class CommandSemanticsTests(unittest.TestCase):
