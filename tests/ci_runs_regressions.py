@@ -10,16 +10,58 @@ import time
 from webhooks import WebhooksHarness
 
 
+def _start_prewarm_trap():
+    import http.server
+    import threading
+    records = []
+    lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            with lock:
+                records.append((self.path, {k.lower(): v for k, v in self.headers.items()}, body))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, fmt, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}", records, lock
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
+    untrusted_srv, untrusted_url, untrusted_reqs, untrusted_lock = _start_prewarm_trap()
+    allow_srv, allow_url, allow_reqs, allow_lock = _start_prewarm_trap()
+    source_sentinel = "ryt_" + "a" * 64
+    prewarm_token = "ryt_" + "b" * 64
     h = WebhooksHarness(args)
     h.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"] = "1"
     h.env["ROOTYARD_CI_ORIGIN_FALLBACK_PER_REPO"] = "1"
     h.env["ROOTYARD_CI_MIRROR_AUDIENCE"] = str(uuid.uuid4())
+    h.env["ROOTYARD_CI_MIRROR_SOURCE_TOKEN"] = source_sentinel
+    h.env["ROOTYARD_CI_MIRROR_PREWARM_ORIGINS"] = allow_url
+    h.env["ROOTYARD_CI_MIRROR_PREWARM_TOKEN"] = prewarm_token
+    h._prewarm_trap = {
+        "untrusted_url": untrusted_url,
+        "untrusted_reqs": untrusted_reqs,
+        "untrusted_lock": untrusted_lock,
+        "allow_url": allow_url,
+        "allow_reqs": allow_reqs,
+        "allow_lock": allow_lock,
+        "source_sentinel": source_sentinel,
+        "prewarm_token": prewarm_token,
+    }
     try:
         h.setup()
         secret = "synthetic-runner-secret-123"
@@ -136,9 +178,265 @@ def main():
             time.sleep(.2)
         assert repaired=="2",repaired
         print("push reconciles PR candidate and creates new runs: passed",flush=True)
+
+        verify_multi_mirror_and_orchestration(h, hook["id"], secret)
         return 0
     finally:
+        untrusted_srv.shutdown()
+        untrusted_srv.server_close()
+        allow_srv.shutdown()
+        allow_srv.server_close()
         h.cleanup()
+
+
+def verify_multi_mirror_and_orchestration(h, hook_id, secret):
+    import threading
+    h.git("checkout", "-b", "feature-multi", "main", cwd=h.work)
+    (h.work / "multi.txt").write_text("multi-mirror fixture\n")
+    h.git("add", "multi.txt", cwd=h.work)
+    h.git("commit", "-m", "multi-mirror candidate", cwd=h.work)
+    m_oid = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
+    h.git("push", "origin", "HEAD:refs/heads/feature-multi", cwd=h.work, token=h.alice)
+    pr2 = h.document(h.pullspath, 201, method="POST", body={
+        "title": "Multi-mirror orchestration", "body": "m2",
+        "head_ref": "refs/heads/feature-multi", "base_ref": "refs/heads/main",
+    })
+    assert pr2["head_oid"] == m_oid
+    run_rows = h.sql(
+        f"SELECT id::text||','||context FROM ci_runs WHERE repository_id='{pr2['repository_id']}' "
+        f"AND pull_number={pr2['number']} AND head_oid='{m_oid}' ORDER BY context"
+    ).splitlines()
+    assert len(run_rows) == 2, run_rows
+    runs2 = {line.split(",")[1]: line.split(",")[0] for line in run_rows}
+    prefix = f"/api/repos/alice/forge/integrations/{hook_id}/runs/"
+    audience = h.env["ROOTYARD_CI_MIRROR_AUDIENCE"]
+
+    def runner(path, body=None, code=200, method="POST"):
+        status, raw, hdrs = h.http(path, method=method, body=body,
+                                   extra_headers={"Authorization": "Bearer " + secret})
+        assert status == code, (path, status, raw[:240])
+        ci_state = {k.lower(): v for k, v in hdrs.items()}.get("x-rootyard-ci-state")
+        return json.loads(raw), ci_state
+
+    # 1. Unauthenticated heartbeat fails 401 before URL/audience checks;
+    #    mirror registration rejects spoofed origin URL, paths, metadata SSRF, and audience mismatch.
+    m1_id, m2_id, m3_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    unauth_hb, _, _ = h.http(f"/api/repos/alice/forge/ci-mirrors/{m1_id}/heartbeat",
+                             method="POST", token=None, body={
+                                 "audience": str(uuid.uuid4()), "url": "origin",
+                                 "storage_generation": 1, "ready_oids": [m_oid],
+                                 "capacity": 2, "active": True,
+                             })
+    assert unauth_hb == 401, unauth_hb
+    for bad_url in ("origin", "https://127.0.0.1:18101/path", "http://169.254.169.254"):
+        st, _, _ = h.http(f"/api/repos/alice/forge/ci-mirrors/{m1_id}/heartbeat",
+                          method="POST", token=h.alice, body={
+                              "audience": audience, "url": bad_url,
+                              "storage_generation": 1, "ready_oids": [m_oid],
+                              "capacity": 2, "active": True,
+                          })
+        assert st == 400, (bad_url, st)
+    st, _, _ = h.http(f"/api/repos/alice/forge/ci-mirrors/{m1_id}/heartbeat",
+                      method="POST", token=h.alice, body={
+                          "audience": str(uuid.uuid4()), "url": "http://127.0.0.1:18101",
+                          "storage_generation": 1, "ready_oids": [m_oid],
+                          "capacity": 2, "active": True,
+                      })
+    assert st == 409, st
+
+    m1_url, m2_url, m3_url = "http://127.0.0.1:18101", "http://127.0.0.1:18102", "http://127.0.0.1:18103"
+    for mid, url, oids in ((m1_id, m1_url, [m_oid]), (m2_id, m2_url, [m_oid]), (m3_id, m3_url, [])):
+        h.document(f"/api/repos/alice/forge/ci-mirrors/{mid}/heartbeat", 200,
+                   method="POST", body={
+                       "audience": audience, "url": url, "storage_generation": 1,
+                       "ready_oids": oids, "capacity": 2, "active": True,
+                   })
+    mirror_list = h.document(f"/api/repos/alice/forge/ci-mirrors?target_oid={m_oid}", 200)
+    assert len(mirror_list["mirrors"]) == 3, mirror_list
+    # Verify inspect reports explicit X-Rootyard-CI-State: ready.
+    inspected, state_hdr = runner(prefix + runs2["ci/test"], method="GET", code=200)
+    assert state_hdr == "ready" and inspected["classification"] == "ready", (inspected, state_hdr)
+
+    # 2. Multi-mirror selection load balances active leases across mirror-1 and mirror-2.
+    c1, st1 = runner(prefix + runs2["ci/test"] + "/claim", {"runner_id": "r1"})
+    c2, st2 = runner(prefix + runs2["ci/lint"] + "/claim", {"runner_id": "r2"})
+    assert st1 == "ready" and st2 == "ready"
+    assert {c1["source"], c2["source"]} == {m1_url, m2_url}, (c1["source"], c2["source"])
+
+    # 3. Mid-job failover moves run off failed_source onto healthy alternate and fences old attempt.
+    other_mirror = m2_url if c1["source"] == m1_url else m1_url
+    runner(prefix + runs2["ci/test"] + "/failover", {
+        "attempt": c1["attempt"], "lease_generation": c1["lease_generation"],
+        "runner_id": "r1", "failed_source": other_mirror,
+    }, code=409)
+    fo, fo_hdr = runner(prefix + runs2["ci/test"] + "/failover", {
+        "attempt": c1["attempt"], "lease_generation": c1["lease_generation"],
+        "runner_id": "r1", "failed_source": c1["source"], "reason": "mirror reset",
+    }, code=200)
+    assert fo_hdr == "ready" and fo["previous_source"] == c1["source"]
+    assert fo["source"] == other_mirror and fo["attempt"] == 2 and fo["lease_generation"] == 2
+    runner(prefix + runs2["ci/test"] + "/heartbeat", {
+        "attempt": c1["attempt"], "lease_generation": c1["lease_generation"], "runner_id": "r1",
+    }, code=409)
+
+    # 4. Requeue-only failover returns waiting state and clears lease cleanly.
+    rq, rq_hdr = runner(prefix + runs2["ci/test"] + "/failover", {
+        "attempt": fo["attempt"], "lease_generation": fo["lease_generation"],
+        "runner_id": "r1", "requeue_only": True,
+    }, code=200)
+    assert rq_hdr == "waiting" and rq["requeued"] is True and rq["state"] == "queued"
+
+    # 5. Disable ready mirrors so m3 (unready) exists, verify prefer_mirror=True classifies waiting (202)
+    #    and wait_for_ready_ms wakes immediately once m3 heartbeats readiness.
+    for mid, url in ((m1_id, m1_url), (m2_id, m2_url)):
+        h.document(f"/api/repos/alice/forge/ci-mirrors/{mid}/heartbeat", 200, method="POST", body={
+            "audience": audience, "url": url, "storage_generation": 1,
+            "ready_oids": [], "capacity": 2, "active": False,
+        })
+    wait_resp, wait_hdr = runner(prefix + runs2["ci/test"] + "/claim", {
+        "runner_id": "r1", "prefer_mirror": True,
+    }, code=202)
+    assert wait_hdr == "waiting" and wait_resp["classification"] == "waiting", (wait_resp, wait_hdr)
+
+    wait_result = {}
+    def do_wait_claim():
+        wait_result["out"] = runner(prefix + runs2["ci/test"] + "/claim", {
+            "runner_id": "r1", "prefer_mirror": True, "wait_for_ready_ms": 5000,
+        }, code=200)
+    th = threading.Thread(target=do_wait_claim, daemon=True)
+    th.start()
+    time.sleep(0.2)
+    h.document(f"/api/repos/alice/forge/ci-mirrors/{m3_id}/heartbeat", 200, method="POST", body={
+        "audience": audience, "url": m3_url, "storage_generation": 1,
+        "ready_oids": [m_oid], "capacity": 2, "active": True,
+    })
+    th.join(timeout=6)
+    w_body, w_hdr = wait_result["out"]
+    assert w_hdr == "ready" and w_body["source"] == m3_url, (w_body, w_hdr)
+
+    # Also verify exclude_sources=['origin'] + prefer_mirror=False + wait_for_ready_ms > 0
+    # still blocks until mirror readiness instead of bypassing wait because origin has budget.
+    h.document(f"/api/repos/alice/forge/ci-mirrors/{m3_id}/heartbeat", 200, method="POST", body={
+        "audience": audience, "url": m3_url, "storage_generation": 1,
+        "ready_oids": [], "capacity": 2, "active": True,
+    })
+    rq_ex, _ = runner(prefix + runs2["ci/test"] + "/failover", {
+        "attempt": w_body["attempt"], "lease_generation": w_body["lease_generation"],
+        "runner_id": "r1", "requeue_only": True,
+    }, code=200)
+    assert rq_ex["requeued"] is True
+    excl_wait = {}
+    def do_excl_wait():
+        excl_wait["out"] = runner(prefix + runs2["ci/test"] + "/claim", {
+            "runner_id": "r1", "prefer_mirror": False,
+            "exclude_sources": ["origin"], "wait_for_ready_ms": 5000,
+        }, code=200)
+    th_excl = threading.Thread(target=do_excl_wait, daemon=True)
+    th_excl.start()
+    time.sleep(0.2)
+    h.document(f"/api/repos/alice/forge/ci-mirrors/{m3_id}/heartbeat", 200, method="POST", body={
+        "audience": audience, "url": m3_url, "storage_generation": 1,
+        "ready_oids": [m_oid], "capacity": 2, "active": True,
+    })
+    th_excl.join(timeout=6)
+    ex_body, ex_hdr = excl_wait["out"]
+    assert ex_hdr == "ready" and ex_body["source"] == m3_url, (ex_body, ex_hdr)
+    w_body = ex_body
+
+    # 6. Disable all mirrors + fill single origin fallback -> overloaded (429), including wait_for_ready_ms=0.
+    h.document(f"/api/repos/alice/forge/ci-mirrors/{m3_id}/heartbeat", 200, method="POST", body={
+        "audience": audience, "url": m3_url, "storage_generation": 1,
+        "ready_oids": [], "capacity": 2, "active": False,
+    })
+    h.sql(f"UPDATE ci_runs SET state='leased',source_url='origin',runner_id='r-held',"
+          f"lease_expires_unix=extract(epoch FROM clock_timestamp())::bigint+60 "
+          f"WHERE id='{runs2['ci/lint']}'")
+    rq2, _ = runner(prefix + runs2["ci/test"] + "/failover", {
+        "attempt": w_body["attempt"], "lease_generation": w_body["lease_generation"],
+        "runner_id": "r1", "requeue_only": True,
+    }, code=200)
+    assert rq2["requeued"] is True
+    ov_body, ov_hdr = runner(prefix + runs2["ci/test"] + "/claim", {"runner_id": "r1"}, code=429)
+    assert ov_hdr == "overloaded" and ov_body["classification"] == "overloaded", (ov_body, ov_hdr)
+    ov0_body, ov0_hdr = runner(prefix + runs2["ci/test"] + "/claim", {
+        "runner_id": "r1", "wait_for_ready_ms": 0,
+    }, code=429)
+    assert ov0_hdr == "overloaded" and ov0_body["classification"] == "overloaded", (ov0_body, ov0_hdr)
+
+    # 6b. Prewarm origin allowlist & credential isolation:
+    #     untrusted heartbeat URLs must never receive HTTP prewarm calls or ROOTYARD_CI_MIRROR_SOURCE_TOKEN;
+    #     only operator-allowlisted origins receive prewarm with ROOTYARD_CI_MIRROR_PREWARM_TOKEN.
+    trap = h._prewarm_trap
+    untrusted_id, allow_id = str(uuid.uuid4()), str(uuid.uuid4())
+    h.document(f"/api/repos/alice/forge/ci-mirrors/{untrusted_id}/heartbeat", 200, method="POST", body={
+        "audience": audience, "url": trap["untrusted_url"], "storage_generation": 1,
+        "ready_oids": [], "capacity": 2, "active": True,
+    })
+    runner(prefix + runs2["ci/test"] + "/claim", {
+        "runner_id": "r1", "prefer_mirror": True, "wait_for_ready_ms": 0,
+    }, code=202)
+    time.sleep(0.4)
+    with trap["untrusted_lock"]:
+        assert len(trap["untrusted_reqs"]) == 0, trap["untrusted_reqs"]
+    h.document(f"/api/repos/alice/forge/ci-mirrors/{untrusted_id}/heartbeat", 200, method="POST", body={
+        "audience": audience, "url": trap["untrusted_url"], "storage_generation": 1,
+        "ready_oids": [], "capacity": 2, "active": False,
+    })
+    h.document(f"/api/repos/alice/forge/ci-mirrors/{allow_id}/heartbeat", 200, method="POST", body={
+        "audience": audience, "url": trap["allow_url"], "storage_generation": 1,
+        "ready_oids": [], "capacity": 2, "active": True,
+    })
+    runner(prefix + runs2["ci/test"] + "/claim", {
+        "runner_id": "r1", "prefer_mirror": True, "wait_for_ready_ms": 0,
+    }, code=202)
+    until = time.monotonic() + 4
+    while time.monotonic() < until:
+        with trap["allow_lock"]:
+            if trap["allow_reqs"]:
+                break
+        time.sleep(0.05)
+    with trap["allow_lock"]:
+        assert len(trap["allow_reqs"]) >= 1, "allowlisted mirror prewarm not delivered"
+        req_path, req_hdrs, req_body = trap["allow_reqs"][0]
+        assert req_path == "/api/repos/alice/forge/mirror-auto-fetch", req_path
+        assert req_hdrs.get("authorization") == f"Bearer {trap['prewarm_token']}", req_hdrs
+        assert trap["source_sentinel"].encode() not in req_body
+        assert trap["source_sentinel"] not in req_hdrs.get("authorization", "")
+    with trap["untrusted_lock"]:
+        assert len(trap["untrusted_reqs"]) == 0, trap["untrusted_reqs"]
+    h.document(f"/api/repos/alice/forge/ci-mirrors/{allow_id}/heartbeat", 200, method="POST", body={
+        "audience": audience, "url": trap["allow_url"], "storage_generation": 1,
+        "ready_oids": [], "capacity": 2, "active": False,
+    })
+
+    # 7. Background reconcile_runs reaps expired lease back to queued preserving m_oid,
+    #    and PR close cancels remaining queued/leased runs durably.
+    h.sql(f"UPDATE ci_runs SET lease_expires_unix=0 WHERE id='{runs2['ci/lint']}'")
+    until = time.monotonic() + 12
+    reaped = ""
+    while time.monotonic() < until:
+        reaped = h.sql(f"SELECT state||','||head_oid FROM ci_runs WHERE id='{runs2['ci/lint']}'")
+        if reaped == f"queued,{m_oid}":
+            break
+        time.sleep(0.2)
+    assert reaped == f"queued,{m_oid}", reaped
+
+    closed = h.document(f"{h.pullspath}/{pr2['number']}", 200, method="PATCH", body={
+        "expected_version": pr2["version"], "state": "closed",
+    })
+    assert closed["state"] == "closed"
+    until = time.monotonic() + 12
+    cancelled = "0"
+    while time.monotonic() < until:
+        cancelled = h.sql(
+            f"SELECT count(*) FROM ci_runs WHERE repository_id='{pr2['repository_id']}' "
+            f"AND pull_number={pr2['number']} AND state='cancelled'"
+        )
+        if cancelled == "2":
+            break
+        time.sleep(0.2)
+    assert cancelled == "2", cancelled
+    print("multi-mirror routing, failover, wait wakeup, overload, reap, cancel: passed", flush=True)
 
 
 if __name__=="__main__":

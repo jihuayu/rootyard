@@ -287,6 +287,7 @@ pub async fn on_pull_synchronized(
                 .await
                 .map_err(Error::internal)?;
         }
+        crate::webhooks::run_ops::reconcile_on_pull_sync(&**client, &state.pool, repository_id, &pull.head_oid).await?;
     }
 
     let delivery_event_id = format!("pull:{}:{}:{}:{}", pull.number, pull.version, pull.head_oid, action);

@@ -1,5 +1,7 @@
 //! Track A: External CI Webhooks, HMAC-SHA256 Delivery & Auto PR CI Pipeline Orchestration.
 pub mod background;
+pub mod ci_classification;
+pub mod ci_controller;
 pub(crate) mod claimed;
 pub mod claims;
 pub mod delivery;
@@ -8,6 +10,7 @@ pub mod ingestion;
 pub mod mirrors;
 pub mod models;
 pub mod policy;
+pub mod run_ops;
 pub mod runs;
 pub(crate) mod scheduling;
 pub mod signing;
@@ -47,8 +50,11 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/repos/{owner}/{name}/ci-source-grants/{hook_id}",
             axum::routing::put(trust::source_grant).delete(trust::source_revoke),
         )
+        .route("/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}", get(run_ops::inspect))
         .route("/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/claim", post(runs::claim))
+        .route("/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/failover", post(run_ops::failover))
         .route("/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/report", post(runs::report))
         .route("/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/heartbeat", post(runs::heartbeat))
+        .route("/api/repos/{owner}/{name}/ci-mirrors", get(mirrors::list))
         .route("/api/repos/{owner}/{name}/ci-mirrors/{mirror_id}/heartbeat", post(mirrors::heartbeat))
 }
