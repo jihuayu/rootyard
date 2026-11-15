@@ -91,7 +91,7 @@ fn scope(kind: ScopeKind, id: Uuid, version: i64, tag: &str, parts: &[Vec<u8>]) 
     DependencyObservation { kind, id, version, digest: digest::scope_digest(tag, &refs) }
 }
 
-fn map_scope_denial(denial: ScopeDenial) -> DecisionError {
+pub(super) fn map_scope_denial(denial: ScopeDenial) -> DecisionError {
     match denial {
         ScopeDenial::InvalidToken => DecisionError::Denied(DenialCode::TokenInvalid),
         ScopeDenial::Forbidden => DecisionError::Denied(DenialCode::ScopeDenied),
