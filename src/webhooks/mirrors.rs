@@ -1,4 +1,5 @@
 //! Primary-side registry of mirror target readiness used by the CI scheduler.
+use super::ci_classification::MirrorNodeStatus;
 use crate::{AppState, Error, auth, ci_pins, members::models::Role, webhooks::ci_controller};
 use axum::{
     Json,
@@ -8,6 +9,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::{collections::BTreeSet, sync::Arc};
+use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -28,12 +30,66 @@ pub struct ListQuery {
     pub target_oid: Option<String>,
 }
 
+pub(crate) async fn list_repo_mirrors(
+    client: &(impl GenericClient + Sync),
+    repo_id: Uuid,
+    expected_audience: Option<Uuid>,
+    target_oid: Option<&str>,
+) -> Result<Vec<MirrorNodeStatus>, Error> {
+    let rows = client
+        .query(
+            "SELECT m.mirror_id, m.url, m.audience, m.storage_generation, m.active, \
+               (m.active=true AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$2) AS alive, \
+               m.capacity, m.heartbeat_unix, jsonb_array_length(m.ready_oids)::bigint AS oid_count, \
+               CASE WHEN $3::text IS NULL THEN NULL ELSE (m.ready_oids ? $3) END AS target_ready, \
+               (SELECT count(*) FROM ci_runs c WHERE c.state='leased' AND c.source_url=m.url \
+                 AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) AS active_leases \
+             FROM ci_mirror_nodes m WHERE m.repository_id=$1 \
+             ORDER BY m.active DESC, m.heartbeat_unix DESC, m.mirror_id ASC",
+            &[&repo_id, &ci_controller::MIRROR_HEARTBEAT_TTL_SECS, &target_oid],
+        )
+        .await
+        .map_err(Error::internal)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let audience: Uuid = row.get("audience");
+            MirrorNodeStatus {
+                mirror_id: row.get("mirror_id"),
+                url: row.get("url"),
+                audience,
+                storage_generation: row.get("storage_generation"),
+                active: row.get("active"),
+                alive: row.get("alive"),
+                audience_matches: expected_audience.is_none_or(|exp| exp == audience),
+                capacity: row.get("capacity"),
+                active_leases: row.get("active_leases"),
+                ready_oid_count: row.get::<_, i64>("oid_count").max(0) as usize,
+                target_ready: row.get("target_ready"),
+                heartbeat_unix: row.get("heartbeat_unix"),
+            }
+        })
+        .collect())
+}
+
 pub async fn heartbeat(
     State(state): State<Arc<AppState>>,
     Path((owner, name, mirror_id)): Path<(String, String, Uuid)>,
     headers: HeaderMap,
     Json(input): Json<Heartbeat>,
 ) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let access = auth::authorize_repo_with_role(
+        &tx,
+        &actor,
+        &owner,
+        &name,
+        Role::Maintain,
+        crate::token_scopes::RepoAction::CiDispatch,
+    )
+    .await?;
     if input.ready_oids.len() > 1000
         || input.capacity < 1
         || input.capacity > 10_000
@@ -48,18 +104,6 @@ pub async fn heartbeat(
     if input.audience != expected_audience {
         return Err(Error(StatusCode::CONFLICT, "mirror audience mismatch"));
     }
-    let actor = auth::authenticate(&state.pool, &headers).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(
-        &tx,
-        &actor,
-        &owner,
-        &name,
-        Role::Maintain,
-        crate::token_scopes::RepoAction::CiDispatch,
-    )
-    .await?;
     let repo_row = tx
         .query_one("SELECT storage_generation,object_format FROM repositories WHERE id=$1", &[&access.repo_id])
         .await
@@ -121,11 +165,6 @@ pub async fn list(
     Query(query): Query<ListQuery>,
     headers: HeaderMap,
 ) -> Result<Response, Error> {
-    if let Some(oid) = query.target_oid.as_deref()
-        && !ci_pins::valid_oid(oid)
-    {
-        return Err(Error::bad_request());
-    }
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
@@ -138,8 +177,13 @@ pub async fn list(
         crate::token_scopes::RepoAction::HooksRead,
     )
     .await?;
+    if let Some(oid) = query.target_oid.as_deref()
+        && !ci_pins::valid_oid(oid)
+    {
+        return Err(Error::bad_request());
+    }
     let expected_audience = crate::ci_checkouts::audience().ok();
-    let mirrors = ci_controller::list_repo_mirrors(&*tx, access.repo_id, expected_audience, query.target_oid.as_deref()).await?;
+    let mirrors = list_repo_mirrors(&*tx, access.repo_id, expected_audience, query.target_oid.as_deref()).await?;
     let origin_budget = ci_controller::query_origin_budget(&*tx, access.repo_id).await?;
     auth::finish_tx(tx, &actor, false).await?;
     Ok((

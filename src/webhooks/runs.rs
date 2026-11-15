@@ -229,7 +229,7 @@ pub async fn claim(
                 snap_head.clone(),
                 excluded.clone(),
             );
-            prewarm_triggered = true;
+            prewarm_triggered = ci_controller::prewarm_configured();
         }
     }
     let target = CheckoutTarget {
@@ -322,7 +322,7 @@ pub async fn claim(
             excluded: &excluded,
         },
         prefer_mirror,
-        input.wait_for_ready_ms.is_some(),
+        wait_ms > 0,
     ).await? {
         Ok(src) => src,
         Err(resp) => {

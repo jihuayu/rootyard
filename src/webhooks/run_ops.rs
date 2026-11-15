@@ -104,7 +104,7 @@ pub async fn inspect(
     let candidate_valid: bool = row.get("candidate_valid");
     let audience = ci_checkouts::audience()?;
     let summary = ci_controller::probe_availability(&**client, repo, generation, audience, &head_oid, &[]).await?;
-    let mirrors = ci_controller::list_repo_mirrors(&**client, repo, Some(audience), Some(&head_oid)).await?;
+    let mirrors = super::mirrors::list_repo_mirrors(&**client, repo, Some(audience), Some(&head_oid)).await?;
     let (global, per_repo) = ci_controller::origin_fallback_limits();
     let class = classify_checkout_state(ClassificationInput {
         trusted_bound,

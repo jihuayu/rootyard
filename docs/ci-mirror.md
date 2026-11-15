@@ -568,8 +568,11 @@ The scheduler and `POST .../integrations/{hook_id}/runs/{run_id}/claim` enforce:
   and the `X-Rootyard-CI-State` response header.
 - **Coalesced prewarming & bounded waiting**: on PR sync (`on_pull_synchronized`),
   background reconciliation (`reconcile_runs`), and unready `claim`, the primary
-  coalesces singleflight `mirror-auto-fetch` prewarm requests (configured via
-  `ROOTYARD_CI_MIRROR_SOURCE_TOKEN`). Callers may pass optional
+  coalesces singleflight `mirror-auto-fetch` prewarm requests strictly to
+  operator-allowlisted origins configured in `ROOTYARD_CI_MIRROR_PREWARM_ORIGINS`
+  using a dedicated low-privilege prewarm token (`ROOTYARD_CI_MIRROR_PREWARM_TOKEN`;
+  the mirror's primary-pull credential `ROOTYARD_CI_MIRROR_SOURCE_TOKEN` is never
+  transmitted by the primary). Callers may pass optional
   `wait_for_ready_ms` (bounded by `ROOTYARD_CI_CHECKOUT_WAIT_QUEUE`, default `64`)
   on `claim` or `wait_ms` (bounded by `ROOTYARD_MIRROR_SYNC_QUEUE_LIMIT`, default
   `32`) on `mirror-auto-fetch` to wait cleanly under burst contention.

@@ -764,6 +764,10 @@ class WebhooksTrackAContractTest(unittest.TestCase):
         ctrl_src = (ROOT / "src/webhooks/ci_controller.rs").read_text(encoding="utf-8")
         for tok in (
             "validate_mirror_url",
+            "parse_prewarm_origins",
+            "validate_prewarm_token",
+            "ROOTYARD_CI_MIRROR_PREWARM_ORIGINS",
+            "ROOTYARD_CI_MIRROR_PREWARM_TOKEN",
             "select_ready_mirror",
             "probe_availability",
             "trigger_coalesced_prewarm",
@@ -773,11 +777,20 @@ class WebhooksTrackAContractTest(unittest.TestCase):
             "notify_slot_released",
         ):
             self.assertIn(tok, ctrl_src, f"ci_controller.rs missing {tok}")
+        self.assertIn('!target.excluded.iter().any(|s| s == "origin")', ctrl_src)
 
         mirrors_src = (ROOT / "src/webhooks/mirrors.rs").read_text(encoding="utf-8")
         self.assertGreaterEqual(mirrors_src.count("#[serde(deny_unknown_fields)]"), 2)
         for tok in ("validate_mirror_url", "mirror audience mismatch", "pub async fn list("):
             self.assertIn(tok, mirrors_src, f"mirrors.rs missing {tok}")
+        self.assertLess(
+            mirrors_src.index("auth::authorize_repo_with_role"),
+            mirrors_src.index("mirror audience mismatch"),
+            "mirrors::heartbeat must authenticate & authorize before audience check",
+        )
+
+        runs_src = (ROOT / "src/webhooks/runs.rs").read_text(encoding="utf-8")
+        self.assertIn("wait_ms > 0", runs_src)
 
         run_ops_src = (ROOT / "src/webhooks/run_ops.rs").read_text(encoding="utf-8")
         self.assertGreaterEqual(run_ops_src.count("#[serde(deny_unknown_fields)]"), 1)

@@ -1,6 +1,6 @@
 //! Durable CI run reconciliation, multi-mirror selection, coalesced prewarming,
 //! and bounded checkout burst waiting.
-use super::ci_classification::{AvailabilitySummary, CheckoutTarget, MirrorNodeStatus, OriginBudgetStatus};
+use super::ci_classification::{AvailabilitySummary, CheckoutTarget, OriginBudgetStatus};
 use crate::{AppState, Error, webhooks::models::validate_webhook_url_with_policy};
 use axum::http::StatusCode;
 use serde_json::json;
@@ -140,48 +140,6 @@ pub(crate) async fn query_origin_budget(
     })
 }
 
-pub(crate) async fn list_repo_mirrors(
-    client: &(impl GenericClient + Sync),
-    repo_id: Uuid,
-    expected_audience: Option<Uuid>,
-    target_oid: Option<&str>,
-) -> Result<Vec<MirrorNodeStatus>, Error> {
-    let rows = client
-        .query(
-            "SELECT m.mirror_id, m.url, m.audience, m.storage_generation, m.active, \
-               (m.active=true AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$2) AS alive, \
-               m.capacity, m.heartbeat_unix, jsonb_array_length(m.ready_oids)::bigint AS oid_count, \
-               CASE WHEN $3::text IS NULL THEN NULL ELSE (m.ready_oids ? $3) END AS target_ready, \
-               (SELECT count(*) FROM ci_runs c WHERE c.state='leased' AND c.source_url=m.url \
-                 AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) AS active_leases \
-             FROM ci_mirror_nodes m WHERE m.repository_id=$1 \
-             ORDER BY m.active DESC, m.heartbeat_unix DESC, m.mirror_id ASC",
-            &[&repo_id, &MIRROR_HEARTBEAT_TTL_SECS, &target_oid],
-        )
-        .await
-        .map_err(Error::internal)?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let audience: Uuid = row.get("audience");
-            MirrorNodeStatus {
-                mirror_id: row.get("mirror_id"),
-                url: row.get("url"),
-                audience,
-                storage_generation: row.get("storage_generation"),
-                active: row.get("active"),
-                alive: row.get("alive"),
-                audience_matches: expected_audience.is_none_or(|exp| exp == audience),
-                capacity: row.get("capacity"),
-                active_leases: row.get("active_leases"),
-                ready_oid_count: row.get::<_, i64>("oid_count").max(0) as usize,
-                target_ready: row.get("target_ready"),
-                heartbeat_unix: row.get("heartbeat_unix"),
-            }
-        })
-        .collect())
-}
-
 type ReadyKey = (Uuid, i64, String);
 type PrewarmKey = (Uuid, String);
 
@@ -263,6 +221,43 @@ impl Drop for WaitSlotGuard {
     }
 }
 
+pub(crate) fn parse_prewarm_origins(raw: &str) -> BTreeSet<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| validate_mirror_url(entry).ok())
+        .collect()
+}
+
+pub(crate) fn validate_prewarm_token(prewarm: Option<&str>, source: Option<&str>) -> Option<String> {
+    let token = prewarm?;
+    if token.is_empty() || token.len() > 256 || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    // Never transmit the mirror->primary read credential on outbound mirror triggers.
+    if source == Some(token) {
+        return None;
+    }
+    Some(token.to_owned())
+}
+
+fn prewarm_config() -> Option<(Vec<String>, String)> {
+    let raw_origins = std::env::var("ROOTYARD_CI_MIRROR_PREWARM_ORIGINS").ok()?;
+    let origins = parse_prewarm_origins(&raw_origins);
+    if origins.is_empty() {
+        return None;
+    }
+    let token = validate_prewarm_token(
+        std::env::var("ROOTYARD_CI_MIRROR_PREWARM_TOKEN").ok().as_deref(),
+        std::env::var("ROOTYARD_CI_MIRROR_SOURCE_TOKEN").ok().as_deref(),
+    )?;
+    Some((origins.into_iter().collect(), token))
+}
+
+pub(crate) fn prewarm_configured() -> bool {
+    prewarm_config().is_some()
+}
+
 pub(crate) fn trigger_coalesced_prewarm(
     pool: deadpool_postgres::Pool,
     repo_id: Uuid,
@@ -270,6 +265,9 @@ pub(crate) fn trigger_coalesced_prewarm(
     head_oid: String,
     excluded: Vec<String>,
 ) -> (bool, usize) {
+    let Some((allowed_origins, token)) = prewarm_config() else {
+        return (false, 0);
+    };
     let key = (repo_id, head_oid.clone());
     let mut map = INFLIGHT_PREWARMS.lock().expect("inflight_prewarms poisoned");
     if let Some(counter) = map.get(&key) {
@@ -285,12 +283,6 @@ pub(crate) fn trigger_coalesced_prewarm(
     };
     handle.spawn(async move {
         let _guard = PrewarmGuard(key);
-        let Ok(token) = std::env::var("ROOTYARD_CI_MIRROR_SOURCE_TOKEN") else {
-            return;
-        };
-        if !token.starts_with("ryt_") || token.len() != 68 {
-            return;
-        }
         let Ok(client) = pool.get().await else {
             return;
         };
@@ -304,10 +296,11 @@ pub(crate) fn trigger_coalesced_prewarm(
                    AND m.audience=$2 AND m.active=true AND m.url<>'origin' \
                    AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$3 \
                    AND NOT (m.ready_oids ? $4) AND NOT (m.url = ANY($5::text[])) \
+                   AND m.url = ANY($6::text[]) \
                  ORDER BY (m.capacity - (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
                      AND c.source_url=m.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp()))) DESC, \
                    m.heartbeat_unix DESC LIMIT 1",
-                &[&repo_id, &audience, &MIRROR_HEARTBEAT_TTL_SECS, &head_oid, &excluded],
+                &[&repo_id, &audience, &MIRROR_HEARTBEAT_TTL_SECS, &head_oid, &excluded, &allowed_origins],
             )
             .await
         else {
@@ -322,6 +315,9 @@ pub(crate) fn trigger_coalesced_prewarm(
         let Ok(base) = validate_mirror_url(&raw_url) else {
             return;
         };
+        if !allowed_origins.contains(&base) {
+            return;
+        }
         let endpoint = format!("{base}/api/repos/{owner}/{name}/mirror-auto-fetch");
         let _ = PREWARM_CLIENT
             .post(&endpoint)
@@ -374,7 +370,8 @@ pub(crate) async fn wait_for_checkout_slot(
         .await?;
         drop(client);
 
-        let origin_ready = !prefer_mirror
+        let allow_origin = !prefer_mirror && !target.excluded.iter().any(|s| s == "origin");
+        let origin_ready = allow_origin
             && summary.origin_budget.global_limit > 0
             && summary.origin_budget.per_repo_limit > 0
             && summary.origin_budget.global_active < summary.origin_budget.global_limit
@@ -480,5 +477,22 @@ mod tests {
         assert_eq!(validate_mirror_url("http://mirror.example").unwrap_err().0, StatusCode::BAD_REQUEST);
         assert_eq!(validate_mirror_url("https://mirror.example").unwrap(), "https://mirror.example");
         assert_eq!(validate_mirror_url("http://127.0.0.1:8080/").unwrap(), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn prewarm_allowlist_filters_invalid_and_rejects_source_token_reuse() {
+        let origins = parse_prewarm_origins(
+            "https://mirror1.example/, http://169.254.169.254, origin, https://mirror2.example:8443/sub, http://127.0.0.1:18101/",
+        );
+        assert_eq!(
+            origins,
+            BTreeSet::from(["http://127.0.0.1:18101".to_owned(), "https://mirror1.example".to_owned()])
+        );
+        assert_eq!(validate_prewarm_token(Some("ryt_same"), Some("ryt_same")), None);
+        assert_eq!(validate_prewarm_token(None, Some("ryt_source_secret")), None);
+        assert_eq!(
+            validate_prewarm_token(Some("ryt_prewarm_scoped"), Some("ryt_source_secret")).as_deref(),
+            Some("ryt_prewarm_scoped")
+        );
     }
 }
