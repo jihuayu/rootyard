@@ -257,17 +257,18 @@ state-machine/snapshot atomicity, or whole-#149 completion. Past-tail empty
 reads starting at `last_log_id.index + 1` remain valid: range ends are
 exclusive.
 
+## State machine, snapshots, and multi-process fault injection
+
+`state_machine` adds `PersistentStateMachine` and `PersistentSnapshotBuilder` implementing openraft **0.9.26** `RaftStateMachine<LogTypeConfig>` and `RaftSnapshotBuilder<LogTypeConfig>`. It uses a dedicated lock `.raftsm.lock`, SQLite database `sm.sqlite3` (`rootyard-refcas-sm/1`, `DELETE` journal, `synchronous=FULL`, `BEGIN IMMEDIATE`, SHA-256 checksums over `meta`, `sm_entries`, and `sm_kv`), and serialized `snapshots/snap-*.snap` payloads (`rootyard-refcas-snapshot/1`) cross-checked on every `open`.
+
+- **Serialization and idempotency**: An async `op_gate` mutex serializes `applied_state`, `apply` (including membership changes), `build_snapshot`, `install_snapshot`, and `get_current_snapshot`. Replaying an already-applied entry, snapshot boundary, or identical snapshot metadata/checksum is an idempotent no-op; conflicting replays or regressive snapshots fail closed.
+- **Atomic snapshot install and rollback**: `install_snapshot` validates JSON/unknown fields, embedded canonical `payload_sha256_hex`, and `SnapshotMeta`, writes a staged `pending-install-*.snap` file, `fsync`s it, renames to a new generation filename while keeping the previous snapshot intact, atomically updates `sm_kv`/`sm_entries`/`meta` in one `BEGIN IMMEDIATE` transaction, and unlinks older snapshots only after `COMMIT`. Failures (`ENOSPC`, `fsync` errors, `SQLITE_FULL`, payload/meta mismatches, or crashes before `COMMIT`) roll back SQLite and delete the uncommitted staged snapshot without disturbing prior state, membership, or the previous active snapshot.
+- **Fixture qualification and fault hooks**: `fixture::qualify_store_dir` checks directory writability/`fsync`, available space (`DEFAULT_MIN_FREE_BYTES`), same backing `st_dev`, and on Linux rejects network filesystems and FUSE mounts from `/proc/self/mountinfo` before tests and `raft-node` start. `fault::FaultController` injects deterministic `ENOSPC`, `fsync` EIO, and mid-install pause barriers.
+- **Conventions and test coverage**:
+  - `tests/raft_suite.rs` verifies all 31 compatible `openraft::testing::Suite` conformance cases (including `last_applied_state` and `transfer_snapshot`), explicitly asserts that the remaining 4 `Suite` cases (`last_membership_in_log`, `last_membership_in_log_multi_step`, `get_membership_from_log_and_empty_sm`, `get_initial_state_membership_from_log_and_sm`) trigger `PersistentLog`'s fail-closed `unavailable prefix` and `revive a purged prefix` refusal guards rather than silently weakening those boundaries, and tests `install_snapshot` vs concurrent `apply(Membership)` serialization, rollback on `ENOSPC`/`fsync`/`SQLITE_FULL`/corruption, and idempotent vs conflicting replay checks.
+  - `src/cluster.rs` and `src/bin/raft-node.rs` provide a bounded TCP JSON RPC Raft node binary (`READY` banner after `qualify_store_dir` and store validation, explicit non-zero exit on corrupted log/SM/snapshot).
+  - `tests/raft_fault_injection.rs` runs real 3-process clusters covering `kill -9` (`SIGKILL`) on follower and leader, injected `fsync` failure, injected `ENOSPC` with snapshot catch-up, corruption refusal on `log.sqlite3`/`sm.sqlite3`/`snap-*.snap`, persisted vote non-double-voting across `kill -9`, and live membership change across crash recovery.
+
 ## Remaining scope
 
-State machine storage, snapshots, RPC, TLS, ReadIndex, complete openraft suite,
-Ref-CAS integration and multi-host qualification remain unimplemented. This
-slice does not complete issues #149 or #115 and has no production routing.
-
-This checkpoint adds bounded startup refusal for a non-dense retained log,
-retains dense positive-first slices with explicit unavailable-prefix refusal,
-and refuses a committed log ID that no retained row or valid purge boundary can
-satisfy, all without changing the on-disk format. It does not implement
-migration of already-corrupt stores, whole-log physical-loss detection,
-state-machine/snapshot or other independent witnesses, or the rest of #149. A
-refused database is left for operator investigation or restore; it is not
-repaired, reset, or migrated.
+Raft RPC TLS/mTLS and production transport integration (#150), Rootyard Ref-CAS engine wiring (#115), and multi-host physical power-loss qualification remain outside this crate. Database corruption still fails closed rather than repairing or migrating corrupt state.

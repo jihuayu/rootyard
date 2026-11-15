@@ -59,6 +59,8 @@ pub mod retention_root;
 /// repository-authority predicate used by every core path.
 pub(crate) mod serving_scope;
 pub mod sql;
+/// Deterministic Raft Ref-CAS state machine (`#116`).
+pub mod state_machine;
 /// Verified accepted-subset selection vocabulary and the private derived
 /// projection of an original whole-batch plan.
 pub mod subset;

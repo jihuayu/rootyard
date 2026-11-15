@@ -174,9 +174,12 @@ class WebhooksTrackAContractTest(unittest.TestCase):
             "/api/repos/{owner}/{name}/integrations/{hook_id}/check-runs": ["POST"],
             "/api/repos/{owner}/{name}/integrations/{hook_id}/trusted-contexts": ["PUT", "DELETE"],
             "/api/repos/{owner}/{name}/ci-source-grants/{hook_id}": ["PUT", "DELETE"],
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}": ["GET"],
             "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/claim": ["POST"],
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/failover": ["POST"],
             "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/report": ["POST"],
             "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/heartbeat": ["POST"],
+            "/api/repos/{owner}/{name}/ci-mirrors": ["GET"],
             "/api/repos/{owner}/{name}/ci-mirrors/{mirror_id}/heartbeat": ["POST"],
         }
         extracted = dict(t5._extract_route_registrations(webhooks_rs))
@@ -738,6 +741,70 @@ class WebhooksTrackAContractTest(unittest.TestCase):
         )
         for flag in ("--binary", "--report", "--keep"):
             self.assertIn(flag, proc.stdout)
+
+    def test_multi_mirror_orchestration_failover_and_classification_contracts(self):
+        for rel in (
+            "src/webhooks/ci_classification.rs",
+            "src/webhooks/ci_controller.rs",
+            "src/webhooks/run_ops.rs",
+            "src/webhooks/mirrors.rs",
+            "src/webhooks/runs.rs",
+        ):
+            p = ROOT / rel
+            self.assertTrue(p.is_file(), f"missing {rel}")
+            lines = p.read_text(encoding="utf-8").splitlines()
+            self.assertLess(len(lines), 500, f"{rel} exceeds 500L modular cap ({len(lines)}L)")
+            src = "\n".join(lines)
+            self.assertNotIn("allow(dead_code)", src, f"{rel} must not use allow(dead_code)")
+
+        cls_src = (ROOT / "src/webhooks/ci_classification.rs").read_text(encoding="utf-8")
+        for tok in ("Ready,", "Waiting,", "Denied,", "Missing,", "Overloaded,", "x-rootyard-ci-state"):
+            self.assertIn(tok, cls_src, f"ci_classification.rs missing {tok}")
+
+        ctrl_src = (ROOT / "src/webhooks/ci_controller.rs").read_text(encoding="utf-8")
+        for tok in (
+            "validate_mirror_url",
+            "parse_prewarm_origins",
+            "validate_prewarm_token",
+            "ROOTYARD_CI_MIRROR_PREWARM_ORIGINS",
+            "ROOTYARD_CI_MIRROR_PREWARM_TOKEN",
+            "select_ready_mirror",
+            "probe_availability",
+            "trigger_coalesced_prewarm",
+            "wait_for_checkout_slot",
+            "reconcile_runs",
+            "notify_mirror_ready",
+            "notify_slot_released",
+        ):
+            self.assertIn(tok, ctrl_src, f"ci_controller.rs missing {tok}")
+        self.assertIn('!target.excluded.iter().any(|s| s == "origin")', ctrl_src)
+
+        mirrors_src = (ROOT / "src/webhooks/mirrors.rs").read_text(encoding="utf-8")
+        self.assertGreaterEqual(mirrors_src.count("#[serde(deny_unknown_fields)]"), 2)
+        for tok in ("validate_mirror_url", "mirror audience mismatch", "pub async fn list("):
+            self.assertIn(tok, mirrors_src, f"mirrors.rs missing {tok}")
+        self.assertLess(
+            mirrors_src.index("auth::authorize_repo_with_role"),
+            mirrors_src.index("mirror audience mismatch"),
+            "mirrors::heartbeat must authenticate & authorize before audience check",
+        )
+
+        runs_src = (ROOT / "src/webhooks/runs.rs").read_text(encoding="utf-8")
+        self.assertIn("wait_ms > 0", runs_src)
+
+        run_ops_src = (ROOT / "src/webhooks/run_ops.rs").read_text(encoding="utf-8")
+        self.assertGreaterEqual(run_ops_src.count("#[serde(deny_unknown_fields)]"), 1)
+        for tok in ("pub async fn inspect(", "pub async fn failover(", "reconcile_on_pull_sync"):
+            self.assertIn(tok, run_ops_src, f"run_ops.rs missing {tok}")
+
+        bg_src = (ROOT / "src/webhooks/background.rs").read_text(encoding="utf-8")
+        self.assertIn("reconcile_runs", bg_src)
+        delivery_src = (ROOT / "src/webhooks/delivery.rs").read_text(encoding="utf-8")
+        self.assertIn("reconcile_on_pull_sync", delivery_src)
+
+        reg_src = (ROOT / "tests/ci_runs_regressions.py").read_text(encoding="utf-8")
+        for tok in ("failover", "ci-mirrors", "requeue_only", "wait_for_ready_ms", "X-Rootyard-CI-State"):
+            self.assertIn(tok, reg_src, f"ci_runs_regressions.py missing coverage for {tok}")
 
 
 if __name__ == "__main__":
