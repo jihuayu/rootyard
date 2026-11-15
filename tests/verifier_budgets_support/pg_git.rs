@@ -326,7 +326,6 @@ fn incompressible_payload(seed: u64, len: usize) -> Vec<u8> {
 pub struct PreparedCommit {
     pub repo: Uuid,
     pub tenant: Uuid,
-    pub gate: CoreGateVersion,
     pub pack_id: Uuid,
     pub plan: PackCommitPlan,
     pub token: PackPendingToken,
@@ -447,7 +446,7 @@ pub async fn prepare_fresh_commit(
         .await?;
     let context = PgPackCommit.capture_context(&mut client, &plan, deadline()).await?;
 
-    Ok(PreparedCommit { repo, tenant, gate, pack_id, plan, token, context, pack_bytes, idx_bytes })
+    Ok(PreparedCommit { repo, tenant, pack_id, plan, token, context, pack_bytes, idx_bytes })
 }
 
 pub async fn pin_committed_snapshot(pool: &Pool, prepared: &PreparedCommit) -> Result<PackSnapshotRef> {
