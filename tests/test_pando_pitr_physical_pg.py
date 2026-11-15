@@ -187,6 +187,68 @@ class FakeProcesses:
         return tracker
 
 
+class ProcTableTest(unittest.TestCase):
+    def test_census_skips_init_keeps_foreign_rows_and_skips_missing(self) -> None:
+        real_stat = physical._proc_stat
+        real_record = physical._process_record
+        calls: list[int] = []
+
+        def fake_stat(pid: int, phase: str) -> dict:
+            calls.append(pid)
+            if pid == 100:
+                return {"pid": 100, "state": "S", "ppid": 1, "pgrp": 100,
+                        "session": 100, "starttime": 10, "uid": os.getuid()}
+            if pid == 200:
+                return {"pid": 200, "state": "S", "ppid": 1, "pgrp": 200,
+                        "session": 200, "starttime": 20, "uid": 0}
+            if pid == 300:
+                raise physical.FixtureError(phase, "process_missing")
+            raise AssertionError(f"unexpected census pid {pid}")
+
+        with mock.patch.object(physical.os, "listdir",
+                               return_value=["1", "100", "200", "300", "not-a-pid"]), \
+                mock.patch.object(physical, "_proc_stat", side_effect=fake_stat), \
+                mock.patch.object(physical, "_current_boot_id", return_value="boot-1"):
+            table = physical._proc_table("test")
+
+        self.assertEqual(set(table), {100, 200})
+        self.assertEqual(calls, [100, 200, 300])
+        self.assertEqual(table[100]["boot_id"], "boot-1")
+        self.assertEqual(table[200]["uid"], 0)  # foreign readable row retained
+        self.assertNotIn(1, table)
+
+        with self.assertRaises(physical.FixtureError) as stat_error:
+            real_stat(1, "test")
+        self.assertEqual((stat_error.exception.phase, stat_error.exception.code),
+                         ("test", "pid_invalid"))
+        with self.assertRaises(physical.FixtureError) as record_error:
+            real_record(1, "test")
+        self.assertEqual((record_error.exception.phase, record_error.exception.code),
+                         ("test", "pid_invalid"))
+
+    def test_census_unreadable_row_still_fails_closed(self) -> None:
+        calls: list[int] = []
+
+        def fake_stat(pid: int, phase: str) -> dict:
+            calls.append(pid)
+            if pid == 100:
+                return {"pid": 100, "state": "S", "ppid": 1, "pgrp": 100,
+                        "session": 100, "starttime": 10, "uid": os.getuid()}
+            raise physical.FixtureError(phase, "proc_unavailable")
+
+        with mock.patch.object(physical.os, "listdir",
+                               return_value=["1", "100", "200"]), \
+                mock.patch.object(physical, "_proc_stat", side_effect=fake_stat), \
+                mock.patch.object(physical, "_current_boot_id", return_value="boot-1"):
+            with self.assertRaises(physical.FixtureError) as caught:
+                physical._proc_table("test")
+
+        self.assertEqual((caught.exception.phase, caught.exception.code),
+                         ("test", "proc_unavailable"))
+        self.assertEqual(calls, [100, 200])
+        self.assertNotIn(1, calls)
+
+
 class PidfdPlatformTest(unittest.TestCase):
     def test_unsupported_pidfd_api_fails_before_popen_or_scratch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="rootyard-pidfd-platform-") as temporary:

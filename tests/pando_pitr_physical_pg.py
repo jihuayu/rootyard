@@ -317,8 +317,13 @@ def _proc_table(phase: str) -> dict[int, dict]:
     for name in names:
         if not name.isdigit():
             continue
+        pid = int(name)
+        if pid <= 1:
+            # init is never fixture-owned; the direct _proc_stat guard stays
+            # intact for every explicit PID lookup.
+            continue
         try:
-            record = _proc_stat(int(name), phase)
+            record = _proc_stat(pid, phase)
         except FixtureError as error:
             if error.code == "process_missing":
                 continue
