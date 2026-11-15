@@ -292,7 +292,8 @@ async fn outage_flush_corrupt_payload_and_breaker_degrade_cleanly_to_origin_and_
     assert_eq!(v5.oid, "oid-6");
     assert!(cache.stats().breaker_skips > skips_before);
 
-    // Restore backend and allow breaker cooldown to lapse -> recovers automatically
+    // Restore restarted/empty backend and allow breaker cooldown to lapse -> recovers automatically
+    mock.flush_all();
     mock.set_mode(MockMode::Healthy);
     tokio::time::sleep(Duration::from_millis(50)).await;
     let (v6, out6) = cache
