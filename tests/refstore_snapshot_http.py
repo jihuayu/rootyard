@@ -33,12 +33,13 @@ LIFECYCLE = "snapshot_http_renew_release_expiry_and_exact_replay"
 AUTHZ = "snapshot_http_authz_malformed_and_cross_repo_refusals"
 HISTORICAL = "snapshot_http_historical_tree_blob_and_current_reachability"
 BROWSE_REFUSALS = "snapshot_http_historical_tree_blob_auth_and_state_refusals"
-CASES = (CREATE_READ, LIFECYCLE, AUTHZ, HISTORICAL, BROWSE_REFUSALS)
+BLOB_BOUND = "snapshot_http_historical_blob_common_read_bound"
+CASES = (CREATE_READ, LIFECYCLE, AUTHZ, HISTORICAL, BROWSE_REFUSALS, BLOB_BOUND)
 
 LIMITATIONS = [
     "Root-only real-service HTTP fixture: requires the attested standalone binary, real PostgreSQL/S3/stock Git and the owned Blob profile. The implementation worker only py-compiled it.",
     "The repository and captured refs/packs come from real API provisioning and stock Git publication; no ready/ACK/terminal/artifact-grant/receipt row is fabricated.",
-    "The fixture exercises the bounded HTTP DTO/receipt projections and coordinator decisions. It does not claim byte-closure materialization, a #174 session/HWM, root/retention HTTP or full issue107 closure.",
+    "The fixture exercises bounded HTTP DTO/receipt projections and coordinator decisions. Its historical content cases exercise the retained materialization/read contract and expected byte-closure behavior at source level, but actual native execution/byte-closure runtime proof, a #174 session/HWM, root/retention HTTP, hosted CI and full issue107 closure are not claimed here.",
     "The token/collaborator metadata cases are fixture inputs: read-only/restricted tokens use the real token API and real PATCH where shown; the write collaborator role row is labeled initial role metadata, not production collaborator API transport.",
     "Exact rows/counters are compared through the run-owned schema. No kernel, power-loss, distributed or scalability claim is made.",
     "The historical tree/blob cases exercise the retained snapshot HTTP content surface; they do not claim a session/HWM, root materialization, hosted inventory or full issue107 acceptance.",
@@ -92,6 +93,12 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
                 return
             time.sleep(0.05)
         raise AssertionError(label + ": pin did not expire naturally within 10s")
+
+    def _configured_blob_read_cap(self):
+        max_inflight = int(self.env.get("ROOTYARD_MAX_INFLIGHT_BYTES", str(256 << 20)))
+        max_response = int(self.env.get("ROOTYARD_MAX_OUTPUT_BYTES", str(512 << 20)))
+        memory = min(32 << 20, max_inflight)
+        return min(4 << 20, memory // 12, max_response // 8, (memory // 12) // 12)
 
     def _renew(self, repo, snapshot, key, generation, lease, token=None):
         return self._request("POST", self._snapshots_path(repo, "/" + str(snapshot) + "/renew"),
@@ -662,6 +669,41 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
             "expired_status": 409,
             "outside_closure_status": 404,
             "malformed_status": 400,
+        }
+
+    def snapshot_http_historical_blob_common_read_bound(self):
+        cap = self._configured_blob_read_cap()
+        assert cap > 2, cap
+        repo, _remote, work, _oid = self.seed("snap-bounds")
+        sizes = {"below.bin": cap - 1, "exact.bin": cap, "above.bin": cap + 1}
+        self.commit_files(work, "browse blob bounds", {name: b"z" * size for name, size in sizes.items()})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+        snapshot = self._create(repo, "browse-bounds", 300)[1]["snapshot_id"]
+        baseline = self._ledger(repo)
+        status, tree, _ = self._tree(repo, snapshot, oid="HEAD")
+        assert status == 200, (status, tree)
+        for name, size in sizes.items():
+            oid = self._tree_item(tree, name)["oid"]
+            retained_status, retained_view, _ = self._blob(repo, snapshot, oid)
+            ordinary_status, ordinary_view, _ = self._current_blob(repo, oid)
+            expected = 413 if name == "above.bin" else 200
+            assert retained_status == expected, (name, retained_status, retained_view)
+            assert ordinary_status == expected, (name, ordinary_status, ordinary_view)
+            if expected == 200:
+                assert retained_view["size"] == size and ordinary_view["size"] == size, (name, retained_view, ordinary_view)
+                assert len(base64.b64decode(retained_view["content_base64"])) == size
+                assert len(base64.b64decode(ordinary_view["content_base64"])) == size
+        status, metadata, _ = self._read(repo, snapshot)
+        assert status == 200 and metadata["complete_git_read_snapshot"] is False, (status, metadata)
+        self.no_bare(repo, "after common blob read boundary")
+        assert self._ledger(repo) == baseline, "common blob boundary reads changed durable metadata"
+        return {
+            "snapshot_id": snapshot,
+            "effective_cap": cap,
+            "below": cap - 1,
+            "exact": cap,
+            "above": cap + 1,
+            "retained_and_current_statuses_match": True,
         }
 
 def select_cases(names):

@@ -3,9 +3,9 @@
 //! No local repository is authoritative. Each request captures the current refs,
 //! materializes their protected pack closure and discards its computed view.
 //!
-//! Every JSON read (this module and [`super::history`]) ends in [`finalize`]:
-//! the body is fully encoded and size-checked first, then the live
-//! authorization is re-run once and its cluster authority incarnation must
+//! Every ordinary current JSON read (this module and [`super::history`]) ends
+//! in [`finalize`]: the body is fully encoded and size-checked first, then the
+//! live authorization is re-run once and its cluster authority incarnation must
 //! equal the capture's own anchor — unconditionally, with or without a key set.
 //! Only after that fence — from the sealed [`MaterializedServingRead`] retained
 //! with the view by [`snapshot::build_sealed_view`] — is a session token
@@ -13,6 +13,11 @@
 //! checked empty capture has no proof, so it never issues, but its anchor is
 //! still fenced; a failed fence drops the encoded body with its slot/byte
 //! leases and returns the generic retryable refusal.
+//!
+//! The [`retained`] child deliberately does not call [`finalize`] or enter the
+//! ordinary current-Browse session path. It uses its own retained-context
+//! post-encoding authorization/state fence and never issues a session token,
+//! current revision or HWM.
 use std::sync::Arc;
 
 use axum::{
@@ -166,11 +171,11 @@ async fn read_blob(
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .ok_or(GatewayError::Internal("native blob size is invalid"))?;
     // Twelve times the payload covers base64, optional text and worst-case
-    // JSON escaping together with their live input/output buffers.
-    let max_blob = MAX_CAPTURE_BYTES
-        .min(memory / 12)
-        .min(session.state.limits().max_response_bytes / 8)
-        .min(session.budget() / 12);
+    // JSON escaping together with their live input/output buffers. The
+    // per-request encoded budget is BrowseSession::budget(), itself memory/12;
+    // the shared helper applies the same /12 floor on both current and retained
+    // Browse paths.
+    let max_blob = blob_read_ceiling(memory, session.state.limits().max_response_bytes, session.budget());
     if size > max_blob {
         return Err(GatewayError::TooLarge);
     }
@@ -210,6 +215,17 @@ fn validate_tree_after(after: Option<&str>) -> Result<Option<&str>, GatewayError
 
 fn memory_budget(state: &BlobGitState) -> u64 {
     MAX_MEMORY_BYTES.min(state.limits().max_inflight_bytes)
+}
+
+/// Shared pre-read ceiling for a blob response. `encoded_budget` is the
+/// per-request JSON encoding budget (`BrowseSession::budget()` for current
+/// Browse, `memory / 12` for the retained view). The final `/12` accounts for
+/// base64/text/JSON expansion; both callers must use this one function.
+fn blob_read_ceiling(memory: u64, max_response: u64, encoded_budget: u64) -> u64 {
+    MAX_CAPTURE_BYTES
+        .min(memory / 12)
+        .min(max_response / 8)
+        .min(encoded_budget / 12)
 }
 
 /// Resolve a short revision against the captured ref pairs (`refs/*` name and

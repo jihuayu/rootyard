@@ -15,8 +15,8 @@ use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 use super::{
-    MAX_CAPTURE_BYTES, bad_input, captured_revision, memory_budget, parse_tree, reachable, require_type, resolve,
-    root_oid, run, validate_spec, validate_tree_after,
+    MAX_CAPTURE_BYTES, bad_input, blob_read_ceiling, captured_revision, memory_budget, parse_tree, reachable,
+    require_type, resolve, root_oid, run, validate_spec, validate_tree_after,
 };
 use super::super::{
     api::strip_name,
@@ -141,9 +141,7 @@ pub(super) async fn blob(
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .ok_or(GatewayError::Internal("native blob size is invalid"))?;
-    let max_blob = MAX_CAPTURE_BYTES
-        .min(memory / 12)
-        .min(state.limits().max_response_bytes / 8);
+    let max_blob = blob_read_ceiling(memory, state.limits().max_response_bytes, memory / 12);
     if size > max_blob {
         return Err(GatewayError::TooLarge);
     }
