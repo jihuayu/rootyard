@@ -45,7 +45,7 @@ use crate::{
                 PackArtifactRole, PackCommitBaseline, PackCommitError, PackCommitExpectation, PackCommitPlan,
                 PackCommitRejectCode, PackCommitScope, PackCommitTerminal, PackMembershipEntry, PackPendingToken,
                 PackRegistrationRequest, PgAuthorizedCommit, PgPackCommit, PlannedArtifact, PlannedPack,
-                PrepareOutcome,
+                PrepareOutcome, ensure_pack_terminal_budget,
             },
         },
         tx::{begin_bounded, commit_bounded},
@@ -511,7 +511,7 @@ fn build_plan(
         gate.group_epoch(),
     )?;
     let expectation = PackCommitExpectation::new(gate.revision(), *gate.digest(), baseline.mode())?;
-    PackCommitPlan::new_with_mode(
+    let plan = PackCommitPlan::new_with_mode(
         scope,
         identity,
         expectation,
@@ -521,8 +521,9 @@ fn build_plan(
         old_memberships,
         planned,
         mode,
-    )
-    .map_err(Into::into)
+    )?;
+    ensure_pack_terminal_budget(&plan).map_err(|_| GatewayError::TooLarge)?;
+    Ok(plan)
 }
 
 async fn publish_pair(
@@ -821,5 +822,74 @@ mod tests {
             })),
             GatewayError::Internal("protected Blob upload was refused")
         ));
+    }
+
+    #[test]
+    fn build_plan_rejects_terminal_budget_overflow_before_admission() {
+        use super::super::protocol::PushCommand;
+        use crate::ref_store::{
+            GitObjectFormat,
+            core::{contract::CoreGate, pack_commit::PackMode},
+        };
+
+        let repo_id = Uuid::new_v4();
+        let tenant_id = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+        let issuer_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let head = RefName::new("refs/heads/main").unwrap();
+        let gate =
+            CoreGate::new(repo_id, tenant_id, GitObjectFormat::Sha1, Uuid::new_v4(), 1, 1, head, 1).unwrap().version();
+        let baseline = PackCommitBaseline::new(gate, PackMode::MetadataOnly, Vec::new(), Vec::new()).unwrap();
+        let pair = Pair {
+            pack: PathBuf::from("test.pack"),
+            idx: PathBuf::from("test.idx"),
+            pack_id: Uuid::new_v4(),
+            pack_sha: "1".repeat(64),
+            pack_len: 128,
+            idx_sha: "2".repeat(64),
+            idx_len: 64,
+        };
+        let request_for = |count: usize| PushRequest {
+            commands: (0..count)
+                .map(|idx| PushCommand {
+                    old: "0".repeat(40),
+                    new: "a".repeat(40),
+                    name: if idx == 0 { "refs/heads/main".to_owned() } else { format!("refs/heads/z-page-{idx:02}") },
+                })
+                .collect(),
+            capabilities: vec!["report-status".to_owned()],
+        };
+        let digest = RequestDigest::of("test-build-plan-budget", &[b"budget"]);
+        let lane = IssuerLane::new(ISSUER_LANE).unwrap();
+        let identity = OperationIdentity::new(repo_id, issuer_id, lane, 1, operation_id, digest).unwrap();
+
+        assert!(
+            build_plan(
+                &request_for(52),
+                std::slice::from_ref(&pair),
+                CommitMode::Atomic,
+                owner_id,
+                &baseline,
+                identity.clone(),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            build_plan(
+                &request_for(53),
+                std::slice::from_ref(&pair),
+                CommitMode::Atomic,
+                owner_id,
+                &baseline,
+                identity.clone(),
+            )
+            .unwrap_err(),
+            GatewayError::TooLarge
+        );
+        assert_eq!(
+            build_plan(&request_for(55), &[pair], CommitMode::Atomic, owner_id, &baseline, identity).unwrap_err(),
+            GatewayError::TooLarge
+        );
     }
 }

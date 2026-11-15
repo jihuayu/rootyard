@@ -5,7 +5,7 @@
 //! sign-in so parent-token revocation also terminates the browser session. The
 //! embedded parent id is bound by the secret's SHA-256 digest: changing it
 //! invalidates the stored browser token instead of selecting another parent.
-use crate::{AppState, Error, auth, db, web::templates::html_response};
+use crate::{Error, application::MetadataState, auth, db, web::templates::html_response};
 use axum::{
     extract::{Form, Query, State},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
@@ -16,9 +16,9 @@ use base64::Engine;
 use deadpool_postgres::Pool;
 use rand::RngCore;
 use serde::Deserialize;
-use std::sync::Arc;
 use uuid::Uuid;
 
+mod challenge;
 mod return_to;
 use return_to::{encode_query_value, is_safe_return_to, login_target, safe_return_to};
 
@@ -104,7 +104,7 @@ enum WebAuthMode {
 }
 
 async fn web_auth_mode(
-    state: &Arc<AppState>,
+    state: &MetadataState,
     headers: &HeaderMap,
     session: Option<&str>,
 ) -> Result<WebAuthMode, Box<Response>> {
@@ -220,7 +220,7 @@ fn error_page(status: StatusCode) -> Response {
     html_response(status, body)
 }
 
-async fn validate_session(state: &Arc<AppState>, secret: &str, csrf: Option<&str>) -> Result<(), Box<Response>> {
+async fn validate_session(state: &MetadataState, secret: &str, csrf: Option<&str>) -> Result<(), Box<Response>> {
     let Some(parent) = session_parent(secret) else {
         return Err(Box::new(Error::unauthorized().into_response()));
     };
@@ -267,7 +267,7 @@ fn basic_authorization(headers: &HeaderMap) -> bool {
 }
 
 pub async fn middleware(
-    State(state): State<Arc<AppState>>,
+    State(state): State<MetadataState>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
@@ -281,7 +281,7 @@ pub async fn middleware(
 
     let auth_mode = match web_auth_mode(&state, &headers, session.as_deref()).await {
         Ok(mode) => mode,
-        Err(response) => return *response,
+        Err(response) => return challenge::session_challenge(*response, &path),
     };
     let session_mode = matches!(auth_mode, WebAuthMode::CookieOnly | WebAuthMode::BrowserSession);
 
@@ -316,14 +316,18 @@ pub async fn middleware(
                 return Error(StatusCode::FORBIDDEN, "CSRF token required").into_response();
             };
             if let Err(response) = validate_session(&state, secret, Some(csrf)).await {
-                return *response;
+                return challenge::session_challenge(*response, &path);
             }
         }
     } else if session_mode
         && let Some(secret) = session.as_deref()
         && let Err(response) = validate_session(&state, secret, None).await
     {
-        return if is_navigation { login_redirect(&path, query.as_deref(), &headers) } else { *response };
+        return if is_navigation {
+            login_redirect(&path, query.as_deref(), &headers)
+        } else {
+            challenge::session_challenge(*response, &path)
+        };
     }
 
     let response = auth::web_scope(next.run(request)).await;
@@ -340,6 +344,7 @@ pub async fn middleware(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReturnTo {
     #[serde(default)]
     return_to: Option<String>,
@@ -370,7 +375,7 @@ pub struct LoginForm {
 }
 
 pub async fn login(
-    State(state): State<Arc<AppState>>,
+    State(state): State<MetadataState>,
     headers: HeaderMap,
     Form(input): Form<LoginForm>,
 ) -> Result<Response, Error> {
@@ -463,7 +468,7 @@ pub async fn login(
     Ok(res)
 }
 
-pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, Error> {
+pub async fn logout(State(state): State<MetadataState>, headers: HeaderMap) -> Result<Response, Error> {
     let secure = secure_cookie(&headers)?;
     if let Some(secret) = session_token(&headers) {
         let client = state.pool.get().await.map_err(Error::internal)?;

@@ -30,8 +30,10 @@ use crate::{
         },
     },
     blob_store::{
-        BlobBackendIdentity, BlobLocator, BlobProvider, config::BlobProfile, opendal::BlobStore,
-        test_support::delete_exact,
+        BlobBackendIdentity, BlobLocator, BlobProvider,
+        config::BlobProfile,
+        opendal::BlobStore,
+        test_support::{corrupt_exact, delete_exact},
     },
     ref_store::{
         MetadataPinPurpose,
@@ -48,8 +50,8 @@ use crate::{
 mod http;
 
 pub(super) use self::http::{
-    MALFORMED_SESSION, contains, ensure_no_disclosure, is_denial, json_read, json_string, looks_like_refs, raw_get,
-    status_succeeds,
+    MALFORMED_SESSION, contains, ensure_no_disclosure, form_encode, is_denial, json_read, json_string, looks_like_refs,
+    raw_get, raw_get_with_cookies, status_succeeds,
 };
 use self::http::{PushSession, RawSession, ServerGuard, observe_push_session};
 
@@ -156,18 +158,39 @@ impl Gateway {
         Ok(())
     }
 
-    /// A real native clone/commit/push through the real Smart HTTP routes.
-    pub(super) async fn push_commit(&self, owner: &Actor, name: &str) -> Result<String> {
+    /// Clone a repository into an isolated temporary checkout through Smart HTTP.
+    pub(super) async fn clone_checkout(
+        &self,
+        owner: &Actor,
+        name: &str,
+    ) -> Result<(tempfile::TempDir, std::path::PathBuf)> {
         let work = tempfile::tempdir().context("temporary Git work tree")?;
         let checkout = work.path().join("clone");
         let url = clone_url(self.address, &owner.username, name, &owner.username, &owner.token);
         let cloned = self.git.clone(work.path(), &url, "clone").await?;
-        ensure!(cloned.success, "real Smart HTTP clone of the empty repository failed");
-        let oid = self.git.commit(&checkout, COMMIT_FILE, COMMIT_CONTENT, "session fixture commit").await?;
-        let pushed = self.git.run(&checkout, &["push", "origin", &format!("HEAD:{PUSHED_REF}")]).await?;
+        ensure!(cloned.success, "real Smart HTTP clone failed");
+        Ok((work, checkout))
+    }
+
+    /// Commit one file and push `HEAD:refs/heads/main` through Smart HTTP.
+    pub(super) async fn commit_and_push(
+        &self,
+        checkout: &std::path::Path,
+        file: &str,
+        content: &str,
+        message: &str,
+    ) -> Result<String> {
+        let oid = self.git.commit(checkout, file, content, message).await?;
+        let pushed = self.git.run(checkout, &["push", "origin", &format!("HEAD:{PUSHED_REF}")]).await?;
         ensure!(pushed.success, "real Smart HTTP push was refused");
         assert_no_compute_views(self.scratch.path()).await?;
         Ok(oid)
+    }
+
+    /// A real native clone/commit/push through the real Smart HTTP routes.
+    pub(super) async fn push_commit(&self, owner: &Actor, name: &str) -> Result<String> {
+        let (_work, checkout) = self.clone_checkout(owner, name).await?;
+        self.commit_and_push(&checkout, COMMIT_FILE, COMMIT_CONTENT, "session fixture commit").await
     }
 
     /// The push response's session headers, captured in memory only.
@@ -187,22 +210,44 @@ pub(super) fn test_tokens(backend: &BlobBackendIdentity) -> Result<SessionTokens
 }
 
 /// Load a key set through the production on-disk loader: a private `0700`
-/// directory with a `0600` schema-2 manifest and a `0600` 32-byte key file.
+/// directory with a `0600` schema-2 manifest and `0600` 32-byte key files.
 pub(super) fn keyring_tokens(backend: &BlobBackendIdentity) -> Result<(tempfile::TempDir, SessionTokens)> {
+    load_keyring_stage(backend, false, true, "v2")
+}
+
+/// Build an on-disk schema-2 keyring for key rotation stages (`v1`, `v2`).
+pub(super) fn load_keyring_stage(
+    backend: &BlobBackendIdentity,
+    include_v1: bool,
+    include_v2: bool,
+    current: &str,
+) -> Result<(tempfile::TempDir, SessionTokens)> {
     let directory = tempfile::tempdir().context("temporary keyring directory")?;
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let mut keys = Vec::new();
+    let mut descriptors = Vec::new();
+    if include_v1 {
+        keys.push(("v1", [0x6au8; 32]));
+        descriptors.push(json!({"key_id": "v1", "id": 41}));
+    }
+    if include_v2 {
+        keys.push(("v2", [0x6bu8; 32]));
+        descriptors.push(json!({"key_id": "v2", "id": 42}));
+    }
     let manifest = json!({
         "schema": 2,
-        "current": "v2",
+        "current": current,
         "lifetime_seconds": KEYRING_LIFETIME,
-        "keys": [{"key_id": "v2", "id": 42}],
+        "keys": descriptors,
     });
     let manifest_path = directory.path().join("keyring.json");
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
     std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o600))?;
-    let key_path = directory.path().join("v2.key");
-    std::fs::write(&key_path, [0x6bu8; 32])?;
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    for (key_id, bytes) in keys {
+        let key_path = directory.path().join(format!("{key_id}.key"));
+        std::fs::write(&key_path, bytes)?;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     let tokens = crate::standalone::session_keyring::load(directory.path(), backend)?;
     Ok((directory, tokens))
 }
@@ -298,10 +343,14 @@ pub(super) async fn remove_collaborator(db: &Db, repository_id: Uuid, user_id: U
     Ok(())
 }
 
-/// Delete the registered `.pack` object of a pushed repository after its pin
-/// was released, leaving the durable registration in place. A later serving
-/// read must fail closed instead of returning the acknowledged refs.
-pub(super) async fn delete_registered_pack(gateway: &Gateway, db: &Db, owner: &Actor, name: &str) -> Result<()> {
+/// Capture one registered pack artifact locator after releasing its pin.
+async fn registered_pack_locator(
+    gateway: &Gateway,
+    db: &Db,
+    owner: &Actor,
+    name: &str,
+    role: PackArtifactRole,
+) -> Result<BlobLocator> {
     let serving = serving(db, gateway, owner, name, false).await?;
     let gate = &serving.gate;
     let owner_id: Uuid = db
@@ -328,12 +377,35 @@ pub(super) async fn delete_registered_pack(gateway: &Gateway, db: &Db, owner: &A
         let snapshot =
             capture.registered_snapshot().ok_or_else(|| anyhow!("private-pushed repository captured empty"))?;
         let pack = snapshot.packs().first().ok_or_else(|| anyhow!("pushed repository registered no pack"))?;
-        pack.artifact(PackArtifactRole::Pack)
+        pack.artifact(role)
             .locator()
             .blob_locator()
             .map_err(|error| anyhow!("registered pack locator is invalid: {error}"))?
     };
     reads.release(&db.pool, &capture, deadline()).await.map_err(|error| anyhow!("capture release failed: {error}"))?;
+    Ok(locator)
+}
+
+/// Delete the registered `.pack` object of a pushed repository after its pin
+/// was released, leaving the durable registration in place. A later serving
+/// read must fail closed instead of returning the acknowledged refs.
+pub(super) async fn delete_registered_pack(gateway: &Gateway, db: &Db, owner: &Actor, name: &str) -> Result<()> {
+    let locator = registered_pack_locator(gateway, db, owner, name, PackArtifactRole::Pack).await?;
     delete_exact(&gateway.store, &locator).await?;
+    Ok(())
+}
+
+/// Delete the registered `.idx` object of a pushed repository after its pin
+/// was released, leaving the durable registration in place.
+pub(super) async fn delete_registered_idx(gateway: &Gateway, db: &Db, owner: &Actor, name: &str) -> Result<()> {
+    let locator = registered_pack_locator(gateway, db, owner, name, PackArtifactRole::Idx).await?;
+    delete_exact(&gateway.store, &locator).await?;
+    Ok(())
+}
+
+/// Overwrite the registered `.pack` object of a pushed repository with corrupt bytes.
+pub(super) async fn corrupt_registered_pack(gateway: &Gateway, db: &Db, owner: &Actor, name: &str) -> Result<()> {
+    let locator = registered_pack_locator(gateway, db, owner, name, PackArtifactRole::Pack).await?;
+    corrupt_exact(&gateway.store, &locator).await?;
     Ok(())
 }

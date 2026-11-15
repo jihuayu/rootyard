@@ -31,7 +31,20 @@ use super::{
 };
 use crate::ref_store::serving::ServingRepository;
 
+/// Smart HTTP keeps the standard Git `Basic` challenge: an unauthorized
+/// advertisement (or any refusal of this route) is rendered with
+/// `GatewayError::git`, so a real Git client retries with its configured
+/// Basic credential exactly as before.
 pub(super) async fn info_refs(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    info_refs_authorized(state, path, uri, headers).await.unwrap_or_else(GatewayError::git)
+}
+
+async fn info_refs_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name)): Path<(String, String)>,
     uri: Uri,
@@ -93,7 +106,17 @@ pub(super) async fn info_refs(
     Ok(bytes_response("application/x-git-upload-pack-advertisement", body))
 }
 
+/// See [`info_refs`]: every refusal of the fetch RPC carries the Basic challenge.
 pub(super) async fn upload_pack(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    upload_pack_authorized(state, path, headers, body).await.unwrap_or_else(GatewayError::git)
+}
+
+async fn upload_pack_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name)): Path<(String, String)>,
     headers: HeaderMap,

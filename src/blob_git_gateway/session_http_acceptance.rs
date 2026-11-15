@@ -57,8 +57,10 @@
 // actor/database/Git modules the HTTP harnesses drive. The admission case
 // imports these same modules instead of loading the files a second time, so
 // no `dead_code` allowance is needed on either side.
+mod browser_tests;
 #[path = "../../tests/blob_gateway_support/session.rs"]
 pub(super) mod fixtures;
+mod matrix_tests;
 mod negative_tests;
 mod support;
 
