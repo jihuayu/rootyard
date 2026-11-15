@@ -264,6 +264,15 @@ impl ArtifactView {
 }
 
 pub(super) async fn create_snapshot(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String)>,
+    headers: HeaderMap,
+    payload: Result<Json<CreateSnapshotBody>, JsonRejection>,
+) -> Response {
+    create_snapshot_authorized(state, path, headers, payload).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn create_snapshot_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -294,6 +303,14 @@ pub(super) async fn create_snapshot(
 }
 
 pub(super) async fn read_snapshot(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    read_snapshot_authorized(state, path, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn read_snapshot_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name, snapshot)): Path<(String, String, String)>,
     headers: HeaderMap,
@@ -316,6 +333,15 @@ pub(super) async fn read_snapshot(
 }
 
 pub(super) async fn renew_snapshot(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String)>,
+    headers: HeaderMap,
+    payload: Result<Json<RenewSnapshotBody>, JsonRejection>,
+) -> Response {
+    renew_snapshot_authorized(state, path, headers, payload).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn renew_snapshot_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name, snapshot)): Path<(String, String, String)>,
     headers: HeaderMap,
@@ -348,6 +374,15 @@ pub(super) async fn renew_snapshot(
 }
 
 pub(super) async fn release_snapshot(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String)>,
+    headers: HeaderMap,
+    payload: Result<Json<ReleaseSnapshotBody>, JsonRejection>,
+) -> Response {
+    release_snapshot_authorized(state, path, headers, payload).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn release_snapshot_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name, snapshot)): Path<(String, String, String)>,
     headers: HeaderMap,

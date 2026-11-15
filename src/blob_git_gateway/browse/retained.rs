@@ -30,6 +30,15 @@ use crate::ref_store::core::pack_snapshot::PgPackSnapshotMaterializer;
 use crate::ref_store::serving::{PgServingSnapshotMetadata, RetainedServingReadContext, ServingSnapshotRead};
 
 pub(super) async fn tree(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String)>,
+    query: Query<TreeQuery>,
+    headers: HeaderMap,
+) -> Response {
+    tree_authorized(state, path, query, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn tree_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name, snapshot)): Path<(String, String, String)>,
     Query(query): Query<TreeQuery>,
@@ -95,6 +104,15 @@ pub(super) async fn tree(
 }
 
 pub(super) async fn blob(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String, String)>,
+    query: Query<BlobByOidQuery>,
+    headers: HeaderMap,
+) -> Response {
+    blob_authorized(state, path, query, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn blob_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name, snapshot, oid)): Path<(String, String, String, String)>,
     Query(query): Query<BlobByOidQuery>,

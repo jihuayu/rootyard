@@ -406,6 +406,14 @@ const HTTP_CANCEL_REASON: &str = "http_cancel_requested";
 /// writes no tombstone; a core row without its exact A3 producer binding fails
 /// closed. An ambiguous cancellation `COMMIT` remains the typed `503` unknown.
 pub(super) async fn cancel_operation(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    cancel_operation_authorized(state, path, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn cancel_operation_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, raw_name, operation)): Path<(String, String, String)>,
     headers: HeaderMap,

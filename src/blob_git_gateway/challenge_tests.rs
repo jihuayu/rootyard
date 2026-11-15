@@ -66,11 +66,12 @@ impl Gateway {
         target: &str,
         headers: &[(&str, &str)],
         body: &'static [u8],
-    ) -> (StatusCode, Vec<String>) {
+    ) -> (StatusCode, Vec<String>, Option<String>, bool) {
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
         let mut request = match method {
             "GET" => client.get(format!("http://{}{target}", self.address)),
             "POST" => client.post(format!("http://{}{target}", self.address)),
+            "DELETE" => client.delete(format!("http://{}{target}", self.address)),
             other => panic!("unsupported test method {other}"),
         };
         for (name, value) in headers {
@@ -84,7 +85,13 @@ impl Gateway {
             .iter()
             .map(|value| value.to_str().unwrap().to_owned())
             .collect();
-        (status, challenges)
+        let cache = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let session = response.headers().contains_key("x-rootyard-session");
+        (status, challenges, cache, session)
     }
 }
 
@@ -99,6 +106,65 @@ fn rpc_content_type(uri: &str) -> &'static str {
         "application/x-git-upload-pack-request"
     } else {
         "application/x-git-receive-pack-request"
+    }
+}
+
+#[tokio::test]
+async fn owner107_historical_routes_advertise_bearer_without_a_session() {
+    let (state, _scratch) = offline_state();
+    let gateway = Gateway::start(&state).await;
+    let snapshot = "11111111-1111-4111-8111-111111111111";
+    let oid = "1".repeat(40);
+    let routes: Vec<(&str, String, Vec<(&str, &str)>, &'static [u8])> = vec![
+        (
+            "POST",
+            "/api/repos/owner/name/operations/11111111-1111-4111-8111-111111111111/cancel".to_owned(),
+            vec![],
+            b"",
+        ),
+        (
+            "POST",
+            "/api/repos/owner/name/snapshots".to_owned(),
+            vec![("content-type", "application/json")],
+            br#"{"idempotency_key":"create-unauth","lease_seconds":60}"#,
+        ),
+        (
+            "GET",
+            format!("/api/repos/owner/name/snapshots/{snapshot}"),
+            vec![],
+            b"",
+        ),
+        (
+            "POST",
+            format!("/api/repos/owner/name/snapshots/{snapshot}/renew"),
+            vec![("content-type", "application/json")],
+            br#"{"idempotency_key":"renew-unauth","expected_generation":1,"lease_seconds":60}"#,
+        ),
+        (
+            "DELETE",
+            format!("/api/repos/owner/name/snapshots/{snapshot}"),
+            vec![("content-type", "application/json")],
+            br#"{"idempotency_key":"release-unauth","expected_generation":1}"#,
+        ),
+        (
+            "GET",
+            format!("/api/repos/owner/name/snapshots/{snapshot}/tree"),
+            vec![],
+            b"",
+        ),
+        (
+            "GET",
+            format!("/api/repos/owner/name/snapshots/{snapshot}/blob/{oid}"),
+            vec![],
+            b"",
+        ),
+    ];
+    for (method, target, headers, body) in routes {
+        let (status, challenges, cache, session) = gateway.send(method, &target, &headers, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {target} was not a tokenless denial");
+        assert_eq!(challenges, [BEARER], "{method} {target} must advertise only the API Bearer challenge");
+        assert_eq!(cache.as_deref(), Some("no-store"), "{method} {target} must stay no-store");
+        assert!(!session, "{method} {target} must not issue a session header on denial");
     }
 }
 
@@ -139,7 +205,7 @@ async fn top_level_api_and_its_aliases_advertise_bearer() {
             } else {
                 (headers.to_vec(), b"")
             };
-            let (status, challenges) = gateway.send(method, uri, &headers, body).await;
+            let (status, challenges, _, _) = gateway.send(method, uri, &headers, body).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri} was not an unauthenticated denial");
             assert_eq!(challenges, [BEARER], "{method} {uri} must not enter a browser Basic auth exchange");
         }
@@ -152,14 +218,14 @@ async fn non_session_cookie_is_ignored_like_no_cookie() {
     let gateway = Gateway::start(&state).await;
     let cookie = format!("rootyard_session=ryt_{}", "zz".repeat(32));
     for uri in ["/web/blob/api/repos", "/web/blob/api/repos/owner/name", "/web/blob/api/repos/owner/name/refs"] {
-        let (status, challenges) = gateway.send("GET", uri, &[("cookie", cookie.as_str())], &[]).await;
+        let (status, challenges, _, _) = gateway.send("GET", uri, &[("cookie", cookie.as_str())], &[]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "GET {uri} was not the gateway's denial");
         assert_eq!(challenges, [BEARER], "GET {uri} must not start a browser Basic auth exchange");
     }
-    let (status, challenges) = gateway.send("GET", "/web/login", &[("cookie", cookie.as_str())], &[]).await;
+    let (status, challenges, _, _) = gateway.send("GET", "/web/login", &[("cookie", cookie.as_str())], &[]).await;
     assert_eq!(status, StatusCode::OK, "the sign-in page renders without a session");
     assert!(challenges.is_empty(), "the sign-in page must not challenge an anonymous render");
-    let (status, challenges) =
+    let (status, challenges, _, _) =
         gateway.send("GET", "/git/owner/name.git/info/refs?service=git-upload-pack", &[("cookie", &cookie)], &[]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(challenges, [BASIC]);
@@ -176,7 +242,7 @@ async fn unsupported_merge_refuses_without_a_challenge() {
     ];
     let uri = "/api/repos/owner/name/merges";
     for headers in rejected {
-        let (status, challenges) = gateway.send("POST", uri, headers, b"").await;
+        let (status, challenges, _, _) = gateway.send("POST", uri, headers, b"").await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "POST {uri} must stay an explicit not-implemented refusal");
         assert!(challenges.is_empty(), "POST {uri} must not challenge: it never authenticates");
     }
@@ -199,7 +265,7 @@ async fn smart_http_denials_advertise_basic() {
             if method == "POST" {
                 all.push(("content-type", rpc_content_type(uri)));
             }
-            let (status, challenges) = gateway.send(method, uri, &all, &[]).await;
+            let (status, challenges, _, _) = gateway.send(method, uri, &all, &[]).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri} was not an unauthenticated denial");
             assert_eq!(challenges, [BASIC], "{method} {uri} must keep the Git Basic challenge");
         }
@@ -215,7 +281,7 @@ async fn syntax_accepted_credentials_reach_the_offline_authority() {
     let bearer = format!("Bearer {token}");
     for uri in ["/api/repos", "/web/blob/api/repos"] {
         for credential in [basic.as_str(), bearer.as_str()] {
-            let (status, challenges) = gateway.send("GET", uri, &[("authorization", credential)], &[]).await;
+            let (status, challenges, _, _) = gateway.send("GET", uri, &[("authorization", credential)], &[]).await;
             assert_ne!(status, StatusCode::UNAUTHORIZED, "GET {uri} rejected the syntactically valid credential");
             assert!(challenges.is_empty(), "GET {uri} must not challenge a syntax-accepted credential");
             assert_ne!(status, StatusCode::OK, "GET {uri} cannot succeed while the authority is offline");
