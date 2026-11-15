@@ -250,7 +250,7 @@ async fn capture_t1(
         drop(client);
         return Err(error);
     }
-    let read = pg::before_deadline(deadline, async {
+    let read = before_deadline(deadline, async {
         let snapshot = PgPackSnapshot.read_checked(&tx, reference, deadline, lane).await?;
         // Cluster is deliberately read after the source snapshot/pin/ref locks
         // in this same short transaction. No preflight cluster read and no
