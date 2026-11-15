@@ -21,6 +21,11 @@ enum ReapAction {
     SimulateUnconfirmedExit(&'static str),
 }
 
+pub(crate) struct ReapFailureProbeResult {
+    pub(crate) result: Result<CohortMeasurement>,
+    pub(crate) real_child_reaped: bool,
+}
+
 struct WorkerSpec<'a> {
     exe: &'a Path,
     phase: &'a str,
@@ -65,13 +70,22 @@ async fn terminate_and_reap(child: &mut Child) -> Result<ExitStatus> {
         .map_err(Into::into)
 }
 
-async fn run_reap(child: &mut Child, action: ReapAction) -> Result<ExitStatus> {
+async fn run_reap(child: &mut Child, action: ReapAction) -> (Result<ExitStatus>, bool) {
     match action {
-        ReapAction::TerminateAndReap => terminate_and_reap(child).await,
+        ReapAction::TerminateAndReap => {
+            let res = terminate_and_reap(child).await;
+            let real_child_reaped = res.is_ok();
+            (res, real_child_reaped)
+        }
         ReapAction::SimulateUnconfirmedExit(reason) => {
-            // Reap the OS child cleanly so no zombie or PG lock lingers while still feeding Err to the cleanup guard.
-            let _ = terminate_and_reap(child).await;
-            Err(anyhow!("{reason}"))
+            // Confirm real OS child exit cleanly without forcing schema DROP so the test records whether reap succeeded.
+            let real_res = terminate_and_reap(child).await;
+            let real_child_reaped = real_res.is_ok();
+            let sim_err = match real_res {
+                Ok(_) => anyhow!("{reason}"),
+                Err(real_err) => anyhow!("{reason}; real child reap also failed: {real_err:#}"),
+            };
+            (Err(sim_err), real_child_reaped)
         }
     }
 }
@@ -103,7 +117,7 @@ async fn handle_terminated_or_timed_out(
     }
 }
 
-async fn spawn_worker_with_cleanup(spec: WorkerSpec<'_>) -> Result<CohortMeasurement> {
+async fn spawn_worker_with_cleanup(spec: WorkerSpec<'_>) -> ReapFailureProbeResult {
     let mut cmd = tokio::process::Command::new(spec.exe);
     cmd.args(["verifier_budget_before_vs_after_pg_s3_git_benchmark", "--exact", "--nocapture", "--test-threads=1"])
         .env(ENV_BENCH_PHASE, spec.phase)
@@ -118,7 +132,10 @@ async fn spawn_worker_with_cleanup(spec: WorkerSpec<'_>) -> Result<CohortMeasure
         cmd.env(ENV_BENCH_PROBE_MARKER, marker);
     }
 
-    let mut child = cmd.spawn()?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => return ReapFailureProbeResult { result: Err(err.into()), real_child_reaped: false },
+    };
     let stdout_task = tokio::spawn(drain_pipe(child.stdout.take()));
     let stderr_task = tokio::spawn(drain_pipe(child.stderr.take()));
 
@@ -135,7 +152,7 @@ async fn spawn_worker_with_cleanup(spec: WorkerSpec<'_>) -> Result<CohortMeasure
                 ))
             };
             let cleanup_res = Db::drop_owned_schema(spec.pg_url, spec.schema).await;
-            match (cohort_res, cleanup_res) {
+            let result = match (cohort_res, cleanup_res) {
                 (Ok(cohort), Ok(())) => Ok(cohort),
                 (Ok(_), Err(c_err)) => Err(c_err.context(format!(
                     "cleanup-not-complete: failed dropping owned schema `{}` after confirmed exit",
@@ -146,21 +163,24 @@ async fn spawn_worker_with_cleanup(spec: WorkerSpec<'_>) -> Result<CohortMeasure
                     "cleanup-not-complete: failed dropping owned schema `{}`: {c_err:#}",
                     spec.schema
                 ))),
-            }
+            };
+            ReapFailureProbeResult { result, real_child_reaped: true }
         }
         Ok(Err(err)) => {
-            let reap_res = run_reap(&mut child, spec.reap_action).await;
+            let (reap_res, real_child_reaped) = run_reap(&mut child, spec.reap_action).await;
             let stdout = collect_pipe(stdout_task).await;
             let stderr = collect_pipe(stderr_task).await;
             let reason = format!("failed waiting on isolated cohort `{}`: {err}", spec.phase);
-            handle_terminated_or_timed_out(&spec, reason, reap_res, stdout, stderr).await
+            let result = handle_terminated_or_timed_out(&spec, reason, reap_res, stdout, stderr).await;
+            ReapFailureProbeResult { result, real_child_reaped }
         }
         Err(_) => {
-            let reap_res = run_reap(&mut child, spec.reap_action).await;
+            let (reap_res, real_child_reaped) = run_reap(&mut child, spec.reap_action).await;
             let stdout = collect_pipe(stdout_task).await;
             let stderr = collect_pipe(stderr_task).await;
             let reason = format!("isolated cohort `{}` timed out after {:?}", spec.phase, spec.timeout);
-            handle_terminated_or_timed_out(&spec, reason, reap_res, stdout, stderr).await
+            let result = handle_terminated_or_timed_out(&spec, reason, reap_res, stdout, stderr).await;
+            ReapFailureProbeResult { result, real_child_reaped }
         }
     }
 }
@@ -186,6 +206,7 @@ pub(crate) async fn run_isolated_cohort_with_timeout(
         reap_action: ReapAction::TerminateAndReap,
     })
     .await
+    .result
 }
 
 pub(crate) async fn run_hang_cleanup_probe(
@@ -208,6 +229,7 @@ pub(crate) async fn run_hang_cleanup_probe(
         reap_action: ReapAction::TerminateAndReap,
     })
     .await
+    .result
 }
 
 pub(crate) async fn run_hang_cleanup_probe_with_reap_failure(
@@ -217,7 +239,7 @@ pub(crate) async fn run_hang_cleanup_probe_with_reap_failure(
     schema: &str,
     marker: &Path,
     timeout: Duration,
-) -> Result<CohortMeasurement> {
+) -> ReapFailureProbeResult {
     spawn_worker_with_cleanup(WorkerSpec {
         exe,
         phase: "hang_cleanup_probe",

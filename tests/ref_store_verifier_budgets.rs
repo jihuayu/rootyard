@@ -270,7 +270,7 @@ async fn failed_reap_preserves_owned_schema_with_cleanup_not_complete_error() ->
     let schema = Db::fresh_schema_name();
     let marker = temp.path().join("migrated.marker");
 
-    let res = run_hang_cleanup_probe_with_reap_failure(
+    let probe = run_hang_cleanup_probe_with_reap_failure(
         &exe,
         &pg_url,
         &temp.path().join("unused.json"),
@@ -279,22 +279,57 @@ async fn failed_reap_preserves_owned_schema_with_cleanup_not_complete_error() ->
         Duration::from_secs(8),
     )
     .await;
-    let err = res.expect_err("simulated reap failure probe must fail");
-    let text = format!("{err:#}");
-    ensure!(text.contains("cleanup-not-complete"), "expected cleanup-not-complete error, got: {text}");
-    ensure!(text.contains(&schema), "expected preserved owned schema `{schema}` in error: {text}");
-    ensure!(marker.is_file(), "probe worker did not migrate `{schema}` before timeout");
-    ensure!(
-        Db::schema_exists(&pg_url, &schema).await?,
-        "owned schema `{schema}` must NOT be dropped when child exit/reap is unconfirmed"
-    );
+    if !probe.real_child_reaped {
+        return match probe.result {
+            Err(err) => {
+                Err(err
+                    .context(format!("real child exit/reap failed; preserving owned schema `{schema}` without DROP")))
+            }
+            Ok(_) => Err(anyhow!(
+                "real child exit/reap could not be confirmed; preserving owned schema `{schema}` without DROP"
+            )),
+        };
+    }
 
-    Db::drop_owned_schema(&pg_url, &schema).await?;
-    ensure!(
-        !Db::schema_exists(&pg_url, &schema).await?,
-        "final test-harness drop_owned_schema failed to remove `{schema}`"
-    );
-    Ok(())
+    let check_res: Result<()> = async {
+        let err = match probe.result {
+            Err(err) => err,
+            Ok(_) => return Err(anyhow!("simulated reap failure probe must fail")),
+        };
+        let text = format!("{err:#}");
+        ensure!(text.contains("cleanup-not-complete"), "expected cleanup-not-complete error, got: {text}");
+        ensure!(text.contains(&schema), "expected preserved owned schema `{schema}` in error: {text}");
+        ensure!(marker.is_file(), "probe worker did not migrate `{schema}` before timeout");
+        ensure!(
+            Db::schema_exists(&pg_url, &schema).await?,
+            "owned schema `{schema}` must NOT be dropped when child exit/reap is unconfirmed"
+        );
+        Ok(())
+    }
+    .await;
+
+    let cleanup_res: Result<()> = match tokio::time::timeout(Duration::from_secs(10), async {
+        Db::drop_owned_schema(&pg_url, &schema).await?;
+        ensure!(
+            !Db::schema_exists(&pg_url, &schema).await?,
+            "final test-harness drop_owned_schema failed to remove `{schema}`"
+        );
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    {
+        Ok(inner) => inner,
+        Err(_) => Err(anyhow!("timed out after 10s cleaning up owned schema `{schema}`")),
+    };
+
+    match (check_res, cleanup_res) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(c_err)) => Err(c_err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(c_err)) => {
+            Err(err.context(format!("additionally, bounded cleanup of owned schema `{schema}` failed: {c_err:#}")))
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
