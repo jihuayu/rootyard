@@ -66,8 +66,9 @@ const TEST_KEY_ID: u8 = 7;
 const TEST_KEY_BYTES: [u8; 32] = [0x5a; 32];
 /// Lifetime signed into every frame for this run.
 const BOUNDED_LIFETIME: u32 = 300;
-/// Bound on each fixture HTTP call.
+/// Bound on each fixture HTTP call and on the whole Chromium run.
 const HTTP_SECONDS: u64 = 300;
+const BROWSER_SECONDS: u64 = 600;
 /// The default Chromium of the browser image; `ROOTYARD_TEST_CHROMIUM`
 /// overrides it.
 const DEFAULT_CHROMIUM: &str = "/usr/bin/chromium";
