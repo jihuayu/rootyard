@@ -691,6 +691,31 @@ class TestJobManifest(unittest.TestCase):
         )
         return batch_path
 
+    def mutate_published_test_cohort(self, batch_path, change):
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        for row in manifest["build"]["cargo_artifacts"]:
+            if row.get("kind") == "test":
+                change(row)
+        for entry in manifest["artifacts"]:
+            if entry.get("kind") == "test":
+                change(entry)
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return batch_path
+
+    def assert_producer_rejected(self, batch_path, expected):
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(expected, self.fixture.last_process.stderr)
+        failed = json.loads(
+            (self.fixture.root / "manifests/job.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(failed["status"], "failed")
+
     def test_accepts_evidence_bound_to_the_built_binary(self):
         manifest = json.loads(self.fixture.job().read_text())
         self.assertEqual(manifest["kind"], "rootyard/native-acceptance-job-manifest")
@@ -1009,7 +1034,9 @@ class TestJobManifest(unittest.TestCase):
     def test_rejects_v2_test_row_that_differs_from_published_artifact(self):
         batch_path = self.fixture.enable_v2_producer_batch_receipt()
         manifest = json.loads(batch_path.read_text(encoding="utf-8"))
-        manifest["build"]["cargo_artifacts"][-1]["source_sha256"] = "0" * 64
+        rows = manifest["build"]["cargo_artifacts"]
+        rows[-1]["source"] = rows[-2]["source"]
+        rows[-1]["source_sha256"] = rows[-2]["source_sha256"]
         batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         self.fixture.job(
             extra=(
@@ -1019,7 +1046,7 @@ class TestJobManifest(unittest.TestCase):
             expect=1,
         )
         self.assertIn(
-            "source_sha256 does not match the build row",
+            "source does not match the build row",
             self.fixture.last_process.stderr,
         )
 
@@ -1182,6 +1209,64 @@ class TestJobManifest(unittest.TestCase):
             expect=1,
         )
         self.assertIn("package_id is required", self.fixture.last_process.stderr)
+
+    def test_rejects_v2_test_row_and_entry_with_null_package_id(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        self.mutate_published_test_cohort(
+            batch_path, lambda item: item.__setitem__("package_id", None)
+        )
+        self.assert_producer_rejected(batch_path, "package_id")
+
+    def test_rejects_v2_test_row_and_entry_with_empty_source(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        self.mutate_published_test_cohort(
+            batch_path, lambda item: item.__setitem__("source", "")
+        )
+        self.assert_producer_rejected(batch_path, "source")
+
+    def test_rejects_v2_test_row_and_entry_with_malformed_profile(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        self.mutate_published_test_cohort(
+            batch_path, lambda item: item.__setitem__("profile", {"test": True})
+        )
+        self.assert_producer_rejected(batch_path, "profile")
+
+    def test_rejects_v2_test_row_and_entry_with_null_source_sha256(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        self.mutate_published_test_cohort(
+            batch_path, lambda item: item.__setitem__("source_sha256", None)
+        )
+        self.assert_producer_rejected(batch_path, "source_sha256")
+
+    def test_rejects_v2_test_row_with_wrong_package_matching_entry(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        self.mutate_published_test_cohort(
+            batch_path, lambda item: item.__setitem__("package_id", "foreign 9.9.9")
+        )
+        self.assert_producer_rejected(
+            batch_path, "does not match validated receipt package"
+        )
+
+    def test_rejects_v2_test_row_with_absent_inventory_source_matching_entry(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+
+        def use_absent_source(item):
+            item["source"] = "tests/foreign_extra_fixture.rs"
+            item["source_sha256"] = "0" * 64
+
+        self.mutate_published_test_cohort(batch_path, use_absent_source)
+        self.assert_producer_rejected(
+            batch_path, "is not present in the validated receipt inventory"
+        )
+
+    def test_rejects_v2_test_row_with_wrong_source_digest_matching_entry(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        self.mutate_published_test_cohort(
+            batch_path, lambda item: item.__setitem__("source_sha256", "0" * 64)
+        )
+        self.assert_producer_rejected(
+            batch_path, "hash does not match the validated receipt inventory"
+        )
 
     def test_fixture_rust_from_receipt_records_full_v1_and_v2_versions_without_compilers(self):
         # An empty PATH makes any accidental bare rustc/cargo probe fail; the

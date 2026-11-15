@@ -498,12 +498,46 @@ def _require_v2_batch_scope(manifest, batch_targets, artifact_rows, typed_target
 
     A batch bin receipt names the lib and every selected/implicit bin.  The same
     one-command batch manifest also appends the selected integration tests, so
-    those extra test rows must form a suffix and remain bound to the manifest's
-    published test artifacts.  A test receipt names the full lib/bin/test
-    cohort and binds its own test row to the validated receipt.
+    those extra test rows must form a suffix, match the recorded ordered
+    ``--test`` requests, revalidate against the shared v2 artifact schema, and
+    bind their package and source digest to the validated receipt.  A test
+    receipt names the full lib/bin/test cohort and binds its own test row to the
+    validated receipt.
     """
     test_rows = [row for row in artifact_rows if row["kind"] == "test"]
     non_test_rows = [row for row in artifact_rows if row["kind"] != "test"]
+    if test_rows:
+        try:
+            test_rows = receipts._validate_v2_artifacts(test_rows, label)
+        except receipts.ReceiptError as error:
+            raise ManifestError(str(error)) from None
+        package_ids = {row.get("package_id") for row in validated.artifacts}
+        require(
+            len(package_ids) == 1,
+            f"{label}: validated receipt does not record exactly one package identity",
+        )
+        package_id = next(iter(package_ids))
+        entries_by_path = {
+            entry["path"]: entry
+            for entry in validated.payload.get("bound_input_inventory", [])
+        }
+        for row in test_rows:
+            require(
+                row["package_id"] == package_id,
+                f"{label}: test artifact package_id {row['package_id']!r} "
+                f"does not match validated receipt package {package_id!r}",
+            )
+            bound_entry = entries_by_path.get(row["source"])
+            require(
+                bound_entry is not None and bound_entry.get("present") is True,
+                f"{label}: test artifact source {row['source']} "
+                "is not present in the validated receipt inventory",
+            )
+            require(
+                bound_entry.get("sha256") == row["source_sha256"],
+                f"{label}: test artifact source {row['source']} "
+                "hash does not match the validated receipt inventory",
+            )
     requested_tests = _recorded_test_targets(receipt.get("command"), label)
     require(
         [row["target"] for row in test_rows] == requested_tests,
