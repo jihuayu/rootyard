@@ -130,14 +130,15 @@ UPDATE`, and are continuously exercised by `tests/token_management.py` in CI.
 * `POST /web/login` (form-urlencoded `username` + `token`, matching browser
   `Origin`, TLS/loopback guard) accepts active `kind = 'api'` tokens — both
   **unrestricted** and **restricted** — and rejects `kind = 'browser'` tokens
-  with `403` so browser children cannot mint chained sessions.
+  with `401` (`StatusCode::UNAUTHORIZED`) so browser children cannot mint chained sessions.
 * When minting a `kind = 'browser'` child in `src/web/session.rs`, `login` copies
   `is_restricted = p.is_restricted`, clamps `read_only = ($4 OR p.read_only)`,
-  and caps `expires_at = LEAST(now + 12h, p.expires_at)`. No mutable grant rows
+  and caps `expires_at = LEAST(clock_timestamp() + interval '12 hours', COALESCE(p.expires_at, clock_timestamp() + interval '12 hours'))`. No mutable grant rows
   are duplicated onto the child token.
-* On every browser request, `validate_session`, `auth::authenticate`,
-  `auth::browser_parent`, and `token_scopes::{browser_parent, *_with_parent}`
-  join child `t` and parent `p` live (`FOR SHARE OF t, p`) so parent revocation,
+* On every browser request, `validate_session` and `auth::authenticate` join
+  child `t` and parent `p` live (`LEFT JOIN` read), and transactional guards in
+  `auth::browser_parent` and `token_scopes::{browser_parent, *_with_parent}`
+  lock child `t` and parent `p` (`FOR SHARE OF t, p`) so parent revocation,
   expiry, rotation, RBAC role loss, `read_only` flip, `PATCH` narrowing, or
   legacy unrestricted-to-restricted upgrade take effect immediately on already-minted
   browser cookies without widening authority.
@@ -171,12 +172,12 @@ remain independent.
 
 ## Verification
 
-* Unit and PostgreSQL integration tests in `src/token_scopes/tests.rs` cover
-  stable action text, mutating classification, empty-grant denial, per-repository
+* Unit and PostgreSQL integration tests in `src/token_scopes/{tests.rs, browser_parent.rs}`
+  cover stable action text, mutating classification, empty-grant denial, per-repository
   exactness, read-only intersection, `clock_timestamp()` expiry, `FOR SHARE`
   vs `FOR UPDATE` blocking (`pg_blocking_pids`), display-name bounds,
-  `inherited_authority_narrows_to_parent_repo_and_read_only_flags`, and
-  `browser_child_inherits_parent_scopes_and_live_mutations`.
+  `inherited_authority_narrows_to_parent_repo_and_read_only_flags` (`browser_parent.rs`), and
+  `browser_child_inherits_parent_scopes_and_live_mutations` (`tests.rs`).
 * Native CI `verify` runs `tests/pat_scope_auth.py --binary --report`,
   `tests/token_management.py --binary --report`, and
   `tests/web_repository_pagination.py --binary --report` against a compiled
