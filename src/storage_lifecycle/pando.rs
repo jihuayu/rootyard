@@ -424,13 +424,13 @@ async fn delete_tombstones(
     let remote =
         crate::storage::remote_objects::RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
     let deadline = Instant::now() + MAINTENANCE_DEADLINE;
-    let verified = crate::pando_gateway::pitr_fence::verify_or_attest(
+    let verified = Box::pin(crate::pando_gateway::pitr_fence::verify_or_attest(
         &state.pool,
         &state.storage.root,
         &remote,
         deadline,
         "attest",
-    )
+    ))
     .await?;
     ensure!(verified.authority_id == authority.id && !verified.remote_delete_fenced, "Pando authority fenced");
     let linked = "EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
@@ -510,7 +510,7 @@ async fn delete_tombstones(
         if lease.ensure_active().is_err() {
             break;
         }
-        if let Err(error) = remote.delete(&key, deadline).await {
+        if let Err(error) = Box::pin(remote.delete(&key, deadline)).await {
             let _ = client
                 .execute(
                     "UPDATE pando_remote_artifacts SET state='retired',claimed_by=NULL,lease_until=NULL, \
@@ -615,8 +615,14 @@ async fn repack(
     let store = PackStore::from_env(state.storage.root.join("pando-pack-work"), state.config.git.clone())?;
     let remote =
         crate::storage::remote_objects::RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
-    crate::pando_gateway::pitr_fence::verify_or_attest(&state.pool, &state.storage.root, &remote, deadline, "attest")
-        .await?;
+    Box::pin(crate::pando_gateway::pitr_fence::verify_or_attest(
+        &state.pool,
+        &state.storage.root,
+        &remote,
+        deadline,
+        "attest",
+    ))
+    .await?;
     let manifest = lease
         .guard(Box::pin(store.publish(
             &state.pool,

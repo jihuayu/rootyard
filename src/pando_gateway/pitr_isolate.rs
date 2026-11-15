@@ -14,11 +14,11 @@
 //! missing, retired, deleting, deleted, or partial live closure fails closed
 //! before modifying PostgreSQL.
 use crate::{
-    pando_gateway::{pack_store::PackManifest, pitr_fence, retention},
+    pando_gateway::{pack_store::PackManifest, pitr_fence, pitr_lock::AuthorityLockGuard, retention},
     storage::remote_objects::{ObjectKey, RemoteObjectStore},
 };
 use anyhow::{Context, Result, bail, ensure};
-use deadpool_postgres::Pool;
+use deadpool_postgres::{Object, Pool};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -151,8 +151,7 @@ async fn validate_legacy_manifest<C: GenericClient + Sync>(
     );
     for (_, ns, sha, expected_size) in expected_manifest_roles(&manifest.parsed) {
         let key = ObjectKey::new(manifest.tenant_id, ns, sha)?;
-        let stored = remote
-            .head(&key, deadline)
+        let stored = Box::pin(remote.head(&key, deadline))
             .await?
             .with_context(|| format!("legacy Pando object {} missing from object store; cannot isolate", key.path()))?;
         ensure!(stored.size == expected_size, "legacy Pando object {} size mismatch", key.path());
@@ -222,7 +221,7 @@ async fn stage_live_migration<C: GenericClient + Sync>(
     let mut links = Vec::new();
     for manifest in &manifests {
         let Some(role_map) = by_manifest.get(&manifest.id) else {
-            validate_legacy_manifest(client, remote, old_authority_id, manifest, deadline).await?;
+            Box::pin(validate_legacy_manifest(client, remote, old_authority_id, manifest, deadline)).await?;
             continue;
         };
         ensure!(
@@ -298,7 +297,7 @@ async fn copy_staged_artifacts(
 ) -> Result<()> {
     tokio::fs::create_dir_all(work_dir).await?;
     for (idx, artifact) in artifacts.values().enumerate() {
-        let stored = remote.head(&artifact.src_key, deadline).await?.with_context(|| {
+        let stored = Box::pin(remote.head(&artifact.src_key, deadline)).await?.with_context(|| {
             format!("cannot isolate cloned authority: source object {} missing", artifact.src_key.path())
         })?;
         ensure!(
@@ -309,18 +308,106 @@ async fn copy_staged_artifacts(
             artifact.size
         );
         let stage_path = work_dir.join(format!("{idx}-{}.bin", artifact.src_key.sha256));
-        remote
-            .get_to_file(&artifact.src_key, &stage_path, artifact.size, deadline)
+        Box::pin(remote.get_to_file(&artifact.src_key, &stage_path, artifact.size, deadline))
             .await
             .with_context(|| format!("download live scoped object {} during isolate", artifact.src_key.path()))?;
-        let put_res = remote
-            .put_file(&artifact.dst_key, &stage_path, artifact.size, deadline)
+        let put_res = Box::pin(remote.put_file(&artifact.dst_key, &stage_path, artifact.size, deadline))
             .await
             .with_context(|| format!("upload isolated scoped object {} during isolate", artifact.dst_key.path()));
         let _ = tokio::fs::remove_file(&stage_path).await;
         put_res?;
     }
     Ok(())
+}
+
+struct MigrationPlan<'a> {
+    previous_id: Uuid,
+    new_authority_id: Uuid,
+    staged_manifest_ids: &'a [Uuid],
+    artifacts: &'a BTreeMap<ArtifactKey, StagedArtifact>,
+    links: &'a [MigratedLink],
+}
+
+async fn commit_isolated_authority_locked(
+    client: &mut Object,
+    data_dir: &Path,
+    remote: &RemoteObjectStore,
+    plan: &MigrationPlan<'_>,
+    deadline: Instant,
+) -> Result<pitr_fence::AuthorityState> {
+    let tx = client.transaction().await?;
+    let locked_auth: Uuid = tx
+        .query_one("SELECT authority_id FROM pando_storage_authorities WHERE singleton FOR UPDATE", &[])
+        .await?
+        .get(0);
+    ensure!(locked_auth == plan.previous_id, "pando_storage_authorities changed concurrently during isolate");
+
+    let current_live_rows = tx
+        .query(
+            "SELECT DISTINCT u.pack_id FROM pando_repository_states s \
+             CROSS JOIN LATERAL unnest(s.pack_ids) AS u(pack_id) ORDER BY u.pack_id",
+            &[],
+        )
+        .await?;
+    let current_live_ids: BTreeSet<Uuid> = current_live_rows.into_iter().map(|r| r.get(0)).collect();
+    let staged_set: BTreeSet<Uuid> = plan.staged_manifest_ids.iter().copied().collect();
+    ensure!(current_live_ids == staged_set, "live Pando pack set changed concurrently during isolate");
+
+    tx.execute("DELETE FROM pando_retention_root_manifests", &[]).await?;
+    tx.execute("DELETE FROM pando_retention_roots", &[]).await?;
+    tx.execute("DELETE FROM pando_manifest_artifacts", &[]).await?;
+    tx.execute("DELETE FROM pando_publication_fences", &[]).await?;
+    tx.execute("DELETE FROM pando_remote_artifacts", &[]).await?;
+    tx.execute(
+        "UPDATE pando_storage_authorities \
+         SET authority_id = $1, generation = 1, restore_generation = restore_generation + 1, \
+             authority_epoch = 1, deployment_id = NULL, volume_id = NULL, \
+             db_system_identifier = NULL, db_database_oid = NULL, db_schema_oid = NULL, \
+             pg_timeline_id = NULL, backend_identity = NULL, proof_nonce = NULL, \
+             remote_delete_fenced = false, remote_delete_fence_reason = NULL, attested_at = NULL, \
+             created_at = clock_timestamp(), rotated_at = clock_timestamp() \
+         WHERE singleton",
+        &[&plan.new_authority_id],
+    )
+    .await?;
+
+    for (key, art) in plan.artifacts {
+        tx.execute(
+            "INSERT INTO pando_remote_artifacts \
+             (authority_id, tenant_id, namespace, sha256, size, object_generation, remote_path, state) \
+             VALUES ($1, $2, $3, $4, $5, 1, $6, 'active')",
+            &[
+                &plan.new_authority_id,
+                &key.tenant_id,
+                &key.namespace,
+                &key.sha256,
+                &(art.size as i64),
+                &art.dst_key.path(),
+            ],
+        )
+        .await?;
+    }
+    for link in plan.links {
+        tx.execute(
+            "INSERT INTO pando_manifest_artifacts \
+             (manifest_id, repository_id, authority_id, tenant_id, namespace, sha256, artifact_role) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &link.manifest_id,
+                &link.repository_id,
+                &plan.new_authority_id,
+                &link.tenant_id,
+                &link.namespace,
+                &link.sha256,
+                &link.role,
+            ],
+        )
+        .await?;
+    }
+    tx.commit().await?;
+
+    pitr_fence::clear_claim_file_best_effort(data_dir, plan.previous_id);
+    Box::pin(pitr_fence::verify_or_attest_locked(client, data_dir, remote, deadline, "isolate_authority")).await
 }
 
 /// Mint a new authority for a cloned/restored database, preserving all live
@@ -340,7 +427,7 @@ pub async fn isolate_cloned_authority(
     let new_authority_id = Uuid::new_v4();
     let (staged_manifest_ids, artifacts, links) = {
         let client = pool.get().await?;
-        stage_live_migration(&**client, remote, previous.id, new_authority_id, deadline).await?
+        Box::pin(stage_live_migration(&**client, remote, previous.id, new_authority_id, deadline)).await?
     };
 
     let _work_guard = if artifacts.is_empty() {
@@ -348,84 +435,19 @@ pub async fn isolate_cloned_authority(
     } else {
         let work_dir = data_dir.join(format!("pando-isolate-{}", Uuid::new_v4()));
         let guard = IsolateWorkDir(work_dir.clone());
-        copy_staged_artifacts(remote, &work_dir, &artifacts, deadline).await?;
+        Box::pin(copy_staged_artifacts(remote, &work_dir, &artifacts, deadline)).await?;
         Some(guard)
     };
 
-    {
-        let mut client = pool.get().await?;
-        let tx = client.transaction().await?;
-        let locked_auth: Uuid = tx
-            .query_one("SELECT authority_id FROM pando_storage_authorities WHERE singleton FOR UPDATE", &[])
-            .await?
-            .get(0);
-        ensure!(locked_auth == previous.id, "pando_storage_authorities changed concurrently during isolate");
-
-        let current_live_rows = tx
-            .query(
-                "SELECT DISTINCT u.pack_id FROM pando_repository_states s \
-                 CROSS JOIN LATERAL unnest(s.pack_ids) AS u(pack_id) ORDER BY u.pack_id",
-                &[],
-            )
-            .await?;
-        let current_live_ids: BTreeSet<Uuid> = current_live_rows.into_iter().map(|r| r.get(0)).collect();
-        let staged_set: BTreeSet<Uuid> = staged_manifest_ids.iter().copied().collect();
-        ensure!(current_live_ids == staged_set, "live Pando pack set changed concurrently during isolate");
-
-        tx.execute("DELETE FROM pando_retention_root_manifests", &[]).await?;
-        tx.execute("DELETE FROM pando_retention_roots", &[]).await?;
-        tx.execute("DELETE FROM pando_manifest_artifacts", &[]).await?;
-        tx.execute("DELETE FROM pando_publication_fences", &[]).await?;
-        tx.execute("DELETE FROM pando_remote_artifacts", &[]).await?;
-        tx.execute(
-            "UPDATE pando_storage_authorities \
-             SET authority_id = $1, generation = 1, restore_generation = restore_generation + 1, \
-                 authority_epoch = 1, deployment_id = NULL, volume_id = NULL, \
-                 db_system_identifier = NULL, db_database_oid = NULL, db_schema_oid = NULL, \
-                 pg_timeline_id = NULL, backend_identity = NULL, proof_nonce = NULL, \
-                 remote_delete_fenced = false, remote_delete_fence_reason = NULL, attested_at = NULL, \
-                 created_at = clock_timestamp(), rotated_at = clock_timestamp() \
-             WHERE singleton",
-            &[&new_authority_id],
-        )
-        .await?;
-
-        for (key, art) in &artifacts {
-            tx.execute(
-                "INSERT INTO pando_remote_artifacts \
-                 (authority_id, tenant_id, namespace, sha256, size, object_generation, remote_path, state) \
-                 VALUES ($1, $2, $3, $4, $5, 1, $6, 'active')",
-                &[
-                    &new_authority_id,
-                    &key.tenant_id,
-                    &key.namespace,
-                    &key.sha256,
-                    &(art.size as i64),
-                    &art.dst_key.path(),
-                ],
-            )
-            .await?;
-        }
-        for link in &links {
-            tx.execute(
-                "INSERT INTO pando_manifest_artifacts \
-                 (manifest_id, repository_id, authority_id, tenant_id, namespace, sha256, artifact_role) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                &[
-                    &link.manifest_id,
-                    &link.repository_id,
-                    &new_authority_id,
-                    &link.tenant_id,
-                    &link.namespace,
-                    &link.sha256,
-                    &link.role,
-                ],
-            )
-            .await?;
-        }
-        tx.commit().await?;
-    }
-
-    pitr_fence::clear_claim_file_best_effort(data_dir, previous.id);
-    pitr_fence::verify_or_attest(pool, data_dir, remote, deadline, "isolate_authority").await
+    let plan = MigrationPlan {
+        previous_id: previous.id,
+        new_authority_id,
+        staged_manifest_ids: &staged_manifest_ids,
+        artifacts: &artifacts,
+        links: &links,
+    };
+    let mut lock = AuthorityLockGuard::acquire(pool, deadline).await?;
+    let res = Box::pin(commit_isolated_authority_locked(lock.client_mut(), data_dir, remote, &plan, deadline)).await;
+    lock.release().await;
+    res
 }

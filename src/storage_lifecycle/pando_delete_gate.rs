@@ -53,7 +53,7 @@ pub async fn check_scheduler_gate(state: &AppState, deadline: Instant) -> Result
             return Ok(DeleteGateDecision::Fenced { reason: error.to_string() });
         }
     };
-    match pitr_fence::verify_or_attest(&state.pool, &state.storage.root, &remote, deadline, "attest").await {
+    match Box::pin(pitr_fence::verify_or_attest(&state.pool, &state.storage.root, &remote, deadline, "attest")).await {
         Ok(authority) => Ok(DeleteGateDecision::Allowed(Box::new(authority))),
         Err(error) => Ok(DeleteGateDecision::Fenced { reason: error.to_string() }),
     }
@@ -68,7 +68,7 @@ pub async fn enter_fenced_delete_execution(
     deadline: Instant,
 ) -> Result<AuthorityState> {
     ensure!(remote_delete_env_enabled()?, "ROOTYARD_PANDO_REMOTE_DELETE is not enabled");
-    pitr_fence::advance_epoch(&state.pool, &state.storage.root, remote, "delete_epoch", deadline).await
+    Box::pin(pitr_fence::advance_epoch(&state.pool, &state.storage.root, remote, "delete_epoch", deadline)).await
 }
 
 /// Verify an artifact row carries an authoritative scoped key owned by the

@@ -182,7 +182,7 @@ impl RemoteObjectStore {
         let key = authority_proof_key(authority_id, epoch)?;
         let raw = match self {
             Self::Local(root) => local_read_proof(root, &key)?,
-            Self::OpenDal(store) => s3_read_proof_if_exists(store, &key, deadline).await?,
+            Self::OpenDal(store) => Box::pin(s3_read_proof_if_exists(store, &key, deadline)).await?,
         };
         let Some(bytes) = raw else {
             return Ok(None);
@@ -204,12 +204,12 @@ impl RemoteObjectStore {
         ensure!(payload.len() <= MAX_AUTHORITY_PROOF_BYTES, "authority proof exceeds size bound");
         let created = match self {
             Self::Local(root) => local_put_proof_if_absent(root, &key, &payload)?,
-            Self::OpenDal(store) => s3_put_proof_if_absent(store, &key, payload, deadline).await?,
+            Self::OpenDal(store) => Box::pin(s3_put_proof_if_absent(store, &key, payload, deadline)).await?,
         };
         if created {
             Ok(AuthorityCreateOutcome::Created)
         } else {
-            let existing = self.read_authority_proof(proof.authority_id, proof.epoch, deadline).await?;
+            let existing = Box::pin(self.read_authority_proof(proof.authority_id, proof.epoch, deadline)).await?;
             Ok(AuthorityCreateOutcome::AlreadyExists(existing))
         }
     }

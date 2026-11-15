@@ -73,7 +73,7 @@ impl RemoteObjectStore {
                 Self::Local(_) => None,
                 Self::OpenDal(store) => Some(store.read_stream(&rel_path, deadline).await.map_err(object_error)?),
             };
-            let mut buf = [0u8; READ_CHUNK];
+            let mut buf = vec![0u8; READ_CHUNK];
             let mut hash = Sha256::new();
             let mut size = 0u64;
             loop {

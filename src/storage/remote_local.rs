@@ -33,7 +33,7 @@ pub(crate) async fn hash_file(path: &Path, deadline: Instant) -> Result<(String,
     let mut file = File::open(path).await?;
     let mut hash = Sha256::new();
     let mut size = 0u64;
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = tokio::time::timeout_at(deadline, file.read(&mut buf)).await??;
         if n == 0 {

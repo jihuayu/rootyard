@@ -350,10 +350,10 @@ async fn seed_manifest(
         (pc_slot, pe_slot, ic_slot, ie_slot)
     };
 
-    remote.put_file(pc_slot.key(), &pc_path, pc_len, deadline()).await?;
-    remote.put_file(pe_slot.key(), &pe_path, pe_len, deadline()).await?;
-    remote.put_file(ic_slot.key(), &ic_path, ic_len, deadline()).await?;
-    remote.put_file(ie_slot.key(), &ie_path, ie_len, deadline()).await?;
+    Box::pin(remote.put_file(pc_slot.key(), &pc_path, pc_len, deadline())).await?;
+    Box::pin(remote.put_file(pe_slot.key(), &pe_path, pe_len, deadline())).await?;
+    Box::pin(remote.put_file(ic_slot.key(), &ic_path, ic_len, deadline())).await?;
+    Box::pin(remote.put_file(ie_slot.key(), &ie_path, ie_len, deadline())).await?;
 
     let manifest = PackManifest {
         version: 1,
@@ -486,7 +486,7 @@ async fn verify_retention_roots_and_pruning(
         .await?;
 
     Box::pin(scheduler::schedule_once(state_a, policy)).await?;
-    drain_worker(state_a, policy).await?;
+    Box::pin(drain_worker(state_a, policy)).await?;
 
     // Force m_drop's retired rows past tombstone grace and verify remote delete advances epoch 2 -> 3
     // while keeping m_keep, m_pinned, legacy_key, and foreign_key intact.
@@ -501,7 +501,7 @@ async fn verify_retention_roots_and_pruning(
     pool_a.get().await?.execute("UPDATE storage_maintenance_repo_state SET last_scan_at=NULL", &[]).await?;
     s3.take_deletes();
     Box::pin(scheduler::schedule_once(state_a, policy)).await?;
-    drain_worker(state_a, policy).await?;
+    Box::pin(drain_worker(state_a, policy)).await?;
 
     let post_del_epoch = pitr_fence::load_authority_state(&**pool_a.get().await?).await?.authority_epoch;
     ensure!(post_del_epoch == 3, "expected epoch advance 2 -> 3 on real remote deletion");
@@ -518,7 +518,7 @@ async fn verify_retention_roots_and_pruning(
     ensure!(retention_roots::release_recovery_root(pool_a, pin.id).await?);
     pool_a.get().await?.execute("UPDATE storage_maintenance_repo_state SET last_scan_at=NULL", &[]).await?;
     Box::pin(scheduler::schedule_once(state_a, policy)).await?;
-    drain_worker(state_a, policy).await?;
+    Box::pin(drain_worker(state_a, policy)).await?;
     pool_a
         .get()
         .await?
@@ -529,12 +529,92 @@ async fn verify_retention_roots_and_pruning(
         .await?;
     pool_a.get().await?.execute("UPDATE storage_maintenance_repo_state SET last_scan_at=NULL", &[]).await?;
     Box::pin(scheduler::schedule_once(state_a, policy)).await?;
-    drain_worker(state_a, policy).await?;
+    Box::pin(drain_worker(state_a, policy)).await?;
     ensure!(pitr_fence::load_authority_state(&**pool_a.get().await?).await?.authority_epoch == 4);
     ensure!(!s3.contains(&m_pinned.pack_cipher_key.path()), "expected released pin pack removed");
     ensure!(s3.contains(&m_keep.pack_cipher_key.path()), "m_keep must remain preserved");
     ensure!(s3.contains(&legacy_key.path()), "legacy v1 object must stay preserved");
     ensure!(s3.contains(&foreign_key.path()), "foreign authority object must stay preserved");
+    Box::pin(verify_concurrent_epoch_advances(primary)).await?;
+    Ok(())
+}
+
+async fn verify_concurrent_epoch_advances(primary: &PrimaryRefs<'_>) -> Result<()> {
+    let before = pitr_fence::load_authority_state(&**primary.pool.get().await?).await?;
+    ensure!(!before.remote_delete_fenced, "authority unexpectedly fenced before concurrency check");
+
+    let (pin_1, pin_2, del_1, del_2, att_1, att_2) = tokio::join!(
+        Box::pin(retention_roots::pin_recovery_root(
+            primary.pool,
+            &primary.state.storage.root,
+            primary.remote,
+            primary.owner,
+            Some(primary.repo),
+            RetentionRootKind::PitrRecoveryPoint,
+            Some("concurrent-pin-1"),
+            Some(3600),
+            &[],
+            deadline(),
+        )),
+        Box::pin(retention_roots::pin_recovery_root(
+            primary.pool,
+            &primary.state.storage.root,
+            primary.remote,
+            primary.owner,
+            Some(primary.repo),
+            RetentionRootKind::PitrRecoveryPoint,
+            Some("concurrent-pin-2"),
+            Some(3600),
+            &[],
+            deadline(),
+        )),
+        Box::pin(pando_delete_gate::enter_fenced_delete_execution(primary.state, primary.remote, deadline())),
+        Box::pin(pando_delete_gate::enter_fenced_delete_execution(primary.state, primary.remote, deadline())),
+        Box::pin(pitr_fence::verify_or_attest(
+            primary.pool,
+            &primary.state.storage.root,
+            primary.remote,
+            deadline(),
+            "concurrent_attest_1",
+        )),
+        Box::pin(pitr_fence::verify_or_attest(
+            primary.pool,
+            &primary.state.storage.root,
+            primary.remote,
+            deadline(),
+            "concurrent_attest_2",
+        )),
+    );
+
+    let pin_1 = pin_1.context("concurrent pin_recovery_root #1 failed")?;
+    let pin_2 = pin_2.context("concurrent pin_recovery_root #2 failed")?;
+    let del_1 = del_1.context("concurrent enter_fenced_delete_execution #1 failed")?;
+    let del_2 = del_2.context("concurrent enter_fenced_delete_execution #2 failed")?;
+    let att_1 = att_1.context("concurrent verify_or_attest #1 failed")?;
+    let att_2 = att_2.context("concurrent verify_or_attest #2 failed")?;
+    ensure!(
+        !del_1.remote_delete_fenced
+            && !del_2.remote_delete_fenced
+            && !att_1.remote_delete_fenced
+            && !att_2.remote_delete_fenced,
+        "intra-deployment concurrency self-fenced healthy authority"
+    );
+
+    let after = pitr_fence::load_authority_state(&**primary.pool.get().await?).await?;
+    ensure!(!after.remote_delete_fenced, "post-concurrency authority state must stay unfenced");
+    ensure!(
+        after.authority_epoch == before.authority_epoch + 4,
+        "expected 4 serialized epoch advances under advisory lock, got {} -> {}",
+        before.authority_epoch,
+        after.authority_epoch
+    );
+    for epoch in (before.authority_epoch + 1)..=after.authority_epoch {
+        let proof_key = format!("pando-authorities/{}/epochs/{epoch:020}.json", after.authority_id);
+        ensure!(primary.s3.contains(&proof_key), "missing serialized epoch proof {proof_key}");
+    }
+
+    ensure!(retention_roots::release_recovery_root(primary.pool, pin_1.id).await?, "release pin_1");
+    ensure!(retention_roots::release_recovery_root(primary.pool, pin_2.id).await?, "release pin_2");
     Ok(())
 }
 
@@ -568,7 +648,7 @@ async fn verify_clone_fencing_and_isolate(
         "protected",
     ))
     .await?;
-    clone_schema_metadata(admin, schema_a, schema_b).await?;
+    Box::pin(clone_schema_metadata(admin, schema_a, schema_b)).await?;
     pool_b
         .get()
         .await?
@@ -591,7 +671,7 @@ async fn verify_clone_fencing_and_isolate(
     let auth_b = pitr_fence::load_authority_state(&**pool_b.get().await?).await?;
     ensure!(auth_b.remote_delete_fenced, "clone authority row must latch remote_delete_fenced=true");
     jobs::enqueue(pool_b, primary.repo, primary.owner, 1, "pando_tombstone_delete").await?;
-    drain_worker(&state_b, primary.policy).await?;
+    Box::pin(drain_worker(&state_b, primary.policy)).await?;
     let clone_job_state: String = pool_b
         .get()
         .await?
@@ -643,13 +723,11 @@ async fn verify_clone_fencing_and_isolate(
                 resolved.key.authority
             );
             ensure!(resolved.key.path() != old_key.path(), "isolated key must differ from source authority path");
-            let head = primary
-                .remote
-                .head(&resolved.key, deadline())
+            let head = Box::pin(primary.remote.head(&resolved.key, deadline()))
                 .await?
                 .context("isolated remote artifact missing in object store")?;
             let dest = hydrate_dir.join(format!("art-{idx}.bin"));
-            primary.remote.get_to_file(&resolved.key, &dest, head.size, deadline()).await?;
+            Box::pin(primary.remote.get_to_file(&resolved.key, &dest, head.size, deadline())).await?;
         }
     }
 
@@ -704,7 +782,7 @@ async fn verify_pitr_rollback_and_split_brain(
     ensure!(matches!(rollback_gate, DeleteGateDecision::Fenced { .. }), "PITR epoch rollback must fence");
     ensure!(pitr_fence::load_authority_state(&**primary.pool.get().await?).await?.remote_delete_fenced);
     jobs::enqueue(primary.pool, primary.repo, primary.owner, 1, "pando_tombstone_delete").await?;
-    drain_worker(primary.state, primary.policy).await?;
+    Box::pin(drain_worker(primary.state, primary.policy)).await?;
     ensure!(primary.s3.take_deletes().is_empty(), "PITR-rolled-back DB issued remote DELETE");
     ensure!(primary.s3.contains(&m_protected.pack_cipher_key.path()));
 
@@ -739,200 +817,203 @@ async fn verify_pitr_rollback_and_split_brain(
     Ok(())
 }
 
-#[tokio::test]
-async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
+const TEST_TOKIO_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+#[test]
+fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
     let Some(db_url) = std::env::var("ROOTYARD_TEST_DATABASE_URL").ok().filter(|v| !v.is_empty()) else {
         eprintln!("pando_pitr_fencing skipped: ROOTYARD_TEST_DATABASE_URL is unset");
         return Ok(());
     };
 
-    let admin = db::pool(&db_url)?;
-    let suffix = Uuid::new_v4().simple().to_string();
-    let schema_a = format!("pitr_a_{suffix}");
-    let schema_b = format!("pitr_b_{suffix}");
-    let schema_c = format!("pitr_c_{suffix}");
-    for s in [&schema_a, &schema_b, &schema_c] {
-        admin.get().await?.batch_execute(&format!("CREATE SCHEMA {s}")).await?;
-    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(TEST_TOKIO_STACK_BYTES)
+        .enable_all()
+        .build()?;
 
-    let admin_task = admin.clone();
-    let schema_a_task = schema_a.clone();
-    let schema_b_task = schema_b.clone();
-    let schema_c_task = schema_c.clone();
-    let result = tokio::spawn(Box::pin(async move {
-        let admin = admin_task;
-        let schema_a = schema_a_task;
-        let schema_b = schema_b_task;
-        let schema_c = schema_c_task;
-        let s3 = LoopbackS3::start().await?;
-        let tmp = TempDir::new()?;
-        let data_a = tmp.path().join("data-a");
-        let data_b = tmp.path().join("data-b");
-        let data_c = tmp.path().join("data-c");
-        let work_dir = tmp.path().join("work");
-        std::fs::create_dir_all(&work_dir)?;
+    runtime.block_on(async {
+        let admin = db::pool(&db_url)?;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let schema_a = format!("pitr_a_{suffix}");
+        let schema_b = format!("pitr_b_{suffix}");
+        let schema_c = format!("pitr_c_{suffix}");
+        for s in [&schema_a, &schema_b, &schema_c] {
+            admin.get().await?.batch_execute(&format!("CREATE SCHEMA {s}")).await?;
+        }
 
-        let _env = EnvGuard::set(&[
-            ("ROOTYARD_OBJECT_STORE_ENDPOINT", Some(&s3.endpoint)),
-            ("ROOTYARD_OBJECT_STORE_BUCKET", Some(s3.bucket)),
-            ("ROOTYARD_OBJECT_STORE_REGION", Some(s3.region)),
-            ("ROOTYARD_OBJECT_STORE_ACCESS_KEY", Some("pitr-test-ak")),
-            ("ROOTYARD_OBJECT_STORE_SECRET_KEY", Some("pitr-test-sk")),
-            ("ROOTYARD_OBJECT_STORE_SESSION_TOKEN", None),
-            ("ROOTYARD_PANDO_REMOTE_DELETE", Some("invalid-value")),
-        ]);
+        let result = tokio::spawn(Box::pin(run_pando_pitr_fencing(
+            admin.clone(),
+            db_url.clone(),
+            schema_a.clone(),
+            schema_b.clone(),
+            schema_c.clone(),
+        )))
+        .await
+        .context("pando_pitr_fencing test task panicked");
 
-        // 1. Fail-closed strict validation of ROOTYARD_PANDO_REMOTE_DELETE.
-        ensure!(
-            pando_delete_gate::remote_delete_env_enabled().is_err(),
-            "bogus ROOTYARD_PANDO_REMOTE_DELETE value must fail closed"
-        );
-        unsafe { std::env::set_var("ROOTYARD_PANDO_REMOTE_DELETE", "true") };
+        for s in [&schema_a, &schema_b, &schema_c] {
+            let _ = admin.get().await?.batch_execute(&format!("DROP SCHEMA IF EXISTS {s} CASCADE")).await;
+        }
 
-        let pool_a = schema_pool(&db_url, &schema_a)?;
-        let pool_b = schema_pool(&db_url, &schema_b)?;
-        let pool_c = schema_pool(&db_url, &schema_c)?;
-        db::migrate(&pool_a).await?;
-        db::migrate(&pool_b).await?;
-        db::migrate(&pool_c).await?;
+        result??;
+        Ok(())
+    })
+}
 
-        let state_a = app_state(test_config(db_url.clone(), data_a.clone()), pool_a.clone())?;
-        let policy = test_policy();
-        let remote = RemoteObjectStore::from_env(work_dir.clone())?;
+async fn run_pando_pitr_fencing(
+    admin: Pool,
+    db_url: String,
+    schema_a: String,
+    schema_b: String,
+    schema_c: String,
+) -> Result<()> {
+    let s3 = LoopbackS3::start().await?;
+    let tmp = TempDir::new()?;
+    let data_a = tmp.path().join("data-a");
+    let data_b = tmp.path().join("data-b");
+    let data_c = tmp.path().join("data-c");
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir)?;
 
-        // 2. Startup check writes external epoch-1 proof and binds PG + local volume coordinates.
-        Box::pin(pitr_fence::startup_check(&pool_a, &state_a.storage.root)).await?;
-        let auth_a = pitr_fence::load_authority_state(&**pool_a.get().await?).await?;
-        ensure!(auth_a.attested_at.is_some(), "expected attested authority after startup_check");
-        ensure!(auth_a.authority_epoch == 1 && auth_a.restore_generation == 0 && !auth_a.remote_delete_fenced);
-        ensure!(s3.contains(&format!("pando-authorities/{}/epochs/00000000000000000001.json", auth_a.authority_id)));
+    let _env = EnvGuard::set(&[
+        ("ROOTYARD_OBJECT_STORE_ENDPOINT", Some(&s3.endpoint)),
+        ("ROOTYARD_OBJECT_STORE_BUCKET", Some(s3.bucket)),
+        ("ROOTYARD_OBJECT_STORE_REGION", Some(s3.region)),
+        ("ROOTYARD_OBJECT_STORE_ACCESS_KEY", Some("pitr-test-ak")),
+        ("ROOTYARD_OBJECT_STORE_SECRET_KEY", Some("pitr-test-sk")),
+        ("ROOTYARD_OBJECT_STORE_SESSION_TOKEN", None),
+        ("ROOTYARD_PANDO_REMOTE_DELETE", Some("invalid-value")),
+    ]);
 
-        let owner = Uuid::new_v4();
-        let repo = Uuid::new_v4();
-        let slug = format!("u{}", &owner.simple().to_string()[..12]);
-        {
-            let client = pool_a.get().await?;
-            client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&owner, &slug]).await?;
-            client
-                .execute(
-                    "INSERT INTO repositories(id,owner_id,name,state,storage_backend,transition_state,storage_generation) \
+    // 1. Fail-closed strict validation of ROOTYARD_PANDO_REMOTE_DELETE.
+    ensure!(
+        pando_delete_gate::remote_delete_env_enabled().is_err(),
+        "bogus ROOTYARD_PANDO_REMOTE_DELETE value must fail closed"
+    );
+    unsafe { std::env::set_var("ROOTYARD_PANDO_REMOTE_DELETE", "true") };
+
+    let pool_a = schema_pool(&db_url, &schema_a)?;
+    let pool_b = schema_pool(&db_url, &schema_b)?;
+    let pool_c = schema_pool(&db_url, &schema_c)?;
+    db::migrate(&pool_a).await?;
+    db::migrate(&pool_b).await?;
+    db::migrate(&pool_c).await?;
+
+    let state_a = app_state(test_config(db_url.clone(), data_a.clone()), pool_a.clone())?;
+    let policy = test_policy();
+    let remote = RemoteObjectStore::from_env(work_dir.clone())?;
+
+    // 2. Startup check writes external epoch-1 proof and binds PG + local volume coordinates.
+    Box::pin(pitr_fence::startup_check(&pool_a, &state_a.storage.root)).await?;
+    let auth_a = pitr_fence::load_authority_state(&**pool_a.get().await?).await?;
+    ensure!(auth_a.attested_at.is_some(), "expected attested authority after startup_check");
+    ensure!(auth_a.authority_epoch == 1 && auth_a.restore_generation == 0 && !auth_a.remote_delete_fenced);
+    ensure!(s3.contains(&format!("pando-authorities/{}/epochs/00000000000000000001.json", auth_a.authority_id)));
+
+    let owner = Uuid::new_v4();
+    let repo = Uuid::new_v4();
+    let slug = format!("u{}", &owner.simple().to_string()[..12]);
+    {
+        let client = pool_a.get().await?;
+        client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&owner, &slug]).await?;
+        client
+            .execute(
+                "INSERT INTO repositories(id,owner_id,name,state,storage_backend,transition_state,storage_generation) \
                      VALUES($1,$2,'pitr-repo','ready','pando','stable',1)",
-                    &[&repo, &owner],
-                )
-                .await?;
-            client
+                &[&repo, &owner],
+            )
+            .await?;
+        client
                 .execute(
                     "INSERT INTO pando_repository_states(repository_id,tenant_id,storage_generation,state,object_format,pack_ids) \
                      VALUES($1,$2,1,'serving','sha1','{}')",
                     &[&repo, &owner],
                 )
                 .await?;
-        }
-
-        let m_keep = Box::pin(seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "keep")).await?;
-        let m_pinned = Box::pin(seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "pin")).await?;
-        let m_drop = Box::pin(seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "drop")).await?;
-
-        let initial_packs: &[Uuid] = &[m_keep.id, m_pinned.id];
-        pool_a
-            .get()
-            .await?
-            .execute("UPDATE pando_repository_states SET pack_ids=$2 WHERE repository_id=$1", &[&repo, &initial_packs])
-            .await?;
-
-        let legacy_bytes = b"legacy-v1-unregistered-bytes";
-        let legacy_sha = hex::encode(Sha256::digest(legacy_bytes));
-        let legacy_file = work_dir.join("legacy.bin");
-        std::fs::write(&legacy_file, legacy_bytes)?;
-        let legacy_key = ObjectKey::new(owner, "pando-cipher", &legacy_sha)?;
-        remote.put_file(&legacy_key, &legacy_file, legacy_bytes.len() as u64, deadline()).await?;
-        let foreign_auth = Uuid::new_v4();
-        let foreign_key = ObjectKey::scoped(owner, foreign_auth, 1, "pando-cipher", &legacy_sha)?;
-        s3.insert_raw(&foreign_key.path(), legacy_bytes.to_vec());
-
-        ensure!(
-            pando_delete_gate::validate_scoped_delete_target(
-                auth_a.authority_id,
-                auth_a.authority_id,
-                owner,
-                1,
-                "pando-cipher",
-                &legacy_sha,
-                &legacy_key.path(),
-            )
-            .is_err()
-        );
-        ensure!(
-            pando_delete_gate::validate_scoped_delete_target(
-                auth_a.authority_id,
-                foreign_auth,
-                owner,
-                1,
-                "pando-cipher",
-                &legacy_sha,
-                &foreign_key.path(),
-            )
-            .is_err()
-        );
-        ensure!(
-            pando_delete_gate::validate_scoped_delete_target(
-                auth_a.authority_id,
-                auth_a.authority_id,
-                owner,
-                1,
-                "pando-cipher",
-                &legacy_sha,
-                &format!("pando-authorities/{}/epochs/00000000000000000001.json", auth_a.authority_id),
-            )
-            .is_err()
-        );
-
-        let primary = PrimaryRefs {
-            pool: &pool_a,
-            state: &state_a,
-            policy: &policy,
-            remote: &remote,
-            s3: &s3,
-            owner,
-            repo,
-        };
-        Box::pin(verify_retention_roots_and_pruning(
-            &primary,
-            &m_keep,
-            &m_pinned,
-            &m_drop,
-            &legacy_key,
-            &foreign_key,
-        ))
-        .await?;
-
-        let m_protected = Box::pin(verify_clone_fencing_and_isolate(
-            &primary,
-            &admin,
-            &m_keep,
-            CloneTarget {
-                db_url: &db_url,
-                schemas: (&schema_a, &schema_b),
-                data_a: &data_a,
-                data_b,
-                work_dir: &work_dir,
-                pool_b: &pool_b,
-                auth_a: &auth_a,
-            },
-        ))
-        .await?;
-
-        Box::pin(verify_pitr_rollback_and_split_brain(&primary, &db_url, data_c, &pool_c, &m_protected)).await?;
-
-        Ok::<(), anyhow::Error>(())
-    }))
-    .await
-    .context("pando_pitr_fencing test task panicked");
-
-    for s in [&schema_a, &schema_b, &schema_c] {
-        let _ = admin.get().await?.batch_execute(&format!("DROP SCHEMA IF EXISTS {s} CASCADE")).await;
     }
 
-    result??;
+    let m_keep = Box::pin(seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "keep")).await?;
+    let m_pinned =
+        Box::pin(seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "pin")).await?;
+    let m_drop = Box::pin(seed_manifest(&pool_a, &remote, &work_dir, repo, owner, auth_a.authority_id, "drop")).await?;
+
+    let initial_packs: &[Uuid] = &[m_keep.id, m_pinned.id];
+    pool_a
+        .get()
+        .await?
+        .execute("UPDATE pando_repository_states SET pack_ids=$2 WHERE repository_id=$1", &[&repo, &initial_packs])
+        .await?;
+
+    let legacy_bytes = b"legacy-v1-unregistered-bytes";
+    let legacy_sha = hex::encode(Sha256::digest(legacy_bytes));
+    let legacy_file = work_dir.join("legacy.bin");
+    std::fs::write(&legacy_file, legacy_bytes)?;
+    let legacy_key = ObjectKey::new(owner, "pando-cipher", &legacy_sha)?;
+    remote.put_file(&legacy_key, &legacy_file, legacy_bytes.len() as u64, deadline()).await?;
+    let foreign_auth = Uuid::new_v4();
+    let foreign_key = ObjectKey::scoped(owner, foreign_auth, 1, "pando-cipher", &legacy_sha)?;
+    s3.insert_raw(&foreign_key.path(), legacy_bytes.to_vec());
+
+    ensure!(
+        pando_delete_gate::validate_scoped_delete_target(
+            auth_a.authority_id,
+            auth_a.authority_id,
+            owner,
+            1,
+            "pando-cipher",
+            &legacy_sha,
+            &legacy_key.path(),
+        )
+        .is_err()
+    );
+    ensure!(
+        pando_delete_gate::validate_scoped_delete_target(
+            auth_a.authority_id,
+            foreign_auth,
+            owner,
+            1,
+            "pando-cipher",
+            &legacy_sha,
+            &foreign_key.path(),
+        )
+        .is_err()
+    );
+    ensure!(
+        pando_delete_gate::validate_scoped_delete_target(
+            auth_a.authority_id,
+            auth_a.authority_id,
+            owner,
+            1,
+            "pando-cipher",
+            &legacy_sha,
+            &format!("pando-authorities/{}/epochs/00000000000000000001.json", auth_a.authority_id),
+        )
+        .is_err()
+    );
+
+    let primary =
+        PrimaryRefs { pool: &pool_a, state: &state_a, policy: &policy, remote: &remote, s3: &s3, owner, repo };
+    Box::pin(verify_retention_roots_and_pruning(&primary, &m_keep, &m_pinned, &m_drop, &legacy_key, &foreign_key))
+        .await?;
+
+    let m_protected = Box::pin(verify_clone_fencing_and_isolate(
+        &primary,
+        &admin,
+        &m_keep,
+        CloneTarget {
+            db_url: &db_url,
+            schemas: (&schema_a, &schema_b),
+            data_a: &data_a,
+            data_b,
+            work_dir: &work_dir,
+            pool_b: &pool_b,
+            auth_a: &auth_a,
+        },
+    ))
+    .await?;
+
+    Box::pin(verify_pitr_rollback_and_split_brain(&primary, &db_url, data_c, &pool_c, &m_protected)).await?;
+
     Ok(())
 }

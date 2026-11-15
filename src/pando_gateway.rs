@@ -10,6 +10,8 @@ pub mod pack_store;
 pub mod pitr_fence;
 #[path = "pando_gateway/pitr_isolate.rs"]
 pub mod pitr_isolate;
+#[path = "pando_gateway/pitr_lock.rs"]
+mod pitr_lock;
 #[path = "pando_gateway/pitr_markers.rs"]
 pub mod pitr_markers;
 #[path = "pando_gateway/pitr_proof_model.rs"]

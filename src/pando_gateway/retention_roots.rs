@@ -78,108 +78,113 @@ pub async fn pin_recovery_root(
         ensure!(secs > 0 && secs <= 10 * 365 * 86_400, "retain_until_secs out of valid range");
     }
 
-    let prepared = pitr_fence::begin_epoch_advance(pool, data_dir, remote, "pin_recovery_root", deadline).await?;
-    let mut client = pool.get().await?;
-    let tx = client.transaction().await?;
-    let committed = pitr_fence::commit_epoch_advance_in_tx(&*tx, &prepared).await?;
+    let mut prepared =
+        Box::pin(pitr_fence::begin_epoch_advance(pool, data_dir, remote, "pin_recovery_root", deadline)).await?;
+    let result: Result<RetentionRootSummary> = async {
+        let tx = prepared.transaction().await?;
+        let committed = pitr_fence::commit_epoch_advance_in_tx(&*tx, prepared.pending()).await?;
 
-    let external_lsn: String = tx
-        .query_one(
-            "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text \
-             ELSE pg_current_wal_lsn()::text END",
-            &[],
-        )
-        .await?
-        .get(0);
-
-    let root_id = Uuid::new_v4();
-    let retain_until_secs_f = retain_until_secs.map(|s| s as f64);
-    let note_owned = note.map(str::to_owned);
-    tx.execute(
-        "INSERT INTO pando_retention_roots \
-         (id, authority_id, tenant_id, repository_id, root_kind, state, restore_generation, \
-          external_lsn, note, retain_until) \
-         VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, \
-                 CASE WHEN $9::double precision IS NULL THEN NULL \
-                 ELSE clock_timestamp() + make_interval(secs => $9::double precision) END)",
-        &[
-            &root_id,
-            &committed.authority_id,
-            &tenant_id,
-            &repository_id,
-            &kind.as_str(),
-            &committed.restore_generation,
-            &external_lsn,
-            &note_owned,
-            &retain_until_secs_f,
-        ],
-    )
-    .await
-    .context("insert Pando retention root")?;
-
-    let mut linked_manifests: Vec<(Uuid, Uuid)> = if explicit_manifests.is_empty() {
-        let rows = tx
-            .query(
-                "SELECT DISTINCT m.id, m.repository_id \
-                 FROM pando_pack_manifests m \
-                 WHERE m.tenant_id = $1 \
-                   AND ($2::uuid IS NULL OR m.repository_id = $2) \
-                   AND ( \
-                     EXISTS ( \
-                       SELECT 1 FROM pando_repository_states s \
-                       WHERE s.repository_id = m.repository_id AND m.id = ANY(s.pack_ids) \
-                     ) \
-                     OR EXISTS ( \
-                       SELECT 1 FROM pando_publication_fences f \
-                       WHERE f.manifest_id = m.id AND f.authority_id = $3 \
-                         AND f.lease_until > clock_timestamp() \
-                     ) \
-                   )",
-                &[&tenant_id, &repository_id, &committed.authority_id],
+        let external_lsn: String = tx
+            .query_one(
+                "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text \
+                 ELSE pg_current_wal_lsn()::text END",
+                &[],
             )
-            .await?;
-        rows.into_iter().map(|r| (r.get(0), r.get(1))).collect()
-    } else {
-        let rows = tx
-            .query(
-                "SELECT id, repository_id FROM pando_pack_manifests \
-                 WHERE tenant_id = $1 AND ($2::uuid IS NULL OR repository_id = $2) \
-                   AND id = ANY($3::uuid[])",
-                &[&tenant_id, &repository_id, &explicit_manifests],
-            )
-            .await?;
-        ensure!(rows.len() == explicit_manifests.len(), "one or more explicit retention manifests were not found");
-        rows.into_iter().map(|r| (r.get(0), r.get(1))).collect()
-    };
+            .await?
+            .get(0);
 
-    linked_manifests.sort();
-    linked_manifests.dedup();
-    for (manifest_id, repo_id) in &linked_manifests {
+        let root_id = Uuid::new_v4();
+        let retain_until_secs_f = retain_until_secs.map(|s| s as f64);
+        let note_owned = note.map(str::to_owned);
         tx.execute(
-            "INSERT INTO pando_retention_root_manifests \
-             (root_id, authority_id, tenant_id, repository_id, manifest_id) \
-             VALUES ($1, $2, $3, $4, $5)",
-            &[&root_id, &committed.authority_id, &tenant_id, repo_id, manifest_id],
+            "INSERT INTO pando_retention_roots \
+             (id, authority_id, tenant_id, repository_id, root_kind, state, restore_generation, \
+              external_lsn, note, retain_until) \
+             VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, \
+                     CASE WHEN $9::double precision IS NULL THEN NULL \
+                     ELSE clock_timestamp() + make_interval(secs => $9::double precision) END)",
+            &[
+                &root_id,
+                &committed.authority_id,
+                &tenant_id,
+                &repository_id,
+                &kind.as_str(),
+                &committed.restore_generation,
+                &external_lsn,
+                &note_owned,
+                &retain_until_secs_f,
+            ],
         )
         .await
-        .context("link manifest to Pando retention root")?;
+        .context("insert Pando retention root")?;
+
+        let mut linked_manifests: Vec<(Uuid, Uuid)> = if explicit_manifests.is_empty() {
+            let rows = tx
+                .query(
+                    "SELECT DISTINCT m.id, m.repository_id \
+                     FROM pando_pack_manifests m \
+                     WHERE m.tenant_id = $1 \
+                       AND ($2::uuid IS NULL OR m.repository_id = $2) \
+                       AND ( \
+                         EXISTS ( \
+                           SELECT 1 FROM pando_repository_states s \
+                           WHERE s.repository_id = m.repository_id AND m.id = ANY(s.pack_ids) \
+                         ) \
+                         OR EXISTS ( \
+                           SELECT 1 FROM pando_publication_fences f \
+                           WHERE f.manifest_id = m.id AND f.authority_id = $3 \
+                             AND f.lease_until > clock_timestamp() \
+                         ) \
+                       )",
+                    &[&tenant_id, &repository_id, &committed.authority_id],
+                )
+                .await?;
+            rows.into_iter().map(|r| (r.get(0), r.get(1))).collect()
+        } else {
+            let rows = tx
+                .query(
+                    "SELECT id, repository_id FROM pando_pack_manifests \
+                     WHERE tenant_id = $1 AND ($2::uuid IS NULL OR repository_id = $2) \
+                       AND id = ANY($3::uuid[])",
+                    &[&tenant_id, &repository_id, &explicit_manifests],
+                )
+                .await?;
+            ensure!(rows.len() == explicit_manifests.len(), "one or more explicit retention manifests were not found");
+            rows.into_iter().map(|r| (r.get(0), r.get(1))).collect()
+        };
+
+        linked_manifests.sort();
+        linked_manifests.dedup();
+        for (manifest_id, repo_id) in &linked_manifests {
+            tx.execute(
+                "INSERT INTO pando_retention_root_manifests \
+                 (root_id, authority_id, tenant_id, repository_id, manifest_id) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[&root_id, &committed.authority_id, &tenant_id, repo_id, manifest_id],
+            )
+            .await
+            .context("link manifest to Pando retention root")?;
+        }
+
+        tx.commit().await?;
+
+        Ok(RetentionRootSummary {
+            id: root_id,
+            authority_id: committed.authority_id,
+            tenant_id,
+            repository_id,
+            root_kind: kind.as_str().into(),
+            state: "active".into(),
+            restore_generation: committed.restore_generation,
+            external_lsn: Some(external_lsn),
+            note: note_owned,
+            manifest_count: linked_manifests.len(),
+        })
     }
-
-    tx.commit().await?;
-    pitr_fence::clear_claim_file_best_effort(data_dir, committed.authority_id);
-
-    Ok(RetentionRootSummary {
-        id: root_id,
-        authority_id: committed.authority_id,
-        tenant_id,
-        repository_id,
-        root_kind: kind.as_str().into(),
-        state: "active".into(),
-        restore_generation: committed.restore_generation,
-        external_lsn: Some(external_lsn),
-        note: note_owned,
-        manifest_count: linked_manifests.len(),
-    })
+    .await;
+    let committed_auth = result.as_ref().ok().map(|s| s.authority_id);
+    prepared.finish(committed_auth).await;
+    result
 }
 
 pub async fn release_recovery_root(pool: &Pool, root_id: Uuid) -> Result<bool> {
