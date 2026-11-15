@@ -8,8 +8,11 @@ candidate must reject that archive unless its explicit legacy schema opt-in is
 given, restore into a brand-new database/data directory under one newly minted
 Pando authority, apply the reviewed current migrations, and serve stock Git
 fetch/clone for both repositories.  Every frozen predecessor source contract
-here keeps its own format/schema verification and then upgrades to the same
-current reviewed target: format20/schema144.
+here keeps its own format/schema verification and then upgrades to the shared
+reviewed target: format20/schema144.  A focused entry point may replace only the
+target fields with the canonical current target from ``schema_baseline``; that
+selection runs the current-catalog assertion below instead of silently treating
+the newest migration ledger entry as proof of the catalog.
 
 ``backup_legacy133_identity.py`` through ``backup_legacy142_pack_snapshots.py`` reuse this
 harness with the format9/schema133 through format18/schema142 contracts and
@@ -1394,6 +1397,67 @@ class LegacyArchiveHarness(BackupHarness):
             schema144_root_or_decision_fabricated=False,
             schema144_decision_fence_enabled=False)
 
+    def assert_current_target_schema(self):
+        """Verify a focused target newer than the shared schema144 default.
+
+        The canonical table set and migration list come from
+        ``schema_baseline``; the current target is never inferred from the
+        manifest produced by the candidate under test.  A genuine
+        format11/schema135 archive has no rows for any post-144 ledger, so the
+        new tables must exist and stay empty (these migrations seed none), and
+        migration 136 must not fabricate a token scope grant for an old token.
+        """
+        from schema_baseline import (
+            CURRENT_SCHEMA_VERSION, EXPECTED_TABLES, SCHEMA_VERSIONS)
+        assert self.contract.target_schema > 144, self.contract.target_schema
+        assert self.contract.target_schema == CURRENT_SCHEMA_VERSION, (
+            self.contract.target_schema, CURRENT_SCHEMA_VERSION)
+        versions = self.query(
+            self.restore_db,
+            "SELECT string_agg(version::text, ',' ORDER BY version) "
+            "FROM schema_migrations")
+        expected_versions = ",".join(str(version) for version in SCHEMA_VERSIONS)
+        assert versions == expected_versions, (versions, expected_versions)
+        tables = self.query(
+            self.restore_db,
+            "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables "
+            "WHERE schemaname='public'")
+        actual_tables = set(filter(None, tables.split(",")))
+        assert actual_tables == EXPECTED_TABLES, (
+            "restored catalog differs from the canonical current table set; "
+            "missing=" + repr(sorted(EXPECTED_TABLES - actual_tables)) +
+            " extra=" + repr(sorted(actual_tables - EXPECTED_TABLES)))
+        new_tables = catalog_tables(CURRENT_SCHEMA_VERSION) - catalog_tables(144)
+        assert new_tables, (
+            "the canonical current catalog adds no table after schema144")
+        seeds = {}
+        for version in range(145, CURRENT_SCHEMA_VERSION + 1):
+            for name, count in migration_seed_counts(version).items():
+                seeds[name] = seeds.get(name, 0) + count
+        assert set(seeds) <= new_tables, (seeds, new_tables)
+        counts = {
+            name: int(self.query(
+                self.restore_db, 'SELECT count(*) FROM public."' + name + '"'))
+            for name in sorted(new_tables)
+        }
+        expected = {name: seeds.get(name, 0) for name in sorted(new_tables)}
+        assert counts == expected, (counts, expected)
+        scope_grants = {}
+        for name in ("token_repository_scopes", "token_namespace_scopes"):
+            scope_grants[name] = int(self.query(
+                self.restore_db, 'SELECT count(*) FROM public."' + name + '"'))
+            assert scope_grants[name] == 0, (
+                "the schema136 migration fabricated a token scope grant in " + name)
+        return dict(
+            current_schema_version=CURRENT_SCHEMA_VERSION,
+            current_migration_versions=versions,
+            current_catalog_tables=len(actual_tables),
+            post_144_new_tables=sorted(new_tables),
+            post_144_new_tables_empty_except_migration_seed=not seeds,
+            post_144_table_rows=counts,
+            legacy_token_scope_grants=scope_grants,
+            legacy_token_scope_grants_empty=not any(scope_grants.values()))
+
     def candidate_restores_and_rotates_authority(self):
         self.use_candidate(self.restore_db, self.restore_data)
         self.args.binary = self.candidate_binary
@@ -1424,6 +1488,9 @@ class LegacyArchiveHarness(BackupHarness):
         self.roots_decision_schema = {}
         if self.contract.target_schema >= 144:
             self.roots_decision_schema = self.assert_roots_decision_schema()
+        current_target = {}
+        if self.contract.target_schema > 144:
+            current_target = self.assert_current_target_schema()
         legacy_fixture = {}
         if self.legacy_pack_marker is not None:
             legacy_fixture = self.assert_legacy_pack_fixture_preserved()
@@ -1519,7 +1586,7 @@ class LegacyArchiveHarness(BackupHarness):
         assert revoked_sessions == "1", revoked_sessions
         assert revoked_browser == "1", revoked_browser
         return dict(**core, **holds, **packs, **a5, **legacy_fixture,
-                    schema_version=int(last),
+                    **current_target, schema_version=int(last),
                     target_format=self.contract.target_format,
                     indexes=len(self.contract.indexes),
                     schema134_identity_constraints=True,

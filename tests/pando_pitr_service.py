@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from dataclasses import dataclass
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -22,9 +24,66 @@ import urllib.parse
 import urllib.request
 import uuid
 
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+import native_build_receipt as receipts  # noqa: E402
+
 MAX_FIXTURE_BODY = 32 * 1024 * 1024
 S3_BUCKET = "rootyard-pitr-e2e"
 S3_REGION = "garage"
+
+MANDATORY_CASES = (
+    "source_retention_and_pruning",
+    "clone_fail_closed_zero_deletes",
+    "operator_isolate_recovered",
+    "post_isolate_empty_cache_http_browse",
+    "post_isolate_stock_git_clone_fetch",
+    "post_isolate_deleted_artifact_refused",
+    "pitr_epoch_rollback_fenced",
+)
+OWNED_HARNESS_FILES = (
+    "tests/pando_pitr_service.py",
+    "tests/test_pando_pitr_service.py",
+    "scripts/native_build_receipt.py",
+)
+DEFAULT_TIMEOUT_SECONDS = 600.0
+TOPOLOGY = {
+    "rootyard": "actual prebuilt Rootyard service selected by the validated build receipt",
+    "git": "stock Git client over loopback HTTP",
+    "database": "actual PostgreSQL reachable through ROOTYARD_TEST_DATABASE_URL",
+    "object_store": "IN-PROCESS Python HTTP S3 fixture (TrackingLoopbackS3); not external Garage/S3",
+    "vault": "IN-PROCESS Python HTTP Vault Transit fixture (TrackingLoopbackVaultTransit); not external Vault",
+    "recovery": "logical pg_dump/pg_restore metadata clone plus simulated epoch rollback; not physical PostgreSQL WAL/PITR",
+    "qualification": "functional local acceptance only; not cloud, hardware, external-provider or production qualification",
+}
+
+
+@dataclass(frozen=True)
+class AcceptanceSpec:
+    """One internal acceptance report contract; defaults preserve the old cases."""
+
+    kind: str
+    mandatory_cases: tuple[str, ...]
+    topology: dict
+    limitations: tuple[str, ...]
+
+
+LIMITATIONS = [
+    "No real external Garage/S3 or Vault service is exercised.",
+    "No physical PostgreSQL WAL, backup, PITR, host/disk failure, RPO/RTO, cloud or hardware qualification is claimed.",
+    "Pando manifests, artifact rows and receipts created by seed_synthetic_manifest are synthetic test fixtures, not production data.",
+    "Suite cleanup is best-effort and is not asserted; cleanup_passed is intentionally not reported.",
+    "CI run identifiers and comments are not evidence by themselves; only the bound source, binary, receipt and executed cases are reported.",
+]
+
+DEFAULT_ACCEPTANCE_SPEC = AcceptanceSpec(
+    kind="rootyard/pando-pitr-service-acceptance",
+    mandatory_cases=MANDATORY_CASES,
+    topology=TOPOLOGY,
+    limitations=tuple(LIMITATIONS),
+)
 
 
 class _DaemonHTTPServer(ThreadingHTTPServer):
@@ -890,25 +949,442 @@ def run_suite(binary: str) -> dict:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def main() -> int:
+class EvidenceError(RuntimeError):
+    """A fixed, credential-free evidence failure at one acceptance phase."""
+
+    def __init__(self, phase: str, code: str) -> None:
+        super().__init__(f"{phase}: {code}")
+        self.phase = phase
+        self.code = code
+
+
+def _require_regular_file(path: Path, phase: str, code: str, *, executable: bool = False) -> None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise EvidenceError(phase, code)
+        if executable and not os.access(path, os.X_OK):
+            raise EvidenceError(phase, code)
+    except OSError:
+        raise EvidenceError(phase, code) from None
+
+
+def _file_identity(path: Path, phase: str, code: str) -> dict:
+    _require_regular_file(path, phase, code)
+    try:
+        info = path.stat()
+        digest = receipts.sha256_file(path)
+    except OSError:
+        raise EvidenceError(phase, code) from None
+    return {
+        "path": str(path.resolve()),
+        "sha256": digest,
+        "mode": stat.S_IMODE(info.st_mode),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+    }
+
+
+def _workspace_head(source_root: Path, phase: str = "preflight") -> str:
+    try:
+        state = receipts.git_state(source_root)
+    except Exception:
+        raise EvidenceError(phase, "git_unavailable") from None
+    head = state.get("head") if isinstance(state, dict) else None
+    if not isinstance(head, str) or not head:
+        raise EvidenceError(phase, "git_unavailable")
+    return head
+
+
+def _require_complete_v2_closure(validated, phase: str):
+    """Require the full v2 closure the shared reader validated before use."""
+    if getattr(validated, "schema", None) != "v2":
+        raise EvidenceError(phase, "receipt_schema_not_v2")
+    if not isinstance(validated.config_digest, str) or not validated.config_digest:
+        raise EvidenceError(phase, "receipt_config_digest_missing")
+    payload = validated.payload
+    inventory = payload.get("bound_input_inventory")
+    bound = payload.get("bound_inputs")
+    if (
+        not isinstance(inventory, list)
+        or not inventory
+        or not isinstance(bound, dict)
+        or not bound.get("digest")
+    ):
+        raise EvidenceError(phase, "receipt_file_closure_missing")
+    toolchain = validated.toolchain
+    if not isinstance(toolchain, dict):
+        raise EvidenceError(phase, "receipt_toolchain_missing")
+    if not toolchain.get("target_triple"):
+        raise EvidenceError(phase, "receipt_toolchain_incomplete")
+    for name in ("cargo", "rustc"):
+        identity = toolchain.get(name)
+        if not isinstance(identity, dict):
+            raise EvidenceError(phase, "receipt_toolchain_incomplete")
+        for field in ("executable", "executable_sha256", "version", "release", "commit_hash", "host"):
+            if not identity.get(field):
+                raise EvidenceError(phase, "receipt_toolchain_incomplete")
+    return validated
+
+
+def _load_bound_receipt(
+    binary: Path,
+    build_receipt: Path,
+    expect_commit: str,
+    source_root: Path,
+    phase: str,
+):
+    try:
+        validated = receipts.load_receipt(
+            build_receipt,
+            source_root=source_root,
+            binary_path=binary,
+            expected_commit=expect_commit,
+            forbid_implicit_build=True,
+        )
+    except receipts.ReceiptError:
+        raise EvidenceError(phase, "receipt_invalid") from None
+    except OSError:
+        raise EvidenceError(phase, "receipt_unreadable") from None
+    return _require_complete_v2_closure(validated, phase)
+
+
+def _harness_identities(harness_files: list[Path], phase: str) -> dict:
+    identities = {}
+    for path in harness_files:
+        path = Path(path)
+        _require_regular_file(path, phase, "harness_missing")
+        try:
+            key = path.resolve().relative_to(ROOT.resolve()).as_posix()
+        except ValueError:
+            key = str(path.resolve())
+        identities[key] = _file_identity(path, phase, "harness_unreadable")
+    return identities
+
+
+def _preflight(
+    binary: Path,
+    build_receipt: Path,
+    expect_commit: str,
+    source_root: Path,
+    harness_files: list[Path],
+) -> tuple[object, dict]:
+    binary = Path(binary).expanduser().resolve()
+    build_receipt = Path(build_receipt).expanduser().resolve()
+    _require_regular_file(binary, "preflight", "binary_missing", executable=True)
+    _require_regular_file(build_receipt, "preflight", "receipt_missing")
+    if not isinstance(expect_commit, str) or not expect_commit:
+        raise EvidenceError("preflight", "expect_commit_missing")
+    head = _workspace_head(source_root)
+    if head != expect_commit:
+        raise EvidenceError("preflight", "source_head_mismatch")
+    validated = _load_bound_receipt(
+        binary, build_receipt, expect_commit, source_root, "preflight"
+    )
+    if validated.workspace_commit != expect_commit:
+        raise EvidenceError("preflight", "receipt_commit_mismatch")
+    binary_identity = _file_identity(binary, "preflight", "binary_unreadable")
+    receipt_identity = _file_identity(build_receipt, "preflight", "receipt_unreadable")
+    if binary_identity["sha256"] != validated.binary_sha256:
+        raise EvidenceError("preflight", "binary_mismatch")
+    if receipt_identity["sha256"] != validated.receipt_sha256:
+        raise EvidenceError("preflight", "receipt_changed")
+    snapshot = {
+        "source_head": head,
+        "source_inputs_sha256": validated.source_inputs_sha256,
+        "workspace_commit": validated.workspace_commit,
+        "receipt_schema": validated.schema,
+        "config_digest": validated.config_digest,
+        "bound_inputs_digest": validated.payload["bound_inputs"]["digest"],
+        "binary": binary_identity,
+        "receipt": receipt_identity,
+        "harnesses": _harness_identities(harness_files, "preflight"),
+    }
+    return validated, snapshot
+
+
+def _postflight(
+    start: dict,
+    binary: Path,
+    build_receipt: Path,
+    expect_commit: str,
+    source_root: Path,
+    harness_files: list[Path],
+) -> dict:
+    binary = Path(binary).expanduser().resolve()
+    build_receipt = Path(build_receipt).expanduser().resolve()
+    head = _workspace_head(source_root, "postflight")
+    if head != expect_commit or head != start["source_head"]:
+        raise EvidenceError("postflight", "source_head_changed")
+    validated = _load_bound_receipt(
+        binary, build_receipt, expect_commit, source_root, "postflight"
+    )
+    binary_identity = _file_identity(binary, "postflight", "provenance_changed")
+    receipt_identity = _file_identity(build_receipt, "postflight", "provenance_changed")
+    current = {
+        "source_head": head,
+        "source_inputs_sha256": validated.source_inputs_sha256,
+        "workspace_commit": validated.workspace_commit,
+        "receipt_schema": validated.schema,
+        "config_digest": validated.config_digest,
+        "bound_inputs_digest": validated.payload["bound_inputs"]["digest"],
+        "binary": binary_identity,
+        "receipt": receipt_identity,
+        "harnesses": _harness_identities(harness_files, "postflight"),
+    }
+    if current != start:
+        raise EvidenceError("postflight", "provenance_changed")
+    return current
+
+
+def _case_records(results: dict, cases: tuple[str, ...] = MANDATORY_CASES) -> list[dict]:
+    records = []
+    for name in cases:
+        if results.get(name) is True:
+            status = "passed"
+        elif name in results:
+            status = "failed"
+        else:
+            status = "missing"
+        records.append({"name": name, "status": status})
+    return records
+
+
+def _toolchain_summary(validated) -> dict:
+    toolchain = validated.toolchain or {}
+    rustc = toolchain.get("rustc") or {}
+    cargo = toolchain.get("cargo") or {}
+    return {
+        "target_triple": toolchain.get("target_triple"),
+        "rustc_release": rustc.get("release"),
+        "rustc_version": rustc.get("version"),
+        "cargo_release": cargo.get("release"),
+        "cargo_version": cargo.get("version"),
+    }
+
+
+def _public_snapshot(snapshot: dict | None) -> dict | None:
+    if snapshot is None:
+        return None
+    return {
+        "source_head": snapshot["source_head"],
+        "source_inputs_sha256": snapshot["source_inputs_sha256"],
+        "workspace_commit": snapshot["workspace_commit"],
+        "receipt_schema": snapshot["receipt_schema"],
+        "config_digest": snapshot["config_digest"],
+        "bound_inputs_digest": snapshot["bound_inputs_digest"],
+        "binary": dict(snapshot["binary"]),
+        "build_receipt": dict(snapshot["receipt"]),
+        "harnesses": {name: dict(identity) for name, identity in snapshot["harnesses"].items()},
+    }
+
+
+def _build_report(
+    *,
+    expect_commit: str,
+    start: dict | None,
+    end: dict | None,
+    validated,
+    results: dict,
+    passed: bool,
+    failure: dict | None,
+    elapsed: float,
+    spec: AcceptanceSpec = DEFAULT_ACCEPTANCE_SPEC,
+) -> dict:
+    cases = _case_records(results, spec.mandatory_cases)
+    start_binary = start["binary"] if start else None
+    start_receipt = start["receipt"] if start else None
+    report = {
+        "kind": spec.kind,
+        "passed": bool(passed),
+        "source_commit": expect_commit,
+        "source_head": start["source_head"] if start else None,
+        "source_inputs_sha256": start["source_inputs_sha256"] if start else None,
+        "workspace_commit": start["workspace_commit"] if start else None,
+        "receipt_schema": start["receipt_schema"] if start else None,
+        "config_digest": start["config_digest"] if start else None,
+        "bound_inputs_digest": start["bound_inputs_digest"] if start else None,
+        "binary_sha256": start_binary["sha256"] if start_binary else None,
+        "build_receipt_sha256": start_receipt["sha256"] if start_receipt else None,
+        "toolchain": _toolchain_summary(validated) if validated is not None else None,
+        "cases": cases,
+        "expected_cases": list(spec.mandatory_cases),
+        "case_count": len(cases),
+        "provenance_unchanged": bool(start is not None and start == end),
+        "provenance": {
+            "before": _public_snapshot(start),
+            "after": _public_snapshot(end),
+        },
+        "topology": dict(spec.topology),
+        "limitations": list(spec.limitations),
+        "duration_seconds": round(elapsed, 3),
+    }
+    for name in spec.mandatory_cases:
+        report[name] = results.get(name) is True
+    if failure is not None:
+        report["failure"] = dict(failure)
+    return report
+
+
+def _validated_spec(spec: AcceptanceSpec) -> AcceptanceSpec:
+    if not isinstance(spec, AcceptanceSpec):
+        raise EvidenceError("report", "spec_invalid")
+    cases = spec.mandatory_cases
+    if (
+        not isinstance(cases, tuple)
+        or not cases
+        or any(not isinstance(name, str) or not name for name in cases)
+        or len(set(cases)) != len(cases)
+    ):
+        raise EvidenceError("report", "spec_invalid")
+    if not isinstance(spec.kind, str) or not spec.kind:
+        raise EvidenceError("report", "spec_invalid")
+    if not isinstance(spec.topology, dict):
+        raise EvidenceError("report", "spec_invalid")
+    if not isinstance(spec.limitations, tuple) or any(
+        not isinstance(item, str) or not item for item in spec.limitations
+    ):
+        raise EvidenceError("report", "spec_invalid")
+    return spec
+
+
+def _merge_report_extra(report: dict, extra: dict) -> None:
+    if not isinstance(extra, dict):
+        raise EvidenceError("report", "extra_invalid")
+    reserved = set(report) | {"failure", "failure_traceback"}
+    for key, value in extra.items():
+        if not isinstance(key, str) or not key or key in reserved:
+            raise EvidenceError("report", "extra_invalid")
+        report[key] = value
+
+
+def run_acceptance(
+    *,
+    binary: str,
+    build_receipt: str,
+    expect_commit: str,
+    report_path: Path | None = None,
+    timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
+    source_root: Path = ROOT,
+    harness_files: list[Path] | None = None,
+    suite=None,
+    spec: AcceptanceSpec | None = None,
+    extra_report: dict | None = None,
+) -> dict:
+    """Run the live suite only after binding it to exact, unchanged evidence."""
+    suite = run_suite if suite is None else suite
+    spec = _validated_spec(DEFAULT_ACCEPTANCE_SPEC if spec is None else spec)
+    harness_files = (
+        [ROOT / name for name in OWNED_HARNESS_FILES]
+        if harness_files is None
+        else list(harness_files)
+    )
+    started = time.monotonic()
+    start = None
+    end = None
+    validated = None
+    results: dict = {}
+    failure = None
+    passed = False
+    try:
+        validated, start = _preflight(
+            Path(binary),
+            Path(build_receipt),
+            expect_commit,
+            source_root,
+            harness_files,
+        )
+        results = suite(str(Path(binary).expanduser().resolve()))
+        if not isinstance(results, dict):
+            raise EvidenceError("suite", "invalid_result")
+        end = _postflight(
+            start,
+            Path(binary),
+            Path(build_receipt),
+            expect_commit,
+            source_root,
+            harness_files,
+        )
+        elapsed = time.monotonic() - started
+        if timeout is not None and (timeout <= 0 or elapsed > timeout):
+            raise EvidenceError("suite", "deadline_exceeded")
+        if results.get("passed") is not True:
+            failure = {"phase": "suite", "code": "suite_not_passed"}
+        elif any(case["status"] != "passed" for case in _case_records(results, spec.mandatory_cases)):
+            failure = {"phase": "suite", "code": "mandatory_case_not_passed"}
+        passed = failure is None and start == end
+    except EvidenceError as error:
+        failure = {
+            "phase": error.phase,
+            "code": error.code,
+            "exception_class": error.__class__.__name__,
+        }
+    except Exception as error:
+        failure = {
+            "phase": "suite",
+            "code": "suite_failed",
+            "exception_class": type(error).__name__,
+        }
+    elapsed = time.monotonic() - started
+    report = _build_report(
+        expect_commit=expect_commit,
+        start=start,
+        end=end,
+        validated=validated,
+        results=results,
+        passed=passed,
+        failure=failure,
+        elapsed=elapsed,
+        spec=spec,
+    )
+    if extra_report is not None:
+        try:
+            _merge_report_extra(report, extra_report)
+        except EvidenceError as error:
+            report["passed"] = False
+            report["failure"] = {
+                "phase": error.phase,
+                "code": error.code,
+                "exception_class": error.__class__.__name__,
+            }
+    if report_path is not None:
+        receipts.atomic_write_json(report_path, report)
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default=os.environ.get("ROOTYARD_BIN") or "target/debug/rootyard")
+    parser.add_argument("--binary", required=True, help="explicit prebuilt rootyard binary")
+    parser.add_argument("--build-receipt", required=True, help="build receipt for that binary")
+    parser.add_argument("--expect-commit", required=True, help="compiled workspace commit")
     parser.add_argument("--report", type=Path)
-    args = parser.parse_args()
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    args = parser.parse_args(argv)
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
         parser.error("ROOTYARD_TEST_DATABASE_URL is required")
     for tool in ("psql", "pg_dump", "pg_restore"):
         if not shutil.which(tool):
             parser.error(f"Required PostgreSQL CLI tool missing: {tool}")
-    binary = str(Path(args.binary).resolve())
-    if not Path(binary).is_file():
-        parser.error(f"rootyard binary not found: {binary}")
-    report = run_suite(binary)
-    if args.report:
-        args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report, indent=2))
-    return 0
+    try:
+        report = run_acceptance(
+            binary=args.binary,
+            build_receipt=args.build_receipt,
+            expect_commit=args.expect_commit,
+            report_path=args.report,
+            timeout=args.timeout,
+        )
+    except OSError:
+        print("pando PITR service acceptance: report write failed", file=sys.stderr)
+        return 1
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if report["passed"]:
+        return 0
+    failure = report.get("failure", {})
+    print(
+        "pando PITR service acceptance: failed "
+        f"({failure.get('phase', 'unknown')}/{failure.get('code', 'unknown')})",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

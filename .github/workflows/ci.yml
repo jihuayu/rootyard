@@ -334,7 +334,12 @@ jobs:
           cp "$latest_pando/results.json" test-results/pando-lab.json
       - name: Exercise live Pando PITR fencing, retention roots, and pg_dump clone safety
         timeout-minutes: 10
-        run: python3 tests/pando_pitr_service.py --binary "$ROOTYARD_BIN" --report test-results/pando-pitr-service.json
+        run: |
+          python3 tests/pando_pitr_service.py \
+            --binary "$ROOTYARD_BIN" \
+            --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+            --expect-commit "$GITHUB_SHA" \
+            --report test-results/pando-pitr-service.json
       - name: Exercise external CI webhooks, HMAC-SHA256 delivery, and auto PR CI pins
         run: python3 tests/webhooks.py --binary "$ROOTYARD_BIN" --report test-results/webhooks.json
       - name: Exercise webhook batching, lease and TLS regressions
@@ -452,6 +457,7 @@ jobs:
             --report ci_dependencies=test-results/ci-dependencies.json \
             --report ci_trust_boundaries=test-results/ci-trust-boundaries.json \
             --report shard_marker_transitions=test-results/shard-marker-transitions.json \
+            --report pando_pitr=test-results/pando-pitr-service.json \
             --require-case shard_marker_transitions=takeover-after-source-marker \
             --require-case shard_marker_transitions=fence-audit-rollback \
             --require-case shard_marker_transitions=fence-transition-before-commit \
@@ -465,6 +471,13 @@ jobs:
             --require-case shard_marker_transitions=recover-audit-rollback \
             --require-case shard_marker_transitions=recover-transition-before-commit \
             --require-case shard_marker_transitions=recover-cutover-after-commit \
+            --require-case pando_pitr=source_retention_and_pruning \
+            --require-case pando_pitr=clone_fail_closed_zero_deletes \
+            --require-case pando_pitr=operator_isolate_recovered \
+            --require-case pando_pitr=post_isolate_empty_cache_http_browse \
+            --require-case pando_pitr=post_isolate_stock_git_clone_fetch \
+            --require-case pando_pitr=post_isolate_deleted_artifact_refused \
+            --require-case pando_pitr=pitr_epoch_rollback_fenced \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
@@ -509,6 +522,8 @@ jobs:
             --harness tests/webhook_pagination.py \
             --harness tests/webhook_pr_sync.py \
             --harness tests/cluster_migration_phases_native.py \
+            --harness tests/pando_pitr_service.py \
+            --harness tests/test_pando_pitr_service.py \
             --harness tests/webhook_tenant_matrix.py \
             --harness tests/browse.py \
             --harness tests/browse_ref_scale.py \

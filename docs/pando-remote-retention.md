@@ -66,6 +66,169 @@ deployment sharing the same bucket:
   `status`, `verify`, `isolate --confirm-shared-bucket`, `pin-recovery-point`,
   and `release-recovery-point`.
 
+## Live-service acceptance harness (#77)
+
+CI runs the prebuilt candidate through the existing reporting boundary:
+
+```sh
+python3 tests/pando_pitr_service.py \
+  --binary "$ROOTYARD_BIN" \
+  --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+  --expect-commit "$GITHUB_SHA" \
+  --report test-results/pando-pitr-service.json
+```
+
+The harness refuses to run unless the shared v2 receipt reader revalidates the
+exact checkout, bound source/config/toolchain inputs, receipt bytes, binary
+digest and expected commit. It revalidates the same closure after the suite and
+only reports `passed: true` when all seven mandatory cases passed and the
+binary, receipt and owned harness hashes/identities are unchanged. The CI
+native manifest binds that report and those seven case names.
+
+Scope is deliberately narrow: actual Rootyard and stock Git run against actual
+PostgreSQL, while object storage and Vault Transit are **in-process loopback
+HTTP fixtures** (`TrackingLoopbackS3` / `TrackingLoopbackVaultTransit`).
+Recovery is a logical `pg_dump`/`pg_restore` metadata clone plus a simulated
+epoch rollback; the seeded Pando metadata and receipts are synthetic fixtures.
+This is not a real external Garage/S3, Vault, physical PostgreSQL WAL/PITR,
+cloud or hardware qualification, and the suite's best-effort cleanup is not
+asserted.
+
+## Real-provider qualification gates (#77)
+
+The hosted live-service case above is only the logical/in-process baseline. The
+separately reviewed real-provider harnesses must be run against one clean final
+source SHA and the exact same source/config/toolchain-bound immutable CLI build
+receipt. They use real owned PostgreSQL 17, real owned Garage and real Vault
+Transit fixtures. The report binding revalidates the source, receipt, binary,
+configuration/toolchain closure and the complete pre/post transitive harness
+identity list before returning a passing report; a report whose source, binary,
+receipt or harness bytes change is not a pass.
+
+Use generic public placeholders below; substitute paths on the qualification
+host. Run these commands from the final clean source tree that matches the
+receipt and binary, and derive the task-specific source variable from that
+tree's HEAD. Provider credentials, DSNs, tokens and locator paths are runtime
+environment data and are never command-line arguments or report artifacts. Do
+not place secrets in argv, shell history, the JSON report or captured
+diagnostics.
+
+```sh
+ROOTYARD_QUALIFICATION_SHA="$(git rev-parse HEAD)"
+
+python3 tests/pando_pitr_physical_service.py \
+  --binary /srv/rootyard/bin/rootyard \
+  --build-receipt /srv/rootyard/evidence/rootyard.build-receipt.json \
+  --expect-commit "$ROOTYARD_QUALIFICATION_SHA" \
+  --pg-bin /opt/postgresql/17/bin \
+  --report /srv/rootyard/evidence/pando-pitr-physical.json \
+  --timeout 1800
+
+python3 tests/pando_backup_restore_service.py \
+  --binary /srv/rootyard/bin/rootyard \
+  --build-receipt /srv/rootyard/evidence/rootyard.build-receipt.json \
+  --expect-commit "$ROOTYARD_QUALIFICATION_SHA" \
+  --pg-bin /opt/postgresql/17/bin \
+  --report /srv/rootyard/evidence/pando-backup-restore.json \
+  --timeout 1800
+```
+
+`--pg-bin` must contain the explicit PostgreSQL 17 tools; `psql` and `git` must
+also be available. `--timeout` is an optional bounded override. Keep provider
+configuration only in the runtime environment. The required preflight names are:
+
+```text
+ROOTYARD_OBJECT_STORE_ENDPOINT
+ROOTYARD_OBJECT_STORE_BUCKET
+ROOTYARD_OBJECT_STORE_REGION
+ROOTYARD_OBJECT_STORE_ACCESS_KEY
+ROOTYARD_OBJECT_STORE_SECRET_KEY
+ROOTYARD_KMS_VAULT_URL
+ROOTYARD_KMS_VAULT_TOKEN
+ROOTYARD_KMS_VAULT_KEY
+ROOTYARD_GARAGE_IMAGE_DIGEST
+ROOTYARD_VAULT_IMAGE_DIGEST
+```
+
+Optional preflight names are `ROOTYARD_OBJECT_STORE_SESSION_TOKEN` and
+`ROOTYARD_KMS_VAULT_MOUNT`. The Garage image must match the immutable
+`expected_digest` in [scripts/owned_garage_fixture.sh](../scripts/owned_garage_fixture.sh)
+(currently `sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a`);
+the Vault pin is currently
+`hashicorp/vault@sha256:44fa1e5a57d0bcf7fb163159872263b79a575e5dbfefd5b9bde1b7e4aada2f32`.
+A different valid-looking digest is not accepted.
+
+AC2 exercises the current metadata-only Pando archive contract from
+`tests/schema_baseline.CURRENT_BACKUP_FORMAT` (currently 25) and the current
+`schema_baseline.SCHEMA_VERSIONS` vector (currently 149). It is not the frozen
+format 23 contract. The paired Blob/RefStore
+`CURRENT_BLOB_BACKUP_FORMAT` (currently 26) and the whole #169 durability,
+RPO/RTO or cross-provider platform remain separate and are not claimed here.
+
+The AC2 archive checks require the CLI result and archive manifest to match the
+current format, the exact current schema vector, `COMPLETE`, zero CLI
+`blob_artifacts` and the Pando-only manifest shape. Do not accept an arbitrary
+integer or infer the expected contract from the manifest under test.
+
+### Fixed AC1 physical case inventory (11)
+
+```text
+physical_restore_to_named_target
+source_external_authority_advanced_after_restore_point
+source_verify_after_clone_gc
+due_unpinned_candidate_observed_before_clone_gc
+stale_clone_fenced_before_remote_delete
+remote_delete_method_count_zero
+known_live_and_pinned_recovery_objects_head_get_digest_unchanged
+clone_isolate_succeeded
+clone_cache_wiped
+real_service_stock_git_clone_fetch_fsck
+owned_resource_cleanup_passed
+```
+
+### Fixed AC2 current-archive case inventory (7)
+
+```text
+archive_current_pando_only_and_backup_verify_passed
+restore_authority_rotated_once_and_restore_generation_incremented_once
+old_authority_claim_not_reused_and_new_closure_readable
+source_and_restored_permissions_preserved
+active_pin_reissued_under_new_authority_and_closure_remains_readable
+single_export_failure_not_published_then_fresh_path_retry_passed
+all_owned_resources_cleaned
+```
+
+A pass requires every fixed case, not a subset, plus unchanged source/binary/
+receipt/harness identities and successful owned cleanup. Raw Rust/service
+stdout/stderr, SQL bodies, credentials, DSNs, object bytes and locator paths are
+not report artifacts.
+
+The other affected service regressions are run through their existing owning
+harnesses and are not replaced by these two real-provider gates:
+
+- `tests/pando_pitr_service.py` — logical/in-process mock service baseline,
+  honestly distinct from the physical AC1 provider run above.
+- `tests/pando_transition_service.py` — transition coverage.
+- `tests/pando_maintenance_service.py` — normal repack/cache and the existing
+  bounded backup-barrier retry.
+- `tests/backup_recovery.py` — recovery-history backup/restore drill.
+- `tests/backup.py` — offline backup/restore drill.
+- `tests/pando_maintenance.rs` — existing stale-claim CAS case; use its normal
+  Rust test runner.
+
+Current hosted CI's full Python discovery (`scripts/run_python_ci_tests.py`)
+includes the new pure boundary test modules, but the existing live CI Pando
+step (`.github/workflows/ci.yml`) invokes only the logical/mock
+`tests/pando_pitr_service.py` harness. The two real-provider commands above are
+not part of hosted CI at this source identity and no new hosted workflow,
+provider credentials or helper platform are required by the original AC.
+Before Issue #77 closure,
+the exact final SHA must be run through both real-provider harnesses and the
+affected regressions, with all 11 + 7 case outcomes, source/binary/receipt/
+harness stability and owned cleanup verified separately. Pure CI or source
+review alone is not an actual-provider qualification claim, and this document
+does not record or assert that the real-provider gates have run or passed.
+
 ## Supported backup contract
 
 Paired Rootyard archives and isolated cloned authorities are the supported Pando
