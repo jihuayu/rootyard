@@ -33,9 +33,12 @@
 //! shared locked predicate both enforce it; every pool checkout is deadline
 //! bounded (`max_size = 1` is supported) and released before a post-commit read.
 //!
-//! Durable snapshot and retention-root HTTP resources remain separate later
-//! work. These internal service facades alone do not close #107 and are not a
-//! foundation-only PR.
+//! Durable snapshot and retention-root resources are wired through these
+//! service facades and the separately mounted modules in
+//! `crate::blob_git_gateway` (`snapshot_metadata`, `retention_roots` and their
+//! browse routes). Their actual HTTP13/native167 qualification against a real
+//! PostgreSQL + remote Blob service is still pending; these internal service
+//! facades alone do not close #107 and are not a foundation-only PR.
 //!
 //! These entry points are internal trusted-caller APIs: the backend identity is
 //! passed by the engine from the store it actually opened and is never accepted
