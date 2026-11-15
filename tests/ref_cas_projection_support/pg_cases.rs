@@ -281,14 +281,15 @@ async fn pg_revoked_token_and_removed_member_project_and_refuse_new_writes() -> 
         .await?;
     client
         .execute(
-            "INSERT INTO repository_collaborators(repository_id,user_id,role) VALUES($1,$2,'write')",
-            &[&repo, &actor],
+            "INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role) VALUES($1,$2,$3,'write')",
+            &[&repo, &tenant, &actor],
         )
         .await?;
+    let token_digest = rootyard::db::digest("tok");
     client
         .execute(
-            "INSERT INTO tokens(id,user_id,token_hash,name) VALUES($1,$2,$3,'temp')",
-            &[&token, &actor, &sha256_hex(b"tok")],
+            "INSERT INTO tokens(id,user_id,digest,display_name) VALUES($1,$2,$3,'temp')",
+            &[&token, &actor, &token_digest],
         )
         .await?;
 
