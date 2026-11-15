@@ -49,10 +49,7 @@ LIMITATIONS = [
 
 
 def input_hashes():
-    root = Path(__file__).resolve().parent
-    names = (Path(__file__).name, "blob_commit_unknown_service.py", "blob_only_service.py",
-             "e2e.py", "native_evidence.py", "ops_provenance.py", "owned_fuse_cleanup.py")
-    return {name: blob.sha256_file(root / name) for name in names}
+    return blob.http_input_hashes()
 
 
 class SnapshotHttpProfile(checkpoint.CheckpointProfile):
@@ -773,24 +770,9 @@ def main(argv=None):
             harness.results.append({"name": "cleanup", "status": "failed", "error": harness.redact(error)})
             success = False
         report = blob.build_report(harness, profile, blob_profile, selected, success)
-        hashes_now = input_hashes()
         report["kind"] = "rootyard/refstore-snapshot-http"
-        report["checkpoint_sha256"] = hashes_now[Path(__file__).name]
-        report["harness_inputs_sha256"] = hashes_now
-        report["harness_inputs"] = {"input_hashes": hashes_now}
         report["limitations"] = LIMITATIONS
-        errors = []
-        if hashes_now != hashes:
-            errors.append("harness/helper source changed during native acceptance")
-        if blob.sha256_file(profile.binary) != profile.build["binary_sha256"]:
-            errors.append("executed binary changed during native acceptance")
-        if blob.sha256_file(profile.binary.with_suffix(".build.json")) != profile.receipt_sha256:
-            errors.append("build receipt changed during native acceptance")
-        if errors:
-            report["inputs_unchanged"] = False
-            report["passed"] = False
-            prior = report.get("binding_error")
-            report["binding_error"] = "; ".join(errors + ([prior] if prior else []))
+        blob.bind_http_report(report, Path(__file__).name, hashes, profile)
         blob.write_report(args.report, report)
         print(json.dumps(report, indent=2))
     return 0 if report["passed"] else 1

@@ -832,7 +832,9 @@ def main(argv=None):
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args(argv)
     env = os.environ.copy()
+    hashes = None
     try:
+        hashes = blob.http_input_hashes()
         profile = snapshot.SnapshotHttpProfile(str(Path(args.binary).resolve()), args.git, env)
         blob_profile = blob.check_blob_profile(env)
         blob.need(env.get("ROOTYARD_TEST_DATABASE_URL"), "ROOTYARD_TEST_DATABASE_URL is required")
@@ -842,6 +844,7 @@ def main(argv=None):
             "kind": "rootyard/refstore-root-browse-http", "passed": False,
             "preflight_failed": True, "error": str(error), "cases": [],
             "expected_cases": [], "limitations": LIMITATIONS,
+            "harness_inputs_sha256": hashes or {},
         })
         print("preflight failed: " + str(error), file=sys.stderr)
         return 2
@@ -864,6 +867,7 @@ def main(argv=None):
             success = False
         report = blob.build_report(harness, profile, blob_profile, cases, success)
         report["kind"] = "rootyard/refstore-root-browse-http"
+        blob.bind_http_report(report, Path(__file__).name, hashes, profile)
         report["limitations"] = LIMITATIONS
         blob.write_report(args.report, report)
         print(json.dumps(report, indent=2))
