@@ -326,6 +326,17 @@ pub struct HoldConsumeRecord {
     pub request_digest: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldRetireRecord {
+    pub request_id: Uuid,
+    pub repository_id: Uuid,
+    pub tenant_id: Uuid,
+    pub hold_ids: Vec<Uuid>,
+    pub retired_count: usize,
+    pub request_digest: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaCounters {
@@ -384,6 +395,7 @@ pub(super) struct SmState {
     pub holds: BTreeMap<Uuid, HoldEntry>,
     pub hold_batches: BTreeMap<Uuid, HoldBatchRecord>,
     pub hold_consumes: BTreeMap<Uuid, HoldConsumeRecord>,
+    pub hold_retires: BTreeMap<Uuid, HoldRetireRecord>,
     pub repo_quotas: BTreeMap<Uuid, QuotaCounters>,
     pub tenant_quotas: BTreeMap<Uuid, QuotaCounters>,
     pub events: Vec<StateMachineEvent>,

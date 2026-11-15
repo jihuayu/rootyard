@@ -118,7 +118,15 @@ pub(super) fn commit_refs(
         );
     }
     if let Some(decision_id) = cmd.decision_id {
-        verify_decision_for_commit(state, decision_id, &request, &gate, effective_tick, &cmd.required_holds)?;
+        verify_decision_for_commit(
+            state,
+            decision_id,
+            &request,
+            &gate,
+            effective_tick,
+            &cmd.required_holds,
+            &cmd.policy_rejects,
+        )?;
     } else if gate.pack_mode == SmPackMode::PackVerified {
         return Err(StateMachineError::Store(RefStoreError::Unsupported(
             "pack_verified repository requires authorized pack decision",

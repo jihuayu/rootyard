@@ -7,7 +7,9 @@ use super::commands::{
     AcquireHoldBatchCommand, MarkHoldConsumedCommand, RetireHoldBatchCommand, ScopeLifecycle, SmHoldState, SmRootState,
 };
 use super::response::{ApplyResponse, StateMachineError};
-use super::state::{HoldBatchRecord, HoldConsumeRecord, HoldEntry, QuotaCounters, RepoEntityKey, SmState};
+use super::state::{
+    HoldBatchRecord, HoldConsumeRecord, HoldEntry, HoldRetireRecord, QuotaCounters, RepoEntityKey, SmState,
+};
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use crate::ref_store::core::artifact_hold::contract::{
     ArtifactHoldPurpose, MAX_BATCH_ARTIFACTS, REPO_MAX_DECLARED_BYTES, REPO_MAX_HOLDS, REPO_MAX_RECEIPTS,
@@ -201,10 +203,20 @@ pub(super) fn retire_hold_batch(
     state: &mut SmState,
     cmd: RetireHoldBatchCommand,
 ) -> Result<ApplyResponse, StateMachineError> {
-    if cmd.request_id.is_nil() || cmd.hold_ids.is_empty() {
+    if cmd.request_id.is_nil() || cmd.repository_id.is_nil() || cmd.tenant_id.is_nil() || cmd.hold_ids.is_empty() {
         return Err(StateMachineError::Store(RefStoreError::InvalidIdentity(
             "retire holds requires non-nil ids".into(),
         )));
+    }
+    let digest = hold_retire_digest(&cmd);
+    if let Some(existing) = state.hold_retires.get(&cmd.request_id) {
+        if existing.repository_id != cmd.repository_id
+            || existing.tenant_id != cmd.tenant_id
+            || existing.request_digest != digest
+        {
+            return Err(StateMachineError::Store(RefStoreError::DigestConflict));
+        }
+        return Ok(ApplyResponse::HoldsRetired { retired_count: existing.retired_count });
     }
     for hold_id in &cmd.hold_ids {
         let hold = state.holds.get(hold_id).ok_or(StateMachineError::HoldNotFound { hold_id: *hold_id })?;
@@ -226,6 +238,17 @@ pub(super) fn retire_hold_batch(
             retired += 1;
         }
     }
+    state.hold_retires.insert(
+        cmd.request_id,
+        HoldRetireRecord {
+            request_id: cmd.request_id,
+            repository_id: cmd.repository_id,
+            tenant_id: cmd.tenant_id,
+            hold_ids: cmd.hold_ids,
+            retired_count: retired,
+            request_digest: digest,
+        },
+    );
     Ok(ApplyResponse::HoldsRetired { retired_count: retired })
 }
 
@@ -266,6 +289,19 @@ fn hold_consume_digest(cmd: &MarkHoldConsumedCommand) -> String {
     }
     let slices: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
     RequestDigest::of("raft-sm-hold-consume-v1", &slices).as_hex()
+}
+
+fn hold_retire_digest(cmd: &RetireHoldBatchCommand) -> String {
+    let mut fields: Vec<Vec<u8>> = vec![
+        cmd.request_id.as_bytes().to_vec(),
+        cmd.repository_id.as_bytes().to_vec(),
+        cmd.tenant_id.as_bytes().to_vec(),
+    ];
+    for id in &cmd.hold_ids {
+        fields.push(id.as_bytes().to_vec());
+    }
+    let slices: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    RequestDigest::of("raft-sm-hold-retire-v1", &slices).as_hex()
 }
 
 fn charge_hold_quota(

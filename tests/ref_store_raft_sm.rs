@@ -15,10 +15,14 @@ use rootyard::ref_store::{
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+#[path = "raft_sm_support/decision_pin_root_cases.rs"]
+mod decision_pin_root_cases;
 #[path = "raft_sm_support/lifecycle_cases.rs"]
 mod lifecycle_cases;
 #[path = "raft_sm_support/recovery_cases.rs"]
 mod recovery_cases;
+#[path = "raft_sm_support/root_hold_cases.rs"]
+mod root_hold_cases;
 
 pub(crate) fn lane() -> IssuerLane {
     IssuerLane::new("raft-sm-test").expect("valid lane")
@@ -242,11 +246,10 @@ fn deterministic_byte_log_replay_and_snapshot_recovery_match_state_digest() {
                 facts_digest: digest("facts"),
                 authz_digest: digest("authz"),
                 dependencies_digest: digest("deps"),
-                verdicts: vec![WireDecisionVerdict {
-                    ref_name: "refs/heads/feat".into(),
-                    accepted: true,
-                    reject_code: None,
-                }],
+                verdicts: vec![
+                    WireDecisionVerdict { ref_name: "refs/heads/feat".into(), accepted: true, reject_code: None },
+                    WireDecisionVerdict { ref_name: "refs/heads/main".into(), accepted: true, reject_code: None },
+                ],
                 authz_epoch: 1,
                 not_after_tick: 500,
                 logical_tick: 110,

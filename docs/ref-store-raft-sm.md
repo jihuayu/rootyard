@@ -4,7 +4,7 @@
 
 ## 实现位置
 
-- 状态机目录：`src/ref_store/core/state_machine/`（每子模块 `< 450` 行）
+- 状态机入口与子模块：`src/ref_store/core/state_machine.rs` + `src/ref_store/core/state_machine/`（每子模块 `< 480` 行）
   - `wire.rs` / `commands.rs` / `response.rs`：带 `#[serde(deny_unknown_fields)]` 的确定性命令、响应与类型化错误。
   - `state.rs` / `snapshot.rs`：全 `BTreeMap` 有序内存表与带 SHA-256 校验和的 `RefCasSnapshot`（覆盖 gates、refs、`cancel_cutoff`、取消墓碑、终态与操作记录、publication decisions、snapshot/pin 租约、retention roots、artifact holds 与配额计数）。
   - `apply_refs.rs` / `apply_commit.rs`：`InitializeGate`、`SetRepositoryLane`、`BeginOperation`、`Cancel`、`AdvanceCancelCutoff` 与 `CommitRefs`（`CommitMode::Atomic` + `CommitMode::AcceptedSubset`）。

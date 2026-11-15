@@ -3,7 +3,7 @@
 //! Release-before-register tombstones, non-reusable `root_id` enforcement,
 //! bound hold verification, and non-refundable root quotas all preserve exact PG behavior.
 
-use super::commands::{RegisterRootCommand, ReleaseRootCommand, ScopeLifecycle, SmHoldState, SmRootState};
+use super::commands::{RegisterRootCommand, ReleaseRootCommand, ScopeLifecycle, SmHoldState, SmPinState, SmRootState};
 use super::response::{ApplyResponse, StateMachineError};
 use super::state::{RepoEntityKey, RootReceiptRecord, RootRecordSm, RootReleaseTombstone, SmState};
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
@@ -14,7 +14,13 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 pub(super) fn register_root(state: &mut SmState, cmd: RegisterRootCommand) -> Result<ApplyResponse, StateMachineError> {
-    if cmd.request_id.is_nil() || cmd.root_id.is_nil() || cmd.operation_id.is_nil() || cmd.repository_id.is_nil() {
+    if cmd.request_id.is_nil()
+        || cmd.root_id.is_nil()
+        || cmd.operation_id.is_nil()
+        || cmd.repository_id.is_nil()
+        || cmd.tenant_id.is_nil()
+        || cmd.owner_id.is_nil()
+    {
         return Err(StateMachineError::Store(RefStoreError::InvalidIdentity(
             "root register ids must be non-nil".into(),
         )));
@@ -71,17 +77,36 @@ pub(super) fn register_root(state: &mut SmState, cmd: RegisterRootCommand) -> Re
         .ok_or(StateMachineError::SnapshotNotFound { snapshot_id: cmd.source_snapshot_id })?
         .clone();
     let pin = state.pins.get(&cmd.source_pin_id).ok_or(StateMachineError::PinNotFound { pin_id: cmd.source_pin_id })?;
+    if pin.state != SmPinState::Active {
+        return Err(StateMachineError::PinReleased { pin_id: pin.pin_id });
+    }
     if snap.repository_id != cmd.repository_id
+        || snap.tenant_id != cmd.tenant_id
+        || pin.repository_id != cmd.repository_id
+        || pin.tenant_id != cmd.tenant_id
         || pin.snapshot_id != snap.snapshot_id
         || pin.generation != cmd.source_pin_generation
     {
         return Err(StateMachineError::RootConflict("source snapshot/pin does not match root scope"));
     }
+    if snap.object_format != cmd.object_format
+        || snap.history_incarnation != cmd.history_incarnation
+        || snap.authority_epoch != cmd.authority_epoch
+        || snap.group_epoch != cmd.group_epoch
+    {
+        return Err(StateMachineError::RootConflict("source snapshot realm does not match root command"));
+    }
 
     let gate =
         state.gates.get(&cmd.repository_id).ok_or(StateMachineError::Store(RefStoreError::RepositoryNotFound))?;
-    if gate.tenant_id != cmd.tenant_id || gate.lifecycle != ScopeLifecycle::Open {
-        return Err(StateMachineError::RootConflict("gate missing, tenant mismatched, or scope closed"));
+    if gate.tenant_id != cmd.tenant_id
+        || gate.lifecycle != ScopeLifecycle::Open
+        || gate.object_format != cmd.object_format
+        || gate.history_incarnation != cmd.history_incarnation
+        || gate.authority_epoch != cmd.authority_epoch
+        || gate.group_epoch != cmd.group_epoch
+    {
+        return Err(StateMachineError::RootConflict("gate missing, tenant/realm mismatched, or scope closed"));
     }
     let gate_digest = gate.version()?.digest().as_hex();
     let gate_revision = gate.revision;

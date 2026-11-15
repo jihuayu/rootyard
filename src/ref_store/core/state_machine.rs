@@ -30,9 +30,10 @@ pub use machine::{RefCasLogEntry, RefCasStateMachine, decode_command, encode_com
 pub use response::{ApplyResponse, SmOperationRecord, SmVersionCheck, StateMachineError};
 pub use snapshot::{RefCasSnapshot, SnapshotBody};
 pub use state::{
-    CancelTombstone, DecisionRecord, GateState, HoldBatchRecord, HoldConsumeRecord, HoldEntry, LaneKey, LaneState,
-    OperationEntry, PinReceiptRecord, PinRecord, QuotaCounters, QuotaEntry, RepoEntityKey, RepoRefsSnapshot,
-    RootReceiptRecord, RootRecordSm, RootReleaseTombstone, SNAPSHOT_FORMAT_VERSION, SnapshotRecord, StateMachineEvent,
+    CancelTombstone, DecisionRecord, GateState, HoldBatchRecord, HoldConsumeRecord, HoldEntry, HoldRetireRecord,
+    LaneKey, LaneState, OperationEntry, PinReceiptRecord, PinRecord, QuotaCounters, QuotaEntry, RepoEntityKey,
+    RepoRefsSnapshot, RootReceiptRecord, RootRecordSm, RootReleaseTombstone, SNAPSHOT_FORMAT_VERSION, SnapshotRecord,
+    StateMachineEvent,
 };
 pub use wire::{
     WireCommitRefsRequest, WireCommitRejection, WireCommitTerminal, WireGateInit, WireHeadUpdate, WireHeadUpdateKind,

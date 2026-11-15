@@ -7,9 +7,10 @@
 use super::commands::AppliedLogId;
 use super::response::StateMachineError;
 use super::state::{
-    CancelTombstone, DecisionRecord, GateState, HoldBatchRecord, HoldConsumeRecord, HoldEntry, LaneState,
-    OperationEntry, PinReceiptRecord, PinRecord, QuotaEntry, RepoEntityKey, RepoRefsSnapshot, RootReceiptRecord,
-    RootRecordSm, RootReleaseTombstone, SNAPSHOT_FORMAT_VERSION, SmState, SnapshotRecord, StateMachineEvent,
+    CancelTombstone, DecisionRecord, GateState, HoldBatchRecord, HoldConsumeRecord, HoldEntry, HoldRetireRecord,
+    LaneState, OperationEntry, PinReceiptRecord, PinRecord, QuotaEntry, RepoEntityKey, RepoRefsSnapshot,
+    RootReceiptRecord, RootRecordSm, RootReleaseTombstone, SNAPSHOT_FORMAT_VERSION, SmState, SnapshotRecord,
+    StateMachineEvent,
 };
 use super::wire::WireOperationRecord;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ pub struct SnapshotBody {
     pub holds: Vec<HoldEntry>,
     pub hold_batches: Vec<HoldBatchRecord>,
     pub hold_consumes: Vec<HoldConsumeRecord>,
+    pub hold_retires: Vec<HoldRetireRecord>,
     pub repo_quotas: Vec<QuotaEntry>,
     pub tenant_quotas: Vec<QuotaEntry>,
     pub events: Vec<StateMachineEvent>,
@@ -126,6 +128,7 @@ pub(super) fn export_snapshot_body(state: &SmState) -> SnapshotBody {
         holds: state.holds.values().cloned().collect(),
         hold_batches: state.hold_batches.values().cloned().collect(),
         hold_consumes: state.hold_consumes.values().cloned().collect(),
+        hold_retires: state.hold_retires.values().cloned().collect(),
         repo_quotas,
         tenant_quotas,
         events: state.events.clone(),
@@ -199,6 +202,9 @@ pub(super) fn restore_from_snapshot(snapshot: &RefCasSnapshot) -> Result<SmState
     }
     for consume in &body.hold_consumes {
         insert_unique(&mut state.hold_consumes, consume.consume_request_id, consume.clone(), "hold consume")?;
+    }
+    for retire in &body.hold_retires {
+        insert_unique(&mut state.hold_retires, retire.request_id, retire.clone(), "hold retire")?;
     }
     for q in &body.repo_quotas {
         state.repo_quotas.insert(q.scope_id, q.counters);

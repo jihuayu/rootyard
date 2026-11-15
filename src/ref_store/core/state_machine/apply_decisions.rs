@@ -3,13 +3,18 @@
 //! Decisions are single-use capability bindings checked before commit without
 //! running Blob I/O, PG queries, or system wall clocks inside `apply`.
 
-use super::commands::{InstallDecisionCommand, ScopeLifecycle, SmDecisionState, SmHoldState, WireDecisionKind};
+use super::commands::{
+    InstallDecisionCommand, ScopeLifecycle, SmDecisionState, SmHoldState, WireDecisionKind, WireDecisionVerdict,
+};
 use super::response::{ApplyResponse, StateMachineError};
 use super::state::{DecisionRecord, GateState, RepoEntityKey, SmState};
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use crate::ref_store::core::command::CommitRefsRequest;
 use crate::ref_store::core::contract::CommitMode;
 use crate::ref_store::core::publication_decision::contract::{REPO_MAX_DECISIONS, TENANT_MAX_DECISIONS};
+use crate::ref_store::core::terminal::CommitRejectCode;
+use crate::ref_store::core::types::RefName;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -27,6 +32,18 @@ pub(super) fn install_decision(
     }
     if cmd.verdicts.is_empty() || cmd.base_revision <= 0 || cmd.authz_epoch <= 0 {
         return Err(StateMachineError::InvalidInput("decision verdicts/revision/epoch out of bounds".into()));
+    }
+    let mut seen_verdict_refs = BTreeSet::new();
+    for verdict in &cmd.verdicts {
+        RefName::new(&verdict.ref_name)?;
+        if !seen_verdict_refs.insert(verdict.ref_name.as_str()) {
+            return Err(StateMachineError::InvalidInput("duplicate ref_name in decision verdicts".into()));
+        }
+        if verdict.accepted != verdict.reject_code.is_none() {
+            return Err(StateMachineError::InvalidInput(
+                "decision verdict accepted flag disagrees with reject_code".into(),
+            ));
+        }
     }
     for digest_hex in [
         &cmd.command_digest,
@@ -48,9 +65,13 @@ pub(super) fn install_decision(
             .get(&existing_id)
             .ok_or(StateMachineError::DecisionNotFound { decision_id: existing_id })?;
         if existing.decision_id != cmd.decision_id
+            || existing.repository_id != cmd.repository_id
             || existing.tenant_id != cmd.tenant_id
             || existing.actor_id != cmd.actor_id
             || existing.kind != cmd.kind
+            || existing.base_revision != cmd.base_revision
+            || existing.authz_epoch != cmd.authz_epoch
+            || existing.not_after_tick != cmd.not_after_tick
             || existing.command_digest != cmd.command_digest
             || existing.selection_digest != cmd.selection_digest
             || existing.policy_digest != cmd.policy_digest
@@ -151,6 +172,7 @@ pub(super) fn verify_decision_for_commit(
     gate: &GateState,
     current_tick: u64,
     required_holds: &[Uuid],
+    policy_rejects: &BTreeMap<String, CommitRejectCode>,
 ) -> Result<(), StateMachineError> {
     let decision = state.decisions.get(&decision_id).ok_or(StateMachineError::DecisionNotFound { decision_id })?;
     if decision.repository_id != request.repository_id()
@@ -192,6 +214,50 @@ pub(super) fn verify_decision_for_commit(
     if decision.command_digest != request.digest().as_hex() {
         return Err(StateMachineError::DecisionDigestMismatch { decision_id, reason: "command digest mismatch" });
     }
+
+    let mut verdict_map: BTreeMap<&str, &WireDecisionVerdict> = BTreeMap::new();
+    for verdict in &decision.verdicts {
+        if verdict.accepted != verdict.reject_code.is_none()
+            || verdict_map.insert(verdict.ref_name.as_str(), verdict).is_some()
+        {
+            return Err(StateMachineError::DecisionDigestMismatch {
+                decision_id,
+                reason: "installed decision contains inconsistent verdicts",
+            });
+        }
+    }
+    if verdict_map.len() != request.refs().len() {
+        return Err(StateMachineError::DecisionDigestMismatch {
+            decision_id,
+            reason: "decision verdicts length disagrees with request refs",
+        });
+    }
+    let mut expected_policy_rejects: BTreeMap<String, CommitRejectCode> = BTreeMap::new();
+    for update in request.refs() {
+        let name = update.name().as_str();
+        let Some(verdict) = verdict_map.get(name) else {
+            return Err(StateMachineError::DecisionDigestMismatch {
+                decision_id,
+                reason: "request ref missing from installed decision verdicts",
+            });
+        };
+        if let Some(code) = verdict.reject_code {
+            expected_policy_rejects.insert(name.to_owned(), code);
+        }
+    }
+    if policy_rejects != &expected_policy_rejects {
+        return Err(StateMachineError::DecisionDigestMismatch {
+            decision_id,
+            reason: "commit policy_rejects disagree with installed decision verdicts",
+        });
+    }
+    if request.mode() == CommitMode::Atomic && !expected_policy_rejects.is_empty() {
+        return Err(StateMachineError::DecisionDigestMismatch {
+            decision_id,
+            reason: "atomic commit refused because installed decision rejected ref(s)",
+        });
+    }
+
     for hold_id in required_holds {
         let hold = state.holds.get(hold_id).ok_or(StateMachineError::HoldNotFound { hold_id: *hold_id })?;
         if hold.repository_id != request.repository_id()

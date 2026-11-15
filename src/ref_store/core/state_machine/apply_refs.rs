@@ -35,6 +35,7 @@ pub(super) fn initialize_gate(
             || existing.head_ref != init.head_ref().as_str()
             || existing.pack_mode != cmd.pack_mode
             || existing.lane != cmd.lane
+            || existing.authz_floor != cmd.authz_floor
         {
             return Err(StateMachineError::Store(RefStoreError::GateConflict));
         }
