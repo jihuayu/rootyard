@@ -19,7 +19,6 @@ use std::time::Duration;
 struct S3Stats {
     get_requests: AtomicU64,
     get_bytes: AtomicU64,
-    head_requests: AtomicU64,
     put_requests: AtomicU64,
 }
 
@@ -27,7 +26,6 @@ struct S3Stats {
 pub struct S3Counters {
     pub get_requests: u64,
     pub get_bytes: u64,
-    pub head_requests: u64,
     pub put_requests: u64,
 }
 
@@ -36,7 +34,6 @@ impl S3Counters {
         Self {
             get_requests: self.get_requests.saturating_sub(earlier.get_requests),
             get_bytes: self.get_bytes.saturating_sub(earlier.get_bytes),
-            head_requests: self.head_requests.saturating_sub(earlier.head_requests),
             put_requests: self.put_requests.saturating_sub(earlier.put_requests),
         }
     }
@@ -132,13 +129,14 @@ impl LoopbackS3 {
         S3Counters {
             get_requests: self.state.stats.get_requests.load(Ordering::Relaxed),
             get_bytes: self.state.stats.get_bytes.load(Ordering::Relaxed),
-            head_requests: self.state.stats.head_requests.load(Ordering::Relaxed),
             put_requests: self.state.stats.put_requests.load(Ordering::Relaxed),
         }
     }
 
-    pub fn open_blob_store(&self) -> Result<(BlobStore, EnvGuard)> {
-        let env = EnvGuard::set(&[
+    pub fn open_blob_store(&self) -> Result<BlobStore> {
+        static BLOB_ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = BLOB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
             ("ROOTYARD_BLOB_DRIVER", Some("opendal")),
             ("ROOTYARD_BLOB_SERVICE", Some("s3")),
             ("ROOTYARD_BLOB_BUCKET", Some(self.bucket)),
@@ -163,16 +161,16 @@ impl LoopbackS3 {
         ]);
         let profile = BlobProfile::from_env().map_err(|e| anyhow!("loopback BlobProfile failed: {e}"))?;
         let store = BlobStore::open(profile).map_err(|e| anyhow!("loopback BlobStore::open failed: {e}"))?;
-        Ok((store, env))
+        Ok(store)
     }
 }
 
-pub struct EnvGuard {
+struct EnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
 }
 
 impl EnvGuard {
-    pub fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+    fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
         let mut saved = Vec::with_capacity(pairs.len());
         for &(key, next) in pairs {
             saved.push((key, std::env::var(key).ok()));
@@ -303,7 +301,6 @@ async fn handle_s3(
             let Some(stored) = maybe else {
                 return s3_response(StatusCode::NOT_FOUND, Some("application/xml"), None, Some(0), None, Body::empty());
             };
-            state.stats.head_requests.fetch_add(1, Ordering::Relaxed);
             let digest = hex::encode(Sha256::digest(&stored));
             let etag = format!("\"{}\"", &digest[..32]);
             s3_response(

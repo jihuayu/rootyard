@@ -93,16 +93,24 @@ impl Drop for SlotPermit {
 }
 
 #[derive(Debug)]
-pub(crate) struct DownloadPermit(SlotPermit);
+pub(crate) struct DownloadPermit {
+    _permit: SlotPermit,
+}
 #[derive(Debug)]
-pub(crate) struct ViewPermit(SlotPermit);
+pub(crate) struct ViewPermit {
+    _permit: SlotPermit,
+}
 #[derive(Debug)]
-pub(crate) struct NativePermit(SlotPermit);
+pub(crate) struct NativePermit {
+    _permit: SlotPermit,
+}
 
 #[cfg(test)]
 impl NativePermit {
     pub(super) fn from_test_permit(permit: OwnedSemaphorePermit) -> Self {
-        Self(SlotPermit { _global: permit, _maintenance: None, counters: Arc::new(SlotCounters::default()) })
+        Self {
+            _permit: SlotPermit { _global: permit, _maintenance: None, counters: Arc::new(SlotCounters::default()) },
+        }
     }
 }
 
@@ -211,7 +219,7 @@ impl BudgetRegistry {
         class: AdmissionClass,
         deadline: Instant,
     ) -> Result<DownloadPermit, PackCommitError> {
-        Ok(DownloadPermit(self.download.acquire(class, deadline, &self.globals.budget_timeouts).await?))
+        Ok(DownloadPermit { _permit: self.download.acquire(class, deadline, &self.globals.budget_timeouts).await? })
     }
 
     pub(crate) async fn acquire_native(
@@ -219,7 +227,7 @@ impl BudgetRegistry {
         class: AdmissionClass,
         deadline: Instant,
     ) -> Result<NativePermit, PackCommitError> {
-        Ok(NativePermit(self.native.acquire(class, deadline, &self.globals.budget_timeouts).await?))
+        Ok(NativePermit { _permit: self.native.acquire(class, deadline, &self.globals.budget_timeouts).await? })
     }
 
     pub(crate) async fn acquire_view(
@@ -227,7 +235,7 @@ impl BudgetRegistry {
         class: AdmissionClass,
         deadline: Instant,
     ) -> Result<ViewPermit, PackCommitError> {
-        Ok(ViewPermit(self.view.acquire(class, deadline, &self.globals.budget_timeouts).await?))
+        Ok(ViewPermit { _permit: self.view.acquire(class, deadline, &self.globals.budget_timeouts).await? })
     }
 
     pub(crate) async fn reserve_staging(

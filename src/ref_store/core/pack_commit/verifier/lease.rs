@@ -305,6 +305,9 @@ mod tests {
         let staging = registry.reserve_staging(64 * 1024, AdmissionClass::Foreground, deadline).await.expect("staging");
         let download = registry.acquire_download(AdmissionClass::Foreground, deadline).await.expect("download");
         let lease = VerificationLease::for_verification(staging, download).expect("lease");
+        assert!(lease.reserved_staging_bytes() >= 64 * 1024);
+        lease.shrink_staging_to(0);
+        assert_eq!(lease.reserved_staging_bytes(), 0);
         lease.release_download();
         drop(registry.acquire_download(AdmissionClass::Foreground, deadline).await.expect("download released"));
         let native = registry.acquire_native(AdmissionClass::Foreground, deadline).await.expect("first native");
