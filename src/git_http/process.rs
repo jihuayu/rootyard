@@ -42,19 +42,17 @@ impl Process {
         Ok(status)
     }
     async fn wait_group_quiescent(&self) {
-        // Keep leader unreaped, reserving PGID, until every member is dead or
-        // zombie. SIGKILL delivery alone is not proof a descendant stopped.
-        let started = Instant::now();
-        let mut reported = false;
-        while !matches!(group_quiescent(self.pid), Ok(true)) {
-            if !reported && started.elapsed() > std::time::Duration::from_secs(5) {
-                eprintln!("rootyard: process group cleanup blocked; retaining write lock and capacity");
-                reported = true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_pid_group_quiescent(
+            self.pid,
+            "rootyard: process group cleanup blocked; retaining write lock and capacity",
+        )
+        .await;
     }
     pub(super) async fn stop(&mut self) {
+        let grace = super::revocation::bound().stop_grace;
+        self.stop_with_grace(grace).await;
+    }
+    pub(super) async fn stop_with_grace(&mut self, grace: std::time::Duration) {
         if let Some(input) = &self.input {
             input.abort();
         }
@@ -63,14 +61,12 @@ impl Process {
         }
         // Keep the leader unreaped for the entire grace period. Otherwise an
         // early leader exit could permit PGID reuse while descendants remain.
-        unsafe {
-            libc::kill(-self.pid, libc::SIGTERM);
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        unsafe {
-            libc::kill(-self.pid, libc::SIGKILL);
-        }
-        self.wait_group_quiescent().await;
+        terminate_group_with_grace(
+            self.pid,
+            grace,
+            "rootyard: process group cleanup blocked; retaining write lock and capacity",
+        )
+        .await;
         let _ = self.child.wait().await;
         self.pid = 0;
     }
@@ -141,14 +137,9 @@ pub(crate) async fn finish_group_child(child: &mut Child) -> io::Result<std::pro
 /// Cancellation and timeout path for a Git leader and all descendants.
 pub(crate) async fn stop_group_child(child: &mut Child) -> io::Result<()> {
     let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
-    unsafe {
-        libc::kill(-pid, libc::SIGTERM);
-    }
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-    wait_group_child_quiescent(pid).await;
+    let grace = super::revocation::bound().stop_grace;
+    terminate_group_with_grace(pid, grace, "rootyard: process group cleanup blocked; retaining maintenance guard")
+        .await;
     let _ = child.wait().await?;
     Ok(())
 }
@@ -165,12 +156,40 @@ pub(crate) async fn kill_group_child(child: &mut Child) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) async fn terminate_group_with_grace(pid: i32, grace: std::time::Duration, warn: &str) {
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
+    let started = Instant::now();
+    loop {
+        if matches!(group_quiescent(pid), Ok(true)) {
+            return;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= grace {
+            break;
+        }
+        let step = (grace - elapsed).min(std::time::Duration::from_millis(15));
+        tokio::time::sleep(step).await;
+    }
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    wait_pid_group_quiescent(pid, warn).await;
+}
+
 async fn wait_group_child_quiescent(pid: i32) {
+    wait_pid_group_quiescent(pid, "rootyard: process group cleanup blocked; retaining maintenance guard").await;
+}
+
+async fn wait_pid_group_quiescent(pid: i32, warn: &str) {
+    // Keep leader unreaped, reserving PGID, until every member is dead or
+    // zombie. SIGKILL delivery alone is not proof a descendant stopped.
     let started = Instant::now();
     let mut reported = false;
     while !matches!(group_quiescent(pid), Ok(true)) {
         if !reported && started.elapsed() > std::time::Duration::from_secs(5) {
-            eprintln!("rootyard: process group cleanup blocked; retaining maintenance guard");
+            eprintln!("{warn}");
             reported = true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

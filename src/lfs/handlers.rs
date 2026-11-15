@@ -276,7 +276,7 @@ async fn download_inner(
         return Err(Error::bad_request());
     }
 
-    let (repo_id, tenant_id, expected_size) = {
+    let (repo_id, tenant_id, storage_generation, expected_size) = {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
         let access = auth::authorize_repo_with_role(
@@ -289,6 +289,12 @@ async fn download_inner(
         )
         .await?;
         let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
+        let gen_row = tx
+            .query_opt("SELECT storage_generation FROM repositories WHERE id = $1", &[&repo_id])
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(Error::not_found)?;
+        let storage_generation: i64 = gen_row.get(0);
         let row = tx
             .query_opt(
                 "SELECT size, state FROM lfs_objects WHERE tenant_id = $1 AND repository_id = $2 AND oid = $3",
@@ -303,26 +309,71 @@ async fn download_inner(
         }
         auth::finish_tx(tx, &actor, false).await?;
         drop(client);
-        (repo_id, tenant_id, db_size as u64)
+        (repo_id, tenant_id, storage_generation, db_size as u64)
     };
 
+    let bound = crate::git_http::revocation::bound();
     let stream_body =
         storage::open_verified_download_stream_until(&state, repo_id, tenant_id, &oid, expected_size, deadline).await?;
     // Opening the stream may verify local bytes or hydrate from the object store.
     // Re-authorize the exact token and repository generation after that slow work,
     // with no database connection held across it, before any response body is sent.
-    reauthorize_repo(
-        &state,
-        &actor,
-        &owner,
-        name,
-        repo_id,
-        tenant_id,
-        auth::Role::Read,
-        crate::token_scopes::RepoAction::ContentsRead,
-        false,
+    match tokio::time::timeout(
+        bound.reauth_timeout,
+        async {
+            reauthorize_repo(
+                &state,
+                &actor,
+                &owner,
+                name,
+                repo_id,
+                tenant_id,
+                auth::Role::Read,
+                crate::token_scopes::RepoAction::ContentsRead,
+                false,
+            )
+            .await?;
+            auth::verify_active_transfer(
+                &state.pool,
+                &actor,
+                repo_id,
+                storage_generation,
+                crate::token_scopes::RepoAction::ContentsRead,
+                auth::Role::Read,
+            )
+            .await
+        },
     )
-    .await?;
+    .await
+    {
+        Ok(res) => res?,
+        Err(_) => return Err(Error::internal("LFS authority check timed out")),
+    }
+    let check_state = state.clone();
+    let check_actor = actor.clone();
+    let stream_body = crate::git_http::revocation::stream_body_with_reauth(state, stream_body, bound, move || {
+        let state = check_state.clone();
+        let actor = check_actor.clone();
+        async move {
+            match tokio::time::timeout(
+                bound.reauth_timeout,
+                auth::verify_active_transfer(
+                    &state.pool,
+                    &actor,
+                    repo_id,
+                    storage_generation,
+                    crate::token_scopes::RepoAction::ContentsRead,
+                    auth::Role::Read,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) => Err(std::io::Error::other("LFS authority revoked")),
+                Err(_) => Err(std::io::Error::other("LFS authority check timed out")),
+            }
+        }
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")

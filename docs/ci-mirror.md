@@ -585,4 +585,33 @@ The scheduler and `POST .../integrations/{hook_id}/runs/{run_id}/claim` enforce:
   and expired leases are reaped back to `queued` automatically without shifting
   the target commit OID.
 
+## Bounded transfer revocation (`ROOTYARD_TRANSFER_REVOCATION_BOUND_MS`)
+
+Active Git HTTP (`git-upload-pack`, `git-receive-pack`), Git LFS downloads, and
+mirror origin-preparation transfers (`mirror-sync` / `mirror-prepare`) enforce
+a configurable end-to-end revocation bound via
+`ROOTYARD_TRANSFER_REVOCATION_BOUND_MS` (default `3000` ms; accepted range
+`300..=60000` ms, validated at startup):
+
+- **Budget partitioning**: each transfer derives `check_interval` (`total / 4`,
+  clamped `50..=5000` ms), `reauth_timeout` (`total / 3`, clamped `100..=2000`
+  ms), and `stop_grace` (`total / 4`, clamped `50..=1000` ms) so detection,
+  PostgreSQL authority re-verification, and process-group termination fit inside
+  the configured bound.
+- **Covered revocation triggers**: user token revocation/expiry, browser session
+  revocation/expiry, collaborator/organization membership removal or role
+  downgrade, restricted grant narrowing, `ci_checkout_jobs` and
+  `ci_integration_checkout_jobs` cancellation/revocation/expiry, webhook or
+  trusted-context deactivation, closed PRs, repository non-`ready` states, and
+  `storage_generation` increments.
+- **Fail-closed authority & origin non-bypass**: if PostgreSQL or authority
+  verification errors or exceeds `reauth_timeout`, the active stream aborts
+  immediately and sends `SIGTERM` to the entire native Git process group (`-pgid`),
+  polling `/proc` quiescence up to `stop_grace` before escalating to `SIGKILL`
+  and waiting for all descendants to exit before releasing repository locks or
+  reaping the leader PID. Mirror preparation (`mirror-prepare` using
+  `ROOTYARD_CI_MIRROR_SOURCE_TOKEN`) periodically revalidates the underlying job
+  scope during both `git clone --mirror` and origin LFS fetches and aborts
+  without publishing partial snapshots or permitting origin fallback bypass.
+
 
