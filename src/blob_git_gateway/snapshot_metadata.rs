@@ -48,14 +48,14 @@ use crate::ref_store::{
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CreateSnapshotBody {
+pub(super) struct CreateSnapshotBody {
     idempotency_key: String,
     lease_seconds: i64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RenewSnapshotBody {
+pub(super) struct RenewSnapshotBody {
     idempotency_key: String,
     expected_generation: i64,
     lease_seconds: i64,
@@ -63,7 +63,7 @@ struct RenewSnapshotBody {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReleaseSnapshotBody {
+pub(super) struct ReleaseSnapshotBody {
     idempotency_key: String,
     expected_generation: i64,
 }

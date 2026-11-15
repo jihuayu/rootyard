@@ -37,7 +37,7 @@ const COMMIT_UNKNOWN_SENTINEL: &str =
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RootCreateBody {
+pub(super) struct RootCreateBody {
     idempotency_key: String,
     source_snapshot_id: Uuid,
     purpose: RootPurposeBody,
@@ -46,14 +46,14 @@ struct RootCreateBody {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReleaseRootBody {
+pub(super) struct ReleaseRootBody {
     idempotency_key: String,
     reason: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReleaseIntentBody {
+pub(super) struct ReleaseIntentBody {
     create: RootCreateBody,
     idempotency_key: String,
     reason: String,
