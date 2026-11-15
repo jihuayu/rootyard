@@ -31,11 +31,12 @@ use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::core::pack_commit::artifact::{RegisteredArtifact, RegisteredPack};
 use crate::ref_store::core::pack_commit::contract::{PackArtifactRole, VERIFIER_MAX_OBJECTS};
 use crate::ref_store::core::pack_commit::error::PackCommitError;
-use futures_util::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::task::JoinSet;
 
 /// Fixed native pack header size. Nothing beyond this is interpreted here.
 const PACK_HEADER_BYTES: usize = 12;
@@ -100,15 +101,47 @@ pub(super) async fn fetch_pairs_staged(
 ) -> Result<Vec<PairInput>, PackCommitError> {
     let planned_bytes = planned_pair_bytes(packs)?;
     check_disk_headroom(incoming, planned_bytes.saturating_mul(2))?;
-    let mut results = stream::iter(packs.iter().copied().enumerate().map(|(index, pack)| async move {
-        let input = fetch_pair(store, pack, incoming, index, lease, deadline).await?;
-        Ok::<(usize, PairInput), PackCommitError>((index, input))
-    }))
-    .buffer_unordered(VERIFIER_PAIR_PREFETCH_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()?;
+    if deadline <= Instant::now() {
+        return Err(refuse("verifier deadline elapsed before staged pair download"));
+    }
+
+    // Clone every captured value before the first `.await` so `JoinSet` tasks are
+    // `'static + Send` and no borrowed lifetimes span suspension points.
+    let owned_store = store.clone();
+    let owned_incoming = incoming.to_path_buf();
+    let owned_lease = Arc::clone(lease);
+    let mut pending: VecDeque<(usize, RegisteredPack)> =
+        packs.iter().enumerate().map(|(index, pack)| (index, (*pack).clone())).collect();
+    let max_in_flight = VERIFIER_PAIR_PREFETCH_CONCURRENCY.max(1);
+    let mut join_set = JoinSet::new();
+    while join_set.len() < max_in_flight
+        && let Some((index, pack)) = pending.pop_front()
+    {
+        spawn_pair_fetch(&mut join_set, &owned_store, pack, &owned_incoming, index, &owned_lease, deadline);
+    }
+
+    let mut results = Vec::with_capacity(packs.len());
+    while !join_set.is_empty() {
+        let joined = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), join_set.join_next())
+            .await
+            .map_err(|_| refuse("verifier deadline elapsed during staged pair download"))?;
+        let Some(task_result) = joined else {
+            break;
+        };
+        let (index, input) = task_result.map_err(|_| refuse("staged pair download task failed"))??;
+        results.push((index, input));
+        if let Some((next_index, next_pack)) = pending.pop_front() {
+            spawn_pair_fetch(
+                &mut join_set,
+                &owned_store,
+                next_pack,
+                &owned_incoming,
+                next_index,
+                &owned_lease,
+                deadline,
+            );
+        }
+    }
     results.sort_by_key(|(index, _)| *index);
     let mut total_objects = 0u64;
     let mut ordered = Vec::with_capacity(results.len());
@@ -180,6 +213,24 @@ pub(super) async fn remove_directory_tree(
         Ok(Err(_)) => Err(refuse("disposable scratch tree cleanup task failed")),
         Err(_) => Err(refuse("disposable scratch tree cleanup is retained until it exits")),
     }
+}
+
+fn spawn_pair_fetch(
+    join_set: &mut JoinSet<Result<(usize, PairInput), PackCommitError>>,
+    store: &BlobStore,
+    pack: RegisteredPack,
+    incoming: &Path,
+    index: usize,
+    lease: &Arc<VerificationLease>,
+    deadline: Instant,
+) {
+    let owned_store = store.clone();
+    let owned_incoming = incoming.to_path_buf();
+    let owned_lease = Arc::clone(lease);
+    join_set.spawn(async move {
+        let input = fetch_pair(&owned_store, &pack, &owned_incoming, index, &owned_lease, deadline).await?;
+        Ok((index, input))
+    });
 }
 
 /// Fetch one registered pair into the owned view and independently re-verify it.
