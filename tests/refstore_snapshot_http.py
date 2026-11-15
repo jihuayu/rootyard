@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 import urllib.parse
 import uuid
 
@@ -70,6 +71,22 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
 
     def _read(self, repo, snapshot, token=None):
         return self._request("GET", self._snapshots_path(repo, "/" + str(snapshot)), token or self.alice)
+
+    def _await_pin_expiry(self, repo, pin_id, label):
+        """Poll the real DB clock against the immutable active-pin expiry."""
+        rid = str(uuid.UUID(repo["id"]))
+        pid = str(uuid.UUID(pin_id))
+        until = time.monotonic() + 10
+        while time.monotonic() < until:
+            state = self.sql(
+                "SELECT (expires_at <= clock_timestamp())::text FROM ref_store_core_pins "
+                "WHERE pin_id='" + pid + "' AND repository_id='" + rid + "'"
+            )
+            assert state in ("t", "f"), (label, state)
+            if state == "t":
+                return
+            time.sleep(0.05)
+        raise AssertionError(label + ": pin did not expire naturally within 10s")
 
     def _renew(self, repo, snapshot, key, generation, lease, token=None):
         return self._request("POST", self._snapshots_path(repo, "/" + str(snapshot) + "/renew"),
@@ -324,9 +341,7 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
         status, expired, _ = self._create(repo, "expired-create", 1)
         assert status == 201, (status, expired)
         expired_id = expired["snapshot_id"]
-        pin_id = str(uuid.UUID(expired["pin_id"]))
-        self.sql("UPDATE ref_store_core_pins SET expires_at=clock_timestamp()-interval '1 second' "
-                 "WHERE pin_id='" + pin_id + "'")
+        self._await_pin_expiry(repo, expired["pin_id"], "expired-create")
         expired_baseline = self._ledger(repo)
         status, expired_read, _ = self._read(repo, expired_id)
         assert status == 409, (status, expired_read)

@@ -1129,6 +1129,31 @@ fn expect_forbidden<T>(label: &str, result: Result<T, rootyard::Error>) -> Resul
     }
 }
 
+async fn wait_for_pin_expiry(pool: &Pool, repo: Uuid, pin_id: Uuid) -> Result<()> {
+    let until = StdInstant::now() + Duration::from_secs(10);
+    loop {
+        let row = pool
+            .get()
+            .await?
+            .query_opt(
+                "SELECT expires_at <= clock_timestamp()
+                   FROM ref_store_core_pins WHERE pin_id=$1 AND repository_id=$2",
+                &[&pin_id, &repo],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Err(anyhow!("fixture pin disappeared before natural expiry"));
+        };
+        if row.get::<_, bool>(0) {
+            return Ok(());
+        }
+        if StdInstant::now() >= until {
+            return Err(anyhow!("fixture pin did not expire naturally within 10s"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_for_backend_blocked_by(pool: &Pool, blocker_pid: i32) -> Result<i32> {
     let until = StdInstant::now() + Duration::from_secs(10);
     loop {
@@ -3250,15 +3275,9 @@ async fn serving_metadata_nonadmin_error_outcomes_are_masked_and_unchanged() -> 
             .await?;
         let snapshot_expired = expired.receipt.snapshot_id();
         let pin_expired = expired.receipt.pin_id();
-        db.pool
-            .get()
-            .await?
-            .execute(
-                "UPDATE ref_store_core_pins SET expires_at=clock_timestamp()-interval '1 second'
-                  WHERE pin_id=$1 AND repository_id=$2",
-                &[&pin_expired, &repo],
-            )
-            .await?;
+        // The one-second lease expires naturally under the real server clock;
+        // never rewrite an active pin row past the migration-140 guard.
+        wait_for_pin_expiry(&db.pool, repo, pin_expired).await?;
 
         // Initial fixture-only role metadata: a real non-owner write collaborator
         // with an unrestricted API token. Not a production collaborator API proof.
@@ -3504,15 +3523,9 @@ async fn serving_metadata_late_read_scope_denial_masks_expired_state() -> Result
             .await?;
         let snapshot_id = expired.receipt.snapshot_id();
         let pin_id = expired.receipt.pin_id();
-        db.pool
-            .get()
-            .await?
-            .execute(
-                "UPDATE ref_store_core_pins SET expires_at=clock_timestamp()-interval '1 second'
-                  WHERE pin_id=$1 AND repository_id=$2",
-                &[&pin_id, &repo],
-            )
-            .await?;
+        // Establish natural DB-clock expiry before acquiring the exact pin
+        // barrier. The active pin row is never rewritten past its guard.
+        wait_for_pin_expiry(&db.pool, repo, pin_id).await?;
 
         // Initial fixture-only token metadata, not a production token API or
         // scope-PATCH race proof. The late narrowing below is a real committed
