@@ -750,7 +750,10 @@ def run_suite(binary: str) -> dict:
         assert s3.contains(probe_keys[0]), "metadata clone deleted probe object in shared bucket"
         assert s3.contains(prod_keys[0]), "metadata clone deleted live production object"
         verify_clone = run_cmd([binary, "pando-authority", "verify"], env=clone_env, check=False)
+        clone_err = verify_clone.stderr.decode(errors="replace")
         assert verify_clone.returncode != 0
+        assert "data directory already in use" not in clone_err, clone_err
+        assert ("fenced" in clone_err or "differs from attested authority" in clone_err), clone_err
         clone_svc.stop()
         results["clone_fail_closed_zero_deletes"] = True
 
@@ -856,7 +859,10 @@ def run_suite(binary: str) -> dict:
         # 6. Simulated PITR epoch rollback on source DB fails closed and latches fence.
         sql_query(src_url, "UPDATE pando_storage_authorities SET authority_epoch = authority_epoch - 1 WHERE singleton;")
         verify_rollback = run_cmd([binary, "pando-authority", "verify"], env=src_live_env, check=False)
+        rollback_err = verify_rollback.stderr.decode(errors="replace")
         assert verify_rollback.returncode != 0
+        assert "data directory already in use" not in rollback_err, rollback_err
+        assert ("epoch is ahead of database" in rollback_err or "fenced" in rollback_err), rollback_err
         assert (
             sql_query(src_url, "SELECT remote_delete_fenced::text FROM pando_storage_authorities WHERE singleton") == "t"
         )

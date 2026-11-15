@@ -76,10 +76,30 @@ async fn status(config: &Config, pool: &Pool, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
+fn open_online_data_dir(config: &Config) -> Result<std::path::PathBuf> {
+    crate::backup::ensure_not_restoring(&config.data_dir)?;
+    match std::fs::symlink_metadata(config.data_dir.join(".volume-id")) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Storage::open(config)?.root);
+        }
+        Err(err) => return Err(err.into()),
+        Ok(_) => {}
+    }
+    let root = config.data_dir.canonicalize()?;
+    crate::backup::ensure_not_restoring(&root)?;
+    match std::fs::symlink_metadata(root.join(".rootyard-mirror")) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!("cannot operate Pando authority against a mirror directory"),
+        Err(err) => return Err(err.into()),
+    }
+    pitr_fence::read_volume_id(&root)?;
+    Ok(root)
+}
+
 async fn verify(config: &Config, pool: &Pool, deadline: Instant) -> Result<()> {
-    let storage = Storage::open(config)?;
-    let remote = RemoteObjectStore::from_env(storage.root.join("pando-pack-work"))?;
-    let verified = pitr_fence::verify_or_attest(pool, &storage.root, &remote, deadline, "manual_check").await?;
+    let data_dir = open_online_data_dir(config)?;
+    let remote = RemoteObjectStore::from_env(data_dir.join("pando-pack-work"))?;
+    let verified = pitr_fence::verify_or_attest(pool, &data_dir, &remote, deadline, "manual_check").await?;
     println!("{}", serde_json::to_string_pretty(&verified)?);
     Ok(())
 }
@@ -114,11 +134,11 @@ async fn pin_cli(config: &Config, pool: &Pool, args: &[String], deadline: Instan
     }
 
     let tenant = tenant_id.context("--tenant UUID is required")?;
-    let storage = Storage::open(config)?;
-    let remote = RemoteObjectStore::from_env(storage.root.join("pando-pack-work"))?;
+    let data_dir = open_online_data_dir(config)?;
+    let remote = RemoteObjectStore::from_env(data_dir.join("pando-pack-work"))?;
     let summary = retention_roots::pin_recovery_root(
         pool,
-        &storage.root,
+        &data_dir,
         &remote,
         tenant,
         repository_id,
