@@ -2962,16 +2962,14 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-metadata", &store).await?;
-        let mut verified =
-            serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
+        let mut verified = serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let create = ServingSnapshotCreate {
             owner: actor.username.clone(),
             name: "serving-metadata".into(),
             idempotency_key: "create-one".into(),
             lease_seconds: 300,
         };
-        let first =
-            PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await?;
+        let first = PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await?;
         ensure!(!first.replayed, "fresh serving create replayed");
         let snapshot_id = first.receipt.snapshot_id();
         let pin_id = first.receipt.pin_id();
@@ -3012,8 +3010,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             gate_version(&db.pool, repo, tenant).await?.revision() > first_gate,
             "decision-gated advance did not move the gate"
         );
-        let replay =
-            PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await?;
+        let replay = PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await?;
         ensure!(replay.replayed, "same-key create did not replay after refs advanced");
         ensure!(replay.receipt.snapshot_id() == snapshot_id, "replay snapshot id moved");
         ensure!(replay.receipt.pin_id() == pin_id, "replay pin id moved");
@@ -3073,8 +3070,7 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
             expected_generation: 1,
             lease_seconds: 120,
         };
-        let renewed =
-            PgServingSnapshotMetadata.renew(&db.pool, &actor, renew.clone(), &backend, deadline()).await?;
+        let renewed = PgServingSnapshotMetadata.renew(&db.pool, &actor, renew.clone(), &backend, deadline()).await?;
         ensure!(!renewed.replayed, "fresh renew replayed");
         ensure!(renewed.receipt.pin_generation() == 2, "renew did not advance generation");
         let renew_replay =
@@ -3083,10 +3079,7 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
         ensure!(renew_replay.receipt.pin_generation() == 2, "renew replay changed generation");
         let changed_lease = ServingSnapshotRenew { lease_seconds: 121, ..renew.clone() };
         ensure!(
-            PgServingSnapshotMetadata
-                .renew(&db.pool, &actor, changed_lease, &backend, deadline())
-                .await
-                .is_err(),
+            PgServingSnapshotMetadata.renew(&db.pool, &actor, changed_lease, &backend, deadline()).await.is_err(),
             "changed renew lease under the same key was accepted"
         );
         let stale = ServingSnapshotRenew { idempotency_key: "renew-stale".into(), expected_generation: 1, ..renew };
@@ -3107,8 +3100,7 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
             PgServingSnapshotMetadata.release(&db.pool, &actor, release.clone(), &backend, deadline()).await?;
         ensure!(!released.replayed, "fresh release replayed");
         ensure!(released.receipt.pin_generation() == 2, "release generation differs");
-        let release_replay =
-            PgServingSnapshotMetadata.release(&db.pool, &actor, release, &backend, deadline()).await?;
+        let release_replay = PgServingSnapshotMetadata.release(&db.pool, &actor, release, &backend, deadline()).await?;
         ensure!(release_replay.replayed, "exact release did not replay");
         ensure!(
             PgServingSnapshotMetadata
@@ -3160,13 +3152,7 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
         let wrong_backend = serving_support::backend_identity("serving-wrong-backend")?;
         ensure!(
             PgServingSnapshotMetadata
-                .read(
-                    &db.pool,
-                    &actor,
-                    ServingSnapshotRead { owner, name, snapshot_id },
-                    &wrong_backend,
-                    deadline(),
-                )
+                .read(&db.pool, &actor, ServingSnapshotRead { owner, name, snapshot_id }, &wrong_backend, deadline(),)
                 .await
                 .is_err(),
             "different opened Blob backend was accepted"
@@ -3688,13 +3674,11 @@ async fn serving_check_version_observes_current_gate_without_state_change() -> R
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-check", &store).await?;
-        let mut verified =
-            serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
+        let mut verified = serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let initial = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
 
         let changed =
-            check_version(&db.pool, &actor, &actor.username, "serving-check", None, &backend, deadline())
-                .await?;
+            check_version(&db.pool, &actor, &actor.username, "serving-check", None, &backend, deadline()).await?;
         let v0 = match changed {
             VersionCheck::Changed(version) => version,
             other => return Err(anyhow!("initial serving check was not Changed: {other:?}")),
@@ -3704,16 +3688,7 @@ async fn serving_check_version_observes_current_gate_without_state_change() -> R
             v0 == gate_version(&db.pool, repo, tenant).await?,
             "initial serving check differs from the owning core gate"
         );
-        match check_version(
-            &db.pool,
-            &actor,
-            &actor.username,
-            "serving-check",
-            Some(&v0),
-            &backend,
-            deadline(),
-        )
-        .await?
+        match check_version(&db.pool, &actor, &actor.username, "serving-check", Some(&v0), &backend, deadline()).await?
         {
             VersionCheck::Unchanged(version) => ensure!(version == v0, "same-known gate changed"),
             other => return Err(anyhow!("same-known serving check was not Unchanged: {other:?}")),
@@ -3737,9 +3712,7 @@ async fn serving_check_version_observes_current_gate_without_state_change() -> R
         // Single-connection pool: the facade owns exactly one checkout for
         // BEGIN/auth/core read/rollback, with no post-read re-checkout.
         let small = db.new_pool(1)?;
-        match check_version(&small, &actor, &actor.username, "serving-check", Some(&v0), &backend, deadline())
-            .await?
-        {
+        match check_version(&small, &actor, &actor.username, "serving-check", Some(&v0), &backend, deadline()).await? {
             VersionCheck::Unchanged(version) => ensure!(version == v0, "single-pool gate changed"),
             other => return Err(anyhow!("single-pool check was not Unchanged: {other:?}")),
         }
@@ -3752,32 +3725,16 @@ async fn serving_check_version_observes_current_gate_without_state_change() -> R
         // A real decision-gated serving ref publication advances the owning gate.
         serving_advance(&db, &store, &git, &mut verified, &actor, 2, b"serving check advance\n").await?;
         let after_advance = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
-        let v1 = match check_version(
-            &db.pool,
-            &actor,
-            &actor.username,
-            "serving-check",
-            Some(&v0),
-            &backend,
-            deadline(),
-        )
-        .await?
-        {
-            VersionCheck::Changed(version) => version,
-            other => return Err(anyhow!("advanced serving check was not Changed: {other:?}")),
-        };
+        let v1 =
+            match check_version(&db.pool, &actor, &actor.username, "serving-check", Some(&v0), &backend, deadline())
+                .await?
+            {
+                VersionCheck::Changed(version) => version,
+                other => return Err(anyhow!("advanced serving check was not Changed: {other:?}")),
+            };
         ensure!(v1.revision() > v0.revision(), "advanced gate revision did not move");
         ensure!(v1 == gate_version(&db.pool, repo, tenant).await?, "advanced serving check differs from core");
-        match check_version(
-            &db.pool,
-            &actor,
-            &actor.username,
-            "serving-check",
-            Some(&v1),
-            &backend,
-            deadline(),
-        )
-        .await?
+        match check_version(&db.pool, &actor, &actor.username, "serving-check", Some(&v1), &backend, deadline()).await?
         {
             VersionCheck::Unchanged(version) => ensure!(version == v1, "post-advance same-known gate changed"),
             other => return Err(anyhow!("post-advance same-known check was not Unchanged: {other:?}")),
@@ -4021,8 +3978,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, _backend) = db.serving_business("serving-materialize", &store).await?;
-        let mut verified =
-            serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
+        let mut verified = serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let first_oid = verified.commit_oid.clone();
         let first_revision = verified.gate.revision();
         let first_pack = verified.new_packs[0].clone();
