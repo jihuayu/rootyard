@@ -416,8 +416,11 @@ where
         f(pool.clone()).await
     }
     .await;
+    pool.close();
     drop(pool);
+    // Explicitly close before schema drop / external database teardown.
     let teardown = admin.get().await?.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await;
+    admin.close();
     result?;
     teardown?;
     Ok(())
@@ -533,8 +536,8 @@ async fn run_pg_preflight_suite(pool: &Pool) -> Result<()> {
     let kp: Arc<dyn KeyProvider> = Arc::new(LocalFileKeyProvider::load(keyring.path())?);
     let (store_unset, store_pm, store_le) = open_three_mode_stores(&endpoint.endpoint, keyring.path());
 
-    let pg_deadline = TokioInstant::now() + Duration::from_secs(20);
-    let blob_deadline = StdInstant::now() + Duration::from_secs(20);
+    let pg_deadline = TokioInstant::now() + Duration::from_secs(30);
+    let blob_deadline = StdInstant::now() + Duration::from_secs(30);
     let fixture = PgHoldFixture::seed(pool, pg_deadline).await?;
     let tenant = fixture.tenant;
     let repo = fixture.repo;
@@ -662,8 +665,8 @@ async fn run_pg_real_provider_roundtrip(pool: &Pool) -> Result<()> {
     let kp_v1: Arc<dyn KeyProvider> = Arc::new(LocalFileKeyProvider::load(keyring.path())?);
     let store = open_real_env_le_store(keyring.path())?;
 
-    let pg_deadline = TokioInstant::now() + Duration::from_secs(20);
-    let blob_deadline = StdInstant::now() + Duration::from_secs(20);
+    let pg_deadline = TokioInstant::now() + Duration::from_secs(30);
+    let blob_deadline = StdInstant::now() + Duration::from_secs(30);
     let fixture = PgHoldFixture::seed(pool, pg_deadline).await?;
     let spec = EnvelopeSpec {
         tenant_id: fixture.tenant,

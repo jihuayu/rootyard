@@ -2290,6 +2290,23 @@ jobs:
           export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
           export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
           export ROOTYARD_BLOB_ROOT="w1c-pg-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          w1c_db="rootyard_run_w1c_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          if [ "${#w1c_db}" -gt 63 ]; then echo "w1c database name exceeds 63 bytes" >&2; exit 1; fi
+          preexisting="$(psql --host 127.0.0.1 --port 55432 --username rootyard --dbname postgres \
+            --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+            -v database="$w1c_db" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          if [ "$preexisting" != "0" ]; then
+            echo "owned w1c database already exists; refusing to adopt it" >&2
+            exit 1
+          fi
+          createdb --host 127.0.0.1 --port 55432 --username rootyard "$w1c_db"
+          export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$w1c_db"
+          export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
           "$w1c_exec" --ignored --list > "$report_dir/ignored-inventory.txt" 2>&1
           "$w1c_exec" --ignored --test-threads=1 > "$report_dir/native.raw.log" 2>&1 || status=$?
           status="${status:-0}"
@@ -2337,6 +2354,24 @@ jobs:
           print('\n'.join(sanitized_lines))
           print('blob_store_w1c_contract PG+Garage S3 accepted: 2 passed, 0 failed, 0 ignored')
           PY
+      - name: "Drop only the job-owned #109 w1c database"
+        if: always()
+        env:
+          PGOPTIONS: ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          w1c_db="rootyard_run_w1c_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          dropdb --host 127.0.0.1 --port 55432 --username rootyard --if-exists "$w1c_db"
+          absent="$(psql --host 127.0.0.1 --port 55432 --username rootyard --dbname postgres \
+            --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+            -v database="$w1c_db" <<'SQL'
+          SELECT count(*) FROM pg_database WHERE datname = :'database';
+          SQL
+          )"
+          test "$absent" = "0"
       - name: Stop only the job-owned Garage fixture
         if: always()
         run: |
