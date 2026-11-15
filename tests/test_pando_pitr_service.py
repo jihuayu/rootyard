@@ -31,6 +31,9 @@ class PandoPitrServiceTest(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertTrue(report["clone_fail_closed_zero_deletes"])
         self.assertTrue(report["operator_isolate_recovered"])
+        self.assertTrue(report["post_isolate_empty_cache_http_browse"])
+        self.assertTrue(report["post_isolate_stock_git_clone_fetch"])
+        self.assertTrue(report["post_isolate_deleted_artifact_refused"])
         self.assertTrue(report["pitr_epoch_rollback_fenced"])
 
 

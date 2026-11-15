@@ -380,6 +380,7 @@ async fn seed_manifest(
     )
     .await?;
     retention::record_manifest(&*tx, &manifest, authority_id).await?;
+    tx.execute("DELETE FROM pando_publication_fences WHERE manifest_id=$1", &[&manifest_id]).await?;
     tx.commit().await?;
 
     Ok(SeededManifest {
@@ -545,6 +546,7 @@ async fn verify_clone_fencing_and_isolate(
     dirs: (&Path, PathBuf, &Path),
     pool_b: &Pool,
     auth_a: &pitr_fence::AuthorityState,
+    m_keep: &SeededManifest,
 ) -> Result<SeededManifest> {
     let (schema_a, schema_b) = schemas;
     let (data_a, data_b, work_dir) = dirs;
@@ -611,6 +613,60 @@ async fn verify_clone_fencing_and_isolate(
         primary.s3.contains(&format!("pando-authorities/{}/epochs/00000000000000000001.json", isolated.authority_id))
     );
     ensure!(primary.s3.contains(&m_protected.pack_cipher_key.path()));
+    ensure!(primary.s3.contains(&m_keep.pack_cipher_key.path()));
+
+    // Verify all 4 scoped artifacts of live m_keep re-registered under isolated.authority_id
+    // and can be hydrated from an empty local cache directory without touching auth_a's keys.
+    let hydrate_dir = work_dir.join("isolated-hydrate-check");
+    std::fs::create_dir_all(&hydrate_dir)?;
+    {
+        let client_b = pool_b.get().await?;
+        for (idx, (ns, old_key)) in [
+            (retention::NAMESPACE_CIPHER, &m_keep.pack_cipher_key),
+            (retention::NAMESPACE_ENVELOPE, &m_keep.pack_env_key),
+            (retention::NAMESPACE_CIPHER, &m_keep.idx_cipher_key),
+            (retention::NAMESPACE_ENVELOPE, &m_keep.idx_env_key),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let resolved = retention::resolve_artifact(&**client_b, primary.owner, ns, &old_key.sha256).await?;
+            ensure!(resolved.registered, "isolated live artifact must remain registered");
+            ensure!(
+                resolved.key.authority == Some((isolated.authority_id, 1)),
+                "isolated live artifact resolved under wrong authority: {:?}",
+                resolved.key.authority
+            );
+            ensure!(resolved.key.path() != old_key.path(), "isolated key must differ from source authority path");
+            let head = primary
+                .remote
+                .head(&resolved.key, deadline())
+                .await?
+                .context("isolated remote artifact missing in object store")?;
+            let dest = hydrate_dir.join(format!("art-{idx}.bin"));
+            primary.remote.get_to_file(&resolved.key, &dest, head.size, deadline()).await?;
+        }
+    }
+
+    // Fail-closed check: if a live manifest's artifact was already marked deleted, isolate MUST refuse
+    // without rotating authority_id.
+    pool_b
+        .get()
+        .await?
+        .execute(
+            "UPDATE pando_remote_artifacts SET state='deleted', deleted_at=clock_timestamp() \
+             WHERE authority_id=$1 AND sha256=$2",
+            &[&isolated.authority_id, &m_keep.pack_cipher_key.sha256],
+        )
+        .await?;
+    let blocked_isolate =
+        Box::pin(pitr_fence::isolate_cloned_authority(pool_b, &state_b.storage.root, primary.remote, deadline())).await;
+    ensure!(blocked_isolate.is_err(), "isolate must fail closed when a live manifest artifact is deleted");
+    ensure!(
+        pitr_fence::load_authority_state(&**pool_b.get().await?).await?.authority_id == isolated.authority_id,
+        "failed isolate must not rotate authority_id"
+    );
+
     Ok(m_protected)
 }
 
@@ -853,6 +909,7 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
             (&data_a, data_b, &work_dir),
             &pool_b,
             &auth_a,
+            &m_keep,
         ))
         .await?;
 

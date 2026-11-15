@@ -286,7 +286,6 @@ pub async fn restore(
     }
     if manifest.format >= 6 && manifest.format != FORMAT_PAIRED {
         authority::fence(&client).await?;
-        crate::pando_gateway::retention::reset_authority(&mut client).await?;
         // Rotate the storage authority exactly once for the whole restored
         // database before importing any repository closure. Per-repository
         // rotation would invalidate paths imported for earlier repositories.

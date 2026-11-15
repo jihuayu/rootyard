@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -175,6 +176,67 @@ class TrackingLoopbackS3:
         self._server.server_close()
 
 
+class TrackingLoopbackVaultTransit:
+    """Minimal Vault Transit loopback supporting wrap (encrypt) and unwrap (decrypt)."""
+
+    def __init__(self, expected_token: str = "pitr-vault-token") -> None:
+        parent = self
+        self._expected_token = expected_token
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                if self.headers.get("X-Vault-Token") != parent._expected_token:
+                    self._reply(403, {"errors": ["permission denied"]})
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0 or length > 64 * 1024:
+                    self._reply(400, {"errors": ["invalid content-length"]})
+                    return
+                body = json.loads(self.rfile.read(length).decode())
+                parts = self.path.split("?", 1)[0].strip("/").split("/")
+                # /v1/<mount>/encrypt/<key> or /v1/<mount>/decrypt/<key>
+                if len(parts) != 4 or parts[0] != "v1":
+                    self._reply(404, {"errors": ["unknown transit path"]})
+                    return
+                op = parts[2]
+                if op == "encrypt":
+                    plaintext = body["plaintext"]
+                    self._reply(200, {"data": {"ciphertext": f"vault:v1:{plaintext}"}})
+                elif op == "decrypt":
+                    ciphertext = body["ciphertext"]
+                    prefix = "vault:v1:"
+                    if not ciphertext.startswith(prefix):
+                        self._reply(400, {"errors": ["invalid ciphertext"]})
+                        return
+                    self._reply(200, {"data": {"plaintext": ciphertext[len(prefix):]}})
+                else:
+                    self._reply(404, {"errors": [f"unsupported op {op}"]})
+
+            def _reply(self, code: int, payload: dict) -> None:
+                raw = json.dumps(payload).encode()
+                self.send_response_only(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                self.wfile.write(raw)
+
+        self._server = _DaemonHTTPServer(("127.0.0.1", 0), Handler)
+        self.endpoint = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
 def db_url_with_db(base_url: str, db_name: str) -> str:
     parts = urllib.parse.urlsplit(base_url)
     return urllib.parse.urlunsplit(parts._replace(path="/" + db_name))
@@ -186,14 +248,34 @@ def alloc_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def run_cmd(argv: list[str], env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[bytes]:
-    res = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+def run_cmd(
+    argv: list[str],
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    res = subprocess.run(argv, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
     if check and res.returncode != 0:
         raise AssertionError(
             f"command failed ({res.returncode}): {argv[0]}: "
             f"{res.stderr.decode(errors='replace')[-2000:]}"
         )
     return res
+
+
+def git_cmd(
+    *args: str,
+    env: dict[str, str],
+    cwd: Path | None = None,
+    username: str | None = None,
+    token: str | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    argv = ["git"]
+    if username and token:
+        auth = base64.b64encode(f"{username}:{token}".encode()).decode()
+        argv += ["-c", f"http.extraHeader=Authorization: Basic {auth}"]
+    argv.extend(args)
+    return run_cmd(argv, env=env, cwd=cwd)
 
 
 def sql_query(db_url: str, query: str) -> str:
@@ -253,6 +335,15 @@ class ServiceHandle:
                 return exc.code, json.loads(raw)
             except json.JSONDecodeError:
                 return exc.code, {"raw": raw}
+
+    def http_raw_basic(self, path: str, username: str, token: str) -> tuple[int, bytes]:
+        auth = base64.b64encode(f"{username}:{token}".encode()).decode()
+        req = urllib.request.Request(self.base_url + path, headers={"Authorization": f"Basic {auth}"}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
 
     def stop(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -384,6 +475,7 @@ def run_suite(binary: str) -> dict:
     clone_url = db_url_with_db(admin_url, clone_db_name)
 
     s3 = TrackingLoopbackS3()
+    vault = TrackingLoopbackVaultTransit()
     services: list[ServiceHandle] = []
     results: dict[str, object] = {}
 
@@ -404,6 +496,9 @@ def run_suite(binary: str) -> dict:
                 "ROOTYARD_OBJECT_STORE_REGION": S3_REGION,
                 "ROOTYARD_OBJECT_STORE_ACCESS_KEY": "pitr-ak",
                 "ROOTYARD_OBJECT_STORE_SECRET_KEY": "pitr-sk",
+                "ROOTYARD_KMS_VAULT_URL": vault.endpoint,
+                "ROOTYARD_KMS_VAULT_TOKEN": "pitr-vault-token",
+                "ROOTYARD_KMS_VAULT_KEY": "pando",
                 "ROOTYARD_STORAGE_MAINTENANCE_POLL_SECONDS": "1",
                 "ROOTYARD_STORAGE_MAINTENANCE_LEASE_SECONDS": "5",
                 "ROOTYARD_STORAGE_SCAN_PERIOD_SECONDS": "1",
@@ -443,8 +538,72 @@ def run_suite(binary: str) -> dict:
         verify_1 = json.loads(run_cmd([binary, "pando-authority", "verify"], env=src_live_env).stdout.decode())
         assert verify_1["authority_id"] == src_auth_id
 
-        # 3. Create repo via live HTTP API, switch repo to serving Pando, test retention roots + safe pruning.
-        code, repo = src_svc.http_json("/api/repos", alice["token"], method="POST", payload={"name": "pitr-live"})
+        # 2b. Create real Pando repository via HTTP + pando-transition cutover + stock git push.
+        code, real_repo = src_svc.http_json("/api/repos", alice["token"], method="POST", payload={"name": "pitr-git-real"})
+        assert code in (200, 201, 202), (code, real_repo)
+        real_repo_id = real_repo["id"]
+        wait_until(
+            lambda: sql_query(src_url, f"SELECT state FROM repositories WHERE id='{real_repo_id}'") == "ready",
+            label="real repository provisioning ready",
+        )
+        real_work = root / "real-git-work"
+        git_cmd("init", "--initial-branch=main", str(real_work), env=base_env)
+        git_cmd("config", "user.name", "PITR Alice", env=base_env, cwd=real_work)
+        git_cmd("config", "user.email", "alice@example.invalid", env=base_env, cwd=real_work)
+        git_cmd("remote", "add", "origin", src_svc.base_url + real_repo["clone_path"], env=base_env, cwd=real_work)
+        (real_work / "hello.txt").write_text("v1 before cutover\n")
+        git_cmd("add", "hello.txt", env=base_env, cwd=real_work)
+        git_cmd("commit", "-m", "v1 pre cutover", env=base_env, cwd=real_work)
+        git_cmd(
+            "push",
+            "origin",
+            "HEAD:refs/heads/main",
+            env=base_env,
+            cwd=real_work,
+            username="alice",
+            token=alice["token"],
+        )
+        src_svc.stop()
+        cutover = json.loads(
+            run_cmd([binary, "pando-transition", "cutover", "--repository", real_repo_id], env=src_live_env).stdout.decode()
+        )
+        assert cutover["direction"] == "gitfs_to_pando", cutover
+
+        src_svc_pando = ServiceHandle(binary, src_live_env, root / "src.log")
+        services.append(src_svc_pando)
+        src_svc_pando.start()
+        git_cmd(
+            "remote",
+            "set-url",
+            "origin",
+            src_svc_pando.base_url + real_repo["clone_path"],
+            env=base_env,
+            cwd=real_work,
+        )
+        (real_work / "pando-after-cutover.txt").write_text("v2 encrypted in pando bucket\n")
+        git_cmd("add", "pando-after-cutover.txt", env=base_env, cwd=real_work)
+        git_cmd("commit", "-m", "v2 pando object", env=base_env, cwd=real_work)
+        head2 = git_cmd("rev-parse", "HEAD", env=base_env, cwd=real_work).stdout.decode().strip()
+        git_cmd(
+            "push",
+            "origin",
+            "HEAD:refs/heads/main",
+            env=base_env,
+            cwd=real_work,
+            username="alice",
+            token=alice["token"],
+        )
+        r_code, src_meta = src_svc_pando.http_json("/api/repos/alice/pitr-git-real", alice["token"])
+        assert r_code == 200 and src_meta.get("storage_backend") == "pando", (r_code, src_meta)
+        i_code, src_refs = src_svc_pando.http_raw_basic(
+            "/alice/pitr-git-real.git/info/refs?service=git-upload-pack",
+            "alice",
+            alice["token"],
+        )
+        assert i_code == 200 and head2.encode() in src_refs, (i_code, src_refs[:400])
+
+        # 3. Create synthetic retention repo, switch repo to serving Pando, test retention roots + safe pruning.
+        code, repo = src_svc_pando.http_json("/api/repos", alice["token"], method="POST", payload={"name": "pitr-live"})
         assert code in (200, 201, 202), (code, repo)
         repo_id = repo["id"]
         owner_id = alice["user_id"]
@@ -452,7 +611,7 @@ def run_suite(binary: str) -> dict:
             lambda: sql_query(src_url, f"SELECT state FROM repositories WHERE id='{repo_id}'") == "ready",
             label="repository provisioning ready",
         )
-        src_svc.stop()
+        src_svc_pando.stop()
 
         sql_query(
             src_url,
@@ -526,6 +685,10 @@ def run_suite(binary: str) -> dict:
         assert status_post_release["active_retention_roots"] == []
         results["source_retention_and_pruning"] = True
 
+        # Seed an unlinked probe manifest before pg_dump so the clone test can retire an unreachable
+        # artifact while keeping live serving packs healthy for post-isolate hydration checks.
+        _m_probe_id, probe_keys = seed_synthetic_manifest(src_url, s3, repo_id, owner_id, src_auth_id, "probe")
+
         # 4. Real pg_dump + pg_restore clone sharing the SAME bucket MUST fail closed.
         dump_file = root / "src-metadata.dump"
         run_cmd(["pg_dump", "--format=custom", "--no-owner", "--no-privileges", "--file", str(dump_file), src_url])
@@ -533,11 +696,11 @@ def run_suite(binary: str) -> dict:
             ["pg_restore", "--dbname", clone_url, "--no-owner", "--no-privileges", "--exit-on-error", str(dump_file)]
         )
 
-        # Force due retired artifacts + queued delete job on clone_db pointing at m_prod live objects.
+        # Force due retired artifacts + queued delete job on clone_db targeting probe_keys[0].
         sql_query(
             clone_url,
             f"UPDATE pando_remote_artifacts SET state='retired', delete_after=clock_timestamp()-interval '60 seconds' "
-            f"WHERE remote_path = '{prod_keys[0]}';"
+            f"WHERE remote_path = '{probe_keys[0]}';"
             f"UPDATE storage_maintenance_repo_state SET last_scan_at = NULL WHERE repository_id='{repo_id}';"
             f"INSERT INTO storage_maintenance_jobs(id,repository_id,tenant_id,kind,repository_generation) "
             f"VALUES(gen_random_uuid(),'{repo_id}','{owner_id}','pando_tombstone_delete',1) ON CONFLICT DO NOTHING;",
@@ -584,13 +747,15 @@ def run_suite(binary: str) -> dict:
             == 1
         ), "clone executed a new succeeding pando_tombstone_delete job"
         assert s3.take_deletes() == [], "metadata clone issued DELETE against shared bucket"
+        assert s3.contains(probe_keys[0]), "metadata clone deleted probe object in shared bucket"
         assert s3.contains(prod_keys[0]), "metadata clone deleted live production object"
         verify_clone = run_cmd([binary, "pando-authority", "verify"], env=clone_env, check=False)
         assert verify_clone.returncode != 0
         clone_svc.stop()
         results["clone_fail_closed_zero_deletes"] = True
 
-        # 5. Operator isolate --confirm-shared-bucket rotates clone authority cleanly without touching old S3 keys.
+        # 5. Operator isolate --confirm-shared-bucket rotates clone authority cleanly without touching old S3 keys,
+        # migrates live scoped objects to the new authority, and serves HTTP browse + stock Git from empty cache.
         isolated = json.loads(
             run_cmd([binary, "pando-authority", "isolate", "--confirm-shared-bucket"], env=clone_env).stdout.decode()
         )
@@ -599,7 +764,93 @@ def run_suite(binary: str) -> dict:
         assert isolated["authority_epoch"] == 1
         assert isolated["remote_delete_fenced"] is False
         run_cmd([binary, "pando-authority", "verify"], env=clone_env)
+        assert s3.contains(prod_keys[0]) and s3.contains(probe_keys[0])
+
+        shutil.rmtree(clone_data / "pando-cache", ignore_errors=True)
+        assert not (clone_data / "pando-cache").exists()
+        clone_serve_env = {**clone_env, "ROOTYARD_STORAGE_MAINTENANCE": "false"}
+        clone_live_svc = ServiceHandle(binary, clone_serve_env, root / "clone.log")
+        services.append(clone_live_svc)
+        clone_live_svc.start()
+
+        m_code, clone_meta = clone_live_svc.http_json("/api/repos/alice/pitr-git-real", alice["token"])
+        assert m_code == 200 and clone_meta.get("storage_backend") == "pando", (m_code, clone_meta)
+        ref_code, clone_refs = clone_live_svc.http_raw_basic(
+            "/alice/pitr-git-real.git/info/refs?service=git-upload-pack",
+            "alice",
+            alice["token"],
+        )
+        assert ref_code == 200 and head2.encode() in clone_refs, (ref_code, clone_refs[:400])
+
+        isolated_checkout = root / "isolated-git-clone"
+        git_cmd(
+            "clone",
+            clone_live_svc.base_url + real_repo["clone_path"],
+            str(isolated_checkout),
+            env=base_env,
+            username="alice",
+            token=alice["token"],
+        )
+        assert git_cmd("rev-parse", "HEAD", env=base_env, cwd=isolated_checkout).stdout.decode().strip() == head2
+        assert (isolated_checkout / "hello.txt").read_text() == "v1 before cutover\n"
+        assert (isolated_checkout / "pando-after-cutover.txt").read_text() == "v2 encrypted in pando bucket\n"
+        assert (clone_data / "pando-cache" / real_repo_id).exists(), "expected empty cache to hydrate from isolated S3"
+        git_cmd("fsck", "--full", "--strict", env=base_env, cwd=isolated_checkout)
+
+        # Push commit 3 to isolated clone and fetch it back over stock HTTP git-upload-pack.
+        git_cmd(
+            "remote",
+            "set-url",
+            "origin",
+            clone_live_svc.base_url + real_repo["clone_path"],
+            env=base_env,
+            cwd=real_work,
+        )
+        (real_work / "post-isolate-fetch.txt").write_text("v3 committed after isolate\n")
+        git_cmd("add", "post-isolate-fetch.txt", env=base_env, cwd=real_work)
+        git_cmd("commit", "-m", "v3 post isolate", env=base_env, cwd=real_work)
+        head3 = git_cmd("rev-parse", "HEAD", env=base_env, cwd=real_work).stdout.decode().strip()
+        git_cmd(
+            "push",
+            "origin",
+            "HEAD:refs/heads/main",
+            env=base_env,
+            cwd=real_work,
+            username="alice",
+            token=alice["token"],
+        )
+        git_cmd(
+            "fetch",
+            "origin",
+            env=base_env,
+            cwd=isolated_checkout,
+            username="alice",
+            token=alice["token"],
+        )
+        assert git_cmd("rev-parse", "FETCH_HEAD", env=base_env, cwd=isolated_checkout).stdout.decode().strip() == head3
+        clone_live_svc.stop()
+
+        # Negative gate: isolate refuses before rotating if any live scoped artifact is deleted.
+        prod_cipher_sha = prod_keys[0].rsplit("/", 1)[-1]
+        sql_query(
+            clone_url,
+            f"UPDATE pando_remote_artifacts SET state='deleted', deleted_at=clock_timestamp() "
+            f"WHERE authority_id='{isolated['authority_id']}' AND sha256='{prod_cipher_sha}';",
+        )
+        blocked_isolate = run_cmd(
+            [binary, "pando-authority", "isolate", "--confirm-shared-bucket"],
+            env=clone_env,
+            check=False,
+        )
+        assert blocked_isolate.returncode != 0, "isolate must refuse when live artifact is marked deleted"
+        assert (
+            sql_query(clone_url, "SELECT authority_id::text FROM pando_storage_authorities WHERE singleton")
+            == isolated["authority_id"]
+        )
         assert s3.contains(prod_keys[0])
+        results["post_isolate_empty_cache_http_browse"] = True
+        results["post_isolate_stock_git_clone_fetch"] = True
+        results["post_isolate_deleted_artifact_refused"] = True
         results["operator_isolate_recovered"] = True
 
         # 6. Simulated PITR epoch rollback on source DB fails closed and latches fence.
@@ -618,6 +869,7 @@ def run_suite(binary: str) -> dict:
                 svc.stop()
             except Exception:
                 pass
+        vault.close()
         s3.close()
         for db_name in (clone_db_name, src_db_name):
             try:

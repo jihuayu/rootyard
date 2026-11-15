@@ -376,10 +376,5 @@ pub async fn isolate_cloned_authority(
     remote: &RemoteObjectStore,
     deadline: Instant,
 ) -> Result<AuthorityState> {
-    let mut client = pool.get().await?;
-    let previous = retention::authority(&**client).await?;
-    retention::reset_authority(&mut client).await?;
-    clear_claim_file_best_effort(data_dir, previous.id);
-    drop(client);
-    verify_or_attest(pool, data_dir, remote, deadline, "isolate_authority").await
+    super::pitr_isolate::isolate_cloned_authority(pool, data_dir, remote, deadline).await
 }
