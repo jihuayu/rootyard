@@ -1195,7 +1195,7 @@ struct RowLock {
 }
 
 impl RowLock {
-    async fn release(mut self) -> Result<()> {
+    async fn release(self) -> Result<()> {
         self.client.batch_execute("ROLLBACK").await?;
         Ok(())
     }
@@ -2963,7 +2963,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-metadata", &store).await?;
         let mut verified =
-            serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+            serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let create = ServingSnapshotCreate {
             owner: actor.username.clone(),
             name: "serving-metadata".into(),
@@ -2971,7 +2971,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             lease_seconds: 300,
         };
         let first =
-            PgServingSnapshotMetadata.create(&db.pool, &actor.identity, create.clone(), &backend, deadline()).await?;
+            PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await?;
         ensure!(!first.replayed, "fresh serving create replayed");
         let snapshot_id = first.receipt.snapshot_id();
         let pin_id = first.receipt.pin_id();
@@ -3007,13 +3007,13 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
 
         // Advance refs and the gate through the real decision-gated publication
         // path; the same create key must still replay the original capture.
-        serving_advance(&db, &store, &git, &mut verified, &actor.identity, 2, b"serving metadata advance\n").await?;
+        serving_advance(&db, &store, &git, &mut verified, &actor, 2, b"serving metadata advance\n").await?;
         ensure!(
             gate_version(&db.pool, repo, tenant).await?.revision() > first_gate,
             "decision-gated advance did not move the gate"
         );
         let replay =
-            PgServingSnapshotMetadata.create(&db.pool, &actor.identity, create.clone(), &backend, deadline()).await?;
+            PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await?;
         ensure!(replay.replayed, "same-key create did not replay after refs advanced");
         ensure!(replay.receipt.snapshot_id() == snapshot_id, "replay snapshot id moved");
         ensure!(replay.receipt.pin_id() == pin_id, "replay pin id moved");
@@ -3023,7 +3023,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         // Changed lease under the same key is a conflict, never a new id.
         let changed = ServingSnapshotCreate { lease_seconds: 301, ..create };
         ensure!(
-            PgServingSnapshotMetadata.create(&db.pool, &actor.identity, changed, &backend, deadline()).await.is_err(),
+            PgServingSnapshotMetadata.create(&db.pool, &actor, changed, &backend, deadline()).await.is_err(),
             "changed lease under the same key was accepted"
         );
         ensure!(snapshot_counts(&db.pool, repo).await? == counts, "conflicting create wrote metadata");
@@ -3041,7 +3041,7 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-lifecycle", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let owner = actor.username.clone();
         let name = "serving-lifecycle".to_string();
         let create = ServingSnapshotCreate {
@@ -3050,13 +3050,13 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
             idempotency_key: "create-life".into(),
             lease_seconds: 300,
         };
-        let first = PgServingSnapshotMetadata.create(&db.pool, &actor.identity, create, &backend, deadline()).await?;
+        let first = PgServingSnapshotMetadata.create(&db.pool, &actor, create, &backend, deadline()).await?;
         let snapshot_id = first.receipt.snapshot_id();
 
         let read = PgServingSnapshotMetadata
             .read(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
                 &backend,
                 deadline(),
@@ -3074,24 +3074,24 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
             lease_seconds: 120,
         };
         let renewed =
-            PgServingSnapshotMetadata.renew(&db.pool, &actor.identity, renew.clone(), &backend, deadline()).await?;
+            PgServingSnapshotMetadata.renew(&db.pool, &actor, renew.clone(), &backend, deadline()).await?;
         ensure!(!renewed.replayed, "fresh renew replayed");
         ensure!(renewed.receipt.pin_generation() == 2, "renew did not advance generation");
         let renew_replay =
-            PgServingSnapshotMetadata.renew(&db.pool, &actor.identity, renew.clone(), &backend, deadline()).await?;
+            PgServingSnapshotMetadata.renew(&db.pool, &actor, renew.clone(), &backend, deadline()).await?;
         ensure!(renew_replay.replayed, "exact renew did not replay");
         ensure!(renew_replay.receipt.pin_generation() == 2, "renew replay changed generation");
         let changed_lease = ServingSnapshotRenew { lease_seconds: 121, ..renew.clone() };
         ensure!(
             PgServingSnapshotMetadata
-                .renew(&db.pool, &actor.identity, changed_lease, &backend, deadline())
+                .renew(&db.pool, &actor, changed_lease, &backend, deadline())
                 .await
                 .is_err(),
             "changed renew lease under the same key was accepted"
         );
         let stale = ServingSnapshotRenew { idempotency_key: "renew-stale".into(), expected_generation: 1, ..renew };
         ensure!(
-            PgServingSnapshotMetadata.renew(&db.pool, &actor.identity, stale, &backend, deadline()).await.is_err(),
+            PgServingSnapshotMetadata.renew(&db.pool, &actor, stale, &backend, deadline()).await.is_err(),
             "stale renew generation was accepted"
         );
 
@@ -3104,17 +3104,17 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
             reason: PinReleaseReason::ClientDone,
         };
         let released =
-            PgServingSnapshotMetadata.release(&db.pool, &actor.identity, release.clone(), &backend, deadline()).await?;
+            PgServingSnapshotMetadata.release(&db.pool, &actor, release.clone(), &backend, deadline()).await?;
         ensure!(!released.replayed, "fresh release replayed");
         ensure!(released.receipt.pin_generation() == 2, "release generation differs");
         let release_replay =
-            PgServingSnapshotMetadata.release(&db.pool, &actor.identity, release, &backend, deadline()).await?;
+            PgServingSnapshotMetadata.release(&db.pool, &actor, release, &backend, deadline()).await?;
         ensure!(release_replay.replayed, "exact release did not replay");
         ensure!(
             PgServingSnapshotMetadata
                 .read(
                     &db.pool,
-                    &actor.identity,
+                    &actor,
                     ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
                     &backend,
                     deadline(),
@@ -3128,7 +3128,7 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
         // repository-scoped and cannot be resolved across repositories.
         let other = provision(
             &db.pool,
-            &actor.identity,
+            &actor,
             ProvisionRequest {
                 owner: None,
                 name: "serving-lifecycle-other".into(),
@@ -3144,7 +3144,7 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
             PgServingSnapshotMetadata
                 .read(
                     &db.pool,
-                    &actor.identity,
+                    &actor,
                     ServingSnapshotRead { owner: owner.clone(), name: "serving-lifecycle-other".into(), snapshot_id },
                     &backend,
                     deadline(),
@@ -3162,7 +3162,7 @@ async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal(
             PgServingSnapshotMetadata
                 .read(
                     &db.pool,
-                    &actor.identity,
+                    &actor,
                     ServingSnapshotRead { owner, name, snapshot_id },
                     &wrong_backend,
                     deadline(),
@@ -3185,7 +3185,7 @@ async fn serving_metadata_late_scope_denial_rolls_back_all_rows_and_counters() -
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-late-scope", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let (restricted, token_id) = db.restricted_identity(repo, actor.id, &actor.username).await?;
         let counts = snapshot_counts(&db.pool, repo).await?;
 
@@ -3264,14 +3264,14 @@ async fn serving_metadata_nonadmin_error_outcomes_are_masked_and_unchanged() -> 
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-oracle", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let owner = actor.username.clone();
         let name = "serving-oracle".to_string();
 
         let existing = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -3287,7 +3287,7 @@ async fn serving_metadata_nonadmin_error_outcomes_are_masked_and_unchanged() -> 
         let released = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -3302,7 +3302,7 @@ async fn serving_metadata_nonadmin_error_outcomes_are_masked_and_unchanged() -> 
         PgServingSnapshotMetadata
             .release(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRelease {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -3319,7 +3319,7 @@ async fn serving_metadata_nonadmin_error_outcomes_are_masked_and_unchanged() -> 
         let expired = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -3438,7 +3438,7 @@ async fn serving_metadata_nonadmin_error_outcomes_are_masked_and_unchanged() -> 
         let owner_read = PgServingSnapshotMetadata
             .read(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: snapshot_existing },
                 &backend,
                 deadline(),
@@ -3448,7 +3448,7 @@ async fn serving_metadata_nonadmin_error_outcomes_are_masked_and_unchanged() -> 
         match PgServingSnapshotMetadata
             .read(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: missing },
                 &backend,
                 deadline(),
@@ -3461,7 +3461,7 @@ async fn serving_metadata_nonadmin_error_outcomes_are_masked_and_unchanged() -> 
         match PgServingSnapshotMetadata
             .renew(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRenew {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -3496,7 +3496,7 @@ async fn serving_metadata_downgraded_admin_replay_and_conflict_are_masked() -> R
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-downgrade", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let owner = actor.username.clone();
         let name = "serving-downgrade".to_string();
 
@@ -3560,13 +3560,13 @@ async fn serving_metadata_late_read_scope_denial_masks_expired_state() -> Result
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-late-read", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let owner = actor.username.clone();
         let name = "serving-late-read".to_string();
         let expired = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -3689,11 +3689,11 @@ async fn serving_check_version_observes_current_gate_without_state_change() -> R
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-check", &store).await?;
         let mut verified =
-            serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+            serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let initial = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
 
         let changed =
-            check_version(&db.pool, &actor.identity, &actor.username, "serving-check", None, &backend, deadline())
+            check_version(&db.pool, &actor, &actor.username, "serving-check", None, &backend, deadline())
                 .await?;
         let v0 = match changed {
             VersionCheck::Changed(version) => version,
@@ -3706,7 +3706,7 @@ async fn serving_check_version_observes_current_gate_without_state_change() -> R
         );
         match check_version(
             &db.pool,
-            &actor.identity,
+            &actor,
             &actor.username,
             "serving-check",
             Some(&v0),
@@ -3737,7 +3737,7 @@ async fn serving_check_version_observes_current_gate_without_state_change() -> R
         // Single-connection pool: the facade owns exactly one checkout for
         // BEGIN/auth/core read/rollback, with no post-read re-checkout.
         let small = db.new_pool(1)?;
-        match check_version(&small, &actor.identity, &actor.username, "serving-check", Some(&v0), &backend, deadline())
+        match check_version(&small, &actor, &actor.username, "serving-check", Some(&v0), &backend, deadline())
             .await?
         {
             VersionCheck::Unchanged(version) => ensure!(version == v0, "single-pool gate changed"),
@@ -3750,11 +3750,11 @@ async fn serving_check_version_observes_current_gate_without_state_change() -> R
         );
 
         // A real decision-gated serving ref publication advances the owning gate.
-        serving_advance(&db, &store, &git, &mut verified, &actor.identity, 2, b"serving check advance\n").await?;
+        serving_advance(&db, &store, &git, &mut verified, &actor, 2, b"serving check advance\n").await?;
         let after_advance = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
         let v1 = match check_version(
             &db.pool,
-            &actor.identity,
+            &actor,
             &actor.username,
             "serving-check",
             Some(&v0),
@@ -3770,7 +3770,7 @@ async fn serving_check_version_observes_current_gate_without_state_change() -> R
         ensure!(v1 == gate_version(&db.pool, repo, tenant).await?, "advanced serving check differs from core");
         match check_version(
             &db.pool,
-            &actor.identity,
+            &actor,
             &actor.username,
             "serving-check",
             Some(&v1),
@@ -3800,7 +3800,7 @@ async fn serving_check_version_refusals_are_exact_and_state_unchanged() -> Resul
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-check-refusals", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let baseline = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
 
         // Initial fixture-only token metadata: write-only ContentsWrite scope.
@@ -3837,7 +3837,7 @@ async fn serving_check_version_refusals_are_exact_and_state_unchanged() -> Resul
         let other_baseline = metadata_ledger_snapshot(&db.pool, other_repo, other_actor.id).await?;
         let error = check_version(
             &db.pool,
-            &actor.identity,
+            &actor,
             &other_actor.username,
             "serving-check-other",
             None,
@@ -3861,7 +3861,7 @@ async fn serving_check_version_refusals_are_exact_and_state_unchanged() -> Resul
         let wrong_backend = serving_support::backend_identity("serving-check-wrong")?;
         let error = check_version(
             &db.pool,
-            &actor.identity,
+            &actor,
             &actor.username,
             "serving-check-refusals",
             None,
@@ -3951,7 +3951,7 @@ async fn serving_check_version_absolute_deadline_bounds_two_sequential_auth_lock
         let started = TokioInstant::now();
         let absolute = started + Duration::from_secs(5);
         let pool = db.pool.clone();
-        let actor_identity = actor.identity.clone();
+        let actor_identity = actor.clone();
         let backend_identity = backend.clone();
         let owner = owner.clone();
         let mut task = Some(tokio::spawn(async move {
@@ -4022,7 +4022,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
         let git = git_binary()?;
         let (tenant, repo, actor, _backend) = db.serving_business("serving-materialize", &store).await?;
         let mut verified =
-            serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+            serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let first_oid = verified.commit_oid.clone();
         let first_revision = verified.gate.revision();
         let first_pack = verified.new_packs[0].clone();
@@ -4034,7 +4034,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
         let created = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4051,7 +4051,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
         let old = PgServingSnapshotMetadata
             .materialize(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
                 &materializer,
                 deadline(),
@@ -4069,7 +4069,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
         );
         let old_digest = old.read_digest_hex();
 
-        serving_advance(&db, &store, &git, &mut verified, &actor.identity, 2, b"retained advance\n").await?;
+        serving_advance(&db, &store, &git, &mut verified, &actor, 2, b"retained advance\n").await?;
         ensure!(verified.gate.revision() > first_revision, "same-realm advance did not move the gate");
         let new_oid = verified.commit_oid.clone();
         let advance_pack = verified.new_packs[0].clone();
@@ -4079,7 +4079,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
         let old_after = PgServingSnapshotMetadata
             .materialize(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
                 &materializer,
                 deadline(),
@@ -4109,7 +4109,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
         let new_created = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4123,7 +4123,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
         let new_view = PgServingSnapshotMetadata
             .materialize(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRead {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4172,7 +4172,7 @@ async fn serving_retained_materialization_refuses_state_backend_and_scope() -> R
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-refuse", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let owner = actor.username.clone();
         let name = "serving-materialize-refuse".to_string();
         let materializer = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
@@ -4180,7 +4180,7 @@ async fn serving_retained_materialization_refuses_state_backend_and_scope() -> R
         let released = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4194,7 +4194,7 @@ async fn serving_retained_materialization_refuses_state_backend_and_scope() -> R
         PgServingSnapshotMetadata
             .release(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRelease {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4211,7 +4211,7 @@ async fn serving_retained_materialization_refuses_state_backend_and_scope() -> R
         let expired = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4227,7 +4227,7 @@ async fn serving_retained_materialization_refuses_state_backend_and_scope() -> R
         let active = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4246,7 +4246,7 @@ async fn serving_retained_materialization_refuses_state_backend_and_scope() -> R
             PgServingSnapshotMetadata
                 .materialize(
                     &db.pool,
-                    &actor.identity,
+                    &actor,
                     ServingSnapshotRead {
                         owner: owner.clone(),
                         name: name.clone(),
@@ -4263,7 +4263,7 @@ async fn serving_retained_materialization_refuses_state_backend_and_scope() -> R
             PgServingSnapshotMetadata
                 .materialize(
                     &db.pool,
-                    &actor.identity,
+                    &actor,
                     ServingSnapshotRead {
                         owner: owner.clone(),
                         name: name.clone(),
@@ -4321,7 +4321,7 @@ async fn serving_retained_materialization_refuses_state_backend_and_scope() -> R
             PgServingSnapshotMetadata
                 .materialize(
                     &db.pool,
-                    &actor.identity,
+                    &actor,
                     ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: active_snapshot },
                     &wrong_materializer,
                     deadline(),
@@ -4340,7 +4340,7 @@ async fn serving_retained_materialization_refuses_state_backend_and_scope() -> R
             PgServingSnapshotMetadata
                 .materialize(
                     &db.pool,
-                    &other_actor.identity,
+                    &other_actor,
                     ServingSnapshotRead {
                         owner: other_actor.username.clone(),
                         name: "serving-materialize-other".into(),
@@ -4373,13 +4373,13 @@ async fn serving_retained_materialization_late_scope_denial_has_no_view() -> Res
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-late", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let owner = actor.username.clone();
         let name = "serving-materialize-late".to_string();
         let created = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4461,13 +4461,13 @@ async fn serving_retained_materialization_generation_change_has_no_view() -> Res
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-gen", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let owner = actor.username.clone();
         let name = "serving-materialize-gen".to_string();
         let created = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4483,7 +4483,7 @@ async fn serving_retained_materialization_generation_change_has_no_view() -> Res
         let materializer = gate.materializer(&store)?;
         let future = PgServingSnapshotMetadata.materialize(
             &db.pool,
-            &actor.identity,
+            &actor,
             ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
             &materializer,
             deadline(),
@@ -4499,7 +4499,7 @@ async fn serving_retained_materialization_generation_change_has_no_view() -> Res
         let renewed = PgServingSnapshotMetadata
             .renew(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotRenew {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4538,13 +4538,13 @@ async fn serving_retained_materialization_cluster_change_has_no_view() -> Result
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-cluster", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let owner = actor.username.clone();
         let name = "serving-materialize-cluster".to_string();
         let created = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4567,7 +4567,7 @@ async fn serving_retained_materialization_cluster_change_has_no_view() -> Result
         let materializer = gate.materializer(&store)?;
         let future = PgServingSnapshotMetadata.materialize(
             &db.pool,
-            &actor.identity,
+            &actor,
             ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
             &materializer,
             deadline(),
@@ -4620,13 +4620,13 @@ async fn serving_retained_materialization_realm_change_has_no_view() -> Result<(
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-realm", &store).await?;
-        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
         let owner = actor.username.clone();
         let name = "serving-materialize-realm".to_string();
         let created = PgServingSnapshotMetadata
             .create(
                 &db.pool,
-                &actor.identity,
+                &actor,
                 ServingSnapshotCreate {
                     owner: owner.clone(),
                     name: name.clone(),
@@ -4649,7 +4649,7 @@ async fn serving_retained_materialization_realm_change_has_no_view() -> Result<(
         let materializer = gate.materializer(&store)?;
         let future = PgServingSnapshotMetadata.materialize(
             &db.pool,
-            &actor.identity,
+            &actor,
             ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
             &materializer,
             deadline(),
