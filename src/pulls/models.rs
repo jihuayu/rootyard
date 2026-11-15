@@ -426,6 +426,32 @@ pub async fn creation_replay(
     row.get::<_, Option<Value>>("response").map(Some).ok_or_else(|| Error::internal("incomplete creation record"))
 }
 
+/// Read a completed creation receipt without reserving the key. Missing rows
+/// are not reserved; a different request conflicts and a committed incomplete
+/// receipt fails closed.
+pub async fn completed_creation_replay(
+    tx: &Transaction<'_>,
+    actor: Uuid,
+    repo: Uuid,
+    key: &str,
+    request: &Value,
+) -> Result<Option<Value>, Error> {
+    let Some(row) = tx
+        .query_opt(
+            "SELECT request,response FROM forge_creation_requests WHERE tenant_id=$1 AND repository_id=$2 AND idempotency_key=$3",
+            &[&actor, &repo, &key],
+        )
+        .await
+        .map_err(Error::internal)?
+    else {
+        return Ok(None);
+    };
+    if row.get::<_, Value>("request") != *request {
+        return Err(Error(StatusCode::CONFLICT, "idempotency key conflict"));
+    }
+    row.get::<_, Option<Value>>("response").map(Some).ok_or_else(|| Error::internal("incomplete creation record"))
+}
+
 pub async fn record_creation(
     tx: &Transaction<'_>,
     actor: Uuid,

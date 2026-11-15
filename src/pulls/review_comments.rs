@@ -5,8 +5,8 @@
 //! edits append immutable `forge_comment_revisions` + `repository_audit_log` entries.
 
 use super::models::{
-    PULL_FIELDS, PullRequest, body_valid, creation_replay, git_cmd, json, positive,
-    record_creation, repo_tenant_id, valid_oid,
+    PULL_FIELDS, PullRequest, body_valid, completed_creation_replay, creation_replay, git_cmd, json,
+    positive, record_creation, repo_tenant_id, valid_oid,
 };
 use crate::{
     AppState, Error,
@@ -274,25 +274,26 @@ pub async fn create_review_comment(
     }
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let key = idempotency_key(&headers)?;
+    let request = sjson!({
+        "operation": "pull_review_comment",
+        "pull_number": number,
+        "path": clean_path,
+        "side": norm_side,
+        "line": line,
+        "body": input.body,
+        "commit_oid": input.commit_oid,
+        "base_oid": input.base_oid,
+        "review_number": input.review_number,
+        "in_reply_to_number": input.in_reply_to_number,
+    });
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Triage, RepoAction::PullsWrite).await?;
     let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
     if let Some(k) = key {
-        let req = sjson!({
-            "operation": "pull_review_comment",
-            "pull_number": number,
-            "path": clean_path,
-            "side": norm_side,
-            "line": line,
-            "body": input.body,
-            "commit_oid": input.commit_oid,
-            "base_oid": input.base_oid,
-            "review_number": input.review_number,
-            "in_reply_to_number": input.in_reply_to_number,
-        });
-        if let Some(saved) = creation_replay(&tx, tenant_id, repo_id, k, &req).await? {
+        // Read-only fast path: never reserve before the Git anchor work below.
+        if let Some(saved) = completed_creation_replay(&tx, tenant_id, repo_id, k, &request).await? {
             finish(tx, &actor, true).await?;
             return Ok(json(StatusCode::CREATED, saved));
         }
@@ -319,6 +320,14 @@ pub async fn create_review_comment(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Triage, RepoAction::PullsWrite).await?;
+    if let Some(k) = key {
+        // Reserve and recheck the same key in the final transaction. The
+        // placeholder, resource, allocation and response commit together.
+        if let Some(saved) = creation_replay(&tx, tenant_id, repo_id, k, &request).await? {
+            finish(tx, &actor, true).await?;
+            return Ok(json(StatusCode::CREATED, saved));
+        }
+    }
     let pull_row = tx
         .query_opt(
             &format!("UPDATE forge_pulls SET next_review_comment_number=next_review_comment_number+1 WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 RETURNING {PULL_FIELDS}, next_review_comment_number-1 AS allocated"),
@@ -332,8 +341,11 @@ pub async fn create_review_comment(
     if locked_pull.state != "open" {
         return Err(Error(StatusCode::CONFLICT, "pull request is not open"));
     }
-    if locked_pull.head_oid != pull.head_oid || locked_pull.base_oid != pull.base_oid {
-        return Err(Error(StatusCode::CONFLICT, "pull request head/base changed concurrently; retry"));
+    if locked_pull.head_oid != pull.head_oid
+        || locked_pull.base_oid != pull.base_oid
+        || locked_pull.version != pull.version
+    {
+        return Err(Error(StatusCode::CONFLICT, "pull request head/base/version changed concurrently; retry"));
     }
     if let Some(rev_num) = input.review_number {
         tx.query_opt(
