@@ -78,23 +78,15 @@ fn open_store() -> Result<BlobStore> {
     ensure!(profile.provider() == BlobProvider::S3, "ROOTYARD_BLOB_SERVICE must be s3 for this suite");
     BlobStore::open(profile).map_err(|error| anyhow!("configured Blob store rejected: {error}"))
 }
-static BLOB_ROOT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Open the configured provider at a different root prefix: a real distinct
-/// physical backend identity without provider IO. The environment is restored
-/// before returning.
+/// Open the configured provider at a different validated root prefix: a real
+/// distinct physical backend identity without any process-global environment
+/// mutation or provider IO.
 fn store_with_root(root: &str) -> Result<BlobStore> {
-    let _guard = BLOB_ROOT_ENV.lock().unwrap_or_else(|poison| poison.into_inner());
-    let previous = std::env::var_os("ROOTYARD_BLOB_ROOT");
-    // SAFETY: this fixture serializes its temporary root mutation with the
-    // local mutex and restores the prior value before returning.
-    unsafe { std::env::set_var("ROOTYARD_BLOB_ROOT", root) };
-    let opened = open_store();
-    match previous {
-        Some(value) => unsafe { std::env::set_var("ROOTYARD_BLOB_ROOT", value) },
-        None => unsafe { std::env::remove_var("ROOTYARD_BLOB_ROOT") },
-    }
-    opened
+    let profile = BlobProfile::from_env().map_err(|error| anyhow!("ROOTYARD_BLOB_* profile rejected: {error}"))?;
+    ensure!(profile.provider() == BlobProvider::S3, "ROOTYARD_BLOB_SERVICE must be s3 for this suite");
+    let profile =
+        profile.with_root(root).map_err(|error| anyhow!("fixture Blob root rejected: {error}"))?;
+    BlobStore::open(profile).map_err(|error| anyhow!("configured Blob store rejected: {error}"))
 }
 fn random_key() -> i64 {
     i64::from_be_bytes(Uuid::new_v4().into_bytes()[..8].try_into().expect("eight bytes"))

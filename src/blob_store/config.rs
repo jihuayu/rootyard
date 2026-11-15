@@ -235,6 +235,17 @@ impl BlobProfile {
         })
     }
 
+    /// Derive a profile with a different validated root prefix from an already
+    /// parsed production profile. Provider, endpoint, bucket, region,
+    /// credentials, timeouts, limits and resource capacities are retained
+    /// unchanged. This performs no environment, provider or network IO.
+    pub fn with_root(mut self, root: impl Into<String>) -> Result<Self, BlobError> {
+        let root = root.into();
+        validate_root(&root)?;
+        self.root = root;
+        Ok(self)
+    }
+
     pub fn provider(&self) -> BlobProvider {
         self.provider
     }
