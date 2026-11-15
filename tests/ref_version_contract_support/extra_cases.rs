@@ -7,7 +7,6 @@ use rootyard::ref_store::core::pack_commit::{
     ArtifactLocator, ArtifactSetDigest, ContentDigest, PackArtifactRole, PackCommitRejectCode, RegisteredArtifact,
     RegisteredPack, pack_set_digest,
 };
-use rootyard::ref_store::core::publication_decision::codes::DecisionRejectCode;
 use rootyard::ref_store::core::terminal::CommitRejectCode;
 use rootyard::ref_store::ref_version::{
     AuthorityKind, BaseRequestSelector, CausalClosureError, CausalReadError, CausalReadOptions, CausalRejectCode,
@@ -387,8 +386,19 @@ fn retention_protectors_and_unknown_operation_never_collected_by_ttl() {
 #[test]
 fn reason_code_vocabulary_and_commit_code_mapping_are_closed() {
     assert_eq!(CausalRejectCode::ALL.len(), 32);
-    for code in DecisionRejectCode::ALL {
-        assert!(CausalRejectCode::refine_decision_reason(code.as_str()).is_ok());
+    for reason in [
+        "force_push_denied",
+        "pull_flow_violation",
+        "self_approval_denied",
+        "check_untrusted",
+        "policy_denied",
+        "protected_branch",
+        "missing_approvals",
+        "required_check_failed",
+        "lfs_locked",
+        "ref_not_writable",
+    ] {
+        assert!(CausalRejectCode::refine_decision_reason(reason).is_ok());
     }
     assert_eq!(
         CausalRejectCode::from_commit_reject_code(CommitRejectCode::PrefixConflict),
