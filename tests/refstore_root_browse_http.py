@@ -457,7 +457,7 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
             "SELECT count(*) FROM pg_stat_activity a "
             "WHERE a.datname=current_database() AND a.state='active' "
             "AND a.wait_event_type='Lock' "
-            "AND a.query LIKE '%SELECT t.read_only, t.is_restricted%' "
+            "AND a.query LIKE '%SELECT t.id, t.read_only, t.is_restricted%' "
             "AND a.query LIKE '%FOR SHARE OF t%' "
             "AND " + str(int(patch_pid)) + " = ANY(pg_blocking_pids(a.pid))", deadline)) == 1
 
