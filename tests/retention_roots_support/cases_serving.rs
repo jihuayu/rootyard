@@ -21,8 +21,8 @@ use crate::retention_roots_support::git::{
     GateRelease, GitGate, assert_pack_identity, git_binary, stock_git_accepts_view,
 };
 use crate::retention_roots_support::pack::create_serving_snapshot;
-use crate::retention_roots_support::serving::verify_new_serving;
 use crate::retention_roots_support::roots;
+use crate::retention_roots_support::serving::verify_new_serving;
 
 /// The serving lane anchors the process-wide public cluster row, so these
 /// fixture cases serialize their own rotation window. No production API is
