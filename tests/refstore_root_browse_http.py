@@ -586,7 +586,7 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
             reasons.append(str(existing.get("reason", "preexisting unresolved state")))
         if reasons:
             self._root_scope_unresolved = {"reason": "; ".join(reasons)}
-            return
+            raise AssertionError("fixture cleanup unresolved")
         self._root_scope_unresolved = None
         super().cleanup()
 

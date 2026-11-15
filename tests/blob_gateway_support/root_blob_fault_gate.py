@@ -18,6 +18,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 CONNECT_TIMEOUT = 5.0
 IO_TIMEOUT = 5.0
+HANDLER_TIMEOUT = 20.0
 MAX_HANDLERS = 8
 STOP_TIMEOUT = 10.0
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "transfer-encoding",
@@ -69,6 +70,22 @@ class RootBlobFaultGate:
     def remaining(deadline):
         return max(0.0, deadline - time.monotonic())
 
+    @staticmethod
+    def join_handlers(threads, listener, deadline):
+        """Join owned handler/listener threads only for the remaining budget."""
+        while True:
+            remaining = RootBlobFaultGate.remaining(deadline)
+            alive = [thread for thread in threads if thread.is_alive()]
+            listener_alive = listener is not None and listener.is_alive()
+            if not alive and not listener_alive:
+                return True
+            if remaining <= 0:
+                return False
+            for thread in alive:
+                thread.join(timeout=min(0.05, remaining))
+            if listener_alive:
+                listener.join(timeout=min(0.05, remaining))
+
     def __init__(self, upstream_endpoint):
         self.upstream = self.validate_endpoint(upstream_endpoint)
         self.armed = False
@@ -77,6 +94,8 @@ class RootBlobFaultGate:
         self.target_gets = 0
         self.forwarded_methods = {}
         self.upstream_errors = 0
+        self._handlers = {}
+        self._connections = set()
         gate = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -108,7 +127,7 @@ class RootBlobFaultGate:
         self.port = self.server.server_address[1]
         self.endpoint = "http://127.0.0.1:" + str(self.port)
         self.thread = threading.Thread(target=self.server.serve_forever,
-                                       kwargs={"poll_interval": 0.05}, daemon=False)
+                                       kwargs={"poll_interval": 0.05}, daemon=True)
         self.started = False
 
     def start(self):
@@ -149,9 +168,49 @@ class RootBlobFaultGate:
             self.server.server_close()
         except Exception:
             pass
+        with self.lock:
+            handlers = list(self._handlers)
+            requests = list(self._handlers.values())
+            connections = list(self._connections)
+        for request in requests:
+            try:
+                request.shutdown(2)
+            except Exception:
+                pass
+            try:
+                request.close()
+            except Exception:
+                pass
+        for connection in connections:
+            try:
+                connection.close()
+            except Exception:
+                pass
         if self.started:
             self.thread.join(timeout=self.remaining(deadline))
-        return (not self.started) or not self.thread.is_alive()
+        return self.join_handlers(handlers, self.thread if self.started else None, deadline)
+
+    def _set_timeout(self, handler, deadline):
+        remaining = self.remaining(deadline)
+        if remaining <= 0:
+            raise TimeoutError("gate handler deadline exhausted")
+        try:
+            handler.connection.settimeout(min(IO_TIMEOUT, remaining))
+        except Exception:
+            pass
+
+    def _read_exact(self, handler, length, deadline):
+        body = bytearray()
+        while len(body) < length:
+            self._set_timeout(handler, deadline)
+            remaining = min(65536, length - len(body))
+            chunk = handler.rfile.read1(remaining)
+            if not chunk:
+                break
+            body.extend(chunk)
+        if len(body) != length:
+            raise ValueError("short gate request body")
+        return bytes(body)
 
     def _fixed(self, handler, status):
         try:
@@ -164,7 +223,37 @@ class RootBlobFaultGate:
         except Exception:
             handler.close_connection = True
 
+    def _note_forward(self, method):
+        with self.lock:
+            self.forwarded_methods[method] = self.forwarded_methods.get(method, 0) + 1
+
+    def _expire_handler(self, handler):
+        try:
+            handler.connection.shutdown(2)
+        except Exception:
+            pass
+        try:
+            handler.connection.close()
+        except Exception:
+            pass
+        conn = getattr(handler, "_upstream_conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _serve(self, handler):
+        expiration = threading.Timer(HANDLER_TIMEOUT, self._expire_handler, args=(handler,))
+        expiration.daemon = True
+        expiration.start()
+        try:
+            self._serve_bounded(handler)
+        finally:
+            expiration.cancel()
+
+    def _serve_bounded(self, handler):
+        deadline = time.monotonic() + HANDLER_TIMEOUT
         method = handler.command
         path = handler.path
         target = self.full_path_matches(method, path, self.armed, self.target_suffix)
@@ -173,44 +262,66 @@ class RootBlobFaultGate:
                 self.target_gets += 1
             self._fixed(handler, 503)
             return
+        conn = None
         try:
             length = self.bounded_body_length(handler.headers.get("Content-Length"))
             if length and method not in ("PUT", "POST"):
                 self._fixed(handler, 400)
                 return
-            body = handler.rfile.read(length) if length else b""
-            if len(body) != length:
-                self._fixed(handler, 400)
-                return
+            body = self._read_exact(handler, length, deadline) if length else b""
             headers = [(name, value) for name, value in handler.headers.items()
                        if name.lower() not in HOP_BY_HOP]
-            conn = http.client.HTTPConnection(*self.upstream,
-                                              timeout=min(CONNECT_TIMEOUT, IO_TIMEOUT))
+            self._note_forward(method)
+            conn = http.client.HTTPConnection(*self.upstream, timeout=min(CONNECT_TIMEOUT, IO_TIMEOUT))
+            with self.lock:
+                self._connections.add(conn)
+            handler._upstream_conn = conn
             try:
+                self._set_timeout(handler, deadline)
                 conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
                 for name, value in headers:
                     conn.putheader(name, value)
                 if body or method in ("PUT", "POST"):
                     conn.putheader("Content-Length", str(len(body)))
                 conn.endheaders(body if body else None)
+                if conn.sock is not None:
+                    conn.sock.settimeout(min(IO_TIMEOUT, self.remaining(deadline)))
                 response = conn.getresponse()
-                payload = response.read(MAX_RESPONSE_BYTES + 1)
-                if len(payload) > MAX_RESPONSE_BYTES:
-                    self._fixed(handler, 502)
-                    return
+                payload = bytearray()
+                while True:
+                    if self.remaining(deadline) <= 0:
+                        raise TimeoutError("gate upstream response deadline exhausted")
+                    if conn.sock is not None:
+                        conn.sock.settimeout(min(IO_TIMEOUT, self.remaining(deadline)))
+                    chunk = response.read1(min(65536, MAX_RESPONSE_BYTES + 1 - len(payload)))
+                    if not chunk:
+                        break
+                    payload.extend(chunk)
+                    if len(payload) > MAX_RESPONSE_BYTES:
+                        self._fixed(handler, 502)
+                        return
                 response_headers = response.getheaders()
             finally:
+                with self.lock:
+                    self._connections.discard(conn)
                 conn.close()
-            with self.lock:
-                self.forwarded_methods[method] = self.forwarded_methods.get(method, 0) + 1
-            self._relay(handler, method, response.status, response_headers, payload)
+            self._relay(handler, method, response.status, response_headers, bytes(payload), deadline)
         except Exception:
             with self.lock:
                 self.upstream_errors += 1
             self._fixed(handler, 502)
+        finally:
+            handler._upstream_conn = None
+            if conn is not None:
+                with self.lock:
+                    self._connections.discard(conn)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     @staticmethod
-    def _relay(handler, method, status, headers, payload):
+    def _relay(handler, method, status, headers, payload, deadline):
         handler.send_response_only(status)
         declared = None
         for name, value in headers:
@@ -226,13 +337,17 @@ class RootBlobFaultGate:
         handler.end_headers()
         handler.close_connection = True
         if method != "HEAD" and payload:
+            try:
+                handler.connection.settimeout(max(0.1, deadline - time.monotonic()))
+            except Exception:
+                pass
             handler.wfile.write(payload)
         handler.wfile.flush()
 
 
 class _BoundedServer(ThreadingHTTPServer):
-    daemon_threads = False
-    block_on_close = True
+    daemon_threads = True
+    block_on_close = False
     allow_reuse_address = True
 
     def __init__(self, address, handler, gate, max_handlers):
@@ -247,14 +362,27 @@ class _BoundedServer(ThreadingHTTPServer):
             except Exception:
                 pass
             return
+        thread = threading.Thread(target=self.process_request_thread,
+                                  args=(request, client_address), daemon=True)
+        with self.gate.lock:
+            self.gate._handlers[thread] = request
         try:
-            super().process_request(request, client_address)
+            thread.start()
         except Exception:
+            with self.gate.lock:
+                self.gate._handlers.pop(thread, None)
             self._slots.release()
+            try:
+                request.close()
+            except Exception:
+                pass
             raise
 
     def process_request_thread(self, request, client_address):
+        thread = threading.current_thread()
         try:
             super().process_request_thread(request, client_address)
         finally:
+            with self.gate.lock:
+                self.gate._handlers.pop(thread, None)
             self._slots.release()

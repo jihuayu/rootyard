@@ -137,9 +137,11 @@ class BlockerCleanupTests(unittest.TestCase):
         self.assertEqual(fake._root_scope_unresolved["reason"], "root request not settled")
         fake.stop = mock.Mock()
         with mock.patch.object(refstore_roots_http.RootsHttpHarness, "cleanup") as base_cleanup:
-            fixture.RootBrowseHttpHarness.cleanup(fake)
+            with self.assertRaises(AssertionError):
+                fixture.RootBrowseHttpHarness.cleanup(fake)
             fake.stop.assert_called_once()
             base_cleanup.assert_not_called()
+        self.assertEqual(fake._root_scope_unresolved["reason"], "root request not settled")
 
     def test_gate_stop_failure_preserves_scratch_and_schema(self):
         fake = object.__new__(fixture.RootBrowseHttpHarness)
@@ -147,10 +149,28 @@ class BlockerCleanupTests(unittest.TestCase):
         fake.stop = mock.Mock()
         fake._root_blob_gate = mock.Mock()
         fake._root_blob_gate.stop.return_value = False
+        success = True
         with mock.patch.object(refstore_roots_http.RootsHttpHarness, "cleanup") as base_cleanup:
-            fixture.RootBrowseHttpHarness.cleanup(fake)
+            try:
+                fixture.RootBrowseHttpHarness.cleanup(fake)
+            except AssertionError:
+                success = False
             fake.stop.assert_called_once()
             fake._root_blob_gate.stop.assert_called_once()
+            base_cleanup.assert_not_called()
+        self.assertFalse(success)
+        self.assertIn("blob forward gate", fake._root_scope_unresolved["reason"])
+
+    def test_gate_stop_exception_fails_cleanup_and_preserves(self):
+        fake = object.__new__(fixture.RootBrowseHttpHarness)
+        fake._root_scope_unresolved = None
+        fake.stop = mock.Mock()
+        fake._root_blob_gate = mock.Mock()
+        fake._root_blob_gate.stop.side_effect = OSError("gate stop failed")
+        with mock.patch.object(refstore_roots_http.RootsHttpHarness, "cleanup") as base_cleanup:
+            with self.assertRaises(AssertionError):
+                fixture.RootBrowseHttpHarness.cleanup(fake)
+            fake.stop.assert_called_once()
             base_cleanup.assert_not_called()
         self.assertIn("blob forward gate", fake._root_scope_unresolved["reason"])
 
@@ -159,7 +179,8 @@ class BlockerCleanupTests(unittest.TestCase):
         fake._root_scope_unresolved = {"reason": "fixture blocker not reaped"}
         fake.stop = mock.Mock()
         with mock.patch.object(refstore_roots_http.RootsHttpHarness, "cleanup") as base_cleanup:
-            fixture.RootBrowseHttpHarness.cleanup(fake)
+            with self.assertRaises(AssertionError):
+                fixture.RootBrowseHttpHarness.cleanup(fake)
             fake.stop.assert_called_once()
             base_cleanup.assert_not_called()
 
