@@ -1,12 +1,14 @@
 //! Personal access token scopes for human users.
 //!
 //! This module owns the *authorisation data model* for restricted personal
-//! access tokens (PATs). The common repository/namespace action enforcement is
-//! wired into the native API and web routes on this integration branch, and
-//! browser login rejects a restricted parent token. Restricted PAT issuance is
-//! still not released: there is no public issuer/CLI, the Git CAS parent-token
-//! lock is missing, and exact browser-child inheritance for a restricted parent
-//! is not implemented.
+//! access tokens (PATs). Direct `api` tokens and parent-bound `browser` child
+//! sessions enforce repository and namespace grants live inside the request's
+//! transaction via [`authorize_repository_for_request_with_parent`],
+//! [`authorize_namespace_for_request_with_parent`], and
+//! [`authorize_repository_late_with_parent`]. Browser children can only inherit
+//! or narrow their parent's live flags (`read_only OR parent.read_only`,
+//! `is_restricted OR parent.is_restricted`), while Git ref publication remains
+//! restricted to direct `api` credentials unless explicitly authorized.
 //!
 //! # Semantics
 //!
@@ -41,6 +43,9 @@ use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio_postgres::{GenericClient, Transaction};
 use uuid::Uuid;
+
+#[path = "token_scopes/browser_parent.rs"]
+mod browser_parent;
 
 /// Repository-scoped actions a restricted human PAT may hold.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -264,85 +269,51 @@ impl TokenAuthority {
 ///
 /// The token row is locked `FOR SHARE OF t` until the transaction ends, which
 /// blocks the `FOR UPDATE` protocol used by grant writers. Unknown, revoked,
-/// expired, foreign, or `browser`-kind tokens yield [`ScopeDenial::InvalidToken`].
-/// Browser children are intentionally not accepted: a browser request must
-/// first resolve its live parent (schema 136) or the OIDC account session, and
-/// that wiring does not exist yet.
+/// expired, foreign, or `browser`-kind tokens yield [`ScopeDenial::InvalidToken`];
+/// browser-session callers must use [`authorize_repository_for_request_with_parent`]
+/// or [`authorize_namespace_for_request_with_parent`] with the bound parent id.
 pub async fn load_authority(
     tx: &Transaction<'_>,
     token_id: Uuid,
     actor_id: Uuid,
 ) -> Result<TokenAuthority, ScopeDenial> {
-    load_authority_in_transaction(tx, token_id, actor_id, false).await
+    load_authority_in_transaction(tx, token_id, actor_id, None, false).await
 }
 
-/// Shared transaction loader. `allow_browser_session` only admits a live
-/// browser child whose own `is_restricted` is false and whose `web_sessions`
-/// row is still live. Browser children never consult grant tables: a restricted
-/// browser child is rejected outright (`InvalidToken`) so it cannot be mistaken
-/// for an unrestricted legacy browser. The caller must additionally verify the
-/// browser session's parent is live and unrestricted; this loader alone cannot
-/// see the parent binding.
+/// Shared transaction loader. When `parent_token_id` is `None`, only direct
+/// `api` tokens are admitted (`FOR SHARE OF t`). When `parent_token_id` is
+/// `Some(parent_id)`, `allow_browser_session` must be true and both the active
+/// `browser` child and its live `api` parent are locked `FOR SHARE OF t, p`;
+/// grant rows are read from the parent token id and flags combine via logical
+/// OR so a browser child can never widen its parent.
 async fn load_authority_in_transaction(
     tx: &Transaction<'_>,
     token_id: Uuid,
     actor_id: Uuid,
+    parent_token_id: Option<Uuid>,
     allow_browser_session: bool,
 ) -> Result<TokenAuthority, ScopeDenial> {
-    let row = tx
-        .query_opt(
-            "SELECT t.read_only, t.is_restricted \
-               FROM tokens t \
-              WHERE t.id = $1 AND t.user_id = $2 AND t.revoked = false \
-                AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
-                AND (t.kind = 'api' OR ($3 AND t.kind = 'browser' AND t.is_restricted = false \
-                     AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = t.id \
-                                  AND NOT s.revoked AND s.expires_at > clock_timestamp()))) \
-              FOR SHARE OF t",
-            &[&token_id, &actor_id, &allow_browser_session],
+    let resolved =
+        browser_parent::load_token_for_share(tx, token_id, actor_id, parent_token_id, allow_browser_session).await?;
+    let (repositories, namespaces) = if resolved.restricted {
+        (
+            browser_parent::load_repository_scopes(tx, resolved.scope_token_id).await?,
+            browser_parent::load_namespace_scopes(tx, resolved.scope_token_id).await?,
         )
-        .await
-        .map_err(|_| ScopeDenial::Unavailable)?;
-    let Some(row) = row else {
-        return Err(ScopeDenial::InvalidToken);
+    } else {
+        (BTreeMap::new(), BTreeMap::new())
     };
-    let read_only: bool = row.get(0);
-    let restricted: bool = row.get(1);
-
-    let mut repositories: BTreeMap<Uuid, BTreeSet<RepoAction>> = BTreeMap::new();
-    let mut namespaces: BTreeMap<Uuid, BTreeSet<NamespaceAction>> = BTreeMap::new();
-    if restricted {
-        let rows = tx
-            .query("SELECT repository_id, action FROM token_repository_scopes WHERE token_id = $1", &[&token_id])
-            .await
-            .map_err(|_| ScopeDenial::Unavailable)?;
-        for row in rows {
-            let repository_id: Uuid = row.get(0);
-            let action: String = row.get(1);
-            let action = RepoAction::parse(&action).ok_or(ScopeDenial::Unavailable)?;
-            repositories.entry(repository_id).or_default().insert(action);
-        }
-        let rows = tx
-            .query("SELECT organization_id, action FROM token_namespace_scopes WHERE token_id = $1", &[&token_id])
-            .await
-            .map_err(|_| ScopeDenial::Unavailable)?;
-        for row in rows {
-            let organization_id: Uuid = row.get(0);
-            let action: String = row.get(1);
-            let action = NamespaceAction::parse(&action).ok_or(ScopeDenial::Unavailable)?;
-            namespaces.entry(organization_id).or_default().insert(action);
-        }
-    }
-
-    Ok(TokenAuthority { token_id, actor_id, read_only, restricted, repositories, namespaces })
+    Ok(TokenAuthority {
+        token_id,
+        actor_id,
+        read_only: resolved.read_only,
+        restricted: resolved.restricted,
+        repositories,
+        namespaces,
+    })
 }
 
-/// Authorise one repository action for an HTTP request.
-///
-/// API tokens use the normal scope path. `allow_browser_session` is only true
-/// inside the browser middleware; a legacy browser child is then treated as an
-/// unrestricted legacy token and granted only if it is itself non-restricted.
-/// Restricted browser children are rejected, never widened.
+/// Authorise one repository action for a direct API HTTP request.
 pub async fn authorize_repository_for_request(
     tx: &Transaction<'_>,
     token_id: Uuid,
@@ -351,12 +322,35 @@ pub async fn authorize_repository_for_request(
     action: RepoAction,
     allow_browser_session: bool,
 ) -> Result<(), ScopeDenial> {
-    let authority = load_authority_in_transaction(tx, token_id, actor_id, allow_browser_session).await?;
+    authorize_repository_for_request_with_parent(
+        tx,
+        token_id,
+        actor_id,
+        None,
+        repository_id,
+        action,
+        allow_browser_session,
+    )
+    .await
+}
+
+/// Authorise one repository action for an HTTP request, inheriting parent grants
+/// and flags when acting through a bound browser child session.
+pub async fn authorize_repository_for_request_with_parent(
+    tx: &Transaction<'_>,
+    token_id: Uuid,
+    actor_id: Uuid,
+    parent_token_id: Option<Uuid>,
+    repository_id: Uuid,
+    action: RepoAction,
+    allow_browser_session: bool,
+) -> Result<(), ScopeDenial> {
+    let authority =
+        load_authority_in_transaction(tx, token_id, actor_id, parent_token_id, allow_browser_session).await?;
     authority.check_repository(repository_id, action)
 }
 
-/// Authorise one organisation namespace action for an HTTP request, with the
-/// same browser rule as [`authorize_repository_for_request`].
+/// Authorise one organisation namespace action for a direct API HTTP request.
 pub async fn authorize_namespace_for_request(
     tx: &Transaction<'_>,
     token_id: Uuid,
@@ -365,22 +359,39 @@ pub async fn authorize_namespace_for_request(
     action: NamespaceAction,
     allow_browser_session: bool,
 ) -> Result<(), ScopeDenial> {
-    let authority = load_authority_in_transaction(tx, token_id, actor_id, allow_browser_session).await?;
+    authorize_namespace_for_request_with_parent(
+        tx,
+        token_id,
+        actor_id,
+        None,
+        organization_id,
+        action,
+        allow_browser_session,
+    )
+    .await
+}
+
+/// Authorise one organisation namespace action for an HTTP request, inheriting
+/// parent grants and flags when acting through a bound browser child session.
+pub async fn authorize_namespace_for_request_with_parent(
+    tx: &Transaction<'_>,
+    token_id: Uuid,
+    actor_id: Uuid,
+    parent_token_id: Option<Uuid>,
+    organization_id: Uuid,
+    action: NamespaceAction,
+    allow_browser_session: bool,
+) -> Result<(), ScopeDenial> {
+    let authority =
+        load_authority_in_transaction(tx, token_id, actor_id, parent_token_id, allow_browser_session).await?;
     authority.check_namespace(organization_id, action)
 }
 
 /// Late repository scope check that locks the token row for the duration of the
 /// caller's transaction when one is supplied.
 ///
-/// The query selects the token `FOR SHARE OF t`. With a real transaction that
-/// lock is held until commit, so a grant writer using the documented `FOR
-/// UPDATE` protocol cannot narrow the grant set between this check and the
-/// commit. A bare auto-commit client only holds the lock for this statement: it
-/// still re-reads the live token and grants immediately before publication, but
-/// callers must not claim that the lock covers a later Git CAS or ref
-/// publication. Callers that need the transaction-scoped guarantee must pass a
-/// real transaction (as the browse ref transaction and ref-admission settlement
-/// paths do).
+/// Direct API callers use `authorize_repository_late` (`parent_token_id = None`);
+/// browser-bound callers use [`authorize_repository_late_with_parent`].
 pub async fn authorize_repository_late<C: GenericClient + Sync>(
     client: &C,
     token_id: Uuid,
@@ -389,43 +400,33 @@ pub async fn authorize_repository_late<C: GenericClient + Sync>(
     action: RepoAction,
     allow_browser_session: bool,
 ) -> Result<(), ScopeDenial> {
-    let row = client
-        .query_opt(
-            "SELECT t.read_only, t.is_restricted \
-               FROM tokens t \
-              WHERE t.id = $1 AND t.user_id = $2 AND t.revoked = false \
-                AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
-                AND (t.kind = 'api' OR ($3 AND t.kind = 'browser' AND t.is_restricted = false \
-                     AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = t.id \
-                                  AND NOT s.revoked AND s.expires_at > clock_timestamp()))) \
-              FOR SHARE OF t",
-            &[&token_id, &actor_id, &allow_browser_session],
-        )
+    authorize_repository_late_with_parent(client, token_id, actor_id, None, repository_id, action, allow_browser_session)
         .await
-        .map_err(|_| ScopeDenial::Unavailable)?;
-    let Some(row) = row else {
-        return Err(ScopeDenial::InvalidToken);
+}
+
+/// Late repository scope check with optional bound browser parent.
+pub async fn authorize_repository_late_with_parent<C: GenericClient + Sync>(
+    client: &C,
+    token_id: Uuid,
+    actor_id: Uuid,
+    parent_token_id: Option<Uuid>,
+    repository_id: Uuid,
+    action: RepoAction,
+    allow_browser_session: bool,
+) -> Result<(), ScopeDenial> {
+    let resolved =
+        browser_parent::load_token_for_share(client, token_id, actor_id, parent_token_id, allow_browser_session)
+            .await?;
+    let repositories = if resolved.restricted {
+        browser_parent::load_repository_scopes(client, resolved.scope_token_id).await?
+    } else {
+        BTreeMap::new()
     };
-    let read_only: bool = row.get(0);
-    let restricted: bool = row.get(1);
-    let mut repositories: BTreeMap<Uuid, BTreeSet<RepoAction>> = BTreeMap::new();
-    if restricted {
-        let rows = client
-            .query("SELECT repository_id, action FROM token_repository_scopes WHERE token_id = $1", &[&token_id])
-            .await
-            .map_err(|_| ScopeDenial::Unavailable)?;
-        for row in rows {
-            let id: Uuid = row.get(0);
-            let action: String = row.get(1);
-            let action = RepoAction::parse(&action).ok_or(ScopeDenial::Unavailable)?;
-            repositories.entry(id).or_default().insert(action);
-        }
-    }
     let authority = TokenAuthority {
         token_id,
         actor_id,
-        read_only,
-        restricted,
+        read_only: resolved.read_only,
+        restricted: resolved.restricted,
         repositories,
         namespaces: BTreeMap::new(),
     };

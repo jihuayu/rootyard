@@ -9,6 +9,9 @@ use deadpool_postgres::{Pool, Transaction};
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
+#[path = "auth/browser_parent.rs"]
+mod browser_parent;
+
 tokio::task_local! { static WEB_AUTH_SCOPE: bool; }
 pub async fn web_scope<F: std::future::Future>(future: F) -> F::Output {
     WEB_AUTH_SCOPE.scope(true, future).await
@@ -25,21 +28,7 @@ pub async fn inherit_web_scope<F: std::future::Future>(enabled: bool, future: F)
 
 pub async fn authenticate(pool: &Pool, headers: &HeaderMap) -> Result<Identity, Error> {
     let (user, token) = credentials(headers)?;
-    let client = pool.get().await.map_err(Error::internal)?;
-    let row = client.query_opt(
-        "SELECT u.id, u.username, t.read_only, t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.digest=$1 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) AND (t.kind='api' OR ($2 AND t.kind='browser' AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked AND s.expires_at>clock_timestamp())))", &[&db::digest(&token), &browser_credentials_allowed()])
-        .await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
-    let identity = Identity {
-        id: row.get(0),
-        username: row.get(1),
-        read_only: row.get(2),
-        token_id: row.get(3),
-        token_digest: db::digest(&token),
-    };
-    if user.as_ref().is_some_and(|u| u != &identity.username) {
-        return Err(Error::unauthorized());
-    }
-    Ok(identity)
+    browser_parent::authenticate_identity(pool, user, &token, browser_credentials_allowed()).await
 }
 
 fn credentials(headers: &HeaderMap) -> Result<(Option<String>, String), Error> {
@@ -144,17 +133,40 @@ pub async fn authorize_repo_with_role(
     }
     // Scopes only narrow the RBAC result above and are read in the same
     // transaction, so a token narrowing cannot race this authorisation.
-    crate::token_scopes::authorize_repository_for_request(
-        tx,
-        actor.token_id,
-        actor.id,
-        repo_id,
-        action,
-        browser_credentials_allowed(),
-    )
-    .await
-    .map_err(scope_error)?;
+    authorize_repo_scope(tx, actor, repo_id, action).await?;
     Ok(RepoAccess { repo_id, owner_id, role: effective_role })
+}
+
+async fn authorize_repo_scope(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    repo_id: Uuid,
+    action: crate::token_scopes::RepoAction,
+) -> Result<(), Error> {
+    let browser = browser_credentials_allowed();
+    match actor.parent_token_id {
+        Some(parent_id) => crate::token_scopes::authorize_repository_for_request_with_parent(
+            tx,
+            actor.token_id,
+            actor.id,
+            Some(parent_id),
+            repo_id,
+            action,
+            browser,
+        )
+        .await
+        .map_err(scope_error),
+        None => crate::token_scopes::authorize_repository_for_request(
+            tx,
+            actor.token_id,
+            actor.id,
+            repo_id,
+            action,
+            browser,
+        )
+        .await
+        .map_err(scope_error),
+    }
 }
 
 fn scope_error(denial: crate::token_scopes::ScopeDenial) -> Error {
@@ -179,16 +191,7 @@ pub async fn authorize_repo_action_by_id(
     action: crate::token_scopes::RepoAction,
 ) -> Result<(), Error> {
     verify_token(tx, actor, action.is_mutating()).await?;
-    crate::token_scopes::authorize_repository_for_request(
-        tx,
-        actor.token_id,
-        actor.id,
-        repo_id,
-        action,
-        browser_credentials_allowed(),
-    )
-    .await
-    .map_err(scope_error)
+    authorize_repo_scope(tx, actor, repo_id, action).await
 }
 
 /// Enforce one organisation namespace action. The organisation role check stays
@@ -200,10 +203,11 @@ pub async fn authorize_namespace_action(
     action: crate::token_scopes::NamespaceAction,
 ) -> Result<(), Error> {
     verify_token(tx, actor, action.is_mutating()).await?;
-    crate::token_scopes::authorize_namespace_for_request(
+    crate::token_scopes::authorize_namespace_for_request_with_parent(
         tx,
         actor.token_id,
         actor.id,
+        actor.parent_token_id,
         organization_id,
         action,
         browser_credentials_allowed(),
@@ -226,32 +230,16 @@ pub async fn reject_restricted_create(tx: &Transaction<'_>, actor: &Identity) ->
     Ok(())
 }
 
-/// True when the acting token carries an explicit restricted grant set.
+/// True when the acting token (or its bound browser parent) carries an explicit
+/// restricted grant set.
 pub async fn token_is_restricted(tx: &Transaction<'_>, actor: &Identity) -> Result<bool, Error> {
-    let row = tx
-        .query_opt(
-            "SELECT t.is_restricted FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 \
-             AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
-             AND (t.kind='api' OR ($4 AND t.kind='browser' AND t.is_restricted = false AND EXISTS \
-                 (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked AND s.expires_at>clock_timestamp()))) FOR SHARE OF t",
-            &[&actor.token_id, &actor.id, &actor.token_digest, &browser_credentials_allowed()],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::unauthorized)?;
-    Ok(row.get(0))
+    browser_parent::token_is_restricted(tx, actor, browser_credentials_allowed()).await
 }
 
 pub async fn verify_token(tx: &Transaction<'_>, actor: &Identity, write: bool) -> Result<(), Error> {
     // A separate statement observes the real database clock *after* lock waits.
-    let row = tx.query_opt(
-        "SELECT t.read_only FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) AND (t.kind='api' OR ($4 AND t.kind='browser' AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked AND s.expires_at>clock_timestamp())))",
-        &[&actor.token_id, &actor.id, &actor.token_digest, &browser_credentials_allowed()],
-    )
-    .await
-    .map_err(Error::internal)?
-    .ok_or_else(Error::unauthorized)?;
-    if write && row.get::<_, bool>(0) {
+    let read_only = browser_parent::token_read_only(tx, actor, browser_credentials_allowed()).await?;
+    if write && read_only {
         return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
     }
     Ok(())
@@ -310,16 +298,7 @@ async fn verify_active_inner(
     if eff < min_role {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
-    crate::token_scopes::authorize_repository_for_request(
-        &tx,
-        actor.token_id,
-        actor.id,
-        repo_id,
-        action,
-        browser_credentials_allowed(),
-    )
-    .await
-    .map_err(scope_error)?;
+    authorize_repo_scope(&tx, actor, repo_id, action).await?;
     Ok(())
 }
 
@@ -330,9 +309,9 @@ pub async fn finish_tx(tx: Transaction<'_>, actor: &Identity, write: bool) -> Re
 }
 
 /// Re-verify the exact token, repository generation/state and effective write
-/// role for an already authenticated identity. Native receive hooks and the
-/// server-side exact-ref CAS transaction call this immediately before their SQL
-/// commit so a revocation during a long transfer cannot publish refs.
+/// role for an already authenticated identity. Direct API callers pass
+/// `parent_token_id = None` via [`verify_repo_write_access`]; browser-bound
+/// callers pass `actor.parent_token_id` via [`verify_repo_write_access_with_parent`].
 pub async fn verify_repo_write_access<C: GenericClient + Sync>(
     client: &C,
     actor_id: Uuid,
@@ -341,19 +320,22 @@ pub async fn verify_repo_write_access<C: GenericClient + Sync>(
     browser: bool,
     action: crate::token_scopes::RepoAction,
 ) -> Result<(), Error> {
-    let token = client
-        .query_opt(
-            "SELECT t.read_only FROM tokens t WHERE t.id=$1 AND t.user_id=$2 \
-             AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
-             AND (t.kind='api' OR ($3 AND t.kind='browser' AND EXISTS \
-                 (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked \
-                  AND s.expires_at>clock_timestamp())))",
-            &[&token_id, &actor_id, &browser],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::unauthorized)?;
-    if action.is_mutating() && token.get::<_, bool>(0) {
+    verify_repo_write_access_with_parent(client, actor_id, token_id, None, repo_id, browser, action).await
+}
+
+/// Parent-aware variant of [`verify_repo_write_access`].
+pub async fn verify_repo_write_access_with_parent<C: GenericClient + Sync>(
+    client: &C,
+    actor_id: Uuid,
+    token_id: Uuid,
+    parent_token_id: Option<Uuid>,
+    repo_id: Uuid,
+    browser: bool,
+    action: crate::token_scopes::RepoAction,
+) -> Result<(), Error> {
+    let read_only =
+        browser_parent::write_token_read_only(client, actor_id, token_id, parent_token_id, browser).await?;
+    if action.is_mutating() && read_only {
         return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
     }
     let repo = client
@@ -373,13 +355,17 @@ pub async fn verify_repo_write_access<C: GenericClient + Sync>(
     if effective < Role::Write {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
-    // Late, non-locking scope check. A bare `GenericClient` cannot keep the
-    // token row `FOR SHARE` until publication, so this only closes the window
-    // at the moment of this statement; the fixed publication lock is tracked
-    // as remaining Git work and is not claimed here.
-    crate::token_scopes::authorize_repository_late(client, token_id, actor_id, repo_id, action, browser)
-        .await
-        .map_err(scope_error)?;
+    crate::token_scopes::authorize_repository_late_with_parent(
+        client,
+        token_id,
+        actor_id,
+        parent_token_id,
+        repo_id,
+        action,
+        browser,
+    )
+    .await
+    .map_err(scope_error)?;
     Ok(())
 }
 
@@ -406,38 +392,15 @@ pub async fn authorize_publication_window(
     storage_generation: i64,
 ) -> Result<(), Error> {
     let browser = browser_credentials_allowed();
-    // Step 1: take the token row lock. The digest is the parent's verified
-    // immutable token identity, never a hook-reported value.
-    tx.query_opt(
-        "SELECT true FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 \
-         AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
-         AND (t.kind='api' OR ($4 AND t.kind='browser' AND t.is_restricted = false AND EXISTS \
-             (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked \
-              AND s.expires_at>clock_timestamp()))) FOR SHARE OF t",
-        &[&actor.token_id, &actor.id, &actor.token_digest, &browser],
-    )
-    .await
-    .map_err(Error::internal)?
-    .ok_or_else(Error::unauthorized)?;
-    // Step 2: an independent statement re-reads the live row after the lock
-    // wait, so expiry, read-only flips and browser-session loss are observed
-    // with the real database clock.
-    let live = tx
-        .query_opt(
-            "SELECT t.read_only, (t.expires_at IS NULL OR t.expires_at > clock_timestamp()), \
-                    (t.kind='api' OR ($4 AND t.kind='browser' AND t.is_restricted = false AND EXISTS \
-                     (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked \
-                      AND s.expires_at>clock_timestamp()))) \
-               FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 AND NOT t.revoked",
-            &[&actor.token_id, &actor.id, &actor.token_digest, &browser],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::unauthorized)?;
-    if !live.get::<_, bool>(1) || !live.get::<_, bool>(2) {
+    // Step 1: take the token row lock (plus parent row lock when browser-bound).
+    browser_parent::lock_publication_tokens(tx, actor, browser).await?;
+    // Step 2: re-read the live row(s) after the lock wait with clock_timestamp().
+    let (read_only, unexpired, live_session) =
+        browser_parent::recheck_publication_tokens(tx, actor, browser).await?;
+    if !unexpired || !live_session {
         return Err(Error::unauthorized());
     }
-    if live.get::<_, bool>(0) {
+    if read_only {
         return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
     }
     // Step 3: current repository generation/state and effective write role,
@@ -463,10 +426,11 @@ pub async fn authorize_publication_window(
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
     // Step 4: the fixed action is ContentsWrite; the token can only narrow.
-    crate::token_scopes::authorize_repository_late(
+    crate::token_scopes::authorize_repository_late_with_parent(
         &**tx,
         actor.token_id,
         actor.id,
+        actor.parent_token_id,
         repository_id,
         crate::token_scopes::RepoAction::ContentsWrite,
         browser,

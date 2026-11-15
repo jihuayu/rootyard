@@ -231,10 +231,10 @@ async fn validate_session(state: &MetadataState, secret: &str, csrf: Option<&str
             "SELECT s.csrf_digest FROM web_sessions s \
              JOIN tokens t ON t.id=s.token_id \
              JOIN tokens p ON p.id=$2 AND p.user_id=t.user_id AND p.kind='api' \
-                  AND p.is_restricted = false \
                   AND NOT p.revoked AND (p.expires_at IS NULL OR p.expires_at>clock_timestamp()) \
-             WHERE t.digest=$1 AND NOT t.revoked AND NOT s.revoked \
-               AND s.expires_at>clock_timestamp()",
+             WHERE t.digest=$1 AND t.kind='browser' AND NOT t.revoked \
+               AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp()) \
+               AND NOT s.revoked AND s.expires_at>clock_timestamp()",
             &[&db::digest(secret), &parent],
         )
         .await
@@ -404,7 +404,7 @@ pub async fn login(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let parent = client
         .query_opt(
-            "SELECT kind, is_restricted FROM tokens WHERE id=$1 AND user_id=$2",
+            "SELECT kind FROM tokens WHERE id=$1 AND user_id=$2",
             &[&actor.token_id, &actor.id],
         )
         .await
@@ -413,17 +413,6 @@ pub async fn login(
         return Err(Error::unauthorized());
     };
     let kind: String = parent.get(0);
-    let restricted: bool = parent.get(1);
-    if restricted {
-        // Restricted API tokens cannot mint a browser child until a parent
-        // binding exists: a child must never become an unrestricted proxy.
-        let mut response = render_login(
-            &target,
-            Some("Restricted API tokens cannot open a browser session yet."),
-        );
-        *response.status_mut() = StatusCode::FORBIDDEN;
-        return Ok(response);
-    }
     if kind != "api" {
         let mut response = render_login(
             &target,
@@ -437,9 +426,9 @@ pub async fn login(
     let inserted = tx
         .execute(
             "INSERT INTO tokens(id,user_id,digest,read_only,expires_at,kind,is_restricted) \
-             SELECT $1,$2,$3,$4,LEAST(clock_timestamp()+interval '12 hours',COALESCE(p.expires_at,clock_timestamp()+interval '12 hours')),'browser',p.is_restricted \
+             SELECT $1,$2,$3,($4 OR p.read_only),LEAST(clock_timestamp()+interval '12 hours',COALESCE(p.expires_at,clock_timestamp()+interval '12 hours')),'browser',p.is_restricted \
              FROM tokens p WHERE p.id=$5 AND p.user_id=$2 AND p.kind='api' AND NOT p.revoked \
-               AND p.is_restricted = false",
+               AND (p.expires_at IS NULL OR p.expires_at > clock_timestamp())",
             &[
                 &token_id,
                 &actor.id,

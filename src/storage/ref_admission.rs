@@ -152,10 +152,11 @@ pub async fn admit(
     if row.get::<_, i64>(0) != generation || row.get::<_, String>(1) != "ready" {
         return Err(conflict("repository generation or state changed during ref admission"));
     }
-    auth::verify_repo_write_access(
+    auth::verify_repo_write_access_with_parent(
         &*tx,
         actor.id,
         actor.token_id,
+        actor.parent_token_id,
         repository_id,
         auth::web_scope_enabled(),
         crate::token_scopes::RepoAction::ContentsWrite,
@@ -689,8 +690,14 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        let actor =
-            Identity { id: actor_id, token_id, username: "alice".into(), read_only: false, token_digest: digest };
+        let actor = Identity {
+            id: actor_id,
+            token_id,
+            parent_token_id: None,
+            username: "alice".into(),
+            read_only: false,
+            token_digest: digest,
+        };
         let repo = Uuid::new_v4();
         pool.get()
             .await

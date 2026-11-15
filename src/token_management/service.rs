@@ -91,20 +91,38 @@ async fn lock_user(tx: &Transaction<'_>, actor: &Identity) -> Result<(), Error> 
 /// or token change that happened while waiting is seen by this request.
 async fn verify_issuer(tx: &Transaction<'_>, actor: &Identity, mutation: bool) -> Result<(), Error> {
     let allow_browser = auth::web_scope_enabled();
-    let row = tx
-        .query_opt(
-            "SELECT t.read_only, t.is_restricted FROM tokens t \
-              WHERE t.id = $1 AND t.user_id = $2 AND t.digest = $3 AND NOT t.revoked \
-                AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
-                AND (t.kind = 'api' OR ($4 AND t.kind = 'browser' AND t.is_restricted = false \
-                     AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = t.id \
-                                  AND NOT s.revoked AND s.expires_at > clock_timestamp()))) \
-              FOR SHARE OF t",
-            &[&actor.token_id, &actor.id, &actor.token_digest, &allow_browser],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::unauthorized)?;
+    let row = match actor.parent_token_id {
+        None => {
+            tx.query_opt(
+                "SELECT t.read_only, t.is_restricted FROM tokens t \
+                  WHERE t.id = $1 AND t.user_id = $2 AND t.digest = $3 AND NOT t.revoked \
+                    AND t.kind = 'api' AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
+                  FOR SHARE OF t",
+                &[&actor.token_id, &actor.id, &actor.token_digest],
+            )
+            .await
+        }
+        Some(parent_id) => {
+            if !allow_browser {
+                return Err(Error::unauthorized());
+            }
+            tx.query_opt(
+                "SELECT (t.read_only OR p.read_only), (t.is_restricted OR p.is_restricted) \
+                   FROM tokens t \
+                   JOIN tokens p ON p.id = $4 AND p.user_id = t.user_id AND p.kind = 'api' \
+                  WHERE t.id = $1 AND t.user_id = $2 AND t.digest = $3 AND NOT t.revoked \
+                    AND t.kind = 'browser' AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
+                    AND NOT p.revoked AND (p.expires_at IS NULL OR p.expires_at > clock_timestamp()) \
+                    AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = t.id \
+                                 AND NOT s.revoked AND s.expires_at > clock_timestamp()) \
+                  FOR SHARE OF t, p",
+                &[&actor.token_id, &actor.id, &actor.token_digest, &parent_id],
+            )
+            .await
+        }
+    }
+    .map_err(Error::internal)?
+    .ok_or_else(Error::unauthorized)?;
     let read_only: bool = row.get(0);
     let restricted: bool = row.get(1);
     if restricted {

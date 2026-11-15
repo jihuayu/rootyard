@@ -162,10 +162,11 @@ async fn scope_allows(
     org: Uuid,
     action: NamespaceAction,
 ) -> Result<bool, Error> {
-    match crate::token_scopes::authorize_namespace_for_request(
+    match crate::token_scopes::authorize_namespace_for_request_with_parent(
         tx,
         actor.token_id,
         actor.id,
+        actor.parent_token_id,
         org,
         action,
         auth::web_scope_enabled(),
@@ -217,6 +218,7 @@ pub async fn organizations_page(
     // A restricted token sees only organizations for which it holds org:read;
     // an unrestricted token keeps the historical account-wide membership list.
     let restricted = auth::token_is_restricted(&tx, &actor).await?;
+    let scope_token_id = actor.scope_token_id();
     let rows = match &cursor {
         None => {
             tx.query(
@@ -227,7 +229,7 @@ pub async fn organizations_page(
                      SELECT 1 FROM token_namespace_scopes s \
                       WHERE s.token_id=$3 AND s.organization_id=o.id AND s.action='org:read')) \
                  ORDER BY ns.slug, o.id LIMIT $4",
-                &[&actor.id, &restricted, &actor.token_id, &(limit + 1)],
+                &[&actor.id, &restricted, &scope_token_id, &(limit + 1)],
             )
             .await
         }
@@ -241,7 +243,7 @@ pub async fn organizations_page(
                       WHERE s.token_id=$3 AND s.organization_id=o.id AND s.action='org:read')) \
                    AND (ns.slug, o.id) > ($4, $5) \
                  ORDER BY ns.slug, o.id LIMIT $6",
-                &[&actor.id, &restricted, &actor.token_id, slug, id, &(limit + 1)],
+                &[&actor.id, &restricted, &scope_token_id, slug, id, &(limit + 1)],
             )
             .await
         }
