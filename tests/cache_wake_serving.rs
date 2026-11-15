@@ -221,7 +221,7 @@ async fn explicit_invalid_and_unavailable_redis_configs_fail_startup_closed() {
 async fn outage_flush_corrupt_payload_and_breaker_degrade_cleanly_to_origin_and_recover() {
     let limits = test_limits();
     let mock = Arc::new(MockFlakyCache::new(limits));
-    let _ = mock.flush_all();
+    mock.flush_all();
     let cache = ServingCache::with_advisory_cache(CacheBackendKind::Redis, mock.clone(), limits).unwrap();
     let key = scoped_key("pando", 9, "blob:src/lib.rs");
     let origin_calls = Arc::new(AtomicUsize::new(0));

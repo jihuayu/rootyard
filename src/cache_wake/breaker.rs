@@ -51,8 +51,8 @@ impl ProbePermit<'_> {
         let was_open = state.open_until.is_some();
         state.probing = false;
         state.failures = state.failures.saturating_add(1);
-        if was_open || state.failures >= self.threshold {
-            state.open_until = Instant::now().checked_add(self.cooldown);
+        if was_open || state.failures >= self.breaker.threshold {
+            state.open_until = Instant::now().checked_add(self.breaker.cooldown);
         }
     }
 }

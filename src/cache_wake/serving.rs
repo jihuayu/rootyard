@@ -97,7 +97,9 @@ impl Backend {
             #[cfg(feature = "state-redis")]
             Self::Redis(cache) => cache,
             #[cfg(feature = "state-redis")]
-            Self::LazyRedis { url, limits, cell } => cell.get_or_try_init(|| RedisCache::connect(url, *limits)).await?,
+            Self::LazyRedis { url, limits, cell } => {
+                cell.get_or_try_init(|| RedisCache::connect(url.as_str(), *limits)).await?
+            }
         })
     }
 
@@ -376,7 +378,7 @@ impl ServingCache {
 
     async fn call_origin<T, E, F, Fut>(
         &self,
-        is_origin_fault: &(impl Fn(&E) -> bool),
+        is_origin_fault: &impl Fn(&E) -> bool,
         load: F,
     ) -> Result<T, OriginError<E>>
     where
