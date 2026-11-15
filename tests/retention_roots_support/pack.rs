@@ -121,7 +121,12 @@ fn hold_scope(plan: &PackCommitPlan) -> Result<HoldScope> {
     .map_err(|error| anyhow!("hold scope rejected: {error}"))
 }
 
-async fn publish(db: &Db, store: &BlobStore, plan: &PackCommitPlan, file: &PairFiles) -> Result<ProtectedPublication> {
+pub(super) async fn publish(
+    db: &Db,
+    store: &BlobStore,
+    plan: &PackCommitPlan,
+    file: &PairFiles,
+) -> Result<ProtectedPublication> {
     let (pack_sha, pack_len) = digest_file(&file.pack)?;
     let (idx_sha, idx_len) = digest_file(&file.idx)?;
     let request = AcquireArtifactHoldsRequest::new(
@@ -154,7 +159,12 @@ async fn publish(db: &Db, store: &BlobStore, plan: &PackCommitPlan, file: &PairF
     Ok(publication)
 }
 
-async fn register(db: &Db, plan: &PackCommitPlan, pack_id: Uuid, publication: &ProtectedPublication) -> Result<()> {
+pub(super) async fn register(
+    db: &Db,
+    plan: &PackCommitPlan,
+    pack_id: Uuid,
+    publication: &ProtectedPublication,
+) -> Result<()> {
     let mut client = db.pool.get().await?;
     let request = PackRegistrationRequest::new(plan, pack_id, publication)?;
     PgPackCommit.register_publication(&mut client, request, deadline()).await?;
