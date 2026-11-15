@@ -35,15 +35,13 @@ use crate::{
             PgPackSnapshot, PgPackSnapshotMaterializer, PgRefStoreCore, ReleaseMetadataPinRequest,
             RenewMetadataPinRequest, serving_scope::LockedScope,
         },
-        tx::commit_bounded,
     },
     token_scopes::RepoAction,
 };
 use axum::http::StatusCode;
-use deadpool_postgres::Pool;
+use deadpool_postgres::{Pool, Transaction};
 use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
-use tokio_postgres::Transaction;
 use uuid::Uuid;
 
 const CREATE_REQUEST_DOMAIN: &str = "serving-durable-snapshot-create-request-v1";
@@ -184,7 +182,7 @@ impl PgServingSnapshotMetadata {
                 .await
                 {
                     Ok(_) => {
-                        let committed = commit_bounded(tx, deadline, repository_id, None).await;
+                        let committed = commit_metadata_bounded(tx, deadline, repository_id).await;
                         crate::ref_store::core::metadata_commit_result(
                             committed,
                             repository_id,
@@ -491,7 +489,7 @@ impl PgServingSnapshotMetadata {
                 .await
                 {
                     Ok(_) => {
-                        let committed = commit_bounded(tx, deadline, repository_id, None).await;
+                        let committed = commit_metadata_bounded(tx, deadline, repository_id).await;
                         crate::ref_store::core::metadata_commit_result(
                             committed,
                             repository_id,
@@ -589,7 +587,7 @@ impl PgServingSnapshotMetadata {
                 .await
                 {
                     Ok(_) => {
-                        let committed = commit_bounded(tx, deadline, repository_id, None).await;
+                        let committed = commit_metadata_bounded(tx, deadline, repository_id).await;
                         crate::ref_store::core::metadata_commit_result(
                             committed,
                             repository_id,
@@ -1149,4 +1147,25 @@ fn map_metadata_error(error: RefStoreError) -> Error {
 
 async fn rollback_bounded(tx: Transaction<'_>) {
     let _ = tokio::time::timeout(Duration::from_secs(2), tx.rollback()).await;
+}
+
+/// Commit one owned deadpool transaction with the canonical metadata outcome
+/// semantics. Before COMMIT is issued, expiry rolls back and reports Timeout.
+/// Once COMMIT is sent, expiry/error is an explicit unknown outcome so the
+/// metadata receipt ledger can resolve it; it is never reported as an abort.
+async fn commit_metadata_bounded(
+    tx: Transaction<'_>,
+    deadline: Instant,
+    repository_id: Uuid,
+) -> Result<(), RefStoreError> {
+    if Instant::now() >= deadline {
+        let _cleanup = timeout_at(Instant::now() + Duration::from_secs(2), tx.rollback()).await;
+        return Err(RefStoreError::Timeout);
+    }
+    match timeout_at(deadline, tx.commit()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => {
+            Err(RefStoreError::CommitUnknown { repository_id, operation_id: None })
+        }
+    }
 }
