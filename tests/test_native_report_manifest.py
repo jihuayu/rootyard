@@ -476,15 +476,24 @@ class ManifestFixture:
         app_rows = [lib] + bin_rows
         batch_rows = app_rows + test_rows
         bound = receipts.capture_bound_inputs(self.root, environ={"PATH": ""})
+        target_dir = self.binary.parent.parent.resolve()
+        command = [
+            "cargo", "build", "--locked", "--profile", "test",
+            "--config", f'build.target-dir = "{target_dir}"',
+            *[item for name in V2_PRODUCER_BINS for item in ("--bin", name)],
+            *[item for name in V2_PRODUCER_TESTS for item in ("--test", name)],
+            "--features", "pando-lab",
+            "--message-format=json-render-diagnostics",
+        ]
         payload = receipts.make_receipt_v2(
             binary_path=self.binary,
-            command=["cargo", "build", "--locked", "--profile", "test", "--features", "pando-lab"],
+            command=command,
             profile="test",
             artifacts=app_rows,
             toolchain=self._v2_toolchain(),
             bound_inputs=bound,
             workspace_commit=self.commit,
-            target_dir=self.binary.parent.parent,
+            target_dir=target_dir,
             target_triple="x86_64-unknown-linux-gnu",
             features="pando-lab",
         )
@@ -667,6 +676,21 @@ class TestJobManifest(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def rewrite_producer_command(self, batch_path, change):
+        receipt = json.loads(self.fixture.receipt.read_text(encoding="utf-8"))
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        command = list(receipt["command"])
+        change(command)
+        receipt["command"] = command
+        manifest["build"]["command"] = command
+        self.fixture.receipt.write_text(
+            json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
+        )
+        batch_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        return batch_path
+
     def test_accepts_evidence_bound_to_the_built_binary(self):
         manifest = json.loads(self.fixture.job().read_text())
         self.assertEqual(manifest["kind"], "rootyard/native-acceptance-job-manifest")
@@ -848,6 +872,15 @@ class TestJobManifest(unittest.TestCase):
         )
         self.assertEqual(len(receipt["batch"]["targets"]), 6)
         self.assertEqual(len(manifest["build"]["cargo_artifacts"]), 8)
+        command = receipt["command"]
+        self.assertEqual(
+            [command[index + 1] for index, token in enumerate(command) if token == "--bin"],
+            list(V2_PRODUCER_BINS),
+        )
+        self.assertEqual(
+            [command[index + 1] for index, token in enumerate(command) if token == "--test"],
+            list(V2_PRODUCER_TESTS),
+        )
         job = json.loads(
             self.fixture.job(
                 extra=(
@@ -955,6 +988,12 @@ class TestJobManifest(unittest.TestCase):
         extra_row["target"] = "foreign_extra_test"
         manifest["build"]["cargo_artifacts"].append(extra_row)
         batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        def request_extra_test(command):
+            index = command.index("--features")
+            command[index:index] = ["--test", "foreign_extra_test"]
+
+        self.rewrite_producer_command(batch_path, request_extra_test)
         self.fixture.job(
             extra=(
                 "--expect-batch-manifest-path", str(batch_path.resolve()),
@@ -983,6 +1022,166 @@ class TestJobManifest(unittest.TestCase):
             "source_sha256 does not match the build row",
             self.fixture.last_process.stderr,
         )
+
+    def test_rejects_v2_forged_test_row_and_published_entry_without_command_request(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        source_row = next(
+            row for row in manifest["build"]["cargo_artifacts"]
+            if row["kind"] == "test"
+        )
+        source_entry = next(
+            entry for entry in manifest["artifacts"] if entry.get("kind") == "test"
+        )
+        manifest["build"]["cargo_artifacts"] = [
+            row for row in manifest["build"]["cargo_artifacts"]
+            if row["kind"] != "test"
+        ]
+        manifest["artifacts"] = [
+            entry for entry in manifest["artifacts"]
+            if entry.get("kind") != "test"
+        ]
+        forged_row = dict(source_row)
+        forged_row["target"] = "foreign_extra_test"
+        forged_entry = dict(source_entry)
+        forged_entry["target"] = "foreign_extra_test"
+        manifest["build"]["cargo_artifacts"].append(forged_row)
+        manifest["artifacts"].append(forged_entry)
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        def drop_all_tests(command):
+            while "--test" in command:
+                index = command.index("--test")
+                del command[index:index + 2]
+
+        self.rewrite_producer_command(batch_path, drop_all_tests)
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "do not match recorded --test order",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_declared_test_order_mismatch(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+
+        def swap_tests(command):
+            positions = [index for index, token in enumerate(command) if token == "--test"]
+            first, second = positions[0] + 1, positions[1] + 1
+            command[first], command[second] = command[second], command[first]
+
+        self.rewrite_producer_command(batch_path, swap_tests)
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "do not match recorded --test order",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_declared_test_missing_request(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+
+        def drop_first_test(command):
+            index = command.index("--test")
+            del command[index:index + 2]
+
+        self.rewrite_producer_command(batch_path, drop_first_test)
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "do not match recorded --test order",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_declared_test_duplicate_request(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+
+        def duplicate_first_test(command):
+            index = command.index("--test")
+            command[index:index] = ["--test", V2_PRODUCER_TESTS[0]]
+
+        self.rewrite_producer_command(batch_path, duplicate_first_test)
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn("recorded --test repeats", self.fixture.last_process.stderr)
+
+    def test_rejects_v2_declared_test_target_mismatch(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+
+        def replace_first_test(command):
+            index = command.index("--test")
+            command[index + 1] = "foreign_test"
+
+        self.rewrite_producer_command(batch_path, replace_first_test)
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "do not match recorded --test order",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_recorded_test_equals_form(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+
+        def use_equals_form(command):
+            index = command.index("--test")
+            command[index:index + 2] = [f"--test={V2_PRODUCER_TESTS[0]}"]
+
+        self.rewrite_producer_command(batch_path, use_equals_form)
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn(
+            "unsupported or malformed recorded --test flag",
+            self.fixture.last_process.stderr,
+        )
+
+    def test_rejects_v2_published_test_entry_missing_required_fields(self):
+        batch_path = self.fixture.enable_v2_producer_batch_receipt()
+        manifest = json.loads(batch_path.read_text(encoding="utf-8"))
+        for entry in manifest["artifacts"]:
+            if entry.get("kind") != "test":
+                continue
+            for field in ("package_id", "profile", "source", "source_sha256"):
+                entry.pop(field, None)
+        batch_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self.fixture.job(
+            extra=(
+                "--expect-batch-manifest-path", str(batch_path.resolve()),
+                "--expect-batch-manifest-sha", digest(batch_path),
+            ),
+            expect=1,
+        )
+        self.assertIn("package_id is required", self.fixture.last_process.stderr)
 
     def test_fixture_rust_from_receipt_records_full_v1_and_v2_versions_without_compilers(self):
         # An empty PATH makes any accidental bare rustc/cargo probe fail; the

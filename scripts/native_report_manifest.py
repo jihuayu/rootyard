@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -419,13 +420,17 @@ def _published_artifact_for(manifest, kind, target, label):
     return matches[0]
 
 
-def _require_published_artifact_matches_row(entry, row, label):
+def _require_published_artifact_matches_row(entry, row, label, required_fields=()):
     identity = f"({row['kind']}, {row['target']})"
     require(
         entry.get("fresh") is row.get("fresh"),
         f"{label}: published artifact {identity} freshness does not match the build row",
     )
     for field in ("package_id", "profile", "source", "source_sha256"):
+        require(
+            field not in required_fields or field in entry,
+            f"{label}: published artifact {identity} {field} is required",
+        )
         if field in entry:
             require(
                 entry.get(field) == row.get(field),
@@ -451,6 +456,42 @@ def _require_published_artifact_matches_row(entry, row, label):
         )
 
 
+def _recorded_test_targets(command, label):
+    """The exact ordered ``--test`` requests in the already-bound build command."""
+    require(
+        isinstance(command, (list, tuple)) and command,
+        f"{label}: recorded build command must be a nonempty list of strings",
+    )
+    requested = []
+    index = 0
+    while index < len(command):
+        token = command[index]
+        if token == "--test":
+            require(
+                index + 1 < len(command),
+                f"{label}: recorded --test has no target",
+            )
+            target = command[index + 1]
+            require(
+                isinstance(target, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,127}", target) is not None,
+                f"{label}: recorded --test target is malformed: {target!r}",
+            )
+            require(
+                target not in requested,
+                f"{label}: recorded --test repeats {target!r}",
+            )
+            requested.append(target)
+            index += 2
+            continue
+        require(
+            not token.startswith("--test"),
+            f"{label}: unsupported or malformed recorded --test flag {token!r}",
+        )
+        index += 1
+    return requested
+
+
 def _require_v2_batch_scope(manifest, batch_targets, artifact_rows, typed_targets,
                             receipt, validated, label):
     """Match a v2 receipt's batch link to the producer cohort it actually built.
@@ -463,6 +504,12 @@ def _require_v2_batch_scope(manifest, batch_targets, artifact_rows, typed_target
     """
     test_rows = [row for row in artifact_rows if row["kind"] == "test"]
     non_test_rows = [row for row in artifact_rows if row["kind"] != "test"]
+    requested_tests = _recorded_test_targets(receipt.get("command"), label)
+    require(
+        [row["target"] for row in test_rows] == requested_tests,
+        f"{label}: test artifact targets {[row['target'] for row in test_rows]!r} "
+        f"do not match recorded --test order {requested_tests!r}",
+    )
     receipt_kind = receipt.get("kind")
     if receipt_kind == "rust-integration-test":
         require(
@@ -540,7 +587,10 @@ def _require_v2_batch_scope(manifest, batch_targets, artifact_rows, typed_target
         f"{label}: published test artifacts do not match the batch test cohort",
     )
     for row, entry in zip(test_rows, published_tests):
-        _require_published_artifact_matches_row(entry, row, label)
+        _require_published_artifact_matches_row(
+            entry, row, label,
+            required_fields=("package_id", "profile", "source", "source_sha256"),
+        )
 
     extras = [
         row for row in artifact_rows
