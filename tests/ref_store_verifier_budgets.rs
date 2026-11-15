@@ -17,8 +17,8 @@ use verifier_budgets_support::bench::{
     read_proc_vm_hwm_kib, verifier_metrics, write_receipt,
 };
 use verifier_budgets_support::pg_git::{
-    Db, PreparedCommit, commit_and_pin_snapshot, deadline, git_binary, git_version_string, prepare_fresh_commit,
-    std_deadline,
+    Db, PreparedCommit, commit_and_pin_snapshot, deadline, git_binary, git_version_string, pin_committed_snapshot,
+    prepare_fresh_commit, std_deadline,
 };
 use verifier_budgets_support::s3::LoopbackS3;
 
@@ -93,7 +93,7 @@ async fn slow_blob_downloads_do_not_starve_fast_native_git_slots() -> Result<()>
                     .await?;
                 ensure!(receipt.is_committed(), "fast commit failed");
                 drop(client);
-                let snap_ref = commit_fast_snapshot(&db_pool, &fast, &receipt).await?;
+                let snap_ref = pin_committed_snapshot(&db_pool, &fast).await?;
                 let view = mat.read(&db_pool, &snap_ref, deadline()).await?;
                 let got_pack = view.pack_bytes(fast.pack_id, deadline()).await?;
                 let got_idx = view.idx_bytes(fast.pack_id, deadline()).await?;
@@ -118,7 +118,7 @@ async fn slow_blob_downloads_do_not_starve_fast_native_git_slots() -> Result<()>
 
         for h in slow_handles {
             let proof = h.await.map_err(|e| anyhow!("slow task panicked: {e}"))??;
-            ensure!(proof.evidence_digest().as_hex().len() == 64);
+            ensure!(proof.verified_pairs() >= 1 && proof.verified_bytes() > 0);
         }
         drop(delays);
 
@@ -141,43 +141,6 @@ async fn slow_blob_downloads_do_not_starve_fast_native_git_slots() -> Result<()>
     .await;
 
     db.finish(outcome).await
-}
-
-async fn commit_fast_snapshot(
-    pool: &deadpool_postgres::Pool,
-    fast: &PreparedCommit,
-    receipt: &rootyard::ref_store::core::pack_commit::PackCommitReceipt,
-) -> Result<rootyard::ref_store::core::PackSnapshotRef> {
-    let owner = uuid::Uuid::new_v4();
-    let scope = rootyard::ref_store::core::MetadataSnapshotScope::new(
-        fast.repo,
-        fast.tenant,
-        owner,
-        rootyard::ref_store::MetadataPinPurpose::Verification,
-        fast.gate.object_format(),
-        fast.gate.history_incarnation(),
-        fast.gate.authority_epoch(),
-        fast.gate.group_epoch(),
-    )?;
-    let snapshot_id = uuid::Uuid::new_v4();
-    let pin_id = uuid::Uuid::new_v4();
-    let expected =
-        rootyard::ref_store::core::PackSnapshotExpectation::new(receipt.terminal.revision, receipt.terminal.digest)?;
-    let req = rootyard::ref_store::core::CreatePackSnapshotRequest::new(
-        scope,
-        uuid::Uuid::new_v4(),
-        pin_id,
-        snapshot_id,
-        300,
-        expected,
-    )?;
-    let mut client = pool.get().await?;
-    let outcome = rootyard::ref_store::core::PgPackSnapshot.create(&mut client, &req, deadline()).await?;
-    ensure!(
-        matches!(outcome, rootyard::ref_store::core::PackSnapshotOutcome::Created { .. }),
-        "snapshot was not created"
-    );
-    Ok(rootyard::ref_store::core::PackSnapshotRef::new(fast.repo, fast.tenant, snapshot_id, pin_id, 1)?)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -234,7 +197,7 @@ async fn maintenance_saturation_preserves_foreground_pg_commit_and_reclaim() -> 
 
         for h in maint_tasks {
             let proof = h.await.map_err(|e| anyhow!("maintenance verify panicked: {e}"))??;
-            ensure!(proof.evidence_digest().as_hex().len() == 64);
+            ensure!(proof.verified_pairs() >= 1 && proof.verified_bytes() > 0);
         }
         drop(guards);
 

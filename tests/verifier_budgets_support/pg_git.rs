@@ -14,12 +14,11 @@ use rootyard::ref_store::core::pack_commit::{
     PlannedArtifact, PlannedPack,
 };
 use rootyard::ref_store::core::{
-    CreatePackSnapshotRequest, MetadataSnapshotScope, PackSnapshotExpectation, PackSnapshotOutcome, PackSnapshotRef,
-    PgPackSnapshot,
+    CreatePackSnapshotRequest, MetadataSnapshotScope, PackSnapshotExpectation, PackSnapshotRef, PgPackSnapshot,
 };
 use rootyard::ref_store::{
     CoreGateInit, CoreGateVersion, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataPinPurpose,
-    OperationIdentity, RefName, RefPrecondition, RefTarget, RefUpdate, RequestDigest,
+    OperationIdentity, PgRefStoreCore, RefName, RefPrecondition, RefTarget, RefUpdate, RequestDigest, VersionCheck,
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -221,12 +220,10 @@ impl Db {
         drop(client);
         let init = CoreGateInit::new(repo, tenant, format, Uuid::new_v4(), 1, 1, RefName::branch("refs/heads/main")?)?;
         let mut client = self.pool.get().await?;
-        let gate = PgRefStoreCoreAlias::initialize(&mut client, &init, deadline()).await?;
+        let gate = PgRefStoreCore.initialize(&mut client, &init, deadline()).await?;
         Ok((tenant, repo, gate.version()))
     }
 }
-
-use rootyard::ref_store::core::PgRefStoreCore as PgRefStoreCoreAlias;
 
 struct GitRepo {
     _root: tempfile::TempDir,
@@ -453,6 +450,32 @@ pub async fn prepare_fresh_commit(
     Ok(PreparedCommit { repo, tenant, gate, pack_id, plan, token, context, pack_bytes, idx_bytes })
 }
 
+pub async fn pin_committed_snapshot(pool: &Pool, prepared: &PreparedCommit) -> Result<PackSnapshotRef> {
+    let mut client = pool.get().await?;
+    let gate = match PgRefStoreCore.check_version(&mut client, prepared.repo, prepared.tenant, None, deadline()).await?
+    {
+        VersionCheck::Changed(version) | VersionCheck::Unchanged(version) => version,
+        VersionCheck::Unknown => return Err(anyhow!("committed repository gate disappeared")),
+    };
+    let scope = MetadataSnapshotScope::new(
+        prepared.repo,
+        prepared.tenant,
+        Uuid::new_v4(),
+        MetadataPinPurpose::Verification,
+        gate.object_format(),
+        gate.history_incarnation(),
+        gate.authority_epoch(),
+        gate.group_epoch(),
+    )?;
+    let snapshot_id = Uuid::new_v4();
+    let pin_id = Uuid::new_v4();
+    let expected = PackSnapshotExpectation::new(gate.revision(), *gate.digest())?;
+    let req = CreatePackSnapshotRequest::new(scope, Uuid::new_v4(), pin_id, snapshot_id, 300, expected)?;
+    let outcome = PgPackSnapshot.create(&mut client, &req, deadline()).await?;
+    ensure!(!outcome.replayed && outcome.receipt.snapshot_id() == snapshot_id, "snapshot was not created");
+    Ok(PackSnapshotRef::new(prepared.repo, prepared.tenant, snapshot_id, pin_id, 1)?)
+}
+
 pub async fn commit_and_pin_snapshot(
     db: &Db,
     prepared: &PreparedCommit,
@@ -469,24 +492,5 @@ pub async fn commit_and_pin_snapshot(
         PgPackCommit.commit_verified_pending(&mut client, &prepared.plan, &prepared.token, &proof, deadline()).await?;
     ensure!(receipt.is_committed(), "verified commit did not reach committed state");
     drop(client);
-
-    let owner = Uuid::new_v4();
-    let scope = MetadataSnapshotScope::new(
-        prepared.repo,
-        prepared.tenant,
-        owner,
-        MetadataPinPurpose::Verification,
-        prepared.gate.object_format(),
-        prepared.gate.history_incarnation(),
-        prepared.gate.authority_epoch(),
-        prepared.gate.group_epoch(),
-    )?;
-    let snapshot_id = Uuid::new_v4();
-    let pin_id = Uuid::new_v4();
-    let expected = PackSnapshotExpectation::new(receipt.terminal.revision, receipt.terminal.digest)?;
-    let req = CreatePackSnapshotRequest::new(scope, Uuid::new_v4(), pin_id, snapshot_id, 300, expected)?;
-    let mut client = db.pool.get().await?;
-    let outcome = PgPackSnapshot.create(&mut client, &req, deadline()).await?;
-    ensure!(matches!(outcome, PackSnapshotOutcome::Created { .. }), "snapshot was not created");
-    Ok(PackSnapshotRef::new(prepared.repo, prepared.tenant, snapshot_id, pin_id, 1)?)
+    pin_committed_snapshot(&db.pool, prepared).await
 }
