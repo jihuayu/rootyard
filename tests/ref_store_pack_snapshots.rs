@@ -6,6 +6,9 @@
 //! A4 registration/proof/verified-commit path to establish `pack_verified`. No fake ACK,
 //! token, receipt or proof is created; no SQL row is used as an ACK. No PASS is claimed here.
 #![allow(clippy::too_many_arguments)]
+// This target uses only `backend_identity` from the shared serving harness;
+// sibling test targets use the remaining helpers, so keep them reusable here.
+#[allow(dead_code)]
 mod serving_support;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -3883,7 +3886,7 @@ async fn serving_check_version_absolute_deadline_bounds_two_sequential_auth_lock
         // Blocker A owns the first auth statement's token/user row. lookup_in_tx
         // initially sets PostgreSQL statement/lock timeout from the remaining
         // absolute deadline once, then runs this statement.
-        let mut first_client = db.pool.get().await?;
+        let first_client = db.pool.get().await?;
         first_client.batch_execute("BEGIN").await?;
         first_client
             .query_opt(
@@ -3897,7 +3900,7 @@ async fn serving_check_version_absolute_deadline_bounds_two_sequential_auth_lock
 
         // Blocker B owns the later repository row, a distinct sequential auth
         // statement. It stays held while the facade must time out.
-        let mut second_client = db.pool.get().await?;
+        let second_client = db.pool.get().await?;
         second_client.batch_execute("BEGIN").await?;
         second_client
             .query_opt("SELECT id FROM repositories WHERE id=$1 FOR UPDATE", &[&repo])
