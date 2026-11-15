@@ -45,6 +45,7 @@ pub(super) struct CreateRepository {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ListQuery {
     limit: Option<i64>,
     cursor: Option<String>,

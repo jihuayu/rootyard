@@ -52,8 +52,18 @@ async fn case(db: &Db) -> Result<()> {
     let origin = format!("http://{}", gateway.address);
     let repo_shell_path = format!("/web/blob/repos/{}/{}", owner.username, name);
 
-    // 1. Anonymous shell requests redirect cleanly to /web/login with return_to.
-    let anon = client.get(format!("{origin}/web/blob")).send().await?;
+    // 1. Non-navigation anonymous /web/blob returns 401 without session headers,
+    //    while browser navigation requests redirect cleanly to /web/login with return_to.
+    let non_nav = client.get(format!("{origin}/web/blob")).send().await?;
+    ensure!(non_nav.status() == 401, "non-navigation anonymous /web/blob expected 401, got {}", non_nav.status());
+    ensure!(!has_session_headers(non_nav.headers()), "anonymous /web/blob 401 must not emit session headers");
+
+    let anon = client
+        .get(format!("{origin}/web/blob"))
+        .header(header::ACCEPT, "text/html")
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await?;
     ensure!(anon.status() == 303, "anonymous /web/blob expected 303, got {}", anon.status());
     ensure!(
         anon.headers().get(header::LOCATION).and_then(|v| v.to_str().ok())
@@ -115,16 +125,17 @@ async fn case(db: &Db) -> Result<()> {
         ensure!(!contains(&html, &owner.token), "{page_path} leaked API token into HTML");
     }
 
-    // 6. Browser cookie + monotonic session chaining across /web/blob/api/*.
+    // 6. Browser cookie + monotonic session chaining across /web/blob/api/* (including numeric query params).
     let alias_base = format!("{origin}/web/blob/api/repos/{}/{}", owner.username, name);
-    let list = raw_get_with_cookies(&client, &format!("{origin}/web/blob/api/repos"), Some(&cookie), None).await?;
+    let list =
+        raw_get_with_cookies(&client, &format!("{origin}/web/blob/api/repos?limit=10"), Some(&cookie), None).await?;
     ensure!(list.status == 200 && contains(&list.body, &name), "browser list alias failed");
     ensure!(list.session.token.is_none(), "repository list must not mint a session bound");
 
     let repo_meta = raw_get_with_cookies(&client, &alias_base, Some(&cookie), None).await?;
     ensure!(repo_meta.status == 200 && contains(&repo_meta.body, &name), "browser get_repo alias failed");
 
-    let refs = raw_get_with_cookies(&client, &format!("{alias_base}/refs"), Some(&cookie), None).await?;
+    let refs = raw_get_with_cookies(&client, &format!("{alias_base}/refs?limit=10"), Some(&cookie), None).await?;
     ensure!(status_succeeds(refs.status), "browser /refs alias failed with {}", refs.status);
     let s1 = refs.session.admit()?;
     ensure!(s1.revision >= live.revision, "browser /refs returned stale revision");
@@ -195,7 +206,7 @@ async fn case(db: &Db) -> Result<()> {
     );
 
     let raw_git = client
-        .get(format!("{origin}/git/{}/{}/info/refs?service=git-upload-pack", owner.username, name))
+        .get(format!("{origin}/git/{}/{}.git/info/refs?service=git-upload-pack", owner.username, name))
         .header(header::COOKIE, &cookie)
         .send()
         .await?;

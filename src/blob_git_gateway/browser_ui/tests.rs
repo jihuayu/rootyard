@@ -7,18 +7,31 @@ use crate::ref_store::GitObjectFormat;
 
 #[test]
 fn query_decoding_is_optional_and_errsafe() {
-    let uri: Uri = "/x?oid=HEAD&path=a%2Fb".parse().unwrap();
+    let uri: Uri = "/x?oid=HEAD&path=a%2Fb&limit=10".parse().unwrap();
     let query: TreeQuery = optional_query(&uri).expect("valid query");
     assert_eq!(query.oid.as_deref(), Some("HEAD"));
     assert_eq!(query.path.as_deref(), Some("a/b"));
+    assert_eq!(query.limit, Some(10));
     let empty: Uri = "/x".parse().unwrap();
     let query: RefsQuery = optional_query(&empty).expect("empty query");
     assert!(query.prefix.is_none() && query.limit.is_none());
-    let unknown: Uri = "/x?surprise=1".parse().unwrap();
-    assert_eq!(
-        optional_query::<TreeQuery>(&unknown).err(),
-        Some(GatewayError::BadRequest("invalid repository browse parameters"))
-    );
+    let refs_limit: RefsQuery = optional_query(&"/x?limit=25".parse().unwrap()).expect("numeric refs limit");
+    assert_eq!(refs_limit.limit, Some(25));
+    let commits_page: CommitsQuery =
+        optional_query(&"/x?after=5&limit=10".parse().unwrap()).expect("numeric commits paging");
+    assert_eq!((commits_page.after, commits_page.limit), (Some(5), Some(10)));
+    assert!(optional_query::<api::ListQuery>(&"/x?limit=10&cursor=abc".parse().unwrap()).is_ok());
+    for invalid in ["/x?surprise=1", "/x?limit=abc"] {
+        let uri: Uri = invalid.parse().unwrap();
+        assert_eq!(
+            optional_query::<TreeQuery>(&uri).err(),
+            Some(GatewayError::BadRequest("invalid repository browse parameters"))
+        );
+        assert_eq!(
+            optional_query::<api::ListQuery>(&uri).err(),
+            Some(GatewayError::BadRequest("invalid repository browse parameters"))
+        );
+    }
 }
 
 #[test]

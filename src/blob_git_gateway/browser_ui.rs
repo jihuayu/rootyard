@@ -35,16 +35,6 @@ use std::sync::Arc;
 #[path = "browser_ui/assets.rs"]
 mod inline;
 
-use axum::{
-    Form, Router,
-    extract::{Path, Query, Request, State, rejection::PathRejection},
-    http::{HeaderMap, HeaderValue, Uri, header},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-};
-use serde_json::Value;
-
 use super::{api, browse, error::GatewayError, history, state::BlobGitState};
 use crate::{
     application::MetadataState,
@@ -53,6 +43,14 @@ use crate::{
         session::{self, LoginForm, normalize_web_headers},
         templates::html_response,
     },
+};
+use axum::{
+    Form, Router,
+    extract::{Path, Query, Request, State, rejection::PathRejection},
+    http::{HeaderMap, HeaderValue, Uri, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
 
 /// Request header carrying the opaque repository session token.
@@ -311,10 +309,8 @@ async fn alias_blob_by_oid(
 }
 
 fn optional_query<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, GatewayError> {
-    let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
-        .map_err(|_| GatewayError::BadRequest("invalid repository browse parameters"))?;
-    let fields = pairs.0.into_iter().map(|(key, value)| (key, Value::String(value))).collect();
-    serde_json::from_value(Value::Object(fields))
+    Query::<T>::try_from_uri(uri)
+        .map(|Query(value)| value)
         .map_err(|_| GatewayError::BadRequest("invalid repository browse parameters"))
 }
 

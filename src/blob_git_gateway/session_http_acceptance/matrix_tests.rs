@@ -260,14 +260,22 @@ async fn restore_and_oversized_case(db: &Db) -> Result<()> {
     ensure!(stranger_oversized.session.token.is_none(), "stranger refusal emitted session header");
     ensure_no_disclosure(&stranger_oversized.body, &secrets, "stranger oversized denial")?;
 
-    db.pool
+    // Rotate `public.cluster_authority` (the cluster-wide restore fence read by
+    // `serving::authority` and `serving_read_sql::sealed`, never `<run_schema>.cluster_authority`).
+    // Serialized under `NATIVE_ACCEPTANCE_SERIAL` and `--test-threads=1` alongside
+    // `serving_tests::contract`, which likewise rotates this singleton and expects
+    // every subsequent test to read the live non-nil incarnation cleanly.
+    let rotated_incarnation: uuid::Uuid = db
+        .pool
         .get()
         .await?
-        .execute(
-            "UPDATE cluster_authority SET incarnation = gen_random_uuid(), rotated_at = clock_timestamp() WHERE singleton = true",
+        .query_one(
+            "UPDATE public.cluster_authority SET incarnation = gen_random_uuid(), rotated_at = clock_timestamp() WHERE singleton = true RETURNING incarnation",
             &[],
         )
-        .await?;
+        .await?
+        .get(0);
+    ensure!(!rotated_incarnation.is_nil(), "rotated public.cluster_authority incarnation must not be nil");
 
     let rotated = raw_get(&client, &format!("{base}/refs"), &owner.token, Some(&pre_restore.token)).await?;
     ensure!(rotated.status == 400, "post-restore pre-rotation token expected 400, got {}", rotated.status);
