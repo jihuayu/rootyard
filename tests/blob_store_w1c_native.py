@@ -540,9 +540,22 @@ def _validate_cas_store(
     bin_path = resolve_cas_path("binary")
     canonical_receipt_path = resolve_cas_path("receipt")
     build_receipt_path = resolve_cas_path("build_receipt")
-    _need(bin_path.name == TARGET_NAME, "receipt", "receipt_artifact_store")
-    _need(canonical_receipt_path.name == f"{TARGET_NAME}.receipt.json", "receipt", "receipt_artifact_store")
-    _need(build_receipt_path.name == f"{TARGET_NAME}.build.json", "receipt", "receipt_artifact_store")
+    _need(obj_path.name == recorded_sha, "receipt", "receipt_artifact_store")
+    _need(
+        bool(re.fullmatch(rf"{re.escape(TARGET_NAME)}(?:-[0-9a-f]+)?", bin_path.name)),
+        "receipt",
+        "receipt_artifact_store",
+    )
+    _need(
+        canonical_receipt_path == bin_path.with_name(f"{bin_path.name}.receipt.json"),
+        "receipt",
+        "receipt_artifact_store",
+    )
+    _need(
+        build_receipt_path == bin_path.with_name(f"{bin_path.name}.build.json"),
+        "receipt",
+        "receipt_artifact_store",
+    )
 
     _require_readonly_regular(obj_path, code="receipt_artifact_store")
     _require_readonly_regular(bin_path, executable=True, code="receipt_artifact_store")
@@ -565,6 +578,7 @@ def _validate_v2_contract(
     validated: receipt_contract.ValidatedReceipt,
     *,
     root: Path,
+    exec_binary: Path,
     require_ci_pins: bool,
     require_package_debug_zero: bool,
     require_strip_debuginfo: bool,
@@ -589,17 +603,26 @@ def _validate_v2_contract(
     _need(payload.get("profile") == "test", "receipt", "receipt_profile")
     _need(len(validated.artifacts) == 1, "receipt", "receipt_artifacts")
     artifact = validated.artifacts[0]
+    artifact_exec = artifact.get("executable")
     _need(
         artifact.get("kind") == "test"
         and artifact.get("target") == TARGET_NAME
         and artifact.get("source") == TEST_SOURCE
         and artifact.get("source_sha256") == payload.get("integration_test_source_sha256")
+        and isinstance(artifact_exec, str)
+        and bool(re.fullmatch(rf"{re.escape(TARGET_NAME)}(?:-[0-9a-f]+)?", Path(artifact_exec).name))
         and artifact.get("executable_sha256") == validated.binary_sha256
         and isinstance(artifact.get("profile"), dict)
         and artifact["profile"].get("test") is True,
         "receipt",
         "receipt_artifacts",
     )
+    if isinstance(payload.get("artifact_store"), dict):
+        _need(
+            exec_binary.name == Path(artifact_exec).name,
+            "receipt",
+            "receipt_artifact_store",
+        )
     toolchain = validated.toolchain or {}
     cargo = toolchain.get("cargo") or {}
     rustc = toolchain.get("rustc") or {}
@@ -719,6 +742,7 @@ def load_and_verify_receipt(
         _validate_v2_contract(
             validated,
             root=root,
+            exec_binary=exec_binary,
             require_ci_pins=require_ci_pins,
             require_package_debug_zero=require_package_debug_zero,
             require_strip_debuginfo=require_strip_debuginfo,

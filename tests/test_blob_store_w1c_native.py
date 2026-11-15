@@ -109,7 +109,9 @@ class W1CNativeFixture:
 
         self.target_dir = self.root / "target"
         self.target_dir.mkdir(parents=True)
-        self.original_bin = self.target_dir / "debug" / w1c.TARGET_NAME
+        self.original_bin = (
+            self.target_dir / "debug" / "deps" / f"{w1c.TARGET_NAME}-0123456789abcdef"
+        )
         self.original_bin.parent.mkdir(parents=True)
         self.original_bin.write_bytes(self.binary_bytes)
 
@@ -187,7 +189,14 @@ class W1CNativeFixture:
             "pin_source": "rust-toolchain.toml",
         }
 
-    def write_v2_cas_receipt(self, mutate=None) -> Path:
+    def write_v2_cas_receipt(
+        self,
+        mutate=None,
+        *,
+        cas_snap_name: str = f"{w1c.TARGET_NAME}-0123456789abcdef",
+        cas_receipt_name: str | None = None,
+        cas_obj_name: str | None = None,
+    ) -> Path:
         bound = receipt_contract.capture_bound_inputs(self.root, environ={"PATH": ""})
         artifact = receipt_contract.cargo_artifact_record(
             {
@@ -213,19 +222,19 @@ class W1CNativeFixture:
         )
         config_key = "c" * 64
         build_id = "b1"
-        obj_path = self.store_root / "objects/sha256" / self.binary_sha
+        obj_path = self.store_root / "objects/sha256" / (cas_obj_name or self.binary_sha)
         obj_path.parent.mkdir(parents=True, exist_ok=True)
         obj_path.write_bytes(self.binary_bytes)
         os.chmod(obj_path, 0o555)
 
         snap_dir = self.store_root / "snapshots" / COMMIT / config_key / build_id
         snap_dir.mkdir(parents=True, exist_ok=True)
-        self.canonical_bin = snap_dir / w1c.TARGET_NAME
+        self.canonical_bin = snap_dir / cas_snap_name
         self.canonical_bin.write_bytes(self.binary_bytes)
         os.chmod(self.canonical_bin, 0o555)
 
-        canonical_receipt = snap_dir / f"{w1c.TARGET_NAME}.receipt.json"
-        canonical_build_receipt = snap_dir / f"{w1c.TARGET_NAME}.build.json"
+        canonical_receipt = snap_dir / (cas_receipt_name or f"{cas_snap_name}.receipt.json")
+        canonical_build_receipt = snap_dir / f"{cas_snap_name}.build.json"
         cas_record = {
             "schema": w1c.STORE_SCHEMA,
             "root": str(self.store_root),
@@ -498,6 +507,11 @@ class BlobStoreW1CNativeTest(unittest.TestCase):
             ("release_profile", "receipt", "receipt_profile"),
             ("missing_strip", "receipt", "receipt_profile"),
             ("wrong_target_artifact", "receipt", "receipt_artifacts"),
+            ("wrong_cas_target_name", "receipt", "receipt_artifact_store"),
+            ("wrong_cas_nonhex_suffix", "receipt", "receipt_artifact_store"),
+            ("mismatched_cas_receipt_name", "receipt", "receipt_artifact_store"),
+            ("mismatched_cas_executable_name", "receipt", "receipt_artifact_store"),
+            ("bad_cas_object_name", "receipt", "receipt_artifact_store"),
         ]
         for mode, exp_stage, exp_code in cases:
             with self.subTest(mode=mode):
@@ -525,7 +539,26 @@ class BlobStoreW1CNativeTest(unittest.TestCase):
                     elif mode == "wrong_target_artifact":
                         payload["cargo_artifacts"][0]["target"] = "other_test"
 
-                self.fixture.write_v2_cas_receipt(mutate=mutator)
+                snap_name = f"{w1c.TARGET_NAME}-0123456789abcdef"
+                receipt_name = None
+                obj_name = None
+                if mode == "wrong_cas_target_name":
+                    snap_name = "other_target-0123456789abcdef"
+                elif mode == "wrong_cas_nonhex_suffix":
+                    snap_name = f"{w1c.TARGET_NAME}-nothex"
+                elif mode == "mismatched_cas_receipt_name":
+                    receipt_name = f"{w1c.TARGET_NAME}.receipt.json"
+                elif mode == "mismatched_cas_executable_name":
+                    snap_name = f"{w1c.TARGET_NAME}-fedcba9876543210"
+                elif mode == "bad_cas_object_name":
+                    obj_name = "bad_object_name"
+
+                self.fixture.write_v2_cas_receipt(
+                    mutate=mutator,
+                    cas_snap_name=snap_name,
+                    cas_receipt_name=receipt_name,
+                    cas_obj_name=obj_name,
+                )
                 if mode == "alias_binary_drift":
                     os.chmod(self.fixture.alias_bin, 0o600)
                     self.fixture.alias_bin.write_bytes(b"tampered")
