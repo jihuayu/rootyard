@@ -8,7 +8,6 @@ use super::{
         WebVersionForm,
     },
     handlers::{authorize_web_repo, normalize_web_headers},
-    models::positive,
     templates::html_response,
 };
 use crate::{
@@ -31,7 +30,7 @@ use crate::{
     },
     members::{audit, models::Role},
     pulls::{
-        models::repo_tenant_id,
+        models::{positive, repo_tenant_id},
         review_comments::{NewPullReviewComment, create_review_comment},
     },
     token_scopes::RepoAction,

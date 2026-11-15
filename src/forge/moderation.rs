@@ -3,7 +3,8 @@
 use super::handlers::{COMMENT_FIELDS, Comment, json, positive};
 use crate::{
     AppState, Error,
-    auth::{self, Identity, finish_tx as finish},
+    auth::{self, finish_tx as finish},
+    db::Identity,
     members::{audit, models::Role},
     pulls::models::repo_tenant_id,
     token_scopes::RepoAction,

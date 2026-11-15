@@ -114,10 +114,10 @@ impl Issue {
     }
 }
 #[derive(Serialize)]
-pub(super) struct Comment {
+pub(crate) struct Comment {
     repository_id: Uuid,
     issue_number: i64,
-    pub(super) number: i64,
+    pub(crate) number: i64,
     author_id: Uuid,
     body: String,
     version: i64,
@@ -129,7 +129,7 @@ pub(super) struct Comment {
     updated_at: String,
 }
 impl Comment {
-    pub(super) fn row(row: &Row) -> Self {
+    pub(crate) fn row(row: &Row) -> Self {
         let moderation_state: String = row.get("moderation_state");
         let raw_body: String = row.get("body");
         Self {
@@ -150,10 +150,10 @@ impl Comment {
 }
 const ISSUE_FIELDS: &str =
     "repository_id,number,author_id,title,body,state,version,label_version,assignee_version,created_at::text,updated_at::text";
-pub(super) const COMMENT_FIELDS: &str =
+pub(crate) const COMMENT_FIELDS: &str =
     "repository_id,issue_number,number,author_id,body,version,edited_at::text,deleted_at::text,moderation_state,moderation_reason,created_at::text,updated_at::text";
 
-pub(super) fn json(status: StatusCode, value: impl Serialize) -> Response {
+pub(crate) fn json(status: StatusCode, value: impl Serialize) -> Response {
     (status, [(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
 }
 pub(super) fn positive(number: i64) -> Result<(), Error> {
@@ -166,7 +166,7 @@ pub(super) fn positive(number: i64) -> Result<(), Error> {
 pub(super) fn title_valid(title: &str) -> bool {
     !title.trim().is_empty() && title.len() <= 256 && !title.chars().any(char::is_control)
 }
-pub(super) fn body_valid(body: &str, required: bool) -> bool {
+pub(crate) fn body_valid(body: &str, required: bool) -> bool {
     body.len() <= 8192
         && (!required || !body.trim().is_empty())
         && !body
@@ -174,7 +174,7 @@ pub(super) fn body_valid(body: &str, required: bool) -> bool {
             .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
 
-pub(super) async fn creation_replay(
+pub(crate) async fn creation_replay(
     tx: &Transaction<'_>,
     actor: Uuid,
     repo: Uuid,
@@ -205,7 +205,7 @@ pub(super) async fn creation_replay(
         .ok_or_else(|| Error::internal("incomplete creation record"))
 }
 
-pub(super) async fn record_creation(
+pub(crate) async fn record_creation(
     tx: &Transaction<'_>,
     actor: Uuid,
     repo: Uuid,
