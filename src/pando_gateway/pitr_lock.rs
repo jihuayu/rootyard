@@ -49,7 +49,7 @@ impl AuthorityLockGuard {
     }
 
     pub(super) fn client(&self) -> &tokio_postgres::Client {
-        &***self.client.as_ref().expect("Pando authority lock client taken")
+        self.client.as_ref().expect("Pando authority lock client taken")
     }
 
     pub(super) fn client_mut(&mut self) -> &mut Object {
