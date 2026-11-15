@@ -100,14 +100,16 @@ pub(crate) async fn enqueue_push_webhooks_in_tx(
         let max_attempts: i64 = hook.get("max_attempts");
         if insert_single_webhook_delivery_tx(
             tx,
-            tenant_id,
-            envelope.repository_id,
-            webhook_id,
-            &secret,
-            max_attempts,
-            &delta.webhook_event_id,
-            &payload,
-            &payload_bytes,
+            WebhookDeliverySpec {
+                tenant_id,
+                repository_id: envelope.repository_id,
+                webhook_id,
+                secret: &secret,
+                max_attempts,
+                delivery_event_id: &delta.webhook_event_id,
+                payload: &payload,
+                payload_bytes: &payload_bytes,
+            },
         )
         .await?
         {
@@ -117,18 +119,31 @@ pub(crate) async fn enqueue_push_webhooks_in_tx(
     Ok(enqueued)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn insert_single_webhook_delivery_tx(
-    tx: &Transaction<'_>,
+struct WebhookDeliverySpec<'a> {
     tenant_id: Uuid,
     repository_id: Uuid,
     webhook_id: Uuid,
-    secret: &str,
+    secret: &'a str,
     max_attempts: i64,
-    delivery_event_id: &str,
-    payload: &Value,
-    payload_bytes: &[u8],
+    delivery_event_id: &'a str,
+    payload: &'a Value,
+    payload_bytes: &'a [u8],
+}
+
+async fn insert_single_webhook_delivery_tx(
+    tx: &Transaction<'_>,
+    spec: WebhookDeliverySpec<'_>,
 ) -> Result<bool, ProjectionError> {
+    let WebhookDeliverySpec {
+        tenant_id,
+        repository_id,
+        webhook_id,
+        secret,
+        max_attempts,
+        delivery_event_id,
+        payload,
+        payload_bytes,
+    } = spec;
     let exists = tx
         .query_opt(
             "SELECT 1 FROM forge_webhook_deliveries WHERE webhook_id = $1 AND event_id = $2",
@@ -261,14 +276,16 @@ pub async fn sync_projected_ref_cas_webhooks_bounded(
         if locked.is_some()
             && insert_single_webhook_delivery_tx(
                 &tx,
-                tenant_id,
-                repository_id,
-                webhook_id,
-                &secret,
-                max_attempts,
-                &delivery_event_id,
-                &payload,
-                &payload_bytes,
+                WebhookDeliverySpec {
+                    tenant_id,
+                    repository_id,
+                    webhook_id,
+                    secret: &secret,
+                    max_attempts,
+                    delivery_event_id: &delivery_event_id,
+                    payload: &payload,
+                    payload_bytes: &payload_bytes,
+                },
             )
             .await?
         {

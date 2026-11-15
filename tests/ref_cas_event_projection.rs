@@ -34,15 +34,13 @@ fn ref_name(raw: &str) -> RefName {
 }
 
 pub(crate) fn make_request(
-    repo: Uuid,
-    tenant: Uuid,
-    issuer: Uuid,
-    history: Uuid,
+    scope: (Uuid, Uuid, Uuid, Uuid),
     seq: i64,
     op_id: Uuid,
     expected_rev: i64,
     updates: Vec<(&str, Option<GitOid>, Option<GitOid>)>,
 ) -> CommitRefsRequest {
+    let (repo, tenant, issuer, history) = scope;
     let refs = updates
         .into_iter()
         .map(|(name, old, new)| {
@@ -147,7 +145,7 @@ fn deterministic_identity_and_rejected_commit_projection() {
         &mut sm,
         1,
         2,
-        make_request(repo, tenant, issuer, history, 1, op1, 99, vec![("refs/heads/main", None, Some(oid(1)))]),
+        make_request((repo, tenant, issuer, history), 1, op1, 99, vec![("refs/heads/main", None, Some(oid(1)))]),
         100,
     );
     // Valid commit at revision 1 emits Committed terminal event.
@@ -155,7 +153,7 @@ fn deterministic_identity_and_rejected_commit_projection() {
         &mut sm,
         1,
         3,
-        make_request(repo, tenant, issuer, history, 2, op2, 1, vec![("refs/heads/main", None, Some(oid(2)))]),
+        make_request((repo, tenant, issuer, history), 2, op2, 1, vec![("refs/heads/main", None, Some(oid(2)))]),
         101,
     );
 
@@ -195,10 +193,7 @@ fn single_tx_pre_commit_and_post_commit_crash_replay() {
         1,
         2,
         make_request(
-            repo,
-            tenant,
-            issuer,
-            history,
+            (repo, tenant, issuer, history),
             1,
             Uuid::from_u128(201),
             1,
@@ -245,10 +240,7 @@ fn out_of_order_gap_refused_and_stale_replay_idempotent() {
         1,
         2,
         make_request(
-            repo,
-            tenant,
-            issuer,
-            history,
+            (repo, tenant, issuer, history),
             1,
             Uuid::from_u128(301),
             1,
@@ -261,10 +253,7 @@ fn out_of_order_gap_refused_and_stale_replay_idempotent() {
         1,
         3,
         make_request(
-            repo,
-            tenant,
-            issuer,
-            history,
+            (repo, tenant, issuer, history),
             2,
             Uuid::from_u128(302),
             2,
@@ -277,10 +266,7 @@ fn out_of_order_gap_refused_and_stale_replay_idempotent() {
         1,
         4,
         make_request(
-            repo,
-            tenant,
-            issuer,
-            history,
+            (repo, tenant, issuer, history),
             3,
             Uuid::from_u128(303),
             3,

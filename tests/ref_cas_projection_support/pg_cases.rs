@@ -102,7 +102,7 @@ fn build_sm_events(
     for idx in 1..=count {
         let op_id = Uuid::new_v4();
         op_ids.push(op_id);
-        let ref_name = RefName::branch(&format!("refs/heads/b{idx}")).unwrap();
+        let ref_name = RefName::branch(format!("refs/heads/b{idx}")).unwrap();
         let req = CommitRefsRequest::new(
             repo,
             tenant,
