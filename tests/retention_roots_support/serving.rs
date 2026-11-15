@@ -7,10 +7,8 @@
 use anyhow::{Result, anyhow, ensure};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::db::{Identity, Repository};
+use rootyard::ref_store::core::pack_commit::{AuthorizedCommitMode, PgAuthorizedCommit, PrepareOutcome};
 use rootyard::ref_store::{CommitMode, GitObjectFormat};
-use rootyard::ref_store::core::pack_commit::{
-    AuthorizedCommitMode, PgAuthorizedCommit, PrepareOutcome,
-};
 
 use super::db::{Db, deadline};
 use super::git::GitRepo;
@@ -79,7 +77,10 @@ pub async fn verify_new_serving(
         .commit(&db.pool, &verified, deadline())
         .await
         .map_err(|error| anyhow!("authorized serving commit refused ({}): {error:?}", error.code()))?;
-    ensure!(receipt.is_committed() && !receipt.replayed, "authorized serving commit was not a fresh committed terminal");
+    ensure!(
+        receipt.is_committed() && !receipt.replayed,
+        "authorized serving commit was not a fresh committed terminal"
+    );
     let gate = super::db::gate_version(&db.pool, repository.id, tenant).await?;
     ensure!(gate.revision() == receipt.terminal.revision, "serving gate after authorized commit differs");
     let new_packs = context.new_packs().to_vec();
