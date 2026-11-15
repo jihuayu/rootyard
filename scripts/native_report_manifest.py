@@ -295,10 +295,39 @@ def _cas_sealed_record(manifest, entry, label):
     return root, record
 
 
-def _cas_bin_paths(manifest, entry, label):
-    """The exact canonical bin snapshot and adjacent receipt for one CAS row."""
+def _batch_primary_identity(receipt, validated, batch, label):
+    """Expected ``(kind, target, binary_name)`` for a batch receipt's primary binary."""
+    binary_name = batch.get("binary")
+    require(
+        isinstance(binary_name, str) and binary_name,
+        f"{label}: batch binary must be a nonempty string",
+    )
+    if receipt.get("kind") == "rust-integration-test":
+        require(
+            validated.schema == "v2",
+            f"{label}: rust-integration-test batch receipt requires v2 schema",
+        )
+        test_artifacts = [
+            row for row in validated.artifacts if row.get("kind") == "test"
+        ]
+        require(
+            len(validated.artifacts) == 1 and len(test_artifacts) == 1,
+            f"{label}: rust-integration-test batch receipt must select exactly one test artifact",
+        )
+        return "test", test_artifacts[0]["target"], binary_name
+    return "bin", binary_name, binary_name
+
+
+def _cas_artifact_paths(manifest, entry, label, *, expected_kind="bin", expected_binary_name=None):
+    """Canonical CAS paths, accepted alias pairs, and sealed record for one CAS row."""
     root, record = _cas_sealed_record(manifest, entry, label)
-    require(record.get("kind") == "bin", f"{label}: sealed record is not a bin")
+    require(
+        record.get("kind") == expected_kind,
+        f"{label}: sealed record is not a {expected_kind}",
+    )
+    binary_name = (
+        expected_binary_name if expected_binary_name is not None else entry.get("target")
+    )
     binary = _absolute_recorded(record.get("binary"), label, "sealed binary")
     receipt = _absolute_recorded(record.get("receipt"), label, "sealed receipt")
     build_receipt = _absolute_recorded(record.get("build_receipt"), label, "sealed build receipt")
@@ -308,7 +337,11 @@ def _cas_bin_paths(manifest, entry, label):
         (build_receipt, "sealed build receipt"),
     ):
         require(_inside(path, root), f"{label}: {what} is outside the sealed store")
-    require(binary.name == entry.get("target"), f"{label}: sealed binary basename is not the target")
+    basename_label = "target" if expected_kind == "bin" else "batch binary"
+    require(
+        binary.name == binary_name,
+        f"{label}: sealed binary basename is not the {basename_label}",
+    )
     require(
         receipt.name == binary.name + ".receipt.json",
         f"{label}: sealed receipt basename is invalid",
@@ -321,19 +354,87 @@ def _cas_bin_paths(manifest, entry, label):
         receipt.parent == binary.parent and build_receipt.parent == binary.parent,
         f"{label}: sealed receipts are not adjacent to the canonical binary",
     )
-    require(
-        _resolved_equal(entry.get("artifact"), binary),
-        f"{label}: manifest artifact is not the sealed canonical snapshot",
-    )
-    require(
-        _resolved_equal(entry.get("receipt"), build_receipt),
-        f"{label}: manifest receipt is not the sealed .build.json alias",
-    )
+    if expected_kind == "test":
+        require(
+            record.get("implicit") is False,
+            f"{label}: sealed test record must not be implicit",
+        )
+        output_alias = record.get("output_alias")
+        if output_alias is None:
+            require(
+                _resolved_equal(entry.get("artifact"), binary),
+                f"{label}: manifest artifact is not the sealed canonical snapshot",
+            )
+            require(
+                _resolved_equal(entry.get("receipt"), build_receipt)
+                or _resolved_equal(entry.get("receipt"), receipt),
+                f"{label}: manifest receipt is not the sealed canonical receipt",
+            )
+            accepted_pairs = ((binary, build_receipt), (binary, receipt))
+        else:
+            require(
+                isinstance(output_alias, dict),
+                f"{label}: sealed test record output_alias must be an object or null",
+            )
+            alias_binary = _absolute_recorded(
+                output_alias.get("path"), label, "sealed output alias path"
+            )
+            alias_receipt = _absolute_recorded(
+                output_alias.get("receipt"), label, "sealed output alias receipt"
+            )
+            require(
+                not _inside(alias_binary, root) and not _inside(alias_receipt, root),
+                f"{label}: sealed output alias must be outside the sealed store",
+            )
+            require(
+                alias_binary.name == binary_name,
+                f"{label}: sealed output alias basename is not the batch binary",
+            )
+            require(
+                alias_receipt.name == alias_binary.name + ".build.json",
+                f"{label}: sealed output alias receipt basename is invalid",
+            )
+            require(
+                alias_receipt.parent == alias_binary.parent,
+                f"{label}: sealed output alias receipt is not adjacent to the alias binary",
+            )
+            require(
+                output_alias.get("overwrote_existing") is False,
+                f"{label}: sealed output alias must not overwrite existing files",
+            )
+            require(
+                _resolved_equal(entry.get("artifact"), alias_binary),
+                f"{label}: manifest artifact is not the sealed output alias",
+            )
+            require(
+                _resolved_equal(entry.get("receipt"), alias_receipt),
+                f"{label}: manifest receipt is not the sealed output alias receipt",
+            )
+            accepted_pairs = (
+                (alias_binary, alias_receipt),
+                (binary, build_receipt),
+                (binary, receipt),
+            )
+    else:
+        if "output_alias" in record:
+            require(
+                record.get("output_alias") is None,
+                f"{label}: sealed bin record must not carry an output_alias",
+            )
+        require(
+            _resolved_equal(entry.get("artifact"), binary),
+            f"{label}: manifest artifact is not the sealed canonical snapshot",
+        )
+        require(
+            _resolved_equal(entry.get("receipt"), build_receipt),
+            f"{label}: manifest receipt is not the sealed .build.json alias",
+        )
+        accepted_pairs = ((binary, build_receipt),)
     require(
         entry.get("sha256") == record.get("binary_sha256"),
         f"{label}: manifest artifact sha256 does not match the sealed digest",
     )
-    return binary, build_receipt, record
+    return binary, build_receipt, record, accepted_pairs
 
 
 def _require_store_matches_receipt(record, validated, label):
@@ -353,7 +454,8 @@ def _require_store_matches_receipt(record, validated, label):
     )
 
 
-def _cas_bin_entry(manifest, binary_name, label):
+def _cas_artifact_entry(manifest, target_name, label, expected_kind="bin"):
+    """Find the single published CAS row matching kind and Cargo target."""
     artifacts = manifest.get("artifacts")
     require(
         isinstance(artifacts, list) and artifacts,
@@ -366,13 +468,194 @@ def _cas_bin_entry(manifest, binary_name, label):
     matched = [
         artifact
         for artifact in artifacts
-        if artifact.get("kind") == "bin" and artifact.get("target") == binary_name
+        if artifact.get("kind") == expected_kind
+        and artifact.get("target") == target_name
     ]
     require(
         len(matched) == 1,
-        f"{label}: expected exactly one CAS bin entry for {binary_name}, got {len(matched)}",
+        f"{label}: expected exactly one CAS {expected_kind} entry for {target_name}, got {len(matched)}",
     )
     return matched[0]
+
+
+def _verify_batch_primary_entry(
+    *,
+    manifest,
+    artifacts,
+    target_dir,
+    batch_targets,
+    typed_targets,
+    receipt,
+    validated,
+    batch,
+    consumed_binary,
+    consumed_receipt,
+    label,
+    verify_cas_on_disk=False,
+):
+    """Bind the primary built executable (bin or integration test) to its batch row."""
+    expected_kind, expected_target, binary_name = _batch_primary_identity(
+        receipt, validated, batch, label
+    )
+    if manifest.get("artifact_store") is None:
+        if expected_kind == "bin":
+            expected_binary = target_dir / "debug" / binary_name
+            expected_receipt = target_dir / "debug" / f"{binary_name}.build.json"
+        else:
+            expected_binary = consumed_binary
+            expected_receipt = consumed_receipt
+
+        def resolves_to(entry_value, expected):
+            if not isinstance(entry_value, str) or not entry_value:
+                return False
+            try:
+                if not Path(entry_value).is_absolute():
+                    return False
+                return Path(entry_value).resolve() == expected.resolve()
+            except (OSError, ValueError, RuntimeError):
+                return False
+
+        matched = [
+            artifact
+            for artifact in artifacts
+            if resolves_to(artifact.get("artifact"), expected_binary)
+            and resolves_to(artifact.get("receipt"), expected_receipt)
+        ]
+        require(
+            len(matched) == 1,
+            f"{label}: expected exactly one entry for {expected_binary} and {expected_receipt}, "
+            f"got {len(matched)}",
+        )
+        entry = matched[0]
+    else:
+        entry = _cas_artifact_entry(
+            manifest, expected_target, label, expected_kind=expected_kind
+        )
+        sealed_binary, sealed_receipt, record, accepted_pairs = _cas_artifact_paths(
+            manifest,
+            entry,
+            label,
+            expected_kind=expected_kind,
+            expected_binary_name=binary_name,
+        )
+        store_root = Path(manifest["artifact_store"]["root"])
+        require(
+            not _inside(store_root, target_dir) and not _inside(target_dir, store_root),
+            f"{label}: artifact store must be disjoint from target_dir",
+        )
+        binary_matches = [
+            pair for pair in accepted_pairs if _resolved_equal(consumed_binary, pair[0])
+        ]
+        require(
+            bool(binary_matches),
+            f"{label}: consumed binary is not the sealed canonical snapshot",
+        )
+        require(
+            any(_resolved_equal(consumed_receipt, pair[1]) for pair in binary_matches),
+            f"{label}: consumed receipt is not the sealed .build.json alias",
+        )
+        _require_store_matches_receipt(record, validated, label)
+        if verify_cas_on_disk and not _resolved_equal(consumed_binary, sealed_binary):
+            require(
+                sealed_binary.is_file() and not sealed_binary.is_symlink(),
+                f"{label}: sealed canonical binary snapshot is missing or a symlink",
+            )
+            require(
+                digest(sealed_binary) == record.get("binary_sha256"),
+                f"{label}: sealed canonical binary snapshot digest mismatch",
+            )
+            require(
+                sealed_receipt.is_file() and not sealed_receipt.is_symlink(),
+                f"{label}: sealed compatibility receipt is missing or a symlink",
+            )
+            require(
+                sealed_receipt.read_bytes() == consumed_receipt.read_bytes(),
+                f"{label}: sealed compatibility receipt does not match consumed receipt",
+            )
+
+    require(
+        entry.get("kind") == expected_kind,
+        f"{label}: binary artifacts entry kind must be '{expected_kind}'",
+    )
+    require(
+        entry.get("target") == expected_target,
+        f"{label}: binary artifacts entry target {entry.get('target')!r} "
+        f"does not match expected target {expected_target!r}",
+    )
+    if validated.schema == "v1":
+        require(
+            entry.get("fresh") is False,
+            f"{label}: binary artifacts entry must not be fresh",
+        )
+    else:
+        require(
+            isinstance(entry.get("fresh"), bool),
+            f"{label}: binary artifacts entry fresh must be a JSON boolean",
+        )
+        selected = _receipt_artifact_for(
+            validated, entry.get("target"), entry.get("kind")
+        )
+        require(
+            selected is not None,
+            f"{label}: binary artifacts entry is not selected by the receipt",
+        )
+        require(
+            entry.get("fresh") is selected["fresh"],
+            f"{label}: binary artifacts entry freshness does not match the receipt",
+        )
+    if expected_kind == "bin":
+        require(
+            entry.get("implicit") is False,
+            f"{label}: binary artifacts entry implicit must be exactly false",
+        )
+    else:
+        require(
+            entry.get("implicit") in (None, False),
+            f"{label}: test artifacts entry must not be implicit",
+        )
+        require(
+            entry.get("source") == selected.get("source"),
+            f"{label}: test artifacts entry source does not match the receipt",
+        )
+        require(
+            entry.get("source_sha256") == selected.get("source_sha256"),
+            f"{label}: test artifacts entry source_sha256 does not match the receipt",
+        )
+        require(
+            receipt.get("integration_test_source") == selected.get("source"),
+            f"{label}: receipt integration_test_source does not match the test artifact",
+        )
+        require(
+            receipt.get("integration_test_source_sha256") == selected.get("source_sha256"),
+            f"{label}: receipt integration_test_source_sha256 does not match the test artifact",
+        )
+        require(
+            receipt.get("original_artifact_sha256") == selected.get("executable_sha256"),
+            f"{label}: receipt original_artifact_sha256 does not match the test executable",
+        )
+        if "original_artifact" in entry:
+            require(
+                _resolved_equal(entry.get("original_artifact"), selected.get("executable")),
+                f"{label}: test artifacts entry original_artifact does not match the test executable",
+            )
+        if "original_artifact_sha256" in entry:
+            require(
+                entry.get("original_artifact_sha256") == selected.get("executable_sha256"),
+                f"{label}: test artifacts entry original_artifact_sha256 does not match the test executable",
+            )
+    require(
+        entry.get("target") in batch_targets,
+        f"{label}: binary entry target is not listed in the batch targets",
+    )
+    require(
+        (expected_kind, entry.get("target")) in typed_targets,
+        f"{label}: ({expected_kind}, {entry.get('target')!r}) target must be in typed_targets",
+    )
+    require(
+        entry.get("sha256") == receipt.get("binary_sha256"),
+        f"{label}: binary artifacts entry sha256 does not match the receipt binary_sha256",
+    )
+    return entry, binary_name
 
 
 def _require_v2_manifest_matches_receipt(rows, validated, label):
@@ -888,93 +1171,25 @@ def verify_batch_receipt(receipt, validated, receipt_file, binary,
         "receipt.target_dir must be a nonempty absolute path",
     )
     target_dir = Path(target_dir_value)
-    if manifest.get("artifact_store") is None:
-        expected_binary = target_dir / "debug" / batch["binary"]
-        expected_receipt = target_dir / "debug" / f'{batch["binary"]}.build.json'
-
-        def resolves_to(entry_value, expected):
-            if not isinstance(entry_value, str) or not entry_value:
-                return False
-            try:
-                if not Path(entry_value).is_absolute():
-                    return False
-                return Path(entry_value).resolve() == expected.resolve()
-            except (OSError, ValueError, RuntimeError):
-                return False
-
-        matched = [
-            artifact
-            for artifact in artifacts
-            if resolves_to(artifact.get("artifact"), expected_binary)
-            and resolves_to(artifact.get("receipt"), expected_receipt)
-        ]
-        require(
-            len(matched) == 1,
-            "batch receipt manifest must contain exactly one entry for the binary and receipt",
-        )
-        entry = matched[0]
-    else:
-        entry = _cas_bin_entry(manifest, batch["binary"], "batch receipt manifest")
-        sealed_binary, sealed_receipt, record = _cas_bin_paths(
-            manifest, entry, "batch receipt manifest"
-        )
-        store_root = Path(manifest["artifact_store"]["root"])
-        require(
-            not _inside(store_root, target_dir) and not _inside(target_dir, store_root),
-            "batch receipt manifest artifact store must be disjoint from target_dir",
-        )
-        require(
-            _resolved_equal(binary, sealed_binary),
-            "batch receipt manifest consumed binary is not the sealed canonical snapshot",
-        )
-        require(
-            _resolved_equal(receipt_file, sealed_receipt),
-            "batch receipt manifest consumed receipt is not the sealed .build.json alias",
-        )
-        _require_store_matches_receipt(record, validated, "batch receipt manifest")
-    require(entry.get("kind") == "bin", "batch receipt binary entry has an invalid kind")
-    if validated.schema == "v1":
-        require(
-            entry.get("fresh") is False,
-            "batch receipt binary entry must not be fresh",
-        )
-    else:
-        require(
-            isinstance(entry.get("fresh"), bool),
-            "batch receipt binary entry fresh must be a JSON boolean",
-        )
-        selected = _receipt_artifact_for(
-            validated, entry.get("target"), entry.get("kind")
-        )
-        require(
-            selected is not None,
-            "batch receipt binary entry is not selected by the receipt",
-        )
-        require(
-            entry.get("fresh") is selected["fresh"],
-            "batch receipt binary entry freshness does not match the receipt",
-        )
-    require(
-        entry.get("implicit") is False,
-        "batch receipt binary entry must not be implicit",
-    )
-    require(
-        entry.get("target") in targets,
-        "batch receipt binary entry target is not listed in the batch targets",
-    )
-    require(
-        ("bin", entry.get("target")) in typed_targets,
-        "bin entry target must be in typed_targets",
-    )
-    require(
-        entry.get("sha256") == receipt.get("binary_sha256"),
-        "batch receipt binary digest does not match the receipt",
+    _, binary_name = _verify_batch_primary_entry(
+        manifest=manifest,
+        artifacts=artifacts,
+        target_dir=target_dir,
+        batch_targets=targets,
+        typed_targets=typed_targets,
+        receipt=receipt,
+        validated=validated,
+        batch=batch,
+        consumed_binary=binary,
+        consumed_receipt=receipt_file,
+        label="batch receipt manifest",
+        verify_cas_on_disk=True,
     )
 
     return {
         "file": str(manifest_path.resolve()),
         "sha256": raw_sha256,
-        "target": entry["target"],
+        "target": binary_name,
     }
 
 
@@ -1389,9 +1604,12 @@ def release_manifest(args):
                     f"{manifest_label}: batch targets {batch_targets!r} do not match "
                     f"build artifact targets {[target for kind, target in typed_targets]!r}",
                 )
+            expected_kind, expected_target, _ = _batch_primary_identity(
+                receipt, validated, batch, label
+            )
             require(
-                ("bin", binary_name) in typed_targets,
-                f"{manifest_label}: no (bin, {binary_name}) target recorded",
+                (expected_kind, expected_target) in typed_targets,
+                f"{manifest_label}: no ({expected_kind}, {expected_target}) target recorded",
             )
 
             target_dir = receipt.get("target_dir")
@@ -1409,102 +1627,25 @@ def release_manifest(args):
                 all(isinstance(artifact, dict) for artifact in artifacts),
                 f"{manifest_label}: artifacts entries must be objects",
             )
-            if manifest.get("artifact_store") is None:
-                expect_binary = Path(target_dir) / "debug" / binary_name
-                expect_receipt = Path(target_dir) / "debug" / f"{binary_name}.build.json"
-                try:
-                    expected_binary_path = expect_binary.resolve()
-                    expected_receipt_path = expect_receipt.resolve()
-                except (OSError, ValueError) as error:
-                    raise ManifestError(f"{label}: cannot resolve the original batch artifact paths: {error}")
-
-                def original_path_matches(value):
-                    if not isinstance(value, str) or not value:
-                        return False
-                    path = Path(value)
-                    if not path.is_absolute():
-                        return False
-                    try:
-                        return Path(value).resolve()
-                    except (OSError, ValueError):
-                        return None
-
-                matched = [
-                    artifact
-                    for artifact in artifacts
-                    if original_path_matches(artifact.get("artifact")) == expected_binary_path
-                    and original_path_matches(artifact.get("receipt")) == expected_receipt_path
-                ]
-                require(
-                    len(matched) == 1,
-                    f"{manifest_label}: expected exactly one artifacts entry for {expect_binary} and {expect_receipt}, "
-                    f"got {len(matched)}",
-                )
-                entry = matched[0]
-            else:
-                entry = _cas_bin_entry(manifest, binary_name, manifest_label)
-                sealed_binary, sealed_receipt, record = _cas_bin_paths(
-                    manifest, entry, manifest_label
-                )
-                store_root = Path(manifest["artifact_store"]["root"])
-                target_path = Path(target_dir)
-                require(
-                    not _inside(store_root, target_path)
-                    and not _inside(target_path, store_root),
-                    f"{manifest_label}: artifact store must be disjoint from target_dir",
-                )
-                recorded_binary = _absolute_recorded(
-                    data.get("binary"), f"job manifest {name}", "binary"
-                )
-                recorded_receipt = _absolute_recorded(
-                    build_receipt.get("file"), label, "receipt file"
-                )
-                require(
-                    _resolved_equal(recorded_binary, sealed_binary),
-                    f"{manifest_label}: recorded binary is not the sealed canonical snapshot",
-                )
-                require(
-                    _resolved_equal(recorded_receipt, sealed_receipt),
-                    f"{manifest_label}: recorded receipt is not the sealed .build.json alias",
-                )
-                _require_store_matches_receipt(record, validated, manifest_label)
-            require(
-                entry.get("kind") == "bin",
-                f"{manifest_label}: binary artifacts entry kind must be 'bin'",
+            recorded_binary = _absolute_recorded(
+                data.get("binary"), f"job manifest {name}", "binary"
             )
-            require(
-                entry.get("target") == binary_name,
-                f"{manifest_label}: binary artifacts entry target {entry.get('target')!r} "
-                f"does not match binary {binary_name!r}",
+            recorded_receipt = _absolute_recorded(
+                build_receipt.get("file"), label, "receipt file"
             )
-            if validated.schema == "v1":
-                require(
-                    entry.get("fresh") is False,
-                    f"{manifest_label}: binary artifacts entry fresh must be exactly false",
-                )
-            else:
-                require(
-                    isinstance(entry.get("fresh"), bool),
-                    f"{manifest_label}: binary artifacts entry fresh must be a JSON boolean",
-                )
-                selected = _receipt_artifact_for(
-                    validated, entry.get("target"), entry.get("kind")
-                )
-                require(
-                    selected is not None,
-                    f"{manifest_label}: binary artifacts entry is not selected by the receipt",
-                )
-                require(
-                    entry.get("fresh") is selected["fresh"],
-                    f"{manifest_label}: binary artifacts entry freshness does not match the receipt",
-                )
-            require(
-                entry.get("implicit") is False,
-                f"{manifest_label}: binary artifacts entry implicit must be exactly false",
-            )
-            require(
-                entry.get("sha256") == receipt.get("binary_sha256"),
-                f"{manifest_label}: binary artifacts entry sha256 does not match the receipt binary_sha256",
+            _verify_batch_primary_entry(
+                manifest=manifest,
+                artifacts=artifacts,
+                target_dir=Path(target_dir),
+                batch_targets=batch_targets,
+                typed_targets=typed_targets,
+                receipt=receipt,
+                validated=validated,
+                batch=batch,
+                consumed_binary=recorded_binary,
+                consumed_receipt=recorded_receipt,
+                label=manifest_label,
+                verify_cas_on_disk=False,
             )
 
             verified["build:batch_manifest"] = {"file": downloaded_manifest.name, "sha256": manifest_sha256}

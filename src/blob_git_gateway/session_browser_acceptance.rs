@@ -88,6 +88,17 @@ fn fault_page_goto_uses_origin_scope() {
     assert!(!BROWSER_SCRIPT.contains("self.web + self.scope"));
 }
 
+#[test]
+fn sign_in_shell_does_not_renavigate_and_waits_for_rendered_status() {
+    let (_, after_sign_in) =
+        BROWSER_SCRIPT.split_once("page.expect_navigation").expect("sign-in navigation step must remain");
+    assert!(!after_sign_in.contains("self.goto(page, self.web + SHELL"));
+    assert!(after_sign_in.contains("fetch(location.pathname, {credentials: 'same-origin'})"));
+    assert!(BROWSER_SCRIPT.contains("await self.status_has(page, \"Read complete.\", reason)"));
+    assert!(BROWSER_SCRIPT.contains("\"CONCURRENT_LOAD_MORE_NOT_DISABLED\""));
+    assert!(BROWSER_SCRIPT.contains("\"CONCURRENT_LOAD_MORE_SENT\""));
+}
+
 #[tokio::test]
 #[ignore = "requires real PostgreSQL, S3-compatible Blob, native Git, a compiled production CLI, Playwright Python and Chromium"]
 async fn standalone_cli_browser_session_is_bound_in_chromium() -> Result<()> {

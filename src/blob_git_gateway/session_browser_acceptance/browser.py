@@ -126,6 +126,8 @@ REASONS = frozenset(
         "REPO_LINK_INVALID",
         "REPO_PAGE_INCOMPLETE",
         "REPO_PAGE_STATUS_INVALID",
+        "CONCURRENT_LOAD_MORE_NOT_DISABLED",
+        "CONCURRENT_LOAD_MORE_SENT",
         "READ_CHAIN_INVALID",
         "API_COOKIE_ONLY_FETCH_FAILED",
         "API_COOKIE_ONLY_STATUS_INVALID",
@@ -480,16 +482,19 @@ class Client:
         await self.no_credentials(page)
         extra["cookies"] = {"session_http_only": True, "session_same_site": "Strict", "csrf_readable": True}
 
-        # 4. The signed-in shell is a direct 200 under its CSP and loads only
-        # its own script; the script lists the repository by name.
-        await self.goto(page, self.web + SHELL, "SHELL_NOT_SERVED")
+        # 4. The signed-in shell (served directly by login's redirect to `/web/blob`
+        # without re-navigating and duplicating the paginated index reads) is a
+        # direct 200 under its CSP and loads only its own script; wait until the
+        # script completes its index read and renders the target repository link.
         served = await evaluate(
             page,
             """async () => {
                 const response = await fetch(location.pathname, {credentials: 'same-origin'});
-                return {status: response.status,
-                        csp: response.headers.get('content-security-policy') || '',
-                        type: response.headers.get('content-type') || ''};
+                return {
+                    status: response.status,
+                    csp: response.headers.get('content-security-policy') || '',
+                    type: response.headers.get('content-type') || '',
+                };
             }""",
             "SHELL_NOT_SERVED",
         )
@@ -662,7 +667,7 @@ class Client:
     async def rendered(self, page, reason):
         """Wait until the page's own script rendered a list, so its first read
         has happened and a later page fetch presents the same bound."""
-        await self.status_has(page, "", reason)
+        await self.status_has(page, "Read complete.", reason)
 
     async def page_reads(self, page):
         """The revisions of the page's own refs/tree/commits responses and
