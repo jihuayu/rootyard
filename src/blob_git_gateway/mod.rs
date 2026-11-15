@@ -90,6 +90,14 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
             "/api/repos/{owner}/{name}/snapshots/{snapshot}/renew",
             post(snapshot_metadata::renew_snapshot),
         )
+        .route(
+            "/api/repos/{owner}/{name}/snapshots/{snapshot}/tree",
+            get(browse::retained::tree),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/snapshots/{snapshot}/blob/{oid}",
+            get(browse::retained::blob),
+        )
         .route("/api/repos/{owner}/{name}/merges", post(api::unsupported_merge))
         .route("/api/repos/{owner}/{name}/tree", get(browse::tree))
         .route("/api/repos/{owner}/{name}/tree/{oid}", get(browse::tree_by_oid))

@@ -14,6 +14,7 @@ grant or successful receipt through SQL.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,9 @@ import blob_only_service as blob  # noqa: E402
 CREATE_READ = "snapshot_http_create_read_replay_after_ref_advance"
 LIFECYCLE = "snapshot_http_renew_release_expiry_and_exact_replay"
 AUTHZ = "snapshot_http_authz_malformed_and_cross_repo_refusals"
-CASES = (CREATE_READ, LIFECYCLE, AUTHZ)
+HISTORICAL = "snapshot_http_historical_tree_blob_and_current_reachability"
+BROWSE_REFUSALS = "snapshot_http_historical_tree_blob_auth_and_state_refusals"
+CASES = (CREATE_READ, LIFECYCLE, AUTHZ, HISTORICAL, BROWSE_REFUSALS)
 
 LIMITATIONS = [
     "Root-only real-service HTTP fixture: requires the attested standalone binary, real PostgreSQL/S3/stock Git and the owned Blob profile. The implementation worker only py-compiled it.",
@@ -38,6 +41,8 @@ LIMITATIONS = [
     "The fixture exercises the bounded HTTP DTO/receipt projections and coordinator decisions. It does not claim byte-closure materialization, a #174 session/HWM, root/retention HTTP or full issue107 closure.",
     "The token/collaborator metadata cases are fixture inputs: read-only/restricted tokens use the real token API and real PATCH where shown; the write collaborator role row is labeled initial role metadata, not production collaborator API transport.",
     "Exact rows/counters are compared through the run-owned schema. No kernel, power-loss, distributed or scalability claim is made.",
+    "The historical tree/blob cases exercise the retained snapshot HTTP content surface; they do not claim a session/HWM, root materialization, hosted inventory or full issue107 acceptance.",
+    "The HTTP fixture has no deterministic production seam between complete content encoding and the final read-scope fence; late-scope removal is covered by the coordinator source/real-PG fixtures, not a live HTTP race here.",
 ]
 
 
@@ -98,6 +103,51 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
         return self._request("DELETE", self._snapshots_path(repo, "/" + str(snapshot)),
                              token or self.alice,
                              {"idempotency_key": key, "expected_generation": generation})
+
+    def _repo_path(self, repo, suffix=""):
+        return ("/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/"
+                + urllib.parse.quote(repo["name"], safe="") + suffix)
+
+    @staticmethod
+    def _query_path(path, params):
+        values = {key: value for key, value in params.items() if value is not None}
+        query = urllib.parse.urlencode(values)
+        return path + ("?" + query if query else "")
+
+    def _tree(self, repo, snapshot, *, oid=None, path=None, after=None, limit=None, token=None):
+        suffix = "/" + str(snapshot) + "/tree"
+        return self._request("GET", self._query_path(self._snapshots_path(repo, suffix), {
+            "oid": oid, "path": path, "after": after, "limit": limit,
+        }), token or self.alice)
+
+    def _blob(self, repo, snapshot, oid, *, path=None, token=None):
+        suffix = "/" + str(snapshot) + "/blob/" + str(oid)
+        return self._request("GET", self._query_path(self._snapshots_path(repo, suffix), {"path": path}),
+                             token or self.alice)
+
+    def _current_tree(self, repo, token=None):
+        return self._request("GET", self._query_path(self._repo_path(repo, "/tree"), {"oid": "HEAD"}),
+                             token or self.alice)
+
+    def _current_blob(self, repo, oid, token=None):
+        return self._request("GET", self._repo_path(repo, "/blob/" + str(oid)), token or self.alice)
+
+    @staticmethod
+    def _tree_item(tree, name):
+        for item in tree["items"]:
+            if item["name"] == name:
+                return item
+        raise AssertionError("tree omitted " + name)
+
+    def _assert_tree_view(self, tree):
+        assert set(tree) == {"oid", "tree_oid", "path", "items", "next_after"}, tree
+        for item in tree["items"]:
+            assert set(item) == {"name", "path", "mode", "kind", "oid", "size"}, item
+        self._forbidden_markers(tree)
+
+    def _assert_blob_view(self, blob):
+        assert set(blob) == {"oid", "size", "is_binary", "content", "content_base64"}, blob
+        self._forbidden_markers(blob)
 
     def _issue_scoped(self, repo, label, actions, read_only=False):
         payload = {
@@ -459,6 +509,160 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
             "malformed_cases": len(malformed),
         }
 
+
+    def snapshot_http_historical_tree_blob_and_current_reachability(self):
+        repo, _remote, work, old_oid = self.seed("snap-browse")
+        created = self._create(repo, "browse-create", 300)
+        assert created[0] == 201, created
+        snapshot = created[1]["snapshot_id"]
+
+        new_oid = self.commit_files(work, "browse advance", {"advance.txt": "advance v2\n"})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+        big = b"x" * (5 * 1024 * 1024)
+        self.commit_files(work, "browse big", {"big.bin": big})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+        big_snapshot = self._create(repo, "browse-big", 300)[1]["snapshot_id"]
+        baseline = self._ledger(repo)
+
+        status, old_tree, _ = self._tree(repo, snapshot, oid=old_oid)
+        assert status == 200, (status, old_tree)
+        self._assert_tree_view(old_tree)
+        assert old_tree["oid"] == old_oid and old_tree["path"] == "", old_tree
+        base = self._tree_item(old_tree, "base.txt")
+        assert base["kind"] == "blob" and base["path"] == "base.txt", base
+        status, old_blob, _ = self._blob(repo, snapshot, base["oid"])
+        assert status == 200, (status, old_blob)
+        self._assert_blob_view(old_blob)
+        assert old_blob["oid"] == base["oid"] and old_blob["size"] == len(b"seed snap-browse\n"), old_blob
+        assert old_blob["is_binary"] is False, old_blob
+        assert base64.b64decode(old_blob["content_base64"]) == b"seed snap-browse\n", old_blob
+        assert old_blob["content"] == "seed snap-browse\n", old_blob
+        status, metadata, _ = self._read(repo, snapshot)
+        assert status == 200 and metadata["complete_git_read_snapshot"] is False, (status, metadata)
+
+        status, current_tree, _ = self._current_tree(repo)
+        assert status == 200, (status, current_tree)
+        advance = self._tree_item(current_tree, "advance.txt")
+        assert advance["kind"] == "blob", advance
+        big_item = self._tree_item(current_tree, "big.bin")
+        assert big_item["size"] == len(big), big_item
+        status, current_blob, _ = self._current_blob(repo, advance["oid"])
+        assert status == 200 and current_blob["content"] == "advance v2\n", (status, current_blob)
+
+        status, old_again, _ = self._tree(repo, snapshot, oid=old_oid)
+        assert status == 200 and self._tree_item(old_again, "base.txt")["oid"] == base["oid"], old_again
+        status, old_blob_again, _ = self._blob(repo, snapshot, base["oid"])
+        assert status == 200 and base64.b64decode(old_blob_again["content_base64"]) == b"seed snap-browse\n"
+
+        status, _, _ = self._tree(repo, snapshot, oid=new_oid)
+        assert status == 404, ("new commit leaked through old snapshot tree", status)
+        status, _, _ = self._blob(repo, snapshot, advance["oid"])
+        assert status == 404, ("new blob leaked through old snapshot", status)
+
+        status, big_tree, _ = self._tree(repo, big_snapshot)
+        assert status == 200, (status, big_tree)
+        big_retained = self._tree_item(big_tree, "big.bin")
+        status, big_blob, _ = self._blob(repo, big_snapshot, big_retained["oid"])
+        assert status == 413, ("oversized retained blob was not bounded", status, big_blob)
+
+        self.no_bare(repo, "after retained historical tree/blob")
+        assert self._ledger(repo) == baseline, "historical tree/blob reads changed durable metadata"
+        return {
+            "snapshot_id": snapshot,
+            "old_oid": old_oid,
+            "new_oid": new_oid,
+            "historical_base_oid": base["oid"],
+            "historical_base_bytes": old_blob["content"],
+            "current_advance_oid": advance["oid"],
+            "new_commit_outside_old_closure": True,
+            "oversized_blob_status": 413,
+            "metadata_complete_git_read_snapshot": False,
+        }
+
+    def snapshot_http_historical_tree_blob_auth_and_state_refusals(self):
+        repo, _remote, work, old_oid = self.seed("snap-browse-refusals")
+        active = self._create(repo, "browse-active", 300)
+        assert active[0] == 201, active
+        active_snapshot = active[1]["snapshot_id"]
+
+        new_oid = self.commit_files(work, "browse ref advance", {"advance.txt": "advance refusal\n"})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+        status, current_tree, _ = self._current_tree(repo)
+        assert status == 200, (status, current_tree)
+        advance = self._tree_item(current_tree, "advance.txt")
+
+        released = self._create(repo, "browse-released", 300)[1]["snapshot_id"]
+        status, released_view, _ = self._release(repo, released, "browse-release", 1)
+        assert status == 200 and released_view["released_at_unix_micros"] is not None, (status, released_view)
+        expired = self._create(repo, "browse-expired", 1)[1]
+        self._await_pin_expiry(repo, expired["pin_id"], "browse-expired")
+        expired_snapshot = expired["snapshot_id"]
+        baseline = self._ledger(repo)
+
+        status, reader_tree, _ = self._tree(repo, active_snapshot, oid=old_oid, token=self.reader)
+        assert status == 200, (status, reader_tree)
+        self._assert_tree_view(reader_tree)
+
+        status, _, _ = self._tree(repo, active_snapshot, token=self.bob)
+        assert status == 404, "non-member tree read was not denied"
+        status, _, _ = self._blob(repo, active_snapshot, old_oid, token=self.bob)
+        assert status == 404, "non-member blob read was not denied"
+        self._insert_write_collaborator(repo, self.bob["user_id"])
+        status, _, _ = self._tree(repo, active_snapshot, token=self.bob)
+        assert status == 403, "write collaborator tree read was not denied"
+        status, _, _ = self._blob(repo, active_snapshot, old_oid, token=self.bob)
+        assert status == 403, "write collaborator blob read was not denied"
+
+        scoped = self._issue_scoped(repo, "browse-scope", ["contents_read", "contents_write"])
+        self._patch_scope(repo, scoped, ["contents_write"])
+        status, _, _ = self._tree(repo, active_snapshot, token=scoped)
+        assert status == 403, "missing read scope tree read was not denied"
+        status, _, _ = self._blob(repo, active_snapshot, old_oid, token=scoped)
+        assert status == 403, "missing read scope blob read was not denied"
+
+        other_repo, _other_remote, _other_work, _other_oid = self.seed("snap-browse-other")
+        status, _, _ = self._tree(other_repo, active_snapshot)
+        assert status == 404, "cross-repository retained snapshot was observable"
+        status, _, _ = self._blob(other_repo, active_snapshot, old_oid)
+        assert status == 404, "cross-repository retained snapshot blob was observable"
+
+        status, _, _ = self._tree(repo, released)
+        assert status == 409, "released retained snapshot tree read was not refused"
+        status, _, _ = self._blob(repo, released, old_oid)
+        assert status == 409, "released retained snapshot blob read was not refused"
+        status, _, _ = self._tree(repo, expired_snapshot)
+        assert status == 409, "expired retained snapshot tree read was not refused"
+        status, _, _ = self._blob(repo, expired_snapshot, old_oid)
+        assert status == 409, "expired retained snapshot blob read was not refused"
+
+        status, _, _ = self._tree(repo, active_snapshot, path="../secret")
+        assert status == 400, "malformed retained tree path was accepted"
+        status, _, _ = self._blob(repo, active_snapshot, old_oid, path="../secret")
+        assert status == 400, "malformed retained blob path was accepted"
+        status, _, _ = self._tree(repo, active_snapshot, limit=101)
+        assert status == 400, "out-of-range retained tree limit was accepted"
+        status, _, _ = self._request("GET", self._snapshots_path(repo, "/not-a-uuid/tree"), self.alice)
+        assert status == 400, "malformed retained snapshot selector was accepted"
+
+        status, _, _ = self._tree(repo, active_snapshot, oid=new_oid)
+        assert status == 404, "new commit leaked through active historical tree"
+        status, _, _ = self._blob(repo, active_snapshot, advance["oid"])
+        assert status == 404, "new blob leaked through active historical view"
+
+        self.no_bare(repo, "after retained browse refusals")
+        assert self._ledger(repo) == baseline, "retained browse refusals changed durable metadata"
+        return {
+            "snapshot_id": active_snapshot,
+            "read_only_owner_status": 200,
+            "nonmember_status": 404,
+            "write_collaborator_status": 403,
+            "missing_read_scope_status": 403,
+            "cross_repo_status": 404,
+            "released_status": 409,
+            "expired_status": 409,
+            "outside_closure_status": 404,
+            "malformed_status": 400,
+        }
 
 def select_cases(names):
     if not names:

@@ -217,7 +217,7 @@ fn issue(
         .map_err(|_| GatewayError::Internal("repository session could not be issued"))
 }
 
-fn body_response(
+pub(super) fn body_response(
     bytes: Vec<u8>,
     slot: tokio::sync::OwnedSemaphorePermit,
     lease: ByteLease,

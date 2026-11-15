@@ -97,6 +97,31 @@ pub struct ServingSnapshotRelease {
     pub reason: PinReleaseReason,
 }
 
+/// Opaque retained materialization context for an HTTP content consumer. It
+/// carries the exact T1 snapshot, cluster anchor and absolute deadline from the
+/// one materialization call so a final post-encoding authorization/state fence
+/// can revalidate the same capture. It is not a serving proof, is not Clone or
+/// Serialize, and has no public constructor or capability.
+pub(crate) struct RetainedServingReadContext {
+    view: MaterializedPackRead,
+    cluster_incarnation: Uuid,
+    deadline: Instant,
+}
+
+impl RetainedServingReadContext {
+    pub(crate) fn view(&self) -> &MaterializedPackRead {
+        &self.view
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    fn into_view(self) -> MaterializedPackRead {
+        self.view
+    }
+}
+
 /// Stateless coordinator. It owns the short bounded transaction and the final
 /// late token check; the core adapters own the existing SQL/ledger details.
 #[derive(Clone, Copy, Debug, Default)]
@@ -320,6 +345,21 @@ impl PgServingSnapshotMetadata {
         materializer: &PgPackSnapshotMaterializer,
         deadline: Instant,
     ) -> Result<MaterializedPackRead, Error> {
+        Ok(self.materialize_with_context(pool, actor, input, materializer, deadline).await?.into_view())
+    }
+
+    /// Internal same-flow form that retains the exact T1 capture, cluster anchor
+    /// and effective absolute deadline until the caller's post-encoding final
+    /// fence. The public [`Self::materialize`] API unwraps the view exactly as
+    /// before.
+    pub(crate) async fn materialize_with_context(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRead,
+        materializer: &PgPackSnapshotMaterializer,
+        deadline: Instant,
+    ) -> Result<RetainedServingReadContext, Error> {
         validate_snapshot(input.snapshot_id)?;
         let deadline = materializer.retained_deadline(deadline).map_err(map_metadata_error)?;
         let backend = materializer.backend_identity();
@@ -356,7 +396,7 @@ impl PgServingSnapshotMetadata {
             Ok(result) => result.map_err(map_metadata_error)?,
             Err(_) => return Err(deadline_error()),
         };
-        retained_t2(
+        let view = retained_t2(
             pool,
             actor,
             repository_id,
@@ -364,6 +404,63 @@ impl PgServingSnapshotMetadata {
             &name,
             &reference,
             prepared,
+            materializer,
+            backend,
+            deadline,
+        )
+        .await?;
+        Ok(RetainedServingReadContext { view, cluster_incarnation, deadline })
+    }
+
+    /// Strict final fence for a retained HTTP content read: after the caller has
+    /// fully read content and encoded its bounded JSON body, re-derive the same
+    /// authorized repository and re-read the exact stored capture in one fresh
+    /// transaction. Current Admin/ContentsRead, ready binding/backend/gate,
+    /// T1 cluster anchor and fresh pin liveness must all still match. The value
+    /// is returned only when that transaction's bounded rollback succeeds.
+    pub(crate) async fn finalize_materialized(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: &ServingSnapshotRead,
+        context: RetainedServingReadContext,
+        materializer: &PgPackSnapshotMaterializer,
+    ) -> Result<MaterializedPackRead, Error> {
+        validate_snapshot(input.snapshot_id)?;
+        let deadline = context.deadline;
+        let backend = materializer.backend_identity();
+        let initial = match timeout_at(
+            deadline,
+            preflight(pool, actor, &input.owner, &input.name, false, backend, deadline),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(deadline_error()),
+        };
+        let view = context.view();
+        if input.snapshot_id != view.snapshot_id()
+            || initial.repository.id != view.repository_id()
+            || initial.gate.tenant_id() != view.tenant_id()
+        {
+            return Err(Error(StatusCode::CONFLICT, "snapshot metadata scope changed"));
+        }
+        let reference = PackSnapshotRef::new(
+            view.repository_id(),
+            view.tenant_id(),
+            view.snapshot_id(),
+            view.pin_id(),
+            view.pin_generation(),
+        )
+        .map_err(map_metadata_error)?;
+        retained_finalize_context(
+            pool,
+            actor,
+            initial.repository.id,
+            initial.gate.tenant_id(),
+            &initial.repository.name,
+            &reference,
+            context,
             materializer,
             backend,
             deadline,
@@ -771,6 +868,118 @@ async fn retained_t2(
                 .await
                 .map_err(map_metadata_error)?;
             prepared.finish(fresh).map_err(map_metadata_error)
+        },
+    )
+    .await;
+    let observed = match observed {
+        Ok(result) => result,
+        Err(_) => Err(deadline_error()),
+    };
+    let cleanup = timeout_at(deadline, tx.rollback()).await;
+    match (observed, cleanup) {
+        (Ok(view), Ok(Ok(()))) => Ok(view),
+        (_, Ok(Err(_))) | (_, Err(_)) => Err(retained_cleanup_error()),
+        (Err(error), Ok(Ok(()))) => Err(error),
+    }
+}
+
+/// Final post-encoding fence for an already materialized retained view. It
+/// reuses the same fresh authorized read and pin-liveness checks as T2 but does
+/// not re-run native work or construct a second view.
+#[allow(clippy::too_many_arguments)]
+async fn retained_finalize_context(
+    pool: &Pool,
+    actor: &Identity,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    name: &str,
+    reference: &PackSnapshotRef,
+    context: RetainedServingReadContext,
+    materializer: &PgPackSnapshotMaterializer,
+    backend: &BlobBackendIdentity,
+    deadline: Instant,
+) -> Result<MaterializedPackRead, Error> {
+    let RetainedServingReadContext { view, cluster_incarnation, .. } = context;
+    let mut client = acquire(pool, deadline).await?;
+    let tx = begin_owned(&mut client, deadline).await?;
+    let observed = timeout_at(
+        deadline,
+        async {
+            let expected_scope = *view.snapshot().scope();
+            serving_admin_gate(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                name,
+                backend,
+                Some(&expected_scope),
+                false,
+                deadline,
+            )
+            .await?;
+            let fresh = match PgPackSnapshot
+                .read_serving_by_snapshot(
+                    &tx,
+                    repository_id,
+                    tenant_id,
+                    reference.snapshot_id(),
+                    backend.as_hex(),
+                    deadline,
+                )
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Err(authorize_failure(
+                        &tx,
+                        actor,
+                        repository_id,
+                        tenant_id,
+                        name,
+                        RepoAction::ContentsRead,
+                        backend,
+                        Some(&expected_scope),
+                        false,
+                        error,
+                        deadline,
+                    )
+                    .await);
+                }
+            };
+            let (_, current_cluster) = final_authority_with_cluster(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                name,
+                RepoAction::ContentsRead,
+                backend,
+                Some(&expected_scope),
+                false,
+                deadline,
+            )
+            .await?;
+            if current_cluster != cluster_incarnation {
+                return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch(
+                    "cluster authority incarnation",
+                )));
+            }
+            materializer
+                .ensure_retained_serving_live(&tx, reference, &fresh, deadline)
+                .await
+                .map_err(map_metadata_error)?;
+            if fresh != *view.snapshot() {
+                return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch(
+                    "retained serving snapshot",
+                )));
+            }
+            if fresh.materialization_digest() != view.proven_binding() {
+                return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch(
+                    "retained serving binding",
+                )));
+            }
+            Ok(view)
         },
     )
     .await;

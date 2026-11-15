@@ -22,7 +22,27 @@ An older pinned revision may remain readable after a newer commit in the same cu
 2. The same private native engine downloads and verifies every captured pack/index outside every PostgreSQL lease.
 3. T2 is a fresh authorized transaction in the same absolute deadline: current Admin/ContentsRead, exact stored capture equality, current ready binding/backend/gate realm, the captured cluster incarnation, a fresh database-clock pin generation/expiry check, and the complete A5b binding comparison with the native closure. No value exists unless T2 cleanup succeeds.
 
-The retained result is `MaterializedPackRead` with no serving proof anchor/session/HWM; it cannot be converted into a transient `MaterializedServingRead` or `VerifiedReadViewProof`. HTTP historical tree/blob resources remain a later checkpoint.
+The retained result is `MaterializedPackRead` with no serving proof anchor/session/HWM; it cannot be converted into a transient `MaterializedServingRead` or `VerifiedReadViewProof`.
+
+## Retained snapshot HTTP content
+
+The opt-in serve-blob gateway exposes only snapshot-scoped
+`GET /api/repos/{owner}/{name}/snapshots/{snapshot}/tree` and
+`GET /api/repos/{owner}/{name}/snapshots/{snapshot}/blob/{oid}`. They reuse the
+current Browse query/path/limit/after/full-OID validation, captured-ref
+reachability (`rev-list --objects --all`), tree/blob rendering and bounded JSON
+encoder. The full OID path is admitted only inside the captured historical ref
+closure; current refs, loose objects, GitFS/Pando and local paths are never
+fallbacks.
+
+The handlers retain the opaque T1 context (exact capture + cluster anchor +
+absolute deadline) through the private Git view copy, content read and bounded
+JSON encoding, then run a fresh same-transaction Admin/ContentsRead, exact
+capture/pin/generation/liveness, current ready binding/backend/gate and cluster
+fence before releasing the response. The metadata GET route remains
+metadata-only with `complete_git_read_snapshot=false`. Retained content never
+uses ordinary Browse session finalization; it emits no session token, current
+revision, HWM or #174 proof. Roots remain later work.
 
 ## Resource ownership
 

@@ -32,6 +32,7 @@ const MAX_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
 
 mod session;
+pub(super) mod retained;
 
 pub(super) use session::{BrowseSession, finalize};
 
@@ -233,12 +234,12 @@ fn captured_revision(refs: &[(String, String)], spec: &str) -> Result<String, Ga
 
 async fn run(
     state: &BlobGitState,
-    view: &ComputedView,
+    git: &native::TempGitView,
     args: &[&str],
     ceiling: u64,
     deadline: Instant,
 ) -> Result<Vec<u8>, GatewayError> {
-    let mut command = view.command(state.git_binary());
+    let mut command = git.command(state.git_binary());
     command.args(args);
     let output = native::run_capture(command, None, ceiling, deadline).await?;
     if !output.success {
@@ -249,11 +250,11 @@ async fn run(
 
 async fn resolve(
     state: &BlobGitState,
-    view: &ComputedView,
+    git: &native::TempGitView,
     expression: &str,
     deadline: Instant,
 ) -> Result<String, GatewayError> {
-    let mut command = view.command(state.git_binary());
+    let mut command = git.command(state.git_binary());
     command.args(["rev-parse", "--verify", "--quiet", "--end-of-options", expression]);
     let output = native::run_capture(command, None, 128, deadline).await?;
     if !output.success {
@@ -269,28 +270,28 @@ async fn resolve(
 
 async fn require_type(
     state: &BlobGitState,
-    view: &ComputedView,
+    git: &native::TempGitView,
     oid: &str,
     expected: &str,
     deadline: Instant,
 ) -> Result<(), GatewayError> {
-    let kind = run(state, view, &["cat-file", "-t", oid], 64, deadline).await?;
+    let kind = run(state, git, &["cat-file", "-t", oid], 64, deadline).await?;
     if kind.strip_suffix(b"\n") == Some(expected.as_bytes()) { Ok(()) } else { Err(GatewayError::NotFound) }
 }
 
 async fn root_oid(
     state: &BlobGitState,
-    view: &ComputedView,
+    git: &native::TempGitView,
     spec: &str,
     memory: u64,
     deadline: Instant,
 ) -> Result<String, GatewayError> {
     if models::valid_non_zero_oid(spec) {
-        reachable(state, view, spec, memory, deadline).await?;
+        reachable(state, git, spec, memory, deadline).await?;
     }
     // Peel annotated tags, including tags of tags, before resolving a path.
-    let oid = resolve(state, view, &format!("{spec}^{{}}"), deadline).await?;
-    let kind = run(state, view, &["cat-file", "-t", &oid], 64, deadline).await?;
+    let oid = resolve(state, git, &format!("{spec}^{{}}"), deadline).await?;
+    let kind = run(state, git, &["cat-file", "-t", &oid], 64, deadline).await?;
     if kind != b"commit\n" && kind != b"tree\n" {
         return Err(GatewayError::NotFound);
     }
@@ -299,7 +300,7 @@ async fn root_oid(
 
 async fn reachable(
     state: &BlobGitState,
-    view: &ComputedView,
+    git: &native::TempGitView,
     oid: &str,
     memory: u64,
     deadline: Instant,
@@ -307,7 +308,7 @@ async fn reachable(
     // Registered packs may also contain unreferenced objects. Knowing a full
     // object id never authorizes browsing those bytes. Only this captured ref
     // closure admits direct object-id reads, including reachable history.
-    let raw = run(state, view, &["rev-list", "--objects", "--all", "--no-object-names"], memory / 2, deadline).await?;
+    let raw = run(state, git, &["rev-list", "--objects", "--all", "--no-object-names"], memory / 2, deadline).await?;
     if raw.split(|byte| *byte == b'\n').any(|line| line == oid.as_bytes()) {
         Ok(())
     } else {

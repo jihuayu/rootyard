@@ -77,6 +77,7 @@ pub use snapshot_metadata::{
     PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead, ServingSnapshotRelease,
     ServingSnapshotRenew,
 };
+pub(crate) use snapshot_metadata::RetainedServingReadContext;
 pub use authority::lookup;
 pub(crate) use authority::lookup_in_tx;
 
