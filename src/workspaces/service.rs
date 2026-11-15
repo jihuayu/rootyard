@@ -389,12 +389,21 @@ pub async fn create(
         {
             return Err(conflict());
         }
+        if head.is_none() {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "only committed SHA-1 repositories (branch or detached HEAD) are supported in workspaces",
+            ));
+        }
+        let tree_listing = git(&state, &dest, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"], 8 * 1024 * 1024).await?;
+        super::compat::validate_tree_listing_no_gitlinks(&tree_listing)?;
         let base_oid = input.base_oid.clone().or(head);
         let dest_fp = dest.clone();
         let initial_fingerprint = super::blocking::run_mutating(&mutation, move |abandoned, _fence| {
             if abandoned.is_abandoned() {
                 return Err(Error::timeout());
             }
+            super::compat::validate_repo(&dest_fp)?;
             super::capture::fingerprint(&dest_fp)
         })
         .await?;

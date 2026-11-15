@@ -434,6 +434,7 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
             if actual != expected {
                 return Err(Error::internal("remote checkpoint inventory mismatch"));
             }
+            super::compat::validate_repo(&root)?;
             core::sync_tree(&root).map_err(Error::internal)?;
             if let Some(parent) = final_path.parent() {
                 fs::create_dir_all(parent).map_err(Error::internal)?;

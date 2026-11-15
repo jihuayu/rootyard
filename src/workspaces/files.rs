@@ -212,6 +212,10 @@ async fn put_mutation(
     }
 
     // Phase 2: capture rollback state (direct + FUSE), write atomically, and compute baseline.
+    let normalized = crate::browse::models::normalize_rel_path(Some(&raw_path))?;
+    if super::compat::is_gitattributes_path(&normalized) {
+        super::compat::validate_gitattributes_bytes(&bytes, true)?;
+    }
     let repo = service::workspace_repo(&state, id);
     let upper_root = upper_fallback_root(&state, id);
     let path_arg = raw_path.clone();
@@ -413,6 +417,11 @@ async fn git_mutation(
     let scanned = match super::blocking::run_mutating(&mutation, move |abandoned, _fence| {
         if abandoned.is_abandoned() {
             return Err(Error::timeout());
+        }
+        if let Some(raw) = super::snapshot::Raw::load(&repo_fp)? {
+            super::compat::validate_raw(&raw)?;
+        } else {
+            super::compat::validate_repo(&repo_fp)?;
         }
         super::capture::fingerprint(&repo_fp)
     })
