@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import traceback
 import urllib.parse
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -38,14 +39,15 @@ class OrganizationLifecycleHarness(BackupHarness, BrowserHarness):
             pages += 1
             items.extend(page["items"])
             next_cursor = page["next_cursor"]
-            header_cursor = self.response_header(headers, "x-next-cursor")
+            headers_ci = {key.lower(): value for key, value in headers.items()}
+            header_cursor = headers_ci.get("x-next-cursor")
             if next_cursor is None:
                 assert not page["truncated"], page
                 assert header_cursor is None, header_cursor
                 break
             assert page["truncated"], page
             assert header_cursor == next_cursor, (header_cursor, next_cursor)
-            link = self.response_header(headers, "link") or ""
+            link = headers_ci.get("link") or ""
             assert 'rel="next"' in link and urllib.parse.quote(next_cursor, safe="") in link, link
             assert next_cursor not in seen_cursors
             seen_cursors.add(next_cursor)
@@ -501,8 +503,8 @@ def main():
         ]:
             h.case(name, fn)
         passed = True
-    except Exception as exc:
-        print(h.redact(exc), file=sys.stderr)
+    except Exception:
+        print(h.redact(traceback.format_exc()), file=sys.stderr)
     finally:
         try:
             h.cleanup()
