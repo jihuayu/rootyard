@@ -156,7 +156,8 @@ impl PgServingRetentionRoots {
         validate_intent(&input.intent)?;
         let deadline = root_deadline(deadline)?;
         let repo = self.preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsWrite, deadline).await?;
-        let derived = derive_intent(&repo.gate, &input.intent)?;
+        let gate = repo.gate()?;
+        let derived = derive_intent(gate, &input.intent)?;
         let scope = root_scope(&repo, input.intent.purpose, &derived.business_intent)?;
 
         // Exact create replay lives entirely on retained root/receipt rows and
@@ -168,10 +169,10 @@ impl PgServingRetentionRoots {
 
         let source = self.source_snapshot(pool, actor, &repo, &scope, &input.intent, deadline).await?;
         let format = source.scope().object_format();
-        if format != repo.gate.object_format()
-            || source.scope().history_incarnation() != repo.gate.history_incarnation()
-            || source.scope().authority_epoch() != repo.gate.authority_epoch()
-            || source.scope().group_epoch() != repo.gate.group_epoch()
+        if format != gate.object_format()
+            || source.scope().history_incarnation() != gate.history_incarnation()
+            || source.scope().authority_epoch() != gate.authority_epoch()
+            || source.scope().group_epoch() != gate.group_epoch()
             || source.scope().tenant_id() != repo.tenant_id
             || source.scope().owner_id() != repo.tenant_id
         {
@@ -184,7 +185,7 @@ impl PgServingRetentionRoots {
             source.pin_id(),
             source.pin_generation(),
         )
-        .map_err(map_root_error)?;
+        .map_err(|error| map_root_error(error.into()))?;
         let request = PrepareRootRequest::new(
             scope,
             reference,
@@ -307,7 +308,7 @@ impl PgServingRetentionRoots {
             }
             ServingRootReleaseTarget::Absent { root_id, create } => {
                 validate_intent(&create)?;
-                let derived = derive_intent(&repo.gate, &create)?;
+                let derived = derive_intent(repo.gate()?, &create)?;
                 if derived.root_id != root_id {
                     return Err(Error::not_found());
                 }
@@ -317,7 +318,7 @@ impl PgServingRetentionRoots {
             }
             ServingRootReleaseTarget::ByIntent { create } => {
                 validate_intent(&create)?;
-                let derived = derive_intent(&repo.gate, &create)?;
+                let derived = derive_intent(repo.gate()?, &create)?;
                 let scope = root_scope(&repo, create.purpose, &derived.business_intent)?;
                 // Reuse the create exact-intent probe. A changed source/selector/
                 // purpose under this create key conflicts here after the probe's
@@ -673,7 +674,7 @@ impl PgServingRetentionRoots {
             source.pin_id(),
             source.pin_generation(),
         )
-        .map_err(map_root_error)?;
+        .map_err(|error| map_root_error(error.into()))?;
         let operation_digest = prepare_request_digest(
             *scope,
             reference,
