@@ -78,11 +78,15 @@ pub struct ServingRootRead {
 
 /// Release target. `Existing` names an already retained root. `Absent` carries
 /// the bounded original create intent for a release-before-register tombstone;
-/// the path root id must equal the server-derived id.
+/// the path root id must equal the server-derived id. `ByIntent` carries only
+/// the original create intent: the facade derives the root id and first probes
+/// retained rows so an already-created exact root can be released and a changed
+/// intent under the same key conflicts without touching that root.
 #[derive(Clone, Debug)]
 pub enum ServingRootReleaseTarget {
     Existing { root_id: Uuid },
     Absent { root_id: Uuid, create: ServingRootIntent },
+    ByIntent { create: ServingRootIntent },
 }
 
 /// Authorized one-way release input.
@@ -321,7 +325,48 @@ impl PgServingRetentionRoots {
                     return Err(Error::not_found());
                 }
                 let scope = root_scope(&repo, create.purpose, &derived.business_intent)?;
-                self.release_absent(pool, actor, &repo, root_id, &create, &derived, &scope, &input, deadline).await
+                self.release_absent(
+                    pool,
+                    actor,
+                    &repo,
+                    root_id,
+                    &create,
+                    &derived,
+                    &scope,
+                    &input,
+                    deadline,
+                    false,
+                )
+                .await
+            }
+            ServingRootReleaseTarget::ByIntent { create } => {
+                validate_intent(&create)?;
+                let derived = derive_intent(&repo.gate, &create)?;
+                let scope = root_scope(&repo, create.purpose, &derived.business_intent)?;
+                // Reuse the create exact-intent probe. A changed source/selector/
+                // purpose under this create key conflicts here after the probe's
+                // final ContentsWrite check and never touches an existing root.
+                if self
+                    .replay_create(pool, actor, &repo, &scope, &create, &derived, deadline)
+                    .await?
+                    .is_some()
+                {
+                    self.release_existing(pool, actor, &repo, derived.root_id, &input, deadline).await
+                } else {
+                    self.release_absent(
+                        pool,
+                        actor,
+                        &repo,
+                        derived.root_id,
+                        &create,
+                        &derived,
+                        &scope,
+                        &input,
+                        deadline,
+                        true,
+                    )
+                    .await
+                }
             }
         }
     }
@@ -634,6 +679,7 @@ impl PgServingRetentionRoots {
         scope: &RootsScope,
         input: &ServingRootRelease,
         deadline: Instant,
+        recheck_existing_on_metadata_miss: bool,
     ) -> Result<RootReceipt, Error> {
         let release_digest =
             derive_release_digest(repo.repository_id, root_id, &input.idempotency_key, &input.reason);
@@ -660,7 +706,29 @@ impl PgServingRetentionRoots {
         // Load the original authorized A5 metadata data-only. This proves the
         // stored snapshot/ref/pack rows and current serving realm/backend, but it
         // does not require the source pin to be live.
-        let source = self.stored_source_snapshot(pool, actor, repo, scope, create, deadline).await?;
+        let source = match self.stored_source_snapshot(pool, actor, repo, scope, create, deadline).await {
+            Ok(source) => source,
+            Err(error) => {
+                // A concurrent exact create may have committed after the ByIntent
+                // probe. If its source snapshot then disappeared, retained root
+                // rows still make the existing release path usable. This narrow
+                // recheck is only for a genuine source-metadata not-found and does
+                // not mask auth/scope/backend/realm/commit failures or renew the
+                // deadline.
+                if recheck_existing_on_metadata_miss && error.0 == StatusCode::NOT_FOUND {
+                    if self
+                        .replay_create(pool, actor, repo, scope, create, derived, deadline)
+                        .await?
+                        .is_some()
+                    {
+                        return self
+                            .release_existing(pool, actor, repo, derived.root_id, input, deadline)
+                            .await;
+                    }
+                }
+                return Err(error);
+            }
+        };
         let reference = PackSnapshotRef::new(
             repo.repository_id,
             repo.tenant_id,

@@ -428,3 +428,178 @@ async fn concurrent_exact_create_replay_is_source_pin_independent() -> Result<()
     .await;
     db.finish(outcome).await
 }
+
+#[tokio::test]
+#[ignore = "requires real PG/S3/Git and the integrated roots/serving modules"]
+async fn release_by_intent_releases_existing_root_after_source_pin_release() -> Result<()> {
+    let db = Db::setup().await?;
+    let store = open_store()?;
+    let git = git_binary()?;
+    let outcome = async {
+        let (verified, actor, repository) =
+            verify_new_serving(&db, &store, &git, "coord-release-by-intent").await?;
+        let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
+        let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
+        let create = create_input(&repository.owner, &repository.name, source.snapshot_id, "coord-by-intent");
+        let receipt = facade.create(&db.pool, &actor, create.clone(), deadline()).await?;
+        roots::release_serving_source(
+            &PgServingSnapshotMetadata,
+            &db.pool,
+            &actor,
+            &store,
+            &repository,
+            &source,
+            deadline(),
+        )
+        .await?;
+        let release = ServingRootRelease {
+            owner: repository.owner.clone(),
+            name: repository.name.clone(),
+            target: ServingRootReleaseTarget::ByIntent { create: create.intent.clone() },
+            idempotency_key: "coord-by-intent-release".to_owned(),
+            reason: "release existing by original intent".to_owned(),
+        };
+        let released = facade.release(&db.pool, &actor, release.clone(), deadline()).await?;
+        ensure!(released.state() == "released" && released.root_id() == receipt.root_id(), "by-intent existing release differs");
+        let counts = root_counts(&db.pool, verified.repo).await?;
+        let usage = repo_usage(&db.pool, verified.repo).await?;
+        let replay = facade.release(&db.pool, &actor, release, deadline()).await?;
+        ensure!(replay.replayed() && replay.state() == "released", "by-intent release replay differs");
+        ensure!(root_counts(&db.pool, verified.repo).await? == counts, "by-intent release replay changed root rows");
+        ensure!(repo_usage(&db.pool, verified.repo).await? == usage, "by-intent release replay charged usage");
+        let record = facade
+            .metadata(
+                &db.pool,
+                &actor,
+                read_input(&repository.owner, &repository.name, receipt.root_id()),
+                deadline(),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("released by-intent root metadata missing"))?;
+        ensure!(record.state() == "released", "by-intent root metadata is not released");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires real PG/S3/Git and the integrated roots/serving modules"]
+async fn release_by_intent_tombstone_replays_before_source_metadata() -> Result<()> {
+    let db = Db::setup().await?;
+    let store = open_store()?;
+    let git = git_binary()?;
+    let outcome = async {
+        let (verified, actor, repository) =
+            verify_new_serving(&db, &store, &git, "coord-release-intent-tombstone").await?;
+        let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
+        let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
+        let create = create_input(
+            &repository.owner,
+            &repository.name,
+            source.snapshot_id,
+            "coord-intent-tombstone",
+        );
+        let release = ServingRootRelease {
+            owner: repository.owner.clone(),
+            name: repository.name.clone(),
+            target: ServingRootReleaseTarget::ByIntent { create: create.intent.clone() },
+            idempotency_key: "coord-intent-tombstone-release".to_owned(),
+            reason: "release before any register".to_owned(),
+        };
+        let first = facade.release(&db.pool, &actor, release.clone(), deadline()).await?;
+        ensure!(first.state() == "released", "pre-register by-intent release state differs");
+        let counts = root_counts(&db.pool, verified.repo).await?;
+        ensure!(
+            counts.heads == 1 && counts.captures == 0 && counts.receipts == 1,
+            "pre-register by-intent release wrote a capture"
+        );
+        roots::release_serving_source(
+            &PgServingSnapshotMetadata,
+            &db.pool,
+            &actor,
+            &store,
+            &repository,
+            &source,
+            deadline(),
+        )
+        .await?;
+        let replay = facade.release(&db.pool, &actor, release, deadline()).await?;
+        ensure!(replay.replayed() && replay.state() == "released", "pre-register release replay differs");
+        ensure!(
+            root_counts(&db.pool, verified.repo).await? == counts,
+            "pre-register release replay changed rows"
+        );
+        ensure!(
+            facade
+                .metadata(
+                    &db.pool,
+                    &actor,
+                    read_input(&repository.owner, &repository.name, first.root_id()),
+                    deadline(),
+                )
+                .await?
+                .is_none(),
+            "pre-register by-intent release unexpectedly gained a capture"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires real PG/S3/Git and the integrated roots/serving modules"]
+async fn release_by_intent_changed_intent_conflicts_without_touching_root() -> Result<()> {
+    let db = Db::setup().await?;
+    let store = open_store()?;
+    let git = git_binary()?;
+    let outcome = async {
+        let (verified, actor, repository) =
+            verify_new_serving(&db, &store, &git, "coord-release-intent-conflict").await?;
+        let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
+        let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
+        let create = create_input(
+            &repository.owner,
+            &repository.name,
+            source.snapshot_id,
+            "coord-intent-conflict",
+        );
+        let receipt = facade.create(&db.pool, &actor, create.clone(), deadline()).await?;
+        let counts = root_counts(&db.pool, verified.repo).await?;
+        let usage = repo_usage(&db.pool, verified.repo).await?;
+        let mut changed = create.intent.clone();
+        changed.purpose = RootPurpose::Workspace;
+        let error = facade
+            .release(
+                &db.pool,
+                &actor,
+                ServingRootRelease {
+                    owner: repository.owner.clone(),
+                    name: repository.name.clone(),
+                    target: ServingRootReleaseTarget::ByIntent { create: changed },
+                    idempotency_key: "coord-intent-conflict-release".to_owned(),
+                    reason: "changed original intent".to_owned(),
+                },
+                deadline(),
+            )
+            .await
+            .expect_err("changed by-intent release was accepted");
+        ensure!(error.0 == StatusCode::CONFLICT, "changed by-intent release returned the wrong status: {error:?}");
+        ensure!(root_counts(&db.pool, verified.repo).await? == counts, "changed by-intent release changed root rows");
+        ensure!(repo_usage(&db.pool, verified.repo).await? == usage, "changed by-intent release charged usage");
+        let record = facade
+            .metadata(
+                &db.pool,
+                &actor,
+                read_input(&repository.owner, &repository.name, receipt.root_id()),
+                deadline(),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("existing root disappeared after changed-intent release"))?;
+        ensure!(record.is_active(), "changed by-intent release released the existing root");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
