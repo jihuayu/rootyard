@@ -9,8 +9,8 @@ use base64::Engine as _;
 use deadpool_postgres::{Manager, Pool};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::db;
-use rootyard::ref_store::serving::{ProvisionRequest, provision};
 use rootyard::ref_store::core::PgRefStoreCore;
+use rootyard::ref_store::serving::{ProvisionRequest, provision};
 use rootyard::ref_store::{CoreGateInit, CoreGateVersion, GitObjectFormat, RefName, VersionCheck};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -77,8 +77,11 @@ pub async fn serving_actor_with_scopes(
 ) -> Result<db::Identity> {
     let username = format!("{label}{}", Uuid::new_v4().simple());
     let issued = db::issue_token(pool, &username, true, false).await?;
-    let token_id: Uuid = issued["token_id"].as_str().ok_or_else(|| anyhow!("issued token has no id"))?
-        .parse().map_err(|_| anyhow!("issued token id is invalid"))?;
+    let token_id: Uuid = issued["token_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("issued token has no id"))?
+        .parse()
+        .map_err(|_| anyhow!("issued token id is invalid"))?;
     let username = issued["username"].as_str().ok_or_else(|| anyhow!("issued token has no username"))?;
     let secret = issued["token"].as_str().ok_or_else(|| anyhow!("issued token has no secret"))?;
     let client = pool.get().await?;
@@ -106,13 +109,7 @@ pub async fn serving_actor_with_scopes(
 /// A real collaborator identity with an initial role metadata row. Role rows are
 /// fixture inputs because the public collaborator transport is outside this
 /// core-lane checkpoint.
-pub async fn grant_collaborator(
-    pool: &Pool,
-    repo_id: Uuid,
-    tenant_id: Uuid,
-    user_id: Uuid,
-    role: &str,
-) -> Result<()> {
+pub async fn grant_collaborator(pool: &Pool, repo_id: Uuid, tenant_id: Uuid, user_id: Uuid, role: &str) -> Result<()> {
     pool.get()
         .await?
         .execute(
@@ -153,13 +150,7 @@ pub async fn set_collaborator_role(pool: &Pool, repo_id: Uuid, user_id: Uuid, ro
 pub async fn revoke_scope(pool: &Pool, identity: &db::Identity, repo_id: Uuid) -> Result<()> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    let removed = rootyard::token_scopes::revoke_repository_scope(
-        &tx,
-        identity.token_id,
-        identity.id,
-        repo_id,
-    )
-    .await?;
+    let removed = rootyard::token_scopes::revoke_repository_scope(&tx, identity.token_id, identity.id, repo_id).await?;
     ensure!(removed, "restricted token scope was not present");
     tx.commit().await?;
     Ok(())

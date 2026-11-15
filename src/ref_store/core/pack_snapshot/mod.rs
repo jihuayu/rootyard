@@ -109,8 +109,8 @@ pub use contract::{
     TENANT_MAX_PACK_SNAPSHOTS, TENANT_PACK_FACTOR,
 };
 pub(crate) use materialize::MaterializedServingRead;
-pub use materialize::{MaterializedPackRead, PgPackSnapshotMaterializer};
 pub(crate) use materialize::RetainedServingPreparation;
+pub use materialize::{MaterializedPackRead, PgPackSnapshotMaterializer};
 pub use pg::PgPackSnapshot;
 pub use read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
 pub use receipt::{PackPinReceipt, PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceipt};

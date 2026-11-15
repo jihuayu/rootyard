@@ -73,19 +73,18 @@ mod retention_roots;
 mod snapshot_metadata;
 
 pub(crate) use authority::AuthorityKind;
+pub use authority::lookup;
+pub(crate) use authority::lookup_in_tx;
 pub use check_version::check_version;
-pub use snapshot_metadata::{
-    PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead, ServingSnapshotRelease,
-    ServingSnapshotRenew,
-};
-pub(crate) use snapshot_metadata::RetainedServingReadContext;
+pub(crate) use retention_roots::ServingRetainedRootReadContext;
 pub use retention_roots::{
     PgServingRetentionRoots, ServingRootCreate, ServingRootIntent, ServingRootRead, ServingRootRelease,
     ServingRootReleaseTarget,
 };
-pub(crate) use retention_roots::ServingRetainedRootReadContext;
-pub use authority::lookup;
-pub(crate) use authority::lookup_in_tx;
+pub(crate) use snapshot_metadata::RetainedServingReadContext;
+pub use snapshot_metadata::{
+    PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead, ServingSnapshotRelease, ServingSnapshotRenew,
+};
 
 /// Default branch a freshly provisioned core gate starts on.
 const DEFAULT_HEAD_REF: &str = "refs/heads/main";

@@ -22,8 +22,7 @@ use crate::{
     ref_store::{
         CoreGate, MetadataPinPurpose, RefStoreError, RequestDigest,
         core::{
-            MetadataSnapshotScope, PgPackSnapshot, PgRefStoreCore,
-            PackReadSnapshot, PackSnapshotRef,
+            MetadataSnapshotScope, PackReadSnapshot, PackSnapshotRef, PgPackSnapshot, PgRefStoreCore,
             retention_root::{
                 PgRetentionRoots, PrepareRootRequest, REGISTER_REQUEST_DIGEST_DOMAIN, ReleaseRootRequest,
                 RootCandidate, RootError, RootPurpose, RootReadView, RootReceipt, RootRecord, RootRef, RootSelector,
@@ -156,17 +155,13 @@ impl PgServingRetentionRoots {
         validate_owner_name(&input.owner, &input.name)?;
         validate_intent(&input.intent)?;
         let deadline = root_deadline(deadline)?;
-        let repo = self
-            .preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsWrite, deadline)
-            .await?;
+        let repo = self.preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsWrite, deadline).await?;
         let derived = derive_intent(&repo.gate, &input.intent)?;
         let scope = root_scope(&repo, input.intent.purpose, &derived.business_intent)?;
 
         // Exact create replay lives entirely on retained root/receipt rows and
         // runs before source pin/snapshot lookup or native work.
-        if let Some(receipt) = self
-            .replay_create(pool, actor, &repo, &scope, &input.intent, &derived, deadline)
-            .await?
+        if let Some(receipt) = self.replay_create(pool, actor, &repo, &scope, &input.intent, &derived, deadline).await?
         {
             return Ok(receipt);
         }
@@ -205,9 +200,9 @@ impl PgServingRetentionRoots {
         }
         let reference = *candidate.reference();
         let expected_scope = *candidate.scope();
-        let expected_cluster = candidate.serving_cluster_incarnation().ok_or_else(|| {
-            Error::internal("serving root candidate lost its cluster anchor")
-        })?;
+        let expected_cluster = candidate
+            .serving_cluster_incarnation()
+            .ok_or_else(|| Error::internal("serving root candidate lost its cluster anchor"))?;
         let request_digest = register_request_digest(&candidate, derived.register_request_id);
 
         let mut client = super::acquire(pool, deadline).await?;
@@ -220,13 +215,7 @@ impl PgServingRetentionRoots {
         let outcome = timeout_at(deadline, async {
             let receipt = match self
                 .roots
-                .register_serving_in_tx(
-                    &tx,
-                    &candidate,
-                    derived.register_request_id,
-                    request_digest,
-                    deadline,
-                )
+                .register_serving_in_tx(&tx, &candidate, derived.register_request_id, request_digest, deadline)
                 .await
             {
                 Ok(receipt) => receipt,
@@ -307,9 +296,7 @@ impl PgServingRetentionRoots {
         validate_key(&input.idempotency_key)?;
         validate_reason(&input.reason)?;
         let deadline = root_deadline(deadline)?;
-        let repo = self
-            .preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsWrite, deadline)
-            .await?;
+        let repo = self.preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsWrite, deadline).await?;
 
         match input.target.clone() {
             ServingRootReleaseTarget::Existing { root_id } => {
@@ -325,19 +312,8 @@ impl PgServingRetentionRoots {
                     return Err(Error::not_found());
                 }
                 let scope = root_scope(&repo, create.purpose, &derived.business_intent)?;
-                self.release_absent(
-                    pool,
-                    actor,
-                    &repo,
-                    root_id,
-                    &create,
-                    &derived,
-                    &scope,
-                    &input,
-                    deadline,
-                    false,
-                )
-                .await
+                self.release_absent(pool, actor, &repo, root_id, &create, &derived, &scope, &input, deadline, false)
+                    .await
             }
             ServingRootReleaseTarget::ByIntent { create } => {
                 validate_intent(&create)?;
@@ -346,11 +322,7 @@ impl PgServingRetentionRoots {
                 // Reuse the create exact-intent probe. A changed source/selector/
                 // purpose under this create key conflicts here after the probe's
                 // final ContentsWrite check and never touches an existing root.
-                if self
-                    .replay_create(pool, actor, &repo, &scope, &create, &derived, deadline)
-                    .await?
-                    .is_some()
-                {
+                if self.replay_create(pool, actor, &repo, &scope, &create, &derived, deadline).await?.is_some() {
                     self.release_existing(pool, actor, &repo, derived.root_id, &input, deadline).await
                 } else {
                     self.release_absent(
@@ -383,9 +355,7 @@ impl PgServingRetentionRoots {
         validate_owner_name(&input.owner, &input.name)?;
         validate_root_id(input.root_id)?;
         let deadline = root_deadline(deadline)?;
-        let repo = self
-            .preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsRead, deadline)
-            .await?;
+        let repo = self.preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsRead, deadline).await?;
         let root = RootRef::new(repo.repository_id, input.root_id, 1).map_err(map_root_error)?;
         let mut client = super::acquire(pool, deadline).await?;
         let tx = super::begin_owned(&mut client, deadline).await?;
@@ -471,9 +441,7 @@ impl PgServingRetentionRoots {
         validate_owner_name(&input.owner, &input.name)?;
         validate_root_id(input.root_id)?;
         let deadline = root_deadline(deadline)?;
-        let repo = self
-            .preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsRead, deadline)
-            .await?;
+        let repo = self.preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsRead, deadline).await?;
         let root = RootRef::new(repo.repository_id, input.root_id, 1).map_err(map_root_error)?;
         let view = match self.roots.materialize_serving(pool, root, deadline).await {
             Ok(view) => view,
@@ -524,18 +492,8 @@ impl PgServingRetentionRoots {
         let expected_binding = RequestDigest::from_str(&view.binding_digest_hex())
             .map_err(|_| Error::internal("retained root binding digest is invalid"))?;
         let expected_cluster = context.cluster_incarnation;
-        self.finish_view_state(
-            pool,
-            actor,
-            &repo,
-            root,
-            &view,
-            &scope,
-            expected_binding,
-            expected_cluster,
-            deadline,
-        )
-        .await?;
+        self.finish_view_state(pool, actor, &repo, root, &view, &scope, expected_binding, expected_cluster, deadline)
+            .await?;
         Ok(view)
     }
 
@@ -597,14 +555,9 @@ impl PgServingRetentionRoots {
                 }
             };
             let scope = root_scope_from_record(&record)?;
-            let release_digest = derive_release_digest(
-                repo.repository_id,
-                root_id,
-                &input.idempotency_key,
-                &input.reason,
-            );
-            let release_request_id =
-                derive_release_request_id(repo.repository_id, root_id, &input.idempotency_key);
+            let release_digest =
+                derive_release_digest(repo.repository_id, root_id, &input.idempotency_key, &input.reason);
+            let release_request_id = derive_release_request_id(repo.repository_id, root_id, &input.idempotency_key);
             let request = ReleaseRootRequest::new(
                 scope,
                 root_id,
@@ -635,17 +588,8 @@ impl PgServingRetentionRoots {
                     };
                 }
             };
-            final_authority_root(
-                &tx,
-                actor,
-                repo,
-                RepoAction::ContentsWrite,
-                &scope,
-                self.backend(),
-                None,
-                deadline,
-            )
-            .await?;
+            final_authority_root(&tx, actor, repo, RepoAction::ContentsWrite, &scope, self.backend(), None, deadline)
+                .await?;
             Ok::<RootReceipt, Error>(receipt)
         })
         .await;
@@ -681,8 +625,7 @@ impl PgServingRetentionRoots {
         deadline: Instant,
         recheck_existing_on_metadata_miss: bool,
     ) -> Result<RootReceipt, Error> {
-        let release_digest =
-            derive_release_digest(repo.repository_id, root_id, &input.idempotency_key, &input.reason);
+        let release_digest = derive_release_digest(repo.repository_id, root_id, &input.idempotency_key, &input.reason);
         let release_request_id = derive_release_request_id(repo.repository_id, root_id, &input.idempotency_key);
 
         // Exact absent-root release replay is source-metadata independent.
@@ -716,14 +659,8 @@ impl PgServingRetentionRoots {
                 // not mask auth/scope/backend/realm/commit failures or renew the
                 // deadline.
                 if recheck_existing_on_metadata_miss && error.0 == StatusCode::NOT_FOUND {
-                    if self
-                        .replay_create(pool, actor, repo, scope, create, derived, deadline)
-                        .await?
-                        .is_some()
-                    {
-                        return self
-                            .release_existing(pool, actor, repo, derived.root_id, input, deadline)
-                            .await;
+                    if self.replay_create(pool, actor, repo, scope, create, derived, deadline).await?.is_some() {
+                        return self.release_existing(pool, actor, repo, derived.root_id, input, deadline).await;
                     }
                 }
                 return Err(error);
@@ -794,17 +731,8 @@ impl PgServingRetentionRoots {
                     };
                 }
             };
-            final_authority_root(
-                &tx,
-                actor,
-                repo,
-                RepoAction::ContentsWrite,
-                scope,
-                self.backend(),
-                None,
-                deadline,
-            )
-            .await?;
+            final_authority_root(&tx, actor, repo, RepoAction::ContentsWrite, scope, self.backend(), None, deadline)
+                .await?;
             Ok::<RootReceipt, Error>(receipt)
         })
         .await;
@@ -845,13 +773,7 @@ impl PgServingRetentionRoots {
             return Err(error);
         }
         let outcome = timeout_at(deadline, async {
-            let replay = PgRetentionRoots::register_replay_in_tx(
-                &tx,
-                scope,
-                root,
-                derived.register_request_id,
-            )
-            .await;
+            let replay = PgRetentionRoots::register_replay_in_tx(&tx, scope, root, derived.register_request_id).await;
             let replay = match replay {
                 Ok(value) => value,
                 Err(error) => {
@@ -876,17 +798,8 @@ impl PgServingRetentionRoots {
                 return Ok::<Option<RootReceipt>, Error>(None);
             };
             let exact = record_matches_intent(&record, repo, input, derived);
-            final_authority_root(
-                &tx,
-                actor,
-                repo,
-                RepoAction::ContentsWrite,
-                scope,
-                self.backend(),
-                None,
-                deadline,
-            )
-            .await?;
+            final_authority_root(&tx, actor, repo, RepoAction::ContentsWrite, scope, self.backend(), None, deadline)
+                .await?;
             if !exact {
                 return Err(Error(
                     StatusCode::CONFLICT,
@@ -930,15 +843,9 @@ impl PgServingRetentionRoots {
             return Err(error);
         }
         let outcome = timeout_at(deadline, async {
-            let replay = PgRetentionRoots::release_replay_in_tx(
-                &tx,
-                scope,
-                release_request_id,
-                root_id,
-                release_digest,
-                reason,
-            )
-            .await;
+            let replay =
+                PgRetentionRoots::release_replay_in_tx(&tx, scope, release_request_id, root_id, release_digest, reason)
+                    .await;
             let replay = match replay {
                 Ok(value) => value,
                 Err(error) => {
@@ -962,17 +869,8 @@ impl PgServingRetentionRoots {
             if replay.is_none() {
                 return Ok::<Option<RootReceipt>, Error>(None);
             }
-            final_authority_root(
-                &tx,
-                actor,
-                repo,
-                RepoAction::ContentsWrite,
-                scope,
-                self.backend(),
-                None,
-                deadline,
-            )
-            .await?;
+            final_authority_root(&tx, actor, repo, RepoAction::ContentsWrite, scope, self.backend(), None, deadline)
+                .await?;
             Ok(replay)
         })
         .await;
@@ -1122,8 +1020,7 @@ impl PgServingRetentionRoots {
         let scope = *view.scope();
         let binding = RequestDigest::from_str(&view.binding_digest_hex())
             .map_err(|_| Error::internal("retained root binding digest is invalid"))?;
-        self.finish_view_state(pool, actor, repo, root, view, &scope, binding, cluster, deadline)
-            .await
+        self.finish_view_state(pool, actor, repo, root, view, &scope, binding, cluster, deadline).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1216,18 +1113,9 @@ impl PgServingRetentionRoots {
         }
         let scope = root_scope_from_gate(repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT)?;
         let outcome = timeout_at(deadline, async {
-            final_authority_root(
-                &tx,
-                actor,
-                repo,
-                RepoAction::ContentsRead,
-                &scope,
-                self.backend(),
-                None,
-                deadline,
-            )
-            .await
-            .map(|_| ())
+            final_authority_root(&tx, actor, repo, RepoAction::ContentsRead, &scope, self.backend(), None, deadline)
+                .await
+                .map(|_| ())
         })
         .await;
         let outcome = match outcome {
@@ -1261,15 +1149,7 @@ impl PgServingRetentionRoots {
             return Err(error);
         }
         let outcome = timeout_at(deadline, async {
-            let access = auth::authorize_repo_with_role(
-                &tx,
-                actor,
-                owner,
-                name,
-                Role::Admin,
-                action,
-            )
-            .await?;
+            let access = auth::authorize_repo_with_role(&tx, actor, owner, name, Role::Admin, action).await?;
             let locked = LockedScope::lock(&tx, access.repo_id, false)
                 .await
                 .map_err(super::map_refstore)?
@@ -1277,17 +1157,13 @@ impl PgServingRetentionRoots {
             if locked.owner_id() != access.owner_id || locked.name() != name {
                 return Err(Error::not_found());
             }
-            locked
-                .require_serving(access.owner_id, self.backend().as_hex())
-                .map_err(super::map_scope_refusal)?;
+            locked.require_serving(access.owner_id, self.backend().as_hex()).map_err(super::map_scope_refusal)?;
             let gate = PgRefStoreCore
                 .read_gate_in_tx(&tx, access.repo_id, false)
                 .await
                 .map_err(super::map_refstore)?
                 .ok_or_else(Error::not_found)?;
-            locked
-                .require_binding_matches_gate(&gate)
-                .map_err(super::map_scope_refusal)?;
+            locked.require_binding_matches_gate(&gate).map_err(super::map_scope_refusal)?;
             if gate.repository_id() != access.repo_id
                 || gate.tenant_id() != access.owner_id
                 || gate.object_format() != locked.object_format()
@@ -1349,10 +1225,7 @@ fn validate_owner_name(owner: &str, name: &str) -> Result<(), Error> {
 }
 
 fn validate_key(key: &str) -> Result<(), Error> {
-    if key.is_empty()
-        || key.len() > ROOT_IDEMPOTENCY_MAX
-        || key.chars().any(char::is_control)
-    {
+    if key.is_empty() || key.len() > ROOT_IDEMPOTENCY_MAX || key.chars().any(char::is_control) {
         return Err(Error(StatusCode::BAD_REQUEST, "invalid root idempotency key"));
     }
     Ok(())
@@ -1380,8 +1253,7 @@ fn validate_intent(intent: &ServingRootIntent) -> Result<(), Error> {
 }
 
 fn root_deadline(deadline: Instant) -> Result<Instant, Error> {
-    crate::ref_store::core::retention_root::effective_deadline(deadline)
-        .map_err(map_root_error)
+    crate::ref_store::core::retention_root::effective_deadline(deadline).map_err(map_root_error)
 }
 
 fn derive_intent(gate: &CoreGate, intent: &ServingRootIntent) -> Result<DerivedIntent, Error> {
@@ -1401,20 +1273,15 @@ fn derive_intent(gate: &CoreGate, intent: &ServingRootIntent) -> Result<DerivedI
     let business_intent = RequestDigest::of(ROOT_BUSINESS_INTENT_DOMAIN, &parts);
     let root_id = derived_uuid(ROOT_ID_DOMAIN, gate.repository_id(), &intent.idempotency_key);
     let operation_id = derived_uuid(ROOT_OPERATION_DOMAIN, gate.repository_id(), &intent.idempotency_key);
-    let register_request_id =
-        derived_uuid(ROOT_REGISTER_REQUEST_DOMAIN, gate.repository_id(), &intent.idempotency_key);
-    Ok(DerivedIntent {
-        root_id,
-        operation_id,
-        register_request_id,
-        business_intent,
-        canonical_oids,
-    })
+    let register_request_id = derived_uuid(ROOT_REGISTER_REQUEST_DOMAIN, gate.repository_id(), &intent.idempotency_key);
+    Ok(DerivedIntent { root_id, operation_id, register_request_id, business_intent, canonical_oids })
 }
 
-fn canonical_selector(selector: &RootSelector, format: crate::ref_store::GitObjectFormat) -> Result<Vec<String>, Error> {
-    crate::ref_store::core::retention_root::canonical_intent_oids(selector, format)
-        .map_err(map_root_error)
+fn canonical_selector(
+    selector: &RootSelector,
+    format: crate::ref_store::GitObjectFormat,
+) -> Result<Vec<String>, Error> {
+    crate::ref_store::core::retention_root::canonical_intent_oids(selector, format).map_err(map_root_error)
 }
 
 fn root_scope(
@@ -1522,23 +1389,12 @@ fn prepare_request_digest(
     selector: &RootSelector,
     register_request_id: Uuid,
 ) -> Result<RequestDigest, Error> {
-    PrepareRootRequest::new(
-        scope,
-        reference,
-        root_id,
-        operation_id,
-        selector.clone(),
-        register_request_id,
-    )
-    .map(|request| request.digest())
-    .map_err(map_root_error)
+    PrepareRootRequest::new(scope, reference, root_id, operation_id, selector.clone(), register_request_id)
+        .map(|request| request.digest())
+        .map_err(map_root_error)
 }
 
-fn record_digest_matches(
-    record: &RootRecord,
-    derived: &DerivedIntent,
-    intent: &ServingRootIntent,
-) -> bool {
+fn record_digest_matches(record: &RootRecord, derived: &DerivedIntent, intent: &ServingRootIntent) -> bool {
     let Ok(scope) = root_scope_from_record(record) else { return false };
     let Ok(reference) = PackSnapshotRef::new(
         record.repository_id(),
@@ -1565,11 +1421,7 @@ fn record_digest_matches(
 fn register_request_digest(candidate: &RootCandidate, request_id: Uuid) -> RequestDigest {
     RequestDigest::of(
         REGISTER_REQUEST_DIGEST_DOMAIN,
-        &[
-            candidate.register_digest().as_bytes(),
-            request_id.as_bytes(),
-            b"register",
-        ],
+        &[candidate.register_digest().as_bytes(), request_id.as_bytes(), b"register"],
     )
 }
 
@@ -1577,20 +1429,10 @@ fn derive_release_request_id(repository_id: Uuid, root_id: Uuid, key: &str) -> U
     derived_uuid_with_root(ROOT_RELEASE_REQUEST_DOMAIN, repository_id, root_id, key)
 }
 
-fn derive_release_digest(
-    repository_id: Uuid,
-    root_id: Uuid,
-    key: &str,
-    reason: &str,
-) -> RequestDigest {
+fn derive_release_digest(repository_id: Uuid, root_id: Uuid, key: &str, reason: &str) -> RequestDigest {
     RequestDigest::of(
         ROOT_RELEASE_INTENT_DOMAIN,
-        &[
-            repository_id.as_bytes(),
-            root_id.as_bytes(),
-            key.as_bytes(),
-            reason.as_bytes(),
-        ],
+        &[repository_id.as_bytes(), root_id.as_bytes(), key.as_bytes(), reason.as_bytes()],
     )
 }
 
@@ -1600,10 +1442,7 @@ fn derived_uuid(domain: &str, repository_id: Uuid, key: &str) -> Uuid {
 }
 
 fn derived_uuid_with_root(domain: &str, repository_id: Uuid, root_id: Uuid, key: &str) -> Uuid {
-    let digest = RequestDigest::of(
-        domain,
-        &[repository_id.as_bytes(), root_id.as_bytes(), key.as_bytes()],
-    );
+    let digest = RequestDigest::of(domain, &[repository_id.as_bytes(), root_id.as_bytes(), key.as_bytes()]);
     uuid_from_digest(digest)
 }
 
@@ -1649,9 +1488,7 @@ fn map_root_error(error: RootError) -> Error {
         RootError::RootObjectMissing { .. } => {
             Error(StatusCode::CONFLICT, "root selector is not present in the captured closure")
         }
-        RootError::RootQuotaExceeded { .. } => {
-            Error(StatusCode::TOO_MANY_REQUESTS, "retained root quota is exhausted")
-        }
+        RootError::RootQuotaExceeded { .. } => Error(StatusCode::TOO_MANY_REQUESTS, "retained root quota is exhausted"),
         RootError::RootReceiptTooLarge { .. } => {
             Error(StatusCode::PAYLOAD_TOO_LARGE, "retained root receipt is too large")
         }
@@ -1689,10 +1526,7 @@ async fn final_authority_root(
     if let Some(expected) = expected_cluster
         && cluster != expected
     {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "cluster authority incarnation changed; retry the same request",
-        ));
+        return Err(Error(StatusCode::CONFLICT, "cluster authority incarnation changed; retry the same request"));
     }
     Ok(cluster)
 }
@@ -1700,10 +1534,7 @@ async fn final_authority_root(
 async fn rollback_strict(tx: Transaction<'_>, deadline: Instant) -> Result<(), Error> {
     match timeout_at(deadline, tx.rollback()).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) | Err(_) => Err(Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "retention root transaction cleanup failed",
-        )),
+        Ok(Err(_)) | Err(_) => Err(Error(StatusCode::SERVICE_UNAVAILABLE, "retention root transaction cleanup failed")),
     }
 }
 

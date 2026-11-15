@@ -22,9 +22,7 @@ use rootyard::ref_store::core::{
     CreatePackSnapshotRequest, MetadataPinOutcome, MetadataSnapshotScope, PackReadSnapshot, PackSnapshotExpectation,
     PackSnapshotOutcome, PackSnapshotRef, PgPackSnapshot, ReleaseMetadataPinRequest,
 };
-use rootyard::ref_store::serving::{
-    PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead,
-};
+use rootyard::ref_store::serving::{PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead};
 use rootyard::ref_store::{
     CoreGateVersion, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataPinPurpose, OperationIdentity,
     PinReleaseReason, RefName, RefPrecondition, RefStoreError, RefTarget, RefUpdate, RequestDigest,
@@ -221,16 +219,7 @@ pub async fn verify_new_serving(
     let repository = super::db::provision_serving(&db.pool, &actor, store, name).await?;
     let tenant = actor.id;
     let gate = super::db::gate_version(&db.pool, repository.id, tenant).await?;
-    let verified = verify_new_in_repo(
-        db,
-        store,
-        git,
-        GitObjectFormat::Sha1,
-        tenant,
-        repository.id,
-        gate,
-    )
-    .await?;
+    let verified = verify_new_in_repo(db, store, git, GitObjectFormat::Sha1, tenant, repository.id, gate).await?;
     Ok((verified, actor, repository))
 }
 
@@ -358,11 +347,7 @@ pub async fn create_serving_snapshot(
         .read(
             &db.pool,
             actor,
-            ServingSnapshotRead {
-                owner: repository.owner.clone(),
-                name: repository.name.clone(),
-                snapshot_id,
-            },
+            ServingSnapshotRead { owner: repository.owner.clone(), name: repository.name.clone(), snapshot_id },
             store.backend_identity(),
             deadline(),
         )

@@ -40,12 +40,7 @@ fn root_id_for(repo_id: Uuid, key: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn create_input(
-    owner: &str,
-    name: &str,
-    snapshot_id: Uuid,
-    key: &str,
-) -> ServingRootCreate {
+fn create_input(owner: &str, name: &str, snapshot_id: Uuid, key: &str) -> ServingRootCreate {
     ServingRootCreate {
         owner: owner.to_owned(),
         name: name.to_owned(),
@@ -69,8 +64,7 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) =
-            verify_new_serving(&db, &store, &git, "coord-exact-replay").await?;
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "coord-exact-replay").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
         let input = create_input(&repository.owner, &repository.name, source.snapshot_id, "coord-replay");
@@ -102,12 +96,7 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         ensure!(repo_usage(&db.pool, verified.repo).await? == usage, "replay charged usage counters");
 
         let view = facade
-            .materialize(
-                &db.pool,
-                &actor,
-                read_input(&repository.owner, &repository.name, root_id),
-                deadline(),
-            )
+            .materialize(&db.pool, &actor, read_input(&repository.owner, &repository.name, root_id), deadline())
             .await?;
         ensure!(view.refs() == record.refs(), "serving root view refs differ after source release");
         stock_git_accepts_view(&view, &verified.fixture, deadline()).await?;
@@ -134,8 +123,7 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
 
         // Actual source-pin expiry has the same no-source replay property.
         let expiring = create_serving_snapshot(&db, &store, &actor, &repository, 8).await?;
-        let expiring_input =
-            create_input(&repository.owner, &repository.name, expiring.snapshot_id, "coord-expiry");
+        let expiring_input = create_input(&repository.owner, &repository.name, expiring.snapshot_id, "coord-expiry");
         let expiring_receipt = facade.create(&db.pool, &actor, expiring_input.clone(), deadline()).await?;
         wait_pin_expired(&db.pool, expiring.pin_id).await?;
         let expiring_view = facade
@@ -165,8 +153,7 @@ async fn changed_create_intent_under_same_key_conflicts_without_charge() -> Resu
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) =
-            verify_new_serving(&db, &store, &git, "coord-changed-intent").await?;
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "coord-changed-intent").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
         let input = create_input(&repository.owner, &repository.name, source.snapshot_id, "coord-changed");
@@ -195,8 +182,7 @@ async fn late_scope_or_role_loss_after_prepare_rolls_back_create_and_reads_deny(
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) =
-            verify_new_serving(&db, &store, &git, "coord-late-auth").await?;
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "coord-late-auth").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let baseline = root_counts(&db.pool, verified.repo).await?;
 
@@ -252,8 +238,7 @@ async fn late_scope_or_role_loss_after_prepare_rolls_back_create_and_reads_deny(
         let owner_facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
         let owner_input = create_input(&repository.owner, &repository.name, source.snapshot_id, "coord-read-scope");
         let owner_receipt = owner_facade.create(&db.pool, &actor, owner_input, deadline()).await?;
-        let reader =
-            serving_actor_with_scopes(&db.pool, verified.repo, &["contents_read"], "coord-late-read-").await?;
+        let reader = serving_actor_with_scopes(&db.pool, verified.repo, &["contents_read"], "coord-late-read-").await?;
         grant_collaborator(&db.pool, verified.repo, verified.tenant, reader.id, "admin").await?;
         let gate = GitGate::new(&git)?;
         let release_guard = GateRelease(&gate);
@@ -282,8 +267,7 @@ async fn release_before_register_fences_delayed_create_and_replays_without_sourc
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) =
-            verify_new_serving(&db, &store, &git, "coord-release-before").await?;
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "coord-release-before").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
         let create_key = "coord-release-before";
@@ -292,10 +276,7 @@ async fn release_before_register_fences_delayed_create_and_replays_without_sourc
         let release = ServingRootRelease {
             owner: repository.owner.clone(),
             name: repository.name.clone(),
-            target: ServingRootReleaseTarget::Absent {
-                root_id,
-                create: create.intent.clone(),
-            },
+            target: ServingRootReleaseTarget::Absent { root_id, create: create.intent.clone() },
             idempotency_key: "coord-release-before-key".to_owned(),
             reason: "release before delayed register".to_owned(),
         };
@@ -333,10 +314,7 @@ async fn release_before_register_fences_delayed_create_and_replays_without_sourc
         .await?;
         let replay = facade.release(&db.pool, &actor, release, deadline()).await?;
         ensure!(replay.replayed() && replay.state() == "released", "release exact replay differs");
-        ensure!(
-            root_counts(&db.pool, verified.repo).await? == counts,
-            "release exact replay charged or rewrote rows"
-        );
+        ensure!(root_counts(&db.pool, verified.repo).await? == counts, "release exact replay charged or rewrote rows");
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -350,15 +328,9 @@ async fn concurrent_exact_create_replay_is_source_pin_independent() -> Result<()
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) =
-            verify_new_serving(&db, &store, &git, "coord-concurrent-replay").await?;
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "coord-concurrent-replay").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
-        let input = create_input(
-            &repository.owner,
-            &repository.name,
-            source.snapshot_id,
-            "coord-concurrent-replay",
-        );
+        let input = create_input(&repository.owner, &repository.name, source.snapshot_id, "coord-concurrent-replay");
 
         // B misses the early retained-replay lookup, reads the live source, then
         // pauses in actual native prepare with no PostgreSQL transaction held.
@@ -370,9 +342,8 @@ async fn concurrent_exact_create_replay_is_source_pin_independent() -> Result<()
         let task_pool = paused_pool.clone();
         let task_actor = actor.clone();
         let task_input = input.clone();
-        let task = tokio::spawn(async move {
-            paused_facade.create(&task_pool, &task_actor, task_input, deadline()).await
-        });
+        let task =
+            tokio::spawn(async move { paused_facade.create(&task_pool, &task_actor, task_input, deadline()).await });
         gate.wait_ready().await?;
         // B's T1 transaction/client is gone while native is paused: the same
         // max-size-one pool can still hand out its only connection.
@@ -414,14 +385,8 @@ async fn concurrent_exact_create_replay_is_source_pin_independent() -> Result<()
         ensure!(replay.root_id() == root_id, "concurrent replay returned another root");
         ensure!(replay.created_at_unix_micros() == created_at, "concurrent replay returned another receipt body");
         ensure!(replay.request_digest() == request_digest, "concurrent replay request digest differs");
-        ensure!(
-            root_counts(&db.pool, verified.repo).await? == counts,
-            "concurrent exact replay rewrote root rows"
-        );
-        ensure!(
-            repo_usage(&db.pool, verified.repo).await? == usage,
-            "concurrent exact replay charged usage"
-        );
+        ensure!(root_counts(&db.pool, verified.repo).await? == counts, "concurrent exact replay rewrote root rows");
+        ensure!(repo_usage(&db.pool, verified.repo).await? == usage, "concurrent exact replay charged usage");
         drop(release_guard);
         Ok::<(), anyhow::Error>(())
     }
@@ -436,8 +401,7 @@ async fn release_by_intent_releases_existing_root_after_source_pin_release() -> 
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) =
-            verify_new_serving(&db, &store, &git, "coord-release-by-intent").await?;
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "coord-release-by-intent").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
         let create = create_input(&repository.owner, &repository.name, source.snapshot_id, "coord-by-intent");
@@ -460,7 +424,10 @@ async fn release_by_intent_releases_existing_root_after_source_pin_release() -> 
             reason: "release existing by original intent".to_owned(),
         };
         let released = facade.release(&db.pool, &actor, release.clone(), deadline()).await?;
-        ensure!(released.state() == "released" && released.root_id() == receipt.root_id(), "by-intent existing release differs");
+        ensure!(
+            released.state() == "released" && released.root_id() == receipt.root_id(),
+            "by-intent existing release differs"
+        );
         let counts = root_counts(&db.pool, verified.repo).await?;
         let usage = repo_usage(&db.pool, verified.repo).await?;
         let replay = facade.release(&db.pool, &actor, release, deadline()).await?;
@@ -468,12 +435,7 @@ async fn release_by_intent_releases_existing_root_after_source_pin_release() -> 
         ensure!(root_counts(&db.pool, verified.repo).await? == counts, "by-intent release replay changed root rows");
         ensure!(repo_usage(&db.pool, verified.repo).await? == usage, "by-intent release replay charged usage");
         let record = facade
-            .metadata(
-                &db.pool,
-                &actor,
-                read_input(&repository.owner, &repository.name, receipt.root_id()),
-                deadline(),
-            )
+            .metadata(&db.pool, &actor, read_input(&repository.owner, &repository.name, receipt.root_id()), deadline())
             .await?
             .ok_or_else(|| anyhow::anyhow!("released by-intent root metadata missing"))?;
         ensure!(record.state() == "released", "by-intent root metadata is not released");
@@ -494,12 +456,7 @@ async fn release_by_intent_tombstone_replays_before_source_metadata() -> Result<
             verify_new_serving(&db, &store, &git, "coord-release-intent-tombstone").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
-        let create = create_input(
-            &repository.owner,
-            &repository.name,
-            source.snapshot_id,
-            "coord-intent-tombstone",
-        );
+        let create = create_input(&repository.owner, &repository.name, source.snapshot_id, "coord-intent-tombstone");
         let release = ServingRootRelease {
             owner: repository.owner.clone(),
             name: repository.name.clone(),
@@ -526,10 +483,7 @@ async fn release_by_intent_tombstone_replays_before_source_metadata() -> Result<
         .await?;
         let replay = facade.release(&db.pool, &actor, release, deadline()).await?;
         ensure!(replay.replayed() && replay.state() == "released", "pre-register release replay differs");
-        ensure!(
-            root_counts(&db.pool, verified.repo).await? == counts,
-            "pre-register release replay changed rows"
-        );
+        ensure!(root_counts(&db.pool, verified.repo).await? == counts, "pre-register release replay changed rows");
         ensure!(
             facade
                 .metadata(
@@ -559,12 +513,7 @@ async fn release_by_intent_changed_intent_conflicts_without_touching_root() -> R
             verify_new_serving(&db, &store, &git, "coord-release-intent-conflict").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
-        let create = create_input(
-            &repository.owner,
-            &repository.name,
-            source.snapshot_id,
-            "coord-intent-conflict",
-        );
+        let create = create_input(&repository.owner, &repository.name, source.snapshot_id, "coord-intent-conflict");
         let receipt = facade.create(&db.pool, &actor, create.clone(), deadline()).await?;
         let counts = root_counts(&db.pool, verified.repo).await?;
         let usage = repo_usage(&db.pool, verified.repo).await?;
@@ -589,12 +538,7 @@ async fn release_by_intent_changed_intent_conflicts_without_touching_root() -> R
         ensure!(root_counts(&db.pool, verified.repo).await? == counts, "changed by-intent release changed root rows");
         ensure!(repo_usage(&db.pool, verified.repo).await? == usage, "changed by-intent release charged usage");
         let record = facade
-            .metadata(
-                &db.pool,
-                &actor,
-                read_input(&repository.owner, &repository.name, receipt.root_id()),
-                deadline(),
-            )
+            .metadata(&db.pool, &actor, read_input(&repository.owner, &repository.name, receipt.root_id()), deadline())
             .await?
             .ok_or_else(|| anyhow::anyhow!("existing root disappeared after changed-intent release"))?;
         ensure!(record.is_active(), "changed by-intent release released the existing root");

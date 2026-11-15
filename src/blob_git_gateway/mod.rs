@@ -30,7 +30,6 @@
 mod api;
 mod browse;
 mod browser_ui;
-mod retention_roots;
 mod config;
 mod error;
 mod history;
@@ -44,6 +43,7 @@ mod read_session;
 mod receive;
 pub(crate) mod repo_session;
 mod resource;
+mod retention_roots;
 mod serving;
 mod session;
 mod smart_http;
@@ -103,18 +103,9 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
         .route("/api/repos", post(api::create_repo).get(api::list_repos))
         .route("/api/repos/{owner}/{name}", get(api::get_repo))
         .route("/api/repos/{owner}/{name}/operations/{operation}", get(api::get_operation))
-        .route(
-            "/api/repos/{owner}/{name}/roots/release-intent",
-            post(retention_roots::release_root_intent),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/roots/{root}/tree",
-            get(browse::roots::tree),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/roots/{root}/blob/{oid}",
-            get(browse::roots::blob),
-        )
+        .route("/api/repos/{owner}/{name}/roots/release-intent", post(retention_roots::release_root_intent))
+        .route("/api/repos/{owner}/{name}/roots/{root}/tree", get(browse::roots::tree))
+        .route("/api/repos/{owner}/{name}/roots/{root}/blob/{oid}", get(browse::roots::blob))
         .route(
             "/api/repos/{owner}/{name}/roots/{root}",
             get(retention_roots::read_root).delete(retention_roots::release_root),
@@ -126,18 +117,9 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
             "/api/repos/{owner}/{name}/snapshots/{snapshot}",
             get(snapshot_metadata::read_snapshot).delete(snapshot_metadata::release_snapshot),
         )
-        .route(
-            "/api/repos/{owner}/{name}/snapshots/{snapshot}/renew",
-            post(snapshot_metadata::renew_snapshot),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/snapshots/{snapshot}/tree",
-            get(browse::retained::tree),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/snapshots/{snapshot}/blob/{oid}",
-            get(browse::retained::blob),
-        )
+        .route("/api/repos/{owner}/{name}/snapshots/{snapshot}/renew", post(snapshot_metadata::renew_snapshot))
+        .route("/api/repos/{owner}/{name}/snapshots/{snapshot}/tree", get(browse::retained::tree))
+        .route("/api/repos/{owner}/{name}/snapshots/{snapshot}/blob/{oid}", get(browse::retained::blob))
         .route("/api/repos/{owner}/{name}/merges", post(api::unsupported_merge))
         .route("/api/repos/{owner}/{name}/tree", get(browse::tree))
         .route("/api/repos/{owner}/{name}/tree/{oid}", get(browse::tree_by_oid))

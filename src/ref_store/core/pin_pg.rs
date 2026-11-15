@@ -149,8 +149,7 @@ impl PgRefStoreCore {
         let tx = begin_bounded(client, deadline).await?;
         let result = async {
             snapshot_sql::durable_write(&tx, deadline).await?;
-            self.renew_in_tx(&tx, request, deadline, snapshot_sql::ScopeLane::Unserved { require_unserved: true })
-                .await
+            self.renew_in_tx(&tx, request, deadline, snapshot_sql::ScopeLane::Unserved { require_unserved: true }).await
         }
         .await;
         match result {

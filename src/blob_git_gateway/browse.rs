@@ -41,9 +41,9 @@ use crate::browse::models::{
 const MAX_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
 
-mod session;
 pub(super) mod retained;
 pub(super) mod roots;
+mod session;
 
 pub(super) use session::{BrowseSession, finalize};
 
@@ -264,10 +264,7 @@ fn memory_budget(state: &BlobGitState) -> u64 {
 /// Browse, `memory / 12` for the retained view). The final `/12` accounts for
 /// base64/text/JSON expansion; both callers must use this one function.
 fn blob_read_ceiling(memory: u64, max_response: u64, encoded_budget: u64) -> u64 {
-    MAX_CAPTURE_BYTES
-        .min(memory / 12)
-        .min(max_response / 8)
-        .min(encoded_budget / 12)
+    MAX_CAPTURE_BYTES.min(memory / 12).min(max_response / 8).min(encoded_budget / 12)
 }
 
 /// Resolve a short revision against the captured ref pairs (`refs/*` name and

@@ -58,21 +58,15 @@ pub async fn check_version(
     // later sequential auth query from inheriting that larger bound and running
     // past the caller deadline. No second transaction or refreshed auth
     // deadline is introduced.
-    let observation = match timeout_at(
-        deadline,
-        async {
-            // Same transaction: authorized serving lookup first (including the
-            // cluster NOWAIT anchor), then the owning-core observation. No
-            // public lookup transaction is opened and no PG lease is re-acquired.
-            let serving = lookup_in_tx(&tx, actor, owner, name, false, backend, deadline).await?;
-            let repository_id = serving.repository.id;
-            let tenant_id = serving.gate.tenant_id();
-            PgRefStoreCore
-                .check_version_in_tx(&tx, repository_id, tenant_id, known, deadline)
-                .await
-                .map_err(map_refstore)
-        },
-    )
+    let observation = match timeout_at(deadline, async {
+        // Same transaction: authorized serving lookup first (including the
+        // cluster NOWAIT anchor), then the owning-core observation. No
+        // public lookup transaction is opened and no PG lease is re-acquired.
+        let serving = lookup_in_tx(&tx, actor, owner, name, false, backend, deadline).await?;
+        let repository_id = serving.repository.id;
+        let tenant_id = serving.gate.tenant_id();
+        PgRefStoreCore.check_version_in_tx(&tx, repository_id, tenant_id, known, deadline).await.map_err(map_refstore)
+    })
     .await
     {
         Ok(result) => result,

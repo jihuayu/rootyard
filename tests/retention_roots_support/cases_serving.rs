@@ -9,13 +9,17 @@ use std::time::Duration;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use rootyard::ref_store::core::retention_root::{RootError, RootRef, RootSelector, PgRetentionRoots};
+use rootyard::ref_store::core::retention_root::{PgRetentionRoots, RootError, RootRef, RootSelector};
 
-use crate::retention_roots_support::common::{adapter, assert_record_matches_source, one_verified, open_store, open_store_with_root};
+use crate::retention_roots_support::common::{
+    adapter, assert_record_matches_source, one_verified, open_store, open_store_with_root,
+};
 use crate::retention_roots_support::db::{
     Db, cluster_incarnation, deadline, root_counts, rotate_cluster, set_cluster_incarnation, wait_pin_expired,
 };
-use crate::retention_roots_support::git::{GateRelease, GitGate, assert_pack_identity, git_binary, stock_git_accepts_view};
+use crate::retention_roots_support::git::{
+    GateRelease, GitGate, assert_pack_identity, git_binary, stock_git_accepts_view,
+};
 use crate::retention_roots_support::pack::{create_serving_snapshot, verify_new_serving};
 use crate::retention_roots_support::roots;
 
@@ -32,8 +36,7 @@ async fn serving_root_materializes_after_source_release_and_expiry() -> Result<(
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) =
-            verify_new_serving(&db, &store, &git, "roots-serving-positive").await?;
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "roots-serving-positive").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let roots = adapter(&store, &git)?;
         let scope = roots::scope(verified.repo, verified.tenant, &verified.gate)?;
@@ -129,8 +132,7 @@ async fn serving_root_refuses_wrong_backend_realm_lane_expired_source_and_cluste
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) =
-            verify_new_serving(&db, &store, &git, "roots-serving-refusals").await?;
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "roots-serving-refusals").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let roots = adapter(&store, &git)?;
         let scope = roots::scope(verified.repo, verified.tenant, &verified.gate)?;
@@ -238,8 +240,8 @@ async fn serving_root_refuses_wrong_backend_realm_lane_expired_source_and_cluste
         .await?;
         let original_cluster = cluster_incarnation(&db.pool).await?;
         rotate_cluster(&db.pool).await?;
-        let rotated_result = roots::register_serving(&roots, &db.pool, rotated_candidate, Uuid::new_v4(), deadline())
-            .await;
+        let rotated_result =
+            roots::register_serving(&roots, &db.pool, rotated_candidate, Uuid::new_v4(), deadline()).await;
         set_cluster_incarnation(&db.pool, original_cluster).await?;
         let rotated_error = rotated_result.expect_err("register accepted a rotated cluster anchor");
         ensure!(
@@ -267,8 +269,7 @@ async fn serving_root_release_before_t2_grants_no_view_and_holds_no_pg_across_na
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) =
-            verify_new_serving(&db, &store, &git, "roots-serving-barrier").await?;
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "roots-serving-barrier").await?;
         let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
         let roots = Arc::new(adapter(&store, &git)?);
         let scope = roots::scope(verified.repo, verified.tenant, &verified.gate)?;

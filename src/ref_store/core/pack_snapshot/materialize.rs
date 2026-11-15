@@ -43,8 +43,8 @@ use super::read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
 use super::request::PackSnapshotRef;
 use super::serving_read::{RegisteredServingRead, ServingReadCapture, revalidate_serving_capture};
 use crate::blob_store::opendal::BlobStore;
-use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use crate::ref_store::MetadataPinPurpose;
+use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use crate::ref_store::core::snapshot_sql;
 use crate::ref_store::pg;
 use crate::ref_store::tx::begin_bounded;
@@ -91,12 +91,11 @@ async fn capture_t1(
 ) -> Result<PackReadSnapshot, RefStoreError> {
     let mut client = pooled_client(pool, deadline).await?;
     let tx = begin_bounded(&mut client, deadline).await?;
-    let read = pg::before_deadline(deadline, PgPackSnapshot.read_checked(
-            &tx,
-            reference,
-            deadline,
-            super::super::snapshot_sql::ScopeLane::LegacyFresh,
-        )).await;
+    let read = pg::before_deadline(
+        deadline,
+        PgPackSnapshot.read_checked(&tx, reference, deadline, super::super::snapshot_sql::ScopeLane::LegacyFresh),
+    )
+    .await;
     let cleanup = match timeout_at(deadline, tx.rollback()).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(RefStoreError::Database("materialized read T1 transaction cleanup failed".into())),
@@ -252,9 +251,7 @@ impl PgPackSnapshotMaterializer {
         deadline: Instant,
     ) -> Result<RetainedServingPreparation, RefStoreError> {
         if cluster_incarnation.is_nil() {
-            return Err(RefStoreError::Database(
-                "retained serving materialization has no cluster incarnation".into(),
-            ));
+            return Err(RefStoreError::Database("retained serving materialization has no cluster incarnation".into()));
         }
         if snapshot.source_kind() != ReadSnapshotSourceKind::RetainedDurable
             || snapshot.scope().purpose() != MetadataPinPurpose::Verification
@@ -276,12 +273,7 @@ impl PgPackSnapshotMaterializer {
                 deadline,
             )
             .await?;
-        Ok(RetainedServingPreparation {
-            snapshot,
-            binding,
-            native,
-            cluster_incarnation,
-        })
+        Ok(RetainedServingPreparation { snapshot, binding, native, cluster_incarnation })
     }
 
     /// Final fresh-clock pin liveness in the caller's already-authorized T2
@@ -528,12 +520,16 @@ impl PgPackSnapshotMaterializer {
         let mut client = pooled_client(pool, deadline).await?;
         let tx = begin_bounded(&mut client, deadline).await?;
         let result = async {
-            let fresh = pg::before_deadline(deadline, PgPackSnapshot.read_checked(
-            &tx,
-            reference,
-            deadline,
-            super::super::snapshot_sql::ScopeLane::LegacyFresh,
-        )).await?;
+            let fresh = pg::before_deadline(
+                deadline,
+                PgPackSnapshot.read_checked(
+                    &tx,
+                    reference,
+                    deadline,
+                    super::super::snapshot_sql::ScopeLane::LegacyFresh,
+                ),
+            )
+            .await?;
             if fresh != prepared.snapshot || fresh.materialization_digest() != prepared.binding {
                 return Err(RefStoreError::MetadataScopeMismatch("pack snapshot changed during materialization"));
             }

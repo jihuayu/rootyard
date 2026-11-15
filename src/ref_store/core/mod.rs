@@ -86,7 +86,6 @@ pub use pack_snapshot::{
     PgPackSnapshot, PgPackSnapshotMaterializer,
 };
 pub use pg::PgRefStoreCore;
-pub(crate) use snapshot_pg::metadata_commit_result;
 pub use retention_root::{
     PgRetentionRoots, PrepareRootRequest, RegisterRootRequest, ReleaseRootRequest, RootCandidate, RootError,
     RootPurpose, RootReadAuthority, RootReadRequest, RootReadView, RootReceipt, RootReceiptQuery, RootRecord, RootRef,
@@ -98,6 +97,7 @@ pub use snapshot_contract::{
     REPO_MAX_RECEIPTS, REPO_MAX_SNAPSHOT_REFS, REPO_MAX_SNAPSHOTS, RefPrefix, TENANT_MAX_LOGICAL_BYTES,
     TENANT_MAX_RECEIPTS, TENANT_MAX_SNAPSHOT_REFS, TENANT_MAX_SNAPSHOTS,
 };
+pub(crate) use snapshot_pg::metadata_commit_result;
 pub use snapshot_receipt::{
     CreateMetadataSnapshotOutcome, MetadataPinOutcome, MetadataPinReceipt, MetadataReceipt, MetadataReceiptLookup,
     MetadataSnapshotPage, MetadataSnapshotReceipt, MetadataSnapshotRef,

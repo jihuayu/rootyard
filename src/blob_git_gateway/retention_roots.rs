@@ -8,21 +8,16 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     body::Body,
     extract::{Path, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     response::Response,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{
-    api::strip_name,
-    error::GatewayError,
-    session::authenticate,
-    state::BlobGitState,
-};
+use super::{api::strip_name, error::GatewayError, session::authenticate, state::BlobGitState};
 use crate::{
     browse::models::valid_non_zero_oid,
     ref_store::{
@@ -138,16 +133,7 @@ async fn create_root_authorized(
     let identity = authenticate(&state, &headers).await?;
     let facade = root_facade(&state)?;
     let receipt = facade
-        .create(
-            state.pool(),
-            &identity,
-            ServingRootCreate {
-                owner,
-                name: name.to_owned(),
-                intent,
-            },
-            state.deadline(),
-        )
+        .create(state.pool(), &identity, ServingRootCreate { owner, name: name.to_owned(), intent }, state.deadline())
         .await
         .map_err(roots_error)?;
     let status = if receipt.replayed() { StatusCode::OK } else { StatusCode::CREATED };
@@ -172,12 +158,7 @@ async fn read_root_authorized(
     let identity = authenticate(&state, &headers).await?;
     let facade = root_facade(&state)?;
     let record = facade
-        .metadata(
-            state.pool(),
-            &identity,
-            ServingRootRead { owner, name: name.to_owned(), root_id },
-            state.deadline(),
-        )
+        .metadata(state.pool(), &identity, ServingRootRead { owner, name: name.to_owned(), root_id }, state.deadline())
         .await
         .map_err(roots_error)?
         .ok_or(GatewayError::NotFound)?;
@@ -365,11 +346,7 @@ fn json_body<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, GatewayErr
     }
 }
 
-fn json_response<T: Serialize>(
-    state: &BlobGitState,
-    status: StatusCode,
-    value: &T,
-) -> Result<Response, GatewayError> {
+fn json_response<T: Serialize>(state: &BlobGitState, status: StatusCode, value: &T) -> Result<Response, GatewayError> {
     let bytes = serde_json::to_vec(value)
         .map_err(|_| GatewayError::Internal("retention root response could not be encoded"))?;
     if bytes.len() as u64 > state.limits().max_response_bytes {
@@ -377,12 +354,8 @@ fn json_response<T: Serialize>(
     }
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+    response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
     Ok(response)
 }
 
@@ -396,18 +369,13 @@ fn roots_error(error: crate::Error) -> GatewayError {
         StatusCode::PAYLOAD_TOO_LARGE => GatewayError::TooLarge,
         StatusCode::TOO_MANY_REQUESTS => GatewayError::TooManyRequests("retained root quota is exhausted"),
         StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => GatewayError::Timeout,
-        StatusCode::SERVICE_UNAVAILABLE
-            if error.1 == COMMIT_UNKNOWN_SENTINEL =>
-        {
+        StatusCode::SERVICE_UNAVAILABLE if error.1 == COMMIT_UNKNOWN_SENTINEL => {
             GatewayError::Unavailable("retention root outcome is unknown; retry the same key and body")
         }
-        StatusCode::SERVICE_UNAVAILABLE => {
-            GatewayError::Unavailable("retention root metadata service is unavailable")
-        }
+        StatusCode::SERVICE_UNAVAILABLE => GatewayError::Unavailable("retention root metadata service is unavailable"),
         _ => GatewayError::Internal("retention root request was refused"),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -415,15 +383,10 @@ mod tests {
 
     #[test]
     fn roots_error_distinguishes_unknown_commit_from_generic_unavailable() {
-        let unknown = roots_error(crate::Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            COMMIT_UNKNOWN_SENTINEL,
-        ));
+        let unknown = roots_error(crate::Error(StatusCode::SERVICE_UNAVAILABLE, COMMIT_UNKNOWN_SENTINEL));
         assert_eq!(
             unknown,
-            GatewayError::Unavailable(
-                "retention root outcome is unknown; retry the same key and body"
-            )
+            GatewayError::Unavailable("retention root outcome is unknown; retry the same key and body")
         );
 
         for error in [
@@ -431,10 +394,7 @@ mod tests {
             crate::Error(StatusCode::SERVICE_UNAVAILABLE, "retention root transaction cleanup failed"),
         ] {
             let mapped = roots_error(error);
-            assert_eq!(
-                mapped,
-                GatewayError::Unavailable("retention root metadata service is unavailable")
-            );
+            assert_eq!(mapped, GatewayError::Unavailable("retention root metadata service is unavailable"));
             assert!(!mapped.message().to_ascii_lowercase().contains("unknown"));
         }
 

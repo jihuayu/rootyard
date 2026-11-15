@@ -85,11 +85,8 @@ impl Gateway {
             .iter()
             .map(|value| value.to_str().unwrap().to_owned())
             .collect();
-        let cache = response
-            .headers()
-            .get(header::CACHE_CONTROL)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+        let cache =
+            response.headers().get(header::CACHE_CONTROL).and_then(|value| value.to_str().ok()).map(str::to_owned);
         let session = response.headers().contains_key("x-rootyard-session");
         (status, challenges, cache, session)
     }
@@ -128,12 +125,7 @@ async fn owner107_historical_routes_advertise_bearer_without_a_session() {
             vec![("content-type", "application/json")],
             br#"{"idempotency_key":"create-unauth","lease_seconds":60}"#,
         ),
-        (
-            "GET",
-            format!("/api/repos/owner/name/snapshots/{snapshot}"),
-            vec![],
-            b"",
-        ),
+        ("GET", format!("/api/repos/owner/name/snapshots/{snapshot}"), vec![], b""),
         (
             "POST",
             format!("/api/repos/owner/name/snapshots/{snapshot}/renew"),
@@ -146,18 +138,8 @@ async fn owner107_historical_routes_advertise_bearer_without_a_session() {
             vec![("content-type", "application/json")],
             br#"{"idempotency_key":"release-unauth","expected_generation":1}"#,
         ),
-        (
-            "GET",
-            format!("/api/repos/owner/name/snapshots/{snapshot}/tree"),
-            vec![],
-            b"",
-        ),
-        (
-            "GET",
-            format!("/api/repos/owner/name/snapshots/{snapshot}/blob/{oid}"),
-            vec![],
-            b"",
-        ),
+        ("GET", format!("/api/repos/owner/name/snapshots/{snapshot}/tree"), vec![], b""),
+        ("GET", format!("/api/repos/owner/name/snapshots/{snapshot}/blob/{oid}"), vec![], b""),
     ];
     for (method, target, headers, body) in routes {
         let (status, challenges, cache, session) = gateway.send(method, &target, &headers, body).await;

@@ -18,11 +18,11 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     body::Body,
     extract::{Path, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     response::Response,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -442,9 +442,7 @@ fn metadata_error(error: crate::Error) -> GatewayError {
         StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => GatewayError::Timeout,
         StatusCode::SERVICE_UNAVAILABLE => {
             if error.1 == "metadata commit outcome is unknown; retry the same request" {
-                GatewayError::Unavailable(
-                    "snapshot metadata commit outcome is unknown; retry the same idempotency key",
-                )
+                GatewayError::Unavailable("snapshot metadata commit outcome is unknown; retry the same idempotency key")
             } else {
                 GatewayError::Unavailable("snapshot metadata is temporarily unavailable")
             }
@@ -453,11 +451,7 @@ fn metadata_error(error: crate::Error) -> GatewayError {
     }
 }
 
-fn json_response<T: Serialize>(
-    state: &BlobGitState,
-    status: StatusCode,
-    value: &T,
-) -> Result<Response, GatewayError> {
+fn json_response<T: Serialize>(state: &BlobGitState, status: StatusCode, value: &T) -> Result<Response, GatewayError> {
     let bytes = serde_json::to_vec(value)
         .map_err(|_| GatewayError::Internal("snapshot metadata response could not be encoded"))?;
     if bytes.len() as u64 > state.limits().max_response_bytes {
@@ -465,11 +459,7 @@ fn json_response<T: Serialize>(
     }
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+    response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
     Ok(response)
 }

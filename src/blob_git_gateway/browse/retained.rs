@@ -14,10 +14,6 @@ use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
-use super::{
-    MAX_CAPTURE_BYTES, bad_input, blob_read_ceiling, captured_revision, memory_budget, parse_tree, reachable,
-    require_type, resolve, root_oid, run, validate_spec, validate_tree_after,
-};
 use super::super::{
     api::strip_name,
     error::GatewayError,
@@ -25,7 +21,13 @@ use super::super::{
     snapshot,
     state::{BlobGitState, ByteLease},
 };
-use crate::browse::models::{BlobByOidQuery, BlobResponse, TreeQuery, TreeResponse, normalize_rel_path, valid_non_zero_oid, validate_limit};
+use super::{
+    MAX_CAPTURE_BYTES, bad_input, blob_read_ceiling, captured_revision, memory_budget, parse_tree, reachable,
+    require_type, resolve, root_oid, run, validate_spec, validate_tree_after,
+};
+use crate::browse::models::{
+    BlobByOidQuery, BlobResponse, TreeQuery, TreeResponse, normalize_rel_path, valid_non_zero_oid, validate_limit,
+};
 use crate::ref_store::core::pack_snapshot::PgPackSnapshotMaterializer;
 use crate::ref_store::serving::{PgServingSnapshotMetadata, RetainedServingReadContext, ServingSnapshotRead};
 
@@ -76,14 +78,9 @@ async fn tree_authorized(
     let expression = if path.is_empty() { format!("{root_oid}^{{tree}}") } else { format!("{root_oid}:{path}") };
     let tree_oid = resolve(&state, &*computed, &expression, deadline).await?;
     require_type(&state, &*computed, &tree_oid, "tree", deadline).await?;
-    let raw = run(
-        &state,
-        &*computed,
-        &["ls-tree", "-z", "-l", &tree_oid],
-        (memory / 8).min(MAX_CAPTURE_BYTES),
-        deadline,
-    )
-    .await?;
+    let raw =
+        run(&state, &*computed, &["ls-tree", "-z", "-l", &tree_oid], (memory / 8).min(MAX_CAPTURE_BYTES), deadline)
+            .await?;
     let mut entries = parse_tree(&raw, &path, after.as_deref(), limit)?;
     let more = entries.len() > limit;
     entries.truncate(limit);

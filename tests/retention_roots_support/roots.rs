@@ -5,15 +5,13 @@ use anyhow::Result;
 use deadpool_postgres::Pool;
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::db::{Identity, Repository};
+use rootyard::ref_store::PinReleaseReason;
 use rootyard::ref_store::core::pack_snapshot::PackSnapshotRef;
 use rootyard::ref_store::core::retention_root::{
     PgRetentionRoots, PrepareRootRequest, RegisterRootRequest, ReleaseRootRequest, RootCandidate, RootReadAuthority,
     RootReadRequest, RootReadView, RootReceipt, RootReceiptQuery, RootRef, RootSelector, RootsScope,
 };
-use rootyard::ref_store::serving::{
-    PgServingSnapshotMetadata, ServingSnapshotRelease,
-};
-use rootyard::ref_store::PinReleaseReason;
+use rootyard::ref_store::serving::{PgServingSnapshotMetadata, ServingSnapshotRelease};
 use rootyard::ref_store::{CoreGateVersion, RequestDigest};
 use tokio::time::Instant;
 use uuid::Uuid;

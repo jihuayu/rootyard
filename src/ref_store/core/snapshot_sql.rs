@@ -122,9 +122,7 @@ pub(super) async fn lock_scope_lane(
     gate_for_update: bool,
 ) -> Result<CoreGate, RefStoreError> {
     match lane {
-        ScopeLane::Unserved { require_unserved: true } => {
-            lock_scope_unserved(tx, scope, gate_for_update).await
-        }
+        ScopeLane::Unserved { require_unserved: true } => lock_scope_unserved(tx, scope, gate_for_update).await,
         ScopeLane::Unserved { require_unserved: false } => lock_scope(tx, scope, false, gate_for_update).await,
         ScopeLane::LegacyFresh => lock_scope(tx, scope, true, gate_for_update).await,
         ScopeLane::Serving { backend_identity } => {
@@ -182,9 +180,7 @@ pub(super) async fn lock_scope_unserved(
     gate_for_update: bool,
 ) -> Result<CoreGate, RefStoreError> {
     use super::serving_scope::{CoreLane, CoreRealm, LockedScope};
-    let locked = LockedScope::lock(tx, scope.repository_id(), false)
-        .await?
-        .ok_or(RefStoreError::RepositoryNotFound)?;
+    let locked = LockedScope::lock(tx, scope.repository_id(), false).await?.ok_or(RefStoreError::RepositoryNotFound)?;
     if locked.owner_id() != scope.tenant_id() {
         return Err(RefStoreError::RepositoryNotFound);
     }
@@ -198,9 +194,7 @@ pub(super) async fn lock_scope_unserved(
     match locked.require_fresh_core(&realm) {
         Ok(CoreLane::LegacyUnservedGitfs) => {}
         Ok(CoreLane::PgRefStore) => {
-            return Err(RefStoreError::Unsupported(
-                "A5a pack snapshot metadata requires an unserved core repository",
-            ));
+            return Err(RefStoreError::Unsupported("A5a pack snapshot metadata requires an unserved core repository"));
         }
         Err(refusal) => return Err(map_snapshot_scope_refusal(refusal)),
     }
@@ -233,15 +227,11 @@ pub(super) async fn lock_scope_serving(
     gate_for_update: bool,
 ) -> Result<CoreGate, RefStoreError> {
     use super::serving_scope::LockedScope;
-    let locked = LockedScope::lock(tx, scope.repository_id(), false)
-        .await?
-        .ok_or(RefStoreError::RepositoryNotFound)?;
+    let locked = LockedScope::lock(tx, scope.repository_id(), false).await?.ok_or(RefStoreError::RepositoryNotFound)?;
     if locked.owner_id() != scope.tenant_id() {
         return Err(RefStoreError::RepositoryNotFound);
     }
-    locked
-        .require_serving(scope.tenant_id(), backend_identity_hex)
-        .map_err(map_serving_scope_refusal)?;
+    locked.require_serving(scope.tenant_id(), backend_identity_hex).map_err(map_serving_scope_refusal)?;
     let gate = current_gate(tx, scope.repository_id(), gate_for_update).await?;
     if gate.tenant_id() != scope.tenant_id() {
         return Err(RefStoreError::RepositoryNotFound);

@@ -18,13 +18,13 @@
 use super::capture::RawCapture;
 use super::error::RootError;
 use super::handle::{RootReadRequest, RootRef};
-use super::scope::RootsScope;
 use super::pg::{before_deadline, bound_tx, effective_deadline, pooled_client, rollback_reads};
+use super::scope::RootsScope;
 use super::view::RootReadView;
-use crate::ref_store::contract::RequestDigest;
-use crate::ref_store::core::pack_commit::{NativeReadRequest, PackCommitError};
-use crate::ref_store::core::MetadataSnapshotScope;
 use crate::ref_store::MetadataPinPurpose;
+use crate::ref_store::contract::RequestDigest;
+use crate::ref_store::core::MetadataSnapshotScope;
+use crate::ref_store::core::pack_commit::{NativeReadRequest, PackCommitError};
 use crate::ref_store::tx::begin_bounded;
 use deadpool_postgres::Pool;
 use tokio::time::Instant;
@@ -159,10 +159,8 @@ impl super::pg::PgRetentionRoots {
             // checked against the retained scope before the cluster anchor.
             let head = super::sql::head_state(&tx, root.repository_id(), root.root_id()).await?;
             let capture = super::sql_read::read_capture(&tx, root).await?;
-            let capture = capture.ok_or(RootError::RootNotFound {
-                repository_id: root.repository_id(),
-                root_id: root.root_id(),
-            })?;
+            let capture = capture
+                .ok_or(RootError::RootNotFound { repository_id: root.repository_id(), root_id: root.root_id() })?;
             let head = head.ok_or(RootError::RootReleased {
                 repository_id: root.repository_id(),
                 root_id: root.root_id(),
@@ -244,9 +242,7 @@ impl super::pg::PgRetentionRoots {
             Ok::<_, RootError>(fresh)
         })
         .await;
-        let sealed = checked.and_then(|fresh| {
-            RootReadView::seal_serving(fresh, native, binding, cluster_incarnation)
-        });
+        let sealed = checked.and_then(|fresh| RootReadView::seal_serving(fresh, native, binding, cluster_incarnation));
         let cleanup = rollback_reads(tx, deadline).await;
         drop(client);
         match (sealed, cleanup) {

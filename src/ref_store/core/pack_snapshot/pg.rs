@@ -29,6 +29,7 @@
 //! deadline covers transaction acquisition, every SQL stage and `COMMIT`.
 use super::super::pack_commit::{self, CapturedRef, PackMode};
 use super::super::pin;
+use super::super::snapshot_contract::MetadataSnapshotScope;
 use super::super::snapshot_contract::{
     MAX_RECEIPT_BODY_BYTES, MAX_SNAPSHOT_REFS, pin_logical_bytes, receipt_logical_bytes, refs_digest,
     snapshot_budget_guard, snapshot_logical_bytes,
@@ -37,10 +38,9 @@ use super::super::snapshot_pg::{metadata_commit_result, replay_receipt};
 use super::super::snapshot_receipt::{
     MetadataReceipt, MetadataSnapshotReceipt, PackReceiptFields, SnapshotReceiptParts,
 };
-use super::super::snapshot_contract::MetadataSnapshotScope;
-use super::ServingSnapshotIdentity;
 use super::super::snapshot_sql::{self, PackHeaderInsert, ScopeLane, SnapshotInsert};
 use super::super::snapshot_usage::{self, UsageDelta};
+use super::ServingSnapshotIdentity;
 use super::contract as pack_contract;
 use super::read_snapshot::{PackReadSnapshot, ReadSnapshotParts};
 use super::receipt::{PackSnapshotOutcome, PackSnapshotReceipt, StoredPackSnapshot};
@@ -405,12 +405,7 @@ impl PgPackSnapshot {
         snapshot_sql::durable_write(tx, deadline).await?;
         pg::before_deadline(
             deadline,
-            self.create_checked(
-                tx,
-                request,
-                deadline,
-                ScopeLane::Serving { backend_identity: backend_identity_hex },
-            ),
+            self.create_checked(tx, request, deadline, ScopeLane::Serving { backend_identity: backend_identity_hex }),
         )
         .await
     }
@@ -477,9 +472,7 @@ impl PgPackSnapshot {
             || pin.owner_id != scope.owner_id()
             || pin.purpose != scope.purpose()
         {
-            return Err(RefStoreError::Database(
-                "stored snapshot pin identity disagrees with its header".into(),
-            ));
+            return Err(RefStoreError::Database("stored snapshot pin identity disagrees with its header".into()));
         }
         Ok(Some(ServingSnapshotIdentity { scope, snapshot_id, pin_id: pin.pin_id }))
     }
@@ -552,17 +545,14 @@ impl PgPackSnapshot {
         header.ensure_read_identity(repository_id, tenant_id)?;
         header.ensure_pack_verified()?;
         let scope = header.stored_scope()?;
-        let Some(pin_identity) =
-            snapshot_sql::pin_identity_by_snapshot(tx, snapshot_id, repository_id).await?
-        else {
+        let Some(pin_identity) = snapshot_sql::pin_identity_by_snapshot(tx, snapshot_id, repository_id).await? else {
             return Err(RefStoreError::Database("stored snapshot has no durable pin identity".into()));
         };
         let pin = snapshot_sql::pin_for_share(tx, pin_identity.pin_id, repository_id)
             .await?
             .ok_or(RefStoreError::MetadataPinNotFound { pin_id: pin_identity.pin_id })?;
         pin.ensure_scope(&scope, snapshot_id)?;
-        let reference =
-            PackSnapshotRef::new(repository_id, tenant_id, snapshot_id, pin.pin_id, pin.generation)?;
+        let reference = PackSnapshotRef::new(repository_id, tenant_id, snapshot_id, pin.pin_id, pin.generation)?;
         self.read_checked_inner(
             tx,
             &reference,

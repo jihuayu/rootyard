@@ -290,24 +290,17 @@ impl super::pg::PgRetentionRoots {
                     ))
                 })?;
                 super::receipt::verify_scope(&row, scope)?;
-                if row.action != RootAction::Register
-                    || row.root_id != root.root_id()
-                    || row.generation != 1
-                {
-                    return Err(RootError::RootDigestConflict(
-                        "register replay resolved to a different root receipt",
-                    ));
+                if row.action != RootAction::Register || row.root_id != root.root_id() || row.generation != 1 {
+                    return Err(RootError::RootDigestConflict("register replay resolved to a different root receipt"));
                 }
                 let receipt = RootReceipt::from_row(row, true)?;
                 Ok(Some((record, receipt)))
             }
             None => {
                 if row.is_some() {
-                    return Err(RootError::Store(
-                        crate::ref_store::contract::RefStoreError::Database(
-                            "register receipt has no retained root capture".into(),
-                        ),
-                    ));
+                    return Err(RootError::Store(crate::ref_store::contract::RefStoreError::Database(
+                        "register receipt has no retained root capture".into(),
+                    )));
                 }
                 Ok(None)
             }
@@ -330,35 +323,25 @@ impl super::pg::PgRetentionRoots {
         };
         super::receipt::verify_scope(&row, scope)?;
         if row.action != RootAction::Release || row.root_id != root_id || row.generation != 2 {
-            return Err(RootError::RootDigestConflict(
-                "release request id reused with a different root",
-            ));
+            return Err(RootError::RootDigestConflict("release request id reused with a different root"));
         }
         let body = row.body.as_object().ok_or_else(|| {
             RootError::Store(crate::ref_store::contract::RefStoreError::Database(
                 "stored release receipt body is not an object".into(),
             ))
         })?;
-        let stored_digest = body
-            .get("release_digest")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                RootError::Store(crate::ref_store::contract::RefStoreError::Database(
-                    "stored release receipt has no release digest".into(),
-                ))
-            })?;
-        let stored_reason = body
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                RootError::Store(crate::ref_store::contract::RefStoreError::Database(
-                    "stored release receipt has no reason".into(),
-                ))
-            })?;
+        let stored_digest = body.get("release_digest").and_then(serde_json::Value::as_str).ok_or_else(|| {
+            RootError::Store(crate::ref_store::contract::RefStoreError::Database(
+                "stored release receipt has no release digest".into(),
+            ))
+        })?;
+        let stored_reason = body.get("reason").and_then(serde_json::Value::as_str).ok_or_else(|| {
+            RootError::Store(crate::ref_store::contract::RefStoreError::Database(
+                "stored release receipt has no reason".into(),
+            ))
+        })?;
         if stored_digest != release_digest.as_hex() || stored_reason != reason {
-            return Err(RootError::RootDigestConflict(
-                "release request id reused with a different digest",
-            ));
+            return Err(RootError::RootDigestConflict("release request id reused with a different digest"));
         }
         Ok(Some(RootReceipt::from_row(row, true)?))
     }

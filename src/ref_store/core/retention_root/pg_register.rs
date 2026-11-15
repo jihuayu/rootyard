@@ -104,17 +104,11 @@ impl PgRetentionRoots {
         deadline: Instant,
     ) -> Result<(), RootError> {
         before_deadline(deadline, async {
-            let pin = super::super::snapshot_sql::pin_for_share(
-                tx,
-                reference.pin_id(),
-                reference.repository_id(),
-            )
-            .await?
-            .ok_or(RootError::Store(
-                crate::ref_store::contract::RefStoreError::MetadataPinNotFound {
+            let pin = super::super::snapshot_sql::pin_for_share(tx, reference.pin_id(), reference.repository_id())
+                .await?
+                .ok_or(RootError::Store(crate::ref_store::contract::RefStoreError::MetadataPinNotFound {
                     pin_id: reference.pin_id(),
-                },
-            ))?;
+                }))?;
             if pin.repository_id != reference.repository_id()
                 || pin.pin_id != reference.pin_id()
                 || pin.snapshot_id != reference.snapshot_id()
@@ -220,8 +214,7 @@ impl PgRetentionRoots {
         } else {
             super::super::snapshot_sql::ScopeLane::LegacyFresh
         };
-        let fresh =
-            PgPackSnapshot.read_checked(tx, candidate.reference(), deadline, lane).await?;
+        let fresh = PgPackSnapshot.read_checked(tx, candidate.reference(), deadline, lane).await?;
         candidate.verify_source(&fresh)?;
         if serving {
             candidate.verify_serving_backend(backend_identity)?;
@@ -264,9 +257,9 @@ impl PgRetentionRoots {
         // (8) Serving-only cluster anchor check after the existing repository/gate/pin/protocol/root locks.
         // This preserves pin/root -> cluster NOWAIT order; the anchor was captured by T1 and is never persisted.
         if serving {
-            let expected = candidate.serving_cluster_incarnation().ok_or(RootError::RootRealmMismatch(
-                "serving candidate has no cluster anchor",
-            ))?;
+            let expected = candidate
+                .serving_cluster_incarnation()
+                .ok_or(RootError::RootRealmMismatch("serving candidate has no cluster anchor"))?;
             let current = super::sql::cluster_incarnation_nowait(tx).await?;
             if current != expected {
                 return Err(RootError::RootRealmMismatch("cluster authority incarnation changed during register"));

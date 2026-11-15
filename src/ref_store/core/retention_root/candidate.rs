@@ -110,12 +110,7 @@ pub(crate) fn expected_register_digest_from_snapshot(
     selector: &RootSelector,
     snapshot: &PackReadSnapshot,
 ) -> Result<RequestDigest, RootError> {
-    let oids = resolve_oids(
-        selector,
-        snapshot.scope().object_format(),
-        snapshot.refs(),
-        snapshot.head_oid_hex(),
-    )?;
+    let oids = resolve_oids(selector, snapshot.scope().object_format(), snapshot.refs(), snapshot.head_oid_hex())?;
     let candidate = RootCandidate::seal(
         SealRequest {
             scope,

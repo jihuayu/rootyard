@@ -64,9 +64,7 @@ pub(super) async fn cluster_incarnation_nowait(tx: &Transaction<'_>) -> Result<U
         RootError::Store(RefStoreError::Database("cluster authority row has no uuid incarnation".into()))
     })?;
     if incarnation.is_nil() {
-        return Err(RootError::Store(RefStoreError::Database(
-            "cluster authority incarnation is nil".into(),
-        )));
+        return Err(RootError::Store(RefStoreError::Database("cluster authority incarnation is nil".into())));
     }
     Ok(incarnation)
 }

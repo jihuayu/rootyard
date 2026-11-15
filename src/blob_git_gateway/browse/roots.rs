@@ -19,24 +19,22 @@ use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
+use super::super::{
+    api::strip_name,
+    error::GatewayError,
+    retention_roots::root_facade,
+    session::authenticate,
+    snapshot,
+    state::{BlobGitState, ByteLease, WorkspaceLease},
+};
 use super::{
     MAX_CAPTURE_BYTES, bad_input, blob_read_ceiling, captured_revision, memory_budget, parse_tree, reachable,
     require_type, resolve, root_oid, run, validate_tree_after,
 };
-use super::super::{
-    api::strip_name,
-    error::GatewayError,
-    session::authenticate,
-    snapshot,
-    state::{BlobGitState, ByteLease, WorkspaceLease},
-    retention_roots::root_facade,
-};
 use crate::browse::models::{
     self, BlobByOidQuery, BlobResponse, TreeQuery, TreeResponse, normalize_rel_path, validate_limit,
 };
-use crate::ref_store::serving::{
-    PgServingRetentionRoots, ServingRetainedRootReadContext, ServingRootRead,
-};
+use crate::ref_store::serving::{PgServingRetentionRoots, ServingRetainedRootReadContext, ServingRootRead};
 
 pub(crate) async fn tree(
     state: State<Arc<BlobGitState>>,
@@ -68,10 +66,8 @@ async fn tree_authorized(
     let lease = state.reserve_bytes(memory)?;
     let facade = root_facade(&state)?;
     let input = ServingRootRead { owner, name: name.to_owned(), root_id };
-    let context = facade
-        .materialize_with_context(state.pool(), &identity, input, deadline)
-        .await
-        .map_err(root_serving_error)?;
+    let context =
+        facade.materialize_with_context(state.pool(), &identity, input, deadline).await.map_err(root_serving_error)?;
     let deadline = context.deadline();
     let computed = snapshot::build_retained_root_view(&state, context.view(), deadline).await?;
     let refs = snapshot::retained_root_refs(context.view());
@@ -80,14 +76,9 @@ async fn tree_authorized(
     let expression = if path.is_empty() { format!("{root_oid}^{{tree}}") } else { format!("{root_oid}:{path}") };
     let tree_oid = resolve(&state, &*computed, &expression, deadline).await?;
     require_type(&state, &*computed, &tree_oid, "tree", deadline).await?;
-    let raw = run(
-        &state,
-        &*computed,
-        &["ls-tree", "-z", "-l", &tree_oid],
-        (memory / 8).min(MAX_CAPTURE_BYTES),
-        deadline,
-    )
-    .await?;
+    let raw =
+        run(&state, &*computed, &["ls-tree", "-z", "-l", &tree_oid], (memory / 8).min(MAX_CAPTURE_BYTES), deadline)
+            .await?;
     let mut entries = parse_tree(&raw, &path, after.as_deref(), limit)?;
     let more = entries.len() > limit;
     entries.truncate(limit);
@@ -136,10 +127,8 @@ async fn blob_authorized(
     let lease = state.reserve_bytes(memory)?;
     let facade = root_facade(&state)?;
     let input = ServingRootRead { owner, name: name.to_owned(), root_id };
-    let context = facade
-        .materialize_with_context(state.pool(), &identity, input, deadline)
-        .await
-        .map_err(root_serving_error)?;
+    let context =
+        facade.materialize_with_context(state.pool(), &identity, input, deadline).await.map_err(root_serving_error)?;
     let deadline = context.deadline();
     let computed = snapshot::build_retained_root_view(&state, context.view(), deadline).await?;
     let refs = snapshot::retained_root_refs(context.view());
@@ -202,10 +191,7 @@ async fn finish_root<T: Serialize>(
     value: &T,
 ) -> Result<Response, GatewayError> {
     let bytes = super::session::encode_response(value, limit)?;
-    facade
-        .finalize_materialized(state.pool(), identity, root.context)
-        .await
-        .map_err(root_serving_error)?;
+    facade.finalize_materialized(state.pool(), identity, root.context).await.map_err(root_serving_error)?;
     Ok(super::session::body_response_with_workspace(bytes, slot, lease, workspace, None))
 }
 

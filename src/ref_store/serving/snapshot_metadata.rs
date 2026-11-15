@@ -20,10 +20,8 @@
 //! principal + action + opaque key. They never contain the gate revision or
 //! lease, so a retry under the same key stays the same identity while changed
 //! lease/selector/generation conflicts in the existing request digest.
-use super::{
-    acquire, begin_owned, deadline_error, map_refstore, map_scope_refusal,
-    ServingRepository,
-};
+use super::{ServingRepository, acquire, begin_owned, deadline_error, map_refstore, map_scope_refusal};
+use crate::ref_store::core::pack_snapshot::RetainedServingPreparation;
 use crate::{
     Error, auth,
     blob_store::BlobBackendIdentity,
@@ -35,14 +33,12 @@ use crate::{
             CreatePackSnapshotRequest, MAX_PIN_LEASE_SECONDS, MaterializedPackRead, MetadataPinOutcome,
             MetadataSnapshotScope, PackReadSnapshot, PackSnapshotExpectation, PackSnapshotOutcome, PackSnapshotRef,
             PgPackSnapshot, PgPackSnapshotMaterializer, PgRefStoreCore, ReleaseMetadataPinRequest,
-            RenewMetadataPinRequest,
-            serving_scope::LockedScope,
+            RenewMetadataPinRequest, serving_scope::LockedScope,
         },
         tx::commit_bounded,
     },
     token_scopes::RepoAction,
 };
-use crate::ref_store::core::pack_snapshot::RetainedServingPreparation;
 use axum::http::StatusCode;
 use deadpool_postgres::Pool;
 use std::time::Duration;
@@ -145,20 +141,9 @@ impl PgServingSnapshotMetadata {
         let preflight = preflight(pool, actor, &input.owner, &input.name, true, backend, deadline).await?;
         let repository_id = preflight.repository.id;
         let scope = scope_from_gate(&preflight.gate)?;
-        let request_id = derived_uuid(
-            CREATE_REQUEST_DOMAIN,
-            repository_id,
-            actor.id,
-            "create",
-            &input.idempotency_key,
-        );
-        let snapshot_id = derived_uuid(
-            CREATE_SNAPSHOT_DOMAIN,
-            repository_id,
-            actor.id,
-            "create",
-            &input.idempotency_key,
-        );
+        let request_id = derived_uuid(CREATE_REQUEST_DOMAIN, repository_id, actor.id, "create", &input.idempotency_key);
+        let snapshot_id =
+            derived_uuid(CREATE_SNAPSHOT_DOMAIN, repository_id, actor.id, "create", &input.idempotency_key);
         let pin_id = derived_uuid(CREATE_PIN_DOMAIN, repository_id, actor.id, "create", &input.idempotency_key);
 
         let mut client = acquire(pool, deadline).await?;
@@ -176,18 +161,10 @@ impl PgServingSnapshotMetadata {
                 None => PackSnapshotExpectation::new(preflight.gate.revision(), *preflight.gate.digest())
                     .map_err(|_| request_construction_error())?,
             };
-            let request = CreatePackSnapshotRequest::new(
-                scope,
-                request_id,
-                pin_id,
-                snapshot_id,
-                input.lease_seconds,
-                expected,
-            )
-            .map_err(|_| request_construction_error())?;
-            PgPackSnapshot
-                .create_serving_checked(&tx, &request, backend.as_hex(), deadline)
-                .await
+            let request =
+                CreatePackSnapshotRequest::new(scope, request_id, pin_id, snapshot_id, input.lease_seconds, expected)
+                    .map_err(|_| request_construction_error())?;
+            PgPackSnapshot.create_serving_checked(&tx, &request, backend.as_hex(), deadline).await
         }
         .await;
         match core {
@@ -280,14 +257,7 @@ impl PgServingSnapshotMetadata {
             )
             .await?;
             let value = match PgPackSnapshot
-                .read_serving_by_snapshot(
-                    &tx,
-                    repository_id,
-                    tenant_id,
-                    input.snapshot_id,
-                    backend.as_hex(),
-                    deadline,
-                )
+                .read_serving_by_snapshot(&tx, repository_id, tenant_id, input.snapshot_id, backend.as_hex(), deadline)
                 .await
             {
                 Ok(value) => value,
@@ -363,22 +333,19 @@ impl PgServingSnapshotMetadata {
         validate_snapshot(input.snapshot_id)?;
         let deadline = materializer.retained_deadline(deadline).map_err(map_metadata_error)?;
         let backend = materializer.backend_identity();
-        let initial = match timeout_at(
-            deadline,
-            preflight(pool, actor, &input.owner, &input.name, false, backend, deadline),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => return Err(deadline_error()),
-        };
+        let initial =
+            match timeout_at(deadline, preflight(pool, actor, &input.owner, &input.name, false, backend, deadline))
+                .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(deadline_error()),
+            };
         let repository_id = initial.repository.id;
         let tenant_id = initial.gate.tenant_id();
         let name = initial.repository.name.clone();
 
         let (snapshot, cluster_incarnation) =
-            retained_t1(pool, actor, repository_id, tenant_id, &name, input.snapshot_id, backend, deadline)
-                .await?;
+            retained_t1(pool, actor, repository_id, tenant_id, &name, input.snapshot_id, backend, deadline).await?;
         let reference = PackSnapshotRef::new(
             repository_id,
             tenant_id,
@@ -387,15 +354,13 @@ impl PgServingSnapshotMetadata {
             snapshot.pin_generation(),
         )
         .map_err(map_metadata_error)?;
-        let prepared = match timeout_at(
-            deadline,
-            materializer.prepare_retained_serving(snapshot, cluster_incarnation, deadline),
-        )
-        .await
-        {
-            Ok(result) => result.map_err(map_metadata_error)?,
-            Err(_) => return Err(deadline_error()),
-        };
+        let prepared =
+            match timeout_at(deadline, materializer.prepare_retained_serving(snapshot, cluster_incarnation, deadline))
+                .await
+            {
+                Ok(result) => result.map_err(map_metadata_error)?,
+                Err(_) => return Err(deadline_error()),
+            };
         let view = retained_t2(
             pool,
             actor,
@@ -429,15 +394,13 @@ impl PgServingSnapshotMetadata {
         validate_snapshot(input.snapshot_id)?;
         let deadline = context.deadline;
         let backend = materializer.backend_identity();
-        let initial = match timeout_at(
-            deadline,
-            preflight(pool, actor, &input.owner, &input.name, false, backend, deadline),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => return Err(deadline_error()),
-        };
+        let initial =
+            match timeout_at(deadline, preflight(pool, actor, &input.owner, &input.name, false, backend, deadline))
+                .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(deadline_error()),
+            };
         let view = context.view();
         if input.snapshot_id != view.snapshot_id()
             || initial.repository.id != view.repository_id()
@@ -487,13 +450,7 @@ impl PgServingSnapshotMetadata {
         let repository_id = preflight.repository.id;
         let tenant_id = preflight.gate.tenant_id();
         let current_scope = scope_from_gate(&preflight.gate)?;
-        let request_id = derived_uuid(
-            RENEW_REQUEST_DOMAIN,
-            repository_id,
-            actor.id,
-            "renew",
-            &input.idempotency_key,
-        );
+        let request_id = derived_uuid(RENEW_REQUEST_DOMAIN, repository_id, actor.id, "renew", &input.idempotency_key);
 
         let mut client = acquire(pool, deadline).await?;
         let tx = begin_owned(&mut client, deadline).await?;
@@ -513,9 +470,7 @@ impl PgServingSnapshotMetadata {
                 input.lease_seconds,
             )
             .map_err(|_| request_construction_error())?;
-            let outcome = PgRefStoreCore
-                .renew_serving_checked(&tx, &request, backend.as_hex(), deadline)
-                .await?;
+            let outcome = PgRefStoreCore.renew_serving_checked(&tx, &request, backend.as_hex(), deadline).await?;
             Ok::<(MetadataPinOutcome, Uuid), RefStoreError>((outcome, identity.pin_id))
         }
         .await;
@@ -592,13 +547,8 @@ impl PgServingSnapshotMetadata {
         let repository_id = preflight.repository.id;
         let tenant_id = preflight.gate.tenant_id();
         let current_scope = scope_from_gate(&preflight.gate)?;
-        let request_id = derived_uuid(
-            RELEASE_REQUEST_DOMAIN,
-            repository_id,
-            actor.id,
-            "release",
-            &input.idempotency_key,
-        );
+        let request_id =
+            derived_uuid(RELEASE_REQUEST_DOMAIN, repository_id, actor.id, "release", &input.idempotency_key);
 
         let mut client = acquire(pool, deadline).await?;
         let tx = begin_owned(&mut client, deadline).await?;
@@ -618,9 +568,7 @@ impl PgServingSnapshotMetadata {
                 input.reason,
             )
             .map_err(|_| request_construction_error())?;
-            let outcome = PgRefStoreCore
-                .release_serving_checked(&tx, &request, backend.as_hex(), deadline)
-                .await?;
+            let outcome = PgRefStoreCore.release_serving_checked(&tx, &request, backend.as_hex(), deadline).await?;
             Ok::<(MetadataPinOutcome, Uuid), RefStoreError>((outcome, identity.pin_id))
         }
         .await;
@@ -708,66 +656,45 @@ async fn retained_t1(
 ) -> Result<(PackReadSnapshot, Uuid), Error> {
     let mut client = acquire(pool, deadline).await?;
     let tx = begin_owned(&mut client, deadline).await?;
-    let observed = timeout_at(
-        deadline,
-        async {
-            serving_admin_gate(
-                &tx,
-                actor,
-                repository_id,
-                tenant_id,
-                name,
-                backend,
-                None,
-                false,
-                deadline,
-            )
-            .await?;
-            let snapshot = match PgPackSnapshot
-                .read_serving_by_snapshot(
+    let observed = timeout_at(deadline, async {
+        serving_admin_gate(&tx, actor, repository_id, tenant_id, name, backend, None, false, deadline).await?;
+        let snapshot = match PgPackSnapshot
+            .read_serving_by_snapshot(&tx, repository_id, tenant_id, snapshot_id, backend.as_hex(), deadline)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Err(authorize_failure(
                     &tx,
+                    actor,
                     repository_id,
                     tenant_id,
-                    snapshot_id,
-                    backend.as_hex(),
+                    name,
+                    RepoAction::ContentsRead,
+                    backend,
+                    None,
+                    false,
+                    error,
                     deadline,
                 )
-                .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    return Err(authorize_failure(
-                        &tx,
-                        actor,
-                        repository_id,
-                        tenant_id,
-                        name,
-                        RepoAction::ContentsRead,
-                        backend,
-                        None,
-                        false,
-                        error,
-                        deadline,
-                    )
-                    .await);
-                }
-            };
-            let (_, cluster_incarnation) = final_authority_with_cluster(
-                &tx,
-                actor,
-                repository_id,
-                tenant_id,
-                name,
-                RepoAction::ContentsRead,
-                backend,
-                Some(snapshot.scope()),
-                false,
-                deadline,
-            )
-            .await?;
-            Ok::<_, Error>((snapshot, cluster_incarnation))
-        },
-    )
+                .await);
+            }
+        };
+        let (_, cluster_incarnation) = final_authority_with_cluster(
+            &tx,
+            actor,
+            repository_id,
+            tenant_id,
+            name,
+            RepoAction::ContentsRead,
+            backend,
+            Some(snapshot.scope()),
+            false,
+            deadline,
+        )
+        .await?;
+        Ok::<_, Error>((snapshot, cluster_incarnation))
+    })
     .await;
     let observed = match observed {
         Ok(result) => result,
@@ -800,76 +727,61 @@ async fn retained_t2(
 ) -> Result<MaterializedPackRead, Error> {
     let mut client = acquire(pool, deadline).await?;
     let tx = begin_owned(&mut client, deadline).await?;
-    let observed = timeout_at(
-        deadline,
-        async {
-            let expected_scope = *prepared.snapshot().scope();
-            serving_admin_gate(
+    let observed = timeout_at(deadline, async {
+        let expected_scope = *prepared.snapshot().scope();
+        serving_admin_gate(&tx, actor, repository_id, tenant_id, name, backend, Some(&expected_scope), false, deadline)
+            .await?;
+        let fresh = match PgPackSnapshot
+            .read_serving_by_snapshot(
                 &tx,
-                actor,
                 repository_id,
                 tenant_id,
-                name,
-                backend,
-                Some(&expected_scope),
-                false,
+                reference.snapshot_id(),
+                backend.as_hex(),
                 deadline,
             )
-            .await?;
-            let fresh = match PgPackSnapshot
-                .read_serving_by_snapshot(
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Err(authorize_failure(
                     &tx,
+                    actor,
                     repository_id,
                     tenant_id,
-                    reference.snapshot_id(),
-                    backend.as_hex(),
+                    name,
+                    RepoAction::ContentsRead,
+                    backend,
+                    Some(&expected_scope),
+                    false,
+                    error,
                     deadline,
                 )
-                .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    return Err(authorize_failure(
-                        &tx,
-                        actor,
-                        repository_id,
-                        tenant_id,
-                        name,
-                        RepoAction::ContentsRead,
-                        backend,
-                        Some(&expected_scope),
-                        false,
-                        error,
-                        deadline,
-                    )
-                    .await);
-                }
-            };
-            let (_, cluster_incarnation) = final_authority_with_cluster(
-                &tx,
-                actor,
-                repository_id,
-                tenant_id,
-                name,
-                RepoAction::ContentsRead,
-                backend,
-                Some(&expected_scope),
-                false,
-                deadline,
-            )
-            .await?;
-            if cluster_incarnation != prepared.cluster_incarnation() {
-                return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch(
-                    "cluster authority incarnation",
-                )));
+                .await);
             }
-            materializer
-                .ensure_retained_serving_live(&tx, reference, &fresh, deadline)
-                .await
-                .map_err(map_metadata_error)?;
-            prepared.finish(fresh).map_err(map_metadata_error)
-        },
-    )
+        };
+        let (_, cluster_incarnation) = final_authority_with_cluster(
+            &tx,
+            actor,
+            repository_id,
+            tenant_id,
+            name,
+            RepoAction::ContentsRead,
+            backend,
+            Some(&expected_scope),
+            false,
+            deadline,
+        )
+        .await?;
+        if cluster_incarnation != prepared.cluster_incarnation() {
+            return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch("cluster authority incarnation")));
+        }
+        materializer
+            .ensure_retained_serving_live(&tx, reference, &fresh, deadline)
+            .await
+            .map_err(map_metadata_error)?;
+        prepared.finish(fresh).map_err(map_metadata_error)
+    })
     .await;
     let observed = match observed {
         Ok(result) => result,
@@ -902,86 +814,67 @@ async fn retained_finalize_context(
     let RetainedServingReadContext { view, cluster_incarnation, .. } = context;
     let mut client = acquire(pool, deadline).await?;
     let tx = begin_owned(&mut client, deadline).await?;
-    let observed = timeout_at(
-        deadline,
-        async {
-            let expected_scope = *view.snapshot().scope();
-            serving_admin_gate(
+    let observed = timeout_at(deadline, async {
+        let expected_scope = *view.snapshot().scope();
+        serving_admin_gate(&tx, actor, repository_id, tenant_id, name, backend, Some(&expected_scope), false, deadline)
+            .await?;
+        let fresh = match PgPackSnapshot
+            .read_serving_by_snapshot(
                 &tx,
-                actor,
                 repository_id,
                 tenant_id,
-                name,
-                backend,
-                Some(&expected_scope),
-                false,
+                reference.snapshot_id(),
+                backend.as_hex(),
                 deadline,
             )
-            .await?;
-            let fresh = match PgPackSnapshot
-                .read_serving_by_snapshot(
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Err(authorize_failure(
                     &tx,
+                    actor,
                     repository_id,
                     tenant_id,
-                    reference.snapshot_id(),
-                    backend.as_hex(),
+                    name,
+                    RepoAction::ContentsRead,
+                    backend,
+                    Some(&expected_scope),
+                    false,
+                    error,
                     deadline,
                 )
-                .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    return Err(authorize_failure(
-                        &tx,
-                        actor,
-                        repository_id,
-                        tenant_id,
-                        name,
-                        RepoAction::ContentsRead,
-                        backend,
-                        Some(&expected_scope),
-                        false,
-                        error,
-                        deadline,
-                    )
-                    .await);
-                }
-            };
-            let (_, current_cluster) = final_authority_with_cluster(
-                &tx,
-                actor,
-                repository_id,
-                tenant_id,
-                name,
-                RepoAction::ContentsRead,
-                backend,
-                Some(&expected_scope),
-                false,
-                deadline,
-            )
-            .await?;
-            if current_cluster != cluster_incarnation {
-                return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch(
-                    "cluster authority incarnation",
-                )));
+                .await);
             }
-            materializer
-                .ensure_retained_serving_live(&tx, reference, &fresh, deadline)
-                .await
-                .map_err(map_metadata_error)?;
-            if fresh != *view.snapshot() {
-                return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch(
-                    "retained serving snapshot",
-                )));
-            }
-            if fresh.materialization_digest() != view.proven_binding() {
-                return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch(
-                    "retained serving binding",
-                )));
-            }
-            Ok(view)
-        },
-    )
+        };
+        let (_, current_cluster) = final_authority_with_cluster(
+            &tx,
+            actor,
+            repository_id,
+            tenant_id,
+            name,
+            RepoAction::ContentsRead,
+            backend,
+            Some(&expected_scope),
+            false,
+            deadline,
+        )
+        .await?;
+        if current_cluster != cluster_incarnation {
+            return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch("cluster authority incarnation")));
+        }
+        materializer
+            .ensure_retained_serving_live(&tx, reference, &fresh, deadline)
+            .await
+            .map_err(map_metadata_error)?;
+        if fresh != *view.snapshot() {
+            return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch("retained serving snapshot")));
+        }
+        if fresh.materialization_digest() != view.proven_binding() {
+            return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch("retained serving binding")));
+        }
+        Ok(view)
+    })
     .await;
     let observed = match observed {
         Ok(result) => result,
@@ -1011,29 +904,24 @@ pub(super) async fn serving_admin_gate(
     deadline: Instant,
 ) -> Result<CoreGate, Error> {
     crate::ref_store::pg::bound(tx, deadline).await.map_err(map_metadata_error)?;
-    let locked = LockedScope::lock(tx, repository_id, false)
-        .await
-        .map_err(map_metadata_error)?
-        .ok_or_else(Error::not_found)?;
+    let locked =
+        LockedScope::lock(tx, repository_id, false).await.map_err(map_metadata_error)?.ok_or_else(Error::not_found)?;
     if locked.owner_id() != tenant_id || locked.name() != name {
         return Err(Error::not_found());
     }
     // Current actor permission is checked before any serving-backend/gate/realm
     // or snapshot-specific refusal can surface. A non-admin must not learn a
     // target's shape from an earlier state-specific error path.
-    let Some((role, _, _)) =
-        crate::members::rbac::resolve_effective_role(tx, repository_id, tenant_id, actor.id)
-            .await
-            .map_err(Error::internal)?
+    let Some((role, _, _)) = crate::members::rbac::resolve_effective_role(tx, repository_id, tenant_id, actor.id)
+        .await
+        .map_err(Error::internal)?
     else {
         return Err(Error::not_found());
     };
     if role < Role::Admin {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
-    let binding = locked
-        .require_serving(tenant_id, backend.as_hex())
-        .map_err(map_scope_refusal)?;
+    let binding = locked.require_serving(tenant_id, backend.as_hex()).map_err(map_scope_refusal)?;
     let gate = PgRefStoreCore
         .read_gate_in_tx(tx, repository_id, gate_for_update)
         .await
@@ -1123,16 +1011,9 @@ pub(super) async fn final_authority_with_cluster(
         .map_err(Error::internal)?
         .ok_or_else(Error::unauthorized)?;
     let _read_only: bool = live.get(0);
-    crate::token_scopes::authorize_repository_late(
-        tx,
-        actor.token_id,
-        actor.id,
-        repository_id,
-        action,
-        false,
-    )
-    .await
-    .map_err(auth::scope_error)?;
+    crate::token_scopes::authorize_repository_late(tx, actor.token_id, actor.id, repository_id, action, false)
+        .await
+        .map_err(auth::scope_error)?;
     Ok((gate, cluster_incarnation))
 }
 
@@ -1197,10 +1078,8 @@ fn scope_from_gate(gate: &CoreGate) -> Result<MetadataSnapshotScope, Error> {
 }
 
 fn derived_uuid(domain: &str, repository_id: Uuid, actor_id: Uuid, action: &str, key: &str) -> Uuid {
-    let digest = RequestDigest::of(
-        domain,
-        &[repository_id.as_bytes(), actor_id.as_bytes(), action.as_bytes(), key.as_bytes()],
-    );
+    let digest =
+        RequestDigest::of(domain, &[repository_id.as_bytes(), actor_id.as_bytes(), action.as_bytes(), key.as_bytes()]);
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
     // RFC 4122 version/variant bits keep these valid non-nil UUIDs without
@@ -1213,9 +1092,7 @@ fn derived_uuid(domain: &str, repository_id: Uuid, actor_id: Uuid, action: &str,
 fn validate_key(value: &str) -> Result<(), Error> {
     if value.is_empty()
         || value.len() > MAX_IDEMPOTENCY_KEY_BYTES
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
     {
         return Err(Error::bad_request());
     }
@@ -1253,9 +1130,7 @@ fn map_metadata_error(error: RefStoreError) -> Error {
         RefStoreError::MetadataSnapshotNotFound { .. } | RefStoreError::MetadataPinNotFound { .. } => {
             Error::not_found()
         }
-        RefStoreError::MetadataScopeMismatch(_) => {
-            Error(StatusCode::CONFLICT, "snapshot metadata scope changed")
-        }
+        RefStoreError::MetadataScopeMismatch(_) => Error(StatusCode::CONFLICT, "snapshot metadata scope changed"),
         RefStoreError::MetadataGateVersionMismatch => {
             Error(StatusCode::CONFLICT, "repository gate changed; retry the same request")
         }
@@ -1265,10 +1140,9 @@ fn map_metadata_error(error: RefStoreError) -> Error {
         RefStoreError::MetadataSnapshotTooLarge { .. } => {
             Error(StatusCode::PAYLOAD_TOO_LARGE, "snapshot metadata is too large")
         }
-        RefStoreError::MetadataCommitUnknown { .. } => Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "metadata commit outcome is unknown; retry the same request",
-        ),
+        RefStoreError::MetadataCommitUnknown { .. } => {
+            Error(StatusCode::SERVICE_UNAVAILABLE, "metadata commit outcome is unknown; retry the same request")
+        }
         other => map_refstore(other),
     }
 }

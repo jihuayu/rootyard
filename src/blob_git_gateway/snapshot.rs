@@ -125,11 +125,9 @@ pub(super) const RETAINED_ROOT_UNBORN_HEAD: &str = "refs/heads/rootyard-retained
 /// only the server-derived synthetic refs for the retained selected object ids.
 pub(super) fn retained_root_refs(view: &RootReadView) -> Vec<(String, String)> {
     match view.selector_kind() {
-        RootSelectorKind::Snapshot => view
-            .refs()
-            .iter()
-            .map(|reference| (reference.name().to_owned(), reference.oid_hex().to_owned()))
-            .collect(),
+        RootSelectorKind::Snapshot => {
+            view.refs().iter().map(|reference| (reference.name().to_owned(), reference.oid_hex().to_owned())).collect()
+        }
         RootSelectorKind::Oids => view
             .root_oids()
             .iter()
@@ -413,14 +411,8 @@ async fn copy_root_packs(
     let format = view.object_format();
     for pack in view.packs() {
         let pack_id = pack.pack_id();
-        let pack_bytes = view
-            .pack_bytes(pack_id, deadline)
-            .await
-            .map_err(root_pack_error)?;
-        let idx_bytes = view
-            .idx_bytes(pack_id, deadline)
-            .await
-            .map_err(root_pack_error)?;
+        let pack_bytes = view.pack_bytes(pack_id, deadline).await.map_err(root_pack_error)?;
+        let idx_bytes = view.idx_bytes(pack_id, deadline).await.map_err(root_pack_error)?;
         stage_pack_pair(git, format, &pack_bytes, &idx_bytes)?;
     }
     Ok(())

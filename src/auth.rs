@@ -333,8 +333,7 @@ pub async fn verify_repo_write_access_with_parent<C: GenericClient + Sync>(
     browser: bool,
     action: crate::token_scopes::RepoAction,
 ) -> Result<(), Error> {
-    let read_only =
-        browser_parent::write_token_read_only(client, actor_id, token_id, parent_token_id, browser).await?;
+    let read_only = browser_parent::write_token_read_only(client, actor_id, token_id, parent_token_id, browser).await?;
     if action.is_mutating() && read_only {
         return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
     }
@@ -395,8 +394,7 @@ pub async fn authorize_publication_window(
     // Step 1: take the token row lock (plus parent row lock when browser-bound).
     browser_parent::lock_publication_tokens(tx, actor, browser).await?;
     // Step 2: re-read the live row(s) after the lock wait with clock_timestamp().
-    let (read_only, unexpired, live_session) =
-        browser_parent::recheck_publication_tokens(tx, actor, browser).await?;
+    let (read_only, unexpired, live_session) = browser_parent::recheck_publication_tokens(tx, actor, browser).await?;
     if !unexpired || !live_session {
         return Err(Error::unauthorized());
     }
