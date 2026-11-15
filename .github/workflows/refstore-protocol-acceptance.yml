@@ -2261,7 +2261,7 @@ jobs:
                   fail(label + ' digest mismatch')
           if sha(canonical_receipt) != sha(alias_receipt):
               fail('canonical build receipt differs from alias receipt')
-          artifacts = receipt.get('artifacts') or []
+          artifacts = receipt.get('cargo_artifacts') or []
           test_src_sha = sha('tests/blob_store_w1c_contract.rs')
           if not any(
               isinstance(item, dict)
@@ -2272,7 +2272,7 @@ jobs:
               and item.get('source_sha256') == test_src_sha
               for item in artifacts
           ):
-              fail('artifacts metadata missing blob_store_w1c_contract source/executable binding')
+              fail('cargo_artifacts metadata missing blob_store_w1c_contract source/executable binding')
           raw_bytes = canonical_receipt.read_bytes()
           copied_receipt_path.unlink(missing_ok=True)
           copied_receipt_path.write_bytes(raw_bytes)
@@ -2334,6 +2334,7 @@ jobs:
               'accepted': True, 'tests': {name: 'ok' for name in expected},
               'result': {'state': 'ok', 'passed': 2, 'failed': 0, 'ignored': 0},
           }, indent=2) + '\n', encoding='utf-8')
+          print('\n'.join(sanitized_lines))
           print('blob_store_w1c_contract PG+Garage S3 accepted: 2 passed, 0 failed, 0 ignored')
           PY
       - name: Stop only the job-owned Garage fixture
