@@ -212,21 +212,23 @@ pub async fn project_event_in_tx(
 
         tx.execute(
             "INSERT INTO ref_cas_projected_refs \
-             (repository_id, ref_name, oid, deleted, revision, history_incarnation, group_id, \
-              group_epoch, log_index, log_term, event_seq, op_event_id, can_authorize_write) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE) \
+             (repository_id, tenant_id, ref_name, oid, deleted, revision, history_incarnation, \
+              group_id, group_epoch, log_index, log_term, event_seq, op_event_id, \
+              can_authorize_write) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,FALSE) \
              ON CONFLICT (repository_id, ref_name) DO UPDATE SET \
-               oid = EXCLUDED.oid, deleted = EXCLUDED.deleted, revision = EXCLUDED.revision, \
-               history_incarnation = EXCLUDED.history_incarnation, group_id = EXCLUDED.group_id, \
-               group_epoch = EXCLUDED.group_epoch, log_index = EXCLUDED.log_index, \
-               log_term = EXCLUDED.log_term, event_seq = EXCLUDED.event_seq, \
-               op_event_id = EXCLUDED.op_event_id, can_authorize_write = FALSE, \
-               updated_at = clock_timestamp() \
+               tenant_id = EXCLUDED.tenant_id, oid = EXCLUDED.oid, deleted = EXCLUDED.deleted, \
+               revision = EXCLUDED.revision, history_incarnation = EXCLUDED.history_incarnation, \
+               group_id = EXCLUDED.group_id, group_epoch = EXCLUDED.group_epoch, \
+               log_index = EXCLUDED.log_index, log_term = EXCLUDED.log_term, \
+               event_seq = EXCLUDED.event_seq, op_event_id = EXCLUDED.op_event_id, \
+               can_authorize_write = FALSE, updated_at = clock_timestamp() \
              WHERE (ref_cas_projected_refs.group_epoch, ref_cas_projected_refs.log_index, \
                     ref_cas_projected_refs.event_seq) \
                    < (EXCLUDED.group_epoch, EXCLUDED.log_index, EXCLUDED.event_seq)",
             &[
                 &envelope.repository_id,
+                &tenant_id,
                 &delta.ref_name,
                 &delta.new_oid,
                 &delta.deleted,
