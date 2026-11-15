@@ -75,7 +75,7 @@ impl ChunkSealWriter<'_> {
             .seal_in_place_append_tag(nonce, Aad::from(&aad), chunk_buf)
             .map_err(|_| EnvelopeError::CiphertextCorrupt("chunk encryption failed"))?;
         self.dst.write_all(chunk_buf).map_err(|_| EnvelopeError::Io("failed writing encrypted chunk"))?;
-        self.ct_hasher.update(chunk_buf);
+        self.ct_hasher.update(&chunk_buf[..]);
         self.ct_written = self
             .ct_written
             .checked_add(chunk_buf.len() as u64)
@@ -195,7 +195,7 @@ pub(super) fn decrypt_ciphertext_inner(
         if plaintext.len() != expected_pt {
             return Err(EnvelopeError::CiphertextCorrupt("decrypted chunk length mismatch"));
         }
-        pt_hasher.update(plaintext);
+        pt_hasher.update(&*plaintext);
         if let Some((_, file, _)) = out_guard.as_mut() {
             file.write_all(plaintext).map_err(|_| EnvelopeError::Io("failed writing decrypted plaintext"))?;
         }

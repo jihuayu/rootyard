@@ -62,7 +62,7 @@ impl EncryptedBlobReceipt {
     }
 
     pub fn plaintext_length(&self) -> u64 {
-        &self.plaintext_length
+        self.plaintext_length
     }
 }
 
