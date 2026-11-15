@@ -82,8 +82,8 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
                 "SELECT (expires_at <= clock_timestamp())::text FROM ref_store_core_pins "
                 "WHERE pin_id='" + pid + "' AND repository_id='" + rid + "'"
             )
-            assert state in ("t", "f"), (label, state)
-            if state == "t":
+            assert state in ("true", "false"), (label, state)
+            if state == "true":
                 return
             time.sleep(0.05)
         raise AssertionError(label + ": pin did not expire naturally within 10s")
