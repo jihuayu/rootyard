@@ -177,11 +177,32 @@ pub struct Db {
     schema: String,
 }
 
+fn validate_owned_schema_name(schema: &str) -> Result<()> {
+    let suffix = schema
+        .strip_prefix("verifier_budgets_")
+        .ok_or_else(|| anyhow!("refusing non-verifier-budgets schema name `{schema}`"))?;
+    ensure!(
+        !suffix.is_empty()
+            && schema.len() <= 63
+            && suffix.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+        "invalid owned schema identifier `{schema}`"
+    );
+    Ok(())
+}
+
 impl Db {
+    pub fn fresh_schema_name() -> String {
+        format!("verifier_budgets_{}", Uuid::new_v4().simple())
+    }
+
     pub async fn setup() -> Result<Self> {
+        Self::setup_with_schema(Self::fresh_schema_name()).await
+    }
+
+    pub async fn setup_with_schema(schema: String) -> Result<Self> {
+        validate_owned_schema_name(&schema)?;
         let (url, _) = database_info().await?;
         let admin = db::pool(url)?;
-        let schema = format!("verifier_budgets_{}", Uuid::new_v4().simple());
         admin.get().await?.batch_execute(&format!("CREATE SCHEMA {schema}")).await?;
         let mut config: tokio_postgres::Config = url.parse()?;
         config.options(format!(
@@ -191,17 +212,47 @@ impl Db {
             .runtime(deadpool_postgres::Runtime::Tokio1)
             .max_size(16)
             .build()?;
-        db::migrate(&pool).await?;
+        if let Err(err) = db::migrate(&pool).await {
+            let _ = Self::drop_owned_schema(url, &schema).await;
+            return Err(err.into());
+        }
         Ok(Self { admin, pool, schema })
     }
 
     pub async fn finish(&self, outcome: Result<()>) -> Result<()> {
-        let drop_res = self.admin.get().await?.batch_execute(&format!("DROP SCHEMA {} CASCADE", self.schema)).await;
+        let drop_res =
+            self.admin.get().await?.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema)).await;
         match (outcome, drop_res) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(err), _) => Err(err),
             (Ok(()), Err(drop_err)) => Err(drop_err.into()),
         }
+    }
+
+    pub async fn drop_owned_schema(pg_url: &str, schema: &str) -> Result<()> {
+        validate_owned_schema_name(schema)?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let admin = db::pool(pg_url)?;
+            admin.get().await?.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow!("timed out dropping schema `{schema}`"))?
+    }
+
+    pub async fn schema_exists(pg_url: &str, schema: &str) -> Result<bool> {
+        validate_owned_schema_name(schema)?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let admin = db::pool(pg_url)?;
+            let rows = admin
+                .get()
+                .await?
+                .query("SELECT 1 FROM information_schema.schemata WHERE schema_name = $1", &[&schema])
+                .await?;
+            Ok::<bool, anyhow::Error>(!rows.is_empty())
+        })
+        .await
+        .map_err(|_| anyhow!("timed out querying schema `{schema}`"))?
     }
 
     async fn create_repo_and_gate(&self, format: GitObjectFormat, tenant: Uuid) -> Result<(Uuid, CoreGateVersion)> {

@@ -12,9 +12,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::sync::Mutex;
 use verifier_budgets_support::bench::{metric_delta, metric_u64, verifier_metrics};
-use verifier_budgets_support::bench_runner::{ENV_BENCH_PHASE, execute_isolated_benchmark, run_benchmark_worker};
+use verifier_budgets_support::bench_runner::{
+    ENV_BENCH_PHASE, execute_isolated_benchmark, run_benchmark_worker, run_hang_cleanup_probe,
+};
 use verifier_budgets_support::pg_git::{
-    Db, commit_and_pin_snapshot, deadline, git_binary, pin_committed_snapshot, prepare_fresh_commit, std_deadline,
+    Db, commit_and_pin_snapshot, deadline, git_binary, pin_committed_snapshot, prepare_fresh_commit, resolved_database,
+    std_deadline,
 };
 use verifier_budgets_support::s3::LoopbackS3;
 
@@ -210,6 +213,38 @@ async fn verifier_budget_before_vs_after_pg_s3_git_benchmark() -> Result<()> {
 
     let _serial = SUITE_LOCK.lock().await;
     execute_isolated_benchmark().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timed_out_isolated_worker_cleans_up_owned_pg_schema() -> Result<()> {
+    let _serial = SUITE_LOCK.lock().await;
+    let (pg_url, _) = resolved_database().await?;
+    ensure!(Db::drop_owned_schema(&pg_url, "verifier_budgets_%").await.is_err());
+    ensure!(Db::drop_owned_schema(&pg_url, "public").await.is_err());
+    ensure!(Db::drop_owned_schema(&pg_url, "verifier_budgets_Bad!").await.is_err());
+
+    let exe = std::env::current_exe()?;
+    let temp = tempfile::tempdir()?;
+    let schema = Db::fresh_schema_name();
+    let marker = temp.path().join("migrated.marker");
+
+    let res = run_hang_cleanup_probe(
+        &exe,
+        &pg_url,
+        &temp.path().join("unused.json"),
+        &schema,
+        &marker,
+        Duration::from_secs(8),
+    )
+    .await;
+    let err = res.expect_err("hanging isolated probe worker must time out");
+    ensure!(err.to_string().contains("timed out"), "expected timeout error, got: {err:#}");
+    ensure!(marker.is_file(), "probe worker did not migrate `{schema}` before timeout kill");
+    ensure!(
+        !Db::schema_exists(&pg_url, &schema).await?,
+        "owned schema `{schema}` leaked after timed-out isolated child termination"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

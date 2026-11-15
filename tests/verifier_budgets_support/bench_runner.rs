@@ -12,14 +12,19 @@ use super::s3::{LoopbackS3, SLOW_DELAY_KEY_TAG, open_blob_store_at, tagged_tenan
 use anyhow::{Result, anyhow, ensure};
 use rootyard::ref_store::core::pack_commit::{PackVerifier, PgPackCommit};
 use std::path::Path;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant as StdInstant};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Child;
 use tokio::sync::Semaphore;
 
 pub const ENV_BENCH_PHASE: &str = "ROOTYARD_VB_PHASE";
 const ENV_BENCH_OUT: &str = "ROOTYARD_VB_OUT";
 const ENV_BENCH_S3_ENDPOINT: &str = "ROOTYARD_VB_S3_ENDPOINT";
+const ENV_BENCH_SCHEMA: &str = "ROOTYARD_VB_SCHEMA";
+const ENV_BENCH_PROBE_MARKER: &str = "ROOTYARD_VB_PROBE_MARKER";
 
 fn update_peak(peak: &AtomicU64, value: u64) {
     let mut cur = peak.load(Ordering::Relaxed);
@@ -157,7 +162,53 @@ async fn run_benchmark_phase(
     })
 }
 
+async fn drain_pipe<R: AsyncRead + Unpin>(pipe: Option<R>) -> Result<Vec<u8>> {
+    let Some(mut reader) = pipe else {
+        return Ok(Vec::new());
+    };
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
+async fn collect_pipe(mut task: tokio::task::JoinHandle<Result<Vec<u8>>>) -> String {
+    match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+        Ok(Ok(Ok(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(Ok(Err(err))) => format!("<pipe read error: {err}>"),
+        Ok(Err(join_err)) => format!("<pipe task panicked: {join_err}>"),
+        Err(_) => {
+            task.abort();
+            "<pipe drain timed out>".to_owned()
+        }
+    }
+}
+
+async fn terminate_and_reap(child: &mut Child) -> Result<ExitStatus> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+    let _ = child.start_kill();
+    tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .map_err(|_| anyhow!("timed out waiting 5s for killed child exit"))?
+        .map_err(Into::into)
+}
+
 pub async fn run_benchmark_worker(phase: &str) -> Result<()> {
+    let schema = std::env::var(ENV_BENCH_SCHEMA).map_err(|_| anyhow!("{ENV_BENCH_SCHEMA} missing in worker"))?;
+    if phase == "hang_cleanup_probe" {
+        let marker =
+            std::env::var(ENV_BENCH_PROBE_MARKER).map_err(|_| anyhow!("{ENV_BENCH_PROBE_MARKER} missing in worker"))?;
+        let db = Db::setup_with_schema(schema).await?;
+        let outcome = async {
+            std::fs::write(&marker, b"migrated\n")?;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        return db.finish(outcome).await;
+    }
+
     let out_path = std::env::var(ENV_BENCH_OUT).map_err(|_| anyhow!("{ENV_BENCH_OUT} missing in worker"))?;
     let endpoint =
         std::env::var(ENV_BENCH_S3_ENDPOINT).map_err(|_| anyhow!("{ENV_BENCH_S3_ENDPOINT} missing in worker"))?;
@@ -169,7 +220,7 @@ pub async fn run_benchmark_worker(phase: &str) -> Result<()> {
 
     let store = open_blob_store_at(&endpoint)?;
     let git = git_binary()?;
-    let db = Db::setup().await?;
+    let db = Db::setup_with_schema(schema).await?;
     let outcome = async {
         let mut commits = Vec::with_capacity(7);
         for i in 0..3 {
@@ -199,6 +250,125 @@ pub async fn run_benchmark_worker(phase: &str) -> Result<()> {
     db.finish(outcome).await
 }
 
+struct WorkerSpec<'a> {
+    exe: &'a Path,
+    phase: &'a str,
+    pg_url: &'a str,
+    s3_endpoint: &'a str,
+    out_path: &'a Path,
+    schema: &'a str,
+    probe_marker: Option<&'a Path>,
+    timeout: Duration,
+}
+
+async fn spawn_worker_with_cleanup(spec: WorkerSpec<'_>) -> Result<CohortMeasurement> {
+    let mut cmd = tokio::process::Command::new(spec.exe);
+    cmd.args(["verifier_budget_before_vs_after_pg_s3_git_benchmark", "--exact", "--nocapture", "--test-threads=1"])
+        .env(ENV_BENCH_PHASE, spec.phase)
+        .env(ENV_BENCH_OUT, spec.out_path)
+        .env("ROOTYARD_TEST_DATABASE_URL", spec.pg_url)
+        .env(ENV_BENCH_S3_ENDPOINT, spec.s3_endpoint)
+        .env(ENV_BENCH_SCHEMA, spec.schema)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(marker) = spec.probe_marker {
+        cmd.env(ENV_BENCH_PROBE_MARKER, marker);
+    }
+
+    let mut child = cmd.spawn()?;
+    let stdout_task = tokio::spawn(drain_pipe(child.stdout.take()));
+    let stderr_task = tokio::spawn(drain_pipe(child.stderr.take()));
+
+    let wait_res = tokio::time::timeout(spec.timeout, child.wait()).await;
+    let cohort_result: Result<CohortMeasurement> = match wait_res {
+        Ok(Ok(status)) => {
+            let stdout = collect_pipe(stdout_task).await;
+            let stderr = collect_pipe(stderr_task).await;
+            if status.success() {
+                read_cohort_file(spec.out_path)
+            } else {
+                Err(anyhow!(
+                    "isolated cohort `{}` exited with {status}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    spec.phase
+                ))
+            }
+        }
+        Ok(Err(err)) => {
+            let reap = terminate_and_reap(&mut child).await;
+            let stdout = collect_pipe(stdout_task).await;
+            let stderr = collect_pipe(stderr_task).await;
+            Err(anyhow!(
+                "failed waiting on isolated cohort `{}`: {err} (reap: {reap:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                spec.phase
+            ))
+        }
+        Err(_) => {
+            let reap = terminate_and_reap(&mut child).await;
+            let stdout = collect_pipe(stdout_task).await;
+            let stderr = collect_pipe(stderr_task).await;
+            Err(anyhow!(
+                "isolated cohort `{}` timed out after {:?} (reap: {reap:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                spec.phase,
+                spec.timeout
+            ))
+        }
+    };
+
+    let cleanup_res = Db::drop_owned_schema(spec.pg_url, spec.schema).await;
+    match (cohort_result, cleanup_res) {
+        (Ok(cohort), Ok(())) => Ok(cohort),
+        (Ok(_), Err(cleanup_err)) => Err(cleanup_err.context(format!("cleanup failed for schema `{}`", spec.schema))),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(cleanup_err)) => {
+            Err(err.context(format!("cleanup also failed for schema `{}`: {cleanup_err:#}", spec.schema)))
+        }
+    }
+}
+
+pub(crate) async fn run_isolated_cohort_with_timeout(
+    exe: &Path,
+    phase: &str,
+    pg_url: &str,
+    s3_endpoint: &str,
+    out_path: &Path,
+    timeout: Duration,
+) -> Result<CohortMeasurement> {
+    let schema = Db::fresh_schema_name();
+    spawn_worker_with_cleanup(WorkerSpec {
+        exe,
+        phase,
+        pg_url,
+        s3_endpoint,
+        out_path,
+        schema: &schema,
+        probe_marker: None,
+        timeout,
+    })
+    .await
+}
+
+pub(crate) async fn run_hang_cleanup_probe(
+    exe: &Path,
+    pg_url: &str,
+    out_path: &Path,
+    schema: &str,
+    marker: &Path,
+    timeout: Duration,
+) -> Result<CohortMeasurement> {
+    spawn_worker_with_cleanup(WorkerSpec {
+        exe,
+        phase: "hang_cleanup_probe",
+        pg_url,
+        s3_endpoint: "http://127.0.0.1:0",
+        out_path,
+        schema,
+        probe_marker: Some(marker),
+        timeout,
+    })
+    .await
+}
+
 async fn run_isolated_cohort(
     exe: &Path,
     phase: &str,
@@ -207,25 +377,9 @@ async fn run_isolated_cohort(
     out_path: &Path,
 ) -> Result<CohortMeasurement> {
     let c_before = s3.counters();
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.args(["verifier_budget_before_vs_after_pg_s3_git_benchmark", "--exact", "--nocapture", "--test-threads=1"])
-        .env(ENV_BENCH_PHASE, phase)
-        .env(ENV_BENCH_OUT, out_path)
-        .env("ROOTYARD_TEST_DATABASE_URL", pg_url)
-        .env(ENV_BENCH_S3_ENDPOINT, s3.endpoint())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(Duration::from_secs(120), cmd.output())
-        .await
-        .map_err(|_| anyhow!("isolated cohort `{phase}` timed out"))??;
-    ensure!(
-        out.status.success(),
-        "isolated cohort `{phase}` exited with {}:\nstdout:\n{}\nstderr:\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let mut cohort =
+        run_isolated_cohort_with_timeout(exe, phase, pg_url, s3.endpoint(), out_path, Duration::from_secs(120)).await?;
     let s3_delta = s3.counters().delta_since(c_before);
-    let mut cohort = read_cohort_file(out_path)?;
     cohort.s3_get_requests = s3_delta.get_requests;
     cohort.s3_get_bytes = s3_delta.get_bytes;
     Ok(cohort)
