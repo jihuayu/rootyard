@@ -6,6 +6,8 @@ import copy
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 for path in (ROOT / "scripts", ROOT / "tests"):
@@ -13,6 +15,7 @@ for path in (ROOT / "scripts", ROOT / "tests"):
         sys.path.insert(0, str(path))
 import http_report_contract as contract  # noqa: E402
 import issue107_http_report_validator as validator  # noqa: E402
+import native_build_receipt as receipts  # noqa: E402
 
 SHA = "a" * 64
 BINARY = "b" * 64
@@ -24,6 +27,7 @@ HEAD = "1" * 40
 INPUT_HASHES = {path: SHA for path in contract.INPUT_PATHS}
 CLI = {
     "schema": "v2",
+    "receipt_schema": receipts.RECEIPT_SCHEMA_V2,
     "binary_sha256": BINARY,
     "source_inputs_sha256": SOURCE,
     "workspace_commit": HEAD,
@@ -132,6 +136,70 @@ class ValidatorMutationTests(unittest.TestCase):
         wrong = suite_reports()
         wrong["roots"]["partial"] = True
         self.assert_code(wrong, "partial_report")
+
+    def test_validate_reports_gate_rejects_legacy_or_incomplete_cli_identity(self):
+        mutations = [
+            ({"schema": "v1"}, "formal_receipt_not_v2"),
+            ({"receipt_schema": None}, "formal_receipt_schema_mismatch"),
+            ({"config_digest": None}, "formal_config_hash_invalid"),
+            ({"rustc_version": None}, "formal_toolchain_missing"),
+            ({"workspace_commit": "0" * 40}, "formal_workspace_mismatch"),
+            ({"binary_sha256": None}, "formal_binary_hash_invalid"),
+            ({"source_inputs_sha256": "not-a-hash"}, "formal_source_hash_invalid"),
+            ({"receipt_sha256": "not-a-hash"}, "formal_receipt_hash_invalid"),
+        ]
+        for mutation, code in mutations:
+            with self.subTest(code=code):
+                cli = dict(CLI)
+                cli.update(mutation)
+                with self.assertRaises(validator.ValidationError) as raised:
+                    validator.validate_reports(
+                        suite_reports(), source_head=HEAD, cli=cli,
+                        expected_input_hashes=dict(INPUT_HASHES), verify_sources=False)
+                self.assertEqual(raised.exception.code, code)
+        with self.assertRaises(validator.ValidationError) as raised:
+            validator.validate_reports(
+                suite_reports(), source_head="A" * 40, cli=CLI,
+                expected_input_hashes=dict(INPUT_HASHES), verify_sources=False)
+        self.assertEqual(raised.exception.code, "formal_source_head_invalid")
+
+    def test_cli_identity_loader_gate_rejects_legacy_or_incomplete_identity(self):
+        valid = SimpleNamespace(
+            schema="v2",
+            payload={"receipt_schema": receipts.RECEIPT_SCHEMA_V2},
+            binary_sha256=BINARY,
+            source_inputs_sha256=SOURCE,
+            workspace_commit=HEAD,
+            config_digest=CONFIG,
+            receipt_sha256=RECEIPT,
+            toolchain={"rustc": {"version": "rustc-test"}},
+        )
+        with mock.patch.object(validator.receipts, "load_receipt", return_value=valid):
+            identity = validator._cli_identity("binary", "receipt", "source", HEAD)
+        self.assertEqual(identity["schema"], "v2")
+        self.assertEqual(identity["config_digest"], CONFIG)
+
+        mutations = [
+            ({"schema": "v1"}, "formal_receipt_not_v2"),
+            ({"payload": {}}, "formal_receipt_schema_mismatch"),
+            ({"config_digest": None}, "formal_config_hash_invalid"),
+            ({"toolchain": None}, "formal_toolchain_missing"),
+            ({"workspace_commit": "0" * 40}, "formal_workspace_mismatch"),
+            ({"binary_sha256": None}, "formal_binary_hash_invalid"),
+        ]
+        for mutation, code in mutations:
+            with self.subTest(code=code):
+                changed = SimpleNamespace(**vars(valid))
+                for key, value in mutation.items():
+                    setattr(changed, key, value)
+                with mock.patch.object(validator.receipts, "load_receipt", return_value=changed):
+                    with self.assertRaises(validator.ValidationError) as raised:
+                        validator._cli_identity("binary", "receipt", "source", HEAD)
+                self.assertEqual(raised.exception.code, code)
+        with mock.patch.object(validator.receipts, "load_receipt", return_value=valid):
+            with self.assertRaises(validator.ValidationError) as raised:
+                validator._cli_identity("binary", "receipt", "source", "A" * 40)
+        self.assertEqual(raised.exception.code, "formal_source_head_invalid")
 
     def test_wrong_source_binary_receipt_config_profile(self):
         wrong = suite_reports(); wrong["snapshot"]["source_head"] = "0" * 40

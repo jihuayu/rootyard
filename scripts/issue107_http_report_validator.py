@@ -52,6 +52,25 @@ def _pairs(values, flag):
     return result
 
 
+def validate_formal_cli_identity(cli, source_head):
+    """One formal v2 identity gate for both receipt loading and direct callers."""
+    _require(isinstance(cli, dict), "formal_cli_identity_missing")
+    _require(cli.get("schema") == "v2", "formal_receipt_not_v2")
+    _require(cli.get("receipt_schema") == receipts.RECEIPT_SCHEMA_V2,
+             "formal_receipt_schema_mismatch")
+    _require(isinstance(source_head, str)
+             and re.fullmatch(r"[0-9a-f]{40}", source_head) is not None,
+             "formal_source_head_invalid")
+    _require(cli.get("workspace_commit") == source_head, "formal_workspace_mismatch")
+    _require(_sha(cli.get("binary_sha256")), "formal_binary_hash_invalid")
+    _require(_sha(cli.get("source_inputs_sha256")), "formal_source_hash_invalid")
+    _require(_sha(cli.get("config_digest")), "formal_config_hash_invalid")
+    _require(_sha(cli.get("receipt_sha256")), "formal_receipt_hash_invalid")
+    rustc = cli.get("rustc_version")
+    _require(isinstance(rustc, str) and bool(rustc.strip()), "formal_toolchain_missing")
+    return cli
+
+
 def _cli_identity(binary, receipt, source_root, source_head):
     validated = receipts.load_receipt(
         receipt,
@@ -63,8 +82,9 @@ def _cli_identity(binary, receipt, source_root, source_head):
     toolchain = validated.toolchain or {}
     rustc = toolchain.get("rustc") if isinstance(toolchain, dict) else None
     rustc_version = rustc.get("version") if isinstance(rustc, dict) else None
-    return {
+    identity = {
         "schema": validated.schema,
+        "receipt_schema": validated.payload.get("receipt_schema"),
         "binary_sha256": validated.binary_sha256,
         "source_inputs_sha256": validated.source_inputs_sha256,
         "workspace_commit": validated.workspace_commit,
@@ -72,6 +92,7 @@ def _cli_identity(binary, receipt, source_root, source_head):
         "receipt_sha256": validated.receipt_sha256,
         "rustc_version": rustc_version,
     }
+    return validate_formal_cli_identity(identity, source_head)
 
 
 def _validate_inputs(report, suite, cli, expected_input_hashes):
@@ -112,8 +133,7 @@ def _validate_report(report, suite, source_head, cli, expected_input_hashes):
     _require(profile.get("config_digest") == cli["config_digest"], "wrong_profile_config")
     _require(profile.get("workspace_commit") == source_head, "wrong_profile_commit")
     _require(profile.get("build_receipt_sha256") == cli["receipt_sha256"], "wrong_build_receipt")
-    if cli["rustc_version"] is not None:
-        _require(profile.get("rustc") == cli["rustc_version"], "wrong_toolchain")
+    _require(profile.get("rustc") == cli["rustc_version"], "wrong_toolchain")
     blob_profile = report.get("blob_profile")
     _require(isinstance(blob_profile, dict), "missing_blob_profile")
     _require(blob_profile.get("driver") == "opendal", "wrong_blob_driver")
@@ -156,6 +176,7 @@ def validate_reports(
     expected_input_hashes=None,
     verify_sources=True,
 ):
+    validate_formal_cli_identity(cli, source_head)
     _require(isinstance(reports, dict), "missing_reports")
     expected_names = [suite["report"] for suite in contract.EXPECTED_SUITES]
     _require(set(reports) == set(expected_names), "report_set_mismatch")
