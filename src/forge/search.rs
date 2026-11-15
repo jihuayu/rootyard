@@ -245,7 +245,8 @@ pub(crate) async fn execute_search(
             &sql,
             &[
                 &actor.id,
-                &actor.token_id,
+                // Browser children read the live grants stored under their parent API token.
+                &actor.scope_token_id(),
                 &target_repo_id,
                 &needle,
                 &c_ts,

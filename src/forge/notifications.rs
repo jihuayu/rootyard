@@ -276,7 +276,8 @@ pub(crate) async fn load_notifications_page(
             &sql,
             &[
                 &actor.id,
-                &actor.token_id,
+                // Browser children read the live grants stored under their parent API token.
+                &actor.scope_token_id(),
                 &unread_only,
                 &query.owner,
                 &query.repo,
@@ -317,7 +318,7 @@ pub(crate) async fn mark_notification_read_tx(
          FOR UPDATE OF n"
     );
     let was_unread: bool = tx
-        .query_opt(&check_sql, &[&actor.id, &actor.token_id, &id])
+        .query_opt(&check_sql, &[&actor.id, &actor.scope_token_id(), &id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?
@@ -353,7 +354,7 @@ pub(crate) async fn mark_all_notifications_read_tx(
          AND ($3::text IS NULL OR ns.slug=$3) AND ($4::text IS NULL OR r.name=$4) \
          AND ({gate})"
     );
-    tx.execute(&sql, &[&actor.id, &actor.token_id, &input.owner, &input.repo])
+    tx.execute(&sql, &[&actor.id, &actor.scope_token_id(), &input.owner, &input.repo])
         .await
         .map_err(Error::internal)
 }
