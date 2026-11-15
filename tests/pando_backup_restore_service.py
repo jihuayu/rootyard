@@ -321,7 +321,7 @@ def _run_ac2_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
         proxy.start()
         proxy_endpoint = f"http://127.0.0.1:{proxy.port}"
         provider_config = replace(config, endpoint=proxy_endpoint)
-        private_root = Path(tempfile.mkdtemp(prefix="rootyard-ac2-backup-restore-"))
+        private_root = Path(tempfile.mkdtemp(prefix="r77-ac2-"))
         private_root.chmod(0o700)
         source_data = private_root / "source-data"
         source_data.mkdir(mode=0o700)
