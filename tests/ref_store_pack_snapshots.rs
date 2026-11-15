@@ -3968,7 +3968,7 @@ async fn serving_check_version_absolute_deadline_bounds_two_sequential_auth_lock
                 started.elapsed() >= Duration::from_millis(3_000),
                 "first auth lock did not consume a substantial part of the absolute deadline"
             );
-            ensure!(started.elapsed() < absolute, "first auth lock consumed the whole deadline");
+            ensure!(TokioInstant::now() < absolute, "first auth lock consumed the whole deadline");
             release_row_lock(first.take()).await?;
 
             let second_backend = wait_for_backend_blocked_by(&db.pool, second_pid).await?;
