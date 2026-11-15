@@ -67,6 +67,7 @@ pub(super) const SCRIPT: &str = r#"'use strict';
   let page = null;
   let sections = [];
   let loadedAllSections = false;
+  let loadingMore = false;
 
   function show(text, error) {
     status.textContent = text;
@@ -181,8 +182,14 @@ pub(super) const SCRIPT: &str = r#"'use strict';
       if (page === scope) show(REFUSED, true);
       return null;
     }
-    if (next !== NO_BOUND) adopt(next.token, next.revision);
-    return page === scope ? {items: list, cursor: parsed.cursor} : null;
+    if (page !== scope) return null;
+    const confirmed = admit(response);
+    if (!confirmed) {
+      if (page === scope) show(REFUSED, true);
+      return null;
+    }
+    if (confirmed !== NO_BOUND) adopt(confirmed.token, confirmed.revision);
+    return {items: list, cursor: parsed.cursor};
   }
 
   async function readPages(scope, buildUrl, startCursor, seen) {
@@ -219,24 +226,34 @@ pub(super) const SCRIPT: &str = r#"'use strict';
     if (section.cursor !== null) {
       const button = el('button', 'Load more', 'load-more');
       button.type = 'button';
+      button.disabled = loadingMore;
       button.addEventListener('click', () => loadMore(section, button));
+      section.button = button;
       section.box.appendChild(button);
+    } else {
+      section.button = null;
     }
   }
 
   async function loadMore(section, button) {
-    if (!loadedAllSections) return;
+    if (!loadedAllSections || loadingMore) return;
     if (page !== section.scope || section.busy || section.cursor === null) return;
+    loadingMore = true;
     section.busy = true;
-    button.disabled = true;
+    for (const entry of sections) if (entry.button) entry.button.disabled = true;
     show(LOADING_MORE, false);
     const batch = await readPages(section.scope, section.buildUrl, section.cursor, section.seen);
     section.busy = false;
+    loadingMore = false;
     if (page !== section.scope) return;
-    if (!batch) { button.disabled = false; return; }
+    if (!batch) {
+      for (const entry of sections) if (entry.button) entry.button.disabled = false;
+      return;
+    }
     for (const item of batch.items) section.items.push(item);
     section.cursor = batch.cursor;
     renderSection(section);
+    for (const entry of sections) if (entry.button) entry.button.disabled = false;
     finishStatus();
   }
 
@@ -258,6 +275,7 @@ pub(super) const SCRIPT: &str = r#"'use strict';
       cursor: batch.cursor,
       seen: seen,
       busy: false,
+      button: null,
     };
     sections.push(section);
     renderSection(section);
@@ -270,6 +288,7 @@ pub(super) const SCRIPT: &str = r#"'use strict';
     page = scope;
     sections = [];
     loadedAllSections = false;
+    loadingMore = false;
     title.textContent = owner + '/' + name;
     clear(nav);
     clear(content);
@@ -320,6 +339,7 @@ pub(super) const SCRIPT: &str = r#"'use strict';
     page = scope;
     sections = [];
     loadedAllSections = false;
+    loadingMore = false;
     title.textContent = 'Blob repositories';
     clear(nav);
     clear(content);

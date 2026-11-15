@@ -245,12 +245,14 @@ fn the_script_parses_the_whole_body_before_adopting_a_bound() {
     let body = read.find("await response.json()").expect("the whole body is parsed");
     let shape = read.find("Array.isArray(data.items)").expect("the body shape is checked");
     let cursor = read.find("parseCursor(scope, response, data, list)").expect("continuation cursor is validated");
-    let adopt = read.find("adopt(next.token, next.revision);").expect("the pair is adopted together");
+    let recheck = read.find("const confirmed = admit(response);").expect("headers are re-checked after awaiting body");
+    let adopt = read.find("adopt(confirmed.token, confirmed.revision);").expect("the pair is adopted together");
     assert!(
-        headers < body && body < shape && shape < cursor && cursor < adopt,
-        "admission, body, shape and cursor checks must precede adoption"
+        headers < body && body < shape && shape < cursor && cursor < recheck && recheck < adopt,
+        "admission, body, shape, cursor and post-await re-check must precede adoption"
     );
-    assert!(read.contains("if (next !== NO_BOUND)"), "a headerless answer must keep the browser boundless");
+    assert!(!read[recheck..adopt].contains("await"), "no await may separate re-validation from adoption");
+    assert!(read.contains("if (confirmed !== NO_BOUND)"), "a headerless answer must keep the browser boundless");
     assert_eq!(read.matches("adopt(").count(), 1, "the read path adopts at exactly one site");
     assert!(!script.contains("currentScript"));
 }
@@ -311,10 +313,23 @@ fn the_script_consumes_pagination_cursors_and_guards_partial_status() {
     let read_branch = finish.find("else show(bound ? READ : NO_SESSION, false);").unwrap();
     assert!(partial_branch < read_branch);
 
+    let render_section = body_of(script, "function renderSection(", "async function loadMore(", "section rendering");
+    assert!(render_section.contains("button.disabled = loadingMore;"));
+    assert!(render_section.contains("section.button = button;"));
+
     let load_more = body_of(script, "async function loadMore(", "async function mountSection(", "load more handler");
-    assert!(load_more.contains("if (!loadedAllSections) return;"));
+    assert!(load_more.contains("if (!loadedAllSections || loadingMore) return;"));
     assert!(load_more.contains("if (page !== section.scope || section.busy || section.cursor === null) return;"));
-    assert!(load_more.contains("button.disabled = true;"));
-    assert!(load_more.contains("if (!batch) { button.disabled = false; return; }"));
+    let lock = load_more.find("loadingMore = true;").expect("global single-flight lock is taken");
+    let disable_all =
+        load_more.find("for (const entry of sections) if (entry.button) entry.button.disabled = true;").unwrap();
+    let fetch_more = load_more.find("await readPages(").unwrap();
+    let unlock = load_more.find("loadingMore = false;").expect("global single-flight lock is released");
+    assert!(lock < disable_all && disable_all < fetch_more && fetch_more < unlock);
+    assert_eq!(
+        load_more.matches("for (const entry of sections) if (entry.button) entry.button.disabled = false;").count(),
+        2,
+        "all section buttons are restored on failure and completion"
+    );
     assert!(load_more.contains("finishStatus();"));
 }

@@ -282,8 +282,8 @@ async fn push_twice(
     let first = git.run(&checkout, &["push", "--quiet", "origin", &branch]).await?;
     ensure!(first.success, "the first real push through the CLI child was refused");
     let first_revision = live_revision(db, backend, owner, name).await?;
-    for idx in 1..=54 {
-        git.ok(&checkout, &["commit", "--quiet", "--allow-empty", "-m", &format!("history pad {idx:02}")]).await?;
+    for idx in 1..=258 {
+        git.ok(&checkout, &["commit", "--quiet", "--allow-empty", "-m", &format!("history pad {idx:03}")]).await?;
     }
     for idx in 1..=258 {
         std::fs::write(checkout.join(format!("z-pad-{idx:03}.txt")), "pad\n")?;

@@ -528,8 +528,12 @@ class Client:
         self.check_origin()
 
         # Real paginated read chain: refs (2 pages, unbound first), tree (5
-        # auto-pages of 50 leaving cursor non-null), commits (2 pages), leaving
-        # explicit "Load more" + incomplete status before the final tree click.
+        # auto-pages of 50 leaving cursor non-null), commits (5 auto-pages of 50
+        # leaving cursor non-null), leaving 2 explicit "Load more" buttons and
+        # partial status. Then delay the real /tree continuation body/response,
+        # attempt a concurrent /commits "Load more" click, verify the UI stays
+        # single-flight and sends zero /commits requests while /tree is in
+        # flight, complete /tree, and finally complete /commits.
         partial_status = await self.status_has(page, "More items remain.", "REPO_PAGE_INCOMPLETE")
         if "Read complete." in partial_status:
             raise Failure("REPO_PAGE_STATUS_INVALID")
@@ -545,24 +549,75 @@ class Client:
             self.config["file"],
             self.config["second_file"],
             self.config["last_ref"],
-            self.config["first_commit_subject"],
             self.config["oid"][:7],
         ):
             if expected not in content:
                 raise Failure("REPO_PAGE_INCOMPLETE")
-        if self.config["last_tree_file"] in content:
+        if self.config["last_tree_file"] in content or self.config["first_commit_subject"] in content:
             raise Failure("REPO_PAGE_INCOMPLETE")
         load_more = page.locator("button.load-more")
-        if await load_more.count() != 1:
+        if await load_more.count() != 2:
             raise Failure("REPO_PAGE_INCOMPLETE")
-        await load_more.click()
+
+        tree_inflight = asyncio.Event()
+        release_tree = asyncio.Event()
+        delayed_tree = {"done": False}
+
+        async def delay_tree(route, request):
+            if not self.confined(request.url):
+                self.escaped = True
+                await route.abort()
+                return
+            if not delayed_tree["done"] and "after=" in request.url:
+                delayed_tree["done"] = True
+                tree_inflight.set()
+                try:
+                    await asyncio.wait_for(release_tree.wait(), timeout=STEP_MS / 1000)
+                except Exception:
+                    await route.abort()
+                    return
+            await route.fallback()
+
+        await page.route(f"{self.origin}{self.alias}/tree*", delay_tree)
+        try:
+            await load_more.nth(0).click()
+            try:
+                await asyncio.wait_for(tree_inflight.wait(), timeout=STEP_MS / 1000)
+            except Exception:
+                raise Failure("REPO_PAGE_INCOMPLETE") from None
+            inflight_status = (await page.locator("#status").text_content()) or ""
+            if "Loading more." not in inflight_status:
+                raise Failure("REPO_PAGE_STATUS_INVALID")
+            if not await load_more.nth(0).is_disabled() or not await load_more.nth(1).is_disabled():
+                raise Failure("CONCURRENT_LOAD_MORE_NOT_DISABLED")
+            commits_before = self.commits_requests
+            await load_more.nth(1).evaluate(
+                "node => { node.click(); node.dispatchEvent(new MouseEvent('click', {bubbles: true})); }"
+            )
+            await asyncio.sleep(0.05)
+            if self.commits_requests != commits_before:
+                raise Failure("CONCURRENT_LOAD_MORE_SENT")
+            release_tree.set()
+            after_tree_status = await self.status_has(page, "More items remain.", "REPO_PAGE_INCOMPLETE")
+            if "Read complete." in after_tree_status:
+                raise Failure("REPO_PAGE_STATUS_INVALID")
+        finally:
+            await page.unroute(f"{self.origin}{self.alias}/tree*", delay_tree)
+
+        if await load_more.count() != 1 or await load_more.nth(0).is_disabled():
+            raise Failure("REPO_PAGE_STATUS_INVALID")
+        after_tree_content = (await page.locator("#content").text_content()) or ""
+        if self.config["last_tree_file"] not in after_tree_content or self.config["first_commit_subject"] in after_tree_content:
+            raise Failure("REPO_PAGE_INCOMPLETE")
+
+        await load_more.nth(0).click()
         status = await self.status_has(page, "Read complete.", "READ_CHAIN_INVALID")
         if "This server did not provide a bounded session." in status:
             raise Failure("READ_CHAIN_INVALID")
         if await load_more.count() != 0:
             raise Failure("REPO_PAGE_STATUS_INVALID")
         completed_content = (await page.locator("#content").text_content()) or ""
-        if self.config["last_tree_file"] not in completed_content:
+        if self.config["first_commit_subject"] not in completed_content:
             raise Failure("REPO_PAGE_INCOMPLETE")
         reads = await self.page_reads(page)
         if reads["complete"] is not True:
@@ -575,6 +630,7 @@ class Client:
             "tree": {"revision": reads["tree"]["revision"]},
             "commits": {"revision": reads["commits"]["revision"]},
             "partial_status_shown": "More items remain." in partial_status and "Read complete." not in partial_status,
+            "concurrent_click_blocked": True,
             "load_more_completed": True,
         }
 
@@ -623,7 +679,7 @@ class Client:
         except Exception:
             raise Failure("READ_CHAIN_INVALID") from None
         pairs = self.read_pairs.get(id(page)) or {}
-        expected_counts = {"refs": 2, "tree": 6, "commits": 2}
+        expected_counts = {"refs": 2, "tree": 6, "commits": 6}
         revisions = {}
         min_revisions = {}
         for tail in tail_names:
