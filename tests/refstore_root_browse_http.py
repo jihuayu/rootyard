@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import subprocess
@@ -20,13 +21,16 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "blob_gateway_support"))
 import blob_only_service as blob  # noqa: E402
+from root_blob_fault_gate import RootBlobFaultGate  # noqa: E402
 import refstore_snapshot_http as snapshot  # noqa: E402
 from refstore_roots_http import RootsHttpHarness  # noqa: E402
 
 ROOT_BROWSE_CASE = "roots_http_browse_selected_closures"
 ROOT_BROWSE_SHA256_CASE = "roots_http_browse_sha256"
 ROOT_SCOPE_FENCE_CASE = "roots_http_post_json_scope_revocation_fence"
+ROOT_PACK_REFUSAL_CASE = "roots_http_registered_pack_get_refusal_no_fallback"
 
 LIMITATIONS = [
     "Root-only real-service HTTP fixture; only py-compiled/static-inspected by the implementation worker.",
@@ -36,10 +40,18 @@ LIMITATIONS = [
     "Stored A5 snapshot/ref/pack prune is not forced by this fixture; the ByIntent source-metadata-miss fallback remains coordinator/source coverage, not this HTTP race.",
     "The post-JSON ContentsRead-removal case uses one test-only Python passthrough wrapper as the serve-blob ROOTYARD_GIT executor plus a run-owned deferred DELETE trigger/advisory blocker. The wrapper is not the production Git profile or binary receipt and is reported separately from the upstream stock Git hash. This is fixture timing, not a product pause hook or a broader fault matrix.",
     "If an owned blocker/request/server/trigger cannot be proven stopped, this fixture preserves its random schema and scratch for diagnosis and reports unresolved cleanup. Confirmed runs still use the normal schema-drop/removal cleanup; this is test reconciliation, not a product retention path.",
+    "The registered-pack refusal case forces one exact Blob GET to a fixed S3 503 through a test-only loopback forward gate. The backend-identity/realm/cluster replacement races remain unforced; this is not a provider-delete/corruption or broad backend loss matrix.",
 ]
 
 
 class RootBrowseHttpHarness(RootsHttpHarness):
+    def __init__(self, args, profile, blob_profile):
+        super().__init__(args, profile, blob_profile)
+        self._root_blob_gate = RootBlobFaultGate(self.env["ROOTYARD_BLOB_ENDPOINT"])
+        self._root_blob_gate.start()
+        self.env["ROOTYARD_BLOB_ENDPOINT"] = self._root_blob_gate.endpoint
+        self._root_blob_gate_sha256 = blob.sha256_file(Path(__file__).resolve().parent / "blob_gateway_support" / "root_blob_fault_gate.py")
+
     def _root_tree(self, repo, root, *, oid=None, path=None, after=None, limit=None, token=None):
         suffix = "/" + str(root) + "/tree"
         return self._request("GET", self._query_path(self._roots_path(repo, suffix), {
@@ -485,16 +497,97 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
         self._root_scope_blocker = retained
         return False, retained
 
+    def _registered_pack_path(self, repo, root_id, generation):
+        rid = str(uuid.UUID(repo["id"]))
+        root = str(uuid.UUID(root_id))
+        raw = self._sql_until(
+            "SELECT pack_storage_tenant_id::text || '|' || pack_authority_id::text || '|' || "
+            "pack_authority_generation::text || '|' || pack_attempt_id::text || '|' || "
+            "pack_namespace || '|' || pack_sha256 "
+            "FROM ref_store_core_root_packs "
+            "WHERE repository_id='" + rid + "' AND root_id='" + root + "' AND generation="
+            + str(int(generation)) + " ORDER BY pack_slot LIMIT 1", time.monotonic() + 10.0)
+        fields = raw.split("|")
+        if len(fields) != 6:
+            raise AssertionError("registered root pack locator row was not exactly one row")
+        tenant, authority, authority_generation, attempt, namespace, sha = fields
+        suffix = ("v1/tenants/" + tenant + "/authorities/" + authority + "/g"
+                  + authority_generation + "/attempts/" + attempt + "/" + namespace + "/" + sha)
+        return suffix, hashlib.sha256(suffix.encode()).hexdigest()
+
+    def _root_durable_digest(self, repo, root_id, generation):
+        rid = str(uuid.UUID(repo["id"]))
+        root = str(uuid.UUID(root_id))
+        gen = str(int(generation))
+        owner = "(SELECT owner_id FROM repositories WHERE id='" + rid + "')"
+        query = (
+            "SELECT jsonb_build_object("
+            "'repo',(SELECT to_jsonb(r) FROM repositories r WHERE r.id='" + rid + "'),"
+            "'snapshots',(SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY s.snapshot_id),'[]'::jsonb) "
+            "FROM ref_store_core_snapshots s WHERE s.repository_id='" + rid + "'),"
+            "'snapshot_refs',(SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.snapshot_id,r.ref_name),'[]'::jsonb) "
+            "FROM ref_store_core_snapshot_refs r JOIN ref_store_core_snapshots s USING(snapshot_id) "
+            "WHERE s.repository_id='" + rid + "'),"
+            "'snapshot_packs',(SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.snapshot_id,p.pack_id),'[]'::jsonb) "
+            "FROM ref_store_core_snapshot_packs p WHERE p.repository_id='" + rid + "'),"
+            "'pack_history',(SELECT coalesce(jsonb_agg(to_jsonb(h) ORDER BY h.request_id),'[]'::jsonb) "
+            "FROM ref_store_core_pack_snapshot_history h WHERE h.repository_id='" + rid + "'),"
+            "'pack_repo_usage',(SELECT coalesce(jsonb_agg(to_jsonb(u)),'[]'::jsonb) "
+            "FROM ref_store_core_pack_snapshot_repo_usage u WHERE u.repository_id='" + rid + "'),"
+            "'pack_tenant_usage',(SELECT coalesce(jsonb_agg(to_jsonb(u)),'[]'::jsonb) "
+            "FROM ref_store_core_pack_snapshot_tenant_usage u WHERE u.tenant_id=" + owner + "),"
+            "'root_heads',(SELECT coalesce(jsonb_agg(to_jsonb(h) ORDER BY h.root_id),'[]'::jsonb) "
+            "FROM ref_store_core_root_heads h WHERE h.repository_id='" + rid + "' AND h.root_id='" + root + "'),"
+            "'roots',(SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.root_id,r.generation),'[]'::jsonb) "
+            "FROM ref_store_core_roots r WHERE r.repository_id='" + rid + "' AND r.root_id='" + root + "'),"
+            "'root_refs',(SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.ref_name),'[]'::jsonb) "
+            "FROM ref_store_core_root_refs r WHERE r.repository_id='" + rid + "' AND r.root_id='" + root
+            + "' AND r.generation=" + gen + "),"
+            "'root_oids',(SELECT coalesce(jsonb_agg(to_jsonb(o) ORDER BY o.ordinal),'[]'::jsonb) "
+            "FROM ref_store_core_root_oids o WHERE o.repository_id='" + rid + "' AND o.root_id='" + root
+            + "' AND o.generation=" + gen + "),"
+            "'root_packs',(SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.pack_id),'[]'::jsonb) "
+            "FROM ref_store_core_root_packs p WHERE p.repository_id='" + rid + "' AND p.root_id='" + root
+            + "' AND p.generation=" + gen + "),"
+            "'root_pack_artifacts',(SELECT coalesce(jsonb_agg(to_jsonb(a) ORDER BY a.registration_id,a.role),'[]'::jsonb) "
+            "FROM ref_store_core_pack_artifacts a WHERE a.registration_id IN "
+            "(SELECT p.registration_id FROM ref_store_core_root_packs p WHERE p.repository_id='" + rid
+            + "' AND p.root_id='" + root + "' AND p.generation=" + gen + ")),"
+            "'root_receipts',(SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.request_id),'[]'::jsonb) "
+            "FROM ref_store_core_root_receipts c WHERE c.repository_id='" + rid + "'),"
+            "'root_repo_usage',(SELECT coalesce(jsonb_agg(to_jsonb(u)),'[]'::jsonb) "
+            "FROM ref_store_core_root_repo_usage u WHERE u.repository_id='" + rid + "'),"
+            "'root_tenant_usage',(SELECT coalesce(jsonb_agg(to_jsonb(u)),'[]'::jsonb) "
+            "FROM ref_store_core_root_tenant_usage u WHERE u.tenant_id=" + owner + ")"
+            ")::text"
+        )
+        raw = self._sql_until(query, time.monotonic() + 10.0)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
     def cleanup(self):
-        # Preserve both the run-owned random schema and scratch when any owned
-        # blocker/request/server/trigger could not be proven stopped. A normal
-        # confirmed run retains the existing e2e cleanup (schema drop/removal).
-        if getattr(self, "_root_scope_unresolved", None) is not None:
+        # Gate and server must stop before schema/scratch cleanup. Preserve both
+        # when any owned server/gate or prior blocker/request state is unresolved.
+        existing = getattr(self, "_root_scope_unresolved", None)
+        reasons = []
+        try:
+            self.stop()
+        except Exception:
+            reasons.append("owned server")
+        gate_stopped = True
+        gate = getattr(self, "_root_blob_gate", None)
+        if gate is not None:
             try:
-                self.stop()
+                gate_stopped = gate.stop(time.monotonic() + 10.0)
             except Exception:
-                pass
+                gate_stopped = False
+        if not gate_stopped:
+            reasons.append("blob forward gate")
+        if existing is not None:
+            reasons.append(str(existing.get("reason", "preexisting unresolved state")))
+        if reasons:
+            self._root_scope_unresolved = {"reason": "; ".join(reasons)}
             return
+        self._root_scope_unresolved = None
         super().cleanup()
 
     def roots_http_post_json_scope_revocation_fence(self):
@@ -674,6 +767,63 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
             self._root_scope_executor = None
 
 
+    def roots_http_registered_pack_get_refusal_no_fallback(self):
+        repo, remote, work, _head = self.seed("roots-http-pack-refusal")
+        head = self.commit_files(work, "registered pack refusal", {"refusal.txt": "refusal bytes\n"})
+        pushed = self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice, check=False)
+        assert pushed.returncode == 0, blob.git_failure(pushed)
+        assert self.remote_refs(remote).get("refs/heads/main") == head
+        target_oid = self.git("rev-parse", "HEAD:refusal.txt", cwd=work).stdout.decode().strip()
+        snapshot_id = self._create(repo, "roots-http-pack-refusal-snapshot", 300)[1]["snapshot_id"]
+        root_id = self._selector_root(repo, "roots-http-pack-refusal-root", snapshot_id, {"kind": "snapshot"})
+        status, root_view = self._read_root(repo, root_id)
+        assert status == 200, (status, root_view)
+        generation = int(root_view["generation"])
+        status, successful = self._root_blob(repo, root_id, target_oid)
+        assert status == 200 and successful["content"] == "refusal bytes\n", (status, successful)
+        suffix, suffix_hash = self._registered_pack_path(repo, root_id, generation)
+        durable_before = self._root_durable_digest(repo, root_id, generation)
+        counts_before = self._root_blob_gate.snapshot()
+        self._root_blob_gate.arm(suffix)
+        try:
+            fault_status, fault_body, _headers = self._root_blob(repo, root_id, target_oid)
+            counts_after = self._root_blob_gate.snapshot()
+            assert 500 <= fault_status < 600, ("unexpected backend refusal status", fault_status)
+            assert set(fault_body) == {"error"}, fault_body
+            self._assert_no_content(fault_status, fault_body)
+            assert counts_after["target_gets"] > counts_before["target_gets"], "registered pack GET did not reach the gate"
+            before_methods = counts_before["forwarded_methods"]
+            after_methods = counts_after["forwarded_methods"]
+            for method in ("PUT", "POST", "DELETE"):
+                assert after_methods.get(method, 0) == before_methods.get(method, 0), (
+                    "upstream " + method + " was sent during the fault window")
+            durable_after = self._root_durable_digest(repo, root_id, generation)
+            assert durable_after == durable_before, "root/backend rows changed during the read refusal"
+            self.no_bare(repo, "during registered pack refusal")
+        finally:
+            self._root_blob_gate.disarm()
+        assert self._root_blob_gate.snapshot()["armed"] is False
+        recovery_counts = self._root_blob_gate.snapshot()["target_gets"]
+        status, recovered = self._root_blob(repo, root_id, target_oid)
+        assert status == 200 and recovered["content"] == "refusal bytes\n", (status, recovered)
+        assert self._root_blob_gate.snapshot()["target_gets"] == recovery_counts, "disarmed gate still blocked the pack"
+        self.no_bare(repo, "after registered pack refusal recovery")
+        return {
+            "target_pack_get_refused": True,
+            "target_gate_hash": suffix_hash,
+            "target_gate_hits": counts_after["target_gets"] - counts_before["target_gets"],
+            "fault_status": fault_status,
+            "error_only_response": True,
+            "durable_rows_unchanged": True,
+            "no_upstream_write_during_fault": True,
+            "recovered_bytes": True,
+            "test_only_gate_sha256": self._root_blob_gate_sha256,
+            "root_browse_fixture_sha256": blob.sha256_file(Path(__file__).resolve()),
+            "gate_armed_during_fault": True,
+            "gate_disarmed_before_recovery": True,
+        }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, help="absolute attested rootyard binary")
@@ -697,7 +847,7 @@ def main(argv=None):
         return 2
     args.binary = str(profile.binary)
     harness = RootBrowseHttpHarness(args, profile, blob_profile)
-    cases = [ROOT_BROWSE_CASE, ROOT_BROWSE_SHA256_CASE, ROOT_SCOPE_FENCE_CASE]
+    cases = [ROOT_BROWSE_CASE, ROOT_BROWSE_SHA256_CASE, ROOT_SCOPE_FENCE_CASE, ROOT_PACK_REFUSAL_CASE]
     success = False
     try:
         harness.prepare()
