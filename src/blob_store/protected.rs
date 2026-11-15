@@ -49,9 +49,7 @@ use uuid::Uuid;
 
 use super::opendal::BlobStore;
 use super::{BlobError, BlobReceipt};
-use crate::ref_store::core::artifact_hold::{
-    ArtifactGrant, ArtifactHoldError, ConsumedArtifacts, ConsumedUpload, PgArtifactHoldStore,
-};
+use crate::ref_store::core::artifact_hold::{ArtifactGrant, ArtifactHoldError, ConsumedUpload, PgArtifactHoldStore};
 
 /// One caller-provided local source. The bytes must hash/length-match the
 /// artifact specification that produced the corresponding granted intent, and
@@ -224,13 +222,28 @@ impl ProtectedUploader {
         sources: &[UploadSource],
         deadline: Instant,
     ) -> Result<ProtectedPublication, ProtectedUploadError> {
+        let (acquire_request_id, consume_request_id, uploads) =
+            self.consume_grant_for_count(pool, grant, sources.len(), deadline).await?;
+        self.publish(acquire_request_id, consume_request_id, uploads, sources, deadline).await
+    }
+
+    /// Validate backend binding & expected slot count, check out one short-lived
+    /// PostgreSQL connection, consume `grant`, and immediately drop the pool
+    /// lease before any provider IO starts.
+    pub(super) async fn consume_grant_for_count(
+        &self,
+        pool: &Pool,
+        grant: ArtifactGrant,
+        actual_count: usize,
+        deadline: Instant,
+    ) -> Result<(Uuid, Uuid, Vec<ConsumedUpload>), ProtectedUploadError> {
         // Physical binding first: the grant's immutable ACK and every granted
         // hold must name this exact store, before a connection or the consume
         // transaction is even attempted.
         self.ensure_grant_backend(&grant)?;
         let expected = grant.artifact_count();
-        if sources.len() != expected {
-            return Err(ProtectedUploadError::SourceCount { expected, actual: sources.len() });
+        if actual_count != expected {
+            return Err(ProtectedUploadError::SourceCount { expected, actual: actual_count });
         }
         let tokio_deadline = tokio::time::Instant::from_std(deadline);
         let consumed = {
@@ -247,7 +260,11 @@ impl ProtectedUploader {
             drop(client);
             consumed
         };
-        self.publish(consumed, sources, deadline).await
+        let acquire_request_id = consumed.acquire_request_id();
+        let consume_request_id = consumed.consume_request_id();
+        let mut uploads: Vec<ConsumedUpload> = consumed.into_uploads();
+        uploads.sort_by_key(|upload| upload.slot);
+        Ok((acquire_request_id, consume_request_id, uploads))
     }
 
     /// Prove that the grant was minted against this opened store: the immutable
@@ -266,19 +283,16 @@ impl ProtectedUploader {
         Ok(())
     }
 
-    /// Publish an already-consumed token. This is reachable only after a
-    /// positive consume ACK; the token is not constructible anywhere else.
+    /// Publish an already-consumed batch. Reachable only after a positive
+    /// consume ACK; the intents are consumed once and never reconstructed.
     async fn publish(
         &self,
-        consumed: ConsumedArtifacts,
+        acquire_request_id: Uuid,
+        consume_request_id: Uuid,
+        uploads: Vec<ConsumedUpload>,
         sources: &[UploadSource],
         deadline: Instant,
     ) -> Result<ProtectedPublication, ProtectedUploadError> {
-        // Read both stable ids before the one-shot hand-over consumes the token.
-        let acquire_request_id = consumed.acquire_request_id();
-        let consume_request_id = consumed.consume_request_id();
-        let mut uploads: Vec<ConsumedUpload> = consumed.into_uploads();
-        uploads.sort_by_key(|upload| upload.slot);
         let mut receipts = Vec::with_capacity(uploads.len());
         for (index, upload) in uploads.into_iter().enumerate() {
             let source = sources.get(index).ok_or(ProtectedUploadError::MissingSource { slot: upload.slot })?;

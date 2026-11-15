@@ -346,7 +346,7 @@ impl SealedCiphertext {
         &self.metadata
     }
 
-    pub fn into_parts(self) -> (TempPathGuard, EnvelopeMetadata) {
+    pub(super) fn into_parts(self) -> (TempPathGuard, EnvelopeMetadata) {
         (self.staging_file, self.metadata)
     }
 }
