@@ -53,6 +53,7 @@ const BUSY_TIMEOUT_MS: u64 = 5_000;
 pub mod cluster;
 pub mod fault;
 pub mod fixture;
+pub mod mtls;
 pub mod state_machine;
 
 // `Cursor` is required by the macro's default `SnapshotData`. Intentionally not documented.

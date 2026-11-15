@@ -384,6 +384,11 @@ jobs:
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
         run: python3 tests/web_sessions.py --binary "$ROOTYARD_BIN" --report test-results/web-sessions.json
+      - name: Exercise scoped PAT/session management and restricted browser-child inheritance
+        timeout-minutes: 10
+        run: |
+          python3 tests/pat_scope_auth.py --binary "$ROOTYARD_BIN" --report test-results/pat-scope-auth.json
+          python3 tests/token_management.py --binary "$ROOTYARD_BIN" --report test-results/token-management.json
       - name: Exercise structured worker-operation diagnostics isolation
         timeout-minutes: 5
         run: python3 tests/worker_diagnostics.py --binary "$ROOTYARD_BIN" --report test-results/worker-diagnostics.json
@@ -418,6 +423,8 @@ jobs:
             --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
             --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
             --report web_sessions=test-results/web-sessions.json \
+            --report pat_scope_auth=test-results/pat-scope-auth.json \
+            --report token_management=test-results/token-management.json \
             --report metrics=test-results/metrics.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
             --report webhook_fairness=test-results/webhook-fairness.json \
@@ -464,6 +471,8 @@ jobs:
             --log-marker "webhook_regressions=verified TLS and plaintext rejection: passed" \
             --log-marker "webhook_regressions=untrusted certificate rejected:" \
             --harness tests/web_sessions.py \
+            --harness tests/pat_scope_auth.py \
+            --harness tests/token_management.py \
             --harness tests/ci_dependencies.py \
             --harness tests/ci_job_checkouts.py \
             --harness tests/ci_source_pins.py \
@@ -553,6 +562,9 @@ jobs:
             --require-case "ci_trust_boundaries=revoked registration, rotated secret and late attempt" \
             --require-case "ci_trust_boundaries=removed webhook context revokes claim/report/merge authority" \
             --require-case "ci_trust_boundaries=API principal token revocation remains management-only" \
+            --require-case pat_scope_auth=restricted.browser_child_inheritance \
+            --require-case token_management=sessions.restricted_browser_child_inheritance \
+            --require-case token_management=sessions.legacy_upgrade_and_parent_rotation_live \
             --fixture-rust-from-receipt \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \

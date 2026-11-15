@@ -187,16 +187,9 @@ async fn list_repos_authorized(
         // Locks the live token row FOR SHARE for this short transaction and
         // returns the exact restricted-grant mode used in the page predicate.
         let restricted = crate::auth::token_is_restricted(&tx, &identity).await.map_err(authority_error)?;
-        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 8] = [
-            &identity.id,
-            &cursor_owner,
-            &cursor_name,
-            &cursor_id,
-            &page_size,
-            &restricted,
-            &identity.token_id,
-            &backend,
-        ];
+        let scope_token_id = identity.scope_token_id();
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 8] =
+            [&identity.id, &cursor_owner, &cursor_name, &cursor_id, &page_size, &restricted, &scope_token_id, &backend];
         tokio::time::timeout_at(deadline, tx.query(&sql, &params))
             .await
             .map_err(|_| GatewayError::Timeout)?

@@ -112,10 +112,11 @@ async fn execute_ref_transaction_inner(
     // unaffiliated caller.
     {
         let client = state.pool.get().await.map_err(Error::internal)?;
-        auth::verify_repo_write_access(
+        auth::verify_repo_write_access_with_parent(
             &**client,
             actor.id,
             actor.token_id,
+            actor.parent_token_id,
             repo.id,
             auth::web_scope_enabled(),
             crate::token_scopes::RepoAction::ContentsWrite,
@@ -269,7 +270,7 @@ async fn execute_ref_transaction_inner(
         }
         // Re-check the caller's token and effective role BEFORE the native CAS.
         // A revoked writer must abort the intent while refs are still untouched.
-        auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repo_id,
+        auth::verify_repo_write_access_with_parent(&*tx, actor.id, actor.token_id, actor.parent_token_id, repo_id,
             auth::web_scope_enabled(), crate::token_scopes::RepoAction::ContentsWrite).await?;
         if test_failpoint("before_cas") {
             return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction aborted before CAS"));

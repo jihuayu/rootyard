@@ -40,7 +40,7 @@ NOTES = [
     "The browser cases use the real /web/login form and the real cookie/Origin/CSRF middleware. Login is issued with http.client so both Set-Cookie headers (session + CSRF) are observable; all other requests use the shared Harness HTTP path.",
     "Basic Authorization on a web mutation is ambient browser authority and is rejected with 403 regardless of Origin; Bearer remains an explicit non-ambient API credential.",
     "Rotation re-validates every copied grant. Any failure (lost role, non-ready repository, database error) aborts before a new row or revocation, so it cannot silently drop a scope.",
-    "The Git CAS parent-token lock and restricted browser-child inheritance are tracked on a separate branch; this suite does not exercise or claim them.",
+    "Restricted browser-child inheritance is active end-to-end: restricted API parents mint bounded browser sessions that inherit parent scopes, read_only, expiry, and revocation live, while management routes return 403 and /web/logout stays allowed.",
     "Self revocation is real owner intent, not a bypass: begin re-verifies the acting row under the per-user advisory lock, the acting token is re-proved after every target-row lock wait and immediately before the revocation statement, and only a transaction that revoked the acting row itself may commit without the final re-check. Cross-user/non-self targets and restricted/read-only issuers keep the full check.",
 ]
 
@@ -454,6 +454,141 @@ def main():
             h.expect("/api/tokens", 200, token=h.alice)
             return "cookie+CSRF revokes the current session 200; cookie 401; parent API token still valid"
 
+        def logout_browser(cookies):
+            connection = http.client.HTTPConnection("127.0.0.1", h.port, timeout=20)
+            connection.request(
+                "POST",
+                "/web/logout",
+                body=b"",
+                headers={"Cookie": cookie_header(cookies), "Origin": h.base},
+            )
+            response = connection.getresponse()
+            raw = response.read()
+            status = response.status
+            connection.close()
+            assert status == 303, f"web logout: expected 303, got {status}: {raw[:300]!r}"
+
+        def case_restricted_browser_child_inheritance():
+            h.create_repository({"name": "hidden"}, token=h.alice)
+            grants = repo_grant(demo, ["repo_read", "contents_read", "issues_write"])
+            parent, _ = issue(h, h.alice, body("browser-child", grants))
+            before_sessions = {item["token_id"] for item in
+                               json.loads(h.expect("/api/sessions", 200, token=h.alice))["items"]}
+            cookies = login_browser(h, "alice", parent["secret"])
+            cookie = cookie_header(cookies)
+            csrf = cookies["rootyard_csrf"]
+            after_sessions = [item["token_id"] for item in
+                              json.loads(h.expect("/api/sessions", 200, token=h.alice))["items"]]
+            created_children = [sid for sid in after_sessions if sid not in before_sessions]
+            assert len(created_children) == 1, f"expected one new child session, got {created_children}"
+            child_id = created_children[0]
+
+            # Scoped browser session sees only granted repositories and actions.
+            listing = h.expect("/web/repos", 200, extra_headers={"Cookie": cookie}).decode("utf-8")
+            assert "/web/repos/alice/demo" in listing, "granted repo missing from /web/repos"
+            assert "/web/repos/alice/hidden" not in listing, "ungranted repo leaked into /web/repos"
+            assert "/web/repos/bob/other" not in listing, "foreign repo leaked into /web/repos"
+            h.expect("/web/repos/alice/demo", 200, extra_headers={"Cookie": cookie})
+            h.expect("/web/repos/alice/hidden", 403, extra_headers={"Cookie": cookie})
+
+            # Granted issues_write mutation works with Origin + CSRF; ungranted repo is 403.
+            h.expect("/web/repos/alice/demo/issues", 201, method="POST",
+                     body={"title": "child-web-issue", "body": "scoped"},
+                     extra_headers={"Cookie": cookie, "Origin": h.base, "X-CSRF-Token": csrf})
+            h.expect("/web/repos/alice/hidden/issues", 403, method="POST",
+                     body={"title": "denied", "body": "no-grant"},
+                     extra_headers={"Cookie": cookie, "Origin": h.base, "X-CSRF-Token": csrf})
+
+            # Ambient Basic and /api cookie smuggling remain blocked.
+            basic = "Basic " + base64.b64encode(("alice:" + parent["secret"]).encode()).decode()
+            h.expect("/web/repos/alice/demo/issues", 403, method="POST",
+                     body={"title": "ambient-basic", "body": "blocked"},
+                     extra_headers={"Authorization": basic, "Cookie": cookie,
+                                    "Origin": "http://evil.example", "X-CSRF-Token": csrf})
+            for api_path in ("/api/repos", "/api/tokens", "/api/sessions"):
+                h.expect(api_path, 401, extra_headers={"Cookie": cookie})
+
+            # Restricted browser child is refused 403 on all token/session management routes.
+            h.expect("/web/settings/tokens", 403, extra_headers={"Cookie": cookie})
+            h.expect("/web/settings/sessions", 403, extra_headers={"Cookie": cookie})
+            h.expect("/web/settings/tokens", 403, method="POST", body=body("nope"),
+                     extra_headers={"Cookie": cookie, "Origin": h.base, "X-CSRF-Token": csrf})
+            h.expect(f"/web/settings/tokens/{parent['id']}/revoke", 403, method="POST", body={},
+                     extra_headers={"Cookie": cookie, "Origin": h.base, "X-CSRF-Token": csrf})
+            h.expect(f"/web/settings/sessions/{child_id}/revoke", 403, method="POST", body={},
+                     extra_headers={"Cookie": cookie, "Origin": h.base, "X-CSRF-Token": csrf})
+
+            # Live PATCH scope narrowing immediately revokes issues_write on the open child cookie.
+            h.expect(f"/api/tokens/{parent['id']}", 200, method="PATCH", token=h.alice,
+                     body={"expected_scope_version": 1,
+                           "repository_grants": repo_grant(demo, ["repo_read", "contents_read"])})
+            h.expect("/web/repos/alice/demo/issues", 403, method="POST",
+                     body={"title": "after-narrow", "body": "denied"},
+                     extra_headers={"Cookie": cookie, "Origin": h.base, "X-CSRF-Token": csrf})
+            h.expect("/web/repos/alice/demo", 200, extra_headers={"Cookie": cookie})
+
+            # /web/logout stays allowed for restricted children while other sessions stay live.
+            second = login_browser(h, "alice", parent["secret"])
+            logout_browser(second)
+            h.expect("/web/repos/alice/demo", 401, extra_headers={"Cookie": cookie_header(second)})
+            h.expect("/web/repos/alice/demo", 200, extra_headers={"Cookie": cookie})
+
+            # Parent revocation immediately invalidates the already-minted child cookie (401).
+            h.expect(f"/api/tokens/{parent['id']}", 204, method="DELETE", token=h.alice)
+            h.expect("/web/repos/alice/demo", 401, extra_headers={"Cookie": cookie})
+
+            # Bounded read_only inheritance + live parent expiry.
+            ro_parent, _ = issue(h, h.alice, body("ro-child", grants, read_only=True))
+            ro_cookies = login_browser(h, "alice", ro_parent["secret"])
+            ro_cookie = cookie_header(ro_cookies)
+            h.expect("/web/repos/alice/demo", 200, extra_headers={"Cookie": ro_cookie})
+            h.expect("/web/settings/tokens", 403, extra_headers={"Cookie": ro_cookie})
+            h.expect("/web/repos/alice/demo/issues", 403, method="POST",
+                     body={"title": "ro-write", "body": "denied"},
+                     extra_headers={"Cookie": ro_cookie, "Origin": h.base,
+                                    "X-CSRF-Token": ro_cookies["rootyard_csrf"]})
+            h.sql(f"UPDATE tokens SET expires_at = clock_timestamp() - interval '1 second' WHERE id = {quote(ro_parent['id'])}")
+            h.expect("/web/repos/alice/demo", 401, extra_headers={"Cookie": ro_cookie})
+            return "restricted child inherits scopes/ro/expiry/revocation live; mgmt 403; logout 303"
+
+        def case_legacy_upgrade_and_parent_rotation_live():
+            user = h.account("create-user", "upgradeweb")
+            cred = {"username": user["username"], "token": user["token"]}
+            h.create_repository({"name": "u1"}, token=cred)
+            h.create_repository({"name": "u2"}, token=cred)
+            u1_id = repo_id(h, user["username"], "u1")
+
+            # Sign in BEFORE legacy parent becomes restricted; verify open management + full listing.
+            cookies = login_browser(h, user["username"], user["token"])
+            cookie = cookie_header(cookies)
+            h.expect("/web/settings/tokens", 200, extra_headers={"Cookie": cookie})
+            before_list = h.expect("/web/repos", 200, extra_headers={"Cookie": cookie}).decode("utf-8")
+            assert f"/web/repos/{user['username']}/u1" in before_list
+            assert f"/web/repos/{user['username']}/u2" in before_list
+
+            # Upgrade the legacy parent to restricted via PATCH: open cookie narrows immediately.
+            h.expect(f"/api/tokens/{user['token_id']}", 200, method="PATCH", token=cred,
+                     body={"expected_scope_version": 1,
+                           "repository_grants": repo_grant(u1_id, ["repo_read", "contents_read"])})
+            h.expect("/web/settings/tokens", 403, extra_headers={"Cookie": cookie})
+            h.expect("/web/settings/sessions", 403, extra_headers={"Cookie": cookie})
+            h.expect(f"/web/repos/{user['username']}/u1", 200, extra_headers={"Cookie": cookie})
+            h.expect(f"/web/repos/{user['username']}/u2", 403, extra_headers={"Cookie": cookie})
+            after_list = h.expect("/web/repos", 200, extra_headers={"Cookie": cookie}).decode("utf-8")
+            assert f"/web/repos/{user['username']}/u1" in after_list
+            assert f"/web/repos/{user['username']}/u2" not in after_list
+
+            # Parent rotation revokes parent immediately, killing any open child session.
+            rot_user = h.account("create-user", "rotateweb")
+            rot_cred = {"username": rot_user["username"], "token": rot_user["token"]}
+            rot_cookies = login_browser(h, rot_user["username"], rot_user["token"])
+            rot_cookie = cookie_header(rot_cookies)
+            h.expect("/web/repos", 200, extra_headers={"Cookie": rot_cookie})
+            h.expect(f"/api/tokens/{rot_user['token_id']}/rotate", 200, method="POST",
+                     token=rot_cred, body={})
+            h.expect("/web/repos", 401, extra_headers={"Cookie": rot_cookie})
+            return "legacy->restricted PATCH and parent rotation apply live on already-minted cookies"
+
         for name, fn in (
             ("tokens.create_once_digest_only", case_create_once_digest_only),
             ("tokens.owner_cross_user_404", case_owner_404),
@@ -470,6 +605,8 @@ def main():
             ("tokens.self_rotate_own_cli_token", case_self_rotate_own_cli_token),
             ("tokens.self_revoke_own_cli_token", case_self_revoke_own_cli_token),
             ("sessions.self_revoke_current_browser", case_self_revoke_current_browser_session),
+            ("sessions.restricted_browser_child_inheritance", case_restricted_browser_child_inheritance),
+            ("sessions.legacy_upgrade_and_parent_rotation_live", case_legacy_upgrade_and_parent_rotation_live),
         ):
             run_case(h, name, fn)
         exit_code = 0 if all(case["status"] == "passed" for case in h.results) else 1
@@ -484,14 +621,16 @@ def main():
             h.results.append(dict(name="cleanup", status="failed", error=h.redact(error),
                                   trace=h.redact(traceback.format_exc())[-2000:]))
             exit_code = 1
+        binary_path = Path(args.binary)
         report = dict(
             suite="token_management",
             executed_native=bool(h.results),
+            passed=exit_code == 0,
             ok=exit_code == 0,
+            binary_sha256=hashlib.sha256(binary_path.read_bytes()).hexdigest() if binary_path.is_file() else "",
             coverage_complete=False,
             untested_scope=[
-                "Git CAS parent-token lock across publication: separate branch, not claimed here.",
-                "Restricted browser-child inheritance for a restricted parent: unimplemented, so only parent login rejection and unrestricted sessions are covered.",
+                "Git CAS browser-token refusal stays fail-closed (BrowserTokenUnsupported); CAS parent-token locking for direct API tokens is covered separately.",
                 "The 128-grant ceiling is unit-tested; this suite does not build 129 real grants across multiple repositories.",
                 "Long-running concurrency/deadlock probes are not a scalability benchmark on this single loopback process.",
             ],
@@ -501,10 +640,8 @@ def main():
                 "Expiry is exercised by moving one token's expires_at with SQL (existing Harness bootstrap channel), not by waiting 30 days.",
                 "The non-ready repository case flips repositories.state with SQL and restores it; role and scope data are never SQL-seeded.",
                 "Chromium-level rendering is exercised by tests/browser_ui.py; this suite drives the same cookie/Origin/CSRF middleware over HTTP.",
-                "The self-rotation/self-revocation cases use dedicated CLI-created users and tokens so no fixture actor is retired; the acting credential is intentionally dead afterwards, which is why they never reuse h.alice/h.bob.",
-                "The implementation worker did not build or run this native suite; the coordinator must run it with --binary/--report before any pass claim.",
+                "The self-rotation/self-revocation and legacy-upgrade cases use dedicated CLI-created users/tokens so no fixture actor is retired.",
             ],
-            release_blocker="Private branch: Git CAS parent-token locking is owned by a parallel branch; restricted token issuance is not released or deployed from here.",
         )
         if args.report:
             args.report.parent.mkdir(parents=True, exist_ok=True)

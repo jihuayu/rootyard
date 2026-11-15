@@ -120,6 +120,7 @@ async fn authorize_transfer(
     let actor = db::Identity {
         id: env.actor_id,
         token_id: env.token_id,
+        parent_token_id: None,
         username: row.get(0),
         read_only: row.get(1),
         token_digest: row.get(2),
@@ -527,6 +528,7 @@ async fn authorize_finalize(
     let actor = db::Identity {
         id: env.actor_id,
         token_id: env.token_id,
+        parent_token_id: None,
         username: row.get(0),
         read_only: row.get(1),
         token_digest: row.get(2),

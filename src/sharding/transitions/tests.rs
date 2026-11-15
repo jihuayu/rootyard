@@ -19,7 +19,7 @@ async fn committed_but_unpublished_marker_reconciles_only_on_own_volume() {
     tx.execute("INSERT INTO tokens(id,user_id,digest) VALUES($1,$2,$3)", &[&token_id, &owner, &digest]).await.unwrap();
     let marker = VolumeFenceMarker::from_route(&route, 1, None, 1);
     let transition_id = stage(&tx, &local, &marker).await.unwrap();
-    let actor = db::Identity { id: owner, token_id, username: "fixture".into(), read_only: false, token_digest: digest };
+    let actor = db::Identity { id: owner, token_id, parent_token_id: None, username: "fixture".into(), read_only: false, token_digest: digest };
     assert!(commit_and_publish(&local, tx, &actor, &marker, transition_id).await.is_err());
     assert!(reject_pending(&local, repo_id).await.is_err());
     reconcile_pending(&foreign).await.unwrap();

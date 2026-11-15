@@ -321,13 +321,22 @@ class WebListingHarness(Harness):
         api_status, api_body, _ = self.http("/api/repos", token=empty)
         assert api_status == 200 and json.loads(api_body) == [], (api_status, api_body[:200])
 
-        # A restricted parent still cannot open a browser child session. This
-        # is the pre-existing contract and is not changed by listing work.
-        login_status, login_body, login_headers = self.login(token=scoped["token"], username="alice")
-        assert login_status == 403, (login_status, login_body[:300])
-        assert not self.cookies(login_headers).get("rootyard_session"), login_headers
+        # Restricted parent tokens mint bounded browser child sessions that
+        # inherit parent discovery scopes while staying 403 on token management.
+        scoped_jar = self.sign_in(token=scoped["token"], username="alice")
+        scoped_web_status, scoped_web_body, _ = self.get("/web/repos", jar=scoped_jar)
+        assert scoped_web_status == 200, (scoped_web_status, scoped_web_body[:300])
+        assert self.links(scoped_web_body) == [("alice", "demo")], self.links(scoped_web_body)
+        empty_jar = self.sign_in(token=empty["token"], username="alice")
+        empty_child_status, empty_child_body, _ = self.get("/web/repos", jar=empty_jar)
+        assert empty_child_status == 200 and self.links(empty_child_body) == [], (
+            empty_child_status, empty_child_body[:300]
+        )
+        assert b"No repositories are available" in empty_child_body
+        mgmt_status, _, _ = self.get("/web/settings/tokens", jar=scoped_jar)
+        assert mgmt_status == 403, f"restricted browser child must get 403 on settings: {mgmt_status}"
         return {"granted_rows": rows, "empty_web": 200, "empty_api": api_status,
-                "restricted_login": login_status}
+                "scoped_child_mgmt": mgmt_status}
 
     def anonymous_contract(self):
         # Source contract in src/web/session.rs: a non-navigation request keeps

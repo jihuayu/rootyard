@@ -277,9 +277,17 @@ pub async fn issue_token(pool: &Pool, username: &str, create_user: bool, read_on
 pub struct Identity {
     pub id: Uuid,
     pub token_id: Uuid,
+    pub parent_token_id: Option<Uuid>,
     pub username: String,
     pub read_only: bool,
     pub(crate) token_digest: Vec<u8>,
+}
+
+impl Identity {
+    /// Returns the token ID whose scope grants govern this identity (parent API token for browser sessions).
+    pub fn scope_token_id(&self) -> Uuid {
+        self.parent_token_id.unwrap_or(self.token_id)
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -341,5 +349,21 @@ mod tests {
             assert!(SCHEMA_VERSIONS[i] < version);
             assert!(!sql.trim().is_empty());
         }
+    }
+    #[test]
+    fn identity_scope_token_prefers_parent() {
+        let child = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        let direct = Identity {
+            id: Uuid::new_v4(),
+            token_id: child,
+            parent_token_id: None,
+            username: "alice".into(),
+            read_only: false,
+            token_digest: vec![],
+        };
+        let session = Identity { parent_token_id: Some(parent), ..direct.clone() };
+        assert_eq!(direct.scope_token_id(), child);
+        assert_eq!(session.scope_token_id(), parent);
     }
 }

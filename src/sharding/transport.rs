@@ -365,7 +365,7 @@ pub async fn authenticate_delegation(state: &Arc<AppState>, headers: &HeaderMap,
         "SELECT u.username, t.read_only, t.digest FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.id = $1 AND t.user_id = $2 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())",
         &[&env.token_id, &env.actor_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
-    let actor = Identity { id: env.actor_id, token_id: env.token_id, username: row.get(0), read_only: row.get(1), token_digest: row.get(2) };
+    let actor = Identity { id: env.actor_id, token_id: env.token_id, parent_token_id: None, username: row.get(0), read_only: row.get(1), token_digest: row.get(2) };
     let access = auth::authorize_repo_with_role(&tx, &actor, owner, name,
         if role_write { Role::Write } else { Role::Read }, if role_write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead }).await?;
     if access.repo_id != env.repository_id { return Err(Error::unauthorized()); }
