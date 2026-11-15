@@ -144,6 +144,7 @@ async fn real_redis_cancelled_inflight_connections_are_closed() {
     let cache = Arc::new(RedisCache::connect(url.as_str(), limits).await.expect("owned proxy Redis must validate"));
     let key = CacheKey::new(CacheKeyParts {
         environment: "test",
+        authority: "git-native",
         schema: 1,
         history_incarnation: Uuid::nil(),
         tenant: Uuid::from_u128(11),
