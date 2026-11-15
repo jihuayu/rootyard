@@ -10,6 +10,7 @@ on:
       - 'vendor/**'
       - 'rust-toolchain.toml'
       - 'migrations/**'
+      - 'tests/blob_store_w1c_contract.rs'
       - 'tests/ref_store_*.rs'
       - 'tests/retention_roots_support/**'
       - 'tests/format22_support/**'
@@ -2182,6 +2183,159 @@ jobs:
             "$evidence/preflight.json" "$evidence" "$upload" || status=1
           ls -la "$upload"
           exit "$status"
+      - name: "Build and exercise #109 blob_store_w1c_contract against PostgreSQL and Garage S3"
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          w1c_dir="$RUNNER_TEMP/refstore-w1c"
+          artifact_store="$HOME/.cache/rootyard/native-artifacts"
+          report_dir="test-results/refstore/blob-store-w1c"
+          rm -rf "$w1c_dir"
+          mkdir -p "$w1c_dir" "$report_dir"
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          git_status="$(git status --porcelain --untracked-files=normal)"
+          if [ -n "$git_status" ]; then
+            echo "worktree check failed: the worktree is not clean before building blob_store_w1c_contract" >&2
+            exit 1
+          fi
+          w1c_bin="$w1c_dir/blob_store_w1c_contract"
+          w1c_report="$w1c_dir/blob_store_w1c_contract-report.json"
+          python3 scripts/build_native_test.py --test blob_store_w1c_contract --features pando-lab \
+            --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$artifact_store" --output "$w1c_bin" > "$w1c_report"
+          w1c_exec="$(python3 - "$w1c_report" "$w1c_bin" "$w1c_bin.build.json" "$report_dir/blob_store_w1c_contract.build.json" <<'PY'
+          import hashlib, json, os, pathlib, re, stat, subprocess, sys
+
+          report_path, alias_path, alias_receipt_path, copied_receipt_path = (pathlib.Path(p) for p in sys.argv[1:5])
+          store_root = pathlib.Path(os.path.expanduser('~/.cache/rootyard/native-artifacts')).resolve()
+          hex64 = re.compile(r'^[0-9a-f]{64}$')
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+
+          def fail(msg):
+              raise SystemExit('w1c prebuilt receipt check failed: ' + msg)
+
+          def sha(path):
+              h = hashlib.sha256()
+              with pathlib.Path(path).open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(1 << 20), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def readonly_file(raw, label):
+              path = pathlib.Path(raw or '')
+              if not path.is_absolute() or '..' in path.parts:
+                  fail(label + ' is not a safe absolute path')
+              if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
+                  fail(label + ' is not a regular non-symlink file')
+              info = path.stat()
+              if info.st_uid != os.geteuid() or (info.st_mode & 0o222):
+                  fail(label + ' must be owned by current user and readonly')
+              return path
+
+          receipt = json.loads(alias_receipt_path.read_text(encoding='utf-8'))
+          report = json.loads(report_path.read_text(encoding='utf-8'))
+          if receipt.get('receipt_schema') != 'rootyard/native-build-receipt/v2':
+              fail('unexpected receipt_schema: ' + repr(receipt.get('receipt_schema')))
+          if receipt.get('workspace_commit') != head:
+              fail('receipt workspace_commit does not match HEAD')
+          if receipt.get('integration_test_source') != 'tests/blob_store_w1c_contract.rs':
+              fail('unexpected integration_test_source: ' + repr(receipt.get('integration_test_source')))
+          record = receipt.get('artifact_store')
+          if not isinstance(record, dict) or record.get('schema') != 'rootyard/native-artifact-store/v1':
+              fail('missing or invalid artifact_store record')
+          if report.get('binary_sha256') != receipt.get('binary_sha256'):
+              fail('report binary_sha256 differs from adjacent receipt')
+          binary_sha = receipt.get('binary_sha256')
+          if not isinstance(binary_sha, str) or not hex64.fullmatch(binary_sha):
+              fail('invalid binary_sha256')
+          if pathlib.Path(record.get('root') or '').resolve() != store_root:
+              fail('artifact_store root is not shared store')
+          canonical_bin = readonly_file(record.get('binary'), 'canonical binary')
+          canonical_receipt = readonly_file(record.get('build_receipt'), 'canonical build receipt')
+          cas_object = readonly_file(record.get('object'), 'content object')
+          alias_bin = readonly_file(alias_path, 'output alias')
+          alias_receipt = readonly_file(alias_receipt_path, 'alias receipt')
+          for candidate, label in ((canonical_bin, 'canonical'), (cas_object, 'cas object'), (alias_bin, 'alias')):
+              if sha(candidate) != binary_sha:
+                  fail(label + ' digest mismatch')
+          if sha(canonical_receipt) != sha(alias_receipt):
+              fail('canonical build receipt differs from alias receipt')
+          artifacts = receipt.get('artifacts') or []
+          test_src_sha = sha('tests/blob_store_w1c_contract.rs')
+          if not any(
+              isinstance(item, dict)
+              and item.get('target') == 'blob_store_w1c_contract'
+              and item.get('kind') == 'test'
+              and item.get('executable_sha256') == binary_sha
+              and item.get('source') == 'tests/blob_store_w1c_contract.rs'
+              and item.get('source_sha256') == test_src_sha
+              for item in artifacts
+          ):
+              fail('artifacts metadata missing blob_store_w1c_contract source/executable binding')
+          raw_bytes = canonical_receipt.read_bytes()
+          copied_receipt_path.unlink(missing_ok=True)
+          copied_receipt_path.write_bytes(raw_bytes)
+          os.chmod(copied_receipt_path, 0o444)
+          print(str(canonical_bin))
+          PY
+          )"
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="w1c-pg-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          "$w1c_exec" --ignored --list > "$report_dir/ignored-inventory.txt" 2>&1
+          "$w1c_exec" --ignored --test-threads=1 > "$report_dir/native.raw.log" 2>&1 || status=$?
+          status="${status:-0}"
+          python3 - "$report_dir/ignored-inventory.txt" "$report_dir/native.raw.log" "$report_dir/native.log" "$report_dir/acceptance.json" "$status" <<'PY'
+          import json, os, pathlib, re, sys
+
+          inv_path, raw_log_path, clean_log_path, json_path = (pathlib.Path(p) for p in sys.argv[1:5])
+          status = sys.argv[5]
+          expected = [
+              'pg_protected_uploader_consume_and_upload_encrypted_against_real_provider',
+              'pg_protected_uploader_preflight_preserves_unconsumed_holds',
+          ]
+          listed = sorted(re.findall(r'^([A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*): test$', inv_path.read_text(), re.MULTILINE))
+          if listed != expected:
+              raise SystemExit('w1c ignored inventory mismatch: got ' + repr(listed) + ', expected ' + repr(expected))
+          raw_text = raw_log_path.read_text(encoding='utf-8', errors='replace')
+          secret_keys = ('ROOTYARD_OBJECT_STORE_ACCESS_KEY', 'ROOTYARD_OBJECT_STORE_SECRET_KEY',
+                         'ROOTYARD_BLOB_ACCESS_KEY_ID', 'ROOTYARD_BLOB_SECRET_ACCESS_KEY')
+          secrets = sorted({os.environ.get(k) or '' for k in secret_keys if len(os.environ.get(k) or '') >= 4}, key=len, reverse=True)
+          sanitized_lines = []
+          for line in raw_text.splitlines():
+              if '://' in line:
+                  sanitized_lines.append('[line withheld: connection string]')
+                  continue
+              for sec in secrets:
+                  line = line.replace(sec, '[redacted]')
+              sanitized_lines.append(line)
+          clean_log_path.write_text('\n'.join(sanitized_lines) + '\n', encoding='utf-8')
+          raw_log_path.unlink(missing_ok=True)
+          if status != '0':
+              print('\n'.join(sanitized_lines), file=sys.stderr)
+              raise SystemExit('w1c PG+S3 tests failed with exit status ' + status)
+          rows = re.findall(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;', raw_text, re.MULTILINE)
+          if rows != [('ok', '2', '0', '0')]:
+              print('\n'.join(sanitized_lines), file=sys.stderr)
+              raise SystemExit('w1c result summary mismatch: ' + repr(rows))
+          ok_names = sorted(re.findall(r'^test ([A-Za-z0-9_]+) \.\.\. ok$', raw_text, re.MULTILINE))
+          if ok_names != expected:
+              raise SystemExit('w1c passed names mismatch: ' + repr(ok_names))
+          json_path.write_text(json.dumps({
+              'version': 1, 'issue': 109, 'suite': 'blob_store_w1c_contract',
+              'accepted': True, 'tests': {name: 'ok' for name in expected},
+              'result': {'state': 'ok', 'passed': 2, 'failed': 0, 'ignored': 0},
+          }, indent=2) + '\n', encoding='utf-8')
+          print('blob_store_w1c_contract PG+Garage S3 accepted: 2 passed, 0 failed, 0 ignored')
+          PY
       - name: Stop only the job-owned Garage fixture
         if: always()
         run: |

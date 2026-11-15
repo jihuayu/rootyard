@@ -395,9 +395,11 @@ async fn public_three_mode_policy_matrix_performs_zero_io_on_refusals() {
     assert!(endpoint.hits() > 0);
 }
 
-#[tokio::test]
-#[ignore = "requires PostgreSQL (ROOTYARD_TEST_DATABASE_URL)"]
-async fn pg_protected_uploader_preflight_preserves_unconsumed_holds() -> Result<()> {
+async fn run_with_migrated_pg_schema<F, Fut>(f: F) -> Result<()>
+where
+    F: FnOnce(Pool) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let url = std::env::var("ROOTYARD_TEST_DATABASE_URL")
         .expect("ROOTYARD_TEST_DATABASE_URL must be set when running ignored PG tests");
     let admin = db::pool(&url)?;
@@ -409,71 +411,82 @@ async fn pg_protected_uploader_preflight_preserves_unconsumed_holds() -> Result<
         .runtime(deadpool_postgres::Runtime::Tokio1)
         .max_size(8)
         .build()?;
-    let result = run_pg_preflight_suite(&pool).await;
+    let result = async {
+        db::migrate(&pool).await?;
+        f(pool.clone()).await
+    }
+    .await;
+    drop(pool);
     let teardown = admin.get().await?.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await;
     result?;
     teardown?;
     Ok(())
 }
 
-async fn run_pg_preflight_suite(pool: &Pool) -> Result<()> {
-    db::migrate(pool).await?;
-    let endpoint = Counting503Endpoint::start().await;
-    let keyring = TempDir::new()?;
-    write_keyring(keyring.path(), "k1", &[("k1", [0x61u8; 32])]);
-    let kp: Arc<dyn KeyProvider> = Arc::new(LocalFileKeyProvider::load(keyring.path())?);
-    let (store_unset, store_pm, store_le) = open_three_mode_stores(&endpoint.endpoint, keyring.path());
+struct PgHoldFixture {
+    tenant: Uuid,
+    repo: Uuid,
+    scope: HoldScope,
+    gate: rootyard::ref_store::RequestDigest,
+}
 
-    let tenant = Uuid::new_v4();
-    let repo = Uuid::new_v4();
-    let history = Uuid::new_v4();
-    let pg_deadline = TokioInstant::now() + Duration::from_secs(20);
-    let blob_deadline = StdInstant::now() + Duration::from_secs(20);
-
-    {
-        let client = pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO users(id,username) VALUES($1,$2)",
-                &[&tenant, &format!("w1c_{}", &tenant.simple().to_string()[..10])],
-            )
-            .await?;
-        client
-            .execute(
-                "INSERT INTO repositories(id,owner_id,name,state,object_format) VALUES($1,$2,$3,'provisioning','sha1')",
-                &[&repo, &tenant, &format!("repo_{}", &repo.simple().to_string()[..10])],
-            )
-            .await?;
-    }
-
-    let gate = {
-        let init =
-            CoreGateInit::new(repo, tenant, GitObjectFormat::Sha1, history, 1, 1, RefName::branch("refs/heads/main")?)?;
-        let mut client = pool.get().await?;
-        *PgRefStoreCore.initialize(&mut client, &init, pg_deadline).await?.digest()
-    };
-    let scope = HoldScope::new(
-        repo,
-        tenant,
-        tenant,
-        ArtifactHoldPurpose::RefPublication,
-        GitObjectFormat::Sha1,
-        history,
-        1,
-        1,
-    )?;
-
-    let work = TempDir::new()?;
-    let src = work.path().join("artifact.bin");
-    let plain = b"protected-uploader-grant-preservation";
-    std::fs::write(&src, plain)?;
-    let spec = EnvelopeSpec { tenant_id: tenant, authority_id: repo, generation: 1, namespace: "packs".into() };
-
-    let mut next_seq = 1i64;
-    let acquire_for = |store: BlobStore, art_spec: ArtifactSpec, seq: i64| async move {
-        let op = OperationIdentity::new(
+impl PgHoldFixture {
+    async fn seed(pool: &Pool, pg_deadline: TokioInstant) -> Result<Self> {
+        let tenant = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let history = Uuid::new_v4();
+        {
+            let client = pool.get().await?;
+            client
+                .execute(
+                    "INSERT INTO users(id,username) VALUES($1,$2)",
+                    &[&tenant, &format!("w1c_{}", &tenant.simple().to_string()[..10])],
+                )
+                .await?;
+            client
+                .execute(
+                    "INSERT INTO repositories(id,owner_id,name,state,object_format) VALUES($1,$2,$3,'provisioning','sha1')",
+                    &[&repo, &tenant, &format!("repo_{}", &repo.simple().to_string()[..10])],
+                )
+                .await?;
+        }
+        let gate = {
+            let init = CoreGateInit::new(
+                repo,
+                tenant,
+                GitObjectFormat::Sha1,
+                history,
+                1,
+                1,
+                RefName::branch("refs/heads/main")?,
+            )?;
+            let mut client = pool.get().await?;
+            *PgRefStoreCore.initialize(&mut client, &init, pg_deadline).await?.digest()
+        };
+        let scope = HoldScope::new(
             repo,
             tenant,
+            tenant,
+            ArtifactHoldPurpose::RefPublication,
+            GitObjectFormat::Sha1,
+            history,
+            1,
+            1,
+        )?;
+        Ok(Self { tenant, repo, scope, gate })
+    }
+
+    async fn acquire_holds(
+        &self,
+        pool: &Pool,
+        store: &BlobStore,
+        specs: Vec<ArtifactSpec>,
+        seq: i64,
+        pg_deadline: TokioInstant,
+    ) -> Result<(Vec<Uuid>, rootyard::ref_store::artifact_hold::ArtifactGrant)> {
+        let op = OperationIdentity::new(
+            self.repo,
+            self.tenant,
             IssuerLane::new("w1c-contract")?,
             seq,
             Uuid::new_v4(),
@@ -487,20 +500,56 @@ async fn run_pg_preflight_suite(pool: &Pool) -> Result<()> {
             tx.commit().await?;
         }
         let req = AcquireArtifactHoldsRequest::new(
-            scope,
+            self.scope,
             op,
             Uuid::new_v4(),
             store.backend_identity().clone(),
-            Uuid::new_v4(),
+            self.repo,
             1,
-            gate,
-            vec![art_spec],
+            self.gate,
+            specs,
         )?;
         let mut client = pool.get().await?;
-        match PgArtifactHoldStore.acquire(&mut client, &store, &req, pg_deadline).await? {
-            AcquireOutcome::Granted { ack, grant } => Ok((ack.holds()[0].hold_id, grant)),
+        match PgArtifactHoldStore.acquire(&mut client, store, &req, pg_deadline).await? {
+            AcquireOutcome::Granted { ack, grant } => {
+                let ids = ack.holds().iter().map(|h| h.hold_id).collect();
+                Ok((ids, grant))
+            }
             AcquireOutcome::Replayed { .. } => Err(anyhow!("unexpected acquire replay")),
         }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL (ROOTYARD_TEST_DATABASE_URL)"]
+async fn pg_protected_uploader_preflight_preserves_unconsumed_holds() -> Result<()> {
+    run_with_migrated_pg_schema(|pool| async move { run_pg_preflight_suite(&pool).await }).await
+}
+
+async fn run_pg_preflight_suite(pool: &Pool) -> Result<()> {
+    let endpoint = Counting503Endpoint::start().await;
+    let keyring = TempDir::new()?;
+    write_keyring(keyring.path(), "k1", &[("k1", [0x61u8; 32])]);
+    let kp: Arc<dyn KeyProvider> = Arc::new(LocalFileKeyProvider::load(keyring.path())?);
+    let (store_unset, store_pm, store_le) = open_three_mode_stores(&endpoint.endpoint, keyring.path());
+
+    let pg_deadline = TokioInstant::now() + Duration::from_secs(20);
+    let blob_deadline = StdInstant::now() + Duration::from_secs(20);
+    let fixture = PgHoldFixture::seed(pool, pg_deadline).await?;
+    let tenant = fixture.tenant;
+    let repo = fixture.repo;
+
+    let work = TempDir::new()?;
+    let src = work.path().join("artifact.bin");
+    let plain = b"protected-uploader-grant-preservation";
+    std::fs::write(&src, plain)?;
+    let spec = EnvelopeSpec { tenant_id: tenant, authority_id: repo, generation: 1, namespace: "packs".into() };
+
+    let mut next_seq = 1i64;
+    let fixture_ref = &fixture;
+    let acquire_for = |store: BlobStore, art_spec: ArtifactSpec, seq: i64| async move {
+        let (holds, grant) = fixture_ref.acquire_holds(pool, &store, vec![art_spec], seq, pg_deadline).await?;
+        Ok::<_, anyhow::Error>((holds[0], grant))
     };
 
     // 1. Plain upload refused under `local-envelope` preserves unconsumed hold.
@@ -562,5 +611,226 @@ async fn run_pg_preflight_suite(pool: &Pool) -> Result<()> {
     let receipt_count: i64 = client.query_one("SELECT count(*) FROM artifact_hold_consume_receipts", &[]).await?.get(0);
     ensure!(receipt_count == 0, "expected 0 consume receipts, found {receipt_count}");
     ensure!(endpoint.hits() == 0, "expected zero HTTP IO across all preflight refusals, got {}", endpoint.hits());
+    Ok(())
+}
+
+fn open_real_env_le_store(keyring: &Path) -> Result<BlobStore> {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let watched = [
+        ENV_BLOB_ENCRYPTION_MODE,
+        ENV_BLOB_KEYRING_DIR,
+        "ROOTYARD_BLOB_MAX_OBJECT_BYTES",
+        "ROOTYARD_BLOB_STAGING_BYTES",
+        "ROOTYARD_BLOB_ACTIVE_UPLOADS",
+        "ROOTYARD_BLOB_ACTIVE_READERS",
+        "ROOTYARD_BLOB_RANGE_FULL_GET_MAX_BYTES",
+        "ROOTYARD_BLOB_DELETE",
+    ];
+    let _reset = EnvResetGuard::capture(&watched);
+    let endpoint = std::env::var("ROOTYARD_BLOB_ENDPOINT").unwrap_or_default();
+    ensure!(!endpoint.trim().is_empty(), "ROOTYARD_BLOB_ENDPOINT must be set for real provider PG contract test");
+    // SAFETY: protected by ENV_LOCK while tests mutate process-wide env.
+    unsafe {
+        std::env::set_var(ENV_BLOB_ENCRYPTION_MODE, "local-envelope");
+        std::env::set_var(ENV_BLOB_KEYRING_DIR, keyring);
+        // Align ResourceLimits with open_three_mode_stores in case both tests share a process.
+        std::env::set_var("ROOTYARD_BLOB_MAX_OBJECT_BYTES", "1048576");
+        for key in [
+            "ROOTYARD_BLOB_STAGING_BYTES",
+            "ROOTYARD_BLOB_ACTIVE_UPLOADS",
+            "ROOTYARD_BLOB_ACTIVE_READERS",
+            "ROOTYARD_BLOB_RANGE_FULL_GET_MAX_BYTES",
+            "ROOTYARD_BLOB_DELETE",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+    let profile = BlobProfile::from_env()?;
+    ensure!(profile.encryption().mode() == BlobEncryptionMode::LocalEnvelope, "expected local-envelope mode");
+    Ok(BlobStore::open(profile)?)
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL (ROOTYARD_TEST_DATABASE_URL) and controlled S3 (ROOTYARD_BLOB_*)"]
+async fn pg_protected_uploader_consume_and_upload_encrypted_against_real_provider() -> Result<()> {
+    run_with_migrated_pg_schema(|pool| async move { run_pg_real_provider_roundtrip(&pool).await }).await
+}
+
+async fn run_pg_real_provider_roundtrip(pool: &Pool) -> Result<()> {
+    let keyring = TempDir::new()?;
+    write_keyring(keyring.path(), "k1", &[("k1", [0x11u8; 32])]);
+    let kp_v1: Arc<dyn KeyProvider> = Arc::new(LocalFileKeyProvider::load(keyring.path())?);
+    let store = open_real_env_le_store(keyring.path())?;
+
+    let pg_deadline = TokioInstant::now() + Duration::from_secs(20);
+    let blob_deadline = StdInstant::now() + Duration::from_secs(20);
+    let fixture = PgHoldFixture::seed(pool, pg_deadline).await?;
+    let spec = EnvelopeSpec {
+        tenant_id: fixture.tenant,
+        authority_id: fixture.repo,
+        generation: 1,
+        namespace: "packs".into(),
+    };
+
+    let work = TempDir::new()?;
+    let mut pack_bytes = b"ROOTYARD-W1C-PACK-PLAINTEXT-MARKER".to_vec();
+    pack_bytes.resize(8192, 0x5Au8);
+    let mut idx_bytes = b"ROOTYARD-W1C-IDX-PLAINTEXT-MARKER".to_vec();
+    idx_bytes.resize(2048, 0xA5u8);
+    let pack_src = work.path().join("pack.bin");
+    let idx_src = work.path().join("pack.idx");
+    std::fs::write(&pack_src, &pack_bytes)?;
+    std::fs::write(&idx_src, &idx_bytes)?;
+
+    let pack_sha = hex::encode(Sha256::digest(&pack_bytes));
+    let idx_sha = hex::encode(Sha256::digest(&idx_bytes));
+    let prep_pack = prepare_file_envelope(&spec, &pack_src, work.path(), 1048576)?;
+    let prep_idx = prepare_file_envelope(&spec, &idx_src, work.path(), 1048576)?;
+    let ct_pack_sha = prep_pack.ciphertext_sha256().to_owned();
+    let ct_pack_len = prep_pack.ciphertext_length();
+    let ct_idx_sha = prep_idx.ciphertext_sha256().to_owned();
+    let ct_idx_len = prep_idx.ciphertext_length();
+    ensure!(ct_pack_sha != pack_sha && ct_pack_len > pack_bytes.len() as u64, "pack envelope did not wrap");
+    ensure!(ct_idx_sha != idx_sha && ct_idx_len > idx_bytes.len() as u64, "idx envelope did not wrap");
+
+    let specs = vec![
+        ArtifactSpec::new("packs", ct_pack_sha.as_str(), ct_pack_len)?,
+        ArtifactSpec::new("packs", ct_idx_sha.as_str(), ct_idx_len)?,
+    ];
+    let (hold_ids, grant) = fixture.acquire_holds(pool, &store, specs, 1, pg_deadline).await?;
+    ensure!(hold_ids.len() == 2, "expected 2 holds, got {}", hold_ids.len());
+
+    {
+        let client = pool.get().await?;
+        let pre_count: i64 = client
+            .query_one("SELECT count(*) FROM artifact_hold_consume_receipts WHERE hold_id = ANY($1)", &[&hold_ids])
+            .await?
+            .get(0);
+        ensure!(pre_count == 0, "expected 0 consume receipts before consume, got {pre_count}");
+    }
+
+    let publication = ProtectedUploader::new(store.clone())
+        .consume_and_upload_encrypted(pool, grant, vec![prep_pack, prep_idx], &kp_v1, blob_deadline)
+        .await?;
+    ensure!(publication.is_complete(), "publication should report complete");
+    let receipts = publication.receipts();
+    ensure!(receipts.len() == 2, "expected 2 encrypted receipts, got {}", receipts.len());
+    ensure!(receipts[0].hold_id() == hold_ids[0] && receipts[0].slot() == 0, "slot 0 hold receipt mismatch");
+    ensure!(receipts[1].hold_id() == hold_ids[1] && receipts[1].slot() == 1, "slot 1 hold receipt mismatch");
+    ensure!(receipts[0].receipt().backend_identity() == store.backend_identity());
+    ensure!(receipts[0].receipt().sha256() == ct_pack_sha && receipts[0].receipt().length() == ct_pack_len);
+    ensure!(receipts[1].receipt().sha256() == ct_idx_sha && receipts[1].receipt().length() == ct_idx_len);
+    ensure!(receipts[0].metadata().key_id()? == *kp_v1.current_key_id());
+
+    {
+        let client = pool.get().await?;
+        let post_count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM artifact_hold_consume_receipts WHERE consume_request_id = $1 AND hold_id = ANY($2)",
+                &[&publication.consume_request_id(), &hold_ids],
+            )
+            .await?
+            .get(0);
+        ensure!(post_count == 2, "expected 2 durable consume receipts, got {post_count}");
+        for id in &hold_ids {
+            let state: String =
+                client.query_one("SELECT state FROM artifact_holds WHERE hold_id = $1", &[id]).await?.get(0);
+            ensure!(state == "active", "append-only artifact_holds state changed unexpectedly: {state}");
+        }
+    }
+
+    let staging = TempDir::new()?;
+    let verified = store
+        .verify_encrypted_blob(
+            receipts[0].receipt().locator(),
+            receipts[0].metadata(),
+            &kp_v1,
+            staging.path(),
+            blob_deadline,
+        )
+        .await?;
+    ensure!(verified.plaintext_sha256() == pack_sha);
+    ensure!(verified.plaintext_length() == pack_bytes.len() as u64);
+    ensure!(verified.key_id() == kp_v1.current_key_id());
+
+    let out_dir = TempDir::new()?;
+    let out_pack = out_dir.path().join("roundtrip.pack");
+    let dec_pack = store
+        .get_decrypted_to_file(
+            receipts[0].receipt().locator(),
+            receipts[0].metadata(),
+            &kp_v1,
+            &out_pack,
+            blob_deadline,
+        )
+        .await?;
+    ensure!(dec_pack.plaintext_sha256() == pack_sha && std::fs::read(&out_pack)? == pack_bytes);
+
+    let out_idx = out_dir.path().join("roundtrip.idx");
+    let dec_idx = store
+        .get_decrypted_to_file(receipts[1].receipt().locator(), receipts[1].metadata(), &kp_v1, &out_idx, blob_deadline)
+        .await?;
+    ensure!(dec_idx.plaintext_sha256() == idx_sha && std::fs::read(&out_idx)? == idx_bytes);
+
+    write_keyring(keyring.path(), "k2", &[("k1", [0x11u8; 32]), ("k2", [0x22u8; 32])]);
+    let kp_both: Arc<dyn KeyProvider> = Arc::new(LocalFileKeyProvider::load(keyring.path())?);
+    let meta0_v2 = rewrap_envelope_metadata(receipts[0].metadata(), &*kp_both)?;
+    let meta1_v2 = rewrap_envelope_metadata(receipts[1].metadata(), &*kp_both)?;
+    let closure_spec = BlobClosureSpec::new(
+        fixture.tenant,
+        fixture.repo,
+        1,
+        BlobClosureEncryption::LocalEnvelope,
+        vec![
+            ClosureEntrySpec::local_envelope(
+                ClosureArtifactRole::Pack,
+                receipts[0].receipt().locator().clone(),
+                meta0_v2,
+            )?
+            .with_expected_plaintext(&pack_sha, pack_bytes.len() as u64)?,
+            ClosureEntrySpec::local_envelope(
+                ClosureArtifactRole::PackIndex,
+                receipts[1].receipt().locator().clone(),
+                meta1_v2,
+            )?
+            .with_expected_plaintext(&idx_sha, idx_bytes.len() as u64)?,
+        ],
+    )?;
+    closure_spec.require_git_pack_pair()?;
+    let proof = store.verify_closure(&closure_spec, Some(&kp_both), Some(staging.path()), blob_deadline).await?;
+    ensure!(proof.encryption() == BlobClosureEncryption::LocalEnvelope);
+    ensure!(proof.has_git_pack_pair() && proof.artifacts().len() == 2);
+
+    let wrong_keyring = TempDir::new()?;
+    write_keyring(wrong_keyring.path(), "k2", &[("k2", [0x22u8; 32])]);
+    let kp_k2_only: Arc<dyn KeyProvider> = Arc::new(LocalFileKeyProvider::load(wrong_keyring.path())?);
+    let wrong_out = out_dir.path().join("wrong-key.pack");
+    let wrong_get = store
+        .get_decrypted_to_file(
+            receipts[0].receipt().locator(),
+            receipts[0].metadata(),
+            &kp_k2_only,
+            &wrong_out,
+            blob_deadline,
+        )
+        .await;
+    ensure!(
+        matches!(wrong_get, Err(EnvelopeError::KeyProvider(KeyProviderError::MissingKey(_)))),
+        "expected MissingKey error with wrong key provider, got {wrong_get:?}"
+    );
+    ensure!(!wrong_out.exists(), "decrypted output file must not exist on MissingKey failure");
+    let wrong_verify = store
+        .verify_encrypted_blob(
+            receipts[0].receipt().locator(),
+            receipts[0].metadata(),
+            &kp_k2_only,
+            staging.path(),
+            blob_deadline,
+        )
+        .await;
+    ensure!(
+        matches!(wrong_verify, Err(EnvelopeError::KeyProvider(KeyProviderError::MissingKey(_)))),
+        "expected MissingKey error in verify_encrypted_blob, got {wrong_verify:?}"
+    );
     Ok(())
 }

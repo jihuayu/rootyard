@@ -184,8 +184,20 @@ landed inside `blob_store` without altering the sealed `put_file` /
      count and byte budgets, fail-closed `Expired` checks on TTL expiry, RAII
      drop cleanup, and `sweep_expired()` reclamation for expired or corrupt /
      lease-less orphaned `rv1-*` view directories.
-   * Unit and contract coverage lives in `src/blob_store/envelope_tests.rs`,
+   * Non-ignored unit and public contract tests live in
+     `src/blob_store/envelope_tests.rs`,
      `src/blob_store/policy_matrix_tests.rs`,
-     `src/blob_store/closure_view_tests.rs`, and `tests/blob_store_w1c_contract.rs`,
-     exercising full compute-directory wipe, three-mode zero-IO policy enforcement,
-     PG preflight hold preservation, and fresh-store/keyring recovery in CI.
+     `src/blob_store/closure_view_tests.rs`, and `tests/blob_store_w1c_contract.rs`
+     (executed on every PR in `ci.yml` `verify` and `pando-lab.yml` `isolated-lab`),
+     exercising full compute-directory wipe, three-mode zero-IO policy
+     enforcement, corrupt/expired view reclamation, and fresh-store/keyring
+     recovery.
+   * The `#[ignore]` PostgreSQL + controlled Garage S3 contracts in
+     `tests/blob_store_w1c_contract.rs`
+     (`pg_protected_uploader_preflight_preserves_unconsumed_holds` and
+     `pg_protected_uploader_consume_and_upload_encrypted_against_real_provider`)
+     are opt-in in raw `cargo test`, and are explicitly built via
+     `scripts/build_native_test.py --test blob_store_w1c_contract` (verified
+     against their adjacent `<binary>.build.json` receipt) and executed with
+     `--ignored --test-threads=1` in `.github/workflows/refstore-protocol-acceptance.yml`
+     (`native`) against `postgres:17` and the job-owned Garage S3 fixture.
