@@ -214,7 +214,7 @@ impl Db {
             .build()?;
         if let Err(err) = db::migrate(&pool).await {
             let _ = Self::drop_owned_schema(url, &schema).await;
-            return Err(err.into());
+            return Err(err);
         }
         Ok(Self { admin, pool, schema })
     }
