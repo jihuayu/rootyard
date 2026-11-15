@@ -727,6 +727,332 @@ def wait_pid_gone(pid: int, timeout: float) -> bool:
     return False
 
 
+PENDING_WRITER_SCRIPT = r'''
+import json
+import os
+import sys
+import time
+
+mount, status = sys.argv[1], sys.argv[2]
+writes = 0
+attempts = 0
+success_ns = 0
+
+
+def publish(phase, error=0):
+    payload = {"phase": phase, "writes": writes, "attempts": attempts,
+               "errno": int(error), "success_ns": success_ns}
+    temporary = status + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, separators=(",", ":"))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, status)
+
+
+try:
+    # Open the parked file before the phase marker so a capture freeze cannot
+    # leave the writer stuck in setup without a publishable wait observation.
+    parked = os.open(os.path.join(mount, "parked.bin"),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    publish("ready")
+    marker = os.open(os.path.join(mount, "gate-target.txt"),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(marker, b"gate-target\n")
+    finally:
+        os.close(marker)
+except OSError as error:
+    publish("setup_error", error.errno)
+    os._exit(22)
+
+publish("writing")
+while True:
+    attempts += 1
+    publish("writing")
+    try:
+        os.write(parked, b"x")
+    except OSError as error:
+        publish("error", error.errno)
+        os._exit(23)
+    writes += 1
+    success_ns = time.time_ns()
+'''
+
+
+def writer_status(path):
+    """Read the writer's safe JSON status; no bodies, paths or logs."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("phase") not in ("ready", "writing", "error", "setup_error"):
+        return None
+    for key in ("writes", "attempts", "errno", "success_ns"):
+        if not isinstance(data.get(key), int):
+            return None
+    return data
+
+
+def process_identity(pid):
+    """Return pid/state/ppid/starttime/pgid, or None when the process is gone."""
+    try:
+        text = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
+        fields = text.rsplit(")", 1)[-1].split()
+        state = fields[0]
+        ppid = int(fields[1])
+        starttime = int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+    try:
+        pgid = os.getpgid(int(pid))
+    except OSError:
+        pgid = None
+    return {"pid": int(pid), "state": state, "ppid": ppid,
+            "starttime": starttime, "pgid": pgid}
+
+
+def open_pidfd(pid):
+    opener = getattr(os, "pidfd_open", None)
+    if opener is None:
+        raise HarnessError("pidfd_open is unavailable on this host")
+    try:
+        return opener(int(pid))
+    except OSError as error:
+        raise HarnessError(f"pidfd_open({pid}) failed: {error}") from None
+
+
+def process_wchan(pid):
+    try:
+        return Path(f"/proc/{int(pid)}/wchan").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def process_syscall(pid):
+    try:
+        return Path(f"/proc/{int(pid)}/syscall").read_text(encoding="utf-8", errors="replace").split()
+    except OSError:
+        return None
+
+
+def process_fd_target(pid, fd):
+    try:
+        return os.readlink(f"/proc/{int(pid)}/fd/{int(fd)}")
+    except (OSError, ValueError):
+        return None
+
+
+def api_namespace_command(api_pid, argv):
+    if shutil.which("nsenter") is None:
+        raise HarnessError("nsenter is required for the API namespace observation")
+    return ["nsenter", "--preserve-credentials",
+            f"--user=/proc/{int(api_pid)}/ns/user",
+            f"--mount=/proc/{int(api_pid)}/ns/mnt",
+            "--", *[str(value) for value in argv]]
+
+
+def spawn_api_namespace(api_pid, argv):
+    """Start one fixture-owned observer/writer in the API's own namespaces.
+
+    The child gets only PATH/LC_ALL; it never inherits database, object-store,
+    token or LD_PRELOAD state from the test process.
+    """
+    return subprocess.Popen(
+        api_namespace_command(api_pid, argv),
+        env={"PATH": os.defpath, "LC_ALL": "C"},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def direct_children(pid):
+    found = set()
+    try:
+        tids = os.listdir(f"/proc/{int(pid)}/task")
+    except OSError:
+        return []
+    for tid in tids:
+        try:
+            text = Path(f"/proc/{int(pid)}/task/{tid}/children").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for value in text.split():
+            try:
+                found.add(int(value))
+            except ValueError:
+                pass
+    return sorted(found)
+
+
+def find_api_helper_pid(api_pid, timeout=5.0):
+    """Find the exact production helper child of the API process."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for child in direct_children(api_pid):
+            try:
+                arguments = Path(f"/proc/{child}/cmdline").read_bytes().split(b"\0")
+                own_group = os.getpgid(child) == child
+            except OSError:
+                continue
+            if own_group and b"--workspace-fuse-helper" in arguments:
+                return child
+        time.sleep(0.05)
+    raise HarnessError("production FUSE helper child was not observed")
+
+
+def read_process_mountinfo(pid):
+    text = Path(f"/proc/{int(pid)}/mountinfo").read_text(encoding="utf-8", errors="surrogateescape")
+    return parse_mountinfo(text)
+
+
+def wait_for_mount_id_gone(holder_pid, mountpoint, mount_id, timeout=EXIT_DEADLINE):
+    """Wait until the holder's namespace no longer carries the exact mount."""
+    expected = str(mountpoint)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            rows = read_process_mountinfo(holder_pid)
+        except OSError as error:
+            raise HarnessError(f"holder mountinfo became unreadable: {error}") from None
+        if not any(row["mount_id"] == int(mount_id)
+                   and row["mountpoint"] == expected
+                   and row["source"] == "rootyard-workspace"
+                   for row in rows):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def wait_for_kernel_wait(writer_pid, mountpoint, status_path, timeout=10.0):
+    """Require an observable kernel FUSE wait plus a stable unresolved attempt.
+
+    ``.hit`` alone is never accepted.  A matching wchan is direct evidence; a
+    write-class syscall whose fd resolves inside the exact mount is the
+    equivalent observation on kernels that hide wchan.  Either way the writer
+    status must show ``attempts == writes + 1`` unchanged across a plateau.
+    """
+    deadline = time.monotonic() + timeout
+    last = None
+    plateau_started = None
+    last_wchan = None
+    last_fd = None
+    while time.monotonic() < deadline:
+        identity = process_identity(writer_pid)
+        if identity is None or identity["state"] == "Z":
+            raise HarnessError(f"writer {writer_pid} exited before kernel-wait evidence")
+        status = writer_status(status_path)
+        if status is None:
+            time.sleep(0.05)
+            continue
+        if status["phase"] in ("error", "setup_error"):
+            raise HarnessError(
+                f"writer phase {status['phase']} errno {status['errno']} before kernel-wait evidence")
+        if status["phase"] != "writing":
+            time.sleep(0.05)
+            continue
+        wchan = process_wchan(writer_pid)
+        syscall = process_syscall(writer_pid)
+        fd_target = None
+        if syscall and len(syscall) > 1 and syscall[0].isdigit():
+            try:
+                fd_target = process_fd_target(writer_pid, int(syscall[1]))
+            except ValueError:
+                fd_target = None
+        kernel_wchan = bool(wchan and (
+            "request_wait_answer" in wchan
+            or ("fuse" in wchan.lower() and "wait" in wchan.lower())))
+        inflight_fd = bool(fd_target and str(mountpoint) in fd_target)
+        pending_attempt = status["attempts"] == status["writes"] + 1
+        key = (status["writes"], status["attempts"])
+        if pending_attempt and key == last:
+            if plateau_started is None:
+                plateau_started = time.monotonic()
+            elif time.monotonic() - plateau_started >= 0.5 and (kernel_wchan or inflight_fd):
+                return {
+                    "writes": status["writes"],
+                    "attempts": status["attempts"],
+                    "wchan": wchan,
+                    "syscall": syscall,
+                    "fd_target": fd_target,
+                    "plateau_seconds": round(time.monotonic() - plateau_started, 3),
+                    "kernel_wchan": kernel_wchan,
+                    "inflight_fd": inflight_fd,
+                }
+        else:
+            plateau_started = None
+        last = key
+        last_wchan = wchan
+        last_fd = fd_target
+        time.sleep(0.05)
+    raise HarnessError(
+        f"BLOCKED: writer {writer_pid} exposed no kernel FUSE wait evidence "
+        f"(wchan={last_wchan!r}, fd={last_fd!r})")
+
+
+def wait_for_fuse_mount(api_pid, mountpoint, timeout=MOUNT_DEADLINE):
+    """Wait for exactly one owned FUSE mount at the lexical expected path."""
+    expected = str(mountpoint)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            rows = read_process_mountinfo(api_pid)
+        except OSError:
+            rows = []
+        matches = [row for row in rows
+                   if row["mountpoint"] == expected
+                   and row["source"] == "rootyard-workspace"
+                   and (row["fstype"] == "fuse" or row["fstype"].startswith("fuse."))]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise HarnessError(f"multiple owned FUSE mounts at {expected}")
+        time.sleep(0.05)
+    raise HarnessError(f"owned FUSE mount was not observed at {expected}")
+
+
+def spawn_api_namespace_holder(api_pid):
+    return spawn_api_namespace(
+        api_pid, [sys.executable, "-c", "import time; time.sleep(600)"])
+
+
+def spawn_api_namespace_writer(api_pid, script, mountpoint, status_path):
+    return spawn_api_namespace(
+        api_pid, [sys.executable, str(script), str(mountpoint), str(status_path)])
+
+
+def wait_process_exit(process, timeout=EXIT_DEADLINE):
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise HarnessError(f"process {process.pid} did not exit within {timeout}s") from None
+
+
+def terminate_process(process, timeout=EXIT_DEADLINE):
+    if process is None:
+        return
+    if process.poll() is None:
+        try:
+            os.kill(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise HarnessError(f"owned process {process.pid} survived SIGKILL") from None
+
+
+def close_fd(fd):
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 def preconditions(binary: Path, repo: Path) -> dict:
     facts = {
         "binary": str(binary),
