@@ -32,11 +32,15 @@ mod remote_gc;
 mod scan;
 #[path = "workspaces/service.rs"]
 pub(crate) mod service;
+#[path = "workspaces/shutdown.rs"]
+mod shutdown;
 #[path = "workspaces/snapshot.rs"]
 pub(crate) mod snapshot;
 #[cfg(test)]
 #[path = "workspaces/snapshot_tests.rs"]
 mod snapshot_tests;
+
+pub use shutdown::{capture_shutdown_grace, stop_capture_before_helper};
 
 use crate::AppState;
 use axum::{

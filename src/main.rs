@@ -353,18 +353,26 @@ async fn run() -> Result<()> {
             .with_graceful_shutdown(shutdown())
             .await?;
             rootyard::workspaces::drain_git_jobs(git_shutdown_grace).await;
-            // The helper is a real child process: normal shutdown fences and
-            // unmounts inside it, then reaps it within a bounded grace. A helper
-            // that does not exit is reported as a failed shutdown.
-            rootyard::workspaces::mounts::shutdown_helper()
-                .await
-                .map_err(|_| anyhow::anyhow!("workspace FUSE helper shutdown failed"))?;
+            // Capture is the only remaining helper producer after HTTP and Git
+            // drain. Stop and drain it before helper teardown, but share one
+            // bounded deadline so a parked scan cannot hang shutdown. Helper
+            // fence/unmount/join still runs on timeout, and any failed part is
+            // returned instead of being reported as a clean shutdown.
+            rootyard::workspaces::stop_capture_before_helper(
+                workspace_capture_stop,
+                workspace_capture_task,
+                rootyard::workspaces::capture_shutdown_grace(),
+                async {
+                    rootyard::workspaces::mounts::shutdown_helper()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("workspace FUSE helper shutdown failed"))
+                },
+            )
+            .await?;
             worker.abort();
             maintenance_stop.cancel();
             session_gc_stop.cancel();
             let _ = session_gc_task.await;
-            workspace_capture_stop.cancel();
-            let _ = workspace_capture_task.await;
             if let Some(task) = controller_task {
                 task.abort();
             }
