@@ -157,7 +157,7 @@ pub async fn authorize_repo_with_role(
     Ok(RepoAccess { repo_id, owner_id, role: effective_role })
 }
 
-fn scope_error(denial: crate::token_scopes::ScopeDenial) -> Error {
+pub(crate) fn scope_error(denial: crate::token_scopes::ScopeDenial) -> Error {
     match denial {
         crate::token_scopes::ScopeDenial::InvalidToken => Error::unauthorized(),
         crate::token_scopes::ScopeDenial::Forbidden => {

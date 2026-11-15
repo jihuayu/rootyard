@@ -208,7 +208,12 @@ async fn capture_t1(
         drop(client);
         return Err(error);
     }
-    let read = pg::before_deadline(deadline, PgPackSnapshot.read_checked(&tx, reference, deadline)).await;
+    let read = pg::before_deadline(deadline, PgPackSnapshot.read_checked(
+        &tx,
+        reference,
+        deadline,
+        super::super::snapshot_sql::ScopeLane::LegacyFresh,
+    )).await;
     let cleanup = rollback_reads(tx, deadline).await;
     drop(client);
     match (read, cleanup) {

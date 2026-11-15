@@ -89,7 +89,12 @@ async fn capture_t1(
 ) -> Result<PackReadSnapshot, RefStoreError> {
     let mut client = pooled_client(pool, deadline).await?;
     let tx = begin_bounded(&mut client, deadline).await?;
-    let read = pg::before_deadline(deadline, PgPackSnapshot.read_checked(&tx, reference, deadline)).await;
+    let read = pg::before_deadline(deadline, PgPackSnapshot.read_checked(
+            &tx,
+            reference,
+            deadline,
+            super::super::snapshot_sql::ScopeLane::LegacyFresh,
+        )).await;
     let cleanup = match timeout_at(deadline, tx.rollback()).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(RefStoreError::Database("materialized read T1 transaction cleanup failed".into())),
@@ -391,7 +396,12 @@ impl PgPackSnapshotMaterializer {
         let mut client = pooled_client(pool, deadline).await?;
         let tx = begin_bounded(&mut client, deadline).await?;
         let result = async {
-            let fresh = pg::before_deadline(deadline, PgPackSnapshot.read_checked(&tx, reference, deadline)).await?;
+            let fresh = pg::before_deadline(deadline, PgPackSnapshot.read_checked(
+            &tx,
+            reference,
+            deadline,
+            super::super::snapshot_sql::ScopeLane::LegacyFresh,
+        )).await?;
             if fresh != prepared.snapshot || fresh.materialization_digest() != prepared.binding {
                 return Err(RefStoreError::MetadataScopeMismatch("pack snapshot changed during materialization"));
             }

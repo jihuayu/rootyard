@@ -84,6 +84,7 @@ pub use pack_snapshot::{
     PgPackSnapshot, PgPackSnapshotMaterializer,
 };
 pub use pg::PgRefStoreCore;
+pub(crate) use snapshot_pg::metadata_commit_result;
 pub use retention_root::{
     PgRetentionRoots, PrepareRootRequest, RegisterRootRequest, ReleaseRootRequest, RootCandidate, RootError,
     RootPurpose, RootReadAuthority, RootReadRequest, RootReadView, RootReceipt, RootReceiptQuery, RootRecord, RootRef,

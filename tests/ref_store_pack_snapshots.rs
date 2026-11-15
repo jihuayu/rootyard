@@ -6,10 +6,14 @@
 //! A4 registration/proof/verified-commit path to establish `pack_verified`. No fake ACK,
 //! token, receipt or proof is created; no SQL row is used as an ACK. No PASS is claimed here.
 #![allow(clippy::too_many_arguments)]
+mod serving_support;
 
 use anyhow::{Context, Result, anyhow, ensure};
+use axum::http::{HeaderMap, HeaderValue, header};
 use deadpool_postgres::{Manager, Pool};
 use rootyard::blob_store::BlobProvider;
+use rootyard::auth;
+use rootyard::blob_store::BlobBackendIdentity;
 use rootyard::blob_store::config::BlobProfile;
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::blob_store::protected::{ProtectedPublication, ProtectedUploader, UploadSource};
@@ -18,9 +22,10 @@ use rootyard::ref_store::artifact_hold::{
     AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldPurpose, ArtifactSpec, HoldScope, PgArtifactHoldStore,
 };
 use rootyard::ref_store::core::pack_commit::{
-    ContentDigest, PackArtifactRole, PackClosureContext, PackClosureProof, PackCommitExpectation, PackCommitPlan,
-    PackCommitReceipt, PackCommitScope, PackMembershipEntry, PackPendingToken, PackRegistrationRequest, PackVerifier,
-    PgPackCommit, PlannedArtifact, PlannedPack, RegisteredPack,
+    AuthorizedCommitMode, ContentDigest, PackArtifactRole, PackClosureContext, PackClosureProof,
+    PackCommitExpectation, PackCommitPlan, PackCommitReceipt, PackCommitScope, PackMembershipEntry, PackPendingToken,
+    PackRegistrationRequest, PackVerifier, PgAuthorizedCommit, PgPackCommit, PlannedArtifact, PlannedPack,
+    PrepareOutcome, RegisteredPack,
 };
 use rootyard::ref_store::core::{
     CreateMetadataSnapshotOutcome, CreateMetadataSnapshotRequest, CreatePackSnapshotRequest, MetadataPinOutcome,
@@ -28,6 +33,10 @@ use rootyard::ref_store::core::{
     PackSnapshotExpectation, PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceiptQuery, PackSnapshotRef,
     PgPackSnapshot, PgRefStoreCore, ReadMetadataSnapshotPageRequest, ReleaseMetadataPinRequest,
     RenewMetadataPinRequest,
+};
+use rootyard::ref_store::serving::{
+    PgServingSnapshotMetadata, ProvisionRequest, ServingSnapshotCreate, ServingSnapshotRead,
+    ServingSnapshotRelease, ServingSnapshotRenew, provision,
 };
 use rootyard::ref_store::{
     CoreGateInit, CoreGateVersion, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataMutationAction,
@@ -176,6 +185,98 @@ impl Db {
         drop(client);
         Ok((tenant, repo))
     }
+    /// One real serving-ready `pg_refstore` repository plus its authenticated
+    /// owner and the Blob backend identity actually opened by this process.
+    async fn serving_business(
+        &self,
+        name: &str,
+        store: &BlobStore,
+    ) -> Result<(Uuid, Uuid, db::Identity, BlobBackendIdentity)> {
+        let user_id = Uuid::new_v4();
+        let username = format!("srv{}", &user_id.simple().to_string()[..12]);
+        let client = self.pool.get().await?;
+        client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&user_id, &username]).await?;
+        let token = format!("ryt_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_id = Uuid::new_v4();
+        let digest = db::digest(&token);
+        client
+            .execute(
+                "INSERT INTO tokens(id,user_id,digest,read_only,kind,is_restricted)
+                 VALUES($1,$2,$3,false,'api',false)",
+                &[&token_id, &user_id, &digest],
+            )
+            .await?;
+        drop(client);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}"))?);
+        let identity = auth::authenticate(&self.pool, &headers)
+            .await
+            .map_err(|error| anyhow!("real token authentication failed: {}", error.1))?;
+        ensure!(
+            identity.id == user_id && identity.token_id == token_id,
+            "authenticated identity differs"
+        );
+        let backend = store.backend_identity().clone();
+        let receipt = provision(
+            &self.pool,
+            &identity,
+            ProvisionRequest { owner: None, name: name.to_owned(), object_format: GitObjectFormat::Sha1 },
+            &backend,
+            deadline(),
+        )
+        .await
+        .map_err(|error| anyhow!("serving provision failed: {}", error.1))?;
+        ensure!(receipt.created, "serving provision unexpectedly reused an existing repository");
+        let tenant: Uuid = self
+            .pool
+            .get()
+            .await?
+            .query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&receipt.repository.id])
+            .await?
+            .get(0);
+        Ok((tenant, receipt.repository.id, identity, backend))
+    }
+
+    /// One restricted API token for the same owner with ContentsRead/Write.
+    async fn restricted_identity(
+        &self,
+        repository_id: Uuid,
+        user_id: Uuid,
+        username: &str,
+    ) -> Result<(db::Identity, Uuid)> {
+        let token = format!("ryt_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_id = Uuid::new_v4();
+        let digest = db::digest(&token);
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO tokens(id,user_id,digest,read_only,kind,is_restricted)
+                 VALUES($1,$2,$3,false,'api',true)",
+                &[&token_id, &user_id, &digest],
+            )
+            .await?;
+        for action in ["contents_read", "contents_write"] {
+            client
+                .execute(
+                    "INSERT INTO token_repository_scopes(token_id,repository_id,action)
+                     VALUES($1,$2,$3)",
+                    &[&token_id, &repository_id, &action],
+                )
+                .await?;
+        }
+        drop(client);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}"))?);
+        let identity = auth::authenticate(&self.pool, &headers)
+            .await
+            .map_err(|error| anyhow!("restricted token authentication failed: {}", error.1))?;
+        ensure!(
+            identity.id == user_id && identity.username.as_str() == username,
+            "restricted identity differs"
+        );
+        Ok((identity, token_id))
+    }
+
     async fn gate(&self, repo: Uuid, tenant: Uuid, format: GitObjectFormat) -> Result<CoreGateVersion> {
         let init = CoreGateInit::new(repo, tenant, format, Uuid::new_v4(), 1, 1, RefName::branch("refs/heads/main")?)?;
         let mut client = self.pool.get().await?;
@@ -534,6 +635,121 @@ async fn verify_advance(
     ensure!(verified.gate.revision() == receipt.terminal.revision, "advanced gate revision differs");
     Ok(packs)
 }
+async fn decided_commit(
+    db: &Db,
+    store: &BlobStore,
+    git: &Path,
+    draft: &Draft,
+    files: &PairFiles,
+    actor: &db::Identity,
+) -> Result<(CoreGateVersion, Vec<RegisteredPack>)> {
+    let mode = match draft.plan.commit_mode().as_str() {
+        "accepted_subset" => AuthorizedCommitMode::AcceptedSubset,
+        "atomic" => AuthorizedCommitMode::Atomic,
+        other => return Err(anyhow!("unknown planned commit mode {other}")),
+    };
+    ensure!(draft.plan.identity().issuer_id() == actor.id, "the producer token is not the operation issuer");
+    let pack_id = draft.plan.packs().first().ok_or_else(|| anyhow!("plan has no pack"))?.pack_id();
+    let publication = publish(db, store, &draft.plan, files).await?;
+    register(db, &draft.plan, pack_id, &publication).await?;
+    let context = closure(db, &draft.plan).await?;
+    ensure!(context.new_packs().len() == 1, "decided closure is not one new pack");
+    let authorized = PgAuthorizedCommit::new(store.clone(), git.to_path_buf())
+        .map_err(|error| anyhow!("authorized adapter rejected the Blob/Git configuration: {error:?}"))?;
+    let prepared = match authorized
+        .prepare(&db.pool, draft.plan.clone(), deadline())
+        .await
+        .map_err(|error| anyhow!("authorized prepare refused ({}): {error:?}", error.code()))?
+    {
+        PrepareOutcome::Prepared(prepared) => prepared,
+        PrepareOutcome::Replayed(_) => return Err(anyhow!("authorized prepare replayed a fresh operation")),
+    };
+    let selection = authorized
+        .select(&db.pool, *prepared, actor, mode, deadline())
+        .await
+        .map_err(|error| anyhow!("authorized select refused ({}): {error:?}", error.code()))?;
+    ensure!(
+        selection.accepted_refs() == draft.plan.refs().len() && !selection.is_all_rejected(),
+        "the decision did not accept every planned ref"
+    );
+    let verified = authorized
+        .verify(selection, deadline())
+        .await
+        .map_err(|error| anyhow!("authorized verify refused ({}): {error:?}", error.code()))?;
+    let receipt = authorized
+        .commit(&db.pool, &verified, deadline())
+        .await
+        .map_err(|error| anyhow!("authorized commit refused ({}): {error:?}", error.code()))?;
+    ensure!(receipt.is_committed() && !receipt.replayed, "decided verified commit did not commit");
+    let gate = gate_version(&db.pool, draft.plan.repository_id(), draft.plan.tenant_id()).await?;
+    ensure!(gate.revision() == receipt.terminal.revision, "gate after decided commit differs");
+    Ok((gate, context.new_packs().to_vec()))
+}
+
+/// A serving-ready repository's first verified publication through the exact
+/// decision-gated facade production serving uses. A legacy A4 commit is blocked
+/// by the repository's irreversible decision fence.
+async fn serving_verified(
+    db: &Db,
+    store: &BlobStore,
+    git: &Path,
+    tenant: Uuid,
+    repo: Uuid,
+    actor: &db::Identity,
+    format: GitObjectFormat,
+) -> Result<Verified> {
+    let gate = gate_version(&db.pool, repo, tenant).await?;
+    let fixture = GitRepo::new(git.to_path_buf(), format).await?;
+    let commit_oid = fixture.build_commit("file.txt", b"serving snapshot fixture\n", "fixture main").await?;
+    fixture.update_ref("refs/heads/main", &commit_oid).await?;
+    let files = fixture.pack_all("first").await?;
+    let draft = draft(
+        db,
+        repo,
+        tenant,
+        1,
+        &gate,
+        vec![main_update(format, None, &commit_oid)?],
+        std::slice::from_ref(&files),
+    )
+    .await?;
+    let (gate, new_packs) = decided_commit(db, store, git, &draft, &files, actor).await?;
+    Ok(Verified { tenant, repo, gate, fixture, commit_oid, plan: draft.plan, new_packs })
+}
+
+/// Advance a serving-ready repository through the same decision-gated facade.
+async fn serving_advance(
+    db: &Db,
+    store: &BlobStore,
+    git: &Path,
+    verified: &mut Verified,
+    actor: &db::Identity,
+    sequence: i64,
+    content: &[u8],
+) -> Result<Vec<RegisteredPack>> {
+    let format = verified.gate.object_format();
+    let oid = verified.fixture.build_commit("advance.txt", content, "fixture advance").await?;
+    verified.fixture.update_ref("refs/heads/main", &oid).await?;
+    let files = verified.fixture.pack_all("advance").await?;
+    let old = verified.commit_oid.clone();
+    let draft = draft(
+        db,
+        verified.repo,
+        verified.tenant,
+        sequence,
+        &verified.gate,
+        vec![main_update(format, Some(&old), &oid)?],
+        std::slice::from_ref(&files),
+    )
+    .await?;
+    let (gate, packs) = decided_commit(db, store, git, &draft, &files, actor).await?;
+    verified.commit_oid = oid;
+    verified.gate = gate;
+    verified.plan = draft.plan;
+    verified.new_packs = packs.clone();
+    Ok(packs)
+}
+
 fn assert_pack_identity(expected: &RegisteredPack, actual: &RegisteredPack) -> Result<()> {
     ensure!(expected.pack_id() == actual.pack_id(), "pack id differs");
     ensure!(expected.registration_id() == actual.registration_id(), "registration id differs");
@@ -2377,6 +2593,328 @@ async fn deadline_on_inflight_commit_returns_no_value_for_create_and_renew() -> 
         let renewed = a2_renew(&observer, &renew).await?;
         ensure!(renewed.replayed, "exact renew retry did not replay");
         ensure!(pack_usage(&db.pool, v.repo).await? == renew_usage, "renew retry duplicated charges");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_it() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-metadata", &store).await?;
+        let mut verified =
+            serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let create = ServingSnapshotCreate {
+            owner: actor.username.clone(),
+            name: "serving-metadata".into(),
+            idempotency_key: "create-one".into(),
+            lease_seconds: 300,
+        };
+        let first =
+            PgServingSnapshotMetadata.create(&db.pool, &actor.identity, create.clone(), &backend, deadline()).await?;
+        ensure!(!first.replayed, "fresh serving create replayed");
+        let snapshot_id = first.receipt.snapshot_id();
+        let pin_id = first.receipt.pin_id();
+        let first_gate = first.receipt.gate_revision();
+        ensure!(first.receipt.scope().tenant_id() == tenant, "serving create tenant differs");
+        let counts = snapshot_counts(&db.pool, repo).await?;
+
+        // The original A5a entry point is deliberately unserved and must reject
+        // a ready pg_refstore repository without writing anything.
+        let old_scope = MetadataSnapshotScope::new(
+            repo,
+            tenant,
+            tenant,
+            MetadataPinPurpose::Verification,
+            GitObjectFormat::Sha1,
+            verified.gate.history_incarnation(),
+            verified.gate.authority_epoch(),
+            verified.gate.group_epoch(),
+        )?;
+        let old_request = CreatePackSnapshotRequest::new(
+            old_scope,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            300,
+            PackSnapshotExpectation::new(verified.gate.revision(), *verified.gate.digest())?,
+        )?;
+        let mut client = db.pool.get().await?;
+        let old = PgPackSnapshot.create(&mut client, &old_request, deadline()).await;
+        ensure!(old.is_err(), "old unserved A5a create accepted a serving repository");
+        drop(client);
+        ensure!(snapshot_counts(&db.pool, repo).await? == counts, "old A5a create wrote metadata");
+
+        // Advance refs and the gate through the real decision-gated publication
+        // path; the same create key must still replay the original capture.
+        serving_advance(
+            &db,
+            &store,
+            &git,
+            &mut verified,
+            &actor.identity,
+            2,
+            b"serving metadata advance\n",
+        )
+        .await?;
+        ensure!(
+            gate_version(&db.pool, repo, tenant).await?.revision() > first_gate,
+            "decision-gated advance did not move the gate"
+        );
+        let replay =
+            PgServingSnapshotMetadata.create(&db.pool, &actor.identity, create.clone(), &backend, deadline()).await?;
+        ensure!(replay.replayed, "same-key create did not replay after refs advanced");
+        ensure!(replay.receipt.snapshot_id() == snapshot_id, "replay snapshot id moved");
+        ensure!(replay.receipt.pin_id() == pin_id, "replay pin id moved");
+        ensure!(replay.receipt.gate_revision() == first_gate, "replay captured a newer gate");
+        ensure!(snapshot_counts(&db.pool, repo).await? == counts, "create replay wrote metadata or counters");
+
+        // Changed lease under the same key is a conflict, never a new id.
+        let changed = ServingSnapshotCreate { lease_seconds: 301, ..create };
+        ensure!(
+            PgServingSnapshotMetadata.create(&db.pool, &actor.identity, changed, &backend, deadline())
+                .await
+                .is_err(),
+            "changed lease under the same key was accepted"
+        );
+        ensure!(snapshot_counts(&db.pool, repo).await? == counts, "conflicting create wrote metadata");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_metadata_read_renew_release_generations_and_cross_repo_refusal() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-lifecycle", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let owner = actor.username.clone();
+        let name = "serving-lifecycle".to_string();
+        let create = ServingSnapshotCreate {
+            owner: owner.clone(),
+            name: name.clone(),
+            idempotency_key: "create-life".into(),
+            lease_seconds: 300,
+        };
+        let first =
+            PgServingSnapshotMetadata.create(&db.pool, &actor.identity, create, &backend, deadline()).await?;
+        let snapshot_id = first.receipt.snapshot_id();
+
+        let read = PgServingSnapshotMetadata
+            .read(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        ensure!(read.snapshot_id() == snapshot_id, "read resolved another snapshot");
+        ensure!(read.pin_generation() == 1, "fresh read generation differs");
+
+        let renew = ServingSnapshotRenew {
+            owner: owner.clone(),
+            name: name.clone(),
+            snapshot_id,
+            idempotency_key: "renew-one".into(),
+            expected_generation: 1,
+            lease_seconds: 120,
+        };
+        let renewed =
+            PgServingSnapshotMetadata.renew(&db.pool, &actor.identity, renew.clone(), &backend, deadline()).await?;
+        ensure!(!renewed.replayed, "fresh renew replayed");
+        ensure!(renewed.receipt.pin_generation() == 2, "renew did not advance generation");
+        let renew_replay =
+            PgServingSnapshotMetadata.renew(&db.pool, &actor.identity, renew.clone(), &backend, deadline()).await?;
+        ensure!(renew_replay.replayed, "exact renew did not replay");
+        ensure!(renew_replay.receipt.pin_generation() == 2, "renew replay changed generation");
+        let changed_lease = ServingSnapshotRenew { lease_seconds: 121, ..renew.clone() };
+        ensure!(
+            PgServingSnapshotMetadata.renew(&db.pool, &actor.identity, changed_lease, &backend, deadline())
+                .await
+                .is_err(),
+            "changed renew lease under the same key was accepted"
+        );
+        let stale = ServingSnapshotRenew {
+            idempotency_key: "renew-stale".into(),
+            expected_generation: 1,
+            ..renew
+        };
+        ensure!(
+            PgServingSnapshotMetadata.renew(&db.pool, &actor.identity, stale, &backend, deadline()).await.is_err(),
+            "stale renew generation was accepted"
+        );
+
+        let release = ServingSnapshotRelease {
+            owner: owner.clone(),
+            name: name.clone(),
+            snapshot_id,
+            idempotency_key: "release-one".into(),
+            expected_generation: 2,
+            reason: PinReleaseReason::ClientDone,
+        };
+        let released =
+            PgServingSnapshotMetadata.release(&db.pool, &actor.identity, release.clone(), &backend, deadline())
+                .await?;
+        ensure!(!released.replayed, "fresh release replayed");
+        ensure!(released.receipt.pin_generation() == 2, "release generation differs");
+        let release_replay =
+            PgServingSnapshotMetadata.release(&db.pool, &actor.identity, release, &backend, deadline()).await?;
+        ensure!(release_replay.replayed, "exact release did not replay");
+        ensure!(
+            PgServingSnapshotMetadata
+                .read(
+                    &db.pool,
+                    &actor.identity,
+                    ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
+                    &backend,
+                    deadline(),
+                )
+                .await
+                .is_err(),
+            "released pin remained readable"
+        );
+
+        // Same authorized owner, different repository: the snapshot selector is
+        // repository-scoped and cannot be resolved across repositories.
+        let other = provision(
+            &db.pool,
+            &actor.identity,
+            ProvisionRequest {
+                owner: None,
+                name: "serving-lifecycle-other".into(),
+                object_format: GitObjectFormat::Sha1,
+            },
+            &backend,
+            deadline(),
+        )
+        .await
+        .map_err(|error| anyhow!("second serving provision failed: {}", error.1))?;
+        ensure!(other.created, "second serving repository was not created");
+        ensure!(
+            PgServingSnapshotMetadata
+                .read(
+                    &db.pool,
+                    &actor.identity,
+                    ServingSnapshotRead { owner: owner.clone(), name: "serving-lifecycle-other".into(), snapshot_id },
+                    &backend,
+                    deadline(),
+                )
+                .await
+                .is_err(),
+            "cross-repository snapshot selector was accepted"
+        );
+
+        // The same authorized owner/selector with a different actually-opened
+        // Blob backend is refused. This fixture mutates the process Blob profile,
+        // so Root runs this binary serially.
+        let wrong_backend = serving_support::backend_identity("serving-wrong-backend")?;
+        ensure!(
+            PgServingSnapshotMetadata
+                .read(
+                    &db.pool,
+                    &actor.identity,
+                    ServingSnapshotRead { owner, name, snapshot_id },
+                    &wrong_backend,
+                    deadline(),
+                )
+                .await
+                .is_err(),
+            "different opened Blob backend was accepted"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_metadata_late_scope_denial_rolls_back_all_rows_and_counters() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-late-scope", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let (restricted, token_id) = db.restricted_identity(repo, actor.id, &actor.username).await?;
+        let counts = snapshot_counts(&db.pool, repo).await?;
+
+        // The preflight sees the real ContentsWrite grant. The trigger removes
+        // it inside the final mutation transaction, so only the late check can
+        // deny; the whole transaction must roll back the trigger's grant edit,
+        // snapshot, pin, receipt, history and counters.
+        let suffix = Uuid::new_v4().simple();
+        let function = format!("rootyard_late_scope_gate_{suffix}");
+        let trigger = format!("rootyard_late_scope_gate_{suffix}");
+        let fired_sequence = format!("rootyard_late_scope_fired_{suffix}");
+        let setup = format!(
+            "CREATE SEQUENCE {fired_sequence} START 100;
+             CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+               PERFORM nextval('{fired_sequence}');
+               DELETE FROM token_repository_scopes
+                WHERE token_id='{token_id}' AND repository_id='{repo}' AND action='contents_write';
+               UPDATE tokens SET scope_version=scope_version+1 WHERE id='{token_id}';
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER {trigger} BEFORE INSERT ON ref_store_core_snapshots
+             FOR EACH ROW EXECUTE FUNCTION {function}();"
+        );
+        db.pool.get().await?.batch_execute(&setup).await?;
+        let denied = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &restricted,
+                ServingSnapshotCreate {
+                    owner: actor.username.clone(),
+                    name: "serving-late-scope".into(),
+                    idempotency_key: "create-late-scope".into(),
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await;
+        let fired_query = format!("SELECT is_called FROM {fired_sequence}");
+        let fired: bool = db.pool.get().await?.query_one(&fired_query, &[]).await?.get(0);
+        let cleanup = format!(
+            "DROP TRIGGER IF EXISTS {trigger} ON ref_store_core_snapshots; \
+             DROP FUNCTION IF EXISTS {function}(); DROP SEQUENCE IF EXISTS {fired_sequence};"
+        );
+        db.pool.get().await?.batch_execute(&cleanup).await?;
+        ensure!(fired, "late scope trigger did not fire");
+        let error = denied.expect_err("late scope narrowing must deny the serving create");
+        ensure!(
+            error.0 == axum::http::StatusCode::FORBIDDEN,
+            "late scope denial returned {} instead of 403",
+            error.0
+        );
+        ensure!(
+            snapshot_counts(&db.pool, repo).await? == counts,
+            "late scope denial left snapshot/pin/receipt/pack rows or counters"
+        );
+        let grants: i64 = db
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT count(*) FROM token_repository_scopes
+                 WHERE token_id=$1 AND repository_id=$2 AND action='contents_write'",
+                &[&token_id, &repo],
+            )
+            .await?
+            .get(0);
+        ensure!(grants == 1, "late scope denial did not roll back the narrowed grant");
         Ok::<(), anyhow::Error>(())
     }
     .await;

@@ -1,0 +1,639 @@
+//! Authorized serving coordinator for durable A5a snapshot metadata.
+//!
+//! This is the narrow serving entry point over the existing
+//! `ref_store_core_snapshots`/pins/receipts/history/quota path. It adds no
+//! migration, table, HTTP route, materializer or root API. The caller supplies
+//! only a repository selector, a bounded opaque idempotency key, a bounded
+//! lease/generation and (for read/renew/release) a snapshot selector. All
+//! repository/tenant/owner/realm/backend/gate facts are derived from the real
+//! ready binding and current core gate.
+//!
+//! Every successful fresh or replay result passes the final
+//! `authorize_repository_late` check on the same transaction that owns the
+//! mutation/receipt and holds the token row `FOR SHARE` until acknowledged
+//! commit (or read rollback). A plain preflight is only an early filter.
+//!
+//! Stable ids are SHA-256 domain-separated from repository + authenticated
+//! principal + action + opaque key. They never contain the gate revision or
+//! lease, so a retry under the same key stays the same identity while changed
+//! lease/selector/generation conflicts in the existing request digest.
+use super::{
+    acquire, begin_owned, map_refstore, map_scope_refusal,
+    ServingRepository,
+};
+use crate::{
+    Error, auth,
+    blob_store::BlobBackendIdentity,
+    db::Identity,
+    members::models::Role,
+    ref_store::{
+        CoreGate, MetadataMutationAction, MetadataPinPurpose, PinReleaseReason, RefStoreError, RequestDigest,
+        core::{
+            CreatePackSnapshotRequest, MAX_PIN_LEASE_SECONDS, MetadataPinOutcome, MetadataSnapshotScope,
+            PackReadSnapshot, PackSnapshotExpectation, PackSnapshotOutcome, PgPackSnapshot, PgRefStoreCore,
+            ReleaseMetadataPinRequest, RenewMetadataPinRequest,
+            serving_scope::LockedScope,
+        },
+        tx::commit_bounded,
+    },
+    token_scopes::RepoAction,
+};
+use axum::http::StatusCode;
+use deadpool_postgres::Pool;
+use std::time::Duration;
+use tokio::time::Instant;
+use tokio_postgres::Transaction;
+use uuid::Uuid;
+
+const CREATE_REQUEST_DOMAIN: &str = "serving-durable-snapshot-create-request-v1";
+const CREATE_SNAPSHOT_DOMAIN: &str = "serving-durable-snapshot-create-snapshot-v1";
+const CREATE_PIN_DOMAIN: &str = "serving-durable-snapshot-create-pin-v1";
+const RENEW_REQUEST_DOMAIN: &str = "serving-durable-snapshot-renew-request-v1";
+const RELEASE_REQUEST_DOMAIN: &str = "serving-durable-snapshot-release-request-v1";
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+const SERVING_PURPOSE: MetadataPinPurpose = MetadataPinPurpose::Verification;
+
+/// Bounded create input. `owner`/`name` are route selectors, not authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServingSnapshotCreate {
+    pub owner: String,
+    pub name: String,
+    pub idempotency_key: String,
+    pub lease_seconds: i64,
+}
+
+/// Bounded read selector. The pin id/generation are reconstructed from rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServingSnapshotRead {
+    pub owner: String,
+    pub name: String,
+    pub snapshot_id: Uuid,
+}
+
+/// Bounded renew input. `expected_generation` is the existing CAS selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServingSnapshotRenew {
+    pub owner: String,
+    pub name: String,
+    pub snapshot_id: Uuid,
+    pub idempotency_key: String,
+    pub expected_generation: i64,
+    pub lease_seconds: i64,
+}
+
+/// Bounded release input. Release is one-way and exact-generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServingSnapshotRelease {
+    pub owner: String,
+    pub name: String,
+    pub snapshot_id: Uuid,
+    pub idempotency_key: String,
+    pub expected_generation: i64,
+    pub reason: PinReleaseReason,
+}
+
+/// Stateless coordinator. It owns the short bounded transaction and the final
+/// late token check; the core adapters own the existing SQL/ledger details.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PgServingSnapshotMetadata;
+
+impl PgServingSnapshotMetadata {
+    /// Capture one durable serving pack snapshot through the existing A5a
+    /// create/replay/quota/history path. A fresh capture uses the current gate;
+    /// an exact retry reconstructs the original gate expectation from the
+    /// stored receipt/header before its digest is checked.
+    pub async fn create(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotCreate,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+    ) -> Result<PackSnapshotOutcome, Error> {
+        validate_key(&input.idempotency_key)?;
+        validate_lease(input.lease_seconds)?;
+        let preflight = preflight(pool, actor, &input.owner, &input.name, true, backend, deadline).await?;
+        let repository_id = preflight.repository.id;
+        let scope = scope_from_gate(&preflight.gate)?;
+        let request_id = derived_uuid(
+            CREATE_REQUEST_DOMAIN,
+            repository_id,
+            actor.id,
+            "create",
+            &input.idempotency_key,
+        );
+        let snapshot_id = derived_uuid(
+            CREATE_SNAPSHOT_DOMAIN,
+            repository_id,
+            actor.id,
+            "create",
+            &input.idempotency_key,
+        );
+        let pin_id = derived_uuid(CREATE_PIN_DOMAIN, repository_id, actor.id, "create", &input.idempotency_key);
+
+        let mut client = acquire(pool, deadline).await?;
+        let tx = begin_owned(&mut client, deadline).await?;
+        let staged = async {
+            let expected = match PgPackSnapshot
+                .serving_create_expectation(&tx, &scope, request_id, pin_id, snapshot_id, deadline)
+                .await
+                .map_err(map_metadata_error)?
+            {
+                Some(expected) => expected,
+                None => PackSnapshotExpectation::new(preflight.gate.revision(), *preflight.gate.digest())
+                    .map_err(map_metadata_error)?,
+            };
+            let request = CreatePackSnapshotRequest::new(
+                scope,
+                request_id,
+                pin_id,
+                snapshot_id,
+                input.lease_seconds,
+                expected,
+            )
+            .map_err(map_metadata_error)?;
+            let outcome = PgPackSnapshot
+                .create_serving_checked(&tx, &request, backend.as_hex(), deadline)
+                .await
+                .map_err(map_metadata_error)?;
+            final_authority(
+                &tx,
+                actor,
+                repository_id,
+                scope.tenant_id(),
+                &preflight.repository.name,
+                RepoAction::ContentsWrite,
+                backend,
+                Some(&scope),
+                true,
+                deadline,
+            )
+            .await?;
+            Ok::<PackSnapshotOutcome, Error>(outcome)
+        }
+        .await;
+        match staged {
+            Ok(outcome) => {
+                let committed = commit_bounded(tx, deadline, repository_id, None).await;
+                crate::ref_store::core::metadata_commit_result(
+                    committed,
+                    repository_id,
+                    request_id,
+                    pin_id,
+                    MetadataMutationAction::Create,
+                )
+                .map_err(map_metadata_error)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                rollback_bounded(tx).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Read one durable serving snapshot by its authorized repository-scoped
+    /// selector. The pin/generation come from stored rows; a historical gate
+    /// revision is allowed after refs advance as long as the current realm and
+    /// serving binding still match.
+    pub async fn read(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRead,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+    ) -> Result<PackReadSnapshot, Error> {
+        validate_snapshot(input.snapshot_id)?;
+        let preflight = preflight(pool, actor, &input.owner, &input.name, false, backend, deadline).await?;
+        let repository_id = preflight.repository.id;
+        let tenant_id = preflight.gate.tenant_id();
+        let mut client = acquire(pool, deadline).await?;
+        let tx = begin_owned(&mut client, deadline).await?;
+        let staged = async {
+            // Deny a non-admin reader before any stored snapshot row is read;
+            // this is an early in-transaction filter, not final authority.
+            serving_admin_gate(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                &preflight.repository.name,
+                backend,
+                None,
+                false,
+                deadline,
+            )
+            .await?;
+            // Pin/gate locks come first; the late token check follows while the
+            // pin FOR SHARE is still held, preserving repository/gate -> pin ->
+            // token order and avoiding a read/release inversion.
+            let value = PgPackSnapshot
+                .read_serving_by_snapshot(
+                    &tx,
+                    repository_id,
+                    tenant_id,
+                    input.snapshot_id,
+                    backend.as_hex(),
+                    deadline,
+                )
+                .await
+                .map_err(map_metadata_error)?;
+            final_authority(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                &preflight.repository.name,
+                RepoAction::ContentsRead,
+                backend,
+                None,
+                false,
+                deadline,
+            )
+            .await?;
+            Ok::<PackReadSnapshot, Error>(value)
+        }
+        .await;
+        rollback_bounded(tx).await;
+        staged
+    }
+
+    /// Renew the stored pin at its exact generation. The stored scope and pin
+    /// id are reconstructed from immutable rows; changed generation/lease under
+    /// the same key conflicts in the existing request digest.
+    pub async fn renew(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRenew,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+    ) -> Result<MetadataPinOutcome, Error> {
+        validate_key(&input.idempotency_key)?;
+        validate_snapshot(input.snapshot_id)?;
+        validate_generation(input.expected_generation)?;
+        validate_lease(input.lease_seconds)?;
+        let preflight = preflight(pool, actor, &input.owner, &input.name, true, backend, deadline).await?;
+        let repository_id = preflight.repository.id;
+        let tenant_id = preflight.gate.tenant_id();
+        let request_id = derived_uuid(
+            RENEW_REQUEST_DOMAIN,
+            repository_id,
+            actor.id,
+            "renew",
+            &input.idempotency_key,
+        );
+
+        let mut client = acquire(pool, deadline).await?;
+        let tx = begin_owned(&mut client, deadline).await?;
+        let staged = async {
+            let identity = PgPackSnapshot
+                .serving_snapshot_identity(&tx, repository_id, tenant_id, input.snapshot_id, deadline)
+                .await
+                .map_err(map_metadata_error)?
+                .ok_or_else(Error::not_found)?;
+            let scope = identity.scope;
+            let request = RenewMetadataPinRequest::new(
+                scope,
+                request_id,
+                identity.pin_id,
+                input.expected_generation,
+                input.lease_seconds,
+            )
+            .map_err(map_metadata_error)?;
+            let outcome = PgRefStoreCore
+                .renew_serving_checked(&tx, &request, backend.as_hex(), deadline)
+                .await
+                .map_err(map_metadata_error)?;
+            final_authority(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                &preflight.repository.name,
+                RepoAction::ContentsWrite,
+                backend,
+                Some(&scope),
+                false,
+                deadline,
+            )
+            .await?;
+            Ok::<(MetadataPinOutcome, Uuid), Error>((outcome, identity.pin_id))
+        }
+        .await;
+        match staged {
+            Ok((outcome, pin_id)) => {
+                let committed = commit_bounded(tx, deadline, repository_id, None).await;
+                crate::ref_store::core::metadata_commit_result(
+                    committed,
+                    repository_id,
+                    request_id,
+                    pin_id,
+                    MetadataMutationAction::Renew,
+                )
+                .map_err(map_metadata_error)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                rollback_bounded(tx).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Release the stored pin at its exact generation. The immutable receipt is
+    /// returned only after acknowledged commit; an exact retry never extends or
+    /// revives the lease.
+    pub async fn release(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRelease,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+    ) -> Result<MetadataPinOutcome, Error> {
+        validate_key(&input.idempotency_key)?;
+        validate_snapshot(input.snapshot_id)?;
+        validate_generation(input.expected_generation)?;
+        let preflight = preflight(pool, actor, &input.owner, &input.name, true, backend, deadline).await?;
+        let repository_id = preflight.repository.id;
+        let tenant_id = preflight.gate.tenant_id();
+        let request_id = derived_uuid(
+            RELEASE_REQUEST_DOMAIN,
+            repository_id,
+            actor.id,
+            "release",
+            &input.idempotency_key,
+        );
+
+        let mut client = acquire(pool, deadline).await?;
+        let tx = begin_owned(&mut client, deadline).await?;
+        let staged = async {
+            let identity = PgPackSnapshot
+                .serving_snapshot_identity(&tx, repository_id, tenant_id, input.snapshot_id, deadline)
+                .await
+                .map_err(map_metadata_error)?
+                .ok_or_else(Error::not_found)?;
+            let scope = identity.scope;
+            let request = ReleaseMetadataPinRequest::new(
+                scope,
+                request_id,
+                identity.pin_id,
+                input.expected_generation,
+                input.reason,
+            )
+            .map_err(map_metadata_error)?;
+            let outcome = PgRefStoreCore
+                .release_serving_checked(&tx, &request, backend.as_hex(), deadline)
+                .await
+                .map_err(map_metadata_error)?;
+            final_authority(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                &preflight.repository.name,
+                RepoAction::ContentsWrite,
+                backend,
+                Some(&scope),
+                false,
+                deadline,
+            )
+            .await?;
+            Ok::<(MetadataPinOutcome, Uuid), Error>((outcome, identity.pin_id))
+        }
+        .await;
+        match staged {
+            Ok((outcome, pin_id)) => {
+                let committed = commit_bounded(tx, deadline, repository_id, None).await;
+                crate::ref_store::core::metadata_commit_result(
+                    committed,
+                    repository_id,
+                    request_id,
+                    pin_id,
+                    MetadataMutationAction::Release,
+                )
+                .map_err(map_metadata_error)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                rollback_bounded(tx).await;
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn preflight(
+    pool: &Pool,
+    actor: &Identity,
+    owner: &str,
+    name: &str,
+    writable: bool,
+    backend: &BlobBackendIdentity,
+    deadline: Instant,
+) -> Result<ServingRepository, Error> {
+    super::lookup(pool, actor, owner, name, writable, backend, deadline).await
+}
+
+async fn serving_admin_gate(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    name: &str,
+    backend: &BlobBackendIdentity,
+    expected_scope: Option<&MetadataSnapshotScope>,
+    gate_for_update: bool,
+    deadline: Instant,
+) -> Result<CoreGate, Error> {
+    crate::ref_store::pg::bound(tx, deadline).await.map_err(map_metadata_error)?;
+    let locked = LockedScope::lock(tx, repository_id, false)
+        .await
+        .map_err(map_metadata_error)?
+        .ok_or_else(Error::not_found)?;
+    if locked.owner_id() != tenant_id || locked.name() != name {
+        return Err(Error::not_found());
+    }
+    let binding = locked
+        .require_serving(tenant_id, backend.as_hex())
+        .map_err(map_scope_refusal)?;
+    let gate = PgRefStoreCore
+        .read_gate_in_tx(tx, repository_id, gate_for_update)
+        .await
+        .map_err(map_metadata_error)?
+        .ok_or_else(Error::not_found)?;
+    locked.require_binding_matches_gate(&gate).map_err(map_scope_refusal)?;
+    if gate.repository_id() != repository_id
+        || gate.tenant_id() != tenant_id
+        || gate.object_format() != binding.object_format()
+    {
+        return Err(Error::internal("durable serving gate/binding realm mismatch"));
+    }
+    if let Some(scope) = expected_scope {
+        if gate.tenant_id() != scope.tenant_id()
+            || gate.object_format() != scope.object_format()
+            || gate.history_incarnation() != scope.history_incarnation()
+            || gate.authority_epoch() != scope.authority_epoch()
+            || gate.group_epoch() != scope.group_epoch()
+        {
+            return Err(Error(StatusCode::CONFLICT, "repository realm changed; retry the same request"));
+        }
+    }
+    let Some((role, _, _)) =
+        crate::members::rbac::resolve_effective_role(tx, repository_id, tenant_id, actor.id)
+            .await
+            .map_err(Error::internal)?
+    else {
+        return Err(Error::not_found());
+    };
+    if role < Role::Admin {
+        return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
+    }
+    Ok(gate)
+}
+
+async fn final_authority(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    name: &str,
+    action: RepoAction,
+    backend: &BlobBackendIdentity,
+    expected_scope: Option<&MetadataSnapshotScope>,
+    gate_for_update: bool,
+    deadline: Instant,
+) -> Result<CoreGate, Error> {
+    let gate = serving_admin_gate(
+        tx,
+        actor,
+        repository_id,
+        tenant_id,
+        name,
+        backend,
+        expected_scope,
+        gate_for_update,
+        deadline,
+    )
+    .await?;
+    let _cluster_incarnation = super::authority::cluster_incarnation_nowait(tx).await?;
+    let live = tx
+        .query_opt(
+            "SELECT t.read_only FROM tokens t
+             WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 AND NOT t.revoked
+               AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) AND t.kind='api'",
+            &[&actor.token_id, &actor.id, &actor.token_digest],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::unauthorized)?;
+    let _read_only: bool = live.get(0);
+    crate::token_scopes::authorize_repository_late(
+        tx,
+        actor.token_id,
+        actor.id,
+        repository_id,
+        action,
+        false,
+    )
+    .await
+    .map_err(auth::scope_error)?;
+    Ok(gate)
+}
+
+fn scope_from_gate(gate: &CoreGate) -> Result<MetadataSnapshotScope, Error> {
+    MetadataSnapshotScope::new(
+        gate.repository_id(),
+        gate.tenant_id(),
+        gate.tenant_id(),
+        SERVING_PURPOSE,
+        gate.object_format(),
+        gate.history_incarnation(),
+        gate.authority_epoch(),
+        gate.group_epoch(),
+    )
+    .map_err(map_metadata_error)
+}
+
+fn derived_uuid(domain: &str, repository_id: Uuid, actor_id: Uuid, action: &str, key: &str) -> Uuid {
+    let digest = RequestDigest::of(
+        domain,
+        &[repository_id.as_bytes(), actor_id.as_bytes(), action.as_bytes(), key.as_bytes()],
+    );
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    // RFC 4122 version/variant bits keep these valid non-nil UUIDs without
+    // changing the deterministic domain-separated payload.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn validate_key(value: &str) -> Result<(), Error> {
+    if value.is_empty()
+        || value.len() > MAX_IDEMPOTENCY_KEY_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+    {
+        return Err(Error::bad_request());
+    }
+    Ok(())
+}
+
+fn validate_lease(value: i64) -> Result<(), Error> {
+    if value <= 0 || value > MAX_PIN_LEASE_SECONDS {
+        return Err(Error::bad_request());
+    }
+    Ok(())
+}
+
+fn validate_generation(value: i64) -> Result<(), Error> {
+    if value <= 0 {
+        return Err(Error::bad_request());
+    }
+    Ok(())
+}
+
+fn validate_snapshot(value: Uuid) -> Result<(), Error> {
+    if value.is_nil() {
+        return Err(Error::bad_request());
+    }
+    Ok(())
+}
+
+fn map_metadata_error(error: RefStoreError) -> Error {
+    match error {
+        RefStoreError::MetadataPinGenerationMismatch { .. } => {
+            Error(StatusCode::CONFLICT, "snapshot pin generation changed")
+        }
+        RefStoreError::MetadataPinExpired { .. } => Error(StatusCode::CONFLICT, "snapshot pin lease expired"),
+        RefStoreError::MetadataPinReleased { .. } => Error(StatusCode::CONFLICT, "snapshot pin is released"),
+        RefStoreError::MetadataSnapshotNotFound { .. } | RefStoreError::MetadataPinNotFound { .. } => {
+            Error::not_found()
+        }
+        RefStoreError::MetadataScopeMismatch(_) => {
+            Error(StatusCode::CONFLICT, "snapshot metadata scope changed")
+        }
+        RefStoreError::MetadataGateVersionMismatch => {
+            Error(StatusCode::CONFLICT, "repository gate changed; retry the same request")
+        }
+        RefStoreError::MetadataQuotaExceeded { .. } => {
+            Error(StatusCode::TOO_MANY_REQUESTS, "retained snapshot quota is exhausted")
+        }
+        RefStoreError::MetadataSnapshotTooLarge { .. } => {
+            Error(StatusCode::PAYLOAD_TOO_LARGE, "snapshot metadata is too large")
+        }
+        RefStoreError::MetadataCommitUnknown { .. } => Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metadata commit outcome is unknown; retry the same request",
+        ),
+        other => map_refstore(other),
+    }
+}
+
+async fn rollback_bounded(tx: Transaction<'_>) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), tx.rollback()).await;
+}

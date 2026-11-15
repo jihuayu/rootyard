@@ -188,6 +188,13 @@ fn map_cluster_incarnation(
     }
 }
 
+/// Read the current cluster authority incarnation with the lookup's exact
+/// `FOR SHARE NOWAIT` policy. The serving metadata coordinator calls this after
+/// its repository/gate lock and before the late token check.
+pub(super) async fn cluster_incarnation_nowait(tx: &Transaction<'_>) -> Result<Uuid, Error> {
+    map_cluster_incarnation(read_cluster_incarnation_nowait(tx).await)
+}
+
 async fn read_repository_in_tx(tx: &Transaction<'_>, repository_id: Uuid) -> Result<Repository, Error> {
     let row = tx
         .query_opt(&format!("{} WHERE r.id=$1", db::REPO_SELECT), &[&repository_id])

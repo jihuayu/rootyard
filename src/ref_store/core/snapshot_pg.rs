@@ -46,7 +46,7 @@ use uuid::Uuid;
 /// Convert an unacknowledged `COMMIT` into the accurately typed metadata
 /// unknown. It is never an abort or a rejection: the caller resolves it with
 /// the same `request_id` through the receipt ledger.
-pub(super) fn metadata_commit_result(
+pub(crate) fn metadata_commit_result(
     result: Result<(), RefStoreError>,
     repository_id: Uuid,
     request_id: Uuid,

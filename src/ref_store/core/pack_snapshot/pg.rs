@@ -37,7 +37,9 @@ use super::super::snapshot_pg::{metadata_commit_result, replay_receipt};
 use super::super::snapshot_receipt::{
     MetadataReceipt, MetadataSnapshotReceipt, PackReceiptFields, SnapshotReceiptParts,
 };
-use super::super::snapshot_sql::{self, PackHeaderInsert, SnapshotInsert};
+use super::super::snapshot_contract::MetadataSnapshotScope;
+use super::ServingSnapshotIdentity;
+use super::super::snapshot_sql::{self, PackHeaderInsert, ScopeLane, SnapshotInsert};
 use super::super::snapshot_usage::{self, UsageDelta};
 use super::contract as pack_contract;
 use super::read_snapshot::{PackReadSnapshot, ReadSnapshotParts};
@@ -45,7 +47,7 @@ use super::receipt::{PackSnapshotOutcome, PackSnapshotReceipt, StoredPackSnapsho
 use super::request::{CreatePackSnapshotRequest, PackSnapshotRef};
 use super::sql;
 use super::usage::{self, PackUsageDelta};
-use crate::ref_store::contract::{MetadataMutationAction, RefStoreError};
+use crate::ref_store::contract::{MetadataMutationAction, RefStoreError, RequestDigest};
 use crate::ref_store::pg;
 use crate::ref_store::tx::{begin_bounded, commit_bounded};
 use tokio::time::Instant;
@@ -74,7 +76,11 @@ impl PgPackSnapshot {
         let tx = begin_bounded(client, deadline).await?;
         let result = async {
             snapshot_sql::durable_write(&tx, deadline).await?;
-            pg::before_deadline(deadline, self.create_checked(&tx, request, deadline)).await
+            pg::before_deadline(
+                deadline,
+                self.create_checked(&tx, request, deadline, ScopeLane::Unserved { require_unserved: true }),
+            )
+            .await
         }
         .await;
         match result {
@@ -101,6 +107,7 @@ impl PgPackSnapshot {
         tx: &Transaction<'_>,
         request: &CreatePackSnapshotRequest,
         deadline: Instant,
+        lane: ScopeLane<'_>,
     ) -> Result<PackSnapshotOutcome, RefStoreError> {
         let scope = request.scope();
         let repository_id = scope.repository_id();
@@ -178,7 +185,7 @@ impl PgPackSnapshot {
         // (3) Exact A2 repository/gate fence, then the pack-mode and expected
         // gate proof. The gate `FOR UPDATE` serializes with `CommitRefs` and the
         // A4 verified commit, so refs, HEAD and memberships are one revision.
-        let gate = snapshot_sql::lock_scope(tx, scope, true, true).await?;
+        let gate = snapshot_sql::lock_scope_lane(tx, scope, lane, true).await?;
         if snapshot_sql::gate_pack_mode(tx, repository_id).await? != PackMode::PackVerified {
             return Err(RefStoreError::Unsupported("fresh pack snapshot capture requires a pack_verified gate"));
         }
@@ -371,6 +378,137 @@ impl PgPackSnapshot {
         })
     }
 
+    /// Serving create inside a caller-owned transaction. The coordinator owns
+    /// the commit and the final late token check; this method only reuses the
+    /// exact A5a SQL/receipt/quota/history path with the serving lane.
+    pub(crate) async fn create_serving_checked(
+        &self,
+        tx: &Transaction<'_>,
+        request: &CreatePackSnapshotRequest,
+        backend_identity_hex: &str,
+        deadline: Instant,
+    ) -> Result<PackSnapshotOutcome, RefStoreError> {
+        snapshot_sql::durable_write(tx, deadline).await?;
+        pg::before_deadline(
+            deadline,
+            self.create_checked(
+                tx,
+                request,
+                deadline,
+                ScopeLane::Serving { backend_identity: backend_identity_hex },
+            ),
+        )
+        .await
+    }
+
+    /// Reconstruct the original captured gate expectation from the stored
+    /// create receipt/header before a retry digest is built. This is what makes
+    /// an exact same-key retry replay after later refs advanced instead of
+    /// conflicting on the new current gate revision.
+    pub(crate) async fn serving_create_expectation(
+        &self,
+        tx: &Transaction<'_>,
+        scope: &MetadataSnapshotScope,
+        request_id: Uuid,
+        pin_id: Uuid,
+        snapshot_id: Uuid,
+        deadline: Instant,
+    ) -> Result<Option<PackSnapshotExpectation>, RefStoreError> {
+        pg::bound(tx, deadline).await?;
+        let Some(stored) = snapshot_sql::stored_receipt(tx, request_id).await? else {
+            return Ok(None);
+        };
+        if stored.action != MetadataMutationAction::Create
+            || stored.repository_id != scope.repository_id()
+            || stored.tenant_id != scope.tenant_id()
+            || stored.pin_id != pin_id
+            || stored.snapshot_id != snapshot_id
+        {
+            return Ok(None);
+        }
+        let Some(header) = snapshot_sql::snapshot_header(tx, snapshot_id, scope.repository_id()).await? else {
+            return Ok(None);
+        };
+        if !header.is_pack_verified() || header.stored_scope()? != *scope {
+            return Ok(None);
+        }
+        let digest: RequestDigest = header.gate_digest.parse()?;
+        PackSnapshotExpectation::new(header.gate_revision, digest).map(Some)
+    }
+
+    /// Resolve the stored snapshot/pin identity for read/renew/release without
+    /// taking a pin lock. The caller's authorized final transaction reconstructs
+    /// all authority from these rows.
+    pub(crate) async fn serving_snapshot_identity(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        tenant_id: Uuid,
+        snapshot_id: Uuid,
+        deadline: Instant,
+    ) -> Result<Option<ServingSnapshotIdentity>, RefStoreError> {
+        pg::bound(tx, deadline).await?;
+        let Some(header) = snapshot_sql::snapshot_header(tx, snapshot_id, repository_id).await? else {
+            return Ok(None);
+        };
+        header.ensure_read_identity(repository_id, tenant_id)?;
+        header.ensure_pack_verified()?;
+        let scope = header.stored_scope()?;
+        let Some(pin) = snapshot_sql::pin_identity_by_snapshot(tx, snapshot_id, repository_id).await? else {
+            return Err(RefStoreError::Database("stored snapshot has no durable pin identity".into()));
+        };
+        if pin.repository_id != repository_id
+            || pin.snapshot_id != snapshot_id
+            || pin.tenant_id != scope.tenant_id()
+            || pin.owner_id != scope.owner_id()
+            || pin.purpose != scope.purpose()
+        {
+            return Err(RefStoreError::Database(
+                "stored snapshot pin identity disagrees with its header".into(),
+            ));
+        }
+        Ok(Some(ServingSnapshotIdentity { scope, snapshot_id, pin_id: pin.pin_id }))
+    }
+
+    /// Serving read by snapshot selector inside a caller-owned transaction.
+    /// The pin id/generation are reconstructed from stored rows; callers never
+    /// supply a sealed reference.
+    pub(crate) async fn read_serving_by_snapshot(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        tenant_id: Uuid,
+        snapshot_id: Uuid,
+        backend_identity_hex: &str,
+        deadline: Instant,
+    ) -> Result<PackReadSnapshot, RefStoreError> {
+        pg::bound(tx, deadline).await?;
+        let Some(header) = snapshot_sql::snapshot_header(tx, snapshot_id, repository_id).await? else {
+            return Err(RefStoreError::MetadataSnapshotNotFound { snapshot_id });
+        };
+        header.ensure_read_identity(repository_id, tenant_id)?;
+        header.ensure_pack_verified()?;
+        let scope = header.stored_scope()?;
+        let Some(pin_identity) =
+            snapshot_sql::pin_identity_by_snapshot(tx, snapshot_id, repository_id).await?
+        else {
+            return Err(RefStoreError::Database("stored snapshot has no durable pin identity".into()));
+        };
+        let pin = snapshot_sql::pin_for_share(tx, pin_identity.pin_id, repository_id)
+            .await?
+            .ok_or(RefStoreError::MetadataPinNotFound { pin_id: pin_identity.pin_id })?;
+        pin.ensure_scope(&scope, snapshot_id)?;
+        let reference =
+            PackSnapshotRef::new(repository_id, tenant_id, snapshot_id, pin.pin_id, pin.generation)?;
+        self.read_checked(
+            tx,
+            &reference,
+            deadline,
+            ScopeLane::Serving { backend_identity: backend_identity_hex },
+        )
+        .await
+    }
+
     /// Read one sealed complete registered-membership snapshot.
     ///
     /// The stored header supplies the trusted historical scope; the current
@@ -385,7 +523,11 @@ impl PgPackSnapshot {
     ) -> Result<PackReadSnapshot, RefStoreError> {
         reference.validate()?;
         let tx = begin_bounded(client, deadline).await?;
-        let result = pg::before_deadline(deadline, self.read_checked(&tx, reference, deadline)).await;
+        let result = pg::before_deadline(
+            deadline,
+            self.read_checked(&tx, reference, deadline, ScopeLane::Unserved { require_unserved: true }),
+        )
+        .await;
         let _ = tx.rollback().await;
         result
     }
@@ -395,6 +537,7 @@ impl PgPackSnapshot {
         tx: &Transaction<'_>,
         reference: &PackSnapshotRef,
         deadline: Instant,
+        lane: ScopeLane<'_>,
     ) -> Result<PackReadSnapshot, RefStoreError> {
         pg::bound(tx, deadline).await?;
         let header = snapshot_sql::snapshot_header(tx, reference.snapshot_id(), reference.repository_id())
@@ -407,7 +550,7 @@ impl PgPackSnapshot {
         // Current realm read fence: same unserved predicate and the same stored
         // object format/history/authority/group epochs, `FOR SHARE` so a
         // transition or epoch move cannot interleave with the read.
-        snapshot_sql::lock_scope(tx, &scope, true, false).await?;
+        snapshot_sql::lock_scope_lane(tx, &scope, lane, false).await?;
         if snapshot_sql::gate_pack_mode(tx, reference.repository_id()).await? != PackMode::PackVerified {
             return Err(RefStoreError::Unsupported("pack snapshot read requires a pack_verified gate"));
         }

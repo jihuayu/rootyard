@@ -58,8 +58,13 @@ use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 mod authority;
+mod snapshot_metadata;
 
 pub(crate) use authority::AuthorityKind;
+pub use snapshot_metadata::{
+    PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead, ServingSnapshotRelease,
+    ServingSnapshotRenew,
+};
 pub use authority::lookup;
 pub(crate) use authority::lookup_in_tx;
 

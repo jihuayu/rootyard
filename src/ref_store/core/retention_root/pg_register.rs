@@ -124,7 +124,12 @@ impl PgRetentionRoots {
         // (4) Fresh revalidation of the ORIGINAL active pin + realm + complete immutable pack identity under the
         // gate lock. This re-reads the source snapshot rows (and locks the pin FOR SHARE) and re-checks liveness,
         // generation, expiry and release; the sealed candidate must agree byte for byte.
-        let fresh = PgPackSnapshot.read_checked(tx, candidate.reference(), deadline).await?;
+        let fresh = PgPackSnapshot.read_checked(
+            tx,
+            candidate.reference(),
+            deadline,
+            super::super::snapshot_sql::ScopeLane::LegacyFresh,
+        ).await?;
         candidate.verify_source(&fresh)?;
 
         // (5) Monotone separate protocol revision (never a gate row shape change). It becomes durable only with
