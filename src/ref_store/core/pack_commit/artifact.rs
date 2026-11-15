@@ -311,6 +311,19 @@ pub fn packs_digest(packs: &[RegisteredPack]) -> RequestDigest {
     RequestDigest::of("core-pack-set-v1", &parts)
 }
 
+/// Canonical causal [`crate::ref_store::ref_version::PackSetDigest`] over registered packs.
+pub fn pack_set_digest(
+    packs: &[RegisteredPack],
+) -> Result<crate::ref_store::core::ref_version::PackSetDigest, PackCommitError> {
+    let entries = packs
+        .iter()
+        .map(crate::ref_store::core::ref_version::PackSetEntry::from_registered)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| PackCommitError::Invalid("registered pack cannot build canonical PackSetDigest"))?;
+    crate::ref_store::core::ref_version::compute_pack_set_digest(&entries)
+        .map_err(|_| PackCommitError::Invalid("registered pack set violates causal PackSetDigest bounds"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +368,9 @@ mod tests {
         let left = pack(1);
         let right = pack(1);
         assert_eq!(left.artifact_set_digest(), right.artifact_set_digest());
+        let causal_left = pack_set_digest(std::slice::from_ref(&left)).unwrap();
+        let causal_right = pack_set_digest(std::slice::from_ref(&right)).unwrap();
+        assert_eq!(causal_left, causal_right);
         assert_eq!(packs_digest(std::slice::from_ref(&left)), packs_digest(&[right]));
         let mut artifacts = left.artifacts().to_vec();
         artifacts[1] = artifact(PackArtifactRole::Idx, 7);

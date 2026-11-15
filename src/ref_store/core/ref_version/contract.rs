@@ -14,14 +14,14 @@ use uuid::Uuid;
 
 /// Fixed ref authority named by the realm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AuthorityKind {
+pub enum AuthorityKind {
     Pg,
     Raft,
 }
 
 impl AuthorityKind {
     /// Canonical one-byte tag: `1 = pg`, `2 = raft`.
-    pub(crate) const fn tag(self) -> u8 {
+    pub const fn tag(self) -> u8 {
         match self {
             Self::Pg => 1,
             Self::Raft => 2,
@@ -31,7 +31,7 @@ impl AuthorityKind {
 
 /// Version kind fixed by the request, never inferred from the target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RefVersionKind {
+pub enum RefVersionKind {
     Publish,
     Delete,
     Repack,
@@ -39,7 +39,7 @@ pub(crate) enum RefVersionKind {
 
 impl RefVersionKind {
     /// Canonical one-byte tag: `1 = publish`, `2 = delete`, `3 = repack`.
-    pub(crate) const fn tag(self) -> u8 {
+    pub const fn tag(self) -> u8 {
         match self {
             Self::Publish => 1,
             Self::Delete => 2,
@@ -51,7 +51,7 @@ impl RefVersionKind {
 /// Per-ref base selector. The legacy shape is bound into the operation digest
 /// for replay separation but can never mint a candidate `VersionId`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BaseRequestSelector {
+pub enum BaseRequestSelector {
     /// `0`: the old request shape did not carry a base selector.
     LegacyNotSupplied,
     /// `1`: explicitly no previous version; legal only for generation 1.
@@ -63,7 +63,7 @@ pub(crate) enum BaseRequestSelector {
 impl BaseRequestSelector {
     /// Canonical one-byte tag: `0 = legacy`, `1 = explicit absent`,
     /// `2 = present with id`.
-    pub(crate) const fn tag(self) -> u8 {
+    pub const fn tag(self) -> u8 {
         match self {
             Self::LegacyNotSupplied => 0,
             Self::ExplicitAbsent => 1,
@@ -75,7 +75,7 @@ impl BaseRequestSelector {
 /// Complete realm of one ref-version namespace. `owner` and issuer scope are
 /// operation fields, not `VersionId` fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RefVersionRealm {
+pub struct RefVersionRealm {
     tenant_id: Uuid,
     repository_id: Uuid,
     history_incarnation: Uuid,
@@ -88,7 +88,7 @@ pub(crate) struct RefVersionRealm {
 
 impl RefVersionRealm {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         tenant_id: Uuid,
         repository_id: Uuid,
         history_incarnation: Uuid,
@@ -110,42 +110,42 @@ impl RefVersionRealm {
         }
     }
 
-    pub(crate) fn tenant_id(&self) -> Uuid {
+    pub fn tenant_id(&self) -> Uuid {
         self.tenant_id
     }
 
-    pub(crate) fn repository_id(&self) -> Uuid {
+    pub fn repository_id(&self) -> Uuid {
         self.repository_id
     }
 
-    pub(crate) fn history_incarnation(&self) -> Uuid {
+    pub fn history_incarnation(&self) -> Uuid {
         self.history_incarnation
     }
 
-    pub(crate) fn authority_kind(&self) -> AuthorityKind {
+    pub fn authority_kind(&self) -> AuthorityKind {
         self.authority_kind
     }
 
-    pub(crate) fn authority_epoch(&self) -> i64 {
+    pub fn authority_epoch(&self) -> i64 {
         self.authority_epoch
     }
 
-    pub(crate) fn group_id(&self) -> i64 {
+    pub fn group_id(&self) -> i64 {
         self.group_id
     }
 
-    pub(crate) fn group_epoch(&self) -> i64 {
+    pub fn group_epoch(&self) -> i64 {
         self.group_epoch
     }
 
-    pub(crate) fn object_format(&self) -> GitObjectFormat {
+    pub fn object_format(&self) -> GitObjectFormat {
         self.object_format
     }
 }
 
 /// One ref entry in the original request order.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RefVersionIntent {
+pub struct RefVersionIntent {
     name: RefName,
     kind: RefVersionKind,
     precondition: RefPrecondition,
@@ -154,7 +154,7 @@ pub(crate) struct RefVersionIntent {
 }
 
 impl RefVersionIntent {
-    pub(crate) fn new(
+    pub fn new(
         name: RefName,
         kind: RefVersionKind,
         precondition: RefPrecondition,
@@ -164,23 +164,23 @@ impl RefVersionIntent {
         Self { name, kind, precondition, base, target }
     }
 
-    pub(crate) fn name(&self) -> &RefName {
+    pub fn name(&self) -> &RefName {
         &self.name
     }
 
-    pub(crate) fn kind(&self) -> RefVersionKind {
+    pub fn kind(&self) -> RefVersionKind {
         self.kind
     }
 
-    pub(crate) fn precondition(&self) -> &RefPrecondition {
+    pub fn precondition(&self) -> &RefPrecondition {
         &self.precondition
     }
 
-    pub(crate) fn base(&self) -> &BaseRequestSelector {
+    pub fn base(&self) -> &BaseRequestSelector {
         &self.base
     }
 
-    pub(crate) fn target(&self) -> &RefTarget {
+    pub fn target(&self) -> &RefTarget {
         &self.target
     }
 }
@@ -189,7 +189,7 @@ impl RefVersionIntent {
 /// order; `packs` are canonically sorted by the codec. There is deliberately no
 /// ref generation field: generation comes from the authority's base version.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OperationDigestInput {
+pub struct OperationDigestInput {
     realm: RefVersionRealm,
     owner_id: Uuid,
     issuer_id: Uuid,
@@ -207,7 +207,7 @@ pub(crate) struct OperationDigestInput {
 
 impl OperationDigestInput {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         realm: RefVersionRealm,
         owner_id: Uuid,
         issuer_id: Uuid,
@@ -239,55 +239,55 @@ impl OperationDigestInput {
         }
     }
 
-    pub(crate) fn realm(&self) -> &RefVersionRealm {
+    pub fn realm(&self) -> &RefVersionRealm {
         &self.realm
     }
 
-    pub(crate) fn owner_id(&self) -> Uuid {
+    pub fn owner_id(&self) -> Uuid {
         self.owner_id
     }
 
-    pub(crate) fn issuer_id(&self) -> Uuid {
+    pub fn issuer_id(&self) -> Uuid {
         self.issuer_id
     }
 
-    pub(crate) fn lane(&self) -> &IssuerLane {
+    pub fn lane(&self) -> &IssuerLane {
         &self.lane
     }
 
-    pub(crate) fn issuer_sequence(&self) -> i64 {
+    pub fn issuer_sequence(&self) -> i64 {
         self.issuer_sequence
     }
 
-    pub(crate) fn operation_id(&self) -> Uuid {
+    pub fn operation_id(&self) -> Uuid {
         self.operation_id
     }
 
-    pub(crate) fn expected_gate_revision(&self) -> i64 {
+    pub fn expected_gate_revision(&self) -> i64 {
         self.expected_gate_revision
     }
 
-    pub(crate) fn expected_gate_digest(&self) -> &RequestDigest {
+    pub fn expected_gate_digest(&self) -> &RequestDigest {
         &self.expected_gate_digest
     }
 
-    pub(crate) fn commit_mode(&self) -> CommitMode {
+    pub fn commit_mode(&self) -> CommitMode {
         self.commit_mode
     }
 
-    pub(crate) fn head(&self) -> &HeadUpdate {
+    pub fn head(&self) -> &HeadUpdate {
         &self.head
     }
 
-    pub(crate) fn refs(&self) -> &[RefVersionIntent] {
+    pub fn refs(&self) -> &[RefVersionIntent] {
         &self.refs
     }
 
-    pub(crate) fn old_membership_digest(&self) -> &RequestDigest {
+    pub fn old_membership_digest(&self) -> &RequestDigest {
         &self.old_membership_digest
     }
 
-    pub(crate) fn packs(&self) -> &[PlannedPack] {
+    pub fn packs(&self) -> &[PlannedPack] {
         &self.packs
     }
 }
@@ -295,20 +295,24 @@ impl OperationDigestInput {
 /// Opaque canonical operation digest. The only constructor is the hash result
 /// inside [`super::digest::operation_digest`].
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-pub(crate) struct OperationDigest([u8; 32]);
+pub struct OperationDigest([u8; 32]);
 
 impl OperationDigest {
     pub(super) const fn from_canonical_hash(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    pub(super) const fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
-    #[cfg(test)]
-    pub(crate) fn as_hex(&self) -> String {
+    pub fn as_hex(&self) -> String {
         hex::encode(self.0)
+    }
+
+    #[cfg(test)]
+    pub(super) const fn from_test_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -320,8 +324,8 @@ impl fmt::Debug for OperationDigest {
 
 /// Opaque candidate ref-version id. A value is not a registered version and is
 /// not a retention, authorization or commit capability.
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-pub(crate) struct VersionId([u8; 32]);
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VersionId([u8; 32]);
 
 impl VersionId {
     pub(super) const fn from_canonical_hash(bytes: [u8; 32]) -> Self {
@@ -329,7 +333,7 @@ impl VersionId {
     }
 
     /// Raw bytes for an internal preimage. This is still not a capability.
-    pub(super) const fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
@@ -338,8 +342,7 @@ impl VersionId {
         Self(bytes)
     }
 
-    #[cfg(test)]
-    pub(crate) fn as_hex(&self) -> String {
+    pub fn as_hex(&self) -> String {
         hex::encode(self.0)
     }
 }
@@ -353,7 +356,7 @@ impl fmt::Debug for VersionId {
 /// Typed codec refusal. Variants carry only fixed field names/reasons, never
 /// caller bytes, paths or credentials.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RefVersionCodecError {
+pub enum RefVersionCodecError {
     NilIdentifier { field: &'static str },
     NegativeCounter { field: &'static str },
     ZeroCounter { field: &'static str },
@@ -377,6 +380,10 @@ pub(crate) enum RefVersionCodecError {
     UnexpectedAuthorityBaseGeneration,
     ZeroAuthorityBaseGeneration,
     GenerationOverflow,
+    SelfDependency,
+    DuplicateDependency,
+    InvalidReasonCode,
+    RecordDigestMismatch,
 }
 
 impl fmt::Display for RefVersionCodecError {
@@ -421,6 +428,10 @@ impl fmt::Display for RefVersionCodecError {
             }
             Self::ZeroAuthorityBaseGeneration => formatter.write_str("an authority base generation must be positive"),
             Self::GenerationOverflow => formatter.write_str("the candidate ref generation overflowed"),
+            Self::SelfDependency => formatter.write_str("a version must not declare a dependency on itself"),
+            Self::DuplicateDependency => formatter.write_str("version object dependencies must be unique"),
+            Self::InvalidReasonCode => formatter.write_str("reason must be a closed canonical ASCII reason code"),
+            Self::RecordDigestMismatch => formatter.write_str("stored version record digest does not match preimage"),
         }
     }
 }
