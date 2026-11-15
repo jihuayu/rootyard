@@ -4,11 +4,10 @@
 //! cancellation, and snapshot restart recovery (`#116`).
 
 use super::*;
-use rootyard::ref_store::core::pack_commit::PackMode;
 use rootyard::ref_store::core::state_machine::{
     AppliedLogId, ApplyResponse, CancelCommand, CommitRefsCommand, InitializeGateCommand, RefCasCommand,
-    RefCasLogEntry, RefCasStateMachine, RepositoryLane, StateMachineError, WireCommitRefsRequest, WireGateInit,
-    WireOperationIdentity, encode_command,
+    RefCasLogEntry, RefCasStateMachine, RepositoryLane, SmPackMode, StateMachineError, WireCommitRefsRequest,
+    WireGateInit, WireOperationIdentity, encode_command,
 };
 use std::collections::BTreeMap;
 
@@ -38,7 +37,7 @@ impl DualHarness {
         let (log_id, _) = self.next_log();
         let cmd = RefCasCommand::InitializeGate(InitializeGateCommand {
             gate: WireGateInit::from(init),
-            pack_mode: PackMode::MetadataOnly,
+            pack_mode: SmPackMode::MetadataOnly,
             lane: RepositoryLane::PgRefstore,
             authz_floor: 1,
         });

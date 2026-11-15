@@ -2,11 +2,10 @@
 //! fencing, cancel-versus-begin/commit, and logical-tick decision expiry tests.
 
 use super::*;
-use rootyard::ref_store::core::pack_commit::PackMode;
 use rootyard::ref_store::core::state_machine::{
     AppliedLogId, ApplyResponse, BeginOperationCommand, CancelCommand, CommitRefsCommand, InitializeGateCommand,
     InstallDecisionCommand, RefCasCommand, RefCasStateMachine, RepositoryLane, ScopeLifecycle,
-    SetRepositoryLaneCommand, SmDecisionState, StateMachineError, WireCommitRefsRequest, WireDecisionKind,
+    SetRepositoryLaneCommand, SmDecisionState, SmPackMode, StateMachineError, WireCommitRefsRequest, WireDecisionKind,
     WireDecisionVerdict, WireGateInit, WireOperationIdentity,
 };
 use rootyard::ref_store::{
@@ -26,7 +25,7 @@ fn idempotent_replay_digest_conflict_dropped_reply_and_lifecycle_fence() {
         AppliedLogId { term: 1, index: 1 },
         RefCasCommand::InitializeGate(InitializeGateCommand {
             gate: WireGateInit::from(&make_init(repo, tenant, history)),
-            pack_mode: PackMode::MetadataOnly,
+            pack_mode: SmPackMode::MetadataOnly,
             lane: RepositoryLane::PgRefstore,
             authz_floor: 1,
         }),
@@ -77,7 +76,7 @@ fn idempotent_replay_digest_conflict_dropped_reply_and_lifecycle_fence() {
             history_incarnation: history,
             authority_epoch: 2,
             group_epoch: 2,
-            pack_mode: PackMode::MetadataOnly,
+            pack_mode: SmPackMode::MetadataOnly,
         }),
     )
     .unwrap();
@@ -165,7 +164,7 @@ fn idempotent_replay_digest_conflict_dropped_reply_and_lifecycle_fence() {
                 history_incarnation: history,
                 authority_epoch: 2,
                 group_epoch: 2,
-                pack_mode: PackMode::MetadataOnly,
+                pack_mode: SmPackMode::MetadataOnly,
             }),
         )
         .unwrap_err();
@@ -192,7 +191,7 @@ fn cancel_versus_begin_commit_and_decision_expiry() {
         AppliedLogId { term: 1, index: 1 },
         RefCasCommand::InitializeGate(InitializeGateCommand {
             gate: WireGateInit::from(&make_init(repo, tenant, history)),
-            pack_mode: PackMode::MetadataOnly,
+            pack_mode: SmPackMode::MetadataOnly,
             lane: RepositoryLane::PgRefstore,
             authz_floor: 1,
         }),

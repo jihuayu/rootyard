@@ -5,7 +5,6 @@
 
 use super::wire::{WireCommitRefsRequest, WireGateInit, WireOperationIdentity};
 use crate::ref_store::contract::MetadataPinPurpose;
-use crate::ref_store::core::contract::CommitMode;
 use crate::ref_store::core::pack_commit::PackMode;
 use crate::ref_store::core::terminal::CommitRejectCode;
 use crate::ref_store::core::types::GitObjectFormat;
@@ -28,6 +27,32 @@ pub enum ScopeLifecycle {
     Open,
     Closing,
     Closed,
+}
+
+/// Mirror of [`PackMode`] with deterministic Serde representation for Raft log & snapshots.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmPackMode {
+    MetadataOnly,
+    PackVerified,
+}
+
+impl From<PackMode> for SmPackMode {
+    fn from(value: PackMode) -> Self {
+        match value {
+            PackMode::MetadataOnly => Self::MetadataOnly,
+            PackMode::PackVerified => Self::PackVerified,
+        }
+    }
+}
+
+impl From<SmPackMode> for PackMode {
+    fn from(value: SmPackMode) -> Self {
+        match value {
+            SmPackMode::MetadataOnly => Self::MetadataOnly,
+            SmPackMode::PackVerified => Self::PackVerified,
+        }
+    }
 }
 
 /// Authoritative lane for a repository inside the state machine.
@@ -107,7 +132,7 @@ pub struct WireHoldArtifactSpec {
 pub struct InitializeGateCommand {
     pub gate: WireGateInit,
     pub lane: RepositoryLane,
-    pub pack_mode: PackMode,
+    pub pack_mode: SmPackMode,
     pub authz_floor: i64,
 }
 
@@ -123,7 +148,7 @@ pub struct SetRepositoryLaneCommand {
     pub history_incarnation: Uuid,
     pub authority_epoch: i64,
     pub group_epoch: i64,
-    pub pack_mode: PackMode,
+    pub pack_mode: SmPackMode,
 }
 
 /// Register a pending operation in the migration-138-compatible registry.

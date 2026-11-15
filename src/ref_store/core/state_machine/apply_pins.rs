@@ -3,11 +3,12 @@
 //! Lease expiry and renewal use only `logical_clock_floor` supplied via Raft log
 //! entries (never wall clocks), preserving non-refundable snapshot quotas.
 
-use super::commands::{CreateSnapshotPinCommand, ReleasePinCommand, RenewPinCommand, ScopeLifecycle, SmPinState};
+use super::commands::{
+    CreateSnapshotPinCommand, ReleasePinCommand, RenewPinCommand, ScopeLifecycle, SmPackMode, SmPinState,
+};
 use super::response::{ApplyResponse, StateMachineError};
 use super::state::{PinReceiptRecord, PinRecord, QuotaCounters, SmState, SnapshotRecord};
 use crate::ref_store::contract::{MetadataMutationAction, RefStoreError, RequestDigest};
-use crate::ref_store::core::pack_commit::PackMode;
 use crate::ref_store::core::snapshot_contract::{
     MAX_PIN_LEASE_SECONDS, MAX_SNAPSHOT_PACKS, MAX_SNAPSHOT_REFS, REPO_MAX_LOGICAL_BYTES, REPO_MAX_RECEIPTS,
     REPO_MAX_SNAPSHOT_REFS, REPO_MAX_SNAPSHOTS, TENANT_MAX_LOGICAL_BYTES, TENANT_MAX_RECEIPTS,
@@ -92,17 +93,17 @@ pub(super) fn create_snapshot_pin(
     if current_refs.len() > MAX_SNAPSHOT_REFS {
         return Err(StateMachineError::QuotaExceeded("snapshot exceeds MAX_SNAPSHOT_REFS"));
     }
+    let head_oid = current_refs.get(&gate.head_ref).cloned();
+    let pack_mode = if cmd.pack_digests.is_empty() { SmPackMode::MetadataOnly } else { gate.pack_mode };
+    let gate_revision = gate.revision;
+    let head_ref = gate.head_ref.clone();
+
     let effective_tick = state.logical_clock_floor.max(cmd.logical_tick);
     let expires_at_tick = effective_tick
         .checked_add(cmd.lease_ticks)
         .ok_or(StateMachineError::InvalidInput("lease tick overflow".into()))?;
     let logical_bytes = (current_refs.len() as i64).saturating_mul(128).saturating_add(512);
     charge_snapshot_quota(state, cmd.repository_id, cmd.tenant_id, current_refs.len() as i64, logical_bytes)?;
-
-    let head_oid = current_refs.get(&gate.head_ref).cloned();
-    let pack_mode = if cmd.pack_digests.is_empty() { PackMode::MetadataOnly } else { gate.pack_mode };
-    let gate_revision = gate.revision;
-    let head_ref = gate.head_ref.clone();
 
     state.advance_clock(effective_tick);
     state.snapshots.insert(

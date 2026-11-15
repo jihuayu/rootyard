@@ -70,8 +70,9 @@ pub(super) fn install_decision(
                 state: existing.state,
             });
         }
+        let existing_decision_id = existing.decision_id;
         state.advance_clock(effective_tick);
-        return Ok(ApplyResponse::DecisionInstalled { decision_id: existing.decision_id, replayed: true });
+        return Ok(ApplyResponse::DecisionInstalled { decision_id: existing_decision_id, replayed: true });
     }
 
     if state.decisions.contains_key(&cmd.decision_id) {

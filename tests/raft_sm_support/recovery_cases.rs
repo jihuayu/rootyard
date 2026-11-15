@@ -2,12 +2,11 @@
 //! pins, retention roots, and artifact holds deterministic recovery tests.
 
 use super::*;
-use rootyard::ref_store::core::pack_commit::PackMode;
 use rootyard::ref_store::core::state_machine::{
     AcquireHoldBatchCommand, AdvanceCancelCutoffCommand, AppliedLogId, ApplyResponse, CancelCommand, CommitRefsCommand,
     CreateSnapshotPinCommand, InitializeGateCommand, RefCasCommand, RefCasSnapshot, RefCasStateMachine,
     RegisterRootCommand, ReleasePinCommand, ReleaseRootCommand, RenewPinCommand, RepositoryLane,
-    RetireHoldBatchCommand, SmHoldState, SmPinState, SmRootState, StateMachineError, WireCommitRefsRequest,
+    RetireHoldBatchCommand, SmHoldState, SmPackMode, SmPinState, SmRootState, StateMachineError, WireCommitRefsRequest,
     WireGateInit, WireHoldArtifactSpec, WireOperationIdentity, decode_command,
 };
 use rootyard::ref_store::{
@@ -31,7 +30,7 @@ fn snapshot_seal_deny_unknown_fields_and_cancel_cutoff_pins_roots_holds_recovery
             AppliedLogId { term: 1, index: 1 },
             RefCasCommand::InitializeGate(InitializeGateCommand {
                 gate: WireGateInit::from(&init),
-                pack_mode: PackMode::MetadataOnly,
+                pack_mode: SmPackMode::MetadataOnly,
                 lane: RepositoryLane::PgRefstore,
                 authz_floor: 2,
             }),

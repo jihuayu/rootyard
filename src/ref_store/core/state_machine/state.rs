@@ -5,14 +5,13 @@
 //! yields identical canonical SHA-256 `state_digest()` and `RefCasSnapshot` checksums.
 
 use super::commands::{
-    AppliedLogId, RepositoryLane, ScopeLifecycle, SmDecisionState, SmHoldState, SmPinState, SmRootState,
+    AppliedLogId, RepositoryLane, ScopeLifecycle, SmDecisionState, SmHoldState, SmPackMode, SmPinState, SmRootState,
     WireDecisionKind, WireDecisionVerdict, WireHoldArtifactSpec,
 };
 use super::response::StateMachineError;
 use super::wire::{WireOperationIdentity, WireOperationRecord};
 use crate::ref_store::contract::{MetadataMutationAction, MetadataPinPurpose, OperationRecord};
 use crate::ref_store::core::contract::{CoreGate, CoreGateVersion};
-use crate::ref_store::core::pack_commit::PackMode;
 use crate::ref_store::core::types::{GitObjectFormat, RefName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,7 +59,7 @@ pub struct GateState {
     pub revision: i64,
     pub roots_revision: i64,
     pub head_ref: String,
-    pub pack_mode: PackMode,
+    pub pack_mode: SmPackMode,
     pub lane: RepositoryLane,
     pub lifecycle: ScopeLifecycle,
     pub authz_floor: i64,
@@ -184,7 +183,7 @@ pub struct SnapshotRecord {
     pub head_ref: String,
     pub head_oid: Option<String>,
     pub refs: BTreeMap<String, String>,
-    pub pack_mode: PackMode,
+    pub pack_mode: SmPackMode,
     pub pack_digests: Vec<String>,
     pub created_tick: u64,
     pub logical_bytes: i64,

@@ -6,14 +6,13 @@ use super::apply_refs::{
     check_lane_conflicts, find_cancellation_for_key, lane_cutoff, lane_key, record_operation_and_lane,
     verify_cancellation, verify_identity,
 };
-use super::commands::{AppliedLogId, CommitRefsCommand, ScopeLifecycle, SmDecisionState};
+use super::commands::{AppliedLogId, CommitRefsCommand, ScopeLifecycle, SmDecisionState, SmPackMode};
 use super::response::{ApplyResponse, StateMachineError};
 use super::state::{GateState, RepoEntityKey, SmState};
 use crate::ref_store::contract::{OperationRecord, OperationState, RefStoreError, TerminalResult};
 use crate::ref_store::core::command::CommitRefsRequest;
 use crate::ref_store::core::contract::CommitMode;
 use crate::ref_store::core::metadata_subset::{self, MetadataSelection};
-use crate::ref_store::core::pack_commit::PackMode;
 use crate::ref_store::core::terminal::{
     CommitRefsReceipt, CommitRejectCode, CommitRejection, CommitTerminal, RefCommitResult,
     ensure_exact_terminal_budget, ensure_terminal_budget,
@@ -120,7 +119,7 @@ pub(super) fn commit_refs(
     }
     if let Some(decision_id) = cmd.decision_id {
         verify_decision_for_commit(state, decision_id, &request, &gate, effective_tick, &cmd.required_holds)?;
-    } else if gate.pack_mode == PackMode::PackVerified {
+    } else if gate.pack_mode == SmPackMode::PackVerified {
         return Err(StateMachineError::Store(RefStoreError::Unsupported(
             "pack_verified repository requires authorized pack decision",
         )));

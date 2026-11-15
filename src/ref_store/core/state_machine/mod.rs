@@ -24,7 +24,7 @@ pub use commands::{
     CommitRefsCommand, CreateSnapshotPinCommand, InitializeGateCommand, InstallDecisionCommand,
     MarkHoldConsumedCommand, NoopCommand, RefCasCommand, RegisterRootCommand, ReleasePinCommand, ReleaseRootCommand,
     RenewPinCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle, SetRepositoryLaneCommand, SmDecisionState,
-    SmHoldState, SmPinState, SmRootState, WireDecisionKind, WireDecisionVerdict, WireHoldArtifactSpec,
+    SmHoldState, SmPackMode, SmPinState, SmRootState, WireDecisionKind, WireDecisionVerdict, WireHoldArtifactSpec,
 };
 pub use machine::{RefCasLogEntry, RefCasStateMachine, decode_command, encode_command};
 pub use response::{ApplyResponse, SmOperationRecord, SmVersionCheck, StateMachineError};

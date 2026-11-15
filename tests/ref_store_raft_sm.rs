@@ -2,11 +2,10 @@
 //!
 //! No PostgreSQL, Git processes, Blob storage, or wall-clock APIs are touched here.
 
-use rootyard::ref_store::core::pack_commit::PackMode;
 use rootyard::ref_store::core::state_machine::{
     AcquireHoldBatchCommand, AppliedLogId, ApplyResponse, CommitRefsCommand, InitializeGateCommand,
     InstallDecisionCommand, MarkHoldConsumedCommand, NoopCommand, RefCasCommand, RefCasLogEntry, RefCasStateMachine,
-    RegisterRootCommand, RepositoryLane, SmDecisionState, SmHoldState, SmRootState, StateMachineError,
+    RegisterRootCommand, RepositoryLane, SmDecisionState, SmHoldState, SmPackMode, SmRootState, StateMachineError,
     WireCommitRefsRequest, WireDecisionKind, WireDecisionVerdict, WireGateInit, WireHoldArtifactSpec, encode_command,
 };
 use rootyard::ref_store::{
@@ -147,7 +146,7 @@ fn deterministic_byte_log_replay_and_snapshot_recovery_match_state_digest() {
             AppliedLogId { term: 1, index: 1 },
             RefCasCommand::InitializeGate(InitializeGateCommand {
                 gate: WireGateInit::from(&init),
-                pack_mode: PackMode::MetadataOnly,
+                pack_mode: SmPackMode::MetadataOnly,
                 lane: RepositoryLane::PgRefstore,
                 authz_floor: 1,
             }),
@@ -165,7 +164,7 @@ fn deterministic_byte_log_replay_and_snapshot_recovery_match_state_digest() {
             1,
             RefCasCommand::InitializeGate(InitializeGateCommand {
                 gate: WireGateInit::from(&init),
-                pack_mode: PackMode::MetadataOnly,
+                pack_mode: SmPackMode::MetadataOnly,
                 lane: RepositoryLane::PgRefstore,
                 authz_floor: 1,
             }),
