@@ -378,14 +378,16 @@ class Harness:
                 "rootyardignore-excluded attribute file was captured despite preflight")
         self.checkpoint(store, info)
 
-        # Ordinary non-filter attributes stay supported.
+        # Ordinary non-filter attributes (including comments and pathnames containing
+        # "filter") stay supported, while actual filter attributes remain rejected.
         _, source, store, base = self.fixture("preflight-ordinary-attributes")
-        self.write(source, ".gitattributes", b"*.txt text eol=lf\n")
+        attrs = b"# custom filter docs\nsrc/filter_utils.rs text eol=lf\n*.txt text eol=lf\n"
+        self.write(source, ".gitattributes", attrs)
         self.git("add", ".gitattributes", cwd=source)
         self.git("commit", "-m", "ordinary attributes", cwd=source)
         base = self.oid(source)
         info, work = self.init(store, source, base)
-        require((work / ".gitattributes").read_bytes() == b"*.txt text eol=lf\n",
+        require((work / ".gitattributes").read_bytes() == attrs,
                 "ordinary .gitattributes was not copied byte-for-byte")
         checked.extend(["rootyardignore-ignored-attributes-accepted", "ordinary-attributes-accepted"])
 
