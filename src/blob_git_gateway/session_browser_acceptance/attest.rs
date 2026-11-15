@@ -125,9 +125,11 @@ pub(super) fn summary(summary: &Value, live: i64) -> Result<Chain> {
         commits_revision: reported_revision(summary, &["reads", "commits", "revision"])?,
         denials: Denials::reported(&summary["denials"])?,
     };
-    ensure!(chain.tree_revision >= chain.refs_revision, "the reported chain regressed");
-    ensure!(chain.commits_revision >= chain.tree_revision, "the reported commit read regressed");
-    ensure!(chain.commits_revision <= live, "a reported revision is ahead of the live gate");
+    ensure!(summary["reads"]["partial_status_shown"].as_bool() == Some(true), "partial status was not observed");
+    ensure!(summary["reads"]["load_more_completed"].as_bool() == Some(true), "Load more did not finish");
+    ensure!(chain.commits_revision >= chain.refs_revision, "the reported commit read regressed");
+    ensure!(chain.tree_revision >= chain.commits_revision, "the final Load more tree read regressed");
+    ensure!(chain.tree_revision <= live, "a reported revision is ahead of the live gate");
     Ok(chain)
 }
 
@@ -262,41 +264,98 @@ pub(super) fn verify(
         "the signed-in page lacked its shell CSP"
     );
 
-    let list_read = at(recorded, find(recorded, Route::WebList, 0, "the list")?, Route::WebList, "the list")?;
-    ensure!(list_read.status == 200, "the repository list was refused");
     ensure!(
-        list_read.request_token.is_none() && list_read.request_revision.is_none(),
-        "the list request presented a session"
+        recorded.iter().filter(|entry| entry.route == Route::WebList).count() == 2,
+        "the list did not paginate across both pages"
     );
+    let list_0 = at(recorded, find(recorded, Route::WebList, 0, "the list page 1")?, Route::WebList, "list page 1")?;
+    ensure!(list_0.status == 200, "the repository list page 1 was refused");
+    ensure!(list_0.request_token.is_none() && list_0.request_revision.is_none(), "list page 1 presented a session");
     ensure!(
-        list_read.response_token.is_none() && list_read.response_revision.is_none(),
-        "the list answer carried a session header"
+        list_0.response_token.is_none() && list_0.response_revision.is_none(),
+        "list page 1 carried a session header"
     );
-    ensure!(list_read.list_names_repository, "the list answer did not name exactly the fixture repository");
+    ensure!(!list_0.has_cursor_query && list_0.has_next_cursor_header, "list page 1 missed x-next-cursor pagination");
+    ensure!(!list_0.list_names_repository, "target repository unexpectedly appeared on list page 1");
 
-    let refs = at(recorded, find(recorded, Route::WebRefs, 0, "refs")?, Route::WebRefs, "refs")?;
-    ensure!(refs.status == 200, "the first refs read was refused");
+    let list_1 = at(recorded, find(recorded, Route::WebList, 1, "the list page 2")?, Route::WebList, "list page 2")?;
+    ensure!(list_1.status == 200, "the repository list page 2 was refused");
+    ensure!(list_1.request_token.is_none() && list_1.request_revision.is_none(), "list page 2 presented a session");
     ensure!(
-        refs.request_token.is_none() && refs.request_revision.is_none(),
+        list_1.response_token.is_none() && list_1.response_revision.is_none(),
+        "list page 2 carried a session header"
+    );
+    ensure!(list_1.has_cursor_query && !list_1.has_next_cursor_header, "list page 2 did not conclude pagination");
+    ensure!(list_1.list_names_repository, "list page 2 did not name the fixture repository");
+
+    let refs_0 = at(recorded, find(recorded, Route::WebRefs, 0, "refs page 1")?, Route::WebRefs, "refs page 1")?;
+    ensure!(refs_0.status == 200, "the first refs read was refused");
+    ensure!(
+        refs_0.request_token.is_none() && refs_0.request_revision.is_none(),
         "the first refs request presented a bound"
     );
-    let refs_pair = Pair::of(refs, "the first refs answer")?;
+    ensure!(!refs_0.has_after_query && refs_0.body_has_next_after, "refs page 1 did not expose next_after");
+    let refs_0_pair = Pair::of(refs_0, "the first refs answer")?;
 
-    let tree = at(recorded, find(recorded, Route::WebTree, 0, "the tree")?, Route::WebTree, "the tree")?;
-    ensure!(tree.status == 200, "the tree read was refused");
-    refs_pair.presented_by(tree, "the tree request")?;
-    ensure!(tree.oid_head, "the tree request did not ask for the pushed HEAD");
-    ensure!(tree.tree_names_files, "the tree answer did not list both pushed files");
-    let tree_pair = Pair::of(tree, "the tree answer")?;
-    ensure!(tree_pair.revision >= refs_pair.revision, "the tree answer regressed below the refs revision");
+    let refs_1 = at(recorded, find(recorded, Route::WebRefs, 1, "refs page 2")?, Route::WebRefs, "refs page 2")?;
+    ensure!(refs_1.status == 200, "the second refs read was refused");
+    ensure!(refs_1.has_after_query && !refs_1.body_has_next_after, "refs page 2 did not finish pagination");
+    refs_0_pair.presented_by(refs_1, "the second refs request")?;
+    let refs_1_pair = Pair::of(refs_1, "the second refs answer")?;
+    ensure!(refs_1_pair.revision >= refs_0_pair.revision, "refs page 2 regressed");
 
-    let commits = at(recorded, find(recorded, Route::WebCommits, 0, "commits")?, Route::WebCommits, "commits")?;
-    ensure!(commits.status == 200, "the commits read was refused");
-    tree_pair.presented_by(commits, "the commits request")?;
-    ensure!(commits.commits_names_oid, "the commits answer did not list the pushed commit");
-    let commits_pair = Pair::of(commits, "the commits answer")?;
-    ensure!(commits_pair.revision >= tree_pair.revision, "the commits answer regressed below the tree revision");
-    ensure!(commits_pair.revision <= live, "the commits answer is ahead of the live gate");
+    let tree_0 = at(recorded, find(recorded, Route::WebTree, 0, "tree page 1")?, Route::WebTree, "tree page 1")?;
+    ensure!(tree_0.status == 200, "the first tree read was refused");
+    refs_1_pair.presented_by(tree_0, "the first tree request")?;
+    ensure!(tree_0.oid_head, "the first tree request did not ask for the pushed HEAD");
+    ensure!(tree_0.tree_names_files, "the first tree page did not list both initial pushed files");
+    ensure!(tree_0.body_has_next_after, "tree page 1 did not expose next_after");
+    let mut prev_tree_pair = Pair::of(tree_0, "tree page 1 answer")?;
+    ensure!(prev_tree_pair.revision >= refs_1_pair.revision, "tree page 1 regressed below refs");
+
+    for occurrence in 1..5 {
+        let entry = at(
+            recorded,
+            find(recorded, Route::WebTree, occurrence, "auto tree continuation")?,
+            Route::WebTree,
+            "tree continuation",
+        )?;
+        ensure!(entry.status == 200, "a tree continuation page was refused");
+        ensure!(
+            entry.tree_oid_head_after && entry.body_has_next_after,
+            "auto tree continuation lacked after/next_after"
+        );
+        prev_tree_pair.presented_by(entry, "auto tree continuation")?;
+        let next_pair = Pair::of(entry, "auto tree continuation answer")?;
+        ensure!(next_pair.revision >= prev_tree_pair.revision, "auto tree continuation regressed");
+        prev_tree_pair = next_pair;
+    }
+
+    let commits_0 =
+        at(recorded, find(recorded, Route::WebCommits, 0, "commits page 1")?, Route::WebCommits, "commits page 1")?;
+    ensure!(commits_0.status == 200, "commits page 1 was refused");
+    prev_tree_pair.presented_by(commits_0, "the first commits request")?;
+    ensure!(!commits_0.has_after_query && commits_0.body_has_next_after, "commits page 1 lacked next_after");
+    ensure!(commits_0.commits_names_oid, "commits page 1 did not list the pushed HEAD commit");
+    let commits_0_pair = Pair::of(commits_0, "commits page 1 answer")?;
+    ensure!(commits_0_pair.revision >= prev_tree_pair.revision, "commits page 1 regressed below tree");
+
+    let commits_1 =
+        at(recorded, find(recorded, Route::WebCommits, 1, "commits page 2")?, Route::WebCommits, "commits page 2")?;
+    ensure!(commits_1.status == 200, "commits page 2 was refused");
+    commits_0_pair.presented_by(commits_1, "the second commits request")?;
+    ensure!(commits_1.has_after_query && !commits_1.body_has_next_after, "commits page 2 did not finish pagination");
+    let commits_1_pair = Pair::of(commits_1, "commits page 2 answer")?;
+    ensure!(commits_1_pair.revision >= commits_0_pair.revision, "commits page 2 regressed");
+
+    let tree_5 =
+        at(recorded, find(recorded, Route::WebTree, 5, "tree Load more page 6")?, Route::WebTree, "tree Load more")?;
+    ensure!(tree_5.status == 200, "tree Load more page 6 was refused");
+    ensure!(tree_5.tree_oid_head_after && !tree_5.body_has_next_after, "tree page 6 did not terminate pagination");
+    commits_1_pair.presented_by(tree_5, "tree Load more request")?;
+    let tree_5_pair = Pair::of(tree_5, "tree Load more answer")?;
+    ensure!(tree_5_pair.revision >= commits_1_pair.revision, "tree Load more answer regressed below commits");
+    ensure!(tree_5_pair.revision <= live, "tree Load more answer is ahead of the live gate");
 
     single_denial(recorded, DenialPath::ApiRepos, Route::ApiRepos, 401, "bearer")?;
     ensure!(denials.api == 401, "the page did not report a direct 401 for its API read");
@@ -316,32 +375,43 @@ pub(super) fn verify(
         single_denial(recorded, DenialPath::GitInfoRefs, Route::Git, 401, "basic")?;
     }
 
-    let fault_index = find(recorded, Route::WebRefs, 1, "the fault page refs")?;
-    let fault_refs = at(recorded, fault_index, Route::WebRefs, "fault refs")?;
-    ensure!(fault_refs.status == 200, "the fault page refs read was refused");
+    let fault_0 =
+        at(recorded, find(recorded, Route::WebRefs, 2, "fault refs page 1")?, Route::WebRefs, "fault refs 1")?;
+    ensure!(fault_0.status == 200, "the fault page first refs read was refused");
     ensure!(
-        fault_refs.request_token.is_none() && fault_refs.request_revision.is_none(),
-        "the fault page refs request presented a bound"
+        fault_0.request_token.is_none() && fault_0.request_revision.is_none(),
+        "the fault page first refs request presented a bound"
     );
+    let fault_0_pair = Pair::of(fault_0, "the fault page first refs answer")?;
+
+    let fault_index = find(recorded, Route::WebRefs, 3, "the fault page refs page 2")?;
+    let fault_refs = at(recorded, fault_index, Route::WebRefs, "fault refs page 2")?;
+    ensure!(fault_refs.status == 200, "the fault page second refs read was refused");
+    fault_0_pair.presented_by(fault_refs, "the fault page second refs request")?;
     let fault_pair = Pair::of(fault_refs, "the fault page refs answer")?;
+    ensure!(fault_pair.revision >= fault_0_pair.revision, "fault refs regressed across pages");
     ensure!(fault_pair.revision > 1, "the fault had no positive lower bound");
     ensure!(fault_pair.revision <= live, "the fault page refs answer is ahead of the live gate");
     ensure!(
-        recorded.iter().filter(|entry| entry.route == Route::WebTree).count() == 1,
+        recorded.iter().filter(|entry| entry.route == Route::WebRefs).count() == 4,
+        "an unexpected refs read was made"
+    );
+    ensure!(
+        recorded.iter().filter(|entry| entry.route == Route::WebTree).count() == 6,
         "an unexpected tree read was made"
     );
     ensure!(
-        recorded.iter().filter(|entry| entry.route == Route::WebCommits).count() == 1,
+        recorded.iter().filter(|entry| entry.route == Route::WebCommits).count() == 2,
         "an unexpected commits read was made"
     );
     ensure!(
-        !recorded[fault_index + 1..].iter().any(|entry| entry.route == Route::WebCommits),
-        "a commits request began after the refused tree"
+        !recorded[fault_index + 1..].iter().any(|entry| matches!(entry.route, Route::WebTree | Route::WebCommits)),
+        "a tree or commits request reached the origin after fault refs"
     );
 
-    ensure!(chain.refs_revision == refs_pair.revision, "the page did not report the refs revision");
-    ensure!(chain.tree_revision == tree_pair.revision, "the page did not report the tree revision");
-    ensure!(chain.commits_revision == commits_pair.revision, "the page did not report the commits revision");
+    ensure!(chain.refs_revision == refs_1_pair.revision, "the page did not report the refs revision");
+    ensure!(chain.tree_revision == tree_5_pair.revision, "the page did not report the final tree revision");
+    ensure!(chain.commits_revision == commits_1_pair.revision, "the page did not report the commits revision");
     ensure!(fault["refs_revision"].as_i64() == Some(fault_pair.revision), "the page named another refs revision");
     ensure!(fault["synthetic_revision"].as_i64() == Some(fault_pair.revision - 1), "the page named another revision");
     page_fault(list, fault)
@@ -349,6 +419,7 @@ pub(super) fn verify(
 
 fn page_fault(list: &Value, fault: &Value) -> Result<()> {
     ensure!(list["status"].as_u64() == Some(200), "the page did not see a successful list answer");
+    ensure!(list["pages"].as_u64() == Some(2), "the page did not traverse both repository list pages");
     ensure!(list["items_shape"].as_bool() == Some(true), "the page list answer changed shape");
     ensure!(list["accepted"].as_bool() == Some(true), "the shipped script did not accept the bare list array");
     ensure!(list["repository_link_clicked"].as_bool() == Some(true), "the page did not click the repository link");

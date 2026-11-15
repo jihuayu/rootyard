@@ -77,6 +77,9 @@ const DEFAULT_PLAYWRIGHT: &str = "/opt/session174-playwright/bin/python3";
 /// The pushed files and the branch the two real pushes update.
 const COMMIT_FILE: &str = "readme.txt";
 const SECOND_FILE: &str = "unsafe-name with spaces.txt";
+const LAST_TREE_FILE: &str = "z-pad-258.txt";
+const LAST_REF: &str = "refs/heads/z-page-54";
+const FIRST_COMMIT_SUBJECT: &str = "session browser fixture commit";
 const PUSHED_REF: &str = "refs/heads/main";
 
 #[test]
@@ -146,8 +149,13 @@ async fn browse(
     chromium: &Path,
 ) -> Result<()> {
     let mut owner = actor::owner(&db.pool).await?;
-    let name = format!("browser-{}", &Uuid::new_v4().simple().to_string()[..12]);
     let client = http_client()?;
+    for idx in 1..=101 {
+        let pad = format!("a-pad-{idx:03}");
+        create_repository(&client, address, &owner, &pad).await?;
+        provision_decision_realm(db, store.backend_identity(), &owner, &pad).await?;
+    }
+    let name = format!("browser-{}", &Uuid::new_v4().simple().to_string()[..12]);
     create_repository(&client, address, &owner, &name).await?;
     provision_decision_realm(db, store.backend_identity(), &owner, &name).await?;
     let (oid, live) = push_twice(db, store.backend_identity(), git, run, address, &owner, &name).await?;
@@ -175,6 +183,9 @@ async fn browse(
         "oid": oid,
         "file": COMMIT_FILE,
         "second_file": SECOND_FILE,
+        "last_tree_file": LAST_TREE_FILE,
+        "last_ref": LAST_REF,
+        "first_commit_subject": FIRST_COMMIT_SUBJECT,
         "expected_revision": live,
         "chromium": chromium,
         "python": browser_python()?,
@@ -266,12 +277,25 @@ async fn push_twice(
     let cloned = git.clone(&work, url.as_str(), "clone").await?;
     ensure!(cloned.success, "real Smart HTTP clone through the CLI child failed");
     let branch = format!("HEAD:{PUSHED_REF}");
-    git.commit(&checkout, COMMIT_FILE, "session browser fixture file\n", "session browser fixture commit").await?;
+    git.commit(&checkout, COMMIT_FILE, "session browser fixture file\n", FIRST_COMMIT_SUBJECT).await?;
+    git.ok(&checkout, &["branch", "-M", "main"]).await?;
     let first = git.run(&checkout, &["push", "--quiet", "origin", &branch]).await?;
     ensure!(first.success, "the first real push through the CLI child was refused");
     let first_revision = live_revision(db, backend, owner, name).await?;
-    let oid = git.commit(&checkout, SECOND_FILE, "second fixture file\n", "session browser advance").await?;
-    let second = git.run(&checkout, &["push", "--quiet", "origin", &branch]).await?;
+    for idx in 1..=54 {
+        git.ok(&checkout, &["commit", "--quiet", "--allow-empty", "-m", &format!("history pad {idx:02}")]).await?;
+    }
+    for idx in 1..=258 {
+        std::fs::write(checkout.join(format!("z-pad-{idx:03}.txt")), "pad\n")?;
+    }
+    std::fs::write(checkout.join(SECOND_FILE), "second fixture file\n")?;
+    git.ok(&checkout, &["add", "."]).await?;
+    git.ok(&checkout, &["commit", "--quiet", "-m", "session browser advance"]).await?;
+    let oid = git.text(&checkout, &["rev-parse", "HEAD"]).await?;
+    for idx in 1..=54 {
+        git.ok(&checkout, &["branch", &format!("z-page-{idx:02}")]).await?;
+    }
+    let second = git.run(&checkout, &["push", "--quiet", "origin", "--all"]).await?;
     ensure!(second.success, "the second real push through the CLI child was refused");
     ensure!(git.text(&checkout, &["rev-parse", "HEAD"]).await? == oid, "the pushed commit is not the local HEAD");
     let live = live_revision(db, backend, owner, name).await?;

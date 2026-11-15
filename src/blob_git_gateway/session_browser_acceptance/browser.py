@@ -193,7 +193,20 @@ def load_config(path):
         raise Failure("CONFIG_UNREADABLE") from None
     except ValueError:
         raise Failure("CONFIG_INVALID") from None
-    strings = ("origin", "username", "token", "repo", "oid", "file", "second_file", "chromium", "profile")
+    strings = (
+        "origin",
+        "username",
+        "token",
+        "repo",
+        "oid",
+        "file",
+        "second_file",
+        "last_tree_file",
+        "last_ref",
+        "first_commit_subject",
+        "chromium",
+        "profile",
+    )
     if not isinstance(config, dict) or any(not isinstance(config.get(key), str) for key in strings):
         raise Failure("CONFIG_INVALID")
     revision = config.get("expected_revision")
@@ -221,8 +234,10 @@ class Client:
         self.cookies = set()
         self.escaped = False
         self.commits_requests = 0
+        self.list_count = 0
         self.route_statuses = {}
         self.read_pairs = {}
+        self.read_sequence = {}
 
     # -- confinement and capture ----------------------------------------
 
@@ -291,12 +306,14 @@ class Client:
                 name = route_name(path)
                 if name is not None:
                     self.route_statuses[name] = status
+                    if name == "web_list":
+                        self.list_count += 1
             tail = path[len(self.alias) + 1:] if path.startswith(self.alias + "/") else None
             if tail in ("refs", "tree", "commits"):
                 revision = headers.get(REVISION, "")
-                self.read_pairs.setdefault(id(page), {}).setdefault(tail, []).append(
-                    {"token": session, "revision": int(revision) if revision.isdecimal() else None}
-                )
+                entry = {"token": session, "revision": int(revision) if revision.isdecimal() else None}
+                self.read_pairs.setdefault(id(page), {}).setdefault(tail, []).append(entry)
+                self.read_sequence.setdefault(id(page), []).append((tail, entry))
 
         def observe_request(request):
             # The one place a commit read is counted; a request that left the
@@ -493,10 +510,14 @@ class Client:
             raise Failure("REPO_LINK_MISSING") from None
         if await link.get_attribute("href") != self.scope:
             raise Failure("REPO_LINK_INVALID")
-        # The visible, correctly linked repository entry is the index's client
-        # acceptance: only the status is recorded, the adapter proves identity.
+        # The visible, correctly linked repository entry (fetched from page 2 via
+        # `x-next-cursor`) is the index's client acceptance: only the status and
+        # page count are recorded, while the adapter proves identity.
+        if self.list_count != 2:
+            raise Failure("LIST_NOT_RENDERED")
         extra["list"] = {
             "status": self.route_statuses.get("web_list"),
+            "pages": self.list_count,
             "items_shape": True,
             "accepted": True,
             "repository_link_clicked": True,
@@ -506,30 +527,56 @@ class Client:
         await page.wait_for_load_state("load", timeout=STEP_MS)
         self.check_origin()
 
-        # Real read chain: refs (unbound), tree, commits, each presenting the
-        # previous pair; the page's own status and content must prove it. The
-        # rendered HEAD tree must carry both real pushes, and every captured
-        # response revision must meet the final committed push's revision.
-        status = await self.status_has(page, "Read complete.", "READ_CHAIN_INVALID")
+        # Real paginated read chain: refs (2 pages, unbound first), tree (5
+        # auto-pages of 50 leaving cursor non-null), commits (2 pages), leaving
+        # explicit "Load more" + incomplete status before the final tree click.
+        partial_status = await self.status_has(page, "More items remain.", "REPO_PAGE_INCOMPLETE")
+        if "Read complete." in partial_status:
+            raise Failure("REPO_PAGE_STATUS_INVALID")
+        try:
+            await page.get_by_role("heading", name="Commits").wait_for(timeout=STEP_MS)
+        except Exception:
+            raise Failure("REPO_PAGE_INCOMPLETE") from None
         content = (await page.locator("#content").text_content()) or ""
         for heading in ("References", "Files at HEAD", "Commits"):
             if heading not in content:
                 raise Failure("REPO_PAGE_INCOMPLETE")
-        # Both real pushes' files (exactly as the tree names them) must render.
-        first_file, second_file = self.config["file"], self.config["second_file"]
-        if first_file not in content or second_file not in content:
+        for expected in (
+            self.config["file"],
+            self.config["second_file"],
+            self.config["last_ref"],
+            self.config["first_commit_subject"],
+            self.config["oid"][:7],
+        ):
+            if expected not in content:
+                raise Failure("REPO_PAGE_INCOMPLETE")
+        if self.config["last_tree_file"] in content:
             raise Failure("REPO_PAGE_INCOMPLETE")
-        if self.config["oid"][:7] not in content:
+        load_more = page.locator("button.load-more")
+        if await load_more.count() != 1:
             raise Failure("REPO_PAGE_INCOMPLETE")
+        await load_more.click()
+        status = await self.status_has(page, "Read complete.", "READ_CHAIN_INVALID")
         if "This server did not provide a bounded session." in status:
             raise Failure("READ_CHAIN_INVALID")
+        if await load_more.count() != 0:
+            raise Failure("REPO_PAGE_STATUS_INVALID")
+        completed_content = (await page.locator("#content").text_content()) or ""
+        if self.config["last_tree_file"] not in completed_content:
+            raise Failure("REPO_PAGE_INCOMPLETE")
         reads = await self.page_reads(page)
         if reads["complete"] is not True:
             raise Failure("READ_CHAIN_INVALID")
         for tail in ("refs", "tree", "commits"):
-            if reads[tail]["revision"] < self.bound:
+            if reads[tail]["min_revision"] < self.bound:
                 raise Failure("API_READ_BOUND_INVALID")
-        extra["reads"] = {tail: {"revision": reads[tail]["revision"]} for tail in ("refs", "tree", "commits")}
+        extra["reads"] = {
+            "refs": {"revision": reads["refs"]["revision"]},
+            "tree": {"revision": reads["tree"]["revision"]},
+            "commits": {"revision": reads["commits"]["revision"]},
+            "partial_status_shown": "More items remain." in partial_status and "Read complete." not in partial_status,
+            "load_more_completed": True,
+        }
 
         # 5. Cookie-only denial of the unchanged bearer-only routes, observed
         # exactly as the origin answers them. The Smart HTTP path is the
@@ -576,25 +623,32 @@ class Client:
         except Exception:
             raise Failure("READ_CHAIN_INVALID") from None
         pairs = self.read_pairs.get(id(page)) or {}
+        expected_counts = {"refs": 2, "tree": 6, "commits": 2}
         revisions = {}
+        min_revisions = {}
         for tail in tail_names:
             responses = pairs.get(tail) or []
-            if len(responses) != 1:
+            if len(responses) != expected_counts[tail]:
                 raise Failure("READ_CHAIN_INVALID")
-            response = responses[0]
-            token = response.get("token") if isinstance(response, dict) else None
-            revision = response.get("revision") if isinstance(response, dict) else None
-            if not isinstance(token, str) or not token:
-                raise Failure("READ_CHAIN_INVALID")
-            if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
-                raise Failure("READ_CHAIN_INVALID")
-            revisions[tail] = revision
-        seen = [revisions[tail] for tail in tail_names]
+            tail_revs = []
+            for response in responses:
+                token = response.get("token") if isinstance(response, dict) else None
+                revision = response.get("revision") if isinstance(response, dict) else None
+                if not isinstance(token, str) or not token:
+                    raise Failure("READ_CHAIN_INVALID")
+                if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
+                    raise Failure("READ_CHAIN_INVALID")
+                tail_revs.append(revision)
+            revisions[tail] = tail_revs[-1]
+            min_revisions[tail] = min(tail_revs)
+        ordered = [entry[1]["revision"] for entry in (self.read_sequence.get(id(page)) or [])]
+        if len(ordered) != sum(expected_counts.values()) or any(not isinstance(r, int) or isinstance(r, bool) or r <= 0 for r in ordered):
+            raise Failure("READ_CHAIN_INVALID")
         return {
-            "refs": {"revision": revisions["refs"]},
-            "tree": {"revision": revisions["tree"]},
-            "commits": {"revision": revisions["commits"]},
-            "complete": all(later >= earlier for earlier, later in zip(seen, seen[1:])),
+            "refs": {"revision": revisions["refs"], "min_revision": min_revisions["refs"]},
+            "tree": {"revision": revisions["tree"], "min_revision": min_revisions["tree"]},
+            "commits": {"revision": revisions["commits"], "min_revision": min_revisions["commits"]},
+            "complete": all(later >= earlier for earlier, later in zip(ordered, ordered[1:])),
         }
 
     async def cookie_only(self, page, path, route):
@@ -787,10 +841,10 @@ class Client:
             if request.url != target:
                 await route.continue_()
                 return
-            # The injected answer is built from this fault page's own first refs
-            # pair, exactly one.
+            # The injected answer is built from this fault page's latest refs
+            # pair (following refs pagination).
             pairs = (self.read_pairs.get(id(fault_page)) or {}).get("refs") or []
-            refs = pairs[0] if len(pairs) == 1 and isinstance(pairs[0], dict) else {}
+            refs = pairs[-1] if len(pairs) == 2 and isinstance(pairs[-1], dict) else {}
             token = refs.get("token")
             revision = refs.get("revision")
             presented = request.headers.get(TOKEN)

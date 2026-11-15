@@ -122,6 +122,11 @@ pub(in super::super) struct Recorded {
     pub response_token: Option<String>,
     pub response_revision: Option<String>,
     pub oid_head: bool,
+    pub tree_oid_head_after: bool,
+    pub has_cursor_query: bool,
+    pub has_after_query: bool,
+    pub has_next_cursor_header: bool,
+    pub body_has_next_after: bool,
     pub location: Option<String>,
     pub csp: Option<String>,
     pub list_names_repository: bool,
@@ -156,6 +161,13 @@ pub(super) fn record(
         oid_head: route == Route::WebTree
             && request.uri.path() == fixture.read_path("tree")
             && tree_oid_is_head(request.uri.query()),
+        tree_oid_head_after: route == Route::WebTree
+            && request.uri.path() == fixture.read_path("tree")
+            && tree_oid_is_head_after(request.uri.query()),
+        has_cursor_query: query_has_param(request.uri.query(), "cursor"),
+        has_after_query: query_has_param(request.uri.query(), "after"),
+        has_next_cursor_header: answer.is_some_and(|answer| answer.contains_key("x-next-cursor")),
+        body_has_next_after: false,
         location: answer.and_then(|answer| text(answer.get(header::LOCATION))),
         csp: answer.and_then(|answer| text(answer.get(header::CONTENT_SECURITY_POLICY))),
         list_names_repository: false,
@@ -168,8 +180,24 @@ fn tree_oid_is_head(query: Option<&str>) -> bool {
     query.is_some_and(|query| query.split('&').eq(["oid=HEAD"]))
 }
 
+fn tree_oid_is_head_after(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        let mut parts = query.split('&');
+        matches!(
+            (parts.next(), parts.next(), parts.next()),
+            (Some("oid=HEAD"), Some(after), None) if after.strip_prefix("after=").is_some_and(|v| !v.is_empty())
+        )
+    })
+}
+
+fn query_has_param(query: Option<&str>, key: &str) -> bool {
+    query.is_some_and(|query| {
+        query.split('&').any(|pair| pair.split_once('=').is_some_and(|(name, value)| name == key && !value.is_empty()))
+    })
+}
+
 pub(super) fn marker(fixture: &Fixture, bytes: &[u8], route: Route, record: &mut Recorded) {
-    if !matches!(route, Route::WebList | Route::WebTree | Route::WebCommits) {
+    if !matches!(route, Route::WebList | Route::WebRefs | Route::WebTree | Route::WebCommits) {
         return;
     }
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
@@ -187,14 +215,15 @@ pub(super) fn marker(fixture: &Fixture, bytes: &[u8], route: Route, record: &mut
             record.list_names_repository = rows.iter().filter(|row| named(row)).count() == 1
                 && rows.iter().filter(|row| row["name"].as_str() == Some(fixture.name.as_str())).count() == 1;
         }
-        Route::WebTree | Route::WebCommits => {
+        Route::WebRefs | Route::WebTree | Route::WebCommits => {
+            record.body_has_next_after = value.get("next_after").is_some_and(|next| !next.is_null());
             let Some(rows) = value["items"].as_array() else {
                 return;
             };
             if route == Route::WebTree {
                 let named = |file: &str| rows.iter().any(|entry| entry["path"].as_str() == Some(file));
                 record.tree_names_files = named(&fixture.file) && named(&fixture.second_file);
-            } else {
+            } else if route == Route::WebCommits {
                 record.commits_names_oid = rows.iter().any(|entry| entry["oid"].as_str() == Some(fixture.oid.as_str()));
             }
         }
@@ -241,7 +270,10 @@ pub(super) fn route_of(fixture_prefix: &str, path: &str) -> Route {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{Challenge, DenialPath, Fixture, Route, denial_of, marker, record, route_of, tree_oid_is_head};
+    use super::{
+        Challenge, DenialPath, Fixture, Route, denial_of, marker, query_has_param, record, route_of, tree_oid_is_head,
+        tree_oid_is_head_after,
+    };
 
     fn fixture() -> Fixture {
         Fixture {
@@ -342,6 +374,11 @@ mod tests {
         assert!(!tree_oid_is_head(Some("oid=HEAD&path=a")));
         assert!(!tree_oid_is_head(Some("oid=HEAD&oid=HEAD")));
         assert!(!tree_oid_is_head(None));
+        assert!(tree_oid_is_head_after(Some("oid=HEAD&after=z-pad-048.txt")));
+        assert!(!tree_oid_is_head_after(Some("oid=HEAD&after=")));
+        assert!(!tree_oid_is_head_after(Some("oid=HEAD")));
+        assert!(query_has_param(Some("cursor=abc"), "cursor"));
+        assert!(!query_has_param(Some("cursor="), "cursor"));
         assert_eq!(fixture().read_path("tree"), "/web/blob/api/repos/owner/repo/tree");
         for (path, route) in [
             ("/web/blob", Route::WebBlob),

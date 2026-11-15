@@ -224,6 +224,196 @@ fn has_session_headers(headers: &axum::http::HeaderMap) -> bool {
     headers.contains_key("x-rootyard-session") || headers.contains_key("x-rootyard-session-revision")
 }
 
+#[tokio::test]
+#[ignore = "requires real PostgreSQL, S3-compatible Blob storage and native Git"]
+async fn browser_aliases_paginate_across_default_limits_with_bounded_session() -> Result<()> {
+    let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    let db = Db::setup().await?;
+    let outcome = pagination_case(&db).await;
+    db.finish(outcome).await
+}
+
+async fn pagination_case(db: &Db) -> Result<()> {
+    let store = support::open_store()?;
+    let (_keyring_dir, tokens) = support::keyring_tokens(store.backend_identity())?;
+    let gateway = Gateway::start(db, store, tokens).await?;
+    let owner = actor::owner(&db.pool).await?;
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .context("no-redirect HTTP client could not be built")?;
+    let origin = format!("http://{}", gateway.address);
+
+    for idx in 1..=101 {
+        let pad = format!("a-pad-{idx:03}");
+        create_serving_repo(&client, &origin, &gateway, db, &owner, &pad).await?;
+    }
+    let name = support::unique_name("browser-page");
+    create_serving_repo(&client, &origin, &gateway, db, &owner, &name).await?;
+
+    let (_work, checkout) = gateway.clone_checkout(&owner, &name).await?;
+    let oid_first = gateway.git.commit(&checkout, COMMIT_FILE, "first commit\n", "first commit").await?;
+    gateway.git.ok(&checkout, &["branch", "-M", "main"]).await?;
+    for idx in 1..=54 {
+        gateway
+            .git
+            .ok(&checkout, &["commit", "--quiet", "--allow-empty", "-m", &format!("page history {idx:02}")])
+            .await?;
+    }
+    for idx in 1..=55 {
+        std::fs::write(checkout.join(format!("f-{idx:02}.txt")), "pad\n")?;
+    }
+    gateway.git.ok(&checkout, &["add", "."]).await?;
+    gateway.git.ok(&checkout, &["commit", "--quiet", "-m", "tree page commit"]).await?;
+    let oid_head = gateway.git.text(&checkout, &["rev-parse", "HEAD"]).await?;
+    for idx in 1..=54 {
+        gateway.git.ok(&checkout, &["branch", &format!("z-ref-{idx:02}")]).await?;
+    }
+    let pushed = gateway.git.run(&checkout, &["push", "--quiet", "origin", "--all"]).await?;
+    ensure!(pushed.success, "multi-page fixture Smart HTTP push was refused");
+    let live = support::live_realm(db, &gateway, &owner, &name, false).await?;
+
+    let form_body = form_encode(&[("username", &owner.username), ("token", &owner.token), ("return_to", "/web/blob")]);
+    let login = client
+        .post(format!("{origin}/web/login"))
+        .header(header::ORIGIN, &origin)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(form_body)
+        .send()
+        .await?;
+    ensure!(login.status() == 303, "POST /web/login expected 303, got {}", login.status());
+    let cookie = extract_cookie_header(login.headers()).context("POST /web/login emitted no Set-Cookie")?;
+
+    // 1. Default `/web/blob/api/repos` (limit=100) emits `x-next-cursor`; `?cursor=` finishes page 2.
+    let page1 = client.get(format!("{origin}/web/blob/api/repos")).header(header::COOKIE, &cookie).send().await?;
+    ensure!(page1.status() == 200, "list page 1 expected 200, got {}", page1.status());
+    ensure!(!has_session_headers(page1.headers()), "list page 1 emitted session headers");
+    let next_cursor = header_text(page1.headers(), header::HeaderName::from_static("x-next-cursor"))
+        .context("102 serving repos did not emit x-next-cursor on page 1")?;
+    ensure!(
+        header_text(page1.headers(), header::LINK).as_deref().is_some_and(|v| v.contains("rel=\"next\"")),
+        "list page 1 missing Link next header"
+    );
+    let repos1: serde_json::Value = page1.json().await?;
+    let rows1 = repos1.as_array().context("list page 1 was not an array")?;
+    ensure!(rows1.len() == 100, "list page 1 expected 100 items, got {}", rows1.len());
+    ensure!(!rows1.iter().any(|r| r["name"].as_str() == Some(name.as_str())), "target repo appeared early on page 1");
+
+    let list_page2_url = format!("{origin}/web/blob/api/repos?cursor={}", crate::pagination::query_value(&next_cursor));
+    let page2 = client.get(list_page2_url).header(header::COOKIE, &cookie).send().await?;
+    ensure!(page2.status() == 200, "list page 2 expected 200, got {}", page2.status());
+    ensure!(!has_session_headers(page2.headers()), "list page 2 emitted session headers");
+    ensure!(!page2.headers().contains_key("x-next-cursor"), "final list page still emitted x-next-cursor");
+    let repos2: serde_json::Value = page2.json().await?;
+    let rows2 = repos2.as_array().context("list page 2 was not an array")?;
+    ensure!(
+        rows2.len() == 2 && rows2.iter().any(|r| r["name"].as_str() == Some(name.as_str())),
+        "list page 2 did not contain target repo ({} rows)",
+        rows2.len()
+    );
+
+    // 2. Default `/refs`, `/tree?oid=HEAD`, and `/commits` (limit=50) paginate cleanly while maintaining bound.
+    let alias_base = format!("{origin}/web/blob/api/repos/{}/{}", owner.username, name);
+    let refs1 = raw_get_with_cookies(&client, &format!("{alias_base}/refs"), Some(&cookie), None).await?;
+    ensure!(status_succeeds(refs1.status), "refs page 1 failed with {}", refs1.status);
+    let s1 = refs1.session.admit()?;
+    ensure!(s1.revision >= live.revision, "refs page 1 behind live revision");
+    let refs1_json: serde_json::Value = serde_json::from_str(&refs1.body)?;
+    ensure!(refs1_json["items"].as_array().is_some_and(|a| a.len() == 50), "refs page 1 length != 50");
+    ensure!(refs1_json["more"].as_bool() == Some(true), "refs page 1 more != true");
+    let refs_after = refs1_json["next_after"].as_str().context("refs page 1 missing next_after")?;
+
+    let refs2_url = format!("{alias_base}/refs?after={}", crate::pagination::query_value(refs_after));
+    let refs2 = raw_get_with_cookies(&client, &refs2_url, Some(&cookie), Some(&s1.token)).await?;
+    ensure!(status_succeeds(refs2.status), "refs page 2 failed with {}", refs2.status);
+    let s2 = refs2.session.admit_at_least(&s1)?;
+    let refs2_json: serde_json::Value = serde_json::from_str(&refs2.body)?;
+    let refs2_items = refs2_json["items"].as_array().context("refs page 2 items missing")?;
+    ensure!(
+        refs2_items.len() == 5
+            && refs2_json["next_after"].is_null()
+            && refs2_json["more"].as_bool() == Some(false)
+            && refs2_items.iter().any(|item| item["name"].as_str() == Some("refs/heads/z-ref-54")),
+        "refs page 2 incomplete"
+    );
+
+    let tree1 =
+        raw_get_with_cookies(&client, &format!("{alias_base}/tree?oid=HEAD"), Some(&cookie), Some(&s2.token)).await?;
+    ensure!(status_succeeds(tree1.status), "tree page 1 failed with {}", tree1.status);
+    let s3 = tree1.session.admit_at_least(&s2)?;
+    let tree1_json: serde_json::Value = serde_json::from_str(&tree1.body)?;
+    ensure!(tree1_json["items"].as_array().is_some_and(|a| a.len() == 50), "tree page 1 length != 50");
+    let tree_after = tree1_json["next_after"].as_str().context("tree page 1 missing next_after")?;
+
+    let tree2_url = format!("{alias_base}/tree?oid=HEAD&after={}", crate::pagination::query_value(tree_after));
+    let tree2 = raw_get_with_cookies(&client, &tree2_url, Some(&cookie), Some(&s3.token)).await?;
+    ensure!(status_succeeds(tree2.status), "tree page 2 failed with {}", tree2.status);
+    let s4 = tree2.session.admit_at_least(&s3)?;
+    let tree2_json: serde_json::Value = serde_json::from_str(&tree2.body)?;
+    let tree2_items = tree2_json["items"].as_array().context("tree page 2 items missing")?;
+    ensure!(
+        tree2_items.len() == 6
+            && tree2_json["next_after"].is_null()
+            && tree2_items.iter().any(|item| item["path"].as_str() == Some(COMMIT_FILE)),
+        "tree page 2 incomplete"
+    );
+
+    let commits1 =
+        raw_get_with_cookies(&client, &format!("{alias_base}/commits"), Some(&cookie), Some(&s4.token)).await?;
+    ensure!(status_succeeds(commits1.status), "commits page 1 failed with {}", commits1.status);
+    let s5 = commits1.session.admit_at_least(&s4)?;
+    let commits1_json: serde_json::Value = serde_json::from_str(&commits1.body)?;
+    ensure!(commits1_json["items"].as_array().is_some_and(|a| a.len() == 50), "commits page 1 length != 50");
+    ensure!(contains(&commits1.body, &oid_head), "commits page 1 missing head commit");
+    let commits_after = commits1_json["next_after"].as_u64().context("commits page 1 missing integer next_after")?;
+    ensure!(commits_after == 50, "commits page 1 next_after expected 50, got {commits_after}");
+
+    let commits2_url = format!("{alias_base}/commits?after={commits_after}");
+    let commits2 = raw_get_with_cookies(&client, &commits2_url, Some(&cookie), Some(&s5.token)).await?;
+    ensure!(status_succeeds(commits2.status), "commits page 2 failed with {}", commits2.status);
+    let _s6 = commits2.session.admit_at_least(&s5)?;
+    let commits2_json: serde_json::Value = serde_json::from_str(&commits2.body)?;
+    ensure!(
+        commits2_json["items"].as_array().is_some_and(|a| a.len() == 6)
+            && commits2_json["next_after"].is_null()
+            && contains(&commits2.body, &oid_first),
+        "commits page 2 missing earliest commit"
+    );
+
+    // 3. An ahead lower bound on any continuation URL still fails closed with 503.
+    let future_rev = live.revision.checked_add(1).context("revision overflow")?;
+    let future = gateway.tokens.issue_for_test(&live.realm, future_rev).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    for continuation in [refs2_url, tree2_url, commits2_url] {
+        let ahead = raw_get_with_cookies(&client, &continuation, Some(&cookie), Some(future.token())).await?;
+        ensure!(ahead.status == 503, "continuation ahead bound expected 503, got {}", ahead.status);
+        ensure!(contains(&ahead.body, BEHIND_MESSAGE), "continuation 503 missing BEHIND_MESSAGE");
+        ensure!(ahead.session.token.is_none() && ahead.session.revision.is_none(), "continuation 503 emitted headers");
+        ensure_no_disclosure(&ahead.body, &[&owner.token, future.token(), &cookie], "continuation ahead 503")?;
+    }
+
+    Ok(())
+}
+
+async fn create_serving_repo(
+    client: &reqwest::Client,
+    origin: &str,
+    gateway: &Gateway,
+    db: &Db,
+    owner: &super::fixtures::actor::Actor,
+    name: &str,
+) -> Result<()> {
+    let response = client
+        .post(format!("{origin}/api/repos"))
+        .bearer_auth(&owner.token)
+        .json(&serde_json::json!({"name": name, "object_format": "sha1"}))
+        .send()
+        .await?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    ensure!(status.is_success(), "create API returned {status}: {}", body["error"].as_str().unwrap_or("<none>"));
+    gateway.provision_decision_realm(db, owner, name).await
+}
+
 fn header_text(headers: &axum::http::HeaderMap, name: header::HeaderName) -> Option<String> {
     headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
 }

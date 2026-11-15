@@ -5,7 +5,7 @@
 const SHELL_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// The inline style tag of the shell, part of its CSP.
-pub(super) const SHELL_STYLE: &str = "<style>body{font:14px/1.5 system-ui,sans-serif;margin:0;color:#1d2327}header{padding:.6rem 1rem;border-bottom:1px solid #d0d4d9}main{padding:1rem}h1{font-size:1.2rem}h2{font-size:1rem;margin-top:1.4rem}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.25rem .5rem;border-bottom:1px solid #e6e8ea}code,.oid{font-family:ui-monospace,monospace;font-size:.85em}[data-kind=error]{color:#8a1c1c}</style>";
+pub(super) const SHELL_STYLE: &str = "<style>body{font:14px/1.5 system-ui,sans-serif;margin:0;color:#1d2327}header{padding:.6rem 1rem;border-bottom:1px solid #d0d4d9}main{padding:1rem}h1{font-size:1.2rem}h2{font-size:1rem;margin-top:1.4rem}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.25rem .5rem;border-bottom:1px solid #e6e8ea}code,.oid{font-family:ui-monospace,monospace;font-size:.85em}[data-kind=error]{color:#8a1c1c}button.load-more{margin:.5rem 0 1rem;padding:.35rem .75rem;font:inherit;cursor:pointer}</style>";
 
 /// One shell for every page. It carries no repository name, list, session
 /// bound or content. The script derives the page scope from
@@ -34,20 +34,30 @@ pub(super) const SHELL: &str = "<!doctype html>
 /// * a half pair (only one session header) is always refused, and once a bound
 ///   was adopted even a headerless successful read is refused;
 /// * a successful answer is read and parsed whole and must have the exact
-///   `{items: [...]}` shape before anything is admitted; only then are its
-///   headers validated against the previous bound and both token and revision
-///   updated together;
+///   `{items: [...]}` shape (or JSON array for the index) and a valid
+///   continuation cursor (`x-next-cursor` / `next_after`) before anything is
+///   admitted; only then are its headers validated against the previous bound
+///   and both token and revision updated together;
+/// * paginated endpoints automatically consume up to `MAX_AUTO_PAGES` pages per
+///   section while forwarding and updating the active session bound on every
+///   continuation request; if a cursor remains afterwards, the section shows
+///   an explicit "Load more" button and the status stays incomplete until all
+///   sections finish with no remaining cursor;
 /// * once a bound exists, every next read presents it and requires a complete,
-///   valid, non-regressing bound in return; a fetch, body, schema, header or
-///   `Behind` refusal keeps the old bound and renders no response data;
+///   valid, non-regressing bound in return; a fetch, body, schema, cursor,
+///   header or `Behind` refusal keeps the old bound and renders no response data;
 /// * the bound lives in closure variables, in memory only, and is never placed
 ///   in a URL, storage, a cookie or a DOM attribute.
 pub(super) const SCRIPT: &str = r#"'use strict';
 (function () {
-  const TOKEN = 'x-rootyard-session', REVISION = 'x-rootyard-session-revision';
+  const TOKEN = 'x-rootyard-session', REVISION = 'x-rootyard-session-revision', NEXT_CURSOR = 'x-next-cursor';
+  const MAX_AUTO_PAGES = 5;
   const status = document.getElementById('status'), title = document.getElementById('title');
   const nav = document.getElementById('nav'), content = document.getElementById('content');
   const READ = 'Read complete.', NO_SESSION = 'Read complete. This server did not provide a bounded session.';
+  const PARTIAL = 'More items remain. Use Load more to continue.';
+  const PARTIAL_NO_SESSION = PARTIAL + ' This server did not provide a bounded session.';
+  const LOADING_MORE = 'Loading more...';
   const REFUSED = 'This read was refused. Reload the page to try again.';
   // The result of an accepted answer that carried no session headers at all:
   // nothing is adopted and the browser stays boundless.
@@ -55,6 +65,8 @@ pub(super) const SCRIPT: &str = r#"'use strict';
   let bound = null;
   let revision = null;
   let page = null;
+  let sections = [];
+  let loadedAllSections = false;
 
   function show(text, error) {
     status.textContent = text;
@@ -91,6 +103,25 @@ pub(super) const SCRIPT: &str = r#"'use strict';
 
   function isObject(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function parseCursor(scope, response, data, list) {
+    if (scope === 'index') {
+      if (!response.headers.has(NEXT_CURSOR)) return {ok: true, cursor: null};
+      const raw = response.headers.get(NEXT_CURSOR);
+      if (raw === null || raw.trim() === '' || !list.length) return {ok: false, cursor: null};
+      return {ok: true, cursor: raw.trim()};
+    }
+    const raw = data.next_after;
+    if (raw === undefined || raw === null) return {ok: true, cursor: null};
+    if (typeof raw === 'string') {
+      if (raw === '' || !list.length) return {ok: false, cursor: null};
+      return {ok: true, cursor: raw};
+    }
+    if (Number.isSafeInteger(raw) && raw >= 0 && list.length) {
+      return {ok: true, cursor: raw};
+    }
+    return {ok: false, cursor: null};
   }
 
   // Adopt the pair this answer established. This is the only place that
@@ -145,59 +176,170 @@ pub(super) const SCRIPT: &str = r#"'use strict';
     try { data = await response.json(); } catch (_) { data = undefined; }
     const list = scope === 'index' && Array.isArray(data) ? data
       : isObject(data) && Array.isArray(data.items) ? data.items : null;
-    if (!list) {
+    const parsed = list ? parseCursor(scope, response, data, list) : null;
+    if (!list || !parsed || !parsed.ok) {
       if (page === scope) show(REFUSED, true);
       return null;
     }
     if (next !== NO_BOUND) adopt(next.token, next.revision);
-    return page === scope ? list : null;
+    return page === scope ? {items: list, cursor: parsed.cursor} : null;
+  }
+
+  async function readPages(scope, buildUrl, startCursor, seen) {
+    const items = [];
+    let cursor = startCursor;
+    for (let step = 0; step < MAX_AUTO_PAGES; step += 1) {
+      const batch = await read(scope, buildUrl(cursor));
+      if (!batch) return null;
+      for (const item of batch.items) items.push(item);
+      cursor = batch.cursor;
+      if (cursor === null) break;
+      const key = (typeof cursor) + ':' + String(cursor);
+      if (seen.has(key)) {
+        if (page === scope) show(REFUSED, true);
+        return null;
+      }
+      seen.add(key);
+    }
+    return page === scope ? {items: items, cursor: cursor} : null;
+  }
+
+  function finishStatus() {
+    if (!loadedAllSections) { show(REFUSED, true); return; }
+    const incomplete = sections.some(section => section.cursor !== null);
+    if (incomplete) show(bound ? PARTIAL : PARTIAL_NO_SESSION, false);
+    else show(bound ? READ : NO_SESSION, false);
+  }
+
+  function renderSection(section) {
+    clear(section.box);
+    section.box.appendChild(section.items.length
+      ? table(section.head, section.items.map(section.mapRow))
+      : el('p', section.emptyText));
+    if (section.cursor !== null) {
+      const button = el('button', 'Load more', 'load-more');
+      button.type = 'button';
+      button.addEventListener('click', () => loadMore(section, button));
+      section.box.appendChild(button);
+    }
+  }
+
+  async function loadMore(section, button) {
+    if (!loadedAllSections) return;
+    if (page !== section.scope || section.busy || section.cursor === null) return;
+    section.busy = true;
+    button.disabled = true;
+    show(LOADING_MORE, false);
+    const batch = await readPages(section.scope, section.buildUrl, section.cursor, section.seen);
+    section.busy = false;
+    if (page !== section.scope) return;
+    if (!batch) { button.disabled = false; return; }
+    for (const item of batch.items) section.items.push(item);
+    section.cursor = batch.cursor;
+    renderSection(section);
+    finishStatus();
+  }
+
+  async function mountSection(spec) {
+    const seen = new Set();
+    const batch = await readPages(spec.scope, spec.buildUrl, null, seen);
+    if (!batch) return null;
+    const box = el('div');
+    if (spec.heading) content.appendChild(el('h2', spec.heading));
+    content.appendChild(box);
+    const section = {
+      scope: spec.scope,
+      box: box,
+      head: spec.head,
+      emptyText: spec.emptyText,
+      mapRow: spec.mapRow,
+      buildUrl: spec.buildUrl,
+      items: batch.items,
+      cursor: batch.cursor,
+      seen: seen,
+      busy: false,
+    };
+    sections.push(section);
+    renderSection(section);
+    return section;
   }
 
   async function repository(owner, name) {
     const scope = 'repos/' + owner + '/' + name;
     const base = '/web/blob/api/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(name);
     page = scope;
+    sections = [];
+    loadedAllSections = false;
     title.textContent = owner + '/' + name;
     clear(nav);
     clear(content);
-    const refs = await read(scope, base + '/refs');
+    const refs = await mountSection({
+      scope: scope,
+      heading: 'References',
+      emptyText: 'This repository has no references yet.',
+      head: ['Name', 'Object', 'Kind'],
+      mapRow: ref => [el('code', ref.name), el('code', short(ref.oid), 'oid'), el('span', ref.kind)],
+      buildUrl: cursor => cursor === null ? base + '/refs' : base + '/refs?after=' + encodeURIComponent(cursor),
+    });
     if (!refs) return;
-    content.appendChild(el('h2', 'References'));
-    content.appendChild(refs.length ? table(['Name', 'Object', 'Kind'], refs.map(ref => [
-      el('code', ref.name), el('code', short(ref.oid), 'oid'), el('span', ref.kind)
-    ])) : el('p', 'This repository has no references yet.'));
     // A failed read already showed its refusal; the sequence stops there so a
     // later read cannot overwrite that status with a success.
-    const tree = await read(scope, base + '/tree?oid=HEAD');
+    const tree = await mountSection({
+      scope: scope,
+      heading: 'Files at HEAD',
+      emptyText: 'No files.',
+      head: ['Path', 'Kind', 'Size'],
+      mapRow: entry => [
+        el('code', entry.path), el('span', entry.kind),
+        el('span', entry.size === null || entry.size === undefined ? '' : entry.size)
+      ],
+      buildUrl: cursor => cursor === null
+        ? base + '/tree?oid=HEAD'
+        : base + '/tree?oid=HEAD&after=' + encodeURIComponent(cursor),
+    });
     if (!tree) return;
-    content.appendChild(el('h2', 'Files at HEAD'));
-    content.appendChild(tree.length ? table(['Path', 'Kind', 'Size'], tree.map(entry => [
-      el('code', entry.path), el('span', entry.kind),
-      el('span', entry.size === null || entry.size === undefined ? '' : entry.size)
-    ])) : el('p', 'No files.'));
-    const commits = await read(scope, base + '/commits');
+    const commits = await mountSection({
+      scope: scope,
+      heading: 'Commits',
+      emptyText: 'No commits.',
+      head: ['Commit', 'Subject', 'Author'],
+      mapRow: commit => [
+        el('code', short(commit.oid), 'oid'), el('span', commit.subject), el('span', commit.author_name)
+      ],
+      buildUrl: cursor => cursor === null
+        ? base + '/commits'
+        : base + '/commits?after=' + encodeURIComponent(String(cursor)),
+    });
     if (!commits) return;
-    content.appendChild(el('h2', 'Commits'));
-    content.appendChild(commits.length ? table(['Commit', 'Subject', 'Author'], commits.map(commit => [
-      el('code', short(commit.oid), 'oid'), el('span', commit.subject), el('span', commit.author_name)
-    ])) : el('p', 'No commits.'));
-    show(bound ? READ : NO_SESSION, false);
+    loadedAllSections = true;
+    finishStatus();
   }
 
   async function index() {
     const scope = 'index';
     page = scope;
+    sections = [];
+    loadedAllSections = false;
     title.textContent = 'Blob repositories';
     clear(nav);
     clear(content);
-    const items = await read(scope, '/web/blob/api/repos');
-    if (!items) return;
-    content.appendChild(items.length ? table(['Repository', 'Format'], items.map(repo => [
-      link('/web/blob/repos/' + encodeURIComponent(repo.owner) + '/' + encodeURIComponent(repo.name),
-        repo.owner + '/' + repo.name),
-      el('span', repo.object_format)
-    ])) : el('p', 'No repositories are visible to this account.'));
-    show(bound ? READ : NO_SESSION, false);
+    const listed = await mountSection({
+      scope: scope,
+      heading: null,
+      emptyText: 'No repositories are visible to this account.',
+      head: ['Repository', 'Format'],
+      mapRow: repo => [
+        link('/web/blob/repos/' + encodeURIComponent(repo.owner) + '/' + encodeURIComponent(repo.name),
+          repo.owner + '/' + repo.name),
+        el('span', repo.object_format)
+      ],
+      buildUrl: cursor => cursor === null
+        ? '/web/blob/api/repos'
+        : '/web/blob/api/repos?cursor=' + encodeURIComponent(cursor),
+    });
+    if (!listed) return;
+    loadedAllSections = true;
+    finishStatus();
   }
 
   const match = /^\/web\/blob\/repos\/([^/]+)\/([^/]+)\/?$/.exec(location.pathname);

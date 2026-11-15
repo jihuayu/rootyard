@@ -244,8 +244,12 @@ fn the_script_parses_the_whole_body_before_adopting_a_bound() {
     let headers = read.find("const next = admit(response);").expect("headers are admitted");
     let body = read.find("await response.json()").expect("the whole body is parsed");
     let shape = read.find("Array.isArray(data.items)").expect("the body shape is checked");
+    let cursor = read.find("parseCursor(scope, response, data, list)").expect("continuation cursor is validated");
     let adopt = read.find("adopt(next.token, next.revision);").expect("the pair is adopted together");
-    assert!(headers < body && body < shape && shape < adopt, "admission and parsing must precede adoption");
+    assert!(
+        headers < body && body < shape && shape < cursor && cursor < adopt,
+        "admission, body, shape and cursor checks must precede adoption"
+    );
     assert!(read.contains("if (next !== NO_BOUND)"), "a headerless answer must keep the browser boundless");
     assert_eq!(read.matches("adopt(").count(), 1, "the read path adopts at exactly one site");
     assert!(!script.contains("currentScript"));
@@ -255,10 +259,11 @@ fn the_script_parses_the_whole_body_before_adopting_a_bound() {
 fn a_failed_repository_read_stops_the_sequence() {
     let repository =
         body_of(inline::SCRIPT, "async function repository(", "async function index(", "the repository page");
-    let refs = repository.find("const refs = await read(").expect("refs are read");
-    let tree = repository.find("const tree = await read(").expect("the tree is read");
-    let commits = repository.find("const commits = await read(").expect("the commits are read");
-    let status = repository.find("show(bound ? READ : NO_SESSION, false);").expect("the success status");
+    let refs = repository.find("const refs = await mountSection(").expect("refs are read");
+    let tree = repository.find("const tree = await mountSection(").expect("the tree is read");
+    let commits = repository.find("const commits = await mountSection(").expect("the commits are read");
+    let ready = repository.find("loadedAllSections = true;").expect("completion gate");
+    let status = repository.find("finishStatus();").expect("the success status");
     let stop = |at: usize, value: &str| {
         repository[at..]
             .find(&format!("if (!{value}) return;"))
@@ -271,9 +276,45 @@ fn a_failed_repository_read_stops_the_sequence() {
         "a failed tree read must not start the commits read"
     );
     assert!(
-        commits < stop(commits, "commits") && stop(commits, "commits") < status,
-        "a failed commits read must precede the success status"
+        commits < stop(commits, "commits") && stop(commits, "commits") < ready && ready < status,
+        "a failed commits read must precede the completion gate and final status"
     );
-    assert_eq!(repository.matches("show(bound ? READ : NO_SESSION, false);").count(), 1, "one closing success status");
-    assert_eq!(repository.matches("show(").count(), 1, "the page itself shows no failure status of its own");
+    assert_eq!(repository.matches("finishStatus();").count(), 1, "one closing status transition");
+    assert_eq!(repository.matches("show(").count(), 0, "the page itself shows no status before finishStatus");
+}
+
+#[test]
+fn the_script_consumes_pagination_cursors_and_guards_partial_status() {
+    let script = inline::SCRIPT;
+    assert!(script.contains("NEXT_CURSOR = 'x-next-cursor'"));
+    assert!(script.contains("const PARTIAL = 'More items remain. Use Load more to continue.';"));
+    assert!(script.contains("?cursor=' + encodeURIComponent(cursor)"));
+    assert!(script.contains("/refs?after=' + encodeURIComponent(cursor)"));
+    assert!(script.contains("/tree?oid=HEAD&after=' + encodeURIComponent(cursor)"));
+    assert!(script.contains("/commits?after=' + encodeURIComponent(String(cursor))"));
+
+    let parse_cursor = body_of(script, "function parseCursor(", "// Adopt the pair", "the cursor parser");
+    assert!(parse_cursor.contains("!list.length"), "empty pages carrying cursors must fail closed");
+    assert!(parse_cursor.contains("Number.isSafeInteger(raw) && raw >= 0"));
+    assert!(parse_cursor.contains("data.next_after"));
+
+    let read_pages =
+        body_of(script, "async function readPages(", "function finishStatus(", "the batch pagination loop");
+    assert!(read_pages.contains("step < MAX_AUTO_PAGES"));
+    assert!(read_pages.contains("seen.has(key)"), "repeated cursors must fail closed instead of looping");
+    assert!(read_pages.contains("seen.add(key)"));
+
+    let finish = body_of(script, "function finishStatus(", "function renderSection(", "status finalization");
+    assert!(finish.contains("if (!loadedAllSections) { show(REFUSED, true); return; }"));
+    assert!(finish.contains("sections.some(section => section.cursor !== null)"));
+    let partial_branch = finish.find("if (incomplete) show(bound ? PARTIAL : PARTIAL_NO_SESSION, false);").unwrap();
+    let read_branch = finish.find("else show(bound ? READ : NO_SESSION, false);").unwrap();
+    assert!(partial_branch < read_branch);
+
+    let load_more = body_of(script, "async function loadMore(", "async function mountSection(", "load more handler");
+    assert!(load_more.contains("if (!loadedAllSections) return;"));
+    assert!(load_more.contains("if (page !== section.scope || section.busy || section.cursor === null) return;"));
+    assert!(load_more.contains("button.disabled = true;"));
+    assert!(load_more.contains("if (!batch) { button.disabled = false; return; }"));
+    assert!(load_more.contains("finishStatus();"));
 }
