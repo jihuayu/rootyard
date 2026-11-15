@@ -25,7 +25,7 @@ use super::{
     opendal::BlobStore,
     protected::{ProtectedUploadError, ProtectedUploader},
 };
-use crate::ref_store::core::artifact_hold::ArtifactGrant;
+use crate::ref_store::core::artifact_hold::{ArtifactGrant, HoldAck};
 
 /// Read-only acknowledgement combining a verified provider ciphertext
 /// [`BlobReceipt`] with local AEAD envelope authentication against a live
@@ -87,7 +87,7 @@ impl BlobStore {
             return Err(EnvelopeError::MetadataCorrupt("envelope metadata does not match upload intent"));
         }
         let locator = intent.locator().clone();
-        let receipt = self.put_file(intent, sealed.ciphertext_path(), deadline).await?;
+        let receipt = self.put_ciphertext_file(intent, sealed.ciphertext_path(), deadline).await?;
         if !receipt.matches(&locator)
             || receipt.provider() != self.provider()
             || receipt.backend_identity().as_hex() != self.backend_identity().as_hex()
@@ -152,9 +152,15 @@ impl BlobStore {
         let label = if destination.is_some() { "dl" } else { "vf" };
         let (ct_guard, ct_file) = create_private_temp_file(staging_dir, label)?;
         drop(ct_file);
-        self.get_to_file(locator, ct_guard.path(), deadline).await?;
-        let receipt =
-            self.verify_receipt(locator, metadata.ciphertext_sha256(), metadata.ciphertext_length(), deadline).await?;
+        let receipt = self
+            .get_to_file_verified_receipt(
+                locator,
+                ct_guard.path(),
+                metadata.ciphertext_sha256(),
+                metadata.ciphertext_length(),
+                deadline,
+            )
+            .await?;
         if receipt.backend_identity().as_hex() != self.backend_identity().as_hex() {
             return Err(EnvelopeError::ForeignBackend);
         }
@@ -187,7 +193,7 @@ pub(super) fn ensure_store_allows_local_envelope(store: &BlobStore, deadline: In
         return Err(EnvelopeError::Blob(BlobError::DeadlineExceeded));
     }
     let enc = store.profile().encryption();
-    if enc.is_explicit() && !enc.is_local_envelope() {
+    if !enc.is_explicit() || !enc.is_local_envelope() {
         return Err(EnvelopeError::EncryptionPolicyMismatch);
     }
     Ok(())
@@ -283,12 +289,76 @@ impl fmt::Debug for ProtectedEncryptedUploadError {
 
 impl std::error::Error for ProtectedEncryptedUploadError {}
 
+pub(super) fn preflight_prepared_against_holds(
+    holds: &[HoldAck],
+    prepared: &[PreparedCiphertext],
+) -> Result<(), EnvelopeError> {
+    if holds.len() != prepared.len() {
+        return Err(EnvelopeError::MetadataCorrupt("prepared ciphertext count does not match granted holds"));
+    }
+    let mut sorted_holds: Vec<&HoldAck> = holds.iter().collect();
+    sorted_holds.sort_by_key(|hold| hold.slot);
+    if sorted_holds.windows(2).any(|pair| pair[0].slot == pair[1].slot) {
+        return Err(EnvelopeError::MetadataCorrupt("duplicate slot in granted holds"));
+    }
+    for (hold, prep) in sorted_holds.iter().zip(prepared.iter()) {
+        prep.spec().validate()?;
+        let spec = prep.spec();
+        if spec.tenant_id != hold.artifact.tenant_id
+            || spec.authority_id != hold.artifact.authority_id
+            || spec.generation != hold.artifact.authority_generation
+            || spec.namespace != hold.artifact.namespace
+        {
+            return Err(EnvelopeError::MetadataCorrupt("prepared ciphertext scope does not match granted hold"));
+        }
+        if prep.ciphertext_sha256() != hold.artifact.sha256 || prep.ciphertext_length() != hold.artifact.length {
+            return Err(EnvelopeError::MetadataCorrupt(
+                "prepared ciphertext digest or length does not match granted hold",
+            ));
+        }
+        let ct_meta = std::fs::symlink_metadata(prep.ciphertext_path())
+            .map_err(|_| EnvelopeError::Io("prepared ciphertext temp file missing before consume"))?;
+        if ct_meta.file_type().is_symlink() || !ct_meta.is_file() || ct_meta.len() != prep.ciphertext_length() {
+            return Err(EnvelopeError::MetadataCorrupt(
+                "prepared ciphertext temp file is missing, symlinked, or truncated before consume",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl ProtectedUploader {
-    /// Grant-gated local-envelope publish: verifies store encryption mode and
-    /// `key_provider` capabilities *before* checking out a PostgreSQL
-    /// connection, consumes `grant` on one short-lived connection, drops the
-    /// lease before wrapping or IO, binds each DEK to the consumed upload
-    /// intent locator, and publishes via the sealed [`BlobStore::put_encrypted_file`].
+    /// Validate encryption policy, `key_provider` capabilities, grant backend
+    /// binding, and every [`PreparedCiphertext`] against `grant`'s sorted
+    /// holds without checking out a PostgreSQL connection or consuming the
+    /// grant.
+    pub fn preflight_encrypted_upload(
+        &self,
+        grant: &ArtifactGrant,
+        prepared: &[PreparedCiphertext],
+        key_provider: &Arc<dyn KeyProvider>,
+        deadline: Instant,
+    ) -> Result<(), ProtectedEncryptedUploadError> {
+        ensure_store_allows_local_envelope(self.store(), deadline)
+            .map_err(|error| ProtectedEncryptedUploadError::Envelope { slot: None, error })?;
+        ensure_local_envelope_provider(key_provider.as_ref())
+            .map_err(|error| ProtectedEncryptedUploadError::Envelope { slot: None, error })?;
+        self.ensure_grant_backend(grant)?;
+        let expected = grant.artifact_count();
+        if prepared.len() != expected {
+            return Err(ProtectedUploadError::SourceCount { expected, actual: prepared.len() }.into());
+        }
+        preflight_prepared_against_holds(grant.ack().holds(), prepared)
+            .map_err(|error| ProtectedEncryptedUploadError::Envelope { slot: None, error })?;
+        Ok(())
+    }
+
+    /// Grant-gated local-envelope publish: validates store encryption policy,
+    /// `key_provider` capabilities, backend binding, and hold-to-ciphertext
+    /// alignment *before* checking out a PostgreSQL connection, consumes
+    /// `grant` on one short-lived connection, drops the lease before wrapping
+    /// or IO, binds each DEK to the consumed upload intent locator, and
+    /// publishes via the sealed [`BlobStore::put_encrypted_file`].
     pub async fn consume_and_upload_encrypted(
         &self,
         pool: &Pool,
@@ -297,10 +367,7 @@ impl ProtectedUploader {
         key_provider: &Arc<dyn KeyProvider>,
         deadline: Instant,
     ) -> Result<ProtectedEncryptedPublication, ProtectedEncryptedUploadError> {
-        ensure_store_allows_local_envelope(self.store(), deadline)
-            .map_err(|error| ProtectedEncryptedUploadError::Envelope { slot: None, error })?;
-        ensure_local_envelope_provider(key_provider.as_ref())
-            .map_err(|error| ProtectedEncryptedUploadError::Envelope { slot: None, error })?;
+        self.preflight_encrypted_upload(&grant, &prepared, key_provider, deadline)?;
         let count = prepared.len();
         let (acquire_request_id, consume_request_id, uploads) =
             self.consume_grant_for_count(pool, grant, count, deadline).await?;

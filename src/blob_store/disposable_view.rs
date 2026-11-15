@@ -139,7 +139,7 @@ impl DisposableViewRoot {
             return Err(DisposableViewError::InvalidArgument("view requires non-nil tenant and authority"));
         }
 
-        let (effective_ttl, view_id, dir_path) = {
+        let (effective_ttl, view_id, root_dir, dir_path) = {
             let mut guard = self.registry.lock().unwrap_or_else(|p| p.into_inner());
             verify_private_dir(&guard.root_dir)?;
             let effective_ttl = ttl.unwrap_or(guard.default_ttl);
@@ -157,11 +157,12 @@ impl DisposableViewRoot {
                 return Err(DisposableViewError::CapacityExceeded("disposable view byte budget exceeded"));
             }
             let view_id = Uuid::new_v4();
-            let dir_path = guard.root_dir.join(format!("{VIEW_DIR_PREFIX}{}", view_id.simple()));
+            let root_dir = guard.root_dir.clone();
+            let dir_path = root_dir.join(format!("{VIEW_DIR_PREFIX}{}", view_id.simple()));
             let expires_at = Instant::now() + effective_ttl;
             guard.active_views.insert(view_id, ActiveViewEntry { reserved_bytes, expires_at });
             guard.total_reserved_bytes = next_bytes;
-            (effective_ttl, view_id, dir_path)
+            (effective_ttl, view_id, root_dir, dir_path)
         };
 
         let expires_at_unix_ms =
@@ -176,7 +177,7 @@ impl DisposableViewRoot {
             pid: std::process::id(),
             expires_at_unix_ms,
         };
-        if let Err(err) = init_view_dirs(&dir_path, &record) {
+        if let Err(err) = init_view_dirs(&root_dir, view_id, &dir_path, &record) {
             let _ = remove_view_dir_safely(&dir_path);
             let mut guard = self.registry.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(entry) = guard.active_views.remove(&view_id) {
@@ -260,6 +261,9 @@ impl DisposableViewRoot {
                 }
             }
             let Ok(record) = read_lease_record(&path.join(LEASE_FILE_NAME)) else {
+                if remove_view_dir_safely(&path)? {
+                    report.removed_views += 1;
+                }
                 continue;
             };
             if record.expires_at_unix_ms <= now_unix_ms {

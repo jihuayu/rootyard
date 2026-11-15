@@ -260,6 +260,10 @@ pub struct PreparedCiphertext {
 }
 
 impl PreparedCiphertext {
+    pub fn spec(&self) -> &EnvelopeSpec {
+        &self.spec
+    }
+
     pub fn ciphertext_sha256(&self) -> &str {
         &self.ciphertext_sha256
     }

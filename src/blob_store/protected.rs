@@ -150,6 +150,7 @@ pub enum ProtectedUploadError {
     ReceiptMismatch {
         slot: i32,
     },
+    EncryptionPolicyMismatch,
 }
 
 impl fmt::Display for ProtectedUploadError {
@@ -175,6 +176,9 @@ impl fmt::Display for ProtectedUploadError {
             Self::ReceiptMismatch { slot } => {
                 write!(formatter, "protected upload slot {slot} returned a receipt that does not match its locator")
             }
+            Self::EncryptionPolicyMismatch => formatter.write_str(
+                "protected plaintext upload is refused under local-envelope encryption mode; no connection was checked out, no hold was consumed and nothing was opened",
+            ),
         }
     }
 }
@@ -215,6 +219,15 @@ impl ProtectedUploader {
     /// provider upload cannot occupy a connection. A timeout or error leaves
     /// the consumed holds and any remote bytes retained, returns no receipt for
     /// an unknown completion, and never mints another grant.
+    /// Check without touching PostgreSQL or Blob that raw plaintext upload is
+    /// permitted by this store's encryption configuration.
+    pub fn preflight_plain_upload_policy(&self) -> Result<(), ProtectedUploadError> {
+        if self.store.profile().encryption().is_local_envelope() {
+            return Err(ProtectedUploadError::EncryptionPolicyMismatch);
+        }
+        Ok(())
+    }
+
     pub async fn consume_and_upload(
         &self,
         pool: &Pool,
@@ -222,6 +235,7 @@ impl ProtectedUploader {
         sources: &[UploadSource],
         deadline: Instant,
     ) -> Result<ProtectedPublication, ProtectedUploadError> {
+        self.preflight_plain_upload_policy()?;
         let (acquire_request_id, consume_request_id, uploads) =
             self.consume_grant_for_count(pool, grant, sources.len(), deadline).await?;
         self.publish(acquire_request_id, consume_request_id, uploads, sources, deadline).await
@@ -271,7 +285,7 @@ impl ProtectedUploader {
     /// ACK's physical backend identity hex and the provider recorded on every
     /// granted hold must equal this store's. Both values are non-secret data;
     /// the comparison yields a typed refusal and no detail.
-    fn ensure_grant_backend(&self, grant: &ArtifactGrant) -> Result<(), ProtectedUploadError> {
+    pub(super) fn ensure_grant_backend(&self, grant: &ArtifactGrant) -> Result<(), ProtectedUploadError> {
         let ack = grant.ack();
         if ack.backend_identity != self.store.backend_identity().as_hex() {
             return Err(ProtectedUploadError::ForeignBackend);

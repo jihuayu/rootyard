@@ -154,6 +154,37 @@ impl BlobStore {
         source: &Path,
         deadline: Instant,
     ) -> Result<BlobReceipt, BlobError> {
+        if self.profile().encryption().is_local_envelope() {
+            return Err(BlobError::Config(
+                "raw plaintext put_file is refused when blob encryption mode is local-envelope".into(),
+            ));
+        }
+        self.put_file_validated(intent, source, deadline).await
+    }
+
+    /// Sealed ciphertext write used exclusively by [`BlobStore::put_encrypted_file`]
+    /// after envelope wrapping and explicit `local-envelope` policy checks.
+    pub(super) async fn put_ciphertext_file(
+        &self,
+        intent: UploadIntent,
+        source: &Path,
+        deadline: Instant,
+    ) -> Result<BlobReceipt, BlobError> {
+        let enc = self.profile().encryption();
+        if !enc.is_explicit() || !enc.is_local_envelope() {
+            return Err(BlobError::Config(
+                "ciphertext upload requires explicit local-envelope blob encryption mode".into(),
+            ));
+        }
+        self.put_file_validated(intent, source, deadline).await
+    }
+
+    async fn put_file_validated(
+        &self,
+        intent: UploadIntent,
+        source: &Path,
+        deadline: Instant,
+    ) -> Result<BlobReceipt, BlobError> {
         // Moving the private fields is allowed only inside blob_store descendants.
         let UploadIntent { locator, backend_identity } = intent;
         // Physical binding first: a foreign intent must not even open the local
@@ -288,6 +319,39 @@ impl BlobStore {
             Ok(result) => result,
             Err(_) => Err(BlobError::DeadlineExceeded),
         }
+    }
+
+    /// Download the verified ciphertext object to `destination` and mint a
+    /// `BlobReceipt` from that single streamed read.
+    pub(super) async fn get_to_file_verified_receipt(
+        &self,
+        locator: &BlobLocator,
+        destination: &Path,
+        expected_sha256: &str,
+        expected_length: u64,
+        deadline: Instant,
+    ) -> Result<BlobReceipt, BlobError> {
+        self.validate_locator(locator)?;
+        if locator.length() != expected_length {
+            return Err(BlobError::LengthMismatch { expected: expected_length, actual: locator.length() });
+        }
+        if locator.sha256() != expected_sha256 {
+            return Err(BlobError::DigestMismatch {
+                expected: expected_sha256.to_owned(),
+                actual: locator.sha256().to_owned(),
+            });
+        }
+        self.get_to_file(locator, destination, deadline).await?;
+        if Instant::now() >= deadline {
+            return Err(BlobError::DeadlineExceeded);
+        }
+        Ok(BlobReceipt::new(
+            locator.clone(),
+            self.provider(),
+            self.backend_identity().clone(),
+            expected_sha256.to_owned(),
+            expected_length,
+        ))
     }
 
     pub async fn verify_receipt(

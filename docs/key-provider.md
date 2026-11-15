@@ -123,10 +123,14 @@ providers are not required for the in-memory OpenDAL tests):
 cargo test --test key_provider_contract
 cargo test --test blob_store_w1c_contract
 cargo test --lib blob_store::envelope_tests
+cargo test --lib blob_store::policy_matrix_tests
 ```
 
 They cover roundtrip, empty and multi-chunk encryption, replaceable
-`KeyProvider` adapters, plaintext-fallback rejection, nonce variance, tampered
+`KeyProvider` adapters, plaintext-fallback rejection, three-mode encryption
+policy enforcement (`unset`, explicit `provider-managed`, explicit
+`local-envelope`) with zero provider IO on refused calls, `ProtectedUploader`
+pre-consume hold-to-prepared validation, nonce variance, tampered
 ciphertext/chunk-order/truncation/trailing-bytes/metadata/nonce/AAD/version/key
 id, wrong and retired/missing keys, old-read/new-write/rewrap with unchanged
 ciphertext, malformed key-file length/mode/symlink/FIFO, keyring directory

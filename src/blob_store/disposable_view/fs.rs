@@ -29,32 +29,46 @@ pub(super) struct ViewLeaseRecord {
     pub(super) expires_at_unix_ms: u64,
 }
 
-pub(super) fn init_view_dirs(dir_path: &Path, record: &ViewLeaseRecord) -> Result<(), DisposableViewError> {
+pub(super) fn init_view_dirs(
+    root_dir: &Path,
+    view_id: Uuid,
+    dir_path: &Path,
+    record: &ViewLeaseRecord,
+) -> Result<(), DisposableViewError> {
+    let staging_dir = root_dir.join(format!(".staging-{}", view_id.simple()));
     DirBuilder::new()
         .mode(0o700)
-        .create(dir_path)
-        .map_err(|_| DisposableViewError::Io("failed creating disposable view directory"))?;
-    verify_private_dir(dir_path)?;
+        .create(&staging_dir)
+        .map_err(|_| DisposableViewError::Io("failed creating disposable staging directory"))?;
+    let init_res = (|| -> Result<(), DisposableViewError> {
+        verify_private_dir(&staging_dir)?;
 
-    let repo_dir = dir_path.join(REPO_SUBDIR_NAME);
-    DirBuilder::new()
-        .mode(0o700)
-        .create(&repo_dir)
-        .map_err(|_| DisposableViewError::Io("failed creating disposable repo directory"))?;
-    verify_private_dir(&repo_dir)?;
+        let repo_dir = staging_dir.join(REPO_SUBDIR_NAME);
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&repo_dir)
+            .map_err(|_| DisposableViewError::Io("failed creating disposable repo directory"))?;
+        verify_private_dir(&repo_dir)?;
 
-    let encoded = serde_json::to_vec(record).map_err(|_| DisposableViewError::Io("failed encoding view lease"))?;
-    let lease_path = dir_path.join(LEASE_FILE_NAME);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&lease_path)
-        .map_err(|_| DisposableViewError::Io("failed creating view lease file"))?;
-    file.write_all(&encoded).map_err(|_| DisposableViewError::Io("failed writing view lease file"))?;
-    file.sync_all().map_err(|_| DisposableViewError::Io("failed syncing view lease file"))?;
-    Ok(())
+        let encoded = serde_json::to_vec(record).map_err(|_| DisposableViewError::Io("failed encoding view lease"))?;
+        let lease_path = staging_dir.join(LEASE_FILE_NAME);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lease_path)
+            .map_err(|_| DisposableViewError::Io("failed creating view lease file"))?;
+        file.write_all(&encoded).map_err(|_| DisposableViewError::Io("failed writing view lease file"))?;
+        file.sync_all().map_err(|_| DisposableViewError::Io("failed syncing view lease file"))?;
+        std::fs::rename(&staging_dir, dir_path)
+            .map_err(|_| DisposableViewError::Io("failed publishing disposable view directory"))?;
+        Ok(())
+    })();
+    if init_res.is_err() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+    init_res
 }
 
 pub(super) fn ensure_private_dir(dir: &Path) -> Result<(), DisposableViewError> {

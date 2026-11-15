@@ -353,3 +353,60 @@ fn disposable_view_isolation_bounds_ttl_expiry_and_sweep() {
     assert!(matches!(expiring.resolve_repo_relative_path(Path::new("HEAD")), Err(DisposableViewError::Expired)));
     l2.reap();
 }
+
+#[test]
+fn disposable_view_sweep_reclaims_corrupt_and_missing_lease_dirs() {
+    let parent = TempDir::new().expect("parent");
+    let root_path = parent.path().join("views");
+    let root = DisposableViewRoot::open(&root_path, 4, 4096, Duration::from_secs(60)).expect("open root");
+    let tenant = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+
+    let live = root.create_view("live-pack", tenant, authority, 512, None).expect("live view");
+    let live_dir = live.dir_path().expect("live dir").to_path_buf();
+
+    // 1. Orphan `rv1-*` directory missing `lease.json`.
+    let orphan_missing = root_path.join(format!("rv1-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir(&orphan_missing).expect("create missing lease dir");
+
+    // 2. Orphan `rv1-*` directory with malformed `lease.json`.
+    let orphan_corrupt = root_path.join(format!("rv1-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir(&orphan_corrupt).expect("create corrupt lease dir");
+    std::fs::write(orphan_corrupt.join("lease.json"), b"{invalid-json").expect("write corrupt lease");
+
+    // 3. Orphan `rv1-*` directory rejected by `deny_unknown_fields`.
+    let orphan_unknown = root_path.join(format!("rv1-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir(&orphan_unknown).expect("create unknown field lease dir");
+    std::fs::write(
+        orphan_unknown.join("lease.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "view_id": Uuid::new_v4(),
+            "purpose": "pack",
+            "tenant_id": tenant,
+            "authority_id": authority,
+            "reserved_bytes": 128,
+            "pid": 1,
+            "expires_at_unix_ms": u64::MAX,
+            "unexpected": true
+        }))
+        .expect("encode json"),
+    )
+    .expect("write unknown field lease");
+
+    // In-flight `.staging-*` directories must not be reaped by `sweep_expired`.
+    let staging_dir = root_path.join(format!(".staging-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir(&staging_dir).expect("create staging dir");
+
+    let report = root.sweep_expired().expect("sweep corrupt orphans");
+    assert_eq!(report.removed_views, 3);
+    assert_eq!(report.skipped_live_views, 1);
+    assert!(!orphan_missing.exists());
+    assert!(!orphan_corrupt.exists());
+    assert!(!orphan_unknown.exists());
+    assert!(live_dir.exists());
+    assert!(staging_dir.exists());
+
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    live.reap();
+}

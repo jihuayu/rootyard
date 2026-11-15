@@ -320,7 +320,7 @@ impl BlobStore {
                 }
             }
             BlobClosureEncryption::LocalEnvelope => {
-                if store_enc.is_explicit() && store_enc.is_provider_managed() {
+                if !store_enc.is_explicit() || !store_enc.is_local_envelope() {
                     return Err(BlobClosureError::EncryptionPolicyMismatch);
                 }
                 if key_provider.is_none() {

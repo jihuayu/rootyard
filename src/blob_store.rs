@@ -40,6 +40,8 @@ mod envelope_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
+mod policy_matrix_tests;
+#[cfg(test)]
 mod provider_contract_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
