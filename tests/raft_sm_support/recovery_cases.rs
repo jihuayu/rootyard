@@ -31,7 +31,7 @@ fn snapshot_seal_deny_unknown_fields_and_cancel_cutoff_pins_roots_holds_recovery
             RefCasCommand::InitializeGate(InitializeGateCommand {
                 gate: WireGateInit::from(&init),
                 pack_mode: SmPackMode::MetadataOnly,
-                lane: RepositoryLane::PgRefstore,
+                lane: RepositoryLane::ServingRefStore,
                 authz_floor: 2,
             }),
         )

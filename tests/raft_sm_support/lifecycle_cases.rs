@@ -26,7 +26,7 @@ fn idempotent_replay_digest_conflict_dropped_reply_and_lifecycle_fence() {
         RefCasCommand::InitializeGate(InitializeGateCommand {
             gate: WireGateInit::from(&make_init(repo, tenant, history)),
             pack_mode: SmPackMode::MetadataOnly,
-            lane: RepositoryLane::PgRefstore,
+            lane: RepositoryLane::ServingRefStore,
             authz_floor: 1,
         }),
     )
@@ -70,7 +70,7 @@ fn idempotent_replay_digest_conflict_dropped_reply_and_lifecycle_fence() {
         RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
             repository_id: repo,
             tenant_id: tenant,
-            lane: RepositoryLane::PgRefstore,
+            lane: RepositoryLane::ServingRefStore,
             lifecycle: ScopeLifecycle::Closing,
             authz_floor: 5,
             history_incarnation: history,
@@ -158,7 +158,7 @@ fn idempotent_replay_digest_conflict_dropped_reply_and_lifecycle_fence() {
             RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
                 repository_id: repo,
                 tenant_id: tenant,
-                lane: RepositoryLane::PgRefstore,
+                lane: RepositoryLane::ServingRefStore,
                 lifecycle: ScopeLifecycle::Open,
                 authz_floor: 5,
                 history_incarnation: history,
@@ -192,7 +192,7 @@ fn cancel_versus_begin_commit_and_decision_expiry() {
         RefCasCommand::InitializeGate(InitializeGateCommand {
             gate: WireGateInit::from(&make_init(repo, tenant, history)),
             pack_mode: SmPackMode::MetadataOnly,
-            lane: RepositoryLane::PgRefstore,
+            lane: RepositoryLane::ServingRefStore,
             authz_floor: 1,
         }),
     )
@@ -236,7 +236,11 @@ fn cancel_versus_begin_commit_and_decision_expiry() {
             facts_digest: digest("f"),
             authz_digest: digest("a"),
             dependencies_digest: digest("d"),
-            verdicts: vec![WireDecisionVerdict { ref_name: "refs/heads/main".into(), allowed: true, reason: None }],
+            verdicts: vec![WireDecisionVerdict {
+                ref_name: "refs/heads/main".into(),
+                accepted: true,
+                reject_code: None,
+            }],
             authz_epoch: 1,
             not_after_tick: 50,
             logical_tick: 12,
@@ -305,7 +309,11 @@ fn cancel_versus_begin_commit_and_decision_expiry() {
             facts_digest: digest("f2"),
             authz_digest: digest("a2"),
             dependencies_digest: digest("d2"),
-            verdicts: vec![WireDecisionVerdict { ref_name: "refs/heads/exp".into(), allowed: true, reason: None }],
+            verdicts: vec![WireDecisionVerdict {
+                ref_name: "refs/heads/exp".into(),
+                accepted: true,
+                reject_code: None,
+            }],
             authz_epoch: 1,
             not_after_tick: 30,
             logical_tick: 20,

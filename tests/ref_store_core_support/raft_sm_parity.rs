@@ -38,7 +38,7 @@ impl DualHarness {
         let cmd = RefCasCommand::InitializeGate(InitializeGateCommand {
             gate: WireGateInit::from(init),
             pack_mode: SmPackMode::MetadataOnly,
-            lane: RepositoryLane::PgRefstore,
+            lane: RepositoryLane::ServingRefStore,
             authz_floor: 1,
         });
         let bytes = encode_command(&cmd)?;

@@ -141,22 +141,30 @@ fn deterministic_byte_log_replay_and_snapshot_recovery_match_state_digest() {
     );
 
     let mut probe = RefCasStateMachine::new();
-    let gate_res = probe
+    probe
         .apply(
             AppliedLogId { term: 1, index: 1 },
             RefCasCommand::InitializeGate(InitializeGateCommand {
                 gate: WireGateInit::from(&init),
                 pack_mode: SmPackMode::MetadataOnly,
-                lane: RepositoryLane::PgRefstore,
+                lane: RepositoryLane::ServingRefStore,
                 authz_floor: 1,
             }),
         )
         .unwrap();
-    let gate_v1 = match gate_res {
-        ApplyResponse::GateInitialized { version, .. } => version,
-        other => panic!("unexpected {other:?}"),
-    };
-    let gate_v1_digest = gate_v1.digest().as_hex();
+    probe
+        .apply(
+            AppliedLogId { term: 1, index: 2 },
+            RefCasCommand::CommitRefs(CommitRefsCommand {
+                request: WireCommitRefsRequest::from(&req1),
+                decision_id: None,
+                required_holds: vec![],
+                policy_rejects: BTreeMap::new(),
+                logical_tick: 100,
+            }),
+        )
+        .unwrap();
+    let gate_v2_digest = probe.read_gate_version(repo).unwrap().unwrap().digest().as_hex();
 
     let cmds = vec![
         (
@@ -165,7 +173,7 @@ fn deterministic_byte_log_replay_and_snapshot_recovery_match_state_digest() {
             RefCasCommand::InitializeGate(InitializeGateCommand {
                 gate: WireGateInit::from(&init),
                 pack_mode: SmPackMode::MetadataOnly,
-                lane: RepositoryLane::PgRefstore,
+                lane: RepositoryLane::ServingRefStore,
                 authz_floor: 1,
             }),
         ),
@@ -183,14 +191,14 @@ fn deterministic_byte_log_replay_and_snapshot_recovery_match_state_digest() {
         (
             1,
             3,
-            RefCasCommand::CreateSnapshotPin(super::raft_sm_support_create_pin(
+            RefCasCommand::CreateSnapshotPin(raft_sm_support_create_pin(
                 repo,
                 tenant,
                 owner,
                 history,
                 snap_id,
                 pin_id,
-                gate_v1_digest.clone(),
+                gate_v2_digest.clone(),
             )),
         ),
         (
@@ -207,7 +215,7 @@ fn deterministic_byte_log_replay_and_snapshot_recovery_match_state_digest() {
                 backend_identity: digest("backend"),
                 authority_id: Uuid::from_u128(777),
                 authority_generation: 1,
-                expected_gate_digest: gate_v1_digest,
+                expected_gate_digest: gate_v2_digest,
                 artifacts: vec![WireHoldArtifactSpec {
                     hold_id,
                     slot: 0,
@@ -234,7 +242,11 @@ fn deterministic_byte_log_replay_and_snapshot_recovery_match_state_digest() {
                 facts_digest: digest("facts"),
                 authz_digest: digest("authz"),
                 dependencies_digest: digest("deps"),
-                verdicts: vec![WireDecisionVerdict { ref_name: "refs/heads/feat".into(), allowed: true, reason: None }],
+                verdicts: vec![WireDecisionVerdict {
+                    ref_name: "refs/heads/feat".into(),
+                    accepted: true,
+                    reject_code: None,
+                }],
                 authz_epoch: 1,
                 not_after_tick: 500,
                 logical_tick: 110,
