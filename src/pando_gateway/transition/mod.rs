@@ -104,6 +104,16 @@ pub async fn cutover(state: &Arc<AppState>, repo: &Repository, deadline: Instant
             client.query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&repo.id]).await?.get(0)
         };
         let store = PackStore::from_env(state.storage.root.join("pando-pack-work"), state.config.git.clone())?;
+        let remote =
+            crate::storage::remote_objects::RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
+        crate::pando_gateway::pitr_fence::verify_or_attest(
+            &state.pool,
+            &state.storage.root,
+            &remote,
+            deadline,
+            "attest",
+        )
+        .await?;
         let manifest = store
             .publish(
                 &state.pool,

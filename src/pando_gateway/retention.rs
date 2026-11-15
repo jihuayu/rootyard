@@ -296,11 +296,18 @@ pub async fn reset_authority(client: &mut tokio_postgres::Client) -> Result<Auth
     // Use a real transaction rather than embedding BEGIN/COMMIT so this can
     // never commit a caller-owned transaction.
     let tx = client.transaction().await?;
+    tx.execute("DELETE FROM pando_retention_root_manifests", &[]).await?;
+    tx.execute("DELETE FROM pando_retention_roots", &[]).await?;
     tx.execute("DELETE FROM pando_manifest_artifacts", &[]).await?;
     tx.execute("DELETE FROM pando_publication_fences", &[]).await?;
     tx.execute("DELETE FROM pando_remote_artifacts", &[]).await?;
     tx.execute(
-        "UPDATE pando_storage_authorities SET authority_id=gen_random_uuid(),generation=1,          created_at=clock_timestamp(),rotated_at=clock_timestamp() WHERE singleton",
+        "UPDATE pando_storage_authorities SET authority_id=gen_random_uuid(),generation=1,\
+         restore_generation=restore_generation+1,authority_epoch=1,\
+         deployment_id=NULL,volume_id=NULL,db_system_identifier=NULL,db_database_oid=NULL,\
+         db_schema_oid=NULL,pg_timeline_id=NULL,backend_identity=NULL,proof_nonce=NULL,\
+         remote_delete_fenced=false,remote_delete_fence_reason=NULL,attested_at=NULL,\
+         created_at=clock_timestamp(),rotated_at=clock_timestamp() WHERE singleton",
         &[],
     )
     .await?;

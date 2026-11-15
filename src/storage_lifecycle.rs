@@ -17,6 +17,8 @@ pub mod models;
 pub mod observability;
 #[path = "storage_lifecycle/pando.rs"]
 pub mod pando;
+#[path = "storage_lifecycle/pando_delete_gate.rs"]
+pub mod pando_delete_gate;
 #[path = "storage_lifecycle/quarantine.rs"]
 pub mod quarantine;
 #[path = "storage_lifecycle/retention.rs"]

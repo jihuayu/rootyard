@@ -567,6 +567,7 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             "lfs_objects",
             "pando_pack_manifests",
             "pando_repository_states",
+            "pando_retention_roots",
             "ref_store_core_gates",
             "ref_store_core_pins",
             "ref_store_core_serving_reads",

@@ -19,15 +19,13 @@ LATEST_PREFIX = f"{LATEST_VERSION:03d}"
 
 # Single explicit source for the current archive format. Tests must not infer
 # the expected format from the manifest produced by the implementation under test.
-# Legacy metadata archives use format21/schema147. Paired PG + OpenDAL Blob
-# closures use format22/schema147. Metadata-only format21 is never an
-# independent Blob byte backup. Old format20
-# remains frozen at schema144; current fixtures are generated from actual
-# PostgreSQL. The schema does not change with format22: both map to the same
-# frozen 147 catalog/version list.
-CURRENT_BACKUP_FORMAT = 21
-CURRENT_BLOB_BACKUP_FORMAT = 22
-CURRENT_SCHEMA_VERSION = 147
+# Legacy metadata archives use format21/schema147, format22/schema147 remains
+# frozen at schema147, format20 remains frozen at schema144. Current archives use
+# format23 (metadata + legacy Pando fence) and format24 (paired PG + OpenDAL Blob
+# closure) at schema148; current fixtures are generated from actual PostgreSQL.
+CURRENT_BACKUP_FORMAT = 23
+CURRENT_BLOB_BACKUP_FORMAT = 24
+CURRENT_SCHEMA_VERSION = 148
 assert LATEST_VERSION == CURRENT_SCHEMA_VERSION, (
     "a new migration requires an explicit current backup format/schema contract bump")
 FROZEN_FORMAT17_SCHEMA_VERSION = 141

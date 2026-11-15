@@ -32,6 +32,7 @@ pub(crate) const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct LegacyS3Store {
     operator: Operator,
+    identity: String,
 }
 
 pub(crate) fn tokio_deadline(deadline: Instant) -> tokio::time::Instant {
@@ -90,7 +91,13 @@ impl LegacyS3Store {
                 "legacy object store provider lacks conditional create (if-none-match)".into(),
             ));
         }
-        Ok(Self { operator })
+        let identity = super::remote_authority::s3_backend_identity(endpoint, region, bucket)
+            .map_err(|error| BlobError::Config(error.to_string()))?;
+        Ok(Self { operator, identity })
+    }
+
+    pub(crate) fn backend_identity(&self) -> &str {
+        &self.identity
     }
 
     pub(crate) fn operator(&self) -> &Operator {

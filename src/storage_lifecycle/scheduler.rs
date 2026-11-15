@@ -195,7 +195,7 @@ async fn schedule_pando(state: &AppState, policy: &Policy) -> Result<usize> {
         if retireable && jobs::enqueue(&state.pool, repo, tenant, generation, "pando_unreachable_mark").await? {
             scheduled += 1;
         }
-        let delete_enabled = std::env::var("ROOTYARD_PANDO_REMOTE_DELETE").ok().as_deref() == Some("true");
+        super::pando_delete_gate::validate_startup_env()?;
         let due = client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM pando_remote_artifacts a                  WHERE a.authority_id=(SELECT authority_id FROM pando_storage_authorities WHERE singleton)                    AND a.tenant_id=$1 AND a.state IN ('retired','deleting')                    AND a.delete_after<=clock_timestamp())",
@@ -203,11 +203,17 @@ async fn schedule_pando(state: &AppState, policy: &Policy) -> Result<usize> {
             )
             .await?
             .get::<_, bool>(0);
-        if due
-            && delete_enabled
-            && jobs::enqueue(&state.pool, repo, tenant, generation, "pando_tombstone_delete").await?
-        {
-            scheduled += 1;
+        if due {
+            let delete_gate = super::pando_delete_gate::check_scheduler_gate(
+                state,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .await?;
+            if matches!(delete_gate, super::pando_delete_gate::DeleteGateDecision::Allowed(_))
+                && jobs::enqueue(&state.pool, repo, tenant, generation, "pando_tombstone_delete").await?
+            {
+                scheduled += 1;
+            }
         }
     }
     Ok(scheduled)

@@ -173,6 +173,9 @@ async fn run() -> Result<()> {
         "pando-transition" if args.len() >= 2 => {
             rootyard::pando_gateway::transition::operator::cli(&config, &pool, &args[1..]).await?;
         }
+        "pando-authority" if args.len() >= 2 => {
+            rootyard::pando_gateway::authority_cli::cli(&config, &pool, &args[1..]).await?;
+        }
         "reconcile" if args.len() == 1 => {
             db::migrate(&pool).await?;
             let storage = Storage::open(&config)?;
@@ -200,6 +203,7 @@ async fn run() -> Result<()> {
         }
         "serve" if args.len() <= 1 => {
             rootyard::config::init_workspace_remote_delete_policy()?;
+            rootyard::storage_lifecycle::pando_delete_gate::validate_startup_env()?;
             let dispatch_settings = rootyard::dispatch::Settings::from_env()?;
             let maintenance_policy = rootyard::storage_lifecycle::models::Policy::from_env()?;
             std::fs::read_to_string("/proc/self/stat")
@@ -260,6 +264,7 @@ async fn run() -> Result<()> {
             rootyard::workspaces::mounts::reconcile_startup(&state)
                 .await
                 .map_err(|_| anyhow::anyhow!("workspace FUSE mount recovery failed"))?;
+            rootyard::pando_gateway::pitr_fence::startup_check(&state.pool, &state.storage.root).await?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
             // Lease renewal is independent of the single-host fencing driver;
             // takeover scanning still requires a verifiable physical fence.
@@ -379,7 +384,7 @@ async fn run() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | serve-blob | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132 | --allow-legacy-schema133 | --allow-legacy-schema134 | --allow-legacy-schema135 | --allow-legacy-schema136 | --allow-legacy-schema137 | --allow-legacy-schema138 | --allow-legacy-schema139 | --allow-legacy-schema140 | --allow-legacy-schema141 | --allow-legacy-schema142 | --allow-legacy-schema143]]"
+            "usage: rootyard [serve | serve-blob | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | pando-authority status|verify|isolate --confirm-shared-bucket|pin-recovery-point|release-recovery-point | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132 | --allow-legacy-schema133 | --allow-legacy-schema134 | --allow-legacy-schema135 | --allow-legacy-schema136 | --allow-legacy-schema137 | --allow-legacy-schema138 | --allow-legacy-schema139 | --allow-legacy-schema140 | --allow-legacy-schema141 | --allow-legacy-schema142 | --allow-legacy-schema143]]"
         ),
     }
     Ok(())

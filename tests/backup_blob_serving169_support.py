@@ -60,6 +60,11 @@ import re
 import types
 import uuid
 
+try:
+    from schema_baseline import CURRENT_BLOB_BACKUP_FORMAT, CURRENT_SCHEMA_VERSION
+except ImportError:
+    from tests.schema_baseline import CURRENT_BLOB_BACKUP_FORMAT, CURRENT_SCHEMA_VERSION
+
 ARTIFACT_SET_DOMAIN = "core-pack-artifact-set-v2"
 ROOT_STATES = ("active", "released")
 # Roles a registration must carry exactly once each, in the canonical slots.
@@ -258,8 +263,10 @@ def format22_manifest_checks(manifest, expected):
     accepted, because one member's surplus can otherwise mask another member's
     deficit.
     """
-    need(manifest.get("format") == 22 == expected["format"], "archive is not format22")
-    schema_versions = expected_schema_versions(expected["schema_versions"], expected["schema_baseline"], 147)
+    need(manifest.get("format") == CURRENT_BLOB_BACKUP_FORMAT == expected["format"],
+         f"archive is not format{CURRENT_BLOB_BACKUP_FORMAT}")
+    schema_versions = expected_schema_versions(
+        expected["schema_versions"], expected["schema_baseline"], CURRENT_SCHEMA_VERSION)
     need(manifest.get("schema_versions") == schema_versions, "unexpected schema versions")
     repos = manifest.get("repositories") or []
     need(len(repos) == len(expected["repos"]), "manifest repository count differs from the API-created set")
@@ -374,7 +381,7 @@ def format22_manifest_checks(manifest, expected):
          "root captures disagree on their producer owner")
     serving_read = _archive_serving_read(expected.get("serving_read"), expected["repos"], tenants,
                                          expected["registered_packs"], expected["producer"])
-    return {"format": 22, "repositories": len(repos), "closure_artifacts": len(artifacts),
+    return {"format": CURRENT_BLOB_BACKUP_FORMAT, "repositories": len(repos), "closure_artifacts": len(artifacts),
             "closure_bytes": closure.get("bytes"), "blob_members": len(blob_files),
             "registrations": len(registrations), "roots": {state: states.count(state) for state in ROOT_STATES},
             "producer_distinct_from_tenant": True, "carry_tables": len(carry),
@@ -1421,7 +1428,8 @@ def native_marker_checks(marker):
     repository tenant or the producer.
     """
     need(marker.get("kind") == MARKER_KIND, "native fixture marker has another kind")
-    need(marker.get("format") == 22, "native fixture is not a format22 source")
+    need(marker.get("format") == CURRENT_BLOB_BACKUP_FORMAT,
+         f"native fixture is not a format{CURRENT_BLOB_BACKUP_FORMAT} source")
     text = json.dumps(marker, sort_keys=True)
     for forbidden in _FORBIDDEN_MARKER_TEXT:
         need(forbidden not in text, "native fixture marker leaks " + forbidden)
