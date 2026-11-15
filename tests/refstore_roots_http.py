@@ -26,7 +26,7 @@ LIMITATIONS = [
     "Repositories, source snapshots, pins, roots and receipts are created through real API/A3/A4/A5/Git/root paths; no SQL or fabricated authority rows are used.",
     "The fixture does not claim Root byte browsing, post-JSON finalization, hosted CI inventory, native acceptance or full issue107 closure.",
     "Authorization/role inputs use the existing real token API and labeled initial collaborator metadata where the public grant transport is outside this metadata checkpoint.",
-    "The same-key concurrent-create/root-release schedule and source-snapshot prune are not run here; existing coordinator source fixtures cover those seams.",
+    "The fixture does not delete/prune stored A5 snapshot/ref/pack rows and does not force the ByIntent source-metadata-miss fallback. Existing coordinator fixtures cover source-pin release and the pre-existing Absent-target tombstone barrier, not this ByIntent-specific race.",
 ]
 
 

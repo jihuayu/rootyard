@@ -35,6 +35,11 @@ use crate::{
     },
 };
 
+/// Exact fixed sentinel from `ref_store::serving::commit_unknown_error`.
+/// Only this known ambiguous-COMMIT error may carry the retry-key/body message.
+const COMMIT_UNKNOWN_SENTINEL: &str =
+    "ref-store commit outcome is unknown; retry the same request to resolve it idempotently";
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootCreateBody {
@@ -391,9 +396,55 @@ fn roots_error(error: crate::Error) -> GatewayError {
         StatusCode::PAYLOAD_TOO_LARGE => GatewayError::TooLarge,
         StatusCode::TOO_MANY_REQUESTS => GatewayError::TooManyRequests("retained root quota is exhausted"),
         StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => GatewayError::Timeout,
-        StatusCode::SERVICE_UNAVAILABLE => {
+        StatusCode::SERVICE_UNAVAILABLE
+            if error.1 == COMMIT_UNKNOWN_SENTINEL =>
+        {
             GatewayError::Unavailable("retention root outcome is unknown; retry the same key and body")
         }
+        StatusCode::SERVICE_UNAVAILABLE => {
+            GatewayError::Unavailable("retention root metadata service is unavailable")
+        }
         _ => GatewayError::Internal("retention root request was refused"),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roots_error_distinguishes_unknown_commit_from_generic_unavailable() {
+        let unknown = roots_error(crate::Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            COMMIT_UNKNOWN_SENTINEL,
+        ));
+        assert_eq!(
+            unknown,
+            GatewayError::Unavailable(
+                "retention root outcome is unknown; retry the same key and body"
+            )
+        );
+
+        for error in [
+            crate::Error(StatusCode::SERVICE_UNAVAILABLE, "ref-store pool unavailable"),
+            crate::Error(StatusCode::SERVICE_UNAVAILABLE, "retention root transaction cleanup failed"),
+        ] {
+            let mapped = roots_error(error);
+            assert_eq!(
+                mapped,
+                GatewayError::Unavailable("retention root metadata service is unavailable")
+            );
+            assert!(!mapped.message().to_ascii_lowercase().contains("unknown"));
+        }
+
+        assert_eq!(
+            roots_error(crate::Error(StatusCode::BAD_REQUEST, "invalid")),
+            GatewayError::BadRequest("invalid retention root request")
+        );
+        assert_eq!(
+            roots_error(crate::Error(StatusCode::INTERNAL_SERVER_ERROR, "internal")),
+            GatewayError::Internal("retention root request was refused")
+        );
     }
 }
