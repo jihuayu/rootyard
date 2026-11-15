@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/native_report_manifest.py"
+CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -27,6 +29,24 @@ import native_report_manifest as manifest_gate  # noqa: E402
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def workflow_batch_manifest_anchor_arguments():
+    """Extract the job-mode collector's anchor flags from the real CI command."""
+    text = CI_YML.read_text(encoding="utf-8")
+    marker = "python3 scripts/native_report_manifest.py --mode job"
+    start = text.index(marker)
+    end = text.find("\n      - name:", start)
+    command = text[start:] if end == -1 else text[start:end]
+    tokens = shlex.split(command.replace("\\\n", " "))
+    anchors = []
+    for index, token in enumerate(tokens):
+        if not token.startswith("--expect-batch-manifest"):
+            continue
+        if index + 1 >= len(tokens):
+            raise AssertionError(f"{token} has no following value in ci.yml")
+        anchors.append((token, tokens[index + 1]))
+    return anchors
 
 
 PANDO_SCHEMA_SQL = (
@@ -565,6 +585,37 @@ class TestJobManifest(unittest.TestCase):
         self.assertEqual(
             job["build_receipt"]["batch_manifest"]["file"], str(batch_path.resolve())
         )
+
+    def test_workflow_job_mode_anchor_flags_reach_the_real_argument_parser(self):
+        anchors = workflow_batch_manifest_anchor_arguments()
+        self.assertEqual(
+            [
+                ("--expect-batch-manifest-path", "$ROOTYARD_BATCH_MANIFEST"),
+                ("--expect-batch-manifest-sha", "$ROOTYARD_BATCH_MANIFEST_SHA256"),
+            ],
+            anchors,
+            "ci.yml must use the parser's complete, unambiguous anchor flags",
+        )
+
+        batch_path = self.fixture.enable_v2_cas_batch_receipt()
+        expected = digest(batch_path)
+        replacements = {
+            "$ROOTYARD_BATCH_MANIFEST": str(batch_path.resolve()),
+            "$ROOTYARD_BATCH_MANIFEST_SHA256": expected,
+        }
+        extra = []
+        for flag, environment_value in anchors:
+            self.assertIn(environment_value, replacements)
+            extra += [flag, replacements[environment_value]]
+
+        job = json.loads(
+            self.fixture.job(extra=tuple(extra)).read_text(encoding="utf-8")
+        )
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(
+            job["build_receipt"]["batch_manifest"]["file"], str(batch_path.resolve())
+        )
+        self.assertEqual(job["build_receipt"]["batch_manifest"]["sha256"], expected)
 
     def test_rejects_expected_manifest_sha_after_a_raw_metadata_change(self):
         batch_path = self.fixture.enable_v2_cas_batch_receipt()

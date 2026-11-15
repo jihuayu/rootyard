@@ -517,7 +517,9 @@ class CargoForkWorkflowTest(unittest.TestCase):
         self.assertIn('--binary "$ROOTYARD_BIN"', manifest)
         # The final report step must consume the exporter's exact manifest
         # identity, not re-derive it from whatever bytes are present later.
-        self.assertIn('--expect-batch-manifest "$ROOTYARD_BATCH_MANIFEST"', manifest)
+        self.assertIn(
+            '--expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST"', manifest
+        )
         self.assertIn(
             '--expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256"', manifest
         )
