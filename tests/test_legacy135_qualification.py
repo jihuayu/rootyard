@@ -114,6 +114,11 @@ class CaseContractTest(unittest.TestCase):
         self.assertNotIn("detail", text)
         self.assertEqual([case["status"] for case in parsed["cases"]], ["passed"] * 7)
 
+    def test_progress_lines_before_terminal_report_are_tolerated(self):
+        raw = "create_real_schema135_pando_source: passed\n" + json.dumps(valid_report())
+        parsed = gate.parse_legacy_report(raw, report_inputs())
+        self.assertEqual(parsed["case_count"], 7)
+
     def test_missing_extra_duplicate_skipped_and_target_drift_fail(self):
         variants = []
         missing = valid_report()

@@ -352,11 +352,26 @@ def invoke_legacy(inputs):
     return code, stdout.getvalue(), stderr.getvalue()
 
 
+def _terminal_json_object(raw):
+    """Read the final JSON object after the harness's own progress lines."""
+    text = raw.strip()
+    if not text:
+        raise QualificationError("legacy_report_invalid")
+    decoder = json.JSONDecoder()
+    for index in range(len(text) - 1, -1, -1):
+        if text[index] != "{":
+            continue
+        try:
+            value, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if end == len(text[index:]):
+            return value
+    raise QualificationError("legacy_report_invalid")
+
+
 def parse_legacy_report(raw, inputs):
-    try:
-        report = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        raise QualificationError("legacy_report_invalid") from None
+    report = _terminal_json_object(raw)
     if not isinstance(report, dict):
         raise QualificationError("legacy_report_invalid")
     if report.get("passed") is not True:
