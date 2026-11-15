@@ -175,12 +175,11 @@ pub struct Db {
     admin: Pool,
     pub pool: Pool,
     schema: String,
-    pub pg_source: &'static str,
 }
 
 impl Db {
     pub async fn setup() -> Result<Self> {
-        let (url, pg_source) = database_info().await?;
+        let (url, _) = database_info().await?;
         let admin = db::pool(url)?;
         let schema = format!("verifier_budgets_{}", Uuid::new_v4().simple());
         admin.get().await?.batch_execute(&format!("CREATE SCHEMA {schema}")).await?;
@@ -193,7 +192,7 @@ impl Db {
             .max_size(16)
             .build()?;
         db::migrate(&pool).await?;
-        Ok(Self { admin, pool, schema, pg_source })
+        Ok(Self { admin, pool, schema })
     }
 
     pub async fn finish(&self, outcome: Result<()>) -> Result<()> {
