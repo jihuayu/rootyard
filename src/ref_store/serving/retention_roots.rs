@@ -659,10 +659,11 @@ impl PgServingRetentionRoots {
                 // recheck is only for a genuine source-metadata not-found and does
                 // not mask auth/scope/backend/realm/commit failures or renew the
                 // deadline.
-                if recheck_existing_on_metadata_miss && error.0 == StatusCode::NOT_FOUND {
-                    if self.replay_create(pool, actor, repo, scope, create, derived, deadline).await?.is_some() {
-                        return self.release_existing(pool, actor, repo, derived.root_id, input, deadline).await;
-                    }
+                if recheck_existing_on_metadata_miss
+                    && error.0 == StatusCode::NOT_FOUND
+                    && self.replay_create(pool, actor, repo, scope, create, derived, deadline).await?.is_some()
+                {
+                    return self.release_existing(pool, actor, repo, derived.root_id, input, deadline).await;
                 }
                 return Err(error);
             }

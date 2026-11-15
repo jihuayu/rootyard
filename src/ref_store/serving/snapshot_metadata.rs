@@ -932,15 +932,14 @@ pub(super) async fn serving_admin_gate(
     {
         return Err(Error::internal("durable serving gate/binding realm mismatch"));
     }
-    if let Some(scope) = expected_scope {
-        if gate.tenant_id() != scope.tenant_id()
+    if let Some(scope) = expected_scope
+        && (gate.tenant_id() != scope.tenant_id()
             || gate.object_format() != scope.object_format()
             || gate.history_incarnation() != scope.history_incarnation()
             || gate.authority_epoch() != scope.authority_epoch()
-            || gate.group_epoch() != scope.group_epoch()
-        {
-            return Err(Error(StatusCode::CONFLICT, "repository realm changed; retry the same request"));
-        }
+            || gate.group_epoch() != scope.group_epoch())
+    {
+        return Err(Error(StatusCode::CONFLICT, "repository realm changed; retry the same request"));
     }
     Ok(gate)
 }

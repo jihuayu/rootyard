@@ -72,12 +72,12 @@ async fn tree_authorized(
     let computed = snapshot::build_retained_root_view(&state, context.view(), deadline).await?;
     let refs = snapshot::retained_root_refs(context.view());
     let spec = captured_revision(&refs, &spec)?;
-    let root_oid = root_oid(&state, &*computed, &spec, memory, deadline).await?;
+    let root_oid = root_oid(&state, &computed, &spec, memory, deadline).await?;
     let expression = if path.is_empty() { format!("{root_oid}^{{tree}}") } else { format!("{root_oid}:{path}") };
-    let tree_oid = resolve(&state, &*computed, &expression, deadline).await?;
-    require_type(&state, &*computed, &tree_oid, "tree", deadline).await?;
+    let tree_oid = resolve(&state, &computed, &expression, deadline).await?;
+    require_type(&state, &computed, &tree_oid, "tree", deadline).await?;
     let raw =
-        run(&state, &*computed, &["ls-tree", "-z", "-l", &tree_oid], (memory / 8).min(MAX_CAPTURE_BYTES), deadline)
+        run(&state, &computed, &["ls-tree", "-z", "-l", &tree_oid], (memory / 8).min(MAX_CAPTURE_BYTES), deadline)
             .await?;
     let mut entries = parse_tree(&raw, &path, after.as_deref(), limit)?;
     let more = entries.len() > limit;
@@ -134,15 +134,15 @@ async fn blob_authorized(
     let refs = snapshot::retained_root_refs(context.view());
     let spec = captured_revision(&refs, &oid)?;
     let oid = if path.is_empty() {
-        let resolved = resolve(&state, &*computed, &spec, deadline).await?;
-        reachable(&state, &*computed, &resolved, memory, deadline).await?;
+        let resolved = resolve(&state, &computed, &spec, deadline).await?;
+        reachable(&state, &computed, &resolved, memory, deadline).await?;
         resolved
     } else {
-        let root = root_oid(&state, &*computed, &spec, memory, deadline).await?;
-        resolve(&state, &*computed, &format!("{root}:{path}"), deadline).await?
+        let root = root_oid(&state, &computed, &spec, memory, deadline).await?;
+        resolve(&state, &computed, &format!("{root}:{path}"), deadline).await?
     };
-    require_type(&state, &*computed, &oid, "blob", deadline).await?;
-    let raw_size = run(&state, &*computed, &["cat-file", "-s", &oid], 64, deadline).await?;
+    require_type(&state, &computed, &oid, "blob", deadline).await?;
+    let raw_size = run(&state, &computed, &["cat-file", "-s", &oid], 64, deadline).await?;
     let size = std::str::from_utf8(&raw_size)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
@@ -151,7 +151,7 @@ async fn blob_authorized(
     if size > max_blob {
         return Err(GatewayError::TooLarge);
     }
-    let raw = run(&state, &*computed, &["cat-file", "blob", &oid], max_blob, deadline).await?;
+    let raw = run(&state, &computed, &["cat-file", "blob", &oid], max_blob, deadline).await?;
     if raw.len() as u64 != size {
         return Err(GatewayError::Internal("native blob length differs from its object size"));
     }
