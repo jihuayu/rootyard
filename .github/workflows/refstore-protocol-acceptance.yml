@@ -478,16 +478,13 @@ jobs:
           for target in "${targets[@]}"; do
             output="$native11_dir/$target"
             build_report="$native11_dir/$target.build-report.json"
-            stderr_file="$RUNNER_TEMP/issue107-native11-$target.stderr"
             if ! python3 scripts/build_native_test.py \
                 --test "$target" --features pando-lab \
                 --artifact-store "$artifact_store" --output "$output" \
-                > "$build_report" 2> "$stderr_file"; then
+                > "$build_report" 2>/dev/null; then
               echo "issue107 native11 preparation failed: $target" >&2
-              rm -f "$stderr_file"
               exit 1
             fi
-            rm -f "$stderr_file"
             test -x "$output"
             test -f "$output.build.json"
           done
