@@ -9,15 +9,21 @@ second fresh owned PG17 database/data directory.  The restored Pando authority,
 closure, pins, Git reads/writes and owner/read-only/revoked tokens are checked
 without manufacturing SQL authority state.
 
-One bounded pass-through proxy gate fails a single known Pando object GET during
-the first archive export.  The failed archive must leave a documented partial,
-never publish COMPLETE, and leave source state unchanged; a fresh-path retry
-must verify and restore successfully.  All process output stays in RAM or is
-discarded.  Provider/DB/token values never enter argv, reports or exceptions.
+One pass-through proxy is started before the first source migration/attestation
+and the same endpoint identity is used for source probes, backup/verify, restore,
+readback and the fresh pin.  The proxy is armed only for one known Pando object
+GET during the selected failed export.  The failed archive must leave a
+documented partial, never publish COMPLETE, and leave source state unchanged; a
+fresh-path retry must verify and restore successfully.  The offline backup path
+has no attestation gate and no pre-GET refusal is claimed.  All process output
+stays in RAM or is discarded.  Provider/DB/token values never enter argv,
+reports or exceptions.
 """
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -60,7 +66,7 @@ AC2_TOPOLOGY = {
 AC2_LIMITATIONS = (
     "Requires an actual source/config-bound prebuilt Rootyard binary and Root-supplied real Garage/Vault fixtures.",
     "Format 23 Pando-only archives are exercised; format-24 paired Blob/RefStore, #169 durability, RPO/RTO and cross-provider migration are out of scope.",
-    "The failed export gate is a single bounded proxy failure for one known Pando object GET, not a fault matrix.",
+    "The failed export gate is a single bounded proxy failure for one known Pando object GET, not a fault matrix; the offline backup path has no pre-GET attestation gate and no such refusal is claimed.",
     "Reports contain only fixed booleans/counts/hashes; SQL bodies, locators, credentials, object bytes and raw process output are excluded.",
     "A successful run is AC2 source execution evidence only; Issue #77 remains open until all required actual regressions and original AC evidence pass.",
 )
@@ -77,6 +83,15 @@ HARNESS_FILES = tuple(dict.fromkeys((
 )))
 MAX_GATE_FAILURES = 64
 DEFAULT_TIMEOUT_SECONDS = 1800.0
+
+
+def _endpoint_hash(endpoint: str) -> str:
+    return hashlib.sha256(endpoint.encode("utf-8")).hexdigest()
+
+
+def _same_provider_endpoint(environments: list[dict[str, str]]) -> bool:
+    values = [env.get("ROOTYARD_OBJECT_STORE_ENDPOINT") for env in environments]
+    return bool(values) and all(isinstance(value, str) and value for value in values) and len(set(values)) == 1
 
 
 def _git_try(args: list[str], *, env: dict[str, str], cwd: Path | None = None,
@@ -161,7 +176,7 @@ def _artifact_sets(probe: ac1._ArtifactProbe, rows: dict) -> tuple[list[dict], s
 
 
 def _run_backup_gate(binary: str, env: dict[str, str], destination: Path,
-                     proxy) -> int:
+                     proxy) -> tuple[int, bool]:
     try:
         process = subprocess.Popen(
             [binary, "backup", str(destination), "--offline"],
@@ -181,7 +196,7 @@ def _run_backup_gate(binary: str, env: dict[str, str], destination: Path,
         except subprocess.TimeoutExpired:
             _kill_group(process)
             raise ac1.PhysicalFailure("backup_failure", "timeout") from None
-        return process.returncode
+        return process.returncode, True
     except Exception:
         _kill_group(process)
         raise
@@ -285,6 +300,10 @@ def _run_ac2_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
         for tool in ("psql", "git"):
             if not shutil.which(tool):
                 raise ac1.PhysicalFailure("precondition", "required_cli_missing")
+        proxy = ac1.CountingProxy(*ac1._s3_endpoint(config.endpoint)[:2])
+        proxy.start()
+        proxy_endpoint = f"http://127.0.0.1:{proxy.port}"
+        provider_config = replace(config, endpoint=proxy_endpoint)
         private_root = Path(tempfile.mkdtemp(prefix="rootyard-ac2-backup-restore-"))
         private_root.chmod(0o700)
         source_data = private_root / "source-data"
@@ -298,6 +317,7 @@ def _run_ac2_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
 
         source_env = dict(environ)
         source_env.update({
+            "ROOTYARD_OBJECT_STORE_ENDPOINT": proxy_endpoint,
             "DATABASE_URL": source_fixture.primary_url,
             "ROOTYARD_DATA_DIR": str(source_data),
             "ROOTYARD_PANDO_REMOTE_DELETE": "false",
@@ -401,9 +421,13 @@ def _run_ac2_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
         if not isinstance(old_root_id, str) or not pin.get("external_lsn") or int(pin.get("manifest_count", 0)) < 1:
             raise ac1.PhysicalFailure("pin", "source_pin_missing")
         rows = ac1._artifact_rows(source_fixture.primary_url, authority, owner_id, repo_id)
-        source_probe, source_probe_set = _artifact_sets(ac1._ArtifactProbe(config), rows)
+        source_probe, source_probe_set = _artifact_sets(ac1._ArtifactProbe(provider_config), rows)
         if not source_probe:
             raise ac1.PhysicalFailure("garage", "protected_objects_missing")
+        source_status = ac1._cli(binary, ["pando-authority", "status"], source_env)
+        source_proof, source_local = ac1._status_backend_identity(source_status)
+        if not source_proof or source_proof != source_local:
+            raise ac1.PhysicalFailure("identity", "source_backend_identity_mismatch")
         extra["source_pin"] = {"manifest_count": int(pin["manifest_count"]), "external_lsn_present": True}
         extra["source_probe_count"] = len(source_probe)
         extra["source_protected_objects"] = source_probe
@@ -414,22 +438,21 @@ def _run_ac2_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
         archive_parent.mkdir(mode=0o700)
         failed_archive = archive_parent / "failed-archive"
         live_leaf = rows["live"][0]["remote_path"].rsplit("/", 1)[-1]
-        proxy = ac1.CountingProxy(*ac1._s3_endpoint(config.endpoint)[:2])
-        proxy.start()
         proxy.arm(live_leaf, None)
         proxy.prepare_gate(fail=True)
         with proxy.get_condition:
             proxy.fail_gets_remaining = MAX_GATE_FAILURES
-        failure_env = {
-            **source_env,
-            "ROOTYARD_OBJECT_STORE_ENDPOINT": f"http://127.0.0.1:{proxy.port}",
-        }
         try:
-            failure_returncode = _run_backup_gate(binary, failure_env, failed_archive, proxy)
+            failure_returncode, failure_get_hit = _run_backup_gate(
+                binary, source_env, failed_archive, proxy)
         finally:
             _release_failure_gate(proxy)
         if failure_returncode == 0:
             raise ac1.PhysicalFailure("backup_failure", "unexpected_success")
+        if not failure_get_hit:
+            raise ac1.PhysicalFailure("backup_failure", "known_get_not_observed")
+        if proxy.armed:
+            raise ac1.PhysicalFailure("backup_failure", "gate_not_disarmed")
         if failed_archive.exists():
             raise ac1.PhysicalFailure("backup_failure", "destination_published")
         partials = _partials(archive_parent)
@@ -441,6 +464,10 @@ def _run_ac2_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
             raise ac1.PhysicalFailure("backup_failure", "source_mutated")
         extra["export_failure"] = {
             "returncode_nonzero": True,
+            "known_target_get_observed": failure_get_hit,
+            "failure_mode": "known_object_get_502",
+            "fault_armed_only_for_selected_failed_export": True,
+            "gate_disarmed_after_failure": True,
             "partial_count": len(partials),
             "complete_published": False,
             "delete_method_count": proxy.method_counts.get("DELETE", 0),
@@ -476,6 +503,8 @@ def _run_ac2_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
             "ROOTYARD_PANDO_REMOTE_DELETE": "false",
             "ROOTYARD_STORAGE_MAINTENANCE": "false",
         }
+        if provider_config.endpoint != proxy_endpoint or not _same_provider_endpoint([source_env, restore_env]):
+            raise ac1.PhysicalFailure("identity", "provider_endpoint_changed")
         restored = ac1._cli(binary, ["restore", str(archive), "--isolated", "--trust-backup"], restore_env, timeout=600)
         if restored.get("restored") is not True or restored.get("started_service") is not False:
             raise ac1.PhysicalFailure("restore", "restore_summary_invalid")
@@ -576,9 +605,24 @@ def _run_ac2_scenario(binary: str, pg_bin: Path, environ: dict[str, str],
             f"SELECT count(*) FROM pando_retention_roots WHERE id='{new_root_id}' AND state='active'", 30)
         if new_root_live != 1:
             raise ac1.PhysicalFailure("pin", "restored_pin_not_active")
+        target_status = ac1._cli(binary, ["pando-authority", "status"], restore_env)
+        target_proof, target_local = ac1._status_backend_identity(target_status)
+        if not target_proof or target_proof != target_local or target_proof != source_proof:
+            raise ac1.PhysicalFailure("identity", "restored_backend_identity_mismatch")
+        extra["endpoint_identity"] = {
+            "single_pass_through_proxy_before_source": True,
+            "source_and_restore_env_identical": _same_provider_endpoint([source_env, restore_env]),
+            "normal_failed_retry_verify_restore_new_pin_same": True,
+            "source_proof_matches_local": True,
+            "restored_proof_matches_source": True,
+            "backend_identity_sha256": ac1._identity_hash(source_proof),
+            "proxy_endpoint_sha256": _endpoint_hash(proxy_endpoint),
+            "fault_armed_only_for_selected_failed_export": True,
+            "offline_backup_pre_get_attestation_gate": False,
+        }
         target_rows = ac1._artifact_rows(
             target_fixture.primary_url, new_authority, owner_id, repo_id)
-        target_probe, target_probe_set = _artifact_sets(ac1._ArtifactProbe(config), target_rows)
+        target_probe, target_probe_set = _artifact_sets(ac1._ArtifactProbe(provider_config), target_rows)
         if not target_probe or not source_probe_set.issubset(target_probe_set):
             raise ac1.PhysicalFailure("garage", "restored_closure_not_readable")
         cases["old_authority_claim_not_reused_and_new_closure_readable"] = old_claims_absent

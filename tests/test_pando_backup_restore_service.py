@@ -9,6 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pando_backup_restore_service as ac2  # noqa: E402
+import pando_pitr_physical_service as ac1  # noqa: E402
 import pando_pitr_service as binding  # noqa: E402
 from test_native_build_receipt_v2 import ReceiptFixture  # noqa: E402
 
@@ -107,6 +108,42 @@ class Ac2SpecBoundaryTest(ReceiptFixture):
         self.assertEqual(report["failure"]["code"], "extra_invalid")
         self.assertEqual([case["name"] for case in report["cases"]],
                          list(ac2.AC2_MANDATORY_CASES))
+
+    def test_provider_endpoint_consistency_helpers_and_binding(self) -> None:
+        endpoint = "http://127.0.0.1:3900"
+        first = {"ROOTYARD_OBJECT_STORE_ENDPOINT": endpoint}
+        second = {"ROOTYARD_OBJECT_STORE_ENDPOINT": endpoint}
+        different = {"ROOTYARD_OBJECT_STORE_ENDPOINT": "http://127.0.0.1:3901"}
+        self.assertTrue(ac2._same_provider_endpoint([first, second]))
+        self.assertFalse(ac2._same_provider_endpoint([first, different]))
+        self.assertFalse(ac2._same_provider_endpoint([{}]))
+        self.assertRegex(ac2._endpoint_hash(endpoint), r"^[0-9a-f]{64}$")
+        self.assertEqual(ac2._endpoint_hash(endpoint), ac2._endpoint_hash(endpoint))
+        self.assertIn(ac1.GARAGE_FIXTURE, ac2.HARNESS_FILES)
+        self.assertEqual(len(ac2.AC2_MANDATORY_CASES), 7)
+
+    def test_ac2_preflight_binds_exact_garage_pin(self) -> None:
+        pin = ac1._owned_garage_pin()
+        env = {
+            "ROOTYARD_OBJECT_STORE_ENDPOINT": "http://127.0.0.1:3900",
+            "ROOTYARD_OBJECT_STORE_BUCKET": "ac2-bound",
+            "ROOTYARD_OBJECT_STORE_REGION": "garage",
+            "ROOTYARD_OBJECT_STORE_ACCESS_KEY": "access",
+            "ROOTYARD_OBJECT_STORE_SECRET_KEY": "secret",
+            "ROOTYARD_KMS_VAULT_URL": "http://127.0.0.1:8200",
+            "ROOTYARD_KMS_VAULT_TOKEN": "token",
+            "ROOTYARD_KMS_VAULT_KEY": "key",
+            "ROOTYARD_GARAGE_IMAGE_DIGEST": pin,
+            "ROOTYARD_VAULT_IMAGE_DIGEST": ac1.VAULT_IMAGE_PIN,
+        }
+        config, metadata = ac2.ac1.preflight_providers(env)
+        self.assertEqual(config.garage_image, pin)
+        self.assertEqual(metadata["garage_image_digest"], pin)
+        with self.assertRaises(ac1.PhysicalFailure) as wrong:
+            ac2.ac1.preflight_providers(dict(
+                env, ROOTYARD_GARAGE_IMAGE_DIGEST="garage@sha256:" + "4" * 64))
+        self.assertEqual((wrong.exception.stage, wrong.exception.code),
+                         ("providers", "garage_image_pin_mismatch"))
 
     def test_no_provider_ac2_suite_does_not_launch_fixtures(self) -> None:
         with mock.patch.object(ac2, "PhysicalPitrFixture") as fixture:
