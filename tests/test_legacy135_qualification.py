@@ -446,6 +446,48 @@ class ProviderOwnershipTest(unittest.TestCase):
                              "vault_cleanup_name_query_failed")
             self.assertTrue(path.exists())
 
+    def test_effective_publication_requires_exact_ipv4_loopback(self):
+        self.assertEqual(gate.published_loopback_url(["127.0.0.1:8201"]),
+                         "http://127.0.0.1:8201")
+        for published in (
+            "0.0.0.0:8201",
+            "[::]:8201",
+            "::1:8201",
+            "localhost:8201",
+            "192.168.1.5:8201",
+            "127.0.0.2:8201",
+        ):
+            with self.subTest(published=published):
+                with self.assertRaises(gate.QualificationError) as caught:
+                    gate.published_loopback_url([published])
+                self.assertEqual(caught.exception.code, "vault_port_not_loopback")
+        for published in ("127.0.0.1", "127.0.0.1:not-a-port",
+                          "127.0.0.1:0", "127.0.0.1:65536"):
+            with self.subTest(published=published):
+                with self.assertRaises(gate.QualificationError) as caught:
+                    gate.published_loopback_url([published])
+                self.assertEqual(caught.exception.code, "vault_port_invalid")
+
+    def test_wildcard_publication_fails_before_vault_api(self):
+        state = owned_state(nonce="123456789ab0")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            runner = FakeRunner([
+                image_result(),
+                Result(0, (state["container_id"] + "\n").encode()),
+                *inspect_results(state),
+                Result(0, b"0.0.0.0:12345\n"),
+            ])
+            fixture = fixture_for(path, runner, state["nonce"])
+            with mock.patch.object(
+                    gate.urllib.request, "urlopen",
+                    side_effect=AssertionError("Vault API must not be called")):
+                with self.assertRaises(gate.QualificationError) as caught:
+                    fixture.start()
+            self.assertEqual(caught.exception.code, "vault_port_not_loopback")
+            self.assertIsNone(fixture.host_url)
+            self.assertTrue(path.exists())
+
     def test_safe_provider_record_excludes_locator_and_tokens(self):
         fixture = gate.VaultFixture("/tmp/state", runner=FakeRunner([]))
         fixture.container_id = "a" * 64

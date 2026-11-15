@@ -597,6 +597,24 @@ def _resolve_owned_container(runner, state, prefix):
     return found
 
 
+def published_loopback_url(lines):
+    """Accept only the exact requested IPv4 loopback publication."""
+    if not lines:
+        raise QualificationError("vault_port_invalid")
+    published = lines[0].strip()
+    if ":" not in published:
+        raise QualificationError("vault_port_invalid")
+    host, port = published.rsplit(":", 1)
+    if host.strip() != "127.0.0.1":
+        raise QualificationError("vault_port_not_loopback")
+    if not port.isdigit():
+        raise QualificationError("vault_port_invalid")
+    number = int(port, 10)
+    if number < 1 or number > 65535:
+        raise QualificationError("vault_port_invalid")
+    return "http://127.0.0.1:" + str(number)
+
+
 class VaultFixture:
     """One exact-owned ephemeral Vault Transit provider."""
 
@@ -773,14 +791,7 @@ class VaultFixture:
         if ports.returncode != 0:
             raise QualificationError("vault_port_failed")
         lines = ports.stdout.decode(errors="replace").splitlines()
-        if not lines or ":" not in lines[0]:
-            raise QualificationError("vault_port_invalid")
-        host, port = lines[0].rsplit(":", 1)
-        if host.strip() not in ("127.0.0.1", "0.0.0.0"):
-            raise QualificationError("vault_port_not_loopback")
-        if not port.isdigit():
-            raise QualificationError("vault_port_invalid")
-        self.host_url = "http://127.0.0.1:" + port
+        self.host_url = published_loopback_url(lines)
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             try:
