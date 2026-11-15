@@ -2,11 +2,14 @@
 //!
 //! This is the narrow serving entry point over the existing
 //! `ref_store_core_snapshots`/pins/receipts/history/quota path. It adds no
-//! migration, table, HTTP route, materializer or root API. The caller supplies
-//! only a repository selector, a bounded opaque idempotency key, a bounded
-//! lease/generation and (for read/renew/release) a snapshot selector. All
-//! repository/tenant/owner/realm/backend/gate facts are derived from the real
-//! ready binding and current core gate.
+//! migration, table, HTTP route or root API. It also owns the narrow authorized
+//! retained-serving materialization entrypoint: T1 authorization/capture, actual
+//! Blob/native closure outside every PG lease, then a fresh authorized T2
+//! recheck and exact post-I/O metadata comparison. The caller supplies only a
+//! repository selector, a bounded opaque idempotency key, a bounded
+//! lease/generation and (for read/renew/release/materialize) a snapshot
+//! selector. All repository/tenant/owner/realm/backend/gate facts are derived
+//! from the real ready binding and current core gate.
 //!
 //! Every successful fresh or replay result passes the final
 //! `authorize_repository_late` check on the same transaction that owns the
@@ -18,7 +21,7 @@
 //! lease, so a retry under the same key stays the same identity while changed
 //! lease/selector/generation conflicts in the existing request digest.
 use super::{
-    acquire, begin_owned, map_refstore, map_scope_refusal,
+    acquire, begin_owned, deadline_error, map_refstore, map_scope_refusal,
     ServingRepository,
 };
 use crate::{
@@ -29,19 +32,21 @@ use crate::{
     ref_store::{
         CoreGate, MetadataMutationAction, MetadataPinPurpose, PinReleaseReason, RefStoreError, RequestDigest,
         core::{
-            CreatePackSnapshotRequest, MAX_PIN_LEASE_SECONDS, MetadataPinOutcome, MetadataSnapshotScope,
-            PackReadSnapshot, PackSnapshotExpectation, PackSnapshotOutcome, PgPackSnapshot, PgRefStoreCore,
-            ReleaseMetadataPinRequest, RenewMetadataPinRequest,
+            CreatePackSnapshotRequest, MAX_PIN_LEASE_SECONDS, MaterializedPackRead, MetadataPinOutcome,
+            MetadataSnapshotScope, PackReadSnapshot, PackSnapshotExpectation, PackSnapshotOutcome, PackSnapshotRef,
+            PgPackSnapshot, PgPackSnapshotMaterializer, PgRefStoreCore, ReleaseMetadataPinRequest,
+            RenewMetadataPinRequest,
             serving_scope::LockedScope,
         },
         tx::commit_bounded,
     },
     token_scopes::RepoAction,
 };
+use crate::ref_store::core::pack_snapshot::RetainedServingPreparation;
 use axum::http::StatusCode;
 use deadpool_postgres::Pool;
 use std::time::Duration;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 use tokio_postgres::Transaction;
 use uuid::Uuid;
 
@@ -298,6 +303,74 @@ impl PgServingSnapshotMetadata {
         result
     }
 
+    /// Materialize one retained durable serving snapshot through the actual
+    /// opened Blob store and trusted native Git engine.
+    ///
+    /// The caller supplies only owner/name/snapshot selectors. T1 resolves the
+    /// exact stored pin/generation/realm/backend from PostgreSQL and requires
+    /// current Admin plus late ContentsRead; native/Blob closure runs outside
+    /// every PG lease; T2 is a fresh authorized read transaction that rechecks
+    /// the same stored capture, cluster anchor, pin liveness and role/scope
+    /// before an unanchored materialized view may be returned.
+    pub async fn materialize(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRead,
+        materializer: &PgPackSnapshotMaterializer,
+        deadline: Instant,
+    ) -> Result<MaterializedPackRead, Error> {
+        validate_snapshot(input.snapshot_id)?;
+        let deadline = materializer.retained_deadline(deadline).map_err(map_metadata_error)?;
+        let backend = materializer.backend_identity();
+        let initial = match timeout_at(
+            deadline,
+            preflight(pool, actor, &input.owner, &input.name, false, backend, deadline),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(deadline_error()),
+        };
+        let repository_id = initial.repository.id;
+        let tenant_id = initial.gate.tenant_id();
+        let name = initial.repository.name.clone();
+
+        let (snapshot, cluster_incarnation) =
+            retained_t1(pool, actor, repository_id, tenant_id, &name, input.snapshot_id, backend, deadline)
+                .await?;
+        let reference = PackSnapshotRef::new(
+            repository_id,
+            tenant_id,
+            snapshot.snapshot_id(),
+            snapshot.pin_id(),
+            snapshot.pin_generation(),
+        )
+        .map_err(map_metadata_error)?;
+        let prepared = match timeout_at(
+            deadline,
+            materializer.prepare_retained_serving(snapshot, cluster_incarnation, deadline),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(map_metadata_error)?,
+            Err(_) => return Err(deadline_error()),
+        };
+        retained_t2(
+            pool,
+            actor,
+            repository_id,
+            tenant_id,
+            &name,
+            &reference,
+            prepared,
+            materializer,
+            backend,
+            deadline,
+        )
+        .await
+    }
+
     /// Renew the stored pin at its exact generation. The stored scope and pin
     /// id are reconstructed from immutable rows; changed generation/lease under
     /// the same key conflicts in the existing request digest.
@@ -522,6 +595,201 @@ async fn preflight(
     super::lookup(pool, actor, owner, name, writable, backend, deadline).await
 }
 
+/// One checked T1 read transaction for retained materialization. The whole
+/// authorization + target read + final late scope check is bounded by the
+/// caller's absolute deadline, and a failed/expired rollback yields no capture.
+#[allow(clippy::too_many_arguments)]
+async fn retained_t1(
+    pool: &Pool,
+    actor: &Identity,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    name: &str,
+    snapshot_id: Uuid,
+    backend: &BlobBackendIdentity,
+    deadline: Instant,
+) -> Result<(PackReadSnapshot, Uuid), Error> {
+    let mut client = acquire(pool, deadline).await?;
+    let tx = begin_owned(&mut client, deadline).await?;
+    let observed = timeout_at(
+        deadline,
+        async {
+            serving_admin_gate(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                name,
+                backend,
+                None,
+                false,
+                deadline,
+            )
+            .await?;
+            let snapshot = match PgPackSnapshot
+                .read_serving_by_snapshot(
+                    &tx,
+                    repository_id,
+                    tenant_id,
+                    snapshot_id,
+                    backend.as_hex(),
+                    deadline,
+                )
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Err(authorize_failure(
+                        &tx,
+                        actor,
+                        repository_id,
+                        tenant_id,
+                        name,
+                        RepoAction::ContentsRead,
+                        backend,
+                        None,
+                        false,
+                        error,
+                        deadline,
+                    )
+                    .await);
+                }
+            };
+            let (_, cluster_incarnation) = final_authority_with_cluster(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                name,
+                RepoAction::ContentsRead,
+                backend,
+                Some(snapshot.scope()),
+                false,
+                deadline,
+            )
+            .await?;
+            Ok::<_, Error>((snapshot, cluster_incarnation))
+        },
+    )
+    .await;
+    let observed = match observed {
+        Ok(result) => result,
+        Err(_) => Err(deadline_error()),
+    };
+    let cleanup = timeout_at(deadline, tx.rollback()).await;
+    match (observed, cleanup) {
+        (Ok(value), Ok(Ok(()))) => Ok(value),
+        (_, Ok(Err(_))) | (_, Err(_)) => Err(retained_cleanup_error()),
+        (Err(error), Ok(Ok(()))) => Err(error),
+    }
+}
+
+/// One checked T2 transaction after native/Blob work: current Admin + late
+/// ContentsRead, exact authorized stored capture, captured cluster anchor,
+/// fresh DB-clock pin liveness, then the unanchored materialized view. No value
+/// exists unless rollback succeeds.
+#[allow(clippy::too_many_arguments)]
+async fn retained_t2(
+    pool: &Pool,
+    actor: &Identity,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    name: &str,
+    reference: &PackSnapshotRef,
+    prepared: RetainedServingPreparation,
+    materializer: &PgPackSnapshotMaterializer,
+    backend: &BlobBackendIdentity,
+    deadline: Instant,
+) -> Result<MaterializedPackRead, Error> {
+    let mut client = acquire(pool, deadline).await?;
+    let tx = begin_owned(&mut client, deadline).await?;
+    let observed = timeout_at(
+        deadline,
+        async {
+            let expected_scope = *prepared.snapshot().scope();
+            serving_admin_gate(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                name,
+                backend,
+                Some(&expected_scope),
+                false,
+                deadline,
+            )
+            .await?;
+            let fresh = match PgPackSnapshot
+                .read_serving_by_snapshot(
+                    &tx,
+                    repository_id,
+                    tenant_id,
+                    reference.snapshot_id(),
+                    backend.as_hex(),
+                    deadline,
+                )
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Err(authorize_failure(
+                        &tx,
+                        actor,
+                        repository_id,
+                        tenant_id,
+                        name,
+                        RepoAction::ContentsRead,
+                        backend,
+                        Some(&expected_scope),
+                        false,
+                        error,
+                        deadline,
+                    )
+                    .await);
+                }
+            };
+            let (_, cluster_incarnation) = final_authority_with_cluster(
+                &tx,
+                actor,
+                repository_id,
+                tenant_id,
+                name,
+                RepoAction::ContentsRead,
+                backend,
+                Some(&expected_scope),
+                false,
+                deadline,
+            )
+            .await?;
+            if cluster_incarnation != prepared.cluster_incarnation() {
+                return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch(
+                    "cluster authority incarnation",
+                )));
+            }
+            materializer
+                .ensure_retained_serving_live(&tx, reference, &fresh, deadline)
+                .await
+                .map_err(map_metadata_error)?;
+            prepared.finish(fresh).map_err(map_metadata_error)
+        },
+    )
+    .await;
+    let observed = match observed {
+        Ok(result) => result,
+        Err(_) => Err(deadline_error()),
+    };
+    let cleanup = timeout_at(deadline, tx.rollback()).await;
+    match (observed, cleanup) {
+        (Ok(view), Ok(Ok(()))) => Ok(view),
+        (_, Ok(Err(_))) | (_, Err(_)) => Err(retained_cleanup_error()),
+        (Err(error), Ok(Ok(()))) => Err(error),
+    }
+}
+
+fn retained_cleanup_error() -> Error {
+    Error(StatusCode::SERVICE_UNAVAILABLE, "retained snapshot metadata cleanup failed")
+}
+
 async fn serving_admin_gate(
     tx: &Transaction<'_>,
     actor: &Identity,
@@ -594,6 +862,34 @@ async fn final_authority(
     gate_for_update: bool,
     deadline: Instant,
 ) -> Result<CoreGate, Error> {
+    final_authority_with_cluster(
+        tx,
+        actor,
+        repository_id,
+        tenant_id,
+        name,
+        action,
+        backend,
+        expected_scope,
+        gate_for_update,
+        deadline,
+    )
+    .await
+    .map(|(gate, _)| gate)
+}
+
+async fn final_authority_with_cluster(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    name: &str,
+    action: RepoAction,
+    backend: &BlobBackendIdentity,
+    expected_scope: Option<&MetadataSnapshotScope>,
+    gate_for_update: bool,
+    deadline: Instant,
+) -> Result<(CoreGate, Uuid), Error> {
     let gate = serving_admin_gate(
         tx,
         actor,
@@ -606,7 +902,7 @@ async fn final_authority(
         deadline,
     )
     .await?;
-    let _cluster_incarnation = super::authority::cluster_incarnation_nowait(tx).await?;
+    let cluster_incarnation = super::authority::cluster_incarnation_nowait(tx).await?;
     let live = tx
         .query_opt(
             "SELECT t.read_only FROM tokens t
@@ -628,7 +924,7 @@ async fn final_authority(
     )
     .await
     .map_err(auth::scope_error)?;
-    Ok(gate)
+    Ok((gate, cluster_incarnation))
 }
 
 fn request_construction_error() -> RefStoreError {

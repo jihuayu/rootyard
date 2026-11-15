@@ -39,17 +39,19 @@
 use super::super::pack_commit::{self, NativeReadClosure, NativeReadEngine, NativeReadRequest, PackCommitError};
 use super::contract as pack_contract;
 use super::pg::PgPackSnapshot;
-use super::read_snapshot::PackReadSnapshot;
+use super::read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
 use super::request::PackSnapshotRef;
 use super::serving_read::{RegisteredServingRead, ServingReadCapture, revalidate_serving_capture};
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
+use crate::ref_store::MetadataPinPurpose;
 use crate::ref_store::core::snapshot_sql;
 use crate::ref_store::pg;
 use crate::ref_store::tx::begin_bounded;
 use deadpool_postgres::Pool;
 use std::path::PathBuf;
 use tokio::time::{Instant, timeout_at};
+use tokio_postgres::Transaction;
 use uuid::Uuid;
 
 /// One absolute effective work deadline for the whole call, including both pool
@@ -119,9 +121,50 @@ impl PreparedReadClosure {
         let binding = snapshot.materialization_digest();
         Self { snapshot, binding }
     }
+}
 
-    fn binding_hex(&self) -> String {
-        self.binding.as_hex()
+/// Prepared retained-serving materialization: T1's exact stored snapshot and
+/// cluster anchor, the verified native closure, and the complete A5b binding
+/// that closure must carry. Only the authorized serving coordinator can build
+/// the final unanchored view after its post-I/O fence.
+pub(crate) struct RetainedServingPreparation {
+    snapshot: PackReadSnapshot,
+    binding: RequestDigest,
+    native: NativeReadClosure,
+    cluster_incarnation: Uuid,
+}
+
+impl RetainedServingPreparation {
+    pub(crate) fn snapshot(&self) -> &PackReadSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn cluster_incarnation(&self) -> Uuid {
+        self.cluster_incarnation
+    }
+
+    /// Seal the final view only when the post-I/O read is the exact T1 capture
+    /// and the native closure carries the same complete A5b binding. The
+    /// retained result is deliberately unanchored: it can never become a
+    /// transient serving proof/session (#174).
+    pub(crate) fn finish(self, fresh: PackReadSnapshot) -> Result<MaterializedPackRead, RefStoreError> {
+        if fresh != self.snapshot {
+            return Err(RefStoreError::MetadataScopeMismatch(
+                "retained serving snapshot changed during materialization",
+            ));
+        }
+        let binding = fresh.materialization_digest();
+        if binding != self.binding {
+            return Err(RefStoreError::MetadataScopeMismatch(
+                "retained serving binding changed during materialization",
+            ));
+        }
+        if self.native.read_digest() != binding {
+            return Err(RefStoreError::MetadataScopeMismatch(
+                "materialized native closure binding differs from the revalidated retained read",
+            ));
+        }
+        Ok(MaterializedPackRead::sealed(fresh, self.native, None))
     }
 }
 
@@ -147,6 +190,129 @@ impl PgPackSnapshotMaterializer {
     /// credential and never a proof on its own.
     pub fn backend_identity_hex(&self) -> &str {
         self.store_identity.as_hex()
+    }
+
+    /// The actual opened Blob backend identity this materializer uses for every
+    /// lane check and T1/T2 authorization.
+    pub(crate) fn backend_identity(&self) -> &crate::blob_store::BlobBackendIdentity {
+        &self.store_identity
+    }
+
+    /// One absolute bounded deadline for the retained materialization entrypoint,
+    /// including pool checkout, T1, Blob/native work, T2 and its cleanup.
+    pub(crate) fn retained_deadline(&self, caller: Instant) -> Result<Instant, RefStoreError> {
+        effective_deadline(caller)
+    }
+
+    /// Shared private native closure. The engine is the only verifier; this
+    /// helper only applies the same pair-coverage and workspace-bound checks to
+    /// the legacy, transient and retained lanes.
+    async fn materialize_native(
+        &self,
+        snapshot: &PackReadSnapshot,
+        binding: &RequestDigest,
+        coverage_error: &'static str,
+        deadline: Instant,
+    ) -> Result<NativeReadClosure, RefStoreError> {
+        let binding_hex = binding.as_hex();
+        let native = self
+            .engine
+            .materialize(
+                &NativeReadRequest {
+                    format: snapshot.scope().object_format(),
+                    head_ref: snapshot.head_ref(),
+                    head_oid: snapshot.head_oid_hex(),
+                    refs: snapshot.refs(),
+                    packs: snapshot.packs(),
+                    read_digest: &binding_hex,
+                },
+                deadline.into_std(),
+            )
+            .await
+            .map_err(map_native_error)?;
+        if i64::try_from(native.verified_pairs()).unwrap_or(i64::MAX) != snapshot.pack_count() {
+            return Err(RefStoreError::Database(coverage_error.into()));
+        }
+        if native.retained_bytes(deadline.into_std()).await.map_err(map_native_error)?
+            > pack_commit::contract::VERIFIER_VIEW_MAX_LOGICAL_BYTES
+        {
+            return Err(RefStoreError::Unsupported("materialized view exceeds its workspace bound"));
+        }
+        Ok(native)
+    }
+
+    /// Actual retained-serving Blob/native closure for an already-authorized T1
+    /// capture. No PostgreSQL transaction is held here. The caller must still
+    /// run the post-I/O authorization/cluster/pin fence in T2 and call
+    /// [`RetainedServingPreparation::finish`] only after it succeeds.
+    pub(crate) async fn prepare_retained_serving(
+        &self,
+        snapshot: PackReadSnapshot,
+        cluster_incarnation: Uuid,
+        deadline: Instant,
+    ) -> Result<RetainedServingPreparation, RefStoreError> {
+        if cluster_incarnation.is_nil() {
+            return Err(RefStoreError::Database(
+                "retained serving materialization has no cluster incarnation".into(),
+            ));
+        }
+        if snapshot.source_kind() != ReadSnapshotSourceKind::RetainedDurable
+            || snapshot.scope().purpose() != MetadataPinPurpose::Verification
+            || snapshot.owner_id() != snapshot.tenant_id()
+            || snapshot.pack_mode() != pack_contract::PACK_MODE_VERIFIED
+            || !snapshot.complete_registered_pack_membership()
+            || snapshot.pack_count() <= 0
+        {
+            return Err(RefStoreError::Unsupported(
+                "retained serving materialization requires a complete pack-verified snapshot",
+            ));
+        }
+        let binding = snapshot.materialization_digest();
+        let native = self
+            .materialize_native(
+                &snapshot,
+                &binding,
+                "native materialization did not cover every registered serving pack",
+                deadline,
+            )
+            .await?;
+        Ok(RetainedServingPreparation {
+            snapshot,
+            binding,
+            native,
+            cluster_incarnation,
+        })
+    }
+
+    /// Final fresh-clock pin liveness in the caller's already-authorized T2
+    /// transaction. The exact pin row is already `FOR SHARE` from the snapshot
+    /// read; this helper re-locks it in the same transaction and compares the
+    /// immutable scope/generation against a fresh database clock after all
+    /// potentially slow pack reads.
+    pub(crate) async fn ensure_retained_serving_live(
+        &self,
+        tx: &Transaction<'_>,
+        reference: &PackSnapshotRef,
+        snapshot: &PackReadSnapshot,
+        deadline: Instant,
+    ) -> Result<(), RefStoreError> {
+        pg::before_deadline(deadline, async {
+            let pin = snapshot_sql::pin_for_share(tx, reference.pin_id(), reference.repository_id())
+                .await?
+                .ok_or(RefStoreError::MetadataPinNotFound { pin_id: reference.pin_id() })?;
+            let row = tx
+                .query_one("SELECT (extract(epoch FROM clock_timestamp())*1000000)::bigint", &[])
+                .await
+                .map_err(pg::db_error)?;
+            let now: i64 = row.get(0);
+            pin.ensure_scope(snapshot.scope(), snapshot.snapshot_id())?;
+            pin.ensure_live(reference.expected_generation())?;
+            if pin.expires_at_unix_micros <= now {
+                return Err(RefStoreError::MetadataPinExpired { pin_id: pin.pin_id, generation: pin.generation });
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Materialize one complete Git read snapshot.
@@ -181,30 +347,14 @@ impl PgPackSnapshotMaterializer {
         // one deadline still bounds T1, every SQL stage, every Blob GET, every
         // native Git child and T2. The complete T1 binding is passed explicitly
         // into the opaque closure.
-        let t1_digest = prepared.binding_hex();
         let native = self
-            .engine
-            .materialize(
-                &NativeReadRequest {
-                    format: prepared.snapshot.scope().object_format(),
-                    head_ref: prepared.snapshot.head_ref(),
-                    head_oid: prepared.snapshot.head_oid_hex(),
-                    refs: prepared.snapshot.refs(),
-                    packs: prepared.snapshot.packs(),
-                    read_digest: &t1_digest,
-                },
-                deadline.into_std(),
+            .materialize_native(
+                &prepared.snapshot,
+                &prepared.binding,
+                "native materialization did not cover every registered pack",
+                deadline,
             )
-            .await
-            .map_err(map_native_error)?;
-        if i64::try_from(native.verified_pairs()).unwrap_or(i64::MAX) != prepared.snapshot.pack_count() {
-            return Err(RefStoreError::Database("native materialization did not cover every registered pack".into()));
-        }
-        if native.retained_bytes(deadline.into_std()).await.map_err(map_native_error)?
-            > pack_commit::contract::VERIFIER_VIEW_MAX_LOGICAL_BYTES
-        {
-            return Err(RefStoreError::Unsupported("materialized view exceeds its workspace bound"));
-        }
+            .await?;
 
         // (T2) Fresh locked revalidation at the very end, still under the one
         // effective deadline. The opaque public value is sealed while the pin
@@ -254,32 +404,14 @@ impl PgPackSnapshotMaterializer {
 
         // Actual Blob + native Git closure, outside every PostgreSQL lease and
         // bounded by the same absolute deadline as the capture and T2.
-        let binding_hex = registered.binding.as_hex();
         let native = self
-            .engine
-            .materialize(
-                &NativeReadRequest {
-                    format: registered.snapshot.scope().object_format(),
-                    head_ref: registered.snapshot.head_ref(),
-                    head_oid: registered.snapshot.head_oid_hex(),
-                    refs: registered.snapshot.refs(),
-                    packs: registered.snapshot.packs(),
-                    read_digest: &binding_hex,
-                },
-                deadline.into_std(),
+            .materialize_native(
+                &registered.snapshot,
+                &registered.binding,
+                "native materialization did not cover every captured serving pack",
+                deadline,
             )
-            .await
-            .map_err(map_native_error)?;
-        if i64::try_from(native.verified_pairs()).unwrap_or(i64::MAX) != registered.snapshot.pack_count() {
-            return Err(RefStoreError::Database(
-                "native materialization did not cover every captured serving pack".into(),
-            ));
-        }
-        if native.retained_bytes(deadline.into_std()).await.map_err(map_native_error)?
-            > pack_commit::contract::VERIFIER_VIEW_MAX_LOGICAL_BYTES
-        {
-            return Err(RefStoreError::Unsupported("materialized view exceeds its workspace bound"));
-        }
+            .await?;
         match self.revalidate_serving(pool, &registered, capture_incarnation, native, deadline).await? {
             Some(view) => Ok(Some(view)),
             None => Err(RefStoreError::Database("serving read transaction cleanup left no view".into())),

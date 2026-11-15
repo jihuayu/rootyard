@@ -29,10 +29,10 @@ use rootyard::ref_store::core::pack_commit::{
 };
 use rootyard::ref_store::core::{
     CreateMetadataSnapshotOutcome, CreateMetadataSnapshotRequest, CreatePackSnapshotRequest, MetadataPinOutcome,
-    MetadataReceipt, MetadataReceiptLookup, MetadataSnapshotPage, MetadataSnapshotScope, PackReadSnapshot,
-    PackSnapshotExpectation, PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceiptQuery, PackSnapshotRef,
-    PgPackSnapshot, PgRefStoreCore, ReadMetadataSnapshotPageRequest, ReleaseMetadataPinRequest,
-    RenewMetadataPinRequest,
+    MaterializedPackRead, MetadataReceipt, MetadataReceiptLookup, MetadataSnapshotPage, MetadataSnapshotScope,
+    PackReadSnapshot, PackSnapshotExpectation, PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceiptQuery,
+    PackSnapshotRef, PgPackSnapshot, PgPackSnapshotMaterializer, PgRefStoreCore, ReadMetadataSnapshotPageRequest,
+    ReleaseMetadataPinRequest, RenewMetadataPinRequest,
 };
 use rootyard::ref_store::serving::{
     PgServingSnapshotMetadata, ProvisionRequest, ServingSnapshotCreate, ServingSnapshotRead,
@@ -44,6 +44,7 @@ use rootyard::ref_store::{
     RefTarget, RefUpdate, RequestDigest, VersionCheck,
 };
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant as StdInstant};
@@ -76,6 +77,24 @@ fn open_store() -> Result<BlobStore> {
     let profile = BlobProfile::from_env().map_err(|error| anyhow!("ROOTYARD_BLOB_* profile rejected: {error}"))?;
     ensure!(profile.provider() == BlobProvider::S3, "ROOTYARD_BLOB_SERVICE must be s3 for this suite");
     BlobStore::open(profile).map_err(|error| anyhow!("configured Blob store rejected: {error}"))
+}
+static BLOB_ROOT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Open the configured provider at a different root prefix: a real distinct
+/// physical backend identity without provider IO. The environment is restored
+/// before returning.
+fn store_with_root(root: &str) -> Result<BlobStore> {
+    let _guard = BLOB_ROOT_ENV.lock().unwrap_or_else(|poison| poison.into_inner());
+    let previous = std::env::var_os("ROOTYARD_BLOB_ROOT");
+    // SAFETY: this fixture serializes its temporary root mutation with the
+    // local mutex and restores the prior value before returning.
+    unsafe { std::env::set_var("ROOTYARD_BLOB_ROOT", root) };
+    let opened = open_store();
+    match previous {
+        Some(value) => unsafe { std::env::set_var("ROOTYARD_BLOB_ROOT", value) },
+        None => unsafe { std::env::remove_var("ROOTYARD_BLOB_ROOT") },
+    }
+    opened
 }
 fn random_key() -> i64 {
     i64::from_be_bytes(Uuid::new_v4().into_bytes()[..8].try_into().expect("eight bytes"))
@@ -521,6 +540,29 @@ impl GitRepo {
         PairFiles::new(pack, self.artifacts_dir()?.join(format!("{name}.idx")))
     }
 }
+/// Reconstruct a disposable Git object view from the exact verified local
+/// pack/index bytes returned by the materializer, then read the historical file
+/// through real Git. This is a fixture check of actual old content, not a
+/// product path: only the materializer's opaque bytes are used.
+async fn read_materialized_file(
+    view: &MaterializedPackRead,
+    git: &Path,
+    oid: &str,
+    path: &str,
+) -> Result<Vec<u8>> {
+    let repo = GitRepo::new(git.to_path_buf(), view.scope().object_format()).await?;
+    let pack_dir = repo.bare.join("objects/pack");
+    std::fs::create_dir_all(&pack_dir)?;
+    for pack in view.packs() {
+        let pack_id = pack.pack_id();
+        let stem = format!("pack-{}", pack_id.simple());
+        std::fs::write(pack_dir.join(format!("{stem}.pack")), view.pack_bytes(pack_id, deadline()).await?)?;
+        std::fs::write(pack_dir.join(format!("{stem}.idx")), view.idx_bytes(pack_id, deadline()).await?)?;
+    }
+    let spec = format!("{oid}:{path}");
+    repo.run(&["cat-file", "-p", spec.as_str()], None).await
+}
+
 struct PairFiles {
     pack: PathBuf,
     idx: PathBuf,
@@ -1115,6 +1157,16 @@ async fn metadata_ledger_snapshot(pool: &Pool, repo: Uuid, tenant: Uuid) -> Resu
     })
 }
 
+fn expect_materialization_failure<T>(
+    label: &str,
+    result: Result<T, rootyard::Error>,
+) -> Result<rootyard::Error> {
+    match result {
+        Ok(_) => Err(anyhow!("{label}: materialization unexpectedly returned a view")),
+        Err(error) => Ok(error),
+    }
+}
+
 fn expect_forbidden<T>(label: &str, result: Result<T, rootyard::Error>) -> Result<()> {
     match result {
         Err(error)
@@ -1418,6 +1470,72 @@ impl Drop for GateBlock {
         }
     }
 }
+
+/// Fixture-only native pause at the FIRST real trusted-Git invocation. The
+/// wrapper then execs the actual Git binary with the original argv, so it only
+/// delays real materialization; it cannot fabricate closure evidence.
+struct NativeGate {
+    dir: tempfile::TempDir,
+}
+
+impl NativeGate {
+    fn new(real_git: &Path) -> Result<Self> {
+        ensure!(real_git.is_absolute(), "trusted git must be absolute");
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join("git-pause");
+        let body = format!(
+            "#!/bin/sh\n\
+             set -eu\n\
+             if [ ! -e '{mark}' ]; then\n\
+             \x20 : > '{ready}'\n\
+             \x20 S=/bin/sleep\n\
+             \x20 [ -x \"$S\" ] || S=/usr/bin/sleep\n\
+             \x20 while [ ! -e '{release}' ]; do \"$S\" 0.02 || :; done\n\
+             \x20 : > '{mark}'\n\
+             fi\n\
+             exec '{real}' \"$@\"\n",
+            mark = dir.path().join("gated").display(),
+            ready = dir.path().join("ready").display(),
+            release = dir.path().join("release").display(),
+            real = real_git.display(),
+        );
+        std::fs::write(&script, body)?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+        Ok(Self { dir })
+    }
+
+    fn binary(&self) -> PathBuf {
+        self.dir.path().join("git-pause")
+    }
+
+    fn materializer(&self, store: &BlobStore) -> Result<PgPackSnapshotMaterializer> {
+        Ok(PgPackSnapshotMaterializer::new(store.clone(), self.binary())?)
+    }
+
+    async fn wait_ready(&self) -> Result<()> {
+        let ready = self.dir.path().join("ready");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("materialization never reached its first native Git invocation"))?;
+        Ok(())
+    }
+
+    fn release(&self) -> Result<()> {
+        std::fs::write(self.dir.path().join("release"), b"go")?;
+        Ok(())
+    }
+}
+
+impl Drop for NativeGate {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.dir.path().join("release"), b"go");
+    }
+}
+
 async fn scenario_assert_sqlstate(pool: &Pool, statement: &str, expected: &str) -> Result<()> {
     let error = pool.get().await?.batch_execute(statement).await.expect_err("statement must be refused");
     ensure!(error.code().map(|code| code.code()) == Some(expected), "unexpected SQLSTATE: {error}");
@@ -4012,6 +4130,699 @@ async fn serving_check_version_absolute_deadline_bounds_two_sequential_auth_lock
         let _ = release_row_lock(first.take()).await;
         let _ = release_row_lock(second.take()).await;
         attempted
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_retained_materialization_old_capture_survives_ref_advance() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, _backend) = db.serving_business("serving-materialize", &store).await?;
+        let mut verified = serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let first_oid = verified.commit_oid.clone();
+        let first_revision = verified.gate.revision();
+        let first_pack = verified.new_packs[0].clone();
+        let first_pack_bytes = std::fs::read(verified.fixture.artifacts_dir()?.join("first.pack"))?;
+        let first_idx_bytes = std::fs::read(verified.fixture.artifacts_dir()?.join("first.idx"))?;
+        let owner = actor.username.clone();
+        let name = "serving-materialize".to_string();
+
+        let created = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "materialize-old".into(),
+                    lease_seconds: 300,
+                },
+                store.backend_identity(),
+                deadline(),
+            )
+            .await?;
+        let snapshot_id = created.receipt.snapshot_id();
+        let materializer = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
+
+        let old = PgServingSnapshotMetadata
+            .materialize(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
+                &materializer,
+                deadline(),
+            )
+            .await?;
+        ensure!(old.complete_git_read_snapshot(), "old retained view is not complete");
+        ensure!(old.gate_revision() == first_revision, "old retained view took a newer gate");
+        ensure!(old.pack_count() == 1 && old.ref_count() == 1, "old retained view shape differs");
+        assert_pack_identity(&first_pack, &old.packs()[0])?;
+        ensure!(old.pack_bytes(first_pack.pack_id(), deadline()).await? == first_pack_bytes, "old pack bytes differ");
+        ensure!(old.idx_bytes(first_pack.pack_id(), deadline()).await? == first_idx_bytes, "old idx bytes differ");
+        ensure!(
+            read_materialized_file(&old, &git, &first_oid, "file.txt").await? == b"serving snapshot fixture\n",
+            "old materialized file bytes differ"
+        );
+        let old_digest = old.read_digest_hex();
+
+        serving_advance(&db, &store, &git, &mut verified, &actor.identity, 2, b"retained advance\n").await?;
+        ensure!(verified.gate.revision() > first_revision, "same-realm advance did not move the gate");
+        let new_oid = verified.commit_oid.clone();
+        let advance_pack = verified.new_packs[0].clone();
+        let advance_pack_bytes = std::fs::read(verified.fixture.artifacts_dir()?.join("advance.pack"))?;
+        let advance_idx_bytes = std::fs::read(verified.fixture.artifacts_dir()?.join("advance.idx"))?;
+
+        let old_after = PgServingSnapshotMetadata
+            .materialize(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
+                &materializer,
+                deadline(),
+            )
+            .await?;
+        ensure!(old_after.gate_revision() == first_revision, "old view took the advanced gate");
+        ensure!(old_after.head_oid_hex() == Some(first_oid.as_str()), "old view HEAD changed");
+        ensure!(
+            old_after.refs().len() == 1 && old_after.refs()[0].oid_hex() == first_oid.as_str(),
+            "old view refs changed"
+        );
+        ensure!(old_after.read_digest_hex() == old_digest, "old retained binding changed after advance");
+        assert_pack_identity(&first_pack, &old_after.packs()[0])?;
+        ensure!(
+            old_after.pack_bytes(first_pack.pack_id(), deadline()).await? == first_pack_bytes,
+            "old pack bytes changed after advance"
+        );
+        ensure!(
+            old_after.idx_bytes(first_pack.pack_id(), deadline()).await? == first_idx_bytes,
+            "old idx bytes changed after advance"
+        );
+        ensure!(
+            read_materialized_file(&old_after, &git, &first_oid, "file.txt").await?
+                == b"serving snapshot fixture\n",
+            "old materialized file bytes changed after advance"
+        );
+
+        let new_created = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "materialize-new".into(),
+                    lease_seconds: 300,
+                },
+                store.backend_identity(),
+                deadline(),
+            )
+            .await?;
+        let new_view = PgServingSnapshotMetadata
+            .materialize(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRead {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    snapshot_id: new_created.receipt.snapshot_id(),
+                },
+                &materializer,
+                deadline(),
+            )
+            .await?;
+        ensure!(new_view.gate_revision() == verified.gate.revision(), "new view gate differs");
+        ensure!(new_view.head_oid_hex() == Some(new_oid.as_str()), "new view HEAD differs");
+        ensure!(new_view.pack_count() == 2 && new_view.packs().len() == 2, "new view pack set differs");
+        for expected in [&first_pack, &advance_pack] {
+            let actual = new_view
+                .packs()
+                .iter()
+                .find(|pack| pack.pack_id() == expected.pack_id())
+                .ok_or_else(|| anyhow!("new view omitted a registered pack"))?;
+            assert_pack_identity(expected, actual)?;
+        }
+        ensure!(
+            new_view.pack_bytes(first_pack.pack_id(), deadline()).await? == first_pack_bytes
+                && new_view.idx_bytes(first_pack.pack_id(), deadline()).await? == first_idx_bytes,
+            "new view did not retain the old pack pair"
+        );
+        ensure!(
+            new_view.pack_bytes(advance_pack.pack_id(), deadline()).await? == advance_pack_bytes
+                && new_view.idx_bytes(advance_pack.pack_id(), deadline()).await? == advance_idx_bytes,
+            "new view did not retain the advance pack pair"
+        );
+        ensure!(
+            read_materialized_file(&new_view, &git, &new_oid, "advance.txt").await? == b"retained advance\n",
+            "new materialized file bytes differ"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_retained_materialization_refuses_state_backend_and_scope() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-refuse", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let owner = actor.username.clone();
+        let name = "serving-materialize-refuse".to_string();
+        let materializer = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
+
+        let released = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "materialize-released".into(),
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        PgServingSnapshotMetadata
+            .release(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRelease {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    snapshot_id: released.receipt.snapshot_id(),
+                    idempotency_key: "materialize-release".into(),
+                    expected_generation: 1,
+                    reason: PinReleaseReason::ClientDone,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+
+        let expired = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "materialize-expired".into(),
+                    lease_seconds: 1,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        wait_for_pin_expiry(&db.pool, repo, expired.receipt.pin_id()).await?;
+
+        let active = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "materialize-active".into(),
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        let active_snapshot = active.receipt.snapshot_id();
+        let baseline = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+
+        let released_error = expect_materialization_failure(
+            "released materialization",
+            PgServingSnapshotMetadata
+                .materialize(
+                    &db.pool,
+                    &actor.identity,
+                    ServingSnapshotRead {
+                        owner: owner.clone(),
+                        name: name.clone(),
+                        snapshot_id: released.receipt.snapshot_id(),
+                    },
+                    &materializer,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(released_error.0 == axum::http::StatusCode::CONFLICT, "released materialization status changed");
+        let expired_error = expect_materialization_failure(
+            "expired materialization",
+            PgServingSnapshotMetadata
+                .materialize(
+                    &db.pool,
+                    &actor.identity,
+                    ServingSnapshotRead {
+                        owner: owner.clone(),
+                        name: name.clone(),
+                        snapshot_id: expired.receipt.snapshot_id(),
+                    },
+                    &materializer,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(expired_error.0 == axum::http::StatusCode::CONFLICT, "expired materialization status changed");
+
+        let nonadmin = db.collaborator(repo, tenant, "write").await?;
+        let nonadmin_error = expect_materialization_failure(
+            "non-admin materialization",
+            PgServingSnapshotMetadata
+                .materialize(
+                    &db.pool,
+                    &nonadmin,
+                    ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: active_snapshot },
+                    &materializer,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(
+            nonadmin_error.0 == axum::http::StatusCode::FORBIDDEN
+                && nonadmin_error.1 == "insufficient repository role",
+            "non-admin materialization denial changed"
+        );
+
+        let (write_only, _) = db
+            .restricted_identity_with(repo, actor.id, &actor.username, &["contents_write"], false)
+            .await?;
+        let scope_error = expect_materialization_failure(
+            "missing ContentsRead materialization",
+            PgServingSnapshotMetadata
+                .materialize(
+                    &db.pool,
+                    &write_only,
+                    ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: active_snapshot },
+                    &materializer,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(
+            scope_error.0 == axum::http::StatusCode::FORBIDDEN
+                && scope_error.1 == "token scope does not permit this action",
+            "missing ContentsRead materialization denial changed"
+        );
+
+        let wrong_store = store_with_root("serving-materialize-wrong")?;
+        let wrong_materializer = PgPackSnapshotMaterializer::new(wrong_store, git.clone())?;
+        let backend_error = expect_materialization_failure(
+            "wrong backend materialization",
+            PgServingSnapshotMetadata
+                .materialize(
+                    &db.pool,
+                    &actor.identity,
+                    ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id: active_snapshot },
+                    &wrong_materializer,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(
+            backend_error.0 == axum::http::StatusCode::CONFLICT
+                && backend_error.1 == "repository is bound to a different Blob backend",
+            "wrong backend materialization denial changed"
+        );
+
+        let (_, _other_repo, other_actor, _) =
+            db.serving_business("serving-materialize-other", &store).await?;
+        let foreign_error = expect_materialization_failure(
+            "foreign snapshot materialization",
+            PgServingSnapshotMetadata
+                .materialize(
+                    &db.pool,
+                    &other_actor.identity,
+                    ServingSnapshotRead {
+                        owner: other_actor.username.clone(),
+                        name: "serving-materialize-other".into(),
+                        snapshot_id: active_snapshot,
+                    },
+                    &materializer,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(
+            foreign_error.0 == axum::http::StatusCode::NOT_FOUND && foreign_error.1 == "not found",
+            "foreign snapshot materialization denial changed"
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == baseline,
+            "retained materialization refusals changed durable state"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_retained_materialization_late_scope_denial_has_no_view() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-late", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let owner = actor.username.clone();
+        let name = "serving-materialize-late".to_string();
+        let created = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "materialize-late".into(),
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        let snapshot_id = created.receipt.snapshot_id();
+        let (restricted, token_id) = db.restricted_identity(repo, actor.id, &actor.username).await?;
+        let baseline = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        let gate = NativeGate::new(&git)?;
+        let materializer = gate.materializer(&store)?;
+        let future = PgServingSnapshotMetadata.materialize(
+            &db.pool,
+            &restricted,
+            ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
+            &materializer,
+            deadline(),
+        );
+        tokio::pin!(future);
+        tokio::select! {
+            result = &mut future => {
+                let _ = result;
+                return Err(anyhow!("materialization completed before its native pause"));
+            }
+            ready = gate.wait_ready() => ready?,
+        }
+
+        let mut narrow = db.pool.get().await?;
+        let tx = narrow.transaction().await?;
+        tx.execute(
+            "DELETE FROM token_repository_scopes
+              WHERE token_id=$1 AND repository_id=$2 AND action='contents_read'",
+            &[&token_id, &repo],
+        )
+        .await?;
+        tx.execute("UPDATE tokens SET scope_version=scope_version+1 WHERE id=$1", &[&token_id]).await?;
+        tx.commit().await?;
+        gate.release()?;
+
+        let result = tokio::time::timeout(Duration::from_secs(30), future)
+            .await
+            .map_err(|_| anyhow!("late-scope materialization did not settle after its native gate released"))?;
+        let error = expect_materialization_failure("late ContentsRead materialization", result)?;
+        ensure!(
+            error.0 == axum::http::StatusCode::FORBIDDEN
+                && error.1 == "token scope does not permit this action",
+            "late materialization denial was not the common late-scope 403"
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == baseline,
+            "late denied materialization changed durable state"
+        );
+        let remaining: i64 = db
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT count(*) FROM token_repository_scopes
+                  WHERE token_id=$1 AND repository_id=$2 AND action='contents_read'",
+                &[&token_id, &repo],
+            )
+            .await?
+            .get(0);
+        ensure!(remaining == 0, "late narrowing did not commit the removed read grant");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_retained_materialization_generation_change_has_no_view() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-gen", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let owner = actor.username.clone();
+        let name = "serving-materialize-gen".to_string();
+        let created = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "materialize-gen".into(),
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        let snapshot_id = created.receipt.snapshot_id();
+        let gate = NativeGate::new(&git)?;
+        let materializer = gate.materializer(&store)?;
+        let future = PgServingSnapshotMetadata.materialize(
+            &db.pool,
+            &actor.identity,
+            ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
+            &materializer,
+            deadline(),
+        );
+        tokio::pin!(future);
+        tokio::select! {
+            result = &mut future => {
+                let _ = result;
+                return Err(anyhow!("materialization completed before its native pause"));
+            }
+            ready = gate.wait_ready() => ready?,
+        }
+        let renewed = PgServingSnapshotMetadata
+            .renew(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotRenew {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    snapshot_id,
+                    idempotency_key: "materialize-gen-renew".into(),
+                    expected_generation: 1,
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        ensure!(renewed.receipt.pin_generation() == 2, "generation race did not renew the pin");
+        let after_renew = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        gate.release()?;
+        let result = tokio::time::timeout(Duration::from_secs(30), future)
+            .await
+            .map_err(|_| anyhow!("generation-race materialization did not settle after native gate release"))?;
+        let error = expect_materialization_failure("generation-race materialization", result)?;
+        ensure!(
+            error.0 == axum::http::StatusCode::CONFLICT,
+            "generation-race materialization was not a conflict"
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == after_renew,
+            "generation-race materialization changed durable state after renewal"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_retained_materialization_cluster_change_has_no_view() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-cluster", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let owner = actor.username.clone();
+        let name = "serving-materialize-cluster".to_string();
+        let created = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "materialize-cluster".into(),
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        let snapshot_id = created.receipt.snapshot_id();
+        let old_incarnation: Uuid = db
+            .pool
+            .get()
+            .await?
+            .query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
+            .await?
+            .get(0);
+        let gate = NativeGate::new(&git)?;
+        let materializer = gate.materializer(&store)?;
+        let future = PgServingSnapshotMetadata.materialize(
+            &db.pool,
+            &actor.identity,
+            ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
+            &materializer,
+            deadline(),
+        );
+        tokio::pin!(future);
+        tokio::select! {
+            result = &mut future => {
+                let _ = result;
+                return Err(anyhow!("materialization completed before its native pause"));
+            }
+            ready = gate.wait_ready() => ready?,
+        }
+        let new_incarnation = Uuid::new_v4();
+        let restore = db.pool.get().await?;
+        db.pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE public.cluster_authority
+                    SET incarnation=$1, rotated_at=clock_timestamp() WHERE singleton=true",
+                &[&new_incarnation],
+            )
+            .await?;
+        let release_result = gate.release();
+        let result = tokio::time::timeout(Duration::from_secs(30), future).await;
+        let restore_result = restore
+            .execute(
+                "UPDATE public.cluster_authority
+                    SET incarnation=$1, rotated_at=clock_timestamp() WHERE singleton=true",
+                &[&old_incarnation],
+            )
+            .await;
+        restore_result?;
+        release_result?;
+        let result = result
+            .map_err(|_| anyhow!("cluster-race materialization did not settle after native gate release"))?;
+        let error = expect_materialization_failure("cluster-race materialization", result)?;
+        ensure!(
+            error.0 == axum::http::StatusCode::CONFLICT,
+            "cluster-race materialization was not a conflict"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
+async fn serving_retained_materialization_realm_change_has_no_view() -> Result<()> {
+    let db = Db::setup().await?;
+    let outcome = async {
+        let store = open_store()?;
+        let git = git_binary()?;
+        let (tenant, repo, actor, backend) = db.serving_business("serving-materialize-realm", &store).await?;
+        serving_verified(&db, &store, &git, tenant, repo, &actor.identity, GitObjectFormat::Sha1).await?;
+        let owner = actor.username.clone();
+        let name = "serving-materialize-realm".to_string();
+        let created = PgServingSnapshotMetadata
+            .create(
+                &db.pool,
+                &actor.identity,
+                ServingSnapshotCreate {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    idempotency_key: "materialize-realm".into(),
+                    lease_seconds: 300,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        let snapshot_id = created.receipt.snapshot_id();
+        let old_epoch: i64 = db
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT authority_epoch FROM ref_store_core_gates WHERE repository_id=$1",
+                &[&repo],
+            )
+            .await?
+            .get(0);
+        let gate = NativeGate::new(&git)?;
+        let materializer = gate.materializer(&store)?;
+        let future = PgServingSnapshotMetadata.materialize(
+            &db.pool,
+            &actor.identity,
+            ServingSnapshotRead { owner: owner.clone(), name: name.clone(), snapshot_id },
+            &materializer,
+            deadline(),
+        );
+        tokio::pin!(future);
+        tokio::select! {
+            result = &mut future => {
+                let _ = result;
+                return Err(anyhow!("materialization completed before its native pause"));
+            }
+            ready = gate.wait_ready() => ready?,
+        }
+        let new_epoch = old_epoch + 1;
+        db.pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE ref_store_core_gates SET authority_epoch=$1 WHERE repository_id=$2",
+                &[&new_epoch, &repo],
+            )
+            .await?;
+        let release_result = gate.release();
+        let result = tokio::time::timeout(Duration::from_secs(30), future).await;
+        let restore_result = db
+            .pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE ref_store_core_gates SET authority_epoch=$1 WHERE repository_id=$2",
+                &[&old_epoch, &repo],
+            )
+            .await;
+        restore_result?;
+        release_result?;
+        let result = result
+            .map_err(|_| anyhow!("realm-race materialization did not settle after native gate release"))?;
+        let _ = expect_materialization_failure("realm-race materialization", result)?;
+        Ok::<(), anyhow::Error>(())
     }
     .await;
     db.finish(outcome).await
