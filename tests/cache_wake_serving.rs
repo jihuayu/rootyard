@@ -180,7 +180,7 @@ async fn standalone_memory_has_no_redis_dependency_and_isolates_authorities() {
     assert_ne!(gitfs_val, pando_val);
 
     let (cached_gitfs, o3) = cache
-        .get_or_load_json(
+        .get_or_load_json::<SampleView, _, _, _>(
             &gitfs_key,
             None,
             |_: &StatusCode| false,
@@ -231,15 +231,19 @@ async fn outage_flush_corrupt_payload_and_breaker_degrade_cleanly_to_origin_and_
         Ok::<_, StatusCode>(SampleView { oid: format!("oid-{count}"), rev })
     };
 
-    let (v1, out1) =
-        cache.get_or_load_json(&key, None, |s| s.is_server_error(), || load(origin_calls.clone(), 1)).await.unwrap();
+    let (v1, out1) = cache
+        .get_or_load_json(&key, None, |s: &StatusCode| s.is_server_error(), || load(origin_calls.clone(), 1))
+        .await
+        .unwrap();
     assert_eq!(out1, CacheOutcome::OriginRefill);
     assert_eq!(v1.oid, "oid-1");
 
     // Simulate Redis FLUSHALL wiping all keys simultaneously
     mock.flush_all();
-    let (v2, out2) =
-        cache.get_or_load_json(&key, None, |s| s.is_server_error(), || load(origin_calls.clone(), 2)).await.unwrap();
+    let (v2, out2) = cache
+        .get_or_load_json(&key, None, |s: &StatusCode| s.is_server_error(), || load(origin_calls.clone(), 2))
+        .await
+        .unwrap();
     assert_eq!(out2, CacheOutcome::OriginRefill);
     assert_eq!(v2.oid, "oid-2");
 
@@ -251,31 +255,39 @@ async fn outage_flush_corrupt_payload_and_breaker_degrade_cleanly_to_origin_and_
             None,
         )
         .await;
-    let (v_strict, out_strict) =
-        cache.get_or_load_json(&key, None, |s| s.is_server_error(), || load(origin_calls.clone(), 3)).await.unwrap();
+    let (v_strict, out_strict) = cache
+        .get_or_load_json(&key, None, |s: &StatusCode| s.is_server_error(), || load(origin_calls.clone(), 3))
+        .await
+        .unwrap();
     assert_eq!(out_strict, CacheOutcome::OriginRefill);
     assert_eq!(v_strict.oid, "oid-3");
     assert!(cache.stats().corrupt_values >= 1);
 
     // Corrupt payload on read is treated as a miss, evicted, and repaired from origin
     mock.set_mode(MockMode::CorruptRead);
-    let (v3, out3) =
-        cache.get_or_load_json(&key, None, |s| s.is_server_error(), || load(origin_calls.clone(), 4)).await.unwrap();
+    let (v3, out3) = cache
+        .get_or_load_json(&key, None, |s: &StatusCode| s.is_server_error(), || load(origin_calls.clone(), 4))
+        .await
+        .unwrap();
     assert_eq!(out3, CacheOutcome::OriginRefill);
     assert_eq!(v3.oid, "oid-4");
     assert!(cache.stats().corrupt_values >= 2);
 
     // Outage triggers advisory breaker and still serves origin without failing reads
     mock.set_mode(MockMode::Outage);
-    let (v4, out4) =
-        cache.get_or_load_json(&key, None, |s| s.is_server_error(), || load(origin_calls.clone(), 5)).await.unwrap();
+    let (v4, out4) = cache
+        .get_or_load_json(&key, None, |s: &StatusCode| s.is_server_error(), || load(origin_calls.clone(), 5))
+        .await
+        .unwrap();
     assert_eq!(out4, CacheOutcome::OriginDegraded);
     assert_eq!(v4.oid, "oid-5");
     assert!(cache.is_advisory_breaker_open());
 
     let skips_before = cache.stats().breaker_skips;
-    let (v5, out5) =
-        cache.get_or_load_json(&key, None, |s| s.is_server_error(), || load(origin_calls.clone(), 6)).await.unwrap();
+    let (v5, out5) = cache
+        .get_or_load_json(&key, None, |s: &StatusCode| s.is_server_error(), || load(origin_calls.clone(), 6))
+        .await
+        .unwrap();
     assert_eq!(out5, CacheOutcome::OriginDegraded);
     assert_eq!(v5.oid, "oid-6");
     assert!(cache.stats().breaker_skips > skips_before);
@@ -283,17 +295,19 @@ async fn outage_flush_corrupt_payload_and_breaker_degrade_cleanly_to_origin_and_
     // Restore backend and allow breaker cooldown to lapse -> recovers automatically
     mock.set_mode(MockMode::Healthy);
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let (v6, out6) =
-        cache.get_or_load_json(&key, None, |s| s.is_server_error(), || load(origin_calls.clone(), 7)).await.unwrap();
+    let (v6, out6) = cache
+        .get_or_load_json(&key, None, |s: &StatusCode| s.is_server_error(), || load(origin_calls.clone(), 7))
+        .await
+        .unwrap();
     assert_eq!(out6, CacheOutcome::OriginRefill);
     assert_eq!(v6.oid, "oid-7");
     assert!(!cache.is_advisory_breaker_open());
 
     let (v7, out7) = cache
-        .get_or_load_json(
+        .get_or_load_json::<SampleView, _, _, _>(
             &key,
             None,
-            |s| s.is_server_error(),
+            |s: &StatusCode| s.is_server_error(),
             || async {
                 panic!("recovered cache must hit without touching origin");
             },

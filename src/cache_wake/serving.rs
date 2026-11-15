@@ -64,20 +64,23 @@ struct Counters {
     breaker_skips: AtomicU64,
 }
 
+#[cfg(feature = "state-redis")]
+struct LazyRedisState {
+    url: Zeroizing<String>,
+    limits: RedisCacheLimits,
+    cell: tokio::sync::OnceCell<RedisCache>,
+}
+
 enum Backend {
-    Memory(MemoryCache),
+    Memory(Box<MemoryCache>),
     Custom {
         kind: CacheBackendKind,
         cache: Arc<dyn AdvisoryCache>,
     },
     #[cfg(feature = "state-redis")]
-    Redis(RedisCache),
+    Redis(Box<RedisCache>),
     #[cfg(feature = "state-redis")]
-    LazyRedis {
-        url: Zeroizing<String>,
-        limits: RedisCacheLimits,
-        cell: tokio::sync::OnceCell<RedisCache>,
-    },
+    LazyRedis(Box<LazyRedisState>),
 }
 
 impl Backend {
@@ -86,19 +89,19 @@ impl Backend {
             Self::Memory(_) => CacheBackendKind::Memory,
             Self::Custom { kind, .. } => *kind,
             #[cfg(feature = "state-redis")]
-            Self::Redis(_) | Self::LazyRedis { .. } => CacheBackendKind::Redis,
+            Self::Redis(_) | Self::LazyRedis(_) => CacheBackendKind::Redis,
         }
     }
 
     async fn resolve(&self) -> Result<&dyn AdvisoryCache> {
         Ok(match self {
-            Self::Memory(cache) => cache,
+            Self::Memory(cache) => cache.as_ref(),
             Self::Custom { cache, .. } => cache.as_ref(),
             #[cfg(feature = "state-redis")]
-            Self::Redis(cache) => cache,
+            Self::Redis(cache) => cache.as_ref(),
             #[cfg(feature = "state-redis")]
-            Self::LazyRedis { url, limits, cell } => {
-                cell.get_or_try_init(|| RedisCache::connect(url.as_str(), *limits)).await?
+            Self::LazyRedis(lazy) => {
+                lazy.cell.get_or_try_init(|| RedisCache::connect(lazy.url.as_str(), lazy.limits)).await?
             }
         })
     }
@@ -163,7 +166,7 @@ impl ServingCache {
 
     pub fn from_memory(limits: CacheLimits) -> Result<Self> {
         let cache = MemoryCache::new(limits)?;
-        Self::build(Backend::Memory(cache), limits)
+        Self::build(Backend::Memory(Box::new(cache)), limits)
     }
 
     pub fn with_advisory_cache(
@@ -176,7 +179,7 @@ impl ServingCache {
 
     #[cfg(feature = "state-redis")]
     pub fn with_redis(redis: RedisCache, limits: CacheLimits) -> Result<Self> {
-        Self::build(Backend::Redis(redis), limits)
+        Self::build(Backend::Redis(Box::new(redis)), limits)
     }
 
     pub async fn from_env() -> Result<Self> {
@@ -240,7 +243,8 @@ impl ServingCache {
             Ok(Err(err)) => return Err(err),
             Err(_) => bail!("Redis startup validation thread panicked"),
         }
-        Self::build(Backend::LazyRedis { url, limits: redis_limits, cell: tokio::sync::OnceCell::new() }, limits)
+        let lazy = LazyRedisState { url, limits: redis_limits, cell: tokio::sync::OnceCell::new() };
+        Self::build(Backend::LazyRedis(Box::new(lazy)), limits)
     }
 
     pub fn backend_kind(&self) -> CacheBackendKind {
