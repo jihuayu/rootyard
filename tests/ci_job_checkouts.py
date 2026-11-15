@@ -790,13 +790,23 @@ class JobCheckoutHarness(SourcePinHarness):
             self.start_mirror()
 
     def _stream_git_until_revoked(
-        self, base, path, token, oid, payload_bytes, revoke, *, check_barrier=True, pause_after_first=0.0
+        self,
+        base,
+        path,
+        token,
+        oid,
+        payload_bytes,
+        revoke,
+        *,
+        check_barrier=True,
+        pause_after_first=0.0,
+        start_barrier=None,
     ):
         def pkt(value):
             return f"{len(value) + 4:04x}".encode() + value
 
         url = urllib.parse.urlsplit(base)
-        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=6)
+        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=15)
         body = pkt(f"want {oid} side-band-64k\n".encode()) + b"0000" + pkt(b"done\n")
         headers = {
             "Authorization": "Bearer " + token["token"],
@@ -810,9 +820,13 @@ class JobCheckoutHarness(SourcePinHarness):
             assert first, "upload-pack returned no data before revocation"
             if check_barrier:
                 assert not self._barrier_available(), "physical GC lock bypassed active Git stream"
+            if start_barrier is not None:
+                start_barrier.wait(timeout=15)
             received = len(first)
             started = time.monotonic()
-            revoke()
+            custom_start = revoke()
+            if custom_start is not None:
+                started = custom_start
             if pause_after_first > 0:
                 time.sleep(pause_after_first)
             interrupted = False
@@ -837,9 +851,11 @@ class JobCheckoutHarness(SourcePinHarness):
         finally:
             connection.close()
 
-    def _stream_lfs_until_revoked(self, base, path, token, expected_size, revoke, *, pause_after_first=1.5):
+    def _stream_lfs_until_revoked(
+        self, base, path, token, expected_size, revoke, *, pause_after_first=1.5, start_barrier=None
+    ):
         url = urllib.parse.urlsplit(base)
-        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=6)
+        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=15)
         try:
             connection.request("GET", path, headers={"Authorization": "Bearer " + token["token"]})
             response = connection.getresponse()
@@ -847,9 +863,13 @@ class JobCheckoutHarness(SourcePinHarness):
             assert int(response.getheader("Content-Length")) == expected_size
             first = response.read(1024)
             assert len(first) == 1024
+            if start_barrier is not None:
+                start_barrier.wait(timeout=15)
             received = len(first)
             started = time.monotonic()
-            revoke()
+            custom_start = revoke()
+            if custom_start is not None:
+                started = custom_start
             time.sleep(pause_after_first)
             interrupted = False
             while time.monotonic() - started < 6:
@@ -987,20 +1007,34 @@ class JobCheckoutHarness(SourcePinHarness):
                 self.sql(f"UPDATE repositories SET storage_generation=1 WHERE id='{repo_id}'")
             self._wait_no_git_children()
 
-            # 5. Concurrent CI ryj_ job cancel + expiry across Git + slow-consumer mirror LFS
+            # 5. Concurrent CI ryj_ job cancel + natural expiry across Git + slow-consumer mirror LFS
             body_a, _, tok_a = self.new_grant(rev_oid)
             body_a_job = body_a["job_id"]
-            body_b, _, tok_b = self.new_grant(rev_oid)
-            for jid in (body_a_job, body_b["job_id"]):
-                self.mirror_expect(
-                    f"/api/repos/alice/demo/ci-checkouts/{jid}/prepare-dependencies",
-                    200,
-                    token=self.alice,
-                    method="POST",
-                    body=b"",
-                )
+            self.mirror_expect(
+                f"/api/repos/alice/demo/ci-checkouts/{body_a_job}/prepare-dependencies",
+                200,
+                token=self.alice,
+                method="POST",
+                body=b"",
+            )
+            exp_b = int(time.time()) + 6
+            body_b, _, tok_b = self.new_grant(rev_oid, expires_unix=exp_b)
+            self.mirror_expect(
+                f"/api/repos/alice/demo/ci-checkouts/{body_b['job_id']}/prepare-dependencies",
+                200,
+                token=self.alice,
+                method="POST",
+                body=b"",
+            )
             ci_git_path = self.path(rev_oid)
             ci_lfs_path = f"/ci/{rev_oid}/git/alice/demo.git/info/lfs/objects/{lfs_oid}"
+            both_streaming = threading.Barrier(2)
+
+            def expire_b():
+                while time.time() <= exp_b + 0.35:
+                    time.sleep(0.05)
+                return time.monotonic()
+
             with ThreadPoolExecutor(max_workers=2) as pool:
                 fut_a = pool.submit(
                     self._stream_git_until_revoked,
@@ -1010,6 +1044,7 @@ class JobCheckoutHarness(SourcePinHarness):
                     rev_oid,
                     pack_size,
                     lambda: self.transition(body_a_job, "cancel"),
+                    start_barrier=both_streaming,
                 )
                 fut_b = pool.submit(
                     self._stream_lfs_until_revoked,
@@ -1017,14 +1052,12 @@ class JobCheckoutHarness(SourcePinHarness):
                     ci_lfs_path,
                     tok_b,
                     len(lfs_bytes),
-                    lambda: self.sql(
-                        f"UPDATE ci_checkout_jobs SET expires_unix={int(time.time()) - 10} "
-                        f"WHERE job_id='{body_b['job_id']}'"
-                    ),
+                    expire_b,
                     pause_after_first=1.6,
+                    start_barrier=both_streaming,
                 )
-                results["concurrent_job_cancel"] = fut_a.result(timeout=15)
-                results["concurrent_job_expired_lfs"] = fut_b.result(timeout=15)
+                results["concurrent_job_cancel"] = fut_a.result(timeout=20)
+                results["concurrent_job_expired_lfs"] = fut_b.result(timeout=25)
             self.mirror_expect(self.advertise(rev_oid), (401, 403), token=tok_a)
             self.mirror_expect(ci_lfs_path, (401, 403), token=tok_b)
             for _ in range(30):
