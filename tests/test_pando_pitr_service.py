@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -110,6 +111,53 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
         self.assert_preflight_failure(report, calls)
         self.assertEqual(report["failure"]["code"], "source_head_mismatch")
 
+    def test_legacy_v1_receipt_without_config_or_toolchain_is_rejected_before_suite(self) -> None:
+        calls: list[str] = []
+
+        def spy(binary: str) -> dict:
+            calls.append(binary)
+            return self.passing_results()
+
+        self.receipt_path.write_text(
+            json.dumps(self.v1_receipt(), indent=2) + "\n", encoding="utf-8"
+        )
+        report = self.run_acceptance(spy)
+        self.assert_preflight_failure(report, calls)
+        self.assertEqual(report["failure"]["code"], "receipt_schema_not_v2")
+
+    def test_v2_missing_config_toolchain_or_file_closure_is_rejected_before_suite(self) -> None:
+        calls: list[str] = []
+
+        def spy(binary: str) -> dict:
+            calls.append(binary)
+            return self.passing_results()
+
+        payload = self.make_v2(workspace_commit=self.commit)
+        for field in ("config_digest", "toolchain", "bound_input_inventory"):
+            with self.subTest(field=field):
+                broken = dict(payload)
+                del broken[field]
+                self.receipt_path.write_text(
+                    json.dumps(broken), encoding="utf-8"
+                )
+                report = self.run_acceptance(spy)
+                self.assert_preflight_failure(report, calls)
+                self.assertEqual(report["failure"]["phase"], "preflight")
+
+    def test_v2_invalid_config_digest_is_rejected_before_suite(self) -> None:
+        calls: list[str] = []
+
+        def spy(binary: str) -> dict:
+            calls.append(binary)
+            return self.passing_results()
+
+        payload = self.make_v2(workspace_commit=self.commit)
+        payload["config_digest"] = "not-a-sha256"
+        self.receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+        report = self.run_acceptance(spy)
+        self.assert_preflight_failure(report, calls)
+        self.assertEqual(report["failure"]["code"], "receipt_invalid")
+
     def test_source_file_closure_drift_fails_before_the_suite(self) -> None:
         calls: list[str] = []
 
@@ -147,6 +195,19 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
         self.assertEqual(report["failure"]["phase"], "postflight")
         self.assertFalse(report["provenance_unchanged"])
         self.assertEqual(report["failure"]["code"], "provenance_changed")
+
+    def test_legacy_v1_receipt_mutation_during_suite_cannot_pass(self) -> None:
+        def mutate(binary: str) -> dict:
+            self.receipt_path.write_text(
+                json.dumps(self.v1_receipt()), encoding="utf-8"
+            )
+            return self.passing_results()
+
+        report = self.run_acceptance(mutate)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failure"]["phase"], "postflight")
+        self.assertEqual(report["failure"]["code"], "receipt_schema_not_v2")
+        self.assertFalse(report["provenance_unchanged"])
 
     def test_false_or_missing_mandatory_case_cannot_pass(self) -> None:
         for missing in (False, True):
@@ -195,6 +256,12 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
         self.assertTrue(report["provenance_unchanged"])
         self.assertEqual(report["provenance"]["before"], report["provenance"]["after"])
         self.assertIn("harnesses", report["provenance"]["before"])
+        self.assertEqual(report["receipt_schema"], "v2")
+        self.assertTrue(report["config_digest"])
+        self.assertTrue(report["bound_inputs_digest"])
+        self.assertTrue(report["toolchain"]["target_triple"])
+        self.assertTrue(report["toolchain"]["cargo_release"])
+        self.assertTrue(report["toolchain"]["rustc_release"])
         topology = json.dumps(report["topology"]).lower()
         for marker in ("in-process", "not external", "logical pg_dump", "not physical"):
             self.assertIn(marker, topology)
@@ -233,6 +300,30 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
 
 
 class PandoPitrServiceTest(unittest.TestCase):
+    def _assert_bound_report(self, report: dict) -> None:
+        if not report.get("passed"):
+            failure = report.get("failure") or {}
+            self.fail(
+                "bound PITR acceptance failed "
+                f"({failure.get('phase', 'unknown')}/"
+                f"{failure.get('code', 'unknown')}/"
+                f"{failure.get('exception_class', 'unknown')})"
+            )
+        self.assertEqual(report.get("receipt_schema"), "v2")
+        self.assertTrue(report.get("config_digest"))
+        self.assertTrue(report.get("bound_inputs_digest"))
+        toolchain = report.get("toolchain") or {}
+        for field in ("target_triple", "cargo_release", "rustc_release"):
+            self.assertTrue(toolchain.get(field), field)
+        self.assertEqual(
+            [case.get("name") for case in report.get("cases", [])],
+            list(pando_pitr_service.MANDATORY_CASES),
+        )
+        for case in report.get("cases", []):
+            self.assertEqual(case.get("status"), "passed")
+        for name in pando_pitr_service.MANDATORY_CASES:
+            self.assertIs(report.get(name), True)
+
     def test_pando_pitr_pg_dump_clone_and_retention_roots(self) -> None:
         in_ci = os.environ.get("GITHUB_ACTIONS") == "true"
         if os.name == "nt" and not in_ci:
@@ -242,20 +333,141 @@ class PandoPitrServiceTest(unittest.TestCase):
                 self.fail("ROOTYARD_TEST_DATABASE_URL is required in GitHub Actions")
             self.skipTest("ROOTYARD_TEST_DATABASE_URL is unset")
         try:
-            binary, _binding = runtime_binary.select_runtime_binary()
+            binary = runtime_binary.select_runtime_binary_path()
         except runtime_binary.RuntimeBinarySelectionError as exc:
+            message = f"prebuilt rootyard binary unavailable ({type(exc).__name__})"
             if in_ci:
-                self.fail(f"prebuilt rootyard binary unavailable in CI: {exc}")
-            self.skipTest(str(exc))
+                self.fail(message)
+            self.skipTest(message)
 
-        report = pando_pitr_service.run_suite(str(binary))
-        self.assertTrue(report["passed"])
-        self.assertTrue(report["clone_fail_closed_zero_deletes"])
-        self.assertTrue(report["operator_isolate_recovered"])
-        self.assertTrue(report["post_isolate_empty_cache_http_browse"])
-        self.assertTrue(report["post_isolate_stock_git_clone_fetch"])
-        self.assertTrue(report["post_isolate_deleted_artifact_refused"])
-        self.assertTrue(report["pitr_epoch_rollback_fenced"])
+        receipt_value = os.environ.get("ROOTYARD_BUILD_RECEIPT")
+        receipt = Path(receipt_value) if receipt_value else binary.with_suffix(".build.json")
+        if not receipt.is_file():
+            message = "build receipt unavailable (receipt_missing)"
+            if in_ci:
+                self.fail(message)
+            self.skipTest(message)
+        expect_commit = (
+            os.environ.get("ROOTYARD_EXPECTED_SOURCE_COMMIT")
+            or os.environ.get("GITHUB_SHA")
+        )
+        if not expect_commit:
+            message = "expected source commit unavailable (expect_commit_missing)"
+            if in_ci:
+                self.fail(message)
+            self.skipTest(message)
+
+        with tempfile.TemporaryDirectory(prefix="rootyard-pando-pitr-unittest-") as temporary:
+            report_path = Path(temporary) / "pando-pitr-service.json"
+            try:
+                report = pando_pitr_service.run_acceptance(
+                    binary=str(binary),
+                    build_receipt=str(receipt),
+                    expect_commit=expect_commit,
+                    report_path=report_path,
+                )
+            except Exception as error:
+                self.fail(f"bound PITR acceptance failed ({type(error).__name__})")
+            self._assert_bound_report(report)
+            try:
+                written = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                self.fail(f"bound PITR report unreadable ({type(error).__name__})")
+            self.assertEqual(written, report)
+
+    def _bound_report(self) -> dict:
+        return {
+            "passed": True,
+            "receipt_schema": "v2",
+            "config_digest": "c" * 64,
+            "bound_inputs_digest": "d" * 64,
+            "toolchain": {
+                "target_triple": "aarch64-unknown-linux-gnu",
+                "cargo_release": "1.101.0",
+                "rustc_release": "1.99.1",
+            },
+            "cases": [
+                {"name": name, "status": "passed"}
+                for name in pando_pitr_service.MANDATORY_CASES
+            ],
+            **{name: True for name in pando_pitr_service.MANDATORY_CASES},
+        }
+
+    def _run_live_wrapper(self, report: dict, *, expect_error: bool = False):
+        with tempfile.TemporaryDirectory(prefix="rootyard-pando-pitr-wrapper-test-") as temporary:
+            binary = Path(temporary) / "rootyard"
+            binary.write_bytes(b"prebuilt-binary")
+            binary.chmod(0o755)
+            receipt = Path(temporary) / "rootyard.build.json"
+            receipt.write_text("{}", encoding="utf-8")
+            env = {
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_SHA": "b" * 40,
+                "ROOTYARD_EXPECTED_SOURCE_COMMIT": COMMIT,
+                "ROOTYARD_BUILD_RECEIPT": str(receipt),
+                "ROOTYARD_TEST_DATABASE_URL": "postgresql://fixture.invalid/example",
+            }
+            calls: list[dict] = []
+
+            def fake_bound(**kwargs) -> dict:
+                calls.append(kwargs)
+                Path(kwargs["report_path"]).write_text(
+                    json.dumps(report), encoding="utf-8"
+                )
+                return report
+
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(runtime_binary, "select_runtime_binary_path",
+                                      return_value=binary), \
+                    mock.patch.object(pando_pitr_service, "run_acceptance",
+                                      side_effect=fake_bound), \
+                    mock.patch.object(pando_pitr_service, "run_suite",
+                                      side_effect=AssertionError("direct suite bypass")):
+                case = PandoPitrServiceTest(
+                    "test_pando_pitr_pg_dump_clone_and_retention_roots"
+                )
+                if expect_error:
+                    with self.assertRaises(AssertionError):
+                        case.test_pando_pitr_pg_dump_clone_and_retention_roots()
+                else:
+                    case.test_pando_pitr_pg_dump_clone_and_retention_roots()
+                self.assertEqual(len(calls), 1)
+            return calls[0], binary, receipt
+
+    def test_live_wrapper_calls_bound_entry_for_exact_binary_receipt_and_commit(self) -> None:
+        kwargs, binary, receipt = self._run_live_wrapper(self._bound_report())
+        self.assertEqual(kwargs["binary"], str(binary))
+        self.assertEqual(kwargs["build_receipt"], str(receipt))
+        self.assertEqual(kwargs["expect_commit"], COMMIT)
+        report_path = Path(kwargs["report_path"])
+        self.assertNotEqual(report_path, ROOT / "test-results" / "pando-pitr-service.json")
+        self.assertIn("rootyard-pando-pitr-unittest-", str(report_path))
+
+    def test_live_wrapper_does_not_fall_back_to_run_suite_on_preflight_refusal(self) -> None:
+        self._run_live_wrapper(
+            {
+                "passed": False,
+                "failure": {
+                    "phase": "preflight",
+                    "code": "receipt_schema_not_v2",
+                    "exception_class": "EvidenceError",
+                },
+            },
+            expect_error=True,
+        )
+
+    def test_live_wrapper_rejects_incomplete_config_and_missing_mandatory_case(self) -> None:
+        invalid = self._bound_report()
+        invalid["config_digest"] = ""
+        self._run_live_wrapper(invalid, expect_error=True)
+
+        missing = self._bound_report()
+        missing["cases"] = [
+            case for case in missing["cases"]
+            if case["name"] != "pitr_epoch_rollback_fenced"
+        ]
+        del missing["pitr_epoch_rollback_fenced"]
+        self._run_live_wrapper(missing, expect_error=True)
 
 
 if __name__ == "__main__":

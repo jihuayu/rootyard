@@ -975,6 +975,37 @@ def _workspace_head(source_root: Path, phase: str = "preflight") -> str:
     return head
 
 
+def _require_complete_v2_closure(validated, phase: str):
+    """Require the full v2 closure the shared reader validated before use."""
+    if getattr(validated, "schema", None) != "v2":
+        raise EvidenceError(phase, "receipt_schema_not_v2")
+    if not isinstance(validated.config_digest, str) or not validated.config_digest:
+        raise EvidenceError(phase, "receipt_config_digest_missing")
+    payload = validated.payload
+    inventory = payload.get("bound_input_inventory")
+    bound = payload.get("bound_inputs")
+    if (
+        not isinstance(inventory, list)
+        or not inventory
+        or not isinstance(bound, dict)
+        or not bound.get("digest")
+    ):
+        raise EvidenceError(phase, "receipt_file_closure_missing")
+    toolchain = validated.toolchain
+    if not isinstance(toolchain, dict):
+        raise EvidenceError(phase, "receipt_toolchain_missing")
+    if not toolchain.get("target_triple"):
+        raise EvidenceError(phase, "receipt_toolchain_incomplete")
+    for name in ("cargo", "rustc"):
+        identity = toolchain.get(name)
+        if not isinstance(identity, dict):
+            raise EvidenceError(phase, "receipt_toolchain_incomplete")
+        for field in ("executable", "executable_sha256", "version", "release", "commit_hash", "host"):
+            if not identity.get(field):
+                raise EvidenceError(phase, "receipt_toolchain_incomplete")
+    return validated
+
+
 def _load_bound_receipt(
     binary: Path,
     build_receipt: Path,
@@ -983,7 +1014,7 @@ def _load_bound_receipt(
     phase: str,
 ):
     try:
-        return receipts.load_receipt(
+        validated = receipts.load_receipt(
             build_receipt,
             source_root=source_root,
             binary_path=binary,
@@ -994,6 +1025,7 @@ def _load_bound_receipt(
         raise EvidenceError(phase, "receipt_invalid") from None
     except OSError:
         raise EvidenceError(phase, "receipt_unreadable") from None
+    return _require_complete_v2_closure(validated, phase)
 
 
 def _harness_identities(harness_files: list[Path], phase: str) -> dict:
@@ -1041,6 +1073,8 @@ def _preflight(
         "source_inputs_sha256": validated.source_inputs_sha256,
         "workspace_commit": validated.workspace_commit,
         "receipt_schema": validated.schema,
+        "config_digest": validated.config_digest,
+        "bound_inputs_digest": validated.payload["bound_inputs"]["digest"],
         "binary": binary_identity,
         "receipt": receipt_identity,
         "harnesses": _harness_identities(harness_files, "preflight"),
@@ -1071,6 +1105,8 @@ def _postflight(
         "source_inputs_sha256": validated.source_inputs_sha256,
         "workspace_commit": validated.workspace_commit,
         "receipt_schema": validated.schema,
+        "config_digest": validated.config_digest,
+        "bound_inputs_digest": validated.payload["bound_inputs"]["digest"],
         "binary": binary_identity,
         "receipt": receipt_identity,
         "harnesses": _harness_identities(harness_files, "postflight"),
@@ -1096,10 +1132,13 @@ def _case_records(results: dict) -> list[dict]:
 def _toolchain_summary(validated) -> dict:
     toolchain = validated.toolchain or {}
     rustc = toolchain.get("rustc") or {}
+    cargo = toolchain.get("cargo") or {}
     return {
         "target_triple": toolchain.get("target_triple"),
         "rustc_release": rustc.get("release"),
         "rustc_version": rustc.get("version"),
+        "cargo_release": cargo.get("release"),
+        "cargo_version": cargo.get("version"),
     }
 
 
@@ -1111,6 +1150,8 @@ def _public_snapshot(snapshot: dict | None) -> dict | None:
         "source_inputs_sha256": snapshot["source_inputs_sha256"],
         "workspace_commit": snapshot["workspace_commit"],
         "receipt_schema": snapshot["receipt_schema"],
+        "config_digest": snapshot["config_digest"],
+        "bound_inputs_digest": snapshot["bound_inputs_digest"],
         "binary": dict(snapshot["binary"]),
         "build_receipt": dict(snapshot["receipt"]),
         "harnesses": {name: dict(identity) for name, identity in snapshot["harnesses"].items()},
@@ -1139,6 +1180,8 @@ def _build_report(
         "source_inputs_sha256": start["source_inputs_sha256"] if start else None,
         "workspace_commit": start["workspace_commit"] if start else None,
         "receipt_schema": start["receipt_schema"] if start else None,
+        "config_digest": start["config_digest"] if start else None,
+        "bound_inputs_digest": start["bound_inputs_digest"] if start else None,
         "binary_sha256": start_binary["sha256"] if start_binary else None,
         "build_receipt_sha256": start_receipt["sha256"] if start_receipt else None,
         "toolchain": _toolchain_summary(validated) if validated is not None else None,
