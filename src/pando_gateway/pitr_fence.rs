@@ -6,7 +6,7 @@
 //! 3. Canonical object-store backend identity (`backend_identity`).
 //! 4. Immutable write-once epoch proofs in the shared object store
 //!    (`pando-authorities/<authority_id>/epochs/<epoch:020>.json`).
-use crate::pando_gateway::{pitr_markers, pitr_proof_model, retention};
+use crate::pando_gateway::{pitr_markers, pitr_proof_model};
 use crate::storage::remote_authority::AuthorityCreateOutcome;
 use crate::storage::remote_objects::RemoteObjectStore;
 use anyhow::{Context, Result, bail, ensure};
