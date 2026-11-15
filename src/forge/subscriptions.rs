@@ -20,6 +20,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Subscription {
     pub repository_id: Uuid,
     pub user_id: Uuid,

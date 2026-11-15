@@ -108,8 +108,28 @@ def _expand_page_table(rs_path: str, prefixes: tuple[str, ...]) -> list[tuple[st
         # leading parameter "/{oid}"; nothing may consume owner or name.
         if tail and (not tail.startswith("/") or tail.split("/")[1] in ("{owner}", "{name}")):
             raise AssertionError(f"{rs_path}: page '{tail}' is not a repository page tail")
-        for prefix in prefixes:
-            expanded.append((prefix + "/repos/{owner}/{name}" + tail, list(page_methods)))
+            for prefix in prefixes:
+                expanded.append((prefix + "/repos/{owner}/{name}" + tail, list(page_methods)))
+    return expanded
+
+
+def _expand_web_collaboration_routes() -> list[tuple[str, list[str]]]:
+    rs_path = "src/web/collaboration.rs"
+    text = (ROOT / rs_path).read_text(encoding="utf-8")
+    mounted = [prefix.strip('"') for prefix in re.findall(r"repo_pages\((\"/[A-Za-z-]+\")\)", text)]
+    if sorted(mounted) != ["/ui", "/web"]:
+        raise AssertionError(f"{rs_path} mounts repo_pages prefixes {mounted}, expected ['/ui', '/web']")
+    if 'let p = |tail: &str| format!("{prefix}/repos/{{owner}}/{{name}}{tail}");' not in text:
+        raise AssertionError(f"{rs_path} does not build repo pages from one shared format! table")
+    expanded: list[tuple[str, list[str]]] = []
+    for raw_path, methods in _extract_route_registrations(ROOT / rs_path):
+        if raw_path.startswith(("/web/", "/ui/")):
+            expanded.append((raw_path, list(methods)))
+        else:
+            if not raw_path.startswith("/") or raw_path.split("/")[1] in ("{owner}", "{name}"):
+                raise AssertionError(f"{rs_path}: page '{raw_path}' is not a repository page tail")
+            for prefix in ("/web", "/ui"):
+                expanded.append((prefix + "/repos/{owner}/{name}" + raw_path, list(methods)))
     return expanded
 
 
@@ -235,6 +255,7 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
                     *_extract_route_registrations(ROOT / "src/web/navigation.rs"),
                     *_expand_page_table("src/web/repository_pages.rs", ("/web", "/ui")),
                     *_expand_page_table("src/web/org_admin.rs", ()),
+                    *_expand_web_collaboration_routes(),
                 ]
             else:
                 regs = _extract_route_registrations(ROOT / rel)
@@ -259,7 +280,17 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         param_by_prefix: dict[tuple[str, ...], tuple[str, str, str]] = {}
         all_files = (*self.ALL_PRIMARY_ROUTER_FILES, "src/mirror.rs")
         for rel in all_files:
-            for raw_path, _ in _extract_route_registrations(ROOT / rel):
+            expanded_regs = (
+                [
+                    *_extract_route_registrations(ROOT / "src/web/navigation.rs"),
+                    *_expand_page_table("src/web/repository_pages.rs", ("/web", "/ui")),
+                    *_expand_page_table("src/web/org_admin.rs", ()),
+                    *_expand_web_collaboration_routes(),
+                ]
+                if rel == "src/web.rs"
+                else _extract_route_registrations(ROOT / rel)
+            )
+            for raw_path, _ in expanded_regs:
                 segments = [s for s in raw_path.strip("/").split("/") if s]
                 norm_prefix: list[str] = []
                 for seg in segments:

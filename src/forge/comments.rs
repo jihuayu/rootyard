@@ -8,9 +8,11 @@ use super::notifications::{NotifySpec, emit_repo_notifications};
 use crate::{
     AppState, Error,
     auth::{self, finish_tx as finish, idempotency_key},
+    db::Identity,
     members::{audit, models::Role},
     token_scopes::RepoAction,
 };
+use deadpool_postgres::Transaction;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -137,6 +139,75 @@ pub async fn get_comment(
     Ok(json(StatusCode::OK, comment))
 }
 
+pub(crate) async fn update_issue_comment_tx(
+    tx: &Transaction<'_>,
+    ids: (Uuid, Uuid),
+    actor: &Identity,
+    role: Role,
+    target: (i64, i64),
+    update: (i64, &str),
+) -> Result<Comment, Error> {
+    let (tenant_id, repo) = ids;
+    let (number, comment_number) = target;
+    let (expected_version, body) = update;
+    let current = tx
+        .query_opt(
+            "SELECT author_id,body,version,moderation_state FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4 FOR UPDATE",
+            &[&tenant_id, &repo, &number, &comment_number],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    let author_id: Uuid = current.get("author_id");
+    let prev_body: String = current.get("body");
+    let cur_version: i64 = current.get("version");
+    let mod_state: String = current.get("moderation_state");
+    if author_id != actor.id && role < Role::Maintain {
+        return Err(Error(StatusCode::FORBIDDEN, "insufficient permission to edit comment"));
+    }
+    if mod_state == "deleted" {
+        return Err(Error(StatusCode::CONFLICT, "deleted comment cannot be edited"));
+    }
+    if cur_version != expected_version {
+        return Err(Error(StatusCode::CONFLICT, "comment version conflict"));
+    }
+    record_comment_revision(
+        tx,
+        RevisionSpec {
+            tenant_id,
+            repository_id: repo,
+            target_type: "issue_comment",
+            parent_number: number,
+            comment_number,
+            action: "edited",
+            actor_id: actor.id,
+            previous_body: &prev_body,
+            new_body: body,
+            reason: "",
+        },
+    )
+    .await?;
+    let row = tx
+        .query_one(
+            &format!("UPDATE forge_issue_comments SET body=$5,edited_at=clock_timestamp(),version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4 RETURNING {COMMENT_FIELDS}"),
+            &[&tenant_id, &repo, &number, &comment_number, &body],
+        )
+        .await
+        .map_err(Error::internal)?;
+    audit::record_audit_event(
+        tx,
+        tenant_id,
+        repo,
+        actor,
+        "issue_comment.edited",
+        "issue_comment",
+        &format!("{number}:{comment_number}"),
+        sjson!({ "expected_version": expected_version }),
+    )
+    .await?;
+    Ok(Comment::row(&row))
+}
+
 pub async fn update_comment(
     State(state): State<Arc<AppState>>,
     Path((owner, name, number, comment_number)): Path<(String, String, i64, i64)>,
@@ -153,63 +224,15 @@ pub async fn update_comment(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Triage, RepoAction::IssuesWrite).await?;
-    let (repo, tenant_id) = (access.repo_id, access.owner_id);
-    let current = tx
-        .query_opt(
-            "SELECT author_id,body,version,moderation_state FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4 FOR UPDATE",
-            &[&tenant_id, &repo, &number, &comment_number],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    let author_id: Uuid = current.get("author_id");
-    let prev_body: String = current.get("body");
-    let cur_version: i64 = current.get("version");
-    let mod_state: String = current.get("moderation_state");
-    if author_id != actor.id && access.role < Role::Maintain {
-        return Err(Error(StatusCode::FORBIDDEN, "insufficient permission to edit comment"));
-    }
-    if mod_state == "deleted" {
-        return Err(Error(StatusCode::CONFLICT, "deleted comment cannot be edited"));
-    }
-    if cur_version != input.expected_version {
-        return Err(Error(StatusCode::CONFLICT, "comment version conflict"));
-    }
-    record_comment_revision(
+    let comment = update_issue_comment_tx(
         &tx,
-        RevisionSpec {
-            tenant_id,
-            repository_id: repo,
-            target_type: "issue_comment",
-            parent_number: number,
-            comment_number,
-            action: "edited",
-            actor_id: actor.id,
-            previous_body: &prev_body,
-            new_body: &input.body,
-            reason: "",
-        },
-    )
-    .await?;
-    let row = tx
-        .query_one(
-            &format!("UPDATE forge_issue_comments SET body=$5,edited_at=clock_timestamp(),version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4 RETURNING {COMMENT_FIELDS}"),
-            &[&tenant_id, &repo, &number, &comment_number, &input.body],
-        )
-        .await
-        .map_err(Error::internal)?;
-    audit::record_audit_event(
-        &tx,
-        tenant_id,
-        repo,
+        (access.owner_id, access.repo_id),
         &actor,
-        "issue_comment.edited",
-        "issue_comment",
-        &format!("{number}:{comment_number}"),
-        sjson!({ "expected_version": input.expected_version }),
+        access.role,
+        (number, comment_number),
+        (input.expected_version, &input.body),
     )
     .await?;
-    let comment = Comment::row(&row);
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::OK, comment))
 }

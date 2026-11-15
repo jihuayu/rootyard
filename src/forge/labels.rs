@@ -26,6 +26,7 @@ const LABEL_FIELDS: &str = "repository_id,name,color,description,version,created
 const MAX_ATTACHED_LABELS: usize = 50;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RepoLabel {
     pub repository_id: Uuid,
     pub name: String,

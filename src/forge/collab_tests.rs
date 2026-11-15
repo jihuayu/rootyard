@@ -1,9 +1,9 @@
 //! Unit tests for Forge collaboration validation, normalization, search, and notification helpers.
 
 use super::{
-    assignees::{AssigneeSetInput, AssigneeVersionQuery},
+    assignees::{AssigneeEntry, AssigneeSetInput, AssigneeVersionQuery},
     labels::{
-        LabelAttachmentInput, LabelListQuery, LabelVersionQuery, NewLabel, PatchLabel,
+        LabelAttachmentInput, LabelListQuery, LabelVersionQuery, NewLabel, PatchLabel, RepoLabel,
         normalize_label_color, normalize_label_name, validate_label_description,
     },
     moderation::{
@@ -11,11 +11,11 @@ use super::{
         RevisionPageQuery, display_comment_body, sanitize_reason,
     },
     notifications::{
-        NOTIFICATION_CHANNEL, NOTIFICATION_RETENTION_DAYS, NotificationQuery, ReadAllInput,
-        sanitize_single_line, valid_iso_cursor_ts, visibility_and_scope_clause,
+        NOTIFICATION_CHANNEL, NOTIFICATION_RETENTION_DAYS, Notification, NotificationQuery,
+        ReadAllInput, sanitize_single_line, valid_iso_cursor_ts, visibility_and_scope_clause,
     },
     search::{SearchQuery, SearchScope, SearchSort, validate_search_query},
-    subscriptions::{OptionalVersionQuery, SubscriptionInput},
+    subscriptions::{OptionalVersionQuery, Subscription, SubscriptionInput},
 };
 use serde::de::DeserializeOwned;
 
@@ -121,4 +121,16 @@ fn forge_input_structs_enforce_deny_unknown_fields() {
     assert_rejects_unknown::<ModerateCommentInput>(r#"{"expected_version":1,"action":"hide","extra":1}"#);
     assert_rejects_unknown::<RevisionPageQuery>(r#"{"after":0,"extra":1}"#);
     assert_rejects_unknown::<SearchQuery>(r#"{"q":"bug","extra":1}"#);
+    assert_rejects_unknown::<AssigneeEntry>(
+        r#"{"user_id":"00000000-0000-0000-0000-000000000000","username":"alice","created_at":"2026-11-15T00:00:00Z","extra":1}"#,
+    );
+    assert_rejects_unknown::<RepoLabel>(
+        r##"{"repository_id":"00000000-0000-0000-0000-000000000000","name":"bug","color":"#0e8a16","description":"","version":1,"created_at":"2026-11-15T00:00:00Z","updated_at":"2026-11-15T00:00:00Z","extra":1}"##,
+    );
+    assert_rejects_unknown::<Subscription>(
+        r#"{"repository_id":"00000000-0000-0000-0000-000000000000","user_id":"00000000-0000-0000-0000-000000000000","target_type":"repository","target_number":0,"state":"subscribed","version":1,"created_at":"2026-11-15T00:00:00Z","updated_at":"2026-11-15T00:00:00Z","extra":1}"#,
+    );
+    assert_rejects_unknown::<Notification>(
+        r#"{"id":"00000000-0000-0000-0000-000000000000","repository_id":"00000000-0000-0000-0000-000000000000","owner":"alice","repo":"demo","recipient_id":"00000000-0000-0000-0000-000000000000","actor_id":null,"channel":"in_app","target_type":"issue","target_number":1,"event_kind":"mentioned","delivery_key":"k1","title":"t","body_excerpt":"b","delivery_count":1,"unread":true,"read_at":null,"expires_at":"2027-01-01T00:00:00Z","created_at":"2026-11-15T00:00:00Z","updated_at":"2026-11-15T00:00:00Z","extra":1}"#,
+    );
 }

@@ -296,7 +296,7 @@ pub fn render_notifications_view(
         format!(
             "<p><a class=\"next-page-link\" href=\"{prefix}/notifications?unread_only={}&cursor={}\">Next page</a></p>",
             unread_only,
-            escape_html(c)
+            pct_encode(c)
         )
     });
     let inner = format!(

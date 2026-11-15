@@ -6,8 +6,8 @@ This document specifies the delivered behavior, authorization boundaries, optimi
 
 - **Scopes**: `all`, `repositories`, `issues`, `pulls`, `comments` (`comments` searches visible Issue comments and visible inline PR review comments).
 - **Deterministic Total-Order Pagination**:
-  - `sort=updated` (default): orders by `(updated_at DESC, kind, repository_id, number, comment_number)`.
-  - `sort=number`: orders by `(number DESC, repository_id, kind, comment_number)`.
+  - `sort=updated` (default): orders by `(updated_at DESC, owner ASC, repo ASC, kind ASC, number ASC, comment_number ASC)`.
+  - `sort=number`: orders by `(number DESC, owner ASC, repo ASC, kind ASC, comment_number ASC)`.
   - `cursor` is an opaque HMAC/scoped keyset token bound to `(scope, sort, query, actor_id, repository_scope)`; mismatched or tampered cursors return `400 Bad Request`.
 - **Live Permission Filtering**:
   - Evaluates live repository visibility, ownership, org membership/teams, repo collaborators/teams, and restricted PAT action scopes (`repo_read`, `issues_read`, `pulls_read`) inside the transaction so revoked membership or narrowed PAT scopes hide results immediately.

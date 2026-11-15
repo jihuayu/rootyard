@@ -7,28 +7,30 @@ use super::{
         WebNewLabelForm, WebNewReviewCommentForm, WebSubscriptionForm, WebUpdateLabelForm,
         WebVersionForm,
     },
-    handlers::{authorize_web_repo, normalize_web_headers},
+    handlers::{load_header_ctx, normalize_web_headers},
+    models::RepoHeaderCtx,
     templates::html_response,
 };
 use crate::{
     AppState, Error,
     auth::{self, finish_tx as finish, idempotency_key},
+    db::Identity,
     forge::{
         assignees::apply_target_assignees_tx,
-        handlers::{COMMENT_FIELDS, Comment, body_valid, creation_replay, json, record_creation},
+        comments::update_issue_comment_tx,
+        handlers::{body_valid, creation_replay, json, record_creation},
         label_targets::apply_target_labels_tx,
         labels::{
             create_label_tx, normalize_label_color, normalize_label_name,
             validate_label_description,
         },
         moderation::{
-            ModerateCommentInput, RevisionSpec, delete_issue_comment_tx,
-            moderate_issue_comment_tx, record_comment_revision,
+            ModerateCommentInput, delete_issue_comment_tx, moderate_issue_comment_tx,
         },
         notifications::{ReadAllInput, mark_all_notifications_read_tx, mark_notification_read_tx},
         subscriptions::{SubscriptionInput, delete_subscription_tx, upsert_subscription_tx},
     },
-    members::{audit, models::Role},
+    members::{audit, models::{self as member_models, RepoAccess, Role}},
     pulls::{
         models::{positive, repo_tenant_id},
         review_comments::{NewPullReviewComment, create_review_comment},
@@ -41,12 +43,36 @@ use axum::{
     http::{HeaderMap, StatusCode, Uri},
     response::Response,
 };
+use deadpool_postgres::Transaction;
 use serde_json::json as sjson;
 use std::sync::Arc;
 use uuid::Uuid;
 
 type App = State<Arc<AppState>>;
 type Res = Result<Response, Error>;
+
+pub(in crate::web) async fn auth_web_actor(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(HeaderMap, Identity), Error> {
+    member_models::ensure_schema(&state.pool).await?;
+    let norm = normalize_web_headers(headers);
+    let actor = auth::authenticate(&state.pool, &norm).await?;
+    Ok((norm, actor))
+}
+
+pub(in crate::web) async fn authorize_web_repo_tx(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    repo: (&str, &str),
+    min_role: Role,
+    action: RepoAction,
+) -> Result<(RepoAccess, RepoHeaderCtx), Error> {
+    let (owner, name) = repo;
+    let access = auth::authorize_repo_with_role(tx, actor, owner, name, min_role, action).await?;
+    let header_ctx = load_header_ctx(tx, owner, name, actor, access).await?;
+    Ok((access, header_ctx))
+}
 
 fn split_csv(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -61,8 +87,7 @@ pub(in crate::web) async fn mark_read_web(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Res {
-    let norm = normalize_web_headers(&headers);
-    let actor = auth::authenticate(&state.pool, &norm).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, true).await?;
@@ -75,8 +100,7 @@ pub(in crate::web) async fn mark_read_web(
 }
 
 pub(in crate::web) async fn mark_all_read_web(State(state): App, headers: HeaderMap) -> Res {
-    let norm = normalize_web_headers(&headers);
-    let actor = auth::authenticate(&state.pool, &norm).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, true).await?;
@@ -99,8 +123,7 @@ async fn subscription_web_inner(
 ) -> Res {
     let (owner, name) = repo;
     let (target_type, target_number) = target;
-    let norm = normalize_web_headers(&headers);
-    let actor = auth::authenticate(&state.pool, &norm).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, true).await?;
@@ -177,12 +200,12 @@ pub(in crate::web) async fn create_label_web(
     headers: HeaderMap,
     Json(input): Json<WebNewLabelForm>,
 ) -> Res {
-    let norm = normalize_web_headers(&headers);
     let prefix = web_prefix(&uri);
-    let (actor, access, header_ctx) =
-        authorize_web_repo(&state, &norm, &owner, &name, Role::Triage, RepoAction::IssuesWrite).await?;
+    let (norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let (access, header_ctx) =
+        authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Triage, RepoAction::IssuesWrite).await?;
     let new_label = crate::forge::labels::NewLabel {
         name: input.name,
         color: input.color,
@@ -219,12 +242,12 @@ pub(in crate::web) async fn update_label_web(
     if let Some(ref desc) = input.description {
         validate_label_description(desc)?;
     }
-    let norm = normalize_web_headers(&headers);
     let prefix = web_prefix(&uri);
-    let (actor, access, header_ctx) =
-        authorize_web_repo(&state, &norm, &owner, &name, Role::Triage, RepoAction::IssuesWrite).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let (access, header_ctx) =
+        authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Triage, RepoAction::IssuesWrite).await?;
     let updated = tx
         .execute(
             "UPDATE forge_labels SET name=COALESCE($5,name),color=COALESCE($6,color),description=COALESCE($7,description),version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND name=$3 AND version=$4",
@@ -249,12 +272,12 @@ pub(in crate::web) async fn delete_label_web(
 ) -> Res {
     let cur = normalize_label_name(&label)?;
     positive(input.expected_version)?;
-    let norm = normalize_web_headers(&headers);
     let prefix = web_prefix(&uri);
-    let (actor, access, header_ctx) =
-        authorize_web_repo(&state, &norm, &owner, &name, Role::Triage, RepoAction::IssuesWrite).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let (access, header_ctx) =
+        authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Triage, RepoAction::IssuesWrite).await?;
     let deleted = tx
         .execute(
             "DELETE FROM forge_labels WHERE tenant_id=$1 AND repository_id=$2 AND name=$3 AND version=$4",
@@ -274,10 +297,10 @@ pub(in crate::web) async fn delete_label_web(
 async fn target_labels_web(state: Arc<AppState>, headers: HeaderMap, repo: (String, String), target: (&'static str, i64), action: RepoAction, input: WebLabelsForm) -> Res {
     let (owner, name) = repo;
     let (kind, number) = target;
-    let norm = normalize_web_headers(&headers);
-    let (actor, access, _) = authorize_web_repo(&state, &norm, &owner, &name, Role::Triage, action).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let (access, _) = authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Triage, action).await?;
     let labels = split_csv(&input.labels);
     let (label_version, items) = apply_target_labels_tx(&tx, (access.owner_id, access.repo_id), &actor, (kind, number), true, input.expected_version, &labels).await?;
     finish(tx, &actor, true).await?;
@@ -287,10 +310,10 @@ async fn target_labels_web(state: Arc<AppState>, headers: HeaderMap, repo: (Stri
 async fn target_assignees_web(state: Arc<AppState>, headers: HeaderMap, repo: (String, String), target: (&'static str, i64), action: RepoAction, input: WebAssigneesForm) -> Res {
     let (owner, name) = repo;
     let (kind, number) = target;
-    let norm = normalize_web_headers(&headers);
-    let (actor, access, _) = authorize_web_repo(&state, &norm, &owner, &name, Role::Triage, action).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let (access, _) = authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Triage, action).await?;
     let assignees = split_csv(&input.assignees);
     let (assignee_version, items) = apply_target_assignees_tx(&tx, (access.owner_id, access.repo_id), &actor, (kind, number), true, input.expected_version, &assignees).await?;
     finish(tx, &actor, true).await?;
@@ -317,44 +340,30 @@ pub(in crate::web) async fn edit_issue_comment_web(State(state): App, Path((owne
     if !body_valid(&input.body, true) {
         return Err(Error::bad_request());
     }
-    let norm = normalize_web_headers(&headers);
-    let (actor, access, _) = authorize_web_repo(&state, &norm, &owner, &name, Role::Triage, RepoAction::IssuesWrite).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let cur = tx.query_opt("SELECT author_id,body,version,moderation_state FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4 FOR UPDATE", &[&access.owner_id, &access.repo_id, &number, &comment_number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    if cur.get::<_, Uuid>("author_id") != actor.id && access.role < Role::Maintain {
-        return Err(Error(StatusCode::FORBIDDEN, "insufficient permission to edit comment"));
-    }
-    if cur.get::<_, &str>("moderation_state") == "deleted" {
-        return Err(Error(StatusCode::CONFLICT, "deleted comment cannot be edited"));
-    }
-    if cur.get::<_, i64>("version") != input.expected_version {
-        return Err(Error(StatusCode::CONFLICT, "comment version conflict"));
-    }
-    let prev: String = cur.get("body");
-    record_comment_revision(&tx, RevisionSpec { tenant_id: access.owner_id, repository_id: access.repo_id, target_type: "issue_comment", parent_number: number, comment_number, action: "edited", actor_id: actor.id, previous_body: &prev, new_body: &input.body, reason: "" }).await?;
-    let row = tx.query_one(&format!("UPDATE forge_issue_comments SET body=$5,edited_at=clock_timestamp(),version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4 RETURNING {COMMENT_FIELDS}"), &[&access.owner_id, &access.repo_id, &number, &comment_number, &input.body]).await.map_err(Error::internal)?;
-    audit::record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "issue_comment.edited", "issue_comment", &format!("{number}:{comment_number}"), sjson!({ "expected_version": input.expected_version })).await?;
-    let comment = Comment::row(&row);
+    let (access, _) = authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Triage, RepoAction::IssuesWrite).await?;
+    let comment = update_issue_comment_tx(&tx, (access.owner_id, access.repo_id), &actor, access.role, (number, comment_number), (input.expected_version, &input.body)).await?;
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::OK, comment))
 }
 
 pub(in crate::web) async fn delete_issue_comment_web(State(state): App, Path((owner, name, number, comment_number)): Path<(String, String, i64, i64)>, headers: HeaderMap, Json(input): Json<WebVersionForm>) -> Res {
-    let norm = normalize_web_headers(&headers);
-    let (actor, access, _) = authorize_web_repo(&state, &norm, &owner, &name, Role::Triage, RepoAction::IssuesWrite).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let (access, _) = authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Triage, RepoAction::IssuesWrite).await?;
     let comment = delete_issue_comment_tx(&tx, (access.owner_id, access.repo_id), &actor, access.role, (number, comment_number), input.expected_version).await?;
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::OK, comment))
 }
 
 pub(in crate::web) async fn moderate_issue_comment_web(State(state): App, Path((owner, name, number, comment_number)): Path<(String, String, i64, i64)>, headers: HeaderMap, Json(input): Json<WebCommentModerateForm>) -> Res {
-    let norm = normalize_web_headers(&headers);
-    let (actor, access, _) = authorize_web_repo(&state, &norm, &owner, &name, Role::Maintain, RepoAction::IssuesWrite).await?;
+    let (_norm, actor) = auth_web_actor(&state, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let (access, _) = authorize_web_repo_tx(&tx, &actor, (&owner, &name), Role::Maintain, RepoAction::IssuesWrite).await?;
     let comment = moderate_issue_comment_tx(&tx, access.owner_id, access.repo_id, &actor, number, comment_number, &ModerateCommentInput { expected_version: input.expected_version, action: input.action, reason: input.reason }).await?;
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::OK, comment))

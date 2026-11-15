@@ -59,4 +59,7 @@ fn review_comment_inputs_enforce_deny_unknown_fields() {
 
     assert!(serde_json::from_str::<ReviewCommentListQuery>(r#"{"outdated":true}"#).is_ok());
     assert!(serde_json::from_str::<ReviewCommentListQuery>(r#"{"outdated":true,"x":1}"#).is_err());
+
+    let bad_rc = r#"{"repository_id":"00000000-0000-0000-0000-000000000000","pull_number":1,"number":1,"review_number":null,"in_reply_to_number":null,"author_id":"00000000-0000-0000-0000-000000000000","commit_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","base_oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pull_version":1,"outdated":false,"path":"a.rs","side":"right","line":1,"body":"ok","version":1,"moderation_state":"visible","edited_at":null,"deleted_at":null,"moderation_reason":"","created_at":"2026-11-15T00:00:00Z","updated_at":"2026-11-15T00:00:00Z","extra":1}"#;
+    assert!(serde_json::from_str::<super::PullReviewComment>(bad_rc).is_err());
 }
