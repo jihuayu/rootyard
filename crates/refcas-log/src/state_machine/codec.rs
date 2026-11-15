@@ -25,6 +25,11 @@ impl SmCommand {
     pub fn encode(&self) -> Res<Vec<u8>> {
         serde_json::to_vec(self).map_err(|e| E::Codec(format!("encode sm command: {e}")))
     }
+
+    /// Validates Ref-CAS metadata key and value byte limits prior to Raft WAL append.
+    pub fn validate_bounds(&self) -> Res<()> {
+        validate_kv_cmd(self)
+    }
 }
 
 pub(crate) struct DecodedPayload {
