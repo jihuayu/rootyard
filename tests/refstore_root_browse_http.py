@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -45,7 +46,7 @@ class RootBrowseHttpHarness(RootsHttpHarness):
         }), token or self.alice)
 
     def _root_blob(self, repo, root, oid, *, path=None, token=None):
-        suffix = "/" + str(root) + "/blob/" + str(oid)
+        suffix = "/" + str(root) + "/blob/" + urllib.parse.quote(str(oid), safe="")
         return self._request("GET", self._query_path(self._roots_path(repo, suffix), {"path": path}),
                              token or self.alice)
 
