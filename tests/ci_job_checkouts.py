@@ -1225,7 +1225,19 @@ class JobCheckoutHarness(SourcePinHarness):
                 retry_status, _, _ = self.mirror_http(prepare_path, int_token, method="POST", body=b"")
                 assert retry_status in (401, 403), retry_status
                 assert not entered.exists(), "revoked integration triggered origin fetch with mirror source token"
-                self.mirror_expect(self.advertise(bypass_oid), (401, 403), token=self.alice)
+                # A normal PAT (even one matching ROOTYARD_CI_MIRROR_SOURCE_TOKEN) cannot use
+                # integration-scoped CI checkout endpoints, and the unsynced commit remains
+                # absent on the mirror (`409`) without triggering an origin fetch.
+                self.mirror_expect(prepare_path, (401, 403), token=self.alice, method="POST", body=b"")
+                self.mirror_expect(
+                    self.path(bypass_oid) + "/info/lfs/objects/batch",
+                    (401, 403),
+                    token=self.alice,
+                    method="POST",
+                    body={"operation": "download", "objects": [{"oid": "0" * 64, "size": 1}]},
+                )
+                assert not entered.exists(), "source-token probe triggered origin fetch"
+                self.mirror_expect(self.advertise(bypass_oid), 409, token=self.alice)
                 self.mirror_expect(self.advertise(bypass_oid), (401, 403), token=int_token)
         finally:
             pause_enabled.unlink(missing_ok=True)
