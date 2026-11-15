@@ -18,6 +18,11 @@
 //! ordinary current-Browse session path. It uses its own retained-context
 //! post-encoding authorization/state fence and never issues a session token,
 //! current revision or HWM.
+//!
+//! The four public handlers are the entry points of the top-level `/api` routes
+//! (and of their `/web/blob/api` aliases), so each one renders its failure with
+//! `GatewayError::api`: an unauthorized read advertises `Bearer` here once,
+//! instead of leaking the pipeline's bare `GatewayError` to either route.
 use std::sync::Arc;
 
 use axum::{
@@ -42,6 +47,15 @@ pub(super) mod retained;
 pub(super) use session::{BrowseSession, finalize};
 
 pub(super) async fn tree(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String)>,
+    query: Query<TreeQuery>,
+    headers: HeaderMap,
+) -> Response {
+    tree_authorized(state, path, query, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn tree_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<TreeQuery>,
@@ -51,6 +65,15 @@ pub(super) async fn tree(
 }
 
 pub(super) async fn tree_by_oid(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String)>,
+    query: Query<TreeByOidQuery>,
+    headers: HeaderMap,
+) -> Response {
+    tree_by_oid_authorized(state, path, query, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn tree_by_oid_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, name, oid)): Path<(String, String, String)>,
     Query(query): Query<TreeByOidQuery>,
@@ -67,6 +90,15 @@ pub(super) async fn tree_by_oid(
 }
 
 pub(super) async fn blob(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String)>,
+    query: Query<BlobQuery>,
+    headers: HeaderMap,
+) -> Response {
+    blob_authorized(state, path, query, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn blob_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<BlobQuery>,
@@ -76,6 +108,15 @@ pub(super) async fn blob(
 }
 
 pub(super) async fn blob_by_oid(
+    state: State<Arc<BlobGitState>>,
+    path: Path<(String, String, String)>,
+    query: Query<BlobByOidQuery>,
+    headers: HeaderMap,
+) -> Response {
+    blob_by_oid_authorized(state, path, query, headers).await.unwrap_or_else(GatewayError::api)
+}
+
+async fn blob_by_oid_authorized(
     State(state): State<Arc<BlobGitState>>,
     Path((owner, name, oid)): Path<(String, String, String)>,
     Query(query): Query<BlobByOidQuery>,

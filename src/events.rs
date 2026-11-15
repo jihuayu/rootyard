@@ -404,6 +404,23 @@ pub async fn worker_once_with_lease(
     Ok(count)
 }
 
+pub async fn process_ref_cas_projection_jobs(
+    pool: &Pool,
+    owner: Uuid,
+    limit: i64,
+    lease_seconds: i64,
+) -> Result<usize> {
+    let batch = usize::try_from(limit.max(1)).unwrap_or(1);
+    crate::ref_store::projector::run_projection_job_worker_once(pool, owner, batch, lease_seconds).await
+}
+
+pub async fn project_ref_cas_event_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    envelope: &crate::ref_store::projector::RefCasEventEnvelope,
+) -> Result<crate::ref_store::projector::SingleEventOutcome> {
+    Ok(crate::ref_store::projector::project_event_in_tx(tx, envelope, None).await?)
+}
+
 pub async fn pending_count(pool: &Pool) -> Result<i64> {
     Ok(pool
         .get()

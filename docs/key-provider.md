@@ -136,3 +136,33 @@ id, wrong and retired/missing keys, old-read/new-write/rewrap with unchanged
 ciphertext, malformed key-file length/mode/symlink/FIFO, keyring directory
 policy, and Debug/JSON redaction. Downstream serving, `RefStore` commit wiring
 (#107/#144), cloud KMS adapters, and destructive GC remain outside this layer.
+
+## Pando Lab Pack Encryption & Resumable KMS Rotation (#21)
+
+Inside `src/pando_lab/lifecycle/`, stored Git pack artifacts use `KeyProvider`
+(`PandoKmsProvider` backed by `LocalFileKeyProvider`) with real authenticated
+encryption (`encryption_mode = "authenticated-envelope-v1"`):
+
+* **Chunked AEAD sealing (`PANDOENC` v2)**: every sealed pack generates a fresh
+  random 32-byte DEK in `Zeroizing<[u8; 32]>` and a random 4-byte nonce prefix
+  combined with an 8-byte big-endian chunk counter (`AES-256-GCM-HMAC-SHA256` or
+  `CHACHA20-POLY1305-SHA256` via `ring::aead`), plus a length-delimited AAD
+  transcript binding cipher suite, `repo`, `pack_id`, `envelope_id`,
+  `pack_sha256`, `idx_sha256`, plaintext length, chunk size, chunk index, and
+  final-chunk flag.
+* **KMS keyring & policy enforcement**: per-repo keyrings live under
+  `$PANDO_ROOT/kms/<repo>` (or `$PANDO_KMS_KEYRING_DIR`) with `0700`/`0600` file
+  modes. `PandoKmsProvider` enforces `provider_revoked`, key revocation
+  (`kms-revoke-key` zeroes and unlinks the `.key` file),
+  `retain_previous_generations`, and `min_readable_key_version`, failing closed on
+  tamper, wrong keys, revoked keys, or revoked provider access.
+* **Resumable key rotation (`kms-rotate`)**: checkpoints progress to both
+  `rotation_state.json` (`0600`) and `pando_lab.kms_rotations` (`IN_PROGRESS` /
+  `COMPLETED`), rewraps only `WrappedKey` metadata (leaving immutable object-store
+  ciphertext unchanged), tolerates fault injection (`--fail-after-packs`) and
+  concurrent writes to newly active keys, and resumes via `--resume`.
+* **Explicit synthetic lab mode**: metadata-only envelope generation
+  (`build_envelope_record` / `--encryption-mode synthetic-metadata-lab-only`) is
+  explicitly labeled `synthetic-metadata-lab-only`, never performs authenticated
+  pack encryption, and is rejected by `object-store-get`, `kms-verify`, and cold
+  pack hydration.

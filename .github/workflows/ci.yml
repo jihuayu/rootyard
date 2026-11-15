@@ -123,7 +123,7 @@ jobs:
         run: cargo test --locked --features pando-lab --test outbox --test resolution_fences -- --ignored
       - name: Verify PostgreSQL RefStore registry and metadata-core contracts
         timeout-minutes: 5
-        run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds -- --ignored --test-threads=1
+        run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds --test ref_cas_event_projection -- --ignored --test-threads=1
       - name: Build relocated rootyard library test harness for the PostgreSQL start gate
         timeout-minutes: 10
         run: |
@@ -364,6 +364,13 @@ jobs:
       - name: Exercise organization and member pagination against real PostgreSQL
         timeout-minutes: 10
         run: python3 tests/organization_pagination.py --binary "$ROOTYARD_BIN" --report test-results/organization-pagination.json
+      - name: Exercise organizations, teams, web admin UI, and backup capabilities
+        timeout-minutes: 15
+        run: |
+          python3 tests/organizations.py --binary "$ROOTYARD_BIN" --report test-results/organizations.json
+          python3 tests/organizations_web.py --binary "$ROOTYARD_BIN" --report test-results/organizations-web.json
+          python3 tests/backup_capabilities.py --binary "$ROOTYARD_BIN" --report test-results/backup-capabilities.json
+          python3 tests/organizations_lifecycle.py --binary "$ROOTYARD_BIN" --report test-results/organizations-lifecycle.json
       - name: Exercise server-side HTML Web UI views, XSS sanitization, and PR/Issue workflows
         run: python3 tests/web.py --binary "$ROOTYARD_BIN" --report test-results/web.json
       - name: Exercise web detail pagination against real PostgreSQL
@@ -420,6 +427,10 @@ jobs:
             --report workspace_capture=test-results/workspace-capture.json \
             --report repository_pagination=test-results/repository-pagination.json \
             --report organization_pagination=test-results/organization-pagination.json \
+            --report organizations=test-results/organizations.json \
+            --report organizations_web=test-results/organizations-web.json \
+            --report backup_capabilities=test-results/backup-capabilities.json \
+            --report organizations_lifecycle=test-results/organizations-lifecycle.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
             --report web_repository_pagination=test-results/web-repository-pagination.json \
             --report worker_diagnostics=test-results/worker-diagnostics.json \
@@ -472,6 +483,11 @@ jobs:
             --harness tests/fixtures/capture_read_gate.c \
             --harness tests/repository_pagination.py \
             --harness tests/organization_pagination.py \
+            --harness tests/organizations.py \
+            --harness tests/organizations_web.py \
+            --harness tests/backup_capabilities.py \
+            --harness tests/organizations_lifecycle.py \
+            --harness tests/backup.py \
             --harness tests/web_detail_pagination.py \
             --harness tests/web_repository_pagination.py \
             --harness tests/worker_diagnostics.py \

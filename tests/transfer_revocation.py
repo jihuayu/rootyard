@@ -71,8 +71,11 @@ class RevocationHarness(MirrorHarness):
         audience = str(uuid.uuid4())
         self.env["ROOTYARD_CI_MIRROR_AUDIENCE"] = audience
         self.mirror_env["ROOTYARD_CI_MIRROR_AUDIENCE"] = audience
+        self.env["ROOTYARD_TRANSFER_REVOCATION_BOUND_MS"] = "1200"
+        self.mirror_env["ROOTYARD_TRANSFER_REVOCATION_BOUND_MS"] = "1200"
         self.setup_mirror()
         writer = self.account("create-token", "alice")
+        expiring = self.account("create-token", "alice")
         with open(self.work / "large.bin", "wb") as output:
             for _ in range(32):
                 output.write(os.urandom(1024 * 1024))
@@ -85,8 +88,30 @@ class RevocationHarness(MirrorHarness):
         def revoke_human():
             self.sql(f"UPDATE tokens SET revoked=true WHERE id='{uuid.UUID(writer['token_id'])}'")
 
+        def expire_human():
+            self.sql(f"UPDATE tokens SET expires_at=now()-interval '1 second' WHERE id='{uuid.UUID(expiring['token_id'])}'")
+
         human = self.stream_until_revoked(self.base, "/git/alice/demo.git",
                                           writer["token"], target, revoke_human)
+        expired = self.stream_until_revoked(self.base, "/git/alice/demo.git",
+                                            expiring["token"], target, expire_human)
+        self.expect("/api/repos/alice/demo/collaborators/bob", (200, 201), method="PUT",
+                    token=self.alice, body={"role": "read", "username": "bob"})
+        try:
+            member_removed = self.stream_until_revoked(
+                self.base, "/git/alice/demo.git", self.bob["token"], target,
+                lambda: self.expect("/api/repos/alice/demo/collaborators/bob", 200, method="DELETE", token=self.alice))
+        finally:
+            self.http("/api/repos/alice/demo/collaborators/bob", method="DELETE", token=self.alice)
+
+        repo_id = self.repo["id"]
+        try:
+            gen_changed = self.stream_until_revoked(
+                self.base, "/git/alice/demo.git", self.reader["token"], target,
+                lambda: self.sql(f"UPDATE repositories SET storage_generation=2 WHERE id='{repo_id}'"))
+        finally:
+            self.sql(f"UPDATE repositories SET storage_generation=1 WHERE id='{repo_id}'")
+
         job = str(uuid.uuid4())
         self.create_pin(oid=target, job=job)
         now = int(time.time())
@@ -102,7 +127,13 @@ class RevocationHarness(MirrorHarness):
 
         mirror = self.stream_until_revoked(self.mirror_base, self.path(target),
                                            credential, target, cancel_job)
-        return {"human_token": human, "cancelled_ci_job": mirror}
+        return {
+            "human_token": human,
+            "expired_token": expired,
+            "removed_collaborator": member_removed,
+            "generation_changed": gen_changed,
+            "cancelled_ci_job": mirror,
+        }
 
 
 def main():

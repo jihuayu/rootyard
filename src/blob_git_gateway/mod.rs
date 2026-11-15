@@ -20,8 +20,16 @@
 //! Local bare Git exists only as a per-request computed view. Durable refs live
 //! in the core and durable bytes in Blob, so the RAII deletion of a compute view
 //! can never lose an already acknowledged ref or byte.
+//!
+//! An unauthenticated request is answered per protocol (#174): every `/api`
+//! JSON route and its `/web/blob/api` alias advertises `Bearer realm="Rootyard"`,
+//! while the three Smart HTTP `/git` endpoints keep the Git
+//! `Basic realm="Rootyard", charset="UTF-8"` challenge. The challenge is
+//! rendered once by the route's own handler (`GatewayError::api` / `GatewayError::git`), so
+//! the two routes that share a handler can never disagree.
 mod api;
 mod browse;
+mod browser_ui;
 mod config;
 mod error;
 mod history;
@@ -45,6 +53,10 @@ mod state;
 #[cfg(test)]
 mod admission_race_acceptance;
 #[cfg(test)]
+mod challenge_tests;
+#[cfg(test)]
+mod session_browser_acceptance;
+#[cfg(test)]
 mod session_http_acceptance;
 
 /// Serializes the two top-level cfg(test) native cases that each pin their own
@@ -64,6 +76,16 @@ pub use config::{BlobGitConfig, BlobGitConfigError, BlobGitLimits, BlobGitNative
 pub use error::GatewayError;
 pub use repo_session::SessionTokens;
 pub use state::BlobGitState;
+
+/// The browser-only `/web` subtree: the shared sign-in/session pages and the
+/// read-only Blob SPA with its GET-only read aliases, all behind the existing
+/// `web::session` middleware (cookie validation, Origin/CSRF for mutations and
+/// navigation handling) with the [`BlobGitState`] metadata extraction.
+fn web_router(state: Arc<BlobGitState>) -> Router<Arc<BlobGitState>> {
+    Router::new()
+        .nest("/web", browser_ui::router())
+        .layer(axum::middleware::from_fn_with_state(state, crate::web::session::middleware))
+}
 
 /// Mount the Blob Git gateway. The caller owns the listener and the real Blob
 /// store; no `AppState`, legacy `Storage` authority or permanent bare repo is
@@ -111,6 +133,9 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
         .route("/git/{owner}/{name}/git-upload-pack", post(smart_http::upload_pack))
         .route("/git/{owner}/{name}/git-receive-pack", post(receive::receive_pack))
         .route("/git/{owner}/{name}/info/lfs/{*rest}", any(api::unsupported_lfs))
+        // The browser subtree is merged before the shared token routes, so a
+        // path both would register keeps the established token API handler.
+        .merge(web_router(state.clone()))
         .merge(crate::token_management::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), request_deadline))
         .with_state(state)

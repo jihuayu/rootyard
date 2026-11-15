@@ -38,6 +38,14 @@ pub struct CasPackManifest {
     pub pack_chunks: Vec<ChunkPartReceipt>,
     pub idx_chunks: Vec<ChunkPartReceipt>,
     pub manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ciphertext_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ciphertext_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cipher_suite: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +56,8 @@ pub struct ObjectStorePutOptions {
     pub corrupt_chunk_part: Option<usize>,
     pub expected_pack_sha256: Option<String>,
     pub expected_pack_bytes: Option<u64>,
+    #[serde(default)]
+    pub cipher_suite: Option<String>,
 }
 
 impl Default for ObjectStorePutOptions {
@@ -59,6 +69,7 @@ impl Default for ObjectStorePutOptions {
             corrupt_chunk_part: None,
             expected_pack_sha256: None,
             expected_pack_bytes: None,
+            cipher_suite: None,
         }
     }
 }
@@ -239,14 +250,55 @@ fn write_atomic_local_cache_file(target: &Path, data: &[u8], expected_sha256: &s
     Ok(())
 }
 
-pub fn put_pack_files(
+fn infer_base_root<'a>(store_root_dir: &'a Path, objects_root: Option<&'a Path>) -> &'a Path {
+    if store_root_dir.file_name().and_then(|s| s.to_str()) == Some("object_store")
+        && let Some(parent) = store_root_dir.parent()
+    {
+        return parent;
+    }
+    if let Some(obj) = objects_root
+        && obj.file_name().and_then(|s| s.to_str()) == Some("objects")
+        && let Some(parent) = obj.parent()
+    {
+        return parent;
+    }
+    store_root_dir
+}
+
+fn decrypt_verified_store_pack(
+    store_root_dir: &Path,
+    base_root: &Path,
+    manifest: &CasPackManifest,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut check = manifest.clone();
+    check.manifest_sha256 = String::new();
+    ensure!(delta::sha256_hex(&serde_json::to_vec(&check)?) == manifest.manifest_sha256, "CAS manifest verification failed");
+    ensure!(manifest.encryption_mode.as_deref() == Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE), "object store pack {} lacks authenticated encryption mode", manifest.pack_id);
+    let cipher_sha = manifest.ciphertext_sha256.as_deref().context("missing ciphertext_sha256 in CAS manifest")?;
+    let cipher_len = manifest.ciphertext_bytes.context("missing ciphertext_bytes in CAS manifest")?;
+    let c_bytes = std::fs::read(store_root_dir.join(&manifest.pack_key))?;
+    let i_bytes = std::fs::read(store_root_dir.join(&manifest.idx_key))?;
+    ensure!(c_bytes.len() as u64 == cipher_len && delta::sha256_hex(&c_bytes) == cipher_sha, "object store ciphertext mismatch");
+    ensure!(i_bytes.len() as u64 == manifest.idx_bytes && delta::sha256_hex(&i_bytes) == manifest.idx_sha256, "object store idx mismatch");
+    let env = lifecycle::read_and_verify_envelope_file(base_root, manifest.repo, manifest.pack_id)?;
+    let pack = Pack { id: manifest.pack_id, pack_sha256: manifest.pack_sha256.clone(), idx_sha256: manifest.idx_sha256.clone() };
+    let p_bytes = lifecycle::rotation::verify_and_decrypt_pack_bytes(base_root, manifest.repo, &pack, &env, &c_bytes)?;
+    ensure!(p_bytes.len() as u64 == manifest.pack_bytes && delta::sha256_hex(&p_bytes) == manifest.pack_sha256, "decrypted pack digest or length mismatch");
+    let rep = delta::verify_pack(&p_bytes, &delta::Limits::default())?;
+    ensure!(rep.object_count == manifest.object_count, "object store pack object_count mismatch");
+    Ok((p_bytes, i_bytes))
+}
+
+pub(crate) fn put_pack_files_sealed(
     store_root_dir: &Path,
     local_objects_root: &Path,
     repo: Uuid,
     pack_id: Uuid,
     opts: &ObjectStorePutOptions,
-) -> Result<(ObjectStorePutReport, CasPackManifest)> {
+    storage_tier: &str,
+) -> Result<(ObjectStorePutReport, CasPackManifest, lifecycle::KmsEnvelopeRecord, lifecycle::provider::KmsKeyPolicy)> {
     ensure!(valid_bucket_name(&opts.bucket), "invalid bucket '{}'", opts.bucket);
+    let suite = opts.cipher_suite.as_deref().unwrap_or(lifecycle::DEFAULT_CIPHER_SUITE);
     let local_dir = local_objects_root.join(repo.to_string());
     let pack_bytes = std::fs::read(local_dir.join(format!("{pack_id}.pack")))?;
     let idx_bytes = std::fs::read(local_dir.join(format!("{pack_id}.idx")))?;
@@ -257,27 +309,52 @@ pub fn put_pack_files(
     if let Some(ref exp_sha) = opts.expected_pack_sha256 { ensure!(exp_sha == &pack_sha256, "expected pack SHA-256 mismatch"); }
     if let Some(exp_len) = opts.expected_pack_bytes { ensure!(exp_len == pack_bytes.len() as u64, "expected pack byte length mismatch"); }
 
+    let base_root = infer_base_root(store_root_dir, Some(local_objects_root));
+    let kms_dir = lifecycle::provider::resolve_kms_dir(base_root, repo);
+    let provider = lifecycle::provider::PandoKmsProvider::open_or_init(&kms_dir, lifecycle::DEFAULT_KMS_KEY_ID)?;
+    let active_key = provider.active_entry()?;
+    let sealed = lifecycle::crypto::seal_pack_bytes(&provider, repo, pack_id, &idx_sha256, suite, active_key.key_version, &pack_bytes)?;
+
     let upload_id = Uuid::new_v4();
     let mut chunks_uploaded = 0usize;
-    let (pack_chunks, ver_pack) = stage_and_reassemble_multipart(store_root_dir, upload_id, &pack_bytes, &pack_sha256, pack_bytes.len() as u64, opts, &mut chunks_uploaded)?;
+    let (pack_chunks, ver_cipher) = stage_and_reassemble_multipart(store_root_dir, upload_id, &sealed.ciphertext, &sealed.ciphertext_sha256, sealed.ciphertext_bytes, opts, &mut chunks_uploaded)?;
     let idx_opts = ObjectStorePutOptions { corrupt_chunk_part: None, expected_pack_sha256: None, expected_pack_bytes: None, ..opts.clone() };
     let (idx_chunks, ver_idx) = stage_and_reassemble_multipart(store_root_dir, Uuid::new_v4(), &idx_bytes, &idx_sha256, idx_bytes.len() as u64, &idx_opts, &mut chunks_uploaded)?;
 
     let (p_key, i_key, m_key) = (pack_key(&opts.bucket, repo, pack_id), idx_key(&opts.bucket, repo, pack_id), manifest_key(repo, pack_id));
     let (b_pack, b_idx, m_path) = (store_root_dir.join(&p_key), store_root_dir.join(&i_key), store_root_dir.join(&m_key));
-    write_immutable_cas_file(&b_pack, &ver_pack, &pack_sha256)?;
-    write_immutable_cas_file(&b_idx, &ver_idx, &idx_sha256)?;
 
-    let mut manifest = CasPackManifest {
-        schema: MANIFEST_SCHEMA.to_owned(), bucket: opts.bucket.clone(), backend: BACKEND_KIND.to_owned(),
-        repo, pack_id, pack_key: p_key.clone(), idx_key: i_key.clone(), manifest_key: m_key.clone(),
-        pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone(), pack_bytes: ver_pack.len() as u64,
-        idx_bytes: ver_idx.len() as u64, object_count: pack_report.object_count, chunk_size: opts.chunk_size,
-        pack_chunks, idx_chunks, manifest_sha256: String::new(),
+    let (manifest, env) = if m_path.is_file() && b_pack.is_file() {
+        let existing_m: CasPackManifest = serde_json::from_slice(&std::fs::read(&m_path)?)?;
+        ensure!(existing_m.pack_sha256 == pack_sha256 && existing_m.idx_sha256 == idx_sha256, "immutable object store key collision on {}", b_pack.display());
+        decrypt_verified_store_pack(store_root_dir, base_root, &existing_m)?;
+        let existing_env = lifecycle::read_and_verify_envelope_file(base_root, repo, pack_id)?;
+        (existing_m, existing_env)
+    } else {
+        write_immutable_cas_file(&b_pack, &ver_cipher, &sealed.ciphertext_sha256)?;
+        write_immutable_cas_file(&b_idx, &ver_idx, &idx_sha256)?;
+        let mut manifest = CasPackManifest {
+            schema: MANIFEST_SCHEMA.to_owned(), bucket: opts.bucket.clone(), backend: BACKEND_KIND.to_owned(),
+            repo, pack_id, pack_key: p_key.clone(), idx_key: i_key.clone(), manifest_key: m_key.clone(),
+            pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone(), pack_bytes: pack_bytes.len() as u64,
+            idx_bytes: ver_idx.len() as u64, object_count: pack_report.object_count, chunk_size: opts.chunk_size,
+            pack_chunks, idx_chunks, manifest_sha256: String::new(),
+            encryption_mode: Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE.to_owned()),
+            ciphertext_sha256: Some(sealed.ciphertext_sha256.clone()), ciphertext_bytes: Some(sealed.ciphertext_bytes),
+            cipher_suite: Some(sealed.cipher_suite.clone()),
+        };
+        manifest.manifest_sha256 = delta::sha256_hex(&serde_json::to_vec(&manifest)?);
+        let m_bytes = serde_json::to_vec_pretty(&manifest)?;
+        write_immutable_cas_file(&m_path, &m_bytes, &delta::sha256_hex(&m_bytes))?;
+        let env = lifecycle::build_authenticated_envelope_record(
+            repo,
+            &Pack { id: pack_id, pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone() },
+            &sealed,
+            storage_tier,
+        )?;
+        lifecycle::write_envelope_file(base_root, &env)?;
+        (manifest, env)
     };
-    manifest.manifest_sha256 = delta::sha256_hex(&serde_json::to_vec(&manifest)?);
-    let m_bytes = serde_json::to_vec_pretty(&manifest)?;
-    write_immutable_cas_file(&m_path, &m_bytes, &delta::sha256_hex(&m_bytes))?;
 
     let report = ObjectStorePutReport {
         repo, pack_id, bucket: opts.bucket.clone(), backend: BACKEND_KIND.to_owned(), upload_id,
@@ -289,7 +366,18 @@ pub fn put_pack_files(
         total_chunks_uploaded: manifest.pack_chunks.len() + manifest.idx_chunks.len(),
         immutable_mode: "0444".to_owned(), status: "published".to_owned(),
     };
-    Ok((report, manifest))
+    Ok((report, manifest, env, provider.policy().clone()))
+}
+
+pub fn put_pack_files(
+    store_root_dir: &Path,
+    local_objects_root: &Path,
+    repo: Uuid,
+    pack_id: Uuid,
+    opts: &ObjectStorePutOptions,
+) -> Result<(ObjectStorePutReport, CasPackManifest)> {
+    let (rep, manifest, _, _) = put_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot")?;
+    Ok((rep, manifest))
 }
 
 pub fn get_pack_files(
@@ -318,18 +406,11 @@ pub fn get_pack_files(
     let m_path = store_root_dir.join(manifest_key(repo, pack_id));
     ensure!(m_path.is_file(), "local pack cache miss for {pack_id} and pack is not present in object store");
     let manifest: CasPackManifest = serde_json::from_slice(&std::fs::read(&m_path)?)?;
-    let mut check = manifest.clone();
-    check.manifest_sha256 = String::new();
-    ensure!(manifest.repo == repo && manifest.pack_id == pack_id && delta::sha256_hex(&serde_json::to_vec(&check)?) == manifest.manifest_sha256, "CAS manifest verification failed");
+    ensure!(manifest.repo == repo && manifest.pack_id == pack_id, "CAS manifest identity mismatch");
     if let Some(ep) = expected_pack_sha256 { ensure!(manifest.pack_sha256 == ep, "manifest pack_sha256 mismatch"); }
     if let Some(ei) = expected_idx_sha256 { ensure!(manifest.idx_sha256 == ei, "manifest idx_sha256 mismatch"); }
-
-    let p_bytes = std::fs::read(store_root_dir.join(&manifest.pack_key))?;
-    let i_bytes = std::fs::read(store_root_dir.join(&manifest.idx_key))?;
-    ensure!(p_bytes.len() as u64 == manifest.pack_bytes && delta::sha256_hex(&p_bytes) == manifest.pack_sha256, "object store pack mismatch");
-    ensure!(i_bytes.len() as u64 == manifest.idx_bytes && delta::sha256_hex(&i_bytes) == manifest.idx_sha256, "object store idx mismatch");
-    let rep = delta::verify_pack(&p_bytes, &delta::Limits::default())?;
-    ensure!(rep.object_count == manifest.object_count, "object store pack object_count mismatch");
+    let base_root = infer_base_root(store_root_dir, Some(local_objects_root));
+    let (p_bytes, i_bytes) = decrypt_verified_store_pack(store_root_dir, base_root, &manifest)?;
     write_atomic_local_cache_file(&local_pack, &p_bytes, &manifest.pack_sha256)?;
     write_atomic_local_cache_file(&local_idx, &i_bytes, &manifest.idx_sha256)?;
     Ok(ObjectStoreGetReport {
@@ -345,7 +426,7 @@ pub(super) async fn ensure_local_pack_cached(config: &Config, repo: Uuid, pack: 
     get_pack_files(&store_root(config), &config.root.join("objects"), &default_bucket(), repo, pack.id, Some(&pack.pack_sha256), Some(&pack.idx_sha256))
 }
 
-pub fn verify_repo_files(store_root_dir: &Path, bucket: &str, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
+fn verify_repo_files_with_base(store_root_dir: &Path, base_root: &Path, bucket: &str, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
     let mut orphan_staging_cleaned = 0usize;
     let mp_dir = store_root_dir.join("multipart");
     if mp_dir.is_dir() {
@@ -362,10 +443,7 @@ pub fn verify_repo_files(store_root_dir: &Path, bucket: &str, repo: Uuid) -> Res
             if path.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
             checked += 1;
             let m: CasPackManifest = serde_json::from_slice(&std::fs::read(&path)?)?;
-            let (pb, ib) = (std::fs::read(store_root_dir.join(&m.pack_key))?, std::fs::read(store_root_dir.join(&m.idx_key))?);
-            ensure!(pb.len() as u64 == m.pack_bytes && delta::sha256_hex(&pb) == m.pack_sha256 && ib.len() as u64 == m.idx_bytes && delta::sha256_hex(&ib) == m.idx_sha256, "bucket object mismatch");
-            let rep = delta::verify_pack(&pb, &delta::Limits::default())?;
-            ensure!(rep.object_count == m.object_count, "bucket object_count mismatch");
+            decrypt_verified_store_pack(store_root_dir, base_root, &m)?;
             verified += 1;
             p_bytes_sum += m.pack_bytes;
             i_bytes_sum += m.idx_bytes;
@@ -374,9 +452,12 @@ pub fn verify_repo_files(store_root_dir: &Path, bucket: &str, repo: Uuid) -> Res
     Ok(ObjectStoreVerifyReport { repo, bucket: bucket.to_owned(), manifests_checked: checked, packs_verified: verified, total_pack_bytes: p_bytes_sum, total_idx_bytes: i_bytes_sum, orphan_staging_cleaned, verified: true })
 }
 
-pub(super) async fn put_pack(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions) -> Result<ObjectStorePutReport> {
-    if remote_enabled() { return super::remote::put(config, repo, pack_id, opts).await; }
-    let (report, manifest) = put_pack_files(&store_root(config), &config.root.join("objects"), repo, pack_id, opts)?;
+pub fn verify_repo_files(store_root_dir: &Path, bucket: &str, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
+    verify_repo_files_with_base(store_root_dir, infer_base_root(store_root_dir, None), bucket, repo)
+}
+
+async fn put_pack_db_inner(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions, storage_tier: &str) -> Result<(ObjectStorePutReport, lifecycle::KmsEnvelopeRecord)> {
+    let (report, manifest, env, policy) = put_pack_files_sealed(&store_root(config), &config.root.join("objects"), repo, pack_id, opts, storage_tier)?;
     let c = config.db().await?;
     c.execute(
         "INSERT INTO pando_lab.object_store_manifests(repo,pack_id,bucket,pack_key,idx_key,manifest_key,pack_sha256,idx_sha256,pack_bytes,idx_bytes,object_count,chunk_size,chunk_count,manifest_json) \
@@ -384,7 +465,19 @@ pub(super) async fn put_pack(config: &Config, repo: Uuid, pack_id: Uuid, opts: &
          ON CONFLICT(repo,pack_id) DO UPDATE SET bucket=EXCLUDED.bucket,manifest_json=EXCLUDED.manifest_json",
         &[&repo, &pack_id, &report.bucket, &report.pack_key, &report.idx_key, &report.manifest_key, &report.pack_sha256, &report.idx_sha256, &(report.pack_bytes as i64), &(report.idx_bytes as i64), &(report.object_count as i64), &(report.chunk_size as i64), &(report.chunk_count as i64), &serde_json::to_value(&manifest)?],
     ).await?;
-    Ok(report)
+    lifecycle::rotation::sync_kms_policy_to_db(&c, repo, &policy).await?;
+    lifecycle::rotation::upsert_envelope_in_db(&c, &env).await?;
+    Ok((report, env))
+}
+
+pub(super) async fn put_pack(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions) -> Result<ObjectStorePutReport> {
+    if remote_enabled() { return super::remote::put(config, repo, pack_id, opts).await; }
+    Ok(put_pack_db_inner(config, repo, pack_id, opts, "hot").await?.0)
+}
+
+pub(crate) async fn put_pack_and_seal_with_suite(config: &Config, repo: Uuid, pack_id: Uuid, cipher_suite: &str, storage_tier: &str) -> Result<lifecycle::KmsEnvelopeRecord> {
+    let opts = ObjectStorePutOptions { cipher_suite: Some(cipher_suite.to_owned()), ..Default::default() };
+    Ok(put_pack_db_inner(config, repo, pack_id, &opts, storage_tier).await?.1)
 }
 
 pub(super) async fn get_pack(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<ObjectStoreGetReport> {
@@ -397,7 +490,7 @@ pub(super) async fn get_pack(config: &Config, repo: Uuid, pack_id: Uuid) -> Resu
 
 pub(super) async fn verify_repo_store(config: &Config, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
     if remote_enabled() { return super::remote::verify(config, repo).await; }
-    let report = verify_repo_files(&store_root(config), &default_bucket(), repo)?;
+    let report = verify_repo_files_with_base(&store_root(config), &config.root, &default_bucket(), repo)?;
     let c = config.db().await?;
     for r in c.query("SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.object_store_manifests WHERE repo=$1", &[&repo]).await? {
         let pid: Uuid = r.get(0);
@@ -441,8 +534,11 @@ mod tests {
         let (repo, pack_id) = (Uuid::new_v4(), Uuid::new_v4());
         let dir = objects_root.join(repo.to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        let mut pack = Vec::from(&b"PACK\x00\x00\x00\x02\x00\x00\x00\x01\x34"[..]);
-        pack.extend_from_slice(&delta::compress_zlib_stored(b"test"));
+        let payload = b"test-secret-payload";
+        let mut pack = Vec::from(&b"PACK\x00\x00\x00\x02\x00\x00\x00\x01"[..]);
+        pack.push(0x80 | 0x30 | ((payload.len() & 0x0f) as u8));
+        pack.push((payload.len() >> 4) as u8);
+        pack.extend_from_slice(&delta::compress_zlib_stored(payload));
         let tr = delta::sha1_digest(&pack);
         pack.extend_from_slice(&tr);
         std::fs::write(dir.join(format!("{pack_id}.pack")), &pack).unwrap();
@@ -453,9 +549,11 @@ mod tests {
         let ok_opts = ObjectStorePutOptions { bucket: "b1".into(), chunk_size: 8, ..Default::default() };
         let (rep, m) = put_pack_files(&tmp, &objects_root, repo, pack_id, &ok_opts).unwrap();
         assert_eq!(rep.status, "published");
+        assert!(!std::fs::read(&rep.bucket_pack_path).unwrap().windows(19).any(|w| w == b"test-secret-payload"));
         std::fs::remove_file(dir.join(format!("{pack_id}.pack"))).unwrap();
         let get_rep = get_pack_files(&tmp, &objects_root, "b1", repo, pack_id, Some(&m.pack_sha256), Some(&m.idx_sha256)).unwrap();
-        assert!(get_rep.rehydrated_from_object_store);
+        assert!(get_rep.rehydrated_from_object_store && std::fs::read(dir.join(format!("{pack_id}.pack"))).unwrap() == pack);
+        assert!(verify_repo_files(&tmp, "b1", repo).unwrap().verified);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

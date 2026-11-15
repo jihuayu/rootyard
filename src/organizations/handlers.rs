@@ -15,13 +15,13 @@ use serde_json::{Value, json as sjson};
 use std::sync::Arc;
 use uuid::Uuid;
 
-type Res = Result<Response, Error>;
+pub(crate) type Res = Result<Response, Error>;
 
 // The two paginated list handlers live in a sibling file to keep this module
 // focused on lifecycle and membership mutations. The re-export preserves the
 // historical `organizations::handlers::{list_members,list_teams}` paths.
 #[path = "listing.rs"]
-mod listing;
+pub(crate) mod listing;
 pub use listing::{list_members, list_teams};
 
 #[derive(Deserialize)]
@@ -91,19 +91,19 @@ pub(crate) async fn member_role(tx: &Transaction<'_>, org: Uuid, actor: Uuid) ->
     Role::parse(row.get::<_, &str>(0))
 }
 
-async fn require_member(tx: &Transaction<'_>, org: Uuid, actor: Uuid, min: Role) -> Result<(), Error> {
+pub(crate) async fn require_member(tx: &Transaction<'_>, org: Uuid, actor: Uuid, min: Role) -> Result<(), Error> {
     if member_role(tx, org, actor).await? < min {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient organization role"));
     }
     Ok(())
 }
-async fn lock_org_for_admin(tx: &Transaction<'_>, org: Uuid, actor: Uuid) -> Result<(), Error> {
+pub(crate) async fn lock_org_for_admin(tx: &Transaction<'_>, org: Uuid, actor: Uuid) -> Result<(), Error> {
     tx.query_one("SELECT id FROM organizations WHERE id=$1 FOR UPDATE", &[&org]).await.map_err(Error::internal)?;
     // Membership is read after the lock. A concurrently revoked admin cannot
     // act on the authority they held before waiting for that lock.
     require_member(tx, org, actor, Role::Admin).await
 }
-async fn audit(
+pub(crate) async fn audit(
     tx: &Transaction<'_>,
     org: Uuid,
     actor: Uuid,
@@ -371,7 +371,10 @@ async fn change_team_member(
     auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgTeamsWrite).await?;
     lock_org_for_admin(&tx, org, actor.id).await?;
     let team: Uuid = tx
-        .query_opt("SELECT id FROM organization_teams WHERE organization_id=$1 AND slug=$2", &[&org, &team_slug])
+        .query_opt(
+            "SELECT id FROM organization_teams WHERE organization_id=$1 AND slug=$2 FOR SHARE",
+            &[&org, &team_slug],
+        )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?
@@ -386,10 +389,13 @@ async fn change_team_member(
     // non-member as an internal error. Check the precondition here, after the
     // admin and team checks, so an unauthorized caller still learns nothing.
     if add {
-        tx.query_opt("SELECT 1 FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", &[&org, &user])
-            .await
-            .map_err(Error::internal)?
-            .ok_or(Error(StatusCode::CONFLICT, "user is not an organization member"))?;
+        tx.query_opt(
+            "SELECT 1 FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 FOR SHARE",
+            &[&org, &user],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or(Error(StatusCode::CONFLICT, "user is not an organization member"))?;
     }
     let changed = if add {
         tx.execute("INSERT INTO organization_team_members(team_id,organization_id,user_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", &[&team,&org,&user]).await.map_err(Error::internal)?

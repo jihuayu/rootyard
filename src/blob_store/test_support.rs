@@ -87,3 +87,17 @@ pub(crate) async fn delete_exact(store: &BlobStore, locator: &BlobLocator) -> an
         .map_err(|error| anyhow::anyhow!("fixture Blob delete failed ({})", error.kind()))?;
     Ok(())
 }
+
+/// Overwrite one already-published object with invalid bytes at its exact locator.
+///
+/// Test-only: proves serving reads fail closed on corrupted pack payloads both
+/// with and without a valid session token.
+pub(crate) async fn corrupt_exact(store: &BlobStore, locator: &BlobLocator) -> anyhow::Result<()> {
+    let path = store.object_path(locator);
+    store
+        .operator()
+        .write(&path, b"corrupted-pack-payload".to_vec())
+        .await
+        .map_err(|error| anyhow::anyhow!("fixture Blob write failed ({})", error.kind()))?;
+    Ok(())
+}

@@ -1,6 +1,6 @@
 # Pando 一致性契约与交付边界
 
-状态：**部分实现（standalone PostgreSQL 会话下界基础已实现并验收；整体设计与分布式/UI 部分未完成）**。本文为 [全新安装实施计划](implementation-plan.md) 补充面向客户端的可观察保证；历史实现和单机测试不是分布式资格。Pando 在这里指目标 Blob-only Git 后端：单机使用 PostgreSQL RefStore，分布式使用 Raft Ref-CAS；两者使用 Blob 保存内容。本地 Git 仓库是可丢的计算视图。GitFS 及旧 Pando 不作为部署模式；本提案不新增旧数据导入、跨模式在线迁移或旧备份升级。
+状态：**部分实现（standalone PostgreSQL 会话下界、浏览器/UI 传播与损坏/保留/轮换/恢复矩阵已实现；分布式 Raft Ref-CAS 与连续投影 cursor 仍未实现）**。本文为 [全新安装实施计划](implementation-plan.md) 补充面向客户端的可观察保证；历史实现和单机测试不是分布式资格。Pando 在这里指目标 Blob-only Git 后端：单机使用 PostgreSQL RefStore，分布式使用 Raft Ref-CAS；两者使用 Blob 保存内容。本地 Git 仓库是可丢的计算视图。GitFS 及旧 Pando 不作为部署模式；本提案不新增旧数据导入、跨模式在线迁移或旧备份升级。
 
 ## 权威与提交
 

@@ -428,7 +428,7 @@ class DrillWiringTest(unittest.TestCase):
 
     def test_drill_stays_on_the_format21_gitfs_family(self):
         self.assertNotIn("serve-blob", self.source)
-        self.assertIn("== 23", self.source)
+        self.assertIn("== 25", self.source)
         self.assertIn("blob_closure", self.source)
 
 

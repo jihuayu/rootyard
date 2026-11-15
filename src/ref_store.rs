@@ -13,6 +13,7 @@ pub mod contract;
 pub mod core;
 pub mod metadata;
 pub mod pg;
+pub mod projector;
 pub mod serving;
 pub(crate) mod tx;
 

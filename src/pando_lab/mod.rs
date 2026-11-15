@@ -422,6 +422,14 @@ pub async fn run() -> Result<()> {
                             .clone();
                         i += 2;
                     }
+                    "--cipher-suite" => {
+                        opts.cipher_suite = Some(
+                            args.get(i + 1)
+                                .context("missing value for --cipher-suite")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
                     other => bail!("unknown object-store-put flag '{other}'"),
                 }
             }
@@ -494,22 +502,34 @@ pub async fn run() -> Result<()> {
                         );
                         i += 2;
                     }
+                    "--encryption-mode" => {
+                        opts.encryption_mode = Some(
+                            args.get(i + 1)
+                                .context("missing value for --encryption-mode")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
                     other => bail!("unknown lifecycle-evaluate flag '{other}'"),
                 }
             }
             let report = lifecycle::evaluate_lifecycle(&config, repo, &opts).await?;
             println!("{}", serde_json::to_string(&report)?);
         }
-        Some("kms-rotate") if args.len() == 3 => {
-            let repo: Uuid = args[1].parse()?;
-            let report = lifecycle::rotate_kms_key(&config, repo, &args[2]).await?;
-            println!("{}", serde_json::to_string(&report)?);
+        Some("kms-rotate")
+        | Some("kms-status")
+        | Some("kms-verify")
+        | Some("kms-revoke-key")
+        | Some("kms-revoke-provider")
+        | Some("kms-grant-provider")
+        | Some("kms-policy") => {
+            lifecycle::rotation::run_kms_cli(&config, &args).await?;
         }
         Some("object-format-detect") | Some("verify-object-format") | Some("compat-matrix") => {
             object_format::run_cli_command(&config, &args).await?;
         }
         _ => bail!(
-            "usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve | verify-delta <pack> | walk-graph <repo> [wants... ^haves...] | diff-export <repo> [^haves...] | gc [repo] | migrate <repo> <gitfs_path> | migrate-step <repo> <gitfs_path> <copy|verify|drain|fence|switchover> | rollback <repo> <gitfs_path> | migration-status <repo> | repack <repo> [--prune-superseded] [--no-object-store] [--pin-oid <oid>...] | pin-root <repo> <name> <oid> | unpin-root <repo> <name> | object-store-put <repo> <pack_id> [--chunk-size <bytes>] [--fail-after-chunks <n>] [--corrupt-chunk <part>] | object-store-get <repo> <pack_id> | object-store-verify <repo> | object-store-status <repo> | lifecycle-evaluate <repo> [--max-packs <n>] [--cold-evict-local] [--auto-repack] | kms-rotate <repo> <new_key_id> | object-format-detect <repo_or_path> | verify-object-format <repo> [--format <sha1|sha256>] | compat-matrix [<repo>] [--client-format <sha1|sha256>] [--protocol-v2]"
+            "usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve | verify-delta <pack> | walk-graph <repo> [wants... ^haves...] | diff-export <repo> [^haves...] | gc [repo] | migrate <repo> <gitfs_path> | migrate-step <repo> <gitfs_path> <copy|verify|drain|fence|switchover> | rollback <repo> <gitfs_path> | migration-status <repo> | repack <repo> [--prune-superseded] [--no-object-store] [--pin-oid <oid>...] | pin-root <repo> <name> <oid> | unpin-root <repo> <name> | object-store-put <repo> <pack_id> [--chunk-size <bytes>] [--fail-after-chunks <n>] [--corrupt-chunk <part>] [--cipher-suite <suite>] | object-store-get <repo> <pack_id> | object-store-verify <repo> | object-store-status <repo> | lifecycle-evaluate <repo> [--max-packs <n>] [--cold-evict-local] [--auto-repack] [--encryption-mode <mode>] | kms-rotate <repo> (<new_key_id> | --resume) [--fail-after-packs <n>] [--revoke-previous] | kms-status <repo> | kms-verify <repo> | kms-revoke-key <repo> <key_id> | kms-revoke-provider <repo> | kms-grant-provider <repo> | kms-policy <repo> [--retain-previous <bool>] [--min-readable-version <n>] | object-format-detect <repo_or_path> | verify-object-format <repo> [--format <sha1|sha256>] | compat-matrix [<repo>] [--client-format <sha1|sha256>] [--protocol-v2]"
         ),
     }
     Ok(())

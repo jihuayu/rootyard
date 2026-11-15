@@ -264,18 +264,44 @@ pub async fn verify_active(
     action: crate::token_scopes::RepoAction,
     min_role: Role,
 ) -> Result<(), Error> {
+    verify_active_inner(pool, actor, repo_id, None, action, min_role).await
+}
+
+pub async fn verify_active_transfer(
+    pool: &Pool,
+    actor: &Identity,
+    repo_id: Uuid,
+    expected_generation: i64,
+    action: crate::token_scopes::RepoAction,
+    min_role: Role,
+) -> Result<(), Error> {
+    verify_active_inner(pool, actor, repo_id, Some(expected_generation), action, min_role).await
+}
+
+async fn verify_active_inner(
+    pool: &Pool,
+    actor: &Identity,
+    repo_id: Uuid,
+    expected_generation: Option<i64>,
+    action: crate::token_scopes::RepoAction,
+    min_role: Role,
+) -> Result<(), Error> {
     let mut client = pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     verify_token(&tx, actor, action.is_mutating()).await?;
     let row = tx
-        .query_opt("SELECT owner_id, state FROM repositories WHERE id=$1", &[&repo_id])
+        .query_opt("SELECT owner_id, state, storage_generation FROM repositories WHERE id=$1", &[&repo_id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     let owner_id: Uuid = row.get("owner_id");
     let state: String = row.get("state");
+    let storage_generation: i64 = row.get("storage_generation");
     if state != "ready" {
         return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
+    }
+    if expected_generation.is_some_and(|expected| expected != storage_generation) {
+        return Err(Error(StatusCode::CONFLICT, "repository generation changed"));
     }
     let Some((eff, _, _)) = crate::members::rbac::resolve_effective_role(&*tx, repo_id, owner_id, actor.id).await?
     else {

@@ -21,3 +21,13 @@ Repository ownership is currently immutable. An administrator's
 leaves the repository unchanged. Moving just the owner column would strand
 tenant-scoped rows and remote object keys; a future transfer requires a
 recoverable rekey of those records and objects before this policy can change.
+
+## HTTP API surface
+
+- `GET /api/orgs` (paginated direct memberships; restricted tokens filtered by `org:read`), `POST /api/orgs`, `GET /api/orgs/{slug}`
+- `GET /api/orgs/{slug}/members`, `PUT/DELETE /api/orgs/{slug}/members/{username}`
+- `GET/POST /api/orgs/{slug}/teams`, `GET/PATCH/DELETE /api/orgs/{slug}/teams/{team_slug}` (CAS `expected_version` on `PATCH`; `DELETE` cascades `organization_team_members`)
+- `GET /api/orgs/{slug}/teams/{team_slug}/members`, `PUT/DELETE /api/orgs/{slug}/teams/{team_slug}/members/{username}`
+- `GET /api/orgs/{slug}/audit` (`maintain`/`admin` paginated organization audit feed)
+
+Verified end-to-end across Git HTTP, LFS objects/locks, Forge issues/PRs/branch-rules, Git views, Workspaces, Web UI, server restart, and offline PostgreSQL backup/restore by `tests/organizations.py`, `tests/organization_pagination.py`, `tests/organizations_web.py`, `tests/backup_capabilities.py`, and `tests/organizations_lifecycle.py`.

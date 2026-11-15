@@ -213,3 +213,60 @@ impl PushSession {
         RawSession { token: self.token.clone(), revision: self.revision.clone() }
     }
 }
+
+pub(crate) async fn raw_get_with_cookies(
+    client: &reqwest::Client,
+    url: &str,
+    cookie_header: Option<&str>,
+    session: Option<&str>,
+) -> Result<RawAnswer> {
+    let mut request = client.get(url);
+    if let Some(cookie) = cookie_header {
+        request = request.header("cookie", cookie);
+    }
+    if let Some(token) = session {
+        request = request.header(SESSION_HEADER, token);
+    }
+    let response = request.send().await.context("browser HTTP read failed")?;
+    let status = response.status().as_u16();
+    let session = RawSession::from_headers(response.headers());
+    let body = response.text().await.context("browser HTTP body read failed")?;
+    Ok(RawAnswer { status, body, session })
+}
+
+pub(crate) fn form_encode(pairs: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (idx, (key, value)) in pairs.iter().enumerate() {
+        if idx > 0 {
+            out.push('&');
+        }
+        push_form_component(&mut out, key);
+        out.push('=');
+        push_form_component(&mut out, value);
+    }
+    out
+}
+
+fn push_form_component(out: &mut String, input: &str) {
+    for &byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            other => {
+                out.push('%');
+                out.push(hex_upper(other >> 4));
+                out.push(hex_upper(other & 0x0f));
+            }
+        }
+    }
+}
+
+fn hex_upper(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'A' + (nibble - 10)) as char,
+        _ => unreachable!(),
+    }
+}
