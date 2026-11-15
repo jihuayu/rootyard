@@ -646,7 +646,7 @@ fn open_real_env_le_store(keyring: &Path) -> Result<BlobStore> {
         }
     }
     let profile = BlobProfile::from_env()?;
-    ensure!(profile.encryption().mode() == BlobEncryptionMode::LocalEnvelope, "expected local-envelope mode");
+    ensure!(profile.encryption().is_local_envelope(), "expected local-envelope mode");
     Ok(BlobStore::open(profile)?)
 }
 
@@ -718,8 +718,13 @@ async fn run_pg_real_provider_roundtrip(pool: &Pool) -> Result<()> {
     ensure!(receipts[0].hold_id() == hold_ids[0] && receipts[0].slot() == 0, "slot 0 hold receipt mismatch");
     ensure!(receipts[1].hold_id() == hold_ids[1] && receipts[1].slot() == 1, "slot 1 hold receipt mismatch");
     ensure!(receipts[0].receipt().backend_identity() == store.backend_identity());
-    ensure!(receipts[0].receipt().sha256() == ct_pack_sha && receipts[0].receipt().length() == ct_pack_len);
-    ensure!(receipts[1].receipt().sha256() == ct_idx_sha && receipts[1].receipt().length() == ct_idx_len);
+    ensure!(
+        receipts[0].receipt().verified_sha256() == ct_pack_sha
+            && receipts[0].receipt().verified_length() == ct_pack_len
+    );
+    ensure!(
+        receipts[1].receipt().verified_sha256() == ct_idx_sha && receipts[1].receipt().verified_length() == ct_idx_len
+    );
     ensure!(receipts[0].metadata().key_id()? == *kp_v1.current_key_id());
 
     {
