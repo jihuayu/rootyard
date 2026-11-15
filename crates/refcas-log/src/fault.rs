@@ -3,8 +3,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+/// Maximum time an armed install barrier waits before releasing to prevent runtime teardown hangs.
+pub const DEFAULT_INSTALL_PAUSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Named durable-IO fault injection point across log, state machine, and snapshot storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -17,9 +21,11 @@ pub enum FaultPoint {
     SmApplyEnospc,
     SnapshotBuildWriteEnospc,
     SnapshotBuildSync,
+    SnapshotBuildPostCommitSync,
     SnapshotInstallWriteEnospc,
     SnapshotInstallStageSync,
     SnapshotInstallCommitSync,
+    SnapshotInstallPostCommitSync,
 }
 
 impl FaultPoint {
@@ -54,6 +60,35 @@ pub struct FaultSpec {
 struct InstallPause {
     entered: mpsc::Sender<()>,
     release: mpsc::Receiver<()>,
+    timeout: Duration,
+}
+
+/// RAII handle for an armed `install_snapshot` pause barrier; dropping releases the paused worker.
+pub struct InstallPauseGuard {
+    entered: Option<mpsc::Receiver<()>>,
+    release: Option<mpsc::Sender<()>>,
+}
+
+impl InstallPauseGuard {
+    /// Takes the entry-notification receiver so dropping this guard still releases the worker on failure.
+    pub fn take_entered(&mut self) -> Option<mpsc::Receiver<()>> {
+        self.entered.take()
+    }
+
+    /// Explicitly releases the paused `install_snapshot` operation.
+    pub fn release(mut self) {
+        if let Some(tx) = self.release.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for InstallPauseGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.release.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 /// Shared fault controller attached to `PersistentLog` and `PersistentStateMachine`.
@@ -104,20 +139,25 @@ impl FaultController {
     }
 
     /// Installs a one-shot pause gate inside `install_snapshot` before SQLite commit.
-    pub fn arm_install_pause(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    pub fn arm_install_pause(&self) -> InstallPauseGuard {
+        self.arm_install_pause_with_timeout(DEFAULT_INSTALL_PAUSE_TIMEOUT)
+    }
+
+    /// Installs a one-shot pause gate with an explicit upper wait bound before auto-release.
+    pub fn arm_install_pause_with_timeout(&self, timeout: Duration) -> InstallPauseGuard {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let mut guard = self.install_pause.lock().expect("install pause poisoned");
-        *guard = Some(InstallPause { entered: entered_tx, release: release_rx });
-        (entered_rx, release_tx)
+        *guard = Some(InstallPause { entered: entered_tx, release: release_rx, timeout });
+        InstallPauseGuard { entered: Some(entered_rx), release: Some(release_tx) }
     }
 
-    /// Signals test coordinator and waits for release when a one-shot install pause is armed.
+    /// Signals test coordinator and waits boundedly for release when a one-shot install pause is armed.
     pub fn pause_install_if_armed(&self) {
         let pause = self.install_pause.lock().expect("install pause poisoned").take();
-        if let Some(InstallPause { entered, release }) = pause {
+        if let Some(InstallPause { entered, release, timeout }) = pause {
             let _ = entered.send(());
-            let _ = release.recv();
+            let _ = release.recv_timeout(timeout);
         }
     }
 }

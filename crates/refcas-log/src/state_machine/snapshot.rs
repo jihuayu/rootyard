@@ -12,10 +12,12 @@ use sha2::{Digest, Sha256};
 
 use crate::fault::{FaultController, FaultPoint};
 use crate::fixture::verify_same_device;
+use crate::state_machine::codec::{
+    MAX_KV_KEY_BYTES, MAX_KV_VAL_BYTES, hex_encode, is_valid_sha256_hex, sm_kv_checksum, validate_digest_and_boundary,
+};
 use crate::state_machine::store::{
     K_APPLIED_COUNT, K_LAST_APPLIED, K_LAST_MEMBERSHIP, K_SNAP_BASE_BOUNDARY_DIGEST, K_SNAP_BASE_LOG_ID,
-    K_STATE_DIGEST, MAX_KV_KEY_BYTES, MAX_KV_VAL_BYTES, SmInner, ZERO_DIGEST_HEX, hex_encode, read_applied_state,
-    read_boundary_entry_digest_hex, read_kv_map, sm_kv_checksum,
+    K_STATE_DIGEST, SmInner, ZERO_DIGEST_HEX, read_applied_state, read_boundary_entry_digest_hex, read_kv_map,
 };
 use crate::{E, LogTypeConfig, Res, get_meta, idx_to_i64, je, meta, set_meta};
 
@@ -54,7 +56,7 @@ impl SnapshotEnvelope {
         Ok(hex_encode(&Sha256::digest(&bytes)))
     }
 
-    /// Verifies format marker, embedded digest, and metadata consistency.
+    /// Verifies format marker, internal digest/boundary formats, embedded digest, and metadata consistency.
     pub fn verify_integrity(&self) -> Res<()> {
         if self.format != SNAPSHOT_FORMAT {
             return Err(E::Refused(format!("unknown snapshot format {:?}; expected {SNAPSHOT_FORMAT}", self.format)));
@@ -64,6 +66,14 @@ impl SnapshotEnvelope {
         }
         if self.last_membership != self.meta.last_membership {
             return Err(E::Refused("snapshot envelope membership mismatches meta.last_membership".into()));
+        }
+        validate_digest_and_boundary(
+            &self.state_digest_hex,
+            self.last_applied.as_ref(),
+            self.boundary_entry_digest_hex.as_deref(),
+        )?;
+        if !is_valid_sha256_hex(&self.payload_sha256_hex) {
+            return Err(E::Codec("invalid snapshot payload_sha256_hex format".into()));
         }
         let expected = self.compute_payload_sha256()?;
         if expected != self.payload_sha256_hex {
@@ -142,6 +152,40 @@ fn validate_safe_filename(name: &str) -> Res<()> {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err(E::Refused(format!("invalid snapshot filename {name:?}")));
     }
+    Ok(())
+}
+
+fn cleanup_candidate_after_commit_err(conn: &Connection, snapshots_dir: &Path, final_name: &str) {
+    // Only unlink the candidate if committed SQLite state proves another (or no) file is active.
+    if let Ok(active) = get_meta(conn, K_ACTIVE_SNAP_FILE)
+        && active.as_deref() != Some(final_name)
+    {
+        let _ = std::fs::remove_file(snapshots_dir.join(final_name));
+    }
+}
+
+fn commit_staged_snapshot(
+    inner: &mut SmInner,
+    snapshots_dir: &Path,
+    final_name: &str,
+    mut guard: StagingCleanupGuard,
+    post_commit_point: Option<FaultPoint>,
+    populate: impl FnOnce(&rusqlite::Transaction<'_>) -> Res<()>,
+) -> Res<()> {
+    let fault = inner.fault.clone();
+    let tx = inner.tx()?;
+    populate(&tx)?;
+    // Disarm unconditional StagingCleanupGuard before SQLite COMMIT: if COMMIT fails after the
+    // commit point (e.g. IOERR_DIR_FSYNC), active metadata may already reference `final_name`.
+    guard.disarm();
+    if let Err(err) = tx.commit() {
+        cleanup_candidate_after_commit_err(&inner.conn, snapshots_dir, final_name);
+        return Err(err.into());
+    }
+    if let Some(point) = post_commit_point {
+        fault.check(point)?;
+    }
+    sweep_old_snapshots(snapshots_dir, final_name);
     Ok(())
 }
 
@@ -255,18 +299,24 @@ pub(crate) fn build_snapshot_blocking(inner: &mut SmInner) -> Res<Snapshot<LogTy
         write_point: FaultPoint::SnapshotBuildWriteEnospc,
         sync_point: FaultPoint::SnapshotBuildSync,
     };
-    let (_final_path, mut guard) = stage_and_sync_file(&spec, &bytes, &fault)?;
+    let (_final_path, guard) = stage_and_sync_file(&spec, &bytes, &fault)?;
 
     let meta_json = je(&snap_meta)?;
-    let tx = inner.tx()?;
-    set_meta(&tx, K_ACTIVE_SNAP_FILE, Some(&final_name))?;
-    set_meta(&tx, K_ACTIVE_SNAP_SHA256, Some(&file_sha))?;
-    set_meta(&tx, K_ACTIVE_SNAP_META, Some(&meta_json))?;
-    set_meta(&tx, K_SNAP_GEN, Some(&next_gen.to_string()))?;
-    tx.commit()?;
-    guard.disarm();
+    commit_staged_snapshot(
+        inner,
+        &snapshots_dir,
+        &final_name,
+        guard,
+        Some(FaultPoint::SnapshotBuildPostCommitSync),
+        |tx| {
+            set_meta(tx, K_ACTIVE_SNAP_FILE, Some(&final_name))?;
+            set_meta(tx, K_ACTIVE_SNAP_SHA256, Some(&file_sha))?;
+            set_meta(tx, K_ACTIVE_SNAP_META, Some(&meta_json))?;
+            set_meta(tx, K_SNAP_GEN, Some(&next_gen.to_string()))?;
+            Ok(())
+        },
+    )?;
 
-    sweep_old_snapshots(&snapshots_dir, &final_name);
     Ok(Snapshot { meta: snap_meta, snapshot: Box::new(Cursor::new(bytes)) })
 }
 
@@ -343,7 +393,7 @@ pub(crate) fn install_snapshot_blocking(
         write_point: FaultPoint::SnapshotInstallWriteEnospc,
         sync_point: FaultPoint::SnapshotInstallStageSync,
     };
-    let (_final_path, mut guard) = stage_and_sync_file(&spec, &raw, &fault)?;
+    let (_final_path, guard) = stage_and_sync_file(&spec, &raw, &fault)?;
 
     fault.pause_install_if_armed();
 
@@ -355,29 +405,36 @@ pub(crate) fn install_snapshot_blocking(
         None => 0,
     };
 
-    let tx = inner.tx()?;
-    tx.execute("DELETE FROM sm_kv", [])?;
-    for (k, v) in &envelope.kv {
-        let csum = sm_kv_checksum(k, v, base_idx);
-        tx.execute("INSERT INTO sm_kv(k,v,last_idx,checksum) VALUES(?1,?2,?3,?4)", (k, v, base_idx, csum))?;
-    }
-    tx.execute("DELETE FROM sm_entries", [])?;
-    set_meta(&tx, K_LAST_APPLIED, last_json.as_deref())?;
-    set_meta(&tx, K_LAST_MEMBERSHIP, Some(&mem_json))?;
-    set_meta(&tx, K_STATE_DIGEST, Some(&envelope.state_digest_hex))?;
-    set_meta(&tx, K_APPLIED_COUNT, Some(&envelope.applied_count.to_string()))?;
-    set_meta(&tx, K_SNAP_BASE_LOG_ID, last_json.as_deref())?;
-    set_meta(&tx, K_SNAP_BASE_BOUNDARY_DIGEST, envelope.boundary_entry_digest_hex.as_deref())?;
-    set_meta(&tx, K_ACTIVE_SNAP_FILE, Some(&final_name))?;
-    set_meta(&tx, K_ACTIVE_SNAP_SHA256, Some(&file_sha))?;
-    set_meta(&tx, K_ACTIVE_SNAP_META, Some(&meta_json))?;
-    set_meta(&tx, K_SNAP_GEN, Some(&next_gen.to_string()))?;
+    let install_fault = fault.clone();
+    commit_staged_snapshot(
+        inner,
+        &snapshots_dir,
+        &final_name,
+        guard,
+        Some(FaultPoint::SnapshotInstallPostCommitSync),
+        |tx| {
+            tx.execute("DELETE FROM sm_kv", [])?;
+            for (k, v) in &envelope.kv {
+                let csum = sm_kv_checksum(k, v, base_idx);
+                tx.execute("INSERT INTO sm_kv(k,v,last_idx,checksum) VALUES(?1,?2,?3,?4)", (k, v, base_idx, csum))?;
+            }
+            tx.execute("DELETE FROM sm_entries", [])?;
+            set_meta(tx, K_LAST_APPLIED, last_json.as_deref())?;
+            set_meta(tx, K_LAST_MEMBERSHIP, Some(&mem_json))?;
+            set_meta(tx, K_STATE_DIGEST, Some(&envelope.state_digest_hex))?;
+            set_meta(tx, K_APPLIED_COUNT, Some(&envelope.applied_count.to_string()))?;
+            set_meta(tx, K_SNAP_BASE_LOG_ID, last_json.as_deref())?;
+            set_meta(tx, K_SNAP_BASE_BOUNDARY_DIGEST, envelope.boundary_entry_digest_hex.as_deref())?;
+            set_meta(tx, K_ACTIVE_SNAP_FILE, Some(&final_name))?;
+            set_meta(tx, K_ACTIVE_SNAP_SHA256, Some(&file_sha))?;
+            set_meta(tx, K_ACTIVE_SNAP_META, Some(&meta_json))?;
+            set_meta(tx, K_SNAP_GEN, Some(&next_gen.to_string()))?;
 
-    fault.check(FaultPoint::SnapshotInstallCommitSync)?;
-    tx.commit()?;
-    guard.disarm();
+            install_fault.check(FaultPoint::SnapshotInstallCommitSync)?;
+            Ok(())
+        },
+    )?;
 
-    sweep_old_snapshots(&snapshots_dir, &final_name);
     Ok(())
 }
 
@@ -407,5 +464,33 @@ pub(crate) fn read_current_snapshot_blocking(inner: &SmInner) -> Res<Option<Snap
             Ok(Some(Snapshot { meta: snap_meta, snapshot: Box::new(Cursor::new(raw)) }))
         }
         _ => Err(E::Refused("inconsistent active snapshot metadata markers on read".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::META_SCHEMA;
+
+    #[test]
+    fn commit_err_cleanup_only_deletes_unreferenced_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join(SNAPSHOTS_DIR);
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let old = snap_dir.join("snap-0001-old.snap");
+        let new_cand = snap_dir.join("snap-0002-new.snap");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&new_cand, b"new").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(META_SCHEMA).unwrap();
+
+        set_meta(&conn, K_ACTIVE_SNAP_FILE, Some("snap-0002-new.snap")).unwrap();
+        cleanup_candidate_after_commit_err(&conn, &snap_dir, "snap-0002-new.snap");
+        assert!(new_cand.exists(), "committed active candidate MUST be preserved after ambiguous commit error");
+
+        set_meta(&conn, K_ACTIVE_SNAP_FILE, Some("snap-0001-old.snap")).unwrap();
+        cleanup_candidate_after_commit_err(&conn, &snap_dir, "snap-0002-new.snap");
+        assert!(!new_cand.exists(), "proven-unreferenced candidate should be removed");
+        assert!(old.exists(), "prior active snapshot must stay intact");
     }
 }

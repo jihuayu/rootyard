@@ -33,25 +33,50 @@ impl Default for NodeConfig {
     }
 }
 
+struct OwnedChild(Option<Child>);
+
+impl OwnedChild {
+    fn take(&mut self) -> Option<Child> {
+        self.0.take()
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = reap_bounded(&mut child, Duration::from_secs(5));
+        }
+    }
+}
+
+fn reap_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
 pub struct NodeProc {
     pub id: u64,
     pub dir: PathBuf,
     pub addr: String,
-    child: Child,
-}
-
-impl Drop for NodeProc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+    child: OwnedChild,
 }
 
 impl NodeProc {
     pub fn spawn(id: u64, dir: &Path, cfg: &NodeConfig) -> Self {
+        Self::spawn_with_ready_timeout(id, dir, cfg, Duration::from_secs(15))
+    }
+
+    pub fn spawn_with_ready_timeout(id: u64, dir: &Path, cfg: &NodeConfig, ready_timeout: Duration) -> Self {
         qualify_store_dir(dir, true, DEFAULT_MIN_FREE_BYTES).expect("qualify node store dir");
         let bin = env!("CARGO_BIN_EXE_raft-node");
-        let mut child = Command::new(bin)
+        let spawned = Command::new(bin)
             .args([
                 "--id",
                 &id.to_string(),
@@ -71,18 +96,19 @@ impl NodeProc {
                 &cfg.lag_threshold.to_string(),
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .expect("spawn raft-node");
-
-        let stdout = child.stdout.take().expect("stdout piped");
+        // Establish own-child RAII immediately so pre-READY timeout/panic never strands a child process.
+        let mut child = OwnedChild(Some(spawned));
+        let stdout = child.0.as_mut().expect("child live").stdout.take().expect("stdout piped");
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut line = String::new();
             let res = BufReader::new(stdout).read_line(&mut line).map(|_| line);
             let _ = tx.send(res);
         });
-        let raw = rx.recv_timeout(Duration::from_secs(15)).expect("raft-node READY timeout").expect("read READY");
+        let raw = rx.recv_timeout(ready_timeout).expect("raft-node READY timeout").expect("read READY");
         let trimmed = raw.trim();
         let json = trimmed
             .strip_prefix("READY ")
@@ -96,8 +122,9 @@ impl NodeProc {
     }
 
     pub fn kill_sigkill(mut self) -> ExitStatus {
-        self.child.kill().expect("kill child");
-        let status = self.child.wait().expect("wait killed child");
+        let mut child = self.child.take().expect("child live");
+        child.kill().expect("kill child");
+        let status = reap_bounded(&mut child, Duration::from_secs(5)).expect("timed out reaping killed child");
         assert!(!status.success(), "killed child unexpectedly exited zero");
         #[cfg(unix)]
         {
@@ -109,15 +136,10 @@ impl NodeProc {
 
     pub fn shutdown_graceful(mut self) {
         let _ = send_rpc(&self.addr, &RpcRequest::Shutdown);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = self.child.try_wait().expect("try_wait") {
-                assert!(status.success(), "graceful shutdown failed: {status}");
-                return;
-            }
-            assert!(Instant::now() < deadline, "node {} graceful shutdown timeout", self.id);
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let status = reap_bounded(self.child.0.as_mut().expect("child live"), Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("node {} graceful shutdown timeout", self.id));
+        self.child.take();
+        assert!(status.success(), "graceful shutdown failed: {status}");
     }
 
     pub fn metrics(&self) -> NodeMetrics {
@@ -168,13 +190,28 @@ pub struct NodeMetrics {
 }
 
 pub fn spawn_corrupt_expect_refused(id: u64, dir: &Path) -> String {
+    use std::io::Read;
     let bin = env!("CARGO_BIN_EXE_raft-node");
-    let output = Command::new(bin)
+    let spawned = Command::new(bin)
         .args(["--id", &id.to_string(), "--dir", &dir.to_string_lossy(), "--check-on-open", "true"])
-        .output()
-        .expect("run corrupted raft-node");
-    assert!(!output.status.success(), "corrupted store MUST refuse startup for node {id}");
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn corrupted raft-node");
+    let mut child = OwnedChild(Some(spawned));
+    let mut stderr_pipe = child.0.as_mut().expect("child live").stderr.take().expect("stderr piped");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let status = reap_bounded(child.0.as_mut().expect("child live"), Duration::from_secs(10))
+        .expect("timed out waiting for corrupted raft-node refusal");
+    child.take();
+    assert!(!status.success(), "corrupted store MUST refuse startup for node {id}");
+    let stderr_buf = rx.recv_timeout(Duration::from_secs(2)).expect("timed out reading corrupted raft-node stderr");
+    let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
     assert!(stderr.contains("ERR "), "expected explicit refusal on stderr, got: {stderr:?}");
     stderr
 }

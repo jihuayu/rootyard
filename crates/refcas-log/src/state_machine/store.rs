@@ -3,23 +3,22 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use openraft::{BasicNode, EntryPayload, LogId, StoredMembership};
+use openraft::{BasicNode, LogId, StoredMembership};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::fault::{FaultController, FaultPoint};
 use crate::fixture::verify_same_device;
-use crate::state_machine::snapshot;
-use crate::{
-    E, EntryOf, Res, checksum, configure, get_meta, idx_from_i64, idx_to_i64, jd, je, lock_named_dir, meta, set_meta,
+use crate::state_machine::codec::{
+    SmCommand, advance_state_digest, compute_entry_digest, decode_entry_payload, hex_encode, sm_entry_checksum,
+    sm_kv_checksum, validate_digest_and_boundary,
 };
+use crate::state_machine::snapshot;
+use crate::{E, EntryOf, Res, configure, get_meta, idx_from_i64, idx_to_i64, jd, je, lock_named_dir, meta, set_meta};
 
 pub(crate) const SM_FORMAT_VERSION: &str = "rootyard-refcas-sm/1";
 const SM_DB_FILE: &str = "sm.sqlite3";
 const SM_LOCK_FILE: &str = ".raftsm.lock";
-pub(crate) const MAX_KV_KEY_BYTES: usize = 4096;
-pub(crate) const MAX_KV_VAL_BYTES: usize = 256 * 1024;
 pub(crate) const ZERO_DIGEST_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub(crate) const K_LAST_APPLIED: &str = "last_applied";
@@ -33,34 +32,7 @@ const META_SCHEMA: &str = "CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL
 const SM_ENTRIES_SCHEMA: &str = "CREATE TABLE sm_entries(idx INTEGER PRIMARY KEY, log_id TEXT NOT NULL, kind TEXT NOT NULL, payload BLOB NOT NULL, entry_digest BLOB NOT NULL CHECK(length(entry_digest)=32), checksum BLOB NOT NULL CHECK(length(checksum)=32));";
 const SM_KV_SCHEMA: &str = "CREATE TABLE sm_kv(k TEXT PRIMARY KEY, v TEXT NOT NULL, last_idx INTEGER NOT NULL, checksum BLOB NOT NULL CHECK(length(checksum)=32)) WITHOUT ROWID;";
 
-/// Structured deterministic state-machine mutation carried inside `EntryPayload::Normal`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub enum SmCommand {
-    Put { key: String, value: String },
-    Delete { key: String },
-}
-
-impl SmCommand {
-    /// Decodes strict `SmCommand` JSON, rejecting unknown fields.
-    pub fn decode_strict(bytes: &[u8]) -> Res<Self> {
-        serde_json::from_slice(bytes).map_err(|e| E::Codec(format!("decode sm command: {e}")))
-    }
-
-    /// Encodes this command as compact JSON bytes for Raft log submission.
-    pub fn encode(&self) -> Res<Vec<u8>> {
-        serde_json::to_vec(self).map_err(|e| E::Codec(format!("encode sm command: {e}")))
-    }
-}
-
 pub(crate) type AppliedState = (Option<LogId<u64>>, StoredMembership<u64, BasicNode>);
-
-struct DecodedPayload {
-    kind: &'static str,
-    payload_bytes: Vec<u8>,
-    kv_cmd: Option<SmCommand>,
-    membership: Option<openraft::Membership<u64, BasicNode>>,
-}
 
 /// Summary of persistent state-machine state for tests and cluster probes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,12 +138,10 @@ fn validate_persisted_state(conn: &Connection) -> Res<()> {
     let _: StoredMembership<u64, BasicNode> =
         meta(conn, K_LAST_MEMBERSHIP)?.ok_or_else(|| E::Refused("missing last_membership in state machine".into()))?;
     let digest = get_meta(conn, K_STATE_DIGEST)?.ok_or_else(|| E::Refused("missing state_digest".into()))?;
-    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(E::Codec("corrupt state_digest format".into()));
-    }
     let _: u64 = meta(conn, K_APPLIED_COUNT)?.ok_or_else(|| E::Refused("missing applied_count".into()))?;
     let snap_base: Option<LogId<u64>> = meta(conn, K_SNAP_BASE_LOG_ID)?;
-    let _ = get_meta(conn, K_SNAP_BASE_BOUNDARY_DIGEST)?;
+    let snap_digest = get_meta(conn, K_SNAP_BASE_BOUNDARY_DIGEST)?;
+    validate_digest_and_boundary(&digest, snap_base.as_ref(), snap_digest.as_deref())?;
 
     if snap_base.zip(last_applied).is_some_and(|(base, last)| last.index < base.index) {
         return Err(E::Refused(format!("last_applied {last_applied:?} precedes snapshot base {snap_base:?}")));
@@ -359,44 +329,6 @@ pub(crate) fn apply_entries(inner: &mut SmInner, entries: Vec<EntryOf>) -> Res<V
     Ok(responses)
 }
 
-fn decode_entry_payload(payload: &EntryPayload<crate::LogTypeConfig>) -> Res<DecodedPayload> {
-    match payload {
-        EntryPayload::Blank => {
-            Ok(DecodedPayload { kind: "blank", payload_bytes: Vec::new(), kv_cmd: None, membership: None })
-        }
-        EntryPayload::Normal(bytes) => {
-            if let Ok(cmd) = serde_json::from_slice::<SmCommand>(bytes) {
-                validate_kv_cmd(&cmd)?;
-                Ok(DecodedPayload { kind: "kv", payload_bytes: cmd.encode()?, kv_cmd: Some(cmd), membership: None })
-            } else {
-                Ok(DecodedPayload { kind: "normal", payload_bytes: bytes.clone(), kv_cmd: None, membership: None })
-            }
-        }
-        EntryPayload::Membership(mem) => Ok(DecodedPayload {
-            kind: "membership",
-            payload_bytes: je(mem)?.into_bytes(),
-            kv_cmd: None,
-            membership: Some(mem.clone()),
-        }),
-    }
-}
-
-fn validate_kv_cmd(cmd: &SmCommand) -> Res<()> {
-    match cmd {
-        SmCommand::Put { key, value } => {
-            if key.len() > MAX_KV_KEY_BYTES || value.len() > MAX_KV_VAL_BYTES {
-                return Err(E::Refused("kv put exceeds key/value byte limits".into()));
-            }
-        }
-        SmCommand::Delete { key } => {
-            if key.len() > MAX_KV_KEY_BYTES {
-                return Err(E::Refused("kv delete exceeds key byte limit".into()));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn apply_kv_cmd(conn: &Connection, idx: i64, cmd: &SmCommand) -> Res<()> {
     match cmd {
         SmCommand::Put { key, value } => {
@@ -443,45 +375,4 @@ fn check_idempotent_replay(
         return Ok(());
     }
     Err(E::Refused(format!("conflicting or unverifiable replay at {lid} against snapshot base {snap_base:?}")))
-}
-
-fn compute_entry_digest(lid: &LogId<u64>, kind: &str, payload: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(lid.leader_id.term.to_be_bytes());
-    hasher.update(lid.leader_id.node_id.to_be_bytes());
-    hasher.update(lid.index.to_be_bytes());
-    hasher.update((kind.len() as u64).to_be_bytes());
-    hasher.update(kind.as_bytes());
-    hasher.update((payload.len() as u64).to_be_bytes());
-    hasher.update(payload);
-    hasher.finalize().into()
-}
-
-fn advance_state_digest(prev_hex: &str, lid: &LogId<u64>, entry_digest: &[u8; 32]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(prev_hex.as_bytes());
-    hasher.update(lid.leader_id.term.to_be_bytes());
-    hasher.update(lid.leader_id.node_id.to_be_bytes());
-    hasher.update(lid.index.to_be_bytes());
-    hasher.update(entry_digest);
-    let out: [u8; 32] = hasher.finalize().into();
-    hex_encode(&out)
-}
-
-pub(crate) fn sm_entry_checksum(idx: i64, log_id: &str, kind: &str, payload: &[u8], digest: &[u8]) -> Vec<u8> {
-    checksum(&[b"sm_entry", &idx.to_be_bytes(), log_id.as_bytes(), kind.as_bytes(), payload, digest])
-}
-
-pub(crate) fn sm_kv_checksum(k: &str, v: &str, last_idx: i64) -> Vec<u8> {
-    checksum(&[b"sm_kv", k.as_bytes(), v.as_bytes(), &last_idx.to_be_bytes()])
-}
-
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
 }

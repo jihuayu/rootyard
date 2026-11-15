@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 use openraft::Vote;
 use openraft::raft::VoteRequest;
 
+use rootyard_refcas_log::PersistentLog;
 use rootyard_refcas_log::cluster::{FaultTarget, RpcRequest, RpcResponse, send_rpc};
 use rootyard_refcas_log::fault::{FaultMode, FaultPoint, FaultSpec};
 use rootyard_refcas_log::fixture::{DEFAULT_MIN_FREE_BYTES, qualify_store_dir};
+use rootyard_refcas_log::state_machine::PersistentStateMachine;
 
 use harness::{
     NodeConfig, NodeProc, add_learner_and_promote, bootstrap_cluster, broadcast_peers, peer_map,
@@ -421,4 +423,25 @@ fn live_membership_change_with_snapshot_and_restart() {
     n1.shutdown_graceful();
     n2.shutdown_graceful();
     n3.shutdown_graceful();
+}
+
+#[test]
+fn harness_pre_ready_failure_kills_and_reaps_child_boundedly() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = NodeConfig::default();
+    let start = Instant::now();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = NodeProc::spawn_with_ready_timeout(1, dir.path(), &cfg, Duration::from_millis(1));
+    }));
+    assert!(res.is_err(), "1ms READY timeout must fail loudly");
+    assert!(start.elapsed() < Duration::from_secs(6), "OwnedChild drop took too long to kill/reap");
+
+    std::thread::sleep(Duration::from_millis(150));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let log = PersistentLog::open(dir.path(), 1, true).await.expect("reclaimed log lock after pre-READY kill");
+        let sm =
+            PersistentStateMachine::open(dir.path(), 1, true).await.expect("reclaimed sm lock after pre-READY kill");
+        drop((log, sm));
+    });
 }

@@ -1,5 +1,6 @@
 //! Persistent `openraft` 0.9.26 `RaftStateMachine` and `RaftSnapshotBuilder` over SQLite.
 
+mod codec;
 mod snapshot;
 mod store;
 
@@ -15,8 +16,9 @@ use tokio::sync::Mutex;
 use crate::fault::FaultController;
 use crate::{E, EntryOf, LogTypeConfig, Res, ioerr, with_inner};
 
+pub use codec::SmCommand;
 pub use snapshot::SnapshotEnvelope;
-pub use store::{SmCommand, StateMachineSummary};
+pub use store::StateMachineSummary;
 
 /// Persistent Raft state machine stored in `sm.sqlite3` plus atomic `snapshots/` files.
 #[derive(Clone)]

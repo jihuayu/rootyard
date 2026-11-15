@@ -149,7 +149,8 @@ fn install_snapshot_and_membership_change_are_strictly_serialized() {
         dst.apply(vec![blank(1, 0), mem_entry(1, 1, BTreeSet::from([1]))]).await.unwrap();
         let _snap1 = dst.get_snapshot_builder().await.build_snapshot().await.unwrap();
 
-        let (entered_rx, release_tx) = fault.arm_install_pause();
+        let mut pause_guard = fault.arm_install_pause();
+        let entered_rx = pause_guard.take_entered().expect("entered receiver");
         let mut dst_install = dst.clone();
         let meta = snap2.meta.clone();
         let raw = snap2.snapshot.into_inner();
@@ -167,7 +168,7 @@ fn install_snapshot_and_membership_change_are_strictly_serialized() {
         let mid_summary = tokio::time::timeout(Duration::from_millis(80), dst.summary()).await;
         assert!(mid_summary.is_err(), "concurrent reader observed unlocked state mid-install");
 
-        release_tx.send(()).unwrap();
+        pause_guard.release();
         install_task.await.unwrap().unwrap();
         let replies = (&mut apply_task).await.unwrap().unwrap();
         assert_eq!(replies.len(), 1);
@@ -239,7 +240,7 @@ fn failed_install_snapshot_rolls_back_state_membership_and_prior_snapshot() {
             last_membership: snap_prior.meta.last_membership.clone(),
             state_digest_hex: "00".repeat(32),
             applied_count: 1,
-            boundary_entry_digest_hex: None,
+            boundary_entry_digest_hex: Some("11".repeat(32)),
             kv: BTreeMap::new(),
             payload_sha256_hex: String::new(),
         };
