@@ -1225,6 +1225,26 @@ class PullsHarness(ForgeHarness):
             # but physically older, poisoning every later case in this schema.
             drops += ", forge_trusted_check_contexts"
             replay = "DELETE FROM schema_migrations WHERE version IN (9,72,107)"
+            if 150 in SCHEMA_VERSIONS:
+                # Dropping forge_pulls also discards migration 150 collaboration
+                # tables and alters; drop its tables and remaining forge_issues /
+                # forge_issue_comments constraints so replaying 150 restores all.
+                drops += (
+                    ", forge_notifications, forge_subscriptions, "
+                    "forge_comment_revisions, forge_pull_review_comments, "
+                    "forge_pull_assignees, forge_issue_assignees, "
+                    "forge_pull_labels, forge_issue_labels, forge_labels; "
+                    "ALTER TABLE forge_issues "
+                    "DROP CONSTRAINT IF EXISTS forge_issues_label_version_check, "
+                    "DROP CONSTRAINT IF EXISTS forge_issues_assignee_version_check; "
+                    "ALTER TABLE forge_issue_comments "
+                    "DROP CONSTRAINT IF EXISTS forge_issue_comments_moderation_state_check, "
+                    "DROP CONSTRAINT IF EXISTS forge_issue_comments_moderation_reason_check, "
+                    "DROP CONSTRAINT IF EXISTS forge_issue_comments_moderation_consistency_check"
+                )
+                replay = (
+                    "DELETE FROM schema_migrations WHERE version IN (9,72,107,150)"
+                )
         self.sql(drops + "; " + replay + "; CREATE TABLE forge_pull_reviews(dummy integer)")
         if 9 in SCHEMA_VERSIONS:
             failed = self.run([self.args.binary, "migrate"], check=False)
