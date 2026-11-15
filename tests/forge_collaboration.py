@@ -2,12 +2,14 @@
 """Real PG 17 + Git + HTTP E2E + Backup/Restore suite for Issue #86 collaboration features."""
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import sys
+import threading
 import traceback
 import urllib.parse
 
@@ -480,6 +482,118 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
             )
         )
         assert audit_cnt >= 4
+
+        # An invalid anchor under a key must repeat the same 400. The read-only
+        # first phase must not leave a committed placeholder that poisons retry.
+        invalid_key = "review-comment-invalid-anchor"
+        invalid_anchor = {"path": "README.md", "side": "right", "line": 1, "body": "outside diff"}
+        for _ in range(2):
+            status, body, _ = self.http(
+                "/api/repos/alice/demo/pulls/1/review-comments",
+                token=self.bob,
+                method="POST",
+                body=invalid_anchor,
+                extra_headers={"Idempotency-Key": invalid_key},
+            )
+            assert status == 400, (status, body[:300])
+        assert self.sql(
+            f"SELECT count(*) FROM forge_creation_requests WHERE idempotency_key='{invalid_key}'"
+        ) == "0"
+
+        # A transient final-transaction failure after anchor validation must roll
+        # back the key, allocation and resource together. The identical retry
+        # (same digest) then creates once and replays the saved response.
+        fault_key = "review-comment-final-phase-fault"
+        fault_body = "final phase fault"
+        pull_counter_sql = (
+            "SELECT next_review_comment_number FROM forge_pulls "
+            f"WHERE repository_id='{self.demo['id']}' AND number=1"
+        )
+        before_fault = int(self.sql(pull_counter_sql))
+        self.sql(
+            "ALTER TABLE forge_pull_review_comments ADD CONSTRAINT fixture_review_comment_final_phase "
+            f"CHECK (body <> '{fault_body}')"
+        )
+        try:
+            status, body, _ = self.http(
+                "/api/repos/alice/demo/pulls/1/review-comments",
+                token=self.bob,
+                method="POST",
+                body={"path": "src/app.py", "side": "right", "line": 2, "body": fault_body},
+                extra_headers={"Idempotency-Key": fault_key},
+            )
+            assert status == 503, (status, body[:300])
+        finally:
+            self.sql("ALTER TABLE forge_pull_review_comments DROP CONSTRAINT fixture_review_comment_final_phase")
+        assert self.sql(
+            f"SELECT count(*) FROM forge_creation_requests WHERE idempotency_key='{fault_key}'"
+        ) == "0"
+        assert int(self.sql(pull_counter_sql)) == before_fault
+        fault_payload = {"path": "src/app.py", "side": "right", "line": 2, "body": fault_body}
+        retried = json.loads(
+            self.expect(
+                "/api/repos/alice/demo/pulls/1/review-comments",
+                201,
+                token=self.bob,
+                method="POST",
+                body=fault_payload,
+                extra_headers={"Idempotency-Key": fault_key},
+            )
+        )
+        assert retried["number"] == before_fault and retried["body"] == fault_body
+        replayed = json.loads(
+            self.expect(
+                "/api/repos/alice/demo/pulls/1/review-comments",
+                201,
+                token=self.bob,
+                method="POST",
+                body=fault_payload,
+                extra_headers={"Idempotency-Key": fault_key},
+            )
+        )
+        assert replayed == retried
+        assert int(self.sql(pull_counter_sql)) == before_fault + 1
+
+        # Concurrent identical keyed requests start from a real barrier and must
+        # allocate exactly one comment/counter slot while all return that result.
+        concurrent_key = "review-comment-concurrent-identical"
+        concurrent_body = "concurrent identical comment"
+        concurrent_payload = {"path": "src/app.py", "side": "right", "line": 2, "body": concurrent_body}
+        before_concurrent = int(self.sql(pull_counter_sql))
+        barrier = threading.Barrier(4)
+
+        def create_concurrent(_):
+            barrier.wait(timeout=20)
+            return self.http(
+                "/api/repos/alice/demo/pulls/1/review-comments",
+                token=self.bob,
+                method="POST",
+                body=concurrent_payload,
+                extra_headers={"Idempotency-Key": concurrent_key},
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(create_concurrent, range(4)))
+        assert all(status == 201 for status, _, _ in results), [status for status, _, _ in results]
+        created = [json.loads(body) for _, body, _ in results]
+        assert all(item == created[0] for item in created)
+        assert created[0]["body"] == concurrent_body and created[0]["number"] == before_concurrent
+        status, body, _ = self.http(
+            "/api/repos/alice/demo/pulls/1/review-comments",
+            token=self.bob,
+            method="POST",
+            body={**concurrent_payload, "body": concurrent_body + " changed"},
+            extra_headers={"Idempotency-Key": concurrent_key},
+        )
+        assert status == 409, (status, body[:300])
+        assert int(self.sql(pull_counter_sql)) == before_concurrent + 1
+        assert self.sql(
+            f"SELECT count(*) FROM forge_creation_requests WHERE idempotency_key='{concurrent_key}'"
+        ) == "1"
+        assert self.sql(
+            "SELECT count(*) FROM forge_pull_review_comments "
+            f"WHERE repository_id='{self.demo['id']}' AND pull_number=1 AND body='{concurrent_body}'"
+        ) == "1"
         return {"outdated_detected": True, "hide_unhide_roundtrip": True, "soft_delete_and_audit": True}
 
     def exercise_search_and_rbac(self):
