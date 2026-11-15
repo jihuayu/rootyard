@@ -538,18 +538,23 @@ async fn verify_retention_roots_and_pruning(
     Ok(())
 }
 
+struct CloneTarget<'a> {
+    db_url: &'a str,
+    schemas: (&'a str, &'a str),
+    data_a: &'a Path,
+    data_b: PathBuf,
+    work_dir: &'a Path,
+    pool_b: &'a Pool,
+    auth_a: &'a pitr_fence::AuthorityState,
+}
+
 async fn verify_clone_fencing_and_isolate(
     primary: &PrimaryRefs<'_>,
     admin: &Pool,
-    db_url: &str,
-    schemas: (&str, &str),
-    dirs: (&Path, PathBuf, &Path),
-    pool_b: &Pool,
-    auth_a: &pitr_fence::AuthorityState,
     m_keep: &SeededManifest,
+    target: CloneTarget<'_>,
 ) -> Result<SeededManifest> {
-    let (schema_a, schema_b) = schemas;
-    let (data_a, data_b, work_dir) = dirs;
+    let CloneTarget { db_url, schemas: (schema_a, schema_b), data_a, data_b, work_dir, pool_b, auth_a } = target;
     // Out-of-band PG metadata clone sharing the SAME bucket (and even identical
     // copied local markers) MUST detect mismatched schema/cluster coordinates,
     // latch remote_delete_fenced=true, and issue ZERO S3 DELETEs.
@@ -904,12 +909,16 @@ async fn pando_pitr_authority_fencing_and_retention_roots() -> Result<()> {
         let m_protected = Box::pin(verify_clone_fencing_and_isolate(
             &primary,
             &admin,
-            &db_url,
-            (&schema_a, &schema_b),
-            (&data_a, data_b, &work_dir),
-            &pool_b,
-            &auth_a,
             &m_keep,
+            CloneTarget {
+                db_url: &db_url,
+                schemas: (&schema_a, &schema_b),
+                data_a: &data_a,
+                data_b,
+                work_dir: &work_dir,
+                pool_b: &pool_b,
+                auth_a: &auth_a,
+            },
         ))
         .await?;
 
