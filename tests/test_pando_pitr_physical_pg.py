@@ -51,8 +51,12 @@ class FakePidfdApi:
         self.live: list[FakePidfd] = []
         self.before_open = None
         self.before_send = None
+        self.fail_open: set[int] = set()
 
     def open(self, pid: int, flags: int) -> FakePidfd:
+        if pid in self.fail_open:
+            self.fail_open.remove(pid)
+            raise ProcessLookupError(pid)
         record = self.processes.records.get(pid)
         if record is None:
             raise ProcessLookupError(pid)
@@ -123,13 +127,15 @@ class FakeProcesses:
         return dict(self.records[pid])
 
     def replace(self, pid: int, *, starttime: int, session: int | None = None,
-                pgrp: int | None = None) -> None:
+                pgrp: int | None = None, ppid: int | None = None) -> None:
         record = self.records[pid]
         record["starttime"] = starttime
         if session is not None:
             record["session"] = session
         if pgrp is not None:
             record["pgrp"] = pgrp
+        if ppid is not None:
+            record["ppid"] = ppid
 
     def signal(self, pid: int, signum: int) -> None:
         self.signals.append((pid, signum))
@@ -355,6 +361,7 @@ class FixtureBoundaryTest(unittest.TestCase):
         tracker = processes.tracker()
         tracker.remember_postmaster(100, "cleanup")
         processes.records.pop(100)
+        processes.records[101]["ppid"] = 1  # PG child reparented after the leader exit
 
         self.assertEqual(set(tracker.members("cleanup")), {101})
         tracker.terminate_all("cleanup", timeout=0.2)
@@ -428,6 +435,43 @@ class FixtureBoundaryTest(unittest.TestCase):
         self.assertEqual(processes.pidfds.closed, processes.pidfds.opened)
         self.assertEqual(processes.pidfds.live, [])
 
+    def test_first_pin_none_does_not_readopt_same_tick_replacement(self) -> None:
+        processes = FakeProcesses()
+        processes.add(800, ppid=1, session=800, starttime=80)
+        processes.pidfds.fail_open.add(800)
+        tracker = processes.tracker()
+
+        tracker.remember_launch(800, "cleanup")
+        self.assertEqual(tracker._pins, {})
+        self.assertTrue(tracker._unknown)
+
+        processes.replace(800, starttime=80, ppid=42, pgrp=999, session=999)
+        self.assertEqual(tracker.members("cleanup"), {})
+        with self.assertRaises(physical.FixtureError) as caught:
+            tracker.terminate_all("cleanup", timeout=0.2)
+
+        self.assertEqual((caught.exception.phase, caught.exception.code),
+                         ("cleanup", "owned_process_unknown"))
+        self.assertEqual(processes.signals, [])
+        self.assertEqual(processes.pidfds.live, [])
+
+    def test_revoked_session_anchor_does_not_adopt_reused_numeric_sid(self) -> None:
+        processes = FakeProcesses()
+        processes.add(900, ppid=1, session=900, starttime=90)
+        tracker = processes.tracker()
+        tracker.remember_postmaster(900, "cleanup")
+
+        processes.records.pop(900)
+        processes.add(900, ppid=42, session=900, pgrp=999, starttime=90)
+        with self.assertRaises(physical.FixtureError) as caught:
+            tracker.terminate_all("cleanup", timeout=0.2)
+
+        self.assertEqual((caught.exception.phase, caught.exception.code),
+                         ("cleanup", "owned_process_unknown"))
+        self.assertEqual(tracker.members("cleanup"), {})
+        self.assertEqual(processes.signals, [])
+        self.assertEqual(processes.pidfds.live, [])
+
     def test_partial_start_without_pidfile_requires_owned_child_absence(self) -> None:
         processes = FakeProcesses()
         processes.add(200, session=200, starttime=20)
@@ -436,6 +480,7 @@ class FixtureBoundaryTest(unittest.TestCase):
         fixture = self.make_fixture(processes)
         fixture.owned.remember_launch(200, "start")
         processes.records.pop(200)
+        processes.records[201]["ppid"] = 1  # detached child is reparented
         fixture.primary_data.mkdir(mode=0o700)
 
         cleanup = fixture.cleanup()
