@@ -26,6 +26,7 @@
 //! Only process groups this verifier spawned are ever signalled (`kill(-pid)` on
 //! the id of a child that was started with `setpgid(0,0)` in this process); there
 //! is no global OS process cleanup and no unowned PID is touched.
+use super::budget::{DownloadPermit, NativePermit, StagingReservation, ViewPermit};
 use super::refuse;
 use super::scratch::TempRoot;
 use crate::ref_store::core::pack_commit::error::PackCommitError;
@@ -33,7 +34,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Child;
-use tokio::sync::OwnedSemaphorePermit;
 
 /// Foreground poll interval while a reaper owns cleanup.
 const FAST_POLL: Duration = Duration::from_millis(10);
@@ -42,31 +42,68 @@ const SLOW_POLL: Duration = Duration::from_millis(250);
 /// Polls before the reaper backs off (~5 s).
 const SLOW_AFTER: u32 = 500;
 
-/// One verification's capacity permits and private workspace.
+/// One verification's separated capacity permits and private workspace.
 pub(super) struct VerificationLease {
     /// The workspace goes before the permits: files only disappear after the
     /// last reference, which is also the point at which capacity returns.
     root: TempRoot,
+    /// Process-wide scratch disk staging reservation, shrinkable once redundant
+    /// `incoming/` or `verify.git/` state is unlinked.
+    staging: Mutex<Option<StagingReservation>>,
+    /// Network download slot held only during Phase 1 fetch/readback.
+    download: Mutex<Option<DownloadPermit>>,
     /// Materialized-view budget. `None` for an A4 native verification.
-    _view_budget: Option<OwnedSemaphorePermit>,
-    /// Native process permit. `None` before A5b native admission and after every
-    /// native child is confirmed quiescent.
-    native: Mutex<Option<OwnedSemaphorePermit>>,
+    _view_budget: Option<ViewPermit>,
+    /// Native process permit. `None` before Phase 2 native admission and after
+    /// every native child is confirmed quiescent.
+    native: Mutex<Option<NativePermit>>,
 }
 
 impl VerificationLease {
-    /// Bind one already-acquired process-wide native slot to a freshly created
-    /// private workspace (A4 shape).
-    pub(super) fn new(permit: OwnedSemaphorePermit) -> Result<Arc<Self>, PackCommitError> {
+    /// Bind separated Phase-1 staging + download permits to a private workspace
+    /// (A4 shape; native permit is admitted in Phase 2 after downloads complete).
+    pub(super) fn for_verification(
+        staging: StagingReservation,
+        download: DownloadPermit,
+    ) -> Result<Arc<Self>, PackCommitError> {
         let root = TempRoot::create()?;
-        Ok(Arc::new(Self { root, _view_budget: None, native: Mutex::new(Some(permit)) }))
+        Ok(Arc::new(Self {
+            root,
+            staging: Mutex::new(Some(staging)),
+            download: Mutex::new(Some(download)),
+            _view_budget: None,
+            native: Mutex::new(None),
+        }))
     }
 
-    /// Bind one already-acquired materialized-view budget to a private workspace.
-    /// No native permit is held until [`Self::admit_native`].
-    pub(super) fn with_view_budget(budget: OwnedSemaphorePermit) -> Result<Arc<Self>, PackCommitError> {
+    /// Bind an already-acquired materialized-view budget plus Phase-1 staging
+    /// and download permits to a private workspace.
+    pub(super) fn with_view_budget(
+        budget: ViewPermit,
+        staging: StagingReservation,
+        download: DownloadPermit,
+    ) -> Result<Arc<Self>, PackCommitError> {
         let root = TempRoot::create()?;
-        Ok(Arc::new(Self { root, _view_budget: Some(budget), native: Mutex::new(None) }))
+        Ok(Arc::new(Self {
+            root,
+            staging: Mutex::new(Some(staging)),
+            download: Mutex::new(Some(download)),
+            _view_budget: Some(budget),
+            native: Mutex::new(None),
+        }))
+    }
+
+    /// Test-only constructor matching `view.rs` tests with a raw native permit.
+    #[cfg(test)]
+    pub(super) fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Result<Arc<Self>, PackCommitError> {
+        let root = TempRoot::create()?;
+        Ok(Arc::new(Self {
+            root,
+            staging: Mutex::new(None),
+            download: Mutex::new(None),
+            _view_budget: None,
+            native: Mutex::new(Some(NativePermit::from_test_permit(permit))),
+        }))
     }
 
     /// Test-only empty lease for unit cases that never run a native child (an
@@ -75,14 +112,15 @@ impl VerificationLease {
     pub(super) fn for_test() -> Arc<Self> {
         Arc::new(Self {
             root: TempRoot::create().expect("test lease root"),
+            staging: Mutex::new(None),
+            download: Mutex::new(None),
             _view_budget: None,
             native: Mutex::new(None),
         })
     }
 
-    /// Install the one native permit for the pending native steps. Callers must
-    /// have acquired the view budget first.
-    pub(super) fn admit_native(&self, permit: OwnedSemaphorePermit) {
+    /// Install the one native permit for Phase-2 Git verification steps.
+    pub(super) fn admit_native(&self, permit: NativePermit) {
         if let Ok(mut native) = self.native.lock() {
             *native = Some(permit);
         } else {
@@ -91,6 +129,28 @@ impl VerificationLease {
             // normal native error path.
             std::mem::forget(permit);
         }
+    }
+
+    /// Release the Blob download slot once Phase-1 download/readback finishes so
+    /// native CPU execution does not pin network admission capacity.
+    pub(super) fn release_download(&self) {
+        if let Ok(mut download) = self.download.lock() {
+            download.take();
+        }
+    }
+
+    /// Shrink the staging byte reservation once redundant temp files are unlinked.
+    pub(super) fn shrink_staging_to(&self, keep_bytes: u64) {
+        if let Ok(mut staging) = self.staging.lock()
+            && let Some(guard) = staging.as_mut()
+        {
+            guard.shrink_to_bytes(keep_bytes);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserved_staging_bytes(&self) -> u64 {
+        self.staging.lock().ok().and_then(|guard| guard.as_ref().map(StagingReservation::reserved_bytes)).unwrap_or(0)
     }
 
     /// Release native capacity only after every native child of this lease was
@@ -230,31 +290,64 @@ pub(super) fn refuse_retained_cleanup() -> PackCommitError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::budget::{AdmissionClass, BudgetRegistry};
     use super::*;
-    use tokio::sync::Semaphore;
+    use std::time::Instant;
+
+    fn test_registry() -> BudgetRegistry {
+        BudgetRegistry::new(1, 1, 1, 1, 1, 1, 64 * 1024 * 1024, 32 * 1024 * 1024)
+    }
 
     #[tokio::test]
     async fn the_slot_and_workspace_live_until_the_last_reference_drops() {
-        let slots = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&slots).acquire_owned().await.expect("first slot");
-        let lease = VerificationLease::new(permit).expect("lease");
+        let registry = test_registry();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let staging = registry.reserve_staging(64 * 1024, AdmissionClass::Foreground, deadline).await.expect("staging");
+        let download = registry.acquire_download(AdmissionClass::Foreground, deadline).await.expect("download");
+        let lease = VerificationLease::for_verification(staging, download).expect("lease");
+        assert!(lease.reserved_staging_bytes() >= 64 * 1024);
+        lease.shrink_staging_to(0);
+        assert_eq!(lease.reserved_staging_bytes(), 0);
+        lease.release_download();
+        drop(registry.acquire_download(AdmissionClass::Foreground, deadline).await.expect("download released"));
+        let native = registry.acquire_native(AdmissionClass::Foreground, deadline).await.expect("first native");
+        lease.admit_native(native);
         let workspace = lease.root_path().to_path_buf();
         assert!(workspace.is_dir(), "the workspace exists with the lease");
-        assert!(Arc::clone(&slots).try_acquire_owned().is_err(), "the slot stays reserved");
+        let expired = Instant::now() + Duration::from_millis(20);
+        assert!(registry.acquire_native(AdmissionClass::Foreground, expired).await.is_err(), "slot stays reserved");
         let second = Arc::clone(&lease);
         drop(lease);
         assert!(workspace.is_dir(), "the workspace survives while a reference is alive");
-        assert!(Arc::clone(&slots).try_acquire_owned().is_err(), "a remaining reference still owns the slot");
+        let expired = Instant::now() + Duration::from_millis(20);
+        assert!(
+            registry.acquire_native(AdmissionClass::Foreground, expired).await.is_err(),
+            "a remaining reference still owns the slot"
+        );
         drop(second);
         assert!(workspace.symlink_metadata().is_err(), "the workspace is removed with the last reference");
-        drop(Arc::clone(&slots).try_acquire_owned().expect("the slot returns with the last reference"));
+        drop(
+            registry
+                .acquire_native(AdmissionClass::Foreground, Instant::now() + Duration::from_secs(1))
+                .await
+                .expect("slot returns"),
+        );
     }
 
     #[test]
     fn an_unconfirmed_retained_state_keeps_its_slot_and_workspace() {
-        let slots = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&slots).try_acquire_owned().expect("slot");
-        let lease = VerificationLease::new(permit).expect("lease");
+        let registry = test_registry();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("rt");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (download, staging, native) = rt.block_on(async {
+            let staging =
+                registry.reserve_staging(64 * 1024, AdmissionClass::Foreground, deadline).await.expect("staging");
+            let download = registry.acquire_download(AdmissionClass::Foreground, deadline).await.expect("download");
+            let native = registry.acquire_native(AdmissionClass::Foreground, deadline).await.expect("native");
+            (download, staging, native)
+        });
+        let lease = VerificationLease::for_verification(staging, download).expect("lease");
+        lease.admit_native(native);
         let workspace = lease.root_path().to_path_buf();
         let watcher = Arc::downgrade(&lease);
         let retained = Retained { child: None, pid: 0, lease: Some(Arc::clone(&lease)) };
@@ -262,6 +355,12 @@ mod tests {
         drop(retained);
         assert!(watcher.upgrade().is_some(), "an unconfirmed retained lease is never released");
         assert!(workspace.symlink_metadata().is_ok(), "its workspace is never removed");
-        assert!(Arc::clone(&slots).try_acquire_owned().is_err(), "its slot is never returned");
+        assert!(
+            rt.block_on(
+                registry.acquire_native(AdmissionClass::Foreground, Instant::now() + Duration::from_millis(20))
+            )
+            .is_err(),
+            "its slot is never returned"
+        );
     }
 }

@@ -11,23 +11,25 @@
 //! native permit is installed only around the native steps and released after
 //! every child is confirmed quiescent. Any uncertain cleanup keeps both the
 //! native permit and the workspace/view budget.
+use super::budget::budgets;
 use super::download;
+use super::handoff;
 use super::lease::VerificationLease;
 use super::refs::{self, RefMap};
 use super::view::NativeView;
-use super::{acquire_slot, acquire_view_budget, arm, refuse};
+use super::{AdmissionClass, acquire_slot_with_class, acquire_view_budget_with_class, arm, refuse};
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::pack_commit::artifact::RegisteredPack;
 use crate::ref_store::core::pack_commit::context::CapturedRef;
 use crate::ref_store::core::pack_commit::contract::{
-    PackArtifactRole, VERIFIER_MAX_OBJECTS, VERIFIER_MAX_PAIRS, VERIFIER_MAX_RESULT_REFS, VERIFIER_MAX_TOTAL_BYTES,
+    PackArtifactRole, VERIFIER_MAX_PAIRS, VERIFIER_MAX_RESULT_REFS, VERIFIER_MAX_TOTAL_BYTES,
     VERIFIER_VIEW_MAX_LOGICAL_BYTES,
 };
 use crate::ref_store::core::pack_commit::error::PackCommitError;
 use crate::ref_store::core::types::{GitObjectFormat, RefName};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
@@ -46,10 +48,17 @@ pub(crate) struct NativeReadRequest<'a> {
     pub(crate) read_digest: &'a str,
 }
 
+struct StoredPair {
+    pack_path: PathBuf,
+    pack_sha256: String,
+    idx_path: PathBuf,
+    idx_sha256: String,
+}
+
 /// Owned native materialization: private workspace + exact verified local files.
 pub(crate) struct NativeReadClosure {
     lease: Arc<VerificationLease>,
-    pairs: BTreeMap<Uuid, (PathBuf, PathBuf)>,
+    pairs: BTreeMap<Uuid, StoredPair>,
     verified_pairs: usize,
     verified_bytes: u64,
     /// The explicit complete T1 binding this closure was materialized for.
@@ -121,18 +130,18 @@ impl NativeReadClosure {
         if registered_len > VERIFIER_VIEW_MAX_LOGICAL_BYTES {
             return Err(refuse("materialized copy read exceeds the workspace bound"));
         }
-        let path = match role {
-            PackArtifactRole::Pack => self.pack_path(pack_id),
-            PackArtifactRole::Idx => self.idx_path(pack_id),
+        let (path, expected_sha) = match role {
+            PackArtifactRole::Pack => self.pack_entry(pack_id),
+            PackArtifactRole::Idx => self.idx_entry(pack_id),
         }
-        .ok_or_else(|| refuse("materialized pack copy is unavailable"))?
-        .to_path_buf();
+        .ok_or_else(|| refuse("materialized pack copy is unavailable"))?;
+        let path = path.to_path_buf();
+        let expected_sha = expected_sha.to_owned();
         let lease = Arc::clone(&self.lease);
         let task = tokio::task::spawn_blocking(move || {
-            // The task owns the lease until this closure actually returns; a
-            // detached join never frees the workspace under the running read.
-            let _lease = lease;
-            read_artifact_blocking(&path, registered_len)
+            // The task owns the lease until the stream finishes; a detached join
+            // never frees the workspace under the running read.
+            handoff::read_verified_streamed(&path, registered_len, Some(&expected_sha), lease, deadline)
         });
         match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), task).await {
             Ok(Ok(result)) => result,
@@ -141,12 +150,12 @@ impl NativeReadClosure {
         }
     }
 
-    fn pack_path(&self, pack_id: Uuid) -> Option<&Path> {
-        self.pairs.get(&pack_id).map(|(pack, _)| pack.as_path())
+    fn pack_entry(&self, pack_id: Uuid) -> Option<(&std::path::Path, &str)> {
+        self.pairs.get(&pack_id).map(|pair| (pair.pack_path.as_path(), pair.pack_sha256.as_str()))
     }
 
-    fn idx_path(&self, pack_id: Uuid) -> Option<&Path> {
-        self.pairs.get(&pack_id).map(|(_, idx)| idx.as_path())
+    fn idx_entry(&self, pack_id: Uuid) -> Option<(&std::path::Path, &str)> {
+        self.pairs.get(&pack_id).map(|pair| (pair.idx_path.as_path(), pair.idx_sha256.as_str()))
     }
 }
 
@@ -172,47 +181,47 @@ impl NativeReadEngine {
         let (refs, read_digest) = validate(request)?;
         let registered = request.packs.iter().collect::<Vec<_>>();
         download::check_live_backend(&self.store, &registered)?;
-        // View budget first, then create the owned workspace, then admit native.
-        let lease = VerificationLease::with_view_budget(acquire_view_budget(deadline).await?)?;
-        // Native admission comes BEFORE `init`, because `init` runs Git. The view
-        // budget was acquired first; the native permit stays installed until every
-        // child below is confirmed quiescent.
-        let native = acquire_slot(deadline).await?;
-        lease.admit_native(native);
+        let planned_bytes = download::planned_pair_bytes(&registered)?;
+        let class = AdmissionClass::Foreground;
+        // Phase 1: view budget, staging reservation, and download slot (no native Git CPU slot yet).
+        let view_budget = acquire_view_budget_with_class(class, deadline).await?;
+        let staging = budgets().reserve_staging(planned_bytes.saturating_mul(2), class, deadline).await?;
+        let download_permit = budgets().acquire_download(class, deadline).await?;
+        let lease = VerificationLease::with_view_budget(view_budget, staging, download_permit)?;
         let view = NativeView::create(&self.git, Arc::clone(&lease), request.format)?;
+        check_workspace(&lease, deadline).await?;
+        preflight_workspace(&lease, planned_bytes.saturating_mul(2), deadline).await?;
+        let staged_pairs =
+            download::fetch_pairs_staged(&self.store, &registered, view.incoming(), &lease, deadline).await?;
+        lease.release_download();
+        check_workspace(&lease, deadline).await?;
+
+        // Phase 2: admit native CPU slot strictly for Git verification/attestation.
+        let native = acquire_slot_with_class(class, deadline).await?;
+        lease.admit_native(native);
         view.init(deadline).await?;
         check_workspace(&lease, deadline).await?;
 
         let mut pairs = BTreeMap::new();
         let mut indexed = BTreeSet::new();
         let mut bytes = 0u64;
-        let mut objects_total = 0u64;
-        for (index, pack) in request.packs.iter().enumerate() {
-            let pair_bytes = pack_bytes(pack)?;
-            // `get_to_file` streams through a staging file and then renames, so the
-            // pre-download peak can be two copies of this pair.
-            preflight_workspace(&lease, pair_bytes.saturating_mul(2), deadline).await?;
-            let download::PairInput { pack: pack_copy, idx, sha256, objects } =
-                download::fetch_pair(&self.store, pack, view.incoming(), index, &lease, deadline).await?;
-            check_workspace(&lease, deadline).await?;
-            let declared = objects;
-            objects_total =
-                objects_total.checked_add(declared).ok_or_else(|| refuse("materialized object count overflowed"))?;
-            if objects_total > VERIFIER_MAX_OBJECTS {
-                return Err(refuse("materialized read exceeds the aggregate verifier object bound"));
-            }
-            view.verify_registered_pair(&idx, deadline).await?;
-            if indexed.insert(sha256) {
+        for (pack, staged) in request.packs.iter().zip(staged_pairs) {
+            view.verify_registered_pair(&staged.idx, deadline).await?;
+            if indexed.insert(staged.sha256.clone()) {
                 // `index-pack` duplicates the verified pack+idx under canonical
                 // names while the incoming copy remains. Refuse the projected
                 // peak before Git can consume disk beyond the view cap.
-                preflight_workspace(&lease, pair_bytes, deadline).await?;
-                view.index_pack(&pack_copy, deadline).await?;
+                preflight_workspace(&lease, staged.bytes, deadline).await?;
+                view.index_pack(&staged.pack, deadline).await?;
                 check_workspace(&lease, deadline).await?;
             }
             bytes =
-                bytes.checked_add(pair_bytes).ok_or_else(|| refuse("materialized artifact byte count overflowed"))?;
-            pairs.insert(pack.pack_id(), (pack_copy, idx));
+                bytes.checked_add(staged.bytes).ok_or_else(|| refuse("materialized artifact byte count overflowed"))?;
+            let idx_sha256 = pack.artifact(PackArtifactRole::Idx).verified_sha256().as_str().to_owned();
+            pairs.insert(
+                pack.pack_id(),
+                StoredPair { pack_path: staged.pack, pack_sha256: staged.sha256, idx_path: staged.idx, idx_sha256 },
+            );
         }
         view.check_pack_directory(indexed.len())?;
         view.attest_refs(
@@ -224,8 +233,11 @@ impl NativeReadEngine {
         .await?;
         check_workspace(&lease, deadline).await?;
         // Every child spawned above is confirmed reaped by the runner. Native
-        // capacity returns now; the workspace and view budget stay owned.
+        // capacity returns now; reclaim disposable `verify.git/` and shrink
+        // staging down to the ~1x retained pair footprint.
         lease.release_native();
+        download::remove_directory_tree(&lease.root_path().join("verify.git"), &lease, deadline).await?;
+        lease.shrink_staging_to(bytes);
         Ok(NativeReadClosure { lease, pairs, verified_pairs: request.packs.len(), verified_bytes: bytes, read_digest })
     }
 }
@@ -262,40 +274,14 @@ fn validate(request: &NativeReadRequest<'_>) -> Result<(RefMap, RequestDigest), 
         if !ids.insert(pack.pack_id()) {
             return Err(refuse("materialized read repeats a pack id"));
         }
-        bytes = bytes.checked_add(pack_bytes(pack)?).ok_or_else(|| refuse("materialized artifact bytes overflowed"))?;
+        bytes = bytes
+            .checked_add(download::single_pair_bytes(pack)?)
+            .ok_or_else(|| refuse("materialized artifact bytes overflowed"))?;
     }
     if bytes > VERIFIER_MAX_TOTAL_BYTES {
         return Err(refuse("materialized read exceeds the verifier total artifact-byte bound"));
     }
     Ok((map, read_digest))
-}
-
-fn pack_bytes(pack: &RegisteredPack) -> Result<u64, PackCommitError> {
-    pack.artifact(PackArtifactRole::Pack)
-        .verified_length()
-        .checked_add(pack.artifact(PackArtifactRole::Idx).verified_length())
-        .ok_or_else(|| refuse("materialized artifact bytes overflowed"))
-}
-
-/// One owned bounded blocking read of exactly one private local copy.
-fn read_artifact_blocking(path: &Path, length: u64) -> Result<Vec<u8>, PackCommitError> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|_| refuse("materialized copy cannot be reopened"))?;
-    let metadata = file.metadata().map_err(|_| refuse("materialized copy cannot be inspected"))?;
-    if !metadata.is_file() {
-        return Err(refuse("materialized copy is not a regular file"));
-    }
-    if metadata.len() != length {
-        return Err(refuse("materialized copy length differs from the registered length"));
-    }
-    let capacity = usize::try_from(length).map_err(|_| refuse("materialized copy length is not addressable"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    let mut reader = file.take(length.saturating_add(1));
-    reader.read_to_end(&mut bytes).map_err(|_| refuse("materialized copy cannot be read"))?;
-    if bytes.len() as u64 != length {
-        return Err(refuse("materialized copy changed length while being read"));
-    }
-    Ok(bytes)
 }
 
 async fn check_workspace(lease: &Arc<VerificationLease>, deadline: Instant) -> Result<(), PackCommitError> {

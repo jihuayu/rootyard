@@ -9,7 +9,7 @@ use super::refuse;
 use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::pack_commit::artifact::{ArtifactSetDigest, RegisteredPack};
 use crate::ref_store::core::pack_commit::context::{CapturedRef, MembershipDigest, PackMembershipEntry, refs_digest};
-use crate::ref_store::core::pack_commit::contract::{PackArtifactRole, VERIFIER_VIEW_MAX_LOGICAL_BYTES};
+use crate::ref_store::core::pack_commit::contract::VERIFIER_VIEW_MAX_LOGICAL_BYTES;
 use crate::ref_store::core::pack_commit::error::PackCommitError;
 use crate::ref_store::core::pack_commit::facts::{RefFacts, VerifiedPackIdentity};
 use crate::ref_store::core::pack_commit::plan::PackCommitPlan;
@@ -28,13 +28,6 @@ pub(super) fn membership_rows(
         rows.insert(entry.pack_id(), (entry.registration_id(), entry.artifact_set_digest(), entry.joined_revision()));
     }
     Ok(rows)
-}
-
-pub(super) fn pair_bytes(pack: &RegisteredPack) -> Result<u64, PackCommitError> {
-    pack.artifact(PackArtifactRole::Pack)
-        .verified_length()
-        .checked_add(pack.artifact(PackArtifactRole::Idx).verified_length())
-        .ok_or_else(|| refuse("publication artifact bytes overflowed"))
 }
 
 pub(super) fn old_ref_map(
