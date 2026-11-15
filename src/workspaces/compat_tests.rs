@@ -77,7 +77,6 @@ fn file_entry(rel: &str, bytes: &[u8]) -> core::Entry {
         kind: "file".to_owned(),
         mode: 0o644,
         size: bytes.len() as u64,
-        target_base64: None,
         sha256: hex::encode(Sha256::digest(bytes)),
     }
 }
@@ -125,10 +124,11 @@ fn unborn_head_and_sha256_are_rejected_as_conflict() {
 
 #[test]
 fn submodules_gitlinks_and_nested_git_are_rejected() {
-    let tree_err = validate_tree_listing_no_gitlinks(
-        b"100644 blob 1111111111111111111111111111111111111111\thello.txt\0160000 commit 2222222222222222222222222222222222222222\tvendor/lib\0",
-    )
-    .unwrap_err();
+    let listing = concat!(
+        "100644 blob 1111111111111111111111111111111111111111\thello.txt\0",
+        "160000 commit 2222222222222222222222222222222222222222\tvendor/lib\0"
+    );
+    let tree_err = validate_tree_listing_no_gitlinks(listing.as_bytes()).unwrap_err();
     assert_eq!(tree_err.0, StatusCode::CONFLICT);
 
     let with_modules = make_valid_repo();

@@ -238,7 +238,6 @@ impl Raw {
         &self.digest
     }
 
-    #[cfg(test)]
     pub(super) fn items(&self) -> Vec<(Origin, core::Entry)> {
         self.merged.values().cloned().collect()
     }

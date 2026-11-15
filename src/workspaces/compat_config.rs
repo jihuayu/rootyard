@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 /// Any `include`, `filter.*`, `diff.*`, `merge.*`, `extensions.*`, `core.hooksPath`,
 /// `core.worktree`, `core.fsmonitor`, `core.untrackedCache`, `core.sparseCheckout`, or
 /// `core.splitIndex` is rejected deterministically with `409 Conflict`.
-pub(super) fn validate_config_bytes(bytes: &[u8]) -> Result<(), Error> {
+pub(in crate::workspaces) fn validate_config_bytes(bytes: &[u8]) -> Result<(), Error> {
     if bytes.contains(&0) {
         return Err(Error(StatusCode::CONFLICT, CONFLICT_CONFIG));
     }
