@@ -113,7 +113,7 @@ impl TestPgEnv {
 
     pub async fn seed_decision(&self, d: &SeedPgDecision<'_>) -> Result<()> {
         let client = self.pool.get().await?;
-        self.seed_decision_on(&*client, d).await
+        self.seed_decision_on(&client, d).await
     }
 
     pub async fn seed_decision_on<C: GenericClient + Sync>(&self, client: &C, d: &SeedPgDecision<'_>) -> Result<()> {
