@@ -2,18 +2,19 @@
 
 use std::time::Duration;
 
+use openraft::LogId;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
-use openraft::{LogId, Raft};
-use rootyard_refcas_log::LogTypeConfig;
 use rootyard_refcas_log::state_machine::{
-    ApplicationCommand, ApplicationLogId, ApplicationRuntimeSnapshot, ApplicationStateMachine, PersistentStateMachine,
+    ApplicationCommand, ApplicationLogId, ApplicationRuntimeSnapshot, ApplicationStateMachine,
 };
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::ref_store::core::state_machine::{RefCasCommand, encode_command};
 use crate::ref_store::raft_backend::error::RaftBackendError;
-use crate::ref_store::raft_backend::outcome::{OutcomeQuery, ProposeOutcome, StoredOutcome, command_digest_hex};
+use crate::ref_store::raft_backend::node::RootRaftNode;
+use crate::ref_store::raft_backend::outcome::ProposeOutcome;
+use crate::ref_store::raft_backend::proposal::command_digest_hex;
 use crate::ref_store::raft_backend::realm::RealmBinding;
 use crate::ref_store::raft_backend::reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine};
 use crate::ref_store::raft_backend::scope::{requires_live_gate_precheck, validate_command_scope};
@@ -178,17 +179,11 @@ impl RootRaftRefCasBackend {
                     .as_any()
                     .downcast_ref::<RootRefCasStateMachine>()
                     .ok_or(RaftBackendError::WrongReducer)?;
-                if reducer.last_applied() != Some(log_id) {
-                    return Err(RaftBackendError::Storage("root reducer coordinate mismatch after write"));
-                }
-                let stored = reducer
-                    .query_outcome(&OutcomeQuery::LogId(log_id))
-                    .cloned()
-                    .ok_or(RaftBackendError::OutcomeMissing(log_id))?;
-                if stored.command_digest_hex != digest_hex {
+                let attempt = reducer.query_attempt(log_id).ok_or(RaftBackendError::OutcomeMissing(log_id))?;
+                if attempt.command_digest_hex != digest_hex {
                     return Err(RaftBackendError::OutcomeDigestMismatch(log_id));
                 }
-                Ok(ProposeOutcome { log_id, outcome: stored.outcome })
+                Ok(ProposeOutcome { log_id, outcome: attempt.outcome.clone() })
             }
             Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd)))) => {
                 Err(RaftBackendError::FollowerRedirect(fwd.leader_id))
@@ -196,12 +191,6 @@ impl RootRaftRefCasBackend {
             Ok(Err(_)) => Err(RaftBackendError::QuorumUnavailable("client write")),
             Err(_) => Err(RaftBackendError::QuorumUnavailable("client write timeout")),
         }
-    }
-
-    /// Linearizable idempotent outcome lookup for an unknown/lost propose acknowledgement.
-    pub async fn query_outcome(&self, query: OutcomeQuery) -> Result<Option<StoredOutcome>, RaftBackendError> {
-        let view = self.read_committed_view().await?;
-        Ok(view.query_outcome(&query))
     }
 
     /// Mints an authoritative view only after a real quorum ReadIndex and local apply barrier.

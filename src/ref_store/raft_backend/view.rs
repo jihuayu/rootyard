@@ -9,7 +9,6 @@ use uuid::Uuid;
 use crate::ref_store::contract::OperationLookup;
 use crate::ref_store::core::state_machine::ScopeLifecycle;
 use crate::ref_store::raft_backend::error::RaftBackendError;
-use crate::ref_store::raft_backend::outcome::{OutcomeQuery, StoredOutcome};
 use crate::ref_store::raft_backend::realm::RealmBinding;
 use crate::ref_store::raft_backend::reducer::RootRefCasStateMachine;
 use crate::ref_store::{CoreGateVersion, VersionCheck};
@@ -108,10 +107,5 @@ impl CommittedRefCasView {
         self.reducer
             .adapter_state_digest_hex()
             .map_err(|e| RaftBackendError::Command(format!("state digest refused: {e}")))
-    }
-
-    /// Idempotent lookup of the actual replicated typed outcome at this committed view.
-    pub fn query_outcome(&self, query: &OutcomeQuery) -> Option<StoredOutcome> {
-        self.reducer.query_outcome(query).cloned()
     }
 }

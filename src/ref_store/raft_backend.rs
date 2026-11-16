@@ -17,6 +17,7 @@ mod backend;
 mod error;
 mod node;
 mod outcome;
+mod proposal;
 mod realm;
 mod reducer;
 mod scope;
@@ -26,8 +27,13 @@ pub use backend::{BackendOptions, RootRaftRefCasBackend};
 pub use error::RaftBackendError;
 pub use node::{RootRaftNode, RootRaftNodeConfig};
 pub use outcome::{
-    GateVersionSnapshot, OperationStateSnapshot, OutcomeKey, OutcomeQuery, ProposeOutcome, RootRefCasApplied,
-    RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind, StoredOutcome, command_digest_hex,
+    GateVersionSnapshot, OperationStateSnapshot, ProposeOutcome, RootRefCasApplied, RootRefCasOutcome,
+    RootRefCasRefusal, RootRefCasRefusalKind,
+};
+pub use proposal::{
+    MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, MAX_ROOT_STATE_BYTES, PROPOSAL_FORMAT, PROPOSAL_WINDOW,
+    ProposalAttempt, ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup, ProposalOutcome,
+    command_digest_hex,
 };
 pub use realm::{NodeTrust, RealmBinding};
 pub use reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine, validate_ref_cas_command};

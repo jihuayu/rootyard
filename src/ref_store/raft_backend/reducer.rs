@@ -10,11 +10,14 @@ use crate::ref_store::core::state_machine::{
     AppliedLogId, NoopCommand, RefCasCommand, RefCasStateMachine, StateMachineError, decode_command, encode_command,
 };
 use crate::ref_store::raft_backend::adapter_state::{
-    adapter_state_digest_hex, export_adapter_state, restore_adapter_state,
+    LegacyAdapterState, adapter_state_digest_v3, export_adapter_state_v3, restore_adapter_state, root_only_state_v3,
 };
 use crate::ref_store::raft_backend::outcome::{
-    OutcomeKey, OutcomeQuery, RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind,
-    StoredOutcome, command_digest_hex, outcome_key,
+    RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind,
+};
+use crate::ref_store::raft_backend::proposal::{
+    MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, PROPOSAL_WINDOW, ProposalAttempt, ProposalAttemptKind,
+    ProposalEnvelope, ProposalId, ProposalLookup, command_digest_hex,
 };
 
 /// Stable application domain for Root Ref-CAS business commands.
@@ -27,12 +30,13 @@ pub const ROOT_REF_CAS_VERSION: u16 = 1;
 #[derive(Clone, Debug, Default)]
 pub struct RootRefCasStateMachine {
     machine: RefCasStateMachine,
-    outcomes: BTreeMap<ApplicationLogId, StoredOutcome>,
+    attempts: BTreeMap<ApplicationLogId, ProposalAttempt>,
+    legacy: Option<LegacyAdapterState>,
 }
 
 impl RootRefCasStateMachine {
     pub fn new() -> Self {
-        Self { machine: RefCasStateMachine::new(), outcomes: BTreeMap::new() }
+        Self { machine: RefCasStateMachine::new(), attempts: BTreeMap::new(), legacy: None }
     }
 
     /// Applied consensus coordinate of the underlying Root state machine.
@@ -62,35 +66,158 @@ impl RootRefCasStateMachine {
         self.machine.logical_clock_floor()
     }
 
-    /// Digest covering the Root snapshot and, when present, the typed outcome ledger.
+    /// Digest covering the Root snapshot and, when present, the bounded receipt window.
     pub fn adapter_state_digest_hex(&self) -> Result<String, ApplicationError> {
+        if let Some(legacy) = self.legacy.as_ref() {
+            return Ok(legacy.digest_hex.clone());
+        }
         let root_digest = self.machine.state_digest().map_err(map_state_error)?;
         let root_snapshot = self.machine.snapshot_bytes().map_err(map_state_error)?;
-        let bytes = export_adapter_state(root_snapshot, &self.outcomes)?;
-        adapter_state_digest_hex(&root_digest, &bytes, self.outcomes.is_empty())
+        let bytes = export_adapter_state_v3(root_snapshot, &self.attempts)?;
+        adapter_state_digest_v3(&root_digest, &bytes)
     }
 
-    /// Idempotent lookup of the actual replicated typed outcome.
-    pub fn query_outcome(&self, query: &OutcomeQuery) -> Option<&StoredOutcome> {
-        match query {
-            OutcomeQuery::LogId(log_id) => self.outcomes.get(log_id),
-            _ => self.outcomes.values().rev().find(|outcome| outcome.matches(query)),
+    /// Exact retained attempt at one application coordinate, if present.
+    pub fn query_attempt(&self, log_id: ApplicationLogId) -> Option<&ProposalAttempt> {
+        self.attempts.get(&log_id)
+    }
+
+    /// Exact caller-stable proposal lookup by first-decision identity.
+    pub fn query_proposal(&self, proposal_id: &ProposalId) -> ProposalLookup {
+        let current_index = self.last_applied_coordinate().map(|coordinate| coordinate.index).unwrap_or(0);
+        if proposal_id.validate_shape().is_err() {
+            return ProposalLookup::Invalid { proposal_id: proposal_id.clone(), reason: "malformed proposal id" };
         }
+        let Some(expires_at_index) = proposal_id.expires_at_index() else {
+            return ProposalLookup::Invalid { proposal_id: proposal_id.clone(), reason: "proposal expiry overflow" };
+        };
+        if current_index > expires_at_index {
+            return ProposalLookup::Expired { proposal_id: proposal_id.clone(), current_index, expires_at_index };
+        }
+        if let Some(first) = self.attempts.values().find(|attempt| {
+            attempt.kind == ProposalAttemptKind::First && attempt.proposal_id.as_ref() == Some(proposal_id)
+        }) {
+            return ProposalLookup::Found {
+                proposal_id: proposal_id.clone(),
+                command_digest_hex: first.command_digest_hex.clone(),
+                original_log_id: first.original_log_id,
+                observed_log_id: first.observed_log_id,
+                outcome: first.outcome.clone(),
+            };
+        }
+        ProposalLookup::NotObserved { proposal_id: proposal_id.clone(), current_index }
+    }
+
+    pub fn retained_attempt_count(&self) -> usize {
+        self.attempts.len()
     }
 
     pub(crate) fn machine(&self) -> &RefCasStateMachine {
         &self.machine
     }
 
-    fn apply_command(
+    fn ensure_v3(&mut self) -> Result<(), ApplicationError> {
+        if self.legacy.is_some() {
+            let root = self.machine.snapshot_bytes().map_err(map_state_error)?;
+            root_only_state_v3(&root)?;
+            self.legacy = None;
+            self.attempts.clear();
+        }
+        Ok(())
+    }
+
+    fn prune_attempts(&mut self, current_index: u64) {
+        let cutoff = current_index.saturating_sub(PROPOSAL_WINDOW);
+        self.attempts.retain(|log_id, _| log_id.index > cutoff);
+    }
+
+    fn attempt_fits(&self, attempt: &ProposalAttempt) -> Result<bool, ApplicationError> {
+        if attempt.serialized_len()? > MAX_PROPOSAL_RECEIPT_BYTES {
+            return Ok(false);
+        }
+        let root = self.machine.snapshot_bytes().map_err(map_state_error)?;
+        if root_only_state_v3(&root).is_err() {
+            return Ok(false);
+        }
+        Ok(export_adapter_state_v3(root, &self.attempts)
+            .map(|bytes| bytes.len() <= MAX_ADAPTER_STATE_BYTES)
+            .unwrap_or(false))
+    }
+
+    fn insert_with_fallback(
+        &mut self,
+        attempt: ProposalAttempt,
+        fallback: ProposalAttempt,
+    ) -> Result<(), ApplicationError> {
+        let prior_attempts = self.attempts.clone();
+        let observed = attempt.observed_log_id;
+        if self.attempts.insert(observed, attempt.clone()).is_some() {
+            return Err(ApplicationError::new("duplicate proposal attempt coordinate"));
+        }
+        self.prune_attempts(observed.index);
+        if self.attempt_fits(&attempt)? {
+            return Ok(());
+        }
+        self.attempts = prior_attempts;
+        let observed = fallback.observed_log_id;
+        if self.attempts.insert(observed, fallback.clone()).is_some() {
+            return Err(ApplicationError::new("duplicate capacity refusal attempt coordinate"));
+        }
+        self.prune_attempts(observed.index);
+        if self.attempt_fits(&fallback)? {
+            Ok(())
+        } else {
+            Err(ApplicationError::new("bounded adapter state cannot admit a capacity refusal"))
+        }
+    }
+
+    fn commit_business_attempt(
+        &mut self,
+        log_id: ApplicationLogId,
+        prior_machine: RefCasStateMachine,
+        attempt: ProposalAttempt,
+        fallback: ProposalAttempt,
+    ) -> Result<(), ApplicationError> {
+        let prior_attempts = self.attempts.clone();
+        if self.attempts.insert(log_id, attempt.clone()).is_some() {
+            return Err(ApplicationError::new("duplicate proposal attempt coordinate"));
+        }
+        self.prune_attempts(log_id.index);
+        if self.attempt_fits(&attempt)? {
+            return Ok(());
+        }
+        self.attempts = prior_attempts;
+        self.machine = prior_machine;
+        self.apply_noop(log_id)?;
+        if self.attempts.insert(log_id, fallback.clone()).is_some() {
+            return Err(ApplicationError::new("duplicate capacity refusal attempt coordinate"));
+        }
+        self.prune_attempts(log_id.index);
+        if self.attempt_fits(&fallback)? {
+            Ok(())
+        } else {
+            Err(ApplicationError::new("bounded adapter state cannot admit a capacity refusal"))
+        }
+    }
+
+    fn apply_noop(&mut self, log_id: ApplicationLogId) -> Result<(), ApplicationError> {
+        let applied = AppliedLogId { term: log_id.term, index: log_id.index };
+        self.machine
+            .apply(applied, RefCasCommand::Noop(NoopCommand { logical_tick: None }))
+            .map_err(map_state_error)?;
+        if self.last_applied_coordinate() != Some(log_id) {
+            return Err(ApplicationError::new("root Ref-CAS coordinate did not advance to the committed log id"));
+        }
+        Ok(())
+    }
+
+    fn apply_core(
         &mut self,
         log_id: ApplicationLogId,
         command: RefCasCommand,
-        digest_hex: String,
-        key: Option<OutcomeKey>,
-    ) -> Result<(), ApplicationError> {
+        prior_machine: RefCasStateMachine,
+    ) -> Result<RootRefCasOutcome, ApplicationError> {
         let applied = AppliedLogId { term: log_id.term, index: log_id.index };
-        let prior = self.machine.clone();
         match self.machine.apply(applied, command) {
             Ok(response) => {
                 if self.last_applied_coordinate() != Some(log_id) {
@@ -98,47 +225,188 @@ impl RootRefCasStateMachine {
                         "root Ref-CAS coordinate did not advance to the committed log id",
                     ));
                 }
-                self.record_outcome(
-                    log_id,
-                    digest_hex,
-                    key,
-                    RootRefCasOutcome::Applied(RootRefCasApplied::from_response(response)),
-                )
+                Ok(RootRefCasOutcome::Applied(RootRefCasApplied::from_response(response)))
             }
             Err(error) => {
                 let Some(kind) = RootRefCasRefusalKind::from_state_machine(&error) else {
                     return Err(map_state_error(error));
                 };
-                // Expected business refusal: discard any staged mutation, advance only the applied
-                // coordinate with a no-tick Noop, and persist the typed refusal. Never turn this
-                // into a StorageError, which would terminate OpenRaft's apply worker.
-                self.machine = prior;
-                self.machine
-                    .apply(applied, RefCasCommand::Noop(NoopCommand { logical_tick: None }))
-                    .map_err(map_state_error)?;
-                if self.last_applied_coordinate() != Some(log_id) {
-                    return Err(ApplicationError::new(
-                        "root Ref-CAS coordinate did not advance after a typed business refusal",
-                    ));
-                }
-                let refusal = RootRefCasRefusal::from_kind(kind);
-                self.record_outcome(log_id, digest_hex, key, RootRefCasOutcome::Refused(refusal))
+                // Expected semantic/business refusal: discard any staged mutation, advance only
+                // the applied coordinate with a no-tick Noop, and retain a fixed typed outcome.
+                self.machine = prior_machine;
+                self.apply_noop(log_id)?;
+                Ok(RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(kind)))
             }
         }
     }
 
-    fn record_outcome(
+    fn commit_protocol_refusal(
         &mut self,
         log_id: ApplicationLogId,
-        command_digest_hex: String,
-        key: Option<OutcomeKey>,
-        outcome: RootRefCasOutcome,
+        proposal_id: ProposalId,
+        digest_hex: String,
+        refusal: RootRefCasRefusalKind,
+        kind: ProposalAttemptKind,
     ) -> Result<(), ApplicationError> {
-        let stored = StoredOutcome { log_id, command_digest_hex, key, outcome };
-        if self.outcomes.insert(log_id, stored).is_some() {
-            return Err(ApplicationError::new("duplicate typed outcome at one application coordinate"));
+        let attempt = ProposalAttempt {
+            proposal_id: Some(proposal_id.clone()),
+            command_digest_hex: digest_hex.clone(),
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(refusal)),
+        };
+        let fallback = ProposalAttempt {
+            proposal_id: Some(proposal_id),
+            command_digest_hex: digest_hex,
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind: ProposalAttemptKind::Capacity,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(RootRefCasRefusalKind::StateCapacity)),
+        };
+        self.apply_noop(log_id)?;
+        self.insert_with_fallback(attempt, fallback)
+    }
+
+    fn apply_proposal(
+        &mut self,
+        log_id: ApplicationLogId,
+        proposal_id: ProposalId,
+        command: RefCasCommand,
+        digest_hex: String,
+    ) -> Result<(), ApplicationError> {
+        let current_index = log_id.index;
+        if proposal_id.validate_shape().is_err()
+            || proposal_id.expires_at_index().is_none()
+            || proposal_id.issued_at_index >= current_index
+        {
+            return self.commit_protocol_refusal(
+                log_id,
+                proposal_id,
+                digest_hex,
+                RootRefCasRefusalKind::ProposalInvalid,
+                ProposalAttemptKind::First,
+            );
         }
-        Ok(())
+        let expires_at_index = proposal_id.expires_at_index().expect("checked proposal expiry");
+        if current_index > expires_at_index {
+            return self.commit_protocol_refusal(
+                log_id,
+                proposal_id,
+                digest_hex,
+                RootRefCasRefusalKind::ProposalExpired,
+                ProposalAttemptKind::Expired,
+            );
+        }
+
+        let first = self
+            .attempts
+            .values()
+            .find(|attempt| {
+                attempt.kind == ProposalAttemptKind::First && attempt.proposal_id.as_ref() == Some(&proposal_id)
+            })
+            .cloned();
+        if let Some(first) = first {
+            if first.command_digest_hex == digest_hex {
+                let attempt = ProposalAttempt {
+                    proposal_id: Some(proposal_id.clone()),
+                    command_digest_hex: digest_hex.clone(),
+                    original_log_id: first.original_log_id,
+                    observed_log_id: log_id,
+                    kind: ProposalAttemptKind::Replayed,
+                    outcome: first.outcome.clone(),
+                };
+                let fallback = ProposalAttempt {
+                    proposal_id: Some(proposal_id),
+                    command_digest_hex: digest_hex,
+                    original_log_id: first.original_log_id,
+                    observed_log_id: log_id,
+                    kind: ProposalAttemptKind::Capacity,
+                    outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(
+                        RootRefCasRefusalKind::StateCapacity,
+                    )),
+                };
+                self.apply_noop(log_id)?;
+                return self.insert_with_fallback(attempt, fallback);
+            }
+            let attempt = ProposalAttempt {
+                proposal_id: Some(proposal_id.clone()),
+                command_digest_hex: digest_hex.clone(),
+                original_log_id: first.original_log_id,
+                observed_log_id: log_id,
+                kind: ProposalAttemptKind::Conflict,
+                outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(
+                    RootRefCasRefusalKind::ProposalConflict,
+                )),
+            };
+            let fallback = ProposalAttempt {
+                proposal_id: Some(proposal_id),
+                command_digest_hex: digest_hex,
+                original_log_id: first.original_log_id,
+                observed_log_id: log_id,
+                kind: ProposalAttemptKind::Capacity,
+                outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(RootRefCasRefusalKind::StateCapacity)),
+            };
+            self.apply_noop(log_id)?;
+            return self.insert_with_fallback(attempt, fallback);
+        }
+
+        if !proposal_id.matches_command(&command) {
+            return self.commit_protocol_refusal(
+                log_id,
+                proposal_id,
+                digest_hex,
+                RootRefCasRefusalKind::ProposalScopeMismatch,
+                ProposalAttemptKind::First,
+            );
+        }
+
+        let prior_machine = self.machine.clone();
+        let outcome = self.apply_core(log_id, command, prior_machine.clone())?;
+        let attempt = ProposalAttempt {
+            proposal_id: Some(proposal_id.clone()),
+            command_digest_hex: digest_hex.clone(),
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind: ProposalAttemptKind::First,
+            outcome: outcome.clone(),
+        };
+        let fallback = ProposalAttempt {
+            proposal_id: Some(proposal_id),
+            command_digest_hex: digest_hex,
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind: ProposalAttemptKind::First,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(RootRefCasRefusalKind::StateCapacity)),
+        };
+        self.commit_business_attempt(log_id, prior_machine, attempt, fallback)
+    }
+
+    fn apply_legacy(
+        &mut self,
+        log_id: ApplicationLogId,
+        command: RefCasCommand,
+        digest_hex: String,
+    ) -> Result<(), ApplicationError> {
+        let prior_machine = self.machine.clone();
+        let outcome = self.apply_core(log_id, command, prior_machine.clone())?;
+        let attempt = ProposalAttempt {
+            proposal_id: None,
+            command_digest_hex: digest_hex.clone(),
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind: ProposalAttemptKind::Legacy,
+            outcome: outcome.clone(),
+        };
+        let fallback = ProposalAttempt {
+            proposal_id: None,
+            command_digest_hex: digest_hex,
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind: ProposalAttemptKind::Legacy,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(RootRefCasRefusalKind::StateCapacity)),
+        };
+        self.commit_business_attempt(log_id, prior_machine, attempt, fallback)
     }
 }
 
@@ -156,15 +424,22 @@ impl ApplicationStateMachine for RootRefCasStateMachine {
     }
 
     fn apply(&mut self, log_id: ApplicationLogId, payload: &[u8]) -> Result<(), ApplicationError> {
-        let command = decode_command(payload).map_err(map_state_error)?;
-        let digest_hex = command_digest_hex(payload);
-        let key = outcome_key(&command);
-        self.apply_command(log_id, command, digest_hex, key)
+        if let Some((proposal_id, command_bytes)) = ProposalEnvelope::decode(payload)? {
+            let command = decode_command(&command_bytes).map_err(map_state_error)?;
+            let digest_hex = command_digest_hex(&command_bytes);
+            self.ensure_v3()?;
+            self.apply_proposal(log_id, proposal_id, command, digest_hex)
+        } else {
+            let command = decode_command(payload).map_err(map_state_error)?;
+            let digest_hex = command_digest_hex(payload);
+            self.ensure_v3()?;
+            self.apply_legacy(log_id, command, digest_hex)
+        }
     }
 
     fn advance_applied(&mut self, log_id: ApplicationLogId) -> Result<(), ApplicationError> {
-        // Raft blank/membership entries are deterministic coordinate advances. A Noop with no
-        // logical tick does not change business state or the outcome ledger.
+        // Raft blank/membership entries advance deterministic expiry/pruning but add no receipt.
+        self.ensure_v3()?;
         let applied = AppliedLogId { term: log_id.term, index: log_id.index };
         self.machine
             .apply(applied, RefCasCommand::Noop(NoopCommand { logical_tick: None }))
@@ -172,18 +447,23 @@ impl ApplicationStateMachine for RootRefCasStateMachine {
         if self.last_applied_coordinate() != Some(log_id) {
             return Err(ApplicationError::new("root Ref-CAS coordinate did not advance for a blank/membership entry"));
         }
+        self.prune_attempts(log_id.index);
         Ok(())
     }
 
     fn export_state(&self) -> Result<Vec<u8>, ApplicationError> {
+        if let Some(legacy) = self.legacy.as_ref() {
+            return Ok(legacy.bytes.clone());
+        }
         let root_snapshot = self.machine.snapshot_bytes().map_err(map_state_error)?;
-        export_adapter_state(root_snapshot, &self.outcomes)
+        export_adapter_state_v3(root_snapshot, &self.attempts)
     }
 
     fn restore_state(&mut self, bytes: &[u8]) -> Result<(), ApplicationError> {
-        let (machine, outcomes) = restore_adapter_state(bytes)?;
-        self.machine = machine;
-        self.outcomes = outcomes;
+        let restored = restore_adapter_state(bytes)?;
+        self.machine = restored.machine;
+        self.attempts = restored.attempts;
+        self.legacy = restored.legacy;
         Ok(())
     }
 

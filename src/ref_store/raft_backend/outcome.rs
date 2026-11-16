@@ -7,12 +7,11 @@
 
 use rootyard_refcas_log::state_machine::ApplicationLogId;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::ref_store::CoreGateVersion;
 use crate::ref_store::contract::{OperationState, RefStoreError};
-use crate::ref_store::core::state_machine::{ApplyResponse, RefCasCommand, ScopeLifecycle, StateMachineError};
+use crate::ref_store::core::state_machine::{ApplyResponse, ScopeLifecycle, StateMachineError};
 use crate::ref_store::core::terminal::CommitTerminal;
 use crate::ref_store::core::types::GitObjectFormat;
 
@@ -266,7 +265,6 @@ pub enum RootRefCasRefusalKind {
     ProposalExpired,
     ProposalConflict,
     ProposalScopeMismatch,
-    ReceiptTooLarge,
     StateCapacity,
     BelowCancelCutoff,
     ScopeClosingOrClosed,
@@ -384,7 +382,6 @@ impl RootRefCasRefusalKind {
             Self::ProposalExpired => "proposal identity expired; historic outcome is unknown",
             Self::ProposalConflict => "proposal identity is bound to a different command digest",
             Self::ProposalScopeMismatch => "proposal identity does not match the bound scope",
-            Self::ReceiptTooLarge => "proposal outcome exceeds the bounded receipt budget",
             Self::StateCapacity => "bounded proposal receipt window cannot admit this decision",
             Self::BelowCancelCutoff => "operation is below the durable cancel cutoff",
             Self::ScopeClosingOrClosed => "repository scope is closing or closed",
@@ -429,76 +426,6 @@ impl RootRefCasRefusalKind {
             Self::MetadataQuotaExceeded => "metadata admission quota exhausted",
             Self::MetadataGateVersionMismatch => "metadata gate version moved before capture",
         }
-    }
-}
-
-/// Stable lookup key for an idempotent command. Commands without an operation/request/decision id
-/// remain queryable by canonical command digest or exact log coordinate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OutcomeKey {
-    Operation(Uuid),
-    Request(Uuid),
-    Decision(Uuid),
-}
-
-/// Public idempotent query selector.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OutcomeQuery {
-    Operation(Uuid),
-    Request(Uuid),
-    Decision(Uuid),
-    /// Lowercase 64-character SHA-256 of the canonical command payload.
-    CommandDigest(String),
-    LogId(ApplicationLogId),
-}
-
-/// Persisted typed outcome at one exact application coordinate.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StoredOutcome {
-    pub log_id: ApplicationLogId,
-    pub command_digest_hex: String,
-    pub key: Option<OutcomeKey>,
-    pub outcome: RootRefCasOutcome,
-}
-
-impl StoredOutcome {
-    pub fn matches(&self, query: &OutcomeQuery) -> bool {
-        match query {
-            OutcomeQuery::Operation(id) => self.key == Some(OutcomeKey::Operation(*id)),
-            OutcomeQuery::Request(id) => self.key == Some(OutcomeKey::Request(*id)),
-            OutcomeQuery::Decision(id) => self.key == Some(OutcomeKey::Decision(*id)),
-            OutcomeQuery::CommandDigest(digest) => self.command_digest_hex.as_str() == digest.as_str(),
-            OutcomeQuery::LogId(log_id) => self.log_id == *log_id,
-        }
-    }
-}
-
-/// Canonical command digest used by the outcome ledger and idempotent queries.
-pub fn command_digest_hex(payload: &[u8]) -> String {
-    hex::encode(Sha256::digest(payload))
-}
-
-/// Extracts the stable idempotency key when the command carries one.
-pub(crate) fn outcome_key(command: &RefCasCommand) -> Option<OutcomeKey> {
-    match command {
-        RefCasCommand::BeginOperation(cmd) => Some(OutcomeKey::Operation(cmd.identity.operation_id)),
-        RefCasCommand::CommitRefs(cmd) => Some(OutcomeKey::Operation(cmd.request.identity.operation_id)),
-        RefCasCommand::Cancel(cmd) => Some(OutcomeKey::Operation(cmd.identity.operation_id)),
-        RefCasCommand::CreateSnapshotPin(cmd) => Some(OutcomeKey::Request(cmd.request_id)),
-        RefCasCommand::RenewPin(cmd) => Some(OutcomeKey::Request(cmd.request_id)),
-        RefCasCommand::ReleasePin(cmd) => Some(OutcomeKey::Request(cmd.request_id)),
-        RefCasCommand::RegisterRoot(cmd) => Some(OutcomeKey::Request(cmd.request_id)),
-        RefCasCommand::ReleaseRoot(cmd) => Some(OutcomeKey::Request(cmd.request_id)),
-        RefCasCommand::AcquireHoldBatch(cmd) => Some(OutcomeKey::Request(cmd.request_id)),
-        RefCasCommand::MarkHoldConsumed(cmd) => Some(OutcomeKey::Request(cmd.request_id)),
-        RefCasCommand::RetireHoldBatch(cmd) => Some(OutcomeKey::Request(cmd.request_id)),
-        RefCasCommand::InstallDecision(cmd) => Some(OutcomeKey::Decision(cmd.decision_id)),
-        RefCasCommand::Noop(_)
-        | RefCasCommand::InitializeGate(_)
-        | RefCasCommand::SetRepositoryLane(_)
-        | RefCasCommand::AdvanceCancelCutoff(_) => None,
     }
 }
 
