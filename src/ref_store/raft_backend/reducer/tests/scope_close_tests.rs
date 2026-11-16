@@ -221,12 +221,15 @@ fn max_cardinality_scope_close_emits_bounded_ack_and_keeps_original_receipt() {
     assert_eq!(retry_attempt.original_log_id, close_log);
     assert_eq!(retry_attempt.outcome, close_attempt.outcome);
     assert_eq!(app.query_attempt(close_log).expect("original close receipt after replay"), &close_attempt);
-
-    assert!(PROPOSAL_WINDOW == 32);
-    assert!(MAX_PROPOSAL_RECEIPT_BYTES == 80 * 1024);
-    assert!(MAX_ROOT_STATE_BYTES + PROPOSAL_WINDOW as usize * MAX_PROPOSAL_RECEIPT_BYTES < MAX_ADAPTER_STATE_BYTES);
-    assert!(MAX_ADAPTER_STATE_BYTES < MAX_APP_STATE_BYTES);
 }
+
+// Compile-time form of the same capacity policy. These are consistency checks on production
+// constants, not runtime behavior evidence; the dynamic 2048/Root/receipt checks remain below.
+const _: () = assert!(PROPOSAL_WINDOW == 32);
+const _: () = assert!(MAX_PROPOSAL_RECEIPT_BYTES == 80 * 1024);
+const _: () =
+    assert!(MAX_ROOT_STATE_BYTES + PROPOSAL_WINDOW as usize * MAX_PROPOSAL_RECEIPT_BYTES < MAX_ADAPTER_STATE_BYTES);
+const _: () = assert!(MAX_ADAPTER_STATE_BYTES < MAX_APP_STATE_BYTES);
 
 #[test]
 fn legacy_full_vector_close_receipt_roundtrips_exactly_and_replays() {
