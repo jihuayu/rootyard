@@ -52,6 +52,23 @@ impl fmt::Debug for PandoWrappedDek {
     }
 }
 
+pub(super) fn parse_vault_ciphertext_version(payload: &[u8]) -> Option<i32> {
+    if payload.is_empty() || payload.len() > PANDO_OPAQUE_PAYLOAD_MAX {
+        return None;
+    }
+    let text = std::str::from_utf8(payload).ok()?;
+    let rest = text.strip_prefix("vault:v")?;
+    let (version, ciphertext) = rest.split_once(':')?;
+    if ciphertext.is_empty()
+        || !ciphertext.bytes().all(|byte| byte.is_ascii_graphic())
+        || !version.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let version = version.parse::<i32>().ok()?;
+    (version >= 1).then_some(version)
+}
+
 impl PandoWrappedDek {
     pub fn key_id(&self) -> &str {
         match self {

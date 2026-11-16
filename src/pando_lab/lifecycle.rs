@@ -10,6 +10,7 @@ pub mod envelopes;
 mod eval;
 pub mod provider;
 pub mod rotation;
+mod vault_provider;
 mod wrapped_dek;
 
 pub use envelopes::{
