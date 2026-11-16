@@ -171,20 +171,44 @@ def validate_inputs(args, environ):
     }
 
 
+def _binding_read_error():
+    return QualificationError("binding_unavailable", "binding")
+
+
 def binding_snapshot(inputs):
+    """Re-read every bound identity without letting OS errors escape.
+
+    A mismatch is a fixed ``*_binding_changed`` code.  Any unreadable source,
+    binary, receipt or harness source is ``binding_unavailable``; no fresh hash
+    is fabricated for the report.
+    """
     try:
         state = receipts.git_state(inputs["source_root"])
-    except (OSError, ValueError, Exception):
-        raise QualificationError("binding_unreadable", "binding") from None
+    except QualificationError:
+        raise
+    except Exception:
+        raise _binding_read_error() from None
     require(state["commit"] == inputs["source_commit"]
             and state["tree"] == inputs["source_tree"],
             "source_binding_changed", "binding")
     require(bool(state["clean"]), "source_became_dirty", "binding")
-    require(sha256_file(inputs["binary"]) == inputs["binary_sha256"],
+    try:
+        binary_sha256 = sha256_file(inputs["binary"])
+    except (OSError, ValueError, TypeError):
+        raise _binding_read_error() from None
+    require(binary_sha256 == inputs["binary_sha256"],
             "binary_binding_changed", "binding")
-    require(sha256_file(inputs["receipt"]) == inputs["receipt_sha256"],
+    try:
+        receipt_sha256 = sha256_file(inputs["receipt"])
+    except (OSError, ValueError, TypeError):
+        raise _binding_read_error() from None
+    require(receipt_sha256 == inputs["receipt_sha256"],
             "receipt_binding_changed", "binding")
-    require(_harness_sha256() == inputs["harness_sha256"],
+    try:
+        harness_sha256 = _harness_sha256()
+    except (OSError, ValueError, TypeError, QualificationError):
+        raise _binding_read_error() from None
+    require(harness_sha256 == inputs["harness_sha256"],
             "harness_binding_changed", "binding")
     return {
         "source_commit": state["commit"],
@@ -194,6 +218,14 @@ def binding_snapshot(inputs):
         "receipt_sha256": inputs["receipt_sha256"],
         "harness_sha256": inputs["harness_sha256"],
     }
+
+
+def _final_binding_code(error):
+    code = getattr(error, "code", "")
+    if code in ("binding_unavailable", "binding_unreadable",
+                "harness_files_missing"):
+        return "binding_unavailable"
+    return "binding_changed"
 
 
 def _failed_case(case_id, code, stage):
@@ -336,7 +368,7 @@ def run_qualification(args, environ=None):
                     report["passed"] = False
                     report["status"] = "failed"
                     report["error_code"] = "report_path_rejected"
-            except OSError:
+            except Exception:
                 report["passed"] = False
                 report["status"] = "failed"
                 report["error_code"] = "report_write_failed"
@@ -377,7 +409,10 @@ def run_qualification(args, environ=None):
             after = binding_snapshot(inputs)
         except QualificationError as error:
             binding_ok = False
-            fatal_code, fatal_stage = error.code, error.stage
+            fatal_code, fatal_stage = _final_binding_code(error), "binding"
+        except Exception:
+            binding_ok = False
+            fatal_code, fatal_stage = "binding_unavailable", "binding"
         else:
             if after != before:
                 binding_ok = False
@@ -392,7 +427,7 @@ def run_qualification(args, environ=None):
             report["passed"] = False
             report["status"] = "failed"
             report["error_code"] = "report_path_rejected"
-    except OSError:
+    except Exception:
         report["passed"] = False
         report["status"] = "failed"
         report["error_code"] = "report_write_failed"
@@ -401,7 +436,16 @@ def run_qualification(args, environ=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    report = run_qualification(args)
+    try:
+        report = run_qualification(args)
+    except Exception:
+        report = _minimal_failed_report()
+        try:
+            if args.report:
+                _write_report(args.report, report)
+        except Exception:
+            pass
+        return 1
     return 0 if report.get("passed") is True else 1
 
 
