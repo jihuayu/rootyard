@@ -18,6 +18,7 @@ use rootyard::blob_store::read_accel::{
 use super::{LoopbackS3, SampleRepoPacks, assert_git_parity, test_ctx};
 
 pub(super) async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Result<()> {
+    detail_classifier::assert_detail_classifier_contract();
     use ReadAccelFallbackReason::{
         MembershipGenerationDrift, PackSetDigestDrift, SidecarArtifactCorrupt, SidecarArtifactMissing,
     };
@@ -201,36 +202,6 @@ fn cached_fallback_kind_label(status: &ReadAccelSidecarStatus) -> &'static str {
         }
     }
     "none"
-}
-
-fn cached_fallback_detail_class(status: &ReadAccelSidecarStatus) -> &'static str {
-    if let ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(ReadAccelFallbackReason::SidecarArtifactCorrupt {
-        detail,
-        ..
-    }) = status
-    {
-        match detail.as_str() {
-            "blob operation deadline exceeded" => "blob-deadline",
-            "read-acceleration operation deadline exceeded" => "read-accel-deadline",
-            "blob digest mismatch" => "blob-digest",
-            "read-acceleration sidecar integrity failed: local sidecar SHA-256 or length mismatch" => {
-                "local-digest-or-length"
-            }
-            "invalid bitmap header magic or length" => "bitmap-header",
-            "blob provider error: blob readback task failed" => "readback-task",
-            "blob provider error: blob destination directory failed" => "destination-directory",
-            "blob provider error: blob staging file creation failed" => "staging-create",
-            "blob provider error: blob staging write failed" => "staging-write",
-            "blob provider error: blob staging fsync failed" => "staging-fsync",
-            "blob provider error: blob destination rename failed" => "destination-rename",
-            "blob provider error: blob destination fsync failed" => "destination-fsync",
-            "blob resource limits conflict with the initialized process-wide context" => "resource-context-conflict",
-            "blob locator already exists" => "blob-already-exists",
-            _ => "unknown",
-        }
-    } else {
-        "none"
-    }
 }
 
 fn cached_fallback_stage_label(
@@ -493,5 +464,7 @@ impl DetailClass {
     }
 }
 
+mod detail_classifier;
 mod parity;
+pub(super) use detail_classifier::cached_fallback_detail_class;
 pub(super) use parity::sha1_and_sha256_parity_and_default_disabled_behavior;
