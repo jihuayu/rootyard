@@ -46,7 +46,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -648,11 +648,12 @@ async fn http_git_info_refs(
         Err(e) => return error_response(e),
     };
     let repo_path = st.bare_git_repo.read().unwrap().clone().expect("bare repo configured");
-    let output = Command::new("git")
-        .args(["upload-pack", "--stateless-rpc", "--advertise-refs"])
-        .arg(&repo_path)
-        .output()
-        .expect("run git upload-pack --advertise-refs");
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["upload-pack", "--stateless-rpc", "--advertise-refs"]).arg(&repo_path);
+    if let Some(proto) = headers.get("git-protocol").and_then(|v| v.to_str().ok()) {
+        cmd.env("GIT_PROTOCOL", proto);
+    }
+    let output = cmd.output().await.expect("run git upload-pack --advertise-refs");
     assert!(output.status.success(), "git advertise-refs failed");
     let header_line = b"# service=git-upload-pack\n";
     let pkt_header = format!("{:04x}", header_line.len() + 4);
@@ -710,15 +711,17 @@ async fn http_git_upload_pack(
         body.to_vec()
     };
     let repo_path = st.bare_git_repo.read().unwrap().clone().expect("bare repo");
-    let mut child = Command::new("git")
-        .args(["upload-pack", "--stateless-rpc"])
-        .arg(&repo_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn git upload-pack");
-    child.stdin.take().unwrap().write_all(&raw_req).expect("write upload-pack stdin");
-    let out = child.wait_with_output().expect("wait git upload-pack");
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["upload-pack", "--stateless-rpc"]).arg(&repo_path).stdin(Stdio::piped()).stdout(Stdio::piped());
+    if let Some(proto) = headers.get("git-protocol").and_then(|v| v.to_str().ok()) {
+        cmd.env("GIT_PROTOCOL", proto);
+    }
+    let mut child = cmd.spawn().expect("spawn git upload-pack");
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&raw_req).await.expect("write upload-pack stdin");
+        stdin.shutdown().await.expect("close upload-pack stdin");
+    }
+    let out = child.wait_with_output().await.expect("wait git upload-pack");
     assert!(out.status.success(), "git upload-pack failed");
     let mut resp = (StatusCode::OK, out.stdout).into_response();
     resp.headers_mut().insert("content-type", HeaderValue::from_static("application/x-git-upload-pack-result"));
@@ -758,7 +761,7 @@ async fn start_gateway_server(st: Arc<GatewayState>) -> Result<String> {
     Ok(format!("http://{addr}"))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires multi-process raft-node binary, openssl, and PostgreSQL 17"]
 async fn real_raft_cluster_http_read_your_writes_monotonic_failover_lag_and_quorum_loss() -> Result<()> {
     let (admin, pool, schema, tenant, repo) = setup_pg_schema().await?;
@@ -938,7 +941,7 @@ async fn real_raft_cluster_http_read_your_writes_monotonic_failover_lag_and_quor
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires multi-process raft-node binary and openssl"]
 async fn real_http_rejects_rotated_history_authority_restore_forged_token_and_revoked_perms() -> Result<()> {
     let bin = raft_node_bin();
@@ -994,16 +997,26 @@ async fn real_http_rejects_rotated_history_authority_restore_forged_token_and_re
         .await?;
     assert_eq!(r_rot.status(), 409, "old token MUST NOT validate against rotated history/incarnation");
 
-    // Forged / tampered token fails closed 401.
+    // Forged / tampered HMAC fails closed 401; corrupt trailing base64 padding fails closed 400.
     let mut bad = old_tok.clone().into_bytes();
-    let end = bad.len() - 1;
-    bad[end] = if bad[end] == b'x' { b'y' } else { b'x' };
+    let mid = bad.len() - 6;
+    bad[mid] = if bad[mid] == b'A' { b'B' } else { b'A' };
     let r_forged = http
         .get(format!("{base_url}/api/raft/nodes/{leader_id}/refs"))
         .header(RAFT_SESSION_HEADER, String::from_utf8(bad)?)
         .send()
         .await?;
     assert_eq!(r_forged.status(), 401);
+
+    let mut corrupt = old_tok.clone().into_bytes();
+    let end = corrupt.len() - 1;
+    corrupt[end] = if corrupt[end] == b'x' { b'y' } else { b'x' };
+    let r_corrupt = http
+        .get(format!("{base_url}/api/raft/nodes/{leader_id}/refs"))
+        .header(RAFT_SESSION_HEADER, String::from_utf8(corrupt)?)
+        .send()
+        .await?;
+    assert_eq!(r_corrupt.status(), 400);
 
     // Revoked live repository permission fails 403 BEFORE version/token issuance.
     st.has_read_permission.store(false, Ordering::SeqCst);
@@ -1020,7 +1033,7 @@ async fn real_http_rejects_rotated_history_authority_restore_forged_token_and_re
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires PostgreSQL 17 with Migration 149"]
 async fn real_pg17_projection_dependency_atomicity_duplicates_gap_abort_and_timeout() -> Result<()> {
     let (admin, pool, schema, tenant, repo) = setup_pg_schema().await?;
@@ -1134,7 +1147,20 @@ async fn real_pg17_projection_dependency_atomicity_duplicates_gap_abort_and_time
     Ok(())
 }
 
-#[tokio::test]
+async fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .with_context(|| format!("spawn git {args:?}"))?;
+    if !out.status.success() {
+        bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires multi-process raft-node, openssl, and stock git"]
 async fn stock_git_compatibility_fixed_oid_closure_and_pin_gc_safety() -> Result<()> {
     let work = tempfile::tempdir()?;
@@ -1143,24 +1169,17 @@ async fn stock_git_compatibility_fixed_oid_closure_and_pin_gc_safety() -> Result
     let clone_dest = work.path().join("clone");
     fs::create_dir_all(&src_tree)?;
 
-    let git_ok = |cwd: &Path, args: &[&str]| -> Result<String> {
-        let out = Command::new("git").args(args).current_dir(cwd).output()?;
-        if !out.status.success() {
-            bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-    };
-    git_ok(work.path(), &["init", "--bare", "--object-format=sha256", bare.to_str().unwrap()])?;
-    git_ok(&bare, &["config", "uploadpack.allowFilter", "false"])?;
-    git_ok(&src_tree, &["init", "-b", "main", "--object-format=sha256"])?;
-    git_ok(&src_tree, &["config", "user.name", "Session Consistency"])?;
-    git_ok(&src_tree, &["config", "user.email", "s175@rootyard.invalid"])?;
+    git_ok(work.path(), &["init", "--bare", "--object-format=sha256", bare.to_str().unwrap()]).await?;
+    git_ok(&bare, &["config", "uploadpack.allowFilter", "false"]).await?;
+    git_ok(&src_tree, &["init", "-b", "main", "--object-format=sha256"]).await?;
+    git_ok(&src_tree, &["config", "user.name", "Session Consistency"]).await?;
+    git_ok(&src_tree, &["config", "user.email", "s175@rootyard.invalid"]).await?;
     fs::write(src_tree.join("README.md"), b"raft session consistency fixture\n")?;
-    git_ok(&src_tree, &["add", "README.md"])?;
-    git_ok(&src_tree, &["commit", "-m", "init commit"])?;
-    let expected_oid = git_ok(&src_tree, &["rev-parse", "HEAD"])?;
-    git_ok(&src_tree, &["push", bare.to_str().unwrap(), "refs/heads/main:refs/heads/main"])?;
-    let _ = git_ok(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    git_ok(&src_tree, &["add", "README.md"]).await?;
+    git_ok(&src_tree, &["-c", "commit.gpgsign=false", "commit", "-m", "init commit"]).await?;
+    let expected_oid = git_ok(&src_tree, &["rev-parse", "HEAD"]).await?;
+    git_ok(&src_tree, &["push", bare.to_str().unwrap(), "refs/heads/main:refs/heads/main"]).await?;
+    let _ = git_ok(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]).await?;
 
     let bin = raft_node_bin();
     let (_pki, n1, n2, n3) = bootstrap_three_nodes(&bin).await?;
@@ -1194,11 +1213,21 @@ async fn stock_git_compatibility_fixed_oid_closure_and_pin_gc_safety() -> Result
     // Stock `git ls-remote` & `git clone` send ZERO custom `x-rootyard-session` headers,
     // hit follower URL -> server ReadIndex redirects cleanly -> clone succeeds with exact OID & fsck=0!
     let remote_url = format!("{base_url}/git/nodes/{follower_id}/repo.git");
-    let ls_out = git_ok(work.path(), &["ls-remote", &remote_url, "refs/heads/main"])?;
+    let ls_out = tokio::time::timeout(
+        Duration::from_secs(30),
+        git_ok(work.path(), &["ls-remote", &remote_url, "refs/heads/main"]),
+    )
+    .await
+    .context("git ls-remote timed out")??;
     assert!(ls_out.starts_with(&expected_oid), "expected OID {expected_oid}, got {ls_out}");
-    git_ok(work.path(), &["clone", &remote_url, clone_dest.to_str().unwrap()])?;
-    assert_eq!(git_ok(&clone_dest, &["rev-parse", "HEAD"])?, expected_oid);
-    let _ = git_ok(&clone_dest, &["fsck", "--strict"])?;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        git_ok(work.path(), &["clone", &remote_url, clone_dest.to_str().unwrap()]),
+    )
+    .await
+    .context("git clone timed out")??;
+    assert_eq!(git_ok(&clone_dest, &["rev-parse", "HEAD"]).await?, expected_oid);
+    let _ = git_ok(&clone_dest, &["fsck", "--strict"]).await?;
 
     // Verify RefCasStateMachine holds cannot retire while an active retention root binds them (pin/GC safety).
     let mut sm = RefCasStateMachine::new();
