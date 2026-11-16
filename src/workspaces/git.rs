@@ -24,10 +24,16 @@ use tokio::{
     task::JoinSet,
 };
 
-pub(super) fn try_slot(state: &AppState) -> Result<OwnedSemaphorePermit, Error> {
-    if !ADMISSION_OPEN.load(Ordering::Acquire) {
-        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "workspace Git admission is closed for shutdown"));
+pub(super) fn ensure_admission_open() -> Result<(), Error> {
+    if ADMISSION_OPEN.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(Error(StatusCode::SERVICE_UNAVAILABLE, "workspace admission is closed for shutdown"))
     }
+}
+
+pub(super) fn try_slot(state: &AppState) -> Result<OwnedSemaphorePermit, Error> {
+    ensure_admission_open()?;
     slot(&state.git_slots)
 }
 
