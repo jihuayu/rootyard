@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 import urllib.parse
 
 from refusal_audit_sql import (
@@ -22,6 +23,52 @@ from refusal_audit_sql import (
 
 PUBLIC_REFS_PAGE_LIMIT = 100
 PUBLIC_REFS_MAX_PAGES = 1000
+REFUSAL_BASELINE_TIMEOUT_SECONDS = 10.0
+REFUSAL_BASELINE_POLL_SECONDS = 0.05
+REFUSAL_BASELINE_KEYS = ("operation_highwater", "refs", "api_refs", "journal", "state")
+
+
+def _refusal_baseline_kind(journal):
+    """Safe category for a journal snapshot; never includes entry names."""
+    if not isinstance(journal, list):
+        return "unknown"
+    if not journal:
+        return "empty"
+    kinds = set()
+    for entry in journal:
+        if not isinstance(entry, str):
+            kinds.add("unknown")
+        elif entry.startswith(".retired-"):
+            kinds.add("retired")
+        elif entry.startswith(".tmp-operation-"):
+            kinds.add("staging")
+        else:
+            kinds.add("operation")
+    return "+".join(sorted(kinds))
+
+
+def _refusal_baseline_state(state):
+    """Safe repository-state category without a recovery reason or other text."""
+    if not isinstance(state, str) or not state:
+        return "unknown"
+    return state.split("/", 1)[0]
+
+
+def _refusal_baseline_causal(snapshot):
+    missing = [key for key in REFUSAL_BASELINE_KEYS if key not in snapshot]
+    if missing:
+        raise AssertionError("policy refusal baseline: phase=incomplete missing_keys="
+                             + ",".join(missing))
+    return tuple(snapshot[key] for key in REFUSAL_BASELINE_KEYS)
+
+
+def _refusal_baseline_error(phase, attempts, state, journal):
+    count = str(len(journal)) if isinstance(journal, list) else "unknown"
+    return ("policy refusal baseline: phase=" + phase
+            + " attempts=" + str(attempts)
+            + " state=" + _refusal_baseline_state(state)
+            + " journal_count=" + count
+            + " journal_kind=" + _refusal_baseline_kind(journal))
 
 
 def public_refs(harness, path, max_pages=None):
@@ -307,6 +354,50 @@ class MixedRefSupport:
                 "journal": self.pending_journal(),
                 "state": self.repository_marker()}
 
+    def await_stable_refusal_baseline(self):
+        """Acquire a fresh ready/empty baseline for the policy refusal interval.
+
+        Two complete snapshots must agree on the causal keys (operation
+        highwater, physical refs, API refs, journal and repository state).  This
+        is a bounded pre-push precondition, not a claim that unrelated producers
+        stay quiet: the unchanged interval audit still owns that check.
+        """
+        deadline = time.monotonic() + REFUSAL_BASELINE_TIMEOUT_SECONDS
+        attempts = 0
+        while True:
+            attempts += 1
+            first = self.ref_state()
+            first_keys = _refusal_baseline_causal(first)
+            first_state = first["state"]
+            first_journal = first["journal"]
+            if first_state != "ready/-":
+                raise AssertionError(_refusal_baseline_error("state", attempts, first_state, first_journal))
+            if first_journal:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(_refusal_baseline_error("journal", attempts, first_state, first_journal))
+                time.sleep(REFUSAL_BASELINE_POLL_SECONDS)
+                continue
+
+            second = self.ref_state()
+            second_keys = _refusal_baseline_causal(second)
+            second_state = second["state"]
+            second_journal = second["journal"]
+            if second_state != "ready/-":
+                raise AssertionError(_refusal_baseline_error("state", attempts, second_state, second_journal))
+            if second_journal:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(_refusal_baseline_error("journal", attempts, second_state, second_journal))
+                time.sleep(REFUSAL_BASELINE_POLL_SECONDS)
+                continue
+            if first_keys != second_keys:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(_refusal_baseline_error("unstable", attempts, second_state, second_journal))
+                time.sleep(REFUSAL_BASELINE_POLL_SECONDS)
+                continue
+            # Return the complete fresh snapshot, never a refs-only copy, so the
+            # original audit sees the same whole baseline the caller observed.
+            return second
+
     def assert_one_aborted_refusal(self, before, label, refs):
         return audit_git_refusal_interval(
             before,
@@ -409,7 +500,7 @@ class MixedRefSupport:
         self.assert_rule_state({main: {"required_approvals": 1, "prevent_force_push": False,
                                        "require_fast_forward": False}})
         self.open_pull_for_main(policy_oid)
-        before = self.ref_state()
+        before = self.await_stable_refusal_baseline()
         refused = self.push_as_owner("--atomic", policy_oid + ":" + main,
                                      self.feature_oid + ":" + topic)
         assert refused.returncode != 0, "approval-protected main accepted a direct push"
