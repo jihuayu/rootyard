@@ -353,7 +353,8 @@ pub async fn verify_grant(
         return Err(CloneKitError::InvalidConfig("grant signing secret must be at least 16 bytes"));
     }
     grant.claims.validate()?;
-    let sig_bytes = hex::decode(&grant.signature_hex).map_err(|_| CloneKitError::Unauthorized("malformed grant mac"))?;
+    let sig_bytes =
+        hex::decode(&grant.signature_hex).map_err(|_| CloneKitError::Unauthorized("malformed grant mac"))?;
     let msg = transcript_bytes(&grant.claims)?;
     hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, signing_secret), &msg, &sig_bytes)
         .map_err(|_| CloneKitError::Unauthorized("grant signature mismatch"))?;
@@ -421,23 +422,22 @@ pub async fn verify_tree_dependencies(
     if !claims.object_format.valid_oid(target_oid) {
         return Err(CloneKitError::IncompleteClosure("invalid target_oid for closure check".into()));
     }
-    let tree_raw =
-        run_git_command(git_binary, Some(repo_dir), &["ls-tree", "-lrz", "--full-tree", target_oid], None)?;
+    let tree_raw = run_git_command(git_binary, Some(repo_dir), &["ls-tree", "-lrz", "--full-tree", target_oid], None)?;
     let (mut gitlinks, mut small_blobs) = (Vec::new(), Vec::new());
     for record in tree_raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         let line = std::str::from_utf8(record)
             .map_err(|_| CloneKitError::DependencyCheckFailed("non-utf8 path in ls-tree".into()))?;
-        let (head, path) =
-            line.split_once('\t').ok_or_else(|| CloneKitError::DependencyCheckFailed("malformed ls-tree row".into()))?;
+        let (head, path) = line
+            .split_once('\t')
+            .ok_or_else(|| CloneKitError::DependencyCheckFailed("malformed ls-tree row".into()))?;
         let mut parts = head.split_ascii_whitespace();
         let (mode, kind, oid) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         let size = parts.next().and_then(|s| s.parse::<u64>().ok());
         if mode == "160000" && kind == "commit" {
             gitlinks.push((path.to_owned(), oid.to_owned()));
         } else if kind == "blob" {
-            let size = size.ok_or_else(|| {
-                CloneKitError::DependencyCheckFailed("ls-tree blob row missing a valid size".into())
-            })?;
+            let size = size
+                .ok_or_else(|| CloneKitError::DependencyCheckFailed("ls-tree blob row missing a valid size".into()))?;
             if size <= 1024 {
                 small_blobs.push((path.to_owned(), oid.to_owned()));
             }

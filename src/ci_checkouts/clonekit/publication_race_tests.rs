@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    CP_AFTER_INSTALL, CP_AFTER_POINTER, CP_BEFORE_INSTALL, CP_BEFORE_LOCK, CP_BEFORE_POINTER,
-    CloneKitPublicationStore, publish_clonekit_versioned, test_seam,
+    CP_AFTER_INSTALL, CP_AFTER_POINTER, CP_BEFORE_INSTALL, CP_BEFORE_LOCK, CP_BEFORE_POINTER, CloneKitPublicationStore,
+    publish_clonekit_versioned, test_seam,
 };
 use crate::ci_checkouts::clonekit::{
     BuildFailurePoint, BuiltCloneKitArtifacts, RetentionPinGuard, RetentionPinLedger,
@@ -59,18 +59,10 @@ fn empty_artifacts(repository_id: Uuid, kit_generation: u64) -> BuiltCloneKitArt
 }
 
 fn held_active_artifacts(repository_id: Uuid, kit_generation: u64, pin: Uuid) -> BuiltCloneKitArtifacts {
-    let pack = CloneKitArtifactDigest {
-        sha256: "a".repeat(64),
-        length: 1,
-        hold_id: Some(Uuid::new_v4()),
-        blob_locator: None,
-    };
-    let idx = CloneKitArtifactDigest {
-        sha256: "b".repeat(64),
-        length: 1,
-        hold_id: Some(Uuid::new_v4()),
-        blob_locator: None,
-    };
+    let pack =
+        CloneKitArtifactDigest { sha256: "a".repeat(64), length: 1, hold_id: Some(Uuid::new_v4()), blob_locator: None };
+    let idx =
+        CloneKitArtifactDigest { sha256: "b".repeat(64), length: 1, hold_id: Some(Uuid::new_v4()), blob_locator: None };
     let manifest = CloneKitManifest {
         schema: CLONEKIT_MANIFEST_SCHEMA,
         tenant_id: Uuid::new_v4(),
@@ -105,10 +97,7 @@ fn attempt_names(store: &CloneKitPublicationStore, repository_id: Uuid) -> Vec<S
 }
 
 fn store_and_repo(td: &TempDir) -> (CloneKitPublicationStore, Uuid) {
-    (
-        CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store"),
-        Uuid::new_v4(),
-    )
+    (CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store"), Uuid::new_v4())
 }
 
 fn publish_baseline(store: &CloneKitPublicationStore, repository_id: Uuid) {
@@ -131,10 +120,7 @@ fn older_publisher_paused_before_lock_loses_to_newer_publication() {
         .expect("newer publication");
     test_seam::release(CP_BEFORE_LOCK);
     let older = older.join().expect("join");
-    assert!(matches!(
-        older,
-        Err(CloneKitError::StaleGeneration { expected_min: 3, actual: 1 })
-    ));
+    assert!(matches!(older, Err(CloneKitError::StaleGeneration { expected_min: 3, actual: 1 })));
     assert_eq!(store.load_latest(repository_id).expect("latest").expect("present"), newer);
     test_seam::reset();
 }
@@ -256,10 +242,7 @@ fn gc_cannot_acquire_lock_while_winner_is_paused_after_install() {
     assert!(store.version_dir(repository_id, 2).exists());
     test_seam::release(CP_AFTER_INSTALL);
     publisher.join().expect("join").expect("publication");
-    assert!(matches!(
-        store.try_gc_generation(repository_id, 2, &ledger),
-        Err(CloneKitError::PinProtectionActive(_))
-    ));
+    assert!(matches!(store.try_gc_generation(repository_id, 2, &ledger), Err(CloneKitError::PinProtectionActive(_))));
     test_seam::reset();
 }
 
@@ -324,8 +307,8 @@ fn cancellation_before_commit_never_advertises_candidate() {
     publish_baseline(&store, repository_id);
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let error = publish_clonekit_versioned(&store, &empty_artifacts(repository_id, 2), git(), None, Some(&cancel))
-        .unwrap_err();
+    let error =
+        publish_clonekit_versioned(&store, &empty_artifacts(repository_id, 2), git(), None, Some(&cancel)).unwrap_err();
     assert!(matches!(error, CloneKitError::TransferCancelled));
     assert_eq!(store.load_latest(repository_id).expect("latest").expect("present").kit_generation, 1);
     assert!(!store.version_dir(repository_id, 2).exists());
@@ -401,14 +384,9 @@ fn failed_publication_preserves_caller_pin_and_manifest_hold_fields() {
     let pin = RetentionPinGuard::acquire(&ledger, repository_id, 2).expect("pin");
     let candidate = held_active_artifacts(repository_id, 2, pin.pin_id());
     let before = candidate.manifest.clone();
-    let error = publish_clonekit_versioned(
-        &store,
-        &candidate,
-        git(),
-        Some(BuildFailurePoint::AfterUploadBeforePublish),
-        None,
-    )
-    .unwrap_err();
+    let error =
+        publish_clonekit_versioned(&store, &candidate, git(), Some(BuildFailurePoint::AfterUploadBeforePublish), None)
+            .unwrap_err();
     assert!(matches!(error, CloneKitError::GitFailed(_)));
     assert_eq!(candidate.manifest, before);
     assert_eq!(ledger.active_pin_for(repository_id, 2), Some(pin.pin_id()));

@@ -16,15 +16,14 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::manifest::{
-    CLONEKIT_IDX_NAMESPACE, CLONEKIT_MANIFEST_SCHEMA, CLONEKIT_PACK_NAMESPACE, CloneKitArtifactDigest,
-    CloneKitError, CloneKitManifest, CloneKitObjectFormat, CloneKitStatus, StoredBlobLocator, compute_file_sha256,
+    CLONEKIT_IDX_NAMESPACE, CLONEKIT_MANIFEST_SCHEMA, CLONEKIT_PACK_NAMESPACE, CloneKitArtifactDigest, CloneKitError,
+    CloneKitManifest, CloneKitObjectFormat, CloneKitStatus, StoredBlobLocator, compute_file_sha256,
     default_git_timeout, ensure_not_cancelled, ensure_private_dir, git_cmd, run_git_command,
 };
 
 #[path = "publication.rs"]
 mod publication;
 
-pub use publication::{CloneKitPublicationStore, publish_clonekit_versioned};
 use crate::{
     blob_store::{
         BlobReceipt,
@@ -37,6 +36,7 @@ use crate::{
         artifact_hold::{AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactSpec, HoldScope, PgArtifactHoldStore},
     },
 };
+pub use publication::{CloneKitPublicationStore, publish_clonekit_versioned};
 
 /// Deterministic fault injection points proving failed builds never overwrite published kits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +91,12 @@ impl RetentionPinLedger {
         if repository_id.is_nil() || pin_id.is_nil() || kit_generation == 0 {
             return Err(CloneKitError::InvalidInput("retention pin requires valid repository, generation, and pin_id"));
         }
-        self.held.write().unwrap_or_else(|p| p.into_inner()).entry((repository_id, kit_generation)).or_default().insert(pin_id);
+        self.held
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry((repository_id, kit_generation))
+            .or_default()
+            .insert(pin_id);
         Ok(())
     }
 
@@ -168,8 +173,7 @@ fn read_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, CloneKitErr
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|err| CloneKitError::CorruptArtifact(format!("open generation file: {err}")))?;
-    let meta =
-        file.metadata().map_err(|err| CloneKitError::CorruptArtifact(format!("stat generation file: {err}")))?;
+    let meta = file.metadata().map_err(|err| CloneKitError::CorruptArtifact(format!("stat generation file: {err}")))?;
     if !meta.is_file() || meta.len() > max_bytes {
         return Err(CloneKitError::CorruptArtifact("generation file is not a bounded regular file".into()));
     }
@@ -215,9 +219,7 @@ fn copy_private_file(src: &Path, dest: &Path) -> Result<(), CloneKitError> {
         .map_err(|err| CloneKitError::GitFailed(format!("create prepared clonekit artifact: {err}")))?;
     io::copy(&mut input, &mut output)
         .map_err(|err| CloneKitError::GitFailed(format!("copy prepared clonekit artifact: {err}")))?;
-    output
-        .sync_all()
-        .map_err(|err| CloneKitError::GitFailed(format!("sync prepared clonekit artifact: {err}")))
+    output.sync_all().map_err(|err| CloneKitError::GitFailed(format!("sync prepared clonekit artifact: {err}")))
 }
 
 fn sync_dir(path: &Path) -> Result<(), CloneKitError> {
@@ -306,11 +308,19 @@ pub fn build_clonekit_from_git(
         .map_err(|e| CloneKitError::GitFailed(e.to_string()))?;
 
     if !head_check.status.success() {
-        let refs_out =
-            run_git_command(&req.git_binary, Some(&req.source_repo_dir), &["for-each-ref", "--count=1", "refs/"], cancel)?;
+        let refs_out = run_git_command(
+            &req.git_binary,
+            Some(&req.source_repo_dir),
+            &["for-each-ref", "--count=1", "refs/"],
+            cancel,
+        )?;
         if refs_out.is_empty() {
             let empty_manifest = manifest_from_request(req, CloneKitStatus::EmptyRepository, None, None, None)?;
-            return Ok(BuiltCloneKitArtifacts { manifest: empty_manifest, staged_pack_path: None, staged_idx_path: None });
+            return Ok(BuiltCloneKitArtifacts {
+                manifest: empty_manifest,
+                staged_pack_path: None,
+                staged_idx_path: None,
+            });
         }
         return Err(CloneKitError::MissingKit);
     }
@@ -322,9 +332,15 @@ pub fn build_clonekit_from_git(
 
     let stage_dir = req.staging_root.join(format!("build-{}", Uuid::new_v4().simple()));
     ensure_private_dir(&stage_dir)?;
-    let rev_list = run_git_command(&req.git_binary, Some(&req.source_repo_dir), &["rev-list", "--objects", &base_oid], cancel)?;
+    let rev_list =
+        run_git_command(&req.git_binary, Some(&req.source_repo_dir), &["rev-list", "--objects", &base_oid], cancel)?;
     let mut pack_cmd = git_cmd(&req.git_binary, Some(&req.source_repo_dir))?;
-    pack_cmd.args(["pack-objects", "--quiet"]).arg(stage_dir.join("clonekit")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    pack_cmd
+        .args(["pack-objects", "--quiet"])
+        .arg(stage_dir.join("clonekit"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = pack_cmd.spawn().map_err(|e| CloneKitError::GitFailed(e.to_string()))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(&rev_list).map_err(|e| CloneKitError::GitFailed(e.to_string()))?;
@@ -342,7 +358,8 @@ pub fn build_clonekit_from_git(
         return Err(CloneKitError::GitFailed("injected failure after pack generation".into()));
     }
 
-    let (pack_path, idx_path) = (stage_dir.join(format!("clonekit-{pack_hash}.pack")), stage_dir.join(format!("clonekit-{pack_hash}.idx")));
+    let (pack_path, idx_path) =
+        (stage_dir.join(format!("clonekit-{pack_hash}.pack")), stage_dir.join(format!("clonekit-{pack_hash}.idx")));
     let idx_arg = idx_path.to_str().ok_or(CloneKitError::InvalidInput("non-utf8 idx path"))?;
     run_git_command(&req.git_binary, Some(&req.source_repo_dir), &["verify-pack", "-s", idx_arg], cancel)?;
 
@@ -354,7 +371,8 @@ pub fn build_clonekit_from_git(
         fs::write(&pack_path, corrupted).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
     }
 
-    let ((pack_sha256, pack_len), (idx_sha256, idx_len)) = (compute_file_sha256(&pack_path)?, compute_file_sha256(&idx_path)?);
+    let ((pack_sha256, pack_len), (idx_sha256, idx_len)) =
+        (compute_file_sha256(&pack_path)?, compute_file_sha256(&idx_path)?);
     let manifest = manifest_from_request(
         req,
         CloneKitStatus::Active,
@@ -417,7 +435,8 @@ pub async fn publish_clonekit_to_blob_store(
     )
     .map_err(|e| CloneKitError::DatabaseFailed(e.to_string()))?;
 
-    let (pg_dl, blob_dl) = (TokioInstant::now() + default_git_timeout(), std::time::Instant::now() + default_git_timeout());
+    let (pg_dl, blob_dl) =
+        (TokioInstant::now() + default_git_timeout(), std::time::Instant::now() + default_git_timeout());
     let mut client = pool.get().await.map_err(|e| CloneKitError::DatabaseFailed(e.to_string()))?;
     let AcquireOutcome::Granted { grant, .. } = PgArtifactHoldStore
         .acquire(&mut client, store, &req, pg_dl)
@@ -468,5 +487,3 @@ pub async fn publish_clonekit_to_blob_store(
     built.manifest = built.manifest.clone().sealed()?;
     Ok(vec![r_pack, r_idx])
 }
-
-

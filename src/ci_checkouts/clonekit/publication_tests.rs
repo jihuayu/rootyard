@@ -128,7 +128,8 @@ fn corrupt_candidate_preserves_existing_generation_and_current() {
     let vdir = store.version_dir(repository_id, 1);
     let manifest_before = fs::read(vdir.join("manifest.json")).expect("manifest");
     let current_before = fs::read(store.current_pointer_path(repository_id)).expect("current");
-    let candidate = active_artifacts(&td, repository_id, 2, b"expected-pack", b"expected-idx", b"wrong-pack", b"expected-idx");
+    let candidate =
+        active_artifacts(&td, repository_id, 2, b"expected-pack", b"expected-idx", b"wrong-pack", b"expected-idx");
     let error = publish_clonekit_versioned(&store, &candidate, Path::new("/usr/bin/git"), None, None).unwrap_err();
 
     assert!(matches!(error, CloneKitError::CorruptArtifact(_)));
@@ -153,7 +154,8 @@ fn failed_attempt_cleanup_removes_only_its_own_directory() {
     fs::create_dir(&installed).expect("installed generation");
     fs::write(installed.join("keep"), b"installed").expect("installed marker");
 
-    let candidate = active_artifacts(&td, repository_id, 2, b"expected-pack", b"expected-idx", b"wrong-pack", b"expected-idx");
+    let candidate =
+        active_artifacts(&td, repository_id, 2, b"expected-pack", b"expected-idx", b"wrong-pack", b"expected-idx");
     assert!(publish_clonekit_versioned(&store, &candidate, Path::new("/usr/bin/git"), None, None).is_err());
 
     assert_eq!(fs::read(other_attempt.join("keep")).expect("other marker"), b"other");
@@ -161,18 +163,9 @@ fn failed_attempt_cleanup_removes_only_its_own_directory() {
     assert_eq!(attempt_names(&store, repository_id), vec![".publish-other-publisher".to_owned()]);
 }
 
-fn prepare_empty(
-    store: &CloneKitPublicationStore,
-    repository_id: Uuid,
-    kit_generation: u64,
-) -> PreparedGeneration {
-    PreparedGeneration::prepare(
-        store,
-        &empty_artifacts(repository_id, kit_generation),
-        Path::new("/usr/bin/git"),
-        None,
-    )
-    .expect("prepared empty generation")
+fn prepare_empty(store: &CloneKitPublicationStore, repository_id: Uuid, kit_generation: u64) -> PreparedGeneration {
+    PreparedGeneration::prepare(store, &empty_artifacts(repository_id, kit_generation), Path::new("/usr/bin/git"), None)
+        .expect("prepared empty generation")
 }
 
 #[test]
@@ -183,28 +176,17 @@ fn locked_recheck_rejects_candidate_prepared_before_newer_publication() {
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
     let older = prepare_empty(&store, repository_id, 1);
-    publish_clonekit_versioned(
-        &store,
-        &empty_artifacts(repository_id, 2),
-        Path::new("/usr/bin/git"),
-        None,
-        None,
-    )
-    .expect("newer publication");
+    publish_clonekit_versioned(&store, &empty_artifacts(repository_id, 2), Path::new("/usr/bin/git"), None, None)
+        .expect("newer publication");
     let _guard = store.acquire_publication_lock(repository_id).expect("guard");
     let error = store.commit_prepared(older, None).unwrap_err();
     assert!(matches!(error, CloneKitError::StaleGeneration { expected_min: 3, actual: 1 }));
     assert_eq!(store.load_latest(repository_id).expect("latest").expect("present").kit_generation, 2);
     drop(_guard);
 
-    let duplicate = publish_clonekit_versioned(
-        &store,
-        &empty_artifacts(repository_id, 2),
-        Path::new("/usr/bin/git"),
-        None,
-        None,
-    )
-    .unwrap_err();
+    let duplicate =
+        publish_clonekit_versioned(&store, &empty_artifacts(repository_id, 2), Path::new("/usr/bin/git"), None, None)
+            .unwrap_err();
     assert!(matches!(duplicate, CloneKitError::StaleGeneration { expected_min: 3, actual: 2 }));
 }
 
@@ -216,24 +198,13 @@ fn busy_publication_lock_is_explicit_and_released_after_guard_drop() {
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
     let guard = store.acquire_publication_lock(repository_id).expect("guard");
-    let error = publish_clonekit_versioned(
-        &store,
-        &empty_artifacts(repository_id, 1),
-        Path::new("/usr/bin/git"),
-        None,
-        None,
-    )
-    .unwrap_err();
+    let error =
+        publish_clonekit_versioned(&store, &empty_artifacts(repository_id, 1), Path::new("/usr/bin/git"), None, None)
+            .unwrap_err();
     assert!(matches!(error, CloneKitError::GitFailed(ref message) if message.contains("busy")));
     drop(guard);
-    publish_clonekit_versioned(
-        &store,
-        &empty_artifacts(repository_id, 1),
-        Path::new("/usr/bin/git"),
-        None,
-        None,
-    )
-    .expect("publication after release");
+    publish_clonekit_versioned(&store, &empty_artifacts(repository_id, 1), Path::new("/usr/bin/git"), None, None)
+        .expect("publication after release");
     assert!(store.repo_dir(repository_id).join(".publication.lock").is_file());
 }
 
@@ -263,14 +234,9 @@ fn generation_u64_max_is_reported_as_exhausted_not_overflowed() {
     let maximum = manifest(repository_id, u64::MAX, CloneKitStatus::EmptyRepository, None, None);
     fs::write(store.current_pointer_path(repository_id), serde_json::to_vec_pretty(&maximum).expect("encode"))
         .expect("current");
-    let error = publish_clonekit_versioned(
-        &store,
-        &empty_artifacts(repository_id, 1),
-        Path::new("/usr/bin/git"),
-        None,
-        None,
-    )
-    .unwrap_err();
+    let error =
+        publish_clonekit_versioned(&store, &empty_artifacts(repository_id, 1), Path::new("/usr/bin/git"), None, None)
+            .unwrap_err();
     assert!(matches!(error, CloneKitError::GitFailed(ref message) if message.contains("exhausted")));
 }
 
@@ -281,14 +247,8 @@ fn exact_unpublished_generation_recovers_and_conflicting_generation_rejects() {
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
-    publish_clonekit_versioned(
-        &store,
-        &empty_artifacts(repository_id, 1),
-        Path::new("/usr/bin/git"),
-        None,
-        None,
-    )
-    .expect("baseline");
+    publish_clonekit_versioned(&store, &empty_artifacts(repository_id, 1), Path::new("/usr/bin/git"), None, None)
+        .expect("baseline");
 
     let candidate = empty_artifacts(repository_id, 2);
     let vdir = store.version_dir(repository_id, 2);
@@ -322,18 +282,13 @@ fn recovery_validates_active_manifest_pack_and_idx_without_git() {
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
-    publish_clonekit_versioned(
-        &store,
-        &empty_artifacts(repository_id, 1),
-        Path::new("/usr/bin/git"),
-        None,
-        None,
-    )
-    .expect("baseline");
+    publish_clonekit_versioned(&store, &empty_artifacts(repository_id, 1), Path::new("/usr/bin/git"), None, None)
+        .expect("baseline");
     let active = active_artifacts(&td, repository_id, 2, b"pack-bytes", b"idx-bytes", b"pack-bytes", b"idx-bytes");
     let vdir = store.version_dir(repository_id, 2);
     fs::create_dir(&vdir).expect("active generation");
-    fs::write(vdir.join("manifest.json"), serde_json::to_vec_pretty(&active.manifest).expect("encode")).expect("manifest");
+    fs::write(vdir.join("manifest.json"), serde_json::to_vec_pretty(&active.manifest).expect("encode"))
+        .expect("manifest");
     fs::write(vdir.join("clonekit.pack"), b"pack-bytes").expect("pack");
     fs::write(vdir.join("clonekit.idx"), b"idx-bytes").expect("idx");
     let attempt = store.ensure_repo_dir(repository_id).expect("repo dir").join(".publish-owned-test");
@@ -372,16 +327,10 @@ fn gc_requires_publication_lock_strictly_older_current_and_held_pin_check() {
     fs::write(future.join("keep"), b"future").expect("future marker");
     assert!(!store.try_gc_generation(repository_id, 3, &ledger).expect("future refused"));
     assert!(future.join("keep").is_file());
-    assert!(matches!(
-        store.try_gc_generation(repository_id, 2, &ledger),
-        Err(CloneKitError::PinProtectionActive(_))
-    ));
+    assert!(matches!(store.try_gc_generation(repository_id, 2, &ledger), Err(CloneKitError::PinProtectionActive(_))));
 
     let pin = RetentionPinGuard::acquire(&ledger, repository_id, 1).expect("pin");
-    assert!(matches!(
-        store.try_gc_generation(repository_id, 1, &ledger),
-        Err(CloneKitError::PinProtectionActive(_))
-    ));
+    assert!(matches!(store.try_gc_generation(repository_id, 1, &ledger), Err(CloneKitError::PinProtectionActive(_))));
     drop(pin);
     assert!(store.try_gc_generation(repository_id, 1, &ledger).expect("old unpinned collection"));
     assert!(!store.version_dir(repository_id, 1).exists());

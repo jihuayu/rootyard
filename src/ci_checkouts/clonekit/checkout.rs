@@ -17,8 +17,8 @@ use super::{
         verify_grant, verify_tree_dependencies,
     },
     manifest::{
-        CloneKitError, CloneKitManifest, CloneKitStatus, compute_file_sha256, default_git_timeout, ensure_not_cancelled,
-        ensure_private_dir, run_git_command, write_atomic_private_file,
+        CloneKitError, CloneKitManifest, CloneKitStatus, compute_file_sha256, default_git_timeout,
+        ensure_not_cancelled, ensure_private_dir, run_git_command, write_atomic_private_file,
     },
 };
 use crate::blob_store::{
@@ -171,9 +171,18 @@ async fn finalize_workspace(
 ) -> Result<CheckoutOutcome, CloneKitError> {
     let claims = &req.grant.claims;
     ensure_not_cancelled(req.cancel.as_ref())?;
-    run_git_command(req.git_binary, Some(&work_repo), &["checkout", "--detach", &claims.target_oid], req.cancel.as_ref())?;
-    let head_raw =
-        run_git_command(req.git_binary, Some(&work_repo), &["rev-parse", "--verify", "HEAD^{commit}"], req.cancel.as_ref())?;
+    run_git_command(
+        req.git_binary,
+        Some(&work_repo),
+        &["checkout", "--detach", &claims.target_oid],
+        req.cancel.as_ref(),
+    )?;
+    let head_raw = run_git_command(
+        req.git_binary,
+        Some(&work_repo),
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        req.cancel.as_ref(),
+    )?;
     let actual_head = String::from_utf8_lossy(&head_raw).trim().to_owned();
     if actual_head != claims.target_oid || !claims.object_format.valid_oid(&actual_head) {
         return Err(CloneKitError::IncompleteClosure(format!(
@@ -304,9 +313,15 @@ async fn download_and_verify_kit_files(
     if gets == 0 {
         let pub_store = req.pub_store.ok_or(CloneKitError::MissingKit)?;
         let (src_pack, src_idx) = pub_store.artifact_paths(manifest.repository_id, manifest.kit_generation);
-        write_atomic_private_file(&dest_pack, &fs::read(&src_pack).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?)?;
+        write_atomic_private_file(
+            &dest_pack,
+            &fs::read(&src_pack).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?,
+        )?;
         ensure_not_cancelled(req.cancel.as_ref())?;
-        write_atomic_private_file(&dest_idx, &fs::read(&src_idx).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?)?;
+        write_atomic_private_file(
+            &dest_idx,
+            &fs::read(&src_idx).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?,
+        )?;
         gets = 2;
     }
 
@@ -325,7 +340,9 @@ fn fallback_error(reason: FallbackReason) -> CloneKitError {
         FallbackReason::CorruptKit => CloneKitError::CorruptArtifact("clonekit verification failed".into()),
         FallbackReason::ExpiredKit => CloneKitError::GrantExpired,
         FallbackReason::StaleKitGeneration => CloneKitError::StaleGeneration { expected_min: 1, actual: 0 },
-        FallbackReason::KitHistoryMismatch => CloneKitError::HistoryChanged { expected: Uuid::nil(), actual: Uuid::nil() },
+        FallbackReason::KitHistoryMismatch => {
+            CloneKitError::HistoryChanged { expected: Uuid::nil(), actual: Uuid::nil() }
+        }
         FallbackReason::InterruptedTransfer => CloneKitError::TransferCancelled,
     }
 }
@@ -383,7 +400,8 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
     };
     let stage_dir = lease.dir_path().map_err(|e| CloneKitError::GitFailed(e.to_string()))?.join("kit-stage");
     ensure_private_dir(&stage_dir)?;
-    let (staged_pack, staged_idx, kit_bytes, gets) = match download_and_verify_kit_files(req, &manifest, &stage_dir).await
+    let (staged_pack, staged_idx, kit_bytes, gets) = match download_and_verify_kit_files(req, &manifest, &stage_dir)
+        .await
     {
         Ok(res) => res,
         Err(err @ (CloneKitError::TransferCancelled | CloneKitError::ForeignBackend)) => return Err(err),
@@ -400,11 +418,17 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
 
     req.authority.check_active(claims).await?;
     ensure_not_cancelled(req.cancel.as_ref())?;
-    run_git_command(req.git_binary, Some(&work_repo), &["init", "--quiet", claims.object_format.git_init_flag()], req.cancel.as_ref())?;
+    run_git_command(
+        req.git_binary,
+        Some(&work_repo),
+        &["init", "--quiet", claims.object_format.git_init_flag()],
+        req.cancel.as_ref(),
+    )?;
 
     let pack_sha = &manifest.pack.as_ref().ok_or(CloneKitError::MissingKit)?.sha256;
     let pack_dir = work_repo.join(".git").join("objects").join("pack");
-    let (dst_pack, dst_idx) = (pack_dir.join(format!("pack-{pack_sha}.pack")), pack_dir.join(format!("pack-{pack_sha}.idx")));
+    let (dst_pack, dst_idx) =
+        (pack_dir.join(format!("pack-{pack_sha}.pack")), pack_dir.join(format!("pack-{pack_sha}.idx")));
     fs::copy(&staged_pack, &dst_pack).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
     fs::copy(&staged_idx, &dst_idx).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
 
@@ -412,14 +436,25 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
     if let Err(err) = run_git_command(req.git_binary, Some(&work_repo), &["verify-pack", "-s", dst_idx_str], None) {
         return if allow_fallback {
             let clean_work = work_repo.with_file_name("checkout-fallback");
-            run_stock_git_checkout(req, clean_work, lease, CheckoutStrategy::StockGitFallback { reason: FallbackReason::CorruptKit }).await
+            run_stock_git_checkout(
+                req,
+                clean_work,
+                lease,
+                CheckoutStrategy::StockGitFallback { reason: FallbackReason::CorruptKit },
+            )
+            .await
         } else {
             Err(err)
         };
     }
 
     let base_oid = manifest.base_commit_oid.as_deref().ok_or(CloneKitError::MissingKit)?;
-    run_git_command(req.git_binary, Some(&work_repo), &["update-ref", "refs/rootyard-clonekit-base", base_oid], req.cancel.as_ref())?;
+    run_git_command(
+        req.git_binary,
+        Some(&work_repo),
+        &["update-ref", "refs/rootyard-clonekit-base", base_oid],
+        req.cancel.as_ref(),
+    )?;
 
     let before_delta = dir_object_bytes(&work_repo);
     let mut total_gets = gets;
@@ -428,10 +463,14 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
     } else {
         run_git_fetch(req, &work_repo, &claims.target_oid)?;
         total_gets += 1;
-        CheckoutStrategy::CloneKitIncremental { kit_generation: manifest.kit_generation, base_commit_oid: base_oid.to_owned() }
+        CheckoutStrategy::CloneKitIncremental {
+            kit_generation: manifest.kit_generation,
+            base_commit_oid: base_oid.to_owned(),
+        }
     };
     let delta_bytes = dir_object_bytes(&work_repo).saturating_sub(before_delta);
-    let _ = run_git_command(req.git_binary, Some(&work_repo), &["update-ref", "-d", "refs/rootyard-clonekit-base"], None);
+    let _ =
+        run_git_command(req.git_binary, Some(&work_repo), &["update-ref", "-d", "refs/rootyard-clonekit-base"], None);
 
     finalize_workspace(
         req,

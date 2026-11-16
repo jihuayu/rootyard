@@ -1,10 +1,6 @@
 //! Source-only same-generation race with two distinct real Active pack/idx candidates.
 
-use std::{
-    fs,
-    path::Path,
-    thread,
-};
+use std::{fs, path::Path, thread};
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -57,16 +53,11 @@ fn assert_distinct_candidates(first: &BuiltCloneKitArtifacts, second: &BuiltClon
 fn same_generation_active_race_has_one_complete_winner_and_stale_retry() {
     let td = TempDir::new().expect("tempdir");
     let ids = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    let candidate_a = fixture::build_active_candidate(&td, ids, 1, "a", b"active-candidate-a-payload")
-        .expect("candidate a");
-    let candidate_b = fixture::build_active_candidate(
-        &td,
-        ids,
-        1,
-        "b",
-        b"active-candidate-b-payload-with-a-different-length",
-    )
-    .expect("candidate b");
+    let candidate_a =
+        fixture::build_active_candidate(&td, ids, 1, "a", b"active-candidate-a-payload").expect("candidate a");
+    let candidate_b =
+        fixture::build_active_candidate(&td, ids, 1, "b", b"active-candidate-b-payload-with-a-different-length")
+            .expect("candidate b");
     assert_eq!(candidate_a.manifest.status, CloneKitStatus::Active);
     assert_eq!(candidate_b.manifest.status, CloneKitStatus::Active);
     assert_distinct_candidates(&candidate_a, &candidate_b);
@@ -160,15 +151,11 @@ fn same_generation_active_race_has_one_complete_winner_and_stale_retry() {
 
     assert!(attempt_names(&store, ids.1).is_empty());
     assert_eq!(
-        fs::read(loser_built.staged_pack_path.as_ref().expect("loser staged pack"))
-            .expect("loser pack")
-            .as_slice(),
+        fs::read(loser_built.staged_pack_path.as_ref().expect("loser staged pack")).expect("loser pack").as_slice(),
         loser_bytes.pack.as_slice()
     );
     assert_eq!(
-        fs::read(loser_built.staged_idx_path.as_ref().expect("loser staged idx"))
-            .expect("loser idx")
-            .as_slice(),
+        fs::read(loser_built.staged_idx_path.as_ref().expect("loser staged idx")).expect("loser idx").as_slice(),
         loser_bytes.idx.as_slice()
     );
     test_seam::reset();

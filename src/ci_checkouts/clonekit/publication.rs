@@ -17,8 +17,7 @@ use super::{
     verify_idx_in_ephemeral_repo, verify_prepared_artifact, write_private_file,
 };
 use crate::ci_checkouts::clonekit::manifest::{
-    CloneKitError, CloneKitManifest, CloneKitStatus, MAX_MANIFEST_JSON_BYTES, ensure_not_cancelled,
-    ensure_private_dir,
+    CloneKitError, CloneKitManifest, CloneKitStatus, MAX_MANIFEST_JSON_BYTES, ensure_not_cancelled, ensure_private_dir,
 };
 
 const REPOSITORY_PREFIX: &str = "repo-";
@@ -176,11 +175,7 @@ impl CloneKitPublicationStore {
         Ok(Some(manifest))
     }
 
-    fn validate_existing_generation(
-        &self,
-        vdir: &Path,
-        candidate: &CloneKitManifest,
-    ) -> Result<(), CloneKitError> {
+    fn validate_existing_generation(&self, vdir: &Path, candidate: &CloneKitManifest) -> Result<(), CloneKitError> {
         let bytes = read_regular_file(&vdir.join(MANIFEST_FILE), MAX_MANIFEST_JSON_BYTES as u64)?;
         let existing = CloneKitManifest::from_verified_json(&bytes)?;
         if existing != *candidate {
@@ -302,12 +297,7 @@ impl OwnedAttempt {
 
     fn into_prepared(mut self, manifest: CloneKitManifest, encoded: Vec<u8>) -> PreparedGeneration {
         self.armed = false;
-        PreparedGeneration {
-            attempt_dir: self.path.clone(),
-            manifest,
-            encoded,
-            committed: false,
-        }
+        PreparedGeneration { attempt_dir: self.path.clone(), manifest, encoded, committed: false }
     }
 }
 

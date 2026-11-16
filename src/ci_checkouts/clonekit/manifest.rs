@@ -405,9 +405,7 @@ pub(super) fn write_atomic_private_file(dest: &Path, bytes: &[u8]) -> Result<(),
         .mode(0o600)
         .open(&tmp)
         .map_err(|e| CloneKitError::GitFailed(e.to_string()))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| CloneKitError::GitFailed(e.to_string()))?;
+    file.write_all(bytes).and_then(|()| file.sync_all()).map_err(|e| CloneKitError::GitFailed(e.to_string()))?;
     drop(file);
     fs::rename(&tmp, dest).map_err(|e| CloneKitError::GitFailed(e.to_string()))
 }
