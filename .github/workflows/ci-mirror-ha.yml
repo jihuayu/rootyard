@@ -56,8 +56,6 @@ jobs:
       ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard:rootyard-ci-only@127.0.0.1:55432/rootyard_ci_mirror_ha
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -125,6 +123,7 @@ jobs:
         run: |
           mkdir -p test-results/ci-mirror-ha
           python3 scripts/build_native.py \
+            --package-debug 0 \
             --strip-debuginfo \
             --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
             --output test-results/ci-mirror-ha/rootyard
