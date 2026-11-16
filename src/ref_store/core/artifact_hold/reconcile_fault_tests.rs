@@ -349,9 +349,13 @@ fn unauthenticated_forged_quorum_and_missing_pg_evidence_fail_closed() {
         backend_identity: backend.clone(),
         groups: vec![g1],
     };
-    let out_lag =
-        evaluate_shared_hold_retirement(&shared, &[verified.clone()], &[make_cursor(f1.history, 10, 1, 2)], None)
-            .unwrap();
+    let out_lag = evaluate_shared_hold_retirement(
+        &shared,
+        std::slice::from_ref(&verified),
+        &[make_cursor(f1.history, 10, 1, 2)],
+        None,
+    )
+    .unwrap();
     assert_eq!(out_lag.status, SharedHoldRetirementStatus::Protected);
     assert!(out_lag.reasons.contains(&RetirementBlockReason::MissingPgEvidence));
     assert!(out_lag.reasons.iter().any(|r| matches!(
