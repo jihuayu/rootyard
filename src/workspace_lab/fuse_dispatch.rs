@@ -469,13 +469,26 @@ fn epoch_matches(queued: Option<i64>, guard: i64) -> bool {
     queued == Some(guard)
 }
 
+/// A panic in the per-mount actor thread. This is a terminal failure: it is
+/// cached so a second teardown attempt cannot turn the same failed join into an
+/// apparent clean result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActorJoinFailure {
+    Panicked,
+}
+
+struct ActorWorker {
+    handle: Option<std::thread::JoinHandle<()>>,
+    outcome: Option<Result<(), ActorJoinFailure>>,
+}
+
 pub(super) struct Dispatcher {
     shared: Arc<Shared>,
     mount_budget: Arc<Budget>,
     global_budget: Arc<Budget>,
     /// Kept for enqueue-time epoch stamping and shutdown fencing.
     gate: Arc<MutationGate>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    worker: Mutex<ActorWorker>,
 }
 
 impl Dispatcher {
@@ -490,11 +503,12 @@ impl Dispatcher {
             mount_budget,
             global_budget,
             gate: gate.clone(),
-            worker: Mutex::new(None),
+            worker: Mutex::new(ActorWorker { handle: None, outcome: None }),
         });
         let actor = Actor { overlay, shared, gate, pool };
         let handle = std::thread::Builder::new().name("rootyard-fuse-actor".into()).spawn(move || actor.run())?;
-        *dispatcher.worker.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
+        *dispatcher.worker.lock().unwrap_or_else(PoisonError::into_inner) =
+            ActorWorker { handle: Some(handle), outcome: None };
         Ok(dispatcher)
     }
 
@@ -533,25 +547,49 @@ impl Dispatcher {
         }
     }
 
-    pub(super) fn shutdown(&self) {
+    /// Quick, non-blocking stop request: fence the gate and close the queue so
+    /// the actor rejects new work and drains its pending replies. This never
+    /// waits for the actor thread.
+    pub(super) fn request_stop(&self) {
         // Fence first so no replay can admit a new mutation, then close the
         // queue and let the actor fail everything still queued with EIO.
         self.gate.fence();
         self.shared.close();
-        let handle = self.worker.lock().unwrap_or_else(PoisonError::into_inner).take();
-        if let Some(handle) = handle {
-            let _ = handle.join();
+    }
+
+    /// Join the actor after [`Dispatcher::request_stop`]. The result is cached:
+    /// an actor panic is a terminal typed failure and is never rewritten as a
+    /// clean join by a later observer.
+    pub(super) fn join_actor(&self) -> Result<(), ActorJoinFailure> {
+        let mut worker = self.worker.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(outcome) = worker.outcome {
+            return outcome;
         }
+        let Some(handle) = worker.handle.take() else {
+            let outcome = Ok(());
+            worker.outcome = Some(outcome);
+            return outcome;
+        };
+        let outcome = match handle.join() {
+            Ok(()) => Ok(()),
+            Err(_) => Err(ActorJoinFailure::Panicked),
+        };
+        worker.outcome = Some(outcome);
+        outcome
+    }
+
+    /// Stop and join the actor. Kept for drop paths and the helper-facing
+    /// consuming teardown, which is fail-closed rather than typed.
+    pub(super) fn shutdown(&self) {
+        self.request_stop();
+        let _ = self.join_actor();
     }
 }
 
 impl Drop for Dispatcher {
     fn drop(&mut self) {
-        self.gate.fence();
-        self.shared.close();
-        if let Some(handle) = self.worker.lock().unwrap_or_else(PoisonError::into_inner).take() {
-            let _ = handle.join();
-        }
+        self.request_stop();
+        let _ = self.join_actor();
     }
 }
 

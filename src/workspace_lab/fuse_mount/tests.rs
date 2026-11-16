@@ -90,6 +90,21 @@ fn mount_handle_offers_a_consuming_joined_teardown_and_a_borrowable_stop() {
 }
 
 #[test]
+fn mount_handle_offers_owner_preserving_typed_teardown_and_quick_stop() {
+    // Compile-time contract only: the registry owner can retry the same
+    // borrowed handle after an actor/unmount/session refusal, while the quick
+    // stop remains a non-blocking shared-borrow operation.
+    fn preserving(handle: &mut MountHandle) -> Result<(), MountTeardownError> {
+        handle.teardown_owned()
+    }
+    fn quick(handle: &MountHandle) {
+        handle.request_stop();
+    }
+    let _: for<'a> fn(&'a mut MountHandle) -> Result<(), MountTeardownError> = preserving;
+    let _: for<'a> fn(&'a MountHandle) = quick;
+}
+
+#[test]
 fn mountinfo_identity_is_the_single_exact_mount_at_the_owned_path() {
     let mountinfo = "\
 36 35 0:32 / /srv/rootyard/workspaces/a/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0

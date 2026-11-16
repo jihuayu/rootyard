@@ -13,6 +13,7 @@ use fuser::{FileAttr, FileType, MountOption};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
+    fmt,
     fs::{self, File},
     io,
     os::{
@@ -93,13 +94,75 @@ pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
 /// The handle also remembers the canonical mount point and the kernel mount ID
 /// captured when it mounted, so its owned teardown can unmount exactly this
 /// mount instead of whichever mount happens to sit at that path by then.
+///
+/// `session` stays owned until an exact, non-lazy unmount of the captured
+/// mount ID has succeeded. A typed teardown failure therefore leaves the live
+/// `fuser` mount in this handle instead of dropping it through the path-based
+/// destructor fallback.
 pub struct MountHandle {
-    session: fuser::BackgroundSession,
+    session: Option<fuser::BackgroundSession>,
     dispatcher: Arc<fuse_dispatch::Dispatcher>,
     /// Canonical mount point the kernel published for this handle.
     mountpoint: PathBuf,
     /// Kernel mount ID captured for this handle when it mounted.
     mount_id: MountId,
+    /// Terminal session-join state. `None` means it has not been attempted.
+    session_join: Option<Result<(), SessionJoinFailureKind>>,
+}
+
+/// Why the owner-preserving legacy teardown did not reach confirmed
+/// quiescence. The handle, its live session and its retained reader stay owned
+/// by the caller on every variant except a repeat of an already-recorded
+/// session-join failure (the session has already been consumed in that case).
+#[derive(Debug)]
+pub(crate) enum MountTeardownError {
+    ActorJoinPanicked,
+    Unmount(io::Error),
+    SessionJoinPanicked,
+    SessionJoin(io::Error),
+    SessionJoinAlreadyFailed,
+    SessionStateInvalid,
+}
+
+impl fmt::Display for MountTeardownError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ActorJoinPanicked => formatter.write_str("FUSE dispatcher actor panicked during join"),
+            Self::Unmount(error) => write!(formatter, "exact FUSE unmount failed: {error}"),
+            Self::SessionJoinPanicked => formatter.write_str("FUSE session thread panicked during join"),
+            Self::SessionJoin(error) => write!(formatter, "FUSE session join failed: {error}"),
+            Self::SessionJoinAlreadyFailed => {
+                formatter.write_str("FUSE session join previously failed after exact unmount")
+            }
+            Self::SessionStateInvalid => formatter.write_str("FUSE session ownership state is inconsistent"),
+        }
+    }
+}
+
+impl std::error::Error for MountTeardownError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionJoinFailureKind {
+    Panicked,
+    Io,
+}
+
+enum SessionJoinFailure {
+    Panicked,
+    Io(io::Error),
+}
+
+/// Join the background session without using `BackgroundSession::join`, which
+/// unwraps both the thread panic and the session I/O result. The public guard is
+/// moved out while the session's remaining fields (including its live `Mount`)
+/// stay alive through the join; they drop only after the join returns.
+fn join_background_session(session: fuser::BackgroundSession) -> Result<(), SessionJoinFailure> {
+    let guard = session.guard;
+    match guard.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(SessionJoinFailure::Io(error)),
+        Err(_) => Err(SessionJoinFailure::Panicked),
+    }
 }
 
 impl MountHandle {
@@ -107,54 +170,100 @@ impl MountHandle {
         self.dispatcher.usage()
     }
 
-    /// Stop the per-mount actor before the session is unmounted. Every reply
-    /// still sitting in a queue slot fails with `EIO`; an operation already
-    /// admitted to the gate may still finish. Reads executing in the global
-    /// read pool re-check the shutdown flag after I/O and reply `EIO`.
+    /// Quick, non-blocking stop request: fence the mutation gate and close the
+    /// per-mount queue. Every reply still sitting in a queue slot fails with
+    /// `EIO`; an operation already admitted to the gate may still finish, and a
+    /// lazy read already executing in the global read pool re-checks the
+    /// shutdown flag after I/O and replies `EIO`.
     ///
-    /// This is the non-consuming half: it neither unmounts nor waits for the
-    /// kernel session thread. Callers that own the handle and are about to
+    /// This is the non-consuming half: it neither joins the actor nor waits for
+    /// the kernel session thread. Callers that own the handle and are about to
     /// exit (the helper teardown, unmount, cancel and publish-failure paths)
     /// must use [`MountHandle::shutdown_and_join`] instead.
+    pub fn request_stop(&self) {
+        self.dispatcher.request_stop();
+    }
+
+    /// Backwards-compatible alias for [`MountHandle::request_stop`].
     pub fn shutdown(&self) {
-        self.dispatcher.shutdown();
+        self.request_stop();
+    }
+
+    /// Owner-preserving, non-panicking legacy teardown.
+    ///
+    /// The caller keeps this handle until every stage succeeds. The order is
+    /// explicit: stop requests, join the actor (which drains admitted mutations
+    /// and, while the current deferred-slot lock is held through `run`, waits
+    /// for an active lazy read), unmount exactly the captured mount ID with
+    /// normal `flags = 0`, and only then consume and join the background
+    /// session. The caller keeps the lazy `Reader` alive until this returns.
+    ///
+    /// A failed actor join or an exact-unmount refusal returns a typed error and
+    /// leaves `session` untouched. There is no path-only unmount, lazy fallback
+    /// or destructor cleanup on that branch. A session-join panic or I/O error
+    /// is terminal failure after the exact unmount and is cached so a retry
+    /// cannot relabel it as success.
+    pub(crate) fn teardown_owned(&mut self) -> Result<(), MountTeardownError> {
+        if let Some(outcome) = self.session_join {
+            return match outcome {
+                Ok(()) => Ok(()),
+                Err(SessionJoinFailureKind::Panicked) => Err(MountTeardownError::SessionJoinPanicked),
+                Err(SessionJoinFailureKind::Io) => Err(MountTeardownError::SessionJoinAlreadyFailed),
+            };
+        }
+        self.request_stop();
+        self.dispatcher.join_actor().map_err(|_| MountTeardownError::ActorJoinPanicked)?;
+        // The session is still owned here. A refusal or identity mismatch must
+        // propagate without dropping the live `fuser` mount.
+        unmount_owned(&self.mountpoint, self.mount_id).map_err(MountTeardownError::Unmount)?;
+        let Some(session) = self.session.take() else {
+            return Err(MountTeardownError::SessionStateInvalid);
+        };
+        match join_background_session(session) {
+            Ok(()) => {
+                self.session_join = Some(Ok(()));
+                Ok(())
+            }
+            Err(SessionJoinFailure::Panicked) => {
+                self.session_join = Some(Err(SessionJoinFailureKind::Panicked));
+                Err(MountTeardownError::SessionJoinPanicked)
+            }
+            Err(SessionJoinFailure::Io(error)) => {
+                self.session_join = Some(Err(SessionJoinFailureKind::Io));
+                Err(MountTeardownError::SessionJoin(error))
+            }
+        }
     }
 
     /// Consuming teardown with a completion barrier.
     ///
-    /// Stops the dispatcher, then consumes the `fuser::BackgroundSession` and
-    /// calls its public `join()`: `join` drops the mount and blocks until
-    /// the kernel session thread has actually ended. That is the difference
-    /// from `shutdown()` + drop, where the background session detaches its join
-    /// handle and a process exiting right afterwards can terminate before the
-    /// unmount completed and leave an owned mount behind.
+    /// Stops the dispatcher, joins the actor, unmounts exactly this handle's
+    /// captured mount with normal `flags = 0`, then consumes the
+    /// `fuser::BackgroundSession` and joins its public guard. That is the
+    /// difference from `request_stop()` + drop, where the background session
+    /// detaches its join handle and a process exiting right afterwards can
+    /// terminate before the unmount completed and leave an owned mount behind.
     ///
-    /// The unmount itself is done here and is not delegated to `join`: on the
-    /// pure-Rust `AutoUnmount` path, dropping `fuser`'s `Mount` only closes the
-    /// fusermount monitor socket, while the session thread still owns its own
-    /// `/dev/fuse` clone and sits in `read`. Closing the monitor alone cannot
-    /// wake that read, so a join-first teardown would wait for a process exit
-    /// that is itself waiting for the join. Unmounting this handle's exact
-    /// mount with a normal (non-lazy) `umount2` while the session descriptor is
-    /// still open makes the kernel fail the parked read with `ENODEV`; `join`
-    /// is then a bounded completion barrier. `AutoUnmount` remains the crash
-    /// path (SIGKILL closes the last descriptor and the monitor socket).
+    /// The unmount itself is done explicitly and is not delegated to `join`: on
+    /// the pure-Rust `AutoUnmount` path, dropping `fuser`'s `Mount` only closes
+    /// the fusermount monitor socket, while the session thread still owns its
+    /// own `/dev/fuse` clone and sits in `read`. Closing the monitor alone
+    /// cannot wake that read, so a join-first teardown would wait for a process
+    /// exit that is itself waiting for the join. Unmounting this handle's exact
+    /// mount while the session descriptor is still open makes the kernel fail
+    /// the parked read with `ENODEV`; the join is then a completion barrier.
+    /// `AutoUnmount` remains the crash path (SIGKILL closes the last descriptor
+    /// and the monitor socket).
     ///
-    /// A refused unmount is never papered over: the session is still joined in
-    /// and the independent shutdown watchdog bounds and fails that exit with a
-    /// non-zero code instead of claiming a graceful teardown.
-    ///
-    /// Returns only after every owned session teardown has completed, so an
-    /// owner may exit successfully after this call. A session thread that
-    /// panicked propagates here (fail closed) instead of being ignored.
-    pub fn shutdown_and_join(self) {
-        let Self { session, dispatcher, mountpoint, mount_id } = self;
-        dispatcher.shutdown();
-        // A refused unmount must fail this process, never be reported as a
-        // graceful teardown: helper-only callers panic and exit non-zero, and
-        // `AutoUnmount` still closes the descriptor on unwind.
-        unmount_owned(&mountpoint, mount_id).expect("owned FUSE unmount failed");
-        session.join();
+    /// A refused unmount is never papered over: this helper-facing wrapper is
+    /// fail-closed and panics with the typed teardown error. Helper callers and
+    /// the independent shutdown watchdog therefore exit non-zero instead of
+    /// claiming a graceful teardown. The owner-preserving registry path uses
+    /// [`MountHandle::teardown_owned`] directly and retains the handle instead.
+    pub fn shutdown_and_join(mut self) {
+        if let Err(error) = self.teardown_owned() {
+            panic!("owned FUSE teardown failed: {error}");
+        }
     }
 }
 
@@ -427,7 +536,7 @@ fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Re
             return Err(error);
         }
     };
-    Ok(MountHandle { session, dispatcher, mountpoint, mount_id })
+    Ok(MountHandle { session: Some(session), dispatcher, mountpoint, mount_id, session_join: None })
 }
 
 /// Spawn the bounded per-mount dispatcher and mount `overlay` in the background.
