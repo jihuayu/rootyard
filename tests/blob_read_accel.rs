@@ -123,7 +123,8 @@ impl LoopbackS3 {
                 if let Some(bytes) = objs.get_mut(&key)
                     && !bytes.is_empty()
                 {
-                    bytes[bytes.len() / 2] ^= 0xff;
+                    let mid = bytes.len() / 2;
+                    bytes[mid] ^= 0xff;
                 }
             }
         }
@@ -249,7 +250,7 @@ impl SampleRepoPacks {
         let s3 = LoopbackS3::shared();
         let mut packs = Vec::new();
         for stem in stems {
-            let mut mk = |ext: &str| -> Result<BlobLocator> {
+            let mk = |ext: &str| -> Result<BlobLocator> {
                 let bytes = std::fs::read(pack_dir.join(format!("{stem}.{ext}")))?;
                 let loc = BlobLocator::new(
                     self.tenant_id,

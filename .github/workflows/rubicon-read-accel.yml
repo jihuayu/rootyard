@@ -81,8 +81,8 @@ jobs:
       - name: Run Clippy, library unit tests, and stock-Git OpenDAL integration tests
         run: |
           cargo clippy --locked --no-default-features --lib --test blob_read_accel -- -D warnings
-          cargo test --locked --no-default-features --lib blob_store::read_accel
-          cargo test --locked --no-default-features --test blob_read_accel
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib blob_store::read_accel
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test blob_read_accel
       - name: Run reproducible read-accel benchmark evaluator
         run: |
           mkdir -p test-results/rubicon-read-accel

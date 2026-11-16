@@ -440,15 +440,15 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_config_refuses_sidecar_build_before_any_io() {
-        let store = test_support::store(ResourceLimits::new(2, 2, 1 << 20).unwrap());
+        let (store, _resources) = test_support::store(ResourceLimits::new(2, 2, 1 << 20).unwrap());
         let dir = tempfile::TempDir::new().unwrap();
         let views =
             super::super::disposable_view::DisposableViewRoot::open(dir.path(), 2, 8 << 20, Duration::from_secs(30))
                 .unwrap();
         let tenant = Uuid::new_v4();
         let repo = Uuid::new_v4();
-        let receipt = test_support::upload(&store, "packs", b"dummy-pack-bytes").await;
-        let idx_receipt = test_support::upload(&store, "packs", b"dummy-idx-bytes").await;
+        let pack_intent = test_support::upload(&store, "packs", b"dummy-pack-bytes");
+        let idx_intent = test_support::upload(&store, "packs", b"dummy-idx-bytes");
         let req = BuildReadAccelRequest {
             tenant_id: tenant,
             repo_id: repo,
@@ -459,8 +459,8 @@ mod tests {
             config: ReadAccelConfig::disabled(),
             packs: vec![AuthoritativePackSource::provider_managed(
                 format!("pack-{}", "a".repeat(40)),
-                receipt.locator().clone(),
-                idx_receipt.locator().clone(),
+                pack_intent.locator().clone(),
+                idx_intent.locator().clone(),
             )],
             refs: Vec::new(),
             retention_registry: None,
