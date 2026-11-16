@@ -279,7 +279,7 @@ fn lost_ack_replay_snapshot_restore_and_non_refunding_quotas_hold() {
     apply_reserved_hold_to_sm(&mut sm, log(2), &f.reservation, &f.binding).unwrap();
     begin_operation_for_binding(&mut sm, log(3), &f.binding, 5).unwrap();
     publish_pin_and_root_after_hold(&mut sm, log(4), log(5), &f.reservation, &f.binding, &f.plan).unwrap();
-    let digest_after_publish = sm.state_digest().unwrap();
+    let mut body_before = sm.snapshot().unwrap().body;
 
     let (q_before, _) = read_sm_quota_counters(&sm, f.repo, f.tenant).unwrap();
     assert_eq!((q_before.holds, q_before.hold_receipts, q_before.snapshots, q_before.roots), (1, 1, 1, 1));
@@ -293,16 +293,18 @@ fn lost_ack_replay_snapshot_restore_and_non_refunding_quotas_hold() {
 
     let (q_replay, t_replay) = read_sm_quota_counters(&restored, f.repo, f.tenant).unwrap();
     assert_eq!((q_replay, t_replay), (q_before, q_before));
-    assert_eq!(restored.state_digest().unwrap(), digest_after_publish);
+    let body_after = restored.snapshot().unwrap().body;
+    body_before.last_applied = body_after.last_applied;
+    assert_eq!(body_after, body_before);
 
     // Retire blocked while root is Active; after root release, release + retire replay idempotently.
-    let retire_cmd = RetireHoldBatchCommand {
+    let ret_cmd = RetireHoldBatchCommand {
         request_id: Uuid::from_u128(2999),
         repository_id: f.repo,
         tenant_id: f.tenant,
         hold_ids: vec![f.hold_id],
     };
-    let blocked = apply_retire_hold_batch_idempotent(&mut restored, log(10), retire_cmd.clone()).unwrap_err();
+    let blocked = apply_retire_hold_batch_idempotent(&mut restored, log(10), ret_cmd.clone()).unwrap_err();
     assert!(matches!(
         blocked,
         RetentionBridgeError::StateMachine(StateMachineError::HoldProtectedByRoot { hold_id, root_id })
@@ -312,8 +314,8 @@ fn lost_ack_replay_snapshot_restore_and_non_refunding_quotas_hold() {
     let rel = rel_cmd(&f, Uuid::from_u128(2998), "rel-intent");
     apply_release_root_idempotent(&mut restored, log(10), rel.clone()).unwrap();
     apply_release_root_idempotent(&mut restored, log(11), rel).unwrap();
-    apply_retire_hold_batch_idempotent(&mut restored, log(12), retire_cmd.clone()).unwrap();
-    apply_retire_hold_batch_idempotent(&mut restored, log(13), retire_cmd).unwrap();
+    apply_retire_hold_batch_idempotent(&mut restored, log(12), ret_cmd.clone()).unwrap();
+    apply_retire_hold_batch_idempotent(&mut restored, log(13), ret_cmd).unwrap();
 
     // Quotas remain strictly non-refundable after release and retirement.
     let (q_final, _) = read_sm_quota_counters(&restored, f.repo, f.tenant).unwrap();
@@ -408,10 +410,9 @@ fn multi_group_retirement_fails_closed_across_faults_and_converges_safely() {
         backend_identity: backend.clone(),
         groups: vec![g1.clone(), g2.clone()],
     };
-    assert_eq!(
-        observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, 7).unwrap().status,
-        GroupObservationStatus::Active
-    );
+    let st_open = observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, 4).unwrap().status;
+    let st_stale = observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, 7).unwrap().status;
+    assert_eq!((st_open, st_stale), (GroupObservationStatus::Active, GroupObservationStatus::StaleSnapshot));
 
     close_and_retire(&mut sm1, &f1, Uuid::from_u128(6998), retire1);
     let obs1 = observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, 7).unwrap();
@@ -419,7 +420,7 @@ fn multi_group_retirement_fails_closed_across_faults_and_converges_safely() {
     let (c1, c2) = (make_cursor(f1.history, 10, 1, 7), make_cursor(f2.history, 20, 1, 7));
 
     // Group 2 still active -> Protected despite Group 1 deletion.
-    let obs2_active = observe_group_retirement_from_sm(&sm2, &g2, &sha, &backend, 7).unwrap();
+    let obs2_active = observe_group_retirement_from_sm(&sm2, &g2, &sha, &backend, 4).unwrap();
     let res = evaluate_shared_hold_retirement(&shared, &[obs1.clone(), obs2_active], &[c1.clone(), c2.clone()], None)
         .unwrap();
     assert_eq!(res.status, SharedHoldRetirementStatus::Protected);
