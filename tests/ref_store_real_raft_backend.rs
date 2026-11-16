@@ -18,8 +18,8 @@ use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{BasicNode, CommittedLeaderId, Config, Entry, EntryPayload, LogId, Raft, ServerState, SnapshotPolicy};
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use rootyard::ref_store::core::state_machine::{
-    CommitRefsCommand, InitializeGateCommand, NoopCommand, RefCasCommand, RepositoryLane, ScopeLifecycle,
-    SetRepositoryLaneCommand, SmPackMode, WireCommitRefsRequest, WireGateInit, encode_command,
+    CommitRefsCommand, CreateSnapshotPinCommand, InitializeGateCommand, NoopCommand, RefCasCommand, RepositoryLane,
+    ScopeLifecycle, SetRepositoryLaneCommand, SmPackMode, WireCommitRefsRequest, WireGateInit, encode_command,
 };
 use rootyard::ref_store::raft_backend::{
     BackendOptions, NodeTrust, OutcomeQuery, ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RaftBackendError, RealmBinding,
@@ -27,8 +27,8 @@ use rootyard::ref_store::raft_backend::{
     RootRefCasStateMachine,
 };
 use rootyard::ref_store::{
-    CommitMode, CommitRefsRequest, CoreGateInit, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, OperationLookup,
-    RefName, RefPrecondition, RefTarget, RefUpdate, VersionCheck,
+    CommitMode, CommitRefsRequest, CoreGateInit, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataPinPurpose,
+    OperationLookup, RefName, RefPrecondition, RefTarget, RefUpdate, VersionCheck,
 };
 use rootyard_refcas_log::LogTypeConfig;
 use rootyard_refcas_log::cluster::{
@@ -80,6 +80,37 @@ fn init_command(repo: Uuid, tenant: Uuid, history: Uuid) -> RefCasCommand {
         lane: RepositoryLane::ServingRefStore,
         pack_mode: SmPackMode::MetadataOnly,
         authz_floor: 1,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_pin_command(
+    repo: Uuid,
+    tenant: Uuid,
+    owner: Uuid,
+    history: Uuid,
+    request_id: Uuid,
+    snapshot_id: Uuid,
+    pin_id: Uuid,
+    lease_ticks: u64,
+) -> RefCasCommand {
+    RefCasCommand::CreateSnapshotPin(CreateSnapshotPinCommand {
+        request_id,
+        repository_id: repo,
+        tenant_id: tenant,
+        owner_id: owner,
+        purpose: MetadataPinPurpose::Verification,
+        snapshot_id,
+        pin_id,
+        object_format: GitObjectFormat::Sha256,
+        history_incarnation: history,
+        authority_epoch: 1,
+        group_epoch: 1,
+        expected_gate_digest: "00".repeat(32),
+        lease_ticks,
+        logical_tick: 999,
+        pack_digests: vec![],
+        request_digest: "11".repeat(32),
     })
 }
 
@@ -532,6 +563,66 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     ));
     assert!(matches!(view.query_operation(operation_id)?, OperationLookup::Known(_)));
     assert!(view.state_digest_hex()?.len() == 64);
+
+    // Decoded normal commands with semantic-invalid fields are durable typed refusals, not fatal
+    // storage/apply errors. Zero lease ticks is valid JSON but core-semantic-invalid; a nil
+    // request id is a core InvalidIdentity. Both must advance the applied coordinate without
+    // changing business state or the logical clock.
+    let before_semantic_floor = view.logical_clock_floor();
+    let before_semantic_refs = view.read_refs();
+    let invalid_input = backend
+        .propose(create_pin_command(
+            repo,
+            tenant,
+            Uuid::new_v4(),
+            history,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            0,
+        ))
+        .await?;
+    let invalid_input_kind = match &invalid_input.outcome {
+        RootRefCasOutcome::Refused(refusal) => refusal.kind,
+        RootRefCasOutcome::Applied(_) => panic!("zero-lease pin unexpectedly applied"),
+    };
+    assert_eq!(invalid_input_kind, RootRefCasRefusalKind::InvalidInput);
+    wait_applied_through(&cluster, invalid_input.log_id.index, Duration::from_secs(10)).await?;
+    let after_invalid_input = backend.read_committed_view().await?;
+    assert!(after_invalid_input.last_applied().is_some_and(|id| id.index >= invalid_input.log_id.index));
+    assert_eq!(after_invalid_input.logical_clock_floor(), before_semantic_floor);
+    assert_eq!(after_invalid_input.read_refs(), before_semantic_refs);
+
+    let invalid_identity = backend
+        .propose(create_pin_command(
+            repo,
+            tenant,
+            Uuid::new_v4(),
+            history,
+            Uuid::nil(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            1,
+        ))
+        .await?;
+    let invalid_identity_kind = match &invalid_identity.outcome {
+        RootRefCasOutcome::Refused(refusal) => refusal.kind,
+        RootRefCasOutcome::Applied(_) => panic!("nil-request-id pin unexpectedly applied"),
+    };
+    assert_eq!(invalid_identity_kind, RootRefCasRefusalKind::InvalidIdentity);
+    wait_applied_through(&cluster, invalid_identity.log_id.index, Duration::from_secs(10)).await?;
+    let after_invalid_identity = backend.read_committed_view().await?;
+    assert!(after_invalid_identity.last_applied().is_some_and(|id| id.index >= invalid_identity.log_id.index));
+    assert_eq!(after_invalid_identity.logical_clock_floor(), before_semantic_floor);
+    assert_eq!(after_invalid_identity.read_refs(), before_semantic_refs);
+
+    // The same quorum still accepts a valid command and serves a fresh ReadIndex view.
+    let healthy_after_semantic = backend.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })).await?;
+    assert!(healthy_after_semantic.outcome.is_applied());
+    let healthy_after_semantic_view = backend.read_committed_view().await?;
+    assert!(
+        healthy_after_semantic_view.last_applied().is_some_and(|id| id.index >= healthy_after_semantic.log_id.index)
+    );
 
     // A valid gate transition to Closing is applied. A subsequent same-scope CommitRefs is a
     // deterministic business refusal: it must advance the replicated applied coordinate and

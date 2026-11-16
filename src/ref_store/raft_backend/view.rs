@@ -43,6 +43,11 @@ impl CommittedRefCasView {
         self.applied
     }
 
+    /// Deterministic logical clock floor at this view.
+    pub fn logical_clock_floor(&self) -> u64 {
+        self.reducer.logical_clock_floor()
+    }
+
     pub fn repository_id(&self) -> Uuid {
         self.repository_id
     }

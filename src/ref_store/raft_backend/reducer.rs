@@ -57,6 +57,11 @@ impl RootRefCasStateMachine {
         self.machine.state_digest()
     }
 
+    /// Deterministic logical clock floor (log-derived; never a wall clock).
+    pub fn logical_clock_floor(&self) -> u64 {
+        self.machine.logical_clock_floor()
+    }
+
     /// Digest covering the Root snapshot and, when present, the typed outcome ledger.
     pub fn adapter_state_digest_hex(&self) -> Result<String, ApplicationError> {
         let root_digest = self.machine.state_digest().map_err(map_state_error)?;
@@ -116,7 +121,7 @@ impl RootRefCasStateMachine {
                         "root Ref-CAS coordinate did not advance after a typed business refusal",
                     ));
                 }
-                let refusal = RootRefCasRefusal { kind, detail: error.to_string() };
+                let refusal = RootRefCasRefusal::from_kind(kind);
                 self.record_outcome(log_id, digest_hex, key, RootRefCasOutcome::Refused(refusal))
             }
         }

@@ -250,9 +250,24 @@ pub struct RootRefCasRefusal {
     pub detail: String,
 }
 
+impl RootRefCasRefusal {
+    /// Fixed, bounded detail. No caller/core string is copied into a receipt.
+    pub fn from_kind(kind: RootRefCasRefusalKind) -> Self {
+        Self { kind, detail: kind.fixed_detail().to_owned() }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RootRefCasRefusalKind {
+    InvalidInput,
+    InvalidIdentity,
+    ProposalInvalid,
+    ProposalExpired,
+    ProposalConflict,
+    ProposalScopeMismatch,
+    ReceiptTooLarge,
+    StateCapacity,
     BelowCancelCutoff,
     ScopeClosingOrClosed,
     AuthzFloorViolation,
@@ -302,6 +317,7 @@ impl RootRefCasRefusalKind {
     /// invariants, and uncertain storage/transaction state must never become business outcomes.
     pub fn from_state_machine(error: &StateMachineError) -> Option<Self> {
         match error {
+            StateMachineError::InvalidInput(_) => Some(Self::InvalidInput),
             StateMachineError::BelowCancelCutoff { .. } => Some(Self::BelowCancelCutoff),
             StateMachineError::ScopeClosingOrClosed { .. } => Some(Self::ScopeClosingOrClosed),
             StateMachineError::AuthzFloorViolation { .. } => Some(Self::AuthzFloorViolation),
@@ -325,14 +341,13 @@ impl RootRefCasRefusalKind {
             StateMachineError::RootDigestConflict(_) => Some(Self::RootDigestConflict),
             StateMachineError::QuotaExceeded(_) => Some(Self::QuotaExceeded),
             StateMachineError::Store(error) => Self::from_store(error),
-            StateMachineError::InvalidInput(_)
-            | StateMachineError::SnapshotCorrupted(_)
-            | StateMachineError::NonMonotonicLogIndex { .. } => None,
+            StateMachineError::SnapshotCorrupted(_) | StateMachineError::NonMonotonicLogIndex { .. } => None,
         }
     }
 
     fn from_store(error: &RefStoreError) -> Option<Self> {
         match error {
+            RefStoreError::InvalidIdentity(_) => Some(Self::InvalidIdentity),
             RefStoreError::RepositoryNotFound => Some(Self::RepositoryNotFound),
             RefStoreError::DigestConflict => Some(Self::DigestConflict),
             RefStoreError::IdentityConflict => Some(Self::IdentityConflict),
@@ -353,11 +368,66 @@ impl RootRefCasRefusalKind {
             RefStoreError::MetadataCursorScopeMismatch => Some(Self::MetadataCursorScopeMismatch),
             RefStoreError::MetadataQuotaExceeded { .. } => Some(Self::MetadataQuotaExceeded),
             RefStoreError::MetadataGateVersionMismatch => Some(Self::MetadataGateVersionMismatch),
-            RefStoreError::InvalidIdentity(_)
-            | RefStoreError::Timeout
+            RefStoreError::Timeout
             | RefStoreError::CommitUnknown { .. }
             | RefStoreError::MetadataCommitUnknown { .. }
             | RefStoreError::Database(_) => None,
+        }
+    }
+
+    /// Fixed safe detail. Receipt bytes never include caller/core error strings.
+    pub fn fixed_detail(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "decoded command failed semantic validation",
+            Self::InvalidIdentity => "decoded command contains invalid identity fields",
+            Self::ProposalInvalid => "proposal identity is invalid or outside its fixed window",
+            Self::ProposalExpired => "proposal identity expired; historic outcome is unknown",
+            Self::ProposalConflict => "proposal identity is bound to a different command digest",
+            Self::ProposalScopeMismatch => "proposal identity does not match the bound scope",
+            Self::ReceiptTooLarge => "proposal outcome exceeds the bounded receipt budget",
+            Self::StateCapacity => "bounded proposal receipt window cannot admit this decision",
+            Self::BelowCancelCutoff => "operation is below the durable cancel cutoff",
+            Self::ScopeClosingOrClosed => "repository scope is closing or closed",
+            Self::AuthzFloorViolation => "authorization epoch is below the monotonic floor",
+            Self::AuthzFloorRegression => "authorization floor regression refused",
+            Self::LifecycleRegression => "scope lifecycle regression refused",
+            Self::DecisionNotFound => "publication decision not found",
+            Self::DecisionConflict => "publication decision state conflict",
+            Self::DecisionExpired => "publication decision expired",
+            Self::DecisionDigestMismatch => "publication decision digest/scope mismatch",
+            Self::HoldNotFound => "artifact hold not found",
+            Self::HoldNotActive => "artifact hold is not active",
+            Self::HoldProtectedByRoot => "artifact hold is protected by an active root",
+            Self::HoldScopeMismatch => "artifact hold scope mismatch",
+            Self::PinNotFound => "snapshot pin not found",
+            Self::PinExpired => "snapshot pin expired",
+            Self::PinReleased => "snapshot pin is permanently released",
+            Self::PinGenerationMismatch => "snapshot pin generation mismatch",
+            Self::SnapshotNotFound => "metadata snapshot not found",
+            Self::RootConflict => "retention root conflict",
+            Self::RootReleased => "retention root already released",
+            Self::RootDigestConflict => "retention root digest conflict",
+            Self::QuotaExceeded => "bounded quota exceeded",
+            Self::RepositoryNotFound => "repository not found",
+            Self::DigestConflict => "operation identity conflicts with a durable digest",
+            Self::IdentityConflict => "operation identity conflicts with a durable record",
+            Self::CancellationConflict => "cancellation tombstone conflict",
+            Self::Cancelled => "operation is cancelled",
+            Self::UnknownOperation => "operation is not registered",
+            Self::OperationPending => "operation is durably pending with unknown outcome",
+            Self::GateConflict => "gate initialization conflicts with the durable gate",
+            Self::TerminalImmutable => "terminal operation result is immutable",
+            Self::Unsupported => "requested capability is unsupported",
+            Self::MetadataSnapshotNotFound => "metadata snapshot not found in scope",
+            Self::MetadataPinNotFound => "metadata pin not found in scope",
+            Self::MetadataPinReleased => "metadata pin is released",
+            Self::MetadataPinExpired => "metadata pin expired",
+            Self::MetadataPinGenerationMismatch => "metadata pin generation mismatch",
+            Self::MetadataSnapshotTooLarge => "metadata snapshot exceeds its bounded limit",
+            Self::MetadataScopeMismatch => "metadata scope mismatch",
+            Self::MetadataCursorScopeMismatch => "metadata cursor scope mismatch",
+            Self::MetadataQuotaExceeded => "metadata admission quota exhausted",
+            Self::MetadataGateVersionMismatch => "metadata gate version moved before capture",
         }
     }
 }
