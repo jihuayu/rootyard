@@ -371,9 +371,13 @@ Each request freshly checks the database grant, expiry, cancellation, credential
 revocation, issuer token revocation/read-only status/expiry, owner and repository
 ready state/storage generation. The check is repeated after potentially slow
 object preparation immediately before Git starts. Database failure denies the
-request; no stale authorization cache is used. Revocation affects new admissions,
-not a stream already admitted before the change. No running-stream interruption
-or zero-duration race-free revocation guarantee is claimed.
+request; no stale authorization cache is used. Admitted streams are also
+re-authorized while they run under the configured transfer bound. The bound is
+measured from the committed authority change, not from a deliberately paused
+client resuming its read: buffered transport can make a later client exception
+look slower than the server cutoff. A Git process-group observation is
+independent evidence that the native producer and its descendants stopped. No
+zero-duration, race-free revocation guarantee is claimed.
 
 The controller can POST to `.../ci-checkouts/{job_id}/cancel` or `/revoke`.
 Cancellation creates a permanent tombstone even before issuance, serializing
@@ -613,6 +617,49 @@ a configurable end-to-end revocation bound via
   `ROOTYARD_CI_MIRROR_SOURCE_TOKEN`) periodically revalidates the underlying job
   scope during both `git clone --mirror` and origin LFS fetches and aborts
   without publishing partial snapshots or permitting origin fallback bypass.
+
+### What the configured-bound acceptance measures
+
+`tests/ci_job_checkouts.py` and the standalone `tests/transfer_revocation.py`
+record a typed monotonic trigger interval. For a committed mutation,
+`t_before` is taken immediately before the real revoke/cancel/remove/generation
+operation and `t_after` after its successful commit; one conservative deadline
+`D = t_before + configured_bound` is used for every observation and is never
+reset to the API response time. For a natural grant or token expiry, the
+authoritative PostgreSQL clock is sampled before and after the scenario and the
+expiry is mapped into monotonic time. The earliest mapped expiry is the lower
+bound, an inconsistent clock mapping is rejected, and no `expiry + 0.35 s`
+fresh-clock shortcut is used.
+
+The real transfer is opened with a fixture-owned small `SO_RCVBUF` set before
+connect; the effective `getsockopt` value is recorded. A 16/24/32 MiB
+incompressible payload and bounded producer channels make the consumer pause
+meaningful, and the harness proves a live fixture 4-tuple with a persistent
+server send queue/socket inode owned by the fixture service. The healthy read
+pause is before the mutation. After the trigger the consumer stays paused for a
+shorter interval (the CI starting point is 800 ms at `B=1200`, inside `D`),
+then drains promptly with the remaining absolute deadline and `read1`-style
+incremental reads. A timeout, local close, or harness cancellation is never a
+pass.
+
+Only confirmed transport truncation (incomplete framing, short
+`Content-Length` EOF, or reset) can be a client observation. A later observation
+does not prove a late server cutoff because buffered bytes can delay visibility.
+For Git, the harness independently captures the actual service-descendant
+process-group leader, start time, and PGID before the trigger, tracks every
+member including non-Git descendants, treats `Z`/`X` as non-running like the
+production quiescence check, and rejects PGID reuse or unobservable `/proc`
+state. The pass rule is exactly `S_upper - E_lower <= B`, with no additive CI
+tolerance. Leak/reap, GC-lock, and staging checks remain separate sanity checks
+and do not reset the bound clock.
+
+Each subcase reports the configured bound, trigger kind and interval (or expiry
+clock bracket), backpressure witness and effective receive buffer, actual pre-
+and post-trigger pauses, client stop kind/time, Git group quiescence and polling
+gaps, and `configured_bound_proven`. Existing top-level case IDs and the original
+17-case inventory are preserved; added report fields are timing evidence, not a
+new runtime qualification. These are harness measurements, not a new server
+telemetry endpoint, and a timed-out or unobservable run remains unproven.
 
 ## Live multi-mirror and multi-controller HA qualification
 

@@ -781,7 +781,7 @@ class JobCheckoutHarness(SourcePinHarness):
     def _git_transfer(self, base, path, token, oid, payload_bytes, *, trigger=None,
                       trigger_kind="committed_mutation", natural_expiry=None,
                       service_pid=None, check_barrier=True, start_barrier=None,
-                      pause_after_first=0.0, rcvbuf=None, require_backpressure=False):
+                      pause_after_first=0.8, rcvbuf=16 * 1024, require_backpressure=True):
         def pkt(value):
             return f"{len(value) + 4:04x}".encode() + value
 
@@ -796,7 +796,7 @@ class JobCheckoutHarness(SourcePinHarness):
             method="POST",
             headers=headers,
             body=body,
-            expected_size=payload_bytes,
+            expected_size=payload_bytes + 8 * 1024 * 1024,
             initial_bytes=4096,
             framing="chunked",
             service_pid=service_pid,
@@ -817,8 +817,8 @@ class JobCheckoutHarness(SourcePinHarness):
 
     def _lfs_transfer(self, base, path, token, expected_size, *, trigger=None,
                       trigger_kind="committed_mutation", natural_expiry=None,
-                      service_pid=None, start_barrier=None, pause_after_first=1.6,
-                      rcvbuf=None, require_backpressure=False):
+                      service_pid=None, start_barrier=None, pause_after_first=0.8,
+                      rcvbuf=16 * 1024, require_backpressure=True):
         result = revocation_transport.run_timed_transfer(
             base=base,
             path=path,
@@ -844,7 +844,7 @@ class JobCheckoutHarness(SourcePinHarness):
         return result
 
     def _stream_git_until_revoked(self, base, path, token, oid, payload_bytes, revoke, *,
-                                  check_barrier=True, pause_after_first=0.0, start_barrier=None,
+                                  check_barrier=True, pause_after_first=0.8, start_barrier=None,
                                   service_pid=None):
         return self._git_transfer(
             base, path, token, oid, payload_bytes, trigger=revoke,
@@ -854,7 +854,7 @@ class JobCheckoutHarness(SourcePinHarness):
         )
 
     def _stream_lfs_until_revoked(self, base, path, token, expected_size, revoke, *,
-                                  pause_after_first=1.6, start_barrier=None, service_pid=None):
+                                  pause_after_first=0.8, start_barrier=None, service_pid=None):
         return self._lfs_transfer(
             base, path, token, expected_size, trigger=revoke,
             service_pid=service_pid or self.proc.pid,
@@ -862,7 +862,7 @@ class JobCheckoutHarness(SourcePinHarness):
         )
 
     def _stream_git_until_expiry(self, base, path, token, oid, payload_bytes, expiry_clock, *,
-                                 pause_after_first=1.6, service_pid=None):
+                                 pause_after_first=0.8, service_pid=None):
         return self._git_transfer(
             base, path, token, oid, payload_bytes, natural_expiry=expiry_clock,
             service_pid=service_pid or self.proc.pid,
@@ -870,12 +870,26 @@ class JobCheckoutHarness(SourcePinHarness):
         )
 
     def _stream_lfs_until_expiry(self, base, path, token, expected_size, expiry_clock, *,
-                                 pause_after_first=1.6, service_pid=None, start_barrier=None):
+                                 pause_after_first=0.8, service_pid=None, start_barrier=None):
         return self._lfs_transfer(
             base, path, token, expected_size, natural_expiry=expiry_clock,
             service_pid=service_pid or self.proc.pid,
             start_barrier=start_barrier, pause_after_first=pause_after_first,
         )
+
+    def _require_configured_bound_proof(self, results):
+        proofs = {
+            name: bool(result.get("configured_bound_proven"))
+            for name, result in results.items()
+            if isinstance(result, dict) and "configured_bound_proven" in result
+        }
+        missing = sorted(name for name, proven in proofs.items() if not proven)
+        assert not missing, {"configured_bound_ms": 1200, "unproven_subcases": missing}
+        return {
+            "configured_bound_ms": 1200,
+            "subcases": proofs,
+            "all_proven": True,
+        }
 
     def bounded_active_transfer_revocation(self):
         lfs_bytes = os.urandom(16 * 1024 * 1024)
@@ -933,7 +947,7 @@ class JobCheckoutHarness(SourcePinHarness):
 
             # 2. Human PAT natural expiry mid-stream, mapped from the DB clock.
             pat_expired = self.account("create-token", "alice")
-            exp_epoch = self._set_token_natural_expiry(pat_expired["token_id"], seconds=8)
+            exp_epoch = self._set_token_natural_expiry(pat_expired["token_id"], seconds=10)
             expiry_before = self._db_clock_sample()
             expiry_before_clock = revocation_timing.reconcile_expiry([expiry_before], exp_epoch)
             results["pat_expired"] = self._stream_git_until_expiry(
@@ -974,7 +988,7 @@ class JobCheckoutHarness(SourcePinHarness):
                         method="DELETE",
                         token=self.alice,
                     ),
-                    pause_after_first=1.6,
+                    pause_after_first=0.8,
                     service_pid=self.proc.pid,
                 )
                 self.expect(f"/git/alice/demo.git/info/lfs/objects/{lfs_oid}", (403, 404), token=self.bob)
@@ -1017,7 +1031,7 @@ class JobCheckoutHarness(SourcePinHarness):
                 body=b"",
             )
             db_now = float(self.sql("SELECT extract(epoch FROM clock_timestamp())"))
-            exp_b = int(db_now) + 8
+            exp_b = int(db_now) + 12
             body_b, _, tok_b = self.new_grant(rev_oid, expires_unix=exp_b)
             self.mirror_expect(
                 f"/api/repos/alice/demo/ci-checkouts/{body_b['job_id']}/prepare-dependencies",
@@ -1051,7 +1065,7 @@ class JobCheckoutHarness(SourcePinHarness):
                     tok_b,
                     len(lfs_bytes),
                     expiry_before_clock,
-                    pause_after_first=1.6,
+                    pause_after_first=0.8,
                     start_barrier=both_streaming,
                     service_pid=self.mirror_proc.pid,
                 )
@@ -1083,7 +1097,7 @@ class JobCheckoutHarness(SourcePinHarness):
                     pack_size,
                     lambda: self.sql("ALTER TABLE tokens RENAME TO checkout_revocation_outage_tokens"),
                     check_barrier=False,
-                    pause_after_first=1.6,
+                    pause_after_first=0.8,
                     service_pid=self.proc.pid,
                 )
                 self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", (500, 503), token=self.reader)
@@ -1098,6 +1112,7 @@ class JobCheckoutHarness(SourcePinHarness):
                     self.sql("ALTER TABLE checkout_revocation_outage_tokens RENAME TO tokens")
             self._wait_no_owned_children([self.proc.pid])
             self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", 200, token=self.reader)
+            results["bound_proof_summary"] = self._require_configured_bound_proof(results)
         return results
 
     def mirror_cannot_bypass_revocation_via_origin(self):
@@ -1249,6 +1264,7 @@ class JobCheckoutHarness(SourcePinHarness):
                     "git_group_within_deadline": group_ok,
                     "configured_bound_proven": bool(abort_ok and group_ok),
                 }
+                assert abort_report["configured_bound_proven"], "mirror prepare abort bound not proven"
                 self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
 
                 # Release primary stub and verify revoked job NEVER falls back to ROOTYARD_CI_MIRROR_SOURCE_TOKEN.

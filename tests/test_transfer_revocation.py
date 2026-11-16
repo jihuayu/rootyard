@@ -142,6 +142,40 @@ class TestTransferRevocationContract(unittest.TestCase):
         self.assertIn("collect_git_output_reauthorized(", sync_src)
         self.assertIn("verify_mirror_sync_authority(", sync_src)
 
+    def test_original_seventeen_top_level_case_inventory_is_preserved(self):
+        path = ROOT / "tests" / "ci_job_checkouts.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        main = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "main")
+        names = None
+        for node in ast.walk(main):
+            if (isinstance(node, ast.Tuple) and node.elts
+                    and all(isinstance(item, ast.Constant) and isinstance(item.value, str)
+                            for item in node.elts)):
+                candidate = [item.value for item in node.elts]
+                if "bounded_active_transfer_revocation" in candidate:
+                    names = candidate
+                    break
+        self.assertEqual(names, [
+            "setup_checkout",
+            "native_clones_and_closure",
+            "declared_tags_and_target_history",
+            "object_wants_do_not_escape",
+            "native_denials_survive_backend_exit",
+            "early_stdin_failure_preserves_denial",
+            "route_and_audience_scope",
+            "immutable_issuance_and_concurrency",
+            "source_evidence_and_input_validation",
+            "cancel_revoke_and_issuer_fences",
+            "live_database_and_repository_fences",
+            "tampered_job_views_fail_closed",
+            "authorization_rechecked_after_closure",
+            "issuer_revoked_during_source_verification",
+            "deleted_source_ref_and_primary_offline",
+            "bounded_active_transfer_revocation",
+            "mirror_cannot_bypass_revocation_via_origin",
+        ])
+
     def test_acceptance_harnesses_declare_revocation_cases(self):
         harness_path = ROOT / "tests" / "ci_job_checkouts.py"
         harness_src = harness_path.read_text(encoding="utf-8")
@@ -277,6 +311,66 @@ class TestTransferRevocationContract(unittest.TestCase):
         self.assertEqual(entries[0].tx_queue, 4096)
         self.assertEqual(entries[0].inode, 424242)
 
+    def test_natural_expiry_requalification_uses_reconciled_earliest_deadline(self):
+        clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
+        base = {
+            "lower_bound_ns": 2_000_000_000,
+            "client_stop": {"confirmed_transport_stop": True, "observed_ns": 2_200_100_000},
+            "client_stop_after_lower_ms": 200.1,
+            "git_group": {"stop_upper_after_lower_ms": 180.0},
+            "git_group_within_deadline": True,
+            "configured_bound_proven": True,
+        }
+        result = revocation_timing.apply_natural_expiry_clock(dict(base), clock, 1200)
+        self.assertEqual(result["deadline_ns"], 2_200_000_000)
+        self.assertFalse(result["client_stop_within_deadline"])
+        self.assertFalse(result["configured_bound_proven"],
+                         "a stop after E_lower+B must not be requalified as a pass")
+        later = dict(base, client_stop={"confirmed_transport_stop": True,
+                                        "observed_ns": 2_199_000_000})
+        later = revocation_timing.apply_natural_expiry_clock(later, clock, 1200)
+        self.assertTrue(later["configured_bound_proven"])
+
+    def test_read_timeout_is_never_a_confirmed_transport_stop(self):
+        class FakeSocket:
+            def settimeout(self, _timeout):
+                pass
+
+        class FakeResponse:
+            def read1(self, _amount):
+                raise socket.timeout("local read timeout")
+
+        result = revocation_timing.read_until_transport_stop(
+            response=FakeResponse(), sock=FakeSocket(), expected_size=1024,
+            initial_received=10, resume_ns=0,
+            deadline_ns=time.monotonic_ns() + 100_000_000,
+            framing="content_length",
+        )
+        self.assertEqual(result.kind, revocation_timing.StopKind.TIMEOUT)
+        self.assertFalse(result.confirmed)
+
+    def test_observer_rejects_unobservable_premature_or_late_group_stop(self):
+        identity = revocation_observer.GroupIdentity(200, 200, 1_000)
+        observer = revocation_observer.ProcGroupObserver([100], clock=lambda: 0)
+        observer.armed_ns = 100_000_000
+        observer.max_poll_gap_ns = 10_000_000
+        observer._tracks = {200: revocation_observer.GroupTrack(
+            identity, first_live_ns=100_000_000, last_live_ns=500_000_000,
+            quiescent_ns=1_300_000_000, max_members=1,
+        )}
+        self.assertFalse(observer.proven(400_000_000, 1_200_000_000))
+        observer._tracks[200].quiescent_ns = 800_000_000
+        self.assertTrue(observer.proven(400_000_000, 1_200_000_000))
+        observer._tracks[200].last_live_ns = 10_000_000
+        self.assertFalse(observer.proven(400_000_000, 1_200_000_000))
+        observer._tracks[200].last_live_ns = 500_000_000
+        observer.unavailable_reason = "proc unobservable"
+        self.assertFalse(observer.proven(400_000_000, 1_200_000_000))
+        observer.unavailable_reason = None
+        observer._tracks[200].quiescent_ns = 100_000_000
+        self.assertFalse(observer.proven(400_000_000, 1_200_000_000),
+                         "a group already stopped before the trigger is not a bound pass")
+
     def test_harness_helpers_declare_bound_evidence(self):
         for rel in ("tests/transfer_revocation_timing.py",
                     "tests/transfer_revocation_observer.py",
@@ -288,10 +382,26 @@ class TestTransferRevocationContract(unittest.TestCase):
         for rel in ("tests/ci_job_checkouts.py", "tests/transfer_revocation.py"):
             source = (ROOT / rel).read_text(encoding="utf-8")
             for expected in common:
-                self.assertIn(expected, source, f"{rel} missing {expected}")
+                self.assertTrue(expected in source, f"{rel} missing {expected}")
         ci_source = (ROOT / "tests/ci_job_checkouts.py").read_text(encoding="utf-8")
-        for expected in ("TriggerInterval", "ProcGroupObserver"):
-            self.assertIn(expected, ci_source, f"ci_job_checkouts.py missing {expected}")
+        for expected in ("TriggerInterval", "ProcGroupObserver", "16 * 1024",
+                         "require_backpressure=True"):
+            self.assertTrue(expected in ci_source, f"ci_job_checkouts.py missing {expected}")
+        transport = (ROOT / "tests/transfer_revocation_transport.py").read_text(encoding="utf-8")
+        for expected in ("SO_RCVBUF", "getsockopt", "fixture_four_tuple",
+                         "server_fd_owned", "deadline_ns = lower_ns + bound_ns",
+                         "post_pause_ns <= bound_ns", "post_transfer_group_stopped"):
+            self.assertTrue(expected in transport, f"transport missing {expected}")
+        docs = (ROOT / "docs" / "ci-mirror.md").read_text(encoding="utf-8")
+        for expected in ("S_upper - E_lower <= B", "small `SO_RCVBUF`",
+                         "A timeout, local close, or harness cancellation is never a",
+                         "no additive CI"):
+            self.assertTrue(expected in docs, f"docs missing {expected}")
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        for helper in ("tests/transfer_revocation_timing.py",
+                       "tests/transfer_revocation_observer.py",
+                       "tests/transfer_revocation_transport.py"):
+            self.assertTrue(f"--harness {helper}" in workflow, f"workflow missing {helper}")
 
 
 if __name__ == "__main__":

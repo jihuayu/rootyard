@@ -2,23 +2,17 @@
 """Native slow Git upload-pack transfer revocation on primary and CI mirror."""
 import argparse
 import hashlib
-import http.client
 import json
 import os
 from pathlib import Path
 import sys
 import time
-import urllib.parse
 import uuid
 
 from ci_mirror import MirrorHarness
 import transfer_revocation_observer as revocation_observer
 import transfer_revocation_timing as revocation_timing
 import transfer_revocation_transport as revocation_transport
-
-
-def packet(payload):
-    return f"{len(payload) + 4:04x}".encode() + payload
 
 
 class RevocationHarness(MirrorHarness):
@@ -67,7 +61,7 @@ class RevocationHarness(MirrorHarness):
                 "Content-Type": "application/x-git-upload-pack-request",
             },
             body=body,
-            expected_size=payload_bytes,
+            expected_size=payload_bytes + 8 * 1024 * 1024,
             initial_bytes=4096,
             framing="chunked",
             service_pid=service_pid or self.proc.pid,
@@ -75,9 +69,9 @@ class RevocationHarness(MirrorHarness):
             trigger=trigger,
             trigger_kind="committed_mutation",
             natural_expiry=natural_expiry,
-            post_pause_ms=0,
-            rcvbuf=None,
-            require_backpressure=False,
+            post_pause_ms=800,
+            rcvbuf=16 * 1024,
+            require_backpressure=True,
             require_group=True,
             active_barrier_check=lambda: not self.barrier_available(),
         )
@@ -119,7 +113,7 @@ class RevocationHarness(MirrorHarness):
         def revoke_human():
             self.cli("revoke-token", writer["token_id"])
 
-        exp_epoch = self._set_token_natural_expiry(expiring["token_id"], seconds=8)
+        exp_epoch = self._set_token_natural_expiry(expiring["token_id"], seconds=10)
         expiry_before = self._db_clock_sample()
         expiry_before_clock = revocation_timing.reconcile_expiry([expiry_before], exp_epoch)
 
@@ -172,13 +166,22 @@ class RevocationHarness(MirrorHarness):
                                            credential, target, cancel_job,
                                            service_pid=self.mirror_proc.pid)
         self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
-        return {
+        results = {
             "human_token": human,
             "expired_token": expired,
             "removed_collaborator": member_removed,
             "generation_changed": gen_changed,
             "cancelled_ci_job": mirror,
         }
+        proofs = {name: bool(result["configured_bound_proven"]) for name, result in results.items()}
+        unproven = sorted(name for name, proven in proofs.items() if not proven)
+        assert not unproven, {"configured_bound_ms": 1200, "unproven_subcases": unproven}
+        results["bound_proof_summary"] = {
+            "configured_bound_ms": 1200,
+            "subcases": proofs,
+            "all_proven": True,
+        }
+        return results
 
 
 def main():

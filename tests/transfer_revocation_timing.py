@@ -191,11 +191,15 @@ def apply_natural_expiry_clock(result, clock, bound_ms):
     client = result["client_stop"]
     client_ok = bool(client["confirmed_transport_stop"] and client["observed_ns"] <= deadline_ns)
     group = result.get("git_group", {})
-    group_stop_ms = group.get("stop_upper_after_lower_ms")
-    if group_stop_ms is None:
-        group_ok = result.get("git_group_within_deadline", True)
+    group_stop_ns = group.get("stop_upper_ns")
+    if group_stop_ns is None:
+        group_stop_ms = group.get("stop_upper_after_lower_ms")
+        if group_stop_ms is None:
+            group_ok = result.get("git_group_within_deadline", True)
+        else:
+            group_stop_ns = result["lower_bound_ns"] + int(round(group_stop_ms * NS_PER_MS))
+            group_ok = group_stop_ns <= deadline_ns
     else:
-        group_stop_ns = result["lower_bound_ns"] + int(round(group_stop_ms * NS_PER_MS))
         group_ok = group_stop_ns <= deadline_ns
     result["expiry_clock"] = clock.report()
     result["deadline_ns"] = deadline_ns

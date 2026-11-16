@@ -270,7 +270,7 @@ class ProcGroupObserver:
         for track in self._tracks.values():
             if track.reuse_detected or not track.quiescent_ns or not track.last_live_ns:
                 return False
-            if track.quiescent_ns > deadline_ns:
+            if track.quiescent_ns < lower_bound_ns or track.quiescent_ns > deadline_ns:
                 return False
             # The group was observed live close enough before the trigger.
             if track.last_live_ns + max(self.max_poll_gap_ns, self.interval_ns) < lower_bound_ns:
@@ -317,6 +317,7 @@ class ProcGroupObserver:
         return {
             "armed": bool(self.armed_ns),
             "groups": groups,
+            "stop_upper_ns": upper,
             "stop_upper_after_lower_ms": (
                 round((upper - lower_bound_ns) / 1_000_000, 3) if upper is not None else None
             ),

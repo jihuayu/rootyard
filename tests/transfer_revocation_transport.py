@@ -87,11 +87,12 @@ def server_fd_owns_inode(service_pid, inode, proc_root=Path("/proc")):
 class BackpressureProbe:
     """Observe the fixture 4-tuple and persistent server-side send backlog."""
 
-    def __init__(self, *, service_pid, server_port, client_socket, effective_rcvbuf,
-                 proc_root=Path("/proc"), net_path=Path("/proc/net/tcp")):
+    def __init__(self, *, service_pid, server_port, client_socket, requested_rcvbuf,
+                 effective_rcvbuf, proc_root=Path("/proc"), net_path=Path("/proc/net/tcp")):
         self.service_pid = service_pid
         self.server_port = int(server_port)
         self.client_port = int(client_socket.getsockname()[1])
+        self.requested_rcvbuf = requested_rcvbuf
         self.effective_rcvbuf = int(effective_rcvbuf)
         self.proc_root = Path(proc_root)
         self.net_path = Path(net_path)
@@ -122,8 +123,9 @@ class BackpressureProbe:
             "effective_so_rcvbuf": self.effective_rcvbuf,
         }
 
-    def wait_persistent(self, *, samples=3, timeout_s=2.0):
+    def wait_persistent(self, *, samples=3, timeout_s=2.0, min_duration_s=0.15):
         deadline = time.monotonic_ns() + int(timeout_s * 1_000_000_000)
+        started = time.monotonic_ns()
         history = []
         while True:
             sample = self.sample()
@@ -139,7 +141,8 @@ class BackpressureProbe:
                                 item.get("client_rx_queue") or 0) > 0
                             for item in window)
                 )
-                if self.persistent:
+                if (self.persistent
+                        and time.monotonic_ns() - started >= min_duration_s * 1_000_000_000):
                     self.window = window
                     return self
             if time.monotonic_ns() >= deadline:
@@ -152,7 +155,12 @@ class BackpressureProbe:
         return {
             "persistent": self.persistent,
             "sample_count": len(window),
+            "requested_so_rcvbuf": self.requested_rcvbuf,
             "effective_so_rcvbuf": self.effective_rcvbuf,
+            "fixture_four_tuple": {
+                "server_port": self.server_port,
+                "client_port": self.client_port,
+            },
             "server_socket_inode": window[0].get("server_socket_inode") if window else None,
             "server_fd_owned": all(item.get("server_fd_owned") for item in window) if window else False,
             "server_tx_queue_min": min((item.get("server_tx_queue") or 0) for item in window) if window else None,
@@ -258,15 +266,25 @@ def run_timed_transfer(
                 service_pid=service_pid,
                 server_port=port,
                 client_socket=connection.sock,
+                requested_rcvbuf=connection.requested_so_rcvbuf,
                 effective_rcvbuf=connection.effective_so_rcvbuf,
             )
             probe.wait_persistent()
+            pre_trigger_sample = probe.sample()
+            probe.persistent = bool(
+                probe.persistent
+                and pre_trigger_sample.get("server_fd_owned")
+                and max(pre_trigger_sample.get("server_tx_queue") or 0,
+                        pre_trigger_sample.get("client_rx_queue") or 0) > 0
+            )
+        else:
+            pre_trigger_sample = None
         if start_barrier is not None:
             start_barrier.wait(timeout=15)
 
         if require_group:
             observer = ProcGroupObserver([service_pid]).arm(exclude_pgids=baseline_groups)
-            observer.start(max_duration_s=max(5.0, bound_ms / 1000 + 5.0))
+            observer.start(max_duration_s=30.0)
         trigger_ready = threading.Event()
 
         def body_reader():
@@ -303,11 +321,13 @@ def run_timed_transfer(
         trigger_ready.set()
 
         if probe is not None:
-            sample_at = min(resume_ns - 20 * NS_PER_MS, time.monotonic_ns() + 500 * NS_PER_MS)
+            sample_at = max(lower_ns, resume_ns - 20 * NS_PER_MS)
             _sleep_until(sample_at)
             post_sample = probe.sample()
+            post_sample_ns = time.monotonic_ns()
         else:
             post_sample = None
+            post_sample_ns = None
         reader.join(timeout=max(1.0, (deadline_ns - time.monotonic_ns()) / 1_000_000_000 + 2.0))
         if reader.is_alive():
             stop = StopObservation(StopKind.TIMEOUT, time.monotonic_ns(), len(first))
@@ -321,17 +341,21 @@ def run_timed_transfer(
             while time.monotonic_ns() < wait_until and not observer.all_quiescent:
                 time.sleep(0.01)
             observer.stop()
-        else:
-            wait_until = deadline_ns
-
         group_ok = observer.proven(lower_ns, deadline_ns) if observer is not None else True
+        group_sanity_ok = True
+        if observer is not None:
+            try:
+                observer.wait_no_live(timeout_s=2.5)
+            except AssertionError:
+                group_sanity_ok = False
+
         pre_trigger_ok = lower_ns > first_ns
         client_ok = stop.confirmed and stop.observed_ns <= deadline_ns
         trigger_ok = interval is None or interval.t_after_ns <= deadline_ns
         backpressure_ok = (not require_backpressure) or bool(probe and probe.persistent)
         post_pause_ok = post_pause_ns <= bound_ns
         proof = bool(client_ok and group_ok and trigger_ok and backpressure_ok
-                     and post_pause_ok and pre_trigger_ok)
+                     and post_pause_ok and pre_trigger_ok and group_sanity_ok)
         end_ns = max(stop.observed_ns, natural_expiry.latest_ns if natural_expiry else stop.observed_ns)
         result = {
             "configured_bound_ms": int(bound_ms),
@@ -344,11 +368,17 @@ def run_timed_transfer(
             "post_trigger_pause_ms": _ms(post_pause_ns),
             "reader_resume_after_lower_ms": _ms(resume_ns - lower_ns),
             "post_pause_within_deadline": post_pause_ok,
+            "initial_bytes_received": len(first),
+            "transfer_incomplete_at_trigger": len(first) < expected_size,
             "backpressure": probe.report() if probe is not None else {
                 "persistent": None,
                 "reason": "not required",
             },
+            "pre_trigger_backpressure_sample": pre_trigger_sample,
             "post_trigger_backpressure_sample": post_sample,
+            "post_trigger_backpressure_sample_after_lower_ms": (
+                _ms(post_sample_ns - lower_ns) if post_sample_ns is not None else None
+            ),
             "client_stop": stop.report(),
             "client_stop_after_lower_ms": _ms(stop.observed_ns - lower_ns),
             "client_stop_within_deadline": client_ok,
@@ -357,6 +387,7 @@ def run_timed_transfer(
                 "reason": "no native Git child for LFS",
             },
             "git_group_within_deadline": group_ok,
+            "post_transfer_group_stopped": group_sanity_ok,
             "configured_bound_proven": proof,
             "observed_end_ns": end_ns,
         }
