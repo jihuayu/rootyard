@@ -57,6 +57,14 @@ async fn preparation_stages_immutable_cas_without_envelope_mirror_and_retry_reus
         .is_ok()
     );
     let cipher_before = std::fs::read(&prepared.report().bucket_pack_path).unwrap();
+    for installed in [
+        &prepared.report().bucket_pack_path,
+        &prepared.report().bucket_idx_path,
+        &prepared.report().manifest_path,
+    ] {
+        assert_eq!(mode_of(Path::new(installed)), 0o444);
+    }
+    assert!(install_temp_files(&tmp).is_empty());
 
     // The raw file-only API has no DB pair, so its own post-prepare mirror is
     // the durable envelope. A retry must recover these exact bytes.
@@ -141,4 +149,110 @@ async fn manifest_and_envelope_validation_rejects_conflicts_without_weakening_bi
     wrong_suite.cipher_suite = Some("CHACHA20-POLY1305-SHA256".into());
     assert!(validate_envelope_record(&envelope, &wrong_suite, repo, pack_id).is_err());
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+fn install_temp_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(".tmp-")))
+        .collect()
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn immutable_install_two_real_threads_with_distinct_payloads_have_one_winner() {
+    let dir = temp_root("install-race");
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("artifact");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let payloads = [b"first-payload".to_vec(), b"second-payload".to_vec()];
+    let runs = payloads
+        .iter()
+        .cloned()
+        .map(|payload| {
+            let target = target.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            let digest = delta::sha256_hex(&payload);
+            std::thread::spawn(move || {
+                super::write_immutable_cas_file_with_barrier(&target, &payload, &digest, &barrier)
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = runs.into_iter().map(|run| run.join().unwrap()).collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let installed = std::fs::read(&target).unwrap();
+    assert!(installed == payloads[0] || installed == payloads[1]);
+    assert_eq!(results[0].is_ok(), installed == payloads[0]);
+    assert_eq!(mode_of(&target), 0o444);
+    assert!(install_temp_files(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn immutable_install_identical_payloads_both_succeed_without_replacement() {
+    let dir = temp_root("install-identical");
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("artifact");
+    let payload = b"same-payload".to_vec();
+    let digest = delta::sha256_hex(&payload);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let runs = (0..2)
+        .map(|_| {
+            let target = target.clone();
+            let payload = payload.clone();
+            let digest = digest.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                super::write_immutable_cas_file_with_barrier(&target, &payload, &digest, &barrier)
+            })
+        })
+        .collect::<Vec<_>>();
+    for run in runs {
+        run.join().unwrap().unwrap();
+    }
+    assert_eq!(std::fs::read(&target).unwrap(), payload);
+    assert_eq!(mode_of(&target), 0o444);
+    assert!(install_temp_files(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn immutable_install_conflicts_nonregular_and_link_failures_never_replace_or_leak_temp() {
+    let dir = temp_root("install-failure");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let conflicting = dir.join("conflicting");
+    std::fs::write(&conflicting, b"existing").unwrap();
+    let new_payload = b"replacement";
+    assert!(super::write_immutable_cas_file(&conflicting, new_payload, &delta::sha256_hex(new_payload)).is_err());
+    assert_eq!(std::fs::read(&conflicting).unwrap(), b"existing");
+    assert!(install_temp_files(&dir).is_empty());
+
+    let nonregular = dir.join("directory-target");
+    std::fs::create_dir(&nonregular).unwrap();
+    assert!(super::write_immutable_cas_file(&nonregular, new_payload, &delta::sha256_hex(new_payload)).is_err());
+    assert!(nonregular.is_dir());
+    assert!(install_temp_files(&dir).is_empty());
+
+    let symlink_target = dir.join("symlink-target");
+    let symlink_destination = dir.join("symlink-destination");
+    std::fs::write(&symlink_destination, b"symlink-existing").unwrap();
+    std::os::unix::fs::symlink(&symlink_destination, &symlink_target).unwrap();
+    assert!(super::write_immutable_cas_file(&symlink_target, new_payload, &delta::sha256_hex(new_payload)).is_err());
+    assert_eq!(std::fs::read(&symlink_destination).unwrap(), b"symlink-existing");
+    assert!(std::fs::symlink_metadata(&symlink_target).unwrap().file_type().is_symlink());
+    assert!(install_temp_files(&dir).is_empty());
+
+    // A genuine link(2) failure after the complete temp exists must clean the
+    // caller's temp and leave no final name.
+    let long_name = dir.join("x".repeat(300));
+    assert!(super::write_immutable_cas_file(&long_name, new_payload, &delta::sha256_hex(new_payload)).is_err());
+    assert!(!long_name.exists());
+    assert!(install_temp_files(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
 }

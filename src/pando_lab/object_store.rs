@@ -2,8 +2,8 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
-    os::unix::fs::PermissionsExt,
+    io::{Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
 };
 
 mod authority;
@@ -223,25 +223,116 @@ pub(super) fn stage_and_reassemble_multipart(
     res
 }
 
-pub(super) fn write_immutable_cas_file(target: &Path, data: &[u8], expected_sha256: &str) -> Result<()> {
+struct ImmutableInstallTemp {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl ImmutableInstallTemp {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ImmutableInstallTemp {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn read_regular_immutable_file_without_following(path: &Path) -> Result<Vec<u8>> {
+    let link_metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        link_metadata.file_type().is_file(),
+        "immutable object store target is not a regular file: {}",
+        path.display()
+    );
+    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "immutable object store target changed to a non-regular file: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn write_immutable_cas_file_with_before_link(
+    target: &Path,
+    data: &[u8],
+    expected_sha256: &str,
+    before_link: impl FnOnce(),
+) -> Result<()> {
     ensure!(delta::sha256_hex(data) == expected_sha256, "CAS payload digest mismatch");
     let parent = target.parent().context("missing CAS parent")?;
     std::fs::create_dir_all(parent)?;
-    if target.exists() {
-        let existing = std::fs::read(target)?;
-        ensure!(existing.len() == data.len() && delta::sha256_hex(&existing) == expected_sha256, "immutable object store key collision on {}", target.display());
-        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o444))?;
-        return Ok(());
-    }
     let tmp = parent.join(format!(".tmp-{}", Uuid::new_v4()));
-    let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o444))?;
-    drop(f);
-    std::fs::rename(&tmp, target)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    let mut temp = ImmutableInstallTemp::new(tmp.clone());
+    {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(data)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+        file.sync_all()?;
+    }
+    before_link();
+    // hard_link is the no-clobber linearization point. The final name never
+    // exposes an incomplete temp, and an existing final is never replaced.
+    match std::fs::hard_link(&tmp, target) {
+        Ok(()) => {
+            let sync = File::open(parent).and_then(|dir| dir.sync_all());
+            let cleanup = std::fs::remove_file(&tmp);
+            if cleanup.is_ok() {
+                temp.disarm();
+            }
+            sync.context("failed to sync the immutable CAS parent directory")?;
+            cleanup.context("failed to remove the immutable CAS temporary file")?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let cleanup = std::fs::remove_file(&tmp);
+            if cleanup.is_ok() {
+                temp.disarm();
+            }
+            cleanup.context("failed to remove the immutable CAS temporary file after collision")?;
+            let existing = read_regular_immutable_file_without_following(target)?;
+            ensure!(
+                existing.len() == data.len() && delta::sha256_hex(&existing) == expected_sha256,
+                "immutable object store key collision on {}",
+                target.display()
+            );
+            Ok(())
+        }
+        Err(error) => {
+            if std::fs::remove_file(&tmp).is_ok() {
+                temp.disarm();
+            }
+            Err(error).with_context(|| format!("failed to install immutable CAS file {}", target.display()))
+        }
+    }
+}
+
+pub(super) fn write_immutable_cas_file(target: &Path, data: &[u8], expected_sha256: &str) -> Result<()> {
+    write_immutable_cas_file_with_before_link(target, data, expected_sha256, || {})
+}
+
+#[cfg(test)]
+pub(crate) fn write_immutable_cas_file_with_barrier(
+    target: &Path,
+    data: &[u8],
+    expected_sha256: &str,
+    barrier: &std::sync::Barrier,
+) -> Result<()> {
+    write_immutable_cas_file_with_before_link(target, data, expected_sha256, || {
+        barrier.wait();
+    })
 }
 
 fn write_atomic_local_cache_file(target: &Path, data: &[u8], expected_sha256: &str) -> Result<()> {
