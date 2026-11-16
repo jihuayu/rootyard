@@ -162,7 +162,7 @@ class OwnedPostgres:
 
     def drop(self):
         _require(self.prechecked_absent, "pg_drop_not_owned")
-        self._psql('DROP DATABASE IF EXISTS "%s";\n' % self.database, timeout=60)
+        self._psql('DROP DATABASE IF EXISTS "%s" WITH (FORCE);\n' % self.database, timeout=60)
         _require(not self._exists(), "pg_database_drop_unverified")
         self.dropped = True
         return True

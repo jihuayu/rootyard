@@ -67,6 +67,8 @@ class VaultFixture:
         self.reconciliation = "not_needed"
         self.denied_rotate = False
         self.derived_verified = False
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
 
     def safe_state(self, phase=None):
         return {
@@ -130,7 +132,7 @@ class VaultFixture:
         request = urllib.request.Request(
             self.host_url + path, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 return response.status, response.read(MAX_BODY + 1)
         except urllib.error.HTTPError as error:
             return error.code, b""
@@ -450,6 +452,12 @@ class VaultFixture:
     def stop(self):
         state = _validate_state(self.safe_state(
             "created" if self.container_id else "intent"))
+        if self.root_token and self.host_url:
+            try:
+                self.api("POST", "/v1/auth/token/revoke-self",
+                         token=self.root_token)
+            except FixtureError:
+                pass
         result = remove_owned_container(self.runner, state)
         self.remove_state()
         self.release_credentials()
