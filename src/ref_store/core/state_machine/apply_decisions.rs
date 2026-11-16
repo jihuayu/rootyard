@@ -201,6 +201,7 @@ pub(super) fn verify_decision_for_commit(
             floor: gate.authz_floor,
         });
     }
+    super::apply_scopes::verify_decision_scopes_open(state, decision_id, decision.authz_epoch)?;
     if current_tick > decision.not_after_tick {
         return Err(StateMachineError::DecisionExpired {
             decision_id,

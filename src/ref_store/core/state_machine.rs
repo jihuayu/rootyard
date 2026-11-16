@@ -12,6 +12,7 @@ mod apply_holds;
 mod apply_pins;
 mod apply_refs;
 mod apply_roots;
+mod apply_scopes;
 pub mod commands;
 pub mod machine;
 pub mod response;
@@ -19,12 +20,17 @@ pub mod snapshot;
 pub mod state;
 pub mod wire;
 
+pub use apply_scopes::{
+    DecisionScopeIndexRecord, SUPPORTED_DECISION_SCOPE_KINDS, ScopeDrainSnapshot, ScopeFloorRecord, ScopeKey,
+    validate_scope_kind,
+};
 pub use commands::{
     AcquireHoldBatchCommand, AdvanceCancelCutoffCommand, AppliedLogId, BeginOperationCommand, CancelCommand,
-    CommitRefsCommand, CreateSnapshotPinCommand, InitializeGateCommand, InstallDecisionCommand,
-    MarkHoldConsumedCommand, NoopCommand, RefCasCommand, RegisterRootCommand, ReleasePinCommand, ReleaseRootCommand,
-    RenewPinCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle, SetRepositoryLaneCommand, SmDecisionState,
-    SmHoldState, SmPackMode, SmPinState, SmRootState, WireDecisionKind, WireDecisionVerdict, WireHoldArtifactSpec,
+    CloseAuthScopeCommand, CommitRefsCommand, CreateSnapshotPinCommand, InitializeGateCommand, InstallDecisionCommand,
+    InstallScopedDecisionCommand, MarkHoldConsumedCommand, NoopCommand, RefCasCommand, RegisterRootCommand,
+    ReleasePinCommand, ReleaseRootCommand, RenewPinCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle,
+    SetRepositoryLaneCommand, SmDecisionState, SmHoldState, SmPackMode, SmPinState, SmRootState, WireDecisionKind,
+    WireDecisionScopeDep, WireDecisionVerdict, WireHoldArtifactSpec,
 };
 pub use machine::{RefCasLogEntry, RefCasStateMachine, decode_command, encode_command};
 pub use response::{ApplyResponse, SmOperationRecord, SmVersionCheck, StateMachineError};

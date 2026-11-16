@@ -8,6 +8,9 @@ use super::apply_refs::{
     advance_cancel_cutoff, begin_operation, cancel_operation, initialize_gate, set_repository_lane,
 };
 use super::apply_roots::{register_root, release_root};
+use super::apply_scopes::{
+    ScopeDrainSnapshot, ScopeFloorRecord, ScopeKey, close_auth_scope, inspect_scope_drain, install_scoped_decision,
+};
 use super::commands::{AppliedLogId, RefCasCommand, ScopeLifecycle};
 use super::response::{ApplyResponse, StateMachineError};
 use super::snapshot::{RefCasSnapshot, compute_body_checksum, export_snapshot_body, restore_from_snapshot};
@@ -221,6 +224,18 @@ impl RefCasStateMachine {
         self.state.cancellations.contains_key(&RepoEntityKey::new(repository_id, operation_id))
     }
 
+    pub fn read_scope_floor(&self, scope_kind: &str, scope_id: Uuid) -> Option<&ScopeFloorRecord> {
+        self.state.scope_floors.get(&ScopeKey::new(scope_kind, scope_id))
+    }
+
+    pub fn inspect_scope_drain(
+        &self,
+        scope_kind: &str,
+        scope_id: Uuid,
+    ) -> Result<ScopeDrainSnapshot, StateMachineError> {
+        inspect_scope_drain(&self.state, scope_kind, scope_id)
+    }
+
     pub fn read_events_since(&self, after_event_seq: u64, limit: usize) -> Vec<StateMachineEvent> {
         self.state.events.iter().filter(|event| event.event_seq > after_event_seq).take(limit).cloned().collect()
     }
@@ -245,6 +260,8 @@ fn apply_inner(
         RefCasCommand::Cancel(cmd) => cancel_operation(state, cmd),
         RefCasCommand::AdvanceCancelCutoff(cmd) => advance_cancel_cutoff(state, cmd),
         RefCasCommand::InstallDecision(cmd) => install_decision(state, cmd),
+        RefCasCommand::InstallScopedDecision(cmd) => install_scoped_decision(state, cmd),
+        RefCasCommand::CloseAuthScope(cmd) => close_auth_scope(state, cmd),
         RefCasCommand::CreateSnapshotPin(cmd) => create_snapshot_pin(state, cmd),
         RefCasCommand::RenewPin(cmd) => renew_pin(state, cmd),
         RefCasCommand::ReleasePin(cmd) => release_pin(state, cmd),
