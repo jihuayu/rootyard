@@ -4,17 +4,18 @@
 //! Issue #169 needs the real HTTP `pg_refstore` repository (`ref_store::serving`
 //! provision), not the offline `Db::business` gitfs/provisioning pair that the
 //! shared `pack::verify_new` creates. This module therefore starts from a
-//! repository and tenant the serving path already returned and only reuses the
-//! unchanged shared helpers: `pack::{closure, prove, commit, release_pin}` and
-//! the raw `pg_refstore` gate read. Its three "different owner" helpers are the
-//! unchanged production calls with an explicit producer owner instead of the
-//! tenant:
+//! repository and tenant the serving path already returned and reuses the
+//! unchanged production pack helpers plus the explicit actor-owned snapshot
+//! facade:
 //!
 //! * `pack_plan::{draft, publish, register}` -- A3 acquire / protected upload /
 //!   A4 register, so the durable holds and the publication carry the real
 //!   request owner (storage tenant/RAM prefix stay derived from the same store);
-//! * `producer_snapshot` -- the A5 pack snapshot created by that owner, which is
-//!   the owner the root `prepare` proves the pin against;
+//! * `producer_snapshot` -- `PgServingSnapshotMetadata::create_actor_owned` and
+//!   `read_actor_owned`, which persist the producer as the A5 owner while the
+//!   repository tenant, gate realm, backend and Admin/ContentsWrite checks stay
+//!   production-derived;
+//! * `release_snapshot_pin` -- the actor-owned snapshot release facade;
 //! * `registration_badges` -- the current typed A4 active membership, captured
 //!   read-only at the verified gate (`PgPackCommit::capture_baseline`, never a
 //!   stale pre-commit plan closure), and the stored `artifact_set_digest` read
@@ -33,14 +34,16 @@
 //! disables a fence or fabricates a digest.
 use anyhow::{Result, anyhow, ensure};
 use rootyard::blob_store::opendal::BlobStore;
+use rootyard::db::Identity;
 use rootyard::ref_store::core::pack_commit::{
     AuthorizedCommitMode, PackArtifactRole, PackCommitPlan, PgAuthorizedCommit, PgPackCommit, PrepareOutcome,
     RegisteredArtifact, RegisteredPack,
 };
-use rootyard::ref_store::core::{
-    CreatePackSnapshotRequest, MetadataPinOutcome, MetadataSnapshotScope, PackReadSnapshot, PackSnapshotExpectation,
+use rootyard::ref_store::core::{MetadataPinOutcome, PackReadSnapshot};
+use rootyard::ref_store::serving::{
+    PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead, ServingSnapshotRelease,
 };
-use rootyard::ref_store::{CoreGateVersion, MetadataPinPurpose};
+use rootyard::ref_store::{CoreGateVersion, PinReleaseReason};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -84,11 +87,10 @@ impl Stage {
     }
 }
 
-/// A5 pack snapshot whose owner (the pin/snapshot scope owner) is `owner`.
+/// Actor-owned A5 pack snapshot receipt/read pair for the format22 source.
 pub struct ProducerSnapshot {
     pub snapshot_id: Uuid,
     pub pin_id: Uuid,
-    pub scope: MetadataSnapshotScope,
     pub read: PackReadSnapshot,
 }
 
@@ -189,77 +191,100 @@ pub async fn decided_pair(
     Ok(context.new_packs().to_vec())
 }
 
-/// The shared `snapshot_scope` with `owner_id` = the producer that will prepare
-/// the root, so `PgPackSnapshot.create` seals a snapshot whose scope owner is
-/// that producer (the root `prepare` compares the pin realm owner-for-owner).
-pub fn producer_snapshot_scope(
-    repo: Uuid,
-    tenant: Uuid,
-    producer: Uuid,
-    gate: &CoreGateVersion,
-) -> Result<MetadataSnapshotScope> {
-    Ok(MetadataSnapshotScope::new(
-        repo,
-        tenant,
-        producer,
-        MetadataPinPurpose::Verification,
-        gate.object_format(),
-        gate.history_incarnation(),
-        gate.authority_epoch(),
-        gate.group_epoch(),
-    )?)
-}
-
-/// `pack::create_snapshot` with the snapshot owner set to `producer`.
-pub async fn producer_snapshot(db: &Db, verified: &Verified, producer: Uuid, lease: i64) -> Result<ProducerSnapshot> {
-    let scope = producer_snapshot_scope(verified.repo, verified.tenant, producer, &verified.gate)?;
-    let request_id = Uuid::new_v4();
-    let snapshot_id = Uuid::new_v4();
-    let pin_id = Uuid::new_v4();
-    let expected = PackSnapshotExpectation::new(verified.gate.revision(), *verified.gate.digest())?;
-    let request = CreatePackSnapshotRequest::new(scope, request_id, pin_id, snapshot_id, lease, expected)?;
-    // Diagnostic only: name the A5 stages with the verified gate the snapshot
-    // expectation is built from; the typed error is kept unchanged.
+/// Capture one durable serving A5 snapshot through the explicit actor-owned
+/// facade. The facade derives the durable owner from the authenticated
+/// producer; repository tenant, gate realm, storage backend and request
+/// identities stay production-derived. No owner-id field or direct SQL exists.
+pub async fn producer_snapshot(
+    db: &Db,
+    store: &BlobStore,
+    verified: &Verified,
+    producer: &Identity,
+    owner: &str,
+    name: &str,
+    lease: i64,
+) -> Result<ProducerSnapshot> {
     let stage = Stage { name: "a5_create", sequence: None, revision: verified.gate.revision() };
-    let outcome = pack::a5_create(&db.pool, &request).await.map_err(|error| stage.tag(error))?;
-    ensure!(!outcome.replayed, "fresh pack snapshot replayed");
-    let stored_owner = db
-        .pool
-        .get()
-        .await?
-        .query_one("SELECT owner_id FROM ref_store_core_snapshots WHERE snapshot_id=$1", &[&snapshot_id])
-        .await?
-        .get::<_, Uuid>(0);
-    ensure!(stored_owner == producer, "the stored A5 snapshot owner is not the producer");
-    let stage = Stage { name: "a5_read", sequence: None, revision: verified.gate.revision() };
-    let read = pack::a5_read(&db.pool, verified.repo, verified.tenant, snapshot_id, pin_id, 1)
+    let created = PgServingSnapshotMetadata
+        .create_actor_owned(
+            &db.pool,
+            producer,
+            ServingSnapshotCreate {
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+                idempotency_key: "format22-producer-a5".into(),
+                lease_seconds: lease,
+            },
+            store.backend_identity(),
+            deadline(),
+        )
         .await
         .map_err(|error| stage.tag(error))?;
+    ensure!(!created.replayed, "fresh actor-owned pack snapshot replayed");
+    ensure!(
+        created.receipt.scope().tenant_id() == verified.tenant
+            && created.receipt.scope().owner_id() == producer.id,
+        "actor-owned A5 receipt scope owner/tenant differs"
+    );
+    let snapshot_id = created.receipt.snapshot_id();
+    let pin_id = created.receipt.pin_id();
+    let stage = Stage { name: "a5_read", sequence: None, revision: verified.gate.revision() };
+    let read = PgServingSnapshotMetadata
+        .read_actor_owned(
+            &db.pool,
+            producer,
+            ServingSnapshotRead {
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+                snapshot_id,
+            },
+            store.backend_identity(),
+            deadline(),
+        )
+        .await
+        .map_err(|error| stage.tag(error))?;
+    ensure!(
+        read.scope().tenant_id() == verified.tenant
+            && read.scope().owner_id() == producer.id
+            && read.snapshot_id() == snapshot_id
+            && read.pin_id() == pin_id,
+        "actor-owned A5 read scope/identity differs"
+    );
     ensure!(read.pack_mode() == "pack_verified", "source snapshot is not pack_verified");
     ensure!(read.pack_count() > 0, "source snapshot has no registered pack membership");
-    Ok(ProducerSnapshot { snapshot_id, pin_id, scope, read })
+    Ok(ProducerSnapshot { snapshot_id, pin_id, read })
 }
 
-/// Rebuild the `retention_roots_support::pack::SourceSnapshot` view of the
-/// producer's snapshot (its `scope` is the authoritative read).
-pub fn as_source(snapshot: &ProducerSnapshot) -> pack::SourceSnapshot {
-    pack::SourceSnapshot {
-        scope: snapshot.scope,
-        request_id: Uuid::new_v4(),
-        snapshot_id: snapshot.snapshot_id,
-        pin_id: snapshot.pin_id,
-        read: snapshot.read.clone(),
-    }
-}
-
-/// Release the A5 pin through the shared `release_pin` with its own scope.
+/// Release the actor-owned A5 pin through the production facade. This is the
+/// source-pin lifecycle, independent of the retained root/snapshot descriptors
+/// that continue to declare every registration after release.
 pub async fn release_snapshot_pin(
     db: &Db,
+    store: &BlobStore,
+    producer: &Identity,
+    owner: &str,
+    name: &str,
     snapshot: &ProducerSnapshot,
     gate: &CoreGateVersion,
 ) -> Result<MetadataPinOutcome> {
     let stage = Stage { name: "release_pin", sequence: None, revision: gate.revision() };
-    pack::release_pin(&db.pool, snapshot.scope, snapshot.pin_id).await.map_err(|error| stage.tag(error))
+    PgServingSnapshotMetadata
+        .release_actor_owned(
+            &db.pool,
+            producer,
+            ServingSnapshotRelease {
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+                snapshot_id: snapshot.snapshot_id,
+                idempotency_key: "format22-producer-a5-release".into(),
+                expected_generation: snapshot.read.pin_generation(),
+                reason: PinReleaseReason::ClientDone,
+            },
+            store.backend_identity(),
+            deadline(),
+        )
+        .await
+        .map_err(|error| stage.tag(error))
 }
 
 /// One registration as the archive stores it: publication digest (the real
