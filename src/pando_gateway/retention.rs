@@ -169,7 +169,7 @@ pub(crate) async fn fence_publication<C: GenericClient + Sync>(
 ) -> Result<()> {
     client
         .execute(
-            "INSERT INTO pando_publication_fences(manifest_id,authority_id,tenant_id,namespace,sha256,lease_until)              VALUES($1,$2,$3,$4,$5,clock_timestamp()+make_interval(secs=>($6::bigint)::double precision))              ON CONFLICT(manifest_id,namespace,sha256) DO UPDATE SET                lease_until=GREATEST(pando_publication_fences.lease_until,EXCLUDED.lease_until)",
+            "INSERT INTO pando_publication_fences(manifest_id,authority_id,tenant_id,namespace,sha256,lease_until)              VALUES($1,$2,$3,$4,$5,clock_timestamp()+make_interval(secs=>($6::bigint)::double precision))              ON CONFLICT(manifest_id,namespace,sha256) DO UPDATE SET                authority_id=EXCLUDED.authority_id,tenant_id=EXCLUDED.tenant_id,                lease_until=GREATEST(pando_publication_fences.lease_until,EXCLUDED.lease_until)",
             &[&manifest_id, &authority_id, &tenant_id, &namespace, &sha256, &PENDING_PUBLICATION_SECONDS],
         )
         .await?;

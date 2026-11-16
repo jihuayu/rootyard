@@ -1,10 +1,12 @@
 //! Tenant-scoped remote object copy and rollback cleanup for ownership transfer.
 use super::{
-    purge_exec::{delete_pando_artifact_fenced, retire_pando_artifact_fenced},
     remote_copy::{copy_and_rekey_workspace_checkpoint, copy_object_if_present},
     transfer_exec::plan_rollback_cleanup_keys,
     transfer_model::{CopiedRemoteObject, plan_lfs_copy, plan_workspace_blob_copy},
-    transfer_pando::{PandoTransferCopy, clear_transfer_pando_fences_tx, copy_pando_objects_with_store},
+    transfer_pando::{
+        PandoTransferCopy, clear_transfer_pando_fences_tx, copy_pando_objects_with_store, persist_copied_objects_pool,
+        remove_copied_artifact, rollback_cleanup_pando_artifact, upsert_copied_artifact,
+    },
 };
 use crate::{
     AppState,
@@ -20,7 +22,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use deadpool_postgres::Pool;
 use serde_json::Value;
-use std::{collections::BTreeSet, path::Path};
+use std::collections::BTreeSet;
 use tokio::{fs, time::Instant};
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
@@ -51,37 +53,6 @@ async fn verify_rollback_lease(pool: &Pool, transfer_id: Uuid, lease_owner: &str
     verify_rollback_lease_with(&**client, transfer_id, lease_owner, lease_epoch).await
 }
 
-async fn persist_copied_objects(
-    state: &AppState,
-    transfer_id: Uuid,
-    lease_owner: &str,
-    lease_epoch: i64,
-    copied: &[CopiedRemoteObject],
-) -> Result<()> {
-    let client = state.pool.get().await?;
-    let val = serde_json::to_value(copied)?;
-    let changed = client
-        .execute(
-            "UPDATE repository_transfers SET copied_objects = $2, updated_at = clock_timestamp() \
-             WHERE id = $1 AND state = 'copying_remote' AND lease_owner = $3 AND lease_epoch = $4",
-            &[&transfer_id, &val, &lease_owner, &lease_epoch],
-        )
-        .await?;
-    ensure!(changed == 1, "transfer lease lost while persisting copied remote objects");
-    Ok(())
-}
-
-fn push_unique(
-    copied: &mut Vec<CopiedRemoteObject>,
-    seen: &mut BTreeSet<(String, String, String)>,
-    item: CopiedRemoteObject,
-) {
-    let sig = (item.kind.clone(), item.from_key.clone(), item.to_key.clone());
-    if seen.insert(sig) {
-        copied.push(item);
-    }
-}
-
 pub async fn copy_repository_remote_objects(
     state: &AppState,
     transfer_id: Uuid,
@@ -92,29 +63,24 @@ pub async fn copy_repository_remote_objects(
     to_owner: Uuid,
     deadline: Instant,
 ) -> Result<Vec<CopiedRemoteObject>> {
-    let client = state.pool.get().await?;
-    let row = client
-        .query_one(
-            "SELECT copied_objects FROM repository_transfers \
-             WHERE id = $1 AND state = 'copying_remote' AND lease_owner = $2 AND lease_epoch = $3",
-            &[&transfer_id, &lease_owner, &lease_epoch],
-        )
-        .await
-        .context("transfer lease lost before remote object copy")?;
-    let existing_val: Value = row.get(0);
-    let mut copied: Vec<CopiedRemoteObject> = serde_json::from_value(existing_val).unwrap_or_default();
+    let mut copied: Vec<CopiedRemoteObject> = {
+        let client = state.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT copied_objects FROM repository_transfers \
+                 WHERE id = $1 AND state = 'copying_remote' AND lease_owner = $2 AND lease_epoch = $3",
+                &[&transfer_id, &lease_owner, &lease_epoch],
+            )
+            .await
+            .context("transfer lease lost before remote object copy")?;
+        let existing_val: Value = row.get(0);
+        serde_json::from_value(existing_val).unwrap_or_default()
+    };
     let mut seen: BTreeSet<(String, String, String)> =
         copied.iter().map(|c| (c.kind.clone(), c.from_key.clone(), c.to_key.clone())).collect();
 
     let stage_dir = state.storage.root.join("tmp");
     fs::create_dir_all(&stage_dir).await?;
-
-    copy_lfs_objects(state, &client, repo_id, from_owner, to_owner, &stage_dir, &mut copied, &mut seen, deadline)
-        .await?;
-    copy_workspace_objects(state, &client, repo_id, from_owner, to_owner, &stage_dir, &mut copied, &mut seen, deadline)
-        .await?;
-    drop(client);
-    let pando_store = RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
     let pando_req = PandoTransferCopy {
         transfer_lease: Some((transfer_id, lease_owner, lease_epoch)),
         repo_id,
@@ -123,32 +89,35 @@ pub async fn copy_repository_remote_objects(
         stage_dir: &stage_dir,
         deadline,
     };
+
+    copy_lfs_objects(state, &pando_req, &mut copied, &mut seen).await?;
+    copy_workspace_objects(state, &pando_req, &mut copied, &mut seen).await?;
+    let pando_store = RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
     copy_pando_objects_with_store(&state.pool, &pando_store, &pando_req, &mut copied, &mut seen).await?;
 
-    persist_copied_objects(state, transfer_id, lease_owner, lease_epoch, &copied).await?;
+    persist_copied_objects_pool(&state.pool, transfer_id, lease_owner, lease_epoch, &copied).await?;
     Ok(copied)
 }
 
 async fn copy_lfs_objects(
     state: &AppState,
-    client: &tokio_postgres::Client,
-    repo_id: Uuid,
-    from_owner: Uuid,
-    to_owner: Uuid,
-    stage_dir: &Path,
+    req: &PandoTransferCopy<'_>,
     copied: &mut Vec<CopiedRemoteObject>,
     seen: &mut BTreeSet<(String, String, String)>,
-    deadline: Instant,
 ) -> Result<()> {
     if std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_none() {
         return Ok(());
     }
-    let rows = client
-        .query(
-            "SELECT oid, size FROM lfs_objects WHERE repository_id = $1 AND tenant_id = $2 AND state = 'ready'",
-            &[&repo_id, &from_owner],
-        )
-        .await?;
+    let (transfer_id, lease_owner, lease_epoch) = req.transfer_lease.context("missing transfer lease for LFS copy")?;
+    let rows = {
+        let client = state.pool.get().await?;
+        client
+            .query(
+                "SELECT oid, size FROM lfs_objects WHERE repository_id = $1 AND tenant_id = $2 AND state = 'ready'",
+                &[&req.repo_id, &req.from_owner],
+            )
+            .await?
+    };
     if rows.is_empty() {
         return Ok(());
     }
@@ -156,70 +125,113 @@ async fn copy_lfs_objects(
     for row in rows {
         let oid: String = row.get(0);
         let size: i64 = row.get(1);
-        let (src, dst) = plan_lfs_copy(from_owner, to_owner, &oid).map_err(|e| anyhow::anyhow!(e))?;
+        let (src, dst) = plan_lfs_copy(req.from_owner, req.to_owner, &oid).map_err(|e| anyhow::anyhow!(e))?;
         let expected = u64::try_from(size).ok();
-        if let Some(rec) = copy_object_if_present(&store, stage_dir, "lfs", &src, &dst, expected, deadline).await? {
-            push_unique(copied, seen, rec);
+        let src_path = src.path();
+        upsert_copied_artifact(
+            copied,
+            seen,
+            CopiedRemoteObject {
+                kind: "lfs".into(),
+                from_key: src_path.clone(),
+                to_key: dst.path(),
+                size: expected.unwrap_or(0),
+                sha256: Some(oid.clone()),
+            },
+        );
+        persist_copied_objects_pool(&state.pool, transfer_id, lease_owner, lease_epoch, copied).await?;
+        if let Some(rec) =
+            copy_object_if_present(&store, req.stage_dir, "lfs", &src, &dst, expected, req.deadline).await?
+        {
+            upsert_copied_artifact(copied, seen, rec);
+        } else {
+            remove_copied_artifact(copied, seen, "lfs", &src_path);
         }
+        persist_copied_objects_pool(&state.pool, transfer_id, lease_owner, lease_epoch, copied).await?;
     }
     Ok(())
 }
 
 async fn copy_workspace_objects(
     state: &AppState,
-    client: &tokio_postgres::Client,
-    repo_id: Uuid,
-    from_owner: Uuid,
-    to_owner: Uuid,
-    stage_dir: &Path,
+    req: &PandoTransferCopy<'_>,
     copied: &mut Vec<CopiedRemoteObject>,
     seen: &mut BTreeSet<(String, String, String)>,
-    deadline: Instant,
 ) -> Result<()> {
-    let manifests: Vec<String> = client
-        .query(
-            "SELECT DISTINCT manifest_digest FROM workspace_checkpoints \
-             WHERE repository_id = $1 AND manifest_digest IS NOT NULL",
-            &[&repo_id],
-        )
-        .await?
-        .into_iter()
-        .map(|r| r.get(0))
-        .collect();
-    let staged = client
-        .query(
-            "SELECT DISTINCT s.digest, s.size FROM workspace_remote_staging_objects s \
-             JOIN workspace_checkpoints c ON c.id = s.checkpoint_id \
-             WHERE c.repository_id = $1 AND s.tenant_id = $2",
-            &[&repo_id, &from_owner],
-        )
-        .await?;
+    let (transfer_id, lease_owner, lease_epoch) =
+        req.transfer_lease.context("missing transfer lease for workspace copy")?;
+    let (manifests, staged) = {
+        let client = state.pool.get().await?;
+        let manifests: Vec<String> = client
+            .query(
+                "SELECT DISTINCT manifest_digest FROM workspace_checkpoints \
+                 WHERE repository_id = $1 AND manifest_digest IS NOT NULL",
+                &[&req.repo_id],
+            )
+            .await?
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+        let staged = client
+            .query(
+                "SELECT DISTINCT s.digest, s.size FROM workspace_remote_staging_objects s \
+                 JOIN workspace_checkpoints c ON c.id = s.checkpoint_id \
+                 WHERE c.repository_id = $1 AND s.tenant_id = $2",
+                &[&req.repo_id, &req.from_owner],
+            )
+            .await?;
+        (manifests, staged)
+    };
     if manifests.is_empty() && staged.is_empty() {
         return Ok(());
     }
     let store = RemoteObjectStore::from_env(state.storage.root.join("workspace-service/local-object-cache"))?;
     for digest in manifests {
-        let src_manifest = ObjectKey::new(from_owner, "workspace", &digest)?;
-        if let Some(head) = store.head(&src_manifest, deadline).await? {
+        let src_manifest = ObjectKey::new(req.from_owner, "workspace", &digest)?;
+        if let Some(head) = store.head(&src_manifest, req.deadline).await? {
             let (_, _, recs) = copy_and_rekey_workspace_checkpoint(
-                &store, stage_dir, from_owner, to_owner, &digest, head.size, deadline,
+                &store,
+                req.stage_dir,
+                req.from_owner,
+                req.to_owner,
+                &digest,
+                head.size,
+                req.deadline,
             )
             .await?;
             for rec in recs {
-                push_unique(copied, seen, rec);
+                upsert_copied_artifact(copied, seen, rec);
             }
+            persist_copied_objects_pool(&state.pool, transfer_id, lease_owner, lease_epoch, copied).await?;
         }
     }
     for row in staged {
         let digest: String = row.get(0);
         let size: i64 = row.get(1);
-        let (src, dst) = plan_workspace_blob_copy(from_owner, to_owner, &digest).map_err(|e| anyhow::anyhow!(e))?;
+        let (src, dst) =
+            plan_workspace_blob_copy(req.from_owner, req.to_owner, &digest).map_err(|e| anyhow::anyhow!(e))?;
         let expected = u64::try_from(size).ok();
+        let src_path = src.path();
+        upsert_copied_artifact(
+            copied,
+            seen,
+            CopiedRemoteObject {
+                kind: "workspace".into(),
+                from_key: src_path.clone(),
+                to_key: dst.path(),
+                size: expected.unwrap_or(0),
+                sha256: Some(digest),
+            },
+        );
+        persist_copied_objects_pool(&state.pool, transfer_id, lease_owner, lease_epoch, copied).await?;
         if let Some(rec) =
-            copy_object_if_present(&store, stage_dir, "workspace", &src, &dst, expected, deadline).await?
+            copy_object_if_present(&store, req.stage_dir, "workspace", &src, &dst, expected, req.deadline).await?
         {
-            push_unique(copied, seen, rec);
+            upsert_copied_artifact(copied, seen, rec);
+        } else {
+            remove_copied_artifact(copied, seen, "workspace", &src_path);
         }
+        persist_copied_objects_pool(&state.pool, transfer_id, lease_owner, lease_epoch, copied).await?;
     }
     Ok(())
 }
@@ -334,29 +346,8 @@ pub(super) async fn cleanup_rollback_objects_with_stores(
                 } else {
                     verify_rollback_lease(pool, transfer_id, lease_owner, lease_epoch).await?;
                 }
-                if let Some(store) = pando_remote_allowed {
-                    delete_pando_artifact_fenced(
-                        pool,
-                        store,
-                        authority_id,
-                        key.tenant_id,
-                        &key.namespace,
-                        &key.sha256,
-                        Some(obj_gen),
-                        deadline,
-                    )
+                rollback_cleanup_pando_artifact(pool, pando_remote_allowed, authority_id, &key, obj_gen, deadline)
                     .await?;
-                } else {
-                    retire_pando_artifact_fenced(
-                        pool,
-                        authority_id,
-                        key.tenant_id,
-                        &key.namespace,
-                        &key.sha256,
-                        Some(obj_gen),
-                    )
-                    .await?;
-                }
             }
             _ => {}
         }

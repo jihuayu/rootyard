@@ -26,7 +26,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -37,6 +37,8 @@ pub(super) struct MockRemoteS3 {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     pub(super) gate_first_delete: AtomicBool,
     pub(super) fail_deletes_500: AtomicBool,
+    pub(super) gets: AtomicUsize,
+    pub(super) fail_gets_after: AtomicUsize,
     pub(super) first_delete_entered: Notify,
     pub(super) release_first_delete: Notify,
 }
@@ -47,6 +49,8 @@ impl MockRemoteS3 {
             objects: Mutex::new(HashMap::new()),
             gate_first_delete: AtomicBool::new(false),
             fail_deletes_500: AtomicBool::new(false),
+            gets: AtomicUsize::new(0),
+            fail_gets_after: AtomicUsize::new(usize::MAX),
             first_delete_entered: Notify::new(),
             release_first_delete: Notify::new(),
         }
@@ -82,14 +86,19 @@ async fn handle_s3(
                 .unwrap(),
             None => empty_resp(StatusCode::NOT_FOUND),
         },
-        Method::GET => match state.objects.lock().unwrap().get(&key).cloned() {
-            Some(bytes) => Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_LENGTH, bytes.len().to_string())
-                .body(Body::from(bytes))
-                .unwrap(),
-            None => empty_resp(StatusCode::NOT_FOUND),
-        },
+        Method::GET => {
+            if state.gets.fetch_add(1, Ordering::SeqCst) >= state.fail_gets_after.load(Ordering::SeqCst) {
+                return empty_resp(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            match state.objects.lock().unwrap().get(&key).cloned() {
+                Some(bytes) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                    .body(Body::from(bytes))
+                    .unwrap(),
+                None => empty_resp(StatusCode::NOT_FOUND),
+            }
+        }
         Method::DELETE => {
             if state.gate_first_delete.swap(false, Ordering::SeqCst) {
                 let release = state.release_first_delete.notified();

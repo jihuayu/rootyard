@@ -254,9 +254,7 @@ pub async fn execute_safe_remote_deletes(
 async fn lock_unreferenced_pando_artifact(
     tx: &Transaction<'_>,
     authority_id: Uuid,
-    tenant_id: Uuid,
-    namespace: &str,
-    sha256: &str,
+    target: &ObjectKey,
     expected_generation: Option<i64>,
     allowed_states: &[&str],
 ) -> Result<Option<i64>> {
@@ -271,7 +269,7 @@ async fn lock_unreferenced_pando_artifact(
         .query_opt(
             "SELECT state, object_generation FROM pando_remote_artifacts \
              WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 FOR UPDATE",
-            &[&authority_id, &tenant_id, &namespace, &sha256],
+            &[&authority_id, &target.tenant_id, &target.namespace, &target.sha256],
         )
         .await?
     else {
@@ -292,7 +290,7 @@ async fn lock_unreferenced_pando_artifact(
                  WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
                    AND lease_until > clock_timestamp() \
              )",
-            &[&authority_id, &tenant_id, &namespace, &sha256],
+            &[&authority_id, &target.tenant_id, &target.namespace, &target.sha256],
         )
         .await?
         .get(0);
@@ -315,20 +313,26 @@ pub(super) async fn delete_pando_artifact_fenced(
     expected_generation: Option<i64>,
     deadline: Instant,
 ) -> Result<bool> {
+    let target = ObjectKey::new(tenant_id, namespace, sha256)?;
+    delete_pando_artifact_states(pool, store, authority_id, &target, expected_generation, false, deadline).await
+}
+
+pub(super) async fn delete_pando_artifact_states(
+    pool: &Pool,
+    store: &RemoteObjectStore,
+    authority_id: Uuid,
+    target: &ObjectKey,
+    expected_generation: Option<i64>,
+    allow_reserved: bool,
+    deadline: Instant,
+) -> Result<bool> {
+    let allowed: &[&str] = if allow_reserved { &["reserved", "active", "retired"] } else { &["active", "retired"] };
     let claim_owner = Uuid::new_v4();
     let obj_gen = {
         let mut client = pool.get().await?;
         let tx = client.transaction().await?;
-        let Some(locked_gen) = lock_unreferenced_pando_artifact(
-            &tx,
-            authority_id,
-            tenant_id,
-            namespace,
-            sha256,
-            expected_generation,
-            &["active", "retired"],
-        )
-        .await?
+        let Some(locked_gen) =
+            lock_unreferenced_pando_artifact(&tx, authority_id, target, expected_generation, allowed).await?
         else {
             tx.commit().await?;
             return Ok(false);
@@ -336,11 +340,11 @@ pub(super) async fn delete_pando_artifact_fenced(
         let marked = tx
             .execute(
                 "UPDATE pando_remote_artifacts \
-                 SET state = 'deleting', claimed_by = $6, claim_generation = claim_generation + 1, \
+                 SET state = 'deleting', reserved_owner = NULL, claimed_by = $6, claim_generation = claim_generation + 1, \
                      lease_until = clock_timestamp() + interval '120 seconds', updated_at = clock_timestamp() \
                  WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
-                   AND object_generation = $5 AND state IN ('active', 'retired')",
-                &[&authority_id, &tenant_id, &namespace, &sha256, &locked_gen, &claim_owner],
+                   AND object_generation = $5 AND (state IN ('active', 'retired') OR ($7 AND state = 'reserved'))",
+                &[&authority_id, &target.tenant_id, &target.namespace, &target.sha256, &locked_gen, &claim_owner, &allow_reserved],
             )
             .await?;
         ensure!(marked == 1, "Pando remote artifact state/generation changed before delete fence");
@@ -348,17 +352,17 @@ pub(super) async fn delete_pando_artifact_fenced(
         locked_gen
     };
 
-    let key = ObjectKey::scoped(tenant_id, authority_id, obj_gen, namespace, sha256)?;
+    let key = ObjectKey::scoped(target.tenant_id, authority_id, obj_gen, &target.namespace, &target.sha256)?;
     store.delete(&key, deadline).await?;
     let client = pool.get().await?;
     let _ = client
         .execute(
             "UPDATE pando_remote_artifacts \
-             SET state = 'deleted', deleted_at = clock_timestamp(), claimed_by = NULL, lease_until = NULL, \
-                 last_error = NULL, updated_at = clock_timestamp() \
+             SET state = 'deleted', deleted_at = clock_timestamp(), reserved_owner = NULL, claimed_by = NULL, \
+                 lease_until = NULL, last_error = NULL, updated_at = clock_timestamp() \
              WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
                AND object_generation = $5 AND state = 'deleting' AND claimed_by = $6",
-            &[&authority_id, &tenant_id, &namespace, &sha256, &obj_gen, &claim_owner],
+            &[&authority_id, &target.tenant_id, &target.namespace, &target.sha256, &obj_gen, &claim_owner],
         )
         .await?;
     Ok(true)
@@ -366,26 +370,18 @@ pub(super) async fn delete_pando_artifact_fenced(
 
 /// Retire an unreferenced authority-scoped Pando artifact under the publisher lock
 /// when remote deletion is disabled or PITR-fenced.
-pub(super) async fn retire_pando_artifact_fenced(
+pub(super) async fn retire_pando_artifact_states(
     pool: &Pool,
     authority_id: Uuid,
-    tenant_id: Uuid,
-    namespace: &str,
-    sha256: &str,
+    target: &ObjectKey,
     expected_generation: Option<i64>,
+    allow_reserved: bool,
 ) -> Result<bool> {
+    let allowed: &[&str] = if allow_reserved { &["reserved", "active"] } else { &["active"] };
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    let Some(locked_gen) = lock_unreferenced_pando_artifact(
-        &tx,
-        authority_id,
-        tenant_id,
-        namespace,
-        sha256,
-        expected_generation,
-        &["active"],
-    )
-    .await?
+    let Some(locked_gen) =
+        lock_unreferenced_pando_artifact(&tx, authority_id, target, expected_generation, allowed).await?
     else {
         tx.commit().await?;
         return Ok(false);
@@ -393,10 +389,11 @@ pub(super) async fn retire_pando_artifact_fenced(
     let updated = tx
         .execute(
             "UPDATE pando_remote_artifacts \
-             SET state = 'retired', retired_at = COALESCE(retired_at, clock_timestamp()), updated_at = clock_timestamp() \
+             SET state = 'retired', reserved_owner = NULL, retired_at = COALESCE(retired_at, clock_timestamp()), \
+                 updated_at = clock_timestamp() \
              WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
-               AND object_generation = $5 AND state = 'active'",
-            &[&authority_id, &tenant_id, &namespace, &sha256, &locked_gen],
+               AND object_generation = $5 AND (state = 'active' OR ($6 AND state = 'reserved'))",
+            &[&authority_id, &target.tenant_id, &target.namespace, &target.sha256, &locked_gen, &allow_reserved],
         )
         .await?;
     ensure!(updated == 1, "Pando remote artifact generation changed during fenced retire");
@@ -437,24 +434,30 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         let tenant = Uuid::new_v4();
 
-        async fn seed(stage: &Path, name: &str, bytes: &[u8]) -> (std::path::PathBuf, String, u64) {
+        async fn seed_key(
+            stage: &Path,
+            store: &RemoteObjectStore,
+            t: Uuid,
+            ns: &str,
+            name: &str,
+            bytes: &[u8],
+            dl: Instant,
+        ) -> (ObjectKey, String) {
             let p = stage.join(name);
             fs::write(&p, bytes).await.unwrap();
-            (p, hex::encode(Sha256::digest(bytes)), bytes.len() as u64)
+            let oid = hex::encode(Sha256::digest(bytes));
+            let key = ObjectKey::new(t, ns, &oid).unwrap();
+            store.put_file(&key, &p, bytes.len() as u64, dl).await.unwrap();
+            (key, oid)
         }
-        let (p_shared, shared_oid, sz_s) = seed(&stage, "shared.bin", b"shared-lfs").await;
-        let (p_uniq, uniq_oid, sz_u) = seed(&stage, "uniq.bin", b"unique-lfs").await;
-        let (p_ws_s, ws_shared_oid, sz_ws) = seed(&stage, "ws-shared.bin", b"shared-ws").await;
-        let (p_ws_u, ws_uniq_oid, sz_wu) = seed(&stage, "ws-uniq.bin", b"unique-ws").await;
-
-        let l_shared_key = ObjectKey::new(tenant, "lfs", &shared_oid).unwrap();
-        let l_uniq_key = ObjectKey::new(tenant, "lfs", &uniq_oid).unwrap();
-        let w_shared_key = ObjectKey::new(tenant, "workspace", &ws_shared_oid).unwrap();
-        let w_uniq_key = ObjectKey::new(tenant, "workspace", &ws_uniq_oid).unwrap();
-        lfs_store.put_file(&l_shared_key, &p_shared, sz_s, deadline).await.unwrap();
-        lfs_store.put_file(&l_uniq_key, &p_uniq, sz_u, deadline).await.unwrap();
-        ws_store.put_file(&w_shared_key, &p_ws_s, sz_ws, deadline).await.unwrap();
-        ws_store.put_file(&w_uniq_key, &p_ws_u, sz_wu, deadline).await.unwrap();
+        let (l_shared_key, shared_oid) =
+            seed_key(&stage, &lfs_store, tenant, "lfs", "shared.bin", b"shared-lfs", deadline).await;
+        let (l_uniq_key, uniq_oid) =
+            seed_key(&stage, &lfs_store, tenant, "lfs", "uniq.bin", b"unique-lfs", deadline).await;
+        let (w_shared_key, ws_shared_oid) =
+            seed_key(&stage, &ws_store, tenant, "workspace", "ws-s.bin", b"shared-ws", deadline).await;
+        let (w_uniq_key, ws_uniq_oid) =
+            seed_key(&stage, &ws_store, tenant, "workspace", "ws-u.bin", b"unique-ws", deadline).await;
 
         let shared_lfs = BTreeSet::from([shared_oid.clone()]);
         let shared_ws = BTreeSet::from([ws_shared_oid.clone()]);

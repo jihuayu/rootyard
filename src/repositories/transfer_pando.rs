@@ -1,6 +1,7 @@
 //! Authority-scoped Pando artifact reservation, copy, rekey verification,
-//! and fence cleanup for repository ownership transfers (#85).
+//! incremental persistence, and rollback cleanup for ownership transfers (#85).
 use super::{
+    purge_exec::{delete_pando_artifact_states, retire_pando_artifact_states},
     remote_copy::copy_object_if_present,
     transfer_exec::parse_tenant_key,
     transfer_model::{CopiedRemoteObject, plan_pando_copy},
@@ -56,24 +57,70 @@ async fn verify_copy_lease(tx: &Transaction<'_>, transfer_id: Uuid, lease_owner:
     Ok(())
 }
 
-fn record_copied_artifact(
+pub(super) async fn persist_copied_objects_tx(
+    tx: &Transaction<'_>,
+    transfer_id: Uuid,
+    lease_owner: &str,
+    lease_epoch: i64,
+    copied: &[CopiedRemoteObject],
+) -> Result<()> {
+    let val = serde_json::to_value(copied)?;
+    let changed = tx
+        .execute(
+            "UPDATE repository_transfers SET copied_objects = $2, updated_at = clock_timestamp() \
+             WHERE id = $1 AND state = 'copying_remote' AND lease_owner = $3 AND lease_epoch = $4",
+            &[&transfer_id, &val, &lease_owner, &lease_epoch],
+        )
+        .await?;
+    ensure!(changed == 1, "transfer lease lost while persisting copied remote objects");
+    Ok(())
+}
+
+pub(super) async fn persist_copied_objects_pool(
+    pool: &Pool,
+    transfer_id: Uuid,
+    lease_owner: &str,
+    lease_epoch: i64,
+    copied: &[CopiedRemoteObject],
+) -> Result<()> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    persist_copied_objects_tx(&tx, transfer_id, lease_owner, lease_epoch, copied).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(super) fn upsert_copied_artifact(
     copied: &mut Vec<CopiedRemoteObject>,
     seen: &mut BTreeSet<(String, String, String)>,
     item: CopiedRemoteObject,
 ) {
     copied.retain(|existing| {
-        let same_src = existing.kind == item.kind && existing.from_key == item.from_key;
-        if same_src && existing.to_key != item.to_key {
+        if existing.kind == item.kind && existing.from_key == item.from_key {
             seen.remove(&(existing.kind.clone(), existing.from_key.clone(), existing.to_key.clone()));
             false
         } else {
             true
         }
     });
-    let sig = (item.kind.clone(), item.from_key.clone(), item.to_key.clone());
-    if seen.insert(sig) {
-        copied.push(item);
-    }
+    seen.insert((item.kind.clone(), item.from_key.clone(), item.to_key.clone()));
+    copied.push(item);
+}
+
+pub(super) fn remove_copied_artifact(
+    copied: &mut Vec<CopiedRemoteObject>,
+    seen: &mut BTreeSet<(String, String, String)>,
+    kind: &str,
+    from_key: &str,
+) {
+    copied.retain(|existing| {
+        if existing.kind == kind && existing.from_key == from_key {
+            seen.remove(&(existing.kind.clone(), existing.from_key.clone(), existing.to_key.clone()));
+            false
+        } else {
+            true
+        }
+    });
 }
 
 async fn copy_single_linked_pando(
@@ -82,8 +129,10 @@ async fn copy_single_linked_pando(
     req: &PandoTransferCopy<'_>,
     item: &LinkedPandoSource,
     src: &ObjectKey,
-    expected: Option<u64>,
-) -> Result<CopiedRemoteObject> {
+    copied: &mut Vec<CopiedRemoteObject>,
+    seen: &mut BTreeSet<(String, String, String)>,
+) -> Result<()> {
+    let expected = u64::try_from(item.size).ok().filter(|&s| s > 0);
     for _ in 0..3 {
         let slot = {
             let mut client = pool.get().await?;
@@ -96,6 +145,20 @@ async fn copy_single_linked_pando(
             let slot = retention::reserve(&*tx, req.to_owner, Some(item.manifest_ids[0]), &item.ns, &item.sha).await?;
             for &mid in &item.manifest_ids[1..] {
                 retention::fence_publication(&*tx, mid, item.auth_id, req.to_owner, &item.ns, &item.sha).await?;
+            }
+            upsert_copied_artifact(
+                copied,
+                seen,
+                CopiedRemoteObject {
+                    kind: item.ns.clone(),
+                    from_key: src.path(),
+                    to_key: slot.key().path(),
+                    size: expected.unwrap_or(0),
+                    sha256: Some(item.sha.clone()),
+                },
+            );
+            if let Some((xfer_id, owner, epoch)) = req.transfer_lease {
+                persist_copied_objects_tx(&tx, xfer_id, owner, epoch, copied).await?;
             }
             tx.commit().await?;
             slot
@@ -124,21 +187,25 @@ async fn copy_single_linked_pando(
                 for &mid in &item.manifest_ids {
                     retention::renew_publication(&*tx, mid).await?;
                 }
+                upsert_copied_artifact(copied, seen, rec);
+                if let Some((xfer_id, owner, epoch)) = req.transfer_lease {
+                    persist_copied_objects_tx(&tx, xfer_id, owner, epoch, copied).await?;
+                }
                 tx.commit().await?;
                 true
             }
         };
         if active {
-            return Ok(rec);
+            return Ok(());
         }
     }
     anyhow::bail!("destination Pando artifact {} reservation was repeatedly superseded", item.sha)
 }
 
 /// Copy linked Pando artifacts through the destination authority's
-/// `reserve -> upload -> activate` + `pando_publication_fences` protocol so
-/// a concurrently deleting generation on `to_owner` is never resurrected,
-/// plus copy any unlinked pre-132 legacy v1 Pando manifests into `to_owner`.
+/// `reserve -> upload -> activate` + `pando_publication_fences` protocol,
+/// persisting every reserved/activated entry incrementally so interruption
+/// or second-object failures always retain a recoverable rollback prefix.
 pub(super) async fn copy_pando_objects_with_store(
     pool: &Pool,
     store: &RemoteObjectStore,
@@ -215,9 +282,7 @@ pub(super) async fn copy_pando_objects_with_store(
         } else {
             ObjectKey::new(req.from_owner, &item.ns, &item.sha)?
         };
-        let expected = u64::try_from(item.size).ok().filter(|&s| s > 0);
-        let rec = copy_single_linked_pando(pool, store, req, &item, &src, expected).await?;
-        record_copied_artifact(copied, seen, rec);
+        copy_single_linked_pando(pool, store, req, &item, &src, copied, seen).await?;
     }
 
     for row in unlinked_manifests {
@@ -235,7 +300,10 @@ pub(super) async fn copy_pando_objects_with_store(
                 if let Some(rec) =
                     copy_object_if_present(store, req.stage_dir, ns, &src, &dst, expected, req.deadline).await?
                 {
-                    record_copied_artifact(copied, seen, rec);
+                    upsert_copied_artifact(copied, seen, rec);
+                    if let Some((xfer_id, owner, epoch)) = req.transfer_lease {
+                        persist_copied_objects_pool(pool, xfer_id, owner, epoch, copied).await?;
+                    }
                 }
             }
         }
@@ -282,9 +350,7 @@ pub(super) async fn verify_pando_rekey_ready_tx(
     }
 
     for row in rows {
-        let auth_id: Uuid = row.get(0);
-        let ns: String = row.get(1);
-        let sha: String = row.get(2);
+        let (auth_id, ns, sha): (Uuid, String, String) = (row.get(0), row.get(1), row.get(2));
         ensure!(auth_id == live_auth, "Pando storage authority rotated before transfer rekey");
         let (copied_auth, copied_gen, copied_path) = copied_map
             .get(&(ns.clone(), sha.clone()))
@@ -312,13 +378,72 @@ pub(super) async fn verify_pando_rekey_ready_tx(
     Ok(true)
 }
 
+/// Remove only this repository's transfer fences on `to_owner` matching the
+/// repository's live manifest owner (before rekey: `from_owner`; after rekey: `to_owner`),
+/// leaving all other publishers' pending fences intact.
 pub(super) async fn clear_transfer_pando_fences_tx(tx: &Transaction<'_>, repo_id: Uuid, to_owner: Uuid) -> Result<()> {
     tx.execute(
         "DELETE FROM pando_publication_fences f \
          USING pando_pack_manifests m \
-         WHERE f.manifest_id = m.id AND m.repository_id = $1 AND f.tenant_id = $2",
+         WHERE f.manifest_id = m.id AND m.repository_id = $1 \
+           AND m.tenant_id = (SELECT owner_id FROM repositories WHERE id = $1) \
+           AND f.tenant_id = $2",
         &[&repo_id, &to_owner],
     )
     .await?;
     Ok(())
+}
+
+/// Delete or retire an authority-scoped destination Pando artifact during rollback
+/// (including crashed `reserved` reservations) and fail closed if it remains
+/// uncleaned without an active sibling manifest reference or pending fence.
+pub(super) async fn rollback_cleanup_pando_artifact(
+    pool: &Pool,
+    pando_remote_allowed: Option<&RemoteObjectStore>,
+    authority_id: Uuid,
+    key: &ObjectKey,
+    obj_gen: i64,
+    deadline: Instant,
+) -> Result<()> {
+    let cleaned = if let Some(store) = pando_remote_allowed {
+        delete_pando_artifact_states(pool, store, authority_id, key, Some(obj_gen), true, deadline).await?
+    } else {
+        retire_pando_artifact_states(pool, authority_id, key, Some(obj_gen), true).await?
+    };
+    if cleaned {
+        return Ok(());
+    }
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT a.state, a.object_generation, \
+                    EXISTS(SELECT 1 FROM pando_manifest_artifacts m \
+                           WHERE m.authority_id = a.authority_id AND m.tenant_id = a.tenant_id \
+                             AND m.namespace = a.namespace AND m.sha256 = a.sha256), \
+                    EXISTS(SELECT 1 FROM pando_publication_fences f \
+                           WHERE f.authority_id = a.authority_id AND f.tenant_id = a.tenant_id \
+                             AND f.namespace = a.namespace AND f.sha256 = a.sha256 \
+                             AND f.lease_until > clock_timestamp()) \
+             FROM pando_remote_artifacts a \
+             WHERE a.authority_id = $1 AND a.tenant_id = $2 AND a.namespace = $3 AND a.sha256 = $4",
+            &[&authority_id, &key.tenant_id, &key.namespace, &key.sha256],
+        )
+        .await?;
+    let Some(r) = row else {
+        return Ok(());
+    };
+    let (state, row_gen, has_manifest, has_fence): (String, i64, bool, bool) = (r.get(0), r.get(1), r.get(2), r.get(3));
+    if row_gen != obj_gen
+        || state == "deleted"
+        || (pando_remote_allowed.is_none() && state == "retired")
+        || has_manifest
+        || has_fence
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "rollback failed to clean unreferenced Pando artifact {}/{} (state={state}, gen={row_gen})",
+        key.namespace,
+        key.sha256
+    )
 }

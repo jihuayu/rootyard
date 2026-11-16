@@ -27,7 +27,7 @@ use std::{
 use tokio::time::Instant;
 use uuid::Uuid;
 
-async fn setup_migrated_pool() -> Option<(Pool, Uuid)> {
+pub(super) async fn setup_migrated_pool() -> Option<(Pool, Uuid)> {
     let base = std::env::var("ROOTYARD_TEST_DATABASE_URL").ok()?;
     let admin = db::pool(&base).unwrap();
     let schema = format!("xfer_pando_full_{}", Uuid::new_v4().simple());
@@ -47,12 +47,12 @@ async fn setup_migrated_pool() -> Option<(Pool, Uuid)> {
     Some((pool, auth_id))
 }
 
-async fn seed_user(pool: &Pool, id: Uuid, prefix: &str) {
+pub(super) async fn seed_user(pool: &Pool, id: Uuid, prefix: &str) {
     let name = format!("{prefix}{}", &id.simple().to_string()[..8]);
     pool.get().await.unwrap().execute("INSERT INTO users(id, username) VALUES($1, $2)", &[&id, &name]).await.unwrap();
 }
 
-async fn seed_transfer_row(
+pub(super) async fn seed_transfer_row(
     c: &Client,
     xfer_id: Uuid,
     repo_id: Uuid,
@@ -72,7 +72,7 @@ async fn seed_transfer_row(
     .unwrap();
 }
 
-async fn seed_linked_repo_manifest(
+pub(super) async fn seed_linked_repo_manifest(
     c: &Client,
     store: &RemoteObjectStore,
     dir: &Path,

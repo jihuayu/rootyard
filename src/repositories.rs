@@ -17,6 +17,8 @@ mod transfer_lease;
 pub mod transfer_model;
 mod transfer_pando;
 #[cfg(test)]
+mod transfer_pando_rollback_tests;
+#[cfg(test)]
 mod transfer_pando_tests;
 pub mod transfer_phases;
 pub mod transfer_remote;
