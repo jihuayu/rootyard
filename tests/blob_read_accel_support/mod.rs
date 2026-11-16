@@ -338,15 +338,6 @@ finite_enum!(StageClass {
     DownloadedLocalIntegrity => "downloaded-local-integrity",
     BitmapPostPlacementHeader => "bitmap-post-placement-header", InconsistentMetrics => "inconsistent-metrics",
 });
-finite_enum!(DetailClass {
-    None => "none", BlobDeadline => "blob-deadline",
-    ReadAccelDeadline => "read-accel-deadline", BlobDigest => "blob-digest",
-    LocalDigestOrLength => "local-digest-or-length", BitmapHeader => "bitmap-header", ReadbackTask => "readback-task",
-    DestinationDirectory => "destination-directory", StagingCreate => "staging-create",
-    StagingWrite => "staging-write", StagingFsync => "staging-fsync", DestinationRename => "destination-rename",
-    DestinationFsync => "destination-fsync", ResourceContextConflict => "resource-context-conflict",
-    BlobAlreadyExists => "blob-already-exists", Unknown => "unknown",
-});
 impl FormatState {
     fn from_format(format: ReadAccelObjectFormat) -> Self {
         match format { ReadAccelObjectFormat::Sha1 => Self::Sha1, ReadAccelObjectFormat::Sha256 => Self::Sha256 }
@@ -448,23 +439,9 @@ impl StageClass {
         }
     }
 }
-impl DetailClass {
-    fn from_label(label: &'static str) -> Self {
-        match label {
-            "none" => Self::None, "blob-deadline" => Self::BlobDeadline,
-            "read-accel-deadline" => Self::ReadAccelDeadline, "blob-digest" => Self::BlobDigest,
-            "local-digest-or-length" => Self::LocalDigestOrLength, "bitmap-header" => Self::BitmapHeader,
-            "readback-task" => Self::ReadbackTask, "destination-directory" => Self::DestinationDirectory,
-            "staging-create" => Self::StagingCreate, "staging-write" => Self::StagingWrite,
-            "staging-fsync" => Self::StagingFsync, "destination-rename" => Self::DestinationRename,
-            "destination-fsync" => Self::DestinationFsync,
-            "resource-context-conflict" => Self::ResourceContextConflict,
-            "blob-already-exists" => Self::BlobAlreadyExists, "unknown" => Self::Unknown, _ => Self::Unknown,
-        }
-    }
-}
-
 mod detail_classifier;
 mod parity;
-pub(super) use detail_classifier::cached_fallback_detail_class;
+mod retention;
+pub(super) use detail_classifier::{DetailClass, cached_fallback_detail_class};
 pub(super) use parity::sha1_and_sha256_parity_and_default_disabled_behavior;
+pub(super) use retention::retention_pin_protects_packs_until_release_and_compaction_rebuild;

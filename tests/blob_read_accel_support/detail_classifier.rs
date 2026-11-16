@@ -53,7 +53,7 @@ fn classify_generated_detail(detail: &str) -> &'static str {
 }
 
 macro_rules! finite_kind_class {
-    ($name:ident, $list:ident, $prefix:literal; $($kind:literal),+ $(,)?) => {
+    ($name:ident, $list:ident, $labels:ident, $prefix:literal; $($kind:literal),+ $(,)?) => {
         fn $name(kind: &str) -> &'static str {
             match kind {
                 $($kind => concat!($prefix, $kind)),+,
@@ -61,12 +61,13 @@ macro_rules! finite_kind_class {
             }
         }
 
-        const $list: &[&str] = &[$($kind),+];
+        const $list: &[&'static str] = &[$($kind),+];
+        const $labels: &[&'static str] = &[$(concat!($prefix, $kind)),+];
     };
 }
 
 // Exact `opendal-core 0.57.0` `ErrorKind` Display values.
-finite_kind_class!(provider_kind_class, PROVIDER_KINDS, "provider-kind/";
+finite_kind_class!(provider_kind_class, PROVIDER_KINDS, PROVIDER_LABELS, "provider-kind/";
     "Unexpected",
     "Unsupported",
     "ConfigInvalid",
@@ -82,7 +83,7 @@ finite_kind_class!(provider_kind_class, PROVIDER_KINDS, "provider-kind/";
 );
 
 // Explicit public stable `std::io::ErrorKind` Debug-name allowlist.
-finite_kind_class!(stream_kind_class, STREAM_KINDS, "stream-kind/";
+finite_kind_class!(stream_kind_class, STREAM_KINDS, STREAM_LABELS, "stream-kind/";
     "NotFound",
     "PermissionDenied",
     "ConnectionRefused",
@@ -169,6 +170,77 @@ fn staging_budget_class(rest: &str) -> &'static str {
         return "unknown";
     };
     if requested > limit { "blob-staging-budget" } else { "unknown" }
+}
+
+const EXISTING_DETAIL_LABELS: &[&'static str] = &[
+    "blob-deadline",
+    "read-accel-deadline",
+    "blob-digest",
+    "local-digest-or-length",
+    "bitmap-header",
+    "readback-task",
+    "destination-directory",
+    "staging-create",
+    "staging-write",
+    "staging-fsync",
+    "destination-rename",
+    "destination-fsync",
+    "resource-context-conflict",
+    "blob-already-exists",
+];
+
+const LENGTH_MISMATCH_LABELS: &[&'static str] = &[
+    "blob-length-mismatch/expected-lt-actual",
+    "blob-length-mismatch/expected-eq-actual",
+    "blob-length-mismatch/expected-gt-actual",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DetailClass(&'static str);
+
+impl DetailClass {
+    const UNKNOWN: Self = Self("unknown");
+
+    pub(super) fn from_label(label: &'static str) -> Self {
+        if audited_detail_label(label) { Self(label) } else { Self::UNKNOWN }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        self.0
+    }
+}
+
+fn audited_detail_label(label: &'static str) -> bool {
+    label == "none"
+        || label == "unknown"
+        || EXISTING_DETAIL_LABELS.contains(&label)
+        || LENGTH_MISMATCH_LABELS.contains(&label)
+        || label == "blob-staging-budget"
+        || PROVIDER_LABELS.contains(&label)
+        || STREAM_LABELS.contains(&label)
+}
+
+pub(super) fn assert_detail_label_adapter_contract() {
+    for &label in EXISTING_DETAIL_LABELS
+        .iter()
+        .chain(PROVIDER_LABELS)
+        .chain(STREAM_LABELS)
+        .chain(LENGTH_MISMATCH_LABELS)
+        .chain(["blob-staging-budget", "none", "unknown"].iter())
+    {
+        assert_eq!(DetailClass::from_label(label).label(), label);
+    }
+
+    for label in [
+        "provider-kind/Bogus",
+        "stream-kind/Uncategorized",
+        "blob-length-mismatch/expected-unknown-actual",
+        "blob-staging-budget trailing",
+        "blob-deadline trailing",
+        "some arbitrary detail",
+    ] {
+        assert_eq!(DetailClass::from_label(label).label(), "unknown");
+    }
 }
 
 pub(super) fn assert_detail_classifier_contract() {
