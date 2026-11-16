@@ -217,7 +217,7 @@ impl PgServingRetentionRoots {
         let mut stage = RootCreateFailureStage::PreflightOrReplay;
         let result = self.create_with_ownership_inner(pool, actor, input, deadline, ownership, &mut stage).await;
         if let Err(error) = &result {
-            let error_class = root_create_error_class(stage, error);
+            let error_class = Self::root_create_error_class(stage, error);
             crate::observability::observe_root_create_failure(stage, error_class, error.0.as_u16());
         }
         result
