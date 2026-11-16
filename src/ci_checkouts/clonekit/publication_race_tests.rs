@@ -140,7 +140,7 @@ fn older_publisher_paused_before_lock_loses_to_newer_publication() {
 }
 
 #[test]
-fn same_generation_race_has_one_winner_and_no_mixed_generation() {
+fn empty_same_generation_race_still_rejects_after_winner() {
     let _serial = test_seam::serial();
     test_seam::reset();
     let td = TempDir::new().expect("tempdir");
