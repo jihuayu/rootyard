@@ -434,6 +434,7 @@ def build_git_http_env(base_env: dict[str, str], askpass_path: Path, token_secre
 
 def write_askpass_script(path: Path) -> Path:
     """Create 0700 askpass script reading username/password from env (never argv)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         bat = path.with_suffix(".cmd")
         bat.write_text(
