@@ -18,7 +18,7 @@ use super::protocol::{
 use crate::workspace_lab::fuse_mount::FreezeDecision;
 use std::{
     collections::HashMap,
-    io,
+    io::{self, Write},
     net::Shutdown,
     os::{
         fd::{AsRawFd, OwnedFd, RawFd},
