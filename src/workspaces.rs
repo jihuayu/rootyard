@@ -42,6 +42,20 @@ mod snapshot_tests;
 
 pub use shutdown::{capture_shutdown_grace, stop_capture_before_helper};
 
+static PROCESS_CLEANUP_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that some native Git process group could not be proved quiescent.
+/// This is a process-wide shutdown fact: a later clean join cannot erase it.
+pub(crate) fn mark_process_cleanup_failure() {
+    PROCESS_CLEANUP_FAILED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether any native Git process-group cleanup failed to prove quiescence.
+/// This remains true for the life of the process.
+pub fn process_cleanup_failed() -> bool {
+    PROCESS_CLEANUP_FAILED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 use crate::AppState;
 use axum::{
     Router,
@@ -54,6 +68,17 @@ pub use service::fence_restored;
 /// provide this guarantee; retry an unknown mutation with the same key.
 pub async fn drain_git_jobs(grace: std::time::Duration) {
     git::drain(grace).await;
+}
+
+/// Close new workspace Git admission while already accepted jobs remain owned.
+pub fn close_git_admission() {
+    git::close_admission();
+}
+
+/// Join the retained owned Git set within the caller's one shutdown deadline.
+/// Returns false on any missed join, cancelled/failed job, or deadline expiry.
+pub async fn drain_git_jobs_until(deadline: tokio::time::Instant) -> bool {
+    git::drain_until(deadline).await
 }
 use std::sync::Arc;
 

@@ -342,54 +342,124 @@ async fn run() -> Result<()> {
             let session_gc_task =
                 tokio::spawn(rootyard::web::session_gc::run(state.pool.clone(), session_gc_stop.clone()));
             // A disconnected client must not cancel a started workspace Git
-            // mutation: owned jobs finish under the normal Git deadline
-            // before the runtime exits. \`router\` consumes the state Arc, so
-            // the drain grace is computed before serving.
+            // mutation. Keep the serving future owned, but do not await its
+            // in-flight requests before the helper has had a chance to unmount
+            // and release a FUSE-parked Git child. `router` consumes the state
+            // Arc, so the one shutdown deadline is computed before serving.
             let git_shutdown_grace = state.config.git_timeout + std::time::Duration::from_secs(30);
-            axum::serve(
-                listener,
-                rootyard::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(shutdown())
-            .await?;
-            rootyard::workspaces::drain_git_jobs(git_shutdown_grace).await;
-            // Capture is the only remaining helper producer after HTTP and Git
-            // drain. Request its stop and await confirmed release within one
-            // bounded grace before helper teardown. If confirmation times out,
-            // helper fence/unmount/join still runs as the backstop and the
-            // shutdown returns an error instead of claiming a drained producer.
-            rootyard::workspaces::stop_capture_before_helper(
+            let http_stop = tokio_util::sync::CancellationToken::new();
+            let http_stop_for_server = http_stop.clone();
+            let mut server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    rootyard::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move { http_stop_for_server.cancelled().await })
+                .await
+            });
+            tokio::select! {
+                _ = shutdown() => {}
+                joined = &mut server => {
+                    return match joined {
+                        Ok(Ok(())) => bail!("HTTP server stopped before the normal shutdown signal"),
+                        Ok(Err(error)) => Err(error.into()),
+                        Err(error) => Err(error.into()),
+                    };
+                }
+            }
+            let shutdown_deadline = tokio::time::Instant::now() + git_shutdown_grace;
+            http_stop.cancel();
+            // The existing Git capacity/job ownership is the mutation admission
+            // mechanism. Already accepted jobs keep their permits and JoinSet
+            // ownership; only new acquisition is refused from here on.
+            rootyard::workspaces::close_git_admission();
+            let mut failures: Vec<&'static str> = Vec::new();
+            let capture_grace = rootyard::workspaces::capture_shutdown_grace().min(remaining_until(shutdown_deadline));
+            if rootyard::workspaces::stop_capture_before_helper(
                 workspace_capture_stop,
                 workspace_capture_task,
-                rootyard::workspaces::capture_shutdown_grace(),
+                capture_grace,
                 async {
                     rootyard::workspaces::mounts::shutdown_helper()
                         .await
                         .map_err(|_| anyhow::anyhow!("workspace FUSE helper shutdown failed"))
                 },
             )
-            .await?;
+            .await
+            .is_err()
+            {
+                failures.push("workspace capture/helper shutdown did not complete cleanly");
+            }
+            // The helper has fenced and unmounted before this join. The retained
+            // Git set consumes only the remaining shared deadline; it is never
+            // dropped/cancelled on expiry.
+            if !rootyard::workspaces::drain_git_jobs_until(shutdown_deadline).await {
+                failures.push("owned workspace Git jobs/process cleanup did not complete cleanly");
+            }
+            match tokio::time::timeout_at(shutdown_deadline, &mut server).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(_))) | Ok(Err(_)) => failures.push("HTTP server did not stop cleanly"),
+                Err(_) => {
+                    server.abort();
+                    failures.push("HTTP server did not join within the shutdown deadline");
+                }
+            }
             worker.abort();
+            if join_aborted_until(shutdown_deadline, worker).await.is_err() {
+                failures.push("background worker did not stop cleanly");
+            }
             maintenance_stop.cancel();
             session_gc_stop.cancel();
-            let _ = session_gc_task.await;
+            if join_task_until(shutdown_deadline, session_gc_task).await.is_err() {
+                failures.push("session GC task did not join cleanly");
+            }
             if let Some(task) = controller_task {
                 task.abort();
+                if join_aborted_until(shutdown_deadline, task).await.is_err() {
+                    failures.push("sharding controller did not stop cleanly");
+                }
             }
             if let Some(task) = maintenance_task {
-                task.await??;
+                match join_task_until(shutdown_deadline, task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => failures.push("workspace maintenance task did not stop cleanly"),
+                }
             }
             dispatch_stop.cancel();
-            let _ = publish_task.await;
+            if join_task_until(shutdown_deadline, publish_task).await.is_err() {
+                failures.push("dispatch publisher did not stop cleanly");
+            }
             if let Some(task) = delivery_task {
-                let _ = task.await;
+                if join_task_until(shutdown_deadline, task).await.is_err() {
+                    failures.push("dispatch delivery worker did not stop cleanly");
+                }
             }
             if let Some(task) = webhook_task {
-                let _ = task.await;
+                if join_task_until(shutdown_deadline, task).await.is_err() {
+                    failures.push("webhook worker did not stop cleanly");
+                }
             }
             if let Some(metrics_worker) = metrics_worker {
                 metrics_worker.abort();
+                if join_aborted_until(shutdown_deadline, metrics_worker).await.is_err() {
+                    failures.push("metrics worker did not stop cleanly");
+                }
             }
+            // A request that passed the old capacity admission immediately before
+            // the close can spawn its owned job after the first drain snapshot.
+            // The serving future and every background producer are joined now, so
+            // this second same-deadline drain catches that late ownership without
+            // resetting or extending the budget.
+            if !rootyard::workspaces::drain_git_jobs_until(shutdown_deadline).await {
+                failures.push("late owned workspace Git jobs/process cleanup did not complete cleanly");
+            }
+            if rootyard::workspaces::process_cleanup_failed() {
+                failures.push("native Git process cleanup did not prove quiescence");
+            }
+            if failures.is_empty() {
+                return Ok(());
+            }
+            bail!("normal shutdown incomplete: {}", failures.join("; "))
         }
         _ => bail!(
             "usage: rootyard [serve | serve-blob | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | pando-authority status|verify|isolate --confirm-shared-bucket|pin-recovery-point|release-recovery-point | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132 | --allow-legacy-schema133 | --allow-legacy-schema134 | --allow-legacy-schema135 | --allow-legacy-schema136 | --allow-legacy-schema137 | --allow-legacy-schema138 | --allow-legacy-schema139 | --allow-legacy-schema140 | --allow-legacy-schema141 | --allow-legacy-schema142 | --allow-legacy-schema143]]"
@@ -430,4 +500,38 @@ async fn shutdown() {
     let mut term =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("install SIGTERM handler");
     tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
+}
+
+fn remaining_until(deadline: tokio::time::Instant) -> std::time::Duration {
+    let now = tokio::time::Instant::now();
+    if deadline <= now { std::time::Duration::ZERO } else { deadline - now }
+}
+
+async fn join_task_until<T>(
+    deadline: tokio::time::Instant,
+    mut task: tokio::task::JoinHandle<T>,
+) -> Result<T, &'static str> {
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err("shutdown task ended abnormally"),
+        Err(_) => {
+            task.abort();
+            Err("shutdown task did not join within the deadline")
+        }
+    }
+}
+
+async fn join_aborted_until<T>(
+    deadline: tokio::time::Instant,
+    mut task: tokio::task::JoinHandle<T>,
+) -> Result<(), &'static str> {
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) if error.is_cancelled() => Ok(()),
+        Ok(Err(_)) => Err("aborted shutdown task failed"),
+        Err(_) => {
+            task.abort();
+            Err("aborted shutdown task did not join within the deadline")
+        }
+    }
 }

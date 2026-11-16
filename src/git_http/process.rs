@@ -12,6 +12,7 @@ impl Process {
         // Observe leader exit without reaping it: the unreaped PID reserves the
         // process-group ID while we clean any surviving descendants. Tokio's
         // Child::wait would reap too early for a safe group signal afterwards.
+        let deadline = Instant::now() + super::revocation::bound().stop_grace;
         loop {
             let exited = {
                 let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
@@ -24,6 +25,7 @@ impl Process {
                     )
                 };
                 if result != 0 {
+                    crate::workspaces::mark_process_cleanup_failure();
                     return Err(io::Error::last_os_error());
                 }
                 unsafe { info.assume_init().si_pid() != 0 }
@@ -31,22 +33,35 @@ impl Process {
             if exited {
                 break;
             }
+            if Instant::now() >= deadline {
+                crate::workspaces::mark_process_cleanup_failure();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Git process group leader exit did not become observable",
+                ));
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         unsafe {
             libc::kill(-self.pid, libc::SIGKILL);
         }
-        self.wait_group_quiescent().await;
-        let status = self.child.wait().await?;
+        if !wait_group_quiescent_until(self.pid, deadline).await {
+            crate::workspaces::mark_process_cleanup_failure();
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "Git process group cleanup did not prove quiescence"));
+        }
+        let status = match self.child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                crate::workspaces::mark_process_cleanup_failure();
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "Git process group leader was not reaped"));
+            }
+            Err(error) => {
+                crate::workspaces::mark_process_cleanup_failure();
+                return Err(error);
+            }
+        };
         self.pid = 0;
         Ok(status)
-    }
-    async fn wait_group_quiescent(&self) {
-        wait_pid_group_quiescent(
-            self.pid,
-            "rootyard: process group cleanup blocked; retaining write lock and capacity",
-        )
-        .await;
     }
     pub(super) async fn stop(&mut self) {
         let grace = super::revocation::bound().stop_grace;
@@ -59,16 +74,32 @@ impl Process {
         if self.pid <= 0 {
             return;
         }
-        // Keep the leader unreaped for the entire grace period. Otherwise an
-        // early leader exit could permit PGID reuse while descendants remain.
-        terminate_group_with_grace(
+        let started = Instant::now();
+        let term_deadline = started + grace / 2;
+        let final_deadline = started + grace;
+        let quiescent = terminate_group_until(
             self.pid,
-            grace,
+            term_deadline,
+            final_deadline,
             "rootyard: process group cleanup blocked; retaining write lock and capacity",
         )
         .await;
-        let _ = self.child.wait().await;
-        self.pid = 0;
+        if quiescent {
+            // Reaping is safe only after the group is quiet. If the leader is not
+            // yet reapable, retain the PID reservation rather than claiming it.
+            match self.child.try_wait() {
+                Ok(Some(_)) => self.pid = 0,
+                _ => {
+                    crate::workspaces::mark_process_cleanup_failure();
+                    eprintln!(
+                        "rootyard: process group quiescent but leader reaping not proven; retaining process-group ownership"
+                    );
+                }
+            }
+        } else {
+            crate::workspaces::mark_process_cleanup_failure();
+            eprintln!("rootyard: process group cleanup did not prove quiescence; retaining process-group ownership");
+        }
     }
 }
 pub(crate) fn group_quiescent(group: i32) -> io::Result<bool> {
@@ -156,6 +187,52 @@ pub(crate) async fn kill_group_child(child: &mut Child) -> io::Result<()> {
     Ok(())
 }
 
+async fn terminate_group_until(pid: i32, term_deadline: Instant, final_deadline: Instant, warn: &str) -> bool {
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
+    loop {
+        if matches!(group_quiescent(pid), Ok(true)) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= term_deadline {
+            break;
+        }
+        let step = (term_deadline - now).min(std::time::Duration::from_millis(10));
+        tokio::time::sleep(step).await;
+    }
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    loop {
+        if matches!(group_quiescent(pid), Ok(true)) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= final_deadline {
+            eprintln!("{warn}");
+            return false;
+        }
+        let step = (final_deadline - now).min(std::time::Duration::from_millis(10));
+        tokio::time::sleep(step).await;
+    }
+}
+
+async fn wait_group_quiescent_until(pid: i32, deadline: Instant) -> bool {
+    loop {
+        if matches!(group_quiescent(pid), Ok(true)) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let step = (deadline - now).min(std::time::Duration::from_millis(10));
+        tokio::time::sleep(step).await;
+    }
+}
+
 pub(crate) async fn terminate_group_with_grace(pid: i32, grace: std::time::Duration, warn: &str) {
     unsafe {
         libc::kill(-pid, libc::SIGTERM);
@@ -198,26 +275,37 @@ async fn wait_pid_group_quiescent(pid: i32, warn: &str) {
 impl Drop for Process {
     fn drop(&mut self) {
         // The process group covers http-backend, receive/upload-pack and their workers.
-        // A cancelled read future drops this Process before its caller releases
-        // the local snapshot gate. Wait here, even on a Tokio worker thread:
-        // SIGKILL delivery alone does not stop descendants before physical GC.
+        // Drop cannot await. Use the existing revocation stop grace as a synchronous
+        // final bound; never wait forever on a FUSE-parked descendant. If quiescence
+        // is not proved, leave the PID reservation and report failure rather than
+        // claiming the group was reaped.
         if self.pid > 0 {
             unsafe {
                 libc::kill(-self.pid, libc::SIGKILL);
             }
-            let started = Instant::now();
-            let mut reported = false;
-            while !matches!(group_quiescent(self.pid), Ok(true)) {
-                if !reported && started.elapsed() > std::time::Duration::from_secs(5) {
-                    eprintln!("rootyard: cancelled Git process group cleanup blocked; retaining snapshot gate");
-                    reported = true;
+            let deadline = std::time::Instant::now() + super::revocation::bound().stop_grace;
+            loop {
+                if matches!(group_quiescent(self.pid), Ok(true)) {
+                    match self.child.try_wait() {
+                        Ok(Some(_)) => self.pid = 0,
+                        _ => {
+                            crate::workspaces::mark_process_cleanup_failure();
+                            eprintln!(
+                                "rootyard: cancelled Git process group quiescent but leader reaping not proven; shutdown fails closed"
+                            );
+                        }
+                    }
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    crate::workspaces::mark_process_cleanup_failure();
+                    eprintln!(
+                        "rootyard: cancelled Git process group cleanup did not prove quiescence; shutdown fails closed rather than claiming reaping"
+                    );
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            // The unreaped leader reserved the process-group ID throughout the
-            // wait. Reaping is safe only after the group is quiescent.
-            let _ = self.child.try_wait();
-            self.pid = 0;
         }
         if let Some(input) = &self.input {
             input.abort();

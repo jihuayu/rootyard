@@ -1,9 +1,12 @@
 //! Ordered, bounded shutdown for the workspace capture producer and its helper.
 //!
-//! The HTTP server and owned Git jobs are drained before this module runs. The
-//! only remaining helper producer is the background capture worker, plus scan
-//! jobs that may have outlived their caller's scan deadline. Capture is asked
-//! to stop and its release is awaited within one total absolute grace; a
+//! The HTTP server has been asked to stop admission and the owned Git jobs are
+//! retained by the caller, not joined here. This module stops the capture
+//! producer, drains accepted scans and invokes the exact-owner helper before
+//! the caller joins the retained HTTP/Git work. The only helper producers are
+//! the background capture worker and scan jobs that may have outlived their
+//! caller's scan deadline. Capture is asked to stop and its release is awaited
+//! within one total absolute grace; a
 //! reserved slice of that grace is used to confirm an abort request before the
 //! helper fences and unmounts. A blind `await` can wait forever on a parked
 //! scan, so a confirmation timeout still runs the helper backstop, returns an
@@ -33,7 +36,8 @@ pub fn capture_shutdown_grace() -> Duration {
 /// Cancel the capture producer, await its release and drain accepted scans with
 /// every wait bounded by one absolute deadline, then unconditionally attempt
 /// helper teardown with its existing bounded fence/unmount/join and
-/// child-process grace.
+/// child-process grace. Helper teardown deliberately precedes the caller's
+/// retained HTTP/Git joins so a FUSE-parked Git child can be released.
 ///
 /// The total grace is not extended: a reserved confirmation slice is taken from
 /// inside it. If capture does not release before the earlier cooperative
