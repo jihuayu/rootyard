@@ -166,10 +166,8 @@ pub async fn collect_purge_preconditions(
         repo_id,
     )
     .await?;
-    let active_ci_pins = crate::ci_pins::roots::active_pinned_oids(state, repo_id, storage_generation)
-        .await
-        .map_err(Error::internal)?
-        .len();
+    let active_ci_pins =
+        crate::ci_pins::active_pinned_oids(state, repo_id, storage_generation).await.map_err(Error::internal)?.len();
 
     let pre = PurgePreconditions {
         deleted,

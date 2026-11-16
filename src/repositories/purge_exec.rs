@@ -80,15 +80,15 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         let tenant = Uuid::new_v4();
 
-        let seed = |name: &str, bytes: &[u8]| async {
+        async fn seed(stage: &Path, name: &str, bytes: &[u8]) -> (std::path::PathBuf, String, u64) {
             let p = stage.join(name);
             fs::write(&p, bytes).await.unwrap();
             (p, hex::encode(Sha256::digest(bytes)), bytes.len() as u64)
-        };
-        let (p_shared, shared_oid, sz_s) = seed("shared.bin", b"shared-lfs").await;
-        let (p_uniq, uniq_oid, sz_u) = seed("uniq.bin", b"unique-lfs").await;
-        let (p_ws_s, ws_shared_oid, sz_ws) = seed("ws-shared.bin", b"shared-ws").await;
-        let (p_ws_u, ws_uniq_oid, sz_wu) = seed("ws-uniq.bin", b"unique-ws").await;
+        }
+        let (p_shared, shared_oid, sz_s) = seed(&stage, "shared.bin", b"shared-lfs").await;
+        let (p_uniq, uniq_oid, sz_u) = seed(&stage, "uniq.bin", b"unique-lfs").await;
+        let (p_ws_s, ws_shared_oid, sz_ws) = seed(&stage, "ws-shared.bin", b"shared-ws").await;
+        let (p_ws_u, ws_uniq_oid, sz_wu) = seed(&stage, "ws-uniq.bin", b"unique-ws").await;
 
         let l_shared_key = ObjectKey::new(tenant, "lfs", &shared_oid).unwrap();
         let l_uniq_key = ObjectKey::new(tenant, "lfs", &uniq_oid).unwrap();

@@ -91,11 +91,12 @@ async fn prepare_transfer(
         let stored_row = existing.as_ref().and_then(|r| {
             let hash: &str = r.get(0);
             let status: i32 = r.get(1);
-            let body: &Value = r.get(2);
+            let body: Value = r.get(2);
             i16::try_from(status).ok().map(|s| (hash, s, body))
         });
         let expected_v = input.expected_version.unwrap_or(0);
-        if let Some(replay) = decide_idempotent_cas(stored_row, req_hash, actual_version, expected_v)? {
+        let stored_ref = stored_row.as_ref().map(|(h, s, b)| (*h, *s, b));
+        if let Some(replay) = decide_idempotent_cas(stored_ref, req_hash, actual_version, expected_v)? {
             auth::finish_tx(tx, actor, false).await?;
             return Ok(Err(replay));
         }
