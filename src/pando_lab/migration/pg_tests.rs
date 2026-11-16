@@ -16,10 +16,15 @@ fn config_for(label: &str) -> (Config, PathBuf) {
     let database = std::env::var("ROOTYARD_TEST_DATABASE_URL")
         .expect("ROOTYARD_TEST_DATABASE_URL must be set when running the ignored migration PG cases");
     assert!(!database.trim().is_empty(), "ROOTYARD_TEST_DATABASE_URL must not be empty");
-    assert!(
-        std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_none(),
-        "migration PG cases require the local-CAS fixture; unset ROOTYARD_OBJECT_STORE_ENDPOINT"
-    );
+    // Preflight every production override that could escape the temporary
+    // fixture root or select a non-Local provider. Presence only: never read or
+    // print the external values, and never mutate process-global environment
+    // from parallel Rust tests. This runs before any temp directory or DB row.
+    for name in
+        ["PANDO_OBJECT_STORE_ROOT", "PANDO_KMS_KEYRING_DIR", "PANDO_KMS_PROVIDER", "ROOTYARD_OBJECT_STORE_ENDPOINT"]
+    {
+        assert!(std::env::var_os(name).is_none(), "migration PG cases require an owned fixture; unset {name}");
+    }
     let root = std::env::temp_dir().join(format!("pando-migration-pg-{label}-{}", Uuid::new_v4()));
     std::fs::create_dir_all(root.join("objects")).unwrap();
     std::fs::create_dir_all(root.join("sessions")).unwrap();
