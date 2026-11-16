@@ -2962,6 +2962,9 @@ async fn deadline_on_inflight_commit_returns_no_value_for_create_and_renew() -> 
 async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_it() -> Result<()> {
     let db = Db::setup().await?;
     let outcome = async {
+        // The first advance publishes exactly these bytes in a one-file tree;
+        // the historical read below must observe that same captured content.
+        const FIRST_ADVANCE_CONTENT: &[u8] = b"serving metadata advance\n";
         let store = open_store()?;
         let git = git_binary()?;
         let (tenant, repo, actor, backend) = db.serving_business("serving-metadata", &store).await?;
@@ -3008,7 +3011,8 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
 
         // Advance refs and the gate through the real decision-gated publication
         // path; the same create key must still replay the original capture.
-        serving_advance(&db, &store, &git, &mut verified, &actor, 2, b"serving metadata advance\n").await?;
+        serving_advance(&db, &store, &git, &mut verified, &actor, 2, FIRST_ADVANCE_CONTENT).await?;
+        let first_advance_head = verified.commit_oid.clone();
         ensure!(
             gate_version(&db.pool, repo, tenant).await?.revision() > first_gate,
             "decision-gated advance did not move the gate"
@@ -3184,6 +3188,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         let owned_b_gate = owned_b.receipt.gate_revision();
         let owned_b_counts = snapshot_counts(&db.pool, repo).await?;
         serving_advance(&db, &store, &git, &mut verified, &actor, 3, b"serving metadata owned advance\n").await?;
+        let second_advance_head = verified.commit_oid.clone();
         let owned_b_replay = PgServingSnapshotMetadata
             .create_actor_owned(&db.pool, &admin_producer, owned_b_create, &backend, deadline())
             .await?;
@@ -3221,6 +3226,14 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         ensure!(!owned_b_read.packs().is_empty(), "actor-owned capture has no registered pack");
         let owned_b_head =
             owned_b_read.head_oid_hex().ok_or_else(|| anyhow!("actor-owned captured head is missing"))?.to_owned();
+        ensure!(
+            owned_b_head == first_advance_head,
+            "actor-owned historical head is not the captured first advance commit"
+        );
+        ensure!(
+            owned_b_head != second_advance_head,
+            "actor-owned historical head followed the later advance"
+        );
         let materializer = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
         let owned_view = PgServingSnapshotMetadata
             .materialize_actor_owned(
@@ -3248,9 +3261,8 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             assert_pack_identity(expected, actual)?;
         }
         ensure!(
-            read_materialized_file(&owned_view, &git, &owned_b_head, "file.txt").await?
-                == b"serving snapshot fixture\n",
-            "actor-owned materialized Git content differs"
+            read_materialized_file(&owned_view, &git, &owned_b_head, "advance.txt").await? == FIRST_ADVANCE_CONTENT,
+            "actor-owned materialized Git content is not the captured first advance"
         );
 
         // The tenant Admin is authorized but is not the owned snapshot's actor;
