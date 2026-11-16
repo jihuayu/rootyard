@@ -257,9 +257,9 @@ async fn incremental_copied_objects_persist_recovers_after_second_object_failure
     .unwrap();
     seed_transfer_row(&c, xfer_id, repo_id, from_owner, to_owner, "inc-repo", "w1").await;
 
-    // Allow 1st artifact copy + read-back verification (`GET` #0 & #1), fail 2nd artifact's `GET` (#2).
+    // Allow 1st artifact transfer (src GET #0, LegacyS3Store verify GET #1, put_file readback GET #2); fail 2nd GET (#3).
     mock.gets.store(0, Ordering::SeqCst);
-    mock.fail_gets_after.store(2, Ordering::SeqCst);
+    mock.fail_gets_after.store(3, Ordering::SeqCst);
     let (mut copied, mut seen) = (Vec::new(), BTreeSet::new());
     let copy_err = copy_pando_objects_with_store(
         &pool,
@@ -286,6 +286,20 @@ async fn incremental_copied_objects_persist_recovers_after_second_object_failure
     let rec = load_record_with_lock(&tx_rec, xfer_id, false).await.unwrap();
     tx_rec.commit().await.unwrap();
     assert_eq!(rec.copied_objects.len(), 2, "durable record captured activated 1st and reserved 2nd artifacts");
+    for (ns, sha, expected_state) in
+        [(retention::NAMESPACE_CIPHER, &sha_1, "active"), (retention::NAMESPACE_ENVELOPE, &sha_2, "reserved")]
+    {
+        assert_eq!(
+            c.query_one(
+                "SELECT state FROM pando_remote_artifacts WHERE authority_id=$1 AND tenant_id=$2 AND namespace=$3 AND sha256=$4",
+                &[&auth_id, &to_owner, &ns, sha],
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            expected_state
+        );
+    }
     let dst_1 = parse_tenant_key(to_owner, &rec.copied_objects[0].to_key).unwrap();
     assert!(store.head(&dst_1, deadline).await.unwrap().is_some());
 

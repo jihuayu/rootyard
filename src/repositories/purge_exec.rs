@@ -267,7 +267,8 @@ async fn lock_unreferenced_pando_artifact(
     }
     let Some(row) = tx
         .query_opt(
-            "SELECT state, object_generation FROM pando_remote_artifacts \
+            "SELECT state, object_generation, (lease_until IS NULL OR lease_until <= clock_timestamp()) \
+             FROM pando_remote_artifacts \
              WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 FOR UPDATE",
             &[&authority_id, &target.tenant_id, &target.namespace, &target.sha256],
         )
@@ -275,9 +276,11 @@ async fn lock_unreferenced_pando_artifact(
     else {
         return Ok(None);
     };
-    let state: String = row.get(0);
-    let obj_gen: i64 = row.get(1);
-    if expected_generation.is_some_and(|exp| exp != obj_gen) || !allowed_states.contains(&state.as_str()) {
+    let (state, obj_gen, lease_expired): (String, i64, bool) = (row.get(0), row.get(1), row.get(2));
+    if expected_generation.is_some_and(|exp| exp != obj_gen)
+        || !allowed_states.contains(&state.as_str())
+        || (state == "deleting" && !lease_expired)
+    {
         return Ok(None);
     }
     let referenced: bool = tx
@@ -326,7 +329,8 @@ pub(super) async fn delete_pando_artifact_states(
     allow_reserved: bool,
     deadline: Instant,
 ) -> Result<bool> {
-    let allowed: &[&str] = if allow_reserved { &["reserved", "active", "retired"] } else { &["active", "retired"] };
+    let allowed: &[&str] =
+        if allow_reserved { &["reserved", "active", "retired", "deleting"] } else { &["active", "retired"] };
     let claim_owner = Uuid::new_v4();
     let obj_gen = {
         let mut client = pool.get().await?;
@@ -343,7 +347,9 @@ pub(super) async fn delete_pando_artifact_states(
                  SET state = 'deleting', reserved_owner = NULL, claimed_by = $6, claim_generation = claim_generation + 1, \
                      lease_until = clock_timestamp() + interval '120 seconds', updated_at = clock_timestamp() \
                  WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
-                   AND object_generation = $5 AND (state IN ('active', 'retired') OR ($7 AND state = 'reserved'))",
+                   AND object_generation = $5 \
+                   AND (state IN ('active', 'retired') OR ($7 AND (state = 'reserved' \
+                        OR (state = 'deleting' AND (lease_until IS NULL OR lease_until <= clock_timestamp())))))",
                 &[&authority_id, &target.tenant_id, &target.namespace, &target.sha256, &locked_gen, &claim_owner, &allow_reserved],
             )
             .await?;
@@ -353,7 +359,29 @@ pub(super) async fn delete_pando_artifact_states(
     };
 
     let key = ObjectKey::scoped(target.tenant_id, authority_id, obj_gen, &target.namespace, &target.sha256)?;
-    store.delete(&key, deadline).await?;
+    if let Err(err) = store.delete(&key, deadline).await {
+        if let Ok(client) = pool.get().await {
+            let err_msg: String = err.to_string().chars().take(512).collect();
+            let _ = client
+                .execute(
+                    "UPDATE pando_remote_artifacts \
+                     SET lease_until = NULL, last_error = $7, updated_at = clock_timestamp() \
+                     WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
+                       AND object_generation = $5 AND state = 'deleting' AND claimed_by = $6",
+                    &[
+                        &authority_id,
+                        &target.tenant_id,
+                        &target.namespace,
+                        &target.sha256,
+                        &obj_gen,
+                        &claim_owner,
+                        &err_msg,
+                    ],
+                )
+                .await;
+        }
+        return Err(err);
+    }
     let client = pool.get().await?;
     let _ = client
         .execute(
@@ -434,58 +462,35 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         let tenant = Uuid::new_v4();
 
-        async fn seed_key(
-            stage: &Path,
-            store: &RemoteObjectStore,
+        async fn put_one(
+            st: &Path,
+            r: &RemoteObjectStore,
             t: Uuid,
             ns: &str,
-            name: &str,
-            bytes: &[u8],
+            b: &[u8],
             dl: Instant,
         ) -> (ObjectKey, String) {
-            let p = stage.join(name);
-            fs::write(&p, bytes).await.unwrap();
-            let oid = hex::encode(Sha256::digest(bytes));
-            let key = ObjectKey::new(t, ns, &oid).unwrap();
-            store.put_file(&key, &p, bytes.len() as u64, dl).await.unwrap();
-            (key, oid)
+            let oid = hex::encode(Sha256::digest(b));
+            let p = st.join(format!("{ns}-{oid}.bin"));
+            fs::write(&p, b).await.unwrap();
+            let k = ObjectKey::new(t, ns, &oid).unwrap();
+            r.put_file(&k, &p, b.len() as u64, dl).await.unwrap();
+            (k, oid)
         }
-        let (l_shared_key, shared_oid) =
-            seed_key(&stage, &lfs_store, tenant, "lfs", "shared.bin", b"shared-lfs", deadline).await;
-        let (l_uniq_key, uniq_oid) =
-            seed_key(&stage, &lfs_store, tenant, "lfs", "uniq.bin", b"unique-lfs", deadline).await;
-        let (w_shared_key, ws_shared_oid) =
-            seed_key(&stage, &ws_store, tenant, "workspace", "ws-s.bin", b"shared-ws", deadline).await;
-        let (w_uniq_key, ws_uniq_oid) =
-            seed_key(&stage, &ws_store, tenant, "workspace", "ws-u.bin", b"unique-ws", deadline).await;
-
-        let shared_lfs = BTreeSet::from([shared_oid.clone()]);
-        let shared_ws = BTreeSet::from([ws_shared_oid.clone()]);
-        let plan = plan_safe_remote_cleanup(
-            tenant,
-            &[shared_oid, uniq_oid],
-            &shared_lfs,
-            &[ws_shared_oid, ws_uniq_oid],
-            &shared_ws,
-            &[],
-        );
-
-        let (dl, dw) = execute_safe_remote_deletes(
-            tenant,
-            Some(&lfs_store),
-            Some(&ws_store),
-            &plan,
-            &shared_lfs,
-            &shared_ws,
-            deadline,
-        )
-        .await
-        .unwrap();
-        assert_eq!((dl, dw), (1, 1));
-        assert!(lfs_store.head(&l_shared_key, deadline).await.unwrap().is_some());
-        assert!(lfs_store.head(&l_uniq_key, deadline).await.unwrap().is_none());
-        assert!(ws_store.head(&w_shared_key, deadline).await.unwrap().is_some());
-        assert!(ws_store.head(&w_uniq_key, deadline).await.unwrap().is_none());
+        let (ls, so) = put_one(&stage, &lfs_store, tenant, "lfs", b"shared-lfs", deadline).await;
+        let (lu, uo) = put_one(&stage, &lfs_store, tenant, "lfs", b"unique-lfs", deadline).await;
+        let (ws, wso) = put_one(&stage, &ws_store, tenant, "workspace", b"shared-ws", deadline).await;
+        let (wu, wuo) = put_one(&stage, &ws_store, tenant, "workspace", b"unique-ws", deadline).await;
+        let (sl, sw) = (BTreeSet::from([so.clone()]), BTreeSet::from([wso.clone()]));
+        let plan = plan_safe_remote_cleanup(tenant, &[so, uo], &sl, &[wso, wuo], &sw, &[]);
+        let res =
+            execute_safe_remote_deletes(tenant, Some(&lfs_store), Some(&ws_store), &plan, &sl, &sw, deadline).await;
+        assert_eq!(res.unwrap(), (1, 1));
+        for (r, k, keep) in
+            [(&lfs_store, &ls, true), (&lfs_store, &lu, false), (&ws_store, &ws, true), (&ws_store, &wu, false)]
+        {
+            assert_eq!(r.head(k, deadline).await.unwrap().is_some(), keep);
+        }
         let _ = fs::remove_dir_all(&dir).await;
     }
 }
