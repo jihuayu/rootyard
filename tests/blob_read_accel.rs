@@ -294,7 +294,7 @@ impl SampleRepoPacks {
             retention_registry: registry,
             key_provider: None,
         };
-        Ok(materialize_git_view_with_read_accel(&ctx.0, &ctx.1, &req, ctx.3).await?)
+        Ok(materialize_git_view_with_read_accel(&ctx.store, &ctx.vr, &req, ctx.dl).await?)
     }
 
     async fn build(
@@ -318,28 +318,31 @@ impl SampleRepoPacks {
             retention_registry: reg,
             key_provider: None,
         };
-        Ok(build_and_upload_sidecars(&ctx.0, &ctx.1, &req, ctx.3).await?)
+        Ok(build_and_upload_sidecars(&ctx.store, &ctx.vr, &req, ctx.dl).await?)
     }
 
     async fn open(
         &self,
         ctx: &TestCtx,
-        gen_num: u64,
-        bundle: Option<&BuiltReadAccelBundle>,
-        enabled: bool,
+        gen_n: u64,
+        b: Option<&BuiltReadAccelBundle>,
+        on: bool,
     ) -> Result<MaterializedAccelView> {
-        self.open_with_packs(ctx, gen_num, &self.packs, bundle, enabled, None).await
+        self.open_with_packs(ctx, gen_n, &self.packs, b, on, None).await
     }
 }
 
-struct TestCtx(BlobStore, DisposableViewRoot, TempDir, Instant);
+struct TestCtx {
+    store: BlobStore,
+    vr: DisposableViewRoot,
+    _dir: TempDir,
+    dl: Instant,
+}
 
-impl TestCtx {
-    fn new() -> Result<Self> {
-        let dir = TempDir::new()?;
-        let vr = DisposableViewRoot::open(dir.path(), 8, 64 << 20, Duration::from_secs(120))?;
-        Ok(Self(LoopbackS3::shared().open_store()?, vr, dir, Instant::now() + Duration::from_secs(60)))
-    }
+fn test_ctx() -> Result<TestCtx> {
+    let _dir = TempDir::new()?;
+    let vr = DisposableViewRoot::open(_dir.path(), 8, 64 << 20, Duration::from_secs(120))?;
+    Ok(TestCtx { store: LoopbackS3::shared().open_store()?, vr, _dir, dl: Instant::now() + Duration::from_secs(60) })
 }
 
 fn assert_git_parity(expected_repo: &Path, candidate_repo: &Path, sample: &SampleRepoPacks) -> Result<()> {
@@ -365,7 +368,7 @@ fn assert_git_parity(expected_repo: &Path, candidate_repo: &Path, sample: &Sampl
 #[tokio::test]
 async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {
     ensure!(!ENABLE_BY_DEFAULT && !ReadAccelConfig::default().enabled);
-    let ctx = TestCtx::new()?;
+    let ctx = test_ctx()?;
     for format in [ReadAccelObjectFormat::Sha1, ReadAccelObjectFormat::Sha256] {
         let sample = SampleRepoPacks::seed(format, false)?;
         let disabled_view = sample.open(&ctx, 1, None, false).await?;
@@ -394,7 +397,7 @@ async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {
 #[tokio::test]
 async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Result<()> {
     let s3 = LoopbackS3::shared();
-    let ctx = TestCtx::new()?;
+    let ctx = test_ctx()?;
     let sample = SampleRepoPacks::seed(ReadAccelObjectFormat::Sha1, true)?;
     let baseline = sample.open(&ctx, 1, None, false).await?;
     let bundle = sample.build(&ctx, 1, 1, &sample.packs, None).await?;
@@ -425,7 +428,7 @@ async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Res
     raw[8] ^= 0xff;
     std::fs::write(&bm_path, raw)?;
     let (status, removed) =
-        verify_and_recover_view_sidecars(cached_view.repo_path()?, Some(&bundle.manifest), ctx.3).await?;
+        verify_and_recover_view_sidecars(cached_view.repo_path()?, Some(&bundle.manifest), ctx.dl).await?;
     ensure!(
         matches!(
             status,
@@ -471,7 +474,7 @@ async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Res
 
 #[tokio::test]
 async fn retention_pin_protects_packs_until_release_and_compaction_rebuild() -> Result<()> {
-    let ctx = TestCtx::new()?;
+    let ctx = test_ctx()?;
     let sample = SampleRepoPacks::seed(ReadAccelObjectFormat::Sha1, true)?;
     ensure!(sample.packs.len() >= 2);
     let registry = PackRetentionRegistry::new();
