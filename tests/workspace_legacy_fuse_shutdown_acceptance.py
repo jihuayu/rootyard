@@ -35,6 +35,7 @@ for path in (TESTS, ROOT):
         sys.path.insert(0, str(path))
 
 from tests import fuse_helper_native_support as support  # noqa: E402
+from tests import workspace_legacy_fuse_shutdown_fifo as legacy_fifo  # noqa: E402
 from tests import workspace_legacy_fuse_shutdown_fixtures as legacy_fixtures  # noqa: E402
 from tests import workspace_legacy_fuse_shutdown_ownership as legacy_ownership  # noqa: E402
 from tests import workspace_legacy_fuse_shutdown_support as legacy_support  # noqa: E402
@@ -49,12 +50,15 @@ REQUIRED_CASES = (
     "test_partial_reconcile_failure_cleans_earlier_owned_mount",
     "tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest."
     "test_post_reconcile_api_bind_failure_cleans_owned_mount",
+    "tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest."
+    "test_sigterm_during_blocked_startup_joins_mounted_owner",
 )
 SOURCE_PATHS = (
     "tests/workspace_legacy_fuse_shutdown_acceptance.py",
     "tests/workspace_legacy_fuse_shutdown_support.py",
     "tests/workspace_legacy_fuse_shutdown_fixtures.py",
     "tests/workspace_legacy_fuse_shutdown_ownership.py",
+    "tests/workspace_legacy_fuse_shutdown_fifo.py",
     "tests/workspace_legacy_fuse_shutdown_report.py",
 )
 CASE_DETAILS: dict[str, dict] = {}
@@ -62,7 +66,7 @@ CONTAINMENT_OWNER = legacy_ownership.ContainmentOwner()
 
 
 class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
-    """Three native cases, each over its own real repository/schema/data root."""
+    """Four native cases, each over its own real repository/schema/data root."""
 
     @classmethod
     def setUpClass(cls):
@@ -110,6 +114,7 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         self.created_mountpoints = []
         self.owned_records = []
         self.conflict = None
+        self.fifo = None
         self.log_path = self.h.root / "server.log"
         self.oracle_log_path = self.log_path
         self._cleanup_deadline = None
@@ -164,6 +169,9 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
                     "failure containment was required or incomplete within the original deadline"
                 )
         finally:
+            if self.fifo is not None:
+                self.fifo.close()
+                self.fifo = None
             pending = int(self.containment_owner.snapshot()["pending"]) > 0
             try:
                 if pending:
@@ -488,6 +496,148 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         )
         self.assertEqual(evidence["joined_mounts"], 1)
         self._record_detail(evidence, code, holder_proof)
+
+
+    def test_sigterm_during_blocked_startup_joins_mounted_owner(self):
+        created = [
+            self._create_workspace(f"legacy-startup-{index}", f"legacy-startup-create-{index}")
+            for index in range(2)
+        ]
+        ordered = sorted(created, key=lambda item: uuid.UUID(item[0]["id"]).bytes)
+        healthy_workspace, healthy_paths = ordered[0]
+        blocked_workspace, blocked_paths = ordered[1]
+        self.assertNotEqual(healthy_workspace["id"], blocked_workspace["id"])
+        healthy_hash = legacy_support.workspace_hash(healthy_workspace["id"])
+        blocked_hash = legacy_support.workspace_hash(blocked_workspace["id"])
+        self.assertNotEqual(healthy_hash, blocked_hash)
+
+        # Preparation is setup containment outside the single case oracle armed
+        # below at the actual SIGTERM trigger.
+        code = legacy_support.stop_service_gracefully(
+            self.h, timeout=legacy_support.PREP_SHUTDOWN_SECONDS
+        )
+        self.assertEqual(code, 0, "preparation service did not stop cleanly before the blocked-startup run")
+        self.owned_records.clear()
+
+        lazy_dir = self.h.root / "data/workspace-service/lazy"
+        self.fifo = legacy_fifo.FifoController(lazy_dir, blocked_workspace["id"])
+        self.fifo.install()
+        service_proc = self._start_oracle_service()
+        holder, holder_proof = self._attach_holder(service_proc)
+        service_identity = legacy_ownership.capture_service_identity(service_proc)
+
+        mount = legacy_support.wait_owned_mount(
+            holder.pid,
+            healthy_paths["mountpoint"],
+            time.monotonic() + legacy_support.STARTUP_OBSERVATION_SECONDS,
+        )
+        mount_id = int(mount["mount_id"])
+        self._remember_record(healthy_paths["mountpoint"], mount_id)
+        service_mount = support.wait_for_fuse_mount(
+            service_proc.pid,
+            healthy_paths["mountpoint"],
+            timeout=legacy_support.STARTUP_OBSERVATION_SECONDS,
+        )
+        self.assertEqual(
+            int(service_mount["mount_id"]),
+            mount_id,
+            "the service and the holder did not observe the same exact first mount",
+        )
+        self.assertEqual(
+            legacy_support.owned_leftovers(holder.pid, [blocked_paths["mountpoint"]]),
+            0,
+            "the blocked second workspace mounted before the FIFO was released",
+        )
+        not_ready_before = legacy_fifo.assert_startup_not_ready(self.h)
+
+        # The reader proof is positive owned OS identity: exact service
+        # PID/starttime plus a FIFO-open kernel wait in that process, never the
+        # earlier mount and never the second reservation.
+        proof = self.fifo.prove_reader_blocked(
+            service_identity["service_pid"],
+            service_identity["service_starttime"],
+            time.monotonic() + legacy_support.STARTUP_OBSERVATION_SECONDS,
+        )
+        legacy_ownership.recheck_service_identity(service_proc, service_identity)
+        self.assertEqual(
+            legacy_support.owned_leftovers(holder.pid, [blocked_paths["mountpoint"]]),
+            0,
+            "the second workspace mounted while its manifest read was blocked",
+        )
+        not_ready_after = legacy_fifo.assert_startup_not_ready(self.h)
+        namespace = int(holder_proof["service_namespace"])
+
+        # The trigger is the only point that arms the one 5 s case oracle.
+        deadline = self._arm_cleanup_deadline()
+        signal_at = time.monotonic()
+        released = None
+        code = None
+        try:
+            self._signal_owned(signal.SIGTERM)
+            released = self.fifo.release_invalid_manifest(deadline)
+            release_seconds = time.monotonic() - signal_at
+            code = support.wait_process_exit(
+                self.h.proc, timeout=max(0.0, deadline - time.monotonic())
+            )
+        finally:
+            self.fifo.close_writer()
+        self._finish_service_exit()
+
+        self.assertIsNotNone(code, "owned service exit status was not observed")
+        self.assertGreater(
+            code,
+            0,
+            "SIGTERM during blocked startup did not return a positive application error",
+        )
+        self.assertNotEqual(code, -signal.SIGTERM, "the service died by SIGTERM instead of an application error")
+        self.assertEqual(
+            released["bytes_written"],
+            len(legacy_fifo.INVALID_MANIFEST),
+            "the owned FIFO release did not write the full invalid manifest before exit",
+        )
+        self.assertLess(
+            release_seconds,
+            legacy_support.ORACLE_SECONDS,
+            "the owned FIFO release was not prompt within the case oracle",
+        )
+
+        legacy_support.wait_exact_mount_gone(
+            holder.pid, healthy_paths["mountpoint"], mount_id, deadline
+        )
+        self.assertEqual(
+            legacy_support.owned_leftovers(
+                holder.pid, [healthy_paths["mountpoint"], blocked_paths["mountpoint"]]
+            ),
+            0,
+            "an owned workspace mount remained after blocked-startup SIGTERM",
+        )
+        legacy_ownership.recheck_holder_identity(holder, holder_proof)
+        evidence = legacy_support.read_join_evidence(
+            self.oracle_log_path,
+            namespace,
+            [healthy_hash],
+            forbidden_workspace_hashes=(blocked_hash,),
+        )
+        self.assertEqual(evidence["joined_mounts"], 1)
+        self.assertEqual(
+            set(evidence["workspace_hashes"]),
+            {healthy_hash},
+            "the evidence did not account exactly the actually joined healthy workspace",
+        )
+        startup_join = legacy_fifo.startup_owner_join_evidence(self.oracle_log_path)
+        self._record_detail(evidence, code, holder_proof)
+        CASE_DETAILS[self.id()].update({
+            "startup_ready_absent": True,
+            "startup_ready_probe_before": not_ready_before,
+            "startup_ready_probe_after": not_ready_after,
+            "service_starttime": int(service_identity["service_starttime"]),
+            "fifo_reader_proof": proof,
+            "fifo_release": dict(released),
+            "fifo_writer_closed": True,
+            "fifo_release_seconds": round(release_seconds, 3),
+            "startup_owner_joined": bool(startup_join["startup_owner_joined"]),
+            "blocked_workspace_hash": blocked_hash,
+        })
 
 
 if __name__ == "__main__":

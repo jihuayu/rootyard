@@ -2,7 +2,7 @@
 """Safe inventory, report, and runner for the legacy shutdown acceptance cases.
 
 This private module is owned by ``tests/workspace_legacy_fuse_shutdown_acceptance.py``.
-It selects the canonical source-bound binary, runs only the exact three case
+It selects the canonical source-bound binary, runs only the exact required case
 selectors, and persists a bounded JSON report. It never stores raw exception
 text, paths, environment values, source payloads, or service logs.
 """

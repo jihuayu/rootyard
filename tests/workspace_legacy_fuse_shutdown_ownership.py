@@ -60,6 +60,43 @@ def owned_service_group(service_proc):
     return pid, pgid
 
 
+def capture_service_identity(service_proc):
+    """Capture the exact owned service PID/starttime before startup trigger."""
+    pid, _pgid = owned_service_group(service_proc)
+    identity = support.process_identity(pid)
+    if not isinstance(identity, dict):
+        raise LegacyAcceptanceError("owned service identity is unavailable")
+    if int(identity.get("pid", -1)) != pid:
+        raise LegacyAcceptanceError("owned service identity PID changed before startup trigger")
+    if identity.get("state") == "Z":
+        raise LegacyAcceptanceError("owned service exited before startup trigger")
+    return {
+        "service_pid": pid,
+        "service_starttime": _positive_int(identity.get("starttime"), "owned service starttime"),
+    }
+
+
+def recheck_service_identity(service_proc, captured):
+    """Require the same owned service PID/starttime just before the trigger."""
+    pid, _pgid = owned_service_group(service_proc)
+    captured_pid = _positive_int(captured.get("service_pid"), "captured owned service pid")
+    if pid != captured_pid:
+        raise LegacyAcceptanceError("owned service PID changed before startup trigger")
+    identity = support.process_identity(pid)
+    if not isinstance(identity, dict):
+        raise LegacyAcceptanceError("owned service identity is unavailable before startup trigger")
+    if int(identity.get("pid", -1)) != captured_pid:
+        raise LegacyAcceptanceError("owned service identity PID changed before startup trigger")
+    if identity.get("state") == "Z":
+        raise LegacyAcceptanceError("owned service exited before startup trigger")
+    starttime = _positive_int(identity.get("starttime"), "owned service starttime")
+    if starttime != _positive_int(
+        captured.get("service_starttime"), "captured owned service starttime"
+    ):
+        raise LegacyAcceptanceError("owned service starttime changed before startup trigger")
+    return {"service_pid": captured_pid, "service_starttime": starttime}
+
+
 def capture_holder_identity(holder, service_proc):
     """Capture the exact owned holder and prove it shares the service namespace."""
     if holder is None:
