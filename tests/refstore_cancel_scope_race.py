@@ -156,6 +156,7 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
         return data
 
     def _start_blocker_sql(self, statement, application_name):
+        self._validate_blocker_application_name(application_name)
         env = self.env.copy()
         env["PGDATABASE"] = self.db
         env["PGAPPNAME"] = application_name
@@ -165,6 +166,7 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
              + "; SELECT pg_sleep(300);"],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self._await_session(process, application_name)
+        self._register_owned_blocker_or_reap(process, application_name)
         return process
 
     def _await_session(self, process, application_name, timeout=15):
@@ -177,22 +179,23 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
                     + self.redact(error[:500].decode(errors="replace")))
             active = self.sql(
                 "SELECT count(*) FROM pg_stat_activity "
-                "WHERE application_name='" + application_name + "' AND state='active'")
+                "WHERE application_name='" + application_name + "' "
+                "AND datname=current_database() AND state='active'")
             held = self.sql(
                 "SELECT count(*) FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid "
                 "WHERE a.application_name='" + application_name + "' "
-                "AND l.locktype='advisory' AND l.granted")
+                "AND a.datname=current_database() AND l.locktype='advisory' AND l.granted")
             if active == "1" and held == "1":
                 return
             time.sleep(0.05)
-        process.terminate()
-        process.wait(timeout=5)
+        self._reap_blocker_child(process)
         raise AssertionError("fixture psql session did not become active: " + application_name)
 
     def _session_pid(self, application_name):
         value = self.sql(
             "SELECT pid FROM pg_stat_activity "
-            "WHERE application_name='" + application_name + "' AND state='active' LIMIT 1")
+            "WHERE application_name='" + application_name + "' "
+            "AND datname=current_database() AND state='active' LIMIT 1")
         assert value, "fixture psql session is not active: " + application_name
         return int(value)
 
