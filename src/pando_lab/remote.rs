@@ -540,16 +540,7 @@ pub(super) async fn get(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<Ob
     let row = client.query_one("SELECT manifest_json,manifest_key FROM pando_lab.object_store_manifests WHERE repo=$1 AND pack_id=$2",
         &[&repo,&pack_id]).await?;
     let manifest: CasPackManifest = serde_json::from_value(row.get(0))?;
-    let mut unsigned = manifest.clone();
-    unsigned.manifest_sha256.clear();
-    ensure!(manifest.schema == object_store::MANIFEST_SCHEMA && manifest.repo == repo
-        && manifest.pack_id == pack_id && manifest.backend == object_store::BACKEND_KIND
-        && manifest.manifest_sha256 == hex::encode(Sha256::digest(serde_json::to_vec(&unsigned)?)),
-        "Pando remote manifest identity or digest mismatch");
-    ensure!(manifest.encryption_mode.as_deref() == Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE),
-        "remote Pando manifest lacks authenticated encryption mode");
-    let cipher_sha = manifest.ciphertext_sha256.as_deref().context("missing remote ciphertext_sha256")?;
-    let cipher_bytes = manifest.ciphertext_bytes.context("missing remote ciphertext_bytes")?;
+    let (cipher_sha, cipher_bytes) = validate_manifest_record(&manifest, repo, pack_id)?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     let manifest_digest = hex::encode(Sha256::digest(&manifest_bytes));
     let manifest_key = key(repo, "pando-manifest", &manifest_digest)?;
@@ -565,16 +556,23 @@ pub(super) async fn get(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<Ob
     let _ = fs::remove_file(&temp).await;
     verified?;
     let (pack, idx) = local_paths(config, repo, pack_id);
-    let pack_key = key(repo, "pando-pack", cipher_sha)?;
+    let pack_key = key(repo, "pando-pack", &cipher_sha)?;
     let idx_key = key(repo, "pando-index", &manifest.idx_sha256)?;
     ensure!(manifest.pack_key == pack_key.path() && manifest.idx_key == idx_key.path(),
         "Pando remote artifact key mismatch");
+    let pack_obj = Pack { id: pack_id, pack_sha256: manifest.pack_sha256.clone(), idx_sha256: manifest.idx_sha256.clone() };
+    // The committed DB envelope is the read authority. A missing or stale file
+    // mirror must never select an older wrapper or fail this read.
+    let env = lifecycle::load_envelope_from_db(&client, repo, &pack_obj).await?
+        .context("missing DB KMS envelope for a published Pando pack")?;
+    validate_db_envelope(&env, repo, pack_id, &manifest.pack_sha256, &manifest.idx_sha256, &manifest)?;
+    // Repair the private file mirror best-effort after the DB authority and
+    // record identity have been verified.
+    let _ = lifecycle::write_envelope_file(&config.root, &env);
     let cache_hit = pack.is_file() && idx.is_file() &&
         scan(&pack, manifest.chunk_size).await.ok().is_some_and(|x| x.0 == manifest.pack_sha256 && x.1 == manifest.pack_bytes) &&
         scan(&idx, manifest.chunk_size).await.ok().is_some_and(|x| x.0 == manifest.idx_sha256 && x.1 == manifest.idx_bytes);
     if !cache_hit {
-        let pack_obj = Pack { id: pack_id, pack_sha256: manifest.pack_sha256.clone(), idx_sha256: manifest.idx_sha256.clone() };
-        let env = lifecycle::read_and_verify_envelope_file(&config.root, repo, pack_id)?;
         let cipher_tmp = config.root.join(format!(".pando-dec-{}", Uuid::new_v4()));
         let dec_res = async {
             store.get_to_file(&pack_key, &cipher_tmp, cipher_bytes, deadline()).await?;
