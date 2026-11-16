@@ -245,9 +245,15 @@ impl MountHandle {
         self.dispatcher.request_stop();
     }
 
-    /// Backwards-compatible alias for [`MountHandle::request_stop`].
+    /// Stop the actor and block until its thread exits.
+    ///
+    /// This preserves the historical public `shutdown()` behavior: unlike
+    /// [`MountHandle::request_stop`], it waits for the actor join. It does not
+    /// unmount or join the kernel session, so an owner that is exiting must
+    /// still use [`MountHandle::shutdown_and_join`] (or the owner-preserving
+    /// typed path).
     pub fn shutdown(&self) {
-        self.request_stop();
+        self.dispatcher.shutdown();
     }
 
     /// Owner-preserving, non-panicking legacy teardown.
