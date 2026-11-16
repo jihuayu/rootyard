@@ -855,8 +855,8 @@ mod tests {
         let tenant = Uuid::from_u128(20);
         let history = Uuid::from_u128(30);
         let init_log = ApplicationLogId::new(1, 1);
-        let init_id = scoped_id(repo, tenant, history, 1, 1, GitObjectFormat::Sha256, 0, 5);
-        let init = init_command(repo, tenant, history, 1, 1, GitObjectFormat::Sha256);
+        let init_id = scoped_id(repo, tenant, history, 1, 2, GitObjectFormat::Sha256, 0, 5);
+        let init = init_command(repo, tenant, history, 1, 2, GitObjectFormat::Sha256);
         app.apply(init_log, &envelope(&init_id, &init)).expect("initial gate");
         let gate = app.machine().read_gate_version(repo).unwrap().expect("live gate");
 
