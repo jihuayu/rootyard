@@ -192,6 +192,16 @@ fn poll_writable(fd: RawFd, wait: Duration) -> Result<(), HelperError> {
     }
 }
 
+/// One complete-frame nonblocking send attempt. This exists so the zero-budget
+/// path cannot retry EINTR/short writes or restart a grace; a short or failed
+/// attempt returns `false` and the caller fail-closes the exact generation.
+fn send_complete_once<F>(bytes: &[u8], send: F) -> bool
+where
+    F: FnOnce(*const u8, usize) -> isize,
+{
+    send(bytes.as_ptr(), bytes.len()) as usize == bytes.len()
+}
+
 /// Write one already-serialized control frame without blocking past the
 /// absolute deadline. The deadline closure re-reads the current teardown cap
 /// on every send/poll iteration. A partial frame is never followed by another
@@ -327,21 +337,14 @@ impl Inner {
             return false;
         }
         let fd = control.as_raw_fd();
-        let mut remaining = &bytes[..];
-        while !remaining.is_empty() {
-            // SAFETY: the socket fd is owned by `control`; the pointer covers
-            // the remaining bytes and `MSG_DONTWAIT` never blocks.
-            let sent = unsafe { libc::send(fd, remaining.as_ptr().cast(), remaining.len(), CONTROL_SEND_FLAGS) };
-            if sent > 0 {
-                remaining = &remaining[sent as usize..];
-                continue;
-            }
-            if sent < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-            }
+        // Exactly one nonblocking attempt: no retry loop and no grace reset.
+        // EINTR, EAGAIN, a short write or any other error is an unproved
+        // best-effort attempt; the caller fail-closes the exact generation.
+        // SAFETY: the socket fd is owned by `control`; the pointer covers the
+        // canonical frame bytes and `MSG_DONTWAIT` never blocks.
+        if !send_complete_once(&bytes, |pointer, length| unsafe {
+            libc::send(fd, pointer.cast(), length, CONTROL_SEND_FLAGS)
+        }) {
             return false;
         }
         control.flush().is_ok()
@@ -1200,6 +1203,17 @@ mod tests {
         };
         assert_eq!(error.code, libc::ETIMEDOUT);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn zero_budget_send_treats_eintr_like_failure_as_one_attempt() {
+        let mut attempts = 0;
+        let sent = send_complete_once(&[1u8, 2, 3], |_, _| {
+            attempts += 1;
+            -1
+        });
+        assert!(!sent);
+        assert_eq!(attempts, 1, "the zero-budget send must not retry EINTR or a short write");
     }
 
     #[test]
