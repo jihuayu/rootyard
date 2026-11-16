@@ -383,6 +383,86 @@ class RubiconProvisioningAndAuthorityTests(unittest.TestCase):
         self.assertIn("exit=2", str(ctx.exception))
         self.assertNotIn("supersecretpw", str(ctx.exception))
 
+    def test_collect_barrier_futures_prefers_root_cause_over_broken_barrier(self) -> None:
+        import threading
+        from concurrent.futures import Future
+        from scripts.rubicon_workload.runner import _collect_barrier_futures
+
+        f_barrier: Future[object] = Future()
+        f_barrier.set_exception(threading.BrokenBarrierError())
+        f_root: Future[object] = Future()
+        f_root.set_exception(RuntimeError("indep clone failed (rc=128)"))
+
+        with self.assertRaisesRegex(RuntimeError, "indep clone failed"):
+            _collect_barrier_futures([f_barrier, f_root])
+
+        f_only_barrier: Future[object] = Future()
+        f_only_barrier.set_exception(threading.BrokenBarrierError())
+        with self.assertRaises(threading.BrokenBarrierError):
+            _collect_barrier_futures([f_only_barrier])
+
+    def test_cli_and_runner_preserve_type_on_empty_exception_with_redaction(self) -> None:
+        import contextlib
+        import io
+        import os
+        import pathlib
+        import tempfile
+        import threading
+        from unittest import mock
+        import scripts.rubicon_mixed_workload as cli_mod
+        from scripts.rubicon_workload.runner import WorkloadConfig, run_rubicon_workload
+
+        with tempfile.TemporaryDirectory() as td:
+            rep = pathlib.Path(td) / "out" / "report.json"
+            fake_pre = {
+                "binary": "/bin/true",
+                "binary_sha256": "0" * 64,
+                "binary_size_bytes": 1,
+                "receipt_verified": False,
+                "git": "/usr/bin/git",
+                "git_version": "git version 2.43.0",
+                "psql_version": "psql 17",
+                "pg_base": "postgresql://u:topsecret@127.0.0.1/db",
+                "s3_loopback_http": False,
+                "s3_host": "127.0.0.1",
+                "s3_port": 9000,
+                "logical_cpus": 2,
+                "tiers": [1],
+                "tier_notes": [],
+            }
+            fake_env = {
+                "ROOTYARD_TEST_DATABASE_URL": "postgresql://u:topsecret@127.0.0.1/db",
+                "ROOTYARD_BLOB_SECRET_ACCESS_KEY": "s3secretval",
+                "ROOTYARD_BLOB_ACCESS_KEY_ID": "s3keyid",
+                "ROOTYARD_BLOB_ENDPOINT": "http://127.0.0.1:9000",
+            }
+            cfg = WorkloadConfig(binary="/bin/true", report=str(rep), git="/usr/bin/git", require_build_receipt=False)
+            with mock.patch("scripts.rubicon_workload.runner._preflight", return_value=fake_pre), \
+                 mock.patch.dict(os.environ, fake_env, clear=False), \
+                 mock.patch("scripts.rubicon_workload.runner._verify_public_cluster_authority", side_effect=threading.BrokenBarrierError()):
+                with self.assertRaises(RuntimeError) as ctx:
+                    run_rubicon_workload(cfg)
+            msg = str(ctx.exception)
+            self.assertIn("BrokenBarrierError", msg)
+            self.assertNotIn("topsecret", msg)
+            self.assertTrue((rep.parent / "failure-diagnostics.log").is_file())
+
+            stderr_buf = io.StringIO()
+            with mock.patch("scripts.rubicon_mixed_workload.run_rubicon_workload", side_effect=TimeoutError()), \
+                 contextlib.redirect_stderr(stderr_buf):
+                rc = cli_mod.main(["--binary", "/bin/true", "--report", str(rep)])
+            self.assertEqual(rc, 1)
+            self.assertIn("rubicon-mixed-workload failed (TimeoutError): TimeoutError", stderr_buf.getvalue())
+
+    def test_start_fleet_sets_concurrent_and_byte_budget_defaults(self) -> None:
+        import inspect
+        from scripts.rubicon_workload.runner import _start_fleet
+
+        src = inspect.getsource(_start_fleet)
+        self.assertIn("ROOTYARD_MAX_CONCURRENT_GIT", src)
+        self.assertIn("ROOTYARD_MAX_REQUEST_BYTES", src)
+        self.assertIn("ROOTYARD_MAX_INFLIGHT_BYTES", src)
+
 
 if __name__ == "__main__":
     unittest.main()

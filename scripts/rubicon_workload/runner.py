@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 import uuid
 from typing import Any
@@ -240,6 +241,11 @@ def _start_fleet(
                 "ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE": "1000",
             }
         )
+        # Ensure single-process tier handles 6-way concurrent push + 4-way CI fetch
+        # without tripping default 256 MiB / 128 MiB = 2 inflight transfer slots.
+        env.setdefault("ROOTYARD_MAX_CONCURRENT_GIT", "16")
+        env.setdefault("ROOTYARD_MAX_REQUEST_BYTES", str(16 * 1024 * 1024))
+        env.setdefault("ROOTYARD_MAX_INFLIGHT_BYTES", str(256 * 1024 * 1024))
         log_f = open(scratch_root / f"serve-blob-{idx}.log", "ab")
         proc = subprocess.Popen([binary, "serve-blob"], env=env, stdout=log_f, stderr=log_f, start_new_session=True)
         fleet.append((proc, f"http://{bind}", sdir, log_f))
@@ -385,6 +391,27 @@ def _phase_seed(
     return repos
 
 
+def _collect_barrier_futures(futures: list[Any]) -> list[Any]:
+    """Wait on all futures and raise any non-BrokenBarrierError root cause first."""
+    results: list[Any] = []
+    primary: BaseException | None = None
+    barrier_err: BaseException | None = None
+    for fut in futures:
+        try:
+            results.append(fut.result())
+        except threading.BrokenBarrierError as exc:
+            if barrier_err is None:
+                barrier_err = exc
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+    if primary is not None:
+        raise primary
+    if barrier_err is not None:
+        raise barrier_err
+    return results
+
+
 def _phase_concurrent_overlap(
     n_procs: int,
     config: WorkloadConfig,
@@ -399,6 +426,21 @@ def _phase_concurrent_overlap(
     acked: list[dict[str, Any]],
 ) -> dict[str, Any]:
     indep_keys = ["text_history", "similar_files", "compressed_media", "small_deltas", "multi_repo_a", "multi_repo_b"]
+    prepared: dict[str, tuple[Path, str, dict[str, str]]] = {}
+    for idx, rkey in enumerate(indep_keys):
+        entry = repos[rkey]
+        remote = bases[idx % n_procs] + entry["info"]["clone_path"]
+        env = build_git_env(base_env, askpass, entry["rw"])
+        wdir = tier_dir / f"indep-{rkey}"
+        clone_proc, _ = run_git(pre["git"], ["clone", remote, str(wdir)], None, env)
+        if clone_proc.returncode != 0:
+            err = clone_proc.stderr.decode("utf-8", errors="replace").strip()[:300]
+            raise RuntimeError(f"indep clone failed for {rkey} (rc={clone_proc.returncode}): {err}")
+        for k, v in (("user.name", "Rubicon Worker"), ("user.email", "worker@example.invalid")):
+            run_git(pre["git"], ["config", k, v], wdir, env)
+        new_oid = materialize_commit_spec(wdir, entry["deltas"][0], pre["git"], env)
+        prepared[rkey] = (wdir, new_oid, env)
+
     barrier = threading.Barrier(len(indep_keys) + 2)
     intervals: list[tuple[int, int]] = []
     lock = threading.Lock()
@@ -406,19 +448,16 @@ def _phase_concurrent_overlap(
 
     def _push_worker(idx: int, rkey: str) -> None:
         entry = repos[rkey]
-        remote = bases[idx % n_procs] + entry["info"]["clone_path"]
-        env = build_git_env(base_env, askpass, entry["rw"])
-        wdir = tier_dir / f"indep-{rkey}"
-        if run_git(pre["git"], ["clone", remote, str(wdir)], None, env)[0].returncode != 0:
-            raise RuntimeError(f"indep clone failed for {rkey}")
-        for k, v in (("user.name", "Rubicon Worker"), ("user.email", "worker@example.invalid")):
-            run_git(pre["git"], ["config", k, v], wdir, env)
-        new_oid = materialize_commit_spec(wdir, entry["deltas"][0], pre["git"], env)
+        wdir, new_oid, env = prepared[rkey]
         ref_name = f"refs/heads/indep_{idx}"
-        barrier.wait(timeout=30)
-        s_ns = time.monotonic_ns()
-        proc, ms = run_git(pre["git"], ["push", "--porcelain", "origin", f"HEAD:{ref_name}"], wdir, env)
-        e_ns = time.monotonic_ns()
+        try:
+            barrier.wait(timeout=30)
+            s_ns = time.monotonic_ns()
+            proc, ms = run_git(pre["git"], ["push", "--porcelain", "origin", f"HEAD:{ref_name}"], wdir, env)
+            e_ns = time.monotonic_ns()
+        except BaseException:
+            barrier.abort()
+            raise
         outcome, _ = classify_git_push(proc, ref_name)
         with lock:
             intervals.append((s_ns, e_ns))
@@ -427,7 +466,11 @@ def _phase_concurrent_overlap(
                 acked.append({"repo_key": rkey, "repo": entry["info"], "ref_name": ref_name, "expected_oid": new_oid, "token": entry["rw"]})
 
     def _browse_worker() -> None:
-        barrier.wait(timeout=30)
+        try:
+            barrier.wait(timeout=30)
+        except BaseException:
+            barrier.abort()
+            raise
         for cycle in range(18):
             if browse_stop.is_set():
                 break
@@ -440,7 +483,11 @@ def _phase_concurrent_overlap(
                 _record_op(records, "browse_api", entry["ds_class"], classify_http_status(st), ms, "measured")
 
     def _maint_worker() -> None:
-        barrier.wait(timeout=30)
+        try:
+            barrier.wait(timeout=30)
+        except BaseException:
+            barrier.abort()
+            raise
         for _ in range(10):
             if maint_stop.is_set():
                 break
@@ -457,12 +504,20 @@ def _phase_concurrent_overlap(
     with ThreadPoolExecutor(max_workers=len(indep_keys) + 2) as pool:
         futs = [pool.submit(_push_worker, i, rk) for i, rk in enumerate(indep_keys)]
         bf, mf = pool.submit(_browse_worker), pool.submit(_maint_worker)
-        for f in futs:
-            f.result()
+        try:
+            _collect_barrier_futures(futs)
+        except BaseException as exc:
+            browse_stop.set()
+            maint_stop.set()
+            try:
+                _collect_barrier_futures([bf, mf])
+            except BaseException as worker_exc:
+                if isinstance(exc, threading.BrokenBarrierError) and not isinstance(worker_exc, threading.BrokenBarrierError):
+                    raise worker_exc from None
+            raise
         browse_stop.set()
         maint_stop.set()
-        bf.result()
-        mf.result()
+        _collect_barrier_futures([bf, mf])
 
     wave_deadline = time.monotonic() + float(config.duration_seconds)
     wave_idx = 1
@@ -504,7 +559,10 @@ def _phase_cas_race(
     for idx in range(participants):
         cdir = tier_dir / f"cas-c{idx}"
         c_env = build_git_env(base_env, askpass, cas_entry["rw"])
-        run_git(pre["git"], ["clone", bases[idx % n_procs] + cas_entry["info"]["clone_path"], str(cdir)], None, c_env)
+        clone_proc, _ = run_git(pre["git"], ["clone", bases[idx % n_procs] + cas_entry["info"]["clone_path"], str(cdir)], None, c_env)
+        if clone_proc.returncode != 0:
+            err = clone_proc.stderr.decode("utf-8", errors="replace").strip()[:300]
+            raise RuntimeError(f"cas clone failed idx={idx} (rc={clone_proc.returncode}): {err}")
         run_git(pre["git"], ["config", "user.name", f"Cas{idx}"], cdir, c_env)
         run_git(pre["git"], ["config", "user.email", f"cas{idx}@example.invalid"], cdir, c_env)
         c_oid = materialize_commit_spec(cdir, CommitSpec(f"cas racer {idx}", {f"cas_{idx}.txt": f"racer={idx} seed={seed}\n".encode()}), pre["git"], c_env)
@@ -514,12 +572,16 @@ def _phase_cas_race(
     def _push(idx: int) -> tuple[str, str, float]:
         cdir, c_oid, op_id = clones[idx]
         c_env = build_git_env(base_env, askpass, cas_entry["rw"])
-        barrier.wait(timeout=20)
+        try:
+            barrier.wait(timeout=20)
+        except BaseException:
+            barrier.abort()
+            raise
         proc, ms = run_git(pre["git"], ["-c", f"http.extraHeader=X-Rootyard-Operation: {op_id}", "push", "--porcelain", "origin", "HEAD:refs/heads/main"], cdir, c_env)
         return classify_git_push(proc, "refs/heads/main")[0], c_oid, ms
 
     with ThreadPoolExecutor(max_workers=participants) as pool:
-        results = list(pool.map(_push, range(participants)))
+        results = _collect_barrier_futures([pool.submit(_push, i) for i in range(participants)])
     winners = [r for r in results if r[0] == "committed_success"]
     losers = [r for r in results if r[0] == "typed_refusal"]
     for out, _, ms in results:
@@ -888,7 +950,22 @@ def run_rubicon_workload(config: WorkloadConfig, env: dict[str, str] | None = No
         out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n")
         return report
     except Exception as exc:
-        raise RuntimeError(redact_text(exc, secrets)) from None
+        msg = redact_text(exc, secrets) or type(exc).__name__
+        tb = redact_text(traceback.format_exc(), secrets)
+        tb_tail = tb[-2500:] if len(tb) > 2500 else tb
+        if config.report:
+            try:
+                diag_path = Path(config.report).parent / "failure-diagnostics.log"
+                diag_path.parent.mkdir(parents=True, exist_ok=True)
+                lines = [f"error: {type(exc).__name__}: {msg}", tb]
+                for log_p in sorted(work_root.glob("tier-*/serve-blob-*.log")):
+                    raw_log = log_p.read_bytes()[-8192:].decode("utf-8", errors="replace")
+                    lines.append(f"--- {log_p.parent.name}/{log_p.name} ---")
+                    lines.append(redact_text(raw_log, secrets))
+                diag_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+            except Exception:
+                pass
+        raise RuntimeError(f"{type(exc).__name__}: {msg}\n{tb_tail}") from None
     finally:
         if s3_proxy is not None:
             s3_proxy.stop()

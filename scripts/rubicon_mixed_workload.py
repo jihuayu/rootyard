@@ -11,8 +11,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from rubicon_workload.report import render_summary_markdown  # noqa: E402
-from rubicon_workload.runner import PreflightError, WorkloadConfig, run_rubicon_workload  # noqa: E402
+from rubicon_workload.report import redact_text, render_summary_markdown  # noqa: E402
+from rubicon_workload.runner import WorkloadConfig, run_rubicon_workload  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,8 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         report = run_rubicon_workload(config)
-    except (PreflightError, RuntimeError, ValueError) as exc:
-        print(f"rubicon-mixed-workload failed: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        detail = redact_text(exc, []) or type(exc).__name__
+        print(f"rubicon-mixed-workload failed ({type(exc).__name__}): {detail}", file=sys.stderr)
         return 1
 
     if args.summary_md:
