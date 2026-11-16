@@ -37,6 +37,15 @@ pub enum ApplyResponse {
         decision_id: Uuid,
         replayed: bool,
     },
+    AuthScopeClosed {
+        scope_kind: String,
+        scope_id: Uuid,
+        lifecycle: ScopeLifecycle,
+        authz_floor: i64,
+        replayed: bool,
+        open_decision_ids: Vec<Uuid>,
+        pending_operation_ids: Vec<Uuid>,
+    },
     SnapshotPinCreated {
         snapshot_id: Uuid,
         pin_id: Uuid,

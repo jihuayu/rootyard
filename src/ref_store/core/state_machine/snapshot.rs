@@ -4,6 +4,7 @@
 //! artifact hold references, operation records, gates, refs, and per-lane `cancel_cutoff`
 //! watermarks, with `#[serde(deny_unknown_fields)]` on every persisted structure.
 
+use super::apply_scopes::{DecisionScopeIndexRecord, ScopeFloorRecord};
 use super::commands::AppliedLogId;
 use super::response::StateMachineError;
 use super::state::{
@@ -31,6 +32,8 @@ pub struct SnapshotBody {
     pub operations: Vec<OperationEntry>,
     pub cancellations: Vec<CancelTombstone>,
     pub decisions: Vec<DecisionRecord>,
+    pub scope_floors: Vec<ScopeFloorRecord>,
+    pub decision_scope_deps: Vec<DecisionScopeIndexRecord>,
     pub snapshots: Vec<SnapshotRecord>,
     pub pins: Vec<PinRecord>,
     pub pin_receipts: Vec<PinReceiptRecord>,
@@ -119,6 +122,8 @@ pub(super) fn export_snapshot_body(state: &SmState) -> SnapshotBody {
         operations,
         cancellations: state.cancellations.values().cloned().collect(),
         decisions: state.decisions.values().cloned().collect(),
+        scope_floors: state.scope_floors.values().cloned().collect(),
+        decision_scope_deps: state.decision_scope_deps.values().cloned().collect(),
         snapshots: state.snapshots.values().cloned().collect(),
         pins: state.pins.values().cloned().collect(),
         pin_receipts: state.pin_receipts.values().cloned().collect(),
@@ -175,6 +180,16 @@ pub(super) fn restore_from_snapshot(snapshot: &RefCasSnapshot) -> Result<SmState
         let op_key = RepoEntityKey::new(decision.repository_id, decision.operation_id);
         insert_unique(&mut state.decisions, decision.decision_id, decision.clone(), "decision")?;
         insert_unique(&mut state.decisions_by_op, op_key, decision.decision_id, "decision op index")?;
+    }
+    for floor in &body.scope_floors {
+        insert_unique(&mut state.scope_floors, floor.key.clone(), floor.clone(), "scope floor")?;
+    }
+    for deps in &body.decision_scope_deps {
+        for dep in &deps.dependencies {
+            let skey = super::apply_scopes::ScopeKey::new(&dep.scope_kind, dep.scope_id);
+            state.scope_decision_index.entry(skey).or_default().insert(deps.decision_id);
+        }
+        insert_unique(&mut state.decision_scope_deps, deps.decision_id, deps.clone(), "decision scope deps")?;
     }
     for snap in &body.snapshots {
         insert_unique(&mut state.snapshots, snap.snapshot_id, snap.clone(), "snapshot header")?;

@@ -12,13 +12,15 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
-use x509_cert::Certificate;
-use x509_cert::der::Decode;
-use x509_cert::der::oid::AssociatedOid;
-use x509_cert::ext::pkix::SubjectAltName;
-use x509_cert::ext::pkix::name::GeneralName;
+mod tenant_san;
 
 use crate::{E, Res};
+
+pub use tenant_san::{
+    RpcCapability, TENANT_CLIENT_DNS_PREFIX, TENANT_DNS_SUFFIX, TENANT_URI_PREFIX, TenantCertScope, VerifiedPeer,
+    extract_tenant_client_scope, extract_verified_peer, parse_tenant_client_dns, parse_tenant_scope_uri,
+    tenant_client_dns_name, tenant_scope_uri, validate_group_id, validate_non_nil_uuid,
+};
 
 /// SAN DNS prefix used for authenticated Raft cluster peer/server node certificates.
 pub const NODE_DNS_PREFIX: &str = "raft-node-";
@@ -73,20 +75,39 @@ impl MtlsServer {
         Ok(Self { acceptor: TlsAcceptor::from(Arc::new(cfg)) })
     }
 
-    /// Completes the mTLS handshake and extracts the verified peer identity from leaf SANs.
-    pub async fn accept(&self, stream: TcpStream) -> io::Result<(server::TlsStream<TcpStream>, PeerIdentity)> {
+    async fn accept_tls_leaf(&self, stream: TcpStream) -> io::Result<(server::TlsStream<TcpStream>, Vec<u8>)> {
         let tls = self.acceptor.accept(stream).await?;
-        let certs = tls
-            .get_ref()
-            .1
-            .peer_certificates()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "missing mTLS peer certificate"))?;
-        let leaf = certs
-            .first()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "empty mTLS certificate chain"))?;
-        let identity = extract_peer_identity(leaf.as_ref())
+        let leaf_der = {
+            let certs = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "missing mTLS peer certificate"))?;
+            let leaf = certs
+                .first()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "empty mTLS certificate chain"))?;
+            leaf.as_ref().to_vec()
+        };
+        Ok((tls, leaf_der))
+    }
+
+    /// Completes the mTLS handshake and extracts a cluster peer/client `PeerIdentity` (rejects tenant client certs).
+    pub async fn accept(&self, stream: TcpStream) -> io::Result<(server::TlsStream<TcpStream>, PeerIdentity)> {
+        let (tls, leaf) = self.accept_tls_leaf(stream).await?;
+        let identity = extract_peer_identity(&leaf)
             .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, format!("peer identity rejected: {e}")))?;
         Ok((tls, identity))
+    }
+
+    /// Completes the mTLS handshake and enforces a strict tenant-scoped client cert (rejects node/unscoped certs).
+    pub async fn accept_tenant(
+        &self,
+        stream: TcpStream,
+    ) -> io::Result<(server::TlsStream<TcpStream>, TenantCertScope)> {
+        let (tls, leaf) = self.accept_tls_leaf(stream).await?;
+        let scope = extract_tenant_client_scope(&leaf)
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, format!("tenant scope rejected: {e}")))?;
+        Ok((tls, scope))
     }
 }
 
@@ -140,34 +161,14 @@ pub fn parse_peer_dns_name(dns: &str) -> Option<PeerIdentity> {
     Some(PeerIdentity::Node(id))
 }
 
-/// Extracts and validates an unambiguous `PeerIdentity` from a DER-encoded X.509 certificate.
+/// Extracts and validates an unambiguous cluster `PeerIdentity` (rejects tenant-scoped certs).
 pub fn extract_peer_identity(cert_der: &[u8]) -> Res<PeerIdentity> {
-    let cert = Certificate::from_der(cert_der).map_err(|e| E::Codec(format!("decode X.509 cert: {e}")))?;
-    let Some(exts) = cert.tbs_certificate.extensions.as_ref() else {
-        return Err(E::Refused("certificate lacks X.509 extensions/SAN".into()));
-    };
-    let mut resolved: Option<PeerIdentity> = None;
-    for ext in exts {
-        if ext.extn_id != SubjectAltName::OID {
-            continue;
-        }
-        let san = SubjectAltName::from_der(ext.extn_value.as_bytes())
-            .map_err(|e| E::Codec(format!("decode SubjectAltName: {e}")))?;
-        for name in san.0 {
-            let GeneralName::DnsName(ia5) = name else {
-                return Err(E::Refused("non-DNS SAN entry not permitted in Ref-CAS mTLS identity cert".into()));
-            };
-            let parsed = parse_peer_dns_name(ia5.as_str())
-                .ok_or_else(|| E::Refused(format!("unrecognized Ref-CAS mTLS SAN DNS {:?}", ia5.as_str())))?;
-            if let Some(prev) = resolved
-                && prev != parsed
-            {
-                return Err(E::Refused(format!("conflicting SAN identities in cert: {prev:?} vs {parsed:?}")));
-            }
-            resolved = Some(parsed);
+    match extract_verified_peer(cert_der)? {
+        VerifiedPeer::Cluster(identity) => Ok(identity),
+        VerifiedPeer::TenantClient(_) => {
+            Err(E::Refused("role confusion: tenant client cert cannot authenticate as Raft cluster peer/admin".into()))
         }
     }
-    resolved.ok_or_else(|| E::Refused("certificate lacks a valid Ref-CAS mTLS SAN identity".into()))
 }
 
 fn ring_provider() -> Arc<CryptoProvider> {

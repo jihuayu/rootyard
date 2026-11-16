@@ -363,6 +363,22 @@ mod tests {
 
         let mut env = read_and_verify_envelope_file(&tmp, repo, pack_id).unwrap();
         assert_eq!(env.encryption_mode, crypto::AUTHENTICATED_ENVELOPE_MODE);
+        assert_eq!(env.provider_kind, provider::PROVIDER_KIND_LOCAL);
+        verify_envelope_record(&env).unwrap();
+
+        // Legacy authenticated envelopes may predate the provider_kind field;
+        // serde's default keeps them readable as the supported local kind.
+        let mut legacy_value = serde_json::to_value(&env).unwrap();
+        legacy_value.as_object_mut().unwrap().remove("provider_kind");
+        let legacy: KmsEnvelopeRecord = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(legacy.provider_kind, provider::PROVIDER_KIND_LOCAL);
+        verify_envelope_record(&legacy).unwrap();
+
+        let mut changed_provider = env.clone();
+        changed_provider.provider_kind = "external-kms-v1".to_owned();
+        assert!(verify_envelope_record(&changed_provider).is_err());
+        changed_provider.wrapped_key_json = Some("not-a-wrapped-dek".to_owned());
+        assert!(verify_envelope_record(&changed_provider).is_err());
         env.storage_tier = "cold_archive".to_owned();
         env.envelope_mac = crypto::compute_authenticated_envelope_mac(&crypto::EnvelopeMacInputs {
             encryption_mode: &env.encryption_mode, repo, pack_id, key_id: &env.key_id, key_version: env.key_version,
