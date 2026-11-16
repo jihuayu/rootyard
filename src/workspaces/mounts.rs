@@ -314,49 +314,98 @@ pub async fn shutdown_helper() -> Result<(), Error> {
     }
 }
 
-/// Deadline-aware helper teardown for the normal signal path. The existing
-/// fence/exact-unmount/exit allowance is capped by the caller's remaining
-/// shared normal-shutdown deadline instead of starting a fresh helper grace.
+/// Merge the current helper slot with every helper client still retained by
+/// the extracted mount registry, keeping one exact generation only once.
+fn collect_unique<T, I, F>(current: Option<T>, entries: I, same: F) -> Vec<T>
+where
+    I: IntoIterator<Item = T>,
+    F: Fn(&T, &T) -> bool,
+{
+    let mut items = Vec::new();
+    if let Some(current) = current {
+        items.push(current);
+    }
+    for entry in entries {
+        if !items.iter().any(|existing| same(existing, &entry)) {
+            items.push(entry);
+        }
+    }
+    items
+}
+
+fn helper_clients(current: Option<Arc<HelperClient>>, entries: &MountRegistry) -> Vec<Arc<HelperClient>> {
+    collect_unique(
+        current,
+        entries.iter().filter_map(|(_, mount)| match mount {
+            MountEntry::Helper(slot) => Some(slot.client.clone()),
+            MountEntry::InProcess(_) => None,
+        }),
+        |left, right| left.generation() == right.generation(),
+    )
+}
+
+fn helper_teardown_error(failures: Vec<String>) -> Error {
+    Error::internal(format!("workspace FUSE helper teardown incomplete: {}", failures.join("; ")))
+}
+
+/// Deadline-aware helper teardown for the normal signal path. Every helper
+/// generation retained by the extracted registry (not only the current slot)
+/// receives the same absolute deadline before any blocking teardown begins.
+/// The existing fence/exact-unmount/exit allowance is capped by the caller's
+/// remaining shared normal-shutdown deadline, never by a fresh helper grace.
 pub async fn shutdown_helper_until(deadline: tokio::time::Instant) -> Result<(), Error> {
-    let client = helper_slot().lock().unwrap().take();
+    let current = helper_slot().lock().unwrap().take();
     let entries = {
         let mut registry = registry().lock().unwrap();
         std::mem::take(&mut *registry)
     };
-    let Some(client) = client else {
-        return super::blocking::run_control(move || {
-            drop(entries);
-            Ok(())
-        })
-        .await;
-    };
-    let teardown_deadline =
-        client.publish_teardown_deadline(deadline.into_std().min(Instant::now() + HELPER_SHUTDOWN_GRACE));
+    let clients = helper_clients(current, &entries);
+    if clients.is_empty() && entries.iter().next().is_none() {
+        return Ok(());
+    }
+    let teardown_deadline = deadline.into_std().min(Instant::now() + HELPER_SHUTDOWN_GRACE);
+    let mut effective = teardown_deadline;
+    for client in &clients {
+        effective = effective.min(client.publish_teardown_deadline(teardown_deadline));
+    }
     let cleanup: HelperShutdown = Box::new(move || {
+        let mut failures = Vec::new();
+        for client in &clients {
+            if let Err(error) = client.shutdown_until(effective) {
+                failures.push(format!("helper generation {}: {error}", client.generation()));
+            }
+        }
+        // Keep the registry entries alive until every retained generation has
+        // had its exact-owner teardown attempt. A failed generation leaves the
+        // helper stage an error; it is never converted to clean quiescence.
         drop(entries);
-        client.shutdown_until(teardown_deadline).map_err(Error::internal)
+        if failures.is_empty() { Ok(()) } else { Err(helper_teardown_error(failures)) }
     });
-    run_helper_cleanup(cleanup, tokio::time::Instant::from_std(teardown_deadline)).await
+    run_helper_cleanup(cleanup, tokio::time::Instant::from_std(effective)).await
 }
 
 /// Compatibility path used when no normal-shutdown deadline was published.
-/// It keeps the previous helper allowance and control-bulkhead dispatch.
+/// It still tears down every retained generation and keeps the previous
+/// per-client helper allowance and control-bulkhead dispatch.
 async fn shutdown_helper_without_deadline() -> Result<(), Error> {
-    let client = helper_slot().lock().unwrap().take();
+    let current = helper_slot().lock().unwrap().take();
     let entries = {
         let mut registry = registry().lock().unwrap();
         std::mem::take(&mut *registry)
     };
-    let Some(client) = client else {
-        return super::blocking::run_control(move || {
-            drop(entries);
-            Ok(())
-        })
-        .await;
-    };
+    let clients = helper_clients(current, &entries);
+    if clients.is_empty() && entries.iter().next().is_none() {
+        return Ok(());
+    }
     super::blocking::run_control(move || {
+        let mut failures = Vec::new();
+        for client in &clients {
+            if let Err(error) = client.shutdown(HELPER_SHUTDOWN_GRACE) {
+                failures.push(format!("helper generation {}: {error}", client.generation()));
+            }
+        }
         drop(entries);
-        client.shutdown(HELPER_SHUTDOWN_GRACE).map_err(Error::internal)
+        if failures.is_empty() { Ok(()) } else { Err(helper_teardown_error(failures)) }
     })
     .await
 }
@@ -391,5 +440,25 @@ async fn run_helper_cleanup(cleanup: HelperShutdown, deadline: tokio::time::Inst
                 "workspace FUSE helper shutdown exceeded the shared normal-shutdown deadline",
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_retained_generations_are_collected_when_the_current_slot_is_known_none() {
+        let collected = collect_unique(None, vec![11u64, 11, 12, 13, 12], |left, right| left == right);
+        assert_eq!(collected, vec![11, 12, 13]);
+
+        let empty = collect_unique(None, Vec::<u64>::new(), |left, right| left == right);
+        assert!(empty.is_empty(), "no current client and no entries must short-circuit");
+    }
+
+    #[test]
+    fn current_generation_is_merged_with_retained_entries_only_once() {
+        let collected = collect_unique(Some(11u64), vec![12, 11, 13, 12], |left, right| left == right);
+        assert_eq!(collected, vec![11, 12, 13]);
     }
 }

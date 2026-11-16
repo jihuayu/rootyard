@@ -302,6 +302,51 @@ impl Inner {
         lock_until(&self.control, || self.effective_deadline(deadline))
     }
 
+    /// Best-effort canonical shutdown frame when no budget remains. It never
+    /// waits for the mutex or socket: if it cannot write the whole frame, the
+    /// caller fail-closes the generation and the deadline-capped reaper kills
+    /// and reaps the exact child. It is not evidence of a clean unmount.
+    fn try_send_shutdown_frame(&self) -> bool {
+        if self.dead.load(Ordering::Acquire) {
+            return false;
+        }
+        let frame = match Frame::request(self.generation, self.next_request(), None, 0, &Body::Shutdown) {
+            Ok(frame) => frame,
+            Err(_) => return false,
+        };
+        let bytes = match encode_frame(&frame) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        let mut control = match self.control.try_lock() {
+            Ok(control) => control,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        if self.dead.load(Ordering::Acquire) {
+            return false;
+        }
+        let fd = control.as_raw_fd();
+        let mut remaining = &bytes[..];
+        while !remaining.is_empty() {
+            // SAFETY: the socket fd is owned by `control`; the pointer covers
+            // the remaining bytes and `MSG_DONTWAIT` never blocks.
+            let sent = unsafe { libc::send(fd, remaining.as_ptr().cast(), remaining.len(), CONTROL_SEND_FLAGS) };
+            if sent > 0 {
+                remaining = &remaining[sent as usize..];
+                continue;
+            }
+            if sent < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+            }
+            return false;
+        }
+        control.flush().is_ok()
+    }
+
     fn deliver(&self, frame: Frame) {
         let expected = lock(&self.pending).remove(&frame.request_id);
         let Some(expected) = expected else { return };
@@ -852,6 +897,24 @@ impl HelperClient {
     /// after the caller's remaining normal-shutdown budget is exhausted.
     pub fn shutdown_until(&self, deadline: Instant) -> Result<(), HelperError> {
         let deadline = self.inner.begin_teardown_deadline(deadline);
+        if Instant::now() >= deadline {
+            // No remaining budget: still make one nonblocking, canonical
+            // shutdown/fence attempt, then fail-closed the exact generation so
+            // the deadline-capped reaper performs the owned kill/reap. This
+            // path never reports success without an observed child exit.
+            let attempted = self.inner.try_send_shutdown_frame();
+            self.inner.stop.store(true, Ordering::Release);
+            return match self.inner.wait_exit_until(deadline) {
+                Ok(()) => {
+                    self.inner.mark_dead();
+                    Ok(())
+                }
+                Err(error) => {
+                    self.inner.fail_generation(error.code, error.message.clone());
+                    if attempted { Err(error) } else { Err(control_deadline_error()) }
+                }
+            };
+        }
         let request_deadline = deadline.min(Instant::now() + REQUEST_DEADLINE);
         let request = self.inner.call_until(None, 0, Body::Shutdown, request_deadline);
         self.inner.stop.store(true, Ordering::Release);
