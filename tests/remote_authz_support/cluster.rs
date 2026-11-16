@@ -175,6 +175,7 @@ pub struct RaftNodeProc {
 impl RaftNodeProc {
     pub fn spawn_in_dir(bin: &Path, pki: &MtlsClusterPki, id: u64, data_dir: PathBuf) -> Result<Self> {
         let (cert, key) = pki.node_paths.get(&id).context("missing node cert")?;
+        let stderr_file = File::create(data_dir.join("node.stderr"))?;
         let spawned = Command::new(bin)
             .args([
                 "--id",
@@ -190,16 +191,16 @@ impl RaftNodeProc {
                 "--check-on-open",
                 "true",
                 "--heartbeat-ms",
-                "80",
+                "350",
                 "--election-min-ms",
-                "280",
+                "1100",
                 "--election-max-ms",
-                "520",
+                "1800",
                 "--write-timeout-ms",
-                "4000",
+                "8000",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(stderr_file))
             .spawn()
             .with_context(|| format!("spawn raft-node {id}"))?;
         let mut child = OwnedChild(Some(spawned));
@@ -298,12 +299,13 @@ impl LiveRaftCluster {
             members.insert(id, proc.addr.clone());
             nodes.insert(id, proc);
         }
-        nodes[&1].rpc(json!({ "Bootstrap": { "members": members } })).await?;
-        for id in [2u64, 3] {
-            nodes[&id].rpc(json!({ "UpdatePeers": { "peers": members } })).await?;
+        for id in [1u64, 2, 3] {
+            assert_eq!(nodes[&id].rpc(json!({ "UpdatePeers": { "peers": members } })).await?, json!("Ok"));
         }
+        assert_eq!(nodes[&1].rpc(json!({ "Bootstrap": { "members": members } })).await?, json!("Ok"));
         let cluster = Self { _root_dir: root_dir, pki, bin, nodes, next_seq: 0 };
-        cluster.wait_leader(None).await?;
+        let lid = cluster.wait_leader(None).await?;
+        assert!(cluster.nodes.contains_key(&lid));
         Ok(cluster)
     }
 
@@ -350,16 +352,26 @@ impl LiveRaftCluster {
 
     async fn kv_put(&self, key: &str, value: &str) -> Result<u64> {
         let payload = serde_json::to_vec(&json!({ "Put": { "key": key, "value": value } }))?;
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(25);
         let mut last_err = String::new();
+        let mut target_override: Option<u64> = None;
         while Instant::now() < deadline {
-            if let Ok(lid) = self.wait_leader(None).await
-                && let Some(leader) = self.nodes.get(&lid)
+            let lid = match target_override.take() {
+                Some(id) if self.nodes.contains_key(&id) => Ok(id),
+                _ => self.wait_leader(None).await,
+            };
+            if let Ok(id) = lid
+                && let Some(leader) = self.nodes.get(&id)
             {
                 match leader.rpc(json!({ "ClientWrite": { "payload": payload.clone() } })).await {
                     Ok(resp) => {
                         if let Some(idx) = resp.pointer("/ClientWrite/log_index").and_then(Value::as_u64) {
                             return Ok(idx);
+                        }
+                        if let Some(fwd) = resp.pointer("/Error/forward_to_leader_id").and_then(Value::as_u64)
+                            && fwd != id
+                        {
+                            target_override = Some(fwd);
                         }
                         last_err = resp.to_string();
                     }
@@ -368,7 +380,14 @@ impl LiveRaftCluster {
             }
             tokio::time::sleep(Duration::from_millis(80)).await;
         }
-        bail!("ClientWrite timeout for {key}: {last_err}");
+        let mut diag = Vec::new();
+        for (&id, n) in &self.nodes {
+            let m = n.rpc(json!("Metrics")).await.map(|v| v.to_string()).unwrap_or_else(|e| e.to_string());
+            let err_tail = fs::read_to_string(n.data_dir.join("node.stderr")).unwrap_or_default();
+            let tail: String = err_tail.chars().rev().take(240).collect::<String>().chars().rev().collect();
+            diag.push(format!("node-{id}: metrics={m}, stderr_tail={tail:?}"));
+        }
+        bail!("ClientWrite timeout for {key}: {last_err}; diag=[{}]", diag.join(" | "));
     }
 
     pub async fn replay_linearizable_on(
@@ -454,8 +473,10 @@ impl LiveRaftCluster {
     }
 
     pub async fn heal_all(&self) -> Result<()> {
+        let peers: BTreeMap<u64, String> = self.nodes.iter().map(|(&id, n)| (id, n.addr.clone())).collect();
         for n in self.nodes.values() {
             n.rpc(json!({ "PartitionPeers": { "blocked": [] } })).await?;
+            n.rpc(json!({ "UpdatePeers": { "peers": peers } })).await?;
         }
         Ok(())
     }

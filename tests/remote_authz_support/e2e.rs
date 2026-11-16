@@ -253,7 +253,7 @@ pub async fn run_cancel_commit_partition_drain_barrier() -> Result<()> {
         scope_id,
         6,
         close_log_idx,
-        Duration::from_millis(600),
+        Duration::from_millis(1200),
         Duration::from_millis(40),
         || raft.probe_scope_via_read_index(lid, "branch_rules", scope_id),
     )

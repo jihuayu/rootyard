@@ -331,13 +331,13 @@ async fn drain_barrier_refuses_unknown_quorum_loss_and_pg_fallback() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires multi-process raft-node binary, openssl, and PostgreSQL 17"]
 async fn e2e_pg17_open_to_closing_grant_rotation_crash_restart_and_replay() -> Result<()> {
     remote_authz_support::e2e::run_open_to_closing_grant_rotation_crash_restart().await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires multi-process raft-node binary, openssl, and PostgreSQL 17"]
 async fn e2e_same_log_cancel_commit_partition_drain_barrier_and_clock_independence() -> Result<()> {
     remote_authz_support::e2e::run_cancel_commit_partition_drain_barrier().await
