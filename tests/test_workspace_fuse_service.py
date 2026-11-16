@@ -149,6 +149,12 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
             helper_pid = None
             helper_identity = None
             api_pidfd = helper_pidfd = writer_pidfd = None
+            new_holder = None
+            new_helper_pid = None
+            new_helper_identity = None
+            new_holder_identity = None
+            new_mount_id = None
+            original_failure = None
             try:
                 h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"] = MOUNT_MODE
                 h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
@@ -291,46 +297,221 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     "local_complete", "an in-flight checkpoint was falsely confirmed")
 
                 # A fresh API must mount the same workspace again, with a new
-                # kernel mount ID, and read the retained lower bytes.
+                # kernel mount ID, and read the retained lower bytes.  Capture
+                # this fresh API/helper identity and mount ID rather than reusing
+                # the crashed API's evidence.
                 support.terminate_process(holder)
                 holder = None
                 h.stop(hard=True)
                 h.start()
-                remount = support.wait_for_fuse_mount(h.proc.pid, mountpoint)
-                self.assertNotEqual(int(remount["mount_id"]), mount_id,
+                new_api_pid = h.proc.pid
+                remount = support.wait_for_fuse_mount(new_api_pid, mountpoint)
+                new_mount_id = int(remount["mount_id"])
+                self.assertNotEqual(new_mount_id, mount_id,
                                     "fresh API reused the crashed mount ID")
                 after = json.loads(h.expect(
                     f"/api/workspaces/{wid}/files?path=hello.txt", 200, token=h.alice))
                 self.assertEqual(base64.b64decode(after["content_base64"]), b"second\n")
+
+                # Capture the fresh identities only after the successful
+                # remount/read, so normal-stop teardown is bound to the exact
+                # API/helper that served this remount rather than a pre-read
+                # observation.
+                new_api_identity = support.process_identity(new_api_pid)
+                self.assertIsNotNone(new_api_identity, "fresh API identity is unavailable")
+                self.assertGreater(new_api_identity["starttime"],
+                                   api_identity["starttime"])
+                if self.backend == HELPER_BACKEND:
+                    new_helper_pid = support.find_api_helper_pid(new_api_pid)
+                    new_helper_identity = support.process_identity(new_helper_pid)
+                    self.assertIsNotNone(new_helper_identity,
+                                         "fresh FUSE helper identity is unavailable")
+                    self.assertEqual(new_helper_identity["pgid"], new_helper_pid,
+                                     "fresh FUSE helper is not in its own process group")
+                    self.assertGreater(new_helper_identity["starttime"],
+                                       new_api_identity["starttime"])
+
+                # Attest the fresh mount in the fresh API's own namespace, then
+                # use a fresh holder to keep that namespace observable across
+                # normal graceful shutdown.  No old namespace/mount evidence is
+                # reused and no foreign mount is scanned.
+                new_holder = support.spawn_api_namespace_holder(new_api_pid)
+                new_holder_identity = support.process_identity(new_holder.pid)
+                self.assertIsNotNone(new_holder_identity,
+                                     "fresh namespace holder identity is unavailable")
+                new_visible = support.wait_for_fuse_mount(
+                    new_holder.pid, mountpoint, timeout=5)
+                self.assertEqual(int(new_visible["mount_id"]), new_mount_id,
+                                 "fresh holder does not see the exact new mount")
+
+                # Default graceful stop, bounded by the existing 5s Harness.stop
+                # bound.  Do not take Harness.stop's SIGKILL/fallback branch:
+                # normal shutdown must exit 0 and release the helper/mount before
+                # the fixture root is deleted.
+                os.killpg(new_api_pid, signal.SIGTERM)
+                new_api_exit = support.wait_process_exit(h.proc, timeout=5)
+                self.assertEqual(new_api_exit, 0,
+                                 f"normal service shutdown exit {new_api_exit}, expected 0")
+                if new_helper_pid is not None:
+                    self.assertTrue(
+                        support.wait_pid_gone(new_helper_pid, support.EXIT_DEADLINE),
+                        "fresh FUSE helper remained after normal shutdown")
+                    new_helper_pid = None
+                self.assertTrue(
+                    support.wait_for_mount_id_gone(
+                        new_holder.pid, mountpoint, new_mount_id,
+                        support.EXIT_DEADLINE),
+                    "fresh owned mount ID remained after normal shutdown")
+                remaining = [
+                    row for row in support.read_process_mountinfo(new_holder.pid)
+                    if row["mountpoint"] == str(mountpoint)
+                    and row["source"] == "rootyard-workspace"
+                    and (row["fstype"] == "fuse" or row["fstype"].startswith("fuse."))
+                ]
+                self.assertEqual(remaining, [],
+                                 "fresh workspace mount remained after normal shutdown")
+                holder_now = support.process_identity(new_holder.pid)
+                self.assertIsNotNone(holder_now, "fresh holder exited before cleanup")
+                self.assertEqual(holder_now["starttime"], new_holder_identity["starttime"],
+                                 "fresh holder identity changed before cleanup")
+                support.terminate_process(new_holder)
+                new_holder = None
+                new_mount_id = None
+            except BaseException as error:
+                original_failure = error
+                raise
             finally:
-                if gate is not None:
-                    gate.with_suffix(".release").touch()
-                for process in (writer, holder):
+                cleanup_failures = []
+
+                def attempt(label, function):
                     try:
-                        support.terminate_process(process)
-                    except Exception:
-                        pass
+                        function()
+                    except BaseException as error:
+                        cleanup_failures.append((label, error))
+
+                if gate is not None:
+                    attempt("release capture gate",
+                            lambda: gate.with_suffix(".release").touch())
+                attempt("stop pending writer",
+                        lambda: support.terminate_process(writer))
+                attempt("stop crashed-API namespace holder",
+                        lambda: support.terminate_process(holder))
                 if helper_pid is not None:
                     current = support.process_identity(helper_pid)
                     if (helper_identity is not None and current is not None
                             and current["state"] != "Z"
                             and current["starttime"] == helper_identity["starttime"]):
+                        attempt("kill crashed-API helper",
+                                lambda: os.killpg(helper_pid, signal.SIGKILL))
+                        if not support.wait_pid_gone(helper_pid, support.EXIT_DEADLINE):
+                            cleanup_failures.append((
+                                "crashed-API helper residue",
+                                AssertionError(
+                                    f"crashed-API helper {helper_pid} remained")))
+
+                # A failure can leave the fresh API alive.  Reclaim only the
+                # verified owned API process group, then still wait for the fresh
+                # helper and mount before fixture-root deletion.
+                if h.proc is not None and h.proc.poll() is None:
+                    try:
+                        os.killpg(h.proc.pid, signal.SIGTERM)
+                        support.wait_process_exit(h.proc, timeout=5)
+                    except BaseException as error:
+                        cleanup_failures.append(("fresh API graceful stop", error))
                         try:
-                            os.killpg(helper_pid, signal.SIGKILL)
+                            os.killpg(h.proc.pid, signal.SIGKILL)
                         except OSError:
                             pass
-                        support.wait_pid_gone(helper_pid, support.EXIT_DEADLINE)
-                support.close_fd(api_pidfd)
-                support.close_fd(helper_pidfd)
-                support.close_fd(writer_pidfd)
-                try:
-                    h.stop(hard=True)
-                except Exception:
-                    pass
-                try:
-                    h.cleanup()
-                except Exception:
-                    pass
+                        try:
+                            support.wait_process_exit(
+                                h.proc, timeout=support.EXIT_DEADLINE)
+                        except BaseException as kill_error:
+                            cleanup_failures.append(("fresh API hard stop", kill_error))
+
+                if new_helper_pid is not None:
+                    current = support.process_identity(new_helper_pid)
+                    if (new_helper_identity is not None and current is not None
+                            and current["starttime"] == new_helper_identity["starttime"]):
+                        if not support.wait_pid_gone(
+                                new_helper_pid, support.EXIT_DEADLINE):
+                            cleanup_failures.append((
+                                "fresh helper residue",
+                                AssertionError(
+                                    f"fresh helper {new_helper_pid} remained")))
+                            if current["state"] != "Z":
+                                attempt("kill fresh helper",
+                                        lambda: os.killpg(
+                                            new_helper_pid, signal.SIGKILL))
+                                if not support.wait_pid_gone(
+                                        new_helper_pid, support.EXIT_DEADLINE):
+                                    cleanup_failures.append((
+                                        "fresh helper unreaped",
+                                        AssertionError(
+                                            f"fresh helper {new_helper_pid} survived")))
+
+                if new_mount_id is not None:
+                    if new_holder is None:
+                        cleanup_failures.append((
+                            "fresh mount unattested",
+                            AssertionError(
+                                f"fresh mount ID {new_mount_id} has no holder")))
+                    else:
+                        holder_now = support.process_identity(new_holder.pid)
+                        if (new_holder_identity is None or holder_now is None
+                                or holder_now["starttime"]
+                                != new_holder_identity["starttime"]):
+                            cleanup_failures.append((
+                                "fresh mount unattested",
+                                AssertionError(
+                                    f"fresh holder identity changed for mount ID "
+                                    f"{new_mount_id}")))
+                        else:
+                            try:
+                                gone = support.wait_for_mount_id_gone(
+                                    new_holder.pid, mountpoint, new_mount_id,
+                                    support.EXIT_DEADLINE)
+                            except BaseException as error:
+                                gone = False
+                                cleanup_failures.append(("fresh mount wait", error))
+                            if not gone:
+                                cleanup_failures.append((
+                                    "fresh mount residue",
+                                    AssertionError(
+                                        f"fresh mount ID {new_mount_id} remained "
+                                        "before root deletion")))
+
+                if new_holder is not None:
+                    holder_now = support.process_identity(new_holder.pid)
+                    if (new_holder_identity is not None and holder_now is not None
+                            and holder_now["starttime"]
+                            != new_holder_identity["starttime"]):
+                        cleanup_failures.append((
+                            "fresh holder identity changed",
+                            AssertionError(
+                                f"holder PID {new_holder.pid} now names another process")))
+                    else:
+                        attempt("stop fresh namespace holder",
+                                lambda: support.terminate_process(new_holder))
+
+                for label, fd in (("close API pidfd", api_pidfd),
+                                  ("close helper pidfd", helper_pidfd),
+                                  ("close writer pidfd", writer_pidfd)):
+                    if fd is not None:
+                        attempt(label, lambda fd=fd: os.close(fd))
+
+                # Both final steps are attempted even if earlier cleanup failed.
+                attempt("harness stop", lambda: h.stop())
+                attempt("harness cleanup", lambda: h.cleanup())
+
+                if cleanup_failures:
+                    detail = "; ".join(
+                        f"{label}: {type(error).__name__}"
+                        for label, error in cleanup_failures)
+                    note = "remount teardown failed: " + detail
+                    if original_failure is not None:
+                        original_failure.add_note(note)
+                    else:
+                        raise AssertionError(note)
 
 
 if __name__=="__main__":unittest.main()
