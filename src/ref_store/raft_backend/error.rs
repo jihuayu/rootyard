@@ -37,7 +37,7 @@ pub enum RaftBackendError {
     /// The stored outcome belongs to a different canonical command payload.
     OutcomeDigestMismatch(ApplicationLogId),
     /// A committed retry's exact receipt is no longer observed within its valid window.
-    RecoveryNotObserved(ProposalId),
+    RecoveryNotObserved(Box<ProposalId>),
     /// Owned-node control/peer RPC failure.
     NodeControl(&'static str),
     /// The persistent state machine was not opened with the root Ref-CAS reducer.

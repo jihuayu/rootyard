@@ -231,7 +231,9 @@ impl RootRaftRefCasBackend {
                         outcome: Some(outcome),
                     }),
                     ProposalLookup::Expired { .. } => Ok(ProposalOutcome::expired(proposal_id, log_id)),
-                    ProposalLookup::NotObserved { .. } => Err(RaftBackendError::RecoveryNotObserved(proposal_id)),
+                    ProposalLookup::NotObserved { .. } => {
+                        Err(RaftBackendError::RecoveryNotObserved(Box::new(proposal_id)))
+                    }
                     ProposalLookup::Invalid { reason, .. } => Err(RaftBackendError::InvalidProposal(reason)),
                 }
             }

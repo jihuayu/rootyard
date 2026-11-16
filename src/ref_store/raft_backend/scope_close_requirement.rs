@@ -157,7 +157,7 @@ pub(crate) fn scope_close_requirement_from_lookup(
             )
         }
         ProposalLookup::Expired { .. } => Err(RaftBackendError::ScopeCloseNotRecoverable("close receipt expired")),
-        ProposalLookup::NotObserved { .. } => Err(RaftBackendError::RecoveryNotObserved(proposal_id)),
+        ProposalLookup::NotObserved { .. } => Err(RaftBackendError::RecoveryNotObserved(Box::new(proposal_id))),
         ProposalLookup::Invalid { reason, .. } => Err(RaftBackendError::InvalidProposal(reason)),
     }
 }
