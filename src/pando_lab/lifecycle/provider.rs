@@ -80,7 +80,7 @@ impl<T: KeyProvider + ?Sized> PandoKeyProvider for T {
                 ));
             };
             let data_key = KeyProvider::unwrap_data_key(self, wrapped, context)?;
-            Ok(PandoDataKey::from_bytes(*data_key.expose_secret()))
+            Ok(PandoDataKey::copy_from_slice(data_key.expose_secret()))
         })
     }
 
