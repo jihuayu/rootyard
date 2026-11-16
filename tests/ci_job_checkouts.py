@@ -23,6 +23,9 @@ import urllib.parse
 import uuid
 
 from ci_source_pins import SourcePinHarness
+import transfer_revocation_observer as revocation_observer
+import transfer_revocation_timing as revocation_timing
+import transfer_revocation_transport as revocation_transport
 
 
 class JobCheckoutHarness(SourcePinHarness):
@@ -713,46 +716,17 @@ class JobCheckoutHarness(SourcePinHarness):
         )
         return "t" in output.splitlines()
 
-    def _active_git_children(self, data_dir=None):
-        proc_dir = Path("/proc")
-        if not proc_dir.is_dir():
-            return []
-        dirs = [data_dir] if data_dir is not None else [self.env["ROOTYARD_DATA_DIR"], self.mirror_env["ROOTYARD_DATA_DIR"]]
-        markers = {f"ROOTYARD_DATA_DIR={item}".encode() for item in dirs}
-        server_pids = {
-            pid for pid in (
-                self.proc.pid if self.proc else None,
-                self.mirror_proc.pid if self.mirror_proc else None,
-            ) if pid is not None
-        }
-        found = []
-        for entry in proc_dir.iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            if pid in server_pids:
-                continue
-            try:
-                comm = (entry / "comm").read_text(errors="replace").strip()
-                if not comm.startswith("git"):
-                    continue
-                environ = (entry / "environ").read_bytes()
-            except OSError:
-                continue
-            if any(marker in environ for marker in markers):
-                found.append((pid, comm))
-        return found
-
-    def _wait_no_git_children(self, timeout=2.5, data_dir=None):
+    def _wait_no_owned_children(self, service_pids, timeout=2.5):
+        """Final reaping sanity from PPID/PGID identity, never process env."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            remaining = self._active_git_children(data_dir=data_dir)
-            if not remaining:
+            table = revocation_observer.read_proc_table(uid=os.geteuid())
+            descendants = revocation_observer.descendant_pids(table, service_pids)
+            live = [pid for pid in descendants if table[pid].live]
+            if not live:
                 return
             time.sleep(0.05)
-        raise AssertionError(
-            f"Leaked Git subprocess(es) remained active: {self._active_git_children(data_dir=data_dir)}"
-        )
+        raise AssertionError("owned service descendant remained live after transfer cleanup")
 
     @contextlib.contextmanager
     def _scoped_revocation_env(self, bound_ms="1200", extra_env=None, extra_mirror_env=None):
@@ -790,106 +764,118 @@ class JobCheckoutHarness(SourcePinHarness):
             self.start()
             self.start_mirror()
 
-    def _stream_git_until_revoked(
-        self,
-        base,
-        path,
-        token,
-        oid,
-        payload_bytes,
-        revoke,
-        *,
-        check_barrier=True,
-        pause_after_first=0.0,
-        start_barrier=None,
-    ):
+    def _db_clock_sample(self):
+        started = time.monotonic_ns()
+        raw = self.sql("SELECT extract(epoch FROM clock_timestamp())")
+        ended = time.monotonic_ns()
+        return revocation_timing.DbClockSample(started, ended, float(raw))
+
+    def _set_token_natural_expiry(self, token_id, seconds=8):
+        token = uuid.UUID(token_id)
+        self.sql(
+            "UPDATE tokens SET expires_at=to_timestamp(floor(extract(epoch FROM clock_timestamp()))"
+            f" + {int(seconds)}) WHERE id='{token}'"
+        )
+        return float(self.sql(f"SELECT extract(epoch FROM expires_at) FROM tokens WHERE id='{token}'"))
+
+    def _git_transfer(self, base, path, token, oid, payload_bytes, *, trigger=None,
+                      trigger_kind="committed_mutation", natural_expiry=None,
+                      service_pid=None, check_barrier=True, start_barrier=None,
+                      pause_after_first=0.0, rcvbuf=None, require_backpressure=False):
         def pkt(value):
             return f"{len(value) + 4:04x}".encode() + value
 
-        url = urllib.parse.urlsplit(base)
-        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=15)
         body = pkt(f"want {oid} side-band-64k\n".encode()) + b"0000" + pkt(b"done\n")
         headers = {
             "Authorization": "Bearer " + token["token"],
             "Content-Type": "application/x-git-upload-pack-request",
         }
-        try:
-            connection.request("POST", path + "/git-upload-pack", body=body, headers=headers)
-            response = connection.getresponse()
-            assert response.status == 200, (response.status, response.read(200))
-            first = response.read(4096)
-            assert first, "upload-pack returned no data before revocation"
-            if check_barrier:
-                assert not self._barrier_available(), "physical GC lock bypassed active Git stream"
-            if start_barrier is not None:
-                start_barrier.wait(timeout=15)
-            received = len(first)
-            started = time.monotonic()
-            custom_start = revoke()
-            if isinstance(custom_start, float):
-                started = custom_start
-            if pause_after_first > 0:
-                time.sleep(pause_after_first)
-            interrupted = False
-            while time.monotonic() - started < 6:
-                try:
-                    chunk = response.read(64 * 1024)
-                except (http.client.IncompleteRead, OSError):
-                    interrupted = True
-                    break
-                if not chunk:
-                    break
-                received += len(chunk)
-                if pause_after_first <= 0:
-                    time.sleep(0.02)
-            elapsed = time.monotonic() - started
-            assert interrupted or received < payload_bytes, (
-                f"Git transfer completed unrevoked ({received}/{payload_bytes} bytes)"
-            )
-            assert received < payload_bytes, f"entire pack escaped after revocation ({received}/{payload_bytes})"
-            assert elapsed < 5, f"bounded revocation took too long: {elapsed:.2f}s"
-            return {"received": received, "elapsed_seconds": round(elapsed, 3)}
-        finally:
-            connection.close()
+        result = revocation_transport.run_timed_transfer(
+            base=base,
+            path=path + "/git-upload-pack",
+            method="POST",
+            headers=headers,
+            body=body,
+            expected_size=payload_bytes,
+            initial_bytes=4096,
+            framing="chunked",
+            service_pid=service_pid,
+            bound_ms=1200,
+            trigger=trigger,
+            trigger_kind=trigger_kind,
+            natural_expiry=natural_expiry,
+            post_pause_ms=int(round(pause_after_first * 1000)),
+            rcvbuf=rcvbuf,
+            require_backpressure=require_backpressure,
+            require_group=True,
+            active_barrier_check=(lambda: not self._barrier_available()) if check_barrier else None,
+            start_barrier=start_barrier,
+        )
+        result["configured_bound_proven"] = bool(result["configured_bound_proven"])
+        result["received"] = result["client_stop"]["received_bytes"]
+        return result
 
-    def _stream_lfs_until_revoked(
-        self, base, path, token, expected_size, revoke, *, pause_after_first=1.5, start_barrier=None
-    ):
-        url = urllib.parse.urlsplit(base)
-        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=15)
-        try:
-            connection.request("GET", path, headers={"Authorization": "Bearer " + token["token"]})
-            response = connection.getresponse()
-            assert response.status == 200, (response.status, response.read(200))
-            assert int(response.getheader("Content-Length")) == expected_size
-            first = response.read(1024)
-            assert len(first) == 1024
-            if start_barrier is not None:
-                start_barrier.wait(timeout=15)
-            received = len(first)
-            started = time.monotonic()
-            custom_start = revoke()
-            if isinstance(custom_start, float):
-                started = custom_start
-            time.sleep(pause_after_first)
-            interrupted = False
-            while time.monotonic() - started < 6:
-                try:
-                    chunk = response.read(64 * 1024)
-                except (http.client.IncompleteRead, OSError):
-                    interrupted = True
-                    break
-                if not chunk:
-                    break
-                received += len(chunk)
-            elapsed = time.monotonic() - started
-            assert (interrupted or received < expected_size) and received < expected_size, (
-                f"LFS transfer escaped after revocation ({received}/{expected_size} bytes)"
-            )
-            assert elapsed < 5, f"LFS revocation took too long: {elapsed:.2f}s"
-            return {"received": received, "elapsed_seconds": round(elapsed, 3)}
-        finally:
-            connection.close()
+    def _lfs_transfer(self, base, path, token, expected_size, *, trigger=None,
+                      trigger_kind="committed_mutation", natural_expiry=None,
+                      service_pid=None, start_barrier=None, pause_after_first=1.6,
+                      rcvbuf=None, require_backpressure=False):
+        result = revocation_transport.run_timed_transfer(
+            base=base,
+            path=path,
+            method="GET",
+            headers={"Authorization": "Bearer " + token["token"]},
+            body=None,
+            expected_size=expected_size,
+            initial_bytes=1024,
+            framing="content_length",
+            service_pid=service_pid,
+            bound_ms=1200,
+            trigger=trigger,
+            trigger_kind=trigger_kind,
+            natural_expiry=natural_expiry,
+            post_pause_ms=int(round(pause_after_first * 1000)),
+            rcvbuf=rcvbuf,
+            require_backpressure=require_backpressure,
+            require_group=False,
+            start_barrier=start_barrier,
+        )
+        result["configured_bound_proven"] = bool(result["configured_bound_proven"])
+        result["received"] = result["client_stop"]["received_bytes"]
+        return result
+
+    def _stream_git_until_revoked(self, base, path, token, oid, payload_bytes, revoke, *,
+                                  check_barrier=True, pause_after_first=0.0, start_barrier=None,
+                                  service_pid=None):
+        return self._git_transfer(
+            base, path, token, oid, payload_bytes, trigger=revoke,
+            service_pid=service_pid or self.proc.pid,
+            check_barrier=check_barrier, start_barrier=start_barrier,
+            pause_after_first=pause_after_first,
+        )
+
+    def _stream_lfs_until_revoked(self, base, path, token, expected_size, revoke, *,
+                                  pause_after_first=1.6, start_barrier=None, service_pid=None):
+        return self._lfs_transfer(
+            base, path, token, expected_size, trigger=revoke,
+            service_pid=service_pid or self.proc.pid,
+            start_barrier=start_barrier, pause_after_first=pause_after_first,
+        )
+
+    def _stream_git_until_expiry(self, base, path, token, oid, payload_bytes, expiry_clock, *,
+                                 pause_after_first=1.6, service_pid=None):
+        return self._git_transfer(
+            base, path, token, oid, payload_bytes, natural_expiry=expiry_clock,
+            service_pid=service_pid or self.proc.pid,
+            pause_after_first=pause_after_first,
+        )
+
+    def _stream_lfs_until_expiry(self, base, path, token, expected_size, expiry_clock, *,
+                                 pause_after_first=1.6, service_pid=None, start_barrier=None):
+        return self._lfs_transfer(
+            base, path, token, expected_size, natural_expiry=expiry_clock,
+            service_pid=service_pid or self.proc.pid,
+            start_barrier=start_barrier, pause_after_first=pause_after_first,
+        )
 
     def bounded_active_transfer_revocation(self):
         lfs_bytes = os.urandom(16 * 1024 * 1024)
@@ -934,6 +920,7 @@ class JobCheckoutHarness(SourcePinHarness):
                 rev_oid,
                 pack_size,
                 lambda: self.cli("revoke-token", pat_revoked["token_id"]),
+                service_pid=self.proc.pid,
             )
             self.expect(f"/git/alice/demo.git/info/refs?service=git-upload-pack", (401, 403), token=pat_revoked)
             for _ in range(30):
@@ -942,21 +929,30 @@ class JobCheckoutHarness(SourcePinHarness):
                 time.sleep(0.05)
             else:
                 raise AssertionError("physical GC lock remained held after PAT revocation")
-            self._wait_no_git_children()
+            self._wait_no_owned_children([self.proc.pid])
 
-            # 2. Human PAT expiry mid-stream
+            # 2. Human PAT natural expiry mid-stream, mapped from the DB clock.
             pat_expired = self.account("create-token", "alice")
-            exp_id = str(uuid.UUID(pat_expired["token_id"]))
-            results["pat_expired"] = self._stream_git_until_revoked(
+            exp_epoch = self._set_token_natural_expiry(pat_expired["token_id"], seconds=8)
+            expiry_before = self._db_clock_sample()
+            expiry_before_clock = revocation_timing.reconcile_expiry([expiry_before], exp_epoch)
+            results["pat_expired"] = self._stream_git_until_expiry(
                 self.base,
                 "/git/alice/demo.git",
                 pat_expired,
                 rev_oid,
                 pack_size,
-                lambda: self.sql(f"UPDATE tokens SET expires_at=now()-interval '1 second' WHERE id='{exp_id}'"),
+                expiry_before_clock,
+                service_pid=self.proc.pid,
+            )
+            expiry_after = self._db_clock_sample()
+            results["pat_expired"] = revocation_timing.apply_natural_expiry_clock(
+                results["pat_expired"],
+                revocation_timing.reconcile_expiry([expiry_before, expiry_after], exp_epoch),
+                1200,
             )
             self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", 401, token=pat_expired)
-            self._wait_no_git_children()
+            self._wait_no_owned_children([self.proc.pid])
 
             # 3. Collaborator membership removal mid-stream on slow-consumer LFS + Git
             self.expect(
@@ -979,12 +975,13 @@ class JobCheckoutHarness(SourcePinHarness):
                         token=self.alice,
                     ),
                     pause_after_first=1.6,
+                    service_pid=self.proc.pid,
                 )
                 self.expect(f"/git/alice/demo.git/info/lfs/objects/{lfs_oid}", (403, 404), token=self.bob)
                 self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", (403, 404), token=self.bob)
             finally:
                 self.http("/api/repos/alice/demo/collaborators/bob", method="DELETE", token=self.alice)
-            self._wait_no_git_children()
+            self._wait_no_owned_children([self.proc.pid])
 
             # 4. Repository storage_generation increment mid-stream
             repo_id = self.repo["id"]
@@ -996,6 +993,7 @@ class JobCheckoutHarness(SourcePinHarness):
                     rev_oid,
                     pack_size,
                     lambda: self.sql(f"UPDATE repositories SET storage_generation=2 WHERE id='{repo_id}'"),
+                    service_pid=self.proc.pid,
                 )
                 self.mirror_expect(self.advertise(self.second), (401, 403, 409), token=self.job_token)
                 for _ in range(30):
@@ -1006,7 +1004,7 @@ class JobCheckoutHarness(SourcePinHarness):
                     raise AssertionError("physical GC lock remained held after storage_generation change")
             finally:
                 self.sql(f"UPDATE repositories SET storage_generation=1 WHERE id='{repo_id}'")
-            self._wait_no_git_children()
+            self._wait_no_owned_children([self.proc.pid])
 
             # 5. Concurrent CI ryj_ job cancel + natural expiry across Git + slow-consumer mirror LFS
             body_a, _, tok_a = self.new_grant(rev_oid)
@@ -1018,7 +1016,8 @@ class JobCheckoutHarness(SourcePinHarness):
                 method="POST",
                 body=b"",
             )
-            exp_b = int(time.time()) + 6
+            db_now = float(self.sql("SELECT extract(epoch FROM clock_timestamp())"))
+            exp_b = int(db_now) + 8
             body_b, _, tok_b = self.new_grant(rev_oid, expires_unix=exp_b)
             self.mirror_expect(
                 f"/api/repos/alice/demo/ci-checkouts/{body_b['job_id']}/prepare-dependencies",
@@ -1027,14 +1026,11 @@ class JobCheckoutHarness(SourcePinHarness):
                 method="POST",
                 body=b"",
             )
+            expiry_before = self._db_clock_sample()
+            expiry_before_clock = revocation_timing.reconcile_expiry([expiry_before], exp_b)
             ci_git_path = self.path(rev_oid)
             ci_lfs_path = f"/ci/{rev_oid}/git/alice/demo.git/info/lfs/objects/{lfs_oid}"
             both_streaming = threading.Barrier(2)
-
-            def expire_b():
-                while time.time() <= exp_b + 0.35:
-                    time.sleep(0.05)
-                return time.monotonic()
 
             with ThreadPoolExecutor(max_workers=2) as pool:
                 fut_a = pool.submit(
@@ -1046,19 +1042,27 @@ class JobCheckoutHarness(SourcePinHarness):
                     pack_size,
                     lambda: self.transition(body_a_job, "cancel"),
                     start_barrier=both_streaming,
+                    service_pid=self.mirror_proc.pid,
                 )
                 fut_b = pool.submit(
-                    self._stream_lfs_until_revoked,
+                    self._stream_lfs_until_expiry,
                     self.mirror_base,
                     ci_lfs_path,
                     tok_b,
                     len(lfs_bytes),
-                    expire_b,
+                    expiry_before_clock,
                     pause_after_first=1.6,
                     start_barrier=both_streaming,
+                    service_pid=self.mirror_proc.pid,
                 )
                 results["concurrent_job_cancel"] = fut_a.result(timeout=20)
                 results["concurrent_job_expired_lfs"] = fut_b.result(timeout=25)
+            expiry_after = self._db_clock_sample()
+            results["concurrent_job_expired_lfs"] = revocation_timing.apply_natural_expiry_clock(
+                results["concurrent_job_expired_lfs"],
+                revocation_timing.reconcile_expiry([expiry_before, expiry_after], exp_b),
+                1200,
+            )
             self.mirror_expect(self.advertise(rev_oid), (401, 403), token=tok_a)
             self.mirror_expect(ci_lfs_path, (401, 403), token=tok_b)
             for _ in range(30):
@@ -1067,7 +1071,7 @@ class JobCheckoutHarness(SourcePinHarness):
                 time.sleep(0.05)
             else:
                 raise AssertionError("physical GC lock remained held after concurrent job teardown")
-            self._wait_no_git_children()
+            self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
 
             # 6. Database / authority outage fails closed within bound without child leak
             try:
@@ -1080,6 +1084,7 @@ class JobCheckoutHarness(SourcePinHarness):
                     lambda: self.sql("ALTER TABLE tokens RENAME TO checkout_revocation_outage_tokens"),
                     check_barrier=False,
                     pause_after_first=1.6,
+                    service_pid=self.proc.pid,
                 )
                 self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", (500, 503), token=self.reader)
                 for _ in range(30):
@@ -1091,7 +1096,7 @@ class JobCheckoutHarness(SourcePinHarness):
             finally:
                 if self.sql("SELECT to_regclass('checkout_revocation_outage_tokens') IS NOT NULL") == "t":
                     self.sql("ALTER TABLE checkout_revocation_outage_tokens RENAME TO tokens")
-            self._wait_no_git_children()
+            self._wait_no_owned_children([self.proc.pid])
             self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", 200, token=self.reader)
         return results
 
@@ -1195,25 +1200,61 @@ class JobCheckoutHarness(SourcePinHarness):
         prepare_path = f"/api/repos/alice/demo/ci-checkouts/{job_id}/prepare-dependencies"
         try:
             with self._scoped_revocation_env(bound_ms="1200", extra_env=extra_env, extra_mirror_env=extra_mirror):
+                baseline = {
+                    identity.pgid for identity in revocation_observer.discover_groups(
+                        revocation_observer.read_proc_table(uid=os.geteuid()),
+                        [self.mirror_proc.pid],
+                    )
+                }
+                observer = None
                 with ThreadPoolExecutor(max_workers=1) as pool:
                     pending = pool.submit(self.mirror_http, prepare_path, int_token, "POST", b"")
-                    deadline = time.monotonic() + 10
+                    arrival_deadline = time.monotonic() + 10
                     while not entered.exists():
-                        assert not pending.done(), ("prepare-dependencies ended early", pending.result())
-                        assert time.monotonic() < deadline, "mirror did not reach paused origin fetch"
+                        assert not pending.done(), "prepare-dependencies ended early"
+                        assert time.monotonic() < arrival_deadline, "mirror did not reach paused origin fetch"
                         time.sleep(0.02)
-                    started = time.monotonic()
-                    self.expect(f"/api/repos/alice/demo/webhooks/{hook_id}", 200, token=self.alice, method="DELETE")
-                    prep_status, prep_body, _ = pending.result(timeout=8)
-                    abort_elapsed = time.monotonic() - started
-                assert prep_status in (401, 403, 500, 502, 503), (prep_status, prep_body[:300])
-                assert abort_elapsed < 5, f"mirror prepare with source token exceeded bound: {abort_elapsed:.2f}s"
-                self._wait_no_git_children(data_dir=self.mirror_env["ROOTYARD_DATA_DIR"])
+                    observer = revocation_observer.ProcGroupObserver(
+                        [self.mirror_proc.pid]
+                    ).arm(exclude_pgids=baseline)
+                    observer.start(max_duration_s=5.0)
+                    trigger, _ = revocation_timing.TriggerInterval.measure(
+                        "webhook_delete",
+                        lambda: self.expect(
+                            f"/api/repos/alice/demo/webhooks/{hook_id}",
+                            200,
+                            token=self.alice,
+                            method="DELETE",
+                        ),
+                    )
+                    deadline_ns = trigger.deadline_ns(1200)
+                    prep_status, _prep_body, _ = pending.result(timeout=8)
+                    pending_ns = time.monotonic_ns()
+                    while time.monotonic_ns() < max(time.monotonic_ns(), deadline_ns + 100_000_000):
+                        if observer.all_quiescent:
+                            break
+                        time.sleep(0.01)
+                    observer.stop()
+                assert prep_status in (401, 403, 500, 502, 503), f"unexpected prepare status {prep_status}"
+                group_ok = observer.proven(trigger.t_before_ns, deadline_ns)
+                abort_ok = pending_ns <= deadline_ns
+                abort_elapsed = (pending_ns - trigger.t_before_ns) / 1_000_000_000
+                abort_report = {
+                    "configured_bound_ms": 1200,
+                    "trigger": trigger.report(),
+                    "prepare_status_actual": prep_status,
+                    "response_after_trigger_ms": round((pending_ns - trigger.t_before_ns) / 1_000_000, 3),
+                    "response_within_deadline": abort_ok,
+                    "git_group": observer.report(trigger.t_before_ns),
+                    "git_group_within_deadline": group_ok,
+                    "configured_bound_proven": bool(abort_ok and group_ok),
+                }
+                self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
 
                 # Release primary stub and verify revoked job NEVER falls back to ROOTYARD_CI_MIRROR_SOURCE_TOKEN.
                 pause_enabled.unlink(missing_ok=True)
                 release.touch()
-                self._wait_no_git_children()
+                self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
 
                 repo_mirror_dir = self.root / "mirror-data" / "repos" / self.repo["id"]
                 assert not (repo_mirror_dir / "job-views" / f"1-{bypass_oid}.git").exists()
@@ -1243,9 +1284,11 @@ class JobCheckoutHarness(SourcePinHarness):
             pause_enabled.unlink(missing_ok=True)
             release.touch()
         return {
-            "mirror_source_token_aborted_within_bound": round(abort_elapsed, 3),
+            "mirror_source_token_abort": abort_report,
+            "mirror_source_token_aborted_within_bound": abort_report["configured_bound_proven"],
             "post_revocation_origin_not_contacted": True,
             "broad_source_token_rejected_on_ci_route": True,
+            "abort_elapsed_seconds": round(abort_elapsed, 3),
         }
 
 

@@ -4,16 +4,21 @@ import ast
 import http.client
 import os
 from pathlib import Path
+import socket
 import sys
+import tempfile
 import time
 import types
 import unittest
 from unittest import mock
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(ROOT / "tests"))
+
+import transfer_revocation_observer as revocation_observer  # noqa: E402
+import transfer_revocation_timing as revocation_timing  # noqa: E402
+import transfer_revocation_transport as revocation_transport  # noqa: E402
 
 
 class TestTransferRevocationContract(unittest.TestCase):
@@ -158,69 +163,135 @@ class TestTransferRevocationContract(unittest.TestCase):
         ):
             self.assertIn(expected, standalone_src)
 
-    def test_harness_stream_helpers_handle_non_float_and_float_revoke_returns(self):
-        extra = {}
-        if not hasattr(os, "O_DIRECTORY") and "owned_fuse_cleanup" not in sys.modules:
-            extra["owned_fuse_cleanup"] = types.ModuleType("owned_fuse_cleanup")
-        with mock.patch.dict(sys.modules, extra):
-            import ci_job_checkouts  # noqa: E402
+    def test_trigger_interval_uses_t_before_and_never_resets_on_api_return(self):
+        interval = revocation_timing.TriggerInterval("revoke", 1_000_000_000, 1_400_000_000)
+        self.assertEqual(interval.duration_ns, 400_000_000)
+        self.assertEqual(interval.deadline_ns(1200), 2_200_000_000)
+        self.assertEqual(
+            interval.deadline_ns(1200) - interval.t_after_ns,
+            800_000_000,
+            "the deadline must not be recomputed from mutation completion",
+        )
+        with self.assertRaises(ValueError):
+            revocation_timing.TriggerInterval("bad", 1, 0)
 
-        class FakeResponse:
-            def __init__(self, *, content_length=None):
-                self.status = 200
-                self._content_length = content_length
-                self._calls = 0
+    def test_natural_expiry_uses_earliest_mapping_and_rejects_jump(self):
+        first = revocation_timing.DbClockSample(1_000_000_000, 1_000_100_000, 100.0)
+        second = revocation_timing.DbClockSample(2_000_000_000, 2_000_100_000, 101.0)
+        clock = revocation_timing.reconcile_expiry([first, second], 110.0)
+        self.assertEqual(clock.earliest_ns, 11_000_000_000)
+        self.assertEqual(clock.latest_ns, 11_000_100_000)
+        self.assertEqual(clock.samples, 2)
+        with self.assertRaises(revocation_timing.InconsistentClockMapping):
+            revoked = revocation_timing.DbClockSample(1_000_000_000, 1_000_100_000, 100.0)
+            jumped = revocation_timing.DbClockSample(1_000_000_000, 1_000_100_000, 100.2)
+            revocation_timing.reconcile_expiry([revoked, jumped], 110.0)
 
-            def getheader(self, name):
-                if name == "Content-Length":
-                    return str(self._content_length)
-                return None
+    def test_timeout_local_close_and_deadline_are_not_confirmed_server_stops(self):
+        kind, _ = revocation_timing.classify_read_error(socket.timeout("local read timeout"))
+        self.assertEqual(kind, revocation_timing.StopKind.TIMEOUT)
+        self.assertFalse(revocation_timing.StopObservation(kind, 1, 0).confirmed)
+        for error in (ConnectionResetError(), ConnectionAbortedError(), BrokenPipeError()):
+            stop, _ = revocation_timing.classify_read_error(error)
+            self.assertEqual(stop, revocation_timing.StopKind.RESET)
 
-            def read(self, _amt=None):
-                self._calls += 1
-                if self._calls == 1:
-                    return b"x" * 4096 if self._content_length is None else b"x" * 1024
-                if self._calls == 2:
-                    return b"y" * 128
-                raise http.client.IncompleteRead(b"")
+    def test_confirmed_truncation_short_eof_and_complete_are_distinct(self):
+        incomplete, partial = revocation_timing.classify_read_error(
+            http.client.IncompleteRead(b"x" * 17)
+        )
+        self.assertEqual(incomplete, revocation_timing.StopKind.INCOMPLETE_READ)
+        self.assertEqual(partial, 17)
+        self.assertTrue(revocation_timing.StopObservation(
+            incomplete, 1, 17).confirmed)
+        self.assertEqual(
+            revocation_timing.classify_clean_eof(
+                framing="content_length", received=10, expected_size=20
+            ),
+            revocation_timing.StopKind.SHORT_EOF,
+        )
+        self.assertEqual(
+            revocation_timing.classify_clean_eof(
+                framing="content_length", received=20, expected_size=20
+            ),
+            revocation_timing.StopKind.COMPLETE,
+        )
+        self.assertFalse(revocation_timing.StopObservation(
+            revocation_timing.StopKind.COMPLETE, 1, 20).confirmed)
 
-        class FakeConn:
-            def __init__(self, content_length=None):
-                self._content_length = content_length
-                self.closed = False
+    def test_owned_group_discovery_tracks_all_members_not_only_git_names(self):
+        table = {
+            100: revocation_observer.ProcStat(100, "S", 1, 100, 10),
+            200: revocation_observer.ProcStat(200, "S", 100, 200, 20),
+            201: revocation_observer.ProcStat(201, "S", 200, 200, 21),
+            300: revocation_observer.ProcStat(300, "S", 999, 300, 30),
+        }
+        groups = revocation_observer.discover_groups(table, [100])
+        self.assertEqual(groups, [revocation_observer.GroupIdentity(200, 200, 20)])
+        track = revocation_observer.GroupTrack(groups[0])
+        track.observe([table[200], table[201]], 1_000)
+        self.assertEqual(track.max_members, 2)
+        self.assertEqual(track.last_live_ns, 1_000)
 
-            def request(self, *_args, **_kwargs):
-                pass
+    def test_pid_or_pgid_reuse_is_a_counterexample_not_a_pass(self):
+        identity = revocation_observer.GroupIdentity(200, 200, 1_000)
+        reused = {200: revocation_observer.ProcStat(200, "S", 100, 200, 2_000)}
+        self.assertTrue(revocation_observer.leader_reused(identity, reused))
+        self.assertFalse(revocation_observer.leader_reused(identity, {
+            200: revocation_observer.ProcStat(200, "S", 100, 200, 1_000)
+        }))
+        observer = revocation_observer.ProcGroupObserver([100], clock=lambda: 0)
+        observer.armed_ns = 100
+        observer.max_poll_gap_ns = 10
+        observer._tracks = {200: revocation_observer.GroupTrack(
+            identity, first_live_ns=100, last_live_ns=500,
+            quiescent_ns=800, max_members=2,
+        )}
+        self.assertTrue(observer.proven(400, 1_200))
+        observer._tracks[200].reuse_detected = True
+        self.assertFalse(observer.proven(400, 1_200))
 
-            def getresponse(self):
-                return FakeResponse(content_length=self._content_length)
+    def test_proc_table_reader_does_not_need_environment_or_cmdline(self):
+        with tempfile.TemporaryDirectory() as root:
+            proc = Path(root)
+            (proc / "200").mkdir()
+            (proc / "200" / "stat").write_text(
+                "200 (git with spaces) S 100 200 200 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0\n"
+            )
+            table = revocation_observer.read_proc_table(proc, uid=None)
+            self.assertEqual(table[200].ppid, 100)
+            self.assertEqual(table[200].pgid, 200)
+            self.assertEqual(table[200].starttime, 20)
+            self.assertFalse((proc / "200" / "environ").exists())
+            self.assertFalse((proc / "200" / "cmdline").exists())
 
-            def close(self):
-                self.closed = True
+    def test_backpressure_net_parser_reads_only_fixture_queue_fields(self):
+        text = (
+            "  sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt   uid  timeout inode\n"
+            "   0: 0100007F:1F90 0100007F:D431 01 00001000:00000000 00:00000000 00000000  1000        0 424242 1\n"
+        )
+        entries = revocation_transport.parse_proc_net_tcp(text)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].local_host, "127.0.0.1")
+        self.assertEqual(entries[0].local_port, 8080)
+        self.assertEqual(entries[0].remote_port, 54321)
+        self.assertEqual(entries[0].tx_queue, 4096)
+        self.assertEqual(entries[0].inode, 424242)
 
-        class DummyHarness:
-            _barrier_available = lambda self: False  # noqa: E731
-            _stream_git_until_revoked = ci_job_checkouts.JobCheckoutHarness._stream_git_until_revoked
-            _stream_lfs_until_revoked = ci_job_checkouts.JobCheckoutHarness._stream_lfs_until_revoked
-
-        dummy = DummyHarness()
-        token = {"token": "ryt_dummy"}
-        for revoke_fn in (
-            lambda: "cli stdout",
-            lambda: b"http body",
-            lambda: None,
-            lambda: time.monotonic(),
-        ):
-            with mock.patch("http.client.HTTPConnection", return_value=FakeConn()):
-                git_res = dummy._stream_git_until_revoked(
-                    "http://127.0.0.1:9", "/git/a/b.git", token, "0" * 40, 1024 * 1024, revoke_fn
-                )
-                self.assertLess(git_res["elapsed_seconds"], 5.0)
-            with mock.patch("http.client.HTTPConnection", return_value=FakeConn(content_length=1024 * 1024)):
-                lfs_res = dummy._stream_lfs_until_revoked(
-                    "http://127.0.0.1:9", "/lfs/obj", token, 1024 * 1024, revoke_fn, pause_after_first=0.0
-                )
-                self.assertLess(lfs_res["elapsed_seconds"], 5.0)
+    def test_harness_helpers_declare_bound_evidence(self):
+        for rel in ("tests/transfer_revocation_timing.py",
+                    "tests/transfer_revocation_observer.py",
+                    "tests/transfer_revocation_transport.py"):
+            path = ROOT / rel
+            self.assertLessEqual(len(path.read_text(encoding="utf-8").splitlines()), 500, rel)
+        common = ("configured_bound_proven", "run_timed_transfer",
+                  "apply_natural_expiry_clock", "client_stop")
+        for rel in ("tests/ci_job_checkouts.py", "tests/transfer_revocation.py"):
+            source = (ROOT / rel).read_text(encoding="utf-8")
+            for expected in common:
+                self.assertIn(expected, source, f"{rel} missing {expected}")
+        ci_source = (ROOT / "tests/ci_job_checkouts.py").read_text(encoding="utf-8")
+        for expected in ("TriggerInterval", "ProcGroupObserver"):
+            self.assertIn(expected, ci_source, f"ci_job_checkouts.py missing {expected}")
 
 
 if __name__ == "__main__":
