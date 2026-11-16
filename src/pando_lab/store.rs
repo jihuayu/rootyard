@@ -8,7 +8,14 @@ use std::{
 };
 
 mod snapshot_retention;
-pub(super) use snapshot_retention::snapshot_and_retain;
+
+pub(super) async fn snapshot_and_retain(
+    client: &mut Client,
+    repo: Uuid,
+    principal: &str,
+) -> Result<Uuid> {
+    snapshot_retention::snapshot_and_retain(client, repo, principal).await
+}
 
 #[cfg(test)]
 pub(super) mod snapshot_pg_support;

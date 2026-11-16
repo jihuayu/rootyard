@@ -6,7 +6,7 @@
 //! sets a repeatable-read session default so each barrier proves the actual
 //! transaction is still read committed.
 
-use super::super::{Config, Control, Pack, Snapshot, repack, store};
+use super::super::{Config, Control, Pack, Snapshot, repack};
 use anyhow::{Result, bail, ensure};
 use std::{
     collections::BTreeMap,
@@ -259,7 +259,7 @@ async fn publish(
     work: &Path,
     roots: &[String],
 ) -> Pack {
-    let (pack, oids) = store::publish_pack(config, repo, Uuid::new_v4(), work, roots)
+    let (pack, oids) = super::publish_pack(config, repo, Uuid::new_v4(), work, roots)
         .await
         .unwrap()
         .expect("incremental pack");
@@ -417,7 +417,7 @@ pub(super) async fn materialize_and_read(
     base: &Path,
     path: &str,
 ) -> String {
-    let repo = store::materialize(config, snapshot, base, &Control::default())
+    let repo = super::materialize(config, snapshot, base, &Control::default())
         .await
         .unwrap();
     let refspec = format!("refs/heads/main:{path}");
