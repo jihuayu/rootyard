@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 from typing import Any
 
+from .cleanup_diagnostics import StopPostcondition
+
 READ_CHUNK = 65536
+PROXY_STOP_TIMEOUT_SECONDS = 2.0
 
 
 class BufferedConn:
@@ -141,22 +145,49 @@ class S3MeterProxy:
         self._status_counts: dict[str, int] = {}
         self._error_responses = 0
         self._threads: list[threading.Thread] = []
+        self._sockets: set[socket.socket] = set()
         self._accept_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
 
-    def stop(self) -> None:
+    def _owned_threads(self) -> list[threading.Thread]:
+        with self._lock:
+            threads = [self._accept_thread, *self._threads]
+        return [thread for thread in threads if thread is not None]
+
+    def _close_owned_sockets(self) -> None:
+        with self._lock:
+            owned = list(self._sockets)
+            self._sockets.clear()
+        for sock in owned:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def stop(self) -> StopPostcondition:
         self._stop.set()
         try:
             self._listen.close()
         except OSError:
             pass
-        if self._accept_thread is not None:
-            self._accept_thread.join(timeout=2.0)
-        for t in self._threads:
-            t.join(timeout=0.5)
+        listener_closed = self._listen.fileno() == -1
+        self._close_owned_sockets()
+        deadline = time.monotonic() + PROXY_STOP_TIMEOUT_SECONDS
+        while True:
+            alive = [thread for thread in self._owned_threads() if thread.is_alive()]
+            if not alive:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            alive[0].join(remaining)
+        alive = [thread for thread in self._owned_threads() if thread.is_alive()]
+        stopped = listener_closed and not alive
+        reason = "closed" if stopped else "thread_alive" if alive else "listener_alive"
+        return StopPostcondition("proxy", stopped, reason)
 
     def reset_counters(self) -> None:
         with self._lock:
@@ -209,9 +240,13 @@ class S3MeterProxy:
 
     def _handle_conn(self, client_sock: socket.socket) -> None:
         upstream_sock: socket.socket | None = None
+        with self._lock:
+            self._sockets.add(client_sock)
         try:
             client_sock.settimeout(30.0)
             upstream_sock = socket.create_connection((self.upstream_host, self.upstream_port), timeout=15.0)
+            with self._lock:
+                self._sockets.add(upstream_sock)
             upstream_sock.settimeout(30.0)
             c_stream = BufferedConn(client_sock)
             u_stream = BufferedConn(upstream_sock)
@@ -283,6 +318,10 @@ class S3MeterProxy:
         except (OSError, EOFError, ValueError):
             pass
         finally:
+            with self._lock:
+                self._sockets.discard(client_sock)
+                if upstream_sock is not None:
+                    self._sockets.discard(upstream_sock)
             for s in (client_sock, upstream_sock):
                 if s is not None:
                     try:

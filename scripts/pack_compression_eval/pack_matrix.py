@@ -446,7 +446,7 @@ def evaluate_repo_pack_matrix(
     }
 
 
-def kill_process_group(proc: subprocess.Popen[bytes]) -> None:
+def kill_process_group(proc: subprocess.Popen[bytes]) -> bool:
     """Terminate and reap a child process group cleanly across POSIX and Windows."""
     try:
         if os.name != "nt" and hasattr(os, "killpg"):
@@ -458,5 +458,6 @@ def kill_process_group(proc: subprocess.Popen[bytes]) -> None:
         pass
     try:
         proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         pass
+    return proc.poll() is not None

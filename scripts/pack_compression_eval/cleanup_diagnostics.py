@@ -8,22 +8,31 @@ argv, paths and command output are never serialized.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 CLEANUP_STATUSES = ("ok", "failed", "not_needed", "skipped")
+STOP_RESOURCES = ("server", "proxy", "sampler")
+STOP_REASONS = ("reaped", "closed", "not_started", "poll_alive", "thread_alive", "listener_alive", "incomplete")
 CLEANUP_FAILURE_CLASSES = (
     "server_stop_timeout",
     "server_stop_os_error",
     "server_stop_error",
+    "server_stop_unverified",
+    "server_stop_incomplete",
     "proxy_stop_timeout",
     "proxy_stop_os_error",
     "proxy_stop_error",
+    "proxy_stop_unverified",
+    "proxy_stop_incomplete",
     "sampler_stop_timeout",
     "sampler_stop_os_error",
     "sampler_stop_error",
+    "sampler_stop_unverified",
+    "sampler_stop_incomplete",
     "psql_timeout",
     "psql_spawn_error",
     "psql_nonzero",
@@ -47,6 +56,15 @@ _FAILURE_PREFIXES = {
     "psql": "psql",
     "scratch": "scratch",
 }
+
+
+@dataclass(frozen=True)
+class StopPostcondition:
+    """Explicit owned resource stop outcome; a void return is not evidence."""
+
+    resource: str
+    stopped: bool
+    reason: str
 
 
 def _status(value: Any, default: str = "not_needed") -> str:
@@ -106,9 +124,14 @@ def _attempt_step(
         return record, "psql_spawn_error" if name == "psql" else f"{prefix}_os_error"
     except Exception:  # noqa: BLE001 - cleanup failures are classified, never serialized
         return record, f"{prefix}_error"
-    if name == "psql" and getattr(result, "returncode", 0) != 0:
+    if name in STOP_RESOURCES:
+        if not isinstance(result, StopPostcondition) or result.resource != name:
+            return record, f"{prefix}_unverified"
+        if not result.stopped:
+            return record, f"{prefix}_incomplete"
+    elif name == "psql" and getattr(result, "returncode", 0) != 0:
         return record, "psql_nonzero"
-    if name == "scratch" and result is False:
+    elif name == "scratch" and result is not True:
         return record, "scratch_remaining"
     record.update(status="ok", **{success_key: True})
     return record, None
@@ -166,6 +189,9 @@ def run_cleanup_steps(
 __all__ = [
     "CLEANUP_FAILURE_CLASSES",
     "CLEANUP_STATUSES",
+    "STOP_REASONS",
+    "STOP_RESOURCES",
+    "StopPostcondition",
     "remove_tree_checked",
     "run_cleanup_steps",
     "sanitize_cleanup",

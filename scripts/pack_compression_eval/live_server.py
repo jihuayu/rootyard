@@ -13,6 +13,7 @@ import time
 from typing import Any
 import urllib.parse
 
+from .cleanup_diagnostics import StopPostcondition
 from .corpus import run_git, url_quote_repo
 from .failure_diagnostics import LiveEvalFailure, git_failure_record
 from .pack_matrix import PackConfigSpec, kill_process_group
@@ -204,17 +205,20 @@ def start_serve_blob(
     raise RuntimeError(f"serve-blob failed readiness probe within 30s: {tail[-400:]}")
 
 
-def stop_serve_blob(proc: subprocess.Popen[bytes], log_f: Any) -> None:
+def stop_serve_blob(proc: subprocess.Popen[bytes], log_f: Any) -> StopPostcondition:
     if proc.poll() is None:
         try:
             proc.terminate()
             proc.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
             kill_process_group(proc)
-    try:
-        log_f.close()
-    except OSError:
-        pass
+    reaped = proc.poll() is not None
+    if log_f is not None:
+        try:
+            log_f.close()
+        except OSError:
+            pass
+    return StopPostcondition("server", reaped, "reaped" if reaped else "poll_alive")
 
 
 def exercise_browse(

@@ -15,6 +15,7 @@ from typing import Any
 import urllib.error
 import urllib.request
 
+from .cleanup_diagnostics import StopPostcondition
 from .s3_meter import S3MeterProxy
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
@@ -154,11 +155,16 @@ class ResourceSampler:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> StopPostcondition:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=3.0)
         self.sample_once()
+        if thread is None:
+            return StopPostcondition("sampler", True, "not_started")
+        stopped = not thread.is_alive()
+        return StopPostcondition("sampler", stopped, "closed" if stopped else "thread_alive")
 
     def sample_once(self) -> None:
         with self._lock:
