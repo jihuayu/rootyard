@@ -12,6 +12,7 @@ use crate::ref_store::raft_backend::realm::RealmBinding;
 
 struct CommandScope {
     repository_id: Option<Uuid>,
+    identity_repository_id: Option<Uuid>,
     tenant_id: Option<Uuid>,
     group_epoch: Option<i64>,
     authority_id: Option<Uuid>,
@@ -28,6 +29,7 @@ fn base(
 ) -> CommandScope {
     CommandScope {
         repository_id: Some(repository_id),
+        identity_repository_id: None,
         tenant_id,
         group_epoch,
         authority_id,
@@ -39,6 +41,10 @@ fn base(
 
 fn commit_request_scope(request: &WireCommitRefsRequest) -> CommandScope {
     CommandScope {
+        // The operation identity duplicates the request repository. Bind it here as well so a
+        // malformed command fails backend preflight instead of relying only on the core
+        // conversion, which keeps its own InvalidIdentity defense.
+        identity_repository_id: Some(request.identity.repository_id),
         history_incarnation: Some(request.history_incarnation),
         authority_epoch: Some(request.authority_epoch),
         object_format: Some(request.object_format),
@@ -86,6 +92,7 @@ pub(crate) fn validate_command_scope(
             // A closing-auth-scope row may name a global scope; only the optional axes actually
             // present are constrained. The proposal identity is still live-gate fenced.
             repository_id: cmd.repository_id,
+            identity_repository_id: None,
             tenant_id: cmd.tenant_id,
             group_epoch: None,
             authority_id: None,
@@ -115,6 +122,12 @@ pub(crate) fn validate_command_scope(
         RefCasCommand::RetireHoldBatch(cmd) => base(cmd.repository_id, Some(cmd.tenant_id), None, None),
     };
 
+    if let (Some(outer_repository_id), Some(identity_repository_id)) =
+        (scope.repository_id, scope.identity_repository_id)
+        && outer_repository_id != identity_repository_id
+    {
+        return Err(RaftBackendError::ScopeMismatch("repository_id"));
+    }
     if scope.repository_id.is_some_and(|value| value != repository_id) {
         return Err(RaftBackendError::ScopeMismatch("repository_id"));
     }
@@ -246,7 +259,7 @@ mod tests {
         WireDecisionScopeDep, WireDecisionVerdict, WireGateInit, WireHeadUpdate, WireHeadUpdateKind,
         WireOperationIdentity,
     };
-    use crate::ref_store::{CoreGateInit, RefName};
+    use crate::ref_store::{CommitRefsRequest, CoreGateInit, RefName, RefStoreError};
     use std::collections::BTreeMap;
 
     fn live_gate(
@@ -516,6 +529,56 @@ mod tests {
             authz_floor: 1,
             change_id: Uuid::from_u128(48),
             logical_tick: 1,
+        }
+    }
+
+    #[test]
+    fn commit_variants_reject_foreign_nested_identity_repository() {
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let realm = RealmBinding::new(tenant, "group-a", Uuid::from_u128(4), history, 1, 2, GitObjectFormat::Sha256, 1)
+            .unwrap();
+        let proposal = proposal(repo, tenant, history, 1, 2, GitObjectFormat::Sha256);
+
+        for (name, command) in [
+            ("CommitRefs", RefCasCommand::CommitRefs(commit_scoped_command(repo, tenant, history).commit)),
+            ("CommitScopedRefs", RefCasCommand::CommitScopedRefs(commit_scoped_command(repo, tenant, history))),
+        ] {
+            assert!(proposal.matches_command(&command), "{name} matching outer request was not accepted");
+            assert!(
+                validate_command_scope(&command, repo, tenant, &realm).is_ok(),
+                "{name} matching outer request failed preflight"
+            );
+
+            let mut foreign_inner = command;
+            let request = match &mut foreign_inner {
+                RefCasCommand::CommitRefs(command) => &mut command.request,
+                RefCasCommand::CommitScopedRefs(command) => &mut command.commit.request,
+                _ => unreachable!(),
+            };
+            assert_eq!(request.repository_id, repo, "{name} fixture lost the valid outer repository");
+            request.identity.repository_id = Uuid::from_u128(11);
+
+            assert!(
+                !proposal.matches_command(&foreign_inner),
+                "{name} matcher accepted a foreign nested identity repository"
+            );
+            assert_eq!(
+                validate_command_scope(&foreign_inner, repo, tenant, &realm),
+                Err(RaftBackendError::ScopeMismatch("repository_id")),
+                "{name} preflight accepted a foreign nested identity repository"
+            );
+
+            let request = match &foreign_inner {
+                RefCasCommand::CommitRefs(command) => &command.request,
+                RefCasCommand::CommitScopedRefs(command) => &command.commit.request,
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(CommitRefsRequest::try_from(request), Err(RefStoreError::InvalidIdentity(_))),
+                "{name} core conversion no longer rejects the foreign nested identity repository"
+            );
         }
     }
 
