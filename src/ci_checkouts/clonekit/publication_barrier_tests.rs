@@ -69,3 +69,58 @@ fn abandoned_publisher_releases_lock_and_preserves_owned_generation() {
     let _guard = store.acquire_publication_lock(repository_id).expect("lock released after abandoned observer");
     test_seam::reset();
 }
+
+#[test]
+fn deadline_boundary_is_inclusive_only_on_or_before() {
+    let _serial = test_seam::serial_with_deadline(Duration::from_millis(100));
+    test_seam::reset();
+    let deadline = test_seam::test_deadline();
+    assert!(test_seam::is_timely_signal(deadline - Duration::from_nanos(1), deadline));
+    assert!(test_seam::is_timely_signal(deadline, deadline));
+    assert!(!test_seam::is_timely_signal(deadline + Duration::from_nanos(1), deadline));
+    test_seam::reset();
+}
+
+#[test]
+fn late_arrival_does_not_satisfy_wait_until() {
+    let _serial = test_seam::serial_with_deadline(Duration::from_millis(100));
+    test_seam::reset();
+    let deadline = test_seam::test_deadline();
+    test_seam::record_arrival_at("late-arrival", deadline + Duration::from_nanos(1));
+    let panic = std::panic::catch_unwind(|| test_seam::wait_until("late-arrival", 1)).unwrap_err();
+    let message = panic_message(panic.as_ref());
+    assert!(message.contains("late-arrival"));
+    assert!(message.contains("expected 1"));
+    assert!(message.contains("observed 0"));
+    assert!(message.contains("deadline"));
+    test_seam::reset();
+}
+
+#[test]
+fn late_release_does_not_satisfy_paused_checkpoint() {
+    let _serial = test_seam::serial_with_deadline(Duration::from_secs(2));
+    test_seam::reset();
+    let td = TempDir::new().expect("tempdir");
+    let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
+    let repository_id = Uuid::new_v4();
+    test_seam::pause_all_at(CP_AFTER_INSTALL);
+    let publisher_store = store.clone();
+    let candidate = empty_artifacts(repository_id, 1);
+    let publisher = std::thread::spawn(move || {
+        publish_clonekit_versioned(&publisher_store, &candidate, Path::new("/usr/bin/git"), None, None)
+    });
+    test_seam::wait_until(CP_AFTER_INSTALL, 1);
+    let deadline = test_seam::test_deadline();
+    test_seam::record_release_at(CP_AFTER_INSTALL, deadline + Duration::from_nanos(1));
+
+    let publisher = publisher.join().expect("join late-release publisher");
+    assert!(matches!(
+        publisher,
+        Err(CloneKitError::GitFailed(ref message)) if message.contains("deadline") && message.contains("after")
+    ));
+    assert!(store.version_dir(repository_id, 1).exists());
+    assert!(store.load_latest(repository_id).expect("latest").is_none());
+    assert!(attempt_names(&store, repository_id).is_empty());
+    let _guard = store.acquire_publication_lock(repository_id).expect("lock released after late release");
+    test_seam::reset();
+}

@@ -13,8 +13,8 @@ struct SeamState {
     pause_all: Vec<&'static str>,
     pause_once: Vec<&'static str>,
     failures: Vec<(&'static str, &'static str)>,
-    arrived: Vec<&'static str>,
-    released: Vec<&'static str>,
+    arrivals: Vec<(&'static str, Instant)>,
+    releases: Vec<(&'static str, Instant)>,
     deadline: Option<Instant>,
     abandoned: bool,
 }
@@ -23,8 +23,8 @@ static STATE: Mutex<SeamState> = Mutex::new(SeamState {
     pause_all: Vec::new(),
     pause_once: Vec::new(),
     failures: Vec::new(),
-    arrived: Vec::new(),
-    released: Vec::new(),
+    arrivals: Vec::new(),
+    releases: Vec::new(),
     deadline: None,
     abandoned: false,
 });
@@ -76,8 +76,8 @@ pub(super) fn reset() {
     state.pause_all.clear();
     state.pause_once.clear();
     state.failures.clear();
-    state.arrived.clear();
-    state.released.clear();
+    state.arrivals.clear();
+    state.releases.clear();
     state.abandoned = false;
     CHANGED.notify_all();
 }
@@ -97,12 +97,67 @@ pub(super) fn fail_once_at(name: &'static str, message: &'static str) {
     lock().failures.push((name, message));
 }
 
-fn arrivals(state: &SeamState, name: &'static str) -> usize {
-    state.arrived.iter().copied().filter(|arrived| *arrived == name).count()
+/// Record the current test-scoped absolute deadline.
+pub(super) fn test_deadline() -> Instant {
+    let state = lock();
+    wait_deadline(&state)
+}
+
+/// Compare a recorded signal against the test deadline. Equality is timely.
+pub(super) fn is_timely_signal(signal: Instant, deadline: Instant) -> bool {
+    signal <= deadline
+}
+
+/// Test-only deterministic arrival injection at an explicit timestamp.
+pub(super) fn record_arrival_at(name: &'static str, at: Instant) {
+    let mut state = lock();
+    state.arrivals.push((name, at));
+    CHANGED.notify_all();
+}
+
+/// Test-only deterministic release injection at an explicit timestamp.
+pub(super) fn record_release_at(name: &'static str, at: Instant) {
+    let mut state = lock();
+    state.releases.push((name, at));
+    CHANGED.notify_all();
+}
+
+fn timely_arrivals(state: &SeamState, name: &'static str, deadline: Instant) -> usize {
+    let mut count = 0;
+    for (arrived_name, at) in &state.arrivals {
+        if *arrived_name == name && is_timely_signal(*at, deadline) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn has_timely_release(state: &SeamState, name: &'static str, deadline: Instant) -> bool {
+    for (released_name, at) in &state.releases {
+        if *released_name == name && is_timely_signal(*at, deadline) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_late_release(state: &SeamState, name: &'static str, deadline: Instant) -> bool {
+    for (released_name, at) in &state.releases {
+        if *released_name == name && !is_timely_signal(*at, deadline) {
+            return true;
+        }
+    }
+    false
 }
 
 fn wait_deadline(state: &SeamState) -> Instant {
     state.deadline.unwrap_or_else(|| Instant::now() + BARRIER_DEADLINE)
+}
+
+fn deadline_message(name: &'static str, expected: usize, observed: usize) -> String {
+    format!(
+        "publication test barrier deadline exceeded: checkpoint {name:?} expected {expected} timely arrival(s), observed {observed}"
+    )
 }
 
 fn fail_barrier(state: &mut SeamState, message: String) -> ! {
@@ -117,28 +172,15 @@ fn fail_checkpoint(state: &mut SeamState, message: String) -> CloneKitError {
     CloneKitError::GitFailed(message)
 }
 
-/// Block until `count` publishers have reached `name`, bounded by the test deadline.
+/// Block until `count` timely arrivals have reached `name`, bounded by the test deadline.
 pub(super) fn wait_until(name: &'static str, count: usize) {
     let mut state = lock();
     if state.abandoned {
         fail_barrier(&mut state, format!("publication test barrier abandoned before waiting for checkpoint {name:?}"));
     }
     let deadline = wait_deadline(&state);
-    let mut observed = arrivals(&state, name);
+    let mut observed = timely_arrivals(&state, name, deadline);
     while observed < count {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            fail_barrier(
-                &mut state,
-                format!(
-                    "publication test barrier deadline exceeded: checkpoint {name:?} expected {count} arrival(s), observed {observed}"
-                ),
-            );
-        }
-        let (next, timeout) =
-            CHANGED.wait_timeout(state, remaining).unwrap_or_else(|poisoned| poisoned.into_inner());
-        state = next;
-        observed = arrivals(&state, name);
         if state.abandoned {
             fail_barrier(
                 &mut state,
@@ -147,13 +189,26 @@ pub(super) fn wait_until(name: &'static str, count: usize) {
                 ),
             );
         }
-        if timeout.timed_out() && observed < count {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            fail_barrier(&mut state, deadline_message(name, count, observed));
+        }
+        let (next, timeout) = CHANGED.wait_timeout(state, remaining).unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = next;
+        observed = timely_arrivals(&state, name, deadline);
+        if state.abandoned {
             fail_barrier(
                 &mut state,
                 format!(
-                    "publication test barrier deadline exceeded: checkpoint {name:?} expected {count} arrival(s), observed {observed}"
+                    "publication test barrier abandoned while waiting for checkpoint {name:?}; expected {count}, observed {observed}"
                 ),
             );
+        }
+        if observed >= count {
+            break;
+        }
+        if timeout.timed_out() {
+            fail_barrier(&mut state, deadline_message(name, count, observed));
         }
     }
     if state.abandoned {
@@ -161,12 +216,11 @@ pub(super) fn wait_until(name: &'static str, count: usize) {
     }
 }
 
-/// Release every publisher paused at `name`.
+/// Release every publisher paused at `name`, recording the release timestamp.
 pub(super) fn release(name: &'static str) {
     let mut state = lock();
-    if !state.released.contains(&name) {
-        state.released.push(name);
-    }
+    let at = Instant::now();
+    state.releases.push((name, at));
     CHANGED.notify_all();
 }
 
@@ -175,8 +229,16 @@ pub(super) fn checkpoint(name: &'static str) -> Result<(), CloneKitError> {
     if state.abandoned {
         return Err(fail_checkpoint(&mut state, format!("publication test barrier abandoned at checkpoint {name:?}")));
     }
-    state.arrived.push(name);
+    let deadline = wait_deadline(&state);
+    let arrived_at = Instant::now();
+    state.arrivals.push((name, arrived_at));
     CHANGED.notify_all();
+    if !is_timely_signal(arrived_at, deadline) {
+        return Err(fail_checkpoint(
+            &mut state,
+            format!("publication test barrier deadline exceeded: checkpoint {name:?} arrived after the deadline"),
+        ));
+    }
     let mut failure = None;
     for index in 0..state.failures.len() {
         if state.failures[index].0 == name {
@@ -202,28 +264,49 @@ pub(super) fn checkpoint(name: &'static str) -> Result<(), CloneKitError> {
         state.pause_all.contains(&name)
     };
     if paused {
-        let deadline = wait_deadline(&state);
-        while !state.released.contains(&name) {
+        loop {
             if state.abandoned {
                 return Err(fail_checkpoint(
                     &mut state,
                     format!("publication test barrier abandoned while waiting to release checkpoint {name:?}"),
                 ));
             }
+            if has_timely_release(&state, name, deadline) {
+                break;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                let suffix = if has_late_release(&state, name, deadline) {
+                    "released only after the deadline"
+                } else {
+                    "was reached but never released"
+                };
                 return Err(fail_checkpoint(
                     &mut state,
-                    format!("publication test barrier deadline exceeded: checkpoint {name:?} was reached but never released"),
+                    format!("publication test barrier deadline exceeded: checkpoint {name:?} {suffix}"),
                 ));
             }
             let (next, timeout) =
                 CHANGED.wait_timeout(state, remaining).unwrap_or_else(|poisoned| poisoned.into_inner());
             state = next;
-            if timeout.timed_out() && !state.released.contains(&name) {
+            if has_timely_release(&state, name, deadline) {
+                break;
+            }
+            if state.abandoned {
                 return Err(fail_checkpoint(
                     &mut state,
-                    format!("publication test barrier deadline exceeded: checkpoint {name:?} was reached but never released"),
+                    format!("publication test barrier abandoned while waiting to release checkpoint {name:?}"),
+                ));
+            }
+            if timeout.timed_out() {
+                let suffix = if has_late_release(&state, name, deadline) {
+                    "released only after the deadline"
+                } else {
+                    "was reached but never released"
+                };
+                return Err(fail_checkpoint(
+                    &mut state,
+                    format!("publication test barrier deadline exceeded: checkpoint {name:?} {suffix}"),
                 ));
             }
         }
