@@ -1,5 +1,6 @@
 //! Exact byte-vector tests for §2.1, §2.3, §2.5, §2.5.1 and §2.5.2 of
 //! `docs/ref-version-pack-contract.md`.
+use super::MAX_VERSION_TERMINAL_BYTES;
 use super::commit_set::{CommitSetHead, CommitSetInput, CommitSetVersionEntry, encode_commit_set};
 use super::contract::{
     AuthorityKind, OperationDigest, OperationDigestInput, RefVersionCodecError, RefVersionIntent, RefVersionKind,
@@ -12,7 +13,6 @@ use super::record::{VersionRecord, VersionRecordInput};
 use super::terminal::{
     VersionResultEntry, VersionResultOutcome, VersionTerminalInput, VersionTerminalKind, encode_terminal,
 };
-use super::MAX_VERSION_TERMINAL_BYTES;
 use crate::ref_store::contract::{IssuerLane, RequestDigest};
 use crate::ref_store::core::pack_commit::PackCommitRejectCode;
 use crate::ref_store::core::publication_decision::codes::DecisionRejectCode;
