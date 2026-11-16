@@ -47,7 +47,7 @@ async fn verify_rollback_lease_with<C: GenericClient + Sync>(
 
 async fn verify_rollback_lease(pool: &Pool, transfer_id: Uuid, lease_owner: &str, lease_epoch: i64) -> Result<()> {
     let client = pool.get().await?;
-    verify_rollback_lease_with(&*client, transfer_id, lease_owner, lease_epoch).await
+    verify_rollback_lease_with(&**client, transfer_id, lease_owner, lease_epoch).await
 }
 
 async fn persist_copied_objects(
@@ -315,7 +315,7 @@ async fn rollback_cleanup_claim_key(
     let claim = {
         let mut client = pool.get().await?;
         let tx = client.transaction().await?;
-        verify_rollback_lease_with(&tx, transfer_id, lease_owner, lease_epoch).await?;
+        verify_rollback_lease_with(&*tx, transfer_id, lease_owner, lease_epoch).await?;
         lock_object_key(&tx, key.tenant_id, &key.namespace, &key.sha256).await.map_err(|e| anyhow::anyhow!(e.1))?;
         let claim =
             claim_if_unreferenced(&tx, key.tenant_id, &key.namespace, &key.sha256, DEFAULT_DELETE_CLAIM_LEASE_SECS)

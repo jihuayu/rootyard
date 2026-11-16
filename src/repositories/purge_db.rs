@@ -15,7 +15,7 @@ use crate::{
     storage::{
         read_leases,
         remote_key_claims::{DEFAULT_DELETE_CLAIM_LEASE_SECS, DeleteClaim, lock_object_key, upsert_delete_claim},
-        remote_objects::{ObjectKey, RemoteObjectStore},
+        remote_objects::RemoteObjectStore,
     },
     storage_lifecycle::pando_delete_gate,
 };

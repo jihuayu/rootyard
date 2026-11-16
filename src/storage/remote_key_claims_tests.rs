@@ -1,7 +1,7 @@
 //! PG-backed and mock-S3 fault-injection regression tests for remote key claims (#85).
 use crate::storage::{
     remote_key_claims::{
-        DEFAULT_DELETE_CLAIM_LEASE_SECS, execute_locked_claimed_delete, has_active_delete_claim, lock_object_key,
+        DEFAULT_DELETE_CLAIM_LEASE_SECS, execute_locked_claimed_delete, has_active_delete_claim,
         sweep_expired_claims_with_stores, upsert_delete_claim, valid_claim_target, wait_or_clear_delete_claim,
     },
     remote_objects::{ObjectKey, RemoteObjectStore},

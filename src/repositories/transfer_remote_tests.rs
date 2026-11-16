@@ -253,13 +253,14 @@ async fn pando_purge_fenced_against_concurrent_reserve_and_link() {
 
     let mut c_res = pool.get().await.unwrap();
     let tx_res = c_res.transaction().await.unwrap();
-    let slot = retention::reserve(&tx_res, tenant, None, retention::NAMESPACE_CIPHER, &sha).await.unwrap();
+    let env_sha = hex::encode(Sha256::digest(b"envelope-bytes"));
+    let (slot, _) = retention::reserve_pair(&*tx_res, tenant, None, &sha, &env_sha).await.unwrap();
     let retention::Slot::Reserved { key: key_g2, .. } = slot else {
         panic!("expected generation bump Slot::Reserved while state='deleting', got {slot:?}");
     };
     assert_eq!(key_g2.authority, Some((auth_id, 2)));
     store.put_file(&key_g2, &payload_path, 12, deadline).await.unwrap();
-    assert!(retention::activate(&tx_res, tenant, retention::NAMESPACE_CIPHER, &sha, 12, &slot).await.unwrap());
+    assert!(retention::activate(&*tx_res, tenant, retention::NAMESPACE_CIPHER, &sha, 12, &slot).await.unwrap());
     tx_res.commit().await.unwrap();
 
     mock.release_first_delete.notify_one();
@@ -356,11 +357,15 @@ async fn rollback_cleanup_preserves_concurrent_publish_and_fences_uncertain_dele
             kind: "lfs".into(),
             from_key: ObjectKey::new(from_owner, "lfs", &sha).unwrap().path(),
             to_key: lfs_keep.path(),
+            size: 14,
+            sha256: Some(sha.clone()),
         },
         CopiedRemoteObject {
             kind: retention::NAMESPACE_CIPHER.into(),
             from_key: ObjectKey::scoped(from_owner, auth_id, 1, retention::NAMESPACE_CIPHER, &sha).unwrap().path(),
             to_key: pando_keep.path(),
+            size: 14,
+            sha256: Some(sha.clone()),
         },
     ];
     cleanup_rollback_objects_with_stores(
@@ -389,6 +394,8 @@ async fn rollback_cleanup_preserves_concurrent_publish_and_fences_uncertain_dele
         kind: "lfs".into(),
         from_key: ObjectKey::new(from_owner, "lfs", &oid_fail).unwrap().path(),
         to_key: lfs_fail.path(),
+        size: 14,
+        sha256: Some(oid_fail.clone()),
     }];
     assert!(
         cleanup_rollback_objects_with_stores(
