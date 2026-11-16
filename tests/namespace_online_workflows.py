@@ -39,8 +39,7 @@ class NamespaceOnlineHarness(Harness):
         return {"username": owner_token["username"], "token": pat["secret"], "id": pat["id"]}
 
     def create_user(self, username):
-        user = self.account("create-user", username, "--token-name", f"{username}-main")
-        return user
+        return self.account("create-user", username)
 
     def create_repo(self, token, name):
         return json.loads(
@@ -394,19 +393,19 @@ class NamespaceOnlineHarness(Harness):
         # Restart with explicit failpoint to exit after step 1 (repo A updated, repo B untouched).
         self.stop()
         self.env["ROOTYARD_CHANGESET_KILL_AFTER_STEP"] = "1"
-        self.start()
         try:
-            st, _, _ = self.http(f"/api/changesets/{cs['id']}/integrate", token=self.alice, method="POST")
-            raise AssertionError(f"expected failpoint exit, got HTTP {st}")
-        except (OSError, urllib.error.URLError, http.client.HTTPException):
-            pass
-        rc = self.proc.wait(timeout=5)
-        assert rc == 79, f"expected failpoint exit 79, got {rc}"
-        self.proc = None
-        if self.log:
-            self.log.close()
-            self.log = None
-        self.env.pop("ROOTYARD_CHANGESET_KILL_AFTER_STEP", None)
+            self.start()
+            response = None
+            try:
+                response = self.http(f"/api/changesets/{cs['id']}/integrate", token=self.alice, method="POST")
+            except (OSError, urllib.error.URLError, http.client.HTTPException):
+                pass
+            assert response is None, f"expected failpoint exit, got HTTP {response[0]}: {response[1][:300]!r}"
+            rc = self.proc.wait(timeout=10)
+            assert rc == 79, f"expected failpoint exit 79, got {rc}"
+        finally:
+            self.env.pop("ROOTYARD_CHANGESET_KILL_AFTER_STEP", None)
+            self.stop()
         self.start()
 
         # Unrelated reader observes explicit 'partial' state, never a false 'complete'.
