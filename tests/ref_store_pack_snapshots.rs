@@ -3230,10 +3230,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             owned_b_head == first_advance_head,
             "actor-owned historical head is not the captured first advance commit"
         );
-        ensure!(
-            owned_b_head != second_advance_head,
-            "actor-owned historical head followed the later advance"
-        );
+        ensure!(owned_b_head != second_advance_head, "actor-owned historical head followed the later advance");
         let materializer = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
         let owned_view = PgServingSnapshotMetadata
             .materialize_actor_owned(
