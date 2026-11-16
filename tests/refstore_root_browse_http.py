@@ -54,14 +54,16 @@ class RootBrowseHttpHarness(RootsHttpHarness):
 
     def _root_tree(self, repo, root, *, oid=None, path=None, after=None, limit=None, token=None):
         suffix = "/" + str(root) + "/tree"
-        return self._request("GET", self._query_path(self._roots_path(repo, suffix), {
+        status, data, _headers = self._request("GET", self._query_path(self._roots_path(repo, suffix), {
             "oid": oid, "path": path, "after": after, "limit": limit,
         }), token or self.alice)
+        return status, data
 
     def _root_blob(self, repo, root, oid, *, path=None, token=None):
         suffix = "/" + str(root) + "/blob/" + urllib.parse.quote(str(oid), safe="")
-        return self._request("GET", self._query_path(self._roots_path(repo, suffix), {"path": path}),
-                             token or self.alice)
+        status, data, _headers = self._request(
+            "GET", self._query_path(self._roots_path(repo, suffix), {"path": path}), token or self.alice)
+        return status, data
 
     def _selector_root(self, repo, key, source_snapshot_id, selector):
         create = self._intent(key, source_snapshot_id, selector=selector)
@@ -656,7 +658,7 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
             blocker = None
             blocker_released = True
             patch_view = self._wait_future(patch_future, deadline)
-            get_status, get_data, _headers = self._wait_future(root_future, deadline)
+            get_status, get_data = self._wait_future(root_future, deadline)
             assert get_status == 403, ("root blob was not denied after committed scope narrowing", get_status)
             assert set(get_data) == {"error"}, get_data
             assert "content" not in get_data and "content_base64" not in get_data and "items" not in get_data
@@ -786,7 +788,7 @@ os.execv(UPSTREAM, [UPSTREAM, *sys.argv[1:]])
         counts_before = self._root_blob_gate.snapshot()
         self._root_blob_gate.arm(suffix)
         try:
-            fault_status, fault_body, _headers = self._root_blob(repo, root_id, target_oid)
+            fault_status, fault_body = self._root_blob(repo, root_id, target_oid)
             counts_after = self._root_blob_gate.snapshot()
             assert 500 <= fault_status < 600, ("unexpected backend refusal status", fault_status)
             assert set(fault_body) == {"error"}, fault_body
