@@ -255,9 +255,10 @@ async fn pando_purge_fenced_against_concurrent_reserve_and_link() {
     let tx_res = c_res.transaction().await.unwrap();
     let env_sha = hex::encode(Sha256::digest(b"envelope-bytes"));
     let (slot, _) = retention::reserve_pair(&*tx_res, tenant, None, &sha, &env_sha).await.unwrap();
-    let retention::Slot::Reserved { key: key_g2, .. } = slot else {
+    let retention::Slot::Reserved { .. } = slot else {
         panic!("expected generation bump Slot::Reserved while state='deleting', got {slot:?}");
     };
+    let key_g2 = slot.key().clone();
     assert_eq!(key_g2.authority, Some((auth_id, 2)));
     store.put_file(&key_g2, &payload_path, 12, deadline).await.unwrap();
     assert!(retention::activate(&*tx_res, tenant, retention::NAMESPACE_CIPHER, &sha, 12, &slot).await.unwrap());
