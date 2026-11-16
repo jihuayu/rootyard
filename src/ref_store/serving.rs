@@ -93,6 +93,11 @@ pub use snapshot_metadata::{
 const DEFAULT_HEAD_REF: &str = "refs/heads/main";
 /// Both epochs of a brand-new authority intent.
 const INITIAL_EPOCH: i64 = 1;
+/// Exact static response identity for an unknown root COMMIT outcome. The
+/// retention-root diagnostic matches this value only to classify the failure;
+/// it is never formatted into the diagnostic event.
+pub(crate) const COMMIT_UNKNOWN_MESSAGE: &str =
+    "ref-store commit outcome is unknown; retry the same request to resolve it idempotently";
 
 /// Trusted-caller request to create or recover one `pg_refstore` repository.
 #[derive(Clone, Debug)]
@@ -193,10 +198,7 @@ fn deadline_error() -> Error {
 }
 
 fn commit_unknown_error() -> Error {
-    Error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "ref-store commit outcome is unknown; retry the same request to resolve it idempotently",
-    )
+    Error(StatusCode::SERVICE_UNAVAILABLE, COMMIT_UNKNOWN_MESSAGE)
 }
 
 fn map_refstore(error: RefStoreError) -> Error {

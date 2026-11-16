@@ -19,6 +19,7 @@ use crate::{
     blob_store::BlobBackendIdentity,
     db::{self, Identity},
     members::models::Role,
+    observability::{RootCreateErrorClass, RootCreateFailureStage},
     ref_store::{
         CoreGate, MetadataPinPurpose, RefStoreError, RequestDigest,
         core::{
@@ -213,6 +214,25 @@ impl PgServingRetentionRoots {
         deadline: Instant,
         ownership: RootOwnership,
     ) -> Result<RootReceipt, Error> {
+        let mut stage = RootCreateFailureStage::PreflightOrReplay;
+        let result = self.create_with_ownership_inner(pool, actor, input, deadline, ownership, &mut stage).await;
+        if let Err(error) = &result {
+            let error_class = root_create_error_class(stage, error);
+            crate::observability::observe_root_create_failure(stage, error_class, error.0.as_u16());
+        }
+        result
+    }
+
+    async fn create_with_ownership_inner(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingRootCreate,
+        deadline: Instant,
+        ownership: RootOwnership,
+        stage: &mut RootCreateFailureStage,
+    ) -> Result<RootReceipt, Error> {
+        *stage = RootCreateFailureStage::PreflightOrReplay;
         validate_owner_name(&input.owner, &input.name)?;
         validate_intent(&input.intent)?;
         let deadline = root_deadline(deadline)?;
@@ -230,6 +250,7 @@ impl PgServingRetentionRoots {
             return Ok(receipt);
         }
 
+        *stage = RootCreateFailureStage::SourceSnapshotLookup;
         let source = self.source_snapshot(pool, actor, &repo, &scope, &input.intent, intent_owner, deadline).await?;
         let format = source.scope().object_format();
         if format != gate.object_format()
@@ -241,6 +262,7 @@ impl PgServingRetentionRoots {
         {
             return Err(Error(StatusCode::CONFLICT, "source snapshot realm changed; retry the same request"));
         }
+        *stage = RootCreateFailureStage::PrepareNativeCandidate;
         let reference = PackSnapshotRef::new(
             repo.repository_id,
             repo.tenant_id,
@@ -269,6 +291,7 @@ impl PgServingRetentionRoots {
             .ok_or_else(|| Error::internal("serving root candidate lost its cluster anchor"))?;
         let request_digest = register_request_digest(&candidate, derived.register_request_id);
 
+        *stage = RootCreateFailureStage::TransactionSetup;
         let mut client = super::acquire(pool, deadline).await?;
         let tx = super::begin_owned(&mut client, deadline).await?;
         if let Err(error) = crate::ref_store::pg::bound(&tx, deadline).await.map_err(super::map_refstore) {
@@ -276,6 +299,7 @@ impl PgServingRetentionRoots {
             drop(client);
             return Err(error);
         }
+        *stage = RootCreateFailureStage::RegisterInTransaction;
         let outcome = timeout_at(deadline, async {
             let receipt = match self
                 .roots
@@ -284,7 +308,7 @@ impl PgServingRetentionRoots {
             {
                 Ok(receipt) => receipt,
                 Err(error) => {
-                    return match final_authority_root(
+                    let authority = final_authority_root(
                         &tx,
                         actor,
                         &repo,
@@ -294,13 +318,17 @@ impl PgServingRetentionRoots {
                         None,
                         deadline,
                     )
-                    .await
-                    {
+                    .await;
+                    return match authority {
                         Ok(_) => Err(map_root_error(error)),
-                        Err(auth_error) => Err(auth_error),
+                        Err(auth_error) => {
+                            *stage = RootCreateFailureStage::FinalAuthorityCheck;
+                            Err(auth_error)
+                        }
                     };
                 }
             };
+            *stage = RootCreateFailureStage::FinalAuthorityCheck;
             final_authority_root(
                 &tx,
                 actor,
@@ -318,6 +346,7 @@ impl PgServingRetentionRoots {
             // independent and must not be rejected by the last fresh check.
             // Fresh registrations still require the final exact pin check.
             if !receipt.replayed() {
+                *stage = RootCreateFailureStage::SourcePinRecheck;
                 self.roots
                     .recheck_serving_source_pin_live_in_tx(&tx, &reference, deadline)
                     .await
@@ -332,15 +361,35 @@ impl PgServingRetentionRoots {
         };
         match outcome {
             Ok(receipt) => {
+                *stage = RootCreateFailureStage::Commit;
                 super::commit_owned(tx, deadline).await?;
                 Ok(receipt)
             }
             Err(error) => {
                 let cleanup = rollback_strict(tx, deadline).await;
                 drop(client);
-                cleanup?;
+                if let Err(cleanup_error) = cleanup {
+                    *stage = RootCreateFailureStage::RollbackCleanup;
+                    return Err(cleanup_error);
+                }
                 Err(error)
             }
+        }
+    }
+
+    /// Classify only the fixed diagnostic identities. The exact commit-unknown
+    /// sentinel is shared with the serving error constructor; deadline and
+    /// returned rollback-cleanup errors have fixed identities. Everything else
+    /// is the coarse `mapped_error` class. No error text is formatted.
+    fn root_create_error_class(stage: RootCreateFailureStage, error: &Error) -> RootCreateErrorClass {
+        if stage == RootCreateFailureStage::RollbackCleanup {
+            RootCreateErrorClass::Cleanup
+        } else if error.0 == StatusCode::GATEWAY_TIMEOUT {
+            RootCreateErrorClass::Deadline
+        } else if error.0 == StatusCode::SERVICE_UNAVAILABLE && error.1 == super::COMMIT_UNKNOWN_MESSAGE {
+            RootCreateErrorClass::CommitUnknown
+        } else {
+            RootCreateErrorClass::MappedError
         }
     }
 
