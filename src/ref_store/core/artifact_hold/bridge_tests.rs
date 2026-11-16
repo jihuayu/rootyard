@@ -1,20 +1,17 @@
-//! Deterministic unit tests for the PG <-> Ref-CAS retention bridge, replay,
-//! cancel/release-before-register, anti-ABA fencing, closing barriers, and multi-group retirement.
+//! Deterministic unit tests for the PG <-> Ref-CAS reserve-before-publish bridge,
+//! opaque reservation boundaries, lost-ACK snapshot replay, cancel/release-before-register,
+//! anti-ABA generation/epoch fencing, closing barriers, and non-refunding quotas.
 
 use super::bridge_contract::{
-    BridgeBinding, GlobalHoldReservation, GroupHoldBinding, PgArtifactHoldReconciliationView, PgCrossRepoSiblingHold,
-    PgHoldRowSummary, SharedHoldReference, SharedHoldRetirementStatus,
+    BridgeBinding, BridgeRootRegistrationPlan, GlobalHoldReservationDto, RetentionBridgeError,
 };
 use super::contract::ArtifactHoldPurpose;
 use super::receipt::{AcquireAck, HoldAck, HoldArtifactIdentity};
+use super::reconcile_proof::{GroupObservationStatus, GroupRetirementObservationDto};
 use super::retention_bridge::{
-    BridgeRootRegistrationPlan, RetentionBridgeError, apply_release_root_idempotent, apply_reserved_hold_to_sm,
+    VerifiedGlobalHoldReservation, apply_release_root_idempotent, apply_reserved_hold_to_sm,
     apply_retire_hold_batch_idempotent, begin_operation_for_binding, publish_pin_and_root_after_hold,
     read_sm_quota_counters, verify_state_machine_gate_for_binding,
-};
-use super::retirement_reconcile::{
-    GroupObservationStatus, GroupRetirementObservation, RetirementBlockReason, evaluate_shared_hold_retirement,
-    observe_group_retirement_from_sm,
 };
 use crate::ref_store::GitObjectFormat;
 use crate::ref_store::contract::{MetadataPinPurpose, RequestDigest};
@@ -23,7 +20,6 @@ use crate::ref_store::core::state_machine::{
     RefCasStateMachine, ReleaseRootCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle,
     SetRepositoryLaneCommand, SmPackMode, StateMachineError, WireGateInit,
 };
-use crate::ref_store::projector::{ProjectionCursor, ProjectionRealm, TruncationCutoff};
 use uuid::Uuid;
 
 fn dhex(label: &str) -> String {
@@ -48,41 +44,6 @@ fn lane_cmd(f: &TestGroupFixture, lifecycle: ScopeLifecycle, authority_epoch: i6
     })
 }
 
-fn make_cursor(history: Uuid, group_id: i64, group_epoch: i64, applied_log_index: u64) -> ProjectionCursor {
-    ProjectionCursor::genesis(ProjectionRealm::new(history, group_id, group_epoch).unwrap())
-        .map(|mut c| {
-            c.applied_event_seq = applied_log_index + 3;
-            c.applied_log_index = applied_log_index;
-            c.applied_log_term = 1;
-            c.last_event_id = Some(format!("ev-{group_id}"));
-            c
-        })
-        .unwrap()
-}
-
-fn grp(f: &TestGroupFixture, group_id: i64, retire_request_id: Uuid) -> GroupHoldBinding {
-    GroupHoldBinding {
-        group_id,
-        history_incarnation: f.history,
-        expected_group_epoch: 1,
-        repository_id: f.repo,
-        tenant_id: f.tenant,
-        hold_ids: vec![f.hold_id],
-        retire_request_id,
-    }
-}
-
-fn pg_row(f: &TestGroupFixture, sha: &str, backend: &str) -> PgHoldRowSummary {
-    PgHoldRowSummary {
-        hold_id: f.hold_id,
-        repository_id: f.repo,
-        tenant_id: f.tenant,
-        sha256: sha.to_owned(),
-        backend_identity: backend.to_owned(),
-        state: "active".into(),
-    }
-}
-
 fn rel_cmd(f: &TestGroupFixture, request_id: Uuid, label: &str) -> ReleaseRootCommand {
     ReleaseRootCommand {
         request_id,
@@ -101,22 +62,6 @@ fn deny_unknown<T: serde::Serialize + serde::de::DeserializeOwned>(val: &T) {
     assert!(serde_json::from_value::<T>(v).is_err());
 }
 
-fn close_and_retire(sm: &mut RefCasStateMachine, f: &TestGroupFixture, release_id: Uuid, retire_id: Uuid) {
-    apply_release_root_idempotent(sm, log(5), rel_cmd(f, release_id, "done")).unwrap();
-    sm.apply(log(6), lane_cmd(f, ScopeLifecycle::Closing, 1)).unwrap();
-    apply_retire_hold_batch_idempotent(
-        sm,
-        log(7),
-        RetireHoldBatchCommand {
-            request_id: retire_id,
-            repository_id: f.repo,
-            tenant_id: f.tenant,
-            hold_ids: vec![f.hold_id],
-        },
-    )
-    .unwrap();
-}
-
 struct TestGroupFixture {
     repo: Uuid,
     tenant: Uuid,
@@ -126,7 +71,7 @@ struct TestGroupFixture {
     operation_id: Uuid,
     hold_id: Uuid,
     binding: BridgeBinding,
-    reservation: GlobalHoldReservation,
+    reservation: VerifiedGlobalHoldReservation,
     plan: BridgeRootRegistrationPlan,
 }
 
@@ -214,8 +159,7 @@ fn setup_group(seed: u128, group_id: i64, sha256: &str, backend: &str) -> (RefCa
         logical_bytes,
         artifacts: vec![HoldAck { hold_id, slot: 0, artifact, declared_bytes, logical_bytes }],
     };
-    let reservation =
-        GlobalHoldReservation { binding: binding.clone(), ack, replayed: false, recovered_from_unknown_commit: false };
+    let reservation = VerifiedGlobalHoldReservation::mint_for_unit_test(binding.clone(), ack);
     let plan = BridgeRootRegistrationPlan {
         pin_request_id: id(12),
         snapshot_id: id(13),
@@ -260,15 +204,25 @@ fn reserve_before_publish_refuses_missing_hold_and_denies_unknown_json_fields() 
     let err =
         publish_pin_and_root_after_hold(&mut sm, log(2), log(3), &f.reservation, &f.binding, &f.plan).unwrap_err();
     assert!(
-        matches!(err, RetentionBridgeError::MissingDurableHold { request_id } if request_id == f.reservation.ack.request_id)
+        matches!(err, RetentionBridgeError::MissingDurableHold { request_id } if request_id == f.reservation.ack().request_id)
     );
     let (repo_q, tenant_q) = read_sm_quota_counters(&sm, f.repo, f.tenant).unwrap();
     assert_eq!((repo_q.holds, repo_q.snapshots, repo_q.roots, tenant_q.holds), (0, 0, 0, 0));
 
-    // Strict serde: reject unexpected fields on DTOs.
+    // Strict serde: reject unexpected fields on untrusted DTOs.
     deny_unknown(&f.binding);
     deny_unknown(&f.plan);
-    deny_unknown(&f.reservation);
+    deny_unknown(&f.reservation.to_dto());
+    let sample_obs_dto = GroupRetirementObservationDto {
+        group_id: 10,
+        repository_id: f.repo,
+        status: GroupObservationStatus::Active,
+        receipt: None,
+        observed_log_index: Some(1),
+        detail: None,
+    };
+    deny_unknown(&sample_obs_dto);
+    assert!(serde_json::from_str::<GlobalHoldReservationDto>("{}").is_err());
 }
 
 #[test]
@@ -375,7 +329,7 @@ fn cancel_and_release_before_register_anti_aba_and_closing_barrier_fence() {
     let mut wrong_backend = f3.binding.clone();
     wrong_backend.backend_identity = dhex("other-bucket");
     assert_eq!(
-        wrong_backend.matches_acquire_ack(&f3.reservation.ack).unwrap_err(),
+        wrong_backend.matches_acquire_ack(f3.reservation.ack()).unwrap_err(),
         RetentionBridgeError::BackendMismatch
     );
     sm3.apply(log(2), lane_cmd(&f3, ScopeLifecycle::Open, 2)).unwrap();
@@ -391,105 +345,4 @@ fn cancel_and_release_before_register_anti_aba_and_closing_barrier_fence() {
         verify_state_machine_gate_for_binding(&sm3, &f3.binding).unwrap_err(),
         RetentionBridgeError::ScopeClosingOrClosed { lifecycle: ScopeLifecycle::Closing, .. }
     ));
-}
-
-#[test]
-fn multi_group_retirement_fails_closed_across_faults_and_converges_safely() {
-    let (sha, backend) = (dhex("shared-physical-pack"), dhex("s3-bucket-shared"));
-    let (mut sm1, f1) = setup_group(6000, 10, &sha, &backend);
-    let (mut sm2, f2) = setup_group(7000, 20, &sha, &backend);
-    for (sm, f) in [(&mut sm1, &f1), (&mut sm2, &f2)] {
-        apply_reserved_hold_to_sm(sm, log(2), &f.reservation, &f.binding).unwrap();
-        publish_pin_and_root_after_hold(sm, log(3), log(4), &f.reservation, &f.binding, &f.plan).unwrap();
-    }
-    let (retire1, retire2) = (Uuid::from_u128(6999), Uuid::from_u128(7999));
-    let (g1, g2) = (grp(&f1, 10, retire1), grp(&f2, 20, retire2));
-    let shared = SharedHoldReference {
-        shared_hold_key: Uuid::from_u128(8888),
-        artifact_digest: sha.clone(),
-        backend_identity: backend.clone(),
-        groups: vec![g1.clone(), g2.clone()],
-    };
-    let st_open = observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, 4).unwrap().status;
-    let st_stale = observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, 7).unwrap().status;
-    assert_eq!((st_open, st_stale), (GroupObservationStatus::Active, GroupObservationStatus::StaleSnapshot));
-
-    close_and_retire(&mut sm1, &f1, Uuid::from_u128(6998), retire1);
-    let obs1 = observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, 7).unwrap();
-    assert_eq!(obs1.status, GroupObservationStatus::Retired);
-    let (c1, c2) = (make_cursor(f1.history, 10, 1, 7), make_cursor(f2.history, 20, 1, 7));
-
-    // Group 2 still active -> Protected despite Group 1 deletion.
-    let obs2_active = observe_group_retirement_from_sm(&sm2, &g2, &sha, &backend, 4).unwrap();
-    let res = evaluate_shared_hold_retirement(&shared, &[obs1.clone(), obs2_active], &[c1.clone(), c2.clone()], None)
-        .unwrap();
-    assert_eq!(res.status, SharedHoldRetirementStatus::Protected);
-    assert!(res.reasons.iter().any(|r| matches!(r, RetirementBlockReason::GroupStillActive { group_id: 20, .. })));
-
-    close_and_retire(&mut sm2, &f2, Uuid::from_u128(7998), retire2);
-    let obs2 = observe_group_retirement_from_sm(&sm2, &g2, &sha, &backend, 7).unwrap();
-    assert_eq!(obs2.status, GroupObservationStatus::Retired);
-    assert_eq!(
-        observe_group_retirement_from_sm(&sm2, &g2, &sha, &backend, 9).unwrap().status,
-        GroupObservationStatus::StaleSnapshot
-    );
-
-    let chk = |obs: &[GroupRetirementObservation],
-               cur: &[ProjectionCursor],
-               pg: Option<&PgArtifactHoldReconciliationView>| {
-        evaluate_shared_hold_retirement(&shared, obs, cur, pg).unwrap()
-    };
-
-    // Tampered receipt, unreachable peer, epoch mismatch, resync/lagging cursor, and cross-repo sibling hold.
-    let mut bad_obs = obs2.clone();
-    bad_obs.receipt.as_mut().unwrap().receipt_digest = dhex("forged");
-    assert!(
-        chk(&[obs1.clone(), bad_obs.clone()], &[c1.clone(), c2.clone()], None)
-            .reasons
-            .iter()
-            .any(|r| matches!(r, RetirementBlockReason::InvalidReceipt { group_id: 20, .. }))
-    );
-
-    bad_obs.status = GroupObservationStatus::Unreachable;
-    bad_obs.receipt = None;
-    assert!(
-        chk(&[obs1.clone(), bad_obs], &[c1.clone(), c2.clone()], None)
-            .reasons
-            .iter()
-            .any(|r| matches!(r, RetirementBlockReason::GroupUnreachable { group_id: 20, .. }))
-    );
-
-    let mut bad_c2 = make_cursor(f2.history, 20, 2, 6);
-    bad_c2.truncation_cutoff = Some(TruncationCutoff {
-        log_index: 7,
-        event_seq: 9,
-        log_term: 1,
-        closure_digest: dhex("cutoff"),
-        archive_uri: None,
-    });
-    let r_lag = chk(&[obs1.clone(), obs2.clone()], &[c1.clone(), bad_c2], None).reasons;
-    assert!(r_lag.iter().any(|r| matches!(r, RetirementBlockReason::CursorEpochMismatch { group_id: 20, .. })));
-    assert!(r_lag.iter().any(|r| matches!(r, RetirementBlockReason::CursorBehindRetirement { group_id: 20, .. })));
-    assert!(r_lag.iter().any(|r| matches!(r, RetirementBlockReason::CursorResyncRequired { group_id: 20, .. })));
-
-    let mut pg_view = PgArtifactHoldReconciliationView {
-        found_holds: vec![pg_row(&f1, &sha, &backend), pg_row(&f2, &sha, &backend)],
-        unreconciled_sibling_holds: vec![PgCrossRepoSiblingHold {
-            repository_id: Uuid::from_u128(9991),
-            hold_id: Uuid::from_u128(9992),
-        }],
-    };
-    assert!(
-        chk(&[obs1.clone(), obs2.clone()], &[c1.clone(), c2.clone()], Some(&pg_view))
-            .reasons
-            .iter()
-            .any(|r| matches!(r, RetirementBlockReason::UnreconciledCrossRepoHold { .. }))
-    );
-
-    pg_view.unreconciled_sibling_holds.clear();
-    let r_ok = chk(&[obs1, obs2], &[c1, c2], Some(&pg_view));
-    assert_eq!(
-        (r_ok.status, r_ok.reconciled_groups, r_ok.reasons.is_empty()),
-        (SharedHoldRetirementStatus::RetiredToSafeReclaim, 2, true)
-    );
 }

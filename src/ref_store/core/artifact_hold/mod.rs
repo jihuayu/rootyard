@@ -53,6 +53,7 @@
 pub mod bridge_contract;
 pub mod contract;
 pub mod receipt;
+pub mod reconcile_proof;
 pub mod request;
 pub mod retention_bridge;
 pub mod retirement_reconcile;
@@ -63,6 +64,8 @@ mod consume;
 mod pg;
 mod query;
 mod quota;
+#[cfg(test)]
+mod reconcile_fault_tests;
 mod registration_ledger;
 mod sql;
 mod sql_rows;

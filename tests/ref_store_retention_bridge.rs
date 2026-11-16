@@ -7,18 +7,19 @@ use deadpool_postgres::{Manager, Pool};
 use rootyard::blob_store::{config::BlobProfile, opendal::BlobStore};
 use rootyard::db;
 use rootyard::ref_store::artifact_hold::bridge_contract::{
-    BridgeBinding, GroupHoldBinding, SharedHoldReference, SharedHoldRetirementStatus,
+    BridgeBinding, GlobalHoldReservationDto, GroupHoldBinding, SharedHoldReference, SharedHoldRetirementStatus,
+};
+use rootyard::ref_store::artifact_hold::reconcile_proof::{
+    GroupObservationStatus, RetirementBlockReason, observe_group_retirement_from_sm,
+    verify_group_observation_with_snapshot,
 };
 use rootyard::ref_store::artifact_hold::retention_bridge::{
     BridgeRootRegistrationPlan, RetentionBridgeError, apply_release_root_idempotent, apply_reserved_hold_to_sm,
     apply_retire_hold_batch_idempotent, begin_operation_for_binding, publish_pin_and_root_after_hold,
     read_sm_quota_counters, recover_global_hold_by_operation, recover_global_hold_by_request,
-    reserve_global_hold_first, verify_state_machine_gate_for_binding,
+    reserve_global_hold_first, reverify_reservation_dto_with_pg, verify_state_machine_gate_for_binding,
 };
-use rootyard::ref_store::artifact_hold::retirement_reconcile::{
-    GroupObservationStatus, RetirementBlockReason, observe_group_retirement_from_sm,
-    reconcile_shared_hold_retirement_with_pg,
-};
+use rootyard::ref_store::artifact_hold::retirement_reconcile::reconcile_shared_hold_retirement_with_pg;
 use rootyard::ref_store::artifact_hold::{AcquireArtifactHoldsRequest, ArtifactHoldPurpose, ArtifactSpec, HoldScope};
 use rootyard::ref_store::core::command::CommitRefsRequest;
 use rootyard::ref_store::core::state_machine::{
@@ -232,17 +233,25 @@ async fn pg_bridge_reserve_before_publish_lost_ack_recovery_and_non_refunding_qu
 
     // Reserve in PG first, then drop grant + response to simulate lost COMMIT ACK.
     let reserved = reserve_global_hold_first(&mut client, &blob, &req, &binding, deadline()).await?;
-    ensure!(!reserved.reservation.replayed && reserved.grant.is_some());
+    ensure!(!reserved.reservation.replayed() && reserved.grant.is_some());
     drop(reserved);
 
     // Recover strictly via original OperationIdentity without creating extra rows or charging quotas twice.
     let recovered = recover_global_hold_by_operation(&mut client, &scope, &binding, deadline()).await?;
-    ensure!(recovered.replayed && recovered.recovered_from_unknown_commit && recovered.hold_ids().len() == 1);
+    ensure!(recovered.replayed() && recovered.recovered_from_unknown_commit() && recovered.hold_ids().len() == 1);
     let by_req = recover_global_hold_by_request(&mut client, &scope, &binding, req_id, deadline()).await?;
-    ensure!(by_req.ack == recovered.ack);
+    ensure!(by_req.ack() == recovered.ack());
+
+    // Untrusted reservation DTOs must be reverified against PG `artifact_holds`; tampered DTOs fail closed.
+    let clean_dto: GlobalHoldReservationDto = recovered.to_dto();
+    let reverified = reverify_reservation_dto_with_pg(&mut client, &scope, &binding, &clean_dto, deadline()).await?;
+    ensure!(reverified.ack() == recovered.ack());
+    let mut tampered_dto = clean_dto;
+    tampered_dto.ack.artifacts[0].hold_id = Uuid::new_v4();
+    ensure!(reverify_reservation_dto_with_pg(&mut client, &scope, &binding, &tampered_dto, deadline()).await.is_err());
 
     let replayed = reserve_global_hold_first(&mut client, &blob, &req, &binding, deadline()).await?;
-    ensure!(replayed.reservation.replayed && replayed.grant.is_none());
+    ensure!(replayed.reservation.replayed() && replayed.grant.is_none());
 
     // Wrong physical bucket must fail closed on backend identity check.
     let wrong_binding =
@@ -591,14 +600,41 @@ async fn pg_multi_group_shared_hold_retirement_and_cursor_reconciler() -> Result
         retire_request_id: ret3,
     };
 
-    let obs1 = observe_group_retirement_from_sm(&sm1, &gb1, &shared_sha, &backend_hex, 8)?;
-    let obs2 = observe_group_retirement_from_sm(&sm2, &gb2, &shared_sha, &backend_hex, 8)?;
-    let obs3 = observe_group_retirement_from_sm(&sm3, &gb3, &shared_sha, &backend_hex, 8)?;
+    // Even with a low caller hint `Some(1)`, barrier locks to `snap.last_applied.index == 8`.
+    let obs1 = observe_group_retirement_from_sm(&sm1, &gb1, &shared_sha, &backend_hex, Some(1))?;
+    let obs2 = observe_group_retirement_from_sm(&sm2, &gb2, &shared_sha, &backend_hex, Some(1))?;
+    let obs3 = observe_group_retirement_from_sm(&sm3, &gb3, &shared_sha, &backend_hex, Some(1))?;
     ensure!(
-        obs1.status == GroupObservationStatus::Retired
-            && obs2.status == GroupObservationStatus::Retired
-            && obs3.status == GroupObservationStatus::Retired
+        obs1.status() == GroupObservationStatus::Retired
+            && obs2.status() == GroupObservationStatus::Retired
+            && obs3.status() == GroupObservationStatus::Retired
     );
+    ensure!(obs1.retired_proof().unwrap().barrier_log_index() == 8);
+
+    // Tampered DTO claiming lower barrier fails snapshot verification.
+    let mut forged_dto = obs1.to_dto();
+    forged_dto.receipt.as_mut().unwrap().retirement_log_index = 1;
+    let forge_err =
+        verify_group_observation_with_snapshot(&forged_dto, &sm1.snapshot()?, &gb1, &shared_sha, &backend_hex, Some(1))
+            .unwrap_err();
+    ensure!(forge_err == RetentionBridgeError::UntrustedObservationProof);
+
+    let shared_two = SharedHoldReference {
+        shared_hold_key: Uuid::new_v4(),
+        artifact_digest: shared_sha.clone(),
+        backend_identity: backend_hex.clone(),
+        groups: vec![gb1.clone(), gb2.clone()],
+    };
+    let mut client = pool.get().await?;
+    // Before truncation, PG cursor for group 10 is only at log_index = 2 < barrier = 8 -> MUST fail closed!
+    let behind =
+        reconcile_shared_hold_retirement_with_pg(&mut client, &shared_two, &[obs1.clone(), obs2.clone()], deadline())
+            .await?;
+    ensure!(behind.status == SharedHoldRetirementStatus::Protected);
+    ensure!(behind.reasons.iter().any(|r| matches!(
+        r,
+        RetirementBlockReason::CursorBehindRetirement { group_id: 10, applied_log_index: 2, retirement_log_index: 8 }
+    )));
 
     // Trigger real PG truncation gap -> stream_state = resync_required -> reconcile MUST fail closed!
     let cutoff =
@@ -618,13 +654,6 @@ async fn pg_multi_group_shared_hold_retirement_and_cursor_reconciler() -> Result
     .unwrap_err();
     ensure!(matches!(trunc_err, ProjectionError::TruncatedBeforeCursor { .. }));
 
-    let shared_two = SharedHoldReference {
-        shared_hold_key: Uuid::new_v4(),
-        artifact_digest: shared_sha.clone(),
-        backend_identity: backend_hex.clone(),
-        groups: vec![gb1.clone(), gb2.clone()],
-    };
-    let mut client = pool.get().await?;
     let lagging =
         reconcile_shared_hold_retirement_with_pg(&mut client, &shared_two, &[obs1.clone(), obs2.clone()], deadline())
             .await?;

@@ -1,13 +1,15 @@
 //! Multi-group shared artifact-hold retirement coordinator and PostgreSQL
 //! projection cursor reconciler (`ref_cas_projection_cursors`, #151).
 
-pub use super::bridge_contract::{
-    GroupHoldBinding, PgArtifactHoldReconciliationView, PgCrossRepoSiblingHold, PgHoldRowSummary, RetentionBridgeError,
-    SharedHoldReference, SharedHoldRetirementStatus,
+use super::reconcile_proof::VerifiedGroupState;
+pub use super::reconcile_proof::{
+    GroupHoldBinding, RetentionBridgeError, RetirementBlockReason, SharedHoldReference, VerifiedGroupObservation,
+    VerifiedGroupRetirement, observe_group_retirement_from_sm, observe_group_retirement_from_snapshot,
+    observe_group_retirement_from_snapshot_bytes, verify_group_observation_with_snapshot,
 };
 pub use super::retention_bridge::apply_retire_hold_batch_idempotent;
 use crate::ref_store::contract::RequestDigest;
-use crate::ref_store::core::state_machine::{RefCasStateMachine, ScopeLifecycle, SmHoldState, SmRootState};
+use crate::ref_store::core::state_machine::ScopeLifecycle;
 use crate::ref_store::pg::{self as ref_pg, db_error};
 use crate::ref_store::projector::{ProjectionCursor, ProjectionStreamState, load_cursor};
 use crate::ref_store::tx::begin_bounded;
@@ -18,10 +20,10 @@ use tokio::time::Instant;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
-/// Irreversible per-group retirement receipt emitted from `RefCasStateMachine`.
+/// Diagnostic / transport DTO for a per-group retirement receipt (NEVER accepted directly by reconciler).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct GroupRetirementReceipt {
+pub struct GroupRetirementReceiptDto {
     pub group_id: i64,
     pub history_incarnation: Uuid,
     pub group_epoch: i64,
@@ -38,7 +40,7 @@ pub struct GroupRetirementReceipt {
     pub receipt_digest: String,
 }
 
-impl GroupRetirementReceipt {
+impl GroupRetirementReceiptDto {
     pub fn compute_digest(&self) -> RequestDigest {
         let tag: &[u8] = match self.scope_lifecycle {
             ScopeLifecycle::Open => b"open",
@@ -73,11 +75,11 @@ impl GroupRetirementReceipt {
         RequestDigest::of("refcas-group-retirement-receipt-v1", &slices)
     }
 
-    pub fn verify_integrity(&self) -> Result<(), RetentionBridgeError> {
+    pub fn verify_digest(&self) -> Result<(), RetentionBridgeError> {
         RequestDigest::from_str(&self.snapshot_digest)?;
         RequestDigest::from_str(&self.receipt_digest)?;
         if self.compute_digest().as_hex() != self.receipt_digest {
-            return Err(RetentionBridgeError::RetirementRefused("group retirement receipt checksum mismatch".into()));
+            return Err(RetentionBridgeError::RetirementRefused("receipt checksum mismatch".into()));
         }
         Ok(())
     }
@@ -93,37 +95,48 @@ pub enum GroupObservationStatus {
     StaleSnapshot,
 }
 
+/// Diagnostic / transport DTO for a per-group observation (NEVER accepted as retirement proof).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct GroupRetirementObservation {
+pub struct GroupRetirementObservationDto {
     pub group_id: i64,
     pub repository_id: Uuid,
     pub status: GroupObservationStatus,
-    pub receipt: Option<GroupRetirementReceipt>,
+    pub receipt: Option<GroupRetirementReceiptDto>,
     pub observed_log_index: Option<u64>,
     pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PgHoldRowSummary {
+    pub hold_id: Uuid,
+    pub repository_id: Uuid,
+    pub tenant_id: Uuid,
+    pub sha256: String,
+    pub backend_identity: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PgCrossRepoSiblingHold {
+    pub repository_id: Uuid,
+    pub hold_id: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PgArtifactHoldReconciliationView {
+    pub found_holds: Vec<PgHoldRowSummary>,
+    pub unreconciled_sibling_holds: Vec<PgCrossRepoSiblingHold>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RetirementBlockReason {
-    GroupMissingObservation { group_id: i64, repository_id: Uuid },
-    GroupDuplicateObservation { group_id: i64, repository_id: Uuid },
-    GroupUnreachable { group_id: i64, repository_id: Uuid },
-    GroupUnknownOutcome { group_id: i64, repository_id: Uuid },
-    GroupStillActive { group_id: i64, repository_id: Uuid },
-    ClosingBarrierNotReached { group_id: i64, repository_id: Uuid },
-    ActiveRootStillProtecting { group_id: i64, repository_id: Uuid, active_roots: usize },
-    HoldNotRetiredInGroup { group_id: i64, repository_id: Uuid },
-    StaleSnapshot { group_id: i64, repository_id: Uuid, observed_log_index: u64, required_log_index: u64 },
-    InvalidReceipt { group_id: i64, repository_id: Uuid },
-    MissingProjectionCursor { group_id: i64, history_incarnation: Uuid },
-    CursorResyncRequired { group_id: i64, history_incarnation: Uuid },
-    CursorEpochMismatch { group_id: i64, expected_epoch: i64, actual_epoch: i64 },
-    CursorBehindRetirement { group_id: i64, applied_log_index: u64, retirement_log_index: u64 },
-    MissingPgHoldRow { repository_id: Uuid, hold_id: Uuid },
-    PgHoldIdentityMismatch { repository_id: Uuid, hold_id: Uuid },
-    UnreconciledCrossRepoHold { repository_id: Uuid, hold_id: Uuid },
+pub enum SharedHoldRetirementStatus {
+    Protected,
+    RetiredToSafeReclaim,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -137,116 +150,9 @@ pub struct SharedHoldReconciliationOutcome {
     pub reasons: Vec<RetirementBlockReason>,
 }
 
-/// Inspect one group's deterministic `RefCasStateMachine` and emit either a
-/// cryptographically sealed `GroupRetirementReceipt` or a typed blocking status.
-pub fn observe_group_retirement_from_sm(
-    sm: &RefCasStateMachine,
-    binding: &GroupHoldBinding,
-    expected_artifact_digest: &str,
-    expected_backend_identity: &str,
-    retirement_log_index: u64,
-) -> Result<GroupRetirementObservation, RetentionBridgeError> {
-    binding.validate()?;
-    RequestDigest::from_str(expected_artifact_digest)?;
-    RequestDigest::from_str(expected_backend_identity)?;
-    if retirement_log_index == 0 {
-        return Err(RetentionBridgeError::InvalidBinding("retirement_log_index must be >= 1".into()));
-    }
-    let snap = sm.snapshot()?;
-    snap.verify_integrity()?;
-    let applied_idx = snap.body.last_applied.map_or(0, |id| id.index);
-    let blk = |status, detail: String| {
-        Ok(GroupRetirementObservation {
-            group_id: binding.group_id,
-            repository_id: binding.repository_id,
-            status,
-            receipt: None,
-            observed_log_index: Some(applied_idx),
-            detail: Some(detail),
-        })
-    };
-    let Some(gate) = sm.read_gate_version(binding.repository_id)? else {
-        return blk(GroupObservationStatus::UnknownOutcome, "missing gate".into());
-    };
-    if (gate.tenant_id(), gate.history_incarnation(), gate.group_epoch())
-        != (binding.tenant_id, binding.history_incarnation, binding.expected_group_epoch)
-    {
-        return blk(GroupObservationStatus::StaleSnapshot, "realm mismatch".into());
-    }
-    if applied_idx < retirement_log_index {
-        return blk(GroupObservationStatus::StaleSnapshot, format!("applied {applied_idx} < {retirement_log_index}"));
-    }
-    let Some((lifecycle, _)) = sm.read_scope_lifecycle(binding.repository_id) else {
-        return blk(GroupObservationStatus::UnknownOutcome, "no lifecycle".into());
-    };
-    if lifecycle == ScopeLifecycle::Open {
-        return blk(GroupObservationStatus::Active, "closing barrier open".into());
-    }
-    let active_roots = snap
-        .body
-        .roots
-        .iter()
-        .filter(|r| {
-            r.state == SmRootState::Active
-                && (r.repository_id == binding.repository_id
-                    || r.bound_hold_ids.iter().any(|id| binding.hold_ids.contains(id)))
-        })
-        .count();
-    if active_roots > 0 {
-        return blk(GroupObservationStatus::Active, format!("{active_roots} active root(s) remain"));
-    }
-    let Some(retire_rec) = snap.body.hold_retires.iter().find(|r| {
-        (r.request_id, r.repository_id, r.tenant_id)
-            == (binding.retire_request_id, binding.repository_id, binding.tenant_id)
-    }) else {
-        return blk(GroupObservationStatus::Active, "no retire receipt".into());
-    };
-    for &hold_id in &binding.hold_ids {
-        if !retire_rec.hold_ids.contains(&hold_id) {
-            return blk(GroupObservationStatus::Active, "hold omitted from retire receipt".into());
-        }
-        let Some(e) = sm.read_hold(hold_id) else {
-            return blk(GroupObservationStatus::UnknownOutcome, "missing hold".into());
-        };
-        if (e.repository_id, e.tenant_id) != (binding.repository_id, binding.tenant_id)
-            || e.artifact_digest != expected_artifact_digest
-            || e.backend_identity != expected_backend_identity
-            || e.state != SmHoldState::Retired
-        {
-            return blk(GroupObservationStatus::Active, "hold not retired".into());
-        }
-    }
-    let mut receipt = GroupRetirementReceipt {
-        group_id: binding.group_id,
-        history_incarnation: binding.history_incarnation,
-        group_epoch: gate.group_epoch(),
-        authority_epoch: gate.authority_epoch(),
-        repository_id: binding.repository_id,
-        tenant_id: binding.tenant_id,
-        scope_lifecycle: lifecycle,
-        retire_request_id: binding.retire_request_id,
-        retired_hold_ids: binding.hold_ids.clone(),
-        active_root_count: active_roots,
-        retirement_log_index,
-        applied_log_index: applied_idx,
-        snapshot_digest: sm.state_digest()?,
-        receipt_digest: String::new(),
-    };
-    receipt.receipt_digest = receipt.compute_digest().as_hex();
-    let (group_id, repository_id, receipt) = (binding.group_id, binding.repository_id, Some(receipt));
-    Ok(GroupRetirementObservation {
-        group_id,
-        repository_id,
-        status: GroupObservationStatus::Retired,
-        receipt,
-        observed_log_index: Some(applied_idx),
-        detail: None,
-    })
-}
-
 fn verify_group_cursor(
     binding: &GroupHoldBinding,
-    receipt: Option<&GroupRetirementReceipt>,
+    proof: Option<&VerifiedGroupRetirement>,
     cursor: Option<&ProjectionCursor>,
     reasons: &mut Vec<RetirementBlockReason>,
 ) {
@@ -263,35 +169,65 @@ fn verify_group_cursor(
     if actual_epoch != expected_epoch {
         reasons.push(RetirementBlockReason::CursorEpochMismatch { group_id, expected_epoch, actual_epoch });
     }
-    if let Some(receipt) = receipt
-        && cursor.applied_log_index < receipt.retirement_log_index
+    if let Some(proof) = proof
+        && cursor.applied_log_index < proof.barrier_log_index()
     {
-        let (applied_log_index, retirement_log_index) = (cursor.applied_log_index, receipt.retirement_log_index);
         reasons.push(RetirementBlockReason::CursorBehindRetirement {
             group_id,
-            applied_log_index,
-            retirement_log_index,
+            applied_log_index: cursor.applied_log_index,
+            retirement_log_index: proof.barrier_log_index(),
         });
     }
 }
 
-fn validate_retired_receipt(
-    binding: &GroupHoldBinding,
-    obs: &GroupRetirementObservation,
+fn check_verified_proof<'a>(
+    shared: &SharedHoldReference,
+    g: &GroupHoldBinding,
+    obs: Option<&'a VerifiedGroupObservation>,
     reasons: &mut Vec<RetirementBlockReason>,
-) -> Option<GroupRetirementReceipt> {
-    let (group_id, repository_id) = (binding.group_id, binding.repository_id);
-    let Some(r) = &obs.receipt else {
-        reasons.push(RetirementBlockReason::InvalidReceipt { group_id, repository_id });
+) -> Option<&'a VerifiedGroupRetirement> {
+    let (group_id, repository_id) = (g.group_id, g.repository_id);
+    let Some(obs) = obs else {
+        reasons.push(RetirementBlockReason::GroupMissingObservation { group_id, repository_id });
         return None;
     };
-    if r.verify_integrity().is_err()
-        || r.group_id != group_id
-        || r.repository_id != repository_id
-        || r.tenant_id != binding.tenant_id
-        || r.history_incarnation != binding.history_incarnation
-        || r.group_epoch != binding.expected_group_epoch
-        || r.retire_request_id != binding.retire_request_id
+    let proof = match obs.state() {
+        VerifiedGroupState::Unreachable => {
+            reasons.push(RetirementBlockReason::GroupUnreachable { group_id, repository_id });
+            return None;
+        }
+        VerifiedGroupState::UnknownOutcome { .. } => {
+            reasons.push(RetirementBlockReason::GroupUnknownOutcome { group_id, repository_id });
+            return None;
+        }
+        VerifiedGroupState::Active { .. } => {
+            reasons.push(RetirementBlockReason::GroupStillActive { group_id, repository_id });
+            return None;
+        }
+        VerifiedGroupState::StaleSnapshot { observed_log_index, required_log_index, .. } => {
+            reasons.push(RetirementBlockReason::StaleSnapshot {
+                group_id,
+                repository_id,
+                observed_log_index: *observed_log_index,
+                required_log_index: *required_log_index,
+            });
+            return None;
+        }
+        VerifiedGroupState::Retired(proof) => proof,
+    };
+    let r = proof.receipt();
+    if r.verify_digest().is_err()
+        || (r.group_id, r.repository_id, r.tenant_id, r.history_incarnation, r.group_epoch, r.retire_request_id)
+            != (
+                group_id,
+                repository_id,
+                g.tenant_id,
+                g.history_incarnation,
+                g.expected_group_epoch,
+                g.retire_request_id,
+            )
+        || proof.artifact_digest() != shared.artifact_digest
+        || proof.backend_identity() != shared.backend_identity
     {
         reasons.push(RetirementBlockReason::InvalidReceipt { group_id, repository_id });
         return None;
@@ -312,38 +248,10 @@ fn validate_retired_receipt(
         });
     }
     let retired_set: BTreeSet<Uuid> = r.retired_hold_ids.iter().copied().collect();
-    if !binding.hold_ids.iter().all(|id| retired_set.contains(id)) {
+    if !g.hold_ids.iter().all(|id| retired_set.contains(id)) {
         reasons.push(RetirementBlockReason::HoldNotRetiredInGroup { group_id, repository_id });
     }
-    Some(r.clone())
-}
-
-fn check_group_observation(
-    g: &GroupHoldBinding,
-    obs: Option<&GroupRetirementObservation>,
-    reasons: &mut Vec<RetirementBlockReason>,
-) -> Option<GroupRetirementReceipt> {
-    let (group_id, repository_id) = (g.group_id, g.repository_id);
-    let Some(obs) = obs else {
-        reasons.push(RetirementBlockReason::GroupMissingObservation { group_id, repository_id });
-        return None;
-    };
-    let reason = match obs.status {
-        GroupObservationStatus::Unreachable => RetirementBlockReason::GroupUnreachable { group_id, repository_id },
-        GroupObservationStatus::UnknownOutcome => {
-            RetirementBlockReason::GroupUnknownOutcome { group_id, repository_id }
-        }
-        GroupObservationStatus::Active => RetirementBlockReason::GroupStillActive { group_id, repository_id },
-        GroupObservationStatus::StaleSnapshot => RetirementBlockReason::StaleSnapshot {
-            group_id,
-            repository_id,
-            observed_log_index: obs.observed_log_index.unwrap_or(0),
-            required_log_index: 1,
-        },
-        GroupObservationStatus::Retired => return validate_retired_receipt(g, obs, reasons),
-    };
-    reasons.push(reason);
-    None
+    Some(proof)
 }
 
 fn check_group_pg_holds(
@@ -370,20 +278,20 @@ fn check_group_pg_holds(
     }
 }
 
-/// Fail-closed multi-group evaluator combining group retirement receipts,
+/// Fail-closed multi-group evaluator consuming ONLY consensus-verified `VerifiedGroupObservation`s,
 /// Migration-149 PG projection cursors, and PG cross-repo `artifact_holds`.
 pub fn evaluate_shared_hold_retirement(
     shared: &SharedHoldReference,
-    observations: &[GroupRetirementObservation],
+    observations: &[VerifiedGroupObservation],
     cursors: &[ProjectionCursor],
     pg_holds: Option<&PgArtifactHoldReconciliationView>,
 ) -> Result<SharedHoldReconciliationOutcome, RetentionBridgeError> {
     shared.validate()?;
     let (mut obs_map, mut reasons) = (BTreeMap::new(), Vec::new());
     for obs in observations {
-        if obs_map.insert((obs.group_id, obs.repository_id), obs).is_some() {
-            let (group_id, repository_id) = (obs.group_id, obs.repository_id);
-            reasons.push(RetirementBlockReason::GroupDuplicateObservation { group_id, repository_id });
+        let key = (obs.group_id(), obs.repository_id());
+        if obs_map.insert(key, obs).is_some() {
+            reasons.push(RetirementBlockReason::GroupDuplicateObservation { group_id: key.0, repository_id: key.1 });
         }
     }
     let cursor_map: BTreeMap<(i64, Uuid), &ProjectionCursor> =
@@ -393,19 +301,19 @@ pub fn evaluate_shared_hold_retirement(
 
     let mut reconciled_groups = 0usize;
     for g in &shared.groups {
-        let valid_receipt =
-            check_group_observation(g, obs_map.get(&(g.group_id, g.repository_id)).copied(), &mut reasons);
+        let valid_proof =
+            check_verified_proof(shared, g, obs_map.get(&(g.group_id, g.repository_id)).copied(), &mut reasons);
         let before = reasons.len();
         verify_group_cursor(
             g,
-            valid_receipt.as_ref(),
+            valid_proof,
             cursor_map.get(&(g.group_id, g.history_incarnation)).copied(),
             &mut reasons,
         );
         if pg_holds.is_some() {
             check_group_pg_holds(g, shared, &hold_map, &mut reasons);
         }
-        if valid_receipt.is_some() && reasons.len() == before {
+        if valid_proof.is_some() && reasons.len() == before {
             reconciled_groups += 1;
         }
     }
@@ -419,12 +327,10 @@ pub fn evaluate_shared_hold_retirement(
     } else {
         SharedHoldRetirementStatus::Protected
     };
-    let (shared_hold_key, artifact_digest, backend_identity) =
-        (shared.shared_hold_key, shared.artifact_digest.clone(), shared.backend_identity.clone());
     Ok(SharedHoldReconciliationOutcome {
-        shared_hold_key,
-        artifact_digest,
-        backend_identity,
+        shared_hold_key: shared.shared_hold_key,
+        artifact_digest: shared.artifact_digest.clone(),
+        backend_identity: shared.backend_identity.clone(),
         status,
         reconciled_groups,
         reasons,
@@ -436,7 +342,7 @@ pub fn evaluate_shared_hold_retirement(
 pub async fn reconcile_shared_hold_retirement_with_pg(
     client: &mut Client,
     shared: &SharedHoldReference,
-    observations: &[GroupRetirementObservation],
+    observations: &[VerifiedGroupObservation],
     deadline: Instant,
 ) -> Result<SharedHoldReconciliationOutcome, RetentionBridgeError> {
     shared.validate()?;
@@ -446,8 +352,9 @@ pub async fn reconcile_shared_hold_retirement_with_pg(
         ref_pg::bound(&tx, deadline).await?;
         let mut cursors = Vec::new();
         for g in &shared.groups {
-            if let Some(c) =
-                load_cursor(&tx, g.group_id, g.history_incarnation).await.map_err(|e| RetentionBridgeError::Database(e.to_string()))?
+            if let Some(c) = load_cursor(&tx, g.group_id, g.history_incarnation)
+                .await
+                .map_err(|e| RetentionBridgeError::Database(e.to_string()))?
             {
                 cursors.push(c);
             }

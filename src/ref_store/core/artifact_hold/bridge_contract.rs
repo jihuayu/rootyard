@@ -4,18 +4,20 @@
 //! Every `Deserialize` struct carries `#[serde(deny_unknown_fields)]`. Zero I/O
 //! or PostgreSQL queries run in this module.
 
-use super::contract::{ArtifactHoldError, HoldScope, MAX_BATCH_ARTIFACTS};
-use super::pg::ArtifactGrant;
+use super::contract::{ArtifactHoldError, HoldScope};
 use super::receipt::AcquireAck;
-pub use super::retention_bridge::BridgeRootRegistrationPlan;
+pub use super::reconcile_proof::{GroupHoldBinding, SharedHoldReference};
+pub use super::retirement_reconcile::{
+    PgArtifactHoldReconciliationView, PgCrossRepoSiblingHold, PgHoldRowSummary, SharedHoldRetirementStatus,
+};
 use crate::blob_store::BlobBackendIdentity;
-use crate::ref_store::contract::{IssuerLane, OperationIdentity, RefStoreError, RequestDigest};
+use crate::ref_store::contract::{IssuerLane, MetadataPinPurpose, OperationIdentity, RefStoreError, RequestDigest};
+use crate::ref_store::core::retention_root::{RootPurpose, RootSelectorKind};
 use crate::ref_store::core::state_machine::{
     AcquireHoldBatchCommand, MarkHoldConsumedCommand, ScopeLifecycle, StateMachineError, WireHoldArtifactSpec,
     WireOperationIdentity,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -36,6 +38,7 @@ pub enum RetentionBridgeError {
     Store(RefStoreError),
     Database(String),
     RetirementRefused(String),
+    UntrustedObservationProof,
 }
 
 impl fmt::Display for RetentionBridgeError {
@@ -64,6 +67,7 @@ impl fmt::Display for RetentionBridgeError {
             Self::Store(err) => write!(f, "ref-store contract error: {err}"),
             Self::Database(msg) => write!(f, "retention bridge database error: {msg}"),
             Self::RetirementRefused(msg) => write!(f, "shared hold retirement refused: {msg}"),
+            Self::UntrustedObservationProof => write!(f, "untrusted retirement DTO rejected; consensus proof required"),
         }
     }
 }
@@ -344,17 +348,18 @@ impl BridgeBinding {
     }
 }
 
-/// Durable receipt proof that PG `artifact_holds` committed before Ref-CAS publish.
+/// Untrusted serializable DTO mirroring a committed PG `artifact_holds` reservation.
+/// Must be verified against PG into an opaque `VerifiedGlobalHoldReservation` before use.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct GlobalHoldReservation {
+pub struct GlobalHoldReservationDto {
     pub binding: BridgeBinding,
     pub ack: AcquireAck,
     pub replayed: bool,
     pub recovered_from_unknown_commit: bool,
 }
 
-impl GlobalHoldReservation {
+impl GlobalHoldReservationDto {
     pub fn hold_ids(&self) -> Vec<Uuid> {
         let mut sorted = self.ack.artifacts.clone();
         sorted.sort_by_key(|item| item.slot);
@@ -369,110 +374,50 @@ impl GlobalHoldReservation {
     }
 }
 
-/// First-reserve outcome pairing the receipted reservation with an optional `ArtifactGrant`.
-pub struct ReservedGlobalHold {
-    pub reservation: GlobalHoldReservation,
-    pub grant: Option<ArtifactGrant>,
-}
-
-/// Binding between one Ref-CAS group + repository and its local `hold_id`s.
+/// Bounded inputs for deterministic snapshot-pin + retention-root publication.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct GroupHoldBinding {
-    pub group_id: i64,
-    pub history_incarnation: Uuid,
-    pub expected_group_epoch: i64,
-    pub repository_id: Uuid,
-    pub tenant_id: Uuid,
-    pub hold_ids: Vec<Uuid>,
-    pub retire_request_id: Uuid,
+pub struct BridgeRootRegistrationPlan {
+    pub pin_request_id: Uuid,
+    pub snapshot_id: Uuid,
+    pub pin_id: Uuid,
+    pub pin_purpose: MetadataPinPurpose,
+    pub lease_ticks: u64,
+    pub pin_logical_tick: u64,
+    pub pack_digests: Vec<String>,
+    pub pin_request_digest: String,
+    pub root_request_id: Uuid,
+    pub root_id: Uuid,
+    pub root_purpose: String,
+    pub business_intent_digest: String,
+    pub selector_kind: String,
+    pub selector_digest: String,
+    pub refs_digest: String,
+    pub pack_set_digest: String,
+    pub register_digest: String,
+    pub root_request_digest: String,
 }
 
-impl GroupHoldBinding {
+impl BridgeRootRegistrationPlan {
     pub fn validate(&self) -> Result<(), RetentionBridgeError> {
-        let err = |msg: &str| RetentionBridgeError::InvalidBinding(msg.into());
-        if self.group_id < 0 || self.expected_group_epoch <= 0 {
-            return Err(err("invalid group_id or expected_group_epoch"));
-        }
-        let ids = [self.history_incarnation, self.repository_id, self.tenant_id, self.retire_request_id];
+        let ids = [self.pin_request_id, self.snapshot_id, self.pin_id, self.root_request_id, self.root_id];
         if ids.iter().any(Uuid::is_nil) {
-            return Err(err("group binding UUIDs must be non-nil"));
+            return Err(RetentionBridgeError::InvalidBinding("pin/root ids must be non-nil".into()));
         }
-        if self.hold_ids.is_empty() || self.hold_ids.len() > MAX_BATCH_ARTIFACTS {
-            return Err(err("group hold_ids batch out of bounds"));
-        }
-        let mut seen = BTreeSet::new();
-        if self.hold_ids.iter().any(|id| id.is_nil() || !seen.insert(*id)) {
-            return Err(err("group hold_ids must be non-nil and unique"));
-        }
-        Ok(())
-    }
-}
-
-/// Complete multi-group declaration for a shared physical artifact hold.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SharedHoldReference {
-    pub shared_hold_key: Uuid,
-    pub artifact_digest: String,
-    pub backend_identity: String,
-    pub groups: Vec<GroupHoldBinding>,
-}
-
-impl SharedHoldReference {
-    pub fn validate(&self) -> Result<(), RetentionBridgeError> {
-        let err = |msg: &str| RetentionBridgeError::InvalidBinding(msg.into());
-        if self.shared_hold_key.is_nil() || self.groups.is_empty() {
-            return Err(err("shared hold requires key and >= 1 group"));
-        }
-        RequestDigest::from_str(&self.artifact_digest)?;
-        RequestDigest::from_str(&self.backend_identity)?;
-        let (mut seen_groups, mut seen_holds) = (BTreeSet::new(), BTreeSet::new());
-        for g in &self.groups {
-            g.validate()?;
-            if !seen_groups.insert((g.group_id, g.repository_id)) {
-                return Err(err("duplicate (group_id, repository_id)"));
-            }
-            if g.hold_ids.iter().any(|id| !seen_holds.insert(*id)) {
-                return Err(err("duplicate hold_id across groups"));
-            }
+        RootPurpose::parse(&self.root_purpose).map_err(|e| RetentionBridgeError::InvalidBinding(e.to_string()))?;
+        RootSelectorKind::parse(&self.selector_kind)
+            .map_err(|e| RetentionBridgeError::InvalidBinding(e.to_string()))?;
+        for hex in [
+            &self.pin_request_digest,
+            &self.business_intent_digest,
+            &self.selector_digest,
+            &self.refs_digest,
+            &self.pack_set_digest,
+            &self.register_digest,
+            &self.root_request_digest,
+        ] {
+            RequestDigest::from_str(hex)?;
         }
         Ok(())
     }
-
-    pub fn all_hold_ids(&self) -> Vec<Uuid> {
-        self.groups.iter().flat_map(|g| g.hold_ids.iter().copied()).collect()
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PgHoldRowSummary {
-    pub hold_id: Uuid,
-    pub repository_id: Uuid,
-    pub tenant_id: Uuid,
-    pub sha256: String,
-    pub backend_identity: String,
-    pub state: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PgCrossRepoSiblingHold {
-    pub repository_id: Uuid,
-    pub hold_id: Uuid,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PgArtifactHoldReconciliationView {
-    pub found_holds: Vec<PgHoldRowSummary>,
-    pub unreconciled_sibling_holds: Vec<PgCrossRepoSiblingHold>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SharedHoldRetirementStatus {
-    Protected,
-    RetiredToSafeReclaim,
 }

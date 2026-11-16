@@ -3,75 +3,86 @@
 //! authorities (`RefCasStateMachine`, #151).
 
 use super::bridge_contract::ObservedRealm;
-pub use super::bridge_contract::{BridgeBinding, GlobalHoldReservation, ReservedGlobalHold, RetentionBridgeError};
+pub use super::bridge_contract::{
+    BridgeBinding, BridgeRootRegistrationPlan, GlobalHoldReservationDto, RetentionBridgeError,
+};
 use super::contract::{ArtifactHoldError, HoldScope};
-use super::pg::{AcquireOutcome, PgArtifactHoldStore};
-use super::receipt::AcquireLookup;
+use super::pg::{AcquireOutcome, ArtifactGrant, PgArtifactHoldStore};
+use super::receipt::{AcquireAck, AcquireLookup};
 use super::request::AcquireArtifactHoldsRequest;
 use crate::blob_store::opendal::BlobStore;
-use crate::ref_store::contract::{
-    IssuerLane, MetadataPinPurpose, OperationLookup, OperationState, RefStoreError, RequestDigest,
-};
+use crate::ref_store::contract::{IssuerLane, OperationLookup, OperationState, RefStoreError};
 use crate::ref_store::core::contract::VersionCheck;
-use crate::ref_store::core::retention_root::{RootPurpose, RootSelectorKind};
 use crate::ref_store::core::state_machine::{
     AppliedLogId, ApplyResponse, BeginOperationCommand, CreateSnapshotPinCommand, QuotaCounters, RefCasCommand,
     RefCasStateMachine, RegisterRootCommand, ReleaseRootCommand, RetireHoldBatchCommand, ScopeLifecycle, SmHoldState,
 };
 use crate::ref_store::pg::{self as ref_pg, db_error};
 use crate::ref_store::tx::begin_bounded;
-use serde::{Deserialize, Serialize};
-use std::str::FromStr;
+use std::collections::BTreeMap;
 use tokio::time::Instant;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
-/// Bounded inputs for deterministic snapshot-pin + retention-root publication.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BridgeRootRegistrationPlan {
-    pub pin_request_id: Uuid,
-    pub snapshot_id: Uuid,
-    pub pin_id: Uuid,
-    pub pin_purpose: MetadataPinPurpose,
-    pub lease_ticks: u64,
-    pub pin_logical_tick: u64,
-    pub pack_digests: Vec<String>,
-    pub pin_request_digest: String,
-    pub root_request_id: Uuid,
-    pub root_id: Uuid,
-    pub root_purpose: String,
-    pub business_intent_digest: String,
-    pub selector_kind: String,
-    pub selector_digest: String,
-    pub refs_digest: String,
-    pub pack_set_digest: String,
-    pub register_digest: String,
-    pub root_request_digest: String,
+/// Opaque PG-verified artifact-hold reservation capability (non-`Deserialize`).
+/// Can only be minted inside `retention_bridge` after PG `artifact_holds` commit/verify.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedGlobalHoldReservation {
+    binding: BridgeBinding,
+    ack: AcquireAck,
+    replayed: bool,
+    recovered_from_unknown_commit: bool,
 }
 
-impl BridgeRootRegistrationPlan {
-    pub fn validate(&self) -> Result<(), RetentionBridgeError> {
-        let ids = [self.pin_request_id, self.snapshot_id, self.pin_id, self.root_request_id, self.root_id];
-        if ids.iter().any(Uuid::is_nil) {
-            return Err(RetentionBridgeError::InvalidBinding("pin/root ids must be non-nil".into()));
-        }
-        RootPurpose::parse(&self.root_purpose).map_err(|e| RetentionBridgeError::InvalidBinding(e.to_string()))?;
-        RootSelectorKind::parse(&self.selector_kind)
-            .map_err(|e| RetentionBridgeError::InvalidBinding(e.to_string()))?;
-        for hex in [
-            &self.pin_request_digest,
-            &self.business_intent_digest,
-            &self.selector_digest,
-            &self.refs_digest,
-            &self.pack_set_digest,
-            &self.register_digest,
-            &self.root_request_digest,
-        ] {
-            RequestDigest::from_str(hex)?;
-        }
-        Ok(())
+impl VerifiedGlobalHoldReservation {
+    #[cfg(test)]
+    pub(super) fn mint_for_unit_test(binding: BridgeBinding, ack: AcquireAck) -> Self {
+        Self { binding, ack, replayed: false, recovered_from_unknown_commit: false }
     }
+
+    pub fn binding(&self) -> &BridgeBinding {
+        &self.binding
+    }
+
+    pub fn ack(&self) -> &AcquireAck {
+        &self.ack
+    }
+
+    pub fn replayed(&self) -> bool {
+        self.replayed
+    }
+
+    pub fn recovered_from_unknown_commit(&self) -> bool {
+        self.recovered_from_unknown_commit
+    }
+
+    pub fn hold_ids(&self) -> Vec<Uuid> {
+        let mut sorted = self.ack.artifacts.clone();
+        sorted.sort_by_key(|item| item.slot);
+        sorted.into_iter().map(|item| item.hold_id).collect()
+    }
+
+    pub fn matches_binding(&self, expected: &BridgeBinding) -> Result<(), RetentionBridgeError> {
+        if &self.binding != expected {
+            return Err(RetentionBridgeError::RealmMismatch("reservation_binding"));
+        }
+        expected.matches_acquire_ack(&self.ack)
+    }
+
+    pub fn to_dto(&self) -> GlobalHoldReservationDto {
+        GlobalHoldReservationDto {
+            binding: self.binding.clone(),
+            ack: self.ack.clone(),
+            replayed: self.replayed,
+            recovered_from_unknown_commit: self.recovered_from_unknown_commit,
+        }
+    }
+}
+
+/// First-reserve outcome pairing the verified reservation with an optional `ArtifactGrant`.
+pub struct ReservedGlobalHold {
+    pub reservation: VerifiedGlobalHoldReservation,
+    pub grant: Option<ArtifactGrant>,
 }
 
 /// Phase 1 (PostgreSQL first): reserve global PG artifact holds before creating
@@ -119,7 +130,7 @@ pub async fn reserve_global_hold_first(
     match PgArtifactHoldStore.acquire(client, blob, request, deadline).await? {
         AcquireOutcome::Granted { ack, grant } => {
             binding.matches_acquire_ack(&ack)?;
-            let reservation = GlobalHoldReservation {
+            let reservation = VerifiedGlobalHoldReservation {
                 binding: binding.clone(),
                 ack,
                 replayed: false,
@@ -129,7 +140,7 @@ pub async fn reserve_global_hold_first(
         }
         AcquireOutcome::Replayed { ack } => {
             binding.matches_acquire_ack(&ack)?;
-            let reservation = GlobalHoldReservation {
+            let reservation = VerifiedGlobalHoldReservation {
                 binding: binding.clone(),
                 ack,
                 replayed: true,
@@ -140,19 +151,61 @@ pub async fn reserve_global_hold_first(
     }
 }
 
-/// Recover a previously committed global hold receipt by known `acquire_request_id`.
+async fn verify_pg_holds_committed(
+    client: &mut Client,
+    binding: &BridgeBinding,
+    ack: &AcquireAck,
+    deadline: Instant,
+) -> Result<(), RetentionBridgeError> {
+    let hold_ids: Vec<Uuid> = ack.artifacts.iter().map(|h| h.hold_id).collect();
+    if hold_ids.is_empty() {
+        return Err(RetentionBridgeError::MissingDurableHold { request_id: ack.request_id });
+    }
+    let tx = begin_bounded(client, deadline).await?;
+    let rows = async {
+        ref_pg::bound(&tx, deadline).await?;
+        tx.query(
+            "SELECT hold_id, repository_id, tenant_id, sha256, backend_identity, state
+             FROM artifact_holds WHERE hold_id = ANY($1) AND request_id = $2",
+            &[&hold_ids, &ack.request_id],
+        )
+        .await
+        .map_err(db_error)
+    }
+    .await;
+    let _ = tx.rollback().await;
+    let map: BTreeMap<Uuid, (Uuid, Uuid, String, String, String)> =
+        rows?.into_iter().map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))).collect();
+    for h in &ack.artifacts {
+        let Some((repo, tenant, sha, backend, state)) = map.get(&h.hold_id) else {
+            return Err(RetentionBridgeError::MissingDurableHold { request_id: ack.request_id });
+        };
+        if (*repo, *tenant) != (binding.repository_id, binding.tenant_id)
+            || sha != &h.artifact.sha256
+            || backend != &binding.backend_identity
+            || state != "active"
+        {
+            return Err(RetentionBridgeError::RealmMismatch("pg_hold_row"));
+        }
+    }
+    Ok(())
+}
+
+/// Recover a previously committed global hold receipt by known `acquire_request_id`
+/// and verify its durable `artifact_holds` rows in PostgreSQL before minting the capability.
 pub async fn recover_global_hold_by_request(
     client: &mut Client,
     scope: &HoldScope,
     binding: &BridgeBinding,
     acquire_request_id: Uuid,
     deadline: Instant,
-) -> Result<GlobalHoldReservation, RetentionBridgeError> {
+) -> Result<VerifiedGlobalHoldReservation, RetentionBridgeError> {
     binding.validate()?;
     match PgArtifactHoldStore.acquire_receipt(client, scope, acquire_request_id, deadline).await? {
         AcquireLookup::Found(ack) => {
             binding.matches_acquire_ack(&ack)?;
-            Ok(GlobalHoldReservation {
+            verify_pg_holds_committed(client, binding, &ack, deadline).await?;
+            Ok(VerifiedGlobalHoldReservation {
                 binding: binding.clone(),
                 ack,
                 replayed: true,
@@ -170,7 +223,7 @@ pub async fn recover_global_hold_by_operation(
     scope: &HoldScope,
     binding: &BridgeBinding,
     deadline: Instant,
-) -> Result<GlobalHoldReservation, RetentionBridgeError> {
+) -> Result<VerifiedGlobalHoldReservation, RetentionBridgeError> {
     binding.validate()?;
     let tx = begin_bounded(client, deadline).await?;
     let query_res: Result<Vec<Uuid>, RetentionBridgeError> = async {
@@ -193,6 +246,23 @@ pub async fn recover_global_hold_by_operation(
         [request_id] => recover_global_hold_by_request(client, scope, binding, *request_id, deadline).await,
         _ => Err(ArtifactHoldError::LedgerIntegrity("multiple acquire requests recorded for operation").into()),
     }
+}
+
+/// Verify an untrusted `GlobalHoldReservationDto` against live PostgreSQL `artifact_holds`
+/// and `artifact_hold_requests` before promoting it into an opaque `VerifiedGlobalHoldReservation`.
+pub async fn reverify_reservation_dto_with_pg(
+    client: &mut Client,
+    scope: &HoldScope,
+    binding: &BridgeBinding,
+    dto: &GlobalHoldReservationDto,
+    deadline: Instant,
+) -> Result<VerifiedGlobalHoldReservation, RetentionBridgeError> {
+    dto.matches_binding(binding)?;
+    let verified = recover_global_hold_by_request(client, scope, binding, dto.ack.request_id, deadline).await?;
+    if verified.ack() != &dto.ack {
+        return Err(RetentionBridgeError::RealmMismatch("reservation_dto_ack"));
+    }
+    Ok(verified)
 }
 
 /// Pure deterministic gate, realm, anti-ABA generation, and cancel-cutoff
@@ -243,16 +313,16 @@ pub fn verify_state_machine_gate_for_binding(
     Ok(version.digest().as_hex())
 }
 
-/// Phase 2 (pure Ref-CAS): install a verified `GlobalHoldReservation` into
+/// Phase 2 (pure Ref-CAS): install a PG-verified `VerifiedGlobalHoldReservation` into
 /// `RefCasStateMachine` with zero PG/Blob I/O; idempotent on replay.
 pub fn apply_reserved_hold_to_sm(
     sm: &mut RefCasStateMachine,
     log_id: AppliedLogId,
-    reservation: &GlobalHoldReservation,
+    reservation: &VerifiedGlobalHoldReservation,
     binding: &BridgeBinding,
 ) -> Result<ApplyResponse, RetentionBridgeError> {
     reservation.matches_binding(binding)?;
-    let cmd = binding.to_hold_batch_command(&reservation.ack)?;
+    let cmd = binding.to_hold_batch_command(reservation.ack())?;
     let applied = cmd
         .artifacts
         .first()
@@ -276,12 +346,12 @@ pub fn begin_operation_for_binding(
 }
 
 /// Phase 3 (reserve-before-publish): register Ref-CAS pin + retention root ONLY
-/// after global PG holds are installed in `RefCasStateMachine`.
+/// after PG-verified global holds are installed in `RefCasStateMachine`.
 pub fn publish_pin_and_root_after_hold(
     sm: &mut RefCasStateMachine,
     pin_log_id: AppliedLogId,
     root_log_id: AppliedLogId,
-    reservation: &GlobalHoldReservation,
+    reservation: &VerifiedGlobalHoldReservation,
     binding: &BridgeBinding,
     plan: &BridgeRootRegistrationPlan,
 ) -> Result<(ApplyResponse, ApplyResponse), RetentionBridgeError> {
@@ -289,18 +359,18 @@ pub fn publish_pin_and_root_after_hold(
     reservation.matches_binding(binding)?;
     let hold_ids = reservation.hold_ids();
     if hold_ids.is_empty() {
-        return Err(RetentionBridgeError::MissingDurableHold { request_id: reservation.ack.request_id });
+        return Err(RetentionBridgeError::MissingDurableHold { request_id: reservation.ack().request_id });
     }
     for hold_id in &hold_ids {
         let Some(entry) = sm.read_hold(*hold_id) else {
-            return Err(RetentionBridgeError::MissingDurableHold { request_id: reservation.ack.request_id });
+            return Err(RetentionBridgeError::MissingDurableHold { request_id: reservation.ack().request_id });
         };
         if entry.repository_id != binding.repository_id
             || entry.tenant_id != binding.tenant_id
-            || entry.batch_request_id != reservation.ack.request_id
+            || entry.batch_request_id != reservation.ack().request_id
             || entry.state == SmHoldState::Retired
         {
-            return Err(RetentionBridgeError::MissingDurableHold { request_id: reservation.ack.request_id });
+            return Err(RetentionBridgeError::MissingDurableHold { request_id: reservation.ack().request_id });
         }
     }
     let gate_digest = verify_state_machine_gate_for_binding(sm, binding)?;
@@ -314,7 +384,7 @@ pub fn publish_pin_and_root_after_hold(
             purpose: plan.pin_purpose,
             snapshot_id: plan.snapshot_id,
             pin_id: plan.pin_id,
-            object_format: reservation.ack.object_format,
+            object_format: reservation.ack().object_format,
             history_incarnation: binding.history_incarnation,
             authority_epoch: binding.authority_epoch,
             group_epoch: binding.group_epoch,
@@ -339,7 +409,7 @@ pub fn publish_pin_and_root_after_hold(
             owner_id: binding.owner_id,
             purpose: plan.root_purpose.clone(),
             business_intent_digest: plan.business_intent_digest.clone(),
-            object_format: reservation.ack.object_format,
+            object_format: reservation.ack().object_format,
             history_incarnation: binding.history_incarnation,
             authority_epoch: binding.authority_epoch,
             group_epoch: binding.group_epoch,
