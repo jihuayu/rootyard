@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import signal
@@ -18,7 +19,12 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from rubicon_workload.runner import _start_fleet  # noqa: E402
+from rubicon_workload.runner import (  # noqa: E402
+    FleetCleanupError,
+    _phase_cold_warm_and_ci,
+    _run_tier,
+    _start_fleet,
+)
 
 _CHILD_CODE = "import time; time.sleep(30)"
 
@@ -131,6 +137,146 @@ class RubiconFleetCleanupTests(unittest.TestCase):
 
     def test_keyboard_interrupt_after_first_worker_reaps_partial_fleet(self) -> None:
         self._run_partial_launch_failure(KeyboardInterrupt(), "popen", expected_logs=2)
+
+    def test_cold_warm_restart_aborts_before_replacement_fleet(self) -> None:
+        cleanup_error = FleetCleanupError(["worker[0]: post_sigkill_wait_timeout"])
+        fleet = [(mock.Mock(pid=1234), "http://127.0.0.1:1", Path("/tmp/scratch"), mock.Mock())]
+        repos = {
+            "text_history": {
+                "info": {"clone_path": "/repo/text.git"},
+                "ds_class": "text_history",
+                "ro": {"username": "u", "token": "t"},
+            },
+            "compressed_media": {
+                "info": {"clone_path": "/repo/media.git"},
+                "ds_class": "compressed_media",
+                "ro": {"username": "u", "token": "t"},
+            },
+        }
+        sampler = mock.Mock()
+        with tempfile.TemporaryDirectory() as td:
+            tier_dir = Path(td)
+            with mock.patch("rubicon_workload.runner.clone_and_fsck", return_value=(True, 1.0, {})), \
+                 mock.patch("rubicon_workload.runner._record_op"), \
+                 mock.patch("rubicon_workload.runner._stop_fleet", side_effect=cleanup_error), \
+                 mock.patch("rubicon_workload.runner._start_fleet") as start_new:
+                with self.assertRaises(FleetCleanupError) as caught:
+                    _phase_cold_warm_and_ci(
+                        1,
+                        {"git": "/usr/bin/git"},
+                        {},
+                        "postgresql://u@127.0.0.1/db",
+                        "http://127.0.0.1:9",
+                        None,
+                        tier_dir / "scratches",
+                        tier_dir,
+                        tier_dir / "askpass.sh",
+                        repos,
+                        [],
+                        fleet,
+                        sampler,
+                    )
+        self.assertIs(caught.exception, cleanup_error)
+        self.assertEqual(start_new.call_count, 0)
+
+    def test_bind_retry_aborts_when_cleanup_incomplete(self) -> None:
+        cleanup_error = FleetCleanupError(["worker[0]: post_sigkill_wait_timeout"])
+        real_open = builtins.open
+        opened_logs: list[Any] = []
+        proc = mock.Mock(pid=1234, returncode=1)
+        proc.poll.return_value = 1
+
+        def tracking_open(file: object, *args: object, **kwargs: object) -> Any:
+            handle = real_open(file, *args, **kwargs)  # type: ignore[arg-type]
+            try:
+                name = Path(file).name  # type: ignore[arg-type]
+            except TypeError:
+                name = ""
+            if name == "serve-blob-0.log":
+                opened_logs.append(handle)
+            return handle
+
+        def fake_popen(_args: list[str], **kwargs: object) -> mock.Mock:
+            kwargs["stdout"].write(b"could not bind Blob service listener\n")  # type: ignore[union-attr]
+            kwargs["stdout"].flush()  # type: ignore[union-attr]
+            return proc
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                with mock.patch("builtins.open", side_effect=tracking_open), \
+                     mock.patch("rubicon_workload.runner.subprocess.Popen", side_effect=fake_popen) as popen_mock, \
+                     mock.patch("rubicon_workload.runner._stop_fleet", side_effect=cleanup_error):
+                    with self.assertRaises(RuntimeError) as caught:
+                        _start_fleet(
+                            1,
+                            "/unused/rootyard",
+                            {},
+                            "/usr/bin/git",
+                            "postgresql://u@127.0.0.1/db",
+                            "http://127.0.0.1:9",
+                            Path(td),
+                        )
+                self.assertEqual(popen_mock.call_count, 1)
+                notes = getattr(caught.exception, "__notes__", [])
+                self.assertTrue(any("worker[0]: post_sigkill_wait_timeout" in note for note in notes))
+            finally:
+                for handle in opened_logs:
+                    if not handle.closed:
+                        handle.close()
+
+    def _run_minimal_tier_with_cleanup_failure(self, phase_error: BaseException | None) -> BaseException:
+        cleanup_error = FleetCleanupError(["worker[0]: log_close_error"])
+        fake_fleet = [(mock.Mock(pid=4321), "http://127.0.0.1:1", Path("/tmp/scratch"), mock.Mock())]
+        sampler = mock.Mock()
+        with tempfile.TemporaryDirectory() as td:
+            tier_dir = Path(td)
+            with ExitStack() as stack:
+                def patch(name: str, **kwargs: object) -> Any:
+                    return stack.enter_context(mock.patch(f"rubicon_workload.runner.{name}", **kwargs))
+
+                patch("_create_user_and_tokens", return_value=({}, {}))
+                patch("_cli", return_value='{"token": "synthetic"}')
+                patch("_start_fleet", return_value=fake_fleet)
+                patch("ResourceSampler", return_value=sampler)
+                if phase_error is None:
+                    patch("_phase_seed", return_value={})
+                else:
+                    patch("_phase_seed", side_effect=phase_error)
+                patch("_phase_concurrent_overlap", return_value={})
+                patch("_phase_same_repo_mixed", return_value={})
+                patch("_phase_cas_race", return_value={})
+                patch("_phase_atomic_subset", return_value={})
+                patch("_phase_cold_warm_and_ci", return_value=(fake_fleet, {}, {}))
+                patch("_phase_fault_and_audit", return_value=({}, {}))
+                patch("query_pg_snapshot_json", return_value={})
+                patch("_stop_fleet", side_effect=cleanup_error)
+                with self.assertRaises(BaseException) as caught:
+                    _run_tier(
+                        1,
+                        mock.Mock(seed=1),
+                        {"binary": "/bin/true", "git": "/usr/bin/git"},
+                        {},
+                        {},
+                        "postgresql://u@127.0.0.1/db",
+                        "http://127.0.0.1:9",
+                        None,
+                        tier_dir,
+                        tier_dir / "askpass.sh",
+                        [],
+                    )
+        return caught.exception
+
+    def test_final_tier_cleanup_failure_blocks_success_result(self) -> None:
+        caught = self._run_minimal_tier_with_cleanup_failure(None)
+        self.assertIsInstance(caught, FleetCleanupError)
+        self.assertEqual(caught.issues, ("worker[0]: log_close_error",))
+
+    def test_final_tier_cleanup_failure_preserves_active_workload_error(self) -> None:
+        workload_error = RuntimeError("synthetic workload phase failure")
+        caught = self._run_minimal_tier_with_cleanup_failure(workload_error)
+        self.assertIs(caught, workload_error)
+        notes = getattr(caught, "__notes__", [])
+        self.assertTrue(any("worker[0]: log_close_error" in note for note in notes))
 
     def test_stuck_first_worker_does_not_skip_later_reap_or_log_close(self) -> None:
         synthetic_pid = 2_000_000_000

@@ -267,6 +267,14 @@ def _read_log_tail(log_path: Path, max_lines: int = 30) -> str:
     return redact_text("\n".join(lines), [])
 
 
+class FleetCleanupError(RuntimeError):
+    """Incomplete owned fleet cleanup with safe per-worker issue facts."""
+
+    def __init__(self, issues: list[str]) -> None:
+        self.issues = tuple(issues)
+        super().__init__("fleet cleanup incomplete: " + "; ".join(self.issues))
+
+
 def _attach_fleet_cleanup_note(exc: BaseException, issues: list[str]) -> None:
     """Attach safe per-worker cleanup facts without replacing the original failure."""
     if not issues:
@@ -362,10 +370,10 @@ def _start_fleet(
             idx, rc = exited
             cleanup_issues = _stop_fleet_issues(fleet)
             tail = _read_log_tail(log_paths[idx])
-            if attempt == 0 and "could not bind Blob service listener" in tail:
-                continue
             error = RuntimeError(f"serve-blob[{idx}] exited during startup with {rc}\n{tail}")
             _attach_fleet_cleanup_note(error, cleanup_issues)
+            if attempt == 0 and not cleanup_issues and "could not bind Blob service listener" in tail:
+                continue
             raise error
         if pending:
             cleanup_issues = _stop_fleet_issues(fleet)
@@ -380,13 +388,34 @@ def _start_fleet(
 def _stop_fleet_issues(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> list[str]:
     """Return safe cleanup facts even if the cleanup pass is interrupted."""
     try:
-        return _stop_fleet(fleet)
+        _stop_fleet(fleet)
+    except FleetCleanupError as error:
+        return list(error.issues)
     except BaseException:
         return ["fleet: cleanup_interrupted"]
+    return []
 
 
-def _stop_fleet(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> list[str]:
-    """Attempt to stop owned workers and return safe per-worker issue facts."""
+def _stop_fleet_preserving_active_error(
+    fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]],
+    active_error: BaseException | None,
+) -> None:
+    """Fail closed on cleanup issues, but keep an already-active workload error."""
+    try:
+        _stop_fleet(fleet)
+    except BaseException as cleanup_error:
+        if active_error is None:
+            raise
+        issues = (
+            list(cleanup_error.issues)
+            if isinstance(cleanup_error, FleetCleanupError)
+            else ["fleet: cleanup_interrupted"]
+        )
+        _attach_fleet_cleanup_note(active_error, issues)
+
+
+def _stop_fleet(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> None:
+    """Attempt to stop owned workers and fail with safe per-worker issue facts."""
     issues: list[str] = []
     for idx, (proc, _, _, _) in enumerate(fleet):
         try:
@@ -424,7 +453,8 @@ def _stop_fleet(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> 
                 log_f.close()
             except Exception:
                 issues.append(f"worker[{idx}]: log_close_error")
-    return issues
+    if issues:
+        raise FleetCleanupError(issues)
 
 
 def _verify_public_cluster_authority(pg_base: str, env: dict[str, str]) -> None:
@@ -1100,8 +1130,9 @@ def _run_tier(
         pg_final = query_pg_snapshot_json(pg_url, base_env)
         sampler.stop()
     finally:
+        active_error = sys.exc_info()[1]
         sampler.stop()
-        _stop_fleet(fleet)
+        _stop_fleet_preserving_active_error(fleet, active_error)
 
     tier_wall = time.monotonic() - tier_start
     s3_tier = S3MeterProxy.delta(s3_proxy.snapshot(), s3_before_tier) if s3_proxy and s3_before_tier else {"observed": False}
