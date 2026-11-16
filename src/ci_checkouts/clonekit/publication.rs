@@ -1,19 +1,24 @@
-//! Private verified-generation preparation and whole-directory CloneKit publication.
+//! Private verified-generation preparation and fenced whole-directory CloneKit publication.
 
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
+    collections::BTreeSet,
+    fs::{self, File, OpenOptions, Permissions},
+    io::Write,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
+use fs2::FileExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{BuildFailurePoint, BuiltCloneKitArtifacts, RetentionPinLedger};
+use super::{
+    BuildFailurePoint, BuiltCloneKitArtifacts, RetentionPinLedger, copy_private_file, read_regular_file,
+    write_private_file,
+};
 use crate::ci_checkouts::clonekit::manifest::{
-    CloneKitError, CloneKitManifest, CloneKitObjectFormat, CloneKitStatus, compute_file_sha256,
-    ensure_not_cancelled, ensure_private_dir, run_git_command,
+    CloneKitError, CloneKitManifest, CloneKitObjectFormat, CloneKitStatus, MAX_MANIFEST_JSON_BYTES,
+    compute_file_sha256, ensure_not_cancelled, ensure_private_dir, run_git_command,
 };
 
 const REPOSITORY_PREFIX: &str = "repo-";
@@ -23,6 +28,7 @@ const PACK_FILE: &str = "clonekit.pack";
 const IDX_FILE: &str = "clonekit.idx";
 const MANIFEST_FILE: &str = "manifest.json";
 const CURRENT_FILE: &str = "current.json";
+const PUBLICATION_LOCK_FILE: &str = ".publication.lock";
 
 /// Atomic versioned disk catalog storing published CloneKit generations and active pointer.
 #[derive(Clone, Debug)]
@@ -33,7 +39,11 @@ pub struct CloneKitPublicationStore {
 impl CloneKitPublicationStore {
     /// Open or initialize a `0o700` publication catalog root directory.
     pub fn open(root_dir: &Path) -> Result<Self, CloneKitError> {
+        let existed = fs::symlink_metadata(root_dir).is_ok();
         ensure_private_dir(root_dir)?;
+        if !existed && let Some(parent) = root_dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            sync_dir(parent)?;
+        }
         Ok(Self { root_dir: root_dir.to_path_buf() })
     }
 
@@ -73,87 +83,197 @@ impl CloneKitPublicationStore {
         kit_generation: u64,
         ledger: &RetentionPinLedger,
     ) -> Result<bool, CloneKitError> {
-        if let Some(pin) = ledger.active_pin_for(repo_id, kit_generation) {
-            return Err(CloneKitError::PinProtectionActive(pin));
+        match fs::symlink_metadata(self.repo_dir(repo_id)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(CloneKitError::GitFailed(format!("stat publication repository: {err}"))),
+            Ok(_) => {}
         }
-        if let Some(latest) = self.load_latest(repo_id)?
-            && latest.kit_generation == kit_generation
-        {
+        let _guard = self.acquire_publication_lock(repo_id)?;
+        let Some(latest) = self.read_current_locked(repo_id)? else {
+            return Ok(false);
+        };
+        if kit_generation == latest.kit_generation {
             return Err(CloneKitError::PinProtectionActive(latest.retention_pin_id.unwrap_or(repo_id)));
         }
-        let dir = self.version_dir(repo_id, kit_generation);
-        if !dir.exists() {
+        if kit_generation > latest.kit_generation {
             return Ok(false);
         }
-        fs::remove_dir_all(&dir).map_err(|e| CloneKitError::GitFailed(format!("remove old kit: {e}")))?;
-        Ok(true)
+        let dir = self.version_dir(repo_id, kit_generation);
+        ledger.with_unpinned_generation(repo_id, kit_generation, || match fs::symlink_metadata(&dir) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(CloneKitError::GitFailed(format!("stat old kit generation: {err}"))),
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                Err(CloneKitError::CorruptArtifact("old kit generation is not a regular directory".into()))
+            }
+            Ok(_) => {
+                fs::remove_dir_all(&dir).map_err(|err| CloneKitError::GitFailed(format!("remove old kit: {err}")))?;
+                Ok(true)
+            }
+        })
     }
 
     fn ensure_repo_dir(&self, repo_id: Uuid) -> Result<PathBuf, CloneKitError> {
         let repo_dir = self.repo_dir(repo_id);
+        let existed = fs::symlink_metadata(&repo_dir).is_ok();
         ensure_private_dir(&repo_dir)?;
+        if !existed {
+            sync_dir(&self.root_dir)?;
+        }
         Ok(repo_dir)
     }
 
-    fn install_prepared(&self, prepared: PreparedGeneration) -> Result<(), CloneKitError> {
-        let repo_id = prepared.manifest.repository_id;
-        let vdir = self.version_dir(repo_id, prepared.manifest.kit_generation);
-        if fs::symlink_metadata(&vdir).is_ok() {
-            return Err(CloneKitError::GitFailed(
-                "destination generation already exists; exact recovery is not yet available".into(),
+    fn acquire_publication_lock(&self, repo_id: Uuid) -> Result<PublicationGuard, CloneKitError> {
+        let repo_dir = self.ensure_repo_dir(repo_id)?;
+        let path = repo_dir.join(PUBLICATION_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|err| CloneKitError::GitFailed(format!("open publication lock: {err}")))?;
+        file.set_permissions(Permissions::from_mode(0o600))
+            .map_err(|err| CloneKitError::GitFailed(format!("secure publication lock: {err}")))?;
+        if !file
+            .metadata()
+            .map_err(|err| CloneKitError::GitFailed(format!("stat publication lock: {err}")))?
+            .file_type()
+            .is_file()
+        {
+            return Err(CloneKitError::InvalidConfig("publication lock is not a regular file"));
+        }
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(PublicationGuard { _file: file }),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Err(CloneKitError::GitFailed(
+                "clonekit publication busy: another process holds the repository publication lock".into(),
+            )),
+            Err(err) => Err(CloneKitError::GitFailed(format!("publication lock failed: {err}"))),
+        }
+    }
+
+    fn read_current_locked(&self, repo_id: Uuid) -> Result<Option<CloneKitManifest>, CloneKitError> {
+        let path = self.current_pointer_path(repo_id);
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(CloneKitError::GitFailed(format!("stat current pointer: {err}"))),
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(CloneKitError::CorruptArtifact("current pointer is not a regular file".into()));
+        }
+        let bytes = read_regular_file(&path, MAX_MANIFEST_JSON_BYTES as u64)?;
+        let manifest = CloneKitManifest::from_verified_json(&bytes)?;
+        if manifest.repository_id != repo_id {
+            return Err(CloneKitError::CorruptArtifact("current pointer repository identity mismatch".into()));
+        }
+        Ok(Some(manifest))
+    }
+
+    fn validate_existing_generation(
+        &self,
+        vdir: &Path,
+        candidate: &CloneKitManifest,
+    ) -> Result<(), CloneKitError> {
+        let bytes = read_regular_file(&vdir.join(MANIFEST_FILE), MAX_MANIFEST_JSON_BYTES as u64)?;
+        let existing = CloneKitManifest::from_verified_json(&bytes)?;
+        if existing != *candidate {
+            return Err(CloneKitError::CorruptArtifact(
+                "existing generation conflicts with candidate; refusing recovery".into(),
             ));
         }
-        fs::rename(&prepared.attempt_dir, &vdir)
-            .map_err(|e| CloneKitError::GitFailed(format!("install prepared generation: {e}")))?;
-        let mut prepared = prepared;
-        prepared.committed = true;
-        sync_dir(&self.repo_dir(repo_id))?;
-        write_current_pointer(&self.current_pointer_path(repo_id), &prepared.encoded)?;
+        let mut expected: BTreeSet<&str> = BTreeSet::new();
+        expected.insert(MANIFEST_FILE);
+        if candidate.status == CloneKitStatus::Active {
+            expected.insert(PACK_FILE);
+            expected.insert(IDX_FILE);
+            let pack = candidate.pack.as_ref().ok_or(CloneKitError::MissingKit)?;
+            let idx = candidate.idx.as_ref().ok_or(CloneKitError::MissingKit)?;
+            verify_prepared_artifact(&vdir.join(PACK_FILE), &pack.sha256, pack.length)?;
+            verify_prepared_artifact(&vdir.join(IDX_FILE), &idx.sha256, idx.length)?;
+        }
+        for entry in fs::read_dir(vdir)
+            .map_err(|err| CloneKitError::CorruptArtifact(format!("read existing generation: {err}")))?
+        {
+            let entry = entry.map_err(|err| CloneKitError::CorruptArtifact(format!("read generation entry: {err}")))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(CloneKitError::CorruptArtifact("existing generation has a non-UTF-8 entry".into()));
+            };
+            if !expected.contains(name) {
+                return Err(CloneKitError::CorruptArtifact(
+                    "existing generation has unexpected entries; refusing recovery".into(),
+                ));
+            }
+        }
         Ok(())
     }
+
+    fn install_or_recover(
+        &self,
+        prepared: &mut PreparedGeneration,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), CloneKitError> {
+        let repo_id = prepared.manifest.repository_id;
+        let vdir = self.version_dir(repo_id, prepared.manifest.kit_generation);
+        match fs::symlink_metadata(&vdir) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                ensure_not_cancelled(cancel)?;
+                fs::rename(&prepared.attempt_dir, &vdir)
+                    .map_err(|err| CloneKitError::GitFailed(format!("install prepared generation: {err}")))?;
+                prepared.committed = true;
+                sync_dir(&self.repo_dir(repo_id))
+            }
+            Err(err) => Err(CloneKitError::GitFailed(format!("stat destination generation: {err}"))),
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(CloneKitError::CorruptArtifact(
+                        "destination generation is not a regular directory".into(),
+                    ));
+                }
+                self.validate_existing_generation(&vdir, &prepared.manifest)
+            }
+        }
+    }
+
+    fn commit_prepared(
+        &self,
+        prepared: PreparedGeneration,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<CloneKitManifest, CloneKitError> {
+        let mut prepared = prepared;
+        let repo_id = prepared.manifest.repository_id;
+        let current = self.read_current_locked(repo_id)?;
+        if let Some(current) = current {
+            if current.kit_generation == u64::MAX {
+                return Err(generation_exhausted());
+            }
+            if prepared.manifest.kit_generation <= current.kit_generation {
+                return Err(stale_generation(current.kit_generation, prepared.manifest.kit_generation));
+            }
+        }
+        ensure_not_cancelled(cancel)?;
+        self.install_or_recover(&mut prepared, cancel)?;
+        let repo_dir = self.ensure_repo_dir(repo_id)?;
+        let mut staged = StagedCurrent::create(&repo_dir)?;
+        staged.write_and_sync(&prepared.encoded)?;
+        ensure_not_cancelled(cancel)?;
+        staged.publish(&repo_dir.join(CURRENT_FILE))?;
+        if sync_dir(&repo_dir).is_err() {
+            return Err(uncertain_publication_error(self, repo_id, &prepared.manifest));
+        }
+        Ok(prepared.manifest.clone())
+    }
+}
+
+struct PublicationGuard {
+    _file: File,
 }
 
 fn sync_dir(path: &Path) -> Result<(), CloneKitError> {
     File::open(path)
         .and_then(|dir| dir.sync_all())
         .map_err(|err| CloneKitError::GitFailed(format!("sync clonekit directory: {err}")))
-}
-
-fn write_private_file(dest: &Path, bytes: &[u8]) -> Result<(), CloneKitError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dest)
-        .map_err(|err| CloneKitError::GitFailed(format!("create prepared clonekit file: {err}")))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|err| CloneKitError::GitFailed(format!("write prepared clonekit file: {err}")))
-}
-
-fn copy_private_file(src: &Path, dest: &Path) -> Result<(), CloneKitError> {
-    let mut input = File::open(src)
-        .map_err(|err| CloneKitError::CorruptArtifact(format!("open staged clonekit artifact: {err}")))?;
-    if !input
-        .metadata()
-        .map_err(|err| CloneKitError::CorruptArtifact(format!("stat staged clonekit artifact: {err}")))?
-        .is_file()
-    {
-        return Err(CloneKitError::CorruptArtifact("staged clonekit artifact is not a regular file".into()));
-    }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dest)
-        .map_err(|err| CloneKitError::GitFailed(format!("create prepared clonekit artifact: {err}")))?;
-    io::copy(&mut input, &mut output)
-        .map_err(|err| CloneKitError::GitFailed(format!("copy prepared clonekit artifact: {err}")))?;
-    output
-        .sync_all()
-        .map_err(|err| CloneKitError::GitFailed(format!("sync prepared clonekit artifact: {err}")))
 }
 
 fn verify_prepared_artifact(path: &Path, expected: &str, expected_len: u64) -> Result<(), CloneKitError> {
@@ -274,26 +394,76 @@ impl Drop for PreparedGeneration {
     }
 }
 
-fn stale_generation(current: u64, actual: u64) -> CloneKitError {
-    match current.checked_add(1) {
-        Some(expected_min) => CloneKitError::StaleGeneration { expected_min, actual },
-        None => CloneKitError::GitFailed(
-            "clonekit generation exhausted: current generation is u64::MAX".into(),
-        ),
+struct StagedCurrent {
+    path: PathBuf,
+    file: File,
+    armed: bool,
+}
+
+impl StagedCurrent {
+    fn create(repo_dir: &Path) -> Result<Self, CloneKitError> {
+        let path = repo_dir.join(format!(".current-{}", Uuid::new_v4().simple()));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|err| CloneKitError::GitFailed(format!("create staged current pointer: {err}")))?;
+        Ok(Self { path, file, armed: true })
+    }
+
+    fn write_and_sync(&mut self, bytes: &[u8]) -> Result<(), CloneKitError> {
+        self.file
+            .write_all(bytes)
+            .and_then(|()| self.file.sync_all())
+            .map_err(|err| CloneKitError::GitFailed(format!("write staged current pointer: {err}")))
+    }
+
+    fn publish(mut self, dest: &Path) -> Result<(), CloneKitError> {
+        fs::rename(&self.path, dest)
+            .map_err(|err| CloneKitError::GitFailed(format!("replace current pointer: {err}")))?;
+        self.armed = false;
+        Ok(())
     }
 }
 
-fn write_current_pointer(current: &Path, encoded: &[u8]) -> Result<(), CloneKitError> {
-    let parent = current.parent().ok_or(CloneKitError::InvalidInput("current pointer missing parent"))?;
-    let temp = parent.join(format!(".current-{}", Uuid::new_v4().simple()));
-    write_private_file(&temp, encoded)?;
-    let result = fs::rename(&temp, current)
-        .map_err(|err| CloneKitError::GitFailed(format!("replace current pointer: {err}")));
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+impl Drop for StagedCurrent {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
-    result?;
-    sync_dir(parent)
+}
+
+fn stale_generation(current: u64, actual: u64) -> CloneKitError {
+    match current.checked_add(1) {
+        Some(expected_min) => CloneKitError::StaleGeneration { expected_min, actual },
+        None => generation_exhausted(),
+    }
+}
+
+fn generation_exhausted() -> CloneKitError {
+    CloneKitError::GitFailed("clonekit generation exhausted: current generation is u64::MAX".into())
+}
+
+fn uncertain_publication_error(
+    store: &CloneKitPublicationStore,
+    repo_id: Uuid,
+    expected: &CloneKitManifest,
+) -> CloneKitError {
+    let candidate_visible = matches!(
+        store.load_latest(repo_id),
+        Ok(Some(manifest))
+            if manifest.kit_generation == expected.kit_generation
+                && manifest.manifest_sha256 == expected.manifest_sha256
+    );
+    let detail = if candidate_visible {
+        "clonekit publication outcome uncertain: current pointer rename completed but repository directory sync failed; candidate is visible but crash durability is unconfirmed"
+    } else {
+        "clonekit publication outcome uncertain: current pointer rename completed but repository directory sync failed; visible current generation is unconfirmed"
+    };
+    CloneKitError::GitFailed(detail.into())
 }
 
 /// Atomically publish built artifacts as the latest kit only after full destination verification.
@@ -306,17 +476,13 @@ pub fn publish_clonekit_versioned(
 ) -> Result<CloneKitManifest, CloneKitError> {
     ensure_not_cancelled(cancel)?;
     built.manifest.verify_integrity()?;
-    if let Some(existing) = store.load_latest(built.manifest.repository_id)?
-        && built.manifest.kit_generation <= existing.kit_generation
-    {
-        return Err(stale_generation(existing.kit_generation, built.manifest.kit_generation));
-    }
     if inject_failure == Some(BuildFailurePoint::AfterUploadBeforePublish) {
         return Err(CloneKitError::GitFailed("injected failure before atomic catalog publish".into()));
     }
     let prepared = PreparedGeneration::prepare(store, built, git_binary, cancel)?;
-    store.install_prepared(prepared)?;
-    Ok(built.manifest.clone())
+    ensure_not_cancelled(cancel)?;
+    let _guard = store.acquire_publication_lock(built.manifest.repository_id)?;
+    store.commit_prepared(prepared, cancel)
 }
 
 #[cfg(test)]

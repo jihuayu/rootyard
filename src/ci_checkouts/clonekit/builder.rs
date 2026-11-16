@@ -2,8 +2,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::RwLock,
@@ -113,6 +114,20 @@ impl RetentionPinLedger {
             .get(&(repository_id, kit_generation))
             .and_then(|s| s.iter().next().copied())
     }
+
+    /// Hold the process-local pin read guard from the check through the collection closure.
+    pub(super) fn with_unpinned_generation<R>(
+        &self,
+        repository_id: Uuid,
+        kit_generation: u64,
+        collect: impl FnOnce() -> Result<R, CloneKitError>,
+    ) -> Result<R, CloneKitError> {
+        let guard = self.held.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(pin) = guard.get(&(repository_id, kit_generation)).and_then(|s| s.iter().next().copied()) {
+            return Err(CloneKitError::PinProtectionActive(pin));
+        }
+        collect()
+    }
 }
 
 /// RAII retention pin guard releasing its pin only after transfer teardown finishes.
@@ -145,6 +160,64 @@ impl Drop for RetentionPinGuard<'_> {
     fn drop(&mut self) {
         self.ledger.release_pin(self.repository_id, self.kit_generation, self.pin_id);
     }
+}
+
+fn read_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, CloneKitError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|err| CloneKitError::CorruptArtifact(format!("open generation file: {err}")))?;
+    let meta =
+        file.metadata().map_err(|err| CloneKitError::CorruptArtifact(format!("stat generation file: {err}")))?;
+    if !meta.is_file() || meta.len() > max_bytes {
+        return Err(CloneKitError::CorruptArtifact("generation file is not a bounded regular file".into()));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| CloneKitError::CorruptArtifact(format!("read generation file: {err}")))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(CloneKitError::CorruptArtifact("generation file exceeds the size cap".into()));
+    }
+    Ok(bytes)
+}
+
+fn write_private_file(dest: &Path, bytes: &[u8]) -> Result<(), CloneKitError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dest)
+        .map_err(|err| CloneKitError::GitFailed(format!("create prepared clonekit file: {err}")))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|err| CloneKitError::GitFailed(format!("write prepared clonekit file: {err}")))
+}
+
+fn copy_private_file(src: &Path, dest: &Path) -> Result<(), CloneKitError> {
+    let mut input = File::open(src)
+        .map_err(|err| CloneKitError::CorruptArtifact(format!("open staged clonekit artifact: {err}")))?;
+    if !input
+        .metadata()
+        .map_err(|err| CloneKitError::CorruptArtifact(format!("stat staged clonekit artifact: {err}")))?
+        .is_file()
+    {
+        return Err(CloneKitError::CorruptArtifact("staged clonekit artifact is not a regular file".into()));
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dest)
+        .map_err(|err| CloneKitError::GitFailed(format!("create prepared clonekit artifact: {err}")))?;
+    io::copy(&mut input, &mut output)
+        .map_err(|err| CloneKitError::GitFailed(format!("copy prepared clonekit artifact: {err}")))?;
+    output
+        .sync_all()
+        .map_err(|err| CloneKitError::GitFailed(format!("sync prepared clonekit artifact: {err}")))
 }
 
 fn manifest_from_request(
