@@ -192,14 +192,22 @@ fn poll_writable(fd: RawFd, wait: Duration) -> Result<(), HelperError> {
     }
 }
 
-/// One complete-frame nonblocking send attempt. This exists so the zero-budget
-/// path cannot retry EINTR/short writes or restart a grace; a short or failed
-/// attempt returns `false` and the caller fail-closes the exact generation.
-fn send_complete_once<F>(bytes: &[u8], send: F) -> bool
+/// One complete-frame nonblocking send attempt. A short or failed attempt runs
+/// `terminal` before this function returns, so a caller that holds the control
+/// guard still marks the exact generation dead before releasing that guard.
+/// It never retries EINTR/short writes or restarts a grace.
+fn send_complete_or_terminal<F, M>(bytes: &[u8], send: F, terminal: M) -> bool
 where
     F: FnOnce(*const u8, usize) -> isize,
+    M: FnOnce(i32),
 {
-    send(bytes.as_ptr(), bytes.len()) as usize == bytes.len()
+    let sent = send(bytes.as_ptr(), bytes.len());
+    if sent as usize == bytes.len() {
+        return true;
+    }
+    let code = if sent < 0 { io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) } else { libc::EIO };
+    terminal(code);
+    false
 }
 
 /// Write one already-serialized control frame without blocking past the
@@ -339,15 +347,27 @@ impl Inner {
         let fd = control.as_raw_fd();
         // Exactly one nonblocking attempt: no retry loop and no grace reset.
         // EINTR, EAGAIN, a short write or any other error is an unproved
-        // best-effort attempt; the caller fail-closes the exact generation.
+        // best-effort attempt. Mark the exact generation terminal while this
+        // guard is still held so a concurrent shutdown sender that acquires the
+        // control mutex afterwards rechecks `dead` and cannot append a frame to
+        // a corrupted stream.
         // SAFETY: the socket fd is owned by `control`; the pointer covers the
         // canonical frame bytes and `MSG_DONTWAIT` never blocks.
-        if !send_complete_once(&bytes, |pointer, length| unsafe {
-            libc::send(fd, pointer.cast(), length, CONTROL_SEND_FLAGS)
-        }) {
+        if !send_complete_or_terminal(
+            &bytes,
+            |pointer, length| unsafe { libc::send(fd, pointer.cast(), length, CONTROL_SEND_FLAGS) },
+            |code| {
+                self.fail_generation(code, "workspace FUSE helper shutdown frame was not sent completely");
+            },
+        ) {
             return false;
         }
-        control.flush().is_ok()
+        if let Err(error) = control.flush() {
+            let code = error.raw_os_error().unwrap_or(libc::EIO);
+            self.fail_generation(code, "workspace FUSE helper shutdown flush failed");
+            return false;
+        }
+        true
     }
 
     fn deliver(&self, frame: Frame) {
@@ -1206,14 +1226,36 @@ mod tests {
     }
 
     #[test]
-    fn zero_budget_send_treats_eintr_like_failure_as_one_attempt() {
+    fn short_zero_budget_send_marks_terminal_before_releasing_the_control_guard() {
+        struct Guard(Arc<AtomicBool>);
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let guard_alive = Arc::new(AtomicBool::new(true));
+        let guard = Guard(guard_alive.clone());
         let mut attempts = 0;
-        let sent = send_complete_once(&[1u8, 2, 3], |_, _| {
-            attempts += 1;
-            -1
-        });
-        assert!(!sent);
+        let mut terminal_calls = 0;
+        let complete = send_complete_or_terminal(
+            &[1u8, 2, 3],
+            |_, _| {
+                attempts += 1;
+                -1
+            },
+            |code| {
+                terminal_calls += 1;
+                assert!(guard_alive.load(Ordering::SeqCst), "terminal marking must precede guard release");
+                assert_eq!(code, libc::EINTR);
+            },
+        );
+        assert!(!complete);
         assert_eq!(attempts, 1, "the zero-budget send must not retry EINTR or a short write");
+        assert_eq!(terminal_calls, 1);
+        drop(guard);
+        assert!(!guard_alive.load(Ordering::SeqCst));
     }
 
     #[test]
